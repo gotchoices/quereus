@@ -384,7 +384,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Returns the updated TableSchema for the engine to register.
 	 */
 	async alterTable(
-		_db: Database,
+		db: Database,
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
@@ -400,10 +400,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 
 		const oldSchema = table.getSchema();
+		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
 
 		switch (change.type) {
 			case 'addColumn': {
-				const newColSchema = columnDefToSchema(change.columnDef, false);
+				const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull);
 
 				// Extract default value from column def constraints
 				let defaultValue: SqlValue = null;
@@ -518,7 +519,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					throw new QuereusError(`Column '${change.oldName}' not found.`, StatusCode.ERROR);
 				}
 
-				const newColSchema = columnDefToSchema(change.newColumnDefAst, false);
+				const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull);
 				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newColSchema : c);
 				const updatedIndexes = (oldSchema.indexes || []).map(idx => ({
 					...idx,
