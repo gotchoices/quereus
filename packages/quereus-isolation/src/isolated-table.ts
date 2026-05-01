@@ -666,7 +666,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 				if (existingOverlayRow) {
 					if (existingOverlayRow[tombstoneIndex] === 1) {
-						// Already deleted, nothing to do
+						// Already deleted, nothing to do — return ok without row so callers
+						// (e.g. dml-executor auto-event path) know no actual row was removed.
 						return { status: 'ok' };
 					}
 					// Convert to tombstone by updating the tombstone flag
@@ -677,6 +678,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						oldKeyValues: targetPK,
 						onConflict: args.onConflict,
 					});
+					// Return the pre-deletion row so dml-executor emits the auto change event.
+					const deletedRow = existingOverlayRow.slice(0, tombstoneIndex) as SqlValue[];
+					return { status: 'ok', row: deletedRow };
 				} else {
 					// Insert tombstone to shadow underlying row
 					// Build a minimal row with PK values and tombstone = 1
@@ -694,9 +698,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						values: tombstoneRow,
 						onConflict: args.onConflict,
 					});
+					// Return a minimal placeholder row (PK columns only) so dml-executor
+					// recognises the delete as successful and emits the auto change event.
+					const placeholderRow: SqlValue[] = new Array(schema.columns.length).fill(null);
+					pkIndices.forEach((colIdx, i) => {
+						placeholderRow[colIdx] = targetPK[i];
+					});
+					return { status: 'ok', row: placeholderRow };
 				}
-
-				return { status: 'ok' };
 			}
 
 			default:
