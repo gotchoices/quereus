@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -288,9 +288,12 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Delegates ALTER TABLE to the underlying module. ADD/DROP/RENAME COLUMN
-	 * mutates the underlying TableSchema in place; any per-connection overlays
-	 * derived from the pre-alter schema are invalidated here.
+	 * Delegates ALTER TABLE to the underlying module and migrates any per-connection
+	 * overlays to the post-alter schema without discarding staged rows.
+	 *
+	 * ADD COLUMN  — appends null to each overlay row's data columns.
+	 * DROP COLUMN — removes the dropped column from each overlay row.
+	 * RENAME / ALTER COLUMN — data column indices are unchanged; only schema metadata rotates.
 	 */
 	async alterTable(
 		db: Database,
@@ -305,19 +308,124 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			);
 		}
 
-		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
-
-		// Invalidate any per-connection overlays derived from the pre-alter schema.
-		// Overlay tables carry columns copied from the underlying schema + tombstone,
-		// so their shape is stale after ADD/DROP/RENAME.
+		// Collect affected overlays before the underlying schema is mutated.
 		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
-		for (const key of [...this.connectionOverlays.keys()]) {
+		const affected: [string, ConnectionOverlayState][] = [];
+		for (const [key, state] of this.connectionOverlays.entries()) {
 			if (key.endsWith(suffix)) {
-				this.connectionOverlays.delete(key);
+				affected.push([key, state]);
 			}
 		}
 
+		// For dropColumn we need the pre-alter column index, readable from any overlay schema.
+		let dropColumnIdx: number | undefined;
+		if (change.type === 'dropColumn' && affected.length > 0) {
+			const overlaySchema = affected[0][1].overlayTable.tableSchema;
+			dropColumnIdx = overlaySchema?.columnIndexMap.get(change.columnName.toLowerCase());
+		}
+
+		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
+
+		// Migrate each affected overlay to the new schema, preserving staged rows.
+		for (const [key, oldState] of affected) {
+			const newState = await this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx);
+			this.connectionOverlays.set(key, newState);
+		}
+
 		return updated;
+	}
+
+	/**
+	 * Rebuilds an overlay table under the post-alter schema, translating each
+	 * staged row to the new column layout.
+	 */
+	private async migrateOverlayForAlter(
+		db: Database,
+		oldState: ConnectionOverlayState,
+		updatedSchema: TableSchema,
+		change: SchemaChangeInfo,
+		dropColumnIdx: number | undefined,
+	): Promise<ConnectionOverlayState> {
+		const oldOverlay = oldState.overlayTable;
+		const oldOverlaySchema = oldOverlay.tableSchema;
+
+		const newOverlaySchema = this.createOverlaySchema(updatedSchema);
+		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
+
+		if (oldState.hasChanges && oldOverlaySchema && oldOverlay.query) {
+			const oldTombstoneIdx = oldOverlaySchema.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
+			if (oldTombstoneIdx === undefined) {
+				throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
+			}
+			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+				const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx);
+				await newOverlayTable.update({ operation: 'insert', values: newRow, preCoerced: true });
+			}
+		}
+
+		return { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges };
+	}
+
+	/**
+	 * Translates a single overlay row from the pre-alter to the post-alter column layout.
+	 * The tombstone value is preserved in the last position.
+	 */
+	private translateOverlayRow(
+		oldRow: Row,
+		oldTombstoneIdx: number,
+		change: SchemaChangeInfo,
+		dropColumnIdx: number | undefined,
+	): SqlValue[] {
+		const tombstoneValue = oldRow[oldTombstoneIdx] as SqlValue;
+		const data = Array.from(oldRow.slice(0, oldTombstoneIdx)) as SqlValue[];
+
+		let newData: SqlValue[];
+		switch (change.type) {
+			case 'addColumn':
+				// New column is always appended after existing data columns.
+				newData = [...data, null];
+				break;
+			case 'dropColumn':
+				newData = dropColumnIdx !== undefined
+					? [...data.slice(0, dropColumnIdx), ...data.slice(dropColumnIdx + 1)]
+					: data;
+				break;
+			case 'renameColumn':
+			case 'alterColumn':
+			case 'alterPrimaryKey':
+				newData = data;
+				break;
+			default: {
+				const _exhaustive: never = change;
+				newData = data;
+			}
+		}
+
+		return [...newData, tombstoneValue];
+	}
+
+	/** Creates a FilterInfo for a full table scan (no constraints). */
+	private makeFullScanFilterInfo(): FilterInfo {
+		return {
+			idxNum: 0,
+			idxStr: null,
+			constraints: [],
+			args: [],
+			indexInfoOutput: {
+				nConstraint: 0,
+				aConstraint: [],
+				nOrderBy: 0,
+				aOrderBy: [],
+				colUsed: 0n,
+				aConstraintUsage: [],
+				idxNum: 0,
+				idxStr: null,
+				orderByConsumed: false,
+				estimatedCost: 1000000,
+				estimatedRows: 1000000n,
+				idxFlags: 0,
+			},
+		};
 	}
 
 	/**

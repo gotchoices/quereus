@@ -243,6 +243,59 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	describe('ALTER TABLE overlay migration', () => {
+		it('INSERT then ADD COLUMN: overlay row survives with NULL in new column', async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t ADD COLUMN score INTEGER`);
+
+			const row = await db.get('SELECT * FROM t WHERE id = 1');
+			expect(row?.id).to.equal(1);
+			expect(row?.name).to.equal('Alice');
+			expect(row?.score).to.be.null;
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('INSERT then DROP COLUMN: overlay row survives without dropped column', async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT, extra TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t2 VALUES (1, 'Alice', 'x')`);
+			await db.exec(`ALTER TABLE t2 DROP COLUMN extra`);
+
+			const row = await db.get('SELECT * FROM t2 WHERE id = 1');
+			expect(row?.id).to.equal(1);
+			expect(row?.name).to.equal('Alice');
+			expect(row).to.not.have.property('extra');
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('INSERT then RENAME COLUMN: overlay row is intact under the new column name', async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t3 (id INTEGER PRIMARY KEY, old_name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t3 VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t3 RENAME COLUMN old_name TO new_name`);
+
+			const row = await db.get('SELECT * FROM t3 WHERE id = 1');
+			expect(row?.id).to.equal(1);
+			expect(row?.new_name).to.equal('Alice');
+			expect(row).to.not.have.property('old_name');
+
+			await db.exec('ROLLBACK');
+		});
+	});
+
 	describe('failed-commit rollback', () => {
 		beforeEach(async () => {
 			const isolatedModule = createIsolatedStoreModule({ provider });
