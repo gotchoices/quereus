@@ -1,5 +1,5 @@
 import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, isUpdateOk, IndexConstraintOp } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, isUpdateOk, IndexConstraintOp, ConflictResolution } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -587,17 +587,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 		switch (operation) {
 			case 'insert': {
-				// Check if there's an existing tombstone in the overlay for this PK.
-				// This happens when a row is deleted then re-inserted with the same PK.
-				// In that case, convert the tombstone to a regular row (update) instead
-				// of inserting, which would fail with a UNIQUE constraint violation.
 				const pkIndices = this.getPrimaryKeyIndices();
 				const pk = values ? pkIndices.map(i => values[i]) : undefined;
 
 				if (pk) {
 					const existingRow = await this.getOverlayRow(overlay, pk);
 					if (existingRow && existingRow[tombstoneIndex] === 1) {
-						// Convert tombstone to regular row
+						// Convert tombstone to regular row (delete then re-insert same PK)
 						const overlayRow = [...(values ?? []), 0];
 						const result = await overlay.update({
 							operation: 'update',
@@ -606,6 +602,16 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 							onConflict: args.onConflict,
 						});
 						return this.stripTombstoneFromResult(result, tombstoneIndex);
+					}
+
+					if (!existingRow) {
+						// No overlay entry — check underlying for PK conflict
+						const pkConflict = await this.checkMergedPKConflict(overlay, pk, tombstoneIndex, args.onConflict);
+						if (pkConflict !== null) return pkConflict;
+
+						// Check non-PK UNIQUE constraints against merged view
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, [pk], tombstoneIndex, args.onConflict);
+						if (ucResult !== null) return ucResult;
 					}
 				}
 
@@ -643,7 +649,24 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					});
 					return this.stripTombstoneFromResult(result, tombstoneIndex);
 				} else {
-					// Insert new overlay row (shadows underlying)
+					// Insert new overlay row (shadows underlying) — check underlying conflicts first
+					const newPK = pkIndices.map(i => values![i]);
+					const pkChanged = !this.keysEqual(targetPK, newPK);
+
+					if (pkChanged) {
+						const pkConflict = await this.checkMergedPKConflict(overlay, newPK, tombstoneIndex, args.onConflict);
+						if (pkConflict !== null) return pkConflict;
+					}
+
+					const selfPks: SqlValue[][] = pkChanged ? [targetPK, newPK] : [targetPK];
+					const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, selfPks, tombstoneIndex, args.onConflict);
+					if (ucResult !== null) return ucResult;
+
+					// For PK-change updates, tombstone the old PK so the underlying row is deleted at flush
+					if (pkChanged) {
+						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
+					}
+
 					const result = await overlay.update({
 						operation: 'insert',
 						values: overlayRow,
@@ -792,6 +815,132 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				idxFlags: 0,
 			},
 		};
+	}
+
+	// ==================== Merged-View Conflict Detection ====================
+
+	private keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
+		if (a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i++) {
+			if (compareSqlValues(a[i], b[i]) !== 0) return false;
+		}
+		return true;
+	}
+
+	private async getUnderlyingRow(pk: SqlValue[]): Promise<Row | undefined> {
+		if (!this.underlyingTable.query) return undefined;
+		for await (const row of this.underlyingTable.query(this.buildPKPointLookupFilter(pk))) {
+			return row;
+		}
+		return undefined;
+	}
+
+	private async insertTombstoneForPK(overlay: VirtualTable, pk: SqlValue[], tombstoneIndex: number): Promise<void> {
+		const schema = this.tableSchema;
+		if (!schema) throw new Error('No table schema');
+		const pkIndices = this.getPrimaryKeyIndices();
+		const tombstoneRow: SqlValue[] = new Array(schema.columns.length + 1).fill(null);
+		pkIndices.forEach((colIdx, i) => { tombstoneRow[colIdx] = pk[i]; });
+		tombstoneRow[tombstoneIndex] = 1;
+		const existing = await this.getOverlayRow(overlay, pk);
+		if (existing) {
+			await overlay.update({ operation: 'update', values: tombstoneRow, oldKeyValues: pk });
+		} else {
+			await overlay.update({ operation: 'insert', values: tombstoneRow });
+		}
+	}
+
+	/**
+	 * Checks if newPK conflicts with an underlying row not already shadowed in the overlay.
+	 * Returns null (no conflict or REPLACE applied) or an UpdateResult (IGNORE / constraint).
+	 */
+	private async checkMergedPKConflict(
+		overlay: VirtualTable,
+		newPK: SqlValue[],
+		tombstoneIndex: number,
+		onConflict?: ConflictResolution,
+	): Promise<UpdateResult | null> {
+		const overlayRow = await this.getOverlayRow(overlay, newPK);
+		if (overlayRow) return null; // overlay handles it (tombstone = no conflict; real = overlay enforces)
+
+		const underlyingRow = await this.getUnderlyingRow(newPK);
+		if (!underlyingRow) return null;
+
+		if (onConflict === ConflictResolution.IGNORE) return { status: 'ok', row: undefined };
+		if (onConflict === ConflictResolution.REPLACE) return null; // same-PK replace: flush will UPDATE underlying
+		return {
+			status: 'constraint',
+			constraint: 'unique',
+			message: 'UNIQUE constraint failed: primary key',
+			existingRow: underlyingRow,
+		};
+	}
+
+	/**
+	 * Scans the underlying table for a row conflicting with newRow on constrainedCols,
+	 * excluding selfPks and rows tombstoned in the overlay.
+	 */
+	private async findMergedUniqueConflict(
+		overlay: VirtualTable,
+		constrainedCols: ReadonlyArray<number>,
+		newRow: Row,
+		selfPks: SqlValue[][],
+		tombstoneIndex: number,
+	): Promise<{ pk: SqlValue[]; row: Row } | null> {
+		if (!this.underlyingTable.query) return null;
+		const pkIndices = this.getPrimaryKeyIndices();
+
+		for await (const underlyingRow of this.underlyingTable.query(this.createFullScanFilterInfo())) {
+			const pk = pkIndices.map(i => underlyingRow[i]);
+			if (selfPks.some(self => this.keysEqual(pk, self))) continue;
+
+			const overlayRow = await this.getOverlayRow(overlay, pk);
+			if (overlayRow && overlayRow[tombstoneIndex] === 1) continue;
+
+			const matches = constrainedCols.every(idx => {
+				if (newRow[idx] === null || underlyingRow[idx] === null) return false;
+				return compareSqlValues(newRow[idx], underlyingRow[idx]) === 0;
+			});
+			if (matches) return { pk, row: underlyingRow };
+		}
+		return null;
+	}
+
+	/**
+	 * Checks all non-PK UNIQUE constraints against the merged view.
+	 * Returns null when all pass or REPLACE evictions succeed.
+	 */
+	private async checkMergedUniqueConstraints(
+		overlay: VirtualTable,
+		newRow: Row,
+		selfPks: SqlValue[][],
+		tombstoneIndex: number,
+		onConflict?: ConflictResolution,
+	): Promise<UpdateResult | null> {
+		const schema = this.tableSchema;
+		const uniqueConstraints = schema?.uniqueConstraints;
+		if (!uniqueConstraints || uniqueConstraints.length === 0) return null;
+
+		for (const uc of uniqueConstraints) {
+			if (uc.columns.some(idx => newRow[idx] === null)) continue;
+
+			const conflict = await this.findMergedUniqueConflict(overlay, uc.columns, newRow, selfPks, tombstoneIndex);
+			if (!conflict) continue;
+
+			if (onConflict === ConflictResolution.IGNORE) return { status: 'ok', row: undefined };
+			if (onConflict === ConflictResolution.REPLACE) {
+				await this.insertTombstoneForPK(overlay, conflict.pk, tombstoneIndex);
+				continue;
+			}
+			const colNames = uc.columns.map(i => schema!.columns[i].name).join(', ');
+			return {
+				status: 'constraint',
+				constraint: 'unique',
+				message: `UNIQUE constraint failed: ${schema!.name} (${colNames})`,
+				existingRow: conflict.row,
+			};
+		}
+		return null;
 	}
 
 	// ==================== Transaction Lifecycle ====================
