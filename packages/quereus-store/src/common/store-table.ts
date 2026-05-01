@@ -57,6 +57,15 @@ function bytesToHex(key: Uint8Array): string {
 	return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** Byte-wise equality check for Uint8Arrays. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
 /**
  * Configuration for a store table.
  */
@@ -234,9 +243,7 @@ export class StoreTable extends VirtualTable {
 
 		const batch = store.batch();
 		for (const { newKey, oldKey, row } of pending.values()) {
-			const oldHex = bytesToHex(oldKey);
-			const newHex = bytesToHex(newKey);
-			if (oldHex !== newHex) {
+			if (!bytesEqual(oldKey, newKey)) {
 				batch.delete(oldKey);
 				batch.put(newKey, serializeRow(row));
 			}
