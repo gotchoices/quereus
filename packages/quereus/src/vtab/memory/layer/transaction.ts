@@ -7,6 +7,7 @@ import type { Layer } from './interface.js';
 import { createLogger } from '../../../common/logger.js';
 import { createPrimaryKeyFunctions } from '../utils/primary-key.js';
 import { QuereusError } from '../../../common/errors.js';
+import { StatusCode } from '../../../common/types.js';
 
 const log = createLogger('vtab:memory:layer:transaction');
 const warnLog = log.extend('warn');
@@ -48,7 +49,15 @@ export class TransactionLayer implements Layer {
 	constructor(parent: Layer) {
 		this.layerId = transactionLayerCounter++;
 		this.parentLayer = parent;
-		this.tableSchemaAtCreation = parent.getSchema(); // Schema is fixed at creation
+		const schema = parent.getSchema();
+		if (!schema) {
+			throw new QuereusError(
+				`TransactionLayer: parent layer ${parent.getLayerId()} has no schema. ` +
+				'This usually means a savepoint snapshot was created before the overlay was initialised.',
+				StatusCode.INTERNAL
+			);
+		}
+		this.tableSchemaAtCreation = schema; // Schema is fixed at creation
 
 		// Initialize primary modifications BTree with parent's primary tree as base
 		const { primaryKeyExtractorFromRow, primaryKeyComparator } = this.getPkExtractorsAndComparators(this.tableSchemaAtCreation);

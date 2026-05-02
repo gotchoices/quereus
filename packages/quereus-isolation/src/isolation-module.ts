@@ -62,6 +62,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	private readonly connectionOverlays = new Map<string, ConnectionOverlayState>();
 
+	/**
+	 * Tracks savepoint depths that were created before the overlay existed, per
+	 * connection+table.  Keyed identically to connectionOverlays.
+	 * When the overlay is created lazily after some savepoints already exist,
+	 * its MemoryVirtualTableConnection stack needs to be padded so that
+	 * rollbackToSavepoint(depth) looks up the correct stack index.
+	 */
+	private readonly preOverlaySavepoints = new Map<string, Set<number>>();
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -115,6 +124,27 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	clearConnectionOverlay(db: Database, schemaName: string, tableName: string): void {
 		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		this.connectionOverlays.delete(key);
+	}
+
+	/**
+	 * Returns (creating if absent) the set of savepoint depths that pre-date the overlay
+	 * for this connection+table.  Shared across all IsolatedTable instances in the
+	 * same connection so that ensureOverlay() on any instance sees the correct set.
+	 */
+	getPreOverlaySavepoints(db: Database, schemaName: string, tableName: string): Set<number> {
+		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		let set = this.preOverlaySavepoints.get(key);
+		if (!set) {
+			set = new Set();
+			this.preOverlaySavepoints.set(key, set);
+		}
+		return set;
+	}
+
+	/** Removes the pre-overlay savepoint set for a connection+table. */
+	clearPreOverlaySavepoints(db: Database, schemaName: string, tableName: string): void {
+		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		this.preOverlaySavepoints.delete(key);
 	}
 
 	/**
@@ -255,6 +285,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	async closeAll(): Promise<void> {
 		this.connectionOverlays.clear();
+		this.preOverlaySavepoints.clear();
 		this.underlyingTables.clear();
 		const underlyingWithClose = this.underlying as { closeAll?: () => Promise<void> };
 		if (typeof underlyingWithClose.closeAll === 'function') {

@@ -35,11 +35,15 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private registeredConnection: IsolatedConnection | null = null;
 
 	/**
-	 * Tracks savepoint depths that were created before the overlay existed.
-	 * When rolling back to one of these savepoints, the overlay is cleared
-	 * entirely (restoring the "no uncommitted changes" state).
+	 * Returns the connection-scoped set of savepoint depths that pre-date the overlay.
+	 * Stored in IsolationModule (keyed by db+schema+table) so all IsolatedTable instances
+	 * for the same connection see the same set — important because each statement creates
+	 * a fresh IsolatedTable instance via module.connect(), so instance-local state would
+	 * be lost between the createSavepoint callback and the ensureOverlay() call.
 	 */
-	private savepointsBeforeOverlay: Set<number> = new Set();
+	private get savepointsBeforeOverlay(): Set<number> {
+		return this.isolationModule.getPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
+	}
 
 	constructor(
 		db: Database,
@@ -131,6 +135,25 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// indexes from the schema during construction.  No explicit createIndex loop
 		// is needed, and calling it would throw a "duplicate index" error.
 		const overlayTable = await this.isolationModule.overlayModule.create(this.db, overlaySchema);
+
+		// If savepoints were created before the overlay existed, the overlay's
+		// connection will be registered with the DB only after the first write.
+		// This means the DB's broadcast of rollbackToSavepoint(depth) will find
+		// the overlay connection's stack empty (or starting at index 0) while the
+		// depth value is non-zero, causing an out-of-range access and a no-op.
+		//
+		// Fix: pre-register the overlay's connection NOW and pad its savepoint stack
+		// with empty snapshots for each pre-overlay depth so the indices align.
+		if (this.savepointsBeforeOverlay.size > 0 && overlayTable.createConnection) {
+			const preAlignedConn = await overlayTable.createConnection();
+			// Registering first ensures MemoryTable.ensureConnection() finds and reuses
+			// this connection rather than creating a new one on the first overlay.update().
+			await (this.db as DatabaseInternal).registerConnection(preAlignedConn);
+			const sortedDepths = [...this.savepointsBeforeOverlay].sort((a, b) => a - b);
+			for (const depth of sortedDepths) {
+				await preAlignedConn.createSavepoint(depth);
+			}
+		}
 
 		// Store in connection-scoped storage
 		const state: ConnectionOverlayState = {
@@ -1191,7 +1214,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	async onConnectionCommit(): Promise<void> {
 		await this.flushAndClearOverlay();
-		this.savepointsBeforeOverlay.clear();
+		this.isolationModule.clearPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 
 	/**
@@ -1200,7 +1223,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	async onConnectionRollback(): Promise<void> {
 		this.clearOverlay();
-		this.savepointsBeforeOverlay.clear();
+		this.isolationModule.clearPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 
 	/**

@@ -736,6 +736,61 @@ describe('IsolationModule', () => {
 
 			await db.exec('COMMIT');
 		});
+
+		it('pre-overlay savepoint: rollback to savepoint created before first write clears overlay', async () => {
+			// sp1 is created before any write in this transaction (so before the overlay exists).
+			// After the INSERT creates the overlay, ROLLBACK TO sp1 must wipe the overlay entirely.
+			await db.exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await db.exec(`INSERT INTO test VALUES (1, 'committed')`);
+
+			await db.exec('BEGIN');
+			await db.exec('SAVEPOINT sp1');      // sp1 pre-dates the overlay
+			await db.exec(`INSERT INTO test VALUES (2, 'will-vanish')`); // creates overlay
+			await db.exec('ROLLBACK TO SAVEPOINT sp1');
+
+			// Overlay should be wiped — only the pre-transaction committed row is visible
+			const rows = await asyncIterableToArray(db.eval('SELECT * FROM test ORDER BY id'));
+			expect(rows.length).to.equal(1);
+			expect(rows[0].id).to.equal(1);
+
+			await db.exec('ROLLBACK');
+
+			// Underlying unchanged
+			const afterRollback = await asyncIterableToArray(db.eval('SELECT * FROM test'));
+			expect(afterRollback.length).to.equal(1);
+			expect(afterRollback[0].id).to.equal(1);
+		});
+
+		it('mixed pre/post-overlay savepoints: rollback to post-overlay sp2 keeps first write, rollback to pre-overlay sp1 wipes all', async () => {
+			// sp1 is pre-overlay, sp2 is post-overlay (created after first INSERT).
+			// ROLLBACK TO sp2 should keep the INSERT before sp2.
+			// ROLLBACK TO sp1 should then wipe everything from the transaction.
+			await db.exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await db.exec(`INSERT INTO test VALUES (1, 'committed')`);
+
+			await db.exec('BEGIN');
+			await db.exec('SAVEPOINT sp1');                               // sp1 pre-overlay
+			await db.exec(`INSERT INTO test VALUES (2, 'after-sp1')`);   // creates overlay
+			await db.exec('SAVEPOINT sp2');                               // sp2 post-overlay
+			await db.exec(`INSERT INTO test VALUES (3, 'after-sp2')`);
+
+			// ROLLBACK TO sp2: undo INSERT (3), keep INSERT (2)
+			await db.exec('ROLLBACK TO SAVEPOINT sp2');
+			let rows = await asyncIterableToArray(db.eval('SELECT * FROM test ORDER BY id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
+
+			// ROLLBACK TO sp1: wipe entire overlay (sp1 pre-dates the overlay)
+			await db.exec('ROLLBACK TO SAVEPOINT sp1');
+			rows = await asyncIterableToArray(db.eval('SELECT * FROM test ORDER BY id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1]);
+
+			await db.exec('COMMIT');
+
+			// Only the pre-transaction row survives
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT * FROM test'));
+			expect(afterCommit.length).to.equal(1);
+			expect(afterCommit[0].id).to.equal(1);
+		});
 	});
 
 	describe('compound primary keys', () => {

@@ -46,7 +46,7 @@ const MEMORY_ONLY_FILES = new Set([
   '41-fk-cross-schema.sqllogic',  // FK cascade on PK-change UPDATE across overlay/underlying not fully handled
   '41-foreign-keys.sqllogic',  // INSERT OR REPLACE on parent when conflicting row is only in underlying store (not overlay) does not return replacedRow, so ON DELETE CASCADE does not fire
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
-  '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
+  // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '102-schema-catalog-edge-cases.sqllogic',  // DROP+CREATE reuse races with isolation-layer underlyingTables state (unrelated to transaction isolation)
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'
   '105-vtab-memory-mutation-kills.sqllogic',  // White-box mutation tests targeting src/vtab/memory/ internals
