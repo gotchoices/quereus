@@ -425,6 +425,83 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	describe('UPDATE that changes the primary key', () => {
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			db.setOption('default_vtab_module', 'store');
+		});
+
+		afterEach(async () => {
+			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
+		it('PK change from underlying row: only new PK visible inside transaction', async () => {
+			await db.exec(`CREATE TABLE t_pkc (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO t_pkc VALUES (1, 'A')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t_pkc SET id = 2 WHERE id = 1`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT id FROM t_pkc ORDER BY id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([2]);
+
+			await db.exec('COMMIT');
+
+			const after = await asyncIterableToArray(db.eval('SELECT id FROM t_pkc ORDER BY id'));
+			expect(after.map((r: any) => r.id)).to.deep.equal([2]);
+		});
+
+		it('PK change rollback restores original underlying row', async () => {
+			await db.exec(`CREATE TABLE t_pkcr (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO t_pkcr VALUES (1, 'A')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t_pkcr SET id = 2 WHERE id = 1`);
+			await db.exec('ROLLBACK');
+
+			const after = await asyncIterableToArray(db.eval('SELECT id FROM t_pkcr ORDER BY id'));
+			expect(after.map((r: any) => r.id)).to.deep.equal([1]);
+		});
+
+		it('PK change after non-PK update in same transaction: only new PK visible', async () => {
+			await db.exec(`CREATE TABLE t_pkc2 (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO t_pkc2 VALUES (1, 'A')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t_pkc2 SET name = 'B' WHERE id = 1`);
+			await db.exec(`UPDATE t_pkc2 SET id = 2 WHERE id = 1`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT id, name FROM t_pkc2 ORDER BY id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([2]);
+			expect(rows[0].name).to.equal('B');
+
+			await db.exec('COMMIT');
+
+			const after = await asyncIterableToArray(db.eval('SELECT id, name FROM t_pkc2 ORDER BY id'));
+			expect(after.map((r: any) => r.id)).to.deep.equal([2]);
+			expect(after[0].name).to.equal('B');
+		});
+
+		it('composite PK change: only new PK visible after commit', async () => {
+			await db.exec(`CREATE TABLE t_cpkc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY(a, b)) USING store`);
+			await db.exec(`INSERT INTO t_cpkc VALUES (1, 1, 'X')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t_cpkc SET a = 2, b = 2 WHERE a = 1 AND b = 1`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT a, b FROM t_cpkc ORDER BY a'));
+			expect(rows.map((r: any) => [r.a, r.b])).to.deep.equal([[2, 2]]);
+
+			await db.exec('COMMIT');
+
+			const after = await asyncIterableToArray(db.eval('SELECT a, b FROM t_cpkc ORDER BY a'));
+			expect(after.map((r: any) => [r.a, r.b])).to.deep.equal([[2, 2]]);
+		});
+	});
+
 	describe('deferred CHECK constraints via IsolatedConnection', () => {
 		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
 

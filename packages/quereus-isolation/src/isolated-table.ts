@@ -694,7 +694,34 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				const overlayRow = [...values, 0]; // tombstone = 0
 
 				if (existingOverlayRow) {
-					// Update existing overlay row
+					const newPK = pkIndices.map(i => values![i]);
+					const pkChanged = !this.keysEqual(targetPK, newPK);
+
+					if (pkChanged) {
+						// PK is changing: check for conflicts at the new PK, then tombstone the old
+						// overlay slot and insert a fresh row at the new PK so the underlying row
+						// at targetPK is shadowed (tombstoned) after flush.
+						const pkConflict = await this.checkMergedPKConflict(overlay, newPK, tombstoneIndex, args.onConflict);
+						if (pkConflict !== null) return pkConflict;
+
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, [targetPK, newPK], tombstoneIndex, args.onConflict);
+						if (ucResult !== null) return ucResult;
+
+						// Remove existing overlay row then insert a tombstone so the underlying
+						// row at targetPK is hidden after flush.  Delete-then-insert avoids a
+						// same-layer upsert that some BTree implementations may not handle
+						// correctly when updating a value inserted in the same transaction.
+						await overlay.update({ operation: 'delete', values: undefined, oldKeyValues: targetPK });
+						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
+						const result = await overlay.update({
+							operation: 'insert',
+							values: overlayRow,
+							onConflict: args.onConflict,
+						});
+						return this.stripTombstoneFromResult(result, tombstoneIndex);
+					}
+
+					// Same PK — update the overlay row in place
 					const result = await overlay.update({
 						...args,
 						values: overlayRow,
