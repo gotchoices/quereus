@@ -39,14 +39,11 @@ const USE_STORE_MODULE = process.env.QUEREUS_TEST_STORE === 'true' || process.en
 const MEMORY_ONLY_FILES = new Set([
   '04-transactions.sqllogic',  // savepoint rollback in overlay does not undo writes when overlay was created after the savepoint (isolation-layer limitation)
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
-  '10.1-ddl-lifecycle.sqllogic',  // DROP+CREATE reuse of table name races with underlyingTables state (unrelated to transaction isolation)
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
-  '40.1-pk-desc-direction.sqllogic',  // PK DESC iteration order not preserved when merging overlay with underlying
-  '41-alter-table.sqllogic',  // ALTER TABLE RENAME through isolation layer does not propagate to overlay schema
+  '41-alter-table.sqllogic',  // IsolationModule does not implement renameTable; RENAME TABLE data disappears through the isolation layer (see fix ticket isolation-rename-table-forwarding)
   '41-foreign-keys.sqllogic',  // INSERT OR REPLACE on parent when conflicting row is only in underlying store (not overlay) does not return replacedRow, so ON DELETE CASCADE does not fire
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
-  '102-schema-catalog-edge-cases.sqllogic',  // DROP+CREATE reuse races with isolation-layer underlyingTables state (unrelated to transaction isolation)
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'
   '105-vtab-memory-mutation-kills.sqllogic',  // White-box mutation tests targeting src/vtab/memory/ internals
 ]);
