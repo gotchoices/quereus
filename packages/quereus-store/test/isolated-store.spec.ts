@@ -534,4 +534,67 @@ describe('Isolated Store Module', () => {
 			expect(afterFailedCommit?.balance).to.equal(100);
 		});
 	});
+
+	describe('DELETE … RETURNING with overlay-only rows', () => {
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			db.setOption('default_vtab_module', 'store');
+		});
+
+		afterEach(async () => {
+			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
+		it('DELETE … RETURNING sees rows inserted earlier in the same transaction', async () => {
+			await db.exec(`CREATE TABLE del_ret (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO del_ret VALUES (1, 'a'), (2, 'b'), (3, 'c')`);
+
+			// DELETE should find all 3 rows that exist only in the overlay
+			const rows = await asyncIterableToArray(db.eval('DELETE FROM del_ret RETURNING id, name'));
+			expect(rows.length, 'RETURNING should yield 3 deleted rows').to.equal(3);
+			expect(rows.map((r: any) => r.id).sort()).to.deep.equal([1, 2, 3]);
+
+			// Table should be empty after DELETE
+			const remaining = await asyncIterableToArray(db.eval('SELECT count(*) as cnt FROM del_ret'));
+			expect(remaining[0].cnt).to.equal(0);
+
+			await db.exec('COMMIT');
+
+			// Committed state: table is empty
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT count(*) as cnt FROM del_ret'));
+			expect(afterCommit[0].cnt).to.equal(0);
+		});
+
+		it('DELETE-as-subquery RETURNING observes overlay rows in composite DML', async () => {
+			await db.exec(`CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT) USING store`);
+			await db.exec(`CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO src VALUES (10, 'x'), (20, 'y'), (30, 'z')`);
+
+			// INSERT into dst using ids returned from DELETE of src (both tables have overlay-only rows)
+			await db.exec(`
+				INSERT INTO dst (id, val)
+				SELECT id, val FROM (DELETE FROM src RETURNING id, val)
+			`);
+
+			// src should be empty (all rows deleted via overlay)
+			const srcRows = await asyncIterableToArray(db.eval('SELECT count(*) as cnt FROM src'));
+			expect(srcRows[0].cnt, 'src should be empty after DELETE').to.equal(0);
+
+			// dst should have the 3 transferred rows
+			const dstRows = await asyncIterableToArray(db.eval('SELECT id, val FROM dst ORDER BY id'));
+			expect(dstRows.length, 'dst should have 3 rows').to.equal(3);
+			expect(dstRows[0].id).to.equal(10);
+			expect(dstRows[1].id).to.equal(20);
+			expect(dstRows[2].id).to.equal(30);
+
+			await db.exec('COMMIT');
+		});
+	});
 });
