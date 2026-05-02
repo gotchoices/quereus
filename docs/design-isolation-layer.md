@@ -355,6 +355,58 @@ For text columns with non-binary collation (NOCASE, etc.):
 
 ---
 
+## Cross-Layer Constraint Detection
+
+### Why Resolve at Write Time
+
+UNIQUE and PRIMARY KEY constraints span the merged view: a write that does not
+collide within the overlay may still collide with an un-tombstoned row in the
+underlying table. Deferring detection to flush time would make overwrites silent
+and lose the chance to honour `ON CONFLICT IGNORE`/`REPLACE` semantics. Detection
+therefore happens in `IsolatedTable.update()` before the overlay write proceeds.
+
+### PK Conflict (`checkMergedPKConflict`)
+
+Called when an INSERT or PK-changing UPDATE produces a new PK with no overlay
+entry at that key:
+
+- Underlying has no row at the PK → no conflict.
+- Underlying has a row → ABORT returns a constraint result (with `existingRow`
+  populated), IGNORE silently no-ops, REPLACE returns null and lets the insert
+  proceed (the overlay row will become an UPDATE at flush).
+
+### Non-PK UNIQUE Conflict (`checkMergedUniqueConstraints`)
+
+For each declared non-PK UNIQUE constraint:
+
+- Skip if the new row is null on any constrained column (SQL NULL semantics).
+- Scan the underlying table for a row matching on all constrained columns,
+  excluding the writer's own PK(s) and any PK currently tombstoned in the
+  overlay.
+- ABORT returns the constraint result; IGNORE no-ops; REPLACE writes a
+  tombstone for the conflicting underlying PK so the row is evicted at flush,
+  then continues.
+
+### Tombstones for Evicted Rows
+
+`insertTombstoneForPK` writes a row with PK columns populated and all other
+columns (including the constrained UNIQUE columns) set to NULL, plus the
+tombstone marker. The null UNIQUE columns ensure the tombstone itself never
+matches a future merged-view UNIQUE check, and the underlying scan skips any
+PK that has a tombstone in the overlay.
+
+### Trade-offs
+
+- Non-PK UNIQUE checks currently do an O(n) scan of the underlying for each
+  write. The overlay's own UNIQUE constraint enforcement covers overlay-only
+  conflicts; the merged-view scan only fills the underlying-only gap. Index-
+  based lookup is a future optimisation.
+- Same-PK REPLACE returns null instead of carrying the replaced row back to
+  the DML executor, so FK CASCADE side-effects do not fire for replacements
+  resolved through the isolation layer (tracked separately).
+
+---
+
 ## Challenges and Mitigations
 
 ### 1. Merge Iteration Complexity
