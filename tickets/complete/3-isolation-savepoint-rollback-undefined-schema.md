@@ -9,11 +9,11 @@ files:
 
 ## What was built
 
-### Root cause (clarified from ticket)
+### Root cause
 
-The original ticket described a crash (`TransactionLayer` with undefined schema).  Investigation revealed the actual failure mode is subtler: when an overlay `MemoryVirtualTableConnection` is registered with the DB **after** one or more savepoints have already been created, its internal savepoint stack starts at index 0 while the DB's depth counter is already at N.  The DB then calls `rollbackToSavepoint(N)` on the connection and `N >= savepointStack.length` → the rollback is silently skipped, leaving overlay data that should have been rolled back intact.
+The original ticket described a crash (`TransactionLayer` with undefined schema). Investigation revealed the actual failure mode is subtler: when an overlay `MemoryVirtualTableConnection` is registered with the DB **after** one or more savepoints have already been created, its internal savepoint stack starts at index 0 while the DB's depth counter is already at N. The DB then calls `rollbackToSavepoint(N)` on the connection and `N >= savepointStack.length` → the rollback is silently skipped, leaving overlay data that should have been rolled back intact.
 
-A secondary bug: `savepointsBeforeOverlay` was an instance-level field on `IsolatedTable`, but the runtime creates a **fresh** `IsolatedTable` instance per statement (via `module.connect()`).  The savepoint callback fires on instance A; `ensureOverlay()` runs on instance B — B's set was always empty so the alignment code never triggered.
+A secondary bug: `savepointsBeforeOverlay` was an instance-level field on `IsolatedTable`, but the runtime creates a **fresh** `IsolatedTable` instance per statement (via `module.connect()`). The savepoint callback fires on instance A; `ensureOverlay()` runs on instance B — B's set was always empty so the alignment code never triggered.
 
 ### Changes
 
@@ -23,8 +23,8 @@ A secondary bug: `savepointsBeforeOverlay` was an instance-level field on `Isola
 - `closeAll()` also clears `preOverlaySavepoints`.
 
 **`packages/quereus-isolation/src/isolated-table.ts`**
-- Replaced the instance-level `savepointsBeforeOverlay: Set<number>` field with a computed getter that delegates to `isolationModule.getPreOverlaySavepoints(this.db, ...)`.  All instances for the same connection now see the same set.
-- In `ensureOverlay()`: when `savepointsBeforeOverlay` is non-empty, pre-register the overlay's connection with the DB and call `createSavepoint(depth)` on it for each pre-overlay depth (in ascending order).  This pads the overlay's savepoint stack so that subsequent `rollbackToSavepoint(N)` broadcasts land on the correct index.
+- Replaced the instance-level `savepointsBeforeOverlay: Set<number>` field with a computed getter that delegates to `isolationModule.getPreOverlaySavepoints(this.db, ...)`. All instances for the same connection now see the same set.
+- In `ensureOverlay()`: when `savepointsBeforeOverlay` is non-empty, pre-register the overlay's connection with the DB and call `createSavepoint(depth)` on it for each pre-overlay depth (in ascending order). This pads the overlay's savepoint stack so that subsequent `rollbackToSavepoint(N)` broadcasts land on the correct index.
 - `onConnectionCommit` / `onConnectionRollback` now call `clearPreOverlaySavepoints` instead of `savepointsBeforeOverlay.clear()`.
 
 **`packages/quereus/src/vtab/memory/layer/transaction.ts`**
@@ -40,11 +40,11 @@ A secondary bug: `savepointsBeforeOverlay` was an instance-level field on `Isola
 
 ## Test coverage
 
-- `yarn workspace @quereus/isolation test` — 62 passing (was 60).
-- `yarn test:store` — 2432 passing, 13 pending (was 2431 passing, 14 pending; the extra pass is `101`).
+- `yarn workspace @quereus/isolation test` — 62 passing (was 60). Re-verified at completion.
+- `yarn test:store` — 2432 passing, 13 pending (was 2431 passing, 14 pending; extra pass is `101`).
 - `yarn test` (memory mode) — no regressions; pre-existing fuzz test failure unchanged.
 
-## Use cases for review
+## Usage / verification scenarios
 
 1. `BEGIN; SAVEPOINT sp1; INSERT …; ROLLBACK TO sp1; SELECT` → empty result (pre-overlay sp1 clears overlay entirely).
 2. `BEGIN; SAVEPOINT sp1; INSERT a; SAVEPOINT sp2; INSERT b; ROLLBACK TO sp2; SELECT` → only `a` visible (post-overlay sp2 rolls back correctly).
