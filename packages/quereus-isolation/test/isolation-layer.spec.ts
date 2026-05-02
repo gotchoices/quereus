@@ -1016,4 +1016,39 @@ describe('IsolationModule', () => {
 			expect(committed?.name).to.equal('modified');
 		});
 	});
+
+	describe('rename table', () => {
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			const memoryModule = new MemoryTableModule();
+			isolatedModule = new IsolationModule({
+				underlying: memoryModule,
+			});
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('preserves row data through ALTER TABLE RENAME TO', async () => {
+			// Regression: IsolationModule did not forward renameTable to the
+			// underlying module, so rows committed under the old name were lost
+			// when subsequent queries hit a fresh underlying state for the new name.
+			await db.exec(`CREATE TABLE t_rename (id INTEGER PRIMARY KEY, val TEXT) USING isolated`);
+			await db.exec(`INSERT INTO t_rename VALUES (1, 'a'), (2, 'b')`);
+			await db.exec(`ALTER TABLE t_rename RENAME TO t_renamed`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t_renamed ORDER BY id`));
+			expect(rows.length).to.equal(2);
+			expect(rows.map((r: any) => [r.id, r.val])).to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('allows writes against the renamed table', async () => {
+			await db.exec(`CREATE TABLE t_rename (id INTEGER PRIMARY KEY, val TEXT) USING isolated`);
+			await db.exec(`INSERT INTO t_rename VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE t_rename RENAME TO t_renamed`);
+			await db.exec(`INSERT INTO t_renamed VALUES (2, 'b')`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t_renamed ORDER BY id`));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
+		});
+	});
 });

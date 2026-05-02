@@ -367,6 +367,67 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Renames a table through the isolation layer.
+	 *
+	 * Forwards to the underlying module so it can re-key its handles and move
+	 * any physical storage, then re-keys our own tracking maps so subsequent
+	 * connect() calls under the new name find the existing underlying state
+	 * and any in-flight per-connection overlays.
+	 *
+	 * Done in this order so a failure in the underlying rename leaves our
+	 * internal maps untouched (the engine will not update the schema catalog
+	 * if this method throws).
+	 */
+	async renameTable(
+		db: Database,
+		schemaName: string,
+		oldName: string,
+		newName: string,
+	): Promise<void> {
+		if (this.underlying.renameTable) {
+			await this.underlying.renameTable(db, schemaName, oldName, newName);
+		}
+
+		// Drop our cached underlying VirtualTable for the old name. It may have
+		// been disconnected by the underlying module (e.g. StoreModule closes
+		// and re-opens stores during rename), so reusing it would yield "store
+		// is closed" errors. The next connect() under the new name will fetch a
+		// fresh underlying table from the underlying module.
+		this.removeUnderlyingState(schemaName, oldName);
+
+		// Re-key per-connection overlay and savepoint state, preserving the
+		// connection-id prefix so overlays created earlier in an open
+		// transaction remain visible under the new name.
+		this.rekeyConnectionScopedMap(this.connectionOverlays, schemaName, oldName, newName);
+		this.rekeyConnectionScopedMap(this.preOverlaySavepoints, schemaName, oldName, newName);
+	}
+
+	/**
+	 * Re-keys all entries of a connection-scoped map (`<dbId>:<schema>.<table>`)
+	 * from oldName to newName, leaving entries for other tables untouched.
+	 */
+	private rekeyConnectionScopedMap<V>(
+		map: Map<string, V>,
+		schemaName: string,
+		oldName: string,
+		newName: string,
+	): void {
+		const oldSuffix = `:${schemaName}.${oldName}`.toLowerCase();
+		const newSuffix = `:${schemaName}.${newName}`.toLowerCase();
+		const moved: Array<[string, V]> = [];
+		for (const [key, value] of map.entries()) {
+			if (key.endsWith(oldSuffix)) {
+				const prefix = key.substring(0, key.length - oldSuffix.length);
+				moved.push([`${prefix}${newSuffix}`, value]);
+				map.delete(key);
+			}
+		}
+		for (const [newKey, value] of moved) {
+			map.set(newKey, value);
+		}
+	}
+
+	/**
 	 * Rebuilds an overlay table under the post-alter schema, translating each
 	 * staged row to the new column layout.
 	 */

@@ -40,7 +40,6 @@ const MEMORY_ONLY_FILES = new Set([
   '04-transactions.sqllogic',  // savepoint rollback in overlay does not undo writes when overlay was created after the savepoint (isolation-layer limitation)
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
-  '41-alter-table.sqllogic',  // IsolationModule does not implement renameTable; RENAME TABLE data disappears through the isolation layer (see fix ticket isolation-rename-table-forwarding)
   '41-foreign-keys.sqllogic',  // INSERT OR REPLACE on parent when conflicting row is only in underlying store (not overlay) does not return replacedRow, so ON DELETE CASCADE does not fire
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
