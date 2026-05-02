@@ -40,14 +40,12 @@ const MEMORY_ONLY_FILES = new Set([
   '04-transactions.sqllogic',  // savepoint rollback in overlay does not undo writes when overlay was created after the savepoint (isolation-layer limitation)
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
   '10.1-ddl-lifecycle.sqllogic',  // DROP+CREATE reuse of table name races with underlyingTables state (unrelated to transaction isolation)
-  '29-constraint-edge-cases.sqllogic',  // CASCADE FK delete across overlay/underlying does not cascade in isolation layer
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   '40.1-pk-desc-direction.sqllogic',  // PK DESC iteration order not preserved when merging overlay with underlying
   '41-alter-table.sqllogic',  // ALTER TABLE RENAME through isolation layer does not propagate to overlay schema
   '41-fk-cross-schema.sqllogic',  // FK cascade on PK-change UPDATE across overlay/underlying not fully handled
   '41-foreign-keys.sqllogic',  // INSERT OR REPLACE on parent when conflicting row is only in underlying store (not overlay) does not return replacedRow, so ON DELETE CASCADE does not fire
   '42-returning.sqllogic',  // RETURNING with DELETE does not include rows already in overlay (isolation-layer limitation)
-  '43-transition-constraints.sqllogic',  // Transition constraint row counts diverge across overlay/underlying merge
   '44-orthogonality.sqllogic',  // DELETE-returning-subquery does not observe overlay writes when merged
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
