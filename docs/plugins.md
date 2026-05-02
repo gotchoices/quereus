@@ -1231,6 +1231,10 @@ interface BaseModuleConfig {}
 interface VirtualTableConnection {
   readonly connectionId: string;
   readonly tableName: string;
+  // Optional: when multiple connections are registered for the same table
+  // (e.g. an isolation wrapper plus its underlying storage connection), set
+  // this on the wrapper so the deferred-constraint queue can disambiguate.
+  readonly isCovering?: boolean;
   begin(): MaybePromise<void>;
   commit(): MaybePromise<void>;
   rollback(): MaybePromise<void>;
