@@ -425,6 +425,79 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	describe('deferred CHECK constraints via IsolatedConnection', () => {
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			db.setOption('default_vtab_module', 'store');
+			await db.exec(`PRAGMA foreign_keys = true`);
+		});
+
+		afterEach(async () => {
+			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
+		it('deferred FK violation surfaces the constraint error at COMMIT, not "multiple candidate connections"', async () => {
+			await db.exec(`
+				CREATE TABLE ref_t (id TEXT PRIMARY KEY, label TEXT) USING store
+			`);
+			await db.exec(`
+				CREATE TABLE dep_t (
+					id INTEGER PRIMARY KEY,
+					ref_id TEXT,
+					CONSTRAINT fk_exists CHECK ON INSERT, UPDATE (
+						EXISTS (SELECT 1 FROM ref_t WHERE ref_t.id = NEW.ref_id)
+					)
+				) USING store
+			`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO dep_t (id, ref_id) VALUES (1, 'missing')`);
+
+			let commitErr: Error | null = null;
+			try {
+				await db.exec('COMMIT');
+			} catch (e) {
+				commitErr = e as Error;
+			}
+
+			expect(commitErr, 'COMMIT should throw a constraint error').to.not.be.null;
+			expect(commitErr!.message.toLowerCase()).to.include('check constraint failed',
+				'error should be a constraint failure, not an internal connection-lookup error');
+			expect(commitErr!.message.toLowerCase()).to.not.include('multiple candidate',
+				'must not throw the ambiguous-connection error');
+
+			// Row must not have been committed
+			const cnt = await db.get('SELECT count(*) as cnt FROM dep_t');
+			expect(cnt?.cnt).to.equal(0);
+		});
+
+		it('deferred CHECK passes when violation is fixed before COMMIT', async () => {
+			await db.exec(`
+				CREATE TABLE parents (id TEXT PRIMARY KEY) USING store
+			`);
+			await db.exec(`
+				CREATE TABLE children (
+					id INTEGER PRIMARY KEY,
+					parent_id TEXT,
+					CONSTRAINT parent_exists CHECK ON INSERT, UPDATE (
+						EXISTS (SELECT 1 FROM parents WHERE parents.id = NEW.parent_id)
+					)
+				) USING store
+			`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO children (id, parent_id) VALUES (1, 'p1')`);
+			await db.exec(`INSERT INTO parents VALUES ('p1')`);
+			await db.exec('COMMIT');
+
+			const row = await db.get('SELECT parent_id FROM children WHERE id = 1');
+			expect(row?.parent_id).to.equal('p1');
+		});
+	});
+
 	describe('failed-commit rollback', () => {
 		beforeEach(async () => {
 			const isolatedModule = createIsolatedStoreModule({ provider });

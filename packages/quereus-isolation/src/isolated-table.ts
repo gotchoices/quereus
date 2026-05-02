@@ -145,16 +145,32 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	/**
 	 * Ensures a connection is registered with the database for transaction coordination.
 	 * This is called before any read or write operation.
+	 *
+	 * Multiple IsolatedTable instances may be created per transaction (one per getVTable()
+	 * call in the runtime). Without reuse, each instance would register a fresh
+	 * IsolatedConnection, causing DeferredConstraintQueue.findConnection() to find multiple
+	 * covering candidates and throw. We therefore reuse the first covering connection
+	 * already registered for this table.
 	 */
 	private async ensureConnection(): Promise<IsolatedConnection> {
 		if (!this.registeredConnection) {
+			// Reuse an existing covering (IsolatedConnection) if one is already registered
+			// for this table — avoids accumulating one IsolatedConnection per statement.
+			const qualifiedName = `${this.schemaName}.${this.tableName}`;
+			const existing = (this.db as DatabaseInternal).getConnectionsForTable(qualifiedName);
+			const existingCovering = existing.find((c: VirtualTableConnection) => c.isCovering) as IsolatedConnection | undefined;
+			if (existingCovering) {
+				this.registeredConnection = existingCovering;
+				return this.registeredConnection;
+			}
+
 			// Create connection - overlay connection created lazily if needed
 			const overlayConn = this.overlayTable
 				? await Promise.resolve(this.overlayTable.createConnection?.())
 				: undefined;
 
 			this.registeredConnection = new IsolatedConnection(
-				this.tableName,
+				`${this.schemaName}.${this.tableName}`,
 				undefined,
 				overlayConn,
 				this
@@ -184,7 +200,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 
 		return new IsolatedConnection(
-			this.tableName,
+			`${this.schemaName}.${this.tableName}`,
 			underlyingConn,
 			overlayConn,
 			this  // Include callback for commit/rollback handling
@@ -199,7 +215,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			underlyingConn,
 			overlayConn,
 		]);
-		return new IsolatedConnection(this.tableName, underlying, overlay, this);
+		return new IsolatedConnection(`${this.schemaName}.${this.tableName}`, underlying, overlay, this);
 	}
 
 	// ==================== Query Operations ====================
@@ -602,6 +618,20 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 							onConflict: args.onConflict,
 						});
 						return this.stripTombstoneFromResult(result, tombstoneIndex);
+					}
+
+					if (existingRow) {
+						// Live row already in overlay for this PK. Return a constraint error with
+						// the actual table name (not the overlay's internal name) for ABORT mode.
+						// IGNORE/REPLACE are handled by passing through to overlay.update() below.
+						if (!args.onConflict || args.onConflict === ConflictResolution.ABORT) {
+							return {
+								status: 'constraint',
+								constraint: 'unique',
+								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
+								existingRow: existingRow.slice(0, tombstoneIndex) as Row,
+							};
+						}
 					}
 
 					if (!existingRow) {

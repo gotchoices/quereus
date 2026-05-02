@@ -174,6 +174,8 @@ export class DeferredConstraintQueue {
 			return connName === normalized || connName === simple;
 		});
 		if (matches.length > 1) {
+			const covering = matches.filter(c => c.isCovering);
+			if (covering.length === 1) return covering[0];
 			throw new QuereusError(
 				`Deferred constraint execution found multiple candidate connections for table ${tableKey}`,
 				StatusCode.INTERNAL
