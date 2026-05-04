@@ -126,3 +126,20 @@ SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('
 DROP TABLE projects;
 DROP TABLE employees;
 DROP TABLE departments;
+
+-- ===== Type-coerced correlation: must NOT be decorrelated =====
+
+-- Correlation `outer.real = inner.text` is rewritten as `outer.real = cast(inner.text as real)`.
+-- The cast hides the equi-pattern; the rule must abort decorrelation rather than
+-- leave the correlation conjunct as a residual filter on the inner side
+-- (which would fail at runtime with "no row context for outer column").
+create table tt1 (c_text0 text unique, c_text1 text not null unique);
+create table tt2 (c_int0 integer unique, c_real1 real, c_text2 text not null primary key);
+insert into tt1 values ('a','x'),('b','y');
+insert into tt2 values (1, 1.5, 'p'),(2, 2.5, 'q');
+
+select count(*) as n from tt2 left join tt1 on c_real1 in (select c_text1 from tt1 where tt2.c_real1 = tt1.c_text1) where c_real1 in (select c_text1 from tt1 where tt2.c_real1 = tt1.c_text1) limit 50;
+→ [{"n":0}]
+
+drop table tt1;
+drop table tt2;

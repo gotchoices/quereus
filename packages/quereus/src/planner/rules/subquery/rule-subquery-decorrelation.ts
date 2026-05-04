@@ -123,6 +123,21 @@ function collectDefinedAttrIds(node: PlanNode): Set<number> {
 }
 
 /**
+ * Returns true if the plan tree contains any column reference to an
+ * attribute id in `attrIds`. Used to detect leftover correlation in
+ * residual inner-only predicates (which may include nested subqueries).
+ */
+function referencesAnyAttr(node: PlanNode, attrIds: Set<number>): boolean {
+	if (node instanceof ColumnReferenceNode && attrIds.has(node.attributeId)) {
+		return true;
+	}
+	for (const child of node.getChildren()) {
+		if (referencesAnyAttr(child, attrIds)) return true;
+	}
+	return false;
+}
+
+/**
  * For an EXISTS subquery, extract the inner relational source and separate
  * the correlation predicate from inner-only predicates.
  *
@@ -180,6 +195,15 @@ function extractExistsCorrelation(
 	if (correlationConjuncts.length === 0) {
 		// No simple equi-correlation found
 		return null;
+	}
+
+	// Safety: residual inner-only conjuncts must not still reference outer
+	// attributes. If they do (e.g. a correlated predicate that didn't match
+	// the strict equi-pattern, such as `outer.x = cast(inner.y as real)` or
+	// `outer.x > inner.y`), decorrelation cannot be safely applied without
+	// preserving the correlation, so abort.
+	for (const conj of innerOnlyConjuncts) {
+		if (referencesAnyAttr(conj, outerAttrIds)) return null;
 	}
 
 	const correlationCondition = combineConjuncts(correlationConjuncts)!;
@@ -285,6 +309,12 @@ function extractInCorrelation(
 			} else {
 				innerOnly.push(conj);
 			}
+		}
+
+		// Safety: residual inner-only conjuncts must not still reference outer
+		// attributes. See note in extractExistsCorrelation.
+		for (const conj of innerOnly) {
+			if (referencesAnyAttr(conj, outerAttrIds)) return null;
 		}
 
 		const allCorrelation = [equiCondition, ...additionalCorrelation];

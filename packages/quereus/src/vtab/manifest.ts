@@ -42,6 +42,10 @@ export interface FunctionPluginInfo {
 export interface CollationPluginInfo {
 	name: string;                  // collation name
 	func: CollationFunction;       // comparison function
+	/** Optional key normalizer; required for the collation to be usable as the
+	 *  key in a compound index. Without it, the collation works for ORDER BY but
+	 *  any attempt to build an index keyed by it will fail at create time. */
+	normalizer?: (s: string) => string;
 }
 
 /**

@@ -10,15 +10,34 @@ import type { Row, SqlValue } from '../common/types.js';
 /** Identity normalizer for BINARY collation (no-op). */
 const IDENTITY_NORMALIZER = (s: string) => s;
 
+/** Strip trailing ASCII space (0x20) only, matching `RTRIM_COLLATION`'s
+ *  comparator. `s.trimEnd()` would also strip tabs, NBSP, and other Unicode
+ *  whitespace — disagreeing with the comparator and producing wrong index keys. */
+const RTRIM_NORMALIZER = (s: string): string => {
+	let end = s.length;
+	while (end > 0 && s.charCodeAt(end - 1) === 0x20) end--;
+	return end === s.length ? s : s.slice(0, end);
+};
+
+const NOCASE_NORMALIZER = (s: string): string => s.toLowerCase();
+
 /** Map a collation name to a string normalizer for key serialization. */
 export function resolveKeyNormalizer(collationName: string | undefined): (s: string) => string {
 	if (!collationName || collationName === 'BINARY') return IDENTITY_NORMALIZER;
 	switch (collationName.toUpperCase()) {
-		case 'NOCASE': return (s: string) => s.toLowerCase();
-		case 'RTRIM':  return (s: string) => s.trimEnd();
+		case 'NOCASE': return NOCASE_NORMALIZER;
+		case 'RTRIM':  return RTRIM_NORMALIZER;
 		default:       return IDENTITY_NORMALIZER;
 	}
 }
+
+/** Built-in normalizers, exported so the `Database` collation registry can seed
+ *  them alongside the comparators. Keys match the SQL canonical names. */
+export const BUILTIN_NORMALIZERS: Readonly<Record<string, (s: string) => string>> = {
+	BINARY: IDENTITY_NORMALIZER,
+	NOCASE: NOCASE_NORMALIZER,
+	RTRIM: RTRIM_NORMALIZER,
+};
 
 /**
  * Core serialization of a single SQL value with type tag and optional collation normalizer.

@@ -13,6 +13,7 @@ import { FunctionFlags } from '../common/constants.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { BINARY_COLLATION, NOCASE_COLLATION, RTRIM_COLLATION, type CollationFunction } from '../util/comparison.js';
+import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
 import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
 import { buildBlock } from '../planner/building/block.js';
@@ -108,8 +109,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly transactionManager: TransactionManager;
 	/** Assertion evaluation */
 	private readonly assertionEvaluator: AssertionEvaluator;
-	/** Per-database collation registry */
-	private readonly collations = new Map<string, CollationFunction>();
+	/** Per-database collation registry — comparator + optional key normalizer.
+	 *  The normalizer is required for index participation; comparator-only
+	 *  collations may still be used in ORDER BY but cannot back a compound index. */
+	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string }>();
 
 	constructor() {
 		this.schemaManager = new SchemaManager(this);
@@ -270,10 +273,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Registers default collation sequences */
 	private registerDefaultCollations(): void {
-		// Register the built-in collations into per-instance registry
-		this.collations.set('BINARY', BINARY_COLLATION);
-		this.collations.set('NOCASE', NOCASE_COLLATION);
-		this.collations.set('RTRIM', RTRIM_COLLATION);
+		// Register the built-in collations into per-instance registry, paired
+		// with their key normalizers so they can back compound indexes.
+		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY });
+		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE });
+		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM  });
 		log("Default collations registered (BINARY, NOCASE, RTRIM)");
 	}
 
@@ -1007,20 +1011,24 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Registers a user-defined collation sequence.
 	 * @param name The name of the collation sequence (case-insensitive).
 	 * @param func The comparison function (a, b) => number (-1, 0, 1).
+	 * @param normalizer Optional key normalizer — a function whose output equality
+	 *   partitions strings into the same equivalence classes as `func` (modulo
+	 *   total ordering). Required to make this collation usable as the key for a
+	 *   compound index; ORDER BY / standalone comparisons work without it.
 	 * @example
 	 * // Example: Create a custom collation for phone numbers
 	 * db.registerCollation('PHONENUMBER', (a, b) => {
-	 *   // Normalize phone numbers by removing non-digit characters
 	 *   const normalize = (phone) => phone.replace(/\D/g, '');
 	 *   const numA = normalize(a);
 	 *   const numB = normalize(b);
 	 *   return numA < numB ? -1 : numA > numB ? 1 : 0;
-	 * });
+	 * }, (s) => s.replace(/\D/g, ''));
 	 *
 	 * // Then use it in SQL:
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
+	 * // CREATE INDEX phone_idx ON contacts(phone COLLATE PHONENUMBER);
 	 */
-	registerCollation(name: string, func: CollationFunction): void {
+	registerCollation(name: string, func: CollationFunction, normalizer?: (s: string) => string): void {
 		this.checkOpen();
 		if (typeof name !== 'string' || !name) {
 			throw new MisuseError('registerCollation: name must be a non-empty string');
@@ -1028,12 +1036,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (typeof func !== 'function') {
 			throw new MisuseError('registerCollation: func must be a function');
 		}
+		if (normalizer !== undefined && typeof normalizer !== 'function') {
+			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
+		}
 		const upperName = name.toUpperCase();
 		if (this.collations.has(upperName)) {
 			log('Overwriting existing collation: %s', upperName);
 		}
-		this.collations.set(upperName, func);
-		log('Registered collation: %s', upperName);
+		this.collations.set(upperName, normalizer !== undefined
+			? { comparator: func, normalizer }
+			: { comparator: func });
+		log('Registered collation: %s%s', upperName, normalizer !== undefined ? ' (with normalizer)' : '');
 	}
 
 	/**
@@ -1107,7 +1120,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Gets a registered collation function */
 	_getCollation(name: string): CollationFunction | undefined {
-		return this.collations.get(name.toUpperCase());
+		return this.collations.get(name.toUpperCase())?.comparator;
+	}
+
+	/** @internal Gets the registered key normalizer for a collation, falling back
+	 *  to the built-in normalizer for `BINARY` / `NOCASE` / `RTRIM` if the
+	 *  collation has no explicit normalizer registered. Returns `undefined` for
+	 *  comparator-only user-defined collations. */
+	_getCollationNormalizer(name: string): ((s: string) => string) | undefined {
+		const upper = name.toUpperCase();
+		const entry = this.collations.get(upper);
+		if (entry?.normalizer !== undefined) return entry.normalizer;
+		// Built-in fallback: even an entry that lost its normalizer (shouldn't
+		// happen for built-ins, but defends against external mutation) still
+		// resolves to the canonical built-in normalizer.
+		return BUILTIN_NORMALIZERS[upper];
 	}
 
 	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {

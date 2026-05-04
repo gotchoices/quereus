@@ -91,6 +91,20 @@ const lengthCollation: CollationFunction = (a: string, b: string): number => {
 	return a < b ? -1 : a > b ? 1 : 0;
 };
 
+/**
+ * Normalizer for LENGTH: produces a string that, under byte-lex equality,
+ * partitions inputs into the same equivalence classes as `lengthCollation`.
+ * Two strings are equal under LENGTH iff they have identical bytes (length tie
+ * is broken by the original byte comparison), so the identity function works.
+ * The 4-digit length prefix would also work and demonstrates the lookup-key
+ * shape for collations whose equivalence is coarser than `===`. We use the
+ * prefix form so the test suite has a non-trivial normalizer to verify against.
+ */
+const lengthNormalizer = (s: string): string => {
+	const len = s.length.toString().padStart(8, '0');
+	return `${len}:${s}`;
+};
+
 const reverseCollation: CollationFunction = (a: string, b: string): number => {
 	return a < b ? 1 : a > b ? -1 : 0;
 };
@@ -127,8 +141,12 @@ const phoneticCollation: CollationFunction = (a: string, b: string): number => {
 export default function register(_db: Database, _config: Record<string, SqlValue> = {}): PluginRegistrations {
 	return {
 		collations: [
+			// LENGTH ships with a normalizer so it can be used as a compound-index key.
+			{ name: 'LENGTH', func: lengthCollation, normalizer: lengthNormalizer },
+			// Comparator-only registrations — usable in ORDER BY but not as
+			// compound-index keys. Index creation referencing one of these throws
+			// `CollationNotIndexableError` at the cellstore boundary.
 			{ name: 'NUMERIC', func: numericCollation },
-			{ name: 'LENGTH', func: lengthCollation },
 			{ name: 'REVERSE', func: reverseCollation },
 			{ name: 'ALPHANUM', func: alphanumCollation },
 			{ name: 'PHONETIC', func: phoneticCollation }

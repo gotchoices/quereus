@@ -164,29 +164,23 @@ export const tableInfoFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError('table_info() requires a table name string argument', StatusCode.ERROR);
 		}
 
-		try {
-			const table = db._findTable(tableName);
-			if (!table) {
-				throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
-			}
+		const table = db._findTable(tableName);
+		if (!table) {
+			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
+		}
 
-			for (let i = 0; i < table.columns.length; i++) {
-				const column = table.columns[i];
-				const isPrimaryKey = table.primaryKeyDefinition.some(pk => pk.index === i);
+		for (let i = 0; i < table.columns.length; i++) {
+			const column = table.columns[i];
+			const isPrimaryKey = table.primaryKeyDefinition.some(pk => pk.index === i);
 
-				yield [
-					i,                                    // cid
-					column.name,                         // name
-					column.logicalType.name,             // type
-					column.notNull ? 1 : 0,             // notnull
-					column.defaultValue?.toString() || null, // dflt_value
-					isPrimaryKey ? 1 : 0                // pk
-				];
-			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
-			// If table info fails, yield an error row
-			yield [0, 'error', 'error', 1, `Failed to get table info: ${error.message}`, 0];
+			yield [
+				i,                                    // cid
+				column.name,                         // name
+				column.logicalType.name,             // type
+				column.notNull ? 1 : 0,             // notnull
+				column.defaultValue?.toString() || null, // dflt_value
+				isPrimaryKey ? 1 : 0                // pk
+			];
 		}
 	}
 );
