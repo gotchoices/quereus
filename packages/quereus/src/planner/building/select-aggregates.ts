@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import type { RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
 import { AggregateNode } from '../nodes/aggregate-node.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -84,12 +84,13 @@ export function buildAggregatePhase(
 	const preAggregateSort = Boolean(hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0);
 	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, hasAggregates, !!hasGroupBy);
 
-	// Validate aggregate/non-aggregate mixing
-	validateAggregateProjections(projections, hasAggregates, !!hasGroupBy);
-
 	// Build GROUP BY expressions
 	const groupByExpressions = stmt.groupBy ?
 		stmt.groupBy.map(expr => buildExpression(selectContext, expr, false)) : [];
+
+	// Validate aggregate/non-aggregate mixing (must run after groupByExpressions are built
+	// so we can check column-coverage of SELECT projections against GROUP BY)
+	validateAggregateProjections(projections, hasAggregates, !!hasGroupBy, groupByExpressions);
 
 	// Create AggregateNode
 	const aggregateNode = new AggregateNode(selectContext.scope, currentInput, groupByExpressions, aggregates);
@@ -154,19 +155,86 @@ function handlePreAggregateSort(
 }
 
 /**
- * Validates that aggregate and non-aggregate projections don't mix inappropriately
+ * Validates that aggregate and non-aggregate projections don't mix inappropriately.
+ * With GROUP BY, every non-aggregate column reference in the SELECT list must
+ * either (a) match a GROUP BY column by attribute id, or (b) appear inside a
+ * subtree whose AST matches a GROUP BY expression. This is intentionally
+ * stricter than full functional-dependency coverage — it matches SQL-92 and
+ * the corpus assertions, without importing SQLite's permissive "bare columns" rule.
  */
 function validateAggregateProjections(
 	projections: Projection[],
 	hasAggregates: boolean,
-	hasGroupBy: boolean
+	hasGroupBy: boolean,
+	groupByExpressions: ScalarPlanNode[]
 ): void {
-	if (projections.length > 0 && hasAggregates && !hasGroupBy) {
+	if (projections.length === 0) return;
+
+	if (hasAggregates && !hasGroupBy) {
 		throw new QuereusError(
 			'Cannot mix aggregate and non-aggregate columns in SELECT list without GROUP BY',
 			StatusCode.ERROR
 		);
 	}
+
+	if (!hasGroupBy) return;
+
+	const groupByAttrIds = new Set<number>();
+	const groupByExprFingerprints = new Set<string>();
+	for (const expr of groupByExpressions) {
+		if (CapabilityDetectors.isColumnReference(expr)) {
+			groupByAttrIds.add(expr.attributeId);
+		}
+		groupByExprFingerprints.add(expressionToString(expr.expression));
+	}
+
+	for (const proj of projections) {
+		const ungrouped = findUngroupedColumnRef(proj.node, groupByAttrIds, groupByExprFingerprints);
+		if (ungrouped) {
+			throw new QuereusError(
+				'Cannot mix aggregate and non-aggregate columns in SELECT list without GROUP BY',
+				StatusCode.ERROR
+			);
+		}
+	}
+}
+
+/**
+ * Walks a scalar expression tree looking for a ColumnReferenceNode whose attribute
+ * id is not covered by GROUP BY. Stops descending when it hits an aggregate-function
+ * subtree (inner column refs are aggregated), a relational subtree (subqueries
+ * resolve their own scope), or any subtree whose AST fingerprint matches a GROUP BY
+ * expression (the whole subtree is grouped, e.g. SELECT id+1 ... GROUP BY id+1).
+ */
+function findUngroupedColumnRef(
+	node: PlanNode,
+	groupByAttrIds: Set<number>,
+	groupByExprFingerprints: Set<string>
+): ColumnReferenceNode | null {
+	if (CapabilityDetectors.isAggregateFunction(node)) {
+		return null;
+	}
+
+	if ('expression' in node) {
+		const fp = expressionToString((node as ScalarPlanNode).expression);
+		if (groupByExprFingerprints.has(fp)) {
+			return null;
+		}
+	}
+
+	if (CapabilityDetectors.isColumnReference(node)) {
+		if (!groupByAttrIds.has(node.attributeId)) {
+			return node as ColumnReferenceNode;
+		}
+		return null;
+	}
+
+	for (const child of node.getChildren()) {
+		if (isRelationalNode(child)) continue;
+		const found = findUngroupedColumnRef(child, groupByAttrIds, groupByExprFingerprints);
+		if (found) return found;
+	}
+	return null;
 }
 
 /**
