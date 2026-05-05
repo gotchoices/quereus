@@ -69,39 +69,47 @@ export const absFunc = createScalarFunction(
 );
 
 // --- round(X, Y?) ---
-export const roundFunc = createScalarFunction(
-	{
-		name: 'round',
-		numArgs: -1,
-		deterministic: true,
-		// Type inference: return the same type as the input for numeric types
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: false,
-			isReadOnly: true
-		}),
-		validateArgTypes: (argTypes) => argTypes[0].isNumeric === true
-	},
-	(numVal: SqlValue, placesVal?: SqlValue): SqlValue => {
-		if (numVal === null) return null;
-		const x = Number(numVal);
-		if (isNaN(x)) return null;
+const roundImpl = (numVal: SqlValue, placesVal?: SqlValue): SqlValue => {
+	if (numVal === null) return null;
+	const x = Number(numVal);
+	if (isNaN(x)) return null;
 
-		let y = 0;
-		if (placesVal !== undefined && placesVal !== null) {
-			const numY = Number(placesVal);
-			if (isNaN(numY)) return null;
-			y = Math.trunc(numY);
-		}
-
-		try {
-			const factor = Math.pow(10, y);
-			return Math.round(x * factor) / factor;
-		} catch {
-			return null;
-		}
+	let y = 0;
+	if (placesVal !== undefined && placesVal !== null) {
+		const numY = Number(placesVal);
+		if (isNaN(numY)) return null;
+		y = Math.trunc(numY);
 	}
+
+	try {
+		const factor = Math.pow(10, y);
+		return Math.round(x * factor) / factor;
+	} catch {
+		return null;
+	}
+};
+
+const roundSchemaBase = {
+	name: 'round',
+	deterministic: true,
+	// Type inference: return the same type as the input for numeric types
+	inferReturnType: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ({
+		typeClass: 'scalar' as const,
+		logicalType: argTypes[0],
+		nullable: false,
+		isReadOnly: true
+	}),
+	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => argTypes[0].isNumeric === true
+};
+
+export const roundFunc1 = createScalarFunction(
+	{ ...roundSchemaBase, numArgs: 1 },
+	roundImpl
+);
+
+export const roundFunc2 = createScalarFunction(
+	{ ...roundSchemaBase, numArgs: 2 },
+	roundImpl
 );
 
 // --- coalesce(...) ---

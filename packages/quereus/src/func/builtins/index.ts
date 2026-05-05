@@ -1,4 +1,4 @@
-import { absFunc, roundFunc, coalesceFunc,
+import { absFunc, roundFunc1, roundFunc2, coalesceFunc,
 	nullifFunc, typeofFunc, randomFunc, randomblobFunc, iifFunc, sqrtFunc,
 	powFunc, powerFunc, floorFunc, ceilFunc, ceilingFunc,
 	clampFunc,
@@ -46,7 +46,8 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	TIMESPAN_FUNC,
 	// Scalar Functions
 	absFunc,
-	roundFunc,
+	roundFunc1,
+	roundFunc2,
 	coalesceFunc,
 	nullifFunc,
 	typeofFunc,
