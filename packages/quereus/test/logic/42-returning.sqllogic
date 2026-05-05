@@ -67,7 +67,7 @@ INSERT INTO test_constrained (id, positive_value, name) VALUES (201, 10, 'valid'
 
 -- Failed INSERT due to constraint - should not return anything
 INSERT INTO test_constrained (id, positive_value, name) VALUES (202, -5, 'invalid') RETURNING id, positive_value;
--- error: CHECK constraint failed: check_0
+-- error: CHECK constraint failed: _check_positive_value
 
 -- Failed INSERT due to NOT NULL - should not return anything
 INSERT INTO test_constrained (id, positive_value, name) VALUES (203, 15, NULL) RETURNING id, name;
@@ -83,7 +83,7 @@ UPDATE test_constrained SET positive_value = 20 WHERE id = 201 RETURNING id, pos
 
 -- Failed UPDATE due to constraint - should not return anything
 UPDATE test_constrained SET positive_value = -1 WHERE id = 201 RETURNING id, positive_value;
--- error: CHECK constraint failed: check_0
+-- error: CHECK constraint failed: _check_positive_value
 
 -- Verify failed update didn't change anything
 SELECT positive_value FROM test_constrained WHERE id = 201;
