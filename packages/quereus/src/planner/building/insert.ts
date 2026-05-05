@@ -24,6 +24,7 @@ import { DmlExecutorNode, type UpsertClausePlan } from '../nodes/dml-executor-no
 import { buildConstraintChecks } from './constraint-builder.js';
 import { buildChildSideFKChecks } from './foreign-key-builder.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
+import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 
 /**
@@ -343,61 +344,6 @@ function buildUpsertClausePlans(
 	});
 }
 
-/**
- * Validates that RETURNING expressions use appropriate NEW/OLD qualifiers for the operation type
- */
-function validateReturningExpression(expr: AST.Expression, operationType: 'INSERT' | 'UPDATE' | 'DELETE'): void {
-	function checkExpression(e: AST.Expression): void {
-		if (e.type === 'column') {
-			if (e.table?.toLowerCase() === 'old' && operationType === 'INSERT') {
-				throw new QuereusError(
-					'OLD qualifier cannot be used in INSERT RETURNING clause',
-					StatusCode.ERROR
-				);
-			}
-			if (e.table?.toLowerCase() === 'new' && operationType === 'DELETE') {
-				throw new QuereusError(
-					'NEW qualifier cannot be used in DELETE RETURNING clause',
-					StatusCode.ERROR
-				);
-			}
-		} else if (e.type === 'binary') {
-			checkExpression(e.left);
-			checkExpression(e.right);
-		} else if (e.type === 'unary') {
-			checkExpression(e.expr);
-		} else if (e.type === 'function') {
-			e.args.forEach(checkExpression);
-		} else if (e.type === 'case') {
-			if (e.baseExpr) checkExpression(e.baseExpr);
-			e.whenThenClauses.forEach(clause => {
-				checkExpression(clause.when);
-				checkExpression(clause.then);
-			});
-			if (e.elseExpr) checkExpression(e.elseExpr);
-		} else if (e.type === 'cast') {
-			checkExpression(e.expr);
-		} else if (e.type === 'collate') {
-			checkExpression(e.expr);
-		} else if (e.type === 'subquery') {
-			// Subqueries in RETURNING are complex - for now, we'll skip validation
-			// A full implementation would need to traverse the subquery's AST
-		} else if (e.type === 'in') {
-			checkExpression(e.expr);
-			if (e.values) {
-				e.values.forEach(checkExpression);
-			}
-		} else if (e.type === 'exists') {
-			// EXISTS subqueries are complex - skip validation for now
-		} else if (e.type === 'windowFunction') {
-			checkExpression(e.function);
-		}
-		// Other expression types (literal, parameter) don't need validation
-	}
-
-	checkExpression(expr);
-}
-
 export function buildInsertStmt(
 	ctx: PlanningContext,
 	stmt: AST.InsertStmt,
@@ -685,8 +631,9 @@ export function buildInsertStmt(
 				}
 			}
 
-			// Validate that OLD references are not used in INSERT RETURNING
-			validateReturningExpression(rc.expr, 'INSERT');
+			// Validate qualifier usage on the AST before column resolution so the
+			// OLD-in-INSERT guard fires before any "column not found" error.
+			validateReturningQualifiers(rc.expr, 'INSERT');
 
 			return {
 				node: buildExpression({ ...ctx, scope: returningScope }, rc.expr) as ScalarPlanNode,

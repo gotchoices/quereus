@@ -17,6 +17,7 @@ import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks } from './constraint-builder.js';
 import { buildParentSideFKChecks } from './foreign-key-builder.js';
+import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 
 export function buildDeleteStmt(
@@ -216,6 +217,10 @@ export function buildDeleteStmt(
     const returningProjections = stmt.returning.map(rc => {
       // TODO: Support RETURNING *
       if (rc.type === 'all') throw new QuereusError('RETURNING * not yet supported', StatusCode.UNSUPPORTED);
+
+      // Validate qualifier usage on the AST before column resolution so the
+      // NEW-in-DELETE guard fires before any "column not found" error.
+      validateReturningQualifiers(rc.expr, 'DELETE');
 
       // Infer alias from column name if not explicitly provided
       let alias = rc.alias;
