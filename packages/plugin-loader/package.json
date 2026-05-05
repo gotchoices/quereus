@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-loader",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "type": "module",
   "description": "Plugin loading system for Quereus - supports dynamic imports for Node.js and browsers",
   "publisher": "Got Choices Foundation",
