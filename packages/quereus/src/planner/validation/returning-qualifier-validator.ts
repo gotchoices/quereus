@@ -47,6 +47,10 @@ export function validateReturningQualifiers(
 		} else if (e.type === 'in') {
 			check(e.expr);
 			if (e.values) e.values.forEach(check);
+		} else if (e.type === 'between') {
+			check(e.expr);
+			check(e.lower);
+			check(e.upper);
 		} else if (e.type === 'windowFunction') {
 			check(e.function);
 		}
