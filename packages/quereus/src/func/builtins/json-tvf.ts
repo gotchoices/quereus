@@ -33,7 +33,7 @@ export const jsonEachFunc = createTableValuedFunction(
 	async function* (jsonInput: SqlValue, rootPath?: SqlValue): AsyncIterable<Row> {
 		const parsedJson = coerceToJsonValue(jsonInput);
 		if (parsedJson === undefined) {
-			throw new QuereusError('json_each() requires a valid JSON value as first argument', StatusCode.ERROR);
+			throw new QuereusError('Error: Invalid JSON provided to json_each', StatusCode.ERROR);
 		}
 
 		const rootPathStr = (typeof rootPath === 'string' && rootPath) ? rootPath : null;
@@ -137,7 +137,7 @@ export const jsonTreeFunc = createTableValuedFunction(
 	async function* (jsonInput: SqlValue, rootPath?: SqlValue): AsyncIterable<Row> {
 		const parsedJson = coerceToJsonValue(jsonInput);
 		if (parsedJson === undefined) {
-			throw new QuereusError('json_tree() requires a valid JSON value as first argument', StatusCode.ERROR);
+			throw new QuereusError('Error: Invalid JSON provided to json_tree', StatusCode.ERROR);
 		}
 
 		const rootPathStr = (typeof rootPath === 'string' && rootPath) ? rootPath : null;
