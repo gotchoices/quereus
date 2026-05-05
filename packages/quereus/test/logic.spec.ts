@@ -566,24 +566,49 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 						console.log(`Executing block (expect error "${errorSubstring}"):\n${sqlBlock}`);
 					}
 
+					// Split into setup statements and final query so that SELECT-iteration
+					// errors (e.g. row-generator throws) are actually surfaced. db.exec on a
+					// SELECT does not consume the result iterator, so errors thrown inside
+					// the generator body would otherwise stay latent. Setup statements run
+					// in a single db.exec so multi-statement DML batches retain atomicity.
+					const statements = sqlBlock.split(';').map(s => s.trim()).filter(s => s.length > 0);
+					const setupStatements = statements.slice(0, -1);
+					const finalStatement = statements[statements.length - 1] ?? '';
+
+					let actualError: Error | undefined;
 					try {
-						await db.exec(sqlBlock);
+						if (setupStatements.length > 0) {
+							await db.exec(setupStatements.join(';\n') + ';');
+						}
+						if (finalStatement) {
+							const prepared = db.prepare(finalStatement);
+							try {
+								// Drain rows so iteration-time errors are raised
+								for await (const _row of prepared.iterateRows()) { /* drain */ }
+							} finally {
+								await prepared.finalize();
+							}
+						}
+					} catch (e: any) {
+						actualError = e instanceof Error ? e : new Error(String(e));
+					}
+
+					if (actualError === undefined) {
 						const baseError = new Error(`[${file}:${lineNum}] Expected error matching "${errorSubstring}" but SQL block executed successfully.\nBlock: ${sqlBlock}`);
 						const diagnostics = generateDiagnostics(db, sqlBlock, baseError);
 						throw new Error(`${baseError.message}${diagnostics}`);
-					} catch (actualError: any) {
-						expect(actualError.message.toLowerCase()).to.include(errorSubstring.toLowerCase(),
-							`[${file}:${lineNum}] Block: ${sqlBlock}\nExpected error containing: "${errorSubstring}"\nActual error: "${actualError.message}"`
-						);
+					}
 
-						// Show location information if available
-						const locationInfo = formatLocationInfo(actualError, sqlBlock);
-						if (TEST_OPTIONS.verbose && locationInfo) {
-							console.log(`   -> Error location: ${locationInfo}`);
-						}
-						if (TEST_OPTIONS.verbose) {
-							console.log(`   -> Caught expected error: ${actualError.message}`);
-						}
+					expect(actualError.message.toLowerCase()).to.include(errorSubstring.toLowerCase(),
+						`[${file}:${lineNum}] Block: ${sqlBlock}\nExpected error containing: "${errorSubstring}"\nActual error: "${actualError.message}"`
+					);
+
+					const locationInfo = formatLocationInfo(actualError, sqlBlock);
+					if (TEST_OPTIONS.verbose && locationInfo) {
+						console.log(`   -> Error location: ${locationInfo}`);
+					}
+					if (TEST_OPTIONS.verbose) {
+						console.log(`   -> Caught expected error: ${actualError.message}`);
 					}
 				};
 

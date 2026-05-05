@@ -219,6 +219,8 @@ export interface IndexSchema {
 	name: string;
 	/** Columns in the index */
 	columns: ReadonlyArray<IndexColumnSchema>;
+	/** Whether the index enforces uniqueness on its key columns */
+	unique?: boolean;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }

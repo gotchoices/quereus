@@ -1236,9 +1236,22 @@ export class MemoryTableManager {
 				}
 			}
 
+			const updatedIndexes = Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry]);
+			let updatedUniqueConstraints = this.tableSchema.uniqueConstraints;
+			if (newIndexSchemaEntry.unique) {
+				const newConstraint = {
+					name: newIndexSchemaEntry.name,
+					columns: Object.freeze(newIndexSchemaEntry.columns.map(c => c.index)),
+				};
+				updatedUniqueConstraints = Object.freeze([
+					...(this.tableSchema.uniqueConstraints ?? []),
+					newConstraint
+				]);
+			}
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
-				indexes: Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry])
+				indexes: updatedIndexes,
+				uniqueConstraints: updatedUniqueConstraints,
 			});
 
 			this.baseLayer.updateSchema(finalNewTableSchema);

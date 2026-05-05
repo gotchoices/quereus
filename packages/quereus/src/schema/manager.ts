@@ -13,6 +13,8 @@ import type { ViewSchema } from './view.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
+import { traverseAst } from '../parser/visitor.js';
+import { FunctionFlags } from '../common/constants.js';
 import { SchemaChangeNotifier } from './change-events.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { buildExpression } from '../planner/building/expression.js';
@@ -878,6 +880,45 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Validates that CHECK constraint expressions don't call non-deterministic
+	 * functions. Walks the AST and looks up each function call against the
+	 * registry; raises if any function lacks the DETERMINISTIC flag. Avoids the
+	 * full planning pipeline because CHECK expressions reference table columns
+	 * whose scope is not yet established at CREATE TABLE time.
+	 */
+	private validateCheckConstraintDeterminism(
+		checkConstraints: ReadonlyArray<RowConstraintSchema>,
+		tableName: string
+	): void {
+		for (const cc of checkConstraints) {
+			let offendingExpr: AST.FunctionExpr | undefined;
+			traverseAst(cc.expr as AST.AstNode, {
+				enterNode: (node: AST.AstNode) => {
+					if (offendingExpr) return false;
+					if (node.type !== 'function') return;
+					const fnNode = node as AST.FunctionExpr;
+					const argCount = fnNode.args?.length ?? 0;
+					const funcSchema = this.findFunction(fnNode.name, argCount)
+						?? this.findFunction(fnNode.name, -1);
+					if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
+						offendingExpr = fnNode;
+						return false;
+					}
+				},
+			});
+			if (offendingExpr) {
+				const constraintName = cc.name ?? `_check_${tableName}`;
+				throw new QuereusError(
+					`Non-deterministic expression not allowed in CHECK constraint '${constraintName}' on table '${tableName}'. ` +
+					`Function '${offendingExpr.name}' is not deterministic. ` +
+					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
+					StatusCode.ERROR
+				);
+			}
+		}
+	}
+
+	/**
 	 * Registers a table schema after module.create() returns, correcting
 	 * name/schema if the module returned different values.
 	 */
@@ -1008,19 +1049,31 @@ export class SchemaManager {
 		return {
 			name: indexName,
 			columns: Object.freeze(indexColumns),
+			unique: stmt.isUnique || undefined,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 	}
 
 	/**
-	 * Returns a new TableSchema with the given index appended.
+	 * Returns a new TableSchema with the given index appended. If the index is
+	 * unique, also adds a matching uniqueConstraint so the mutation manager
+	 * enforces uniqueness on insert/update through its existing checks.
 	 */
 	private addIndexToTableSchema(tableSchema: TableSchema, indexSchema: IndexSchema): TableSchema {
 		const updatedIndexes = [...(tableSchema.indexes || []), indexSchema];
-		return {
+		const result: TableSchema = {
 			...tableSchema,
 			indexes: Object.freeze(updatedIndexes),
 		};
+		if (indexSchema.unique) {
+			const newConstraint: UniqueConstraintSchema = {
+				name: indexSchema.name,
+				columns: Object.freeze(indexSchema.columns.map(c => c.index)),
+			};
+			const updatedConstraints = [...(tableSchema.uniqueConstraints ?? []), newConstraint];
+			result.uniqueConstraints = Object.freeze(updatedConstraints);
+		}
+		return result;
 	}
 
 	/**
@@ -1130,6 +1183,15 @@ export class SchemaManager {
 			throw new QuereusError(`Internal error: Schema '${targetSchemaName}' not found.`, StatusCode.INTERNAL);
 		}
 
+		const seenColumnNames = new Set<string>();
+		for (const col of stmt.columns) {
+			const lower = col.name.toLowerCase();
+			if (seenColumnNames.has(lower)) {
+				throw new QuereusError(`Duplicate column name: ${col.name}`, StatusCode.ERROR, undefined, stmt.table.loc?.start.line, stmt.table.loc?.start.column);
+			}
+			seenColumnNames.add(lower);
+		}
+
 		const existingTable = schema.getTable(tableName);
 		const existingView = schema.getView(tableName);
 
@@ -1147,6 +1209,7 @@ export class SchemaManager {
 		const baseTableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo);
 
 		this.validateDefaultDeterminism(baseTableSchema.columns, tableName);
+		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName);
 
 		let tableInstance: VirtualTable;
 		try {

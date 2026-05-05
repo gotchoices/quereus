@@ -81,7 +81,7 @@ DROP TABLE t_pk;
 CREATE TABLE t_sub (id INTEGER, val TEXT);
 INSERT INTO t_sub VALUES (1, 'a'), (2, 'b');
 SELECT (SELECT val FROM t_sub);
--- error: subquery returned more than 1 row
+-- error: subquery returned more than one row
 DROP TABLE t_sub;
 
 -- Type Error: Invalid type conversion in strict context
