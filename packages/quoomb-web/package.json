@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "@quereus/babel-fish": "workspace:^",
     "@quereus/plugin-indexeddb": "workspace:^",
     "@quereus/plugin-loader": "workspace:^",
     "@quereus/quereus": "workspace:^",
@@ -57,10 +58,12 @@
     "comlink": "^4.4.2",
     "dexie": "4.2.1",
     "lucide-react": "^0.562.0",
+    "mermaid": "^11.14.0",
     "monaco-editor": "^0.55.1",
     "papaparse": "^5.5.3",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
+    "react-markdown-mermaid": "^0.0.3",
     "react-split": "^2.0.14",
     "zustand": "^5.0.10"
   }
