@@ -1,9 +1,9 @@
-import { StatusCode, type Row } from "../../common/types.js";
+import { StatusCode, type Row, type SqlValue } from "../../common/types.js";
 import { SeqScanNode, IndexScanNode, IndexSeekNode } from "../../planner/nodes/table-access-nodes.js";
 import { QuereusError } from "../../common/errors.js";
 import type { VirtualTable } from "../../vtab/table.js";
 import type { BaseModuleConfig, AnyVirtualTableModule } from "../../vtab/module.js";
-import type { Instruction, RuntimeContext } from "../types.js";
+import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
 import type { EmissionContext } from "../emission-context.js";
 import { createValidatedInstruction, emitPlanNode } from "../emitters.js";
 import { disconnectVTable } from "../utils.js";
@@ -30,7 +30,7 @@ export function emitSeqScan(plan: SeqScanNode | IndexScanNode | IndexSeekNode, c
 	// Capture the module info key for runtime retrieval
 	const moduleKey = `vtab_module:${schema.vtabModuleName}`;
 
-  async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: any[]): AsyncIterable<Row> {
+  async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
 		const capturedModuleInfo = ctx.getCapturedSchemaObject<{ module: AnyVirtualTableModule, auxData?: unknown }>(moduleKey);
 		if (!capturedModuleInfo) {
@@ -56,7 +56,7 @@ export function emitSeqScan(plan: SeqScanNode | IndexScanNode | IndexSeekNode, c
 			schema.name,
 			options
 		);
-	} catch (e: any) {
+	} catch (e: unknown) {
 		const message = e instanceof Error ? e.message : String(e);
 		throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 	}
@@ -82,7 +82,7 @@ export function emitSeqScan(plan: SeqScanNode | IndexScanNode | IndexSeekNode, c
 				rowSlot.set(row);
 				yield row;
 			}
-		} catch (e: any) {
+		} catch (e: unknown) {
 			const message = e instanceof Error ? e.message : String(e);
 			throw new QuereusError(`Error during query on table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 		} finally {
@@ -102,7 +102,7 @@ export function emitSeqScan(plan: SeqScanNode | IndexScanNode | IndexSeekNode, c
 
   return createValidatedInstruction(
     params,
-    run,
+    run as InstructionRun,
     ctx,
     `${plan.nodeType}(${schema.name})`
   );

@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
+import type { SqlValue } from '../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('INTEGER to REAL compatibility fix', () => {
 	let db: Database;
@@ -29,7 +32,7 @@ describe('INTEGER to REAL compatibility fix', () => {
 		await stmt.finalize();
 
 		// Verify all rows were inserted
-		const rows: any[] = [];
+		const rows: ResultRow[] = [];
 		for await (const row of db.eval('SELECT * FROM test ORDER BY id')) {
 			rows.push(row);
 		}
@@ -46,7 +49,7 @@ describe('INTEGER to REAL compatibility fix', () => {
 		const stmt = db.prepare('SELECT * FROM test WHERE value > ?', [1.5]);
 
 		// Should work with integer value 40
-		const rows: any[] = [];
+		const rows: ResultRow[] = [];
 		for await (const row of stmt.all([40])) {
 			rows.push(row);
 		}
@@ -61,17 +64,17 @@ describe('INTEGER to REAL compatibility fix', () => {
 		const stmt = db.prepare('SELECT * FROM test WHERE id = ?', [1]);
 
 		// Should reject float value
-		let error: any;
+		let error: Error | undefined;
 		try {
 			await stmt.get([3.14]);
 		} catch (e) {
-			error = e;
+			error = e as Error;
 		}
 
 		expect(error).to.exist;
-		expect(error.message).to.include('Parameter type mismatch');
-		expect(error.message).to.include('expected INTEGER');
-		expect(error.message).to.include('REAL');
+		expect(error!.message).to.include('Parameter type mismatch');
+		expect(error!.message).to.include('expected INTEGER');
+		expect(error!.message).to.include('REAL');
 
 		await stmt.finalize();
 	});

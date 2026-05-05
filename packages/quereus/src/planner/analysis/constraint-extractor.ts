@@ -121,8 +121,8 @@ export function extractConstraints(
 		let acc = residualExpressions[0];
 		for (let i = 1; i < residualExpressions.length; i++) {
 			const right = residualExpressions[i];
-			const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (acc as any).expression, right: (right as any).expression };
-			acc = new BinaryOpNode((acc as any).scope, ast, acc, right);
+			const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+			acc = new BinaryOpNode(acc.scope, ast, acc, right);
 		}
 		residualPredicate = acc;
 	}
@@ -289,8 +289,8 @@ function combineParts(parts: ScalarPlanNode[]): ScalarPlanNode | undefined {
   let acc = parts[0];
   for (let i = 1; i < parts.length; i++) {
     const right = parts[i];
-    const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (acc as any).expression, right: (right as any).expression };
-    acc = new BinaryOpNode((acc as any).scope, ast, acc, right);
+    const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+    acc = new BinaryOpNode(acc.scope, ast, acc, right);
   }
   return acc;
 }
@@ -1089,8 +1089,8 @@ function combineResiduals(predicates: ScalarPlanNode[]): ScalarPlanNode | undefi
     let acc = predicates[0];
     for (let i = 1; i < predicates.length; i++) {
         const right = predicates[i];
-        const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (acc as any).expression, right: (right as any).expression };
-        acc = new BinaryOpNode((acc as any).scope, ast, acc, right);
+        const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+        acc = new BinaryOpNode(acc.scope, ast, acc, right);
     }
     return acc;
 }
@@ -1104,9 +1104,8 @@ function walkPlanForPredicates(
 ): void {
   if (!plan) return;
   // If node exposes predicates via characteristic, collect them
-  if (CapabilityDetectors.isPredicateSource(plan as any)) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const preds = (plan as any).getPredicates() as ReadonlyArray<ScalarPlanNode>;
+  if (CapabilityDetectors.isPredicateSource(plan)) {
+    const preds = plan.getPredicates() as ReadonlyArray<ScalarPlanNode>;
     for (const p of preds) {
       callback(p, 'PredicateSource');
     }
@@ -1127,7 +1126,7 @@ function createTableInfosFromPlan(plan: RelationalPlanNode | PlanNode): TableInf
   const seen = new Set<string>();
 
   function visitAny(node: PlanNode): void {
-    const id = (node as any).id ?? null;
+    const id = node.id ?? null;
     if (id !== null) {
       const k = String(id);
       if (seen.has(k)) return;
@@ -1171,7 +1170,7 @@ export function createTableInfoFromNode(node: RelationalPlanNode, relationName?:
 		: undefined;
 
 	const relName = relationName || node.toString();
-	const relationKey = `${relName}#${(node as any).id ?? 'unknown'}`;
+	const relationKey = `${relName}#${node.id ?? 'unknown'}`;
 
 	return {
 		relationName: relName,

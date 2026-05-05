@@ -9,6 +9,7 @@ import type {
 	ColumnDef,
 	TableConstraint,
 	DeleteStmt,
+	FromClause,
 } from '../src/parser/ast.js';
 
 // Helper to build an IdentifierExpr
@@ -159,7 +160,7 @@ describe('Emit: missing statement types', () => {
 			const selectNode = {
 				type: 'select' as const,
 				columns: [{ type: 'all' as const }],
-				from: [mutSource as any],
+				from: [mutSource as unknown as FromClause],
 			};
 			const result = astToString(selectNode);
 			// Currently the from clause falls through to [unknown_from]

@@ -4,19 +4,22 @@ import { DEFAULT_TUNING } from '../../src/planner/optimizer.js';
 import { PassManager, TraversalOrder, createPass } from '../../src/planner/framework/pass.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import type { OptContext } from '../../src/planner/framework/context.js';
+import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import type { Optimizer } from '../../src/planner/optimizer.js';
+import type { StatsProvider } from '../../src/planner/stats/index.js';
 
 type TestNode = {
 	id: string;
 	nodeType: PlanNodeType;
-	getChildren(): readonly any[];
-	withChildren(newChildren: readonly any[]): any;
+	getChildren(): readonly PlanNode[];
+	withChildren(newChildren: readonly PlanNode[]): PlanNode;
 	getLogicalAttributes(): Record<string, unknown>;
 };
 
 function createTestContext(db: Database, overrides?: Partial<OptContext>): OptContext {
 	return {
-		optimizer: {} as any,
-		stats: {} as any,
+		optimizer: {} as Optimizer,
+		stats: {} as StatsProvider,
 		tuning: { ...DEFAULT_TUNING, ...(overrides?.tuning ?? {}) },
 		phase: 'rewrite',
 		depth: 0,
@@ -39,7 +42,7 @@ describe('PassManager', () => {
 					id: String(nextId++),
 					nodeType,
 					getChildren: () => [],
-					withChildren: () => self,
+					withChildren: () => self as unknown as PlanNode,
 					getLogicalAttributes: () => ({}),
 				};
 				return self;
@@ -58,14 +61,14 @@ describe('PassManager', () => {
 					id: 'a-filter-to-project',
 					nodeType: PlanNodeType.Filter,
 					phase: 'rewrite',
-					fn: () => makeNode(PlanNodeType.Project) as any,
+					fn: () => makeNode(PlanNodeType.Project) as unknown as PlanNode,
 					priority: 10
 				},
 				{
 					id: 'b-project-to-filter',
 					nodeType: PlanNodeType.Project,
 					phase: 'rewrite',
-					fn: () => makeNode(PlanNodeType.Filter) as any,
+					fn: () => makeNode(PlanNodeType.Filter) as unknown as PlanNode,
 					priority: 20
 				},
 			);
@@ -78,7 +81,7 @@ describe('PassManager', () => {
 			});
 
 			const root = makeNode(PlanNodeType.Filter);
-			const optimized = pm.execute(root as any, context);
+			const optimized = pm.execute(root as unknown as PlanNode, context);
 
 			expect(optimized.nodeType).to.equal(PlanNodeType.Filter);
 
@@ -102,8 +105,8 @@ describe('PassManager', () => {
 					const self: TestNode = {
 						id: String(nextId++),
 						nodeType: PlanNodeType.Filter,
-						getChildren: () => (child ? [child] : []),
-						withChildren: () => self,
+						getChildren: () => (child ? [child as unknown as PlanNode] : []),
+						withChildren: () => self as unknown as PlanNode,
 						getLogicalAttributes: () => ({}),
 					};
 					current = self;
@@ -128,7 +131,7 @@ describe('PassManager', () => {
 
 			const deepPlan = makeChain(20);
 
-			expect(() => pm.execute(deepPlan as any, context)).to.throw(/Maximum optimization depth exceeded/);
+			expect(() => pm.execute(deepPlan as unknown as PlanNode, context)).to.throw(/Maximum optimization depth exceeded/);
 		} finally {
 			await db.close();
 		}

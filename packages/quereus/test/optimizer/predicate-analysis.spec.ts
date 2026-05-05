@@ -10,10 +10,10 @@ import { extractConstraints, type TableInfo } from '../../src/planner/analysis/c
 import { TEXT_TYPE } from '../../src/types/builtin-types.js';
 
 describe('Predicate analysis', () => {
-	const scope = EmptyScope.instance as unknown as any;
+	const scope = EmptyScope.instance;
 
 	function colRef(attrId: number, name: string, index: number): ColumnReferenceNode {
-		const expr: AST.ColumnExpr = { type: 'column', schema: undefined as any, table: undefined as any, name } as unknown as AST.ColumnExpr;
+		const expr: AST.ColumnExpr = { type: 'column', name };
 		const columnType = {
 			typeClass: 'scalar' as const,
 			logicalType: TEXT_TYPE,
@@ -29,27 +29,27 @@ describe('Predicate analysis', () => {
 	}
 
 	function andNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (left as any).expression, right: (right as any).expression };
+		const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: left.expression, right: right.expression };
 		return new BinaryOpNode(scope, ast, left, right);
 	}
 
 	function orNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: 'OR', left: (left as any).expression, right: (right as any).expression };
+		const ast: AST.BinaryExpr = { type: 'binary', operator: 'OR', left: left.expression, right: right.expression };
 		return new BinaryOpNode(scope, ast, left, right);
 	}
 
 	function eqNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: '=', left: (left as any).expression, right: (right as any).expression };
+		const ast: AST.BinaryExpr = { type: 'binary', operator: '=', left: left.expression, right: right.expression };
 		return new BinaryOpNode(scope, ast, left, right);
 	}
 
 	function notNode(operand: ScalarPlanNode): UnaryOpNode {
-		const ast: AST.UnaryExpr = { type: 'unary', operator: 'NOT', expr: (operand as any).expression };
+		const ast: AST.UnaryExpr = { type: 'unary', operator: 'NOT', expr: operand.expression };
 		return new UnaryOpNode(scope, ast, operand);
 	}
 
 	function minusNode(operand: ScalarPlanNode): UnaryOpNode {
-		const ast: AST.UnaryExpr = { type: 'unary', operator: '-', expr: (operand as any).expression };
+		const ast: AST.UnaryExpr = { type: 'unary', operator: '-', expr: operand.expression };
 		return new UnaryOpNode(scope, ast, operand);
 	}
 
@@ -67,11 +67,10 @@ describe('Predicate analysis', () => {
     let totalValues = 0;
     while (stack.length) {
       const n = stack.pop()!;
-      const exprOp = (n as any).expression?.operator;
+      const exprOp = (n as { expression?: { operator?: string } }).expression?.operator;
       if (exprOp === 'OR') {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const b = n as any;
-        stack.push(b.left as ScalarPlanNode, b.right as ScalarPlanNode);
+        const b = n as BinaryOpNode;
+        stack.push(b.left, b.right);
         continue;
       }
       if (n.nodeType === PlanNodeType.BinaryOp && exprOp === '=') {
@@ -79,8 +78,7 @@ describe('Predicate analysis', () => {
         continue;
       }
       if (n.nodeType === PlanNodeType.In) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const values = ((n as any).values as unknown[] | undefined) ?? [];
+        const values = (n as { values?: unknown[] }).values ?? [];
         totalValues += values.length;
         continue;
       }
@@ -158,12 +156,12 @@ describe('Predicate analysis', () => {
 		};
 
 		function gtNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-			const ast: AST.BinaryExpr = { type: 'binary', operator: '>', left: (left as any).expression, right: (right as any).expression };
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '>', left: left.expression, right: right.expression };
 			return new BinaryOpNode(scope, ast, left, right);
 		}
 
 		function ltNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-			const ast: AST.BinaryExpr = { type: 'binary', operator: '<', left: (left as any).expression, right: (right as any).expression };
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '<', left: left.expression, right: right.expression };
 			return new BinaryOpNode(scope, ast, left, right);
 		}
 

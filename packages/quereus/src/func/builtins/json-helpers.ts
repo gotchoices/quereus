@@ -182,17 +182,17 @@ export function prepareJsonValue(value: SqlValue): JSONValue {
  * @param data The data to copy
  * @returns A deep copy of the input data
  */
-export function deepCopyJson(data: any): any {
+export function deepCopyJson(data: JSONValue): JSONValue {
 	if (data === null || typeof data !== 'object') {
 		return data;
 	}
 	if (Array.isArray(data)) {
 		return data.map(deepCopyJson);
 	}
-	const copy: Record<string, any> = {};
+	const copy: Record<string, JSONValue> = {};
 	for (const key in data) {
 		if (Object.prototype.hasOwnProperty.call(data, key)) {
-			copy[key] = deepCopyJson(data[key]);
+			copy[key] = deepCopyJson((data as Record<string, JSONValue>)[key]);
 		}
 	}
 	return copy;

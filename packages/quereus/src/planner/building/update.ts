@@ -143,7 +143,7 @@ export function buildUpdateStmt(
   const { oldRowDescriptor, newRowDescriptor, flatRowDescriptor } = buildOldNewRowDescriptors(oldAttributes, newAttributes);
 
   // Build context descriptor if we have context attributes
-  const contextDescriptor: RowDescriptor = contextAttributes.length > 0 ? [] : undefined as any;
+  const contextDescriptor: RowDescriptor | undefined = contextAttributes.length > 0 ? [] : undefined;
   if (contextDescriptor) {
     contextAttributes.forEach((attr, index) => {
       contextDescriptor[attr.id] = index;

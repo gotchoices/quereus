@@ -251,7 +251,6 @@ describe('Statement Iterator Cleanup', () => {
 			const stmt = db.prepare('select * from test_data');
 
 			// Break immediately without consuming any rows
-			// eslint-disable-next-line @typescript-eslint/no-unused-vars
 			for await (const _row of stmt.all()) {
 				break;
 			}

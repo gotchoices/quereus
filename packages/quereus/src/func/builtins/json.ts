@@ -12,7 +12,7 @@ import { createScalarFunction, createAggregateFunction } from '../registration.j
 import { coerceToJsonValue, resolveJsonPathForModify, prepareJsonValue, deepCopyJson, getJsonType } from './json-helpers.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
-import type { Instruction, RuntimeContext } from '../../runtime/types.js';
+import type { Instruction, InstructionRun, RuntimeContext } from '../../runtime/types.js';
 import { PlanNodeType } from '../../planner/nodes/plan-node-type.js';
 import { LiteralNode } from '../../planner/nodes/scalar.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
@@ -55,14 +55,13 @@ function emitJsonSchema(
 		if (typeof schemaDef === 'string') {
 			try {
 				// Compile the validator once at emission time using moat-maker
-				const parts: any = [schemaDef];
-				parts.raw = [schemaDef];
-				const compiledValidator = validator(parts, ...[]);
+				const parts = Object.assign([schemaDef], { raw: [schemaDef] }) as unknown as TemplateStringsArray;
+				const compiledValidator = validator(parts);
 
 				// Emit only the JSON argument (first operand)
 				const jsonArgInstruction = emitPlanNode(plan.operands[0], ctx);
 
-				function run(_rctx: RuntimeContext, ...args: any[]): SqlValue {
+				function run(_rctx: RuntimeContext, ...args: SqlValue[]): SqlValue {
 					const json = args[0];
 					const data = coerceToJsonValue(json);
 					if (data === undefined) return false;
@@ -78,7 +77,7 @@ function emitJsonSchema(
 
 				return {
 					params: [jsonArgInstruction],
-					run,
+					run: run as InstructionRun,
 					note: `json_schema(cached:${schemaDef.substring(0, 20)}...)`
 				};
 			} catch (e) {
@@ -100,9 +99,8 @@ export const jsonSchemaFunc = createScalarFunction(
 		if (data === undefined) return false;
 
 		try {
-			const parts: any = [schemaDef];
-			parts.raw = [schemaDef];
-			const compiledValidator = validator(parts, ...[]);
+			const parts = Object.assign([schemaDef], { raw: [schemaDef] }) as unknown as TemplateStringsArray;
+			const compiledValidator = validator(parts);
 			const isValid = compiledValidator.matches(data);
 			return isValid;
 		} catch (e) {

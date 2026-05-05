@@ -65,7 +65,12 @@ function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
 function combineConjuncts(conjuncts: ScalarPlanNode[]): ScalarPlanNode | null {
 	if (conjuncts.length === 0) return null;
 	return conjuncts.reduce((acc, cur) =>
-		new BinaryOpNode(cur.scope, { type: 'binary', operator: 'AND' } as any, acc, cur)
+		new BinaryOpNode(
+			cur.scope,
+			{ type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+			acc,
+			cur
+		)
 	);
 }
 
@@ -280,7 +285,7 @@ function extractInCorrelation(
 
 	const equiCondition = new BinaryOpNode(
 		outerColRef.scope,
-		{ type: 'binary', operator: '=' } as any,
+		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
 		outerColRef,
 		innerColRef
 	);

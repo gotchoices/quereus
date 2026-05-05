@@ -59,8 +59,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			} finally {
 				slot.close();
 			}
-		} catch (error: any) {
-			throw new QuereusError(`Table-valued function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
 	}
 
@@ -101,8 +102,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			} finally {
 				slot.close();
 			}
-		} catch (error: any) {
-			throw new QuereusError(`Table-valued function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
 	}
 

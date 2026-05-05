@@ -52,7 +52,7 @@ interface IndexStyleContext {
 }
 
 function isIndexStyleContext(ctx: unknown): ctx is IndexStyleContext {
-	return !!ctx && typeof ctx === 'object' && (ctx as any).kind === 'index-style';
+	return !!ctx && typeof ctx === 'object' && (ctx as { kind?: string }).kind === 'index-style';
 }
 
 export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode | null {

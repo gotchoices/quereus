@@ -134,7 +134,7 @@ function collectReferencedAttributeIds(expr: ScalarPlanNode): Set<number> {
 	const ids = new Set<number>();
 	walkExpr(expr, node => {
 		if (CapabilityDetectors.isColumnReference(node)) {
-			ids.add((node as any).attributeId as number);
+			ids.add(node.attributeId);
 		}
 	});
 	return ids;

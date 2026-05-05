@@ -78,7 +78,12 @@ function extractEquiPairs(
 	let residual: ScalarPlanNode | undefined;
 	if (residuals.length > 0) {
 		residual = residuals.reduce((acc, cur) =>
-			new BinaryOpNode(cur.scope, { type: 'binary', operator: 'AND' } as any, acc, cur)
+			new BinaryOpNode(
+				cur.scope,
+				{ type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+				acc,
+				cur
+			)
 		);
 	}
 
@@ -172,7 +177,7 @@ function createSortForEquiPairs(
 		// Create a ColumnReferenceNode for this attribute
 		const colRef = new ColumnReferenceNode(
 			scope,
-			{ type: 'column', table: '', column: attr.name, schema: '' } as any,
+			{ type: 'column', table: '', name: attr.name, schema: '' },
 			attr.type,
 			attr.id,
 			idx

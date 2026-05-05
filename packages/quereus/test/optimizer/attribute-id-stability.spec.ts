@@ -24,7 +24,7 @@ describe('Attribute ID stability', () => {
 		const refs: Array<{ attributeId: number; column: string }> = [];
 
 		for await (const r of db.eval("SELECT properties FROM query_plan(?) WHERE node_type = 'ColumnReference'", [sql])) {
-			const properties = (r as any).properties as string | null;
+			const properties = (r as { properties?: string | null }).properties ?? null;
 			if (!properties) continue;
 			const parsed = JSON.parse(properties);
 			if (typeof parsed?.attributeId === 'number' && typeof parsed?.column === 'string') {

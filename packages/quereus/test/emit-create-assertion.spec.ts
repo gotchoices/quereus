@@ -3,6 +3,8 @@ import { Database } from '../src/index.js';
 import { emitCreateAssertion } from '../src/runtime/emit/create-assertion.js';
 import type { EmissionContext } from '../src/runtime/emission-context.js';
 import type { RuntimeContext } from '../src/runtime/types.js';
+import type { CreateAssertionNode } from '../src/planner/nodes/create-assertion-node.js';
+import type * as AST from '../src/parser/ast.js';
 import { QuereusError } from '../src/common/errors.js';
 
 describe('Emit: CREATE ASSERTION error handling', () => {
@@ -24,12 +26,12 @@ describe('Emit: CREATE ASSERTION error handling', () => {
 			operator: '=',
 			left: null,
 			right: null,
-		} as any;
+		} as unknown as AST.Expression;
 
 		const fakePlan = {
 			name: 'bad_assertion',
 			checkExpression: poisonExpr,
-		} as any;
+		} as unknown as CreateAssertionNode;
 
 		const instruction = emitCreateAssertion(fakePlan, {} as EmissionContext);
 

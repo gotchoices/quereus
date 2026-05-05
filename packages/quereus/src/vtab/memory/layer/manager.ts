@@ -939,7 +939,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Add Column', this._tableName, { columnName: newColumnSchema.name });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1001,7 +1001,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Drop Column', this._tableName, { columnName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1065,7 +1065,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Rename Column', this._tableName, { oldName, newName: newColumnName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1202,7 +1202,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1268,7 +1268,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Create Index', this._tableName, { indexName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			logger.error('Create Index', this._tableName, e);
@@ -1311,7 +1311,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Drop Index', this._tableName, { indexName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			logger.error('Drop Index', this._tableName, e);

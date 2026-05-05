@@ -5,6 +5,9 @@ import type { Database } from '../core/database.js';
 import type { BaseType, ScalarType, RelationType } from '../common/datatype.js';
 import type { AggValue } from '../func/registration.js';
 import type { LogicalType } from '../types/logical-type.js';
+import type { ScalarFunctionCallNode } from '../planner/nodes/function.js';
+import type { EmissionContext } from '../runtime/emission-context.js';
+import type { Instruction } from '../runtime/types.js';
 
 /**
  * Type for a scalar function implementation.
@@ -25,12 +28,15 @@ export type IntegratedTableValuedFunc = (db: Database, ...args: SqlValue[]) => M
 /**
  * Type for aggregate step function.
  */
+// Accumulator type is opaque to the framework; concrete reducers know their state shape.
+// Using `unknown` here would require contravariant casts at every aggregate registration site.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AggregateReducer<T = any> = (accumulator: T, ...args: SqlValue[]) => T;
 
 /**
  * Type for aggregate finalizer function.
  */
+// See AggregateReducer above for rationale on `any` here.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AggregateFinalizer<T = any> = (accumulator: T) => SqlValue;
 
@@ -40,10 +46,10 @@ export type AggregateFinalizer<T = any> = (accumulator: T) => SqlValue;
  * optimize constant arguments, or perform other emission-time optimizations.
  */
 export type CustomEmitterHook = (
-	plan: any, // ScalarFunctionCallNode, but we avoid circular dependency
-	ctx: any,  // EmissionContext, but we avoid circular dependency
-	defaultEmit: (plan: any, ctx: any) => any // Instruction
-) => any; // Instruction
+	plan: ScalarFunctionCallNode,
+	ctx: EmissionContext,
+	defaultEmit: (plan: ScalarFunctionCallNode, ctx: EmissionContext) => Instruction
+) => Instruction;
 
 /**
  * Base interface for all function schemas with common properties.

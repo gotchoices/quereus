@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Projection pruning', () => {
 	let db: Database;
@@ -26,22 +29,22 @@ describe('Projection pruning', () => {
 		const q = "select name FROM v";
 
 		// Verify correctness
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(3);
 		expect(results[0].name).to.equal('Alpha');
 
 		// Check plan: find PROJECT nodes and inspect projection counts
-		const projects: any[] = [];
+		const projects: ResultRow[] = [];
 		for await (const r of db.eval("select properties FROM query_plan(?) WHERE op = 'PROJECT'", [q])) {
 			projects.push(r);
 		}
 
 		// The inner (view) project should have been pruned
 		// We expect at least one PROJECT with projectionCount < 5
-		const counts = projects.map((p: any) => {
+		const counts = projects.map((p) => {
 			const props = typeof p.properties === 'string' ? JSON.parse(p.properties) : p.properties;
-			return props.projectionCount;
+			return (props as { projectionCount: number }).projectionCount;
 		});
 		// At least one project should have fewer than 5 columns (the original view width)
 		expect(counts.some((c: number) => c < 5)).to.be.true;
@@ -49,7 +52,7 @@ describe('Projection pruning', () => {
 
 	it('returns correct results after pruning', async () => {
 		await setup();
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval("select name, value FROM v WHERE id = 1")) results.push(r);
 		expect(results).to.have.lengthOf(1);
 		expect(results[0].name).to.equal('Alpha');
@@ -59,7 +62,7 @@ describe('Projection pruning', () => {
 	it('preserves all columns when all are referenced', async () => {
 		await setup();
 		const q = "select id, name, email, category, value FROM v";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(3);
 		// Verify all columns present
@@ -72,11 +75,11 @@ describe('Projection pruning', () => {
 		await db.exec("INSERT INTO orders VALUES (10, 1, 50), (20, 2, 75)");
 
 		const q = "select v.name, o.amount FROM v JOIN orders o ON v.id = o.tid";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 
 		expect(results).to.have.lengthOf(2);
-		const names = results.map((r: any) => r.name).sort();
+		const names = results.map(r => r.name).sort();
 		expect(names).to.deep.equal(['Alpha', 'Beta']);
 
 		await db.exec("DROP TABLE orders");
@@ -85,7 +88,7 @@ describe('Projection pruning', () => {
 	it('handles count(*) from view — can prune all but one projection', async () => {
 		await setup();
 		const q = "select count(*) as cnt FROM v";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(1);
 		expect(results[0].cnt).to.equal(3);

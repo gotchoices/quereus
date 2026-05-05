@@ -1,6 +1,9 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import type { ScalarType } from '../src/common/datatype.js';
+import type { SqlValue } from '../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Parameter Type System', () => {
 	let db: Database;
@@ -30,7 +33,7 @@ describe('Parameter Type System', () => {
 
 		it('should infer INTEGER from JavaScript integer number', async () => {
 			await db.exec('INSERT INTO type_test (id, int_col) VALUES (?, ?)', [1, 42]);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT int_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -40,7 +43,7 @@ describe('Parameter Type System', () => {
 
 		it('should infer REAL from JavaScript float number', async () => {
 			await db.exec('INSERT INTO type_test (id, real_col) VALUES (?, ?)', [1, 3.14]);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT real_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -50,7 +53,7 @@ describe('Parameter Type System', () => {
 
 		it('should infer INTEGER from JavaScript bigint', async () => {
 			await db.exec('INSERT INTO type_test (id, int_col) VALUES (?, ?)', [1, 9007199254740991n]);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT int_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -60,7 +63,7 @@ describe('Parameter Type System', () => {
 
 		it('should infer TEXT from JavaScript string', async () => {
 			await db.exec('INSERT INTO type_test (id, text_col) VALUES (?, ?)', [1, 'hello']);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT text_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -70,7 +73,7 @@ describe('Parameter Type System', () => {
 
 		it('should infer BOOLEAN from JavaScript boolean', async () => {
 			await db.exec('INSERT INTO type_test (id, bool_col) VALUES (?, ?)', [1, true]);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT bool_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -81,7 +84,7 @@ describe('Parameter Type System', () => {
 		it('should infer BLOB from JavaScript Uint8Array', async () => {
 			const blob = new Uint8Array([1, 2, 3, 4]);
 			await db.exec('INSERT INTO type_test (id, blob_col) VALUES (?, ?)', [1, blob]);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT blob_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -92,7 +95,7 @@ describe('Parameter Type System', () => {
 
 		it('should handle NULL parameters', async () => {
 			await db.exec('INSERT INTO type_test (id, text_col) VALUES (?, ?)', [1, null]);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT text_col FROM type_test WHERE id = ?', [1])) {
 				rows.push(row);
 			}
@@ -118,7 +121,7 @@ describe('Parameter Type System', () => {
 				'INSERT INTO users (id, name, age, score) VALUES (:id, :name, :age, :score)',
 				{ id: 1, name: 'Alice', age: 30, score: 95.5 }
 			);
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM users WHERE id = :id', { id: 1 })) {
 				rows.push(row);
 			}
@@ -131,7 +134,7 @@ describe('Parameter Type System', () => {
 
 	describe('Type Conversion in Expressions', () => {
 		it('should allow explicit type conversion with conversion functions', async () => {
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT date(?) as d', ['2024-01-15'])) {
 				rows.push(row);
 			}
@@ -161,7 +164,7 @@ describe('Parameter Type System', () => {
 			await stmt.run([2, 100]);
 
 			// Verify both rows were inserted
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM mixed_test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -177,17 +180,17 @@ describe('Parameter Type System', () => {
 			const stmt = db.prepare('INSERT INTO mixed_test (id, value_col) VALUES (?, ?)', [1, 42]);
 
 			// Try to execute with REAL parameter (different type - should throw)
-			let error: any;
+			let error: Error | undefined;
 			try {
 				await stmt.run([2, 3.14]);
 			} catch (e) {
-				error = e;
+				error = e as Error;
 			}
 
 			expect(error).to.exist;
-			expect(error.message).to.include('Parameter type mismatch');
-			expect(error.message).to.include('expected INTEGER');
-			expect(error.message).to.include('physical type REAL');
+			expect(error!.message).to.include('Parameter type mismatch');
+			expect(error!.message).to.include('expected INTEGER');
+			expect(error!.message).to.include('physical type REAL');
 
 			await stmt.finalize();
 		});
@@ -208,7 +211,7 @@ describe('Parameter Type System', () => {
 			await stmt.run([2, 100]);
 
 			// Verify rows were inserted
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM mixed_test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -224,7 +227,7 @@ describe('Parameter Type System', () => {
 			const stmt = db.prepare('SELECT * FROM mixed_test WHERE value_col > ?', [50]);
 
 			// First query
-			let rows: any[] = [];
+			let rows: ResultRow[] = [];
 			for await (const row of stmt.all()) {
 				rows.push(row);
 			}
@@ -255,14 +258,14 @@ describe('Parameter Type System', () => {
 			expect(result2!.value).to.equal(200);
 
 			// Should reject float (different physical type: REAL vs INTEGER)
-			let error: any;
+			let error: Error | undefined;
 			try {
 				await stmt.get([3.14]);
 			} catch (e) {
-				error = e;
+				error = e as Error;
 			}
 			expect(error).to.exist;
-			expect(error.message).to.include('Parameter type mismatch');
+			expect(error!.message).to.include('Parameter type mismatch');
 
 			await stmt.finalize();
 		});

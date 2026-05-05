@@ -906,7 +906,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			if (typeof schema.stepFunction !== 'function') {
 				throw new MisuseError('registerFunction: aggregate schema.stepFunction must be a function');
 			}
-			if (typeof (schema as any).finalizeFunction !== 'function') {
+			if (!('finalizeFunction' in schema) || typeof schema.finalizeFunction !== 'function') {
 				throw new MisuseError('registerFunction: aggregate schema.finalizeFunction must be a function');
 			}
 		} else if ('implementation' in schema) {

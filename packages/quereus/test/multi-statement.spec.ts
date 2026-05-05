@@ -1,6 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
+import type { SqlValue } from '../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Multi-statement execution', () => {
 	let db: Database;
@@ -24,7 +27,7 @@ describe('Multi-statement execution', () => {
 			`);
 
 			// Verify all three rows were inserted
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -50,7 +53,7 @@ describe('Multi-statement execution', () => {
 			`);
 
 			// Verify all updates were applied
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -67,7 +70,7 @@ describe('Multi-statement execution', () => {
 				INSERT INTO users VALUES (1, 'Alice');
 			`);
 
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM users')) {
 				rows.push(row);
 			}
@@ -80,7 +83,7 @@ describe('Multi-statement execution', () => {
 	describe('eval() method', () => {
 		it('should execute setup statements and return results from final query', async () => {
 			// Multi-statement batch: setup + query
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval(`
 				CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);
 				INSERT INTO test VALUES (1, 'first');
@@ -100,7 +103,7 @@ describe('Multi-statement execution', () => {
 		it('should execute multiple INSERTs and return results from final SELECT', async () => {
 			await db.exec('CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)');
 
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval(`
 				INSERT INTO test VALUES (1, 10);
 				INSERT INTO test VALUES (2, 20);
@@ -118,7 +121,7 @@ describe('Multi-statement execution', () => {
 			await db.exec('CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)');
 			await db.exec("INSERT INTO test VALUES (1, 'single')");
 
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM test')) {
 				rows.push(row);
 			}
@@ -142,7 +145,7 @@ describe('Multi-statement execution', () => {
 			}
 
 			// The INSERT should still be committed despite early termination
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM partial_test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -169,7 +172,7 @@ describe('Multi-statement execution', () => {
 			await iterator.return!(undefined);
 
 			// The INSERT should still be committed
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM return_test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -199,7 +202,7 @@ describe('Multi-statement execution', () => {
 			}
 
 			// The INSERT should be rolled back
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM throw_test ORDER BY id')) {
 				rows.push(row);
 			}
@@ -228,7 +231,7 @@ describe('Multi-statement execution', () => {
 			}
 
 			// Both INSERTs should be committed
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM sequence_test ORDER BY id')) {
 				rows.push(row);
 			}

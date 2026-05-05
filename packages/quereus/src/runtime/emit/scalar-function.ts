@@ -31,8 +31,9 @@ export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx:
 
 		try {
 			return scalarFunction.implementation(...args);
-		} catch (error: any) {
-			throw new QuereusError(`Function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error, plan.expression.loc?.start.line, plan.expression.loc?.start.column);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined, plan.expression.loc?.start.line, plan.expression.loc?.start.column);
 		}
 	}
 

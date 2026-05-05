@@ -1,6 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
+import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import type { WindowNode } from '../../src/planner/nodes/window-node.js';
 
 describe('Planner: window function types', () => {
 	let db: Database;
@@ -16,16 +18,16 @@ describe('Planner: window function types', () => {
 	});
 
 	function getWindowFunctionTypesFromPlan(sql: string): Array<{ fn: string; resultType: string }> {
-		const plan = db.getPlan(sql) as any;
+		const plan = db.getPlan(sql) as PlanNode;
 
-		const windows: any[] = [];
-		const stack: any[] = [plan];
+		const windows: WindowNode[] = [];
+		const stack: PlanNode[] = [plan];
 		while (stack.length > 0) {
 			const node = stack.pop();
 			if (!node || typeof node !== 'object') continue;
 
 			if (node.nodeType === PlanNodeType.Window) {
-				windows.push(node);
+				windows.push(node as WindowNode);
 			}
 
 			if (typeof node.getChildren === 'function') {

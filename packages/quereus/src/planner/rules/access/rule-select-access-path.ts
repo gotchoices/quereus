@@ -21,7 +21,9 @@ import { SeqScanNode, IndexScanNode, IndexSeekNode, EmptyResultNode } from '../.
 import { seqScanCost } from '../../cost/index.js';
 import type { ColumnMeta, BestAccessPlanRequest, BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import { FilterInfo } from '../../../vtab/filter-info.js';
-import type { IndexConstraintUsage } from '../../../vtab/index-info.js';
+import type { IndexConstraint, IndexConstraintUsage } from '../../../vtab/index-info.js';
+import type { SqlValue } from '../../../common/types.js';
+import type { Scope } from '../../scopes/scope.js';
 import { TableReferenceNode } from '../../nodes/reference.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
@@ -99,17 +101,16 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	const vtabModule = retrieveNode.vtabModule;
 
 	// Check if we have pre-computed access plan from ruleGrowRetrieve
-	const indexCtx = retrieveNode.moduleCtx as any; // IndexStyleContext from grow rule
 	let accessPlan: BestAccessPlanResult;
 	let constraints: PlannerPredicateConstraint[];
-	let residualPredicate: PlanNode | undefined;
+	let residualPredicate: ScalarPlanNode | undefined;
 
-	if (indexCtx?.accessPlan) {
+	if (isIndexStyleContext(retrieveNode.moduleCtx)) {
 		// Use pre-computed access plan from grow rule
 		log('Using pre-computed access plan from grow rule');
-		accessPlan = indexCtx.accessPlan;
-		constraints = indexCtx.originalConstraints || [];
-		residualPredicate = indexCtx.residualPredicate;
+		accessPlan = retrieveNode.moduleCtx.accessPlan;
+		constraints = (retrieveNode.moduleCtx.originalConstraints as PlannerPredicateConstraint[]) || [];
+		residualPredicate = retrieveNode.moduleCtx.residualPredicate;
 	} else {
 		// Extract constraints from grown pipeline in source using table instance key
 		const tInfo = createTableInfoFromNode(retrieveNode.tableRef, `${tableSchema.schemaName}.${tableSchema.name}`);
@@ -146,7 +147,7 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	let finalNode: PlanNode = rebuiltPipeline;
 	if (residualPredicate) {
 		log('Wrapping rebuilt pipeline with residual filter');
-		finalNode = new FilterNode(rebuiltPipeline.scope, rebuiltPipeline as any, residualPredicate as any);
+		finalNode = new FilterNode(rebuiltPipeline.scope, rebuiltPipeline, residualPredicate);
 	}
 
 	log('Selected access for table %s (cost: %f, rows: %s)', tableSchema.name, accessPlan.cost, accessPlan.rows);
@@ -304,24 +305,21 @@ function selectPhysicalNodeFromPlan(
 			// Multi-seek: IN on single-column index
 			const colIdx = seekCols[0];
 			const inConstraint = eqBySeekCol.get(colIdx)!;
-			const inValues = inConstraint.value as unknown as unknown[];
+			const inValues = inConstraint.value as unknown as SqlValue[];
 
 			// Use valueExpr nodes when available (mixed-binding IN from OR collapse),
 			// otherwise construct literal nodes from values
 			const seekKeys: ScalarPlanNode[] = Array.isArray(inConstraint.valueExpr)
-				? (inConstraint.valueExpr as ScalarPlanNode[])
-				: inValues.map(v => {
-					const lit: AST.LiteralExpr = { type: 'literal', value: v } as unknown as AST.LiteralExpr;
-					return new LiteralNode(tableRef.scope, lit);
-				});
+				? inConstraint.valueExpr
+				: inValues.map(v => literalFromValue(tableRef.scope, v));
 
-			const inConstraints = inValues.map((_v, i) => ({
+			const inConstraints: { constraint: IndexConstraint; argvIndex: number }[] = inValues.map((_v, i) => ({
 				constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
 				argvIndex: i + 1,
 			}));
 			const fi: FilterInfo = {
 				...filterInfo,
-				constraints: inConstraints as any,
+				constraints: inConstraints,
 				idxStr: `idx=${idxStrName}(0);plan=5;inCount=${inValues.length}`,
 			};
 
@@ -340,18 +338,18 @@ function selectPhysicalNodeFromPlan(
 
 		if (hasMultiValueIn && seekCols.length > 1) {
 			// Composite IN multi-seek: generate cross-product of all column values
-			const columnValues: { colIdx: number; values: unknown[]; exprs?: ScalarPlanNode[] }[] = [];
+			const columnValues: { colIdx: number; values: SqlValue[]; exprs?: ScalarPlanNode[] }[] = [];
 			for (const colIdx of seekCols) {
 				const c = eqBySeekCol.get(colIdx)!;
 				if (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length > 1) {
 					columnValues.push({
 						colIdx,
-						values: c.value as unknown as unknown[],
-						exprs: Array.isArray(c.valueExpr) ? c.valueExpr as ScalarPlanNode[] : undefined,
+						values: c.value as unknown as SqlValue[],
+						exprs: Array.isArray(c.valueExpr) ? c.valueExpr : undefined,
 					});
 				} else {
 					// Single equality value for this column
-					const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown[])[0] : c.value;
+					const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : c.value as SqlValue;
 					columnValues.push({ colIdx, values: [val] });
 				}
 			}
@@ -369,21 +367,19 @@ function selectPhysicalNodeFromPlan(
 					if (cv.exprs && cv.exprs[valueIdx]) {
 						return cv.exprs[valueIdx];
 					}
-					const v = cv.values[valueIdx];
-					const lit: AST.LiteralExpr = { type: 'literal', value: v } as unknown as AST.LiteralExpr;
-					return new LiteralNode(tableRef.scope, lit);
+					return literalFromValue(tableRef.scope, cv.values[valueIdx]);
 				})
 			);
 
 			// Build seek constraints: one EQ constraint per value in the flattened args
-			const seekConstraints = seekKeys.map((_sk, i) => ({
+			const seekConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekKeys.map((_sk, i) => ({
 				constraint: { iColumn: seekCols[i % seekWidth], op: IndexConstraintOp.EQ, usable: true },
 				argvIndex: i + 1,
 			}));
 
 			const fi: FilterInfo = {
 				...filterInfo,
-				constraints: seekConstraints as any,
+				constraints: seekConstraints,
 				idxStr: `idx=${idxStrName}(0);plan=5;inCount=${crossProduct.length};seekWidth=${seekWidth}`,
 			};
 
@@ -403,13 +399,12 @@ function selectPhysicalNodeFromPlan(
 		// Standard equality seek on all seek columns
 		const seekKeys: ScalarPlanNode[] = seekCols.map(colIdx => {
 			const c = eqBySeekCol.get(colIdx)!;
-			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr as unknown as ScalarPlanNode;
-			const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown[])[0] : c.value;
-			const lit: AST.LiteralExpr = { type: 'literal', value: val } as unknown as AST.LiteralExpr;
-			return new LiteralNode(tableRef.scope, lit);
+			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
+			const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : (c.value as SqlValue);
+			return literalFromValue(tableRef.scope, val);
 		});
 
-		const eqConstraints = seekCols.map((colIdx, i) => ({
+		const eqConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekCols.map((colIdx, i) => ({
 			constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
 			argvIndex: i + 1,
 		}));
@@ -453,7 +448,7 @@ function selectPhysicalNodeFromPlan(
 
 		if (prefixEqCols.length > 0 && trailingRangeCol !== undefined) {
 			const seekKeys: ScalarPlanNode[] = [];
-			const allConstraints: { constraint: { iColumn: number; op: number; usable: boolean }; argvIndex: number }[] = [];
+			const allConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 			let argv = 1;
 
 			// Add prefix equality values
@@ -461,11 +456,11 @@ function selectPhysicalNodeFromPlan(
 				const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
 					(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
 					handledByCol.has(c.columnIndex))!;
-				const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown[])[0] : c.value;
+				const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : (c.value as SqlValue);
 				seekKeys.push(c.valueExpr && !Array.isArray(c.valueExpr)
-					? c.valueExpr as unknown as ScalarPlanNode
-					: new LiteralNode(tableRef.scope, { type: 'literal', value: val } as any));
-				allConstraints.push({ constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ as unknown as number, usable: true }, argvIndex: argv });
+					? c.valueExpr
+					: literalFromValue(tableRef.scope, val));
+				allConstraints.push({ constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true }, argvIndex: argv });
 				argv++;
 			}
 
@@ -475,19 +470,19 @@ function selectPhysicalNodeFromPlan(
 			const upper = trailingConstraints.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
 
 			if (lower) {
-				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(lower.op as any), usable: true }, argvIndex: argv });
-				seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr as any : new LiteralNode(tableRef.scope, { type: 'literal', value: lower.value } as any));
+				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
+				seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
 				argv++;
 			}
 			if (upper) {
-				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(upper.op as any), usable: true }, argvIndex: argv });
-				seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr as any : new LiteralNode(tableRef.scope, { type: 'literal', value: upper.value } as any));
+				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
+				seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue));
 				argv++;
 			}
 
 			const fi: FilterInfo = {
 				...filterInfo,
-				constraints: allConstraints as any,
+				constraints: allConstraints,
 				idxStr: `idx=${idxStrName}(0);plan=7;prefixLen=${prefixEqCols.length}`,
 			};
 
@@ -518,23 +513,23 @@ function selectPhysicalNodeFromPlan(
 		const upper = colConstraints.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
 
 		const seekKeys: ScalarPlanNode[] = [];
-		const rangeConstraints: { constraint: { iColumn: number; op: number; usable: boolean }; argvIndex: number }[] = [];
+		const rangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 
 		let argv = 1;
 		if (lower) {
-			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(lower.op as any), usable: true }, argvIndex: argv });
-			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr as any : new LiteralNode(tableRef.scope, { type: 'literal', value: lower.value } as any));
+			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
+			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
 			argv++;
 		}
 		if (upper) {
-			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(upper.op as any), usable: true }, argvIndex: argv });
-			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr as any : new LiteralNode(tableRef.scope, { type: 'literal', value: upper.value } as any));
+			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
+			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue));
 			argv++;
 		}
 
 		const fi: FilterInfo = {
 			...filterInfo,
-			constraints: rangeConstraints as any,
+			constraints: rangeConstraints,
 			idxStr: `idx=${idxStrName}(0);plan=3`,
 		};
 
@@ -571,25 +566,25 @@ function selectPhysicalNodeFromPlan(
 				const opStr = range.lower.op === '>=' ? 'ge' : 'gt';
 				parts.push(opStr);
 				seekKeys.push(range.lower.valueExpr
-					?? new LiteralNode(tableRef.scope, { type: 'literal', value: range.lower.value } as any));
+					?? literalFromValue(tableRef.scope, range.lower.value));
 			}
 			if (range.upper) {
 				const opStr = range.upper.op === '<=' ? 'le' : 'lt';
 				parts.push(opStr);
 				seekKeys.push(range.upper.valueExpr
-					?? new LiteralNode(tableRef.scope, { type: 'literal', value: range.upper.value } as any));
+					?? literalFromValue(tableRef.scope, range.upper.value));
 			}
 			rangeOps.push(parts.join(':'));
 		}
 
-		const orRangeConstraints = seekKeys.map((_sk, i) => ({
-			constraint: { iColumn: orRangeConstraint.columnIndex, op: IndexConstraintOp.GE as unknown as number, usable: true },
+		const orRangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekKeys.map((_sk, i) => ({
+			constraint: { iColumn: orRangeConstraint.columnIndex, op: IndexConstraintOp.GE, usable: true },
 			argvIndex: i + 1,
 		}));
 
 		const fi: FilterInfo = {
 			...filterInfo,
-			constraints: orRangeConstraints as any,
+			constraints: orRangeConstraints,
 			idxStr: `idx=${idxStrName}(0);plan=6;rangeCount=${ranges.length};rangeOps=${rangeOps.join(',')}`,
 		};
 
@@ -665,14 +660,13 @@ function selectPhysicalNodeLegacy(
 	const treatAsHandledPk = coversPk && pkCols.every(pk => handledByCol.has(pk.index) || eqByCol.has(pk.index));
 
 	if ((hasEqualityConstraints && coversPk || treatAsHandledPk) && maybeRows <= 10) {
-		const seekKeys = pkCols.map(pk => {
+		const seekKeys: ScalarPlanNode[] = pkCols.map(pk => {
 			const c = eqByCol.get(pk.index)!;
-			if (c.valueExpr) return c.valueExpr as unknown as ScalarPlanNode;
-			const lit: AST.LiteralExpr = { type: 'literal', value: c.value } as unknown as AST.LiteralExpr;
-			return new LiteralNode(tableRef.scope, lit);
+			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
+			return literalFromValue(tableRef.scope, c.value as SqlValue);
 		});
 
-		const eqConstraints = pkCols.map((pk, i) => ({
+		const eqConstraints: { constraint: IndexConstraint; argvIndex: number }[] = pkCols.map((pk, i) => ({
 			constraint: { iColumn: pk.index, op: IndexConstraintOp.EQ, usable: true },
 			argvIndex: i + 1,
 		}));
@@ -705,23 +699,23 @@ function selectPhysicalNodeLegacy(
 		const upper = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '<' || c.op === '<='));
 
 		const seekKeys: ScalarPlanNode[] = [];
-		const rangeConstraints: { constraint: { iColumn: number; op: number; usable: boolean }; argvIndex: number }[] = [];
+		const rangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 
 		let argv = 1;
 		if (lower) {
-			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(lower.op as any), usable: true }, argvIndex: argv });
-			seekKeys.push(lower.valueExpr ? lower.valueExpr as any : new LiteralNode(tableRef.scope, { type: 'literal', value: lower.value } as any));
+			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
+			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
 			argv++;
 		}
 		if (upper) {
-			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(upper.op as any), usable: true }, argvIndex: argv });
-			seekKeys.push(upper.valueExpr ? upper.valueExpr as any : new LiteralNode(tableRef.scope, { type: 'literal', value: upper.value } as any));
+			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
+			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue));
 			argv++;
 		}
 
 		const fi: FilterInfo = {
 			...filterInfo,
-			constraints: rangeConstraints as any,
+			constraints: rangeConstraints,
 			idxStr: 'idx=_primary_(0);plan=3',
 		};
 
@@ -769,7 +763,7 @@ function selectPhysicalNodeLegacy(
 
 // Narrow module context originating from grow-retrieve index-style fallback
 function isIndexStyleContext(ctx: unknown): ctx is { kind: 'index-style'; accessPlan: BestAccessPlanResult; residualPredicate?: ScalarPlanNode; originalConstraints: unknown[] } {
-	return !!ctx && typeof ctx === 'object' && (ctx as any).kind === 'index-style';
+	return !!ctx && typeof ctx === 'object' && (ctx as { kind?: string }).kind === 'index-style';
 }
 
 /**
@@ -819,11 +813,18 @@ function cartesianProduct<T>(arrays: T[][]): T[][] {
 	);
 }
 
-function opToIndexOp(op: '>' | '>=' | '<' | '<='): number {
+type RangeOp = '>' | '>=' | '<' | '<=';
+
+function opToIndexOp(op: RangeOp): IndexConstraintOp {
 	switch (op) {
-		case '>': return IndexConstraintOp.GT as unknown as number;
-		case '>=': return IndexConstraintOp.GE as unknown as number;
-		case '<': return IndexConstraintOp.LT as unknown as number;
-		case '<=': return IndexConstraintOp.LE as unknown as number;
+		case '>': return IndexConstraintOp.GT;
+		case '>=': return IndexConstraintOp.GE;
+		case '<': return IndexConstraintOp.LT;
+		case '<=': return IndexConstraintOp.LE;
 	}
+}
+
+function literalFromValue(scope: Scope, value: SqlValue): LiteralNode {
+	const lit: AST.LiteralExpr = { type: 'literal', value };
+	return new LiteralNode(scope, lit);
 }
