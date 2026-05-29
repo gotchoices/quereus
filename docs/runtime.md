@@ -844,6 +844,42 @@ const value = await entry.evaluator(runtimeCtx);
 - Captured for deferred constraints
 - Preserved across savepoints (part of queued row data)
 
+### Statement-Level Atomicity
+
+A multi-row `INSERT`/`UPDATE`/`DELETE` is atomic at the statement level: either
+all of its row effects apply or none do, mirroring SQLite's
+implicit-savepoint-per-statement semantics. In autocommit this is masked because
+`_finalizeImplicitTransaction` rolls back the whole implicit transaction on
+error; inside an explicit `begin … rollback` the guarantee comes from a
+statement-scope savepoint instead.
+
+All three DML generators route through one shared higher-order async generator,
+`runWithStatementSavepoints` (`runtime/emit/dml-executor.ts`), which owns the
+savepoint lifecycle and calls back a per-row `processRow` closure for the
+operation-specific body:
+
+- **non-FAIL** (ABORT default / IGNORE / REPLACE / ROLLBACK): a single
+  statement-scope savepoint (`__stmt_atomic_N`) is opened before the row loop,
+  released after it completes, and rolled-back-and-released on **any** throw
+  escaping the loop — whether from the source iterator (a `ConstraintCheckNode`
+  above the executor raising NOT NULL / CHECK / parent-side FK RESTRICT before a
+  row is yielded) or from `processRow` (a vtab-returned constraint, or the
+  runtime RESTRICT pre-check). This is what reverts rows 1..N-1 when row N fails.
+- **OR FAIL**: deliberately *skips* the statement wrap (FAIL keeps prior rows)
+  and instead opens a per-row savepoint (`__or_fail_N`), released on success and
+  rolled back on throw, so only the failing row's partial work (including a
+  row-time MV backing write that landed before a later maintenance throw) is
+  undone.
+
+The savepoint helpers used are always the broadcast variants
+(`_createSavepointBroadcast` / `_releaseSavepointBroadcast` /
+`_rollbackAndReleaseSavepointBroadcast`) so per-connection savepoint stacks stay
+in lockstep with the `TransactionManager`'s stack. This covers the row-time MV
+backing connection, which registers lazily on the first maintenance call:
+`Database.registerConnection` replays the active savepoint depth (which already
+includes the statement savepoint created before the row loop) onto it, so the
+backing write participates in the same rollback/release.
+
 ### Implementation Guidelines for Emitter Authors
 
 **When adding new mutation operations:**

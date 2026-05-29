@@ -67,6 +67,33 @@ insert into rt values (6, 60), (6, 61);
 select * from rt_ix order by x;
 → [{"x":5,"id":3},{"x":50,"id":5},{"x":100,"id":2}]
 
+-- A FAILED multi-row UPDATE inside an explicit transaction is atomic at the
+-- statement level: the first row's source write AND its row-time backing
+-- maintenance are both reverted when a later row trips a source constraint.
+-- (The statement savepoint that wraps the source UPDATE also unwinds the
+-- backing connection, which rides the same savepoint stack.)
+create table rta (id integer primary key, x integer not null);
+insert into rta values (1, 10), (2, 20), (3, 30);
+create materialized view rta_ix as select x, id from rta order by x with refresh = 'row-time';
+select * from rta_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
+
+begin;
+-- id=1 updates to x=11 (and maintains the backing), then id=2 violates NOT NULL.
+update rta set x = case when id = 2 then null else x + 1 end where id in (1, 2);
+-- error: NOT NULL constraint failed: rta.x
+
+-- Neither the source nor the MV backing retains id=1's x=11 mid-transaction.
+select x from rta where id = 1;
+→ [{"x":10}]
+select * from rta_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
+rollback;
+
+-- And nothing persisted after rollback either.
+select * from rta_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
+
 -- ===================================
 -- 3. Differential vs on-commit-incremental over the SAME body: row-time is
 --    visible mid-transaction; on-commit-incremental is not (it maintains at
