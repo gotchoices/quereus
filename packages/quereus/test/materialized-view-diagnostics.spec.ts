@@ -67,4 +67,28 @@ describe('Materialized view create-time gate diagnostic', () => {
 			{ id: 1, status: 'open' }, { id: 2, status: 'open' }, { id: 3, status: 'shipped' },
 		]);
 	});
+
+	// A duplicate-producing ("bag") body fails the set contract at fill time (before
+	// the row-time gate is reached). This path is separate from the gate diagnostic
+	// above; it must still name the MV + set contract, never leak the backing table,
+	// and never suggest `distinct`/`group by` (both of which the gate now rejects).
+	it('a duplicate-producing body fails the set contract with a non-leaking diagnostic', async () => {
+		await db.exec(`
+			create table orders (id integer primary key, status text);
+			insert into orders values (1, 'open'), (2, 'open'), (3, 'shipped');
+		`);
+
+		const err = await captureError('create materialized view mv_status as select status from orders;');
+		expect(err.message).to.contain('must be a set');
+		expect(err.message).to.contain('mv_status');
+		// Never leaks the hidden backing-table name…
+		expect(err.message).to.not.contain('_mv_');
+		// …and steers to the now-valid remedies only (not the gate-rejected distinct/group by).
+		expect(err.message).to.match(/create view/);
+		expect(err.message).to.match(/create table/);
+
+		// The failed create rolled back, so the name is free for an eligible body.
+		await db.exec('create materialized view mv_status as select id, status from orders;');
+		expect(db.schemaManager.getMaterializedView('main', 'mv_status'), 'MV registered after rollback').to.not.be.undefined;
+	});
 });

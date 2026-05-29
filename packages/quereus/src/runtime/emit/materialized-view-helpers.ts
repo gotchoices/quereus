@@ -30,7 +30,9 @@ export function materializedViewNotASetError(schemaName: string, viewName: strin
 	return new QuereusError(
 		`materialized view '${schemaName}.${viewName}' body produces duplicate rows, `
 			+ `but a materialized view must be a set: its body needs a unique key. `
-			+ `Add \`distinct\`, a \`group by\`/aggregation, or project a key column so every row is unique.`,
+			+ `Project the source's primary-key column(s) so every row is unique; for a `
+			+ `non-keyed result use a plain \`create view\` (live re-evaluation) or `
+			+ `\`create table ... as <body>\` (a one-off snapshot).`,
 		StatusCode.CONSTRAINT,
 	);
 }

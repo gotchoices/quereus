@@ -1245,17 +1245,14 @@ export class MemoryTableManager {
 	 * Privileged **transactional** maintenance write: apply an ordered
 	 * {@link MaintenanceOp} batch to a given connection's *pending*
 	 * {@link TransactionLayer} (creating it lazily, exactly as a user write would).
-	 * This is the transaction-layer analogue of {@link applyMaintenance} (which
-	 * mutates the committed base): the row-time materialized-view maintenance path
-	 * uses it so a covering structure's backing table is kept consistent
-	 * synchronously with each source row-write — within the same transaction,
-	 * visible to later reads on this connection (reads-own-writes), and
-	 * committed/rolled-back in lockstep with the source write by the Database's
-	 * coordinated commit.
+	 * The row-time materialized-view maintenance path uses it so a covering
+	 * structure's backing table is kept consistent synchronously with each source
+	 * row-write — within the same transaction, visible to later reads on this
+	 * connection (reads-own-writes), and committed/rolled-back in lockstep with the
+	 * source write by the Database's coordinated commit.
 	 *
-	 * Like {@link applyMaintenance}, it deliberately bypasses
-	 * {@link validateMutationPermissions} (which throws READONLY for MV backing
-	 * tables) and reuses {@link TransactionLayer.recordUpsert} /
+	 * It deliberately bypasses {@link validateMutationPermissions} (which throws
+	 * READONLY for MV backing tables) and reuses {@link TransactionLayer.recordUpsert} /
 	 * {@link TransactionLayer.recordDelete} so secondary-index and change-tracking
 	 * bookkeeping stay correct. No latch is taken: the pending layer is private to
 	 * `connection`, only this synchronous path writes it, and the tree mutations are

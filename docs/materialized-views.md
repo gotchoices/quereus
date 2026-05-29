@@ -151,9 +151,11 @@ optimized/analyzed body, a superset of the coverage prover's shape in
 - a row-preserving **linear** body `TableReference → optional Filter → Project →
   optional Sort` — **no** aggregate, set operation, `DISTINCT`, recursive CTE,
   table-valued function, or `LIMIT`/`OFFSET`;
-- a projection that is **passthrough or deterministic expressions** over single-
-  source columns (a non-deterministic projection is rejected, consistent with the
-  engine's [determinism enforcement](architecture.md#constraints));
+- a **passthrough** projection — every output column forwards a source column
+  (a bare column reference or a simple rename); a computed/expression column
+  (e.g. `v + 1`) is rejected, since maintenance is a pure column permutation of
+  the changed row (deterministic projected expressions are deferred to
+  `materialized-view-rowtime-expression-projections`);
 - the projection includes **every** PK column of `T`, so each source row maps to a
   unique backing key (and the backing key identifies the source row);
 - a partial `WHERE`, if present, evaluable on a single source row (compiled via
