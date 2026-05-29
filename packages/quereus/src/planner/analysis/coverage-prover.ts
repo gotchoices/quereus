@@ -531,24 +531,30 @@ function resolveFullScanTableRef(node: RelationalPlanNode): TableReferenceNode |
 }
 
 /**
- * True iff `cond` (after normalization) is a pure conjunction of
- * column-to-column equalities — `a.x = b.y AND …` with no other operator and no
- * non-column operand. The inner-join no-row-loss proof needs this: a residual
- * non-equi conjunct (or an equality to a literal/expression) can drop `T` rows
- * the FK→PK guarantee assumes survive, so any such condition disqualifies.
+ * The count of column-to-column equality conjuncts in `cond` (after
+ * normalization) when `cond` is a pure conjunction of them — `a.x = b.y AND …`
+ * with no other operator and no non-column operand — or `undefined` otherwise.
+ * The inner-join no-row-loss proof needs this: a residual non-equi conjunct (or
+ * an equality to a literal/expression) can drop `T` rows the FK→PK guarantee
+ * assumes survive, so any such condition disqualifies. The count lets the caller
+ * confirm every conjunct produced a cross-side equi-pair (see
+ * `pureJoinEquiAttrPairs`): a column equality whose operands sit on the *same*
+ * side is a single-relation filter that `extractEquiPairsFromCondition` silently
+ * drops yet still restricts the join's row set.
  */
-function isPureColumnEquiCondition(cond: ScalarPlanNode): boolean {
+function pureColumnEquiConjunctCount(cond: ScalarPlanNode): number | undefined {
 	const stack: ScalarPlanNode[] = [normalizePredicate(cond)];
+	let count = 0;
 	while (stack.length) {
 		const n = stack.pop()!;
 		if (n instanceof BinaryOpNode) {
 			const op = n.expression.operator;
 			if (op === 'AND') { stack.push(n.left, n.right); continue; }
-			if (op === '=' && n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) continue;
+			if (op === '=' && n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) { count++; continue; }
 		}
-		return false;
+		return undefined;
 	}
-	return true;
+	return count;
 }
 
 /**
@@ -557,8 +563,13 @@ function isPureColumnEquiCondition(cond: ScalarPlanNode): boolean {
  * so breaks the no-row-loss proof). Physical joins (`BloomJoin`/`MergeJoin`)
  * pre-extract their equi-pairs and stash any remainder in `residualCondition`; a
  * logical `JoinNode` carries a single `condition` that must be a pure
- * AND-of-column-equalities. A bare cross join (no condition / no equi-pairs)
- * yields an empty list, which the caller treats as "no FK to align".
+ * AND-of-column-equalities *every one of which crosses the two join sides*. A
+ * same-side column equality (e.g. `c.x = c.y`) passes the pure-equi shape but is
+ * a single-relation filter `extractEquiPairsFromCondition` drops — so we reject
+ * unless the extracted cross-side pair count matches the conjunct count, rather
+ * than leaning on predicate pushdown to have hoisted it below the join. A bare
+ * cross join (no condition / no equi-pairs) yields an empty list, which the
+ * caller treats as "no FK to align".
  */
 function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[] | undefined {
 	if (join instanceof BloomJoinNode || join instanceof MergeJoinNode) {
@@ -566,11 +577,16 @@ function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[
 	}
 	if (join instanceof JoinNode) {
 		if (!join.condition) return [];
-		if (!isPureColumnEquiCondition(join.condition)) return undefined;
+		const conjunctCount = pureColumnEquiConjunctCount(join.condition);
+		if (conjunctCount === undefined) return undefined;
 		const leftAttrs = join.left.getAttributes();
 		const rightAttrs = join.right.getAttributes();
-		return extractEquiPairsFromCondition(join.condition, leftAttrs, rightAttrs)
+		const pairs = extractEquiPairsFromCondition(join.condition, leftAttrs, rightAttrs)
 			.map(p => ({ leftAttrId: leftAttrs[p.left].id, rightAttrId: rightAttrs[p.right].id }));
+		// A conjunct that produced no cross-side pair is a same-side filter that
+		// restricts rows without aligning `T` to the lookup — disqualify.
+		if (pairs.length !== conjunctCount) return undefined;
+		return pairs;
 	}
 	return undefined;
 }

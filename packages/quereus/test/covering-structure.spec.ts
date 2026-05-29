@@ -551,6 +551,27 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		}
 	});
 
+	it('negative shape: INNER join whose ON clause adds a same-side equality filter does not cover', async () => {
+		// `c.grp1 = c.grp2` is a single-relation filter on the lookup side: orders
+		// rows whose matched customer has grp1 != grp2 are dropped ⇒ row loss. It
+		// passes the pure-column-equi shape but produces no cross-side equi-pair, so
+		// the FK-alignment proof must reject it (whether the optimizer pushes it
+		// below the join as a Filter or leaves it on the logical JoinNode).
+		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id and c.grp1 = c.grp2 order by o.customer_id, o.sku';
+		const db = await freshDb([
+			'create table customers (id integer primary key, grp1 integer not null, grp2 integer not null, name text)',
+			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
+			`create materialized view ix as ${body}`,
+		]);
+		try {
+			const result = await prove(db, 'ix', body, 'orders');
+			expect(result.covers, 'a same-side equality filter in the ON clause drops T rows').to.be.false;
+			if (!result.covers) expect(result.reason).to.equal('shape');
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('eager link: a covering INNER-FK join MV stamps covers + coveringStructureName', async () => {
 		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
 		const db = await freshDb([
