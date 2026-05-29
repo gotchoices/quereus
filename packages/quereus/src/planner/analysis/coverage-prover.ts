@@ -91,11 +91,17 @@
  * fact `isUnique` already consumes — so `binding-extractor.ts` needs no change.
  *
  * The v1 projection / ordering / predicate checks are frame-correct for a join
- * body unchanged: the covering columns all belong to `T` (UC + PK), the
- * lookup-side attributes simply are not in `baseAttrToCol` and are ignored, the
- * join `ON` lives in the AST `from` clause (not `WHERE`), and a name-collision
- * guard (`proveJoinOneToOne`) rejects a join whose lookup side shares a UC column
- * name — since the AST ORDER BY / WHERE checks resolve columns by *bare name*.
+ * body: the covering columns all belong to `T` (UC + PK), the lookup-side
+ * attributes simply are not in `baseAttrToCol` and are ignored, and the join `ON`
+ * lives in the AST `from` clause (not `WHERE`). The AST `ORDER BY` / `WHERE`
+ * column resolution is **qualifier-aware** (`makeBodyColumnResolver`): `alias.col`
+ * resolves to a `T` column only when `alias` denotes `T`'s reference, and a bare
+ * `col` only when unambiguous across the join's sources. A term on a lookup-side
+ * column therefore fails on its own terms (`ordering-mismatch` for an `ORDER BY`,
+ * `predicate-entailment` for a `WHERE`) rather than mis-mapping onto a same-named
+ * `T` column — so a 1:1 join whose lookup key shares a UC column name (e.g.
+ * `line_items ⋈ products on l.sku = p.sku`) now covers, instead of being rejected
+ * by the former bare-name collision guard.
  *
  * **Join elimination, not handled here.** When the optimizer eliminates a
  * key-preserving lookup join (lookup columns unprojected + FK→PK alignment, see
@@ -161,7 +167,7 @@ import type { MaterializedViewSchema } from '../../schema/view.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
-import { columnIndexFromExpr, collectColumnNames } from './predicate-shape.js';
+import type { ColumnIndexResolver } from './predicate-shape.js';
 import { normalizePredicate } from './predicate-normalizer.js';
 import { isUnique } from '../util/fd-utils.js';
 import { lookupCoveringFK } from '../util/ind-utils.js';
@@ -183,6 +189,9 @@ const COVERS: CoverageResult = { covers: true };
 function notCovers(reason: CoverageFailureReason): CoverageResult {
 	return { covers: false, reason };
 }
+
+/** Shared empty lookup-name set for single-source bodies (no join frame). */
+const EMPTY_NAMES: ReadonlySet<string> = new Set<string>();
 
 /**
  * Outcome of `proveEffectiveKeyUnique`. `not-a-key` means the body's effective
@@ -259,7 +268,7 @@ export function proveCoverage(
 	//      The *predicate* is taken from the AST below (the optimizer may absorb
 	//      a WHERE into an index range seek and drop the FilterNode, so the plan
 	//      is not a faithful predicate source). The topmost join (if any) is
-	//      captured for the fan-out gate — see `proveJoinOneToOne`. ----
+	//      captured for the fan-out gate — see `proveJoinNoFanout`. ----
 	let tableRef: TableReferenceNode | undefined;
 	let topJoin: RelationalPlanNode | undefined;
 	let node: RelationalPlanNode | undefined = root;
@@ -328,21 +337,35 @@ export function proveCoverage(
 		if (!coveredBaseCols.has(pk.index)) return notCovers('missing-pk-column');
 	}
 
-	// ---- Multi-source (join body) obligations: the name-collision guard (so the
-	//      AST-based ORDER BY / WHERE name resolution below cannot mis-resolve a
-	//      lookup column to a UC column) and the no-fan-out gate. Vacuous — and
-	//      v1 behavior unchanged — for a single-source chain (`topJoin` absent). ----
+	// ---- Lookup-side column names in the join's output frame (a `T` attribute is
+	//      one whose id is a key of `baseAttrToCol`); empty for a single-source
+	//      body. Feeds the qualifier-aware AST resolver's unqualified-name
+	//      ambiguity check below. ----
+	const lookupNames = topJoin !== undefined ? lookupColumnNames(topJoin, baseAttrToCol) : EMPTY_NAMES;
+
+	// ---- Multi-source (join body) no-fan-out gate: `T`'s primary key must remain
+	//      a unique key of the topmost join's output. Vacuous — and v1 behavior
+	//      unchanged — for a single-source chain (`topJoin` absent). ----
 	if (topJoin !== undefined) {
-		const oneToOne = proveJoinOneToOne(topJoin, tableRef, baseAttrToCol, uc, baseTable);
-		if (!oneToOne.covers) return oneToOne;
+		const noFanout = proveJoinNoFanout(topJoin, tableRef, baseTable);
+		if (!noFanout.covers) return noFanout;
 	}
+
+	// ---- Qualifier-aware AST column resolution. An ORDER BY / WHERE term
+	//      `alias.col` resolves to a base-table `T` column only when `alias`
+	//      denotes `T`'s reference; an unqualified `col` only when `T` has it and
+	//      no lookup-side column shares the name. A term resolving to a lookup
+	//      column is then handled on its own terms below (ORDER BY ⇒
+	//      `ordering-mismatch`, WHERE ⇒ `predicate-entailment`), never mis-mapped
+	//      onto `T`. For a single-source body this is plain bare-name resolution. ----
+	const resolveBodyColumn = makeBodyColumnResolver(mv.selectAst, baseTable, lookupNames);
 
 	// ---- Ordering: the body's declared ORDER BY columns must be a permutation of
 	//      the UC columns. The prover never invents an ordering — a missing one
 	//      fails. Read from the body AST rather than `mv.ordering`: the optimizer
 	//      drops the Sort (leaving `physical.ordering` empty) whenever an index
 	//      scan already supplies the order, so the AST is the faithful source. ----
-	const orderingBaseCols = bodyOrderByColumns(mv.selectAst, baseTable);
+	const orderingBaseCols = bodyOrderByColumns(mv.selectAst, resolveBodyColumn);
 	if (orderingBaseCols === undefined) return notCovers('ordering-mismatch');
 	if (!isPermutation(orderingBaseCols, uc.columns)) return notCovers('ordering-mismatch');
 
@@ -350,7 +373,7 @@ export function proveCoverage(
 	//      holds) must equal the governed set (rows where uc.predicate holds,
 	//      NULL-excluded). The WHERE is read from the AST (see shape note). ----
 	const bodyWhere = mv.selectAst.type === 'select' ? mv.selectAst.where : undefined;
-	return provePredicateAlignment(bodyWhere, uc, baseTable);
+	return provePredicateAlignment(bodyWhere, uc, baseTable, resolveBodyColumn);
 }
 
 /**
@@ -406,11 +429,16 @@ export function proveEffectiveKeyUnique(
  *   - completeness — `P` adds no restriction beyond those clauses (a NOT-NULL on
  *     any UC column is always allowed, since UNIQUE already ignores NULL rows),
  *     so the materialized set is not a strict subset that would miss conflicts.
+ *
+ * `resolveBodyColumn` resolves the body WHERE's column references (qualifier-aware
+ * for join bodies). `uc.predicate` is a constraint on `T`, so it always resolves
+ * by bare name against `baseTable` (the default).
  */
 function provePredicateAlignment(
 	bodyWhere: AST.Expression | undefined,
 	uc: UniqueConstraintSchema,
 	baseTable: TableSchema,
+	resolveBodyColumn: ColumnIndexResolver,
 ): CoverageResult {
 	// Required clauses (the governed scope).
 	const requiredClauses: GuardClause[] = [];
@@ -426,9 +454,11 @@ function provePredicateAlignment(
 
 	// Recognize P. An unrecognized conjunct makes the materialized set unbounded
 	// from the prover's view — reject (we can prove neither containment direction).
+	// A WHERE term on a lookup column resolves to `undefined` via the qualifier-
+	// aware resolver ⇒ unrecognized ⇒ this same rejection path (predicate-entailment).
 	let pClauses: GuardClause[] = [];
 	if (bodyWhere) {
-		const clauses = recognizeConjunctiveClauses(bodyWhere, baseTable);
+		const clauses = recognizeConjunctiveClauses(bodyWhere, baseTable, resolveBodyColumn);
 		if (clauses === undefined) {
 			return notCovers(uc.predicate || nullableUcCols.length === 0 ? 'predicate-entailment' : 'missing-null-skip');
 		}
@@ -609,7 +639,7 @@ function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[
  *    a non-FK or non-PK equi-join carries no inclusion guarantee at all.
  *
  * The complementary no-fan-out (≤1) obligation is unchanged — it is the join-
- * frame `isUnique(T.pk)` gate in `proveJoinOneToOne`, which a FK→PK join also
+ * frame `isUnique(T.pk)` gate in `proveJoinNoFanout`, which a FK→PK join also
  * satisfies (the PK side's key is covered by the equi-pairs).
  */
 function innerJoinRetainsConstrainedTable(
@@ -654,55 +684,40 @@ function innerJoinRetainsConstrainedTable(
 }
 
 /**
- * Join-body obligations beyond the v1 single-source checks (the no-row-loss
- * obligation is the structural side/type gate in the shape walk; here we cover
- * name-resolution safety and the no-fan-out gate). `topJoin` is the topmost
- * binary join in the body; `tableRef` is the bound `T`; `baseAttrToCol` maps
- * `T`'s attribute ids to its column indices (its keys identify `T`'s attributes,
- * so every join-output attribute *not* in it is a lookup-side column).
- *
- *  - **Name-collision guard.** The ORDER BY and WHERE checks resolve columns by
- *    *bare name* against `baseTable` (`columnIndexFromExpr` ignores any
- *    table/alias qualifier). In a join body a lookup column sharing a UC (or
- *    UC-predicate) column's name would mis-resolve to `T`'s column, so a
- *    sort/filter on the *lookup* column could be wrongly accepted — a false
- *    `Covers`. Reject (`shape`) on any such name collision. PK names are exempt:
- *    the PK is consumed only via stable attribute ids, never resolved by name.
- *
- *  - **No fan-out.** `T`'s primary key must be a unique key of `topJoin`'s output
- *    relation (`isUnique`). Checked at the join frame rather than the projected
- *    `root` — see the module doc ("Why the join frame, not the projected root").
+ * Lowercased names of the lookup-side columns in `topJoin`'s output frame — a
+ * `T` attribute is exactly one whose id is a key of `baseAttrToCol`, so every
+ * other join-output attribute belongs to a lookup side. Feeds the qualifier-aware
+ * resolver's unqualified-name ambiguity check.
  */
-function proveJoinOneToOne(
+function lookupColumnNames(
+	topJoin: RelationalPlanNode,
+	baseAttrToCol: ReadonlyMap<number, number>,
+): Set<string> {
+	const names = new Set<string>();
+	for (const attr of topJoin.getAttributes()) {
+		if (!baseAttrToCol.has(attr.id)) names.add(attr.name.toLowerCase());
+	}
+	return names;
+}
+
+/**
+ * No-fan-out (≤1) gate for a join body: `T`'s primary key must be a unique key of
+ * `topJoin`'s output relation (`isUnique`), mapped into the join output frame via
+ * stable attribute ids. Checked at the join frame rather than the projected
+ * `root` — see the module doc ("Why the join frame, not the projected root").
+ *
+ * The complementary no-row-loss (≥1) obligation is the structural side/type gate
+ * in the shape walk; name-resolution safety is now the qualifier-aware resolver
+ * (`makeBodyColumnResolver`), which made the former bare-name collision guard
+ * unnecessary.
+ */
+function proveJoinNoFanout(
 	topJoin: RelationalPlanNode,
 	tableRef: TableReferenceNode,
-	baseAttrToCol: ReadonlyMap<number, number>,
-	uc: UniqueConstraintSchema,
 	baseTable: TableSchema,
 ): CoverageResult {
-	const joinAttrs = topJoin.getAttributes();
-
-	// Lookup-side column names anywhere in the join's output frame (a `T`
-	// attribute is exactly one whose id is a key of `baseAttrToCol`).
-	const lookupNames = new Set<string>();
-	for (const attr of joinAttrs) {
-		if (!baseAttrToCol.has(attr.id)) lookupNames.add(attr.name.toLowerCase());
-	}
-	// `T` columns the AST-based ORDER BY / WHERE checks can resolve by name: the
-	// UC columns plus any column referenced by a partial-UC predicate.
-	const nameSensitiveCols = new Set<number>(uc.columns);
-	if (uc.predicate) {
-		for (const c of collectColumnNames(uc.predicate, baseTable.columnIndexMap)) nameSensitiveCols.add(c);
-	}
-	for (const c of nameSensitiveCols) {
-		const name = baseTable.columns[c]?.name.toLowerCase();
-		if (name !== undefined && lookupNames.has(name)) return notCovers('shape');
-	}
-
-	// Fan-out gate: `T.pk`, mapped into the join output frame via stable attribute
-	// ids, must be a unique key of the join output.
 	const joinAttrToIndex = new Map<number, number>();
-	joinAttrs.forEach((a, i) => joinAttrToIndex.set(a.id, i));
+	topJoin.getAttributes().forEach((a, i) => joinAttrToIndex.set(a.id, i));
 	const tAttrs = tableRef.getAttributes();
 	const pkInJoinFrame: number[] = [];
 	for (const pk of baseTable.primaryKeyDefinition) {
@@ -717,21 +732,102 @@ function proveJoinOneToOne(
 }
 
 /**
+ * Builds the qualifier-aware {@link ColumnIndexResolver} the AST ORDER BY / WHERE
+ * checks use to map a column reference to a base-table `T` column index:
+ *
+ *  - **Qualified** (`alias.col` / `table.col`) — a `T` column only when the
+ *    qualifier denotes `T`'s reference (its alias, or its table name when
+ *    unaliased, collected from the body FROM clause). A qualifier denoting a
+ *    lookup source (or any unknown qualifier) yields `undefined`.
+ *  - **Unqualified** (`col`) — a `T` column only when `T` has it *and* no
+ *    lookup-side column shares the name (`lookupNames`). An ambiguous bare name
+ *    would be a plan-time error for a real body, but resolving to `undefined`
+ *    here is the sound fallback regardless.
+ *
+ * `undefined` means "not a (resolvable) `T` column", which the ORDER BY check
+ * turns into `ordering-mismatch` and the WHERE recognizer turns into an
+ * unrecognized conjunct (⇒ `predicate-entailment`). For a single-source body
+ * `lookupNames` is empty and `T`'s sole qualifier is in the set, so this reduces
+ * to bare-name resolution — v1 behavior unchanged.
+ */
+function makeBodyColumnResolver(
+	selectAst: AST.QueryExpr,
+	baseTable: TableSchema,
+	lookupNames: ReadonlySet<string>,
+): ColumnIndexResolver {
+	const tQualifiers = collectBaseTableQualifiers(selectAst, baseTable);
+	return (expr) => {
+		const ref = columnRefParts(expr);
+		if (ref === undefined) return undefined;
+		if (ref.qualifier !== undefined) {
+			return tQualifiers.has(ref.qualifier) ? baseTable.columnIndexMap.get(ref.name) : undefined;
+		}
+		if (lookupNames.has(ref.name)) return undefined;
+		return baseTable.columnIndexMap.get(ref.name);
+	};
+}
+
+/**
+ * The `(qualifier?, name)` of a column reference (both lowercased), or `undefined`
+ * when `expr` is not a column reference the prover resolves. A `ColumnExpr`
+ * carries an optional `table` qualifier; a bare `IdentifierExpr` has none, and a
+ * schema-qualified identifier is rejected (matches `columnIndexFromExpr`).
+ */
+function columnRefParts(expr: AST.Expression): { qualifier?: string; name: string } | undefined {
+	if (expr.type === 'column') {
+		const c = expr as AST.ColumnExpr;
+		return { qualifier: c.table?.toLowerCase(), name: c.name.toLowerCase() };
+	}
+	if (expr.type === 'identifier') {
+		const id = expr as AST.IdentifierExpr;
+		if (id.schema) return undefined;
+		return { name: id.name.toLowerCase() };
+	}
+	return undefined;
+}
+
+/**
+ * The set of lowercased FROM-clause qualifiers (alias, or table name when
+ * unaliased) that denote the base table `T`. Walks the body FROM clause through
+ * nested joins. Subquery / function sources cannot be `T` (the shape walk binds
+ * `T` to a `TableReferenceNode`), so their alias is intentionally absent — a
+ * reference qualified by it resolves to `undefined` (a lookup/derived column).
+ */
+function collectBaseTableQualifiers(selectAst: AST.QueryExpr, baseTable: TableSchema): Set<string> {
+	const out = new Set<string>();
+	if (selectAst.type !== 'select' || !selectAst.from) return out;
+	const stack: AST.FromClause[] = [...selectAst.from];
+	while (stack.length > 0) {
+		const f = stack.pop()!;
+		if (f.type === 'join') {
+			stack.push(f.left, f.right);
+			continue;
+		}
+		if (f.type === 'table') {
+			const ts = f as AST.TableSource;
+			const denotesT = ts.table.name.toLowerCase() === baseTable.name.toLowerCase()
+				&& (ts.table.schema === undefined || ts.table.schema.toLowerCase() === baseTable.schemaName.toLowerCase());
+			if (denotesT) out.add((ts.alias ?? ts.table.name).toLowerCase());
+		}
+	}
+	return out;
+}
+
+/**
  * Base-table column indices named by the body's `ORDER BY`, in order, or
  * `undefined` when there is no `ORDER BY`, the body is not a plain SELECT, or any
- * ordering term is not a bare column of the base table (the prover never invents
- * an ordering). A table/alias qualifier on the term is ignored — the parser emits
- * `alias.col` as an `AST.ColumnExpr` (`type: 'column'`) which `columnIndexFromExpr`
- * resolves by bare name; the join-body name-collision guard (`proveJoinOneToOne`)
- * has already rejected the case where that bare name is ambiguous across sources.
+ * ordering term does not resolve to a `T` column via `resolve` (the prover never
+ * invents an ordering). `resolve` is qualifier-aware for join bodies, so an
+ * `ORDER BY` on a *lookup*-side column yields `undefined` here ⇒ the caller
+ * reports `ordering-mismatch`, the correct reason (it is not a `T` ordering).
  */
-function bodyOrderByColumns(selectAst: AST.QueryExpr, baseTable: TableSchema): number[] | undefined {
+function bodyOrderByColumns(selectAst: AST.QueryExpr, resolve: ColumnIndexResolver): number[] | undefined {
 	if (selectAst.type !== 'select') return undefined;
 	const orderBy = selectAst.orderBy;
 	if (!orderBy || orderBy.length === 0) return undefined;
 	const cols: number[] = [];
 	for (const term of orderBy) {
-		const col = columnIndexFromExpr(term.expr, baseTable.columnIndexMap);
+		const col = resolve(term.expr);
 		if (col === undefined) return undefined;
 		cols.push(col);
 	}

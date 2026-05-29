@@ -13,9 +13,22 @@ import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 
 /**
+ * Resolves an AST column/identifier expression to a base-table column index, or
+ * `undefined` when it is not a (recognized) column of the frame. The default
+ * realization is bare-name resolution — `columnIndexFromExpr` bound to a column
+ * index map, ignoring any table/alias qualifier. The coverage prover injects a
+ * qualifier-aware variant for join bodies, so `alias.col` resolves only against
+ * the source `alias` actually denotes (see `coverage-prover.ts`).
+ */
+export type ColumnIndexResolver = (expr: AST.Expression) => number | undefined;
+
+/**
  * Return the column index for an `AST.ColumnExpr` or unqualified
  * `AST.IdentifierExpr` that names a column in `columnIndexMap`; undefined
- * otherwise. Schema-qualified identifiers (`other.foo`) are rejected.
+ * otherwise. Schema-qualified identifiers (`other.foo`) are rejected. The
+ * table/alias qualifier on a `ColumnExpr` (`alias.col`) is **ignored** — bare
+ * name resolution only; callers needing qualifier-awareness compose a
+ * {@link ColumnIndexResolver}.
  */
 export function columnIndexFromExpr(
 	expr: AST.Expression,

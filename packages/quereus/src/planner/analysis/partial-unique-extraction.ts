@@ -65,7 +65,7 @@
 import type { FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
 import type { TableSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
-import { columnIndexFromExpr, flattenDisjunction, flipComparison, literalValue } from './predicate-shape.js';
+import { columnIndexFromExpr, flattenDisjunction, flipComparison, literalValue, type ColumnIndexResolver } from './predicate-shape.js';
 import { compareSqlValues } from '../../util/comparison.js';
 
 const cache = new WeakMap<TableSchema, ReadonlyArray<FunctionalDependency>>();
@@ -96,10 +96,14 @@ export function extractPartialUniqueGuardedFds(
 	const isColumnNumericDeclared = (col: number): boolean =>
 		tableSchema.columns[col]?.logicalType?.isNumeric === true;
 
+	// Partial-index predicates are single-table (no joins / qualifiers), so plain
+	// bare-name resolution against this table's column map is faithful.
+	const resolve: ColumnIndexResolver = (e) => columnIndexFromExpr(e, tableSchema.columnIndexMap);
+
 	for (const uc of ucs) {
 		if (uc.predicate === undefined) continue;
 
-		const clauses = recognizeGuardClauses(uc.predicate, tableSchema.columnIndexMap, isColumnNotNullDeclared, isColumnNumericDeclared);
+		const clauses = recognizeGuardClauses(uc.predicate, resolve, isColumnNotNullDeclared, isColumnNumericDeclared);
 		if (!clauses) continue;
 		if (clauses.length === 0) continue;
 
@@ -140,7 +144,7 @@ export function extractPartialUniqueGuardedFds(
  */
 function recognizeGuardClauses(
 	expr: AST.Expression,
-	columnIndexMap: ReadonlyMap<string, number>,
+	resolve: ColumnIndexResolver,
 	isColumnNotNullDeclared: (col: number) => boolean,
 	isColumnNumericDeclared: (col: number) => boolean,
 ): GuardClause[] | undefined {
@@ -159,7 +163,7 @@ function recognizeGuardClauses(
 
 	const clauses: GuardClause[] = [];
 	for (const conjunct of conjuncts) {
-		const clause = recognizeClause(conjunct, columnIndexMap, isColumnNotNullDeclared, isColumnNumericDeclared);
+		const clause = recognizeClause(conjunct, resolve, isColumnNotNullDeclared, isColumnNumericDeclared);
 		if (!clause) return undefined;
 		clauses.push(clause);
 	}
@@ -176,16 +180,26 @@ function recognizeGuardClauses(
  * Reuses the partial-UNIQUE recognizers verbatim — NO new predicate shapes — so
  * the coverage prover (`coverage-prover.ts`) speaks exactly the same predicate
  * language as partial-UNIQUE FD extraction.
+ *
+ * `resolve` overrides how column references map to `tableSchema` column indices
+ * (the NOT-NULL / numeric gates still key off `tableSchema`, which is sound: only
+ * indices the resolver yields are gated). Default is bare-name resolution against
+ * `tableSchema.columnIndexMap`. The coverage prover passes a qualifier-aware
+ * resolver for join-body WHERE clauses so a lookup-side column resolves to
+ * `undefined` (⇒ the whole predicate is unrecognized ⇒ a sound rejection)
+ * instead of mis-resolving onto a same-named base-table column.
  */
 export function recognizeConjunctiveClauses(
 	expr: AST.Expression,
 	tableSchema: TableSchema,
+	resolve?: ColumnIndexResolver,
 ): GuardClause[] | undefined {
 	const isColumnNotNullDeclared = (col: number): boolean =>
 		tableSchema.columns[col]?.notNull === true;
 	const isColumnNumericDeclared = (col: number): boolean =>
 		tableSchema.columns[col]?.logicalType?.isNumeric === true;
-	return recognizeGuardClauses(expr, tableSchema.columnIndexMap, isColumnNotNullDeclared, isColumnNumericDeclared);
+	const resolver: ColumnIndexResolver = resolve ?? ((e) => columnIndexFromExpr(e, tableSchema.columnIndexMap));
+	return recognizeGuardClauses(expr, resolver, isColumnNotNullDeclared, isColumnNumericDeclared);
 }
 
 /**
@@ -320,19 +334,19 @@ function rangeSubset(
  */
 function recognizeClause(
 	expr: AST.Expression,
-	columnIndexMap: ReadonlyMap<string, number>,
+	resolve: ColumnIndexResolver,
 	isColumnNotNullDeclared: (col: number) => boolean,
 	isColumnNumericDeclared: (col: number) => boolean,
 ): GuardClause | undefined {
 	if (expr.type === 'unary') {
 		const u = expr as AST.UnaryExpr;
 		if (u.operator === 'IS NULL' || u.operator === 'IS NOT NULL') {
-			const col = columnIndexFromExpr(u.expr, columnIndexMap);
+			const col = resolve(u.expr);
 			if (col === undefined) return undefined;
 			return { kind: 'is-null', column: col, negated: u.operator === 'IS NOT NULL' };
 		}
 		if (u.operator === 'NOT') {
-			const col = columnIndexFromExpr(u.expr, columnIndexMap);
+			const col = resolve(u.expr);
 			if (col === undefined) return undefined;
 			if (!isColumnNotNullDeclared(col)) return undefined;
 			if (!isColumnNumericDeclared(col)) return undefined;
@@ -341,19 +355,19 @@ function recognizeClause(
 		return undefined;
 	}
 	if (expr.type === 'in') {
-		return recognizeIn(expr as AST.InExpr, columnIndexMap);
+		return recognizeIn(expr as AST.InExpr, resolve);
 	}
 	if (expr.type === 'between') {
-		return recognizeBetween(expr as AST.BetweenExpr, columnIndexMap);
+		return recognizeBetween(expr as AST.BetweenExpr, resolve);
 	}
 	if (expr.type === 'binary') {
 		const b = expr as AST.BinaryExpr;
 		if (b.operator === 'OR') {
-			return recognizeOr(b, columnIndexMap, isColumnNotNullDeclared, isColumnNumericDeclared);
+			return recognizeOr(b, resolve, isColumnNotNullDeclared, isColumnNumericDeclared);
 		}
 		if (b.operator === '=' || b.operator === '==') {
-			const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
-			const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
+			const lIdx = resolve(b.left);
+			const rIdx = resolve(b.right);
 
 			if (lIdx !== undefined && rIdx !== undefined) {
 				if (lIdx === rIdx) return undefined;
@@ -372,7 +386,7 @@ function recognizeClause(
 			return undefined;
 		}
 		if (b.operator === '<' || b.operator === '<=' || b.operator === '>' || b.operator === '>=') {
-			return recognizeRange(b, columnIndexMap);
+			return recognizeRange(b, resolve);
 		}
 		return undefined;
 	}
@@ -385,10 +399,10 @@ function recognizeClause(
  */
 function recognizeRange(
 	b: AST.BinaryExpr,
-	columnIndexMap: ReadonlyMap<string, number>,
+	resolve: ColumnIndexResolver,
 ): GuardClause | undefined {
-	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
-	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
+	const lIdx = resolve(b.left);
+	const rIdx = resolve(b.right);
 	let colIdx: number | undefined;
 	let lit: ReturnType<typeof literalValue>;
 	let op: string;
@@ -424,10 +438,10 @@ function recognizeRange(
  */
 function recognizeBetween(
 	expr: AST.BetweenExpr,
-	columnIndexMap: ReadonlyMap<string, number>,
+	resolve: ColumnIndexResolver,
 ): GuardClause | undefined {
 	if (expr.not === true) return undefined;
-	const colIdx = columnIndexFromExpr(expr.expr, columnIndexMap);
+	const colIdx = resolve(expr.expr);
 	if (colIdx === undefined) return undefined;
 	const lo = literalValue(expr.lower);
 	const hi = literalValue(expr.upper);
@@ -443,11 +457,11 @@ function recognizeBetween(
  */
 function recognizeIn(
 	expr: AST.InExpr,
-	columnIndexMap: ReadonlyMap<string, number>,
+	resolve: ColumnIndexResolver,
 ): GuardClause | undefined {
 	if (expr.subquery !== undefined) return undefined;
 	if (!expr.values || expr.values.length === 0) return undefined;
-	const col = columnIndexFromExpr(expr.expr, columnIndexMap);
+	const col = resolve(expr.expr);
 	if (col === undefined) return undefined;
 	const subs: GuardClause[] = [];
 	for (const v of expr.values) {
@@ -467,7 +481,7 @@ function recognizeIn(
  */
 function recognizeOr(
 	expr: AST.BinaryExpr,
-	columnIndexMap: ReadonlyMap<string, number>,
+	resolve: ColumnIndexResolver,
 	isColumnNotNullDeclared: (col: number) => boolean,
 	isColumnNumericDeclared: (col: number) => boolean,
 ): GuardClause | undefined {
@@ -475,7 +489,7 @@ function recognizeOr(
 	if (disjuncts.length === 0) return undefined;
 	const subs: GuardClause[] = [];
 	for (const d of disjuncts) {
-		const sub = recognizeClause(d, columnIndexMap, isColumnNotNullDeclared, isColumnNumericDeclared);
+		const sub = recognizeClause(d, resolve, isColumnNotNullDeclared, isColumnNumericDeclared);
 		if (!sub) return undefined;
 		if (sub.kind === 'or-of') {
 			for (const s of sub.clauses) subs.push(s);

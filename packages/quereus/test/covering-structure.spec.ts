@@ -459,19 +459,49 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		}
 	});
 
-	it('negative shape: a join on a UC column whose lookup side reuses that column name is rejected (name-collision guard)', async () => {
-		// products.sku collides with the UC column `sku`; bare-name resolution in
-		// the ORDER BY / WHERE checks could mis-resolve it, so the guard rejects.
+	// products.sku reuses the UC column name `sku`, but the prover's ORDER BY /
+	// WHERE resolution is now qualifier-aware, so `l.sku` (T) and `p.sku` (lookup)
+	// are kept distinct — no bare-name collision guard. The natural-key 1:1 lookup
+	// join therefore covers.
+	const LINE_ITEMS_PRODUCTS = [
+		'create table line_items (oid integer not null, lineno integer not null, sku text not null, primary key (oid, lineno), unique (oid, sku))',
+		'create table products (sku text primary key, name text)',
+	];
+
+	it('positive: a 1:1 join whose lookup key reuses a UC column name, sorted by the T-qualified column, covers', async () => {
 		const body = 'select l.oid, l.sku, l.lineno from line_items l left join products p on l.sku = p.sku order by l.oid, l.sku';
-		const db = await freshDb([
-			'create table line_items (oid integer not null, lineno integer not null, sku text not null, primary key (oid, lineno), unique (oid, sku))',
-			'create table products (sku text primary key, name text)',
-			`create materialized view ix as ${body}`,
-		]);
+		const db = await freshDb([...LINE_ITEMS_PRODUCTS, `create materialized view ix as ${body}`]);
+		try {
+			expect((await prove(db, 'ix', body, 'line_items')).covers, 'a UC-named lookup key qualified to T still covers').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative ordering-mismatch: the SAME UC-shared name qualified to the LOOKUP side is not a T ordering', async () => {
+		// `order by l.oid, p.sku` sorts by the lookup-side `sku`, not T's — so it is
+		// an ordering-mismatch, NOT a `shape` rejection (the old collision guard).
+		const body = 'select l.oid, l.sku, l.lineno from line_items l left join products p on l.sku = p.sku order by l.oid, p.sku';
+		const db = await freshDb([...LINE_ITEMS_PRODUCTS, `create materialized view ix as ${body}`]);
 		try {
 			const result = await prove(db, 'ix', body, 'line_items');
-			expect(result.covers, 'a lookup column reusing a UC column name must be rejected').to.be.false;
-			if (!result.covers) expect(result.reason).to.equal('shape');
+			expect(result.covers, 'ordering on a lookup column cannot cover').to.be.false;
+			if (!result.covers) expect(result.reason).to.equal('ordering-mismatch');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative predicate-entailment: a WHERE on the UC-shared name qualified to the LOOKUP side is rejected for the right reason', async () => {
+		// `where p.sku is null` filters on the lookup-side `sku` (the anti-join
+		// pattern keeps the LEFT join), so it is a predicate-entailment failure —
+		// NOT `shape` as the bare-name collision guard would have reported.
+		const body = 'select l.oid, l.sku, l.lineno from line_items l left join products p on l.sku = p.sku where p.sku is null order by l.oid, l.sku';
+		const db = await freshDb([...LINE_ITEMS_PRODUCTS, `create materialized view ix as ${body}`]);
+		try {
+			const result = await prove(db, 'ix', body, 'line_items');
+			expect(result.covers, 'a lookup-side WHERE cannot cover').to.be.false;
+			if (!result.covers) expect(result.reason).to.equal('predicate-entailment');
 		} finally {
 			await db.close();
 		}

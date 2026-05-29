@@ -483,10 +483,13 @@ and [Lenses § the constraint-role split](lens.md).
 Multi-source 1:1 join bodies are **delivered**: outer-join row preservation
 (`coverage-prover-multi-source-bodies`) and `inner`/`cross` lookup joins on an enforced
 NOT-NULL FK→PK (`coverage-prover-inner-join-fk-preservation`, the no-row-loss obligation
-closed by referential integrity). Remaining follow-up:
-`coverage-prover-qualified-name-resolution` (qualifier-aware AST resolution so a 1:1 join
-body whose lookup side reuses a UC column name covers). Full-outer covering stays deferred
-(it injects lookup-only rows with no governed `T` row).
+closed by referential integrity). The AST `ORDER BY` / `WHERE` column resolution is
+**qualifier-aware** (`coverage-prover-qualified-name-resolution`): `alias.col` resolves to
+a `T` column only when `alias` denotes `T`'s reference (and a bare `col` only when
+unambiguous across the join's sources), so a 1:1 join whose lookup key reuses a UC column
+name now covers — a term on a lookup column instead fails on its own terms
+(`ordering-mismatch` / `predicate-entailment`). Full-outer covering stays deferred (it
+injects lookup-only rows with no governed `T` row).
 
 ## Out of scope / roadmap
 
