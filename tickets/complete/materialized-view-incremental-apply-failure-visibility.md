@@ -2,6 +2,8 @@ description: Two-tier incremental-MV apply-failure recovery (Tier-1 full-rebuild
 files: packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/core/database.ts, packages/quereus/src/schema/view.ts, packages/quereus/src/planner/building/select.ts, packages/quereus/src/runtime/emit/materialized-view.ts, packages/quereus/test/materialized-view-diagnostics.spec.ts, docs/materialized-views.md
 ----
 
+> **⚠ Superseded (2026-05-29) — feature removed.** Materialized views are being consolidated to a single **row-time** model by `materialized-view-rowtime-only-consolidation` (plan): the `manual` and `on-commit-incremental` refresh policies and the post-commit divergence / self-heal subsystem are removed. The work archived here is retained as historical record only.
+
 ## What shipped
 
 An incremental MV (`refresh = 'on-commit-incremental'`) that fails a maintenance
@@ -88,5 +90,5 @@ ticket rather than an inline fix.
   equivalent; the shared wrapper is the cleaner choice. Fine.
 - *No `getDivergedMaterializedViews()` enumerator.* Intentionally out of scope per
   the plan; the read error is the observable. Fine.
-- *Direct reads of the hidden `sqlite_mv_<name>` backing table bypass the guard.*
+- *Direct reads of the hidden `_mv_<name>` backing table bypass the guard.*
   Not a supported read path.

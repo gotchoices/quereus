@@ -2,6 +2,8 @@ description: Materialized-view engine substrate (phase 1, manual refresh) — pa
 files: packages/quereus/src/parser/ast.ts, packages/quereus/src/parser/parser.ts, packages/quereus/src/emit/ast-stringify.ts, packages/quereus/src/schema/view.ts, packages/quereus/src/schema/schema.ts, packages/quereus/src/schema/manager.ts, packages/quereus/src/schema/catalog.ts, packages/quereus/src/schema/change-events.ts, packages/quereus/src/planner/nodes/materialized-view-nodes.ts, packages/quereus/src/planner/building/materialized-view.ts, packages/quereus/src/planner/building/select.ts, packages/quereus/src/planner/building/schema-resolution.ts, packages/quereus/src/planner/building/insert.ts, packages/quereus/src/planner/building/update.ts, packages/quereus/src/planner/building/delete.ts, packages/quereus/src/runtime/emit/materialized-view.ts, packages/quereus/src/runtime/emit/materialized-view-helpers.ts, packages/quereus/src/runtime/emit/drop-table.ts, packages/quereus/src/runtime/emit/drop-view.ts, packages/quereus/src/runtime/register.ts, packages/quereus/src/vtab/memory/layer/manager.ts, packages/quereus/src/core/database.ts, packages/quereus/src/core/database-materialized-views.ts
 ----
 
+> **⚠ Partly superseded (2026-05-29).** `materialized-view-rowtime-only-consolidation` (plan) makes materialized views **row-time only** and removes the `manual` full-refresh policy and refresh-policy knob described here. The underlying keyed-derived-relation substrate (backing table, PK inference, dual registration) survives; the refresh-policy framing does not.
+
 Phase-1 materialized views as **keyed derived relations**: a stored relation
 defined by a query body, primary-keyed, addressable like any virtual table, with
 manual full-refresh. See the original implement handoff (commit
@@ -20,7 +22,7 @@ records the review disposition.
   including the `drop materialized view` two-word form. The `using <mod>(...)`
   clause parses before `as` and is forward-compatible (`moduleName`/`moduleArgs`).
 - **Schema layer** — Dual registration verified: backing `TableSchema` under the
-  reserved `sqlite_mv_<name>` (`backingTableNameFor`) in `Schema.tables`; the
+  reserved `_mv_<name>` (`backingTableNameFor`) in `Schema.tables`; the
   `MaterializedViewSchema` in the new `Schema.materializedViews` map. Name
   disjointness is enforced *both directions* in `schema.ts` (`addTable`/`addView`
   reject MV-name clashes; `addMaterializedView` rejects table/view clashes).
@@ -90,7 +92,7 @@ records the review disposition.
 
 - **Bag body with duplicate rows fails create/refresh.** A body with no inferable
   key materializes on an all-columns PK; if it emits duplicate rows,
-  `replaceBaseLayer` throws a raw `UNIQUE constraint failed: sqlite_mv_<name> PK.`
+  `replaceBaseLayer` throws a raw `UNIQUE constraint failed: _mv_<name> PK.`
   and the statement fails. A common, intuitive definition (e.g.
   `create materialized view mv as select status from orders`) is therefore
   unusable, and a body that becomes duplicate-producing after source edits fails

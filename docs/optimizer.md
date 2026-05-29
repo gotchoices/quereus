@@ -374,7 +374,7 @@ estimatedRows: (operands) => {
 
 Non-deterministic or trace-only TVFs (`execution_trace`, `row_trace`, `stack_trace`, `scheduler_program`, `schema_size`, `explain_assertion`, `schema`) skip advertisement.
 
-**Consumed by materialized-view maintenance.** Beyond optimizer property propagation, the TVF `relationalAdvertisement` (`keys` / `isSet`) is read *directly* by incremental materialized-view maintenance to bound a lateral-TVF fan-out. For a body like `base t cross join lateral json_each(t.arr) je`, a base-row change maps to many backing rows; the maintainer deletes them by base-PK prefix and re-inserts the recomputed fan-out, but only when the advertisement proves the TVF-derived portion of the backing PK is a *superkey* of the TVF output (so the re-insert is a set on the backing PK). This consumes the advertisement directly because `combineJoinKeys` (`planner/util/key-utils.ts`) returns `[]` for a keyless cross/lateral join — it never forms the **product key** `(leftKey ∪ shiftedRightKey)`, so `keysOf` cannot surface the keyed cross-product key and the MV backing PK falls back to all-columns. Teaching `combineJoinKeys` to emit keyed cross-product join keys is the general fix (optimizer-wide blast radius), filed as the backlog item `optimizer-keyed-cross-product-join-keys`; until then the consumption stays MV-local. See [Incremental Maintenance](incremental-maintenance.md) and [Materialized Views § Incremental refresh](materialized-views.md#incremental-refresh).
+**Relevant to materialized-view maintenance (deferred shape).** The TVF `relationalAdvertisement` (`keys` / `isSet`) is the surface a lateral-TVF row-time materialized-view body would consume to bound a fan-out (`base t cross join lateral json_each(t.arr) je`): a base-row change maps to many backing rows that a prefix-delete + recomputed-fan-out maintenance would need to prove set on the backing PK. This shape is **not** in the current row-time eligibility gate — it is deferred to `materialized-view-rowtime-general-bodies`. The reason it would need the advertisement *directly* is that `combineJoinKeys` (`planner/util/key-utils.ts`) returns `[]` for a keyless cross/lateral join — it never forms the **product key** `(leftKey ∪ shiftedRightKey)`, so `keysOf` cannot surface the keyed cross-product key. Teaching `combineJoinKeys` to emit keyed cross-product join keys is the general fix, filed as the backlog item `optimizer-keyed-cross-product-join-keys`. See [Materialized Views](materialized-views.md).
 
 ### Constant Folding Subsystem
 
@@ -1954,9 +1954,9 @@ During assertion creation/update:
 
 ## Binding-aware Delta Planning (Reusable)
 
-The same analysis used for assertions generalizes to incremental view maintenance and other delta-driven features. `analyzeRowSpecific` returns a `RowSpecificResult { classifications, groupKeys }`; `extractBindings` packages that into a `PlanBindings { perRelation, relationToBase }` map of `BindingMode` per `TableReferenceNode` instance. The full runtime surface is documented in [`docs/incremental-maintenance.md`](incremental-maintenance.md).
+The same analysis used for assertions generalizes to reactive watches, the lens layer, and other delta-driven features. `analyzeRowSpecific` returns a `RowSpecificResult { classifications, groupKeys }`; `extractBindings` packages that into a `PlanBindings { perRelation, relationToBase }` map of `BindingMode` per `TableReferenceNode` instance. The full runtime surface is documented in [`docs/incremental-maintenance.md`](incremental-maintenance.md).
 
-The **public** projection of this analysis is the `ChangeScope` data contract — a JSON-serializable description of "what state does this prepared statement depend on?". `Statement.getChangeScope()` returns one for any prepared statement; see [`docs/change-scope.md`](change-scope.md). One refinement lives at this boundary: a read of an `on-commit-incremental` materialized view resolves to a reference on its (never-user-written) backing table, so the analyzer projects it onto the MV's source tables — `getChangeScope()` reports (and `Database.watch` fires on) *source* mutations rather than the backing table. See [`docs/change-scope.md` § Materialized-view reference projection](change-scope.md#materialized-view-reference-projection).
+The **public** projection of this analysis is the `ChangeScope` data contract — a JSON-serializable description of "what state does this prepared statement depend on?". `Statement.getChangeScope()` returns one for any prepared statement; see [`docs/change-scope.md`](change-scope.md). One refinement lives at this boundary: a read of a materialized view resolves to a reference on its (never-user-written) backing table, so the analyzer projects it onto the MV's source tables — `getChangeScope()` reports (and `Database.watch` fires on) *source* mutations rather than the backing table. See [`docs/change-scope.md` § Materialized-view reference projection](change-scope.md#materialized-view-reference-projection).
 
 ### Modes of Specificity
 - Row-specific (`'row'`): unique key fully covered (under FD closure including FK→PK and EC-derived FDs); bind PK/unique key columns.
@@ -1976,14 +1976,18 @@ For `'row'` bindings, the chosen key prefers the table's primary key when it's a
 - Preserve attribute IDs; parameter order follows key column order. `'row'` parameters use the prefix `pk0..pkN-1`; `'group'` parameters use `gk0..gkN-1`.
 - Each consumer owns its residual cache, keyed by `(relationKey, BindingMode.kind, columnsJoined)`.
 
-### Delta Execution Strategy
-- On COMMIT, the `DeltaExecutor` walks each `DeltaSubscription`. Per relation, it pulls projected tuples from `TransactionManager.getChangedTuples` and either parameterizes the residual per tuple, or — when changed distinct tuples ≥ `tuning.deltaPerRowFallbackRatio × estimatedRows(base)` — falls back to a single global run.
-- The change-capture layer registers per-base-table column-projection demand via `registerCaptureSpec`. PK is always captured implicitly; non-PK columns are retained only when at least one consumer has registered demand. UPDATEs emit both OLD and NEW projections when any captured column changes value, making per-group dispatch see group-membership transitions.
-- Multiple consumers (assertions, MVs, signals) share the same kernel and the same change capture; only their `apply` callbacks differ.
+### Runtime execution
 
-### Applicability Beyond Assertions
-- Materialized Views / covering structures: compute ΔQ and merge into the cached relation. `on-commit-incremental` materialized views are **live** — the `MaterializedViewManager` registers one `DeltaSubscription` per view with an `apply` that delete-then-upserts the recomputed slice per binding tuple ([Materialized Views § Incremental refresh](materialized-views.md#incremental-refresh)). Note the MV path does **not** reuse `extractBindings`' equality-pinned classification (which reports a bare MV scan / group-by-non-key as `'global'`); it derives source-identity bindings (PK / group-key) directly. The [lens layer](lens.md) consumes the same kernel for set-level constraint maintenance and enforcement.
-- Triggers/Signals: invoke actions only for affected keys/groups.
+The runtime side — how a `DeltaSubscription` is registered, how capture demand and
+the savepoint-layered change log work, the cost-fallback-to-global rule, and the
+plug-in pattern for new consumers — is documented in
+[Incremental Maintenance](incremental-maintenance.md). This section is only the
+*analysis* half: classifying references and choosing binding keys. The live
+consumers are assertions and `Database.watch`; the [lens layer](lens.md) consumes
+the kernel for set-level constraint maintenance/enforcement where no covering
+structure answers it; triggers/signals are future consumers. Materialized views are
+maintained synchronously at the DML write boundary, **not** through this kernel (see
+[Materialized Views](materialized-views.md)).
 
 This places “what to bind” in the optimizer and “when/how to execute residuals” in the runtime, enabling reuse across features.
 

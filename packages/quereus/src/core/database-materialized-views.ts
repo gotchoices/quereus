@@ -268,7 +268,7 @@ export class MaterializedViewManager {
 		// wholesale-rebuilt backing bases (`globallyChangedBacking`). A backing base
 		// in `pendingDelta` reads from the overlay; everything else (genuine user
 		// tables) delegates to the change log. Backing-table names use the reserved
-		// `sqlite_mv_` prefix and never collide with user-table names, so per-base
+		// `_mv_` prefix and never collide with user-table names, so per-base
 		// routing is unambiguous.
 		const executorCtx: DeltaExecutorContext = {
 			getChangedBaseTables: () => {

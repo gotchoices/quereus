@@ -483,7 +483,7 @@ export class SchemaManager {
 
 	/**
 	 * Reverse lookup: find the materialized view in `schemaName` whose backing
-	 * table is `backingName`. Backing tables follow the reserved `sqlite_mv_<name>`
+	 * table is `backingName`. Backing tables follow the reserved `_mv_<name>`
 	 * convention (see {@link backingTableNameFor}), so the MV name is derived from
 	 * the prefix and confirmed against the MV's own `backingTableName`.
 	 *

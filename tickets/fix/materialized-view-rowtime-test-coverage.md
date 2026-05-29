@@ -1,7 +1,19 @@
 description: Harden test coverage for row-time (write-through) materialized-view maintenance. The shipped `53-materialized-views-rowtime.sqllogic` covers 3 of the 6 DML maintenance hook sites and several behaviors only weakly. The underlying code was reviewed and found correct; this ticket is about closing coverage gaps so future regressions are caught, not about fixing a known defect.
-prereq:
+prereq: materialized-view-rowtime-only-consolidation
 files: packages/quereus/test/logic/53-materialized-views-rowtime.sqllogic, packages/quereus/src/runtime/emit/dml-executor.ts, packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/parser/parser.ts
 ----
+
+> **Scope note (post row-time-only consolidation).** `materialized-view-rowtime-only-consolidation`
+> makes row-time the *sole* MV model and **removes the `with refresh = '...'`
+> clause** — the DDL becomes a bare `create materialized view v as select …`. Every
+> example below that writes `with refresh = 'row-time'` is now just
+> `create materialized view`. The "round-trip the `row-time` policy" and
+> "parse-error for an unknown refresh literal" spec ideas at the bottom are
+> superseded: instead assert the bare DDL round-trips and that **any** `with
+> refresh` clause is now a parse error. Maintenance also batches per-statement
+> (not strictly per-row) after the consolidation — the six hook sites still fire,
+> but a multi-row statement flushes once; keep that in mind when asserting backing
+> contents mid- vs post-statement.
 
 ## Why
 

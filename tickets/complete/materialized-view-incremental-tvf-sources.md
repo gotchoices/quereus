@@ -2,6 +2,8 @@ description: Maintain `on-commit-incremental` materialized views whose body fans
 files: packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/vtab/memory/layer/manager.ts, packages/quereus/src/emit/ast-stringify.ts, packages/quereus/test/logic/52-materialized-views-incremental.sqllogic, packages/quereus/test/materialized-view-lateral-tvf.spec.ts, docs/materialized-views.md, docs/incremental-maintenance.md, docs/optimizer.md
 ----
 
+> **⚠ Superseded (2026-05-29) — feature removed.** Materialized views are being consolidated to a single **row-time** model by `materialized-view-rowtime-only-consolidation` (plan): the `manual` and `on-commit-incremental` refresh policies and the post-commit divergence / self-heal subsystem are removed. The work archived here is retained as historical record only.
+
 ## What landed
 
 A lateral-TVF fan-out body maintains **incrementally** via a bounded base-PK

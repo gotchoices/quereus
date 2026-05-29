@@ -1,85 +1,66 @@
-description: A materialized view's build-time read-state flags (`diverged`, `stale`) are bypassed by already-cached prepared-statement plans — a query planned before the flag was set keeps reading the backing table and returns wrong/stale rows with no error, defeating the "no silent wrong reads" guarantee.
+description: A materialized view's build-time `stale` read-state guard is bypassed by already-cached prepared-statement plans — a query planned before the source schema changed keeps reading the backing table and returns stale rows with no error/re-validation, defeating the "no silent stale reads" guarantee.
+prereq: materialized-view-rowtime-only-consolidation
 files: packages/quereus/src/planner/building/select.ts, packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/core/statement.ts, packages/quereus/src/runtime/emit/materialized-view.ts, packages/quereus/src/schema/view.ts, packages/quereus/src/schema/schema.ts
 ----
 
+> **Scope note (post row-time-only consolidation).** This ticket originally
+> covered **both** `diverged` and `stale`. The `diverged` flag and the entire
+> post-commit divergence subsystem are removed by
+> `materialized-view-rowtime-only-consolidation` (row-time maintenance is
+> transactional — it cannot drift, so there is nothing to diverge). What remains
+> is the `stale` half of the same cached-plan bypass, described below.
+
 ## Problem
 
-Both materialized-view read-state guards live in `select.ts` `buildFrom`
-(`mvSchema.diverged` → unconditional error; `mvSchema.stale` → body re-validation),
-i.e. they fire at **plan-build time**. A `Statement` caches its optimized plan and
-only recompiles when a schema-change *event* invalidates one of its tracked
-dependencies (see `statement.ts` — `schemaChangeUnsubscriber`, `needsCompile`).
+The materialized-view `stale` read-state guard lives in `select.ts` `buildFrom`
+(`mvSchema.stale` → body re-validation), i.e. it fires at **plan-build time**. A
+`Statement` caches its optimized plan and only recompiles when a schema-change
+*event* invalidates one of its tracked dependencies (see `statement.ts` —
+`schemaChangeUnsubscriber`, `needsCompile`).
 
-The `diverged` flag is set on the **post-commit incremental-maintenance path**
-(`database-materialized-views.ts` `apply` catch → `mv.diverged = true`) **without
-emitting any schema-change event**. So a prepared statement that was planned
-against the MV *before* it diverged keeps its cached plan, reads the backing table
-directly, and returns the (now wrong) rows with **no error** — exactly the silent
-wrong read the parent ticket set out to prevent.
+`stale` is set by the schema-change subscription when a *source* table is
+dropped/altered. But a cached `select <cols> from mv` statement depends on the
+**backing** table, not the source, so the source's `table_modified` /
+`table_removed` event does not invalidate it. The cached plan keeps reading the
+backing table directly and returns rows against a definition whose source has
+structurally changed — with no `stale` re-validation.
 
-`stale` has the **same** bypass for the same reason (it is set by the schema-change
-subscription, but a cached `select <cols> from mv` statement depends on the backing
-table, not the source, so the source's `table_modified` event does not invalidate
-it). The parent ticket inherited the limitation; it did not introduce it.
-
-### Reproduction (verified during review)
+### Reproduction shape
 
 ```ts
 const stmt = await db.prepare('select id, x from mv order by id');
 for await (const r of stmt.iterateRows()) { /* plan cached here */ }
 
-db._setMaterializedViewMaintenanceFault(p => {
-  if (p === 'residual' || p === 'rebuild') throw new Error('inject');
-});
-await db.exec('update t set x = 999 where id = 2;');   // -> mv.diverged === true
+await db.exec('alter table t add column z integer;');   // -> mv.stale === true
 
 await stmt.reset();
-for await (const r of stmt.iterateRows()) { /* RETURNS OLD ROWS, NO ERROR */ }
-// A *fresh* `db.eval('select ... from mv')` errors correctly.
+for await (const r of stmt.iterateRows()) { /* bypasses the stale re-validation */ }
+// A *fresh* db.eval('select ... from mv') re-validates correctly.
 ```
-
-The same shape reproduces for `stale` via a source `alter table ... add column`.
 
 ## Expected behavior
 
-A read against an MV whose read-state flag is set must observe that state
-regardless of whether the reading statement's plan was cached before the flag
-flipped. No code path should silently serve diverged/stale backing rows.
-
-> **Note — the diverged *action* is changing.** The planned
-> `materialized-view-cascading-divergence-propagation` work replaces the
-> `diverged` hard-error with **live-body fallback** (a diverged/tainted MV
-> resolves reads to its un-materialized body instead of erroring), and adds a
-> third read-state flag — `tainted` (set when an *upstream* MV diverged). This
-> fix's contract is unchanged in spirit but should be framed as "a cached plan
-> must observe the *current* read-state and re-resolve accordingly" rather than
-> "must error": once divergence self-heals, the right cached-plan behavior is to
-> recompile onto the fallback, not to throw. Whatever mechanism this fix uses
-> (invalidation event vs. runtime-flag check) must therefore cover **three**
-> flags — `diverged`, `stale`, and the forthcoming `tainted` — and must drive a
-> *re-resolution*, not just a guard. If this fix lands first, leave the seam
-> generic over read-state rather than hard-coding the error.
+A read against an MV whose `stale` flag is set must observe that state regardless
+of whether the reading statement's plan was cached before the flag flipped. No
+code path should silently serve stale backing rows; the cached plan must
+re-resolve (recompile → re-hit the build-time `stale` re-validation) when the flag
+toggles.
 
 ## Notes for the implementer (design space, not a plan)
 
-- The flags are runtime-only and currently toggle without notifying the
+- The flag is runtime-only and currently toggles without notifying the
   statement-cache invalidation machinery. Candidate directions:
   - Emit a schema-change / invalidation signal for the MV (and/or its backing
-    table) when `diverged`/`stale` toggles, so dependent cached plans recompile and
-    re-hit the build-time guard. The `diverged` set happens in the post-commit
-    window — confirm emitting an invalidation event there is safe.
-  - Or move the guard from plan-build time to emit/runtime (check the live flag when
-    the backing-table scan actually runs), so it is immune to plan caching.
-- Whatever the fix, cover **both** `diverged` and `stale` — they share the gap.
-- Regression test: prepare a statement, flip the flag via the existing
-  `_setMaterializedViewMaintenanceFault` seam (diverged) and a source schema change
-  (stale), then re-execute the *same* prepared statement and assert it errors.
+    table) when `stale` toggles, so dependent cached plans recompile and re-hit
+    the build-time guard.
+  - Or move the guard from plan-build time to emit/runtime (check the live flag
+    when the backing-table scan actually runs), so it is immune to plan caching.
+- Regression test: prepare a statement, flip `stale` via a source schema change,
+  then re-execute the *same* prepared statement and assert it re-validates
+  (errors if the body no longer plans, serves correct rows otherwise) rather than
+  serving the cached backing read.
 
 ## Related
 
-- Parent: `materialized-view-incremental-apply-failure-visibility` (added the
-  `diverged` flag + two-tier recovery; its docs now carry a caveat pointing here).
-- `materialized-view-cascading-divergence-propagation` (plan): changes the
-  diverged read action from hard-error to live-body fallback and adds the
-  `tainted` flag — the two should be implemented coherently (this fix supplies the
-  cache-invalidation/re-resolution seam that the self-healing reads ride on).
+- `materialized-view-rowtime-only-consolidation` (prereq) — removes `diverged`;
+  leaves `stale` as the sole MV read-state flag this fix must cover.

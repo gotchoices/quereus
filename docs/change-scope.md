@@ -223,26 +223,25 @@ AND-of-children so `subtreeHasSideEffects` is reliable.
 ### Materialized-view reference projection
 
 A `select` from a materialized view resolves to a `TableReference` on the MV's
-backing table (`sqlite_mv_<name>`), not a body expansion — so the analyzer would
-naively report the *backing table* as the watched table. For an
-`on-commit-incremental` MV that is wrong: its backing table is maintained at
-COMMIT from its sources and is **never written through the user change log**, so
-a `Database.watch` on it would never fire.
+backing table (`_mv_<name>`), not a body expansion — so the analyzer would
+naively report the *backing table* as the watched table. That is wrong: the
+backing table is maintained synchronously from its sources at the row-write
+boundary (row-time) and is **never written through the user change log**, so a
+`Database.watch` on it would never fire.
 
-The analyzer therefore **projects** an incremental-MV backing reference onto the
-MV's source tables. `Statement.getChangeScope()` passes
+The analyzer therefore **projects** a materialized-view backing reference onto
+the MV's source tables. `Statement.getChangeScope()` passes
 `analyzeChangeScope` a `resolveMaterializedViewSource` resolver (backed by
-`SchemaManager.getMaterializedViewByBackingTable`); when a reference is an
-`on-commit-incremental` MV's backing table, its watch is replaced by the MV's
+`SchemaManager.getMaterializedViewByBackingTable`); when a reference is a
+materialized view's backing table, its watch is replaced by the MV's
 cached source-union scope (`MaterializedViewSchema.sourceScope`, built once at
 registration by `buildSourceUnionScope`). The projected scope is `unionScopes`-d
 into the result, so reading both the MV and a source directly reports the source
 once. v1's source-union is a `full` watch per source; a precise per-source
 row/group scope is a future refinement.
 
-A **`manual`** MV is *not* projected: its backing table is user-observable state
-that `refresh materialized view` writes, and its cadence is `refresh`, not source
-mutations — so it keeps reporting the backing table. See
+Every materialized view is projected this way: all are row-time maintained off
+the user change log, so the backing table is never the right watch target. See
 [materialized-views.md § Change-scope projection](materialized-views.md#change-scope-projection).
 
 ## The two cases that look the same but are not
@@ -285,9 +284,9 @@ describes more.
   that the analyzer cannot decode into a `ScopeValue`, the watch falls
   back to `{kind:'full'}` rather than emitting `{kind:'rows', values: []}`
   (which would describe "watch zero rows" and under-specify the scope).
-- **Incremental-MV source projection is whole-table.** Reading an
-  `on-commit-incremental` MV projects to a `{kind:'full'}` watch per source
-  table (see [Materialized-view reference projection](#materialized-view-reference-projection)).
+- **MV source projection is whole-table.** Reading a materialized view projects
+  to a `{kind:'full'}` watch per source table (see
+  [Materialized-view reference projection](#materialized-view-reference-projection)).
   Even when the MV's body keys on a source PK or group key, the projected scope
   does not yet narrow to those rows/groups — sound but coarse.
 

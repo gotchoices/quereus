@@ -1,4 +1,4 @@
-description: A duplicate-producing ("bag") materialized-view body now fails create/refresh with a purpose-built "must be a set" diagnostic that names the view and explains the v1 set-semantics contract, instead of leaking the hidden backing table via the raw `UNIQUE constraint failed: sqlite_mv_<name> PK`. Decision: option 1 (clear diagnostic + documented contract); no silent de-dup, no synthetic identity.
+description: A duplicate-producing ("bag") materialized-view body now fails create/refresh with a purpose-built "must be a set" diagnostic that names the view and explains the v1 set-semantics contract, instead of leaking the hidden backing table via the raw `UNIQUE constraint failed: _mv_<name> PK`. Decision: option 1 (clear diagnostic + documented contract); no silent de-dup, no synthetic identity.
 files: packages/quereus/src/vtab/memory/layer/manager.ts, packages/quereus/src/runtime/emit/materialized-view-helpers.ts, packages/quereus/src/runtime/emit/materialized-view.ts, packages/quereus/test/logic/51-materialized-views.sqllogic, packages/quereus/test/materialized-view-diagnostics.spec.ts, docs/materialized-views.md
 ----
 
@@ -29,7 +29,7 @@ Wired into the two full-rebuild fill paths:
 - `51-materialized-views.sqllogic` §9: bag-at-create fails, name freed on
   rollback, late-duplicate-at-refresh fails — all `must be a set`.
 - `materialized-view-diagnostics.spec.ts`: the negative assertion (message
-  contains `must be a set` + view name, does **not** contain `sqlite_mv_` / `PK.`)
+  contains `must be a set` + view name, does **not** contain `_mv_` / `PK.`)
   plus API-level rollback re-proof.
 
 ## Review findings

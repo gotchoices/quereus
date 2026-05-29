@@ -605,7 +605,7 @@ Releases all resources associated with the statement. The statement cannot be us
 describing what base-table state and external inputs the statement reads
 from. The result is a static analysis — sound but conservative — and is
 the public projection of the binding analysis used by assertions and
-incremental view maintenance. See [Change-scope Documentation](change-scope.md)
+reactive watches. See [Change-scope Documentation](change-scope.md)
 for the full data contract.
 
 ### Analyzer-only

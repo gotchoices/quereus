@@ -145,7 +145,7 @@ drop table s2;
 
 -- A duplicate-producing ("bag") body fails loudly at CREATE with a purpose-built
 -- diagnostic that names the MV and the set-semantics contract, NOT the hidden
--- backing table's raw `UNIQUE constraint failed: sqlite_mv_... PK` (see the
+-- backing table's raw `UNIQUE constraint failed: _mv_... PK` (see the
 -- focused spec for the no-backing-table-name assertion).
 create table orders (id integer primary key, status text);
 insert into orders values (1, 'open'), (2, 'open'), (3, 'shipped');

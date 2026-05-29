@@ -5,7 +5,7 @@ import { Database } from '../src/index.js';
  * The bag-body contract: a v1 materialized view must be a *set*. A
  * duplicate-producing body fails with a purpose-built diagnostic that names the
  * MV and explains the contract — NOT the raw `UNIQUE constraint failed:
- * sqlite_mv_<name> PK` that leaks the hidden backing table.
+ * _mv_<name> PK` that leaks the hidden backing table.
  *
  * The sqllogic harness (`51-materialized-views.sqllogic` §9) covers the positive
  * "must be a set" substring and the create/refresh behavior; it cannot express
@@ -38,7 +38,7 @@ describe('Materialized view bag-body diagnostic', () => {
 		expect(err.message).to.contain('must be a set');
 		expect(err.message).to.contain("mv_status");
 		// …and it never leaks the hidden backing-table implementation detail.
-		expect(err.message).to.not.contain('sqlite_mv_');
+		expect(err.message).to.not.contain('_mv_');
 		expect(err.message).to.not.contain('PK.');
 	});
 

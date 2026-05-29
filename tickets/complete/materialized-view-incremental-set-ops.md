@@ -2,6 +2,8 @@ description: Set-operation (`union`/`intersect`/`except`/`union all`) `on-commit
 files: packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/planner/building/materialized-view.ts, packages/quereus/test/logic/52-materialized-views-incremental.sqllogic, docs/materialized-views.md
 ----
 
+> **⚠ Superseded (2026-05-29) — feature removed.** Materialized views are being consolidated to a single **row-time** model by `materialized-view-rowtime-only-consolidation` (plan): the `manual` and `on-commit-incremental` refresh policies and the post-commit divergence / self-heal subsystem are removed. The work archived here is retained as historical record only.
+
 ## What landed
 
 Same delivery shape as `materialized-view-incremental-recursive-cte`: a body

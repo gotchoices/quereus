@@ -163,10 +163,12 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
   - [ ] Extend classification with group-specific (GROUP BY / PARTITION BY) keys
   - [ ] Binding propagation across equi-joins to related tables
   - [ ] Residual construction helper to inject `= ?` filters on bound relation
-- [ ] Materialized Views (future)
-  - [ ] Register view definition and incrementalization strategy
-  - [ ] Compute ΔView on COMMIT and merge into storage
-  - [ ] `explain_view_delta(name)` diagnostics
+- [ ] Reactive signals / triggers (future kernel consumers)
+  - [ ] Register a reactive plan and act on per-binding deltas at COMMIT
+
+> Note: materialized views are **not** a kernel consumer — they are maintained
+> synchronously at the DML write boundary (row-time), off this post-commit kernel.
+> See [Materialized Views](materialized-views.md).
 
 ### Milestones (Implementation Outline)
 

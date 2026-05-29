@@ -25,7 +25,7 @@ describe('Materialized view plan shape', () => {
 		const serialized = serializePlanTree(plan);
 
 		// Resolves to the backing table…
-		expect(serialized).to.contain('sqlite_mv_mv');
+		expect(serialized).to.contain('_mv_mv');
 		// …via a TableReference node (key-based addressing of a stored relation).
 		expect(serialized).to.contain('TableReference');
 		// …and NOT by re-expanding the body against the source table `t`.
@@ -44,6 +44,6 @@ describe('Materialized view plan shape', () => {
 		// reference re-validates and resolves to the backing table.
 		const plan = db.getPlan('select * from mv');
 		const serialized = serializePlanTree(plan);
-		expect(serialized).to.contain('sqlite_mv_mv');
+		expect(serialized).to.contain('_mv_mv');
 	});
 });

@@ -74,7 +74,7 @@ describe('Statement.getChangeScope (integration)', () => {
 
 		const scope = db.prepare('select * from mv').getChangeScope();
 		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
-		expect(tables).to.deep.equal(['main.sqlite_mv_mv']);
+		expect(tables).to.deep.equal(['main._mv_mv']);
 		// A manual MV does NOT surface the source table.
 		expect(tables).to.not.include('main.src');
 	});
@@ -91,7 +91,7 @@ describe('Statement.getChangeScope (integration)', () => {
 		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
 		expect(tables).to.deep.equal(['main.src']);
 		// The backing table is NOT reported — nothing user-writes it.
-		expect(tables).to.not.include('main.sqlite_mv_mvi');
+		expect(tables).to.not.include('main._mv_mvi');
 	});
 
 	it('a query reading both an incremental MV and its source reports the source once', async () => {

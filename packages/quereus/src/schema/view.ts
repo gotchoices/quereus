@@ -166,7 +166,7 @@ export interface MaterializedViewSchema {
 /** Conventional derived name for a materialized view's backing table. Reserved
  *  prefix; backing tables are hidden from user-facing catalog enumeration. */
 export function backingTableNameFor(mvName: string): string {
-	return `sqlite_mv_${mvName}`;
+	return `_mv_${mvName}`;
 }
 
 /**

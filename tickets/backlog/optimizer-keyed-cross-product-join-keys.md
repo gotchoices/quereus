@@ -14,11 +14,11 @@ the **cross product of two keyed relations is itself keyed** by the pair
 
 This conservative choice avoids key-count blow-up (k_left × k_right keys, which
 compound across chained joins), but it means downstream consumers that need an
-actual *column* key — notably incremental materialized-view maintenance, which
-wants `(base.PK ∪ TVF-per-call-key)` as the backing PK of a lateral-TVF body —
+actual *column* key — notably row-time materialized-view maintenance of a
+lateral-TVF body, which wants `(base.PK ∪ TVF-per-call-key)` as the backing PK —
 cannot recover it from `keysOf` and must reason about the advertisement directly
-(see `materialized-view-incremental-tvf-sources`, which works around this
-MV-locally).
+(see `materialized-view-rowtime-general-bodies`, the lateral-TVF row-time shape
+that would otherwise work around this MV-locally).
 
 ## Expected behavior
 
@@ -43,7 +43,8 @@ outer/semi/anti behavior is unchanged.
 
 ## Use case
 
-Unblocks letting `materialized-view-incremental-tvf-sources` (and the deferred
-both-clean join path) lean on `keysOf` for the backing PK instead of bespoke
-advertisement reasoning, and improves key-driven optimizations (distinct
-elimination, covering proofs) for cross/lateral products generally.
+Unblocks letting the lateral-TVF row-time shape in
+`materialized-view-rowtime-general-bodies` (and the deferred both-clean join path)
+lean on `keysOf` for the backing PK instead of bespoke advertisement reasoning,
+and improves key-driven optimizations (distinct elimination, covering proofs) for
+cross/lateral products generally.

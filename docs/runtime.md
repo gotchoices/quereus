@@ -1253,35 +1253,27 @@ The batched driver:
 
 The `composeOuterRows(outerRow, branchBuf, descriptors, padLengths) → Row[]` helper (NULL-pad + inner-drop + Cartesian-product composition) is shared by both drivers so they compose identically; an empty array signals a dropped outer row.
 
-## Incremental Delta Runtime (Design)
+## Incremental Delta Runtime
 
-Quereus can reuse a single incremental runtime to power multiple features that react to base-table changes: transaction-deferred assertions, materialized views, and future trigger-like facilities. The core idea is to execute only the affected slice of a registered query at transaction boundaries using binding-aware residual plans.
+Quereus runs a single reusable **change-driven delta kernel** at transaction
+boundaries: it captures changed rows per base table (savepoint-aware), and at COMMIT
+executes only the affected slice of each registered consumer's query via
+binding-aware residual plans, falling back to a global re-evaluation past a cost
+threshold. Live consumers are transaction-deferred **assertions** (pre-commit) and
+**`Database.watch`** (post-commit); reactive signals, triggers, and the lens layer
+plug into the same surface.
 
-### Goals
-- Reuse the same delta infrastructure across assertions and views
-- Execute parameterized residuals per affected key/group; fall back to global when required
-- Respect savepoints; changes rolled back via SAVEPOINT should not be visible to COMMIT-time checks
+The kernel — its lifecycle (capture demand → record → read at COMMIT), the
+`DeltaSubscription` contract, savepoint merge semantics, and the plug-in pattern for
+new consumers — is documented definitively in
+[Incremental Maintenance](incremental-maintenance.md). The optimizer-side analysis
+that classifies a plan's references (`'row'` / `'group'` / `'global'`) and chooses
+binding keys is in
+[Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable).
 
-### Building Blocks
-- ChangeCapture (existing): per-transaction change log tracking primary-key tuples per base table; savepoint aware
-- BindingInference: classifies a plan’s table references as row-specific, group-specific, or global (see optimizer doc) and identifies binding keys (PK/unique or group-by/partition keys)
-- ParameterizedPlanCache: per-registrant (assertion/view) and per relationKey, store prepared residual plans with parameter slots aligned to key order
-- DeltaExecutor: at COMMIT, select impacted registrants, decide global vs per-binding execution, early-exit on first violation (assertions) or produce delta rows (views)
-
-### Execution Modes
-- Assertions: run residuals and fail on first non-empty result (error → rollback)
-- Materialized Views (future): compute ΔView and merge into cached table (insert/update/delete)
-
-### Savepoints
-- On SAVEPOINT: push a new change layer
-- On ROLLBACK TO: discard the top layer
-- On RELEASE: merge the top layer into the previous one
-
-### Diagnostics
-- `explain_assertion(name)` exposes classification and prepared parameter layout for assertions
-- Future: `explain_view_delta(name)` for materialized views
-
-This design keeps runtime responsibilities focused on execution and caching, while the optimizer provides binding inference and plan shaping. See the optimizer document for analysis details.
+> Materialized views do **not** use this kernel — they are maintained synchronously
+> at the DML write boundary inside the writing transaction (row-time); see
+> [Materialized Views](materialized-views.md).
 
 ## Type Coercion Best Practices
 

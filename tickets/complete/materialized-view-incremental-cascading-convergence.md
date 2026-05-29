@@ -2,6 +2,8 @@ description: Cascading incremental materialized views (an `on-commit-incremental
 files: packages/quereus/src/runtime/delta-executor.ts, packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/core/database-transaction.ts, packages/quereus/test/logic/52-materialized-views-incremental.sqllogic, packages/quereus/test/incremental/delta-executor.spec.ts, docs/materialized-views.md, docs/incremental-maintenance.md
 ----
 
+> **⚠ Superseded (2026-05-29) — feature removed.** Materialized views are being consolidated to a single **row-time** model by `materialized-view-rowtime-only-consolidation` (plan): the `manual` and `on-commit-incremental` refresh policies and the post-commit divergence / self-heal subsystem are removed. The work archived here is retained as historical record only.
+
 ## What was implemented
 
 Cascading incremental MVs converge within a single COMMIT. Before this change a
