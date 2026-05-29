@@ -445,7 +445,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		// The fan-out gate must map BOTH pk attributes into the join frame for the
 		// isUnique check, not just the first. The lookup is on region_id (a non-UC,
 		// non-PK column) to a unique key, with no lookup-side name colliding with a
-		// UC column — so the name-collision guard does not (correctly) intervene.
+		// UC column — so the qualifier-aware resolver maps the ORDER BY cleanly to T.
 		const body = 'select l.oid, l.sku, l.lineno from line_items l left join regions r on l.region_id = r.rid order by l.oid, l.sku';
 		const db = await freshDb([
 			'create table line_items (oid integer not null, lineno integer not null, sku text not null, region_id integer not null, primary key (oid, lineno), unique (oid, sku))',
