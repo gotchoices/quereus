@@ -1,0 +1,229 @@
+-- Lens explicit overrides + per-attribute merge (docs/lens.md).
+-- `declare lens for X over Y { view T as <select> [hiding (...)] }` composes an
+-- effective read body: covered columns (override) ⊕ default-mapper gap-fill ⊖
+-- hidden. Read-correct only — write enforcement is the prover ticket's concern.
+
+-- ===================================
+-- 1. Rename override + sparse gap-fill
+-- ===================================
+
+declare schema ybasis {
+	table CarCore {
+		id integer primary key,
+		speed integer,
+		color text
+	}
+}
+
+-- run
+
+apply schema ybasis;
+
+-- run
+
+insert into ybasis.CarCore values (1, 120, 'red'), (2, 90, 'blue');
+
+-- run
+
+declare logical schema carapp {
+	table Car {
+		id integer primary key,
+		maxSpeed integer,
+		color text
+	}
+}
+
+-- run
+
+-- Override covers id + maxSpeed (renamed from speed); color is gap-filled.
+declare lens for carapp over ybasis {
+	view Car as select id, speed as maxSpeed from ybasis.CarCore
+}
+
+-- run
+
+apply schema carapp;
+
+-- run
+
+select * from carapp.Car order by id;
+→ [{"id": 1, "maxSpeed": 120, "color": "red"}, {"id": 2, "maxSpeed": 90, "color": "blue"}]
+
+select color from carapp.Car where id = 2;
+→ [{"color": "blue"}]
+
+-- ===================================
+-- 2. Hide via `hiding (...)` — omitted from select * and from resolution
+-- ===================================
+
+declare schema ph {
+	table PersonCore {
+		id integer primary key,
+		name text
+	}
+}
+
+-- run
+
+apply schema ph;
+
+-- run
+
+insert into ph.PersonCore values (1, 'Ada');
+
+-- run
+
+declare logical schema papp {
+	table Person {
+		id integer primary key,
+		name text,
+		secret text
+	}
+}
+
+-- run
+
+declare lens for papp over ph {
+	view Person as select id, name from ph.PersonCore hiding (secret)
+}
+
+-- run
+
+apply schema papp;
+
+-- run
+
+select * from papp.Person;
+→ [{"id": 1, "name": "Ada"}]
+
+select secret from papp.Person;
+-- error: secret
+
+-- ===================================
+-- 3. Filter override — where restricts reads
+-- ===================================
+
+declare schema ub {
+	table Acct {
+		id integer primary key,
+		active integer
+	}
+}
+
+-- run
+
+apply schema ub;
+
+-- run
+
+insert into ub.Acct values (1, 1), (2, 0), (3, 1);
+
+-- run
+
+declare logical schema uapp {
+	table Acct {
+		id integer primary key,
+		active integer
+	}
+}
+
+-- run
+
+declare lens for uapp over ub {
+	view Acct as select * from ub.Acct where active = 1
+}
+
+-- run
+
+apply schema uapp;
+
+-- run
+
+select id from uapp.Acct order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- ===================================
+-- 4. Cross-basis join (full coverage) — body used verbatim
+-- ===================================
+
+declare schema cb {
+	table Core {
+		id integer primary key,
+		name text
+	}
+	table Contact {
+		id integer primary key,
+		email text
+	}
+}
+
+-- run
+
+apply schema cb;
+
+-- run
+
+insert into cb.Core values (1, 'Ada');
+
+-- run
+
+insert into cb.Contact values (1, 'ada@x.io');
+
+-- run
+
+declare logical schema capp {
+	table Person {
+		id integer primary key,
+		name text,
+		email text
+	}
+}
+
+-- run
+
+declare lens for capp over cb {
+	view Person as select c.id, c.name, k.email from cb.Core c join cb.Contact k using (id)
+}
+
+-- run
+
+apply schema capp;
+
+-- run
+
+select * from capp.Person;
+→ [{"id": 1, "name": "Ada", "email": "ada@x.io"}]
+
+-- ===================================
+-- 5. Hide-via-gap-fill trap — uncovered column the basis cannot back errors
+-- ===================================
+
+declare schema tb {
+	table CoreT {
+		id integer primary key
+	}
+}
+
+-- run
+
+apply schema tb;
+
+-- run
+
+declare logical schema tapp {
+	table T {
+		id integer primary key,
+		name text
+	}
+}
+
+-- run
+
+declare lens for tapp over tb {
+	view T as select id from tb.CoreT
+}
+
+-- run
+
+apply schema tapp;
+-- error: name

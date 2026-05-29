@@ -33,6 +33,34 @@ export class DeclareSchemaNode extends VoidNode {
 }
 
 /**
+ * DECLARE LENS statement plan node — stores a lens block (basis binding +
+ * per-table overrides) keyed by logical schema name. See docs/lens.md.
+ */
+export class DeclareLensNode extends VoidNode {
+	override readonly nodeType = PlanNodeType.DeclareLens;
+
+	constructor(
+		scope: Scope,
+		public readonly statementAst: AST.DeclareLensStmt
+	) {
+		super(scope, 1);
+	}
+
+	override toString(): string {
+		return `DECLARE LENS FOR ${this.statementAst.logicalSchema} OVER ${this.statementAst.basisSchema}`;
+	}
+
+	override getLogicalAttributes(): Record<string, unknown> {
+		return {
+			type: 'declareLens',
+			logicalSchema: this.statementAst.logicalSchema,
+			basisSchema: this.statementAst.basisSchema,
+			overrideCount: this.statementAst.overrides.length,
+		};
+	}
+}
+
+/**
  * DIFF SCHEMA statement plan node - returns DDL statements as rows
  */
 export class DiffSchemaNode extends PlanNode implements RelationalPlanNode {

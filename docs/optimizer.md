@@ -1301,6 +1301,8 @@ Origination is **derivable structurally** without any per-node declaration: an I
 
 A companion per-node surface, `PlanNode.getAttributeIndex(): ReadonlyMap<number, number>` (cached, mirrors the `attributesCache` pattern; rebuilds automatically since `withChildren` mints a fresh instance), answers the local "attrId → its index in this node's output" question — replacing the scattered `attrs.findIndex(a => a.id === …)` scans (e.g. `bloom-join-node.ts`, `rule-monotonic-range-access.ts`).
 
+This provenance surface is the **future** mechanism for the [lens](lens.md#overrides-are-merged-per-attribute) sparse-override merge: addressing override coverage by stable attribute ID is what the lens prover (`lens-prover-and-constraint-attachment`) needs when it plans the compiled body to read the FD/key surface. **v1 of the merge does not yet use it** — it composes at the AST level, reading coverage by output-column *name* and recomputing (re-reading the override from source) on every deploy, which delivers the same rename-then-add composability without pulling the planner into the lens compiler. When the prover lands, the merge moves onto the plan tree and addresses attributes by ID.
+
 ### Functional Dependency Tracking
 
 Functional dependencies (FDs) are the canonical surface for "what determines what" on a relational physical node's output. There is no separate `uniqueKeys` field — a unique key `K` is encoded as the FD `K → (all_cols \ K)`, and `∅ → all_cols` encodes the "at-most-one-row" claim that used to be `uniqueKeys: [[]]`.

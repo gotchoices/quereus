@@ -357,7 +357,15 @@ export class Parser {
 			// TODO: Replace pragmas with build-in functions
 			case 'PRAGMA': this.advance(); stmt = this.pragmaStatement(startToken, withClause); break;
 			case 'ANALYZE': this.advance(); stmt = this.analyzeStatement(startToken); break;
-			case 'DECLARE': this.advance(); stmt = this.declareSchemaStatement(startToken); break;
+			case 'DECLARE': {
+				this.advance();
+				// `declare lens …` is a sibling statement, not a `declare schema`
+				// variant: branch on the contextual LENS keyword.
+				stmt = this.peekKeyword('LENS')
+					? this.declareLensStatement(startToken)
+					: this.declareSchemaStatement(startToken);
+				break;
+			}
 			case 'DIFF': this.advance(); stmt = this.diffSchemaStatement(startToken); break;
 			case 'APPLY': this.advance(); stmt = this.applySchemaStatement(startToken); break;
 			case 'EXPLAIN': this.advance(); stmt = this.explainSchemaStatement(startToken); break;
@@ -966,10 +974,15 @@ export class Parser {
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
 		} else if (this.checkIdentifierLike([]) &&
+			!this.checkNext(1, TokenType.LPAREN) &&
 			!this.checkNext(1, TokenType.DOT) &&
 			!this.checkNext(1, TokenType.COMMA) &&
 			!this.isJoinToken() &&
 			!this.isEndOfClause()) {
+			// A bare identifier immediately followed by '(' is never a base-table
+			// alias (standardTableSource parses no alias column-list) — guarding on
+			// LPAREN lets a contextual trailing clause like `hiding (...)` survive
+			// the FROM parse instead of being swallowed as an alias.
 			const aliasToken = this.advance();
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
@@ -3005,6 +3018,55 @@ export class Parser {
 
 		const endTok = this.previous();
 		return { type: 'declareSchema', schemaName, version, using, items, ...(isLogical ? { isLogical: true } : {}), loc: _createLoc(startToken, endTok) };
+	}
+
+	/**
+	 * Parses `declare lens for <X> over <Y> { ( view <T> as <select> [hiding (<cols>)] ;? )* }`.
+	 * The DECLARE token is already consumed by {@link statement}. `lens`, `for`,
+	 * and `hiding` are contextual keywords (matched via peekKeyword's IDENTIFIER
+	 * fallback); `over` is the existing window-function keyword.
+	 */
+	private declareLensStatement(startToken: Token): AST.DeclareLensStmt {
+		this.consumeKeyword('LENS', "Expected 'LENS' after DECLARE.");
+		this.consumeKeyword('FOR', "Expected 'FOR' after DECLARE LENS.");
+		const logicalSchema = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected logical schema name after 'FOR'.");
+		this.consumeKeyword('OVER', "Expected 'OVER' after the logical schema name.");
+		const basisSchema = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected basis schema name after 'OVER'.");
+
+		this.consume(TokenType.LBRACE, "Expected '{' to start the lens declaration block.");
+		const overrides: AST.LensOverride[] = [];
+		while (!this.check(TokenType.RBRACE)) {
+			if (this.isAtEnd()) break;
+			this.consumeKeyword('VIEW', "Expected 'view' to begin a lens override.");
+			const table = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected the logical table name after 'view'.");
+			this.consumeKeyword('AS', "Expected 'AS' after the logical table name.");
+			const body = this.parseQueryExpr();
+			if (body.type !== 'select') {
+				throw this.error(this.previous(), `A lens override body must be a SELECT; got '${body.type}'.`);
+			}
+
+			// Optional: hiding (col1, col2, ...) — omits columns from the effective
+			// body + the registered view's column list. The LPAREN-guard in
+			// standardTableSource keeps `hiding` from being swallowed as a table alias.
+			let hiding: string[] | undefined;
+			if (this.matchKeyword('HIDING')) {
+				this.consume(TokenType.LPAREN, "Expected '(' after 'hiding'.");
+				hiding = this.identifierList();
+				this.consume(TokenType.RPAREN, "Expected ')' after the hiding column list.");
+			}
+
+			overrides.push({ table, select: body, ...(hiding ? { hiding } : {}) });
+			this.match(TokenType.SEMICOLON);
+		}
+		this.consume(TokenType.RBRACE, "Expected '}' to close the lens declaration block.");
+
+		return {
+			type: 'declareLens',
+			logicalSchema,
+			basisSchema,
+			overrides,
+			loc: _createLoc(startToken, this.previous()),
+		};
 	}
 
 	private declareTableItem(): AST.DeclaredTable {

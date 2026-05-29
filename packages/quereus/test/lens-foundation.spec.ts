@@ -262,6 +262,30 @@ describe('lens foundation: default-basis inference', () => {
 			await db.close();
 		}
 	});
+
+	it('an explicit `declare lens for x over y` resolves the multi-candidate ambiguity', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t { id integer primary key, name text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.t values (1, 'from-y')");
+			await db.exec('declare schema z { table t { id integer primary key, name text } }');
+			await db.exec('apply schema z');
+			await db.exec("insert into z.t values (1, 'from-z')");
+
+			await db.exec('declare logical schema x { table t { id integer primary key, name text } }');
+			// With two physical bases the foundation cannot infer; the explicit
+			// `over y` binding picks the basis and the apply succeeds against y.
+			await db.exec('declare lens for x over y { }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('t')!;
+			expect(slot.defaultBasis.schemaName).to.equal('y');
+			expect(await rows(db, 'select * from x.t')).to.deep.equal([{ id: 1, name: 'from-y' }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens foundation: DDL round-trip', () => {

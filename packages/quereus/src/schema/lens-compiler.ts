@@ -7,7 +7,7 @@ import type * as AST from '../parser/ast.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { astToString } from '../emit/ast-stringify.js';
-import { buildLogicalConstraints, type LensSlot } from './lens.js';
+import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance } from './lens.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:lens-compiler');
@@ -47,11 +47,32 @@ export function deployLogicalSchema(
 	const schemaManager = db.schemaManager;
 	const logicalSchema = schemaManager.getSchemaOrFail(logicalSchemaName);
 
+	// The lens block (explicit `over Y` basis + sparse overrides), if declared.
+	// Re-read from source on every deploy — that is what lets a rename and a
+	// later column-add compose without attribute-ID plumbing (docs/lens.md § D2).
+	const lensDecl = db.declaredSchemaManager.getLensDeclaration(logicalSchemaName);
+	const overridesByTable = indexOverrides(lensDecl, declaredSchema, logicalSchemaName);
+
 	// Infer the basis lazily, only when there is ≥1 logical table to align. An
 	// empty logical declaration (e.g. re-applying X after all its tables are
 	// removed) is a pure detach-everything operation and must NOT fail on basis
-	// ambiguity — removal never depends on the basis (asymmetric removal).
+	// resolution — removal never depends on the basis (asymmetric removal).
 	let basis: { schema: Schema; schemaName: string } | undefined;
+	const resolveBasis = (): { schema: Schema; schemaName: string } => {
+		if (lensDecl) {
+			// Explicit `over Y` binding resolves the foundation's default-basis
+			// ambiguity (docs/lens.md § D4); `inferDefaultBasis` is NOT consulted.
+			const basisSchema = schemaManager.getSchema(lensDecl.basisSchema);
+			if (!basisSchema) {
+				throw new QuereusError(
+					`lens: basis schema '${lensDecl.basisSchema}' for logical schema '${logicalSchemaName}' does not exist (declared via 'declare lens for ${logicalSchemaName} over ${lensDecl.basisSchema}')`,
+					StatusCode.ERROR,
+				);
+			}
+			return { schema: basisSchema, schemaName: basisSchema.name };
+		}
+		return inferDefaultBasis(schemaManager, logicalSchemaName);
+	};
 
 	// Compile everything FIRST (basis alignment can throw — name mismatch, etc.).
 	// Only after every table aligns successfully do we mutate the catalog, so a
@@ -60,15 +81,33 @@ export function deployLogicalSchema(
 	for (const item of declaredSchema.items) {
 		if (item.type !== 'declaredTable') continue;
 
-		basis ??= inferDefaultBasis(schemaManager, logicalSchemaName);
+		basis ??= resolveBasis();
 		const logicalTable = schemaManager.buildLogicalTableSchema(item.tableStmt, logicalSchema.name);
-		const compiledBody = compileDefaultBody(logicalTable, logicalSchemaName, basis.schema, basis.schemaName);
+		const override = overridesByTable.get(logicalTable.name.toLowerCase());
+
+		let compiledBody: AST.SelectStmt;
+		let provenance: LensColumnProvenance[];
+		let hiding: ReadonlySet<string> | undefined;
+		let effectiveColumns: string[];
+		if (override) {
+			const merged = compileOverrideBody(logicalTable, logicalSchemaName, basis.schemaName, schemaManager, override);
+			compiledBody = merged.body;
+			provenance = merged.provenance;
+			hiding = merged.hiding.size > 0 ? merged.hiding : undefined;
+			effectiveColumns = merged.effectiveColumns;
+		} else {
+			compiledBody = compileDefaultBody(logicalTable, logicalSchemaName, basis.schema, basis.schemaName);
+			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
+			effectiveColumns = logicalTable.columns.map(c => c.name);
+		}
 
 		const slot: LensSlot = {
 			logicalTable,
 			defaultBasis: { schemaName: basis.schemaName },
-			override: undefined,
+			override: override?.select,
+			hiding,
 			compiledBody,
+			columnProvenance: provenance,
 			attachedConstraints: buildLogicalConstraints(logicalTable),
 		};
 		const view: ViewSchema = {
@@ -77,11 +116,12 @@ export function deployLogicalSchema(
 			sql: astToString(compiledBody),
 			selectAst: compiledBody,
 			// Pin the consumer-facing column names to the *logical* declaration
-			// (the contract), independent of the basis column casing. Equivalent
-			// to `create view T(<logical cols>) as <body>`: `select * from X.T`
-			// then surfaces the logical names, not whatever the basis happens to
-			// spell them. Write-through is unaffected (positional passthrough).
-			columns: logicalTable.columns.map(c => c.name),
+			// (the contract, minus hidden columns), independent of the basis
+			// column casing. Equivalent to `create view T(<logical cols>) as
+			// <body>`: `select * from X.T` then surfaces the logical names, not
+			// whatever the basis happens to spell them. Write-through is
+			// unaffected (positional passthrough).
+			columns: effectiveColumns,
 			tags: logicalTable.tags,
 		};
 		compiled.push({ slot, view });
@@ -237,4 +277,210 @@ export function compileDefaultBody(
 			table: { type: 'identifier', name: basisTable.name, schema: basisSchemaName },
 		}],
 	};
+}
+
+/**
+ * Indexes a lens block's overrides by lowercased logical-table name, validating
+ * that each names a logical table the declaration actually carries. The check
+ * is skipped for an empty declaration (a pure detach-everything re-apply, which
+ * never aligns a basis).
+ */
+function indexOverrides(
+	lensDecl: AST.DeclareLensStmt | undefined,
+	declaredSchema: AST.DeclareSchemaStmt,
+	logicalSchemaName: string,
+): Map<string, AST.LensOverride> {
+	const byTable = new Map<string, AST.LensOverride>();
+	if (!lensDecl) return byTable;
+
+	const declaredTableNames = new Set<string>();
+	for (const item of declaredSchema.items) {
+		if (item.type === 'declaredTable') declaredTableNames.add(item.tableStmt.table.name.toLowerCase());
+	}
+	for (const ov of lensDecl.overrides) {
+		const key = ov.table.toLowerCase();
+		if (declaredTableNames.size > 0 && !declaredTableNames.has(key)) {
+			throw new QuereusError(
+				`lens: override 'view ${ov.table} as ...' references logical table '${logicalSchemaName}.${ov.table}', which is not declared in logical schema '${logicalSchemaName}'`,
+				StatusCode.ERROR,
+			);
+		}
+		byTable.set(key, ov);
+	}
+	return byTable;
+}
+
+/** A basis table referenced by an override's FROM clause, with its ref name. */
+interface OverrideSource {
+	/** The resolved basis table schema. */
+	table: TableSchema;
+	/** Alias if the FROM gave one, else the table name — used to qualify refs. */
+	refName: string;
+}
+
+/**
+ * Composes one effective **read** body for a logical table that has a
+ * `declare lens` override, per docs/lens.md § D2:
+ *
+ *   covered columns (override projection) ⊕ default-mapper gap-fill ⊖ hidden.
+ *
+ * Coverage is read **by name** from the override's output column names (alias or
+ * bare name, and `*`-expansion of FROM-source columns). Each uncovered,
+ * non-hidden logical column is gap-filled from a same-named basis column of the
+ * override's FROM. When a gap is not reachable from the FROM (the hide-via-
+ * gap-fill trap, or a partial cross-basis join), the compile errors rather than
+ * emit an unsound body. The composition is recomputed on every deploy.
+ */
+function compileOverrideBody(
+	logicalTable: TableSchema,
+	logicalSchemaName: string,
+	basisSchemaName: string,
+	schemaManager: SchemaManager,
+	override: AST.LensOverride,
+): { body: AST.SelectStmt; provenance: LensColumnProvenance[]; hiding: ReadonlySet<string>; effectiveColumns: string[] } {
+	const select = override.select;
+	const logicalName = logicalTable.name;
+	const hidden = new Set((override.hiding ?? []).map(h => h.toLowerCase()));
+
+	// Resolve FROM-source basis tables once — used for both `*` expansion and
+	// gap-fill. Opaque sources (subquery / function / unresolvable table) are
+	// tracked so a gap that actually needs them errors precisely.
+	const { sources, hasOpaqueSource } = collectOverrideSources(select.from, basisSchemaName, schemaManager);
+	const qualify = sources.length > 1;
+
+	// Coverage map: lowercased output-column name -> the expression producing it.
+	const coverage = new Map<string, AST.Expression>();
+	let hasStar = false;
+	let starTable: string | undefined;
+	for (const col of select.columns) {
+		if (col.type === 'all') {
+			hasStar = true;
+			if (col.table) starTable = col.table.toLowerCase();
+			continue;
+		}
+		const outName = deriveColumnOutputName(col);
+		if (outName) coverage.set(outName.toLowerCase(), col.expr);
+	}
+
+	// `*` covers every FROM-source column not already explicitly covered.
+	if (hasStar) {
+		for (const src of sources) {
+			if (starTable && src.refName.toLowerCase() !== starTable) continue;
+			for (const c of src.table.columns) {
+				const key = c.name.toLowerCase();
+				if (!coverage.has(key)) coverage.set(key, columnRef(c.name, qualify ? src.refName : undefined));
+			}
+		}
+	}
+
+	const composed: AST.ResultColumn[] = [];
+	const provenance: LensColumnProvenance[] = [];
+	const effectiveColumns: string[] = [];
+	for (const col of logicalTable.columns) {
+		const key = col.name.toLowerCase();
+		if (hidden.has(key)) {
+			provenance.push({ logicalColumn: col.name, source: 'hidden' });
+			continue;
+		}
+		const coveredExpr = coverage.get(key);
+		if (coveredExpr !== undefined) {
+			composed.push({ type: 'column', expr: coveredExpr, alias: col.name });
+			provenance.push({ logicalColumn: col.name, source: 'override' });
+		} else {
+			const ref = gapFillRef(col.name, sources, qualify);
+			if (!ref) {
+				throw new QuereusError(
+					gapFillError(logicalSchemaName, logicalName, col.name, sources, hasOpaqueSource),
+					StatusCode.ERROR,
+				);
+			}
+			composed.push({ type: 'column', expr: ref, alias: col.name });
+			provenance.push({ logicalColumn: col.name, source: 'default' });
+		}
+		effectiveColumns.push(col.name);
+	}
+
+	// Preserve every non-projection clause of the override (where/group/having/
+	// order/limit/distinct/with — the filter shape, etc.); replace only the
+	// projection with the composed logical-column list.
+	const body: AST.SelectStmt = { ...select, columns: composed };
+	return { body, provenance, hiding: hidden, effectiveColumns };
+}
+
+/** Walks an override's FROM tree, collecting introspectable basis-table sources. */
+function collectOverrideSources(
+	from: ReadonlyArray<AST.FromClause> | undefined,
+	basisSchemaName: string,
+	schemaManager: SchemaManager,
+): { sources: OverrideSource[]; hasOpaqueSource: boolean } {
+	const sources: OverrideSource[] = [];
+	let hasOpaqueSource = false;
+
+	const walk = (node: AST.FromClause): void => {
+		switch (node.type) {
+			case 'table': {
+				const schemaName = node.table.schema ?? basisSchemaName;
+				const tbl = schemaManager.getSchema(schemaName)?.getTable(node.table.name);
+				if (!tbl) { hasOpaqueSource = true; return; }
+				sources.push({ table: tbl, refName: node.alias ?? tbl.name });
+				break;
+			}
+			case 'join': {
+				walk(node.left);
+				walk(node.right);
+				break;
+			}
+			default:
+				// subquerySource / functionSource — not introspectable in v1.
+				hasOpaqueSource = true;
+				break;
+		}
+	};
+
+	if (from) for (const f of from) walk(f);
+	return { sources, hasOpaqueSource };
+}
+
+/** Output name a result column contributes: its alias, or the bare column name. */
+function deriveColumnOutputName(col: AST.ResultColumnExpr): string | undefined {
+	if (col.alias) return col.alias;
+	return col.expr.type === 'column' ? col.expr.name : undefined;
+}
+
+/** Builds a column reference, optionally qualified by a source ref name. */
+function columnRef(name: string, refName: string | undefined): AST.ColumnExpr {
+	return refName ? { type: 'column', name, table: refName } : { type: 'column', name };
+}
+
+/** Finds a same-named basis column across the override's FROM sources. */
+function gapFillRef(colName: string, sources: ReadonlyArray<OverrideSource>, qualify: boolean): AST.ColumnExpr | undefined {
+	const lower = colName.toLowerCase();
+	for (const src of sources) {
+		const idx = src.table.columnIndexMap.get(lower);
+		if (idx !== undefined) {
+			// Reference the basis column by its actual name (casing); the logical
+			// alias is applied by the caller.
+			return columnRef(src.table.columns[idx].name, qualify ? src.refName : undefined);
+		}
+	}
+	return undefined;
+}
+
+/** Diagnostic for an uncovered, non-hidden logical column the FROM can't gap-fill. */
+function gapFillError(
+	logicalSchemaName: string,
+	logicalName: string,
+	colName: string,
+	sources: ReadonlyArray<OverrideSource>,
+	hasOpaqueSource: boolean,
+): string {
+	const sourceDesc = sources.length === 0
+		? 'the override FROM exposes no introspectable basis table'
+		: `basis source(s) ${sources.map(s => s.table.name).join(', ')} have no column '${colName}'`;
+	if (sources.length > 1 || hasOpaqueSource) {
+		// Cross-basis / partial-coverage fidelity boundary (docs/lens.md § D2).
+		return `lens: override for logical table '${logicalSchemaName}.${logicalName}' covers only some columns; uncovered column '${colName}' is not reachable from the override's FROM (${sourceDesc}) — it would need a basis source the v1 single-source mapper cannot join in. Cover it explicitly or list it in hiding(...)`;
+	}
+	// Single-source hide-via-gap-fill trap (docs/lens.md § D3).
+	return `lens: override for logical table '${logicalSchemaName}.${logicalName}' leaves column '${colName}' uncovered and ${sourceDesc} to gap-fill from (the hide-via-gap-fill trap) — add it to the override projection or list it in hiding(...)`;
 }

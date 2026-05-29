@@ -14,7 +14,7 @@ export interface AstNode {
 		| 'collate' | 'primaryKey' | 'notNull' | 'null' | 'unique' | 'check' | 'default' | 'foreignKey' | 'generated' | 'windowFunction'
 		| 'windowDefinition' | 'windowFrame' | 'currentRow' | 'unboundedPreceding' | 'unboundedFollowing' | 'preceding' | 'following'
 		| 'subquerySource' | 'case' | 'in' | 'exists' | 'values' | 'between'
-		| 'declareSchema' | 'diffSchema' | 'applySchema' | 'explainSchema'
+		| 'declareSchema' | 'declareLens' | 'diffSchema' | 'applySchema' | 'explainSchema'
 		| 'declaredTable' | 'declaredIndex' | 'declaredView' | 'declaredMaterializedView' | 'declaredSeed' | 'declaredAssertion' | 'declareIgnored' | 'upsert'
 		| 'analyze';
 	loc?: {
@@ -610,6 +610,7 @@ export type Statement =
 	| PragmaStmt
 	| AnalyzeStmt
 	| DeclareSchemaStmt
+	| DeclareLensStmt
 	| DiffSchemaStmt
 	| ApplySchemaStmt
 	| ExplainSchemaStmt;
@@ -695,4 +696,38 @@ export interface ExplainSchemaStmt extends AstNode {
 	type: 'explainSchema';
 	schemaName?: string;
 	version?: string;
+}
+
+/**
+ * `declare lens for X over Y { view T as <select> [hiding (...)] ... }` — the
+ * lens authoring surface (sibling of `declare schema`, NOT a variant of it).
+ *
+ * Binds a logical schema (`for X`) to a basis schema (`over Y`) and supplies
+ * per-logical-table sparse overrides. The basis binding lives on the lens, not
+ * the logical schema, which is what keeps the logical design embodiment-free
+ * (one logical schema can target different bases across deployments). See
+ * `docs/lens.md` § Sparse Overrides / Syntax.
+ */
+export interface DeclareLensStmt extends AstNode {
+	type: 'declareLens';
+	/** The logical schema this lens binds (`for X`). */
+	logicalSchema: string;
+	/** The basis schema the lens aligns over (`over Y`) — the explicit basis. */
+	basisSchema: string;
+	/** Per-logical-table sparse overrides. */
+	overrides: readonly LensOverride[];
+}
+
+/**
+ * One `view T as <select> [hiding (...)]` entry inside a {@link DeclareLensStmt}.
+ * `select` is the authored override body; `hiding` lists logical columns to omit
+ * from the effective body and the registered view's column list.
+ */
+export interface LensOverride {
+	/** The logical table this override targets. */
+	table: string;
+	/** The authored override body (a relation-producing SELECT). */
+	select: SelectStmt;
+	/** Logical columns to hide (omit from effective body + view column list). */
+	hiding?: readonly string[];
 }

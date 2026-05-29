@@ -110,6 +110,8 @@ export function astToString(node: AST.AstNode): string {
 			return pragmaToString(node as AST.PragmaStmt);
 		case 'declareSchema':
 			return declareSchemaToString(node as unknown as AST.DeclareSchemaStmt);
+		case 'declareLens':
+			return declareLensToString(node as unknown as AST.DeclareLensStmt);
 		case 'diffSchema':
 			return `diff schema ${(node as unknown as AST.DiffSchemaStmt).schemaName || 'main'}`;
 		case 'applySchema': {
@@ -913,6 +915,19 @@ function declareSchemaToString(stmt: AST.DeclareSchemaStmt): string {
 	s += ' {';
 	for (const it of stmt.items) {
 		s += ' ' + declareItemToString(it) + ';';
+	}
+	s += ' }';
+	return s;
+}
+
+function declareLensToString(stmt: AST.DeclareLensStmt): string {
+	let s = `declare lens for ${quoteIdentifier(stmt.logicalSchema)} over ${quoteIdentifier(stmt.basisSchema)} {`;
+	for (const ov of stmt.overrides) {
+		s += ` view ${quoteIdentifier(ov.table)} as ${selectToString(ov.select)}`;
+		if (ov.hiding && ov.hiding.length > 0) {
+			s += ` hiding (${ov.hiding.map(quoteIdentifier).join(', ')})`;
+		}
+		s += ';';
 	}
 	s += ' }';
 	return s;

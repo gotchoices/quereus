@@ -44,6 +44,20 @@ export type LogicalConstraint =
 	| { kind: 'foreignKey'; constraint: ForeignKeyConstraintSchema };
 
 /**
+ * Where one logical column's effective-body mapping came from, in logical
+ * declaration order. Consumed by the `quereus_effective_lens` TVF.
+ *
+ * - `override` — the column is covered by the `declare lens` override body.
+ * - `default`  — gap-filled by the default name-based mapper.
+ * - `hidden`   — listed in `hiding (...)`; absent from the effective body and
+ *   the registered view's column list.
+ */
+export interface LensColumnProvenance {
+	logicalColumn: string;
+	source: 'override' | 'default' | 'hidden';
+}
+
+/**
  * The per-logical-table mapping slot. Populated at lens-compile time
  * (the `apply schema X` step for a logical schema).
  */
@@ -57,13 +71,25 @@ export interface LensSlot {
 	/** The basis schema this slot aligns against. */
 	defaultBasis: SchemaRef;
 	/**
-	 * Explicit override body. Always undefined in this ticket — the
-	 * `declare lens for X over Y` override surface lands in
-	 * `lens-explicit-overrides-and-attribute-merge`.
+	 * The authored override body from `declare lens for X over Y { view T as ... }`,
+	 * when one covers this logical table. `undefined` for a purely default-mapped
+	 * table. The effective {@link compiledBody} is composed from this override
+	 * (covered columns) ⊕ default-mapper gap-fill (uncovered columns) ⊖ {@link hiding}.
 	 */
 	override?: AST.SelectStmt;
-	/** The effective body — produced by the default mapper. */
+	/**
+	 * Logical columns hidden via `hiding (...)` (lowercased). Omitted from the
+	 * effective body and the registered view's column list. Empty/absent when the
+	 * override declares no `hiding` clause.
+	 */
+	hiding?: ReadonlySet<string>;
+	/** The effective body — default mapper, or override ⊕ gap-fill ⊖ hidden. */
 	compiledBody: AST.SelectStmt;
+	/**
+	 * Per-logical-column provenance, in declaration order (covers hidden columns
+	 * too). Surfaced by the `quereus_effective_lens` introspection TVF.
+	 */
+	columnProvenance: ReadonlyArray<LensColumnProvenance>;
 	/**
 	 * The logical spec's constraints, verbatim. Routed to enforcement by the
 	 * prover ticket (`lens-prover-and-constraint-attachment`); stored as-is here.

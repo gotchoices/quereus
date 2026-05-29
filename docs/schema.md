@@ -299,6 +299,23 @@ Destructive changes (drops) require explicit acknowledgement. See the [SQL Refer
 
 The equivalence guarantee that direct `create table` / `create view` DDL and the corresponding `declare schema` + `apply schema` body produce indistinguishable catalogs and runtime behaviour is enforced by `test/declarative-equivalence.spec.ts` (curated corpus) plus the `Declarative-schema equivalence (property)` block in `test/property.spec.ts` (`fast-check`-driven dragnet).
 
+### Logical schemas and lenses
+
+`declare logical schema X { ... }` declares a design-only schema (`kind: 'logical'`) — columns and *logical* constraints, no module / index / storage. At `apply schema X` the lens compiler aligns each logical table against a basis schema and registers an inlined effective view body, so reads ride the standard view path and writes ride [view updateability](view-updateability.md).
+
+`declare lens for X over Y { view T as <select> [hiding (cols)] ... }` is a **sibling statement** (parsed to `DeclareLensStmt`, stored on `DeclaredSchemaManager` keyed by the logical schema name) that binds logical schema `X` to an **explicit basis** `Y` and supplies per-table sparse overrides:
+
+```sql
+declare logical schema X { table Car (id int primary key, maxSpeed int, color text); }
+declare lens for X over Y {
+  view Car as select id, speed as maxSpeed from Y.CarCore   -- rename; color gap-filled
+            hiding (internalNote);                          -- omit a logical column
+}
+apply schema X;
+```
+
+The override projection covers some columns (by output name); the default mapper gap-fills the rest from the override's `FROM`; `hiding (...)` omits columns from both the effective body and the registered view. `over Y` is the explicit basis (it resolves the auto-inference ambiguity that arises with multiple physical bases). Inspect the composed result with `quereus_effective_lens(schema, table)`. See [Lenses and Layered Schemas](lens.md) for the full model — including the v1 name-based / re-read-from-source merge and the gap-fill fidelity boundary.
+
 ### Migration Order
 
 `generateMigrationDDL` produces DDL in a fixed order:

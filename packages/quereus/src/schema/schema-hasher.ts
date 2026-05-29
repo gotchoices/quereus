@@ -1,5 +1,6 @@
 import type * as AST from '../parser/ast.js';
 import { generateDeclaredDDL } from './catalog.js';
+import { astToString } from '../emit/ast-stringify.js';
 import { fnv1aHash, toBase64Url } from '../util/hash.js';
 
 /**
@@ -51,9 +52,19 @@ function stripTagsFromDeclaredSchema(schema: AST.DeclareSchemaStmt): AST.Declare
 }
 
 /**
- * Computes a hash of a declared schema for versioning
+ * Computes a hash of a declared schema (or a lens block) for versioning.
+ *
+ * A `declare lens` block is **behavioral** — it changes what `select * from X.T`
+ * returns — so it participates in hashing on its own canonical SQL (the basis
+ * binding + every override, tags-free by construction). Keyed independently of
+ * the logical schema it binds, matching how the lens block is stored.
  */
-export function computeSchemaHash(declaredSchema: AST.DeclareSchemaStmt): string {
+export function computeSchemaHash(declaredSchema: AST.DeclareSchemaStmt | AST.DeclareLensStmt): string {
+	if (declaredSchema.type === 'declareLens') {
+		const canonicalText = 'lens\n' + astToString(declaredSchema);
+		return toBase64Url(fnv1aHash(canonicalText));
+	}
+
 	// Strip tags before generating DDL — tags are non-behavioral metadata
 	const strippedSchema = stripTagsFromDeclaredSchema(declaredSchema);
 	const ddlStatements = generateDeclaredDDL(strippedSchema);
@@ -73,7 +84,7 @@ export function computeSchemaHash(declaredSchema: AST.DeclareSchemaStmt): string
 /**
  * Computes a short hash (first 8 characters) for display
  */
-export function computeShortSchemaHash(declaredSchema: AST.DeclareSchemaStmt): string {
+export function computeShortSchemaHash(declaredSchema: AST.DeclareSchemaStmt | AST.DeclareLensStmt): string {
 	const fullHash = computeSchemaHash(declaredSchema);
 	return fullHash.substring(0, 8);
 }

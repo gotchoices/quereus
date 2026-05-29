@@ -57,6 +57,42 @@ export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 	};
 }
 
+export function emitDeclareLens(plan: PlanNode, _ctx: EmissionContext): Instruction {
+	const lensStmt = (plan as unknown as { statementAst: AST.DeclareLensStmt }).statementAst;
+
+	const run = (rctx: RuntimeContext): Row => {
+		const logicalSchema = lensStmt.logicalSchema;
+		log('DECLARE LENS for %s over %s', logicalSchema, lensStmt.basisSchema);
+
+		// Re-declaration is an error at the per-table grain: two `view T as` for
+		// the same logical table within one block (see docs/lens.md § D1).
+		const seen = new Set<string>();
+		for (const ov of lensStmt.overrides) {
+			const key = ov.table.toLowerCase();
+			if (seen.has(key)) {
+				throw new QuereusError(
+					`lens: duplicate override 'view ${ov.table} as ...' for logical table '${logicalSchema}.${ov.table}' in one lens block`,
+					StatusCode.ERROR,
+				);
+			}
+			seen.add(key);
+		}
+
+		// Store keyed by logical schema name; re-applied (and re-read from source)
+		// on every `apply schema X`, so overrides survive baseline regeneration.
+		rctx.db.declaredSchemaManager.setLensDeclaration(logicalSchema, lensStmt);
+
+		// Void result.
+		return [];
+	};
+
+	return {
+		params: [],
+		run: run as InstructionRun,
+		note: `declare lens for ${lensStmt.logicalSchema} over ${lensStmt.basisSchema}`,
+	};
+}
+
 export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
 	const diffStmt = (plan as unknown as { statementAst: AST.DiffSchemaStmt }).statementAst;
 

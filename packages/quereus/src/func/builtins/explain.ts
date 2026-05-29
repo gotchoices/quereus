@@ -14,6 +14,7 @@ import { Scheduler } from "../../runtime/scheduler.js";
 import { analyzeRowSpecific } from "../../planner/analysis/constraint-extractor.js";
 import { Parser } from "../../parser/parser.js";
 import * as AST from "../../parser/ast.js";
+import { astToString } from "../../emit/ast-stringify.js";
 import { GlobalScope } from "../../planner/scopes/global.js";
 import { ParameterScope } from "../../planner/scopes/param.js";
 import type { PlanningContext } from "../../planner/planning-context.js";
@@ -710,6 +711,52 @@ export const schemaSizeFunc = createIntegratedTableValuedFunction(
 	},
 	async function* (_db: Database, _sql: SqlValue): AsyncIterable<Row> {
 		// TODO: Implementation of schemaSizeFunc
+	}
+);
+
+// Effective-lens introspection: the composed read body + per-attribute
+// provenance for a logical table (docs/lens.md § quereus_effective_lens).
+export const effectiveLensFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_effective_lens',
+		numArgs: 2,
+		deterministic: false, // Depends on current lens deployment state.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'source', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'effective_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue, tableArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string' || typeof tableArg !== 'string') {
+			throw new QuereusError('quereus_effective_lens(schema, table) requires two string arguments', StatusCode.ERROR);
+		}
+
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_effective_lens: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_effective_lens: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+		const slot = schema.getLensSlot(tableArg);
+		if (!slot) {
+			throw new QuereusError(`quereus_effective_lens: no lens slot for '${schemaArg}.${tableArg}'`, StatusCode.NOTFOUND);
+		}
+
+		// Repeat the composed body on every row (symmetry with query_plan), so a
+		// single SELECT surfaces both the per-column provenance and the SQL.
+		const effectiveSql = astToString(slot.compiledBody);
+		for (const p of slot.columnProvenance) {
+			yield [p.logicalColumn, p.source, effectiveSql];
+		}
 	}
 );
 

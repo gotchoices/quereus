@@ -74,17 +74,43 @@ The authoring goal is **override without takeover**: a developer renaming one co
 
 The generated mapping is never written into source. The authored artifact contains **only deviations**, so the source is all signal and no noise — which is precisely why full code-generation fails (it buries the intentional, abnormal mappings in generated noise). The full effective mapping is inspectable on demand ("show effective mapping") but is not the thing the developer edits.
 
-### Overrides are merged per-attribute, on the plan tree
+### Overrides are merged per-attribute
 
 An override authored as ordinary SQL is consumed as a **sparse patch keyed by attribute**, not as opaque text. At compile time, for each logical table:
 
 1. The override `select` (if any) is parsed to a relational expression.
-2. Its output **attribute provenance** is read — which logical columns it covers, and from which basis expressions. Overrides are addressed by **stable attribute ID**, not by name or position, so they survive regeneration of the baseline (this rides on the existing [attribute-provenance](optimizer.md#attribute-provenance) system).
-3. For every logical column the override does not cover, the default mapper generates the mapping and composes it in.
+2. Its output **coverage** is read — which logical columns it covers, and from which basis expressions.
+3. For every logical column the override does not cover (and does not `hiding`), the default mapper generates the mapping and composes it in.
 
-So renaming a column and later adding a column compose cleanly: the rename override is untouched, and the new column appears as an uncovered attribute the mapper fills. The merge happens at the relational-plan level — Quereus has the full parser and attribute system — never at the text level.
+So renaming a column and later adding a column compose cleanly: the rename override is untouched, and the new column appears as an uncovered attribute the mapper fills. The result is one effective `select` whose projection is exactly the logical columns, in declaration order, minus the hidden ones.
 
 Most overrides cap the generated body at the boundary (rename = projection-with-alias, hide = projection-away, compute = extend, filter = restrict) and never touch the join interior. A change that *must* reach inside the join (a column now originating from a different basis table) is genuinely structural, cannot reduce to a boundary cap, and therefore correctly costs more authoring and surfaces as signal.
+
+#### v1 is name-based and re-read from source — the load-bearing simplification
+
+The eventual mechanism addresses coverage by **stable attribute ID** on the plan tree (riding the existing [attribute-provenance](optimizer.md#attribute-provenance) system), which is what the [prover](#implementation-surface) needs anyway. **v1 composes at the AST level** and reconciles the same two properties more cheaply:
+
+- **Coverage is read by name.** A logical column is *covered* when the override's output column name (the `as` alias, e.g. `speed as maxSpeed`, or a bare column name, or a `*`-expansion of a FROM source) matches the logical column name (case-insensitive). Everything else is gap-filled.
+- **Survival across baseline regeneration comes from re-reading the override AST from source on every deploy**, not from attribute-ID plumbing. The stored override is never rewritten, so the *rename-then-add* example composes: the rename override is untouched and the freshly-added logical column is simply uncovered → gap-filled. This re-read-from-source is the simplification that stands in for the attribute-ID property; it is the load-bearing assumption of the v1 merger.
+
+**`hiding (col, ...)`** lists logical columns to omit from the effective body *and* from the registered view's column list, so `select * from X.T` does not surface them and `X.T.<hidden>` resolves to unknown-column. (Bikeshed-safe synonyms `omit` / `exclude` were considered; `hiding` was chosen.) The logical spec still *declares* a hidden column — the prover decides what an attached constraint over a hidden column means.
+
+#### Gap-fill fidelity boundary (error, don't guess)
+
+Gap-fill resolves an uncovered logical column against the basis tables in the override's `FROM`. When it cannot:
+
+- **Single-source override, basis lacks the column** — the *hide-via-gap-fill trap*: the compile errors naming the column (the author meant to hide it, or to cover it, and did neither).
+- **Partial cross-basis join, the gap needs another source** — a full-coverage cross-basis join is fine (gap-fill is a no-op and the body is used verbatim), but a join that covers only *some* columns where an uncovered column is *not reachable from the override's `FROM`* errors rather than emit an unsound body. Reaching a column that lives in a different basis source the single-source mapper cannot join in is genuinely structural and is `lens-multi-source-decomposition`'s concern.
+
+### `quereus_effective_lens(schema, table)`
+
+The composed effective mapping is inspectable on demand (not editable text — see [the baseline is never authored text](#the-baseline-is-never-authored-text)). The integrated TVF `quereus_effective_lens(schema, table)` resolves the lens slot for a logical `(schema, table)` and yields one row per logical column, in declaration order:
+
+| column | meaning |
+|---|---|
+| `logical_column` | logical column name |
+| `source` | `'override'` (covered by the override) · `'default'` (gap-filled by the default mapper) · `'hidden'` (`hiding (...)`) |
+| `effective_sql` | the composed effective body SQL (repeated on every row) |
 
 ## Constraint Attachment
 
@@ -217,12 +243,15 @@ declare lens for X over Y {
   view Car as
     select id, speed as maxSpeed              -- rename override
     from Y.CarCore join Y.CarPerf using (id);  -- other Car columns gap-filled
+  view Audit as
+    select id, who from Y.AuditLog
+    hiding (raw_blob);                          -- omit raw_blob from the lens
   -- tables of X not mentioned here are auto-mapped against Y entirely
 }
 ```
 
 - `declare logical schema X { ... }` — `kind: 'logical'`, declarative end-state, diffed by the schema differ.
-- `declare lens for X over Y { ... }` — names the logical schema (`for X`) and the default basis (`over Y`), and populates lens slots. Unmentioned tables are auto-mapped; columns unmentioned within a mentioned table are gap-filled. The basis binding lives on the lens, never on the logical schema — that is what keeps the logical schema embodiment-free and lets one logical schema target multiple bases across deployments.
+- `declare lens for X over Y { ... }` — names the logical schema (`for X`) and the **explicit basis** (`over Y`), and populates lens slots. It is a **sibling statement of `declare schema`, not a variant** of it. Unmentioned tables are auto-mapped; columns unmentioned within a mentioned table are gap-filled; columns in `hiding (...)` are omitted entirely. The basis binding lives on the lens, never on the logical schema — that is what keeps the logical schema embodiment-free and lets one logical schema target multiple bases across deployments. Re-declaring a lens for X replaces the prior block; two `view T as` for the same logical table within one block is an error. The lens must be declared **before** `apply schema X` (it is re-read from source on every apply).
 
 ## Implementation Surface
 
@@ -231,8 +260,8 @@ Status legend: **shipped** (landed by `lens-foundation-and-default-mapper`) / **
 - **shipped** — `src/schema/schema.ts` — `Schema.kind: 'physical' | 'logical'` (default `'physical'`), plus the per-`Schema` lens-slot registry.
 - **shipped** — `src/schema/table.ts` — `vtabModule` is optional and `isLogical?: boolean` added; the logical-table spec is built (columns + constraints, no module) and held in the lens slot, while its compiled effective body is registered as an ordinary `ViewSchema` so reads ride the existing view path and writes ride [view updateability](view-updateability.md). (The compiled body is a registered view, not a `viewDefinition`-carrying `TableSchema` — see the audit note below.)
 - **shipped** — `src/schema/lens.ts` — the per-logical-table lens slot (`LensSlot`): logical-table spec, default-basis binding (`SchemaRef`), compiled effective body, attached constraints (`LogicalConstraint`). `override` is present in the type but always `undefined` until the override ticket.
-- **shipped** — `src/parser/parser.ts` + `src/parser/ast.ts` + `src/emit/ast-stringify.ts` — parse `declare logical schema X { ... }` (the `LOGICAL` contextual keyword sets `DeclareSchemaStmt.isLogical`), and round-trip it back to DDL. **pending** — `declare lens for … over …` (override surface).
-- **shipped** — `src/schema/lens-compiler.ts` — the default **name-based aligner** (single-source, v1): aligns each logical table/column to a basis table/column by name, emits the inline effective view body, infers the default basis, and rejects physical constructs under a logical schema. Wired into `apply schema X` (`runtime/emit/schema-declarative.ts`). **pending** — per-attribute merge of override ⊕ generated gaps (override ticket); n-way decomposition (decomposition ticket).
+- **shipped** — `src/parser/parser.ts` + `src/parser/ast.ts` + `src/emit/ast-stringify.ts` — parse `declare logical schema X { ... }` (the `LOGICAL` contextual keyword sets `DeclareSchemaStmt.isLogical`) **and `declare lens for X over Y { view T as <select> [hiding (...)] }`** (the `DeclareLensStmt` sibling statement), each round-tripping back to DDL. `declare lens` is hashed (behaviorally) by `computeSchemaHash`.
+- **shipped** — `src/schema/lens-compiler.ts` — the default **name-based aligner** (single-source, v1) **plus the per-attribute sparse-override merger** (override-covered columns ⊕ default-mapper gap-fill ⊖ `hiding`, with the hide-trap / partial-cross-basis-join fidelity boundary erroring rather than guessing) and the **explicit `over Y` basis binding** (which resolves the default-basis ambiguity — `inferDefaultBasis` is consulted only when no lens block is declared). The composition is recomputed (re-read from source) on every `apply schema X` (`runtime/emit/schema-declarative.ts`). `quereus_effective_lens(schema, table)` (`func/builtins/explain.ts`) introspects the result. **pending** — n-way decomposition (decomposition ticket); routing attached constraints to enforcement (prover ticket — an MV/lens here is **read-correct, write-unsound** for logical-constraint enforcement).
 - **pending** — `src/schema/lens-prover.ts` — proves the compiled body's FD / key / domain surface conforms to the logical spec (the PutGet / GetPut completeness checks); reports unproven obligations. Until it lands, **type/nullability conformance is not gated** and the attached constraints are stored verbatim, not yet routed to enforcement.
 - **shipped (partial)** — `src/schema/schema-differ.ts`, `src/schema/schema-hasher.ts` — kind-aware diffing (logical per-table diff is attach/detach-lens, never a basis-table drop; the logical-removals-do-not-drop-basis asymmetry), and the schema hash covers the schema kind + logical declarations. **pending** — the deployed-basis hash record / engine-emitted re-decomposition backfill DDL (`lens-re-decomposition-backfill-ddl`).
 - **pending** — Module mapping advertisement — modules optionally advertise a default logical→basis mapping strategy consumed by the aligner (`lens-module-mapping-advertisement`).

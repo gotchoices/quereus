@@ -10,6 +10,8 @@ const log = createLogger('schema:declared');
 export class DeclaredSchemaManager {
 	private declaredSchemas: Map<string, AST.DeclareSchemaStmt> = new Map();
 	private seedData: Map<string, Map<string, SqlValue[][]>> = new Map(); // schemaName -> tableName -> rows
+	/** Lens blocks keyed by *logical* schema name (the `for X` of `declare lens for X over Y`). */
+	private lensDeclarations: Map<string, AST.DeclareLensStmt> = new Map();
 
 	/**
 	 * Stores a declared schema
@@ -76,7 +78,23 @@ export class DeclaredSchemaManager {
 	removeDeclaredSchema(schemaName: string): void {
 		this.declaredSchemas.delete(schemaName.toLowerCase());
 		this.seedData.delete(schemaName.toLowerCase());
+		this.lensDeclarations.delete(schemaName.toLowerCase());
 		log('Removed declared schema: %s', schemaName);
+	}
+
+	/**
+	 * Stores (replacing any prior) the lens block for a logical schema. Keyed by
+	 * the logical schema name (`for X`); re-declaring a lens for X overwrites,
+	 * matching `declare schema`'s overwrite-on-redeclare. See docs/lens.md § D1.
+	 */
+	setLensDeclaration(logicalSchemaName: string, declaration: AST.DeclareLensStmt): void {
+		this.lensDeclarations.set(logicalSchemaName.toLowerCase(), declaration);
+		log('Stored lens declaration for: %s', logicalSchemaName);
+	}
+
+	/** Retrieves the lens block declared for a logical schema, if any. */
+	getLensDeclaration(logicalSchemaName: string): AST.DeclareLensStmt | undefined {
+		return this.lensDeclarations.get(logicalSchemaName.toLowerCase());
 	}
 }
 

@@ -92,6 +92,7 @@ export enum PlanNodeType {
   Pragma = 'Pragma',
   Analyze = 'Analyze',
   DeclareSchema = 'DeclareSchema',
+  DeclareLens = 'DeclareLens',
   DiffSchema = 'DiffSchema',
   ApplySchema = 'ApplySchema',
   ExplainSchema = 'ExplainSchema',

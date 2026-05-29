@@ -69,7 +69,7 @@ import { emitRetrieve } from './emit/retrieve.js';
 import { emitRemoteQuery } from './emit/remote-query.js';
 import { emitEmptyResult } from './emit/empty-result.js';
 import { emitEmptyRelation } from './emit/empty-relation.js';
-import { emitDeclareSchema, emitDiffSchema, emitApplySchema, emitExplainSchema } from './emit/schema-declarative.js';
+import { emitDeclareSchema, emitDeclareLens, emitDiffSchema, emitApplySchema, emitExplainSchema } from './emit/schema-declarative.js';
 
 let registered = false;
 
@@ -159,6 +159,7 @@ export function registerEmitters() {
 
 	// Declarative schema
 	registerEmitter(PlanNodeType.DeclareSchema, emitDeclareSchema as EmitterFunc);
+	registerEmitter(PlanNodeType.DeclareLens, emitDeclareLens as EmitterFunc);
 	registerEmitter(PlanNodeType.DiffSchema, emitDiffSchema as EmitterFunc);
 	registerEmitter(PlanNodeType.ApplySchema, emitApplySchema as EmitterFunc);
 	registerEmitter(PlanNodeType.ExplainSchema, emitExplainSchema as EmitterFunc);

@@ -26,7 +26,7 @@ import { buildAnalyzeStmt } from './analyze.js';
 import { buildValuesStmt } from './select.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { buildDeclareSchemaStmt, buildDiffSchemaStmt, buildApplySchemaStmt, buildExplainSchemaStmt } from './declare-schema.js';
+import { buildDeclareSchemaStmt, buildDeclareLensStmt, buildDiffSchemaStmt, buildApplySchemaStmt, buildExplainSchemaStmt } from './declare-schema.js';
 
 export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): BlockNode {
 	const plannedStatements = statements.map((stmt) => {
@@ -94,6 +94,8 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 				return buildValuesStmt(ctx, stmt as AST.ValuesStmt);
 			case 'declareSchema':
 				return buildDeclareSchemaStmt(ctx, stmt);
+			case 'declareLens':
+				return buildDeclareLensStmt(ctx, stmt);
 			case 'diffSchema':
 				return buildDiffSchemaStmt(ctx, stmt);
 			case 'applySchema':
