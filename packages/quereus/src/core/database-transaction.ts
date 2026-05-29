@@ -45,9 +45,6 @@ export interface TransactionManagerContext {
 	 *  back. Invoked after all connections commit but before the change log
 	 *  is cleared. */
 	runPostCommitWatchers(): Promise<void>;
-	/** Fire incremental materialized-view maintenance. Same post-commit window
-	 *  as watchers; errors logged, never rolled back. */
-	runPostCommitMaterializedViews(): Promise<void>;
 }
 
 /**
@@ -263,17 +260,9 @@ export class TransactionManager {
 				errorLog('Post-commit watcher dispatch threw: %O', err);
 			}
 
-			// Maintain incremental materialized views in the same post-commit
-			// window (change log alive). Ordered after watchers. MV-over-MV chains
-			// converge in this single pass: the manager processes MVs in dependency-
-			// topological order and feeds each producer's backing-table write to its
-			// dependents via a per-pass delta overlay layered on the change log (see
-			// docs/materialized-views.md, docs/incremental-maintenance.md).
-			try {
-				await this.ctx.runPostCommitMaterializedViews();
-			} catch (err) {
-				errorLog('Post-commit materialized-view maintenance threw: %O', err);
-			}
+			// Materialized views are NOT a post-commit consumer: each is row-time
+			// maintained synchronously at the DML boundary, so its backing table is
+			// already current and committed in lockstep with the source write.
 		} catch (e) {
 			// On pre-commit assertion failure (or commit error), rollback all connections
 			const conns = this.ctx.getAllConnections();
@@ -466,7 +455,7 @@ export class TransactionManager {
 	/**
 	 * Merge an incoming op into the active layer with last-write-wins semantics:
 	 *  - INSERT after DELETE → UPDATE (rare; same PK reappears with new values)
-	 *  - UPDATE after INSERT → INSERT (with refreshed newProjection)
+	 *  - UPDATE after INSERT → INSERT (newProjection updated in place)
 	 *  - DELETE after INSERT → drop entry (net no-op)
 	 *  - DELETE after UPDATE → DELETE with carrying-over oldProjection from the first OLD
 	 *  - INSERT/UPDATE chains preserve the original `oldProjection` so the OLD

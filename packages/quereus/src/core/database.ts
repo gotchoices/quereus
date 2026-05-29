@@ -55,7 +55,7 @@ import {
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
-import { MaterializedViewManager, type MaintenanceFaultPhase } from './database-materialized-views.js';
+import { MaterializedViewManager } from './database-materialized-views.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
 import { Table } from './table-handle.js';
@@ -1723,19 +1723,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		await this.watcherManager.runPostCommit();
 	}
 
-	/** @internal Fire incremental materialized-view maintenance after a commit,
-	 *  while the change log is still alive. Errors are logged, never rolled back. */
-	public async runPostCommitMaterializedViews(): Promise<void> {
-		await this.materializedViewManager.runPostCommit();
-	}
-
-	/** @internal Compile + register an `on-commit-incremental` MV for delta
-	 *  maintenance (no-op for `manual`). Throws on an ineligible body. */
+	/** @internal Compile + register an MV for row-time write-through maintenance.
+	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate). */
 	public registerMaterializedView(mv: MaterializedViewSchema): void {
 		this.materializedViewManager.registerMaterializedView(mv);
 	}
 
-	/** @internal Detach an MV's incremental subscription (DROP path). */
+	/** @internal Detach an MV's row-time maintenance plan (DROP path). */
 	public unregisterMaterializedView(schemaName: string, name: string): void {
 		this.materializedViewManager.unregisterMaterializedView(schemaName, name);
 	}
@@ -1787,15 +1781,6 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		newSourcePk: readonly SqlValue[],
 	): Promise<Array<{ pk: SqlValue[]; row?: Row }>> {
 		return this.materializedViewManager.lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
-	}
-
-	/** @internal Test-only: install (or clear, with `undefined`) a fault injector
-	 *  on the incremental materialized-view maintenance path. Throwing from the
-	 *  injector simulates a failure at the given phase so the two-tier recovery
-	 *  (full-rebuild self-heal / `diverged`) can be exercised. Production never
-	 *  sets this. */
-	public _setMaterializedViewMaintenanceFault(fn: ((phase: MaintenanceFaultPhase) => void) | undefined): void {
-		this.materializedViewManager.maintenanceFaultInjector = fn;
 	}
 
 	/** @internal Invalidate cached assertion plan (called on DROP ASSERTION) */

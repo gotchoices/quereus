@@ -63,29 +63,14 @@ describe('Statement.getChangeScope (integration)', () => {
 		expect(r.values).to.deep.equal([[99]]);
 	});
 
-	it('a MANUAL materialized-view reference reports the BACKING table in its change scope', async () => {
-		// A manual MV's backing table IS user-observable state (refresh writes it),
-		// and its cadence is `refresh`, not source mutations — so change-scope keeps
-		// reporting the backing table. (An incremental MV projects to its sources;
-		// see the next test.)
+	it('a materialized-view reference reports the SOURCE table, not the backing table', async () => {
+		// Every MV is row-time maintained: its backing table is written off the user
+		// change log (synchronously at the DML boundary) and never appears in it — so
+		// a watch on it would never fire. change-scope projects the reference onto the
+		// source instead.
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		await db.exec("INSERT INTO src VALUES (1, 'a')");
-		await db.exec('CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM src');
-
-		const scope = db.prepare('select * from mv').getChangeScope();
-		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
-		expect(tables).to.deep.equal(['main._mv_mv']);
-		// A manual MV does NOT surface the source table.
-		expect(tables).to.not.include('main.src');
-	});
-
-	it('an INCREMENTAL materialized-view reference reports the SOURCE table, not the backing table', async () => {
-		// An `on-commit-incremental` MV's backing table is maintained at COMMIT from
-		// its sources and never written through the user change log — so a watch on
-		// it would never fire. change-scope projects the reference onto the source.
-		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
-		await db.exec("INSERT INTO src VALUES (1, 'a')");
-		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src WITH refresh = 'on-commit-incremental'");
+		await db.exec('CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src');
 
 		const scope = db.prepare('select * from mvi').getChangeScope();
 		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
@@ -94,12 +79,12 @@ describe('Statement.getChangeScope (integration)', () => {
 		expect(tables).to.not.include('main._mv_mvi');
 	});
 
-	it('a query reading both an incremental MV and its source reports the source once', async () => {
+	it('a query reading both an MV and its source reports the source once', async () => {
 		// The projected source-union scope unions/dedups against a direct read of
 		// the same source table — the source appears exactly once.
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		await db.exec("INSERT INTO src VALUES (1, 'a')");
-		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src WITH refresh = 'on-commit-incremental'");
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
 
 		const scope = db.prepare('select mvi.v from mvi join src on src.id = mvi.id').getChangeScope();
 		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
@@ -110,7 +95,7 @@ describe('Statement.getChangeScope (integration)', () => {
 		// v1 projects to a `{kind:'full'}`, columns:'all' watch per source even when
 		// the MV body keys on a source PK — sound but coarse (see docs known-imprecisions).
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
-		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src WITH refresh = 'on-commit-incremental'");
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
 
 		const scope = db.prepare('select v from mvi where id = 1').getChangeScope();
 		expect(scope.watches).to.have.length(1);
@@ -119,12 +104,12 @@ describe('Statement.getChangeScope (integration)', () => {
 		expect(scope.watches[0].scope).to.deep.equal({ kind: 'full' });
 	});
 
-	it('getChangeScope on an incremental MV whose source was dropped throws cleanly (no dropped-table watch)', async () => {
+	it('getChangeScope on an MV whose source was dropped throws cleanly (no dropped-table watch)', async () => {
 		// Dropping a source marks the MV stale; re-planning `select * from mvi` for
 		// analysis raises the same "stale; drop and recreate" error executing it does
 		// — so the resolver never yields a watch on the now-missing source table.
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
-		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src WITH refresh = 'on-commit-incremental'");
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
 		await db.exec('DROP TABLE src');
 
 		expect(() => db.prepare('select * from mvi').getChangeScope()).to.throw(/stale/i);
@@ -304,13 +289,13 @@ describe('Database.watch (integration)', () => {
 		await stmt.finalize();
 	});
 
-	it('end-to-end: a watch on an INCREMENTAL MV fires on a SOURCE mutation', async () => {
+	it('end-to-end: a watch on an MV fires on a SOURCE mutation', async () => {
 		// The MV reference projects to its source, so the watch is registered on
 		// `src` — a source mutation fires it (the backing table is never directly
 		// user-written; watching it would never fire).
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		await db.exec("INSERT INTO src VALUES (1, 'a')");
-		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src WITH refresh = 'on-commit-incremental'");
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
 		const stmt = db.prepare('select * from mvi');
 		const scope = stmt.getChangeScope();
 		expect(scope.watches.map(w => w.table.table)).to.deep.equal(['src']);

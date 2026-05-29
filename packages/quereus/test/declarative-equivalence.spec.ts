@@ -789,23 +789,6 @@ describe('declarative-equivalence: materialized views', () => {
 		});
 	});
 
-	it('MV over a compound select round-trips (self-contained, no source table)', async function () {
-		await runCase({
-			name: 'mv-roundtrip-compound',
-			directDDL: [
-				'create materialized view mv2 as select 1 as a, 10 as b union all select 2 as a, 20 as b',
-			],
-			declarativeBody: `materialized view mv2 as select 1 as a, 10 as b union all select 2 as a, 20 as b`,
-			expectMaterializedViews: ['mv2'],
-			probes: [
-				{
-					sql: 'select a, b from mv2 order by a',
-					expect: { rows: [{ a: 1, b: 10 }, { a: 2, b: 20 }] },
-				},
-			],
-		});
-	});
-
 	it('explicit column-list MV round-trips and renames the body columns', async function () {
 		await runCase({
 			name: 'mv-roundtrip-collist',

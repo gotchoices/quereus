@@ -444,19 +444,10 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				// (not a body expansion). The optimizer then sees the backing table's
 				// physical-property surface and `getChangeScope()` reports it.
 
-				// Divergence (data drift) is checked unconditionally, BEFORE the stale
-				// (structural) re-validation: the body still plans — it is the backing
-				// data that has silently diverged from the sources because an incremental
-				// apply failed and could not self-heal. Erroring here guarantees no silent
-				// wrong reads until a successful refresh/rebuild clears the flag.
-				if (mvSchema.diverged) {
-					throw new QuereusError(
-						`materialized view '${fromClause.table.name}' diverged from its sources `
-							+ `(incremental maintenance failed and could not self-heal); `
-							+ `run \`refresh materialized view ${fromClause.table.name}\``,
-						StatusCode.ERROR,
-					);
-				}
+				// The only currency hazard for a row-time MV is a *structural* source
+				// change (`stale`): the backing data itself is kept consistent
+				// transactionally, so it never silently drifts. Re-validate the body on
+				// `stale` before resolving the reference.
 				if (mvSchema.stale) {
 					// Re-validate the body against current source schemas. An
 					// incompatible change (dropped source, dropped column, …) makes

@@ -46,10 +46,9 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 		}
 	}
 
-	// Binding-based incremental eligibility (which source shapes are maintainable,
-	// and which classify whole-MV 'global') is checked entirely at runtime in the
-	// create emitter's `compile()` against the optimized/analyzed body — there is
-	// no build-time AST rejection to do here.
+	// Row-time eligibility (the body must be a passthrough projection of a single
+	// keyed source) is checked entirely at runtime in the create emitter, against
+	// the optimized/analyzed body — there is no build-time AST rejection to do here.
 	const sql = createMaterializedViewToString(stmt);
 	const bodySql = astToString(stmt.select);
 
@@ -63,7 +62,6 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 		bodySql,
 		sql,
 		stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
-		stmt.refreshPolicy
 	);
 }
 

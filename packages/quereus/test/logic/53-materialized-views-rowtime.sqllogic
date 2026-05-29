@@ -1,10 +1,10 @@
 -- 53-materialized-views-rowtime.sqllogic — row-time (write-through) materialized
--- views (phase 3, refresh = 'row-time'). The covering-index-shaped backing table
--- is maintained SYNCHRONOUSLY with each source row-write, within the same
--- transaction and visible mid-statement — not deferred to COMMIT like
--- 'on-commit-incremental'. Observable here purely by reading the MV (which
--- resolves to its backing table); row-time UNIQUE enforcement is a separate
--- downstream ticket.
+-- views. Every materialized view is row-time maintained: the covering-index-shaped
+-- backing table is kept consistent SYNCHRONOUSLY with each source row-write, within
+-- the same transaction and visible mid-statement (reads-own-writes), and rolled back
+-- in lockstep with the source write. Observable here purely by reading the MV (which
+-- resolves to its backing table); row-time UNIQUE enforcement is covered separately
+-- in 54-covering-mv-enforcement.sqllogic.
 
 -- ===================================
 -- 1. Autocommit write-through — insert / update / delete reflected with no BEGIN
@@ -13,7 +13,7 @@
 
 create table rt (id integer primary key, x integer);
 insert into rt values (1, 10), (2, 20);
-create materialized view rt_ix as select x, id from rt order by x with refresh = 'row-time';
+create materialized view rt_ix as select x, id from rt order by x;
 
 -- MV equals the body at create time
 select * from rt_ix order by x;
@@ -74,7 +74,7 @@ select * from rt_ix order by x;
 -- backing connection, which rides the same savepoint stack.)
 create table rta (id integer primary key, x integer not null);
 insert into rta values (1, 10), (2, 20), (3, 30);
-create materialized view rta_ix as select x, id from rta order by x with refresh = 'row-time';
+create materialized view rta_ix as select x, id from rta order by x;
 select * from rta_ix order by x;
 → [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
 
@@ -95,40 +95,14 @@ select * from rta_ix order by x;
 → [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
 
 -- ===================================
--- 3. Differential vs on-commit-incremental over the SAME body: row-time is
---    visible mid-transaction; on-commit-incremental is not (it maintains at
---    COMMIT). After commit, both agree.
--- ===================================
-
-create table d (id integer primary key, x integer);
-insert into d values (1, 10), (2, 20);
-create materialized view d_rt as select x, id from d order by x with refresh = 'row-time';
-create materialized view d_ci as select x, id from d order by x with refresh = 'on-commit-incremental';
-
-begin;
-insert into d values (3, 30);
--- row-time reflects the pending source row immediately
-select * from d_rt order by x;
-→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
--- on-commit-incremental does NOT reflect it pre-commit
-select * from d_ci order by x;
-→ [{"x":10,"id":1},{"x":20,"id":2}]
-commit;
--- after commit, both agree
-select * from d_rt order by x;
-→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
-select * from d_ci order by x;
-→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
-
--- ===================================
--- 4. Partial body (WHERE) — scope transitions. A row contributes a backing row
+-- 3. Partial body (WHERE) — scope transitions. A row contributes a backing row
 --    only while its predicate is unambiguously TRUE; an UPDATE across the
 --    predicate boundary deletes / inserts the backing row.
 -- ===================================
 
 create table rtf (id integer primary key, x integer);
 insert into rtf values (1, 5), (2, -3), (3, 8);
-create materialized view rtf_ix as select x, id from rtf where x > 0 order by x with refresh = 'row-time';
+create materialized view rtf_ix as select x, id from rtf where x > 0 order by x;
 select * from rtf_ix order by x;
 → [{"x":5,"id":1},{"x":8,"id":3}]
 
@@ -153,7 +127,7 @@ select * from rtf_ix order by x;
 → [{"x":9,"id":3}]
 
 -- ===================================
--- 5. Multi-row statement reads-own-writes — every row's maintenance accumulates
+-- 4. Multi-row statement reads-own-writes — every row's maintenance accumulates
 --    in the same backing pending layer; a multi-row INSERT yields the full set.
 --    (For the covering-index shape the backing key carries the source PK, so two
 --    distinct source rows never collide on the backing key; this verifies
@@ -162,18 +136,18 @@ select * from rtf_ix order by x;
 -- ===================================
 
 create table m (id integer primary key, x integer);
-create materialized view m_ix as select x, id from m order by x, id with refresh = 'row-time';
+create materialized view m_ix as select x, id from m order by x, id;
 insert into m values (1, 5), (2, 5), (3, 7);
 select * from m_ix order by x, id;
 → [{"x":5,"id":1},{"x":5,"id":2},{"x":7,"id":3}]
 
 -- ===================================
--- 6. Compound-PK source — backing key carries both PK columns.
+-- 5. Compound-PK source — backing key carries both PK columns.
 -- ===================================
 
 create table cp (a integer, b integer, v integer, primary key (a, b));
 insert into cp values (1, 1, 100), (1, 2, 200);
-create materialized view cp_ix as select a, b, v from cp with refresh = 'row-time';
+create materialized view cp_ix as select a, b, v from cp;
 select * from cp_ix order by a, b;
 → [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200}]
 insert into cp values (2, 1, 300);
@@ -184,13 +158,13 @@ select * from cp_ix order by a, b;
 → [{"a":1,"b":1,"v":999},{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
 
 -- ===================================
--- 7. Two row-time MVs over one source — both maintained from a single write.
+-- 6. Two row-time MVs over one source — both maintained from a single write.
 -- ===================================
 
 create table s (id integer primary key, x integer);
 insert into s values (1, 1);
-create materialized view s_p as select id, x from s with refresh = 'row-time';
-create materialized view s_o as select x, id from s order by x with refresh = 'row-time';
+create materialized view s_p as select id, x from s;
+create materialized view s_o as select x, id from s order by x;
 insert into s values (2, 2);
 select * from s_p order by id;
 → [{"id":1,"x":1},{"id":2,"x":2}]
@@ -198,52 +172,59 @@ select * from s_o order by x;
 → [{"x":1,"id":1},{"x":2,"id":2}]
 
 -- ===================================
--- 8. Eligibility gate — non-covering-index shapes are rejected at create. Each
---    diagnostic names the 'row-time' policy. A manual MV over the same body is
---    always fine (no eligibility gate).
+-- 7. Mandatory create-time gate — a body that is not row-time maintainable is
+--    rejected at CREATE with a shape-specific diagnostic that steers to a plain
+--    `view` / `create table … as`, and does NOT mention a refresh policy.
 -- ===================================
 
 create table g (id integer primary key, k integer, v integer);
 insert into g values (1, 100, 5);
 
 -- aggregate body
-create materialized view bad_agg as select k, sum(v) as sv from g group by k with refresh = 'row-time';
--- error: row-time
-
--- a manual MV over the same aggregate body still succeeds
-create materialized view ok_manual as select k, sum(v) as sv from g group by k;
-select * from ok_manual order by k;
-→ [{"k":100,"sv":5}]
-drop materialized view ok_manual;
+create materialized view bad_agg as select k, sum(v) as sv from g group by k;
+-- error: cannot be materialized
 
 -- join body (also multi-source)
 create table g2 (id integer primary key, w integer);
-create materialized view bad_join as select g.id, g.v from g join g2 on g.id = g2.id with refresh = 'row-time';
--- error: row-time
+create materialized view bad_join as select g.id, g.v from g join g2 on g.id = g2.id;
+-- error: cannot be materialized
 
 -- set-operation body
-create materialized view bad_union as select id, v from g union select id, w from g2 with refresh = 'row-time';
--- error: row-time
+create materialized view bad_union as select id, v from g union select id, w from g2;
+-- error: cannot be materialized
 
 -- LIMIT body
-create materialized view bad_limit as select id, v from g limit 10 with refresh = 'row-time';
--- error: row-time
+create materialized view bad_limit as select id, v from g limit 10;
+-- error: cannot be materialized
 
 -- DISTINCT that drops the source PK
-create materialized view bad_distinct as select distinct v from g with refresh = 'row-time';
--- error: row-time
+create materialized view bad_distinct as select distinct v from g;
+-- error: cannot be materialized
 
 -- recursive-CTE body
-create materialized view bad_rec as with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r with refresh = 'row-time';
--- error: row-time
+create materialized view bad_rec as with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r;
+-- error: cannot be materialized
 
 -- projection dropping a source PK column
-create materialized view bad_nopk as select v from g with refresh = 'row-time';
--- error: row-time
+create materialized view bad_nopk as select v from g;
+-- error: cannot be materialized
 
 -- non-passthrough (computed/expression) projected column
-create materialized view bad_expr as select id, v + 1 as v1 from g with refresh = 'row-time';
--- error: row-time
+create materialized view bad_expr as select id, v + 1 as v1 from g;
+-- error: cannot be materialized
+
+-- ===================================
+-- 8. MV-over-MV is rejected at create (cascade deferred). A write to a backing
+--    table bypasses the DML-executor hook that fires row-time maintenance, so a
+--    dependent MV would silently serve stale rows — the gate closes this.
+-- ===================================
+
+create table mvsrc (id integer primary key, x integer);
+insert into mvsrc values (1, 10);
+create materialized view mv_base as select id, x from mvsrc;
+-- a materialized view whose body reads another materialized view is rejected
+create materialized view mv_over as select id, x from mv_base;
+-- error: materialized views over materialized views
 
 -- ===================================
 -- 9. DROP detaches the row-time plan — subsequent source writes are not maintained
@@ -252,7 +233,7 @@ create materialized view bad_expr as select id, v + 1 as v1 from g with refresh 
 
 create table dr (id integer primary key, x integer);
 insert into dr values (1, 1);
-create materialized view dr_ix as select id, x from dr with refresh = 'row-time';
+create materialized view dr_ix as select id, x from dr;
 drop materialized view dr_ix;
 -- a write after DROP must not touch any detached plan
 insert into dr values (2, 2);

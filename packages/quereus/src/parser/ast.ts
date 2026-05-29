@@ -336,8 +336,6 @@ export interface CreateMaterializedViewStmt extends AstNode {
 	moduleArgs?: Record<string, SqlValue>;
 	isTemporary?: boolean;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
-	/** Refresh policy from a trailing `with refresh = '...'` clause. Absent ⇒ manual. */
-	refreshPolicy?: 'manual' | 'on-commit-incremental' | 'row-time';
 }
 
 // REFRESH MATERIALIZED VIEW statement

@@ -1,4 +1,7 @@
--- 51-materialized-views.sqllogic — materialized view core (phase 1, manual refresh)
+-- 51-materialized-views.sqllogic — materialized view core. Every MV is row-time
+-- maintained: source writes are reflected immediately (within the writing
+-- transaction), and `refresh materialized view` is an explicit full-rebuild verb
+-- (no longer required for currency).
 
 -- ===================================
 -- 1. Initial materialization
@@ -16,18 +19,17 @@ select x, y from t order by x;
 → [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"}]
 
 -- ===================================
--- 2. Source mutation does NOT update the MV until refresh (phase 1)
+-- 2. Source mutation is reflected immediately (row-time); refresh is idempotent
 -- ===================================
 
 insert into t values (4, 'd');
 
--- MV still reflects create-time snapshot
+-- MV reflects the new source row without any refresh
 select * from mv order by x;
-→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"}]
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
 
+-- refresh is an explicit full rebuild — a no-op for an already-current MV
 refresh materialized view mv;
-
--- After refresh the new source row appears
 select * from mv order by x;
 → [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
 
@@ -44,11 +46,8 @@ update mv set y = 'zz' where x = 1;
 delete from mv where x = 1;
 -- error: read-only
 
--- Source remains writable; reflected only after refresh
+-- Source remains writable; reflected immediately
 insert into t values (5, 'e');
-select * from mv order by x;
-→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
-refresh materialized view mv;
 select * from mv order by x;
 → [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"},{"x":5,"y":"e"}]
 
@@ -79,16 +78,20 @@ drop materialized view omv;
 drop table ot;
 
 -- ===================================
--- 6. PK fallback — body with no provable key materializes on the all-columns key
+-- 6. Mandatory gate — a body that drops the source primary key is rejected at
+--    create (a materialized view must project its source key so each source row
+--    maps to exactly one backing row). The diagnostic steers to a plain view /
+--    `create table … as`, never a refresh policy.
 -- ===================================
 
 create table pt (x integer primary key, y text);
 insert into pt values (1, 'a'), (2, 'b'), (3, 'c');
--- `select y from pt` projects away the key; keysOf yields no smaller key, so the
--- backing table uses the all-columns PK. Rows are distinct, so no crash.
 create materialized view pmv as select y from pt;
-select * from pmv order by y;
-→ [{"y":"a"},{"y":"b"},{"y":"c"}]
+-- error: cannot be materialized
+-- the failed create rolled the backing table back, so the name is free
+create materialized view pmv as select x, y from pt;
+select * from pmv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"}]
 drop materialized view pmv;
 drop table pt;
 
@@ -138,40 +141,3 @@ select * from smv2;
 -- error: stale
 drop materialized view smv2;
 drop table s2;
-
--- ===================================
--- 9. Bag-body contract — a materialized view must be a set
--- ===================================
-
--- A duplicate-producing ("bag") body fails loudly at CREATE with a purpose-built
--- diagnostic that names the MV and the set-semantics contract, NOT the hidden
--- backing table's raw `UNIQUE constraint failed: _mv_... PK` (see the
--- focused spec for the no-backing-table-name assertion).
-create table orders (id integer primary key, status text);
-insert into orders values (1, 'open'), (2, 'open'), (3, 'shipped');
-create materialized view mv_status as select status from orders;
--- error: must be a set
-
--- The failed create rolled the backing table back, so the name is free: a
--- de-duplicated (`distinct`) body over the same source materializes cleanly.
-create materialized view mv_status as select distinct status from orders;
-select * from mv_status order by status;
-→ [{"status":"open"},{"status":"shipped"}]
-drop materialized view mv_status;
-drop table orders;
-
--- Late duplicate at REFRESH: a body that is duplicate-free at create but becomes
--- duplicate-producing after source edits fails with the same diagnostic at the
--- next refresh (inherent to the bag case under set semantics; see docs).
-create table u (id integer primary key, k text);
-insert into u values (1, 'a'), (2, 'b');
--- distinct at create → materializes on the all-columns key
-create materialized view mv_u as select k from u;
-select * from mv_u order by k;
-→ [{"k":"a"},{"k":"b"}]
--- now two 'a' rows → the body is a bag
-update u set k = 'a' where id = 2;
-refresh materialized view mv_u;
--- error: must be a set
-drop materialized view mv_u;
-drop table u;

@@ -30,8 +30,11 @@ function bodyRoot(db: Database, bodySql: string): RelationalPlanNode {
 }
 
 /**
- * Creates the MV, then runs the prover directly against the named UNIQUE
- * constraint on the named base table so per-reason outcomes are observable.
+ * Runs the prover directly against the named UNIQUE constraint on the named base
+ * table so per-reason outcomes are observable. Prefers the registered MV, falling
+ * back to a parsed-body stub when the body is row-time-ineligible (joins, LIMIT, …)
+ * and thus cannot back a real MV — the prover reads only `mv.selectAst`, so the
+ * stub is faithful (cf. {@link proveUnmaterialized}).
  */
 async function prove(
 	db: Database,
@@ -40,11 +43,11 @@ async function prove(
 	tableName: string,
 	ucIndex = 0,
 ): Promise<CoverageResult> {
-	const mv = db.schemaManager.getMaterializedView('main', mvName);
-	expect(mv, 'MV registered').to.not.be.undefined;
+	const mv = db.schemaManager.getMaterializedView('main', mvName)
+		?? ({ selectAst: parseSelect(bodySql) } as unknown as MaterializedViewSchema);
 	const table = db.schemaManager.getTable('main', tableName)!;
 	const uc = table.uniqueConstraints![ucIndex];
-	return proveCoverage(bodyRoot(db, bodySql), mv!, uc, table);
+	return proveCoverage(bodyRoot(db, bodySql), mv, uc, table);
 }
 
 /**
@@ -112,7 +115,10 @@ describe('coverage prover — negative (one per reason)', () => {
 		tableName: string,
 		reason: string,
 	): Promise<void> {
-		const db = await freshDb(ddl);
+		// Prove against the planned body (create-MV lines stripped): several of these
+		// shapes are row-time-ineligible, so no real MV is created — `prove` falls back
+		// to a parsed-body stub. The prover reads only the body, so results are identical.
+		const db = await freshDb(ddl.filter(s => !/create\s+materialized\s+view/i.test(s)));
 		try {
 			const result = await prove(db, mvName, bodySql, tableName);
 			expect(result.covers, `expected NotCovers(${reason})`).to.be.false;
@@ -281,7 +287,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 
 	it('positive: LEFT join to a unique lookup key (T on the preserving left side) covers', async () => {
 		const body = 'select o.customer_id, o.sku, o.id from orders o left join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
-		const db = await freshDb([...ORDERS_CUSTOMERS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...ORDERS_CUSTOMERS]);
 		try {
 			expect((await prove(db, 'ix', body, 'orders')).covers, 'left-join to unique lookup is 1:1').to.be.true;
 		} finally {
@@ -308,7 +314,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku))',
 			'create table tags (id integer primary key, val integer not null, label text)',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
@@ -321,7 +326,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 
 	it('negative shape: the same body as an INNER join loses unmatched T rows', async () => {
 		const body = 'select o.customer_id, o.sku, o.id from orders o inner join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
-		const db = await freshDb([...ORDERS_CUSTOMERS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...ORDERS_CUSTOMERS]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
 			expect(result.covers, 'inner join cannot prove no-row-loss').to.be.false;
@@ -335,7 +340,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		// customers LEFT JOIN orders preserves customers; orders rows with no
 		// matching customer are dropped ⇒ row loss for orders.
 		const body = 'select o.customer_id, o.sku, o.id from customers c left join orders o on o.customer_id = c.id order by o.customer_id, o.sku';
-		const db = await freshDb([...ORDERS_CUSTOMERS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...ORDERS_CUSTOMERS]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
 			expect(result.covers, 'T on the non-preserving side cannot cover').to.be.false;
@@ -349,7 +354,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const body = 'select o1.customer_id, o1.sku, o1.id from orders o1 join orders o2 on o1.id = o2.id order by o1.customer_id, o1.sku';
 		const db = await freshDb([
 			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku))',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
@@ -362,7 +366,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 
 	it('negative: WHERE referencing a lookup column cannot sneak through', async () => {
 		const body = 'select o.customer_id, o.sku, o.id from orders o left join customers c on o.customer_id = c.id where c.name is not null order by o.customer_id, o.sku';
-		const db = await freshDb([...ORDERS_CUSTOMERS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...ORDERS_CUSTOMERS]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
 			expect(result.covers, 'a non-T filter must not be accepted').to.be.false;
@@ -376,29 +380,20 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		}
 	});
 
-	it('eager link: a covering join MV stamps covers + coveringStructureName', async () => {
+	it('create-time gate: a join body is rejected and the create rolls back cleanly (no MV, no link)', async () => {
+		// The prover admits this join body as covering (the prove() tests above), but
+		// a join body is not row-time maintainable, so the mandatory create gate
+		// rejects it. Join-body MVs are deferred to materialized-view-rowtime-general-bodies.
 		const body = 'select o.customer_id, o.sku, o.id from orders o left join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
-		const db = await freshDb([...ORDERS_CUSTOMERS, `create materialized view ix as ${body}`]);
+		const db = await freshDb(ORDERS_CUSTOMERS);
 		try {
-			const uc = db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0];
-			expect(uc.coveringStructureName, 'forward pointer set to the join MV').to.equal('ix');
-			const mv = db.schemaManager.getMaterializedView('main', 'ix')!;
-			expect(mv.covers).to.deep.include({ schemaName: 'main', tableName: 'orders' });
-		} finally {
-			await db.close();
-		}
-	});
-
-	it('eager link: a fanning join MV stamps nothing', async () => {
-		const body = 'select o.customer_id, o.sku, o.id from orders o left join tags t on o.customer_id = t.val order by o.customer_id, o.sku';
-		const db = await freshDb([
-			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku))',
-			'create table tags (id integer primary key, val integer not null, label text)',
-			`create materialized view ix as ${body}`,
-		]);
-		try {
-			expect(db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0].coveringStructureName).to.be.undefined;
-			expect(db.schemaManager.getMaterializedView('main', 'ix')!.covers).to.be.undefined;
+			let err: unknown;
+			try { await db.exec(`create materialized view ix as ${body}`); } catch (e) { err = e; }
+			expect(err, 'join body rejected at create').to.not.be.undefined;
+			expect(String((err as Error).message)).to.contain('cannot be materialized');
+			// Rolled back: no MV registered, and the UNIQUE constraint keeps no link.
+			expect(db.schemaManager.getMaterializedView('main', 'ix'), 'no MV after rejected create').to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0].coveringStructureName, 'no forward pointer').to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -412,7 +407,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			...ORDERS_CUSTOMERS,
 			'create table addresses (id integer primary key, city text)',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			expect((await prove(db, 'ix', body, 'orders')).covers, 'a 1:1 chain of LEFT joins is still 1:1').to.be.true;
@@ -429,7 +423,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			...ORDERS_CUSTOMERS,
 			'create table tags (id integer primary key, val integer not null, label text)',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
@@ -450,7 +443,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table line_items (oid integer not null, lineno integer not null, sku text not null, region_id integer not null, primary key (oid, lineno), unique (oid, sku))',
 			'create table regions (rid integer primary key, rname text)',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			expect((await prove(db, 'ix', body, 'line_items')).covers, 'composite-PK 1:1 lookup join covers').to.be.true;
@@ -470,7 +462,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 
 	it('positive: a 1:1 join whose lookup key reuses a UC column name, sorted by the T-qualified column, covers', async () => {
 		const body = 'select l.oid, l.sku, l.lineno from line_items l left join products p on l.sku = p.sku order by l.oid, l.sku';
-		const db = await freshDb([...LINE_ITEMS_PRODUCTS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...LINE_ITEMS_PRODUCTS]);
 		try {
 			expect((await prove(db, 'ix', body, 'line_items')).covers, 'a UC-named lookup key qualified to T still covers').to.be.true;
 		} finally {
@@ -482,7 +474,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		// `order by l.oid, p.sku` sorts by the lookup-side `sku`, not T's — so it is
 		// an ordering-mismatch, NOT a `shape` rejection (the old collision guard).
 		const body = 'select l.oid, l.sku, l.lineno from line_items l left join products p on l.sku = p.sku order by l.oid, p.sku';
-		const db = await freshDb([...LINE_ITEMS_PRODUCTS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...LINE_ITEMS_PRODUCTS]);
 		try {
 			const result = await prove(db, 'ix', body, 'line_items');
 			expect(result.covers, 'ordering on a lookup column cannot cover').to.be.false;
@@ -497,7 +489,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		// pattern keeps the LEFT join), so it is a predicate-entailment failure —
 		// NOT `shape` as the bare-name collision guard would have reported.
 		const body = 'select l.oid, l.sku, l.lineno from line_items l left join products p on l.sku = p.sku where p.sku is null order by l.oid, l.sku';
-		const db = await freshDb([...LINE_ITEMS_PRODUCTS, `create materialized view ix as ${body}`]);
+		const db = await freshDb([...LINE_ITEMS_PRODUCTS]);
 		try {
 			const result = await prove(db, 'ix', body, 'line_items');
 			expect(result.covers, 'a lookup-side WHERE cannot cover').to.be.false;
@@ -519,7 +511,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table customers (id integer primary key, name text)',
 			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			expect((await prove(db, 'ix', body, 'orders')).covers, 'NOT-NULL FK inner join is 1:1').to.be.true;
@@ -533,7 +524,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table parent (a integer not null, b integer not null, label text, primary key (a, b))',
 			'create table child (id integer primary key, pa integer not null, pb integer not null, sku text not null, unique (pa, pb, sku), foreign key (pa, pb) references parent(a, b))',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			expect((await prove(db, 'ix', body, 'child')).covers, 'composite NOT-NULL FK inner join is 1:1').to.be.true;
@@ -552,7 +542,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table customers (id integer primary key, name text)',
 			'create table orders (id integer primary key, customer_id integer not null, sku text not null, region_id integer null, unique (customer_id, sku), foreign key (region_id) references customers(id))',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
@@ -570,7 +559,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table customers (id integer primary key, code integer not null unique, name text)',
 			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku))',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
@@ -591,7 +579,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb([
 			'create table customers (id integer primary key, grp1 integer not null, grp2 integer not null, name text)',
 			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
-			`create materialized view ix as ${body}`,
 		]);
 		try {
 			const result = await prove(db, 'ix', body, 'orders');
@@ -602,20 +589,6 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		}
 	});
 
-	it('eager link: a covering INNER-FK join MV stamps covers + coveringStructureName', async () => {
-		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
-		const db = await freshDb([
-			'create table customers (id integer primary key, name text)',
-			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
-			`create materialized view ix as ${body}`,
-		]);
-		try {
-			expect(db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0].coveringStructureName, 'forward pointer set').to.equal('ix');
-			expect(db.schemaManager.getMaterializedView('main', 'ix')!.covers).to.deep.include({ schemaName: 'main', tableName: 'orders' });
-		} finally {
-			await db.close();
-		}
-	});
 });
 
 describe('introspection hiding', () => {
@@ -785,12 +758,12 @@ describe('coverage prover — effective-key (stub unit)', () => {
 
 /**
  * Row-time covering enforcement — a UNIQUE constraint whose conflict resolution
- * is answered by an explicit `row-time` covering MV's backing table rather than
- * the auto-index (`covering-structure-mv-rowtime-enforcement`). The covering MV
- * is `select <uc-cols>, <pk> from T order by <uc-cols> with refresh = 'row-time'`,
- * so it is both *covering* (the prover links it) and *row-time* (its backing is
- * consistent mid-statement). `findIndexForConstraint` then prefers it over the
- * auto-index, and the source PK is recovered from the MV projection so
+ * is answered by an explicit covering MV's backing table rather than the
+ * auto-index (`covering-structure-mv-rowtime-enforcement`). The covering MV is
+ * `select <uc-cols>, <pk> from T order by <uc-cols>`, so it is both *covering*
+ * (the prover links it) and *row-time* (every MV is row-time maintained, so its
+ * backing is consistent mid-statement). `findIndexForConstraint` then prefers it
+ * over the auto-index, and the source PK is recovered from the MV projection so
  * IGNORE/ABORT/REPLACE resolve against the correct source row.
  */
 describe('row-time covering enforcement', () => {
@@ -814,30 +787,24 @@ describe('row-time covering enforcement', () => {
 	async function freshCovered(extra: string[] = []): Promise<void> {
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, unique (x, y))');
-		await db.exec("create materialized view ix as select x, y, id from t order by x, y with refresh = 'row-time'");
+		await db.exec("create materialized view ix as select x, y, id from t order by x, y");
 		for (const stmt of extra) await db.exec(stmt);
 	}
 
-	it('resolver: a row-time covering MV is found; manual / on-commit-incremental are not', async () => {
+	it('resolver: a row-time covering MV is enforcement-ready; a table without one is not', async () => {
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, unique (x, y))');
-		await db.exec("create materialized view rt as select x, y, id from t order by x, y with refresh = 'row-time'");
+		await db.exec('create materialized view rt as select x, y, id from t order by x, y');
 		const uc = () => db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
 		expect(uc().coveringStructureName, 'forward pointer set').to.equal('rt');
 		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'row-time MV is enforcement-ready').to.equal('rt');
 
-		// A second table whose covering MV is `manual` must NOT be enforcement-ready.
+		// A UNIQUE constraint with no covering MV has no enforcement-ready structure
+		// (the O(1) negative fast path: no row-time plan reads the source).
 		await db.exec('create table u (id integer primary key, x integer not null, y integer not null, unique (x, y))');
-		await db.exec('create materialized view man as select x, y, id from u order by x, y');
 		const ucu = db.schemaManager.getTable('main', 'u')!.uniqueConstraints![0];
-		expect(ucu.coveringStructureName, 'manual MV still links').to.equal('man');
-		expect(db._findRowTimeCoveringStructure('main', 'u', ucu), 'manual MV is not row-time consistent').to.be.undefined;
-
-		// An on-commit-incremental covering MV is likewise not row-time consistent.
-		await db.exec('create table w (id integer primary key, x integer not null, y integer not null, unique (x, y))');
-		await db.exec("create materialized view ci as select x, y, id from w order by x, y with refresh = 'on-commit-incremental'");
-		const ucw = db.schemaManager.getTable('main', 'w')!.uniqueConstraints![0];
-		expect(db._findRowTimeCoveringStructure('main', 'w', ucw), 'on-commit-incremental MV is not row-time consistent').to.be.undefined;
+		expect(ucu.coveringStructureName, 'no covering MV → no forward pointer').to.be.undefined;
+		expect(db._findRowTimeCoveringStructure('main', 'u', ucu), 'no covering MV → not enforcement-ready').to.be.undefined;
 	});
 
 	it('INSERT conflict, default ABORT → UNIQUE constraint failed: t (x, y)', async () => {
@@ -849,7 +816,7 @@ describe('row-time covering enforcement', () => {
 	it('ABORT reports the prior source row recovered via the MV projection (ON CONFLICT upsert)', async () => {
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, n text, unique (x, y))');
-		await db.exec("create materialized view ix as select x, y, id, n from t order by x, y with refresh = 'row-time'");
+		await db.exec("create materialized view ix as select x, y, id, n from t order by x, y");
 		await db.exec("insert into t values (1, 5, 5, 'orig')");
 		// The conflict must resolve against the prior source row (id=1) the MV recovers:
 		// the upsert updates id=1 in place (id stays 1, n←'new') rather than inserting id=2,
@@ -898,7 +865,7 @@ describe('row-time covering enforcement', () => {
 		// `on conflict replace` default drives REPLACE for the conflicting UPDATE.
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, unique (x, y) on conflict replace)');
-		await db.exec("create materialized view ix as select x, y, id from t order by x, y with refresh = 'row-time'");
+		await db.exec("create materialized view ix as select x, y, id from t order by x, y");
 		await db.exec('insert into t values (1, 5, 5), (2, 6, 6)');
 		// id=1 moves onto (6,6): id=2 is evicted (recovered by PK) + its backing entry maintained.
 		await db.exec('update t set x = 6, y = 6 where id = 1');
@@ -923,7 +890,7 @@ describe('row-time covering enforcement', () => {
 		// With a schema-level REPLACE default the PK-changing move evicts id=2.
 		db = new Database();
 		await db.exec('create table t2 (id integer primary key, x integer not null, y integer not null, unique (x, y) on conflict replace)');
-		await db.exec("create materialized view ix2 as select x, y, id from t2 order by x, y with refresh = 'row-time'");
+		await db.exec("create materialized view ix2 as select x, y, id from t2 order by x, y");
 		await db.exec('insert into t2 values (1, 5, 5), (2, 6, 6)');
 		await db.exec('update t2 set id = 99, x = 6, y = 6 where id = 1');
 		expect(await selectAll('select * from t2 order by id')).to.deep.equal([{ id: 99, x: 6, y: 6 }]);
@@ -933,7 +900,7 @@ describe('row-time covering enforcement', () => {
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, active integer not null)');
 		await db.exec('create unique index uq on t (x, y) where active = 1');
-		await db.exec("create materialized view ix as select x, y, id from t where active = 1 order by x, y with refresh = 'row-time'");
+		await db.exec("create materialized view ix as select x, y, id from t where active = 1 order by x, y");
 		const uc = db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
 		expect(uc.coveringStructureName, 'partial covering MV linked').to.equal('ix');
 		expect(db._findRowTimeCoveringStructure('main', 't', uc)?.name).to.equal('ix');
@@ -948,15 +915,16 @@ describe('row-time covering enforcement', () => {
 		await expectThrows(() => db.exec('insert into t values (5, 5, 5, 1)'), 'UNIQUE constraint failed: t (x, y)');
 	});
 
-	it('non-row-time covering MV falls through to the auto-index (still enforced)', async () => {
+	it('a bare-DDL covering MV is row-time and is used for enforcement', async () => {
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, unique (x, y))');
-		// A `manual` covering MV links but is NOT row-time consistent ⇒ not used for enforcement.
+		// Every MV is row-time maintained, so a covering MV declared with bare DDL (the
+		// only form now) links AND is enforcement-ready — used in preference to the auto-index.
 		await db.exec('create materialized view man as select x, y, id from t order by x, y');
 		const uc = db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
 		expect(uc.coveringStructureName).to.equal('man');
-		expect(db._findRowTimeCoveringStructure('main', 't', uc), 'manual MV is not enforcement-ready').to.be.undefined;
-		// Enforcement still works (via the auto-index).
+		expect(db._findRowTimeCoveringStructure('main', 't', uc)?.name, 'row-time covering MV is enforcement-ready').to.equal('man');
+		// Enforcement works (the auto-index would also catch it).
 		await db.exec('insert into t values (1, 5, 5)');
 		await expectThrows(() => db.exec('insert into t values (2, 5, 5)'), 'UNIQUE constraint failed: t (x, y)');
 	});

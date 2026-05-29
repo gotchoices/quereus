@@ -40,40 +40,29 @@ const logger = createMemoryTableLoggers('layer:manager');
  *    table is kept consistent synchronously with each source row-write. Now that
  *    row-time write-through MV maintenance exists, {@link MemoryTableManager.findIndexForConstraint}
  *    returns this variant *in preference to* `memory-index` whenever a linked,
- *    non-stale, non-diverged row-time covering MV is present: it makes the MV the
- *    live conflict-resolution path (physical schemas otherwise never reach it,
- *    since the auto-index always exists) and is exactly the structure the lens
- *    layer makes sole once the auto-index is retired. A `manual` /
- *    `on-commit-incremental` covering MV is NOT row-time consistent mid-statement
- *    and is never returned here. See `docs/materialized-views.md` § Covering structures.
+ *    non-stale row-time covering MV is present: it makes the MV the live
+ *    conflict-resolution path (physical schemas otherwise never reach it, since
+ *    the auto-index always exists) and is exactly the structure the lens layer
+ *    makes sole once the auto-index is retired. See
+ *    `docs/materialized-views.md` § Covering structures.
  */
 export type CoveringStructure =
 	| { kind: 'memory-index'; index: MemoryIndex }
 	| { kind: 'materialized-view'; view: MaterializedViewSchema };
 
 /**
- * A single incremental-maintenance operation applied to an MV backing table's
- * committed base layer by {@link MemoryTableManager.applyMaintenance}.
+ * A single row-time-maintenance operation applied to an MV backing table's
+ * pending transaction layer by {@link MemoryTableManager.applyMaintenanceToLayer}.
  *
  * - `delete-key` removes the row with this full primary key (no-op if absent).
- * - `delete-by-prefix` removes *every* row whose leading `prefixLength` primary-key
- *   columns equal `prefix`. Used by the lateral-TVF fan-out maintenance path: a
- *   single base-row change maps to many backing rows sharing a common base-PK
- *   prefix, which one exact `delete-key` cannot express. The leading prefix
- *   columns are guaranteed ascending by the compile-time gate
- *   (`computePrefixDeleteOrder` in `database-materialized-views.ts`), so the
- *   matching rows form a contiguous, forward-scannable run on the primary btree.
  * - `upsert` replaces the row sharing this row's PK, or inserts when absent.
  *
- * The per-binding apply path emits `delete-key` (full MV-PK) + `upsert`; the
- * lateral-TVF fan-out path emits `delete-by-prefix` (base-PK prefix) + `upsert`.
- * Shapes whose recomputed fan-out cannot be proven a set on the backing PK fall
- * back to a full rebuild instead (always correct; see
- * `docs/materialized-views.md` § Incremental refresh).
+ * Row-time maintenance is one-source-row → one-backing-row, so a per-row delta is
+ * always a `delete-key` (old image) and/or an `upsert` (new image) — see
+ * `docs/materialized-views.md` § Row-time refresh.
  */
 export type MaintenanceOp =
 	| { kind: 'delete-key'; key: BTreeKeyForPrimary }
-	| { kind: 'delete-by-prefix'; prefix: readonly SqlValue[]; prefixLength: number }
 	| { kind: 'upsert'; row: Row };
 
 /** Origin + structure name for a UNIQUE constraint's implicit covering structure. */
@@ -973,8 +962,8 @@ export class MemoryTableManager {
 
 	/**
 	 * Resolves the {@link CoveringStructure} enforcing a UNIQUE constraint. Prefers
-	 * a linked, non-stale, non-diverged `row-time` covering MV when one is present
-	 * (the live enforcement path in v1; the sole structure once the auto-index is
+	 * a linked, non-stale row-time covering MV when one is present (the live
+	 * enforcement path in v1; the sole structure once the auto-index is
 	 * retired — see {@link CoveringStructure}), falling back to the auto-built
 	 * `memory-index`. The row-time resolution is a synchronous map lookup with an
 	 * O(1) negative fast path, so a non-covered table stays on the index path at
@@ -1253,68 +1242,6 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Apply a batch of incremental-maintenance operations directly to the
-	 * committed base layer. Used by the {@link import('../../../core/database-materialized-views.js').MaterializedViewManager}
-	 * to maintain an `on-commit-incremental` materialized view's backing table
-	 * post-commit, off the user-transaction path.
-	 *
-	 * Deliberately bypasses the user write-boundary (it is NOT gated by
-	 * `validateMutationPermissions`, which throws READONLY for MV backing tables)
-	 * and does not require a user {@link MemoryTableConnection}. Mirrors
-	 * {@link replaceBaseLayer}'s discipline: acquire the SchemaChange latch, drain
-	 * any in-flight committed transaction layers to base, then mutate the base
-	 * tree in place under the latch. Operations are applied in order, so callers
-	 * encode delete-then-upsert as two ops; secondary indexes are rebuilt once at
-	 * the end.
-	 *
-	 * Atomic from the event-loop's perspective: the only awaits are the latch and
-	 * the drain — the tree mutations + index rebuild are synchronous, so a
-	 * concurrent fresh scan never observes a partial batch.
-	 */
-	async applyMaintenance(ops: readonly MaintenanceOp[]): Promise<void> {
-		if (ops.length === 0) return;
-		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
-		try {
-			await this.ensureSchemaChangeSafety();
-
-			const tree = this.baseLayer.primaryTree;
-			for (const op of ops) {
-				switch (op.kind) {
-					case 'delete-key': {
-						const path = tree.find(op.key);
-						if (path.on) tree.deleteAt(path);
-						break;
-					}
-					case 'delete-by-prefix': {
-						this.deleteByPrefix(op.prefix, op.prefixLength);
-						break;
-					}
-					case 'upsert': {
-						const key = this.primaryKeyFunctions.extractFromRow(op.row);
-						const path = tree.find(key);
-						if (path.on) tree.deleteAt(path);
-						tree.insert(op.row);
-						break;
-					}
-				}
-			}
-			this.baseLayer.rebuildAllSecondaryIndexes();
-
-			// The base was mutated in place; connections already referencing it
-			// observe the new state. Re-point any still reading a stale layer
-			// (mirrors replaceBaseLayer / ensureSchemaChangeSafety).
-			for (const conn of this.connections.values()) {
-				if (conn.readLayer !== this.baseLayer) {
-					conn.readLayer = this.baseLayer;
-				}
-			}
-		} finally {
-			release();
-		}
-	}
-
-	/**
 	 * Privileged **transactional** maintenance write: apply an ordered
 	 * {@link MaintenanceOp} batch to a given connection's *pending*
 	 * {@link TransactionLayer} (creating it lazily, exactly as a user write would).
@@ -1352,73 +1279,7 @@ export class MemoryTableManager {
 					layer.recordUpsert(key, op.row, existing);
 					break;
 				}
-				case 'delete-by-prefix':
-					// Row-time maintenance (covering-index shape) is one-source-row →
-					// one-backing-row, so it never emits a fan-out prefix delete.
-					throw new QuereusError(
-						`delete-by-prefix is not supported by transactional row-time maintenance`,
-						StatusCode.INTERNAL,
-					);
 			}
-		}
-	}
-
-	/**
-	 * Delete every committed base-layer row whose leading `prefixLength` primary-key
-	 * columns equal `prefix`. The fan-out half of the lateral-TVF maintenance op:
-	 * one base-row change maps to many backing rows sharing a base-PK prefix.
-	 *
-	 * Soundness rests on two facts the compile-time gate guarantees:
-	 *  - the leading prefix columns are the *base* PK and lead the backing PK, so
-	 *    rows sharing the prefix all derive from the one changed base row, and
-	 *  - those leading columns are ascending, so the matching rows form a single
-	 *    contiguous, forward-scannable run on the primary btree.
-	 *
-	 * Implementation mirrors `scanLayer`'s prefix-range scan: seek to the prefix
-	 * (the composite-key comparator's length-diff branch positions a shorter probe
-	 * just before all full keys sharing it), forward-scan collecting matches, and
-	 * stop at the first mismatch (the run is contiguous from the seek, so the first
-	 * non-match ends it — including an empty run). Matches are collected first, then
-	 * deleted by key, so the scan never mutates the tree it is walking. Per-column
-	 * equality is collation-aware (the prefix columns' declared collation).
-	 */
-	private deleteByPrefix(prefix: readonly SqlValue[], prefixLength: number): void {
-		const tree = this.baseLayer.primaryTree;
-		const pkDef = this.tableSchema.primaryKeyDefinition;
-
-		const seekKey = prefix.slice() as unknown as BTreeKeyForPrimary;
-		const path = tree.find(seekKey);
-		// A shorter probe never matches a (longer) full key exactly, so `find`
-		// lands on a crack; step onto the first element at/after it. (Guard `on`
-		// defensively in case a degenerate schema stores a same-length key.)
-		if (!path.on) tree.moveNext(path);
-
-		const toDelete: BTreeKeyForPrimary[] = [];
-		while (path.on) {
-			const row = tree.at(path)!;
-			const key = this.primaryKeyFunctions.extractFromRow(row);
-			const keyArr = (Array.isArray(key) ? key : [key]) as SqlValue[];
-			let matches = true;
-			for (let j = 0; j < prefixLength; j++) {
-				const collation = pkDef[j]?.collation ?? 'BINARY';
-				if (compareSqlValues(keyArr[j], prefix[j], collation) !== 0) { matches = false; break; }
-			}
-			if (!matches) {
-				// The seek lands exactly at the run's lower boundary (the comparator's
-				// length-diff branch sorts a shorter probe just before all full keys
-				// sharing its prefix), and the matching rows are contiguous, so the
-				// first mismatch ends the run — including the empty-run case (nothing
-				// to delete, e.g. a freshly inserted base row), which would otherwise
-				// scan to the end of the tree. Mirrors `scanLayer`'s prefix-range break.
-				break;
-			}
-			toDelete.push(key);
-			tree.moveNext(path);
-		}
-
-		for (const key of toDelete) {
-			const p = tree.find(key);
-			if (p.on) tree.deleteAt(p);
 		}
 	}
 

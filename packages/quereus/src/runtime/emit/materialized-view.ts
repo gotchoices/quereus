@@ -7,7 +7,7 @@ import type { Instruction, RuntimeContext } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
-import type { MaterializedViewSchema, RefreshPolicy } from '../../schema/view.js';
+import type { MaterializedViewSchema } from '../../schema/view.js';
 import { backingTableNameFor } from '../../schema/view.js';
 import { astToString } from '../../emit/ast-stringify.js';
 import {
@@ -22,16 +22,6 @@ import {
 	unlinkCoveredUniqueConstraints,
 	materializedViewNotASetError,
 } from './materialized-view-helpers.js';
-
-/** Map the parsed `with refresh = '...'` literal onto a {@link RefreshPolicy} kind
- *  (absent ⇒ `manual`). */
-function refreshPolicyKind(policy: CreateMaterializedViewNode['refreshPolicy']): RefreshPolicy['kind'] {
-	switch (policy) {
-		case 'on-commit-incremental': return 'on-commit-incremental';
-		case 'row-time': return 'row-time';
-		default: return 'manual';
-	}
-}
 
 export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -88,7 +78,6 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 			sourceTables: shape.sourceTables,
 			stale: false,
 			origin: 'explicit',
-			refreshPolicy: { kind: refreshPolicyKind(plan.refreshPolicy) },
 		};
 		// Eagerly record the constraint↔structure link if this MV covers a UNIQUE
 		// constraint (informational — enforcement still routes through the
@@ -96,10 +85,10 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 		linkCoveredUniqueConstraints(db, mv, plan.bodySql);
 		sm.addMaterializedView(mv);
 
-		// Compile + register incremental maintenance (no-op for manual). The
-		// binding-based eligibility check runs here (it needs the analyzed body)
-		// and throws on a 'global'-source body — roll the whole MV back so an
-		// ineligible `on-commit-incremental` errors cleanly at create time.
+		// Compile + register row-time write-through maintenance. The mandatory
+		// eligibility gate runs here (it needs the analyzed body) and throws on a
+		// body that is not row-time maintainable — roll the whole MV back so an
+		// ineligible body errors cleanly at create time.
 		try {
 			db.registerMaterializedView(mv);
 		} catch (e) {
@@ -142,10 +131,6 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		await rebuildBacking(db, mv);
 
 		mv.stale = false;
-		// A successful full re-materialization clears data divergence too — the
-		// backing table now matches the sources (distinct from `stale`, which tracks
-		// structural body breakage). A later incremental apply never clears this.
-		mv.diverged = false;
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_refreshed',
 			schemaName: plan.schemaName,
@@ -182,10 +167,9 @@ export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: E
 			throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
 		}
 
-		// Detach any incremental DeltaSubscription + release its capture demand
-		// (no-op for a manual MV). The manager also reacts to the
+		// Detach the row-time maintenance plan. The manager also reacts to the
 		// `materialized_view_removed` event below, but detaching first keeps the
-		// stale subscription from firing on the backing-table drop's change log.
+		// stale plan from firing on the backing-table drop.
 		db.unregisterMaterializedView(plan.schemaName, plan.viewName);
 
 		// Clear any constraint↔structure link this MV established. No enforcement

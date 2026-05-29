@@ -197,12 +197,11 @@ const DML_NODE_TYPES = new Set<PlanNodeType>([
 
 /**
  * Resolves a table reference's qualified name to the source-union `ChangeScope`
- * that should replace its watch. The sole use is projecting an
- * `on-commit-incremental` materialized view's backing-table reference onto the
- * sources whose mutations actually drive its maintenance: the backing table is
- * never user-written, so a watch on it would never fire. Returns `undefined`
- * for anything that is not an incremental-MV backing table (ordinary tables,
- * and `manual` MVs — whose cadence is `refresh`, not source mutations).
+ * that should replace its watch. The sole use is projecting a materialized
+ * view's backing-table reference onto the sources whose mutations actually drive
+ * its maintenance: the backing table is row-time maintained off the user change
+ * log, so a watch on it would never fire. Returns `undefined` for anything that
+ * is not an MV backing table (ordinary tables).
  */
 export type MaterializedViewSourceResolver = (table: QualifiedName) => ChangeScope | undefined;
 
@@ -246,10 +245,10 @@ export function analyzeChangeScope(
 			const tableName = ref.tableSchema.name.toLowerCase();
 			const table: QualifiedName = { schema: schemaName, table: tableName };
 
-			// An `on-commit-incremental` MV's backing table is maintained at COMMIT
-			// from its sources and never appears in the user change log. Replace the
-			// (never-firing) backing-table watch with the MV's source-union scope so
-			// a watcher fires on a SOURCE mutation instead.
+			// An MV's backing table is row-time maintained from its sources and never
+			// appears in the user change log. Replace the (never-firing) backing-table
+			// watch with the MV's source-union scope so a watcher fires on a SOURCE
+			// mutation instead.
 			const mvScope = options?.resolveMaterializedViewSource?.(table);
 			if (mvScope) {
 				mvSourceScopes.push(mvScope);
@@ -716,10 +715,10 @@ function sortedDedupParamIndices(set: Set<number | string>): ReadonlyArray<numbe
 /**
  * Build the conservative source-union `ChangeScope` for a materialized view:
  * one `{kind:'full'}` watch (columns `'all'`) per source table. This is the
- * scope an `on-commit-incremental` MV reference projects to, so a watcher fires
- * on any source mutation. A precise per-source row/group scope — mirroring the
- * maintenance bindings the `MaterializedViewManager` already derives — is a
- * future refinement.
+ * scope a materialized view reference projects to, so a watcher fires on any
+ * source mutation. A precise per-source row scope — mirroring the row-time
+ * maintenance the `MaterializedViewManager` already derives — is a future
+ * refinement.
  *
  * @param sourceTables Qualified lowercased `schema.table` names, as recorded on
  *   `MaterializedViewSchema.sourceTables`.

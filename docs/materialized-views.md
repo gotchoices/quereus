@@ -14,14 +14,6 @@ transaction just made (reads-own-writes); maintenance commits and rolls back in
 lockstep with the source write. The user never reasons about *when* the view is
 consistent.
 
-> **Status.** This document describes the **row-time-only** contract decided in
-> `materialized-view-rowtime-only-consolidation` (plan). The row-time mechanism,
-> covering-structure links, and row-time UNIQUE enforcement are **delivered**. The
-> *removal* of the legacy `manual` and `on-commit-incremental` refresh policies and
-> the post-commit divergence subsystem is in progress under that ticket; until it
-> lands, the engine still parses `with refresh = '...'` and ships those policies.
-> The contract below is the target.
-
 ## Why one model
 
 A materialized view exists to be a *correctness-free* optimization: the user adds

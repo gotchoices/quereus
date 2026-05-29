@@ -1,11 +1,12 @@
 -- 54-covering-mv-enforcement.sqllogic — row-time UNIQUE enforcement routed
--- through an explicit `row-time` covering materialized view's backing table
+-- through an explicit covering materialized view's backing table
 -- (covering-structure-mv-rowtime-enforcement). The covering MV
--- `select <uc-cols>, <pk> from T order by <uc-cols> with refresh = 'row-time'`
--- is both *covering* (the prover links it to the UNIQUE constraint) and
--- *row-time* (its backing is consistent mid-statement), so `findIndexForConstraint`
--- prefers it over the auto-index and the source PK is recovered from the MV
--- projection to resolve IGNORE / ABORT / REPLACE against the correct source row.
+-- `select <uc-cols>, <pk> from T order by <uc-cols>` is both *covering* (the
+-- prover links it to the UNIQUE constraint) and row-time (every MV is row-time
+-- maintained, so its backing is consistent mid-statement), so
+-- `findIndexForConstraint` prefers it over the auto-index and the source PK is
+-- recovered from the MV projection to resolve IGNORE / ABORT / REPLACE against
+-- the correct source row.
 --
 -- This file runs under BOTH the memory module (`yarn test`) and the store module
 -- (`yarn test:store`); under the store the source table is a store table while the
@@ -16,7 +17,7 @@
 -- ===================================
 
 create table t (id integer primary key, x integer not null, y integer not null, unique (x, y));
-create materialized view ix as select x, y, id from t order by x, y with refresh = 'row-time';
+create materialized view ix as select x, y, id from t order by x, y;
 insert into t values (1, 5, 5);
 
 -- default ABORT: a duplicate (x,y) with a different PK is rejected
@@ -48,7 +49,7 @@ select id, x, y from t order by id;
 -- ===================================
 
 create table m (id integer primary key, x integer not null, y integer not null, unique (x, y));
-create materialized view m_ix as select x, y, id from m order by x, y with refresh = 'row-time';
+create materialized view m_ix as select x, y, id from m order by x, y;
 
 -- ABORT: the second row collides with the first written earlier in the statement
 insert into m values (1, 7, 7), (2, 7, 7);
@@ -68,7 +69,7 @@ select id, x, y from m order by id;
 -- ===================================
 
 create table u (id integer primary key, x integer not null, y integer not null, unique (x, y));
-create materialized view u_ix as select x, y, id from u order by x, y with refresh = 'row-time';
+create materialized view u_ix as select x, y, id from u order by x, y;
 insert into u values (1, 5, 5), (2, 6, 6);
 
 -- moving id=1 onto (6,6) collides with id=2 (UPDATE OR <action> is unsupported,
@@ -80,7 +81,7 @@ select id, x, y from u order by id;
 → [{"id":1,"x":5,"y":5},{"id":2,"x":6,"y":6}]
 
 create table ur (id integer primary key, x integer not null, y integer not null, unique (x, y) on conflict replace);
-create materialized view ur_ix as select x, y, id from ur order by x, y with refresh = 'row-time';
+create materialized view ur_ix as select x, y, id from ur order by x, y;
 insert into ur values (1, 5, 5), (2, 6, 6);
 
 -- the REPLACE default drives eviction of id=2 when id=1 moves onto (6,6)
@@ -96,7 +97,7 @@ select id, x, y from ur order by id;
 -- ===================================
 
 create table pk (id integer primary key, x integer not null, y integer not null, unique (x, y));
-create materialized view pk_ix as select x, y, id from pk order by x, y with refresh = 'row-time';
+create materialized view pk_ix as select x, y, id from pk order by x, y;
 insert into pk values (1, 5, 5);
 
 update pk set id = 10 where id = 1;
@@ -111,7 +112,7 @@ select x, y, id from pk_ix order by x, y;
 
 create table p (id integer primary key, x integer not null, y integer not null, active integer not null);
 create unique index p_uq on p (x, y) where active = 1;
-create materialized view p_ix as select x, y, id from p where active = 1 order by x, y with refresh = 'row-time';
+create materialized view p_ix as select x, y, id from p where active = 1 order by x, y;
 
 insert into p values (1, 5, 5, 1);
 -- an out-of-scope row sharing (x,y) does NOT conflict
@@ -129,8 +130,9 @@ select count(*) as n from p;
 → [{"n":4}]
 
 -- ===================================
--- 6. A non-row-time (manual) covering MV is NOT used for enforcement — the
---    auto-index still enforces, so the constraint holds either way.
+-- 6. A covering MV declared with bare DDL (the only form now — every MV is
+--    row-time maintained) routes enforcement through the MV just like the explicit
+--    cases above. The auto-index also still enforces, so the constraint holds.
 -- ===================================
 
 create table man (id integer primary key, x integer not null, y integer not null, unique (x, y));

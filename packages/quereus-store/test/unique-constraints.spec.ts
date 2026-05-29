@@ -209,17 +209,18 @@ describe('StoreTable UNIQUE constraints', () => {
 		});
 	});
 
-	// StoreTable routes UNIQUE conflict resolution through a linked `row-time`
+	// StoreTable routes UNIQUE conflict resolution through a linked row-time
 	// covering materialized view's backing table when one is present (the store
 	// analogue of the memory enforcement path; see
-	// covering-structure-mv-rowtime-enforcement). The backing table is the memory
-	// module, queried through the db with reads-own-writes. Exercised directly here
-	// (no isolation overlay), since the isolation-wrapped logic sweep enforces UNIQUE
-	// via its own merged-view detection rather than the covering MV.
+	// covering-structure-mv-rowtime-enforcement). Every MV is row-time maintained.
+	// The backing table is the memory module, queried through the db with
+	// reads-own-writes. Exercised directly here (no isolation overlay), since the
+	// isolation-wrapped logic sweep enforces UNIQUE via its own merged-view
+	// detection rather than the covering MV.
 	describe('covering materialized-view enforcement', () => {
 		beforeEach(async () => {
 			await db.exec(`CREATE TABLE cm (id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL, UNIQUE (x, y)) USING store`);
-			await db.exec(`CREATE MATERIALIZED VIEW cm_ix AS SELECT x, y, id FROM cm ORDER BY x, y WITH refresh = 'row-time'`);
+			await db.exec(`CREATE MATERIALIZED VIEW cm_ix AS SELECT x, y, id FROM cm ORDER BY x, y`);
 			await db.exec(`INSERT INTO cm VALUES (1, 5, 5)`);
 		});
 

@@ -136,7 +136,7 @@ export { SchemaManager } from './schema/manager.js';
 export { buildColumnIndexMap, columnDefToSchema } from './schema/table.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
-export type { MaterializedViewSchema, ViewSchema, RefreshPolicy } from './schema/view.js';
+export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';
 export { generateTableDDL, generateIndexDDL } from './schema/ddl-generator.js';
 
 // Partial-index predicate compilation (used by store modules to honor partial UNIQUE)

@@ -783,10 +783,6 @@ export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewS
 
 	parts.push('as', astToString(stmt.select));
 
-	if (stmt.refreshPolicy && stmt.refreshPolicy !== 'manual') {
-		parts.push(`with refresh = '${stmt.refreshPolicy}'`);
-	}
-
 	const viewTagStr = tagsClauseToString(stmt.tags);
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
 

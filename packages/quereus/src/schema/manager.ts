@@ -487,9 +487,10 @@ export class SchemaManager {
 	 * convention (see {@link backingTableNameFor}), so the MV name is derived from
 	 * the prefix and confirmed against the MV's own `backingTableName`.
 	 *
-	 * Used by change-scope analysis to project an `on-commit-incremental` MV's
-	 * backing-table reference onto its sources. Returns undefined when `backingName`
-	 * is not a backing-table name, or no MV in that schema is backed by it.
+	 * Used by change-scope analysis to project a materialized view's backing-table
+	 * reference onto its sources, and by the row-time create gate to reject
+	 * MV-over-MV bodies. Returns undefined when `backingName` is not a backing-table
+	 * name, or no MV in that schema is backed by it.
 	 */
 	getMaterializedViewByBackingTable(schemaName: string | null, backingName: string): MaterializedViewSchema | undefined {
 		const lower = backingName.toLowerCase();
