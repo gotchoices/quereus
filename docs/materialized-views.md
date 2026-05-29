@@ -378,12 +378,19 @@ only forgoes an optimization, a false *Covers* would be unsound):
   or a `LIMIT`/`OFFSET` row cap ⇒ not covering.
 - **Join (1:1) decomposition.** "Exactly one MV row per governed `T` row" splits
   into two independent obligations:
-    - *No row loss (≥1):* `T` must sit on the row-**preserving** side of every join
-      between the body root and `T`'s reference — a `left` join with `T` in the left
-      subtree, or a `right` join with `T` in the right subtree. `inner`/`cross`,
-      `semi`/`anti`, `full`, and `T` on the dropping side are rejected as *shape*.
-      (FDs encode uniqueness, not existence, so this is a structural plan-walk
-      check.)
+    - *No row loss (≥1):* proven structurally during the plan walk, two ways:
+      **(a) row preservation** — `T` on the row-**preserving** side of the join (a
+      `left` join with `T` in the left subtree, or a `right` join with `T` in the
+      right subtree); or **(b) referential integrity** — an `inner`/`cross` join
+      whose equi-pairs are a **NOT-NULL foreign key from `T` to the lookup table's
+      primary key**, over a lookup side that exposes the parent's *full* row set, so
+      enforced RI makes the join 1:1 (`innerJoinRetainsConstrainedTable`; the same
+      NOT-NULL-FK + full-parent-row-set discipline `rule-join-elimination`'s INNER
+      branch uses — declared FKs are trusted as inclusion dependencies, so this
+      adds no assumption the optimizer doesn't already make). An `inner`/`cross`
+      join *without* a covering NOT-NULL FK, `semi`/`anti`, `full`, and `T` on the
+      dropping side are rejected as *shape*. (FDs encode uniqueness, not existence,
+      so obligation (a) is a structural plan-walk check; (b) reads the FK schema.)
     - *No fan-out (≤1):* `T`'s primary key must be a unique key of the **topmost
       join's output relation** (read via `isUnique`). The optimizer emits
       `T.pk → all_join_cols` into the join's FDs exactly when the equi-pairs cover a
@@ -473,12 +480,13 @@ FD-derived output key masks base-row duplicates. See
 [Optimizer § Effective-key proving](optimizer.md#effective-key-proving-body-proves-it)
 and [Lenses § the constraint-role split](lens.md).
 
-Remaining covering follow-ups: `coverage-prover-inner-join-fk-preservation` (admit an
-`inner`/`cross` lookup join when an enforced NOT-NULL FK proves every `T` row matches,
-closing the no-row-loss obligation structurally) and
-`coverage-prover-qualified-name-resolution` (qualifier-aware AST resolution so a 1:1
-join body whose lookup side reuses a UC column name covers). Multi-source (outer-join
-1:1) bodies are **delivered** (`coverage-prover-multi-source-bodies`).
+Multi-source 1:1 join bodies are **delivered**: outer-join row preservation
+(`coverage-prover-multi-source-bodies`) and `inner`/`cross` lookup joins on an enforced
+NOT-NULL FK→PK (`coverage-prover-inner-join-fk-preservation`, the no-row-loss obligation
+closed by referential integrity). Remaining follow-up:
+`coverage-prover-qualified-name-resolution` (qualifier-aware AST resolution so a 1:1 join
+body whose lookup side reuses a UC column name covers). Full-outer covering stays deferred
+(it injects lookup-only rows with no governed `T` row).
 
 ## Out of scope / roadmap
 

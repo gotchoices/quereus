@@ -27,13 +27,24 @@
  * **The 1:1 join decomposition.** "Exactly one MV row per governed `T` row"
  * splits into two independent obligations, each proven by a distinct surface:
  *
- *  - **No row loss (≥1).** `T` must sit on the row-*preserving* side of every
- *    join between the body root and `T`'s reference: a `left` join with `T` in
- *    the left subtree, or a `right` join with `T` in the right subtree. All
- *    other join types/positions (`inner`/`cross` drop unmatched `T` rows;
+ *  - **No row loss (≥1).** Proven one of two ways during the plan walk:
+ *
+ *      1. *Row preservation* — `T` sits on the row-*preserving* side of the join:
+ *         a `left` join with `T` in the left subtree, or a `right` join with `T`
+ *         in the right subtree.
+ *      2. *Referential integrity* — an `inner`/`cross` join whose equi-pairs are
+ *         a **NOT-NULL foreign key from `T` to the lookup table's primary key**,
+ *         over a lookup side that exposes the parent's *full* row set
+ *         (`innerJoinRetainsConstrainedTable`). Enforced RI then makes every `T`
+ *         row match exactly one lookup row, so the inner join loses nothing. This
+ *         leans on the engine treating declared FKs as inclusion dependencies —
+ *         see the RI soundness note below.
+ *
+ *    Every other join type/position (`inner`/`cross` *without* a covering FK;
  *    `semi`/`anti` filter; `full` injects lookup-only rows; `T` on the dropping
- *    side) are rejected as `shape`. This is a *structural* check during the
- *    plan walk — FDs encode uniqueness, not existence, so they cannot prove it.
+ *    side) is rejected as `shape`. FDs encode uniqueness, not existence, so
+ *    obligation (1) cannot be FD-derived; obligation (2) reads the FK schema +
+ *    the lookup-side plan shape directly.
  *
  *  - **No fan-out (≤1).** `T`'s primary key must be a unique key of the
  *    **topmost join's output relation**, read through `isUnique`. The optimizer
@@ -56,8 +67,20 @@
  *
  * Both obligations are required and neither implies the other: a `left` join to
  * a *non-unique* lookup key is row-preserving but fans out (caught by the fan-out
- * gate); an `inner` join to a unique lookup key does not fan out but loses
- * unmatched `T` rows (caught by the structural side/type gate).
+ * gate); an `inner` join to a unique *non-FK* (or nullable-FK) lookup key does
+ * not fan out but can lose `T` rows (caught by the no-row-loss gate). A NOT-NULL
+ * FK→PK inner join satisfies both at once: the FK target is the PK, so it is
+ * unique (no fan-out) *and* every `T` row matches (no row loss).
+ *
+ * **Referential-integrity soundness (load-bearing).** Obligation (2) is sound
+ * only because Quereus *enforces* referential integrity: `pragma foreign_keys`
+ * defaults on, and the optimizer treats every declared FK as a hard inclusion
+ * dependency (`child.fk ⊆ parent.pk` — see `util/ind-utils.ts`). The INNER
+ * branch of `rule-join-elimination` already relies on exactly this invariant to
+ * drop an FK→PK join, so admitting the same shape here introduces no *new*
+ * assumption. If FKs were advisory — or RI is disabled and orphan child rows are
+ * inserted — both this admit path *and* inner join elimination would be unsound
+ * together; that is a global optimizer assumption, not one this prover owns.
  *
  * **NOT the `extractBindings` `'row'` classification.** A tempting-but-wrong
  * signal is the binding extractor's `'row'` class (`binding-extractor.ts`,
@@ -80,9 +103,9 @@
  * v1 path covers it with no join-specific code. This module handles the residual
  * cases where the join survives the optimizer but is still provably 1:1.
  *
- * Inner/cross covering via enforced referential integrity, and full-outer
- * covering, remain deferred (see the backlog tickets in the implement ticket's
- * out-of-scope list).
+ * Inner/cross covering via enforced referential integrity is handled (obligation
+ * (2) above). Full-outer covering remains deferred (it injects lookup-only rows
+ * that have no governed `T` row).
  *
  * ---
  *
@@ -120,17 +143,28 @@
  * separate concern of the row-time-enforcement / lens tickets, not this one.
  */
 
-import type { RelationalPlanNode, GuardClause } from '../nodes/plan-node.js';
+import type { RelationalPlanNode, ScalarPlanNode, GuardClause } from '../nodes/plan-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
-import { TableReferenceNode } from '../nodes/reference.js';
+import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { FilterNode } from '../nodes/filter.js';
+import { JoinNode, extractEquiPairsFromCondition } from '../nodes/join-node.js';
+import { BloomJoinNode } from '../nodes/bloom-join-node.js';
+import { MergeJoinNode } from '../nodes/merge-join-node.js';
+import { SeqScanNode, IndexScanNode } from '../nodes/table-access-nodes.js';
+import { AliasNode } from '../nodes/alias-node.js';
+import { SortNode } from '../nodes/sort.js';
+import { RetrieveNode } from '../nodes/retrieve-node.js';
+import { BinaryOpNode } from '../nodes/scalar.js';
+import type { EquiJoinPair } from '../nodes/join-utils.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaterializedViewSchema } from '../../schema/view.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
 import { columnIndexFromExpr, collectColumnNames } from './predicate-shape.js';
+import { normalizePredicate } from './predicate-normalizer.js';
 import { isUnique } from '../util/fd-utils.js';
+import { lookupCoveringFK } from '../util/ind-utils.js';
 
 export type CoverageFailureReason =
 	| 'shape'
@@ -235,20 +269,30 @@ export function proveCoverage(
 			break;
 		}
 		if (BINARY_JOIN_TYPES.has(node.nodeType) && CapabilityDetectors.isJoin(node)) {
-			const left = node.getLeftSource();
-			const right = node.getRightSource();
+			const left: RelationalPlanNode = node.getLeftSource();
+			const right: RelationalPlanNode = node.getRightSource();
 			const joinType = node.getJoinType();
 			const leftHasT = subtreeContainsConstrainedTable(left, baseTable);
 			const rightHasT = subtreeContainsConstrainedTable(right, baseTable);
 			// `T` on both sides (self-join) or neither ⇒ ambiguous / not our table.
 			if (leftHasT === rightHasT) return notCovers('shape');
-			// No row loss: `T` must be on the preserving side — `left` preserves the
-			// left subtree, `right` preserves the right subtree. Every other join
-			// type/position drops or duplicates governed `T` rows.
-			if (leftHasT && joinType !== 'left') return notCovers('shape');
-			if (rightHasT && joinType !== 'right') return notCovers('shape');
+			const tSide: RelationalPlanNode = leftHasT ? left : right;
+			const lookupSide: RelationalPlanNode = leftHasT ? right : left;
+			// No row loss: `T` must keep every governed row. Two sound paths:
+			//  - row-preservation — `T` on the preserving side of an outer join
+			//    (`left`→left subtree, `right`→right subtree); or
+			//  - referential integrity — an `inner`/`cross` join whose equi-pairs are
+			//    a NOT-NULL FK from `T` to the lookup table's PK, so enforced RI makes
+			//    every `T` row match exactly one lookup row (`innerJoinRetainsConstrainedTable`).
+			// Every other join type/position drops or duplicates governed `T` rows.
+			const rowPreserving = (leftHasT && joinType === 'left') || (rightHasT && joinType === 'right');
+			if (!rowPreserving) {
+				const fkRetained = (joinType === 'inner' || joinType === 'cross')
+					&& innerJoinRetainsConstrainedTable(node, tSide, lookupSide, baseTable);
+				if (!fkRetained) return notCovers('shape');
+			}
 			if (topJoin === undefined) topJoin = node;
-			node = leftHasT ? left : right;
+			node = tSide;
 			continue;
 		}
 		if (node instanceof FilterNode || PASS_THROUGH.has(node.nodeType)) {
@@ -428,6 +472,169 @@ function subtreeContainsConstrainedTable(node: RelationalPlanNode, baseTable: Ta
 		if (subtreeContainsConstrainedTable(rel, baseTable)) return true;
 	}
 	return false;
+}
+
+/**
+ * The `TableReferenceNode` over `baseTable` somewhere in `node`'s subtree, or
+ * `undefined`. Like `subtreeContainsConstrainedTable` but returns the node so
+ * `T`'s stable attribute ids can be mapped to its base column indices. (A
+ * self-join is already rejected upstream, so the first match is unambiguous.)
+ */
+function findConstrainedTableRef(node: RelationalPlanNode, baseTable: TableSchema): TableReferenceNode | undefined {
+	if (node instanceof TableReferenceNode) {
+		return node.tableSchema.name.toLowerCase() === baseTable.name.toLowerCase()
+			&& node.tableSchema.schemaName.toLowerCase() === baseTable.schemaName.toLowerCase()
+			? node : undefined;
+	}
+	for (const rel of node.getRelations()) {
+		const found = findConstrainedTableRef(rel, baseTable);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+/**
+ * The leaf `TableReferenceNode` of `node` **iff** the path down to it exposes the
+ * table's *full* row set — nothing filters, seeks, limits, or deduplicates rows.
+ * Returns `undefined` otherwise.
+ *
+ * This is the optimized-plan analogue of `ind-utils.ts`'s
+ * `isRowPreservingPathToTable` (which recognizes the *logical*-plan shape:
+ * bare TableReference / Retrieve-of-bare-table / Alias / Sort). After physical
+ * access selection a full scan is a `SeqScan`/`IndexScan` over the table — so we
+ * additionally admit those, but only when **not range-bounded** (`rangeBoundedOn`
+ * unset; a bounded scan drops rows). `IndexSeek`/`TableSeek` (row-reducing
+ * seeks), `Filter`, `LimitOffset`, `Distinct`, `Project`, joins, aggregates, …
+ * all disqualify by falling through to `undefined`.
+ *
+ * Required for the inner-join FK admit path: the lookup (parent) side must
+ * produce the parent's full row set, else a `T` row whose parent was filtered
+ * out would be dropped despite the FK guarantee — re-introducing row loss.
+ */
+function resolveFullScanTableRef(node: RelationalPlanNode): TableReferenceNode | undefined {
+	let n: RelationalPlanNode = node;
+	for (;;) {
+		if (n instanceof TableReferenceNode) return n;
+		if (n instanceof SeqScanNode || n instanceof IndexScanNode) {
+			if (n.rangeBoundedOn) return undefined;
+			n = n.source;
+			continue;
+		}
+		if (n instanceof AliasNode || n instanceof SortNode || n instanceof RetrieveNode) {
+			const rels = n.getRelations();
+			if (rels.length !== 1) return undefined;
+			n = rels[0];
+			continue;
+		}
+		return undefined;
+	}
+}
+
+/**
+ * True iff `cond` (after normalization) is a pure conjunction of
+ * column-to-column equalities — `a.x = b.y AND …` with no other operator and no
+ * non-column operand. The inner-join no-row-loss proof needs this: a residual
+ * non-equi conjunct (or an equality to a literal/expression) can drop `T` rows
+ * the FK→PK guarantee assumes survive, so any such condition disqualifies.
+ */
+function isPureColumnEquiCondition(cond: ScalarPlanNode): boolean {
+	const stack: ScalarPlanNode[] = [normalizePredicate(cond)];
+	while (stack.length) {
+		const n = stack.pop()!;
+		if (n instanceof BinaryOpNode) {
+			const op = n.expression.operator;
+			if (op === 'AND') { stack.push(n.left, n.right); continue; }
+			if (op === '=' && n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Equi-pairs of a binary join in attribute-id form, or `undefined` when the join
+ * carries anything beyond an equi-only condition (which could drop `T` rows and
+ * so breaks the no-row-loss proof). Physical joins (`BloomJoin`/`MergeJoin`)
+ * pre-extract their equi-pairs and stash any remainder in `residualCondition`; a
+ * logical `JoinNode` carries a single `condition` that must be a pure
+ * AND-of-column-equalities. A bare cross join (no condition / no equi-pairs)
+ * yields an empty list, which the caller treats as "no FK to align".
+ */
+function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[] | undefined {
+	if (join instanceof BloomJoinNode || join instanceof MergeJoinNode) {
+		return join.residualCondition === undefined ? join.equiPairs : undefined;
+	}
+	if (join instanceof JoinNode) {
+		if (!join.condition) return [];
+		if (!isPureColumnEquiCondition(join.condition)) return undefined;
+		const leftAttrs = join.left.getAttributes();
+		const rightAttrs = join.right.getAttributes();
+		return extractEquiPairsFromCondition(join.condition, leftAttrs, rightAttrs)
+			.map(p => ({ leftAttrId: leftAttrs[p.left].id, rightAttrId: rightAttrs[p.right].id }));
+	}
+	return undefined;
+}
+
+/**
+ * No-row-loss proof for an `inner`/`cross` join: every governed `T` row is
+ * retained because the join's equi-pairs are a **NOT-NULL foreign key from `T`
+ * to the lookup table's primary key**, and Quereus enforces referential
+ * integrity (declared FKs are treated as inclusion dependencies — the same
+ * `lookupCoveringFK` + full-parent-row-set discipline the INNER branch of
+ * `rule-join-elimination` relies on; see the module doc's soundness note).
+ *
+ * Each obligation closes a distinct row-loss gap:
+ *  - **equi-only join** (`pureJoinEquiAttrPairs`) — a residual/non-equi conjunct
+ *    could fail for the FK-matched lookup row and drop the `T` row.
+ *  - **full parent row set** (`resolveFullScanTableRef` on the lookup side) — a
+ *    filtered/seeked lookup side could omit the parent row a `T` row references.
+ *  - **NOT-NULL FK to the PK** (`lookupCoveringFK`, `!match.nullable`) — a NULL
+ *    FK value has no parent (MATCH SIMPLE), so a nullable FK can drop `T` rows;
+ *    a non-FK or non-PK equi-join carries no inclusion guarantee at all.
+ *
+ * The complementary no-fan-out (≤1) obligation is unchanged — it is the join-
+ * frame `isUnique(T.pk)` gate in `proveJoinOneToOne`, which a FK→PK join also
+ * satisfies (the PK side's key is covered by the equi-pairs).
+ */
+function innerJoinRetainsConstrainedTable(
+	join: RelationalPlanNode,
+	tSide: RelationalPlanNode,
+	lookupSide: RelationalPlanNode,
+	baseTable: TableSchema,
+): boolean {
+	const equiPairs = pureJoinEquiAttrPairs(join);
+	if (!equiPairs || equiPairs.length === 0) return false;
+
+	const tRef = findConstrainedTableRef(tSide, baseTable);
+	if (!tRef) return false;
+	const lookupRef = resolveFullScanTableRef(lookupSide);
+	if (!lookupRef) return false;
+
+	// Stable attribute id → base column index on each side.
+	const tAttrToCol = new Map<number, number>();
+	tRef.getAttributes().forEach((a, i) => tAttrToCol.set(a.id, i));
+	const lookupAttrToCol = new Map<number, number>();
+	lookupRef.getAttributes().forEach((a, i) => lookupAttrToCol.set(a.id, i));
+
+	// Split every equi-pair into (T-FK column, lookup-PK column). A pair that does
+	// not connect `T` to the lookup table cleanly (e.g. references a third source)
+	// is unprovable ⇒ reject.
+	const fkCols: number[] = [];
+	const pkCols: number[] = [];
+	for (const p of equiPairs) {
+		let fkCol = tAttrToCol.get(p.leftAttrId);
+		let pkCol = lookupAttrToCol.get(p.rightAttrId);
+		if (fkCol === undefined || pkCol === undefined) {
+			fkCol = tAttrToCol.get(p.rightAttrId);
+			pkCol = lookupAttrToCol.get(p.leftAttrId);
+		}
+		if (fkCol === undefined || pkCol === undefined) return false;
+		fkCols.push(fkCol);
+		pkCols.push(pkCol);
+	}
+
+	const match = lookupCoveringFK(baseTable, lookupRef.tableSchema, fkCols, pkCols);
+	return match !== undefined && !match.nullable;
 }
 
 /**

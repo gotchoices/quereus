@@ -476,6 +476,95 @@ describe('coverage prover — multi-source (join) bodies', () => {
 			await db.close();
 		}
 	});
+
+	// --- INNER / CROSS-equi joins admitted via enforced referential integrity:
+	//     a NOT-NULL FK from T to the lookup PK makes the inner join 1:1, so no
+	//     governed T row is dropped. The lookup column is projected in every
+	//     positive case so `rule-join-elimination` does NOT collapse the join to
+	//     the v1 single-source path — the inner-join multi-source walk is what is
+	//     under test (confirmed: the body keeps a surviving HashJoin). ---
+
+	it('positive: INNER join on a NOT-NULL FK to the lookup PK covers (RI ⇒ no row loss)', async () => {
+		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
+		const db = await freshDb([
+			'create table customers (id integer primary key, name text)',
+			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
+			`create materialized view ix as ${body}`,
+		]);
+		try {
+			expect((await prove(db, 'ix', body, 'orders')).covers, 'NOT-NULL FK inner join is 1:1').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('positive: INNER join on a composite NOT-NULL FK covers', async () => {
+		const body = 'select c.pa, c.pb, c.sku, c.id, p.label from child c inner join parent p on c.pa = p.a and c.pb = p.b order by c.pa, c.pb, c.sku';
+		const db = await freshDb([
+			'create table parent (a integer not null, b integer not null, label text, primary key (a, b))',
+			'create table child (id integer primary key, pa integer not null, pb integer not null, sku text not null, unique (pa, pb, sku), foreign key (pa, pb) references parent(a, b))',
+			`create materialized view ix as ${body}`,
+		]);
+		try {
+			expect((await prove(db, 'ix', body, 'child')).covers, 'composite NOT-NULL FK inner join is 1:1').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative shape: INNER join on a NULLABLE FK can drop T rows (NULL FK has no parent)', async () => {
+		// region_id is explicitly `null` (Quereus columns are NOT NULL by default —
+		// Third Manifesto), so orders rows with NULL region_id match no customer and
+		// are dropped by the inner join ⇒ row loss ⇒ must not cover. The UC
+		// (customer_id, sku) is NOT NULL so predicate alignment is satisfied; the
+		// rejection is purely the no-row-loss gate.
+		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.region_id = c.id order by o.customer_id, o.sku';
+		const db = await freshDb([
+			'create table customers (id integer primary key, name text)',
+			'create table orders (id integer primary key, customer_id integer not null, sku text not null, region_id integer null, unique (customer_id, sku), foreign key (region_id) references customers(id))',
+			`create materialized view ix as ${body}`,
+		]);
+		try {
+			const result = await prove(db, 'ix', body, 'orders');
+			expect(result.covers, 'a nullable FK cannot prove no-row-loss').to.be.false;
+			if (!result.covers) expect(result.reason).to.equal('shape');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative shape: INNER join on a non-FK UNIQUE lookup key carries no inclusion guarantee', async () => {
+		// c.code is UNIQUE (no fan-out) but there is NO foreign key from orders, so
+		// an orders.customer_id with no matching c.code is dropped ⇒ row loss.
+		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.code order by o.customer_id, o.sku';
+		const db = await freshDb([
+			'create table customers (id integer primary key, code integer not null unique, name text)',
+			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku))',
+			`create materialized view ix as ${body}`,
+		]);
+		try {
+			const result = await prove(db, 'ix', body, 'orders');
+			expect(result.covers, 'a non-FK equi-join to a unique key cannot prove no-row-loss').to.be.false;
+			if (!result.covers) expect(result.reason).to.equal('shape');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('eager link: a covering INNER-FK join MV stamps covers + coveringStructureName', async () => {
+		const body = 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
+		const db = await freshDb([
+			'create table customers (id integer primary key, name text)',
+			'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
+			`create materialized view ix as ${body}`,
+		]);
+		try {
+			expect(db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0].coveringStructureName, 'forward pointer set').to.equal('ix');
+			expect(db.schemaManager.getMaterializedView('main', 'ix')!.covers).to.deep.include({ schemaName: 'main', tableName: 'orders' });
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('introspection hiding', () => {
