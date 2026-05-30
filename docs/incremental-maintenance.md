@@ -41,14 +41,18 @@ covering structure answers it.
 > **MV-over-MV cascade.** A materialized view whose source is another MV's backing table
 > is maintained synchronously in the same row-time pass, *not* through this kernel. A
 > backing write is itself a row-write, so each MV's per-row maintenance reports the
-> **effective** backing changes it applied (`applyRowTimeChange` → the layer's
+> **effective** backing changes it applied (`applyMaintenancePlan` → the layer's
 > `applyMaintenanceToLayer` returns a `BackingRowChange[]`), and the manager routes
 > those onward to any MV reading that backing — `maintainRowTime` recurses, DAG-ordered
 > and atomic within the statement. This path is *arm-agnostic*: it routes whatever
 > per-row backing delta a maintenance plan produces, so a chain may mix maintenance arms
-> uniformly. (When the substrate spike lands and folds `applyRowTimeChange` into a shared
-> `applyMaintenancePlan`, the cascade flow is unchanged: `applyMaintenancePlan` →
-> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`.)
+> uniformly. (`incremental-maintenance-plan-abstraction` landed the first step of the
+> fold: `applyRowTimeChange` is now `applyMaintenancePlan`, which dispatches on
+> `MaintenancePlan.kind`; the cascade flow is unchanged: `applyMaintenancePlan` →
+> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Its
+> `'inverse-projection'` arm is the only one wired today, gated by the
+> maintenance-equivalence property harness
+> `test/incremental/maintenance-equivalence.spec.ts`.)
 
 ## Pipeline at a glance
 

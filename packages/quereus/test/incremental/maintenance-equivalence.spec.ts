@@ -1,0 +1,164 @@
+import { expect } from 'chai';
+import * as fc from 'fast-check';
+import { Database } from '../../src/core/database.js';
+import { QuereusError } from '../../src/common/errors.js';
+import { StatusCode, type SqlValue } from '../../src/common/types.js';
+
+/**
+ * Maintenance-equivalence property harness — the correctness oracle for row-time
+ * materialized-view maintenance (`MaintenancePlan`'s `'inverse-projection'` arm).
+ *
+ * For a zoo of eligible covering-index body shapes, it asserts the fundamental
+ * invariant after every random source mutation and after rollback:
+ *
+ *     read(MV backing)  ==  evaluate(body against source)        (as multisets)
+ *
+ * The MV is read via `select * from mv` (resolves to its synchronously-maintained
+ * backing table); the oracle re-runs the MV's defining SELECT *live* against the
+ * source table. Maintenance and live evaluation must agree for any mutation
+ * sequence — including predicate-scope transitions and key-changing updates — and
+ * must revert in lockstep when the enclosing transaction rolls back.
+ *
+ * This is the regression net every subsequent incremental-maintenance ticket runs
+ * against; new body shapes are admitted only once they stay green here. Runs under
+ * `yarn test` (Mocha + ts-node/esm), no separate config.
+ *
+ * Shapes NOT covered here (future tickets extend the harness): aggregates / joins /
+ * lateral TVFs (the `'residual-recompute'` arm, not yet wired) and MV-over-MV chains
+ * (the cascade ticket extends the harness to chain assertions).
+ */
+
+/** An eligible covering-index body shape: its defining SELECT is both the MV body and
+ *  the live oracle. Every shape projects the source PK (`id`) so it is a keyed set. */
+interface BodyShape {
+	readonly label: string;
+	readonly body: string;
+}
+
+/** All shapes read the same source `src (id pk, a, b, k)`; only the body varies so the
+ *  one mutation generator drives them all (inserts / non-key updates / key-changing
+ *  updates / deletes against the shared columns). */
+const SHAPES: readonly BodyShape[] = [
+	// Single-column passthrough projection (PK only), no predicate.
+	{ label: 'single-column passthrough (PK only), no predicate', body: 'select id from src' },
+	// Multi-column passthrough with a partial WHERE — random mutations move rows in and
+	// out of the `k > 5` true-region (predicate-scope transitions).
+	{ label: 'multi-column passthrough + partial WHERE (predicate-scope transitions)', body: 'select id, a, b from src where k > 5' },
+	// Projection that reorders source columns (a permutation, not identity) while still
+	// covering the PK.
+	{ label: 'column-reordering projection (permutation, not identity)', body: 'select b, a, id from src' },
+	// Passthrough whose maintenance is exercised primarily by key-changing UPDATEs (the
+	// generator below mutates `id` itself).
+	{ label: 'passthrough exercised by key-changing UPDATEs', body: 'select id, a from src' },
+];
+
+/** One random source mutation. Key-changing updates rewrite the PK itself; collisions
+ *  are tolerated (see {@link applyMutation}). */
+type Mutation =
+	| { readonly kind: 'insert'; readonly id: number; readonly a: number; readonly b: number; readonly k: number }
+	| { readonly kind: 'update'; readonly id: number; readonly a: number; readonly b: number; readonly k: number }
+	| { readonly kind: 'updateKey'; readonly oldId: number; readonly newId: number; readonly a: number; readonly b: number; readonly k: number }
+	| { readonly kind: 'delete'; readonly id: number };
+
+// A small id space (so inserts/key-changes collide and predicate transitions recur)
+// and a `k` range straddling the `k > 5` boundary.
+const idArb = fc.integer({ min: 1, max: 6 });
+const valArb = fc.integer({ min: 0, max: 10 });
+
+const mutationArb: fc.Arbitrary<Mutation> = fc.oneof(
+	fc.record({ kind: fc.constant('insert' as const), id: idArb, a: valArb, b: valArb, k: valArb }),
+	fc.record({ kind: fc.constant('update' as const), id: idArb, a: valArb, b: valArb, k: valArb }),
+	fc.record({ kind: fc.constant('updateKey' as const), oldId: idArb, newId: idArb, a: valArb, b: valArb, k: valArb }),
+	fc.record({ kind: fc.constant('delete' as const), id: idArb }),
+);
+
+function sqlFor(m: Mutation): string {
+	switch (m.kind) {
+		case 'insert': return `insert into src (id, a, b, k) values (${m.id}, ${m.a}, ${m.b}, ${m.k})`;
+		case 'update': return `update src set a = ${m.a}, b = ${m.b}, k = ${m.k} where id = ${m.id}`;
+		case 'updateKey': return `update src set id = ${m.newId}, a = ${m.a}, b = ${m.b}, k = ${m.k} where id = ${m.oldId}`;
+		case 'delete': return `delete from src where id = ${m.id}`;
+	}
+}
+
+/**
+ * Apply one mutation, tolerating PK-collision constraint violations. A plain ABORT
+ * constraint failure is statement-atomic — it reverts both the source write and its
+ * row-time backing maintenance (53-materialized-views-rowtime.sqllogic §2), leaving
+ * the transaction open and source/MV still equivalent. Any *other* error (e.g. an
+ * `INTERNAL` from maintenance) propagates and fails the property — that is the bug
+ * class this harness is built to catch.
+ */
+async function applyMutation(db: Database, m: Mutation): Promise<void> {
+	try {
+		await db.exec(sqlFor(m));
+	} catch (e) {
+		if (e instanceof QuereusError && e.code === StatusCode.CONSTRAINT) return;
+		throw e;
+	}
+}
+
+/** Canonical, order-stable serialization of a single result row's values. Rows are
+ *  compared positionally (the MV's `select *` and the body share an identical column
+ *  order), so a value array is a faithful row key. */
+function canonRow(values: readonly SqlValue[]): string {
+	return JSON.stringify(values, (_k, v) => (typeof v === 'bigint' ? `${v}n` : v));
+}
+
+/** Read a query as an order-insensitive multiset of canonical rows. */
+async function readMultiset(db: Database, sql: string): Promise<string[]> {
+	const rows: string[] = [];
+	for await (const row of db.eval(sql)) {
+		rows.push(canonRow(Object.values(row) as SqlValue[]));
+	}
+	return rows.sort();
+}
+
+/** Assert `read(MV) == evaluate(body)` as multisets. */
+async function assertEquivalent(db: Database, body: string, phase: string): Promise<void> {
+	const fromMv = await readMultiset(db, 'select * from mv');
+	const fromBody = await readMultiset(db, body);
+	expect(fromMv, `${phase}: MV backing diverged from live body`).to.deep.equal(fromBody);
+}
+
+describe('Materialized-view maintenance equivalence (covering-index shapes)', () => {
+	for (const shape of SHAPES) {
+		describe(shape.label, () => {
+			let db: Database;
+
+			beforeEach(async () => {
+				db = new Database();
+				await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+				// Committed seed straddling the `k > 5` predicate, restored to before every
+				// run by the always-rolled-back transaction below.
+				await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2), (3, 7, 1, 9)');
+				await db.exec(`create materialized view mv as ${shape.body}`);
+			});
+
+			afterEach(async () => { await db.close(); });
+
+			it('read(MV) == evaluate(body) across random mutations, in-txn and after rollback', async () => {
+				await fc.assert(fc.asyncProperty(
+					fc.array(mutationArb, { minLength: 1, maxLength: 10 }),
+					async (mutations) => {
+						// Equivalent against the committed baseline.
+						await assertEquivalent(db, shape.body, 'baseline');
+
+						await db.exec('begin');
+						try {
+							for (const m of mutations) await applyMutation(db, m);
+							// Reads-own-writes: the MV backing reflects every pending source
+							// write mid-transaction, matching the live body.
+							await assertEquivalent(db, shape.body, 'in-transaction');
+						} finally {
+							await db.exec('rollback');
+						}
+
+						// Maintenance reverted in lockstep with the rolled-back source writes.
+						await assertEquivalent(db, shape.body, 'post-rollback');
+					},
+				), { numRuns: 40 });
+			});
+		});
+	}
+});

@@ -204,10 +204,19 @@ Write-through (`put` semantics on an MV) is future work
 
 ## Maintenance (row-time, per-statement)
 
-For each materialized view the manager caches a `RowTimeMaintenancePlan`
+For each materialized view the manager caches a `MaintenancePlan`
 (projection column map + backing PK + optional predicate), keyed by source base.
-The per-row backing delta is a **pure projection of the changed row** — no body
-re-execution, no scan, no compiled residual:
+This shipped covering-index plan is now the `'inverse-projection'` arm of the
+`MaintenancePlan` tagged union (the former private `RowTimeMaintenancePlan`, lifted
+verbatim — `incremental-maintenance-plan-abstraction`); the union's `'full-rebuild'`
+and `'residual-recompute'` arms are reserved for the cost gate
+(`incremental-maintenance-cost-gate`) and general bodies
+(`materialized-view-rowtime-general-bodies`) and are unreachable today. The
+correctness oracle for this arm is the maintenance-equivalence property harness
+(`test/incremental/maintenance-equivalence.spec.ts`): for every eligible body shape
+it asserts `read(MV) == evaluate(body)` after each random source mutation and after
+rollback. The per-row backing delta is a **pure projection of the changed row** — no
+body re-execution, no scan, no compiled residual:
 
 | source op | maintenance |
 |---|---|

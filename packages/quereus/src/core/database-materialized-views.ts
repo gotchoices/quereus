@@ -22,7 +22,7 @@
  *     from the MV uses, so the change is visible mid-transaction (reads-own-writes)
  *     and is committed/rolled-back in lockstep with the source write by the
  *     coordinated commit. A body that is not row-time maintainable is rejected at
- *     create (see {@link MaterializedViewManager.buildRowTimePlan}).
+ *     create (see {@link MaterializedViewManager.buildMaintenancePlan}).
  */
 
 import type { SchemaManager } from '../schema/manager.js';
@@ -36,6 +36,7 @@ import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/refere
 import { AggregateNode } from '../planner/nodes/aggregate-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
+import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import { getBackingManager } from '../runtime/emit/materialized-view-helpers.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
@@ -66,15 +67,33 @@ export interface MaterializedViewManagerContext {
 }
 
 /**
- * Compiled per-MV row-time (write-through) maintenance plan, derived once at
- * registration from the covering-index shape. Per source row-write, the backing
- * delta is a pure projection of the changed row: project the source row to a
- * backing row (a column permutation — passthrough columns only), key it by the
- * backing physical PK, and (if the partial predicate admits it) delete the old
- * image / upsert the new image. No body re-execution, no scan — see
- * `docs/materialized-views.md` § Row-time refresh.
+ * A compiled per-MV maintenance plan — how {@link MaterializedViewManager.applyMaintenancePlan}
+ * keeps an MV's backing table consistent with a source row-write. A tagged union over
+ * the maintenance strategies the incremental substrate names (the spike's
+ * `incremental-maintenance-substrate-spike` design). Today the builder
+ * ({@link MaterializedViewManager.buildMaintenancePlan}) only ever produces the
+ * `'inverse-projection'` arm — the shipped covering-index semantics, lifted here
+ * byte-for-byte from the former private `RowTimeMaintenancePlan`. The other two arms
+ * are reserved convergence points, **unreachable** until the cost gate
+ * (`incremental-maintenance-cost-gate`) and general-bodies
+ * (`materialized-view-rowtime-general-bodies`) tickets wire selection logic; routing
+ * one through `applyMaintenancePlan` today trips a loud `INTERNAL` guard.
  */
-interface RowTimeMaintenancePlan {
+export type MaintenancePlan =
+	| InverseProjectionPlan
+	| FullRebuildPlan
+	| ResidualRecomputePlan;
+
+/**
+ * The shipped covering-index maintenance arm (the former `RowTimeMaintenancePlan`,
+ * verbatim). Per source row-write the backing delta is a pure projection of the
+ * changed row: project the source row to a backing row (a column permutation —
+ * passthrough columns only), key it by the backing physical PK, and (if the partial
+ * predicate admits it) delete the old image / upsert the new image. No body
+ * re-execution, no scan — see `docs/materialized-views.md` § Row-time refresh.
+ */
+export interface InverseProjectionPlan {
+	readonly kind: 'inverse-projection';
 	/** The MV this plan maintains. */
 	mv: MaterializedViewSchema;
 	/** Lowercased `schema.table` of the single source `T`. */
@@ -93,11 +112,45 @@ interface RowTimeMaintenancePlan {
 	predicate?: CompiledPredicate;
 }
 
+/**
+ * The always-correct escape hatch: re-run the body to completion and swap the backing
+ * base layer (the `rebuildBacking` strategy). Stub here — **unreachable** until
+ * `incremental-maintenance-cost-gate` (1.6) wires the selector that routes to it when
+ * inverse projection would cost more than a wholesale rebuild. Carries only the
+ * common identity fields; the rebuild re-derives everything else from the MV body.
+ */
+export interface FullRebuildPlan {
+	readonly kind: 'full-rebuild';
+	mv: MaterializedViewSchema;
+	sourceBase: string;
+	backingSchema: string;
+	backingTableName: string;
+}
+
+/**
+ * The general-body residual-recompute arm: re-evaluate a per-binding residual of the
+ * body for each changed binding tuple. Stub here — **unreachable** until
+ * `materialized-view-rowtime-general-bodies` (3) builds its body on this abstraction.
+ * It carries the {@link BindingMode} the spike names as the convergence point — the
+ * incremental engine and the delta executor sharing one binding analysis — plus a
+ * `degradeToRebuild` escape flag (fall back to full rebuild when the residual cannot
+ * be parameterized).
+ */
+export interface ResidualRecomputePlan {
+	readonly kind: 'residual-recompute';
+	mv: MaterializedViewSchema;
+	sourceBase: string;
+	backingSchema: string;
+	backingTableName: string;
+	binding: BindingMode;
+	degradeToRebuild: boolean;
+}
+
 export class MaterializedViewManager {
 	private unsubscribeSchemaChanges: (() => void) | null = null;
 
-	/** Compiled row-time plans keyed by MV `schema.name` (lowercase). */
-	private readonly rowTime = new Map<string, RowTimeMaintenancePlan>();
+	/** Compiled maintenance plans keyed by MV `schema.name` (lowercase). */
+	private readonly rowTime = new Map<string, MaintenancePlan>();
 
 	/** Source base (lowercased `schema.table`) → set of MV keys with a row-time plan
 	 *  reading it. The per-row DML maintenance hook looks plans up by source base. */
@@ -132,8 +185,8 @@ export class MaterializedViewManager {
 
 	/**
 	 * Compile + register an MV for row-time write-through maintenance. Always
-	 * builds the row-time plan via {@link buildRowTimePlan}, which throws on a body
-	 * that is not row-time maintainable — the create emitter rolls the MV back on
+	 * builds the maintenance plan via {@link buildMaintenancePlan}, which throws on a
+	 * body that is not row-time maintainable — the create emitter rolls the MV back on
 	 * throw, so an ineligible body errors cleanly at create time.
 	 */
 	registerMaterializedView(mv: MaterializedViewSchema): void {
@@ -145,7 +198,7 @@ export class MaterializedViewManager {
 		// backing table. v1 is the conservative union of a `full` watch per source.
 		mv.sourceScope = buildSourceUnionScope(mv.sourceTables);
 		this.releaseRowTime(key);
-		const plan = this.buildRowTimePlan(mv); // throws on ineligible shape
+		const plan = this.buildMaintenancePlan(mv); // throws on ineligible shape
 		this.rowTime.set(key, plan);
 		let set = this.rowTimeBySource.get(plan.sourceBase);
 		if (!set) { set = new Set(); this.rowTimeBySource.set(plan.sourceBase, set); }
@@ -222,7 +275,7 @@ export class MaterializedViewManager {
 		for (const key of keys) {
 			const plan = this.rowTime.get(key);
 			if (!plan) continue;
-			const backingChanges = await this.applyRowTimeChange(plan, change);
+			const backingChanges = await this.applyMaintenancePlan(plan, change);
 			if (backingChanges.length === 0) continue;
 			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
@@ -252,13 +305,39 @@ export class MaterializedViewManager {
 	}
 
 	/**
-	 * Compute one plan's per-row backing delta, apply it, and return the
-	 * **effective** {@link BackingRowChange}(s) the backing layer realized (so the
-	 * cascade can drive this plan's own dependents). An out-of-scope row (or a delete
-	 * of an absent backing key) yields no change.
+	 * Dispatch a maintenance plan on its `kind`, compute the per-row backing delta,
+	 * apply it, and return the **effective** {@link BackingRowChange}(s) the backing
+	 * layer realized (so the cascade can drive this plan's own dependents). Today the
+	 * builder only ever yields `'inverse-projection'`; the `'full-rebuild'` and
+	 * `'residual-recompute'` arms are loud `INTERNAL` guards (unreachable until the
+	 * cost-gate / general-bodies tickets wire their selection — see {@link MaintenancePlan}).
 	 */
-	private async applyRowTimeChange(
-		plan: RowTimeMaintenancePlan,
+	private async applyMaintenancePlan(
+		plan: MaintenancePlan,
+		change: BackingRowChange,
+	): Promise<BackingRowChange[]> {
+		switch (plan.kind) {
+			case 'inverse-projection':
+				return this.applyInverseProjection(plan, change);
+			case 'full-rebuild':
+			case 'residual-recompute':
+				throw new QuereusError(
+					`materialized view '${plan.mv.name}': '${plan.kind}' maintenance is not yet wired `
+						+ `(reachable only once the cost-gate / general-bodies tickets land)`,
+					StatusCode.INTERNAL,
+				);
+		}
+	}
+
+	/**
+	 * Compute an `'inverse-projection'` plan's per-row backing delta, apply it, and
+	 * return the **effective** {@link BackingRowChange}(s) the backing layer realized.
+	 * An out-of-scope row (or a delete of an absent backing key) yields no change. This
+	 * body is the shipped covering-index maintenance, lifted verbatim from the former
+	 * `applyRowTimeChange`.
+	 */
+	private async applyInverseProjection(
+		plan: InverseProjectionPlan,
 		change: BackingRowChange,
 	): Promise<BackingRowChange[]> {
 		const inScope = (row: Row): boolean => plan.predicate === undefined || plan.predicate.evaluate(row) === true;
@@ -334,8 +413,12 @@ export class MaterializedViewManager {
 	 * A write to `mv1` then drives `mv2` via the cascade in {@link maintainRowTime} — no
 	 * separate dependency structure: the existing `rowTimeBySource[backingBase]` index
 	 * already records the producer→consumer edge the moment `mv2` registers.
+	 *
+	 * Returns only the `'inverse-projection'` arm of {@link MaintenancePlan} — the shape
+	 * allowlist is unchanged from `buildRowTimePlan`. The cost gate (1.6) and
+	 * general-bodies (3) tickets extend this to route the other arms.
 	 */
-	private buildRowTimePlan(mv: MaterializedViewSchema): RowTimeMaintenancePlan {
+	private buildMaintenancePlan(mv: MaterializedViewSchema): MaintenancePlan {
 		const db = this.ctx as unknown as Database;
 		const { plan } = this.ctx._buildPlan([mv.selectAst as AST.Statement]);
 		const analyzed = this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
@@ -430,6 +513,7 @@ export class MaterializedViewManager {
 		}
 
 		return {
+			kind: 'inverse-projection',
 			mv,
 			sourceBase,
 			backingSchema: mv.schemaName,
@@ -518,6 +602,10 @@ export class MaterializedViewManager {
 	): Promise<Array<{ pk: SqlValue[]; row?: Row }>> {
 		const plan = this.rowTime.get(mvKey(mv.schemaName, mv.name));
 		if (!plan) return [];
+		// Covering-conflict resolution reads the inverse projection (source↔backing
+		// column map). Only the `'inverse-projection'` arm carries it; the other arms
+		// are unreachable today (see {@link MaintenancePlan}) — defensively skip.
+		if (plan.kind !== 'inverse-projection') return [];
 
 		const [srcSchemaName, srcTableName] = plan.sourceBase.split('.');
 		const sourceSchema = this.ctx._findTable(srcTableName, srcSchemaName);

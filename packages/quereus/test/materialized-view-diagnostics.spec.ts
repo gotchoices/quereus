@@ -99,7 +99,7 @@ describe('Materialized view create-time gate diagnostic', () => {
  * the `tableRefs.length` checks run first, so a multi-table UNION reports a
  * source-count reason (not "set operation") and a recursive-CTE-only / TVF-only
  * body reports "reads no source table". These cases lock the literal tails the
- * `buildRowTimePlan` rejects actually produce (captured from the engine), so a
+ * `buildMaintenancePlan` rejects actually produce (captured from the engine), so a
  * reason silently re-routing to a different branch is caught.
  *
  * NOTE: the "set operation (union/intersect/except)", "recursive CTE", "calls a
