@@ -306,6 +306,34 @@ delete from d where id = 1;
 select id, x from d3 order by id;
 → []
 
+-- Fan-out at a cascade backing: one inner MV (`fo1`) feeds TWO outer MVs with
+-- distinct backing keys. A single source write maintains the inner backing once,
+-- whose effective per-row change is routed to BOTH dependents (the manager loops
+-- over every MV reading that backing base, not just the first).
+create table fo (id integer primary key, x integer);
+create materialized view fo1 as select id, x from fo;
+create materialized view fo2a as select id, x from fo1;
+create materialized view fo2b as select x, id from fo1 order by x;
+insert into fo values (1, 10), (2, 20);
+select id, x from fo2a order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select x, id from fo2b order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2}]
+
+-- update cascades to BOTH fan-out branches (each re-keys its own backing)
+update fo set x = 99 where id = 1;
+select id, x from fo2a order by id;
+→ [{"id":1,"x":99},{"id":2,"x":20}]
+select x, id from fo2b order by x;
+→ [{"x":20,"id":2},{"x":99,"id":1}]
+
+-- delete cascades to both branches
+delete from fo where id = 2;
+select id, x from fo2a order by id;
+→ [{"id":1,"x":99}]
+select x, id from fo2b order by x;
+→ [{"x":99,"id":1}]
+
 -- Mid-transaction visibility through the chain + whole-chain atomic rollback. The
 -- new row is visible at the deepest level before commit (reads-own-writes rides the
 -- per-statement backing connections), and rollback reverts every level in lockstep.
