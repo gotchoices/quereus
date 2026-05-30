@@ -653,6 +653,22 @@ describe('coverage prover — IND-derived no-row-loss (Wave 2)', () => {
 				expected: { covers: false, reason: 'shape' },
 			},
 			{
+				// A composite FK `(pa, pb) → (a, b)` guarantees the *positional* pairing
+				// `pa → a, pb → b` only; a permuted ON `c.pa = p.b AND c.pb = p.a` is NOT
+				// covered by the FK (it would match a different parent row). The structural
+				// path rejects this via `lookupCoveringFK`'s positional alignment; the IND
+				// path must reject it too — its set-equality `{pa:a, pb:b}` ≠ `{pa:b, pb:a}`
+				// — keeping the two derivations in lockstep on the permutation edge.
+				name: 'permuted composite FK ⇒ shape',
+				ddl: [
+					'create table parent (a integer not null, b integer not null, label text, primary key (a, b))',
+					'create table child (id integer primary key, pa integer not null, pb integer not null, sku text not null, unique (pa, pb, sku), foreign key (pa, pb) references parent(a, b))',
+				],
+				body: 'select c.pa, c.pb, c.sku, c.id, p.label from child c inner join parent p on c.pa = p.b and c.pb = p.a order by c.pa, c.pb, c.sku',
+				table: 'child',
+				expected: { covers: false, reason: 'shape' },
+			},
+			{
 				name: 'non-FK unique lookup key ⇒ shape',
 				ddl: [
 					'create table customers (id integer primary key, code integer not null unique, name text)',
