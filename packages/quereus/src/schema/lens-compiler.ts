@@ -8,6 +8,7 @@ import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { astToString } from '../emit/ast-stringify.js';
 import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance } from './lens.js';
+import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:lens-compiler');
@@ -110,6 +111,12 @@ export function deployLogicalSchema(
 			columnProvenance: provenance,
 			attachedConstraints: buildLogicalConstraints(logicalTable),
 		};
+
+		// PoC: validate the reserved `quereus.*` tag namespace shape + site on the
+		// logical table and its constraints, INSIDE the compile-first loop so an
+		// invalid tag fails the deploy atomically (before any catalog mutation).
+		// Only shape/site is checked here — no reserved tag's semantics are read.
+		validateLensTags(slot);
 		const view: ViewSchema = {
 			name: logicalTable.name,
 			schemaName: logicalSchema.name,
@@ -140,6 +147,42 @@ export function deployLogicalSchema(
 		logicalSchema.addLensSlot(slot);
 		logicalSchema.addView(view);
 		log('Deployed lens for %s.%s over %s', logicalSchemaName, slot.logicalTable.name, slot.defaultBasis.schemaName);
+	}
+}
+
+/**
+ * PoC wiring for `reserved-tags.ts`: validates the reserved `quereus.*` tag
+ * namespace on one lens slot's logical table (`logical-table` site) and each of
+ * its attached constraints (`logical-constraint` site).
+ *
+ * Severity policy is the registry's; this caller only routes it: a
+ * `severity:'error'` diagnostic (unknown key, mis-sited key, malformed enum/CSV
+ * value) throws a {@link QuereusError} with the sited message — consistent with
+ * the other compile-time lens errors, and atomic because validation runs before
+ * catalog mutation. `severity:'warning'` diagnostics (e.g. an empty
+ * `quereus.lens.ack` rationale) are logged via the existing `log` channel; the
+ * deploy-summary warning channel (`docs/lens.md:169`) is `3-lens-prover` Phase
+ * C's to build. Errors take precedence — warnings only log when none fail.
+ *
+ * This validates shape/site only. `quereus.update.*` keys are reachable through
+ * the same {@link validateReservedTags} entry point but are NOT wired into any
+ * DML/view path here (that is `view-mutation-plan-node-substrate` Phase 2's).
+ */
+function validateLensTags(slot: LensSlot): void {
+	const diagnostics: TagDiagnostic[] = [
+		...validateReservedTags(slot.logicalTable.tags, 'logical-table'),
+	];
+	for (const constraint of slot.attachedConstraints) {
+		const tags = constraint.kind === 'primaryKey' ? undefined : constraint.constraint.tags;
+		if (tags) diagnostics.push(...validateReservedTags(tags, 'logical-constraint'));
+	}
+
+	const firstError = diagnostics.find(d => d.severity === 'error');
+	if (firstError) {
+		throw new QuereusError(firstError.message, StatusCode.ERROR);
+	}
+	for (const diag of diagnostics) {
+		log('lens advisory (%s) on %s.%s: %s', diag.reason, slot.logicalTable.schemaName, slot.logicalTable.name, diag.message);
 	}
 }
 

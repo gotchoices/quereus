@@ -266,8 +266,18 @@ User-defined functions declare their profile at registration. A predicate-typed 
 
 Default propagation is deterministic and predicate-honest. When a user wants different behavior, they attach tags via the existing `with tags (...)` syntax (see [SQL Reference §Tags](sql.md#tags)).
 
-The reserved `quereus.update.*` namespace controls propagation (shape and site
-validation for this namespace is specified under `reserved-tag-namespace-typed-registry`):
+The reserved `quereus.update.*` namespace controls propagation. Shape and site
+validation for the whole `quereus.*` namespace is centralized in the typed
+registry `packages/quereus/src/schema/reserved-tags.ts`
+(`validateReservedTags(tags, site)`): each reserved key is matched to a frozen
+spec, its position checked against the key's legal `TagSite` set (`view-ddl`,
+`union-branch`, `join`, `dml-stmt`, `projection`, `logical-table`,
+`logical-constraint`), and its value checked against a `TagValueSchema`
+(`csv-of-identifiers`, an enum, an `expression`, …). An unknown or mis-sited key
+is a hard **error**; a malformed value is an error too, except an empty
+`quereus.lens.ack` rationale, which is only a **warning**. The rows below are the
+`quereus.update.*` seeds — the registry validates their shape/site; their Effect
+(semantics) is realized by the view-mutation override surface, not the registry:
 
 | Tag | Where | Effect |
 |---|---|---|

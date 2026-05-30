@@ -1,0 +1,218 @@
+import { expect } from 'chai';
+import {
+	validateReservedTags,
+	getReservedTag,
+	getReservedTagByTemplate,
+	RESERVED_TAGS,
+	type TagSite,
+} from '../../src/schema/reserved-tags.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+/** Validate `tags` at `site` and return the diagnostics. */
+function check(tags: Record<string, SqlValue>, site: TagSite) {
+	return validateReservedTags(tags, site);
+}
+
+describe('Reserved tag registry', () => {
+	describe('namespace gate', () => {
+		it('passes free-form user tags through untouched', () => {
+			const diags = check({ display_name: 'X', audit: true }, 'logical-table');
+			expect(diags).to.have.length(0);
+		});
+
+		it('ignores user tags even alongside reserved ones', () => {
+			const diags = check(
+				{ display_name: 'X', 'quereus.update.policy': 'strict' },
+				'view-ddl',
+			);
+			expect(diags).to.have.length(0);
+		});
+
+		it('returns no diagnostics for undefined tags', () => {
+			expect(validateReservedTags(undefined, 'logical-table')).to.have.length(0);
+		});
+	});
+
+	describe('unknown-reserved-tag', () => {
+		it('flags a typo on an exact key', () => {
+			const diags = check({ 'quereus.update.taget': 'a' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+			expect(diags[0].severity).to.equal('error');
+			expect(diags[0].message.toLowerCase()).to.include('unknown reserved tag');
+		});
+
+		it('flags a typo on a templated key', () => {
+			const diags = check({ 'quereus.lens.akc.x': 'r' }, 'logical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+		});
+
+		it('treats an empty template remainder as unknown (default_for.)', () => {
+			const diags = check({ 'quereus.update.default_for.': '1' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+		});
+
+		it('treats an empty template remainder as unknown (lens.ack.)', () => {
+			const diags = check({ 'quereus.lens.ack.': 'r' }, 'logical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+		});
+	});
+
+	describe('tag-not-allowed-here', () => {
+		it('rejects delete_via on a view DDL site', () => {
+			const diags = check({ 'quereus.update.delete_via': 'left_delete' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('tag-not-allowed-here');
+			expect(diags[0].severity).to.equal('error');
+			expect(diags[0].message.toLowerCase()).to.include('not allowed');
+		});
+
+		it('rejects lens.ack on a view DDL site', () => {
+			const diags = check({ 'quereus.lens.ack.no-backing-index': 'r' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('tag-not-allowed-here');
+		});
+
+		it('rejects policy on a DML statement site', () => {
+			const diags = check({ 'quereus.update.policy': 'strict' }, 'dml-stmt');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('tag-not-allowed-here');
+		});
+	});
+
+	describe('invalid-tag-value: enum', () => {
+		it('rejects an out-of-set policy (error)', () => {
+			const diags = check({ 'quereus.update.policy': 'looose' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('error');
+			expect(diags[0].message.toLowerCase()).to.include('invalid value');
+		});
+
+		it('rejects an out-of-set delete_via (error)', () => {
+			const diags = check({ 'quereus.update.delete_via': 'sideways' }, 'join');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('error');
+		});
+
+		it('accepts every enum member', () => {
+			expect(check({ 'quereus.update.policy': 'lenient' }, 'view-ddl')).to.have.length(0);
+			expect(check({ 'quereus.update.delete_via': 'right_insert' }, 'union-branch')).to.have.length(0);
+			expect(check({ 'quereus.update.delete_via': 'parent' }, 'join')).to.have.length(0);
+		});
+	});
+
+	describe('invalid-tag-value: csv-of-identifiers', () => {
+		it('accepts a comma-separated identifier list', () => {
+			expect(check({ 'quereus.update.target': 'base_a, base_b' }, 'view-ddl')).to.have.length(0);
+		});
+
+		it('rejects an empty value (error)', () => {
+			const diags = check({ 'quereus.update.exclude': '' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('error');
+		});
+
+		it('rejects an empty segment (error)', () => {
+			const diags = check({ 'quereus.update.target': 'a, , b' }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+		});
+	});
+
+	describe('invalid-tag-value: required-nonempty-rationale (warning)', () => {
+		it('warns on an empty rationale', () => {
+			const diags = check({ 'quereus.lens.ack.no-backing-index': '' }, 'logical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('warning');
+		});
+
+		it('warns on a whitespace-only rationale', () => {
+			const diags = check({ 'quereus.lens.ack.no-backing-index': '   ' }, 'logical-constraint');
+			expect(diags).to.have.length(1);
+			expect(diags[0].severity).to.equal('warning');
+		});
+
+		it('accepts a non-empty rationale with no diagnostic', () => {
+			const diags = check(
+				{ 'quereus.lens.ack.no-backing-index:vin': 'low-write table; commit-time scan is acceptable' },
+				'logical-table',
+			);
+			expect(diags).to.have.length(0);
+		});
+	});
+
+	describe('invalid-tag-value: string / expression', () => {
+		it('accepts a default_for expression at view DDL', () => {
+			expect(check({ 'quereus.update.default_for.created': 'epoch_ms()' }, 'view-ddl')).to.have.length(0);
+		});
+
+		it('accepts a lens.access hint at a logical table', () => {
+			expect(check({ 'quereus.lens.access.vin': 'lookup' }, 'logical-table')).to.have.length(0);
+		});
+
+		it('rejects a non-text default_for value (error)', () => {
+			const diags = check({ 'quereus.update.default_for.created': 42 }, 'view-ddl');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('error');
+		});
+	});
+
+	describe('getReservedTag (typed, exact key)', () => {
+		it('reads an enum value as its union', () => {
+			const tags = { 'quereus.update.policy': 'strict' };
+			const policy = getReservedTag(tags, 'quereus.update.policy');
+			expect(policy).to.equal('strict');
+		});
+
+		it('returns undefined for an absent key', () => {
+			expect(getReservedTag({}, 'quereus.update.policy')).to.be.undefined;
+		});
+
+		it('returns undefined for a null value', () => {
+			expect(getReservedTag({ 'quereus.update.policy': null }, 'quereus.update.policy')).to.be.undefined;
+		});
+	});
+
+	describe('getReservedTagByTemplate', () => {
+		it('enumerates default_for instances with their column segment', () => {
+			const tags = {
+				'quereus.update.default_for.created': 'epoch_ms()',
+				'quereus.update.default_for.status': "'new'",
+				display_name: 'ignored',
+			};
+			const instances = getReservedTagByTemplate(tags, 'quereus.update.default_for.<column>');
+			expect(instances.map(i => i.segment).sort()).to.deep.equal(['created', 'status']);
+		});
+
+		it('captures the whole remainder of a lens.ack code (including :target)', () => {
+			const tags = { 'quereus.lens.ack.no-backing-index:vin': 'rationale' };
+			const instances = getReservedTagByTemplate(tags, 'quereus.lens.ack.<code>');
+			expect(instances).to.have.length(1);
+			expect(instances[0].segment).to.equal('no-backing-index:vin');
+			expect(instances[0].value).to.equal('rationale');
+		});
+
+		it('skips an empty remainder', () => {
+			const instances = getReservedTagByTemplate({ 'quereus.lens.ack.': 'r' }, 'quereus.lens.ack.<code>');
+			expect(instances).to.have.length(0);
+		});
+	});
+
+	describe('RESERVED_TAGS table', () => {
+		it('is frozen', () => {
+			expect(Object.isFrozen(RESERVED_TAGS)).to.equal(true);
+		});
+
+		it('seeds all seven documented keys', () => {
+			expect(RESERVED_TAGS).to.have.length(7);
+		});
+	});
+});
