@@ -459,19 +459,29 @@ only forgoes an optimization, a false *Covers* would be unsound):
   or a `LIMIT`/`OFFSET` row cap ⇒ not covering.
 - **Join (1:1) decomposition.** "Exactly one MV row per governed `T` row" splits
   into two independent obligations:
-    - *No row loss (≥1):* proven structurally during the plan walk, two ways:
+    - *No row loss (≥1):* proven during the plan walk, two ways:
       **(a) row preservation** — `T` on the row-**preserving** side of the join (a
       `left` join with `T` in the left subtree, or a `right` join with `T` in the
       right subtree); or **(b) referential integrity** — an `inner`/`cross` join
-      whose equi-pairs are a **NOT-NULL foreign key from `T` to the lookup table's
-      primary key**, over a lookup side that exposes the parent's *full* row set, so
-      enforced RI makes the join 1:1 (`innerJoinRetainsConstrainedTable`; the same
-      NOT-NULL-FK + full-parent-row-set discipline `rule-join-elimination`'s INNER
-      branch uses — declared FKs are trusted as inclusion dependencies, so this
-      adds no assumption the optimizer doesn't already make). An `inner`/`cross`
-      join *without* a covering NOT-NULL FK, `semi`/`anti`, `full`, and `T` on the
-      dropping side are rejected as *shape*. (FDs encode uniqueness, not existence,
-      so obligation (a) is a structural plan-walk check; (b) reads the FK schema.)
+      whose equi-pairs witness an inclusion dependency from the `T`-side relation to
+      the lookup table's **primary key**, over a lookup side that exposes the
+      parent's *full* row set, so enforced RI makes the join 1:1
+      (`innerJoinRetainsConstrainedTable`). Obligation (b) is **IND-derived** (Wave 2):
+      it first consults the propagated `PhysicalProperties.inds` surface on the
+      `T`-side subtree (`indDerivedNoRowLoss`) and falls back to the structural
+      NOT-NULL-FK-on-`T` check (`lookupCoveringFK` + `!match.nullable`). Both gate on
+      the same preconditions, so they agree on every single-FK shape; the IND path
+      additionally proves no-row-loss across **multi-hop FK chains** (`T → M → P`),
+      where the threaded IND `M.cols ⊆ P.pk` — carried onto the `T ⋈ M` sub-frame by
+      join propagation — discharges the outer `⋈ P` join that a single
+      `lookupCoveringFK(T, P, …)` call cannot see. Both lean on the same NOT-NULL-FK +
+      full-parent-row-set inclusion-dependency trust `rule-join-elimination`'s INNER
+      branch uses, so this adds no assumption the optimizer doesn't already make. An
+      `inner`/`cross` join *without* a covering NOT-NULL FK/IND, `semi`/`anti`,
+      `full`, and `T` on the dropping side are rejected as *shape*. (FDs encode
+      uniqueness, not existence, so obligation (a) is a structural plan-walk check;
+      (b) is discharged from the propagated IND surface with the structural FK-schema
+      read as fallback.)
     - *No fan-out (≤1):* `T`'s primary key must be a unique key of the **topmost
       join's output relation** (read via `isUnique`). The optimizer emits
       `T.pk → all_join_cols` into the join's FDs exactly when the equi-pairs cover a
@@ -593,7 +603,11 @@ and [Lenses § the constraint-role split](lens.md).
 Multi-source 1:1 join bodies are **delivered**: outer-join row preservation
 (`coverage-prover-multi-source-bodies`) and `inner`/`cross` lookup joins on an enforced
 NOT-NULL FK→PK (`coverage-prover-inner-join-fk-preservation`, the no-row-loss obligation
-closed by referential integrity). The AST `ORDER BY` / `WHERE` column resolution is
+closed by referential integrity). That no-row-loss obligation is now **IND-derived**
+(`coverage-prover-ind-derived-no-row-loss`): it discharges from the propagated
+`PhysicalProperties.inds` surface first (structural NOT-NULL-FK fallback retained), which
+additionally covers **multi-hop FK chains** (`T → M → P`) whose threaded IND a single
+`lookupCoveringFK` call cannot see. The AST `ORDER BY` / `WHERE` column resolution is
 **qualifier-aware** (`coverage-prover-qualified-name-resolution`): `alias.col` resolves to
 a `T` column only when `alias` denotes `T`'s reference (and a bare `col` only when
 unambiguous across the join's sources), so a 1:1 join whose lookup key reuses a UC column

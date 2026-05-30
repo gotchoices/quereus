@@ -593,6 +593,187 @@ describe('coverage prover — multi-source (join) bodies', () => {
 });
 
 /**
+ * IND-derived no-row-loss (Wave 2, `coverage-prover-ind-derived-no-row-loss`).
+ * The inner/cross no-row-loss obligation now consults the propagated
+ * `PhysicalProperties.inds` surface first (`indDerivedNoRowLoss`), falling back to
+ * the structural NOT-NULL-FK check (`lookupCoveringFK`). This is a pure
+ * strengthening: identical verdicts on every existing single-FK shape (both paths
+ * agree — the equivalence suite), and it newly proves no-row-loss for multi-hop FK
+ * chains (`T → M → P`) whose threaded IND a single `lookupCoveringFK` call cannot
+ * see. The `structuralOnly` option on `proveCoverage` is a verification seam that
+ * disables the IND path so the equivalence assertion can compare the two
+ * derivations directly.
+ */
+describe('coverage prover — IND-derived no-row-loss (Wave 2)', () => {
+	/** Proves a planned (unmaterialized) join body, optionally structural-only. */
+	function proveBody(db: Database, body: string, tableName: string, structuralOnly = false): CoverageResult {
+		const table = db.schemaManager.getTable('main', tableName)!;
+		const uc = table.uniqueConstraints![0];
+		const mvStub = { selectAst: parseSelect(body) } as unknown as MaterializedViewSchema;
+		return proveCoverage(bodyRoot(db, body), mvStub, uc, table, { structuralOnly });
+	}
+
+	// --- Equivalence (the heart): on every existing NOT-NULL FK→PK single-hop
+	//     shape, the IND-derived path and the structural-only path return identical
+	//     verdicts, and both match the pre-Wave-2 golden. Because the only behavioral
+	//     difference between the two derivations is `innerJoinRetainsConstrainedTable`,
+	//     a deep-equal here is the structural guarantee they cannot disagree on the
+	//     single-FK corpus. ---
+	describe('equivalence with structural-only on the single-FK corpus', () => {
+		interface Case { name: string; ddl: string[]; body: string; table: string; expected: CoverageResult; }
+		const CASES: Case[] = [
+			{
+				name: 'single NOT-NULL FK inner join covers',
+				ddl: [
+					'create table customers (id integer primary key, name text)',
+					'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
+				],
+				body: 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id order by o.customer_id, o.sku',
+				table: 'orders',
+				expected: { covers: true },
+			},
+			{
+				name: 'composite NOT-NULL FK inner join covers',
+				ddl: [
+					'create table parent (a integer not null, b integer not null, label text, primary key (a, b))',
+					'create table child (id integer primary key, pa integer not null, pb integer not null, sku text not null, unique (pa, pb, sku), foreign key (pa, pb) references parent(a, b))',
+				],
+				body: 'select c.pa, c.pb, c.sku, c.id, p.label from child c inner join parent p on c.pa = p.a and c.pb = p.b order by c.pa, c.pb, c.sku',
+				table: 'child',
+				expected: { covers: true },
+			},
+			{
+				name: 'nullable FK ⇒ shape',
+				ddl: [
+					'create table customers (id integer primary key, name text)',
+					'create table orders (id integer primary key, customer_id integer not null, sku text not null, region_id integer null, unique (customer_id, sku), foreign key (region_id) references customers(id))',
+				],
+				body: 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.region_id = c.id order by o.customer_id, o.sku',
+				table: 'orders',
+				expected: { covers: false, reason: 'shape' },
+			},
+			{
+				name: 'non-FK unique lookup key ⇒ shape',
+				ddl: [
+					'create table customers (id integer primary key, code integer not null unique, name text)',
+					'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku))',
+				],
+				body: 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.code order by o.customer_id, o.sku',
+				table: 'orders',
+				expected: { covers: false, reason: 'shape' },
+			},
+			{
+				name: 'same-side equality filter in ON ⇒ shape',
+				ddl: [
+					'create table customers (id integer primary key, grp1 integer not null, grp2 integer not null, name text)',
+					'create table orders (id integer primary key, customer_id integer not null, sku text not null, unique (customer_id, sku), foreign key (customer_id) references customers(id))',
+				],
+				body: 'select o.customer_id, o.sku, o.id, c.name from orders o inner join customers c on o.customer_id = c.id and c.grp1 = c.grp2 order by o.customer_id, o.sku',
+				table: 'orders',
+				expected: { covers: false, reason: 'shape' },
+			},
+		];
+
+		for (const c of CASES) {
+			it(`both paths agree: ${c.name}`, async () => {
+				const db = await freshDb(c.ddl);
+				try {
+					const withInd = proveBody(db, c.body, c.table, false);
+					const structuralOnly = proveBody(db, c.body, c.table, true);
+					expect(withInd, 'IND path matches the pre-Wave-2 golden').to.deep.equal(c.expected);
+					expect(structuralOnly, 'IND-derived and structural-only verdicts are identical').to.deep.equal(withInd);
+				} finally {
+					await db.close();
+				}
+			});
+		}
+	});
+
+	// --- Two-hop strengthening: `cc → mm → pp`, both hops NOT-NULL FK→PK, all
+	//     full-scan lookups. The outer `⋈ pp` join equates `mm.p_id = pp.pid`, an
+	//     mm-vs-pp condition that carries no T-side column, so a single
+	//     `lookupCoveringFK(cc, pp, …)` call abstains. The threaded IND `mm.p_id ⊆
+	//     pp.pid` (carried onto the `cc ⋈ mm` sub-frame by Wave-1 join propagation)
+	//     discharges it — propagation alone, no transitive closure needed. ---
+	const TWO_HOP_DDL = [
+		'create table pp (pid integer primary key, pname text)',
+		'create table mm (mid integer primary key, p_id integer not null, foreign key (p_id) references pp(pid))',
+		'create table cc (id integer primary key, m_id integer not null, sku text not null, unique (m_id, sku), foreign key (m_id) references mm(mid))',
+	];
+	const TWO_HOP_BODY = 'select c.m_id, c.sku, c.id, p.pname from cc c join mm m on c.m_id = m.mid join pp p on m.p_id = p.pid order by c.m_id, c.sku';
+
+	it('positive: a two-hop FK chain covers via the threaded IND where the structural single-call abstains', async () => {
+		const db = await freshDb(TWO_HOP_DDL);
+		try {
+			expect(proveBody(db, TWO_HOP_BODY, 'cc', false).covers, 'composed IND proves no-row-loss across both hops').to.be.true;
+			// Structural-only sees one hop at a time, so the outer mm→pp hop is invisible
+			// to `lookupCoveringFK(cc, pp, …)` ⇒ the pre-Wave-2 result is NotCovers('shape').
+			const structuralOnly = proveBody(db, TWO_HOP_BODY, 'cc', true);
+			expect(structuralOnly.covers, 'structural-only abstains on the outer hop').to.be.false;
+			if (!structuralOnly.covers) expect(structuralOnly.reason).to.equal('shape');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative: a nullable mid→parent FK yields a nullRejecting threaded IND ⇒ no admit', async () => {
+		// mm.p_id is nullable, so the seeded mm→pp IND is `nullRejecting` — a NULL
+		// p_id has no parent, so the inner join could drop an (cc⋈mm) row. The IND
+		// path skips nullRejecting INDs (the same reason the structural path requires
+		// `!match.nullable`) ⇒ no admit.
+		const db = await freshDb([
+			'create table pp (pid integer primary key, pname text)',
+			'create table mm (mid integer primary key, p_id integer null, foreign key (p_id) references pp(pid))',
+			'create table cc (id integer primary key, m_id integer not null, sku text not null, unique (m_id, sku), foreign key (m_id) references mm(mid))',
+		]);
+		try {
+			const r = proveBody(db, TWO_HOP_BODY, 'cc', false);
+			expect(r.covers, 'a NULL-rejecting IND can drop rows ⇒ must not cover').to.be.false;
+			if (!r.covers) expect(r.reason).to.equal('shape');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative: the outer join on a non-FK mm column has no matching IND ⇒ no admit', async () => {
+		// mm.q_id is NOT NULL but is not a foreign key, so no IND on the `cc ⋈ mm`
+		// frame pairs `mm.q_id` to `pp.pid`. The IND pairing mismatches the join's
+		// equi-pairs ⇒ the IND path abstains and the structural fallback also fails
+		// (the join column is not a T column) ⇒ NotCovers.
+		const db = await freshDb([
+			'create table pp (pid integer primary key, pname text)',
+			'create table mm (mid integer primary key, p_id integer not null, q_id integer not null, foreign key (p_id) references pp(pid))',
+			'create table cc (id integer primary key, m_id integer not null, sku text not null, unique (m_id, sku), foreign key (m_id) references mm(mid))',
+		]);
+		const body = 'select c.m_id, c.sku, c.id, p.pname from cc c join mm m on c.m_id = m.mid join pp p on m.q_id = p.pid order by c.m_id, c.sku';
+		try {
+			const r = proveBody(db, body, 'cc', false);
+			expect(r.covers, 'the join column is not the FK ⇒ the IND pairing mismatches').to.be.false;
+			if (!r.covers) expect(r.reason).to.equal('shape');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('negative: a row-reduced (seeked) lookup side cannot cover (shared full-row-set precondition)', async () => {
+		// `p.pid > 5` range-seeks the pp lookup, so it no longer exposes the parent's
+		// full row set. `innerJoinRetainsConstrainedTable` checks `resolveFullScanTableRef`
+		// before the IND path even runs, so the IND derivation never fires; the
+		// lookup-column WHERE additionally fails predicate alignment. Either sound
+		// rejection is acceptable — the point is that a row-reduced lookup cannot cover.
+		const db = await freshDb(TWO_HOP_DDL);
+		const body = 'select c.m_id, c.sku, c.id, p.pname from cc c join mm m on c.m_id = m.mid join pp p on m.p_id = p.pid where p.pid > 5 order by c.m_id, c.sku';
+		try {
+			const r = proveBody(db, body, 'cc', false);
+			expect(r.covers, 'a row-reduced lookup re-introduces row loss ⇒ must not cover').to.be.false;
+			if (!r.covers) expect(['shape', 'predicate-entailment']).to.include(r.reason);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
  * Cross-schema qualifier resolution — the prover's ORDER BY / WHERE qualifier
  * matching is (schema, table)-aware, so a `schema.table.col` term whose *table*
  * name collides with `T`'s but whose *schema* denotes a different schema does NOT

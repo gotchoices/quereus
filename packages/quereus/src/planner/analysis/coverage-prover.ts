@@ -33,18 +33,26 @@
  *         a `left` join with `T` in the left subtree, or a `right` join with `T`
  *         in the right subtree.
  *      2. *Referential integrity* — an `inner`/`cross` join whose equi-pairs are
- *         a **NOT-NULL foreign key from `T` to the lookup table's primary key**,
- *         over a lookup side that exposes the parent's *full* row set
- *         (`innerJoinRetainsConstrainedTable`). Enforced RI then makes every `T`
- *         row match exactly one lookup row, so the inner join loses nothing. This
- *         leans on the engine treating declared FKs as inclusion dependencies —
- *         see the RI soundness note below.
+ *         an inclusion dependency from the `T`-side relation to the lookup table's
+ *         **primary key**, over a lookup side that exposes the parent's *full* row
+ *         set (`innerJoinRetainsConstrainedTable`). Enforced RI then makes every
+ *         `T` row match exactly one lookup row, so the inner join loses nothing.
+ *         This obligation is now **IND-derived** (Wave 2): it first consults the
+ *         propagated `PhysicalProperties.inds` surface on the `T`-side subtree
+ *         (`indDerivedNoRowLoss`) and falls back to the original structural
+ *         NOT-NULL-FK-on-`T` check (`lookupCoveringFK`, `!match.nullable`) when no
+ *         IND discharges it. Both gate on the same preconditions, so they agree on
+ *         every single-FK shape; the IND path additionally proves no-row-loss
+ *         across multi-hop FK chains (`T → M → P`) whose threaded IND a single
+ *         `lookupCoveringFK` call cannot see. Both lean on the engine treating
+ *         declared FKs as inclusion dependencies — see the RI soundness note below.
  *
- *    Every other join type/position (`inner`/`cross` *without* a covering FK;
+ *    Every other join type/position (`inner`/`cross` *without* a covering FK/IND;
  *    `semi`/`anti` filter; `full` injects lookup-only rows; `T` on the dropping
  *    side) is rejected as `shape`. FDs encode uniqueness, not existence, so
- *    obligation (1) cannot be FD-derived; obligation (2) reads the FK schema +
- *    the lookup-side plan shape directly.
+ *    obligation (1) cannot be FD-derived; obligation (2) is discharged from the
+ *    propagated IND surface (the Wave-1 over-claim-free guarantee licenses trusting
+ *    it) with the structural FK-schema read as fallback.
  *
  *  - **No fan-out (≤1).** `T`'s primary key must be a unique key of the
  *    **topmost join's output relation**, read through `isUnique`. The optimizer
@@ -163,7 +171,7 @@
  * separate concern of the row-time-enforcement / lens tickets, not this one.
  */
 
-import type { RelationalPlanNode, ScalarPlanNode, GuardClause } from '../nodes/plan-node.js';
+import type { RelationalPlanNode, ScalarPlanNode, GuardClause, InclusionDependency } from '../nodes/plan-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -198,6 +206,19 @@ export type CoverageFailureReason =
 export type CoverageResult =
 	| { covers: true }
 	| { covers: false; reason: CoverageFailureReason };
+
+/**
+ * Options for {@link proveCoverage}. Production callers leave this empty.
+ *
+ * `structuralOnly` is a verification seam: it disables the Wave-2 IND-derived
+ * no-row-loss path so the inner/cross obligation uses only the structural
+ * NOT-NULL-FK check. The equivalence test runs each existing FK→PK body twice
+ * (IND on vs `structuralOnly`) and asserts identical verdicts — the structural
+ * guarantee that the two derivations cannot disagree on the single-FK corpus.
+ */
+export interface ProveCoverageOptions {
+	readonly structuralOnly?: boolean;
+}
 
 const COVERS: CoverageResult = { covers: true };
 function notCovers(reason: CoverageFailureReason): CoverageResult {
@@ -264,6 +285,7 @@ export function proveCoverage(
 	mv: MaterializedViewSchema,
 	uc: UniqueConstraintSchema,
 	baseTable: TableSchema,
+	opts: ProveCoverageOptions = {},
 ): CoverageResult {
 	// ---- Row cap: a LIMIT/OFFSET body materializes only a prefix of the
 	//      governed rows, so it can never be observation-equivalent. Read from the
@@ -311,7 +333,7 @@ export function proveCoverage(
 			const rowPreserving = (leftHasT && joinType === 'left') || (rightHasT && joinType === 'right');
 			if (!rowPreserving) {
 				const fkRetained = (joinType === 'inner' || joinType === 'cross')
-					&& innerJoinRetainsConstrainedTable(node, tSide, lookupSide, baseTable);
+					&& innerJoinRetainsConstrainedTable(node, tSide, lookupSide, baseTable, opts.structuralOnly === true);
 				if (!fkRetained) return notCovers('shape');
 			}
 			if (topJoin === undefined) topJoin = node;
@@ -637,23 +659,33 @@ function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[
 
 /**
  * No-row-loss proof for an `inner`/`cross` join: every governed `T` row is
- * retained because the join's equi-pairs are a **NOT-NULL foreign key from `T`
- * to the lookup table's primary key**, and Quereus enforces referential
- * integrity (declared FKs are treated as inclusion dependencies — the same
- * `lookupCoveringFK` + full-parent-row-set discipline the INNER branch of
- * `rule-join-elimination` relies on; see the module doc's soundness note).
+ * retained because the join's equi-pairs are an inclusion dependency from the
+ * `T`-side relation to the lookup table's primary key, and Quereus enforces
+ * referential integrity (declared FKs are treated as inclusion dependencies; see
+ * the module doc's soundness note).
  *
- * Each obligation closes a distinct row-loss gap:
+ * Two preconditions are shared by both proof paths and gate up front:
  *  - **equi-only join** (`pureJoinEquiAttrPairs`) — a residual/non-equi conjunct
- *    could fail for the FK-matched lookup row and drop the `T` row.
+ *    could fail for the matched lookup row and drop the `T` row.
  *  - **full parent row set** (`resolveFullScanTableRef` on the lookup side) — a
- *    filtered/seeked lookup side could omit the parent row a `T` row references.
- *  - **NOT-NULL FK to the PK** (`lookupCoveringFK`, `!match.nullable`) — a NULL
- *    FK value has no parent (MATCH SIMPLE), so a nullable FK can drop `T` rows;
- *    a non-FK or non-PK equi-join carries no inclusion guarantee at all.
+ *    filtered/seeked lookup side could omit the parent row a `T` row references,
+ *    re-introducing row loss regardless of any inclusion guarantee.
  *
- * The complementary no-fan-out (≤1) obligation is unchanged — it is the join-
- * frame `isUnique(T.pk)` gate in `proveJoinNoFanout`, which a FK→PK join also
+ * Two interchangeable derivations then discharge the inclusion obligation:
+ *  1. **IND-derived** (`indDerivedNoRowLoss`, Wave 2, tried first) — a propagated
+ *     non-`nullRejecting` IND on the `T`-side subtree whose `(cols → targetCols)`
+ *     pairing matches the join's equi-pairs and whose target is the lookup
+ *     parent's key. This composes across multi-hop FK chains (`T → M → P`) where
+ *     a single `lookupCoveringFK` call sees only one hop.
+ *  2. **Structural fallback** (`lookupCoveringFK`, `!match.nullable`) — a NOT-NULL
+ *     FK declared *on `T`* to the lookup table's PK. Retained verbatim so a
+ *     missing IND never regresses an existing optimization.
+ *
+ * Both gate on the same preconditions and the same non-null inclusion to the
+ * parent's key, so they cannot disagree on the single-FK corpus (the seeded IND
+ * mirrors `lookupCoveringFK` exactly: same PK-cover validation, same nullability
+ * bit). The complementary no-fan-out (≤1) obligation is unchanged — it is the
+ * join-frame `isUnique(T.pk)` gate in `proveJoinNoFanout`, which a FK→PK join also
  * satisfies (the PK side's key is covered by the equi-pairs).
  */
 function innerJoinRetainsConstrainedTable(
@@ -661,14 +693,25 @@ function innerJoinRetainsConstrainedTable(
 	tSide: RelationalPlanNode,
 	lookupSide: RelationalPlanNode,
 	baseTable: TableSchema,
+	structuralOnly = false,
 ): boolean {
 	const equiPairs = pureJoinEquiAttrPairs(join);
 	if (!equiPairs || equiPairs.length === 0) return false;
 
-	const tRef = findConstrainedTableRef(tSide, baseTable);
-	if (!tRef) return false;
+	// Shared precondition: the lookup side must expose the parent's full row set.
 	const lookupRef = resolveFullScanTableRef(lookupSide);
 	if (!lookupRef) return false;
+
+	// (1) IND-derived path (Wave 2), tried first — proves multi-hop chains the
+	//     single-call structural check below cannot see. The `structuralOnly`
+	//     verification seam disables it so the equivalence test can assert the two
+	//     derivations agree on every single-FK shape.
+	if (!structuralOnly && indDerivedNoRowLoss(equiPairs, tSide, lookupRef)) return true;
+
+	// (2) Structural fallback (unchanged): a NOT-NULL FK declared on `T` to the
+	//     lookup table's PK.
+	const tRef = findConstrainedTableRef(tSide, baseTable);
+	if (!tRef) return false;
 
 	// Stable attribute id → base column index on each side.
 	const tAttrToCol = new Map<number, number>();
@@ -695,6 +738,103 @@ function innerJoinRetainsConstrainedTable(
 
 	const match = lookupCoveringFK(baseTable, lookupRef.tableSchema, fkCols, pkCols);
 	return match !== undefined && !match.nullable;
+}
+
+/**
+ * IND-derived no-row-loss proof (Wave 2). Discharges the inner/cross join's
+ * inclusion obligation from the **propagated** IND surface (`PhysicalProperties.inds`)
+ * on the `T`-side subtree, rather than re-reading the FK declaration on `T`.
+ *
+ * Admit when there is an IND on `tSide` whose `(cols → targetCols)` positional
+ * pairing equals (as a set) the join's `(tSide-output-col → lookup-base-col)`
+ * equi-pairs, with:
+ *  - `nullRejecting === false` — a NULL-rejecting (nullable-FK) IND can drop `T`
+ *    rows whose `cols` tuple is NULL, exactly the reason the structural path
+ *    requires `!match.nullable`;
+ *  - `target.kind === 'table'` matching the lookup parent's `(schema, table)`; and
+ *  - the IND's `targetCols` (a key of the parent — seeded INDs target the parent
+ *    PK) aligned positionally with the lookup-side equi-columns.
+ *
+ * Soundness. The IND `tSide.cols ⊆ parent.targetCols` (total, since not
+ * null-rejecting) guarantees, for every `tSide` row, a parent row `p` with
+ * `p.targetCols = tSide.cols`. When the join's equi-pairs are exactly that
+ * `(cols → targetCols)` pairing, `p` satisfies every equi-condition, so the row is
+ * retained — no row loss. The lookup-side full-row-set precondition (checked by the
+ * caller) ensures `p` is actually present in the lookup scan.
+ *
+ * Equivalence with the structural path. The IND set on a bare `T`-side is exactly
+ * `seedTableForeignKeyInds(T)` — one total/NOT-NULL IND per declared FK→parent-PK,
+ * with the same PK-cover and nullability validation `lookupCoveringFK` applies. The
+ * set-equality match below mirrors `lookupCoveringFK`'s "equi-pairs are exactly the
+ * FK columns paired to the whole parent PK" requirement, so the two paths admit the
+ * identical single-FK shapes. The IND path's additional reach is **composition**:
+ * a `T → M → P` chain carries a threaded IND (`M.cols ⊆ P.pk`) on the `T ⋈ M`
+ * sub-frame via Wave-1 join propagation, which discharges the outer `⋈ P` join no
+ * single `lookupCoveringFK(T, P, …)` call can prove.
+ */
+function indDerivedNoRowLoss(
+	equiPairs: readonly EquiJoinPair[],
+	tSide: RelationalPlanNode,
+	lookupRef: TableReferenceNode,
+): boolean {
+	const inds = tSide.physical?.inds;
+	if (!inds || inds.length === 0) return false;
+
+	// Map each equi-pair to (tSide-output-col, lookup-base-col). The IND `cols`
+	// live in `tSide`'s output frame; the lookup base-col aligns with the target's
+	// `targetCols` (output index = base column index at the lookup TableReference).
+	const tSideAttrToCol = new Map<number, number>();
+	tSide.getAttributes().forEach((a, i) => tSideAttrToCol.set(a.id, i));
+	const lookupAttrToCol = new Map<number, number>();
+	lookupRef.getAttributes().forEach((a, i) => lookupAttrToCol.set(a.id, i));
+
+	const joinPairs: Array<[number, number]> = [];
+	for (const p of equiPairs) {
+		let tCol = tSideAttrToCol.get(p.leftAttrId);
+		let lCol = lookupAttrToCol.get(p.rightAttrId);
+		if (tCol === undefined || lCol === undefined) {
+			tCol = tSideAttrToCol.get(p.rightAttrId);
+			lCol = lookupAttrToCol.get(p.leftAttrId);
+		}
+		// A pair not cleanly split across tSide / lookup (e.g. a third source) is
+		// unprovable from this IND surface ⇒ abstain (caller falls back to structural).
+		if (tCol === undefined || lCol === undefined) return false;
+		joinPairs.push([tCol, lCol]);
+	}
+
+	const lookupSchema = lookupRef.tableSchema.schemaName.toLowerCase();
+	const lookupTable = lookupRef.tableSchema.name.toLowerCase();
+
+	for (const ind of inds) {
+		if (ind.nullRejecting) continue;
+		if (ind.target.kind !== 'table') continue;
+		if (ind.target.schema.toLowerCase() !== lookupSchema) continue;
+		if (ind.target.table.toLowerCase() !== lookupTable) continue;
+		if (indPairsMatchJoinPairs(ind, joinPairs)) return true;
+	}
+	return false;
+}
+
+/**
+ * True iff the IND's positional `(cols[j] → target.targetCols[j])` pairing, taken
+ * as a set, equals the join's `(tSideCol → lookupCol)` equi-pairs. Set (not
+ * ordered) comparison so the equi-pair extraction order is irrelevant; lengths
+ * must match so the join equates *exactly* the IND's columns to the parent's key
+ * — the same all-of-the-FK-columns, all-of-the-PK requirement `lookupCoveringFK`
+ * enforces, keeping the two derivations in lockstep on the single-FK corpus.
+ */
+function indPairsMatchJoinPairs(ind: InclusionDependency, joinPairs: ReadonlyArray<readonly [number, number]>): boolean {
+	if (ind.cols.length !== joinPairs.length) return false;
+	if (ind.target.targetCols.length !== ind.cols.length) return false;
+	const indSet = new Set<string>();
+	for (let j = 0; j < ind.cols.length; j++) {
+		indSet.add(`${ind.cols[j]}:${ind.target.targetCols[j]}`);
+	}
+	if (indSet.size !== ind.cols.length) return false; // duplicate IND pair ⇒ not a clean match
+	for (const [tCol, lCol] of joinPairs) {
+		if (!indSet.has(`${tCol}:${lCol}`)) return false;
+	}
+	return true;
 }
 
 /**
