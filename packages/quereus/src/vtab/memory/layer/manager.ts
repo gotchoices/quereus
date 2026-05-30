@@ -141,7 +141,17 @@ export class MemoryTableManager {
 		this.isReadOnly = readOnly;
 		this.eventEmitter = eventEmitter;
 
-		this.ensureUniqueConstraintIndexes();
+		// Phase D (docs/lens.md § Departures — Auto-index for unique/PK): the legacy
+		// eager auto-index for UNIQUE constraints is a *physical*-schema behavior. A
+		// logical schema's UNIQUE contributes only a key/FD to the optimizer and an
+		// enforced boundary constraint — it creates NO structure; any covering index
+		// is an explicit basis-layer materialized view. Logical tables are never
+		// module-backed (a MemoryTableManager is never constructed for one), so this
+		// path is already unreachable for them — we gate explicitly regardless, so the
+		// separation is enforced at the source rather than relying on that invariant.
+		if (!this.isLogicalSchema()) {
+			this.ensureUniqueConstraintIndexes();
+		}
 		this.initializePrimaryKeyFunctions();
 
 		this.baseLayer = new BaseLayer(this.tableSchema);
@@ -150,6 +160,17 @@ export class MemoryTableManager {
 
 	private initializePrimaryKeyFunctions(): void {
 		this.primaryKeyFunctions = createPrimaryKeyFunctions(this.tableSchema);
+	}
+
+	/**
+	 * One-bit guard on `Schema.kind` (docs/lens.md § Departures): true when this
+	 * table belongs to a logical schema. Prefers the table's own `isLogical` flag
+	 * and falls back to the owning schema's `kind`, so the gate holds even if a
+	 * logical TableSchema were ever (incorrectly) handed to a memory manager.
+	 */
+	private isLogicalSchema(): boolean {
+		if (this.tableSchema.isLogical === true) return true;
+		return this.db.schemaManager.getSchema(this.schemaName)?.kind === 'logical';
 	}
 
 	/**

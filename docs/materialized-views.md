@@ -448,6 +448,20 @@ vocabulary — the **covering structure** — so the enforcement layer (and the 
 layer above it) can pattern-match a single surface (`CoveringStructure` in
 `vtab/memory/layer/manager.ts`):
 
+> **The recommended response to a `lens.no-backing-index` advisory.** When the
+> [lens prover](lens.md#constraint-attachment) classifies a logical `unique` /
+> primary key as `enforced-set-level` with `mode: 'commit-time'`, it means no basis
+> covering structure answers it, so enforcement falls back to the O(n) commit-time
+> `DeltaExecutor` scan and warns. The fix is to declare an **explicit basis covering
+> materialized view** (`order by` the constraint columns, projecting the UC columns
+> + source PK — NULL-skipped via `where … is not null` for a nullable column) over
+> the basis. The coverage prover then links it to the basis UC, `proveLens` resolves
+> it via `_findRowTimeCoveringStructure`, and the obligation upgrades to
+> `mode: 'row-time'` — O(log n) and conflict-resolution-capable (`insert or replace`
+> / `or ignore`), which the commit-time scan cannot offer. In the logical-schema
+> world (where the auto-index is retired) this covering MV is the *sole* row-time
+> structure.
+
 ```
 type CoveringStructure =
   | { kind: 'memory-index';      index: MemoryIndex }            // the auto-built secondary BTree

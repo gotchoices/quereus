@@ -11,6 +11,7 @@ import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance,
 	type LensRelationBacking, type LensTableSnapshot, type LensDeploymentSnapshot } from './lens.js';
 import { computeSchemaHash } from './schema-hasher.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
+import { proveLens, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
 import { createLogger } from '../common/logger.js';
 import type { MappingAdvertisement, DecompositionMember } from '../vtab/mapping-advertisement.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
@@ -46,7 +47,7 @@ export function deployLogicalSchema(
 	db: Database,
 	declaredSchema: AST.DeclareSchemaStmt,
 	logicalSchemaName: string,
-): void {
+): LensDeployReport {
 	validateLogicalDeclaration(declaredSchema, logicalSchemaName);
 
 	const schemaManager = db.schemaManager;
@@ -87,6 +88,12 @@ export function deployLogicalSchema(
 	let allAdvertisements: MappingAdvertisement[] | undefined;
 
 	const compiled: Array<{ slot: LensSlot; view: ViewSchema }> = [];
+	// Prover accumulators (docs/lens.md § Coverage checklist). Errors aggregate
+	// across every table and throw atomically below — before any catalog mutation,
+	// preserving the existing atomic-deploy property. Warnings flow to the report.
+	const proveErrors: LensDiagnostic[] = [];
+	const proveWarnings: LensDiagnostic[] = [];
+	const obligationsByTable = new Map<string, ReadonlyArray<ConstraintObligation>>();
 	for (const item of declaredSchema.items) {
 		if (item.type !== 'declaredTable') continue;
 
@@ -151,6 +158,19 @@ export function deployLogicalSchema(
 		// invalid tag fails the deploy atomically (before any catalog mutation).
 		// Only shape/site is checked here — no reserved tag's semantics are read.
 		validateLensTags(slot);
+
+		// Prove the slot and classify its constraints (docs/lens.md § Coverage
+		// checklist). The verdict is recorded on the slot (obligations + readOnly)
+		// and its diagnostics are aggregated into the deploy report. Errors are
+		// thrown atomically after every table is proved (below), preserving the
+		// atomic-deploy contract; warnings never block.
+		const prove = proveLens(slot, db);
+		slot.obligations = prove.obligations;
+		slot.readOnly = prove.readOnly;
+		proveErrors.push(...prove.errors);
+		proveWarnings.push(...prove.warnings);
+		obligationsByTable.set(logicalTable.name.toLowerCase(), prove.obligations);
+
 		const view: ViewSchema = {
 			name: logicalTable.name,
 			schemaName: logicalSchema.name,
@@ -166,6 +186,13 @@ export function deployLogicalSchema(
 			tags: logicalTable.tags,
 		};
 		compiled.push({ slot, view });
+	}
+
+	// Atomic block: any prover error aborts the deploy BEFORE the catalog mutation
+	// below, so a failed re-apply leaves the prior lens state untouched. Every
+	// blocking diagnostic is listed (sited) in one error.
+	if (proveErrors.length > 0) {
+		throw new QuereusError(formatProveErrors(logicalSchemaName, proveErrors), StatusCode.ERROR);
 	}
 
 	// Clear-and-rebuild: drop all current lens views + slots, then register the
@@ -189,6 +216,26 @@ export function deployLogicalSchema(
 	// (docs/lens.md § The deployed basis representation).
 	const snapshot = buildDeploymentSnapshot(db, compiled, basis, logicalSchemaName);
 	db.declaredSchemaManager.rotateDeployedLensSnapshot(logicalSchemaName, snapshot);
+
+	// Errors are already thrown above; a returned report carries only advisories.
+	// Persist it on the manager — the stable hook the sibling acknowledgment ticket
+	// reads to fingerprint / tally / expand advisories (docs/lens.md § Acknowledging
+	// advisories). `apply schema` returning these as result rows is deferred to that
+	// ticket (converting the universally-used void statement to relational is a
+	// separate, high-blast-radius change); the report is fully produced here.
+	const report: LensDeployReport = { errors: [], warnings: proveWarnings, obligationsByTable };
+	db.declaredSchemaManager.setDeployedLensReport(logicalSchemaName, report);
+	return report;
+}
+
+/**
+ * Formats the aggregated blocking diagnostics into one atomic deploy error. Each
+ * diagnostic's `message` is included verbatim (so a caller / test matching a
+ * specific sited substring still matches), prefixed by its stable code.
+ */
+function formatProveErrors(logicalSchemaName: string, errors: ReadonlyArray<LensDiagnostic>): string {
+	const lines = errors.map(e => ` - [${e.code}] ${e.message}`);
+	return `lens: deploy of logical schema '${logicalSchemaName}' blocked by ${errors.length} error(s):\n${lines.join('\n')}`;
 }
 
 /**

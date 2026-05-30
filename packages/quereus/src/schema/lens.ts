@@ -7,6 +7,7 @@ import type {
 	PrimaryKeyColumnDefinition,
 } from './table.js';
 import type { MappingAdvertisement } from '../vtab/mapping-advertisement.js';
+import type { ConstraintObligation } from './lens-prover.js';
 
 /**
  * Lens layer — per-logical-table mapping slots.
@@ -99,10 +100,27 @@ export interface LensSlot {
 	 */
 	columnProvenance: ReadonlyArray<LensColumnProvenance>;
 	/**
-	 * The logical spec's constraints, verbatim. Routed to enforcement by the
-	 * prover ticket (`lens-prover-and-constraint-attachment`); stored as-is here.
+	 * The logical spec's constraints, verbatim. The prover ({@link ./lens-prover.ts})
+	 * classifies each into an {@link ConstraintObligation} stored on
+	 * {@link obligations}; this list is the raw input it consumes.
 	 */
 	attachedConstraints: ReadonlyArray<LogicalConstraint>;
+	/**
+	 * Per-constraint enforcement classification, produced by `proveLens` and
+	 * populated post-prove in the lens compiler. `undefined` before the prover
+	 * runs. 1:1 with {@link attachedConstraints} in order. The *live* per-write
+	 * enforcement that consumes these (row-local check pipeline, set-level
+	 * existence routing, FK DeltaExecutor) lands in `lens-constraint-enforcement-wiring`.
+	 */
+	obligations?: ReadonlyArray<ConstraintObligation>;
+	/**
+	 * Whether the logical table is read-only — its primary key is not
+	 * reconstructible at the lens boundary, so reads work but any mutation errors
+	 * at the lens (`planner/building/view-mutation.ts` raises). Set by `proveLens`;
+	 * `undefined`/`false` ⇒ writable. See `docs/lens.md` § Coverage checklist
+	 * (Key reconstructibility).
+	 */
+	readOnly?: boolean;
 	/**
 	 * The resolved primary-storage advertisement, when a module advertised a
 	 * decomposition for this logical table (see {@link MappingAdvertisement}).

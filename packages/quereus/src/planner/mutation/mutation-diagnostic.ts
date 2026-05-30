@@ -24,7 +24,8 @@ export type MutationDiagnosticReason =
 	| 'no-base-lineage'            // VALUES body / no reachable base table
 	| 'nested-view'                // body sources another view / CTE (inline-propagation deferred)
 	| 'unsupported-source'         // INSERT source shape we cannot thread filter defaults through yet
-	| 'returning-through-view';    // RETURNING projected through a view — Phase 6
+	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
+	| 'lens-read-only';            // logical table whose PK is not reconstructible at the lens boundary
 
 /**
  * Structured mutation diagnostic. Mirrors the `MutationDiagnostic` shape in

@@ -2,6 +2,7 @@ import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import type { LensDeploymentSnapshot } from './lens.js';
+import type { LensDeployReport } from './lens-prover.js';
 
 const log = createLogger('schema:declared');
 
@@ -29,6 +30,14 @@ export class DeclaredSchemaManager {
 	 * § The deployed basis representation).
 	 */
 	private deployedLensSnapshots: Map<string, LensSnapshotPair> = new Map();
+	/**
+	 * Latest lens deploy report (prover warnings + per-constraint obligations)
+	 * keyed by *logical* schema name. Captured on each successful `apply schema X`.
+	 * This is the **stable hook** the sibling acknowledgment ticket
+	 * (`lens-advisory-acknowledgment`) reads to fingerprint / tally / expand the
+	 * advisories. Errors never reach here — they throw atomically during deploy.
+	 */
+	private deployedLensReports: Map<string, LensDeployReport> = new Map();
 
 	/**
 	 * Stores a declared schema
@@ -97,6 +106,7 @@ export class DeclaredSchemaManager {
 		this.seedData.delete(schemaName.toLowerCase());
 		this.lensDeclarations.delete(schemaName.toLowerCase());
 		this.deployedLensSnapshots.delete(schemaName.toLowerCase());
+		this.deployedLensReports.delete(schemaName.toLowerCase());
 		log('Removed declared schema: %s', schemaName);
 	}
 
@@ -130,6 +140,20 @@ export class DeclaredSchemaManager {
 	/** Retrieves the rotated `{ previous, current }` snapshot pair for a logical schema, if any. */
 	getDeployedLensSnapshots(logicalSchemaName: string): LensSnapshotPair | undefined {
 		return this.deployedLensSnapshots.get(logicalSchemaName.toLowerCase());
+	}
+
+	/**
+	 * Stores (replacing any prior) the lens deploy report for a logical schema,
+	 * captured on each successful `apply schema X`. The stable hook the sibling
+	 * acknowledgment ticket consumes (see {@link deployedLensReports}).
+	 */
+	setDeployedLensReport(logicalSchemaName: string, report: LensDeployReport): void {
+		this.deployedLensReports.set(logicalSchemaName.toLowerCase(), report);
+	}
+
+	/** Retrieves the latest lens deploy report for a logical schema, if any. */
+	getDeployedLensReport(logicalSchemaName: string): LensDeployReport | undefined {
+		return this.deployedLensReports.get(logicalSchemaName.toLowerCase());
 	}
 }
 

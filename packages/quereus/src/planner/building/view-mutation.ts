@@ -170,6 +170,21 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
  * shape.
  */
 function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis {
+	// Lens read-only gate: a logical table whose primary key is not reconstructible
+	// at the lens boundary deploys read-only (the prover sets `LensSlot.readOnly`;
+	// docs/lens.md § Coverage checklist). Reads still resolve through the registered
+	// view; any mutation errors here with a precise diagnostic. The lookup only
+	// matches a logical schema's lens slot — a plain view / MV (physical schema) has
+	// none, so this never false-positives on ordinary view write-through.
+	const lensSlot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	if (lensSlot?.readOnly) {
+		raiseMutationDiagnostic({
+			reason: 'lens-read-only',
+			table: view.name,
+			message: `cannot write through logical table '${view.schemaName}.${view.name}': its primary key is not reconstructible at the lens boundary, so it is read-only (deploy advisory lens.pk-not-reconstructible)`,
+		});
+	}
+
 	if (view.selectAst.type !== 'select') {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
