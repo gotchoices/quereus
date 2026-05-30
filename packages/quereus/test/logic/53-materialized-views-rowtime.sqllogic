@@ -538,17 +538,19 @@ select x, id, payload from sk_ix order by x, id;
 → [{"x":8,"id":1,"payload":"a2"},{"x":8,"id":2,"payload":"b"}]
 
 -- ===================================
--- 16. Source schema change + recreate re-registration. A COMPATIBLE source ALTER
---     (add an unprojected nullable column) fires a `table_modified` event that marks
---     the MV stale and DETACHES the row-time plan: the MV keeps reading its last
+-- 16. Source schema change + refresh / recreate re-registration. A COMPATIBLE source
+--     ALTER (add an unprojected nullable column) fires a `table_modified` event that
+--     marks the MV stale and DETACHES the row-time plan: the MV keeps reading its last
 --     snapshot, and a post-alter source write is NOT maintained (stale until refresh
---     or recreate). Dropping the source instead makes the MV read a clean stale
---     error. Recreating the MV re-registers a fresh plan; maintenance resumes.
---     KNOWN GAP (see materialized-view-refresh-reregister-rowtime): `refresh` clears
---     stale + rebuilds the snapshot but does NOT re-register the row-time plan, so
---     only drop+recreate (asserted here) fully restores maintenance.
+--     or recreate). BOTH `refresh materialized view` and drop+recreate restore the
+--     MV — they (a) rebuild the snapshot to include the missed row(s) AND (b) re-register
+--     a fresh row-time plan so subsequent source writes resume propagating. Dropping the
+--     source instead makes the MV read a clean stale error.
 -- ===================================
 
+-- 16a. `refresh materialized view` re-registers the row-time plan (the bug this file's
+--      ticket fixed: refresh used to rebuild the snapshot but leave the plan detached,
+--      so post-refresh source writes were silently dropped).
 create table al (id integer primary key, x integer);
 insert into al values (1, 10);
 create materialized view al_ix as select id, x from al;
@@ -561,16 +563,85 @@ insert into al (id, x) values (2, 20);
 select id, x from al_ix order by id;
 → [{"id":1,"x":10}]
 
--- recreate re-registers a fresh row-time plan; the rebuild reflects all source rows
-drop materialized view al_ix;
-create materialized view al_ix as select id, x from al;
+-- refresh rebuilds the snapshot to include the missed row AND re-registers the plan
+refresh materialized view al_ix;
 select id, x from al_ix order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
 
--- maintenance has resumed against the new plan
+-- maintenance has resumed against the re-registered plan: a subsequent write IS reflected
 insert into al (id, x) values (3, 30);
 select id, x from al_ix order by id;
 → [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- 16b. drop+recreate is the other restore path; it must also end fully maintained.
+create table al2 (id integer primary key, x integer);
+insert into al2 values (1, 10);
+create materialized view al2_ix as select id, x from al2;
+
+alter table al2 add column extra text null;
+insert into al2 (id, x) values (2, 20);
+select id, x from al2_ix order by id;
+→ [{"id":1,"x":10}]
+
+-- recreate re-registers a fresh row-time plan; the rebuild reflects all source rows
+drop materialized view al2_ix;
+create materialized view al2_ix as select id, x from al2;
+select id, x from al2_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- maintenance has resumed against the new plan
+insert into al2 (id, x) values (3, 30);
+select id, x from al2_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- 16c. Idempotent-registration guard — refreshing a NOT-stale MV re-registers the plan
+--      (release-then-rebuild), which must leave maintenance working with no duplicate
+--      rowTimeBySource entry breaking subsequent writes.
+create table nr (id integer primary key, x integer);
+insert into nr values (1, 10);
+create materialized view nr_ix as select id, x from nr;
+-- refresh a never-stale MV: harmless no-op re-attach
+refresh materialized view nr_ix;
+-- maintenance still fires after the redundant re-register
+insert into nr values (2, 20);
+select id, x from nr_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- 16d. Compound-PK MV resumes maintenance after a refresh.
+create table cpr (a integer, b integer, v integer, primary key (a, b));
+insert into cpr values (1, 1, 100);
+create materialized view cpr_ix as select a, b, v from cpr;
+alter table cpr add column note text null;
+insert into cpr (a, b, v) values (1, 2, 200);
+select a, b, v from cpr_ix order by a, b;
+→ [{"a":1,"b":1,"v":100}]
+refresh materialized view cpr_ix;
+select a, b, v from cpr_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200}]
+-- subsequent compound-PK write is maintained
+insert into cpr (a, b, v) values (2, 1, 300);
+select a, b, v from cpr_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
+
+-- 16e. Partial (WHERE) MV resumes maintenance after a refresh, predicate still honored.
+create table par (id integer primary key, x integer);
+insert into par values (1, 5);
+create materialized view par_ix as select id, x from par where x > 0;
+alter table par add column note text null;
+-- one in-scope and one out-of-scope write while stale (both unmaintained)
+insert into par (id, x) values (2, 8);
+insert into par (id, x) values (3, -1);
+select id, x from par_ix order by id;
+→ [{"id":1,"x":5}]
+refresh materialized view par_ix;
+-- rebuild applies the predicate: the in-scope missed row appears, the out-of-scope does not
+select id, x from par_ix order by id;
+→ [{"id":1,"x":5},{"id":2,"x":8}]
+-- maintenance resumed: in-scope write reflected, out-of-scope still excluded
+insert into par (id, x) values (4, 10);
+insert into par (id, x) values (5, -2);
+select id, x from par_ix order by id;
+→ [{"id":1,"x":5},{"id":2,"x":8},{"id":4,"x":10}]
 
 -- dropping the SOURCE of a row-time MV makes a read a clean stale diagnostic, not a crash
 create table ds (id integer primary key, x integer);

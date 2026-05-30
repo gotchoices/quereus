@@ -343,11 +343,18 @@ Row-time maintenance keeps an MV consistent with its sources' *data*. But a
 events and marks any MV whose `sourceTables` includes the changed table as
 **stale**.
 
+Marking an MV stale also **detaches its row-time maintenance plan** (the compiled
+plan is invalidated by the schema change), so while stale the MV serves its last
+snapshot and source writes are not propagated.
+
 - On the next **reference**, a stale MV re-validates its body against the current
   source schemas. If the body no longer plans, the reference errors with a staleness
   diagnostic ("a source changed in an incompatible way — drop and recreate") rather
   than serving rows against a broken definition.
-- On the next successful **refresh**, the stale flag is cleared.
+- On the next successful **refresh** (or a drop-and-recreate), the stale flag is
+  cleared, the backing snapshot is rebuilt, *and* the detached row-time plan is
+  **re-registered** — so subsequent source writes resume propagating. (Re-registration
+  is idempotent, so refreshing a never-stale MV is a harmless no-op re-attach.)
 
 `stale` is the **only** MV read-state flag. (The `diverged` flag and the two-tier
 apply-failure recovery existed only for the asynchronous on-commit model, which
