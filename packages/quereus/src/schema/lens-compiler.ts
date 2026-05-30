@@ -649,7 +649,25 @@ function compileOverrideBody(
 ): { body: AST.SelectStmt; provenance: LensColumnProvenance[]; hiding: ReadonlySet<string>; effectiveColumns: string[] } {
 	const select = override.select;
 	const logicalName = logicalTable.name;
+
+	// Every FROM source the override names must live in the declared basis — an
+	// override referencing a *different* existing schema (e.g. `Z.Foo` while the
+	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
+	validateOverrideBasisSources(select.from, basisSchemaName, logicalSchemaName, logicalName);
+
 	const hidden = new Set((override.hiding ?? []).map(h => h.toLowerCase()));
+	// `hiding (...)` names that match no logical column are silently a no-op (a
+	// typo hides nothing). Validate against the logical columns, preserving the
+	// author's spelling in the message.
+	const logicalColumnNames = new Set(logicalTable.columns.map(c => c.name.toLowerCase()));
+	for (const h of override.hiding ?? []) {
+		if (!logicalColumnNames.has(h.toLowerCase())) {
+			throw new QuereusError(
+				`lens: override for logical table '${logicalSchemaName}.${logicalName}' hides unknown column '${h}'; it matches no column of the logical table`,
+				StatusCode.ERROR,
+			);
+		}
+	}
 
 	// Resolve FROM-source basis tables once — used for both `*` expansion and
 	// gap-fill. Opaque sources (subquery / function / unresolvable table) are
@@ -668,7 +686,16 @@ function compileOverrideBody(
 			continue;
 		}
 		const outName = deriveColumnOutputName(col);
-		if (outName) coverage.set(outName.toLowerCase(), col.expr);
+		if (!outName) {
+			// A computed (non-column) projection term without an alias maps to no
+			// logical column — it would be silently dropped, then the same-named
+			// logical column gap-filled from the basis (a wrong, surprising read).
+			throw new QuereusError(
+				`lens: override for logical table '${logicalSchemaName}.${logicalName}' has a computed projection term '${astToString(col.expr)}' with no output name; add an alias (... as <name>) so it maps to a logical column`,
+				StatusCode.ERROR,
+			);
+		}
+		coverage.set(outName.toLowerCase(), col.expr);
 	}
 
 	// `*` covers every FROM-source column not already explicitly covered.
@@ -748,6 +775,49 @@ function collectOverrideSources(
 
 	if (from) for (const f of from) walk(f);
 	return { sources, hasOpaqueSource };
+}
+
+/**
+ * Validates that every introspectable `table` source in an override's FROM tree
+ * resolves to the declared basis schema. A table qualified with a *different*
+ * existing schema would otherwise bind there silently (re-anchoring the lens off
+ * its `over Y` basis); reject it at deploy time. Unqualified tables default to
+ * the basis and are fine; tables qualified with the basis name are fine; opaque
+ * sources (subquery / function) are not introspectable and are left to the
+ * existing gap-fill error path. Mirrors `collectOverrideSources`'s FROM walk but
+ * does not share it (that helper is also used where re-anchoring is allowed).
+ */
+function validateOverrideBasisSources(
+	from: ReadonlyArray<AST.FromClause> | undefined,
+	basisSchemaName: string,
+	logicalSchemaName: string,
+	logicalName: string,
+): void {
+	if (!from) return;
+	const lowerBasis = basisSchemaName.toLowerCase();
+	const walk = (node: AST.FromClause): void => {
+		switch (node.type) {
+			case 'table': {
+				const schema = node.table.schema;
+				if (schema && schema.toLowerCase() !== lowerBasis) {
+					throw new QuereusError(
+						`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${schema}.${node.table.name}' outside the declared basis '${basisSchemaName}' (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
+						StatusCode.ERROR,
+					);
+				}
+				break;
+			}
+			case 'join': {
+				walk(node.left);
+				walk(node.right);
+				break;
+			}
+			default:
+				// subquerySource / functionSource — not introspectable in v1.
+				break;
+		}
+	};
+	for (const f of from) walk(f);
 }
 
 /** Output name a result column contributes: its alias, or the bare column name. */

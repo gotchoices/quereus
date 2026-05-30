@@ -3044,6 +3044,12 @@ export class Parser {
 			if (body.type !== 'select') {
 				throw this.error(this.previous(), `A lens override body must be a SELECT; got '${body.type}'.`);
 			}
+			// A compound set-operation parses as a single `select` node carrying a
+			// `compound` (or legacy `union`) pointer; the override merger composes
+			// only the top leg, so reject the shape rather than silently mis-map.
+			if (body.compound || body.union) {
+				throw this.error(this.previous(), `A lens override body must be a single SELECT; compound set-operations (union/intersect/except) are not supported in v1 lens overrides.`);
+			}
 
 			// Optional: hiding (col1, col2, ...) — omits columns from the effective
 			// body + the registered view's column list. The LPAREN-guard in

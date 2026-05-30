@@ -230,6 +230,81 @@ describe('lens overrides: duplicate view rejection', () => {
 	});
 });
 
+describe('lens overrides: body-shape validation', () => {
+	// Defect 1: a compound set-operation override body composes only its top leg,
+	// so it is rejected at parse time rather than silently mis-mapped.
+	it('rejects a compound (union all) override body at parse time', async () => {
+		const db = new Database();
+		try {
+			await expectThrows(
+				() => db.exec('declare lens for x over y { view Car as select id, speed from y.CarCore union all select id, speed from y.CarOther }'),
+				/single SELECT|compound|union/i,
+			);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 2: a `values (...)` body is not a SELECT — the existing guard rejects it.
+	it('rejects a values override body at parse time', async () => {
+		const db = new Database();
+		try {
+			await expectThrows(
+				() => db.exec('declare lens for x over y { view Car as values (1, 2) }'),
+				/must be a SELECT.*values|values/i,
+			);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 3: an unaliased computed projection term maps to no logical column;
+	// it would be silently dropped and the logical column wrongly gap-filled.
+	it('errors on an unaliased computed projection term, naming it', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed * 2 from y.CarCore }');
+			await expectThrows(() => db.exec('apply schema x'), /computed projection term|no output name|add an alias/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 4: a `hiding (...)` name matching no logical column is a silent no-op.
+	it('errors on a hiding name that matches no logical column, naming it', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, color text } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, color text } }');
+			await db.exec('declare lens for x over y { view Car as select id, color from y.CarCore hiding (colour) }');
+			await expectThrows(() => db.exec('apply schema x'), /hides unknown column 'colour'|unknown column.*colour/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 5: an override FROM source qualified with a different existing schema
+	// silently re-anchors the lens off its declared `over Y` basis.
+	it('errors on a FROM source outside the declared basis', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare schema z { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema z');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from z.CarCore }');
+			await expectThrows(() => db.exec('apply schema x'), /outside the declared basis|references basis relation 'z/i);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens overrides: quereus_effective_lens', () => {
 	it('returns composed SQL + per-attribute source for a logical table', async () => {
 		const db = new Database();

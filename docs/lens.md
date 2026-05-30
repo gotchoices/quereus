@@ -109,7 +109,15 @@ The eventual mechanism addresses coverage by **stable attribute ID** on the plan
 - **Coverage is read by name.** A logical column is *covered* when the override's output column name (the `as` alias, e.g. `speed as maxSpeed`, or a bare column name, or a `*`-expansion of a FROM source) matches the logical column name (case-insensitive). Everything else is gap-filled.
 - **Survival across baseline regeneration comes from re-reading the override AST from source on every deploy**, not from attribute-ID plumbing. The stored override is never rewritten, so the *rename-then-add* example composes: the rename override is untouched and the freshly-added logical column is simply uncovered → gap-filled. This re-read-from-source is the simplification that stands in for the attribute-ID property; it is the load-bearing assumption of the v1 merger.
 
-**`hiding (col, ...)`** lists logical columns to omit from the effective body *and* from the registered view's column list, so `select * from X.T` does not surface them and `X.T.<hidden>` resolves to unknown-column. (Bikeshed-safe synonyms `omit` / `exclude` were considered; `hiding` was chosen.) The logical spec still *declares* a hidden column — the prover decides what an attached constraint over a hidden column means.
+**`hiding (col, ...)`** lists logical columns to omit from the effective body *and* from the registered view's column list, so `select * from X.T` does not surface them and `X.T.<hidden>` resolves to unknown-column. (Bikeshed-safe synonyms `omit` / `exclude` were considered; `hiding` was chosen.) The logical spec still *declares* a hidden column — the prover decides what an attached constraint over a hidden column means. Each `hiding (...)` name is validated against the logical table's columns at deploy time; a name that matches no logical column (a typo) is an error, not a silent no-op.
+
+#### v1 override body-shape restrictions (reject, don't mis-map)
+
+The v1 merger composes one effective body by replacing **only the top SELECT's projection** with the composed logical-column list (covered ⊕ gap-fill ⊖ hidden). Body shapes that this single-projection rewrite cannot soundly compose are rejected at deploy/parse time rather than silently mis-mapped:
+
+- **The body must be a single `SELECT`.** Compound set-operations (`union` / `union all` / `intersect` / `except`) and `values (...)` bodies are rejected at parse time — the merger would compose only the top leg and keep the rest verbatim.
+- **A computed projection term must be aliased.** An unaliased non-column term (e.g. `select id, speed * 2 from …`) maps to no logical column; it is rejected (naming the term) rather than dropped and gap-filled.
+- **Override `FROM` sources must live in the declared basis.** A table qualified with a *different* existing schema (e.g. `from Z.Foo` while the lens is `over Y`) would silently re-anchor the body to `Z`; it is rejected. Unqualified tables (default to the basis) and tables qualified with the basis name are fine, including cross-table joins *within* the basis.
 
 #### Gap-fill fidelity boundary (error, don't guess)
 
