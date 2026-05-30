@@ -83,13 +83,20 @@ export function resolveEscalationPolicy(logicalTable: TableSchema): EscalationPo
 	};
 }
 
-/** Parses a CSV of advisory codes into a lowercased set (empty when absent). */
+/**
+ * Parses a CSV of advisory codes into a set of **code bases** (empty when
+ * absent). Each entry is normalized through {@link advisoryCodeBase}, so a policy
+ * may name a code either fully (`lens.no-backing-index`) or bare
+ * (`no-backing-index`, mirroring the ack tag remainder) — both resolve to the
+ * same base the governance compares against. Without this, the bare form would
+ * silently no-op the escalation.
+ */
 function parseCodeCsv(value: string | undefined): Set<string> {
 	const set = new Set<string>();
 	if (!value) return set;
 	for (const part of value.split(',')) {
 		const code = part.trim().toLowerCase();
-		if (code.length > 0) set.add(code);
+		if (code.length > 0) set.add(advisoryCodeBase(code));
 	}
 	return set;
 }
@@ -321,7 +328,8 @@ export function applyAckGovernance(
 	const errors: LensDiagnostic[] = [];
 
 	for (const w of warnings) {
-		if (policy.errorOn.has(w.code)) {
+		const codeBase = advisoryCodeBase(w.code);
+		if (policy.errorOn.has(codeBase)) {
 			errors.push(escalationError(w, 'error-on'));
 			continue; // an ack cannot suppress an error-on code
 		}
@@ -350,7 +358,7 @@ export function applyAckGovernance(
 			outWarnings.push(w);
 		}
 
-		if (policy.requireAck.has(w.code) && !validlyAcked) {
+		if (policy.requireAck.has(codeBase) && !validlyAcked) {
 			errors.push(escalationError(w, 'require-ack'));
 		}
 	}

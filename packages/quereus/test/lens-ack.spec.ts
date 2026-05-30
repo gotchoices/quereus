@@ -178,6 +178,46 @@ describe('lens ack: fingerprint re-surface + stability', () => {
 	});
 });
 
+describe('lens ack: constraint-scoped acks', () => {
+	it('an ack placed on the constraint (not the table) suppresses that constraint\'s advisory', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// The ack tag rides the constraint's own `with tags`, not the table's.
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, constraint uq unique (email) with tags ("quereus.lens.ack.no-backing-index" = 'constraint-scoped ack')) }`);
+			await db.exec('apply schema x');
+
+			const r = report(db);
+			expect(r.acknowledged.length, 'the constraint-scoped ack suppressed its advisory').to.equal(1);
+			expect(r.acknowledged[0].code).to.equal('lens.no-backing-index');
+			expect(r.acknowledged[0].rationale).to.match(/constraint-scoped ack/);
+			expect(warningCodes(db)).to.not.include('lens.no-backing-index');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a constraint-scoped ack suppresses only its own constraint; a sibling constraint still surfaces', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null, vin text null) }');
+			await db.exec('apply schema y');
+			// Ack on the `email` unique only; the `vin` unique is left un-acked.
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, vin text null, constraint uqe unique (email) with tags ("quereus.lens.ack.no-backing-index" = 'email accepted'), unique (vin)) }`);
+			await db.exec('apply schema x');
+
+			const r = report(db);
+			expect(r.acknowledged.length, 'only the email constraint acked').to.equal(1);
+			const surfaced = r.warnings.filter(w => w.code === 'lens.no-backing-index');
+			expect(surfaced.length, 'the vin advisory still surfaces').to.equal(1);
+			expect(surfaced[0].fingerprintInputs?.constraintColumns).to.deep.equal(['vin']);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens ack: escalation policy', () => {
 	it('require-ack — an un-acked instance blocks the deploy; a valid ack clears it', async () => {
 		const db = new Database();
@@ -194,6 +234,20 @@ describe('lens ack: escalation policy', () => {
 			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, unique (email)) with tags ("quereus.lens.policy.require-ack" = 'lens.no-backing-index', "quereus.lens.ack.no-backing-index" = 'commit-time scan accepted') }`);
 			await db.exec('apply schema x');
 			expect(report(db).acknowledged.length, 'the ack clears require-ack').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a policy code may be written bare (no `lens.` prefix), mirroring the ack tag remainder', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// The bare `no-backing-index` form (matching the ack tag remainder) must
+			// escalate identically to the fully-qualified `lens.no-backing-index`.
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, unique (email)) with tags ("quereus.lens.policy.require-ack" = 'no-backing-index') }`);
+			await expectThrows(() => db.exec('apply schema x'), /require-ack|no-backing-index/);
 		} finally {
 			await db.close();
 		}
