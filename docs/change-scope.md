@@ -75,8 +75,14 @@ For each `TableWatch.columns`:
 - A `ReadonlySet<string>` lists the lowercased column names actually
   read by the plan (output projection plus filter/group/order/aggregate
   inputs).
-- The sentinel `'all'` is used when the plan does not read any
-  column-specific data (e.g. `select count(*) from t`).
+- The sentinel `'all'` is used in two cases: when the plan does not read
+  any column-specific data (e.g. `select count(*) from t`), AND when the
+  plan serves a table's *whole row* to its output (a `select *`, which the
+  planner elides to a passthrough that forwards the base table's entire
+  attribute set with no per-column `ColumnReferenceNode`). In the latter
+  case pinning to `'all'` keeps the read set sound — a downstream host that
+  emits precise pk+column change events would otherwise miss changes to
+  every non-predicate column of the watched row.
 
 A `kind: 'full'` watch with `columns: {a, b}` is meaningful: the
 underlying query scans the table but only reads `a` and `b`. A future

@@ -16,6 +16,7 @@
  */
 import type { SqlValue, SqlParameters } from '../../common/types.js';
 import type { ScalarType } from '../../common/datatype.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode, ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { ScalarFunctionCallNode } from '../nodes/function.js';
@@ -114,8 +115,11 @@ export type WatchScope =
 export interface TableWatch {
 	readonly table: QualifiedName;
 	/**
-	 * Columns of the table actually read by the plan. `'all'` is reserved for
-	 * count-style plans that read nothing column-specific.
+	 * Columns of the table actually read by the plan. `'all'` covers both
+	 * count-style plans that read nothing column-specific AND whole-row reads
+	 * (`select *`) that forward the table's entire attribute set to the output —
+	 * in either case the watch maps downstream to a row-level dep rather than a
+	 * cell dep on an enumerated column subset.
 	 */
 	readonly columns: ReadonlySet<string> | 'all';
 	readonly scope: WatchScope;
@@ -347,13 +351,18 @@ function collectTableRefs(plan: PlanNode): TableReferenceNode[] {
 
 /**
  * Walk the plan and, for each TableReference, collect the set of output
- * column indices that any scalar expression in the plan reads.
+ * column indices that any scalar expression in the plan reads. The value is
+ * either the explicit set of read column indices, or the `'all'` sentinel when
+ * the plan serves the table's whole row to its output (a `select *` /
+ * non-enumerable star — see below).
  */
-function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNode[]): Map<string, Set<number>> {
-	const result = new Map<string, Set<number>>();
+function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNode[]): Map<string, Set<number> | 'all'> {
+	const result = new Map<string, Set<number> | 'all'>();
 	const attrToRelKeyAndIdx = new Map<number, { relKey: string; colIdx: number }>();
+	const refByRelKey = new Map<string, TableReferenceNode>();
 	for (const ref of tableRefs) {
 		const relKey = relKeyFor(ref);
+		refByRelKey.set(relKey, ref);
 		const attrs = ref.getAttributes();
 		attrs.forEach((a, i) => attrToRelKeyAndIdx.set(a.id, { relKey, colIdx: i }));
 	}
@@ -362,19 +371,56 @@ function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNo
 		if (node instanceof ColumnReferenceNode) {
 			const info = attrToRelKeyAndIdx.get(node.attributeId);
 			if (info) {
-				let s = result.get(info.relKey);
-				if (!s) {
-					s = new Set<number>();
+				const cur = result.get(info.relKey);
+				// A relKey already pinned to 'all' (whole-row read) stays 'all';
+				// individual column reads can't narrow it.
+				if (cur !== 'all') {
+					const s = cur ?? new Set<number>();
+					s.add(info.colIdx);
 					result.set(info.relKey, s);
 				}
-				s.add(info.colIdx);
 			}
 		}
 		for (const c of node.getChildren()) visit(c as unknown as PlanNode);
 	}
 	visit(plan);
 
+	// `select *` (and any unresolved/whole-row star projection) is elided by the
+	// planner to a passthrough that forwards the base table's OWN attribute ids
+	// straight to the plan output, with no intervening ColumnReferenceNode — so
+	// the scan above never records those columns and the watch would under-report
+	// its read set (typically to just the WHERE-predicate column). When an output
+	// relation forwards a table reference's ENTIRE attribute set, the whole row is
+	// served to the caller: pin that table to 'all' so it maps downstream to a
+	// row-level dep, not a cell dep on the predicate column. Under-counting here
+	// is unsound for a host that emits precise pk+column change events (it would
+	// miss changes to every non-predicate column); over-counting only costs an
+	// extra wakeup. See `docs/change-scope.md` and the binding DepSpec contract.
+	const outputAttrIds = new Set<number>();
+	for (const rel of collectOutputRelations(plan)) {
+		for (const attr of rel.getAttributes()) outputAttrIds.add(attr.id);
+	}
+	for (const [relKey, ref] of refByRelKey) {
+		const attrs = ref.getAttributes();
+		if (attrs.length > 0 && attrs.every(a => outputAttrIds.has(a.id))) {
+			result.set(relKey, 'all');
+		}
+	}
+
 	return result;
+}
+
+/**
+ * The top-level output relation(s) of a plan — the relations whose attribute
+ * lists are the query's result row(s). A `BlockNode` is not itself relational;
+ * its result statements are surfaced via `getRelations()`. A bare relational
+ * plan is its own output. Only the TOP relations are returned (not their
+ * relational descendants) so a forwarded base-table attribute id distinguishes
+ * "served to the caller" (whole-row `select *`) from "consumed internally".
+ */
+function collectOutputRelations(plan: PlanNode): readonly RelationalPlanNode[] {
+	if (isRelationalNode(plan)) return [plan];
+	return plan.getRelations();
 }
 
 /**
@@ -457,7 +503,8 @@ function extractParamId(expr: ScalarPlanNode): number | string | undefined {
 
 /* --- Scope building ------------------------------------------------------ */
 
-function buildColumnSet(ref: TableReferenceNode, indices: Set<number> | undefined): ReadonlySet<string> | 'all' {
+function buildColumnSet(ref: TableReferenceNode, indices: Set<number> | 'all' | undefined): ReadonlySet<string> | 'all' {
+	if (indices === 'all') return 'all';
 	if (indices === undefined || indices.size === 0) return 'all';
 	const attrs = ref.getAttributes();
 	const names = new Set<string>();

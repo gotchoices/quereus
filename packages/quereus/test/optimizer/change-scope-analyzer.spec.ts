@@ -219,6 +219,37 @@ describe('analyzeChangeScope', () => {
 			expect(w.columns).to.not.equal('all');
 			expect([...(w.columns as ReadonlySet<string>)]).to.deep.equal(['v']);
 		});
+
+		it('select * from Entity where id = ? (whole-row PK read) → rows scope with columns = "all"', async () => {
+			// A `select *` is elided to a passthrough that forwards the base table's
+			// OWN attribute ids to the output with no ColumnReferenceNode, so the
+			// ColumnReferenceNode scan records only the WHERE-predicate column (`id`).
+			// The whole-row-forwarded detection must pin `columns` to 'all' (→ a
+			// row-level dep downstream), not a cell dep on `id`.
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER) USING memory');
+			const scope = scopeFor(db, 'select * from Entity where id = ?', [200]);
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.scope.kind).to.equal('rows');
+			expect(w.columns).to.equal('all');
+		});
+
+		it('select * from Entity where id = 200 (literal) → columns = "all"', async () => {
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER) USING memory');
+			const scope = scopeFor(db, 'select * from Entity where id = 200');
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.columns).to.equal('all');
+		});
+
+		it('select name from Entity where id = ? → columns = {"id","name"} (explicit projection NOT widened to all)', async () => {
+			// Guards against spuriously widening an explicit projection: a Project
+			// node narrows the output to a SUBSET of the table's attrs, so the
+			// whole-row detection must NOT fire here.
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER) USING memory');
+			const scope = scopeFor(db, 'select name from Entity where id = ?', [200]);
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.columns).to.not.equal('all');
+			expect([...(w.columns as ReadonlySet<string>)].sort()).to.deep.equal(['id', 'name']);
+		});
 	});
 
 	describe('DML statements', () => {
