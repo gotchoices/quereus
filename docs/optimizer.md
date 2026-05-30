@@ -1445,6 +1445,7 @@ type IndTarget =
 | Join (right)                                                   | Keep `shiftInds(rightInds, leftCols)`; drop left.                                                                                          |
 | Join (semi / anti)                                             | Keep left INDs only (right columns are not in the output).                                                                                 |
 | Join (full)                                                    | Drop both (either side can be NULL-padded).                                                                                                |
+| `FanOutLookupJoinNode`                                         | Fold each branch through `propagateJoinInds` (inner/left per branch mode) exactly as FDs fold — keeps the outer's seeded INDs and unions each inner branch's shifted INDs. Without this the FK-seeded INDs are lost when `rule-fanout-lookup-join` rewrites the join chain into this node. |
 | `AggregateNode` / `SetOperationNode` / `WindowNode`            | Emit none — these reshape relational identity.                                                                                             |
 | `AsyncGatherNode` (crossProduct)                               | Could shift+merge like FDs, but **deferred** this wave (no consumer) — left undefined with a code comment.                                 |
 

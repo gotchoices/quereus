@@ -8,13 +8,14 @@ import {
 	type ConstantBinding,
 	type DomainConstraint,
 	type FunctionalDependency,
+	type InclusionDependency,
 } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
-import { propagateJoinFds } from './join-utils.js';
+import { propagateJoinFds, propagateJoinInds } from './join-utils.js';
 
 /**
  * The mode a FanOutLookupJoin branch contributes for one outer row:
@@ -264,6 +265,13 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 		let equiv: ReadonlyArray<ReadonlyArray<number>> = outerPhys.equivClasses ?? [];
 		let bindings: ReadonlyArray<ConstantBinding> = outerPhys.constantBindings ?? [];
 		let domains: ReadonlyArray<DomainConstraint> = outerPhys.domainConstraints ?? [];
+		// INDs fold through the branch joins the same way FDs do: each fan-out
+		// branch is an inner/left join, so `propagateJoinInds` keeps the outer's
+		// seeded INDs (outer columns stay at their original indices) and unions in
+		// each inner branch's shifted INDs. Without this the FK-seeded INDs the
+		// JoinNode would have carried are lost the moment `rule-fanout-lookup-join`
+		// rewrites the join chain into this node.
+		let inds: ReadonlyArray<InclusionDependency> = outerPhys.inds ?? [];
 		let leftColCount = this.outer.getAttributes().length;
 
 		for (let i = 0; i < this.branches.length; i++) {
@@ -278,6 +286,7 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 				equivClasses: equiv,
 				constantBindings: bindings,
 				domainConstraints: domains,
+				inds,
 			};
 			const merged = propagateJoinFds(
 				joinType,
@@ -293,6 +302,7 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 			equiv = merged.equivClasses ?? [];
 			bindings = merged.constantBindings ?? [];
 			domains = merged.domainConstraints ?? [];
+			inds = propagateJoinInds(joinType, leftPhys, rightPhys, leftColCount) ?? [];
 			leftColCount = totalCols;
 		}
 
@@ -303,6 +313,7 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 			equivClasses: equiv.length > 0 ? equiv : undefined,
 			constantBindings: bindings.length > 0 ? bindings : undefined,
 			domainConstraints: domains.length > 0 ? domains : undefined,
+			inds: inds.length > 0 ? inds : undefined,
 			estimatedRows: this.computeEstimatedRows(),
 		};
 	}

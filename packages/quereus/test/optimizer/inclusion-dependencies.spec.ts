@@ -19,6 +19,8 @@ import {
 	type PlanNode,
 	type RelationalPlanNode,
 } from '../../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
 import type { ForeignKeyConstraintSchema, PrimaryKeyColumnDefinition, TableSchema } from '../../src/schema/table.js';
 import { buildColumnIndexMap } from '../../src/schema/table.js';
@@ -357,6 +359,81 @@ describe('IND seeding + propagation (end-to-end)', () => {
 
 	it('the IND survives row-preserving pass-throughs (sort + limit)', () => {
 		expect(hasParentInd(rootInds('select * from child order by cid limit 5'))).to.equal(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// FanOutLookupJoin: the outer's seeded INDs survive the branch-fold rewrite
+// ---------------------------------------------------------------------------
+//
+// `rule-fanout-lookup-join` collapses a chain of FK→PK lookup joins (each a
+// JoinNode, which propagates `inds`) into a single FanOutLookupJoinNode. That
+// node folds the branches through `propagateJoinInds` exactly as it folds FDs,
+// so the outer relation's seeded INDs (here orders→cust/prod/region) must
+// survive on the fan-out output — a regression guard for the fold path.
+describe('IND propagation through FanOutLookupJoin', () => {
+	/** Memory module with non-zero latency so the fan-out cost gate has a win. */
+	class HighLatencyMemoryModule extends MemoryTableModule {
+		readonly expectedLatencyMs = 25;
+	}
+
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		db.registerModule('hi_lat_memory', new HighLatencyMemoryModule());
+		// Tighten concurrency so 3 branches surface a positive cost gate.
+		const before = db.optimizer.tuning;
+		db.optimizer.updateTuning({ ...before, parallel: { ...before.parallel, concurrency: 2 } });
+		await db.exec('create table cust (id integer primary key, name text) using hi_lat_memory');
+		await db.exec('create table prod (id integer primary key, sku text) using hi_lat_memory');
+		await db.exec('create table region (id integer primary key, label text) using hi_lat_memory');
+		await db.exec(`create table orders (
+			order_id integer primary key,
+			customer_id integer not null references cust(id),
+			product_id integer not null references prod(id),
+			region_id integer not null references region(id),
+			total real
+		) using memory`);
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	function findFanOut(rootNode: PlanNode): RelationalPlanNode | undefined {
+		const seen = new Set<string>();
+		const stack: PlanNode[] = [rootNode];
+		while (stack.length > 0) {
+			const n = stack.pop()!;
+			if (seen.has(n.id)) continue;
+			seen.add(n.id);
+			if (n.nodeType === PlanNodeType.FanOutLookupJoin) return n as RelationalPlanNode;
+			for (const child of n.getChildren()) stack.push(child);
+		}
+		return undefined;
+	}
+
+	it('keeps the outer FK-seeded INDs on the folded fan-out node', () => {
+		const sql = `select o.order_id, c.name, p.sku, r.label
+			from orders o
+			left join cust c on o.customer_id = c.id
+			left join prod p on o.product_id = p.id
+			left join region r on o.region_id = r.id`;
+		const block = db.getPlan(sql) as unknown as PlanNode;
+		const fanOut = findFanOut(block);
+		expect(fanOut, 'expected rule-fanout-lookup-join to fire').to.not.equal(undefined);
+
+		const inds = fanOut!.physical.inds ?? [];
+		const targets = new Set(
+			inds.filter(i => i.target.kind === 'table').map(i => (i.target as { table: string }).table),
+		);
+		// All three outer→lookup INDs (NOT-NULL FKs to each PK) survive the fold.
+		expect(targets.has('cust'), `targets=${[...targets].join(',')}`).to.equal(true);
+		expect(targets.has('prod'), `targets=${[...targets].join(',')}`).to.equal(true);
+		expect(targets.has('region'), `targets=${[...targets].join(',')}`).to.equal(true);
+		// Left-join fold keeps only the preserved (outer) side — no branch INDs leak.
+		expect(inds.every(i => i.nullRejecting === false), 'NOT-NULL FKs ⇒ total INDs').to.equal(true);
 	});
 });
 
