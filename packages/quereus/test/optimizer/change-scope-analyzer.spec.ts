@@ -250,6 +250,31 @@ describe('analyzeChangeScope', () => {
 			expect(w.columns).to.not.equal('all');
 			expect([...(w.columns as ReadonlySet<string>)].sort()).to.deep.equal(['id', 'name']);
 		});
+
+		it('select * from A join B (whole-row join) → BOTH sides widened to "all"', async () => {
+			// A join forwards both inputs' attribute ids to the output relation
+			// (buildJoinAttributes preserves them), so a `select *` over a join
+			// serves BOTH base rows whole — neither side may under-report. This is
+			// the multi-table case the single-table tests above do not exercise.
+			await db.exec('CREATE TABLE A (id INTEGER PRIMARY KEY, av TEXT) USING memory');
+			await db.exec('CREATE TABLE B (id INTEGER PRIMARY KEY, bv TEXT) USING memory');
+			const scope = scopeFor(db, 'select * from A join B on A.id = B.id where A.id = ?', [200]);
+			expect(findWatch(scope, 'main', 'a').columns).to.equal('all');
+			expect(findWatch(scope, 'main', 'b').columns).to.equal('all');
+		});
+
+		it('select A.* from A join B → only the starred side widens; the other stays enumerated', async () => {
+			// `A.*` forwards A's whole attribute set but only B's join-key column
+			// reaches the plan (via the ON ColumnReferenceNode), so the whole-row
+			// detection fires for A alone — B keeps its enumerated read set.
+			await db.exec('CREATE TABLE A (id INTEGER PRIMARY KEY, av TEXT) USING memory');
+			await db.exec('CREATE TABLE B (id INTEGER PRIMARY KEY, bv TEXT) USING memory');
+			const scope = scopeFor(db, 'select A.* from A join B on A.id = B.id where A.id = ?', [200]);
+			expect(findWatch(scope, 'main', 'a').columns).to.equal('all');
+			const bCols = findWatch(scope, 'main', 'b').columns;
+			expect(bCols).to.not.equal('all');
+			expect([...(bCols as ReadonlySet<string>)]).to.deep.equal(['id']);
+		});
 	});
 
 	describe('DML statements', () => {
