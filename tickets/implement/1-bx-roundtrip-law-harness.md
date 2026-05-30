@@ -18,6 +18,11 @@ property suite. This ticket implements Tier A of that spike over the shape the
 backward walk admits today (single-source projection-and-filter; the Phase-1
 AST-rewrite path in `building/view-mutation.ts`).
 
+The canonical spec for the three laws (PutGet / GetPut / forward-backward lineage
+agreement), the assertion shapes, and the derived-dual discipline they gate lives in
+`docs/view-updateability.md` § "Round-Trip Laws and the Derived Backward Walk" — this
+ticket implements the property block that section describes.
+
 This is pure test code. It touches no engine surface and does not depend on the
 plan-node substrate — it depends only on the spike's spec.
 
@@ -72,10 +77,10 @@ existing harness where practical.
   non-flaky (re-run 5×, mirroring how Key Soundness was stabilized).
 - A negative self-test proves each law throws on an injected violation (the
   `checkNoOverClaim('injected', …)` pattern).
-- `docs/view-updateability.md` § Mutation Propagation gains a short "Round-trip laws"
-  note pointing at the property block as the backward-direction soundness net (the
-  dual of Key Soundness for the forward direction), and `docs/architecture.md`'s
-  property-test catalog gains a bullet for it.
+- `docs/view-updateability.md` § "Round-Trip Laws and the Derived Backward Walk"
+  (already authored by the spike) gains a back-reference to the landed property block
+  as the backward-direction soundness net (the dual of Key Soundness for the forward
+  direction), and `docs/architecture.md`'s property-test catalog gains a bullet for it.
 - Full `yarn test` green; no regression.
 
 ## TODO (implement)
@@ -102,6 +107,7 @@ Phase 3 — the three laws
 
 Phase 4 — stabilize + document
 - [ ] `numRuns: 50`; re-run 5× for flake.
-- [ ] Doc note in `docs/view-updateability.md` § Mutation Propagation; bullet in
+- [ ] Back-reference the landed property block from `docs/view-updateability.md`
+      § "Round-Trip Laws and the Derived Backward Walk"; bullet in
       `docs/architecture.md` property-test catalog.
 - [ ] Full `yarn test`; confirm green and no regression.

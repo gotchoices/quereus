@@ -422,15 +422,106 @@ Each surface mirrors a one-to-one correspondence with an existing engine surface
 > hand-maintained single-source AST walk (`update-lineage.ts`,
 > `scalar-invertibility.ts`, `propagate.ts`). When the plan-node substrate threads
 > `updateLineage` / `AttributeDefault` onto `PhysicalProperties`, it does so as the
-> **derived dual of each operator's forward FD walk** — the backward method reads
-> the same FD/EC/domain annotation `computePhysical` already produces, rather than
-> re-deriving its own — gated by a **per-operator round-trip law** (PutGet / GetPut /
-> lineage-agreement) in the property suite, the backward-direction analogue of the
-> forward Key Soundness harness. This discipline is being settled by the
-> `bx-operator-model-and-roundtrip-laws` design-spike before
-> `view-mutation-plan-node-substrate` threads the surface; the law itself lands first
-> as `bx-roundtrip-law-harness`. Nothing about the spike changes the intent described
-> above — it only fixes *how* the two directions are kept structurally in agreement.
+> **derived dual of each operator's forward FD walk**, gated by the per-operator
+> **round-trip law**. That discipline is decided — see § Round-Trip Laws and the
+> Derived Backward Walk above. The law lands first and standalone as
+> `bx-roundtrip-law-harness`; `view-mutation-plan-node-substrate` then threads each
+> operator's backward method as the law-gated derived dual.
+
+## Round-Trip Laws and the Derived Backward Walk
+
+The forward relational direction is computed once, structurally: each operator's
+`computePhysical` derives its output `PhysicalProperties.fds` (key / FD /
+equivalence-class / domain) from its children, and the **Key Soundness** property
+harness (`test/property.spec.ts` § Key Soundness, Tiers 1 + 2) materializes rows and
+asserts the claimed `keysOf` / `isSet` never over-claim. That harness is the
+structural net that keeps the forward walk honest.
+
+The **backward** direction — given a mutation against a relation, which base
+operations realize it — must be kept in lock-step with the forward direction, or an
+operator could advertise a key forward while its `put` / lineage rule silently
+disagrees about which base column that key threads to, with no test red. This
+section fixes the discipline that prevents that divergence. It is the decided
+output of the `bx-operator-model-and-roundtrip-laws` design-spike (Bohannon, Pierce
+& Vaughan 2006, *Relational Lenses*; Voigtländer, *bidirectionalization for free*).
+
+### The backward walk is a derived dual, not a parallel hand-walk
+
+There is **one** FD/EC/domain annotation per node — the `PhysicalProperties.fds`
+the forward `computePhysical` already produces. Each operator's backward method
+**reads that annotation**; it does not re-derive or hand-duplicate its own:
+
+- **Project** inverts exactly the scalar transforms `analysis/scalar-invertibility.ts`
+  classifies (`passthrough` / `inverse` / `opaque`), and threads keys along exactly
+  the FDs `computePhysical` emitted; a non-invertible output is marked `computed`.
+- **Filter (σ)** routes constant-FD defaults from the same `∅ → c = v` guarded FDs
+  the forward Filter produced.
+- **Join** composes per-source lineage along the join FDs the forward pass computed.
+
+This is the Bohannon–Pierce–Vaughan move adapted to Quereus's FD-annotated
+operators: the operator's FD/predicate *type* determines **both** directions, so the
+directions cannot silently disagree once the round-trip law (below) is green.
+
+**North-star (committed, sequenced).** Auto-deriving `put` from `get`
+(Voigtländer-style bidirectionalization) is the committed direction. v1 hand-writes
+each backward method, but every one is **authored as a get→put derivation from the
+shared forward annotation** — shaped so the eventual mechanical auto-deriver is a
+refactor behind the same law, never an unwind of a parallel hand-walk. The
+auto-deriver itself is deferred only until the operator set stabilizes
+(general-bodies, lateral-TVF, multi-source decomposition are still in-flight). The
+load-bearing invariant: **no operator may introduce a backward rule that
+auto-derivation could not later reproduce.**
+
+### The three round-trip laws
+
+A per-operator round-trip property block in `test/property.spec.ts`, sibling to Key
+Soundness (same positional-core + negative-self-test structure), forces the backward
+walk to agree with the forward walk over the writable fragment. For a randomly-seeded
+small base table and a spread of view bodies (single-source projection-and-filter
+today; the planned multi-source tree once the substrate lands):
+
+- **PutGet (write-then-read).** Apply a generated mutation through the view, read the
+  view back, and assert the read reflects exactly the mutation's effect on the
+  writable columns — no rows appear/disappear outside the view predicate, computed
+  columns are untouched (a write to one is rejected with the `no-inverse` diagnostic,
+  not silently dropped), and a key the forward walk claims on the view output is the
+  same tuple the backward walk used to bind the base row. This is the law that turns
+  the two hand-fixed Phase-1 review regressions — `LIMIT`/`OFFSET`/`DISTINCT`
+  write-widening and the alias-qualifier leak — into *property* failures.
+- **GetPut (read-then-write-back).** Read a row through the view, write the same
+  values back via an update keyed on the view's identifying predicate, assert the base
+  table diff is empty.
+- **Forward/backward lineage agreement (the structural crux).** Plan the body; for
+  each output column cross-check the backward lineage (`deriveViewColumns` →
+  `ViewColumnLineage`) against the forward FD facts (`keysOf` / `fds` via the unified
+  surface): every `base`-writable column has a forward FD path to that base column,
+  and every key the forward walk advertises is reconstructible by the backward
+  identifying predicate. A disagreement reds the test.
+
+The law is the **acceptance gate** for the derived backward walk: a new operator's
+backward method is not "done" until PutGet / GetPut / lineage-agreement are green over
+a planned tree that surfaces it. It lands first and standalone as
+`bx-roundtrip-law-harness` over the shipped single-source path (pure test code, no
+engine surface), then `view-mutation-plan-node-substrate` extends the same block to
+the planned multi-source tree as it threads each operator's backward method.
+
+### The predicate-honest complement
+
+The § Philosophy fan-out makes the **complement** — what a write holds fixed, i.e.
+what the view does *not* expose — *determined*, not chosen (the Bancilhon–Spyratos
+ambiguity does not arise). Make it a first-class derived object. For the single-source
+projection-and-filter case the complement is:
+
+- the **projected-away base columns** (present in the base, absent from the view
+  image), plus
+- the **negation-free residual of the view predicate** (the σ conjuncts that constrain
+  base rows the view never surfaces),
+
+expressed in the same FD/predicate vocabulary as the forward walk. With the complement
+in hand the lens prover's *Round-trip (lens laws)* check becomes **computed**, not an
+enumerated checklist: **GetPut** holds iff `put` leaves the complement fixed, and
+**PutGet** holds iff `get ∘ put` reproduces the written view image. The substrate
+exposes this object; `3-lens-prover-and-constraint-attachment` consumes it.
 
 ## Background
 
@@ -439,7 +530,8 @@ Quereus's view updateability draws on the following bodies of work:
 - **Bancilhon, F., & Spyratos, N. (1981). "Update Semantics of Relational Views."** Established the constant-complement framework. Quereus sidesteps the ambiguity by adopting predicate-honest fan-out: rather than choosing one of several legal complements, Quereus applies every consistent base operation.
 - **Date, C. J., & Darwen, H. (2006). "Databases, Types, and the Relational Model: The Third Manifesto."** The principle that any relation expression should be a first-class mutation target underpins the unification of views, CTEs, and subqueries-in-`from` as the same propagation surface.
 - **Keller, A. M. (1985). "Algorithms for Translating View Updates to Database Updates for Views Involving Selections, Projections, and Joins."** Source of the per-operator decomposition strategies, adapted here to use functional dependencies rather than per-view annotation.
-- **Bohannon, A., Pierce, B. C., & Vaughan, J. A. (2006). "Relational Lenses: A Language for Updatable Views."** Types `select` / `project` / `join` lenses with FD-and-predicate annotations and proves GetPut / PutGet *compositionally, per operator*. Directly on point for Quereus's FD-annotated operators: whether the backward (`put`) direction should be a *derived, law-checked* dual of each operator's forward FD walk — rather than a parallel hand-maintained walk — is being reconsidered under the **`bx-operator-model-and-roundtrip-laws`** design-spike (the per-operator round-trip law that forces the two directions to agree). See also Foster et al. (2007) in [the lens layer's background](lens.md#background).
+- **Bohannon, A., Pierce, B. C., & Vaughan, J. A. (2006). "Relational Lenses: A Language for Updatable Views."** Types `select` / `project` / `join` lenses with FD-and-predicate annotations and proves GetPut / PutGet *compositionally, per operator*. Directly on point for Quereus's FD-annotated operators, and the basis for the decided discipline in § Round-Trip Laws and the Derived Backward Walk: the backward (`put`) direction is a *derived, law-checked* dual of each operator's forward FD walk — never a parallel hand-maintained walk. See also Foster et al. (2007) in [the lens layer's background](lens.md#background).
+- **Voigtländer, J. (2009). "Bidirectionalization for Free!"** Source of the committed north-star: mechanically deriving `put` from `get`. Quereus authors every operator's backward method as a get→put derivation now (the auto-deriver itself is sequenced once the operator set stabilizes), so the eventual mechanical derivation is a refactor behind the same round-trip law.
 - **Dataphor (Alphora, D4 language).** The closest commercial precedent. Quereus borrows the `default_for`-style metadata mechanism and the view-as-first-class-target stance; it extends the model with FD- and EC-driven default recovery, eliminating most cases where a Dataphor user would have annotated.
 - **Litak, T., & Mikulás, S. (2012). "Relational Lattices."** Algebraic framework over the relational lattice. Quereus's propagation rules read as the lattice-dual of the optimizer's query-rewriting rules.
 - **Hegner, S. (2004). "An Order-Based Theory of Updates for Closed Database Views."** Influential on the outer-join materialization semantics.

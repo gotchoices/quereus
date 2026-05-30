@@ -42,6 +42,20 @@ For every logical aspect of `T`, run the corresponding check. Each error blocks 
 
 The prover is a consumer of the unified `keysOf` / `isUnique` surface plus the FD framework. Most of the inference is already shipped; the prover *applies* it to a specific question per logical aspect.
 
+**Round-trip (lens laws) is computed over the complement, not enumerated.** The
+`bx-operator-model-and-roundtrip-laws` spike (decided; see
+`docs/view-updateability.md` § "Round-Trip Laws and the Derived Backward Walk")
+makes the **predicate-honest complement** of a lens body a first-class derived
+object — the base facts outside the body's projection/predicate image, in the same
+FD/predicate vocabulary. `view-mutation-plan-node-substrate` produces it. With the
+complement in hand this row is a *computed* check rather than a hand-enumerated
+checklist of failure shapes: **GetPut** holds iff `put` leaves the complement fixed,
+and **PutGet** holds iff `get ∘ put` reproduces the written view image. The prover
+evaluates these two predicates over the complement object; it does not re-derive the
+backward walk. This is an *informing* dependency, not a hard prereq — the prover can
+ship its enumerated form first and tighten to the computed form once the substrate
+exposes the complement.
+
 ### Coverage prover (warnings)
 
 | Check | Advisory code |
