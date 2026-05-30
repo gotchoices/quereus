@@ -444,14 +444,20 @@ export class MaterializedViewManager {
 	 * already records the producer→consumer edge the moment `mv2` registers.
 	 *
 	 * Eligibility is a *cost choice* among the body's structurally-sound strategies
-	 * ({@link selectMaintenanceStrategy}): for the covering-index shape these are
-	 * `'inverse-projection'` and the `'full-rebuild'` floor, and inverse projection is
-	 * always cheapest — so this still only ever returns the `'inverse-projection'` arm
-	 * today, now annotated with the chosen strategy and its cost inputs ({@link MaintenanceSourceStats}).
-	 * The synchronous degrade-vs-reject split lives here too: a body whose cheapest sound
-	 * strategy is a pathological per-write full rebuild ({@link isFullRebuildPathological}) is
-	 * rejected at create. The general-bodies (3) ticket widens the sound set so the other
-	 * arms become reachable.
+	 * ({@link selectMaintenanceStrategy}). For the covering-index shape the sound set is
+	 * `['inverse-projection']` *only* — `'full-rebuild'` is the always-correct floor for
+	 * shapes where inverse projection is NOT sound (which the general-bodies (3) ticket
+	 * adds), so it is deliberately not a competitor here: were it in the sound set, a
+	 * small/empty source's body cost would undercut inverse projection's per-row cost and
+	 * argmin would pick the unwired `'full-rebuild'` arm. So this still only ever returns
+	 * the `'inverse-projection'` arm today, now annotated with the chosen strategy and its
+	 * cost inputs ({@link MaintenanceSourceStats}).
+	 *
+	 * The synchronous degrade-vs-reject machinery (`isFullRebuildPathological` reject-at-create,
+	 * `shouldDegradeToRebuild` per-write demotion, both in `planner/cost/index.ts`) is
+	 * implemented but **dormant**: it is unreachable while `'inverse-projection'` is the only
+	 * wired/sound arm. The general-bodies (3) ticket widens the sound set so the other arms —
+	 * and that machinery — become reachable.
 	 */
 	private buildMaintenancePlan(mv: MaterializedViewSchema): MaintenancePlan {
 		const db = this.ctx as unknown as Database;
