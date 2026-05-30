@@ -8,7 +8,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, type SqlValue } from '@quereus/quereus';
+import { Database, type SqlValue, type ChangeScope, type WatchEvent, type DatabaseDataChangeEvent } from '@quereus/quereus';
 
 async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
 	const out: Record<string, SqlValue>[] = [];
@@ -261,6 +261,50 @@ describe('StoreTable UNIQUE constraints', () => {
 		it('a PK-only UPDATE (UC unchanged) is not a self-conflict', async () => {
 			await db.exec(`UPDATE cm SET id = 99 WHERE id = 1`);
 			expect(await collect(db, `SELECT * FROM cm ORDER BY id`)).to.deep.equal([{ id: 99, x: 5, y: 5 }]);
+		});
+	});
+
+	// A secondary-UNIQUE REPLACE eviction (a new row collides on a NON-PK UNIQUE with an
+	// existing row at a DIFFERENT primary key) is now surfaced via UpdateResult.evictedRows,
+	// so the DML executor runs the full delete pipeline for the evicted row — FK ON DELETE
+	// actions, change-scope deltas, and delete events. Exercised on the direct store module
+	// (no isolation overlay); see internal-eviction-reporting.
+	describe('internal-eviction reporting (secondary-UNIQUE REPLACE)', () => {
+		it('cascades FK ON DELETE CASCADE to the evicted row\'s children', async () => {
+			await db.exec(`CREATE TABLE p (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`CREATE TABLE c (cid INTEGER PRIMARY KEY, pid INTEGER NOT NULL, FOREIGN KEY (pid) REFERENCES p(id) ON DELETE CASCADE) USING store`);
+			await db.exec(`INSERT INTO p VALUES (1, 'a@x')`);
+			await db.exec(`INSERT INTO c VALUES (10, 1), (11, 1)`);
+			// new row (id=2, email='a@x') evicts id=1 at a different PK; children cascade.
+			await db.exec(`INSERT OR REPLACE INTO p VALUES (2, 'a@x')`);
+			expect(await collect(db, `SELECT id, email FROM p ORDER BY id`)).to.deep.equal([{ id: 2, email: 'a@x' }]);
+			expect(await collect(db, `SELECT cid FROM c ORDER BY cid`)).to.deep.equal([]);
+		});
+
+		it('records a change-scope watch delta and a delete event for the evicted PK', async () => {
+			await db.exec(`CREATE TABLE pe (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO pe VALUES (1, 'a@x')`);
+
+			const dataEvents: DatabaseDataChangeEvent[] = [];
+			const unsub = db.onDataChange(e => dataEvents.push(e));
+			const watchEvents: WatchEvent[] = [];
+			const scope: ChangeScope = {
+				watches: [{ table: { schema: 'main', table: 'pe' }, columns: new Set(['id']), scope: { kind: 'rows', key: ['id'], values: [[1]] } }],
+				nonDeterministicSources: [],
+				unboundParameters: [],
+			};
+			const sub = db.watch(scope, e => watchEvents.push(e));
+
+			await db.exec(`INSERT OR REPLACE INTO pe VALUES (2, 'a@x')`);
+			sub.unsubscribe();
+			unsub();
+
+			// (b) Database.watch / change-scope delta for the evicted PK (id=1).
+			expect(watchEvents).to.have.length(1);
+			expect(watchEvents[0].matched[0].hits).to.deep.equal([[1]]);
+			// (c) a delete event for the evicted row.
+			const deletes = dataEvents.filter(e => e.type === 'delete' && e.tableName === 'pe');
+			expect(deletes.map(d => d.key)).to.deep.equal([[1]]);
 		});
 	});
 });

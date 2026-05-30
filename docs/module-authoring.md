@@ -563,6 +563,21 @@ class MyTable extends VirtualTable {
 
 When `getStatistics()` is implemented, the `ANALYZE` command calls it directly. Otherwise, ANALYZE performs a full scan to collect statistics. Statistics are cached on `TableSchema.statistics` and consumed by `CatalogStatsProvider` for selectivity estimation.
 
+## Update results and REPLACE displacement
+
+`update()` returns an `UpdateResult`. On success (`{ status: 'ok', … }`) it may report rows that this same call displaced via `OR REPLACE` conflict resolution, through two **independent, additive, optional** channels. A module that reports neither behaves exactly as it would have before the channels existed — so the field is purely opt-in.
+
+```typescript
+type UpdateResult =
+  | { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] }
+  | { status: 'constraint'; constraint: ConstraintType; message?: string; existingRow?: Row };
+```
+
+- **`replacedRow`** — the row displaced at the **same primary key** by a PK-collision REPLACE (the new row landed on an occupied PK; the old row had the same PK). The executor models it as an update-in-place of that PK slot: change-tracking as `update(replacedRow → newRow)` on the INSERT path (or `delete(replacedRow)` on a UPDATE move), with foreign-key actions fired as a *delete* of the old image.
+- **`evictedRows`** — rows at **other primary keys** fully removed because REPLACE resolved a **non-PK UNIQUE** conflict for this same `update()` call. Report them in **user-facing schema** (no internal/overlay columns). The executor models **each** as a full DELETE — change-tracking, row-time materialized-view maintenance, foreign-key `ON DELETE` actions (CASCADE / SET NULL / …), and a delete event — fired **before** the new row's own bookkeeping, matching the substrate's evict-then-write order.
+
+Report `evictedRows` whenever your `update()` internally deletes a row at a different PK to resolve a secondary-UNIQUE REPLACE; otherwise those cross-cutting effects (FK cascades, change subscriptions, events, covering-MV backing maintenance) silently do **not** run for the evicted row. Detection is necessarily module-specific (each module enumerates its current rows its own way), but the maintenance and cascades are **not** — reporting the eviction lets the engine's single post-write pipeline handle them uniformly. The two channels are independent and may both be present in principle; the executor handles each cleanly.
+
 ## Mutation Statements
 
 Virtual table modules can opt-in to receive deterministic mutation statements for each row-level operation. This enables replication, audit logging, and change data capture with guaranteed reproducibility.

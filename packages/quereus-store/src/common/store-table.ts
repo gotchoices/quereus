@@ -650,12 +650,15 @@ export class StoreTable extends VirtualTable {
 
 				// Enforce non-PK UNIQUE constraints. Pass the original statement-level
 				// onConflict so checkUniqueConstraints can resolve each UC's own
-				// defaultConflict independently of the PK's default.
+				// defaultConflict independently of the PK's default. Secondary-UNIQUE
+				// REPLACE evictions accumulate in `evicted` for the executor pipeline.
+				const evicted: Row[] = [];
 				const ucResult = await this.checkUniqueConstraints(
 					inTransaction,
 					coerced,
 					[pk],
 					args.onConflict,
+					evicted,
 				);
 				if (ucResult) return ucResult;
 
@@ -706,7 +709,7 @@ export class StoreTable extends VirtualTable {
 					}
 				}
 
-				return { status: 'ok', row: coerced, replacedRow: oldRow ?? undefined };
+				return { status: 'ok', row: coerced, replacedRow: oldRow ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };
 			}
 
 			case 'update': {
@@ -759,12 +762,15 @@ export class StoreTable extends VirtualTable {
 				const selfPks: SqlValue[][] = pkChanged ? [oldPk, newPk] : [oldPk];
 				const shouldCheckUniques = pkChanged
 					|| (oldRow ? this.uniqueColumnsChanged(oldRow, coerced) : true);
+				// Secondary-UNIQUE REPLACE evictions accumulate for the executor pipeline.
+				const evicted: Row[] = [];
 				if (shouldCheckUniques) {
 					const ucResult = await this.checkUniqueConstraints(
 						inTransaction,
 						coerced,
 						selfPks,
 						args.onConflict,
+						evicted,
 					);
 					if (ucResult) return ucResult;
 				}
@@ -814,7 +820,7 @@ export class StoreTable extends VirtualTable {
 					this.eventEmitter?.emitDataChange(updateEvent);
 				}
 
-				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined };
+				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };
 			}
 
 			case 'delete': {
@@ -983,12 +989,17 @@ export class StoreTable extends VirtualTable {
 	 *
 	 * Reads through the transaction coordinator's pending writes when active so
 	 * intra-transaction duplicates are detected.
+	 *
+	 * REPLACE evictions (rows at OTHER PKs) are deleted from storage and pushed onto
+	 * `evicted` so the DML executor runs the full delete pipeline for each
+	 * (change-tracking, row-time MV maintenance, FK cascade, auto-events).
 	 */
 	protected async checkUniqueConstraints(
 		inTransaction: boolean,
 		newRow: Row,
 		selfPks: SqlValue[][],
-		onConflict?: ConflictResolution,
+		onConflict: ConflictResolution | undefined,
+		evicted: Row[],
 	): Promise<UpdateResult | null> {
 		const schema = this.tableSchema!;
 		const uniqueConstraints = schema.uniqueConstraints;
@@ -1019,15 +1030,13 @@ export class StoreTable extends VirtualTable {
 			}
 			if (effective === ConflictResolution.REPLACE) {
 				await this.deleteRowAt(inTransaction, conflict.pk, conflict.row);
-				// The eviction bypasses the DML-executor row-time hook, so maintain the
-				// covering structure directly: drop the evicted source row's backing entry
-				// within this statement (else a later same-UC row sees a phantom).
-				if (coveringMv) {
-					await (this.db as DatabaseInternal)._maintainRowTimeCoveringStructures(
-						`${schema.schemaName}.${schema.name}`,
-						{ op: 'delete', oldRow: conflict.row },
-					);
-				}
+				// Report the eviction so the executor runs its full delete pipeline —
+				// including the row-time covering-structure maintenance that drops the
+				// evicted source row's backing entry within this statement (else a later
+				// same-UC row sees a phantom). The executor processes the eviction before
+				// the writing row's own bookkeeping, so the backing delete still lands
+				// mid-statement.
+				evicted.push(conflict.row);
 				continue;
 			}
 			const colNames = uc.columns.map(i => schema.columns[i].name).join(', ');

@@ -17,6 +17,7 @@ import type { MaterializedViewSchema } from '../src/schema/view.js';
 import { parseSelect } from '../src/parser/index.js';
 import type * as AST from '../src/parser/ast.js';
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
+import type { ChangeScope, WatchEvent, DatabaseDataChangeEvent } from '../src/index.js';
 
 async function freshDb(ddl: string[]): Promise<Database> {
 	const db = new Database();
@@ -1304,5 +1305,101 @@ describe('row-time covering enforcement', () => {
 		await db.exec('insert into t values (2, 6)'); // different x ⇒ ok
 		await expectThrows(() => db.exec('insert into t values (3, 5)'), 'UNIQUE constraint failed: t (x)');
 		expect(await selectAll('select * from t order by id')).to.deep.equal([{ id: 1, x: 5 }, { id: 2, x: 6 }]);
+	});
+});
+
+/**
+ * Internal-eviction reporting (`internal-eviction-reporting`) — a secondary-UNIQUE
+ * REPLACE eviction (a new row collides on a NON-PK UNIQUE with an existing row at a
+ * DIFFERENT primary key) is surfaced via `UpdateResult.evictedRows`, so the DML
+ * executor runs the full delete pipeline for the evicted row: FK ON DELETE actions,
+ * `Database.watch` / change-scope deltas, and data-change events. The non-covered
+ * variants (plain UNIQUE auto-index, no covering MV) prove the FK/event fix
+ * independently of the covering-MV path.
+ */
+describe('internal-eviction reporting (secondary-UNIQUE REPLACE)', () => {
+	let db: Database;
+	afterEach(async () => { if (db) await db.close(); });
+
+	async function selectAll(sql: string): Promise<Record<string, unknown>[]> {
+		const rows: Record<string, unknown>[] = [];
+		for await (const row of db.eval(sql)) rows.push(row);
+		return rows;
+	}
+
+	/** A `rows` change-scope watch on a single-column-PK row. */
+	function rowsWatch(table: string, pk: number): ChangeScope {
+		return {
+			watches: [{
+				table: { schema: 'main', table },
+				columns: new Set(['id']),
+				scope: { kind: 'rows', key: ['id'], values: [[pk]] },
+			}],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+	}
+
+	it('non-covered: INSERT OR REPLACE eviction cascades FK ON DELETE CASCADE to the evictee children', async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, email text not null, unique (email))');
+		await db.exec('create table c (cid integer primary key, pid integer not null, foreign key (pid) references p(id) on delete cascade)');
+		await db.exec("insert into p values (1, 'a@x')");
+		await db.exec('insert into c values (10, 1), (11, 1)');
+		// new row (id=2, email='a@x') collides on UNIQUE(email) with id=1 (different PK):
+		// id=1 is evicted and its children cascade away.
+		await db.exec("insert or replace into p values (2, 'a@x')");
+		expect(await selectAll('select id, email from p order by id')).to.deep.equal([{ id: 2, email: 'a@x' }]);
+		expect(await selectAll('select cid from c order by cid')).to.deep.equal([]);
+	});
+
+	it('non-covered: ON DELETE SET NULL nulls the evictee children', async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, email text not null, unique (email))');
+		await db.exec('create table c (cid integer primary key, pid integer null, foreign key (pid) references p(id) on delete set null)');
+		await db.exec("insert into p values (1, 'a@x')");
+		await db.exec('insert into c values (10, 1)');
+		await db.exec("insert or replace into p values (2, 'a@x')");
+		expect(await selectAll('select cid, pid from c order by cid')).to.deep.equal([{ cid: 10, pid: null }]);
+	});
+
+	it('non-covered: eviction records a change-scope watch delta and a delete event for the evicted PK', async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, email text not null, unique (email))');
+		await db.exec("insert into p values (1, 'a@x')");
+
+		const dataEvents: DatabaseDataChangeEvent[] = [];
+		const unsub = db.onDataChange(e => dataEvents.push(e));
+		const watchEvents: WatchEvent[] = [];
+		const sub = db.watch(rowsWatch('p', 1), e => watchEvents.push(e));
+
+		await db.exec("insert or replace into p values (2, 'a@x')");
+		sub.unsubscribe();
+		unsub();
+
+		// (b) Database.watch / change-scope delta for the evicted PK (id=1).
+		expect(watchEvents).to.have.length(1);
+		expect(watchEvents[0].matched[0].hits).to.deep.equal([[1]]);
+		// (c) a delete event for the evicted row.
+		const deletes = dataEvents.filter(e => e.type === 'delete' && e.tableName === 'p');
+		expect(deletes.map(d => d.key)).to.deep.equal([[1]]);
+		expect(deletes[0].oldRow).to.deep.equal([1, 'a@x']);
+	});
+
+	it('covered: eviction cascades FK and keeps the covering MV backing consistent', async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, x integer not null, y integer not null, unique (x, y))');
+		await db.exec('create materialized view p_ix as select x, y, id from p order by x, y');
+		await db.exec('create table c (cid integer primary key, pid integer not null, foreign key (pid) references p(id) on delete cascade)');
+		await db.exec('insert into p values (1, 5, 5)');
+		await db.exec('insert into c values (10, 1)');
+
+		await db.exec('insert or replace into p values (2, 5, 5)');
+		expect(await selectAll('select id, x, y from p order by id')).to.deep.equal([{ id: 2, x: 5, y: 5 }]);
+		// FK cascade fired for the evicted parent.
+		expect(await selectAll('select cid from c order by cid')).to.deep.equal([]);
+		// Covering MV backing reflects only the surviving row (the eviction's row-time
+		// maintenance now flows through the executor pipeline).
+		expect(await selectAll('select x, y, id from p_ix order by x, y')).to.deep.equal([{ x: 5, y: 5, id: 2 }]);
 	});
 });

@@ -171,15 +171,37 @@ export type ConstraintType = 'unique' | 'check' | 'not_null' | 'foreign_key';
  * Result of a VirtualTable.update() operation.
  * Replaces exception-based constraint signaling to distinguish expected
  * constraint violations from unexpected errors (network issues, bugs, etc.).
+ *
+ * Two REPLACE-displacement channels, both consumed by the DML executor so the
+ * single post-write pipeline (change-tracking, row-time MV maintenance, FK
+ * cascade, auto-events) runs uniformly across substrates:
+ *
+ * - `replacedRow` — the row displaced at the *same PK* by a PK-collision REPLACE.
+ *   The executor models it as an update-in-place of that PK slot (an
+ *   `update(replacedRow → newRow)` on the INSERT path, a `delete(replacedRow)` on
+ *   the UPDATE move path), firing FK actions as a *delete* of the old image.
+ * - `evictedRows` — rows at *other PKs* fully removed because REPLACE resolved a
+ *   non-PK UNIQUE conflict for this same `update()` call, in user-facing schema
+ *   (no overlay tombstone column). The executor models **each** as a full DELETE
+ *   (`_recordDelete` + row-time maintenance + `executeForeignKeyActions('delete')`
+ *   + a delete auto-event), fired **before** the new row's own bookkeeping to match
+ *   the substrate's evict-then-write journal order.
+ *
+ * Both fields are optional and additive: a module that reports neither behaves
+ * exactly as a module would have before they existed. `replacedRow` and
+ * `evictedRows` are independent and may both be present in principle (today's
+ * memory/store INSERT paths short-circuit on a PK collision before the secondary
+ * UNIQUE check, so they do not co-occur there — but the executor handles both
+ * cleanly regardless).
  */
 export type UpdateResult =
-	| { status: 'ok'; row?: Row; replacedRow?: Row }
+	| { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] }
 	| { status: 'constraint'; constraint: ConstraintType; message?: string; existingRow?: Row };
 
 /**
  * Type guard to check if an UpdateResult indicates success.
  */
-export function isUpdateOk(result: UpdateResult): result is { status: 'ok'; row?: Row; replacedRow?: Row } {
+export function isUpdateOk(result: UpdateResult): result is { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] } {
 	return result.status === 'ok';
 }
 

@@ -740,13 +740,19 @@ workloads.
 **The eviction-maintenance edge.** A REPLACE evicts the conflicting **source** row
 directly on the source storage (memory transaction layer / store delete), which
 *bypasses* the DML-executor row-time maintenance hook (it fires only for DML-executor
-row writes, not for evictions internal to a vtab's update). So every REPLACE eviction
-on this path also drives `Database._maintainRowTimeCoveringStructures(sourceBase,
-{ op: 'delete', oldRow })` to remove the evicted row's backing entry within the same
-statement — otherwise that entry would go stale and produce a phantom conflict for a
-later same-UC row. Symmetrically, the conflict path validates every backing candidate
-against the *live* source row before acting, so a stale candidate is skipped rather
-than raised as a false conflict.
+row writes, not for evictions internal to a vtab's update). Rather than each substrate
+re-driving a slice of the pipeline itself, the eviction is **reported** to the executor
+via `UpdateResult.evictedRows` (`internal-eviction-reporting`): the substrate only
+*detects and deletes* the evicted source row, then surfaces it, and the executor runs
+the **same** post-write delete pipeline it runs for an ordinary delete — including
+`maintainRowTimeStructures({ op:'delete', oldRow })`, which removes the evicted row's
+backing entry within the same statement (otherwise that entry would go stale and produce
+a phantom conflict for a later same-UC row). The executor processes a write's
+`evictedRows` *before* that write's own bookkeeping (evict-then-write), so the backing
+delete still lands mid-statement. Symmetrically, the conflict path validates every
+backing candidate against the *live* source row before acting, so a stale candidate is
+skipped rather than raised as a false conflict. Maintenance and cascades thus live
+solely in the executor (DRY); detection stays substrate-local.
 
 **Store-module parity.** `store-table.ts` routes UNIQUE conflict resolution through
 the same `_findRowTimeCoveringStructure` / `_lookupCoveringConflicts` surface (the
@@ -758,8 +764,14 @@ copied schema whose constraint never received that mutation, so the resolver fal
 back to the authoritative schema-manager constraint matched by column set
 (`resolveCoveringStructureName`). The **isolation-wrapped** store path
 (`createIsolatedStoreModule`, exercised by `yarn test:store`) enforces UNIQUE via its
-own merged-view detection rather than the covering MV; routing that layer through the
-covering MV is tracked in `covering-mv-isolation-layer-enforcement-routing`.
+own merged-view detection rather than the covering MV — but it no longer needs to import
+any covering-MV routing to keep the backing consistent: its REPLACE evictions are
+reported via `UpdateResult.evictedRows` (`internal-eviction-reporting`), and the
+executor's eviction pipeline maintains the backing uniformly across memory, direct
+store, and isolation alike. This **resolves** `covering-mv-isolation-layer-enforcement-routing`:
+the backing consistency that ticket asked for is obtained structurally (report the
+eviction, let the one pipeline maintain it) rather than by re-pasting covering-MV
+detection into the isolation layer.
 
 **FD-derived "body proves it" is a different proof.** Separate from base-table
 covering, `coverage-prover.ts` exposes `proveEffectiveKeyUnique`, which proves the
@@ -823,10 +835,12 @@ The following extensions build on this substrate:
   can live in a module other than the in-memory table.
 - **Covering-structure enforcement follow-ups** — the backing-PK prefix scan and the
   physical-schema preference decision are **delivered** (MV stays in preference, now
-  O(log n) via the prefix scan). Remaining: thread per-column collation into
-  `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`) so non-binary
-  covering MVs also use the prefix scan instead of the full-scan fallback, and
-  isolation-layer routing (`covering-mv-isolation-layer-enforcement-routing`).
+  O(log n) via the prefix scan). Isolation-layer backing consistency is also **delivered**
+  — via internal-eviction reporting rather than routing covering-MV detection into the
+  isolation layer (`internal-eviction-reporting` resolves
+  `covering-mv-isolation-layer-enforcement-routing`). Remaining: thread per-column
+  collation into `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`)
+  so non-binary covering MVs also use the prefix scan instead of the full-scan fallback.
 - **Lens / layered schemas** — indexes and set-level constraint enforcement expressed
   as covering materialized views in the basis layer. See
   [Lenses and Layered Schemas](lens.md).

@@ -526,6 +526,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			return undefined;
 		}
 
+		// Internal REPLACE evictions (rows at OTHER PKs removed to resolve a non-PK
+		// UNIQUE conflict) run the full delete pipeline here, before the new row's
+		// own bookkeeping — evict-then-write, matching the substrate journal order.
+		await processEvictions(ctx, needsAutoEvents, tableKey, result.evictedRows, backingConnCache);
+
 		const replacedRow = result.replacedRow;
 
 		if (replacedRow) {
@@ -554,6 +559,39 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		}
 
 		return flatRow;
+	}
+
+	/**
+	 * Drive the full delete pipeline for every internal REPLACE eviction reported
+	 * in `evictedRows` — rows at *other PKs* a substrate removed to resolve a non-PK
+	 * UNIQUE conflict for this same `vtab.update()` call. The substrate deletes the
+	 * row from its own storage but cannot run the cross-cutting post-write steps
+	 * (change-tracking, row-time MV maintenance, FK cascade, auto-events) — those
+	 * live solely here. So each evicted row is processed as a full DELETE, exactly
+	 * like {@link processDeleteRow}'s own bookkeeping.
+	 *
+	 * Called *before* the writing row's own insert/update bookkeeping so the
+	 * eviction's row-time maintenance and FK cascade land in the substrate's
+	 * evict-then-write order (a later same-key backing write must not be undone by
+	 * an earlier-PK eviction's delete).
+	 */
+	async function processEvictions(
+		ctx: RuntimeContext,
+		needsAutoEvents: boolean,
+		tableKey: string,
+		evictedRows: readonly Row[] | undefined,
+		backingConnCache: BackingConnectionCache,
+	): Promise<void> {
+		if (!evictedRows || evictedRows.length === 0) return;
+		for (const evicted of evictedRows) {
+			const evictedKeyValues = pkColumnIndicesInSchema.map(idx => evicted[idx]);
+			ctx.db._recordDelete(tableKey, evicted, pkColumnIndicesInSchema);
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'delete', oldRow: evicted }, backingConnCache);
+			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', evicted);
+			if (needsAutoEvents) {
+				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...evicted]);
+			}
+		}
 	}
 
 	// UPDATE ----------------------------------------------------
@@ -662,6 +700,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...result.replacedRow]);
 			}
 		}
+
+		// Internal REPLACE evictions (rows at OTHER PKs removed to resolve a non-PK
+		// UNIQUE conflict for this same update) run the full delete pipeline here,
+		// after any same-PK replacedRow handling and before the moved row's own
+		// bookkeeping — evict-then-write, matching the substrate journal order.
+		await processEvictions(ctx, needsAutoEvents, tableKey, result.evictedRows, backingConnCache);
 
 		// Track change (UPDATE): pass full rows so the change capture can
 		// project the columns any active subscription cares about.

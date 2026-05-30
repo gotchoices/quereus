@@ -880,6 +880,34 @@ backing connection, which registers lazily on the first maintenance call:
 includes the statement savepoint created before the row loop) onto it, so the
 backing write participates in the same rollback/release.
 
+### Per-row post-write pipeline and internal evictions
+
+After each successful `vtab.update()`, the executor's `processRow` body runs one
+**post-write pipeline** for the row: change-tracking (`_recordInsert` /
+`_recordUpdate` / `_recordDelete`, consumed by `Database.watch` / change-scope and
+the `DeltaExecutor`), row-time materialized-view backing maintenance
+(`maintainRowTimeStructures`), foreign-key `ON DELETE` / `ON UPDATE` actions
+(`executeForeignKeyActions`), and — for modules without native event support — a
+data-change auto-event. This pipeline has exactly one home; substrates do not drive
+any of it themselves.
+
+A REPLACE conflict resolved inside `vtab.update()` can delete rows the executor
+never asked it to touch. Two channels on the `ok` `UpdateResult` report them so the
+pipeline still runs uniformly (`internal-eviction-reporting`):
+
+- **`replacedRow`** — the row displaced at the *same PK* by a PK-collision REPLACE,
+  modeled as an update-in-place of that PK slot (FK fired as a delete of the old
+  image).
+- **`evictedRows`** — rows at *other PKs* removed because REPLACE resolved a non-PK
+  UNIQUE conflict for this same call. The executor runs the **full delete pipeline**
+  for each (a shared `processEvictions` helper: `_recordDelete` +
+  `maintainRowTimeStructures({op:'delete'})` + `executeForeignKeyActions('delete')` +
+  a delete auto-event), fired **before** the writing row's own bookkeeping so the
+  evict-then-write order the substrate journaled is preserved. This is what makes a
+  secondary-UNIQUE REPLACE eviction fire FK cascades, change subscriptions, events,
+  and covering-MV backing maintenance — uniformly across the memory, store, and
+  isolation substrates, none of which re-drive the pipeline themselves.
+
 ### Implementation Guidelines for Emitter Authors
 
 **When adding new mutation operations:**

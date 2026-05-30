@@ -36,12 +36,12 @@ select id, x, y from t order by id;
 insert or replace into t values (10, 5, 5);
 select id, x, y from t order by id;
 → [{"id":10,"x":5,"y":5}]
--- NOTE: the backing table reflecting the internal REPLACE eviction (the MV showing
--- only id=10) is asserted in the memory-module spec (test/covering-structure.spec.ts)
--- and the direct store-table spec (quereus-store/test/unique-constraints.spec.ts).
--- It is NOT asserted here because the isolation-wrapped store path (yarn test:store)
--- enforces UNIQUE via its own merged-view detection rather than the covering MV, so
--- the internal eviction's backing maintenance does not run on that path.
+-- The internal REPLACE eviction is now reported via `UpdateResult.evictedRows`, so the
+-- DML executor's eviction pipeline maintains the covering MV's backing uniformly across
+-- memory, direct store, AND the isolation-wrapped store path (yarn test:store) — the MV
+-- shows only id=10 on every path (internal-eviction-reporting).
+select x, y, id from ix order by x, y;
+→ [{"x":5,"y":5,"id":10}]
 
 -- ===================================
 -- 2. Multi-row INSERT with an intra-statement duplicate (reads-own-writes through
@@ -88,6 +88,10 @@ insert into ur values (1, 5, 5), (2, 6, 6);
 update ur set x = 6, y = 6 where id = 1;
 select id, x, y from ur order by id;
 → [{"id":1,"x":6,"y":6}]
+-- the evicted id=2 is reported via `evictedRows`, so its backing entry is removed and
+-- the moved id=1 is maintained — the covering MV shows only (6,6,id=1) on every path.
+select x, y, id from ur_ix order by x, y;
+→ [{"x":6,"y":6,"id":1}]
 
 -- ===================================
 -- 4. UPDATE that changes the PK only (UC value unchanged) is NOT a self-conflict.
@@ -251,6 +255,10 @@ create materialized view rr_ix as select x, y, id from rr order by x, y;
 insert or replace into rr values (1, 7, 7), (2, 7, 7);
 select id, x, y from rr order by id;
 → [{"id":2,"x":7,"y":7}]
+-- the intra-statement eviction of id=1 is reported via `evictedRows`; its backing entry
+-- is removed and id=2 maintained — the covering MV shows only (7,7,id=2) on every path.
+select x, y, id from rr_ix order by x, y;
+→ [{"x":7,"y":7,"id":2}]
 
 -- ===================================
 -- 10. Per-statement batching must preserve covering-UNIQUE enforcement visibility on the
