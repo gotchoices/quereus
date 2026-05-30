@@ -12,7 +12,7 @@ import { Cached } from '../../util/cached.js';
 import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import { TableAccessCapable } from '../framework/characteristics.js';
-import { addFd, singletonFd } from '../util/fd-utils.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 /**
  * Advertisement lifted from a `BestAccessPlanResult` onto a physical leaf node:
@@ -392,8 +392,7 @@ export class IndexSeekNode extends TableAccessNode {
 				// Full PK equality seek — at most one row. Encode via the singleton
 				// FD `∅ → all_cols`.
 				const colCount = this.source.getType().columns.length;
-				const singleton = singletonFd(colCount);
-				const fds = singleton ? addFd(base.fds ?? [], singleton) : base.fds;
+				const fds = addSingletonFd(base.fds ?? [], colCount);
 				return { ...base, estimatedRows: 1, fds } as Partial<PhysicalProperties>;
 			}
 		}

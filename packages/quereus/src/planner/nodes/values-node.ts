@@ -5,7 +5,7 @@ import { PlanNodeType } from './plan-node-type.js';
 import { Cached } from '../../util/cached.js';
 import { formatScalarType } from '../../util/plan-formatter.js';
 import { Row } from '../../common/types.js';
-import { singletonFd } from '../util/fd-utils.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 /**
  * Represents a VALUES clause, producing a relation from literal rows.
@@ -107,13 +107,10 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
     if (this.rows.length > 1) {
       return { estimatedRows: this.rows.length };
     }
-    const singleton = singletonFd(this.getAttributes().length);
-    if (singleton === undefined) {
-      return { estimatedRows: this.rows.length };
-    }
+    const fds = addSingletonFd([], this.getAttributes().length);
     return {
       estimatedRows: this.rows.length,
-      fds: [singleton],
+      fds: fds.length > 0 ? fds : undefined,
     };
   }
 

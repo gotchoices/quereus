@@ -8,7 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import { PredicateCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
 import { createTableInfoFromNode, extractConstraints } from '../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
-import { addFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, singletonFd, stripGuard } from '../util/fd-utils.js';
+import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
 
 /**
  * Represents a filter operation (WHERE clause).
@@ -112,8 +112,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			const result = extractConstraints(this.predicate, [tableInfo]);
 			const covered = result.coveredKeysByTable?.get(tableInfo.relationKey) || [];
 			if (covered.length > 0) {
-				const singleton = singletonFd(sourceAttrs.length);
-				if (singleton) fds = addFd(fds, singleton);
+				fds = addSingletonFd(fds, sourceAttrs.length);
 				rows = 1;
 			}
 		}

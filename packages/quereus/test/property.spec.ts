@@ -8,7 +8,7 @@ import type { Row, SqlValue } from '../src/common/types.js';
 import { Parser } from '../src/parser/parser.js';
 import { QuereusError } from '../src/common/errors.js';
 import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
-import { keysOf, isUnique } from '../src/planner/util/fd-utils.js';
+import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner/util/fd-utils.js';
 import { deriveViewColumns } from '../src/planner/analysis/update-lineage.js';
 import type * as AST from '../src/parser/ast.js';
 import { type PlanNode, type RelationalPlanNode, isRelationalNode } from '../src/planner/nodes/plan-node.js';
@@ -1800,6 +1800,50 @@ describe('Property-Based Tests', () => {
 			// Sanity: across the shape zoo at least some inner nodes must have
 			// materialized, or the tier is silently a no-op.
 			expect(checkedNodes, `Tier 2 checked no inner nodes (skipped ${skippedNodes})`).to.be.greaterThan(0);
+		});
+
+		// --- Singleton equivalence law ---
+		// The three channels that encode the ≤1-row fact must never disagree: the
+		// empty key `[]` surfaced by `keysOf`, the `∅ → all_cols` FD detected by
+		// `hasSingletonFd`, and the node-level predicate `isAtMostOneRow`
+		// (= `isUnique([])`). A future producer that emits one channel without the
+		// others — an `isSet`/empty-key claim with no FD, or the converse — breaks
+		// an implication below. These are pure plan-level facts (no materialization
+		// needed), so the law walks every relational node in the optimized tree,
+		// not only the emittable ones Tier 2 can isolate.
+		function checkSingletonEquivalence(label: string, node: RelationalPlanNode): void {
+			const colCount = node.getType().columns.length;
+			const atMostOne = isAtMostOneRow(node);
+			// (a) canonical ≤1-row truth ⇒ the empty key is surfaced by `keysOf`.
+			if (atMostOne && !keysOf(node).some(k => k.length === 0)) {
+				throw new Error(`singleton disagreement: isAtMostOneRow holds but keysOf has no empty key on ${label}`);
+			}
+			// (b) the `∅ → all_cols` FD ⇒ canonical ≤1-row truth.
+			if (hasSingletonFd(node.physical?.fds, colCount) && !atMostOne) {
+				throw new Error(`singleton disagreement: ∅→all_cols FD present but isAtMostOneRow is false on ${label}`);
+			}
+		}
+
+		it('singleton equivalence: the ≤1-row channels never disagree', async () => {
+			await createTables();
+
+			let checkedNodes = 0;
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
+				fc.constantFrom(...queries),
+				async (rowsA, rowsB, q) => {
+					await seedTables(rowsA, rowsB);
+					const block = db.getPlan(q) as unknown as PlanNode;
+					for (const node of collectRelationalNodes(block)) {
+						checkSingletonEquivalence(`${node.nodeType}[${node.id}] of \`${q}\``, node);
+						checkedNodes++;
+					}
+				},
+			), { numRuns: 50 });
+
+			// Sanity: the walk must actually have examined nodes.
+			expect(checkedNodes, 'singleton-equivalence law checked no nodes').to.be.greaterThan(0);
 		});
 	});
 

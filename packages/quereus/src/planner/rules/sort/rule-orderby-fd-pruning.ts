@@ -55,7 +55,7 @@ import type { PlanNode } from '../../nodes/plan-node.js';
 import type { OptContext as _OptContext } from '../../framework/context.js';
 import { SortNode, type SortKey } from '../../nodes/sort.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
-import { computeClosure, expandEcsToFds, isUnique, keysOf } from '../../util/fd-utils.js';
+import { computeClosure, expandEcsToFds, isAtMostOneRow, isUnique, keysOf } from '../../util/fd-utils.js';
 
 const log = createLogger('optimizer:rule:orderby-fd-pruning');
 
@@ -64,11 +64,11 @@ export function ruleOrderByFdPruning(node: PlanNode, _context: _OptContext): Pla
 
 	// Whole-Sort elimination: a provably ≤1-row source is trivially totally
 	// ordered, so the ORDER BY is a pure no-op no matter how many keys it lists.
-	// `isUnique([], source)` is true iff the empty key is present in the unified
+	// `isAtMostOneRow(source)` is true iff the empty key is present in the unified
 	// key surface (a `∅ → all_cols` singleton FD, a declared empty key, etc.).
 	// Drop the SortNode entirely — must run before the `< 2` guard so single-key
 	// sorts over a singleton source are eliminated too.
-	if (isUnique([], node.source)) {
+	if (isAtMostOneRow(node.source)) {
 		log('Eliminating ORDER BY over provably ≤1-row source');
 		return node.source;
 	}

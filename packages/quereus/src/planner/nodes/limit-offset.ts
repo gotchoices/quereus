@@ -7,7 +7,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { LimitCapable } from '../framework/characteristics.js';
 import { CastNode, CollateNode, LiteralNode } from './scalar.js';
-import { mergeFds, singletonFd } from '../util/fd-utils.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 /**
  * Represents a LIMIT/OFFSET operation.
@@ -113,10 +113,7 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 		let fds = sourcePhysical?.fds;
 		const limit = this.constantLimit();
 		if (limit !== undefined && limit <= 1) {
-			const singleton = singletonFd(this.getAttributes().length);
-			if (singleton !== undefined) {
-				fds = mergeFds(sourcePhysical?.fds ?? [], [singleton]);
-			}
+			fds = addSingletonFd(sourcePhysical?.fds ?? [], this.getAttributes().length);
 		}
 
 		return {

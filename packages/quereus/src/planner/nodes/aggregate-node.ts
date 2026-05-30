@@ -1,7 +1,7 @@
 import { PlanNodeType } from './plan-node-type.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type UnaryRelationalNode, type Attribute, isRelationalNode, type PhysicalProperties } from './plan-node.js';
 import { ColumnReferenceNode } from './reference.js';
-import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, singletonFd, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, addSingletonFd, projectConstantBindings, projectDomainConstraints, projectFds, superkeyToFd } from '../util/fd-utils.js';
 import type { ConstantBinding, DomainConstraint, FunctionalDependency } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
@@ -53,9 +53,9 @@ export function propagateAggregateFds(
     // Single-group aggregate: emit the singleton FD if there is at least one
     // output column. Source-side FDs do not survive — every source row collapses
     // into one output row, so per-row source determinations no longer apply.
-    const singleton = singletonFd(outputColumnCount);
+    const fds = addSingletonFd([], outputColumnCount);
     return {
-      fds: singleton ? [singleton] : undefined,
+      fds: fds.length > 0 ? fds : undefined,
     };
   }
 

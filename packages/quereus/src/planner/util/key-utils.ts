@@ -5,7 +5,7 @@ import type { TableSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { LiteralNode } from '../nodes/scalar.js';
-import { isSuperkey, isUnique, keysOf, type KeyRel } from './fd-utils.js';
+import { isAtMostOneRow, isSuperkey, isUnique, keysOf, type KeyRel } from './fd-utils.js';
 
 /**
  * Project unique keys through a projection mapping.
@@ -426,9 +426,9 @@ export function analyzeJoinKeyCoverage(
 		? isUnique(equiPairs.map(p => p.right), rightRel)
 		: coversLogicalKey(rightLogicalKeys, rightEqSet) || isSuperkey(rightEqSet, rightPhys?.fds, rightColCount);
 
-	// ≤1-row sides: `isUnique([], rel)` is true iff the relation is at-most-one-row.
-	const leftIsSingleton = leftRel ? isUnique([], leftRel) : false;
-	const rightIsSingleton = rightRel ? isUnique([], rightRel) : false;
+	// ≤1-row sides: the named spelling of the at-most-one-row predicate.
+	const leftIsSingleton = leftRel ? isAtMostOneRow(leftRel) : false;
+	const rightIsSingleton = rightRel ? isAtMostOneRow(rightRel) : false;
 
 	const preservedKeys: number[][] = [];
 	let estimatedRows: number | undefined = undefined;

@@ -649,6 +649,24 @@ export function singletonFd(columnCount: number): FunctionalDependency | undefin
 }
 
 /**
+ * Fold the singleton FD `∅ → {0..columnCount-1}` ("at-most-one-row") into `fds`
+ * via `addFd`. The canonical producer-side spelling of the ≤1-row fact — every
+ * `computePhysical` site that proves a relation emits ≤1 row should reach for
+ * this rather than open-coding `singletonFd` + `addFd`.
+ *
+ * A no-op returning a copy of `fds` when `columnCount === 0` (since
+ * `singletonFd(0)` is `undefined` — a zero-column relation cannot carry the
+ * marker). Pairs with the `hasSingletonFd` / `isAtMostOneRow` read surface.
+ */
+export function addSingletonFd(
+	fds: ReadonlyArray<FunctionalDependency>,
+	columnCount: number,
+): FunctionalDependency[] {
+	const singleton = singletonFd(columnCount);
+	return singleton ? addFd(fds, singleton) : fds.slice();
+}
+
+/**
  * True iff `attrs` is asserted to be a unique key by the FD set — i.e., there
  * exists some FD whose determinants are a subset of `attrs` and whose closure
  * covers all columns. Stricter than `isSuperkey`: the trivial "all-cols is a
@@ -824,6 +842,24 @@ export function isUnique(cols: readonly number[], rel: KeyRel): boolean {
 	}
 
 	return false;
+}
+
+/**
+ * The single named spelling of the node-level "at-most-one-row" predicate:
+ * true iff `rel` is provably ≤1-row. Defined as `isUnique([], rel)` — the empty
+ * key is a subset of every column set, so a relation carrying it (via a declared
+ * empty key, the `∅ → all_cols` singleton FD, or any other channel `keysOf`
+ * reconciles) reports unique on the empty column list.
+ *
+ * Use this at node / rule level. The FD-only `hasSingletonFd` is the lower-level
+ * test `keysOf` itself calls; `isAtMostOneRow` is the surface consumers (joins,
+ * sort elimination) should reach for. Note it does **not** capture the
+ * zero-column `estimatedRows === 1` case — a zero-column relation has no
+ * representable empty key — so consumers needing that fallback keep their own
+ * check (see `characteristics.guaranteesUniqueRows`).
+ */
+export function isAtMostOneRow(rel: KeyRel): boolean {
+	return isUnique([], rel);
 }
 
 /**
