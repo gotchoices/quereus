@@ -237,6 +237,21 @@ function sourceRelKey(src: OverrideSource): string {
 }
 
 /**
+ * The basis columns an engine-generated skeleton insert must supply: NOT NULL,
+ * no default, non-generated. A column that is nullable, defaulted, or generated
+ * has its own value source, so a skeleton may soundly omit it; these have none,
+ * so omitting one would fail an unguarded NOT NULL constraint. Walks the member's
+ * *full* schema so it also flags required columns the lens maps to no logical
+ * column (which never appear in the relation's `(basisColumn → logicalColumn)`
+ * pairs). See `LensRelationBacking.requiredBasisColumns`.
+ */
+function requiredBasisColumnsOf(table: TableSchema): string[] {
+	return table.columns
+		.filter(c => c.notNull && c.defaultValue === null && !c.generated)
+		.map(c => c.name);
+}
+
+/**
  * Derives, per basis relation, the `(basisColumn → logicalColumn)` pairs it backs
  * for one compiled effective body — the record a later re-decomposition diffs and
  * backfills (docs/lens.md § The deployed basis representation). Two contributions:
@@ -267,7 +282,12 @@ function deriveRelationBacking(
 		const key = sourceRelKey(src);
 		let rb = result.get(key);
 		if (!rb) {
-			rb = { relationId: key, basisRelation: { schema: src.table.schemaName, table: src.table.name }, columns: [] };
+			rb = {
+				relationId: key,
+				basisRelation: { schema: src.table.schemaName, table: src.table.name },
+				columns: [],
+				requiredBasisColumns: requiredBasisColumnsOf(src.table),
+			};
 			result.set(key, rb);
 		}
 		const cols = rb.columns as Array<{ basisColumn: string; logicalColumn: string }>;

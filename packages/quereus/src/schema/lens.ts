@@ -143,6 +143,17 @@ export interface LensRelationBacking {
 	 * get-body spells it — what the backfill selects from the prior-get subquery).
 	 */
 	columns: ReadonlyArray<{ basisColumn: string; logicalColumn: string }>;
+	/**
+	 * Basis columns of this member that an engine-generated skeleton insert *must*
+	 * supply a value for: `notNull && defaultValue === null && !generated` (original
+	 * case). A skeleton that omits any of these (because it is not reconstructible
+	 * from the prior get-body) would fail an unguarded NOT NULL constraint, so the
+	 * classifier nulls the SQL out rather than emit an un-runnable insert. Captured
+	 * from the member's full {@link TableSchema} in `deriveRelationBacking`, so it
+	 * also covers required columns the lens maps to *no* logical column (an omitted
+	 * column never appears in {@link columns}). See `docs/lens.md` § Classification.
+	 */
+	requiredBasisColumns: readonly string[];
 }
 
 /**

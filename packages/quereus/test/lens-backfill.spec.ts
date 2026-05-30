@@ -151,9 +151,12 @@ describe('lens backfill: new column needs application data', () => {
 			expect(color.category).to.equal('partial');
 			expect(String(color.generated_columns)).to.equal('id');
 			expect(String(color.missing_columns)).to.equal('color');
-			// The engine generates only the reconstructible (id) projection — the
-			// insert column list and select are exactly `id`; it never fabricates `color`.
-			expect(String(color.backfill_sql).toLowerCase()).to.match(/insert into \S+ \(id\) select id from/);
+			// `color` is NOT NULL with no default, so a key-only skeleton would fail an
+			// unguarded NOT NULL constraint — the SQL is nulled out (the app owns the
+			// insert) while the partial classification + reconstructible record stand.
+			// It never fabricates `color`. (The runnable skeleton + round-trip for the
+			// nullable / defaulted variants are covered by the dedicated tests below.)
+			expect(color.backfill_sql).to.be.null;
 		} finally {
 			await db.close();
 		}
@@ -162,11 +165,11 @@ describe('lens backfill: new column needs application data', () => {
 
 describe('lens backfill: partial backfill runs end-to-end', () => {
 	// The generated `partial` SQL inserts a key-only skeleton, leaving the new
-	// column NULL for the app to UPDATE. That skeleton insert is only runnable
-	// when the new column is NULLABLE — Quereus columns are NOT NULL by default,
-	// so `color` is declared `null` here. The NOT-NULL-default case (where the
-	// skeleton insert would fail an unguarded NOT NULL constraint) is the known
-	// limitation tracked by `lens-partial-backfill-not-null-classification`.
+	// column NULL for the app to UPDATE. That skeleton is only runnable when every
+	// omitted column is nullable, defaulted, or generated — Quereus columns are NOT
+	// NULL by default, so `color` is declared `null` here. This is the nullable
+	// happy path the NOT-NULL classification fix must not regress; the NOT-NULL
+	// no-default case (skeleton nulled out) is covered below.
 	it('runs the engine skeleton insert, then the app supplies the new column; the relation round-trips', async () => {
 		const db = new Database();
 		try {
@@ -203,6 +206,96 @@ describe('lens backfill: partial backfill runs end-to-end', () => {
 			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
 				{ id: 1, vin: 'AAA', speed: 120, color: 'red' },
 				{ id: 2, vin: 'BBB', speed: 90, color: 'blue' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens backfill: partial with a NOT-NULL no-default new column', () => {
+	// The skeleton insert seeds only the reconstructible (key) columns and relies
+	// on the basis to mint the rest from their declared defaults. When a missing
+	// column is NOT NULL with no default, the basis cannot mint it — the skeleton
+	// would fail an unguarded NOT NULL constraint — so the classifier nulls the SQL
+	// out (the app owns the insert) while keeping the `partial` category + the
+	// reconstructible-column record. `color text` is NOT NULL by default here.
+	it('keeps category partial, nulls out backfill_sql, and names the NOT-NULL block', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Src { id integer primary key, vin text, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Src values (1, 'AAA', 120), (2, 'BBB', 90)");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, vin, speed from y.Src }');
+			await db.exec('apply schema x'); // snapshot 1 (prior basis = Src)
+
+			// Re-decompose into CarCore + CarPerf (pure) plus a NEW CarColor member
+			// carrying `color` — NOT NULL by default, no default expression.
+			await db.exec('declare schema y { table Src { id integer primary key, vin text, speed integer } table CarCore { id integer primary key, vin text } table CarPerf { id integer primary key, speed integer } table CarColor { id integer primary key, color text } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text, speed integer, color text } }');
+			await db.exec('declare lens for x over y { view Car as select c.id, c.vin, p.speed, k.color from y.CarCore c join y.CarPerf p using (id) join y.CarColor k using (id) }');
+			await db.exec('apply schema x'); // snapshot 2
+
+			const bf = await rows(db, "select * from quereus_basis_backfill('x') order by basis_relation");
+			const byRel = new Map(bf.map(r => [rel(r), r]));
+
+			const color = byRel.get('y.carcolor')!;
+			// Category + reconstructible record preserved; SQL nulled out.
+			expect(color.category).to.equal('partial');
+			expect(String(color.generated_columns)).to.equal('id');
+			expect(String(color.missing_columns)).to.equal('color');
+			expect(color.backfill_sql, 'skeleton omitting NOT-NULL no-default color must be nulled out').to.be.null;
+			expect(String(color.reason).toLowerCase()).to.contain('not null');
+			expect(String(color.reason).toLowerCase()).to.contain('color');
+
+			// Every *emitted* backfill (the re-decomposition members) is runnable —
+			// none throws a NOT NULL constraint. The app then owns the CarColor insert.
+			for (const r of bf) if (r.backfill_sql) await db.exec(String(r.backfill_sql));
+			await db.exec("insert into y.CarColor values (1, 'red'), (2, 'blue')");
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
+				{ id: 1, vin: 'AAA', speed: 120, color: 'red' },
+				{ id: 2, vin: 'BBB', speed: 90, color: 'blue' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens backfill: partial with a defaulted new column', () => {
+	// A missing column with a DEFAULT has a value source, so the skeleton may omit
+	// it soundly — the basis default mints it. The skeleton must still be emitted.
+	it('emits a runnable skeleton; the basis default mints the new column', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Src { id integer primary key, vin text, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Src values (1, 'AAA', 120), (2, 'BBB', 90)");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, vin, speed from y.Src }');
+			await db.exec('apply schema x'); // snapshot 1
+
+			// CarColor.color is NOT NULL but carries a deterministic default.
+			await db.exec("declare schema y { table Src { id integer primary key, vin text, speed integer } table CarCore { id integer primary key, vin text } table CarPerf { id integer primary key, speed integer } table CarColor { id integer primary key, color text default ('?') } }");
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text, speed integer, color text } }');
+			await db.exec('declare lens for x over y { view Car as select c.id, c.vin, p.speed, k.color from y.CarCore c join y.CarPerf p using (id) join y.CarColor k using (id) }');
+			await db.exec('apply schema x'); // snapshot 2
+
+			const bf = await rows(db, "select * from quereus_basis_backfill('x') order by basis_relation");
+			const color = new Map(bf.map(r => [rel(r), r])).get('y.carcolor')!;
+			expect(color.category).to.equal('partial');
+			expect(color.backfill_sql, 'defaulted column lets the skeleton emit').to.be.a('string');
+
+			// Run every backfill; the default mints color, so the relation round-trips.
+			for (const r of bf) if (r.backfill_sql) await db.exec(String(r.backfill_sql));
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
+				{ id: 1, vin: 'AAA', speed: 120, color: '?' },
+				{ id: 2, vin: 'BBB', speed: 90, color: '?' },
 			]);
 		} finally {
 			await db.close();

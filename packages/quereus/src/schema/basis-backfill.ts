@@ -97,6 +97,8 @@ export function computeBasisBackfill(
 interface NewRelationGroup {
 	basisRelation: { schema: string; table: string };
 	cols: ReadonlyArray<{ basisColumn: string; logicalColumn: string }>;
+	/** Member columns a skeleton insert must supply (NOT NULL, no default, non-generated). */
+	requiredBasisColumns: readonly string[];
 }
 
 /** Classifies every new basis relation backing one logical table. */
@@ -115,7 +117,7 @@ function classifyTable(
 	const groups = new Map<string, NewRelationGroup>();
 	for (const [key, backing] of curTable.relationBacking) {
 		if (prevRelations.has(key)) continue; // relation already existed under the prior lens
-		groups.set(key, { basisRelation: backing.basisRelation, cols: backing.columns });
+		groups.set(key, { basisRelation: backing.basisRelation, cols: backing.columns, requiredBasisColumns: backing.requiredBasisColumns });
 	}
 
 	// A surrogate shared key spread across >1 new member cannot be soundly
@@ -180,7 +182,18 @@ function classifyRelation(
 		: generated.length === 0 ? 'needs-data'
 		: 'partial';
 
-	const backfillSql = generated.length > 0
+	// A skeleton insert supplies only the reconstructible (generated) basis columns
+	// and relies on the basis to mint the rest from their declared defaults. That is
+	// sound iff every NOT-NULL, no-default, non-generated member column is among the
+	// reconstructible ones — otherwise the omitted required column has no value source
+	// and the insert fails an unguarded NOT NULL constraint. When it cannot run, null
+	// the SQL out (the app must own the insert) but keep the category + reconstructible
+	// record so the app still learns which columns are recoverable.
+	const generatedLower = new Set(generated.map(g => g.basisColumn.toLowerCase()));
+	const unsatisfiedRequired = group.requiredBasisColumns.filter(c => !generatedLower.has(c.toLowerCase()));
+	const skeletonRunnable = unsatisfiedRequired.length === 0;
+
+	const backfillSql = generated.length > 0 && skeletonRunnable
 		? astToString(buildBackfillInsert(group.basisRelation, generated, prevTable.getBody))
 		: null;
 
@@ -191,6 +204,9 @@ function classifyRelation(
 		reason = `partial re-decomposition: columns [${generated.map(g => g.basisColumn).join(', ')}] reconstruct from the prior get-body for '${curTable.logicalTable}'; columns [${missing.join(', ')}] are new and must be supplied by the application`;
 	} else {
 		reason = `needs-data: no column of ${basisRelation} existed in the prior basis for '${curTable.logicalTable}'; the application must supply this backfill`;
+	}
+	if (generated.length > 0 && !skeletonRunnable) {
+		reason += `; cannot emit a runnable skeleton: basis column(s) [${unsatisfiedRequired.join(', ')}] are NOT NULL with no default and are not reconstructible from the prior get-body, so the application must own the insert`;
 	}
 
 	return {

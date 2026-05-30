@@ -257,7 +257,7 @@ For each **new** basis relation `R` (one the prior lens did not back) the differ
 
 The per-relation category is then `re-decomposition` (every column reconstructible → fully engine-generated), `partial` (some reconstructible → engine generates those, lists the rest as `missing`), or `needs-data` (none → entirely the application's). Threading one *surrogate* shared key across the members of a multi-relation split (evaluate-once-and-thread) is `lens-multi-source-put-fanout`'s concern; a multi-member surrogate split emits a `needs-data` deferred-note row rather than an unsound insert.
 
-> **Known limitation (`lens-partial-backfill-not-null-classification`):** a `partial` row's generated `backfill_sql` is a key-only skeleton `insert` that leaves the `missing` columns NULL for the application to `UPDATE`. Because Quereus columns are **NOT NULL by default**, running that skeleton insert verbatim fails an unguarded NOT NULL constraint whenever a `missing` column is NOT NULL with no default. Until that ticket lands, treat `partial` `backfill_sql` as runnable only when the `missing` columns are nullable or defaulted; otherwise the application owns the whole insert.
+**The NOT-NULL rule.** A `partial` row's generated `backfill_sql` is a key-only skeleton `insert` that seeds only the reconstructible columns and relies on the basis to mint each omitted column from its declared default. That is sound **only when every omitted (missing / unmapped) basis column is nullable, defaulted, or generated** — those have a value source the skeleton may safely leave out. Because Quereus columns are **NOT NULL by default**, an omitted column that is NOT NULL with no default has *no* value source: running the skeleton would fail an unguarded NOT NULL constraint. In that case the classifier emits **`backfill_sql = null`** (the application owns the whole insert) while keeping the `partial` category and the `generated_columns` record, so the app still learns which columns are reconstructible. The runnability test is at the relation level — every NOT-NULL, no-default, non-generated basis column of the member must be among the reconstructible columns — so it also covers a required member column the lens maps to no logical column (`requiredBasisColumns` on `LensRelationBacking`, captured from the member's full schema). **Any emitted `backfill_sql` therefore never fails an unguarded NOT NULL constraint.**
 
 #### `quereus_basis_backfill(logical_schema)`
 
@@ -268,7 +268,7 @@ The classified rows are introspected by the integrated TVF `quereus_basis_backfi
 | `logical_table` | the logical table the basis relation backs |
 | `basis_relation` | `schema.table` of the new basis member |
 | `category` | `re-decomposition` · `partial` · `needs-data` |
-| `backfill_sql` | the generated `insert … select … from (<prior get>)` for the reconstructible columns; `NULL` when `needs-data` |
+| `backfill_sql` | the generated `insert … select … from (<prior get>)` for the reconstructible columns; `NULL` when `needs-data`, or when a `partial` skeleton would violate NOT NULL (an omitted column is NOT NULL with no default) and the application must own the insert |
 | `generated_columns` | comma-joined basis columns the engine backfills |
 | `missing_columns` | comma-joined basis columns the application must supply (empty for `re-decomposition`) |
 | `reason` | human note: classification rationale, surrogate omissions, basis-hash-drift warning |
@@ -281,7 +281,7 @@ The generated `backfill_sql` reads the **prior** get-body over the **prior** bas
 
 1. `apply schema Y` — migrate the basis (new member tables created; **prior members retained**, not dropped — they are the backfill source).
 2. `apply schema X` — recompile the lens over the new basis (rotates the snapshot; `previous` now holds the prior get-body).
-3. `select * from quereus_basis_backfill('x')` — fetch rows; run the `re-decomposition` / `partial` `backfill_sql`; supply app data for `missing_columns` / `needs-data` rows.
+3. `select * from quereus_basis_backfill('x')` — fetch rows; run every non-`NULL` `backfill_sql` (`re-decomposition` and runnable `partial` skeletons — none can fail a NOT NULL constraint); supply app data for `missing_columns`, `needs-data` rows, and any `partial` row whose `backfill_sql` is `NULL` (the skeleton would violate NOT NULL, so the app owns the insert).
 4. GC the now-detached prior basis members when convenient (out of scope here).
 
 Because the backfill reads the persisted prior get-body (not the live `X.T` view), step 3 is robust to the lens already pointing at the new basis — the snapshot, not catalog timing, is the source of truth.
