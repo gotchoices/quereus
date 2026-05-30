@@ -199,15 +199,50 @@ stored rows and cost like a table scan, not like re-running the body. (An
 unqualified MV reference resolves against the current schema; a materialized view
 in a non-current schema must be qualified.)
 
-## Write boundary (read-only)
+## Write boundary (write-through)
 
-A materialized view is **read-only to direct DML**. `INSERT` / `UPDATE` / `DELETE`
-targeting an MV name are rejected at build time (`assertNotMaterializedView` is
-wired into all three DML builders). The stored contents change only through
-row-time maintenance (or `REFRESH` / a declarative rebuild). The *source* tables
-remain fully writable, and a source write propagates to the MV synchronously.
-Write-through (`put` semantics on an MV) is future work
-(`materialized-view-writes-through-body`).
+`INSERT` / `UPDATE` / `DELETE` targeting an MV *name* is **rewritten to target the
+MV's source table `T`** and re-planned through the ordinary base-table builder — the
+identical AST-level rewrite plain-view mutation performs
+(`planner/building/view-mutation.ts`), reached via the same `getView(…) ??
+getMaterializedView(…)` dispatch now wired into all three DML builders. Every MV is
+(post row-time consolidation) a single-source projection-and-filter — a strict subset
+of the [view-updateability](view-updateability.md) Phase-1 shape — so write-through is
+pure routing, with no MV-specific propagation code. The rewritten write hits `T`,
+which fires the existing row-time maintenance hook, so the backing is brought into
+sync **inside the same statement / transaction**: a subsequent `select … from mv` sees
+the write (reads-own-writes) and a rollback reverts source + backing in lockstep. A
+write-through to an MV is observably **indistinguishable from writing the source and
+reading the MV**.
+
+Per-column writeability is inherited verbatim from
+[view updateability](view-updateability.md):
+
+- a **passthrough / rename** column routes the assignment/value to its base column;
+- a **deterministic-expression** column (e.g. `x + 1 as y`) is **read-only** — a write
+  to it raises the `no-inverse` diagnostic; reads are unaffected and the column is
+  re-derived by maintenance on a passthrough write;
+- an omitted column pinned by an equality selection predicate (`… where color =
+  'green'`) is defaulted on the base via the constant-FD path; an insert that provably
+  contradicts the predicate is rejected (`predicate-contradiction`); an update carrying
+  a row out of the predicate scope succeeds in `T` and the maintenance update arm
+  removes it from the MV.
+
+Two cases are **rejected** (also inherited):
+
+- **RETURNING through an MV** raises the `returning-through-view` diagnostic (the
+  RETURNING-through-views phase is not shipped); when it lands the MV path picks it up
+  for free.
+- **MV-over-MV write-through** — DML against an MV whose body's source is *itself* a
+  materialized view — is rejected (`its body reads a materialized view`): its rewrite
+  would target the inner MV's read-only backing table. The source→backing maintenance
+  *cascade* ([§ MV-over-MV cascade](#mv-over-mv-cascade)) is the read/maintain direction
+  and is unaffected; only the MV-name *write* direction one level down is deferred.
+
+There is no `with check option` and no `instead of` trigger — the body `where` is a
+read-time filter, not a write-time invariant (same stance as view updateability). The
+*source* tables remain fully writable directly, and a source write propagates to the MV
+synchronously regardless of which boundary the write entered through.
 
 ## Maintenance (row-time, per-statement)
 
@@ -632,10 +667,13 @@ The following extensions build on this substrate:
   shapes are rejected today; this now builds on the maintenance substrate spike above.
 - **Concurrent refresh** (`materialized-view-concurrent-refresh`) — overlapping
   refreshes and refresh-while-read beyond today's atomic base-layer swap.
-- **Write-through DML** (`materialized-view-writes-through-body`) — accept DML against
-  an MV and propagate to sources via [view updateability](view-updateability.md).
-  Distinct from row-time *maintenance*: this is writing *the MV*, not keeping it in
-  sync with source writes.
+- **Write-through DML** — **delivered** (`materialized-view-dml-write-through`): DML
+  against an MV name is rewritten to its source via
+  [view updateability](view-updateability.md) and the row-time hook syncs the backing
+  (see [§ Write boundary](#write-boundary-write-through)). Distinct from row-time
+  *maintenance*: this writes *the MV*, not keeping it in sync with source writes.
+  Residual: write-through to an MV whose source is *another MV* (routing one level down
+  to the inner MV's own write-through) is deferred — rejected today.
 - **Backing-module pluggability** — honor `USING <module>(...)` so the stored relation
   can live in a module other than the in-memory table.
 - **Covering-structure enforcement follow-ups** — the backing-PK prefix scan and the

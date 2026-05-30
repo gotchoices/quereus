@@ -19,7 +19,7 @@ import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks } from './constraint-builder.js';
 import { buildParentSideFKChecks } from './foreign-key-builder.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
-import { isCommittedSchemaRef, assertNotMaterializedView } from './schema-resolution.js';
+import { isCommittedSchemaRef } from './schema-resolution.js';
 import { rewriteViewDelete } from './view-mutation.js';
 
 export function buildDeleteStmt(
@@ -31,16 +31,17 @@ export function buildDeleteStmt(
     throw new QuereusError(`Cannot modify committed-state table 'committed.${stmt.table.name}'`, StatusCode.ERROR);
   }
 
-  // Materialized views are read-only — reject before resolving the target.
-  assertNotMaterializedView(ctx, stmt.table.name, stmt.table.schema);
-
   // Apply schema path from statement if present
   const contextWithSchemaPath = stmt.schemaPath
     ? { ...ctx, schemaPath: stmt.schemaPath }
     : ctx;
 
-  // View-mediated delete: rewrite to target the view's base table and re-plan.
-  const deleteView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name);
+  // View- or materialized-view-mediated delete: rewrite to target the underlying
+  // base table and re-plan. An MV is a single-source projection-and-filter, so the
+  // same rewrite routes write-through to its source `T`; the row-time maintenance
+  // hook then syncs the backing. See docs/materialized-views.md § Write boundary.
+  const deleteView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
+    ?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
   if (deleteView) {
     return buildDeleteStmt(contextWithSchemaPath, rewriteViewDelete(contextWithSchemaPath, stmt, deleteView));
   }

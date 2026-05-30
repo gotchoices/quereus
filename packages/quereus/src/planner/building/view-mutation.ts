@@ -1,6 +1,5 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
-import type { ViewSchema } from '../../schema/view.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { QuereusError } from '../../common/errors.js';
@@ -21,10 +20,34 @@ import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.j
  * conflict / RETURNING / FK / mutation-context machinery is reused verbatim and
  * `getChangeScope()` / `Database.watch` see the base write with no extra wiring.
  *
- * See `docs/view-updateability.md`. Multi-source fan-out, the `ViewMutationNode`
- * orchestrator, and RETURNING-through-views are later phases — rejected here
- * with a structured diagnostic.
+ * The same rewrite drives **materialized-view write-through**: every MV is
+ * (post row-time consolidation) a single-source projection-and-filter — a strict
+ * subset of the shape this classifier accepts — so DML targeting an MV name is
+ * rewritten to its source `T` and re-planned identically; the existing row-time
+ * maintenance hook then brings the backing into sync within the same statement
+ * (reads-own-writes, rollback in lockstep). Hence the view parameter is the
+ * minimal {@link MutableViewLike} structural shape both `ViewSchema` and
+ * `MaterializedViewSchema` satisfy — the rewrite reads only `name` /
+ * `schemaName` / `selectAst` / `columns`. See `docs/materialized-views.md`
+ * § Write boundary and `docs/view-updateability.md`.
+ *
+ * Multi-source fan-out, the `ViewMutationNode` orchestrator, and
+ * RETURNING-through-views are later phases — rejected here with a structured
+ * diagnostic.
  */
+
+/**
+ * The minimal view-schema surface the rewrite reads — satisfied by both
+ * `ViewSchema` and `MaterializedViewSchema`. Keeping the parameter structural
+ * lets MV write-through reuse the plain-view rewrite verbatim, with no MV-shaped
+ * special-casing in the three builders.
+ */
+interface MutableViewLike {
+	readonly name: string;
+	readonly schemaName: string;
+	readonly selectAst: AST.QueryExpr;
+	readonly columns?: ReadonlyArray<string>;
+}
 
 /** A base column pinned to a constant by the view's selection predicate. */
 interface FilterConstant {
@@ -146,7 +169,7 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
  * view→base column model. Throws a structured diagnostic on any unsupported
  * shape.
  */
-function analyzeView(ctx: PlanningContext, view: ViewSchema): ViewAnalysis {
+function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis {
 	if (view.selectAst.type !== 'select') {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
@@ -194,6 +217,21 @@ function analyzeView(ctx: PlanningContext, view: ViewSchema): ViewAnalysis {
 			reason: 'nested-view',
 			table: view.name,
 			message: `cannot write through view '${view.name}': its body references another view; nested-view mutation is not yet supported`,
+		});
+	}
+	// MV-over-MV (or a plain view over an MV): the body's single source is itself a
+	// materialized view, so `buildSelectStmt` resolved it to that MV's *backing* table —
+	// re-planning the rewrite against the backing name would hit a relation that is
+	// read-only to user DML. Write-through one level down (route to the inner MV's own
+	// write-through + the maintenance cascade) is deferred; reject cleanly. The
+	// source→backing maintenance cascade is unaffected — that is the read/maintain
+	// direction; this guards only the MV-name *write* direction.
+	if (ctx.schemaManager.getMaterializedView(fromTable.table.schema ?? null, fromTable.table.name)) {
+		raiseMutationDiagnostic({
+			reason: 'nested-view',
+			table: view.name,
+			message: `cannot write through '${view.name}': its body reads a materialized view; `
+				+ `write-through to a materialized-view-over-materialized-view is not yet supported — write the base source instead`,
 		});
 	}
 
@@ -262,7 +300,7 @@ function extractFilterConstants(where: AST.Expression | undefined, baseTable: Ta
 	return out;
 }
 
-function findViewColumn(analysis: ViewAnalysis, name: string, view: ViewSchema): ViewColumn {
+function findViewColumn(analysis: ViewAnalysis, name: string, view: MutableViewLike): ViewColumn {
 	const vc = analysis.viewColumns.find(c => c.name.toLowerCase() === name.toLowerCase());
 	if (!vc) {
 		throw new QuereusError(`Column '${name}' not found in view '${view.name}'`, StatusCode.ERROR);
@@ -289,7 +327,7 @@ function remapper(analysis: ViewAnalysis): (col: AST.ColumnExpr) => AST.Expressi
 
 // --- INSERT ---------------------------------------------------------------
 
-export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: ViewSchema): AST.InsertStmt {
+export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike): AST.InsertStmt {
 	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 
@@ -346,7 +384,7 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 }
 
 /** Reject an insert literal that contradicts a selection-predicate constant. */
-function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: FilterConstant, view: ViewSchema): void {
+function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: FilterConstant, view: MutableViewLike): void {
 	if (source.type !== 'values' || fc.value === undefined) return;
 	for (const row of source.values) {
 		const cell = row[columnIndex];
@@ -364,7 +402,7 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 
 // --- UPDATE ---------------------------------------------------------------
 
-export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: ViewSchema): AST.UpdateStmt {
+export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike): AST.UpdateStmt {
 	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
@@ -390,7 +428,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 
 // --- DELETE ---------------------------------------------------------------
 
-export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: ViewSchema): AST.DeleteStmt {
+export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike): AST.DeleteStmt {
 	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
@@ -409,7 +447,7 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
 }
 
 /** RETURNING through a view is Phase 6 — reject it explicitly for now. */
-function rejectReturning(returning: AST.ResultColumn[] | undefined, view: ViewSchema): void {
+function rejectReturning(returning: AST.ResultColumn[] | undefined, view: MutableViewLike): void {
 	if (returning && returning.length > 0) {
 		raiseMutationDiagnostic({
 			reason: 'returning-through-view',

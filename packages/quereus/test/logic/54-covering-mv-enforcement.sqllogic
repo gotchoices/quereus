@@ -275,3 +275,49 @@ update ub set x = 100 where id in (1, 2);
 -- error: UNIQUE constraint failed
 select id, x from ub order by id;
 → [{"id":1,"x":1},{"id":2,"x":2},{"id":3,"x":3}]
+
+-- ===================================
+-- 11. Write-through to a covering MV (materialized-view-dml-write-through). DML
+--     targeting the covering MV's *name* is rewritten to target the source table
+--     (write-through via view updateability) and re-planned through the base-table
+--     builder, so the source write is UNIQUE-enforced through the same covering MV's
+--     backing it would be for a direct source write. A conflicting write-through is
+--     therefore resolved (ABORT / IGNORE / REPLACE) against the live backing exactly
+--     as a direct source write is — write-through and covering enforcement compose
+--     with no extra wiring. Asserts source end-state only (store-safe).
+-- ===================================
+
+create table wt (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view wt_ix as select x, y, id from wt order by x, y;
+
+-- the first write-through INSERT lands in the source
+insert into wt_ix (id, x, y) values (1, 5, 5);
+select id, x, y from wt order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- default ABORT: a write-through INSERT duplicating (x,y) with a new PK is rejected
+insert into wt_ix (id, x, y) values (2, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from wt order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR IGNORE through the MV: the duplicate is silently skipped
+insert or ignore into wt_ix (id, x, y) values (2, 5, 5);
+select id, x, y from wt order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR REPLACE through the MV: the prior source row (recovered by PK = 1 from the backing)
+-- is evicted, the new row lands
+insert or replace into wt_ix (id, x, y) values (10, 5, 5);
+select id, x, y from wt order by id;
+→ [{"id":10,"x":5,"y":5}]
+
+-- UPDATE through the MV moving a row onto an existing UC value is rejected (ABORT
+-- default; UPDATE OR <action> is unsupported, so the constraint default governs)
+create table wu (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view wu_ix as select x, y, id from wu order by x, y;
+insert into wu_ix (id, x, y) values (1, 5, 5), (2, 6, 6);
+update wu_ix set x = 6, y = 6 where id = 1;
+-- error: UNIQUE constraint failed
+select id, x, y from wu order by id;
+→ [{"id":1,"x":5,"y":5},{"id":2,"x":6,"y":6}]

@@ -26,7 +26,7 @@ import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builde
 import { buildChildSideFKChecks } from './foreign-key-builder.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
-import { isCommittedSchemaRef, assertNotMaterializedView } from './schema-resolution.js';
+import { isCommittedSchemaRef } from './schema-resolution.js';
 import { rewriteViewInsert } from './view-mutation.js';
 
 /**
@@ -375,12 +375,15 @@ export function buildInsertStmt(
 		throw new QuereusError(`Cannot modify committed-state table 'committed.${stmt.table.name}'`, StatusCode.ERROR);
 	}
 
-	// Materialized views are read-only — reject before resolving the target.
-	assertNotMaterializedView(ctx, stmt.table.name, stmt.table.schema);
-
-	// View-mediated insert: if the target is an (updateable) view, rewrite the
-	// statement to target its base table and re-plan through this same builder.
-	const insertView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name);
+	// View- or materialized-view-mediated insert: if the target names an (updateable)
+	// view or a materialized view, rewrite the statement to target the underlying base
+	// table and re-plan through this same builder. A materialized view is a single-source
+	// projection-and-filter (the row-time eligibility shape), so the same rewrite routes
+	// write-through to its source `T`; the existing row-time maintenance hook then brings
+	// the backing into sync within the statement. See docs/materialized-views.md
+	// § Write boundary.
+	const insertView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
+		?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
 	if (insertView) {
 		return buildInsertStmt(contextWithSchemaPath, rewriteViewInsert(contextWithSchemaPath, stmt, insertView));
 	}

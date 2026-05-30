@@ -18,7 +18,7 @@ import { ReturningNode } from '../nodes/returning-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
-import { isCommittedSchemaRef, assertNotMaterializedView } from './schema-resolution.js';
+import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { rewriteViewUpdate } from './view-mutation.js';
 
@@ -31,16 +31,17 @@ export function buildUpdateStmt(
     throw new QuereusError(`Cannot modify committed-state table 'committed.${stmt.table.name}'`, StatusCode.ERROR);
   }
 
-  // Materialized views are read-only — reject before resolving the target.
-  assertNotMaterializedView(ctx, stmt.table.name, stmt.table.schema);
-
   // Apply schema path from statement if present
   const contextWithSchemaPath = stmt.schemaPath
     ? { ...ctx, schemaPath: stmt.schemaPath }
     : ctx;
 
-  // View-mediated update: rewrite to target the view's base table and re-plan.
-  const updateView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name);
+  // View- or materialized-view-mediated update: rewrite to target the underlying
+  // base table and re-plan. An MV is a single-source projection-and-filter, so the
+  // same rewrite routes write-through to its source `T`; the row-time maintenance
+  // hook then syncs the backing. See docs/materialized-views.md § Write boundary.
+  const updateView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
+    ?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
   if (updateView) {
     return buildUpdateStmt(contextWithSchemaPath, rewriteViewUpdate(contextWithSchemaPath, stmt, updateView));
   }

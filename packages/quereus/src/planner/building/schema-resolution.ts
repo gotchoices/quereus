@@ -18,22 +18,6 @@ export function isCommittedSchemaRef(schemaName?: string): boolean {
 }
 
 /**
- * Rejects DML whose target names a materialized view. Materialized views are
- * read-only in v1 — writes must target the source tables; MV reads reflect new
- * source state only after `refresh materialized view`. Enabling write-through
- * later is a routing-only change (the body AST is retained on the schema).
- */
-export function assertNotMaterializedView(ctx: PlanningContext, tableName: string, schemaName?: string): void {
-	const targetSchema = schemaName ?? ctx.schemaManager.getCurrentSchemaName();
-	if (ctx.schemaManager.getMaterializedView(targetSchema, tableName)) {
-		throw new QuereusError(
-			'materialized views are read-only; write to the source tables instead.',
-			StatusCode.ERROR,
-		);
-	}
-}
-
-/**
  * Resolves a table schema at build time and records the dependency.
  */
 export function resolveTableSchema(

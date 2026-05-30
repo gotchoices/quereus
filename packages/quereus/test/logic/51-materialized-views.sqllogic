@@ -34,17 +34,28 @@ select * from mv order by x;
 → [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
 
 -- ===================================
--- 3. Read-only boundary — DML on the MV is rejected
+-- 3. Write boundary — DML on the MV name routes through to the source table
+--    (write-through via view updateability), and the backing reflects it within
+--    the statement. Full write-through coverage is in 53.1; this just locks the
+--    core boundary having flipped from "read-only" to "write-through".
 -- ===================================
 
+-- insert through the MV lands in the source and is reflected in the MV
 insert into mv values (9, 'z');
--- error: read-only
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"},{"x":9,"y":"z"}]
+select x, y from t order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"},{"x":9,"y":"z"}]
 
-update mv set y = 'zz' where x = 1;
--- error: read-only
+-- update through the MV
+update mv set y = 'Z' where x = 9;
+select y from mv where x = 9;
+→ [{"y":"Z"}]
 
-delete from mv where x = 1;
--- error: read-only
+-- delete through the MV (restores the pre-write state for the next section)
+delete from mv where x = 9;
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
 
 -- Source remains writable; reflected immediately
 insert into t values (5, 'e');

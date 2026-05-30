@@ -31,9 +31,16 @@ substrate, which becomes the single propagation path for all view mutations (its
 single-source case is the trivial one-base-op path); `building/view-mutation.ts` is
 removed once parity is proven.
 
-**Write-through materialized views** remain read-only at the user-write boundary
-(`materialized-view-core`, shipped). Write-through-MV is a future ticket gated on
-this one.
+**Write-through materialized views** are **delivered** for the passthrough /
+projection-filter shape (`materialized-view-dml-write-through`): DML targeting an MV
+name is rewritten to its source table and re-planned through this same Phase-1 rewrite,
+then the row-time maintenance hook syncs the backing within the statement
+(reads-own-writes; rollback in lockstep). The MV path inherits the per-column lineage
+rules verbatim — passthrough/rename columns are writeable, computed columns are
+read-only (`no-inverse`), and RETURNING is rejected (`returning-through-view`) until the
+RETURNING phase lands. An MV whose source is *itself* a materialized view is rejected
+for write-through (its rewrite would target a read-only backing table). See
+[docs/materialized-views.md § Write boundary](materialized-views.md#write-boundary-write-through).
 
 ## Overview
 
