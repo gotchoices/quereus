@@ -2015,6 +2015,15 @@ describe('Property-Based Tests', () => {
 				['id'], [], [[1]], () => true,
 			)).to.throw(/lineage disagreement/);
 
+			// Lineage (B): a forward key traces to base columns that do not
+			// reconstruct the base PK (here the key is `a` only, no `id` and no
+			// filter pinning `id`). This is the branch the zoo never reaches on its
+			// own (every real forward key traces to `id`), so pin it here.
+			expect(() => assertLineageAgreement('injected-unreconstructed-pk',
+				[{ name: 'a', base: 'a' }],
+				['id'], [], [[0]], () => true,
+			)).to.throw(/does not reconstruct base PK/);
+
 			// Lineage (C): the base PK survives but the forward walk lost the key.
 			expect(() => assertLineageAgreement('injected-lost-key',
 				[{ name: 'id', base: 'id' }, { name: 'a', base: 'a' }],
@@ -2202,10 +2211,20 @@ describe('Property-Based Tests', () => {
 					const keys = keysOf(root);
 					const model = viewModel(body);
 
-					// The forward output and the backward model must be column-aligned.
+					// The forward output and the backward model must be column-aligned
+					// positionally: `assertLineageAgreement` feeds model-derived column
+					// indices straight into `isUnique` (law C), which reads them as
+					// forward-output indices, so a name/order skew between the two
+					// surfaces would silently check the wrong columns. Assert exact
+					// positional name agreement, not just matching arity.
 					if (model.length !== cols.length) {
 						throw new Error(`lineage disagreement on ${body}: backward model has ${model.length} columns, forward plan has ${cols.length}`);
 					}
+					model.forEach((m, i) => {
+						if (m.name.toLowerCase() !== cols[i].toLowerCase()) {
+							throw new Error(`lineage disagreement on ${body}: backward model column ${i} is '${m.name}' but forward plan column ${i} is '${cols[i]}' (positional skew)`);
+						}
+					});
 
 					const filterConstBase = k === undefined ? [] : ['a'];
 					assertLineageAgreement(body, model, basePk, filterConstBase, keys, idx => isUnique(idx, root));
