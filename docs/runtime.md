@@ -908,6 +908,14 @@ pipeline still runs uniformly (`internal-eviction-reporting`):
   and covering-MV backing maintenance — uniformly across the memory, store, and
   isolation substrates, none of which re-drive the pipeline themselves.
 
+`processEvictions` fires the FK *actions* (`CASCADE` / `SET NULL` / `SET DEFAULT`) but
+not the `RESTRICT` / `NO ACTION` pre-check that `processDeleteRow` runs via
+`assertTransitiveRestrictsForParentMutation` — the substrate has already deleted the
+evicted row before reporting it, so there is no pre-mutation point at which to block.
+An eviction of a row referenced by a `RESTRICT` (or default `NO ACTION`) child thus
+proceeds silently and orphans the child, where SQLite fails the statement. Tracked in
+`eviction-restrict-fk-enforcement`.
+
 ### Implementation Guidelines for Emitter Authors
 
 **When adding new mutation operations:**

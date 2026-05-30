@@ -578,6 +578,8 @@ type UpdateResult =
 
 Report `evictedRows` whenever your `update()` internally deletes a row at a different PK to resolve a secondary-UNIQUE REPLACE; otherwise those cross-cutting effects (FK cascades, change subscriptions, events, covering-MV backing maintenance) silently do **not** run for the evicted row. Detection is necessarily module-specific (each module enumerates its current rows its own way), but the maintenance and cascades are **not** — reporting the eviction lets the engine's single post-write pipeline handle them uniformly. The two channels are independent and may both be present in principle; the executor handles each cleanly.
 
+> **Known limitation — `ON DELETE RESTRICT` / `NO ACTION` is not enforced for evictions.** The executor fires the FK *actions* (`CASCADE` / `SET NULL` / `SET DEFAULT`) for an evicted row, but it does **not** run the `RESTRICT` pre-check (`assertNoRestrictedChildrenForParentMutation`) — the substrate has already physically deleted the row by the time it reports `evictedRows`, so there is no pre-mutation point to block at. A secondary-UNIQUE REPLACE that evicts a row referenced by a `RESTRICT` (or default `NO ACTION`) child therefore proceeds silently and orphans the child, where SQLite would fail the statement. Tracked in `eviction-restrict-fk-enforcement`.
+
 ## Mutation Statements
 
 Virtual table modules can opt-in to receive deterministic mutation statements for each row-level operation. This enables replication, audit logging, and change data capture with guaranteed reproducibility.
