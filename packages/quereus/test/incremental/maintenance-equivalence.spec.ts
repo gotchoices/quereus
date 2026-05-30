@@ -162,3 +162,46 @@ describe('Materialized-view maintenance equivalence (covering-index shapes)', ()
 		});
 	}
 });
+
+/** Minimal reach into the manager's private plan map so a stubbed-arm plan can be
+ *  routed through the real DML maintenance path. The map key is lowercase
+ *  `schema.name` (see `mvKey` in database-materialized-views.ts). */
+interface PlanMapHandle { readonly materializedViewManager: { readonly rowTime: Map<string, { kind: string }> }; }
+
+/**
+ * The `MaintenancePlan` union has two stubbed arms (`'full-rebuild'`,
+ * `'residual-recompute'`) that the builder never emits today. They exist as named
+ * convergence points for the cost-gate / general-bodies tickets, guarded by a loud
+ * `INTERNAL` throw in `applyMaintenancePlan` so a future mis-wire fails fast rather
+ * than silently no-op'ing maintenance. The builder can't produce them, so this
+ * white-box test mutates a registered plan's `kind` in place and drives a real source
+ * write through the maintenance path to assert the guard fires (and locks its wording
+ * + status code) until those tickets make the arms reachable.
+ */
+describe('Materialized-view maintenance plan — stubbed-arm guard', () => {
+	for (const kind of ['full-rebuild', 'residual-recompute'] as const) {
+		it(`throws INTERNAL when a '${kind}' plan reaches applyMaintenancePlan`, async () => {
+			const db = new Database();
+			try {
+				await db.exec('create table src (id integer primary key, a integer)');
+				await db.exec('create materialized view mv as select id, a from src');
+
+				// Force the registered plan onto a stub arm the builder never yields.
+				const plan = (db as unknown as PlanMapHandle).materializedViewManager.rowTime.get('main.mv');
+				expect(plan, 'expected a registered inverse-projection plan').to.exist;
+				plan!.kind = kind;
+
+				let caught: unknown;
+				try {
+					await db.exec('insert into src (id, a) values (1, 1)');
+				} catch (e) { caught = e; }
+
+				expect(caught, 'a stub-arm plan must trip the guard, not no-op').to.be.instanceOf(QuereusError);
+				expect((caught as QuereusError).code).to.equal(StatusCode.INTERNAL);
+				expect((caught as QuereusError).message).to.contain(kind).and.to.contain('not yet wired');
+			} finally {
+				await db.close();
+			}
+		});
+	}
+});

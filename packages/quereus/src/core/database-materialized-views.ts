@@ -326,6 +326,16 @@ export class MaterializedViewManager {
 						+ `(reachable only once the cost-gate / general-bodies tickets land)`,
 					StatusCode.INTERNAL,
 				);
+			default: {
+				// A new arm added to MaintenancePlan must extend this dispatch; the
+				// never-assignment makes that a compile error rather than a silent
+				// fall-through (noImplicitReturns is off in this package).
+				const exhaustiveCheck: never = plan;
+				throw new QuereusError(
+					`unknown maintenance plan kind: ${(exhaustiveCheck as MaintenancePlan).kind}`,
+					StatusCode.INTERNAL,
+				);
+			}
 		}
 	}
 
