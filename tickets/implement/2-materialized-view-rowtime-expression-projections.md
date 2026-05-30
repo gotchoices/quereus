@@ -1,5 +1,5 @@
 description: Lift the row-time eligibility gate's passthrough-only projection restriction. Allow a **deterministic expression projection** over single-source columns (e.g. `select id, x + 1 as x1, lower(name) as ln from t`). Such a projection is still a pure per-row (per-statement) function of the changed row — O(log n), no body re-execution — so it fits row-time. Non-deterministic projections remain rejected. PK and UNIQUE-covered columns must still be passthrough (the backing key / conflict-resolution inverse projection depend on it).
-prereq: materialized-view-rowtime-only-consolidation
+prereq: materialized-view-rowtime-only-consolidation, incremental-maintenance-plan-abstraction
 files: packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/vtab/memory/utils/predicate.ts, packages/quereus/src/planner/validation/determinism-validator.ts, packages/quereus/test/logic/53-materialized-views-rowtime.sqllogic, docs/materialized-views.md
 ----
 

@@ -29,6 +29,14 @@ covering structure answers it.
 > [Materialized Views](materialized-views.md). Materialized views still use
 > *change-scope* analysis for `Database.watch` source projection (the cached
 > `sourceScope`); they just do not ride the delta-execution kernel.
+>
+> A design-spike (`incremental-maintenance-substrate-spike`) is reconsidering whether
+> this kernel and the row-time MV maintenance path should converge on one shared
+> `MaintenancePlan` abstraction plus a backward (maintenance-direction) cost gate —
+> and whether a Z-set / DBSP-style delta circuit is worth adopting for harder body
+> shapes. The synchronous, in-transaction *application policy* for materialized views
+> is **not** in question; only the shared representation and cost model are. No outcome
+> is assumed here until the spike lands.
 
 ## Pipeline at a glance
 

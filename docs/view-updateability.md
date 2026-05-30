@@ -24,7 +24,12 @@ The plan-node-threaded `updateLineage` / `AttributeDefault` surface on
 `PhysicalProperties` (§ Implementation Surface) and a `ViewMutationNode`
 orchestrator over reused `DmlExecutorNode`s are the **multi-source Phase-2
 foundation** and are intentionally not wired yet — for the single-source case the
-AST rewrite is complete and an orchestrator over one base op adds no behavior.
+AST rewrite is complete and an orchestrator over one base op adds no behavior. The
+retire-or-keep decision for this substrate is settled under
+`view-mutation-plan-node-substrate`: the AST rewrite is **retired** in favor of the
+substrate, which becomes the single propagation path for all view mutations (its
+single-source case is the trivial one-base-op path); `building/view-mutation.ts` is
+removed once parity is proven.
 
 **Write-through materialized views** remain read-only at the user-write boundary
 (`materialized-view-core`, shipped). Write-through-MV is a future ticket gated on
@@ -261,7 +266,8 @@ User-defined functions declare their profile at registration. A predicate-typed 
 
 Default propagation is deterministic and predicate-honest. When a user wants different behavior, they attach tags via the existing `with tags (...)` syntax (see [SQL Reference §Tags](sql.md#tags)).
 
-The reserved `quereus.update.*` namespace controls propagation:
+The reserved `quereus.update.*` namespace controls propagation (shape and site
+validation for this namespace is specified under `reserved-tag-namespace-typed-registry`):
 
 | Tag | Where | Effect |
 |---|---|---|
@@ -412,6 +418,20 @@ Diagnostics include a suggestion when one applies — for instance, `no-default`
 
 Each surface mirrors a one-to-one correspondence with an existing engine surface: lineage parallels FDs, propagation parallels emission, and view metadata parallels table metadata. No new subsystem is introduced — view updateability is the existing FD / EC / predicate-normalization infrastructure consulted in the mutation direction.
 
+> **Forward note — how the backward surface lands.** Phase 1 ships these as the
+> hand-maintained single-source AST walk (`update-lineage.ts`,
+> `scalar-invertibility.ts`, `propagate.ts`). When the plan-node substrate threads
+> `updateLineage` / `AttributeDefault` onto `PhysicalProperties`, it does so as the
+> **derived dual of each operator's forward FD walk** — the backward method reads
+> the same FD/EC/domain annotation `computePhysical` already produces, rather than
+> re-deriving its own — gated by a **per-operator round-trip law** (PutGet / GetPut /
+> lineage-agreement) in the property suite, the backward-direction analogue of the
+> forward Key Soundness harness. This discipline is being settled by the
+> `bx-operator-model-and-roundtrip-laws` design-spike before
+> `view-mutation-plan-node-substrate` threads the surface; the law itself lands first
+> as `bx-roundtrip-law-harness`. Nothing about the spike changes the intent described
+> above — it only fixes *how* the two directions are kept structurally in agreement.
+
 ## Background
 
 Quereus's view updateability draws on the following bodies of work:
@@ -419,6 +439,7 @@ Quereus's view updateability draws on the following bodies of work:
 - **Bancilhon, F., & Spyratos, N. (1981). "Update Semantics of Relational Views."** Established the constant-complement framework. Quereus sidesteps the ambiguity by adopting predicate-honest fan-out: rather than choosing one of several legal complements, Quereus applies every consistent base operation.
 - **Date, C. J., & Darwen, H. (2006). "Databases, Types, and the Relational Model: The Third Manifesto."** The principle that any relation expression should be a first-class mutation target underpins the unification of views, CTEs, and subqueries-in-`from` as the same propagation surface.
 - **Keller, A. M. (1985). "Algorithms for Translating View Updates to Database Updates for Views Involving Selections, Projections, and Joins."** Source of the per-operator decomposition strategies, adapted here to use functional dependencies rather than per-view annotation.
+- **Bohannon, A., Pierce, B. C., & Vaughan, J. A. (2006). "Relational Lenses: A Language for Updatable Views."** Types `select` / `project` / `join` lenses with FD-and-predicate annotations and proves GetPut / PutGet *compositionally, per operator*. Directly on point for Quereus's FD-annotated operators: whether the backward (`put`) direction should be a *derived, law-checked* dual of each operator's forward FD walk — rather than a parallel hand-maintained walk — is being reconsidered under the **`bx-operator-model-and-roundtrip-laws`** design-spike (the per-operator round-trip law that forces the two directions to agree). See also Foster et al. (2007) in [the lens layer's background](lens.md#background).
 - **Dataphor (Alphora, D4 language).** The closest commercial precedent. Quereus borrows the `default_for`-style metadata mechanism and the view-as-first-class-target stance; it extends the model with FD- and EC-driven default recovery, eliminating most cases where a Dataphor user would have annotated.
 - **Litak, T., & Mikulás, S. (2012). "Relational Lattices."** Algebraic framework over the relational lattice. Quereus's propagation rules read as the lattice-dual of the optimizer's query-rewriting rules.
 - **Hegner, S. (2004). "An Order-Based Theory of Updates for Closed Database Views."** Influential on the outer-join materialization semantics.

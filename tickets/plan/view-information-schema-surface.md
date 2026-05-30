@@ -1,5 +1,5 @@
 description: Expose view updateability metadata through `information_schema.views` — the `is_insertable_into`, `is_updatable`, `is_deletable`, and `effective_targets` columns per the `docs/view-updateability.md` § "information_schema surface" section. Reads off the `updateLineage` / `attributeDefaults` surfaces produced by `view-updateability-phase-1`; independently reviewable once that lands.
-prereq: view-updateability-phase-1
+prereq: view-updateability-phase-1, view-mutation-plan-node-substrate
 files: docs/view-updateability.md
 ----
 
@@ -15,11 +15,18 @@ core write-through machinery reviews independently of the introspection surface.
 - `is_deletable` — whether a delete can propagate.
 - `effective_targets` — the set of base tables a mutation against the view reaches.
 
-These are computable directly from the per-attribute `updateLineage`
-(`base` / `computed` / `null-extended`) and `attributeDefaults` surfaces that
-`view-updateability-phase-1` adds to relational plan nodes, plus the
+These are computable from the per-attribute `updateLineage`
+(`base` / `computed` / `null-extended`) and `attributeDefaults` surfaces, plus the
 propagation pass's per-base operation list (the same source `ChangeScope`
 consumes for `effective_targets`).
+
+> **Surface dependency.** The *plan-node-threaded* `updateLineage` / `AttributeDefault`
+> on `PhysicalProperties` is delivered by `view-mutation-plan-node-substrate`, **not**
+> `view-updateability-phase-1` — Phase 1 shipped only the single-source AST-rewrite
+> lineage in `planner/analysis/update-lineage.ts`. Hence the added
+> `view-mutation-plan-node-substrate` prereq. A v1 of this surface could report from the
+> Phase-1 single-source lineage for the common case; general per-column accuracy needs
+> the substrate.
 
 ## Why backlog, not plan
 

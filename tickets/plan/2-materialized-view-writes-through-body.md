@@ -19,6 +19,13 @@ So write-through to an MV is **not a new subsystem** — it is wiring the MV nam
 the propagation path plain views already use, plus one happy composition with
 row-time maintenance.
 
+> **Coordination — AST-rewrite retirement.** Write-through reuses the Phase-1 AST
+> rewrite (`building/view-mutation.ts`). `view-mutation-plan-node-substrate` **retires**
+> that rewrite in favour of the plan-node substrate, so write-through ships on the AST
+> rewrite now (the cheap, already-shipped path) and **migrates to the substrate when that
+> ticket lands** — same single-source propagation, no behavior change. That call-site
+> migration is listed in the substrate ticket's retire step.
+
 ## What it does
 
 `insert` / `update` / `delete` (with optional `returning`) against an MV name:

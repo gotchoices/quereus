@@ -1,5 +1,5 @@
 description: Batch row-time materialized-view maintenance at the **statement boundary** rather than strictly per source row, amortizing the backing-connection/layer lookup over a whole statement. Reads-own-writes must still hold *between* statements within a transaction. Critically, this must NOT break **within-statement** covering-MV UNIQUE enforcement, which scans the backing table for prior rows of the *same* statement.
-prereq: materialized-view-rowtime-only-consolidation
+prereq: materialized-view-rowtime-only-consolidation, incremental-maintenance-plan-abstraction
 files: packages/quereus/src/runtime/emit/dml-executor.ts, packages/quereus/src/core/database.ts, packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/vtab/memory/layer/manager.ts, packages/quereus/test/logic/53-materialized-views-rowtime.sqllogic, packages/quereus/test/logic/54-covering-mv-enforcement.sqllogic, docs/materialized-views.md
 ----
 

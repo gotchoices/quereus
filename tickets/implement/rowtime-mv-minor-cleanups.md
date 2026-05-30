@@ -1,5 +1,5 @@
 description: Minor type-safety / DRY cleanups around row-time materialized-view maintenance, plus a note on a pre-existing predicate-truthiness divergence. None are correctness bugs in the shipped row-time feature; grouped here to avoid churning the green build at review time.
-prereq:
+prereq: incremental-maintenance-plan-abstraction
 files: packages/quereus/src/runtime/emit/dml-executor.ts, packages/quereus/src/core/database.ts, packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/vtab/memory/utils/predicate.ts, packages/quereus/src/util/comparison.ts
 ----
 

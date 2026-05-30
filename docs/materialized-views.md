@@ -489,10 +489,18 @@ injects lookup-only rows with no governed `T` row).
 
 The following extensions build on this substrate:
 
+- **Unified maintenance substrate** (`incremental-maintenance-substrate-spike`) — a
+  design-spike reconsidering *how* the next maintenance shapes are built: it unifies
+  this row-time inverse-projection path and the post-commit `DeltaExecutor` binding
+  kernel under one `MaintenancePlan` abstraction, adds a backward
+  (maintenance-direction) cost gate, and decides via a bounded proof-of-concept whether
+  a Z-set / DBSP-style delta circuit is worth adopting for the harder shapes. The
+  spike's outcome is not yet decided; the general-bodies and MV-over-MV-cascade items
+  below are retargeted to build on its abstraction once it lands.
 - **Row-time general bodies** (`materialized-view-rowtime-general-bodies`) — extend
   the eligibility gate to single-source aggregates, inner/cross-join row-preserving
   bodies, and lateral-TVF fan-out, maintained synchronously per statement. These
-  shapes are rejected today.
+  shapes are rejected today; this now builds on the maintenance substrate spike above.
 - **Cascading MV-over-MV** — a materialized view whose source is another MV's backing
   table. Requires the maintenance write to drive dependents synchronously (DAG-ordered)
   within the statement; deferred from the consolidation (an MV-over-MV is rejected

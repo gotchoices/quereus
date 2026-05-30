@@ -1,5 +1,6 @@
+----
 description: Multi-source n-way decomposition in the lens default mapper — generate the inlined effective body as a join across several basis relations (columnar split / EAV / column-family), with optional components outer-joined onto the row-identity anchor and mandatory (`not null`) components inner-joined, a shared key that may be a surrogate, and the singleton (`primary key ()`) existence-relation degenerate case. Extends the v1 single-source name aligner. Design source: `docs/lens.md` § "The Default Mapper".
-prereq: lens-module-mapping-advertisement
+prereq: lens-module-mapping-advertisement, optimizer-inclusion-dependency-property
 files: docs/lens.md, packages/quereus/src/schema/lens-compiler.ts
 ----
 
@@ -13,8 +14,13 @@ Three properties from `docs/lens.md` are load-bearing for correctness:
 - **The shared key need not be a logical key** — a module may join on a surrogate and carry the logical key as a value column. A surrogate is supplied at insert by a basis default and must be **evaluated once per logical row and threaded** across every branch of the fan-out so all members agree on identity (rides the mutation-context substrate from `view-updateability-phase-1`).
 - **The empty key (singleton) is the degenerate case, not a special path** — `primary key ()` decomposes to a zero-column existence relation; the key-equi-join reduces to `left join ... on true`. The mandatory-column elision applies identically.
 
+## Existence soundness rides the propagated IND surface
+
+The mandatory-component inner-join and the put fan-out are sound only if every logical row provably **exists** in each mandatory basis relation. Because a decomposition joins its basis relations on a substrate-managed **surrogate** (not a declared SQL foreign key), the existing `ind-utils.ts` `lookupCoveringFK` helper is structurally blind to it. This ticket therefore consumes the propagated inclusion-dependency property from `optimizer-inclusion-dependency-property`: the lens compiler **injects** an `InclusionDependency` per mandatory component, targeting the decomposition's existence anchor (`IndTarget.kind: 'relation'`), so the lens prover validates the n-way put/get against a threaded existence fact rather than re-deriving structure per decomposition. The existence anchor named by the advertisement (`lens-module-mapping-advertisement`, the existence-anchor facet) is the `relationId` those injected INDs point at.
+
 ## What this ticket should specify
 
 - How the aligner reads an advertisement and synthesizes the join (anchor selection, outer vs inner per nullability, key-equi-join construction).
 - Surrogate generation + threading through the propagation path.
-- Tests for: columnar split round-trip, optional-component preservation (row with a null optional column survives), singleton existence relation, surrogate-key insert reaching all branches with one resolved value.
+- How the lens compiler emits the injected IND per mandatory component onto the anchor relation, and how the prover consumes it.
+- Tests for: columnar split round-trip, optional-component preservation (row with a null optional column survives), singleton existence relation, surrogate-key insert reaching all branches with one resolved value, and an injected-IND existence-anchor proof for a mandatory component.

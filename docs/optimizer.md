@@ -1307,6 +1307,8 @@ This provenance surface is the **future** mechanism for the [lens](lens.md#overr
 
 Functional dependencies (FDs) are the canonical surface for "what determines what" on a relational physical node's output. There is no separate `uniqueKeys` field — a unique key `K` is encoded as the FD `K → (all_cols \ K)`, and `∅ → all_cols` encodes the "at-most-one-row" claim that used to be `uniqueKeys: [[]]`.
 
+This is the **forward** direction, and the [Key Soundness harness](architecture.md) backstops it: it never over-claims a key. The **backward** direction — view/lens update propagation (`put`) — is designed to read this *same* per-node FD/EC/domain annotation rather than maintain a parallel one, gated by a per-operator round-trip law; the discipline is being settled under the `bx-operator-model-and-roundtrip-laws` spike (see [view updateability § Implementation Surface](view-updateability.md#implementation-surface)).
+
 ```typescript
 export interface FunctionalDependency {
   readonly determinants: readonly number[]; // empty = "constant"
@@ -1558,6 +1560,8 @@ Predicates `predicateImpliesGuard` recognizes today: `col = literal` / `col = co
 - `isSuperkey(attrs, fds, columnCount)` / `isAssertedKey(attrs, fds, columnCount)` — closure-based superkey check. `isSuperkey` returns true on the trivial all-cols tautology; `isAssertedKey` is stricter — it requires some FD in the set whose determinants ⊆ attrs and whose closure covers all columns. Use the latter when you need a positive uniqueness claim (e.g. strict-monotonicOn detection).
 - `hasAnyKey(fds, columnCount)` — true iff the FD set encodes any non-trivial key (replaces the legacy `uniqueKeys.length > 0` check).
 - `hasSingletonFd(fds, columnCount)` — true iff `∅ → all_cols` is present (replaces the `[[]]` marker).
+
+**Singleton equivalence (planned — `singleton-fd-producer-dry-and-law`).** Three representations encode the same "≤1-row" fact: an empty-key `[]` in `RelationType.keys`, the null-determinant `∅ → all_cols` FD in `physical.fds`, and `isUnique([])` returning true. The `singleton-fd-producer-dry-and-law` ticket will consolidate their producers behind canonical helpers (proposed `addSingletonFd` / `isAtMostOneRow`) and add a **Singleton equivalence** property law pinning the three to agree — a node claiming any one must satisfy all three. Not yet shipped; the helpers and law land with that ticket. (Forward uniqueness facts are already backstopped by the Key Soundness harness; the backward-direction analogue is the planned `bx-roundtrip-law-harness`.)
 - `deriveKeysFromFds(fds, columnCount)` — enumerate the minimal full-cover key sets from the FD set.
 - `shiftFds(fds, offset)` / `shiftEquivClasses(classes, offset)` — column index translation for joins.
 - `mergeEquivClasses(a, b)` / `addEquivalence(classes, a, b)` — transitive-closure union of overlapping classes.
@@ -1609,6 +1613,13 @@ Foreign keys are inclusion dependencies — `child.fk ⊆ parent.pk` — and thr
 The federated-vtab payoff: each fold removes a remote round-trip to the parent table. Rules abstain conservatively when: the FK is undeclared, equi-pairs don't cover all FK columns, the parent side has a row-reducing wrapper (Filter, LimitOffset, Distinct, Project, non-trivial Retrieve pipeline), or — for the anti-join and inner-join cases — any FK column is nullable.
 
 The anti-join-to-empty rewrite emits `EmptyRelationNode` carrying L's attribute IDs and `RelationType`. Downstream the const-fold pass (`rule-empty-relation-folding`, Structural priority 27) cascades that emptiness up through immediate Filter / Project / Sort / LimitOffset / Distinct / inner-or-cross-or-semi-anti joins; see "Empty-relation folding" below.
+
+> **IND promotion note.** INDs are not yet a propagated dependency-family member of
+> `PhysicalProperties` — only FK-declared INDs are exploited by the three rules above,
+> via on-demand helpers in `util/ind-utils.ts`. Promotion to a first-class propagated
+> surface (so downstream rules can read the IND set without re-walking FK declarations)
+> is under design in `optimizer-inclusion-dependency-property`; the on-demand `ind-utils`
+> helpers are retained as the interim surface.
 
 ### Fan-out lookup join (FK→PK + 1:n cross)
 

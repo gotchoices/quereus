@@ -1,7 +1,21 @@
-description: Extend the (now sole) row-time materialized-view maintenance model beyond the covering-index shape to general incrementally-maintainable bodies — single-source aggregates, inner/cross-join row-preserving bodies, and lateral-TVF fan-out — maintaining their backing tables synchronously with source writes (per-statement). After `materialized-view-rowtime-only-consolidation`, row-time is the *only* MV model, so these shapes are currently **rejected at CREATE**; this ticket is what lets them be materialized at all.
-prereq: materialized-view-rowtime-only-consolidation
+----
+description: Retargeted onto the shared MaintenancePlan substrate: implements residual-recompute + prefix-delete arms, cost-gated; consumes lateral-TVF backing PK from keysOf once join-keys lands. Renamed (seq prefix 3).
+prereq: materialized-view-rowtime-only-consolidation, incremental-maintenance-substrate-spike, optimizer-keyed-cross-product-join-keys
 files: packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/runtime/emit/dml-executor.ts, docs/materialized-views.md
 ----
+
+> **Retargeted onto the shared maintenance substrate** (`incremental-maintenance-substrate-spike`).
+> This ticket no longer designs residual maintenance from scratch. The spike establishes
+> the `MaintenancePlan` strategy union and the backward maintenance **cost gate**; this
+> ticket implements the `'residual-recompute'` arm (single-source aggregates and
+> row-preserving inner/cross joins) and the `'prefix-delete'` arm (lateral-TVF fan-out)
+> **on that abstraction**, choosing incremental-vs-rebuild via the cost gate rather than a
+> hand-rolled ratio. The lateral-TVF backing PK comes from `keysOf` once
+> `optimizer-keyed-cross-product-join-keys` lands (its product-key advertisement), so this
+> ticket consumes that key instead of bespoke advertisement reasoning. The open "is
+> residual re-execution affordable / where is the cost cliff" question below is now
+> **answered by the spike's cost gate**, not re-opened here. The shared
+> maintenance-equivalence property test from the spike is this ticket's regression oracle.
 
 ## Problem / future concern
 
