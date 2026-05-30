@@ -39,11 +39,14 @@ import { emitPlanNode } from '../runtime/emitters.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import { RowContextMap } from '../runtime/context-helpers.js';
+import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
+import { isAsyncIterable } from '../runtime/utils.js';
 import type { RuntimeContext } from '../runtime/types.js';
 import { AggregateNode } from '../planner/nodes/aggregate-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
+import { injectKeyFilter } from '../planner/analysis/key-filter.js';
 import {
 	selectMaintenanceStrategy,
 	seqScanCost,
@@ -180,18 +183,46 @@ export interface FullRebuildPlan extends MaintenancePlanCommon {
 }
 
 /**
- * The general-body residual-recompute arm: re-evaluate a per-binding residual of the
- * body for each changed binding tuple. Stub here — **unreachable** until
- * `materialized-view-rowtime-general-bodies` (3) builds its body on this abstraction.
- * It carries the {@link BindingMode} the spike names as the convergence point — the
- * incremental engine and the delta executor sharing one binding analysis — plus a
- * `degradeToRebuild` escape flag (fall back to full rebuild when the residual cannot
- * be parameterized).
+ * The general-body residual-recompute arm: per source change, derive the affected
+ * binding key(s) from the changed row, run a key-filtered residual of the body against
+ * **live mid-transaction source state**, delete the old backing slice for that key, and
+ * upsert the recomputed slice. Wired for the **single-source aggregate** shape
+ * (`select g1,… , agg(…) from T [where P] group by g1,…` over bare group columns) by
+ * `materialized-view-rowtime-residual-recompute`; the 1:1 row-preserving join shape
+ * (`'row'` binding) reuses the same kernel in a follow-on ticket.
+ *
+ * The residual is the body with a key-equality filter injected on `T`'s
+ * `TableReferenceNode` via {@link injectKeyFilter} (parameterized `gk0…` for a group
+ * binding, `pk0…` for a row binding), compiled + cached once at registration and run
+ * synchronously through the live transaction so the source read is reads-own-writes —
+ * the synchronous analogue of `database-assertions.ts`'s residual path.
+ *
+ * It carries the {@link BindingMode} the spike names as the convergence point (built
+ * directly from the body's shape — for an aggregate, the bare GROUP BY columns; NOT
+ * via `extractBindings`, whose `'group'` classification additionally requires the group
+ * key to cover a source unique key and so reports `'global'` for the common
+ * `group by <non-key>` body). `degradeToRebuild` is the cost gate's full-rebuild escape
+ * flag — dormant in v1 (the per-row recompute is correct without batching, and the
+ * full-rebuild arm is unwired).
  */
 export interface ResidualRecomputePlan extends MaintenancePlanCommon {
 	readonly kind: 'residual-recompute';
 	binding: BindingMode;
 	degradeToRebuild: boolean;
+	/** Cached scheduler for the key-filtered residual (the body with `injectKeyFilter`
+	 *  applied on `T`). Re-run per affected key tuple, bound through the live transaction. */
+	residualScheduler: Scheduler;
+	/** Bind-parameter prefix the residual was compiled with: `'gk'` (group) / `'pk'` (row). */
+	bindParamPrefix: 'gk' | 'pk';
+	/** Source-column indices of the binding key (group columns / row key columns). The
+	 *  affected key tuple is `bindColumns.map(c => changedRow[c])`, bound to `${prefix}{i}`. */
+	bindColumns: number[];
+	/** Backing-table physical primary-key definition (the column order the btree keys on). */
+	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	/** Source column projected (passthrough) into each backing-PK column, in
+	 *  `backingPkDefinition` order. The old backing slice's delete key for a changed row
+	 *  `R` is `buildPrimaryKeyFromValues(backingPkSourceCols.map(sc => R[sc]), backingPkDefinition)`. */
+	backingPkSourceCols: number[];
 }
 
 /**
@@ -383,10 +414,10 @@ export class MaterializedViewManager {
 	/**
 	 * Dispatch a maintenance plan on its `kind`, compute the per-row backing delta,
 	 * apply it, and return the **effective** {@link BackingRowChange}(s) the backing
-	 * layer realized (so the cascade can drive this plan's own dependents). Today the
-	 * builder only ever yields `'inverse-projection'`; the `'full-rebuild'` and
-	 * `'residual-recompute'` arms are loud `INTERNAL` guards (unreachable until the
-	 * cost-gate / general-bodies tickets wire their selection — see {@link MaintenancePlan}).
+	 * layer realized (so the cascade can drive this plan's own dependents). The builder
+	 * yields `'inverse-projection'` (covering-index shape) and `'residual-recompute'`
+	 * (single-source aggregate); the `'full-rebuild'` arm is still a loud `INTERNAL`
+	 * guard (unreachable until its selection is wired — see {@link MaintenancePlan}).
 	 */
 	private async applyMaintenancePlan(
 		plan: MaintenancePlan,
@@ -396,11 +427,12 @@ export class MaterializedViewManager {
 		switch (plan.kind) {
 			case 'inverse-projection':
 				return this.applyInverseProjection(plan, change, cache);
-			case 'full-rebuild':
 			case 'residual-recompute':
+				return this.applyResidualRecompute(plan, change, cache);
+			case 'full-rebuild':
 				throw new QuereusError(
 					`materialized view '${plan.mv.name}': '${plan.kind}' maintenance is not yet wired `
-						+ `(reachable only once the cost-gate / general-bodies tickets land)`,
+						+ `(reachable only once the cost-gate full-rebuild selection lands)`,
 					StatusCode.INTERNAL,
 				);
 			default: {
@@ -565,13 +597,11 @@ export class MaterializedViewManager {
 		// of a backing write recursively (DAG-ordered, atomic within the statement); the
 		// eligibility checks below evaluate against the keyed backing schema unchanged.
 
-		// Row-collapsing / fan-out / cross-row / unbounded shapes break one-source-row →
-		// one-backing-row, so write-through could not be a pure projection.
-		if (findAggregate(analyzed)) reject('its body uses an aggregate');
-		// A window function reads across the partition, so a backing column would depend on
-		// other source rows — not a pure per-row projection. It is already caught structurally
-		// by the passthrough/single-row-expression projection check below, but reject it
-		// explicitly here for a clear diagnostic.
+		// Structural rejections that hold for *every* maintenance shape. A window
+		// function reads across the partition, set ops / recursive CTEs / TVFs / row caps
+		// are out of the row-time model entirely. Joins are single-source-incompatible
+		// for the covering-index and aggregate arms; the 1:1 join arm (a follow-on ticket)
+		// lifts this one. Keep these exactly as they were.
 		if (containsNodeType(analyzed, PlanNodeType.Window)) reject('its body uses a window function');
 		if (containsAnyJoin(analyzed)) reject('its body contains a join');
 		if (containsNodeType(analyzed, PlanNodeType.Distinct)) reject('its body uses DISTINCT');
@@ -580,6 +610,17 @@ export class MaterializedViewManager {
 		if (containsNodeType(analyzed, PlanNodeType.TableFunctionCall)) reject('its body calls a table-valued function');
 		if (mv.selectAst.type === 'select' && (mv.selectAst.limit !== undefined || mv.selectAst.offset !== undefined)) {
 			reject('its body uses LIMIT/OFFSET');
+		}
+
+		// Single-source aggregate (`group by` over bare columns) → residual-recompute arm.
+		// Each changed source row belongs to exactly one group; maintaining the MV means
+		// recomputing that group's backing row from live state (delete old slice → run the
+		// group-keyed residual → upsert). A scalar aggregate (no GROUP BY) is rejected in
+		// v1 by `buildAggregateResidualPlan`. This replaces the former blanket aggregate
+		// rejection.
+		const aggregate = findAggregate(analyzed);
+		if (aggregate) {
+			return this.buildAggregateResidualPlan(mv, analyzed, tableRef, sourceBase, aggregate, reject);
 		}
 
 		const sourcePkCols = sourceSchema.primaryKeyDefinition.map(d => d.index);
@@ -720,6 +761,289 @@ export class MaterializedViewManager {
 			projectors,
 			predicate,
 		};
+	}
+
+	/**
+	 * Build a `'residual-recompute'` plan for a single-source aggregate body
+	 * (`select g1,…, agg(…) from T [where P] group by g1,…` over **bare** group columns),
+	 * or throw via `reject` with a shape diagnostic. Each changed source row belongs to
+	 * exactly one group `(g1,…)`; maintaining the MV means recomputing that group's
+	 * backing row from live state — delete the old slice, run the group-keyed residual,
+	 * upsert the recomputed slice (zero rows when the group emptied). See
+	 * {@link ResidualRecomputePlan} and `docs/incremental-maintenance.md` § residual-recompute.
+	 *
+	 * NOTE: the group binding is derived **directly** from the aggregate node's bare GROUP
+	 * BY columns, not via `extractBindings`. `analyzeRowSpecific`'s `'group'` classification
+	 * additionally requires the group key to cover a *source* unique key (so it reports
+	 * `'global'` for the common `group by <non-key>` body), which is the wrong test here —
+	 * the backing is keyed by the group key regardless of whether it is a source key.
+	 */
+	private buildAggregateResidualPlan(
+		mv: MaterializedViewSchema,
+		analyzed: BlockNode,
+		tableRef: TableReferenceNode,
+		sourceBase: string,
+		aggregate: AggregateLike,
+		reject: (detail: string) => never,
+	): MaintenancePlan {
+		// Require an explicit GROUP BY. A scalar aggregate (no GROUP BY) is one global
+		// row keyed by the empty key — deferred in v1 (the residual + harness do not yet
+		// cover the empty-key shape cleanly).
+		if (aggregate.groupBy.length === 0) {
+			reject('its body is a scalar aggregate with no GROUP BY (a single global row is not row-time maintainable in v1)');
+		}
+
+		// Map T's output attributes to source column indices. T is a bare
+		// `TableReferenceNode`, so output-column index == source-column index.
+		const sourceAttrToCol = new Map<number, number>();
+		tableRef.getAttributes().forEach((a, i) => sourceAttrToCol.set(a.id, i));
+		const producingByAttrId = collectProducingExprs(analyzed);
+
+		// Transitive provenance: chase output-attr → producing ColumnReference chains
+		// (Project-over-Aggregate adds a hop the single-hop `resolveSourceCol` cannot
+		// follow) until landing on a T source column, or `undefined`.
+		const resolveToSourceCol = (attrId: number): number | undefined => {
+			const seen = new Set<number>();
+			let cur: number | undefined = attrId;
+			while (cur !== undefined && !seen.has(cur)) {
+				seen.add(cur);
+				const direct = sourceAttrToCol.get(cur);
+				if (direct !== undefined) return direct;
+				const expr = producingByAttrId.get(cur);
+				if (expr instanceof ColumnReferenceNode) { cur = expr.attributeId; continue; }
+				return undefined;
+			}
+			return undefined;
+		};
+
+		// Each GROUP BY expression must be a bare source column (a computed group key has
+		// no source-column index to bind / key the backing on).
+		const groupColumns: number[] = [];
+		for (const expr of aggregate.groupBy) {
+			if (!(expr instanceof ColumnReferenceNode)) {
+				reject('its GROUP BY includes a computed expression (only bare source columns are row-time maintainable in v1)');
+			}
+			const sourceCol = sourceAttrToCol.get((expr as ColumnReferenceNode).attributeId);
+			if (sourceCol === undefined) {
+				reject('its GROUP BY references a value that is not a column of the single source');
+			}
+			groupColumns.push(sourceCol!);
+		}
+
+		// Determinism: a residual must reproduce exactly what `select <body>` returns, so a
+		// volatile group/aggregate expression (random()/now()/volatile UDF) is rejected.
+		for (const expr of aggregate.groupBy) {
+			const det = checkDeterministic(expr);
+			if (!det.valid) reject(`it groups by a non-deterministic expression (${det.expression})`);
+		}
+		for (const agg of aggregate.aggregates) {
+			const det = checkDeterministic(agg.expression);
+			if (!det.valid) reject(`it aggregates a non-deterministic expression (${det.expression})`);
+		}
+
+		// Backing table + its physical PK. The aggregate's group-key FD
+		// (`propagateAggregateFds`) makes the group key the backing key (via `keysOf`).
+		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+
+		// Map each backing-PK column back to the source group column it projects, so a
+		// changed row's old backing-slice delete key can be built. Every backing-PK column
+		// MUST resolve to a GROUP BY source column — else the backing key is not the group
+		// key and point-keyed delete+upsert would be unsound.
+		const rootAttrs = relationalAttributes(analyzed);
+		if (!rootAttrs) reject('its body produced no relational output');
+		const groupColumnSet = new Set(groupColumns);
+		const backingPkSourceCols: number[] = [];
+		for (const d of backingPkDefinition) {
+			const attr = rootAttrs![d.index];
+			const sourceCol = attr ? resolveToSourceCol(attr.id) : undefined;
+			if (sourceCol === undefined || !groupColumnSet.has(sourceCol)) {
+				reject(`its backing primary key includes column '${backing.columns[d.index]?.name ?? d.index}', `
+					+ `which is not a GROUP BY source column (the backing key must be the group key)`);
+			}
+			backingPkSourceCols.push(sourceCol!);
+		}
+
+		// Compile + cache the group-keyed residual once (the body with `g1 = :gk0 AND …`
+		// injected on T). Re-run per affected group key against the live transaction.
+		const relKey = `${sourceBase}#${tableRef.id ?? 'unknown'}`;
+		const residualScheduler = this.compileResidual(analyzed, relKey, groupColumns, 'gk', reject);
+
+		// ── Cost gate ──
+		// The residual is the structurally-sound incremental arm for an aggregate body;
+		// 'full-rebuild' is the always-correct floor for shapes where the residual is NOT
+		// sound, so (as with inverse-projection) it is not a competitor here. We still
+		// record the chosen strategy + cost inputs for parity with the substrate.
+		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
+		const hasPredicate = mv.selectAst.type === 'select' && mv.selectAst.where !== undefined;
+		const sourceStats = this.estimateMaintenanceStats(tableRef.tableSchema, backing.columns.length, hasPredicate);
+		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
+		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
+		if (chosenStrategy !== 'residual-recompute') {
+			throw new QuereusError(
+				`Internal error: cost gate selected unwired strategy '${chosenStrategy}' for materialized view '${mv.name}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		return {
+			kind: 'residual-recompute',
+			mv,
+			sourceBase,
+			backingSchema: mv.schemaName,
+			backingTableName: mv.backingTableName,
+			chosenStrategy,
+			sourceStats,
+			binding: { kind: 'group', groupColumns: [...groupColumns] },
+			degradeToRebuild: false,
+			residualScheduler,
+			bindParamPrefix: 'gk',
+			bindColumns: groupColumns,
+			backingPkDefinition,
+			backingPkSourceCols,
+		};
+	}
+
+	/**
+	 * Compile the key-filtered residual for a binding into a reusable {@link Scheduler}:
+	 * the analyzed body with a key-equality filter injected on `T`'s `TableReferenceNode`
+	 * (parameterized `${paramPrefix}0…`), then optimized + emitted. Mirrors the assertion
+	 * evaluator's residual compilation (`database-assertions.ts`) so the two cannot drift.
+	 * Throws via `reject` if `injectKeyFilter` could not target `T`.
+	 */
+	private compileResidual(
+		analyzed: BlockNode,
+		relKey: string,
+		bindColumns: readonly number[],
+		paramPrefix: 'gk' | 'pk',
+		reject: (detail: string) => never,
+	): Scheduler {
+		const db = this.ctx as unknown as Database;
+		const rewritten = injectKeyFilter(analyzed, relKey, bindColumns, paramPrefix);
+		if (rewritten === analyzed) {
+			reject('its body could not be parameterized for residual maintenance (the source reference was not found)');
+		}
+		const optimized = this.ctx.optimizer.optimize(rewritten, db) as BlockNode;
+		const instruction = emitPlanNode(optimized, new EmissionContext(db));
+		return new Scheduler(instruction);
+	}
+
+	/**
+	 * Execute the cached key-filtered residual for one affected key tuple, returning its
+	 * result rows (0 or 1 for the aggregate shape). Bound through a fresh
+	 * {@link RuntimeContext} on the live `db` so the residual's source scan reuses `T`'s
+	 * transaction connection and reads this statement's pending writes (reads-own-writes)
+	 * — the synchronous analogue of `database-assertions.ts:executeResidualPerTuple`.
+	 */
+	private async runResidual(plan: ResidualRecomputePlan, keyTuple: readonly SqlValue[]): Promise<Row[]> {
+		const params: Record<string, SqlValue> = {};
+		for (let i = 0; i < keyTuple.length; i++) {
+			params[`${plan.bindParamPrefix}${i}`] = keyTuple[i];
+		}
+		const rctx: RuntimeContext = {
+			db: this.ctx as unknown as Database,
+			stmt: undefined,
+			params,
+			context: createStrictRowContextMap(),
+			tableContexts: wrapTableContextsStrict(new Map()),
+			enableMetrics: false,
+		};
+		const result = await plan.residualScheduler.run(rctx);
+		const rows: Row[] = [];
+		if (isAsyncIterable(result)) {
+			for await (const r of result as AsyncIterable<Row>) rows.push(r);
+		}
+		return rows;
+	}
+
+	/**
+	 * Compute a `'residual-recompute'` plan's per-row backing delta and apply it: derive
+	 * the affected binding key(s) from the changed row (OLD ∪ NEW, deduped), and for each —
+	 * delete the old backing slice for that key, re-run the key-filtered residual against
+	 * live source state, and upsert the recomputed slice (0 or 1 rows). An emptied group
+	 * (residual returns nothing) leaves only the delete, removing the stale backing row.
+	 * Returns the effective {@link BackingRowChange}(s) the backing layer realized, for the
+	 * MV-over-MV cascade.
+	 *
+	 * Per-row recompute is correct without per-statement batching: every change to a group
+	 * triggers a full recompute of that group from live (reads-own-writes) state, so the
+	 * last change to touch a group writes the authoritative backing row. Batching/dedup
+	 * across a whole statement is an affordability optimization deferred with the
+	 * statement-flush boundary (see the ticket handoff).
+	 */
+	private async applyResidualRecompute(
+		plan: ResidualRecomputePlan,
+		change: BackingRowChange,
+		cache?: BackingConnectionCache,
+	): Promise<BackingRowChange[]> {
+		// Distinct affected keys (OLD ∪ NEW), deduped on the backing-key values: a
+		// non-key-changing update recomputes the group once; a key-changing update
+		// recomputes both the old and the new group.
+		const affected = new Map<string, { keyTuple: SqlValue[]; keyVals: SqlValue[]; deleteKey: BTreeKeyForPrimary }>();
+		const addFrom = (row: Row): void => {
+			const keyVals = plan.backingPkSourceCols.map(sc => row[sc]);
+			const dedupKey = canonKeyValues(keyVals);
+			if (affected.has(dedupKey)) return;
+			affected.set(dedupKey, {
+				keyTuple: plan.bindColumns.map(c => row[c]),
+				keyVals,
+				deleteKey: buildPrimaryKeyFromValues(keyVals, plan.backingPkDefinition),
+			});
+		};
+		if (change.op === 'insert') addFrom(change.newRow);
+		else if (change.op === 'delete') addFrom(change.oldRow);
+		else { addFrom(change.oldRow); addFrom(change.newRow); }
+
+		const ops: MaintenanceOp[] = [];
+		for (const { keyTuple, keyVals, deleteKey } of affected.values()) {
+			ops.push({ kind: 'delete-key', key: deleteKey });
+			const recomputed = await this.runResidual(plan, keyTuple);
+			// Upsert only the recomputed rows whose backing key equals the affected key.
+			// The residual for key K must only contribute K's slice; any other row is
+			// spurious and is dropped. This is the soundness net for an emptied group: when
+			// no source row matches the key, a *correct* grouped residual returns zero rows,
+			// but a constant-pinned multi-column grouped aggregate is mis-collapsed by the
+			// optimizer into a *scalar* aggregate that emits one all-NULL `count=0` row over
+			// the empty input (a pre-existing optimizer bug, filed separately as
+			// `fix/optimizer-constant-group-aggregate-empty-input-spurious-row`). That row's
+			// key ≠ K, so it is filtered here and the delete-without-upsert correctly removes
+			// the emptied group's backing row.
+			for (const row of recomputed) {
+				if (this.residualRowMatchesKey(plan, row, keyVals)) ops.push({ kind: 'upsert', row });
+			}
+		}
+		if (ops.length === 0) return [];
+
+		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const manager = getBackingManager(backing);
+		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return manager.applyMaintenanceToLayer(connection, ops);
+	}
+
+	/**
+	 * True iff `row`'s backing primary-key columns equal `keyVals` (the affected binding
+	 * key, in `backingPkDefinition` order), under each column's collation. Used to keep
+	 * only the residual row(s) belonging to the recomputed key — see
+	 * {@link applyResidualRecompute}.
+	 */
+	private residualRowMatchesKey(plan: ResidualRecomputePlan, row: Row, keyVals: readonly SqlValue[]): boolean {
+		for (let i = 0; i < plan.backingPkDefinition.length; i++) {
+			const d = plan.backingPkDefinition[i];
+			if (compareSqlValues(row[d.index], keyVals[i], d.collation) !== 0) return false;
+		}
+		return true;
 	}
 
 	/**
@@ -1007,6 +1331,12 @@ function isBinaryCollation(collation: string | undefined): boolean {
 
 function mvKey(schemaName: string, name: string): string {
 	return `${schemaName}.${name}`.toLowerCase();
+}
+
+/** Canonical, order-stable, bigint-safe string for a key tuple — used to dedup the
+ *  distinct affected backing keys of a single change in the residual-recompute arm. */
+function canonKeyValues(values: readonly SqlValue[]): string {
+	return JSON.stringify(values, (_k, v) => (typeof v === 'bigint' ? `${v}n` : v));
 }
 
 /** Aggregate node types (logical + physical) — the analyzed plan may carry any. */

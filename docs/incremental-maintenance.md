@@ -51,10 +51,32 @@ covering structure answers it.
 > uniformly. (`incremental-maintenance-plan-abstraction` landed the first step of the
 > fold: `applyRowTimeChange` is now `applyMaintenancePlan`, which dispatches on
 > `MaintenancePlan.kind`; the cascade flow is unchanged: `applyMaintenancePlan` →
-> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Its
-> `'inverse-projection'` arm is the only one wired today, gated by the
+> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Two arms are
+> wired today: `'inverse-projection'` (the covering-index shape) and
+> `'residual-recompute'` (single-source aggregates, below). Both are gated by the
 > maintenance-equivalence property harness
 > `test/incremental/maintenance-equivalence.spec.ts`.)
+>
+> **The `'residual-recompute'` arm — the synchronous analogue of the assertion
+> residual path.** A single-source aggregate body (`select g1,…, agg(…) from T [where
+> P] group by g1,…` over **bare** group columns) is maintained by re-running a
+> *key-filtered residual* of the body, exactly the primitive the assertion consumer
+> uses — only synchronously, in-transaction, rather than at COMMIT. At create the body
+> is rewritten with `injectKeyFilter(body, T, groupColumns, 'gk')` (the shared
+> primitive in `key-filter.ts`) and compiled once. Per source change the manager
+> derives the affected group key(s) from the changed row (the `BindingMode`'s
+> `{ kind: 'group'; groupColumns }`, built directly from the aggregate's bare GROUP BY
+> — *not* via `extractBindings`, whose `'group'` classification additionally demands the
+> group key cover a *source* unique key and so reports `'global'` for the common
+> `group by <non-key>` body), deletes that group's old backing slice, runs the residual
+> bound to the affected key against **live mid-transaction source state**
+> (reads-own-writes, the same emit → `Scheduler` path the assertion evaluator uses), and
+> upserts the recomputed group row. A group-key-changing UPDATE recomputes both the OLD
+> and NEW groups; an emptied group's residual returns zero rows, so the delete-without-
+> upsert removes its backing row. Per-row recompute is correct without per-statement
+> batching — every change to a group recomputes it from live state, so the last write
+> wins. (The 1:1 row-preserving join shape reuses this same kernel with a `'row'`/`'pk'`
+> binding in a follow-on ticket.)
 
 ## Pipeline at a glance
 

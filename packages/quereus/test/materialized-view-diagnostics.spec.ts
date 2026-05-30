@@ -71,7 +71,7 @@ describe('Materialized view create-time gate diagnostic', () => {
 	// A duplicate-producing ("bag") body fails the set contract at fill time (before
 	// the row-time gate is reached). This path is separate from the gate diagnostic
 	// above; it must still name the MV + set contract, never leak the backing table,
-	// and never suggest `distinct`/`group by` (both of which the gate now rejects).
+	// and steer only to the keyed remedies (`create view` / `create table`).
 	it('a duplicate-producing body fails the set contract with a non-leaking diagnostic', async () => {
 		await db.exec(`
 			create table orders (id integer primary key, status text);
@@ -83,7 +83,7 @@ describe('Materialized view create-time gate diagnostic', () => {
 		expect(err.message).to.contain('mv_status');
 		// Never leaks the hidden backing-table name…
 		expect(err.message).to.not.contain('_mv_');
-		// …and steers to the now-valid remedies only (not the gate-rejected distinct/group by).
+		// …and steers to the keyed remedies (`create view` / `create table`).
 		expect(err.message).to.match(/create view/);
 		expect(err.message).to.match(/create table/);
 
@@ -132,7 +132,10 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 
 	// label → [body, distinctive tail substring]
 	const cases: Array<[string, string, string]> = [
-		['aggregate', 'select k, sum(v) as sv from g group by k', 'its body uses an aggregate'],
+		// A `group by` aggregate over bare columns is now ACCEPTED (residual-recompute —
+		// see the positive case below). A *scalar* aggregate (no GROUP BY) is still
+		// rejected in v1 (one global row, deferred).
+		['scalar aggregate (no GROUP BY)', 'select count(*) as c, sum(v) as s from g', 'scalar aggregate with no GROUP BY'],
 		['join (multi-source)', 'select g.id, g.v from g join g2 on g.id = g2.id', 'its body reads more than one source table (joins are not supported)'],
 		['self-join (multi-source)', 'select a.id, a.v from g a join g b on a.id = b.id', 'its body reads more than one source table (joins are not supported)'],
 		['union over two tables (multi-source, NOT set-op)', 'select id, v from g union select id, w from g2', 'its body reads more than one source table (joins are not supported)'],
@@ -178,6 +181,38 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 
 		await db.exec('delete from g where id = 1;');
 		expect(await read()).to.deep.equal([{ id: 2, v1: -7, av: 8 }]);
+	});
+
+	// A single-source `group by` aggregate over bare columns is now ACCEPTED and
+	// maintained by the residual-recompute arm: each source write recomputes the
+	// affected group's backing row from live state (delete the old slice → run the
+	// group-keyed residual → upsert), with an emptied group's backing row removed.
+	it('accepts a single-source aggregate and maintains groups on source writes', async () => {
+		await db.exec('insert into g values (2, 100, 7), (3, 200, 1);');
+		await db.exec('create materialized view ga as select k, count(*) as c, sum(v) as s from g group by k;');
+		expect(db.schemaManager.getMaterializedView('main', 'ga'), 'aggregate MV registered').to.not.be.undefined;
+
+		const read = async (): Promise<Record<string, unknown>[]> => {
+			const rows: Record<string, unknown>[] = [];
+			for await (const row of db.eval('select k, c, s from ga order by k')) {
+				rows.push({ k: row.k, c: Number(row.c), s: Number(row.s) });
+			}
+			return rows;
+		};
+		// g: (1,100,5),(2,100,7),(3,200,1) → groups k=100 {5,7}, k=200 {1}.
+		expect(await read()).to.deep.equal([{ k: 100, c: 2, s: 12 }, { k: 200, c: 1, s: 1 }]);
+
+		// Insert into an existing group recomputes only that group.
+		await db.exec('insert into g values (4, 200, 10);');
+		expect(await read()).to.deep.equal([{ k: 100, c: 2, s: 12 }, { k: 200, c: 2, s: 11 }]);
+
+		// Group-key-changing update: move id=1 from k=100 to a fresh k=300 (recomputes both).
+		await db.exec('update g set k = 300 where id = 1;');
+		expect(await read()).to.deep.equal([{ k: 100, c: 1, s: 7 }, { k: 200, c: 2, s: 11 }, { k: 300, c: 1, s: 5 }]);
+
+		// Deleting the last row of group k=300 removes its backing row entirely.
+		await db.exec('delete from g where id = 1;');
+		expect(await read()).to.deep.equal([{ k: 100, c: 1, s: 7 }, { k: 200, c: 2, s: 11 }]);
 	});
 
 	// MV-over-MV is no longer rejected — the cascade (database-materialized-views.ts)

@@ -134,47 +134,75 @@ async function assertEquivalent(db: Database, body: string, phase: string): Prom
 	expect(fromMv, `${phase}: MV backing diverged from live body`).to.deep.equal(fromBody);
 }
 
-describe('Materialized-view maintenance equivalence (covering-index shapes)', () => {
-	for (const shape of SHAPES) {
-		describe(shape.label, () => {
-			let db: Database;
+/**
+ * Single-source aggregate body shapes (`select g…, agg(…) from src [where P] group by g…`)
+ * maintained by the `'residual-recompute'` arm. The shared `mutationArb` drives the
+ * cases needed: `insert` adds rows; `update`/`updateKey` rewrite `k`/`a`, so they move
+ * rows across `group by k` / `group by a, k` groups (group-key-changing updates) and
+ * across the `a > 3` partial-WHERE scope; `delete` (plus collisions) empties groups. The
+ * oracle re-runs the same aggregate body live, so incremental maintenance and live
+ * evaluation must agree — including emptied groups, where the residual returns zero rows
+ * and the backing row must disappear.
+ */
+const AGGREGATE_SHAPES: readonly BodyShape[] = [
+	{ label: 'group by k: count + sum (group-key-changing updates, emptied groups)', body: 'select k, count(*) as c, sum(a) as s from src group by k' },
+	{ label: 'group by k + partial WHERE a > 3 (predicate-scope transitions)', body: 'select k, count(*) as c, sum(a) as s from src where a > 3 group by k' },
+	{ label: 'group by k: count + sum + min + max', body: 'select k, count(*) as c, sum(a) as s, min(b) as mn, max(b) as mx from src group by k' },
+	{ label: 'multi-column group by (a, k)', body: 'select a, k, count(*) as c, sum(b) as s from src group by a, k' },
+];
 
-			beforeEach(async () => {
-				db = new Database();
-				await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
-				// Committed seed straddling the `k > 5` predicate, restored to before every
-				// run by the always-rolled-back transaction below.
-				await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2), (3, 7, 1, 9)');
-				await db.exec(`create materialized view mv as ${shape.body}`);
+/**
+ * Define one equivalence suite per body shape: after every random mutation (and after
+ * rollback), the synchronously-maintained MV backing must equal the live body as a
+ * multiset. Shared by the covering-index (`'inverse-projection'`) and single-source
+ * aggregate (`'residual-recompute'`) shape sets.
+ */
+function defineEquivalenceSuite(suiteTitle: string, shapes: readonly BodyShape[]): void {
+	describe(suiteTitle, () => {
+		for (const shape of shapes) {
+			describe(shape.label, () => {
+				let db: Database;
+
+				beforeEach(async () => {
+					db = new Database();
+					await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+					// Committed seed straddling the `k > 5` / `a > 3` predicates, restored to
+					// before every run by the always-rolled-back transaction below.
+					await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2), (3, 7, 1, 9)');
+					await db.exec(`create materialized view mv as ${shape.body}`);
+				});
+
+				afterEach(async () => { await db.close(); });
+
+				it('read(MV) == evaluate(body) across random mutations, in-txn and after rollback', async () => {
+					await fc.assert(fc.asyncProperty(
+						fc.array(mutationArb, { minLength: 1, maxLength: 10 }),
+						async (mutations) => {
+							// Equivalent against the committed baseline.
+							await assertEquivalent(db, shape.body, 'baseline');
+
+							await db.exec('begin');
+							try {
+								for (const m of mutations) await applyMutation(db, m);
+								// Reads-own-writes: the MV backing reflects every pending source
+								// write mid-transaction, matching the live body.
+								await assertEquivalent(db, shape.body, 'in-transaction');
+							} finally {
+								await db.exec('rollback');
+							}
+
+							// Maintenance reverted in lockstep with the rolled-back source writes.
+							await assertEquivalent(db, shape.body, 'post-rollback');
+						},
+					), { numRuns: 40 });
+				});
 			});
+		}
+	});
+}
 
-			afterEach(async () => { await db.close(); });
-
-			it('read(MV) == evaluate(body) across random mutations, in-txn and after rollback', async () => {
-				await fc.assert(fc.asyncProperty(
-					fc.array(mutationArb, { minLength: 1, maxLength: 10 }),
-					async (mutations) => {
-						// Equivalent against the committed baseline.
-						await assertEquivalent(db, shape.body, 'baseline');
-
-						await db.exec('begin');
-						try {
-							for (const m of mutations) await applyMutation(db, m);
-							// Reads-own-writes: the MV backing reflects every pending source
-							// write mid-transaction, matching the live body.
-							await assertEquivalent(db, shape.body, 'in-transaction');
-						} finally {
-							await db.exec('rollback');
-						}
-
-						// Maintenance reverted in lockstep with the rolled-back source writes.
-						await assertEquivalent(db, shape.body, 'post-rollback');
-					},
-				), { numRuns: 40 });
-			});
-		});
-	}
-});
+defineEquivalenceSuite('Materialized-view maintenance equivalence (covering-index shapes)', SHAPES);
+defineEquivalenceSuite('Materialized-view maintenance equivalence (single-source aggregate shapes)', AGGREGATE_SHAPES);
 
 /** Minimal reach into the manager's private plan map so a stubbed-arm plan can be
  *  routed through the real DML maintenance path. The map key is lowercase
@@ -182,17 +210,21 @@ describe('Materialized-view maintenance equivalence (covering-index shapes)', ()
 interface PlanMapHandle { readonly materializedViewManager: { readonly rowTime: Map<string, { kind: string }> }; }
 
 /**
- * The `MaintenancePlan` union has two stubbed arms (`'full-rebuild'`,
- * `'residual-recompute'`) that the builder never emits today. They exist as named
- * convergence points for the cost-gate / general-bodies tickets, guarded by a loud
- * `INTERNAL` throw in `applyMaintenancePlan` so a future mis-wire fails fast rather
- * than silently no-op'ing maintenance. The builder can't produce them, so this
- * white-box test mutates a registered plan's `kind` in place and drives a real source
- * write through the maintenance path to assert the guard fires (and locks its wording
- * + status code) until those tickets make the arms reachable.
+ * The `MaintenancePlan` union still has one stubbed arm (`'full-rebuild'`) that the
+ * builder never emits today — a named convergence point for the cost-gate full-rebuild
+ * selection, guarded by a loud `INTERNAL` throw in `applyMaintenancePlan` so a future
+ * mis-wire fails fast rather than silently no-op'ing maintenance. The builder can't
+ * produce it, so this white-box test mutates a registered plan's `kind` in place and
+ * drives a real source write through the maintenance path to assert the guard fires
+ * (and locks its wording + status code) until that selection is wired.
+ *
+ * The `'residual-recompute'` arm is **no longer** a stub — it is wired for single-source
+ * aggregate bodies (covered by the aggregate equivalence suite above), so mutating an
+ * inverse-projection plan's kind to it would dispatch into the (unprepared) residual
+ * path rather than the guard. It is therefore excluded here.
  */
 describe('Materialized-view maintenance plan — stubbed-arm guard', () => {
-	for (const kind of ['full-rebuild', 'residual-recompute'] as const) {
+	for (const kind of ['full-rebuild'] as const) {
 		it(`throws INTERNAL when a '${kind}' plan reaches applyMaintenancePlan`, async () => {
 			const db = new Database();
 			try {

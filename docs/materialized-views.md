@@ -176,6 +176,24 @@ schema unchanged — for `mv2 as select id, x from mv1`, the source PK is `mv1`'
 PK, which `mv2` projects. A write to `mv1` then drives `mv2` synchronously (see
 [Maintenance § MV-over-MV cascade](#mv-over-mv-cascade)).
 
+A second eligible shape is the **single-source aggregate**
+(`materialized-view-rowtime-residual-recompute`):
+
+- a **single** source table `T`;
+- a body of the form `select g1,…, agg(…) from T [where P] group by g1,…` whose
+  **GROUP BY columns are bare source columns** (a *computed* group key is rejected in
+  v1 — the group columns must be source-column indices so the backing can be keyed on
+  them); a *scalar* aggregate with **no** `GROUP BY` (one global row) is deferred in v1;
+- a **deterministic** body — the group-by and aggregate expressions must be reproducible
+  (`random()` / `now()` / volatile UDFs are rejected on determinism), so the recomputed
+  slice is exactly what `select <body>` would return;
+- the backing primary key is the **group key** (the group-key FD makes `keysOf` derive
+  it), so each group maps to exactly one backing row.
+
+Unlike the covering-index shape, this is maintained not by a pure projection but by a
+bounded **key-filtered residual** of the body (see
+[Maintenance § residual-recompute](#maintenance-row-time-per-statement)).
+
 Any other body is **rejected at create** with a shape-specific diagnostic that
 names the unsupported feature and steers the user to a plain `view` (for live
 re-evaluation) or `create table … as <body>` (for a one-off snapshot). There is no
@@ -186,10 +204,12 @@ escape-hatch policy that accepts an ineligible body.
 > effectively unreachable for memory tables. The relevant create-time failure is
 > "projection drops a source PK column."
 
-The shapes deferred to `materialized-view-rowtime-general-bodies` — single-source
-aggregates, inner/cross-join row-preserving bodies, and lateral-TVF fan-out — are
-rejected today; recursion and set operations are out of the row-time model
-entirely (no bounded per-write residual).
+Single-source aggregates (`group by` over bare columns) are now **accepted** (the
+residual-recompute shape above). The shapes still deferred to follow-on tickets —
+inner/cross-join row-preserving bodies (the 1:1-join residual arm,
+`materialized-view-rowtime-residual-join`) and lateral-TVF fan-out
+(`materialized-view-rowtime-prefix-delete-lateral-tvf`) — are rejected today; recursion
+and set operations are out of the row-time model entirely (no bounded per-write residual).
 
 ## Query resolution
 
@@ -246,19 +266,20 @@ synchronously regardless of which boundary the write entered through.
 
 ## Maintenance (row-time, per-statement)
 
-For each materialized view the manager caches a `MaintenancePlan`
-(per-column projectors + backing PK + optional predicate), keyed by source base.
-This shipped covering-index plan is now the `'inverse-projection'` arm of the
-`MaintenancePlan` tagged union (the former private `RowTimeMaintenancePlan`, lifted
-verbatim — `incremental-maintenance-plan-abstraction`); the union's `'full-rebuild'`
-and `'residual-recompute'` arms are reserved for the cost gate
-(`incremental-maintenance-cost-gate`) and general bodies
-(`materialized-view-rowtime-general-bodies`) and are unreachable today. The
-correctness oracle for this arm is the maintenance-equivalence property harness
-(`test/incremental/maintenance-equivalence.spec.ts`): for every eligible body shape
-it asserts `read(MV) == evaluate(body)` after each random source mutation and after
-rollback. The per-row backing delta is a **pure projection of the changed row** — no
-body re-execution, no scan, no compiled residual. `project(r)` copies the passthrough
+For each materialized view the manager caches a `MaintenancePlan`, keyed by source
+base, and dispatches on its `kind`. Two arms are wired today: `'inverse-projection'`
+(the covering-index shape) and `'residual-recompute'` (single-source aggregates). The
+union's `'full-rebuild'` arm remains reserved for the cost gate
+(`incremental-maintenance-cost-gate`) and is unreachable today. The correctness oracle
+for both arms is the maintenance-equivalence property harness
+(`test/incremental/maintenance-equivalence.spec.ts`): for every eligible body shape it
+asserts `read(MV) == evaluate(body)` after each random source mutation and after
+rollback.
+
+### `'inverse-projection'` (covering-index shape)
+
+The per-row backing delta is a **pure projection of the changed row** — no body
+re-execution, no scan, no compiled residual. `project(r)` copies the passthrough
 columns and evaluates each deterministic-expression column against the single changed
 row (reusing the runtime, so the value matches `select <body>` exactly):
 
@@ -272,6 +293,46 @@ The update arm covers predicate-scope transitions and key-changing updates. This
 bounded O(log n) per-row cost (a btree delete + insert) — identical to the
 secondary-index maintenance a UNIQUE auto-index already performs — is why row-time
 is affordable for this shape and not for general bodies.
+
+### `'residual-recompute'` (single-source aggregate shape)
+
+When the body is a single-source aggregate (`group by` over bare columns) the per-row
+delta is not a projection but a **bounded, key-filtered re-execution** of the body. At
+create, the body is rewritten with `injectKeyFilter(body, T, groupColumns, 'gk')` (the
+shared residual primitive in `planner/analysis/key-filter.ts`, also used by the
+assertion evaluator) and compiled once into a cached scheduler. The plan carries a
+`BindingMode` of `{ kind: 'group'; groupColumns }`, built **directly from the
+aggregate's bare GROUP BY columns** — *not* via `extractBindings`, whose `'group'`
+classification additionally requires the group key to cover a *source* unique key (and
+so reports `'global'` for the common `group by <non-key>` body, which would route to the
+unwired rebuild/reject path).
+
+Per source change the manager derives the affected group key(s) from the changed row,
+and for each:
+
+| source op | affected group key(s) | maintenance |
+|---|---|---|
+| insert `r` | NEW group of `r` | delete the group's old backing row; run the residual bound to the key; upsert the recomputed group row |
+| delete `r` | OLD group of `r` | delete; run residual (zero rows if emptied → no upsert) |
+| update `old→new` | OLD ∪ NEW group (deduped) | per affected key: delete; run residual; upsert |
+
+The residual runs against **live mid-transaction source state** (reads-own-writes,
+through the same emit → `Scheduler` path the assertion evaluator uses), so the
+recomputed slice is exactly what `select <body>` would return at that point. A
+group-key-changing UPDATE recomputes both the OLD and NEW groups; the always-delete-
+before-rerun discipline is what makes an **emptied group** correct — the residual
+returns zero rows, so the delete-without-upsert removes the stale backing row. Only the
+recomputed row(s) whose backing key equals the affected key are upserted (a soundness
+net that also discards a spurious empty-group row a constant-pinned multi-column grouped
+aggregate can produce under a known optimizer mis-collapse — see
+`fix/optimizer-constant-group-aggregate-empty-input-spurious-row`).
+
+Per-row recompute is correct **without** per-statement batching: every change to a group
+recomputes it from live state, so the last change to touch a group writes the
+authoritative row. Batching/dedup of distinct affected keys across a whole statement (and
+the cost gate's runtime `degradeToRebuild`) is an affordability optimization deferred with
+the statement-flush boundary — the per-statement batching that shipped is connection-
+resolution caching only, not op-buffering.
 
 ### MV-over-MV cascade
 
@@ -675,10 +736,15 @@ The following extensions build on this substrate:
   (maintenance-direction) cost gate. The
   spike's outcome is not yet decided; the general-bodies item below is retargeted to
   build on its abstraction once it lands.
-- **Row-time general bodies** (`materialized-view-rowtime-general-bodies`) — extend
-  the eligibility gate to single-source aggregates, inner/cross-join row-preserving
-  bodies, and lateral-TVF fan-out, maintained synchronously per statement. These
-  shapes are rejected today; this now builds on the maintenance substrate spike above.
+- **Row-time general bodies** — extend the eligibility gate beyond the covering-index
+  shape to bodies maintained by a bounded key-filtered residual. **Single-source
+  aggregates** (`group by` over bare columns) are **delivered**
+  (`materialized-view-rowtime-residual-recompute`, the `'residual-recompute'` arm). The
+  remaining shapes — **inner/cross-join row-preserving (1:1) bodies**
+  (`materialized-view-rowtime-residual-join`, reusing the residual primitive with a
+  `'row'`/`'pk'` binding) and **lateral-TVF fan-out**
+  (`materialized-view-rowtime-prefix-delete-lateral-tvf`, the by-prefix delete) — are
+  rejected today.
 - **Concurrent refresh** (`materialized-view-concurrent-refresh`) — overlapping
   refreshes and refresh-while-read beyond today's atomic base-layer swap.
 - **Write-through DML** — **delivered** (`materialized-view-dml-write-through`): DML

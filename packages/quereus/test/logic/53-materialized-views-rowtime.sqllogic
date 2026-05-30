@@ -188,9 +188,10 @@ select * from s_o order by x;
 create table g (id integer primary key, k integer, v integer);
 insert into g values (1, 100, 5);
 
--- aggregate body
-create materialized view bad_agg as select k, sum(v) as sv from g group by k;
--- error: its body uses an aggregate
+-- scalar aggregate (no GROUP BY) — one global row, deferred in v1. A `group by`
+-- aggregate over bare columns is now ACCEPTED (residual-recompute — see §22).
+create materialized view bad_scalar_agg as select count(*) as c, sum(v) as sv from g;
+-- error: scalar aggregate with no GROUP BY
 
 -- join body (multi-source: the source-count check fires before the join check)
 create table g2 (id integer primary key, w integer);
@@ -836,3 +837,90 @@ select id, x from bc2 order by id;
 delete from bc where id in (2, 4);
 select id, x from bc2 order by id;
 → [{"id":1,"x":10},{"id":3,"x":30}]
+
+-- ===================================
+-- 22. Single-source aggregate bodies (`group by` over bare columns) — the
+--     residual-recompute arm. Per source write, the affected group's backing row is
+--     recomputed from live state (delete old slice → run the group-keyed residual →
+--     upsert); an emptied group's backing row is removed. Observable purely by reading
+--     the MV. (materialized-view-rowtime-residual-recompute)
+-- ===================================
+
+create table ag (id integer primary key, k integer, v integer);
+insert into ag values (1, 1, 10), (2, 1, 5), (3, 2, 7);
+create materialized view ag_sum as select k, count(*) as c, sum(v) as s from ag group by k;
+
+-- MV equals the body at create time (groups k=1 {10,5}, k=2 {7}).
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":15},{"k":2,"c":1,"s":7}]
+
+-- INSERT into an existing group recomputes only that group.
+insert into ag values (4, 2, 3);
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":15},{"k":2,"c":2,"s":10}]
+
+-- INSERT that opens a NEW group adds a backing row.
+insert into ag values (5, 3, 100);
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":15},{"k":2,"c":2,"s":10},{"k":3,"c":1,"s":100}]
+
+-- Non-key UPDATE recomputes the affected group's aggregate.
+update ag set v = 20 where id = 1;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":25},{"k":2,"c":2,"s":10},{"k":3,"c":1,"s":100}]
+
+-- Group-key-changing UPDATE: move id=2 from k=1 to k=2 (BOTH old + new groups recomputed).
+update ag set k = 2 where id = 2;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":1,"s":20},{"k":2,"c":3,"s":15},{"k":3,"c":1,"s":100}]
+
+-- DELETE the last row of a group → its backing row disappears (emptied group).
+delete from ag where id = 5;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":1,"s":20},{"k":2,"c":3,"s":15}]
+
+-- Mid-transaction visibility + rollback reverts in lockstep (reads-own-writes).
+begin;
+insert into ag values (6, 1, 1000);
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":1020},{"k":2,"c":3,"s":15}]
+rollback;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":1,"s":20},{"k":2,"c":3,"s":15}]
+
+-- 22b. Partial-WHERE aggregate — only rows whose predicate is TRUE contribute; a
+--      predicate-scope transition recomputes the affected group, and a group whose
+--      every contributing row leaves scope loses its backing row.
+create table agp (id integer primary key, k integer, v integer);
+insert into agp values (1, 1, 5), (2, 1, -2), (3, 2, 8);
+create materialized view agp_sum as select k, sum(v) as s from agp where v > 0 group by k;
+select k, s from agp_sum order by k;
+→ [{"k":1,"s":5},{"k":2,"s":8}]
+
+-- id=2 enters scope (v: -2 → 3): group k=1 recomputed.
+update agp set v = 3 where id = 2;
+select k, s from agp_sum order by k;
+→ [{"k":1,"s":8},{"k":2,"s":8}]
+
+-- id=1 leaves scope (v: 5 → -1): group k=1 recomputed.
+update agp set v = -1 where id = 1;
+select k, s from agp_sum order by k;
+→ [{"k":1,"s":3},{"k":2,"s":8}]
+
+-- the last in-scope row of group k=1 leaves scope → its backing row disappears.
+update agp set v = -5 where id = 2;
+select k, s from agp_sum order by k;
+→ [{"k":2,"s":8}]
+
+-- 22c. Multi-column group by (a, k) — composite group key as the backing key.
+create table agm (id integer primary key, a integer, k integer, v integer);
+insert into agm values (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 1, 30);
+create materialized view agm_sum as select a, k, sum(v) as s from agm group by a, k;
+select a, k, s from agm_sum order by a, k;
+→ [{"a":1,"k":1,"s":10},{"a":1,"k":2,"s":20},{"a":2,"k":1,"s":30}]
+
+-- key-changing update moves (a,k) from (1,1) to (2,1): old composite group emptied,
+-- new composite group recomputed (regression guard for the multi-column delete key).
+update agm set a = 2 where id = 1;
+select a, k, s from agm_sum order by a, k;
+→ [{"a":1,"k":2,"s":20},{"a":2,"k":1,"s":40}]
