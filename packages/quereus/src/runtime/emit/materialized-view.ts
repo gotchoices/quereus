@@ -130,13 +130,16 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 
 		await rebuildBacking(db, mv);
 
-		mv.stale = false;
 		// Re-register row-time write-through maintenance. A source schema change that
 		// marked this MV stale also detached its row-time plan; the rebuild above only
 		// fixes the snapshot, so without re-registering, subsequent source writes would
 		// silently not propagate. Registration is idempotent (it releases any existing
 		// plan first), so a refresh of a never-stale MV is a harmless no-op re-attach.
+		// Re-register BEFORE clearing `stale`: if registration ever threw (the eligibility
+		// gate re-runs here), leaving the MV stale makes the next read re-validate/error
+		// rather than silently serve an unmaintained snapshot.
 		db.registerMaterializedView(mv);
+		mv.stale = false;
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_refreshed',
 			schemaName: plan.schemaName,

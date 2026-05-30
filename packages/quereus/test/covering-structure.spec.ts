@@ -894,6 +894,30 @@ describe('row-time covering enforcement', () => {
 		expect(await selectAll('select * from t order by id')).to.deep.equal([{ id: 1, x: 5, y: 5 }]);
 	});
 
+	it('covering enforcement resumes after a refresh following a compatible source ALTER', async () => {
+		// A compatible `alter table … add column` marks the covering MV stale and
+		// DETACHES its row-time plan, so while stale `findRowTimeCoveringStructure`
+		// returns undefined and enforcement falls back to the auto-index. `refresh`
+		// must re-register the row-time plan (the fix in
+		// materialized-view-refresh-reregister-rowtime), restoring the MV as the
+		// enforcement-ready covering structure — the `coveringStructureName` forward
+		// pointer survives the alter (the spread in runAddColumn keeps it).
+		await freshCovered(['insert into t values (1, 5, 5)']);
+		const uc = () => db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
+		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'covering before alter').to.equal('ix');
+
+		await db.exec('alter table t add column note text null');
+		expect(uc().coveringStructureName, 'forward pointer survives compatible alter').to.equal('ix');
+		expect(db._findRowTimeCoveringStructure('main', 't', uc()), 'stale MV is not enforcement-ready').to.be.undefined;
+
+		await db.exec('refresh materialized view ix');
+		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'refresh restores the covering MV').to.equal('ix');
+
+		// Enforcement is answered through the re-registered covering MV's backing table.
+		await expectThrows(() => db.exec('insert into t (id, x, y) values (2, 5, 5)'), 'UNIQUE constraint failed: t (x, y)');
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 1 }]);
+	});
+
 	it('ABORT reports the prior source row recovered via the MV projection (ON CONFLICT upsert)', async () => {
 		db = new Database();
 		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, n text, unique (x, y))');
