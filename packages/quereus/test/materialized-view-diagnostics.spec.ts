@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
+import { createTableValuedFunction } from '../src/func/registration.js';
+import { INTEGER_TYPE } from '../src/types/builtin-types.js';
+import type { Row, SqlValue } from '../src/common/types.js';
 
 /**
  * The mandatory create-time gate: every materialized view is row-time maintained,
@@ -275,5 +278,138 @@ describe('Materialized view `with refresh` is a parse error', () => {
 		const err = await captureError("create materialized view v2 as select id, x from t with refresh = 'bogus';");
 		expect(err.message).to.contain('after CTE name');
 		expect(db.schemaManager.getMaterializedView('main', 'v2'), 'no MV registered on parse failure').to.be.undefined;
+	});
+});
+
+/**
+ * Single-source lateral-TVF fan-out bodies (`select T.pk…, f.* from T cross join lateral
+ * tvf(<args over T>) f`) are maintained by the `'prefix-delete'` arm: each base row maps to
+ * N backing rows keyed by the composite product key `(T.pk ∪ tvf-key)`; per source write,
+ * the base row's whole fan-out slice is deleted by base-PK prefix and re-fanned from live
+ * state. The deep correctness oracle is the property harness
+ * (`incremental/maintenance-equivalence.spec.ts` § lateral-TVF). This spec locks the
+ * acceptance/maintenance contract and the *negative* shape rejections the sqllogic harness
+ * cannot express (a TVF that advertises no per-call key; a non-deterministic TVF).
+ */
+describe('Materialized view lateral-TVF fan-out arm (prefix-delete)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table lt (id integer primary key, x integer);');
+		await db.exec('insert into lt values (1, 2), (2, 3), (3, 0);');
+	});
+	afterEach(async () => { await db.close(); });
+
+	async function captureError(sql: string): Promise<Error> {
+		try { await db.exec(sql); } catch (e) { return e instanceof Error ? e : new Error(String(e)); }
+		throw new Error(`Expected an error from: ${sql}`);
+	}
+
+	const read = async (): Promise<Array<Record<string, unknown>>> => {
+		const rows: Array<Record<string, unknown>> = [];
+		for await (const row of db.eval('select id, value from lf order by id, value')) {
+			rows.push({ id: Number(row.id), value: Number(row.value) });
+		}
+		return rows;
+	};
+
+	it('accepts a lateral generate_series fan-out and maintains the slice on source writes', async () => {
+		await db.exec('create materialized view lf as select lt.id, lt.x, f.value from lt cross join lateral generate_series(1, lt.x) f;');
+		expect(db.schemaManager.getMaterializedView('main', 'lf'), 'lateral-TVF MV registered').to.not.be.undefined;
+
+		// id=1 → value 1,2 ; id=2 → value 1,2,3 ; id=3 (x=0) → empty fan-out.
+		expect(await read()).to.deep.equal([
+			{ id: 1, value: 1 }, { id: 1, value: 2 },
+			{ id: 2, value: 1 }, { id: 2, value: 2 }, { id: 2, value: 3 },
+		]);
+
+		// INSERT adds a new base row's whole fan-out.
+		await db.exec('insert into lt values (4, 2);');
+		expect(await read()).to.deep.equal([
+			{ id: 1, value: 1 }, { id: 1, value: 2 },
+			{ id: 2, value: 1 }, { id: 2, value: 2 }, { id: 2, value: 3 },
+			{ id: 4, value: 1 }, { id: 4, value: 2 },
+		]);
+
+		// UPDATE that grows the fan-out (2 → 4 rows): old slice deleted, new fan-out upserted.
+		await db.exec('update lt set x = 4 where id = 1;');
+		expect(await read()).to.deep.equal([
+			{ id: 1, value: 1 }, { id: 1, value: 2 }, { id: 1, value: 3 }, { id: 1, value: 4 },
+			{ id: 2, value: 1 }, { id: 2, value: 2 }, { id: 2, value: 3 },
+			{ id: 4, value: 1 }, { id: 4, value: 2 },
+		]);
+
+		// Base-PK-changing UPDATE moves the whole prefix (id 2 → 5).
+		await db.exec('update lt set id = 5 where id = 2;');
+		expect((await read()).filter(r => r.id === 2)).to.deep.equal([]);
+		expect((await read()).filter(r => r.id === 5)).to.deep.equal([
+			{ id: 5, value: 1 }, { id: 5, value: 2 }, { id: 5, value: 3 },
+		]);
+
+		// DELETE removes the whole fan-out slice.
+		await db.exec('delete from lt where id = 1;');
+		expect((await read()).filter(r => r.id === 1)).to.deep.equal([]);
+	});
+
+	it('reads-own-writes + rollback reverts the fan-out slice in lockstep', async () => {
+		await db.exec('create materialized view lf as select lt.id, lt.x, f.value from lt cross join lateral generate_series(1, lt.x) f;');
+		await db.exec('begin;');
+		await db.exec('insert into lt values (9, 3);');
+		expect((await read()).filter(r => r.id === 9), 'reads-own-writes mid-transaction').to.have.length(3);
+		await db.exec('rollback;');
+		expect((await read()).filter(r => r.id === 9), 'rolled back in lockstep').to.deep.equal([]);
+	});
+
+	it('rejects a lateral TVF that advertises no per-call key with a shape diagnostic', async () => {
+		// A deterministic TVF that fans into distinct rows 1..n but advertises NO per-call
+		// key — the fan-out rows are not individually addressable, so the composite product
+		// key cannot form. (Fill succeeds because the rows happen to be distinct; the shape
+		// gate then rejects at register.)
+		db.registerFunction(createTableValuedFunction(
+			{
+				name: 'fan_nokey', numArgs: 1, deterministic: true,
+				returnType: {
+					typeClass: 'relation', isReadOnly: true, isSet: false,
+					columns: [{ name: 'n', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true }],
+					keys: [], rowConstraints: [],
+				},
+				relationalAdvertisement: { deterministic: true },
+			},
+			async function* (count: SqlValue): AsyncIterable<Row> {
+				const c = typeof count === 'bigint' ? Number(count) : Number(count ?? 0);
+				for (let i = 1; i <= c; i++) yield [i];
+			},
+		));
+
+		const err = await captureError('create materialized view bad_nokey as select lt.id, s.n from lt cross join lateral fan_nokey(lt.x) s;');
+		expect(err.message).to.contain('cannot be materialized');
+		expect(err.message).to.contain('advertises no per-call key');
+		expect(db.schemaManager.getMaterializedView('main', 'bad_nokey'), 'no MV registered after shape rejection').to.be.undefined;
+	});
+
+	it('rejects a non-deterministic lateral TVF (the fan-out must be reproducible)', async () => {
+		// Flagged non-deterministic (with a per-call key, so the determinism gate — not the
+		// keyless gate — is what fires); its body yields 1..n so the create's fill still
+		// produces a set before the gate rejects.
+		db.registerFunction(createTableValuedFunction(
+			{
+				name: 'fan_rnd', numArgs: 1, deterministic: false,
+				returnType: {
+					typeClass: 'relation', isReadOnly: true, isSet: true,
+					columns: [{ name: 'n', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true }],
+					keys: [[{ index: 0 }]], rowConstraints: [],
+				},
+				relationalAdvertisement: { isSet: true, keys: [[{ index: 0 }]], deterministic: false },
+			},
+			async function* (count: SqlValue): AsyncIterable<Row> {
+				const c = typeof count === 'bigint' ? Number(count) : Number(count ?? 0);
+				for (let i = 1; i <= c; i++) yield [i];
+			},
+		));
+
+		const err = await captureError('create materialized view bad_rnd as select lt.id, s.n from lt cross join lateral fan_rnd(lt.x) s;');
+		expect(err.message).to.contain('cannot be materialized');
+		expect(err.message).to.contain('non-deterministic table-valued function');
+		expect(db.schemaManager.getMaterializedView('main', 'bad_rnd'), 'no MV registered after determinism rejection').to.be.undefined;
 	});
 });

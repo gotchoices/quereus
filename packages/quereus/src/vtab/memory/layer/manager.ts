@@ -56,14 +56,22 @@ export type CoveringStructure =
  *
  * - `delete-key` removes the row with this full primary key (no-op if absent).
  * - `upsert` replaces the row sharing this row's PK, or inserts when absent.
+ * - `delete-by-prefix` removes **every** row whose leading PK columns equal
+ *   `keyPrefix` (no-op when nothing matches). It replaces a whole prefix-keyed
+ *   *slice* — used by the lateral-TVF fan-out arm (`'prefix-delete'`), where one
+ *   base row maps to many backing rows sharing the base-PK prefix. The backing
+ *   btree is ordered by the composite PK with the base-PK columns leading, so the
+ *   slice is a contiguous range the scan seeks to and early-terminates on.
  *
- * Row-time maintenance is one-source-row → one-backing-row, so a per-row delta is
- * always a `delete-key` (old image) and/or an `upsert` (new image) — see
- * `docs/materialized-views.md` § Row-time refresh.
+ * The point ops (`delete-key`/`upsert`) keep a one-source-row → one-backing-row
+ * delta (covering-index, aggregate-residual); `delete-by-prefix` is the
+ * one-source-row → N-backing-rows primitive — see `docs/materialized-views.md`
+ * § Row-time refresh and `docs/incremental-maintenance.md` § prefix-delete.
  */
 export type MaintenanceOp =
 	| { kind: 'delete-key'; key: BTreeKeyForPrimary }
-	| { kind: 'upsert'; row: Row };
+	| { kind: 'upsert'; row: Row }
+	| { kind: 'delete-by-prefix'; keyPrefix: SqlValue[] };
 
 /**
  * The *effective* per-row change {@link MemoryTableManager.applyMaintenanceToLayer}
@@ -1303,13 +1311,19 @@ export class MemoryTableManager {
 	 * synchronous — so a multi-row statement's later rows observe earlier rows'
 	 * pending writes with no interleaving.
 	 *
-	 * Returns the **effective** changes it applied (one {@link BackingRowChange} per op
-	 * that mutated the layer): a `delete-key` that found a row → `delete`; an `upsert` →
-	 * `update` when it replaced an existing row, else `insert`. A `delete-key` for an
-	 * absent row produces nothing. The MV-over-MV cascade feeds these onward to MVs
-	 * reading this backing table (see `database-materialized-views.ts` § cascade).
+	 * Returns the **effective** changes it applied (one {@link BackingRowChange} per
+	 * backing row it mutated): a `delete-key` that found a row → `delete`; an `upsert` →
+	 * `update` when it replaced an existing row, else `insert`; a `delete-by-prefix` →
+	 * one `delete` per matched row. A `delete-key`/`delete-by-prefix` that matches
+	 * nothing produces nothing. The MV-over-MV cascade feeds these onward to MVs reading
+	 * this backing table (see `database-materialized-views.ts` § cascade).
+	 *
+	 * Async only because `delete-by-prefix` reuses the async layer scan to enumerate the
+	 * prefix slice; the point ops stay synchronous within the same pass, so a multi-row
+	 * statement's later rows still observe earlier rows' pending writes with no
+	 * interleaving (no await separates a single op's lookup from its record).
 	 */
-	applyMaintenanceToLayer(connection: MemoryTableConnection, ops: readonly MaintenanceOp[]): BackingRowChange[] {
+	async applyMaintenanceToLayer(connection: MemoryTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]> {
 		const changes: BackingRowChange[] = [];
 		if (ops.length === 0) return changes;
 		this.ensureTransactionLayer(connection);
@@ -1332,6 +1346,32 @@ export class MemoryTableManager {
 						? { op: 'update', oldRow: existing, newRow: op.row }
 						: { op: 'insert', newRow: op.row });
 					break;
+				}
+				case 'delete-by-prefix': {
+					// Range-scan the primary tree over the half-open interval whose leading
+					// PK columns equal `keyPrefix` (the btree orders by the composite PK,
+					// base-PK columns leading, so the slice is contiguous; `scanLayer`'s
+					// `equalityPrefix` seeks to it and early-terminates on prefix mismatch).
+					// Collect the matched rows first, THEN `recordDelete` each — the same
+					// per-row bookkeeping (secondary indexes, change tracking) the point
+					// `delete-key` arm uses, over a prefix range instead of a point.
+					// Collect-then-delete avoids mutating the tree mid-iteration.
+					const scanPlan: ScanPlan = { indexName: 'primary', descending: false, equalityPrefix: op.keyPrefix };
+					const matched: Array<{ key: BTreeKeyForPrimary; row: Row }> = [];
+					for await (const row of scanLayerImpl(layer, scanPlan)) {
+						matched.push({ key: this.primaryKeyFunctions.extractFromRow(row), row });
+					}
+					for (const { key, row } of matched) {
+						layer.recordDelete(key, row);
+						changes.push({ op: 'delete', oldRow: row });
+					}
+					break;
+				}
+				default: {
+					// A new MaintenanceOp must extend this switch; never-assignment makes
+					// that a compile error rather than a silent no-op.
+					const exhaustiveCheck: never = op;
+					throw new QuereusError(`Unknown maintenance op: ${JSON.stringify(exhaustiveCheck)}`, StatusCode.INTERNAL);
 				}
 			}
 		}

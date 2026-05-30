@@ -43,6 +43,7 @@ import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/s
 import { isAsyncIterable } from '../runtime/utils.js';
 import type { RuntimeContext } from '../runtime/types.js';
 import { AggregateNode } from '../planner/nodes/aggregate-node.js';
+import { TableFunctionCallNode } from '../planner/nodes/table-function-call.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
@@ -96,19 +97,19 @@ export interface MaterializedViewManagerContext {
  * A compiled per-MV maintenance plan — how {@link MaterializedViewManager.applyMaintenancePlan}
  * keeps an MV's backing table consistent with a source row-write. A tagged union over
  * the maintenance strategies the incremental substrate names (the spike's
- * `incremental-maintenance-substrate-spike` design). Today the builder
- * ({@link MaterializedViewManager.buildMaintenancePlan}) only ever produces the
- * `'inverse-projection'` arm — the shipped covering-index semantics, lifted here
- * byte-for-byte from the former private `RowTimeMaintenancePlan`. The other two arms
- * are reserved convergence points, **unreachable** until the cost gate
- * (`incremental-maintenance-cost-gate`) and general-bodies
- * (`materialized-view-rowtime-general-bodies`) tickets wire selection logic; routing
- * one through `applyMaintenancePlan` today trips a loud `INTERNAL` guard.
+ * `incremental-maintenance-substrate-spike` design). The builder
+ * ({@link MaterializedViewManager.buildMaintenancePlan}) produces three reachable arms:
+ * `'inverse-projection'` (the covering-index shape), `'residual-recompute'` (single-source
+ * aggregates), and `'prefix-delete'` (single-source lateral-TVF fan-out). The
+ * `'full-rebuild'` arm is a reserved convergence point, **unreachable** until the cost
+ * gate wires its selection logic; routing one through `applyMaintenancePlan` today trips a
+ * loud `INTERNAL` guard.
  */
 export type MaintenancePlan =
 	| InverseProjectionPlan
 	| FullRebuildPlan
-	| ResidualRecomputePlan;
+	| ResidualRecomputePlan
+	| PrefixDeletePlan;
 
 /**
  * The shipped covering-index maintenance arm (the former `RowTimeMaintenancePlan`,
@@ -223,6 +224,53 @@ export interface ResidualRecomputePlan extends MaintenancePlanCommon {
 	 *  `backingPkDefinition` order. The old backing slice's delete key for a changed row
 	 *  `R` is `buildPrimaryKeyFromValues(backingPkSourceCols.map(sc => R[sc]), backingPkDefinition)`. */
 	backingPkSourceCols: number[];
+}
+
+/**
+ * The single-source lateral-TVF fan-out arm: a body of the shape
+ * `select T.pk…, …, f.* from T cross join lateral tvf(<args over T>) f`, where each base
+ * row of `T` fans out to **N** backing rows (one per row the TVF emits for it). The
+ * backing PK is the **composite product key** `(T.pk ∪ tvf-key)` that
+ * `optimizer-keyed-cross-product-join-keys` advertises through `keysOf` over the lateral
+ * join, with the base PK as its **leading prefix** (asserted at build).
+ *
+ * Per changed base row, maintenance is: **delete the whole fan-out slice by base-PK
+ * prefix** (a `'delete-by-prefix'` {@link MaintenanceOp}, since one base row owns many
+ * backing rows sharing the prefix), then re-run the TVF fan-out **residual** for that base
+ * row and **upsert** each recomputed row. An UPDATE is delete-old-prefix + recompute-new
+ * (the base PK may move); a DELETE is delete-old-prefix with no recompute; an INSERT is
+ * recompute-and-upsert. This reuses the residual kernel of {@link ResidualRecomputePlan}
+ * unchanged — the affected-key derivation, the `injectKeyFilter` residual (pinned to the
+ * base `TableReferenceNode` with the `'pk'` prefix), reads-own-writes execution, the cost
+ * gate — and differs only in the **prefix** delete (vs point-key) and the **N-row**
+ * residual (vs ≤1). The body's WHERE, if any, is part of the residual (so an out-of-scope
+ * base row fans out to zero rows), exactly as in the aggregate arm.
+ *
+ * `chosenStrategy` is `'residual-recompute'` (the shared key-filtered re-execution cost
+ * shape — the fan-out factor is unknown at create); `kind` is `'prefix-delete'` (the
+ * apply-arm dispatcher). `degradeToRebuild` is dormant (as in the aggregate arm).
+ */
+export interface PrefixDeletePlan extends MaintenancePlanCommon {
+	readonly kind: 'prefix-delete';
+	/** Substrate parity (the base-PK 'row' binding); unread by the apply path, which uses
+	 *  `bindColumns` / `backingPrefixSourceCols`. */
+	binding: BindingMode;
+	degradeToRebuild: boolean;
+	/** Cached scheduler for the base-PK-keyed residual (the body with `injectKeyFilter`
+	 *  applied on `T`, `'pk'` prefix). Re-run per affected base key; fans out to N rows. */
+	residualScheduler: Scheduler;
+	bindParamPrefix: 'pk';
+	/** Source-`T` PK column indices (the base key). The affected key tuple is
+	 *  `bindColumns.map(c => changedRow[c])`, bound to `pk{i}`. */
+	bindColumns: number[];
+	/** Full backing-table physical primary key (base-PK prefix ++ TVF-key tail). */
+	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	/** Number of leading backing-PK columns that form the base-PK prefix (= `bindColumns.length`). */
+	basePrefixLength: number;
+	/** Source-`T` column projected into each leading (base-prefix) backing-PK column, in
+	 *  backing-PK order. The by-prefix delete key for a changed row `R` is
+	 *  `backingPrefixSourceCols.map(sc => R[sc])`. */
+	backingPrefixSourceCols: number[];
 }
 
 /**
@@ -415,9 +463,10 @@ export class MaterializedViewManager {
 	 * Dispatch a maintenance plan on its `kind`, compute the per-row backing delta,
 	 * apply it, and return the **effective** {@link BackingRowChange}(s) the backing
 	 * layer realized (so the cascade can drive this plan's own dependents). The builder
-	 * yields `'inverse-projection'` (covering-index shape) and `'residual-recompute'`
-	 * (single-source aggregate); the `'full-rebuild'` arm is still a loud `INTERNAL`
-	 * guard (unreachable until its selection is wired — see {@link MaintenancePlan}).
+	 * yields `'inverse-projection'` (covering-index shape), `'residual-recompute'`
+	 * (single-source aggregate), and `'prefix-delete'` (single-source lateral-TVF fan-out);
+	 * the `'full-rebuild'` arm is still a loud `INTERNAL` guard (unreachable until its
+	 * selection is wired — see {@link MaintenancePlan}).
 	 */
 	private async applyMaintenancePlan(
 		plan: MaintenancePlan,
@@ -429,6 +478,8 @@ export class MaterializedViewManager {
 				return this.applyInverseProjection(plan, change, cache);
 			case 'residual-recompute':
 				return this.applyResidualRecompute(plan, change, cache);
+			case 'prefix-delete':
+				return this.applyPrefixDelete(plan, change, cache);
 			case 'full-rebuild':
 				throw new QuereusError(
 					`materialized view '${plan.mv.name}': '${plan.kind}' maintenance is not yet wired `
@@ -598,19 +649,31 @@ export class MaterializedViewManager {
 		// eligibility checks below evaluate against the keyed backing schema unchanged.
 
 		// Structural rejections that hold for *every* maintenance shape. A window
-		// function reads across the partition, set ops / recursive CTEs / TVFs / row caps
-		// are out of the row-time model entirely. Joins are single-source-incompatible
-		// for the covering-index and aggregate arms; the 1:1 join arm (a follow-on ticket)
-		// lifts this one. Keep these exactly as they were.
+		// function reads across the partition, set ops / recursive CTEs / row caps are
+		// out of the row-time model entirely.
 		if (containsNodeType(analyzed, PlanNodeType.Window)) reject('its body uses a window function');
-		if (containsAnyJoin(analyzed)) reject('its body contains a join');
 		if (containsNodeType(analyzed, PlanNodeType.Distinct)) reject('its body uses DISTINCT');
 		if (containsNodeType(analyzed, PlanNodeType.SetOperation)) reject('its body uses a set operation (union/intersect/except)');
 		if (containsNodeType(analyzed, PlanNodeType.RecursiveCTE)) reject('its body uses a recursive CTE');
-		if (containsNodeType(analyzed, PlanNodeType.TableFunctionCall)) reject('its body calls a table-valued function');
 		if (mv.selectAst.type === 'select' && (mv.selectAst.limit !== undefined || mv.selectAst.offset !== undefined)) {
 			reject('its body uses LIMIT/OFFSET');
 		}
+
+		// Single base source `T` joined to ONE lateral table-valued function — a fan-out
+		// body (each base row produces N backing rows) → the prefix-delete arm. Routed
+		// here, *before* the generic join rejection below, because a lateral fan-out
+		// surfaces BOTH a Join and a TableFunctionCall. The source-count check above
+		// already rejected a TVF-only body (0 base refs) and a multi-base join (≥2 refs);
+		// the builder soundness-checks the rest of the shape (single TVF/join, advertised
+		// composite product key, base PK leading the backing PK, deterministic fan-out).
+		if (containsNodeType(analyzed, PlanNodeType.TableFunctionCall)) {
+			return this.buildLateralTvfPrefixDeletePlan(mv, analyzed, tableRef, sourceBase, reject);
+		}
+
+		// Joins are single-source-incompatible for the covering-index and aggregate arms;
+		// the lateral-TVF fan-out (above) is the only admitted join shape. A non-TVF
+		// lateral subquery join over `T` alone still rejects here.
+		if (containsAnyJoin(analyzed)) reject('its body contains a join');
 
 		// Single-source aggregate (`group by` over bare columns) → residual-recompute arm.
 		// Each changed source row belongs to exactly one group; maintaining the MV means
@@ -802,19 +865,8 @@ export class MaterializedViewManager {
 		// Transitive provenance: chase output-attr → producing ColumnReference chains
 		// (Project-over-Aggregate adds a hop the single-hop `resolveSourceCol` cannot
 		// follow) until landing on a T source column, or `undefined`.
-		const resolveToSourceCol = (attrId: number): number | undefined => {
-			const seen = new Set<number>();
-			let cur: number | undefined = attrId;
-			while (cur !== undefined && !seen.has(cur)) {
-				seen.add(cur);
-				const direct = sourceAttrToCol.get(cur);
-				if (direct !== undefined) return direct;
-				const expr = producingByAttrId.get(cur);
-				if (expr instanceof ColumnReferenceNode) { cur = expr.attributeId; continue; }
-				return undefined;
-			}
-			return undefined;
-		};
+		const resolveToSourceCol = (attrId: number): number | undefined =>
+			resolveTransitiveSourceCol(attrId, sourceAttrToCol, producingByAttrId);
 
 		// Each GROUP BY expression must be a bare source column (a computed group key has
 		// no source-column index to bind / key the backing on).
@@ -935,16 +987,22 @@ export class MaterializedViewManager {
 	}
 
 	/**
-	 * Execute the cached key-filtered residual for one affected key tuple, returning its
-	 * result rows (0 or 1 for the aggregate shape). Bound through a fresh
-	 * {@link RuntimeContext} on the live `db` so the residual's source scan reuses `T`'s
-	 * transaction connection and reads this statement's pending writes (reads-own-writes)
-	 * — the synchronous analogue of `database-assertions.ts:executeResidualPerTuple`.
+	 * Execute a cached key-filtered residual for one affected key tuple, returning its
+	 * result rows (0 or 1 for the aggregate shape; 0..N for the lateral-TVF fan-out shape).
+	 * Bound through a fresh {@link RuntimeContext} on the live `db` so the residual's source
+	 * scan reuses `T`'s transaction connection and reads this statement's pending writes
+	 * (reads-own-writes) — the synchronous analogue of
+	 * `database-assertions.ts:executeResidualPerTuple`. Shared by the residual-recompute
+	 * (`'gk'`) and prefix-delete (`'pk'`) arms.
 	 */
-	private async runResidual(plan: ResidualRecomputePlan, keyTuple: readonly SqlValue[]): Promise<Row[]> {
+	private async runResidual(
+		residualScheduler: Scheduler,
+		bindParamPrefix: 'gk' | 'pk',
+		keyTuple: readonly SqlValue[],
+	): Promise<Row[]> {
 		const params: Record<string, SqlValue> = {};
 		for (let i = 0; i < keyTuple.length; i++) {
-			params[`${plan.bindParamPrefix}${i}`] = keyTuple[i];
+			params[`${bindParamPrefix}${i}`] = keyTuple[i];
 		}
 		const rctx: RuntimeContext = {
 			db: this.ctx as unknown as Database,
@@ -954,7 +1012,7 @@ export class MaterializedViewManager {
 			tableContexts: wrapTableContextsStrict(new Map()),
 			enableMetrics: false,
 		};
-		const result = await plan.residualScheduler.run(rctx);
+		const result = await residualScheduler.run(rctx);
 		const rows: Row[] = [];
 		if (isAsyncIterable(result)) {
 			for await (const r of result as AsyncIterable<Row>) rows.push(r);
@@ -1003,7 +1061,7 @@ export class MaterializedViewManager {
 		const ops: MaintenanceOp[] = [];
 		for (const { keyTuple, keyVals, deleteKey } of affected.values()) {
 			ops.push({ kind: 'delete-key', key: deleteKey });
-			const recomputed = await this.runResidual(plan, keyTuple);
+			const recomputed = await this.runResidual(plan.residualScheduler, plan.bindParamPrefix, keyTuple);
 			// Upsert only the recomputed rows whose backing key equals the affected key.
 			// The residual for key K must only contribute K's slice; any other row is
 			// spurious and is dropped. This is the soundness net for an emptied group: when
@@ -1042,6 +1100,257 @@ export class MaterializedViewManager {
 		for (let i = 0; i < plan.backingPkDefinition.length; i++) {
 			const d = plan.backingPkDefinition[i];
 			if (compareSqlValues(row[d.index], keyVals[i], d.collation) !== 0) return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Build a `'prefix-delete'` plan for a single-source lateral-TVF fan-out body
+	 * (`select T.pk…, …, f.* from T cross join lateral tvf(<args over T>) f`), or throw via
+	 * `reject` with a shape diagnostic. The backing PK is the composite product key
+	 * `(T.pk ∪ tvf-key)` that `keysOf` advertises through the lateral join; the base PK is
+	 * its leading prefix. See {@link PrefixDeletePlan} and `docs/incremental-maintenance.md`
+	 * § prefix-delete.
+	 *
+	 * Soundness gates: exactly one lateral TVF and one join (no nested/multi TVF, no
+	 * aggregate over the fan-out); a deterministic TVF + deterministic operands (the
+	 * residual must reproduce the body); the base PK projected and forming the **leading
+	 * prefix** of the backing PK with a non-empty TVF-key tail (so each base row's fan-out
+	 * rows are individually addressable and a by-prefix delete selects exactly one base
+	 * row's slice). An `order by` over the fan-out that reorders the composite key so the
+	 * base PK no longer leads is rejected here (steered to a plain view). The body's WHERE,
+	 * if any, is part of the residual (so an out-of-scope base row fans out to zero rows),
+	 * exactly as in the aggregate arm — no separate predicate is compiled.
+	 */
+	private buildLateralTvfPrefixDeletePlan(
+		mv: MaterializedViewSchema,
+		analyzed: BlockNode,
+		tableRef: TableReferenceNode,
+		sourceBase: string,
+		reject: (detail: string) => never,
+	): MaintenancePlan {
+		// Exactly one lateral TVF and one join. A second base table is already rejected by
+		// the single-source check upstream; this rejects a second TVF / chained lateral
+		// join (`t join lateral tvf1 join lateral tvf2`).
+		if (countNodeType(analyzed, PlanNodeType.TableFunctionCall) !== 1) {
+			reject('its body calls more than one table-valued function (only a single lateral TVF fan-out is row-time maintainable)');
+		}
+		if (countJoins(analyzed) !== 1) {
+			reject('its body has more than one join over the lateral table-valued function (only a single base source joined to one lateral TVF is row-time maintainable)');
+		}
+		// An aggregate over the fan-out is a different shape — reject (the TVF route is taken
+		// before the aggregate route, so an `... group by` over a lateral TVF lands here).
+		if (findAggregate(analyzed)) {
+			reject('its body aggregates over a lateral table-valued function (not row-time maintainable in v1)');
+		}
+
+		// Determinism: a residual must reproduce exactly what `select <body>` returns, so a
+		// volatile TVF (or a volatile argument expression) is rejected.
+		const tvf = findTableFunctionCall(analyzed);
+		if (!tvf) {
+			// Unreachable — countNodeType(...) === 1 above guarantees one exists.
+			throw new QuereusError(`Internal error: lateral TVF node not found for materialized view '${mv.name}'`, StatusCode.INTERNAL);
+		}
+		if (tvf.physical.deterministic === false) {
+			reject(`it fans out through a non-deterministic table-valued function '${tvf.functionName}' (a row-time fan-out must be reproducible from the base row)`);
+		}
+		for (const operand of tvf.operands) {
+			const det = checkDeterministic(operand);
+			if (!det.valid) reject(`it passes a non-deterministic argument (${det.expression}) to the lateral table-valued function`);
+		}
+
+		// The lateral TVF must advertise a per-call key, so the composite product key is a
+		// real column key `(base PK ∪ TVF key)` rather than the all-columns / `isSet`
+		// fallback. Without one the fan-out rows are not individually addressable by a proper
+		// key — the by-prefix delete + keyed upsert would be unsound — so reject (steer to a
+		// plain view). `getType().keys` carries the validated advertisement (an out-of-range
+		// key advertisement is dropped, leaving this empty), so it is the authoritative
+		// "did the TVF advertise a usable key" signal.
+		if (tvf.getType().keys.length === 0) {
+			reject(`its lateral table-valued function '${tvf.functionName}' advertises no per-call key, so the fan-out rows are not individually addressable (use a plain view)`);
+		}
+
+		// Base T's PK source columns.
+		const sourceSchema = tableRef.tableSchema;
+		const sourcePkCols = sourceSchema.primaryKeyDefinition.map(d => d.index);
+		if (sourcePkCols.length === 0) reject(`its base source '${sourceBase}' has no primary key`);
+
+		// Backing table + its physical PK (the composite product key).
+		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+
+		// Map each output attribute to a base-T source column (or `undefined` for a TVF
+		// output column). T's attributes pass through the join unchanged, so a base-PK
+		// output column resolves to a T column while a TVF-key output column does not.
+		const sourceAttrToCol = new Map<number, number>();
+		tableRef.getAttributes().forEach((a, i) => sourceAttrToCol.set(a.id, i));
+		const producingByAttrId = collectProducingExprs(analyzed);
+		const rootAttrs = relationalAttributes(analyzed);
+		if (!rootAttrs) reject('its body produced no relational output');
+
+		// Prefix soundness: the LEADING `basePrefixLen` backing-PK columns must each
+		// project (transitively) a distinct base-T PK column, their set must equal the base
+		// PK, and there must be a non-empty TVF-key tail. So the base PK is the leading
+		// prefix of the composite product key and the by-prefix delete selects exactly one
+		// base row's fan-out.
+		const basePrefixLen = sourcePkCols.length;
+		if (backingPkDefinition.length <= basePrefixLen) {
+			// Defensive: with an advertised TVF key (checked above) the product key carries a
+			// non-empty tail; a degenerate composite that collapsed to the base PK alone is
+			// not addressable per fan-out row.
+			reject('its backing primary key has no fan-out tail beyond the base primary key (the composite product key did not form — use a plain view)');
+		}
+		const basePkSet = new Set(sourcePkCols);
+		const leadingSourceCols = new Set<number>();
+		const backingPrefixSourceCols: number[] = [];
+		for (let i = 0; i < basePrefixLen; i++) {
+			const d = backingPkDefinition[i];
+			const attr = rootAttrs![d.index];
+			const sc = attr ? resolveTransitiveSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
+			if (sc === undefined || !basePkSet.has(sc)) {
+				reject('its backing primary key does not lead with the base source primary key (the base PK must be the leading prefix of the composite product key — an `order by` over the fan-out that reorders it is not row-time maintainable)');
+			}
+			leadingSourceCols.add(sc!);
+			backingPrefixSourceCols.push(sc!);
+		}
+		if (leadingSourceCols.size !== basePkSet.size) {
+			reject('its backing primary key prefix does not cover the base source primary key');
+		}
+		// The TVF-key tail must NOT re-use a base-PK column — else the fan-out rows would
+		// not be distinguished and the "key" would be base-only (defensive: the product key
+		// places the TVF key, a distinct relation's columns, in the tail).
+		for (let i = basePrefixLen; i < backingPkDefinition.length; i++) {
+			const d = backingPkDefinition[i];
+			const attr = rootAttrs![d.index];
+			const sc = attr ? resolveTransitiveSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
+			if (sc !== undefined && basePkSet.has(sc)) {
+				reject('its backing primary key repeats a base primary-key column in the fan-out tail (the TVF key must distinguish fan-out rows)');
+			}
+		}
+
+		// Compile + cache the base-PK-keyed residual once (the body with `T.pk = :pk0 AND …`
+		// injected on T). Re-run per affected base key against the live transaction; it
+		// re-runs the lateral join + TVF for that single base row, fanning out to N rows.
+		const relKey = `${sourceBase}#${tableRef.id ?? 'unknown'}`;
+		const residualScheduler = this.compileResidual(analyzed, relKey, sourcePkCols, 'pk', reject);
+
+		// ── Cost gate ──
+		// The fan-out residual shares the residual-recompute cost shape (a key-filtered
+		// re-execution of the body); the fan-out factor (rows per base key) is not known at
+		// create, so we cost it as a residual and record the choice for substrate parity.
+		// The synchronous reject-at-create / degrade-to-rebuild machinery stays dormant, as
+		// it does for the other arms (a TVF whose fan-out is pathological is not detectable
+		// without fan-out stats — deferred with the fanning-keyed-join follow-up).
+		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
+		const hasPredicate = mv.selectAst.type === 'select' && mv.selectAst.where !== undefined;
+		const sourceStats = this.estimateMaintenanceStats(sourceSchema, backing.columns.length, hasPredicate);
+		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
+		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
+		if (chosenStrategy !== 'residual-recompute') {
+			throw new QuereusError(
+				`Internal error: cost gate selected unwired strategy '${chosenStrategy}' for materialized view '${mv.name}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		return {
+			kind: 'prefix-delete',
+			mv,
+			sourceBase,
+			backingSchema: mv.schemaName,
+			backingTableName: mv.backingTableName,
+			chosenStrategy,
+			sourceStats,
+			binding: { kind: 'row', keyColumns: [...sourcePkCols] },
+			degradeToRebuild: false,
+			residualScheduler,
+			bindParamPrefix: 'pk',
+			bindColumns: sourcePkCols,
+			backingPkDefinition,
+			basePrefixLength: basePrefixLen,
+			backingPrefixSourceCols,
+		};
+	}
+
+	/**
+	 * Compute a `'prefix-delete'` plan's per-row backing delta and apply it: derive the
+	 * affected base key(s) from the changed row (OLD ∪ NEW, deduped on the base key), and
+	 * for each — **delete the whole fan-out slice by base-PK prefix**, re-run the
+	 * base-PK-keyed residual against live source state, and **upsert** each recomputed
+	 * fan-out row. A base-PK-changing UPDATE recomputes both the OLD base key (slice
+	 * removed; residual returns nothing for the now-absent old PK) and the NEW base key
+	 * (new fan-out upserted); a DELETE removes the old slice with no recompute; an INSERT
+	 * recomputes-and-upserts (its prefix delete is a no-op). Returns the effective
+	 * {@link BackingRowChange}(s) the backing layer realized, for the MV-over-MV cascade.
+	 *
+	 * Structurally the same as {@link applyResidualRecompute}, differing only in the
+	 * **prefix** delete (one base row owns N backing rows sharing the prefix) and the
+	 * **N-row** residual. Per-row recompute is correct without per-statement batching: the
+	 * residual reads live (reads-own-writes) state, so the last write to a base key produces
+	 * the authoritative slice. (Statement-level dedup of distinct base keys is the same
+	 * affordability optimization deferred for the aggregate arm.)
+	 */
+	private async applyPrefixDelete(
+		plan: PrefixDeletePlan,
+		change: BackingRowChange,
+		cache?: BackingConnectionCache,
+	): Promise<BackingRowChange[]> {
+		// Distinct affected base keys (OLD ∪ NEW), deduped on the base-PK values. `keyTuple`
+		// binds the residual (`pk{i}`); `prefix` is the by-prefix delete key (the base-PK
+		// values in backing-PK order — identical here since the base PK leads the backing
+		// PK, but kept distinct for clarity).
+		const affected = new Map<string, { keyTuple: SqlValue[]; prefix: SqlValue[] }>();
+		const addFrom = (row: Row): void => {
+			const keyTuple = plan.bindColumns.map(c => row[c]);
+			const dedupKey = canonKeyValues(keyTuple);
+			if (affected.has(dedupKey)) return;
+			affected.set(dedupKey, { keyTuple, prefix: plan.backingPrefixSourceCols.map(sc => row[sc]) });
+		};
+		if (change.op === 'insert') addFrom(change.newRow);
+		else if (change.op === 'delete') addFrom(change.oldRow);
+		else { addFrom(change.oldRow); addFrom(change.newRow); }
+
+		const ops: MaintenanceOp[] = [];
+		for (const { keyTuple, prefix } of affected.values()) {
+			ops.push({ kind: 'delete-by-prefix', keyPrefix: prefix });
+			const recomputed = await this.runResidual(plan.residualScheduler, plan.bindParamPrefix, keyTuple);
+			// Upsert each recomputed fan-out row. The residual for base key K filters T to K,
+			// so every row it returns shares K's base-PK prefix; the prefix-match guard is a
+			// defensive soundness net (mirrors the aggregate arm's `residualRowMatchesKey`).
+			for (const row of recomputed) {
+				if (this.residualRowMatchesBasePrefix(plan, row, prefix)) ops.push({ kind: 'upsert', row });
+			}
+		}
+		if (ops.length === 0) return [];
+
+		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const manager = getBackingManager(backing);
+		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return manager.applyMaintenanceToLayer(connection, ops);
+	}
+
+	/**
+	 * True iff `row`'s **leading** (base-prefix) backing-PK columns equal `prefixVals` (the
+	 * affected base key, in backing-PK order), under each column's collation. Keeps only the
+	 * residual fan-out row(s) belonging to the recomputed base key — see
+	 * {@link applyPrefixDelete}.
+	 */
+	private residualRowMatchesBasePrefix(plan: PrefixDeletePlan, row: Row, prefixVals: readonly SqlValue[]): boolean {
+		for (let i = 0; i < plan.basePrefixLength; i++) {
+			const d = plan.backingPkDefinition[i];
+			if (compareSqlValues(row[d.index], prefixVals[i], d.collation) !== 0) return false;
 		}
 		return true;
 	}
@@ -1395,6 +1704,32 @@ function containsAnyJoin(node: PlanNode): boolean {
 	return false;
 }
 
+/** Count nodes of the given type (recursive `getChildren` walk). Used by the
+ *  lateral-TVF gate to reject nested/multiple TVFs. */
+function countNodeType(node: PlanNode, type: PlanNodeType): number {
+	let n = node.nodeType === type ? 1 : 0;
+	for (const child of node.getChildren()) n += countNodeType(child as unknown as PlanNode, type);
+	return n;
+}
+
+/** Count join nodes (logical + physical) in the plan — used to reject a chained
+ *  lateral join (the admitted lateral-TVF shape carries exactly one). */
+function countJoins(node: PlanNode): number {
+	let n = 0;
+	for (const t of JOIN_NODE_TYPES) n += countNodeType(node, t);
+	return n;
+}
+
+/** Find the first {@link TableFunctionCallNode} anywhere in the plan, or `undefined`. */
+function findTableFunctionCall(node: PlanNode): TableFunctionCallNode | undefined {
+	if (node instanceof TableFunctionCallNode) return node;
+	for (const child of node.getChildren()) {
+		const found = findTableFunctionCall(child as unknown as PlanNode);
+		if (found) return found;
+	}
+	return undefined;
+}
+
 /** Collect `relationKey → TableReferenceNode` over a plan. */
 function collectTableRefs(node: PlanNode, out = new Map<string, TableReferenceNode>()): Map<string, TableReferenceNode> {
 	if (node instanceof TableReferenceNode) {
@@ -1446,6 +1781,31 @@ function resolveSourceCol(
 	const expr = producingByAttrId.get(outAttrId);
 	if (expr instanceof ColumnReferenceNode) {
 		return sourceAttrToCol.get(expr.attributeId);
+	}
+	return undefined;
+}
+
+/**
+ * Transitive provenance: chase an output-attr → producing `ColumnReference` chain (a
+ * Project-over-Aggregate or a passthrough-through-Join adds a hop the single-hop
+ * {@link resolveSourceCol} cannot follow) until landing on a base-source column, or
+ * `undefined` (e.g. a TVF-output column with no base-source identity). Shared by the
+ * aggregate-residual and lateral-TVF arms.
+ */
+function resolveTransitiveSourceCol(
+	attrId: number,
+	sourceAttrToCol: Map<number, number>,
+	producingByAttrId: Map<number, ScalarPlanNode>,
+): number | undefined {
+	const seen = new Set<number>();
+	let cur: number | undefined = attrId;
+	while (cur !== undefined && !seen.has(cur)) {
+		seen.add(cur);
+		const direct = sourceAttrToCol.get(cur);
+		if (direct !== undefined) return direct;
+		const expr = producingByAttrId.get(cur);
+		if (expr instanceof ColumnReferenceNode) { cur = expr.attributeId; continue; }
+		return undefined;
 	}
 	return undefined;
 }

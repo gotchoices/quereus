@@ -194,6 +194,30 @@ Unlike the covering-index shape, this is maintained not by a pure projection but
 bounded **key-filtered residual** of the body (see
 [Maintenance § residual-recompute](#maintenance-row-time-per-statement)).
 
+A third eligible shape is the **single-source lateral-TVF fan-out**
+(`materialized-view-rowtime-prefix-delete-lateral-tvf`):
+
+- a **single** base source table `T` with a primary key, joined to **one lateral
+  table-valued function** whose arguments are per-row functions of `T`
+  (`select T.pk…, f.* from T cross join lateral tvf(<args over T>) f`) — so each base row
+  drives an independent fan-out of **N** rows; no second base table, no nested/multiple
+  TVF, no aggregate / `DISTINCT` / set-op / recursion over the fan-out;
+- a **deterministic** TVF (and deterministic argument expressions) — the residual must
+  reproduce exactly what `select <body>` returns;
+- the TVF **advertises a per-call key**, so the backing primary key is the **composite
+  product key** `(T.pk ∪ tvf-key)` that `keysOf` derives across the lateral join (the
+  base PK ∪ the TVF's own key, shifted) — a real column key, not the all-columns/`isSet`
+  fallback. A TVF that advertises no per-call key makes the fan-out rows individually
+  un-addressable and is rejected on *shape*;
+- the base PK is **projected** and is the **leading prefix** of the backing PK (an
+  `order by` over the fan-out that reorders the composite key so the base PK no longer
+  leads is rejected on *shape* — the by-prefix delete depends on the base PK leading).
+
+This is maintained by a **by-prefix delete** of the base row's whole fan-out slice plus a
+**re-fan residual** (see [Maintenance § prefix-delete](#maintenance-row-time-per-statement)):
+one base row owns many backing rows sharing the base-PK prefix, so the slice is replaced
+as a unit rather than a single point key.
+
 Any other body is **rejected at create** with a shape-specific diagnostic that
 names the unsupported feature and steers the user to a plain `view` (for live
 re-evaluation) or `create table … as <body>` (for a one-off snapshot). There is no
@@ -204,12 +228,14 @@ escape-hatch policy that accepts an ineligible body.
 > effectively unreachable for memory tables. The relevant create-time failure is
 > "projection drops a source PK column."
 
-Single-source aggregates (`group by` over bare columns) are now **accepted** (the
-residual-recompute shape above). The shapes still deferred to follow-on tickets —
-inner/cross-join row-preserving bodies (the 1:1-join residual arm,
-`materialized-view-rowtime-residual-join`) and lateral-TVF fan-out
-(`materialized-view-rowtime-prefix-delete-lateral-tvf`) — are rejected today; recursion
-and set operations are out of the row-time model entirely (no bounded per-write residual).
+Single-source aggregates (`group by` over bare columns) and single-source lateral-TVF
+fan-out are now **accepted** (the residual-recompute and prefix-delete shapes above). The
+shape still deferred to a follow-on ticket — a **fanning keyed join** (a non-1:1
+inner/cross join, the natural next consumer of the same by-prefix machinery: it shares the
+by-prefix delete + product key, differing only in that the "fan-out residual" is the join
+rather than a TVF) — is rejected today, as is the 1:1 row-preserving join arm
+(`materialized-view-rowtime-residual-join`). Recursion and set operations are out of the
+row-time model entirely (no bounded per-write residual).
 
 ## Query resolution
 
@@ -267,11 +293,12 @@ synchronously regardless of which boundary the write entered through.
 ## Maintenance (row-time, per-statement)
 
 For each materialized view the manager caches a `MaintenancePlan`, keyed by source
-base, and dispatches on its `kind`. Two arms are wired today: `'inverse-projection'`
-(the covering-index shape) and `'residual-recompute'` (single-source aggregates). The
-union's `'full-rebuild'` arm remains reserved for the cost gate
-(`incremental-maintenance-cost-gate`) and is unreachable today. The correctness oracle
-for both arms is the maintenance-equivalence property harness
+base, and dispatches on its `kind`. Three arms are wired today: `'inverse-projection'`
+(the covering-index shape), `'residual-recompute'` (single-source aggregates), and
+`'prefix-delete'` (single-source lateral-TVF fan-out). The union's `'full-rebuild'` arm
+remains reserved for the cost gate (`incremental-maintenance-cost-gate`) and is
+unreachable today. The correctness oracle for these arms is the maintenance-equivalence
+property harness
 (`test/incremental/maintenance-equivalence.spec.ts`): for every eligible body shape it
 asserts `read(MV) == evaluate(body)` after each random source mutation and after
 rollback.
@@ -333,6 +360,41 @@ authoritative row. Batching/dedup of distinct affected keys across a whole state
 the cost gate's runtime `degradeToRebuild`) is an affordability optimization deferred with
 the statement-flush boundary — the per-statement batching that shipped is connection-
 resolution caching only, not op-buffering.
+
+### `'prefix-delete'` (single-source lateral-TVF fan-out shape)
+
+When the body fans a single base row out through a lateral table-valued function, one
+base row owns **N** backing rows that all share the **base-PK prefix** of the composite
+product key `(T.pk ∪ tvf-key)`. So this arm replaces a **prefix-keyed slice** (vs the
+point-keyed slice the residual-recompute arm replaces): the per-source-change delta is a
+**by-prefix delete** of the base row's whole fan-out plus a **re-fan residual**. It reuses
+the residual kernel of the aggregate arm unchanged — the affected-key derivation, the
+`injectKeyFilter` residual (pinned to the base `TableReferenceNode` with the **`'pk'`**
+prefix, compiled + cached once), reads-own-writes execution, the cost gate — and differs
+only in the prefix delete (vs a point key) and the **N-row** residual (vs ≤1).
+
+| source op | affected base key(s) | maintenance |
+|---|---|---|
+| insert `r` | NEW base PK of `r` | delete-by-prefix (no-op, no prior slice); run the residual bound to the base key; upsert each fanned row |
+| delete `r` | OLD base PK of `r` | delete-by-prefix the whole slice; run residual (zero rows, base row gone → no upsert) |
+| update `old→new` | OLD ∪ NEW base PK (deduped) | per affected base key: delete-by-prefix; run residual; upsert each fanned row |
+
+A base-PK-changing UPDATE moves the whole prefix — the OLD base key's slice is deleted
+(its residual returns nothing) and the NEW base key's fan-out is re-computed and upserted.
+The body's `WHERE`, if any, is part of the residual, so an out-of-scope base row fans out
+to zero rows (the delete-without-upsert removes its slice) — predicate-scope transitions
+need no separate predicate. The by-prefix delete is the `'delete-by-prefix'`
+`MaintenanceOp`: a range-scan of the backing primary btree over the half-open interval
+whose leading columns equal the base PK (the btree orders by the composite PK, base PK
+leading, so the slice is contiguous), `recordDelete`-ing each matched row with the same
+bookkeeping the point `delete-key` op uses. As with the aggregate arm, per-row recompute
+is correct without per-statement batching (the residual reads live state, so the last
+write to a base key wins), and statement-level dedup is the same deferred optimization.
+
+The natural next consumer of this same machinery is a **fanning keyed join** (a non-1:1
+inner/cross join): it shares the by-prefix delete + composite product key, differing only
+in that the "fan-out residual" is the join rather than a TVF. It is deferred to a
+follow-on ticket.
 
 ### MV-over-MV cascade
 
@@ -739,12 +801,15 @@ The following extensions build on this substrate:
 - **Row-time general bodies** — extend the eligibility gate beyond the covering-index
   shape to bodies maintained by a bounded key-filtered residual. **Single-source
   aggregates** (`group by` over bare columns) are **delivered**
-  (`materialized-view-rowtime-residual-recompute`, the `'residual-recompute'` arm). The
-  remaining shapes — **inner/cross-join row-preserving (1:1) bodies**
+  (`materialized-view-rowtime-residual-recompute`, the `'residual-recompute'` arm), and
+  **single-source lateral-TVF fan-out** is **delivered**
+  (`materialized-view-rowtime-prefix-delete-lateral-tvf`, the `'prefix-delete'` arm: a
+  by-prefix delete of the base row's fan-out + a re-fan residual, keyed by the composite
+  product key). The remaining shapes — **inner/cross-join row-preserving (1:1) bodies**
   (`materialized-view-rowtime-residual-join`, reusing the residual primitive with a
-  `'row'`/`'pk'` binding) and **lateral-TVF fan-out**
-  (`materialized-view-rowtime-prefix-delete-lateral-tvf`, the by-prefix delete) — are
-  rejected today.
+  `'row'`/`'pk'` binding) and a **fanning keyed join** (a non-1:1 inner/cross join that
+  reuses the prefix-delete by-prefix machinery, the join standing in for the TVF fan-out)
+  — are rejected today.
 - **Concurrent refresh** (`materialized-view-concurrent-refresh`) — overlapping
   refreshes and refresh-while-read beyond today's atomic base-layer swap.
 - **Write-through DML** — **delivered** (`materialized-view-dml-write-through`): DML

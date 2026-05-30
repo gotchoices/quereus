@@ -51,10 +51,10 @@ covering structure answers it.
 > uniformly. (`incremental-maintenance-plan-abstraction` landed the first step of the
 > fold: `applyRowTimeChange` is now `applyMaintenancePlan`, which dispatches on
 > `MaintenancePlan.kind`; the cascade flow is unchanged: `applyMaintenancePlan` →
-> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Two arms are
-> wired today: `'inverse-projection'` (the covering-index shape) and
-> `'residual-recompute'` (single-source aggregates, below). Both are gated by the
-> maintenance-equivalence property harness
+> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Three arms are
+> wired today: `'inverse-projection'` (the covering-index shape), `'residual-recompute'`
+> (single-source aggregates, below), and `'prefix-delete'` (single-source lateral-TVF
+> fan-out, below). All are gated by the maintenance-equivalence property harness
 > `test/incremental/maintenance-equivalence.spec.ts`.)
 >
 > **The `'residual-recompute'` arm — the synchronous analogue of the assertion
@@ -77,6 +77,39 @@ covering structure answers it.
 > batching — every change to a group recomputes it from live state, so the last write
 > wins. (The 1:1 row-preserving join shape reuses this same kernel with a `'row'`/`'pk'`
 > binding in a follow-on ticket.)
+>
+> **The `'prefix-delete'` arm — point-keyed vs prefix-keyed slice replacement.** A
+> single-source lateral-TVF fan-out body (`select T.pk…, f.* from T cross join lateral
+> tvf(<args over T>) f`) fans each base row out to **N** backing rows. The residual-
+> recompute arm replaces a **point-keyed** slice — one group / one 1:1 row, deleted by a
+> single backing key (`'delete-key'`). The lateral-TVF arm replaces a **prefix-keyed**
+> slice of unknown cardinality — a base row's whole fan-out, every backing row whose
+> leading PK columns equal the base PK — so it needs (1) a **by-prefix delete** primitive
+> the point arm lacks and (2) an N-row residual whose rows all share the base-PK prefix but
+> are distinguished by the TVF-key tail. Everything else is the residual kernel above,
+> consumed unchanged: the affected-key derivation (here the base PK), the
+> `injectKeyFilter(body, T, basePkColumns, 'pk')` residual pinned to the base
+> `TableReferenceNode`, the per-statement batched accumulator, the cost gate, reads-own-
+> writes execution. The backing PK is the **composite product key** `(T.pk ∪ tvf-key)`
+> that `keysOf` advertises across the lateral join (`optimizer-keyed-cross-product-join-
+> keys`), with the base PK as its leading prefix (asserted at build). Per source change:
+> delete-by-prefix the OLD base PK's whole slice, re-run the residual for the NEW base PK,
+> upsert each fanned row (a base-PK-changing UPDATE processes both, OLD ∪ NEW deduped); the
+> body's WHERE is part of the residual, so an out-of-scope base row fans out to zero rows.
+> (The natural next consumer is a **fanning keyed join** — a non-1:1 inner/cross join — that
+> reuses this same by-prefix delete + product key, the join standing in for the TVF fan-out;
+> deferred to a follow-on ticket.)
+>
+> **The re-added `delete-by-prefix` `MaintenanceOp`.** The row-time consolidation had
+> removed an old by-prefix delete op; the prefix-delete arm re-introduces it on the shared
+> substrate. `applyMaintenanceToLayer` (`vtab/memory/layer/manager.ts`) gains a
+> `'delete-by-prefix'` arm: it range-scans the backing primary btree over the half-open
+> interval whose leading columns equal `keyPrefix` (the btree is ordered by the composite
+> PK, base-PK columns leading, so the slice is contiguous and the scan seeks to it and
+> early-terminates on a prefix mismatch), then `recordDelete`s each matched row with the
+> **same** per-row bookkeeping (secondary indexes, change tracking) the point `delete-key`
+> arm uses. The op is therefore the prefix-keyed analogue of `delete-key` — one base row's
+> fan-out replaced as a unit.
 
 ## Pipeline at a glance
 

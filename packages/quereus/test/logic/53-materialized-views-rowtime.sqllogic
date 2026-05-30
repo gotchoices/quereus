@@ -231,6 +231,13 @@ create materialized view bad_nondet as select id, random() as r from g;
 create materialized view bad_subq as select id, (select g.v) as vv from g;
 -- error: containing a subquery
 
+-- Lateral-TVF fan-out whose `order by` reorders the composite product key so the base PK
+-- no longer leads it — the by-prefix delete would be unsound, so it is rejected on SHAPE.
+-- (A lateral TVF that advertises NO per-call key is likewise rejected on shape; that case
+-- needs a custom keyless TVF and is covered in materialized-view-diagnostics.spec.ts.)
+create materialized view bad_lateral_order as select g.id, f.value from g cross join lateral generate_series(1, g.v) f order by f.value;
+-- error: does not lead with the base source primary key
+
 -- ===================================
 -- 8. MV-over-MV cascade. A materialized view whose source is itself another MV's
 --    backing table is accepted: `building/select.ts` rewrites the inner-MV reference
@@ -970,3 +977,73 @@ select k, s from ags_down order by k;
 delete from ags where k = 2;
 select k, s from ags_down order by k;
 → [{"k":1,"s":22}]
+
+-- ===================================
+-- 23. Single-source lateral-TVF fan-out bodies (`select T.pk…, f.* from T cross join
+--     lateral tvf(<args over T>) f`) — the prefix-delete arm. Each base row fans out to N
+--     backing rows keyed by the composite product key (base PK ∪ TVF key). Per source
+--     write, the base row's WHOLE fan-out slice is deleted by base-PK prefix and re-fanned
+--     from live state; an INSERT adds a slice, a base-PK-changing UPDATE moves the whole
+--     prefix, a DELETE removes the slice. (materialized-view-rowtime-prefix-delete-lateral-tvf)
+-- ===================================
+
+create table lt (id integer primary key, x integer);
+insert into lt values (1, 2), (2, 3), (3, 0);
+create materialized view lt_fan as select lt.id, lt.x, f.value from lt cross join lateral generate_series(1, lt.x) f;
+
+-- MV equals the body at create time: id=1 → {1,2}, id=2 → {1,2,3}, id=3 (x=0) → empty.
+select id, value from lt_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
+
+-- INSERT adds a new base row's whole fan-out slice.
+insert into lt values (4, 2);
+select id, value from lt_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3},{"id":4,"value":1},{"id":4,"value":2}]
+
+-- UPDATE that GROWS the fan-out (x: 2 → 4): old slice deleted, new fan-out upserted.
+update lt set x = 4 where id = 1;
+select id, value from lt_fan where id = 1 order by value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":1,"value":3},{"id":1,"value":4}]
+
+-- UPDATE that SHRINKS the fan-out (x: 3 → 1): stale tail rows removed by the prefix delete.
+update lt set x = 1 where id = 2;
+select id, value from lt_fan where id = 2 order by value;
+→ [{"id":2,"value":1}]
+
+-- Base-PK-changing UPDATE moves the WHOLE prefix (id 4 → 7): old prefix gone, new fanned.
+update lt set id = 7 where id = 4;
+select id, value from lt_fan where id in (4, 7) order by id, value;
+→ [{"id":7,"value":1},{"id":7,"value":2}]
+
+-- DELETE removes the whole fan-out slice.
+delete from lt where id = 1;
+select id, value from lt_fan where id = 1 order by value;
+→ []
+
+-- Mid-transaction visibility + rollback reverts the slice in lockstep (reads-own-writes).
+begin;
+insert into lt values (9, 3);
+select id, value from lt_fan where id = 9 order by value;
+→ [{"id":9,"value":1},{"id":9,"value":2},{"id":9,"value":3}]
+rollback;
+select id, value from lt_fan where id = 9 order by value;
+→ []
+
+-- An out-of-scope base row (partial WHERE) fans out to zero rows; a scope transition
+-- re-fans it. The body's WHERE is part of the residual, so maintenance tracks it.
+create table ltw (id integer primary key, x integer, k integer);
+insert into ltw values (1, 2, 9), (2, 3, 1);
+create materialized view ltw_fan as select ltw.id, g.value from ltw cross join lateral generate_series(1, ltw.x) g where ltw.k > 5;
+-- only id=1 (k=9 > 5) is in scope at create.
+select id, value from ltw_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2}]
+
+-- id=2 enters scope (k: 1 → 7): its fan-out appears.
+update ltw set k = 7 where id = 2;
+select id, value from ltw_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
+
+-- id=1 leaves scope (k: 9 → 2): its whole fan-out slice disappears.
+update ltw set k = 2 where id = 1;
+select id, value from ltw_fan order by id, value;
+→ [{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]

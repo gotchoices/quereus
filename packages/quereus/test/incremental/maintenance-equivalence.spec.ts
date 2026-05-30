@@ -23,9 +23,10 @@ import { StatusCode, type SqlValue } from '../../src/common/types.js';
  * against; new body shapes are admitted only once they stay green here. Runs under
  * `yarn test` (Mocha + ts-node/esm), no separate config.
  *
- * Shapes NOT covered here (future tickets extend the harness): aggregates / joins /
- * lateral TVFs (the `'residual-recompute'` arm, not yet wired) and MV-over-MV chains
- * (the cascade ticket extends the harness to chain assertions).
+ * Shape sets covered: covering-index (`'inverse-projection'`), single-source aggregate
+ * (`'residual-recompute'`), and single-source lateral-TVF fan-out (`'prefix-delete'`).
+ * Shapes NOT covered here (future tickets extend the harness): fanning keyed joins and
+ * MV-over-MV chains over these arms.
  */
 
 /** An eligible covering-index body shape: its defining SELECT is both the MV body and
@@ -201,8 +202,28 @@ function defineEquivalenceSuite(suiteTitle: string, shapes: readonly BodyShape[]
 	});
 }
 
+/**
+ * Single-source lateral-TVF fan-out body shapes (`select T.pk…, …, f.value from T cross
+ * join lateral generate_series(1, <col>) f`) maintained by the `'prefix-delete'` arm. Each
+ * base row fans out to `<col>` rows keyed by the generated `value`; the backing PK is the
+ * composite product key `(id, value)`. The shared `mutationArb` drives every case: `insert`
+ * adds a base row's whole fan-out; `update` rewrites `a`/`k`, growing/shrinking the fan-out
+ * (and moving rows across the `k > 5` partial-WHERE scope); `updateKey` rewrites the base PK
+ * `id`, moving the entire prefix (the by-prefix delete of the OLD prefix + recompute of the
+ * NEW); `delete` (plus collisions) removes a slice. `generate_series(1, n)` for `n ≤ 0`
+ * yields zero rows — a base row with `a`/`k` ≤ 0, or out of the WHERE scope, contributes no
+ * backing rows, so the oracle and the maintained backing must agree on the empty fan-out.
+ */
+const LATERAL_TVF_SHAPES: readonly BodyShape[] = [
+	{ label: 'lateral generate_series fan-out (PK + fan-out value)', body: 'select src.id, f.value from src cross join lateral generate_series(1, src.a) f' },
+	{ label: 'lateral fan-out + passthrough columns (id, a, k, value)', body: 'select src.id, src.a, src.k, f.value from src cross join lateral generate_series(1, src.a) f' },
+	{ label: 'lateral fan-out + partial WHERE k>5 (scope transitions on/off)', body: 'select src.id, f.value from src cross join lateral generate_series(1, src.a) f where src.k > 5' },
+	{ label: 'lateral fan-out driven by k (column other than a)', body: 'select src.id, f.value from src cross join lateral generate_series(1, src.k) f' },
+];
+
 defineEquivalenceSuite('Materialized-view maintenance equivalence (covering-index shapes)', SHAPES);
 defineEquivalenceSuite('Materialized-view maintenance equivalence (single-source aggregate shapes)', AGGREGATE_SHAPES);
+defineEquivalenceSuite('Materialized-view maintenance equivalence (lateral-TVF fan-out shapes)', LATERAL_TVF_SHAPES);
 
 /** Minimal reach into the manager's private plan map so a stubbed-arm plan can be
  *  routed through the real DML maintenance path. The map key is lowercase
