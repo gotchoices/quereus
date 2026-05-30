@@ -159,6 +159,34 @@ describe('lens prover: obligation classification', () => {
 			await db.close();
 		}
 	});
+
+	it('enforced-set-level commit-time — a reconstructible PK the basis does not prove (set-level, not read-only)', async () => {
+		const db = new Database();
+		try {
+			// Basis keys on `id`; the logical table re-keys on `code`, a plain
+			// (reconstructible) basis column the basis does not guarantee unique. The PK
+			// is therefore neither `proved` nor read-only — it routes to a set-level
+			// existence check, exercising the PK (not just unique) set-level path and the
+			// no-backing-index advisory labelled for a primary key.
+			await db.exec('declare schema y { table t (id integer primary key, code text) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (code text primary key, id integer) }');
+			await db.exec('apply schema x');
+
+			const s = slot(db, 't');
+			expect(s.readOnly ?? false, 'reconstructible PK ⇒ writable').to.equal(false);
+			const pk = findObligation(s, 'primaryKey');
+			expect(pk.kind).to.equal('enforced-set-level');
+			expect(pk.kind === 'enforced-set-level' && pk.mode).to.equal('commit-time');
+
+			const warns = report(db).warnings.filter(w => w.code === 'lens.no-backing-index');
+			expect(warns.length, 'one no-backing-index advisory for the PK').to.equal(1);
+			expect(warns[0].site.constraint, 'advisory sited on the primary key').to.match(/primary key/);
+			expect(warns[0].fingerprintInputs?.constraintColumns).to.deep.equal(['code']);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens prover: blocking errors', () => {
@@ -208,6 +236,24 @@ describe('lens prover: blocking errors', () => {
 			await db.exec('declare logical schema x { table m (id integer primary key, doubled integer, constraint pos check (doubled >= 0)) }');
 			await db.exec('declare lens for x over y { view m as select id, v * 2 as doubled from y.src }');
 			await expectThrows(() => db.exec('apply schema x'), /lens\.unrealizable-constraint|no write path|computed/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('aggregates every blocking error into one atomic deploy failure (no catalog mutation)', async () => {
+		const db = new Database();
+		try {
+			// Two independent type mismatches (`a`, `b` both int-over-text) must both be
+			// reported in a single aggregated error — the deploy blocks atomically before
+			// any catalog mutation, so the prior (absent) lens state is untouched.
+			await db.exec('declare schema y { table t (a text primary key, b text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (a integer primary key, b integer null) }');
+			await expectThrows(() => db.exec('apply schema x'), /blocked by 2 error\(s\)/);
+
+			// Atomicity: a blocked deploy leaves no deploy report behind.
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
 		} finally {
 			await db.close();
 		}

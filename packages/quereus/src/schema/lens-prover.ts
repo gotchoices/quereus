@@ -24,9 +24,11 @@ const log = createLogger('schema:lens-prover');
  * What it cannot prove, it reports — it never silently assumes coverage.
  *
  * Two outputs per slot ({@link LensProveResult}):
- *  - **diagnostics** — five errors (any one blocks the deploy) + three warnings
- *    (advisory, surfaced in the deploy report). See `docs/lens.md` § Coverage
- *    checklist.
+ *  - **diagnostics** — five errors (any one blocks the deploy) + four
+ *    warning-severity diagnostics that flow to the deploy report: three pure
+ *    advisories (no-backing-index / no-answering-structure / partial-override)
+ *    plus the read-only verdict (`pk-not-reconstructible`). See `docs/lens.md`
+ *    § Coverage checklist.
  *  - **obligations + readOnly** — per-constraint enforcement classification and
  *    the writable-or-read-only verdict, recorded on the {@link LensSlot}. The
  *    *live* per-write enforcement wiring (row-local check pipeline, set-level
@@ -222,8 +224,7 @@ function buildProveContext(slot: LensSlot, db: Database): ProveContext {
  */
 function planBody(db: Database, body: AST.SelectStmt): RelationalPlanNode | undefined {
 	try {
-		const plan = db.getPlan(astToString(body)) as unknown as { getRelations(): readonly RelationalPlanNode[] };
-		return plan.getRelations()[0];
+		return db.getPlan(astToString(body)).getRelations()[0];
 	} catch (e) {
 		log('lens-prover: body failed to plan, skipping plan-derived checks: %O', e);
 		return undefined;
