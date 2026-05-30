@@ -303,6 +303,47 @@ describe('lens overrides: body-shape validation', () => {
 			await db.close();
 		}
 	});
+
+	// Defect 5, join arm: the FROM walk descends both legs, so a cross-basis leg
+	// inside a join is rejected too (not only a single top-level table source).
+	it('errors on a cross-basis leg inside a join', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare schema z { table Extra { id integer primary key, note text } }');
+			await db.exec('apply schema z');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select c.id, c.speed from y.CarCore c join z.Extra e on e.id = c.id }');
+			await expectThrows(() => db.exec('apply schema x'), /outside the declared basis|references basis relation 'z/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 3 guard must NOT over-reject: a computed projection term that *is*
+	// aliased maps to a logical column, and an uncovered logical column is still
+	// gap-filled from the basis. This pins the boundary so a future tightening of
+	// the unaliased-term check cannot silently start rejecting valid bodies.
+	it('accepts an aliased computed term alongside gap-fill', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer, fast integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed * 2 as fast from y.CarCore }');
+			// `id`+`fast` covered by the override; `speed` gap-filled from y.CarCore.
+			await db.exec('apply schema x');
+			const cols = await rows(db, "select logical_column, source from quereus_effective_lens('x', 'Car') order by logical_column");
+			expect(cols).to.deep.equal([
+				{ logical_column: 'fast', source: 'override' },
+				{ logical_column: 'id', source: 'override' },
+				{ logical_column: 'speed', source: 'default' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens overrides: quereus_effective_lens', () => {

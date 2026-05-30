@@ -117,7 +117,7 @@ The v1 merger composes one effective body by replacing **only the top SELECT's p
 
 - **The body must be a single `SELECT`.** Compound set-operations (`union` / `union all` / `intersect` / `except`) and `values (...)` bodies are rejected at parse time — the merger would compose only the top leg and keep the rest verbatim.
 - **A computed projection term must be aliased.** An unaliased non-column term (e.g. `select id, speed * 2 from …`) maps to no logical column; it is rejected (naming the term) rather than dropped and gap-filled.
-- **Override `FROM` sources must live in the declared basis.** A table qualified with a *different* existing schema (e.g. `from Z.Foo` while the lens is `over Y`) would silently re-anchor the body to `Z`; it is rejected. Unqualified tables (default to the basis) and tables qualified with the basis name are fine, including cross-table joins *within* the basis.
+- **Override `FROM` sources must live in the declared basis.** A `table` source (including each leg of a join) qualified with a *different* existing schema (e.g. `from Z.Foo` while the lens is `over Y`) would silently re-anchor the body to `Z`; it is rejected. Unqualified tables (default to the basis) and tables qualified with the basis name are fine, including cross-table joins *within* the basis. *Known gap:* the v1 check only walks top-level `table`/`join` sources — a cross-basis table buried inside a **subquery source** (`from (select * from Z.Foo)`) is not yet caught when the override covers every logical column (no gap-fill to trip the basis-reachability error). Tracked for hardening.
 
 #### Gap-fill fidelity boundary (error, don't guess)
 

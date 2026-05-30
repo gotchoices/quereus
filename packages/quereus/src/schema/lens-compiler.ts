@@ -782,10 +782,17 @@ function collectOverrideSources(
  * resolves to the declared basis schema. A table qualified with a *different*
  * existing schema would otherwise bind there silently (re-anchoring the lens off
  * its `over Y` basis); reject it at deploy time. Unqualified tables default to
- * the basis and are fine; tables qualified with the basis name are fine; opaque
- * sources (subquery / function) are not introspectable and are left to the
- * existing gap-fill error path. Mirrors `collectOverrideSources`'s FROM walk but
- * does not share it (that helper is also used where re-anchoring is allowed).
+ * the basis and are fine; tables qualified with the basis name are fine.
+ *
+ * KNOWN GAP: opaque sources (subquery / function) are not descended into, so a
+ * cross-basis table hidden inside a subquery FROM (e.g.
+ * `from (select * from z.Foo)`) is NOT caught here. The gap-fill error path only
+ * catches it when some logical column is left uncovered; a subquery override that
+ * covers every logical column explicitly still re-anchors silently. Closing this
+ * requires walking nested subquery FROM trees (and excluding their CTE names) —
+ * tracked by `lens-override-subquery-cross-basis`. Mirrors
+ * `collectOverrideSources`'s FROM walk but does not share it (that helper is also
+ * used where re-anchoring is allowed).
  */
 function validateOverrideBasisSources(
 	from: ReadonlyArray<AST.FromClause> | undefined,
