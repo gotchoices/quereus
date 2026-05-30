@@ -92,3 +92,111 @@ describe('Materialized view create-time gate diagnostic', () => {
 		expect(db.schemaManager.getMaterializedView('main', 'mv_status'), 'MV registered after rollback').to.not.be.undefined;
 	});
 });
+
+/**
+ * Per-reason gate diagnostics. The sqllogic harness (§7) pins one distinctive tail
+ * per case, but it cannot ergonomically express the *check-ordering* subtleties:
+ * the `tableRefs.length` checks run first, so a multi-table UNION reports a
+ * source-count reason (not "set operation") and a recursive-CTE-only / TVF-only
+ * body reports "reads no source table". These cases lock the literal tails the
+ * `buildRowTimePlan` rejects actually produce (captured from the engine), so a
+ * reason silently re-routing to a different branch is caught.
+ *
+ * NOTE: the "set operation (union/intersect/except)", "recursive CTE", "calls a
+ * table-valued function", "has no primary key", and "WHERE not evaluable" reject
+ * branches are NOT reachable from a clean single-source SQL body — an earlier
+ * source-count check (≥2 refs for any union/join/subquery-source; 0 refs for a
+ * CTE-only / TVF-only body) fires first, and every base table is keyed. They
+ * remain as defensive guards. See the row-time-test-coverage review handoff.
+ */
+describe('Materialized view gate diagnostic — per-reason tails', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec(`
+			create table g (id integer primary key, k integer, v integer);
+			create table g2 (id integer primary key, w integer);
+			insert into g values (1, 100, 5);
+		`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	async function captureError(sql: string): Promise<Error> {
+		try {
+			await db.exec(sql);
+		} catch (e) {
+			return e instanceof Error ? e : new Error(String(e));
+		}
+		throw new Error(`Expected an error from: ${sql}`);
+	}
+
+	// label → [body, distinctive tail substring]
+	const cases: Array<[string, string, string]> = [
+		['aggregate', 'select k, sum(v) as sv from g group by k', 'its body uses an aggregate'],
+		['join (multi-source)', 'select g.id, g.v from g join g2 on g.id = g2.id', 'its body reads more than one source table (joins are not supported)'],
+		['self-join (multi-source)', 'select a.id, a.v from g a join g b on a.id = b.id', 'its body reads more than one source table (joins are not supported)'],
+		['union over two tables (multi-source, NOT set-op)', 'select id, v from g union select id, w from g2', 'its body reads more than one source table (joins are not supported)'],
+		['WHERE subquery over another table (multi-source)', 'select id, v from g where v in (select w from g2)', 'its body reads more than one source table (joins are not supported)'],
+		['DISTINCT (single source)', 'select distinct v from g', 'its body uses DISTINCT'],
+		['LIMIT', 'select id, v from g limit 10', 'its body uses LIMIT/OFFSET'],
+		['OFFSET', 'select id, v from g order by id limit 5 offset 2', 'its body uses LIMIT/OFFSET'],
+		['recursive-CTE-only (reads no base table)', 'with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r', 'its body reads no source table'],
+		['drops a source PK column', 'select v from g', "it does not project source primary-key column 'id'"],
+		['computed/expression column', 'select id, v + 1 as v1 from g', 'it projects a computed/expression column'],
+	];
+
+	for (const [label, body, tail] of cases) {
+		it(`rejects ${label} with its distinctive tail`, async () => {
+			const err = await captureError(`create materialized view bad as ${body};`);
+			expect(err.message, label).to.contain('cannot be materialized');
+			expect(err.message, `${label}: distinctive tail`).to.contain(tail);
+		});
+	}
+
+	it('rejects a materialized view over a materialized view with the MV-over-MV tail', async () => {
+		await db.exec('create materialized view mv_base as select id, v from g;');
+		const err = await captureError('create materialized view mv_over as select id, v from mv_base;');
+		expect(err.message).to.contain('cannot be materialized');
+		expect(err.message).to.contain('materialized views over materialized views are not yet supported');
+		// Never leaks the hidden backing-table name to the user.
+		expect(err.message).to.not.contain('_mv_mv_over');
+	});
+});
+
+/**
+ * The `with refresh = …` clause is gone entirely (every MV is row-time maintained,
+ * with no policy knob). The parser consumes only a trailing `with tags (...)`, so a
+ * trailing `with refresh = …` is left unconsumed and fails at the statement
+ * boundary — a parse error, regardless of the literal value (the clause is never
+ * inspected). Supersedes any "round-trip the row-time policy" expectation.
+ */
+describe('Materialized view `with refresh` is a parse error', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, x integer);');
+	});
+	afterEach(async () => { await db.close(); });
+
+	async function captureError(sql: string): Promise<Error> {
+		try {
+			await db.exec(sql);
+		} catch (e) {
+			return e instanceof Error ? e : new Error(String(e));
+		}
+		throw new Error(`Expected an error from: ${sql}`);
+	}
+
+	it('rejects `with refresh = \'row-time\'` as a parse error', async () => {
+		const err = await captureError("create materialized view v1 as select id, x from t with refresh = 'row-time';");
+		// The trailing clause is reparsed as a stray statement → CTE-shaped parse error.
+		expect(err.message).to.contain('after CTE name');
+		expect(db.schemaManager.getMaterializedView('main', 'v1'), 'no MV registered on parse failure').to.be.undefined;
+	});
+
+	it('rejects an unknown `with refresh = \'bogus\'` literal identically (clause is never inspected)', async () => {
+		const err = await captureError("create materialized view v2 as select id, x from t with refresh = 'bogus';");
+		expect(err.message).to.contain('after CTE name');
+		expect(db.schemaManager.getMaterializedView('main', 'v2'), 'no MV registered on parse failure').to.be.undefined;
+	});
+});

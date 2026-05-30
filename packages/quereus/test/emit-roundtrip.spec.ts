@@ -296,6 +296,30 @@ describe('Emit: statement round-trips', () => {
 		});
 	});
 
+	describe('CREATE MATERIALIZED VIEW', () => {
+		// Post-consolidation shape: bare `create materialized view … as select …`
+		// with NO `with refresh` policy clause (every MV is row-time maintained).
+		it('basic (no refresh policy)', () => {
+			roundTripStmt('create materialized view mv as select id, x from t');
+		});
+
+		it('IF NOT EXISTS', () => {
+			roundTripStmt('create materialized view if not exists mv as select id, x from t');
+		});
+
+		it('with column list', () => {
+			roundTripStmt('create materialized view mv (a, b) as select id, x from t');
+		});
+
+		it('with a partial (WHERE) + ORDER BY body', () => {
+			roundTripStmt('create materialized view mv as select x, id from t where x > 0 order by x');
+		});
+
+		it('with tags', () => {
+			roundTripStmt('create materialized view mv as select id, x from t with tags (owner = \'me\')');
+		});
+	});
+
 	describe('DROP', () => {
 		it('DROP TABLE', () => {
 			roundTripStmt('drop table t');
