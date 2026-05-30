@@ -161,6 +161,14 @@ optimized/analyzed body, a superset of the coverage prover's shape in
 - a partial `WHERE`, if present, evaluable on a single source row (compiled via
   `compilePredicate`; subqueries / cross-row references are rejected).
 
+The single source `T` may itself be **another materialized view's backing table** (an
+MV-over-MV chain). A reference to `mv1` is rewritten to a `TableReference` against
+`mv1`'s backing table (`building/select.ts`), so the source base *is* `mv1`'s backing
+base and the same eligibility checks evaluate against the (keyed `memory`) backing
+schema unchanged — for `mv2 as select id, x from mv1`, the source PK is `mv1`'s backing
+PK, which `mv2` projects. A write to `mv1` then drives `mv2` synchronously (see
+[Maintenance § MV-over-MV cascade](#mv-over-mv-cascade)).
+
 Any other body is **rejected at create** with a shape-specific diagnostic that
 names the unsupported feature and steers the user to a plain `view` (for live
 re-evaluation) or `create table … as <body>` (for a one-off snapshot). There is no
@@ -211,6 +219,37 @@ The update arm covers predicate-scope transitions and key-changing updates. This
 bounded O(log n) per-row cost (a btree delete + insert) — identical to the
 secondary-index maintenance a UNIQUE auto-index already performs — is why row-time
 is affordable for this shape and not for general bodies.
+
+### MV-over-MV cascade
+
+A backing write is itself a row-write that every MV reading *that backing table* must
+see. After a plan maintains its backing, the manager looks up
+`rowTimeBySource[backingBase]`; when non-empty, each **effective** per-row backing
+change is routed back through `maintainRowTime`, recursively. `applyMaintenanceToLayer`
+returns the `BackingRowChange[]` it actually realized (a `delete-key` that found a row →
+`delete`; an `upsert` → `update` when it replaced an existing row, else `insert`), so
+the cascade needs no source re-read — the layer already knows each op's before-image.
+
+Because a consumer MV can only be created once its producer exists (and an MV's sources
+are fixed at create), the dependency graph is **acyclic**. Synchronous depth-first
+recursion is therefore **DAG-ordered** — a producer's backing is fully written before
+its consumers run — and the whole chain commits/rolls-back atomically on the live
+transaction (a depth-≥2 backing connection registers lazily on its first cascade write,
+and `Database.registerConnection` replays the active savepoint stack onto it, including
+the statement-atomicity savepoint, so a rollback reverts every level in lockstep). A
+non-chained MV keeps today's cost exactly (one map lookup, no recursion) via the leaf
+fast path (`!rowTimeBySource.has(backingBase)`). A defense-in-depth depth guard
+(bounded by the count of registered row-time MVs — an upper bound on a valid chain) is
+the backstop for the structurally-impossible cycle.
+
+**Semantic-edge-B (reads-own-writes through the chain).** Cascade writes ride the same
+per-statement backing connection a `select`/enforcement scan resolves to, so a later
+same-statement source row's enforcement scan on a downstream covering MV's backing
+(`lookupCoveringConflicts`) observes every row the cascade already wrote this statement.
+There must be **no** deferred/end-of-statement flush on the cascade path that could hide
+an earlier row from a later enforcement read; each level applies synchronously, so flush
+order is trivially correct (if op-coalescing is layered on later, a level must flush
+before recursing into its dependents).
 
 ### Synchronous, transactional, per-statement
 
@@ -495,16 +534,12 @@ The following extensions build on this substrate:
   kernel under one `MaintenancePlan` abstraction, adds a backward
   (maintenance-direction) cost gate, and decides via a bounded proof-of-concept whether
   a Z-set / DBSP-style delta circuit is worth adopting for the harder shapes. The
-  spike's outcome is not yet decided; the general-bodies and MV-over-MV-cascade items
-  below are retargeted to build on its abstraction once it lands.
+  spike's outcome is not yet decided; the general-bodies item below is retargeted to
+  build on its abstraction once it lands.
 - **Row-time general bodies** (`materialized-view-rowtime-general-bodies`) — extend
   the eligibility gate to single-source aggregates, inner/cross-join row-preserving
   bodies, and lateral-TVF fan-out, maintained synchronously per statement. These
   shapes are rejected today; this now builds on the maintenance substrate spike above.
-- **Cascading MV-over-MV** — a materialized view whose source is another MV's backing
-  table. Requires the maintenance write to drive dependents synchronously (DAG-ordered)
-  within the statement; deferred from the consolidation (an MV-over-MV is rejected
-  until then).
 - **Concurrent refresh** (`materialized-view-concurrent-refresh`) — overlapping
   refreshes and refresh-while-read beyond today's atomic base-layer swap.
 - **Write-through DML** (`materialized-view-writes-through-body`) — accept DML against

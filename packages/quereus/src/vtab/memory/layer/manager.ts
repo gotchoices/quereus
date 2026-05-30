@@ -65,6 +65,25 @@ export type MaintenanceOp =
 	| { kind: 'delete-key'; key: BTreeKeyForPrimary }
 	| { kind: 'upsert'; row: Row };
 
+/**
+ * The *effective* per-row change {@link MemoryTableManager.applyMaintenanceToLayer}
+ * applied to a backing table's pending layer — the same `{ op, oldRow?, newRow? }`
+ * shape the row-time maintenance hook already consumes for a source write. The layer
+ * knows each op's before-image (it looks it up to apply the op), so it reports the
+ * realized change without the caller re-reading the backing table.
+ *
+ * This is what drives the **MV-over-MV cascade**: a backing write to MV `B` is itself
+ * a row-write that every MV reading `B`'s backing must see, so the cascade routes each
+ * `BackingRowChange` back through `maintainRowTime(B.backingBase, change)`. It is the
+ * same shape as the inbound source change by design (unify, don't duplicate) — see
+ * `core/database-materialized-views.ts` § cascade.
+ */
+export interface BackingRowChange {
+	op: 'insert' | 'update' | 'delete';
+	oldRow?: Row;
+	newRow?: Row;
+}
+
 /** Origin + structure name for a UNIQUE constraint's implicit covering structure. */
 export interface ImplicitCoveringStructure {
 	/** Name of the secondary index (the synchronously-maintained BTree) that realizes the constraint. */
@@ -1258,26 +1277,40 @@ export class MemoryTableManager {
 	 * `connection`, only this synchronous path writes it, and the tree mutations are
 	 * synchronous — so a multi-row statement's later rows observe earlier rows'
 	 * pending writes with no interleaving.
+	 *
+	 * Returns the **effective** changes it applied (one {@link BackingRowChange} per op
+	 * that mutated the layer): a `delete-key` that found a row → `delete`; an `upsert` →
+	 * `update` when it replaced an existing row, else `insert`. A `delete-key` for an
+	 * absent row produces nothing. The MV-over-MV cascade feeds these onward to MVs
+	 * reading this backing table (see `database-materialized-views.ts` § cascade).
 	 */
-	applyMaintenanceToLayer(connection: MemoryTableConnection, ops: readonly MaintenanceOp[]): void {
-		if (ops.length === 0) return;
+	applyMaintenanceToLayer(connection: MemoryTableConnection, ops: readonly MaintenanceOp[]): BackingRowChange[] {
+		const changes: BackingRowChange[] = [];
+		if (ops.length === 0) return changes;
 		this.ensureTransactionLayer(connection);
 		const layer = connection.pendingTransactionLayer!;
 		for (const op of ops) {
 			switch (op.kind) {
 				case 'delete-key': {
 					const existing = this.lookupEffectiveRow(op.key, layer);
-					if (existing) layer.recordDelete(op.key, existing);
+					if (existing) {
+						layer.recordDelete(op.key, existing);
+						changes.push({ op: 'delete', oldRow: existing });
+					}
 					break;
 				}
 				case 'upsert': {
 					const key = this.primaryKeyFunctions.extractFromRow(op.row);
 					const existing = this.lookupEffectiveRow(key, layer);
 					layer.recordUpsert(key, op.row, existing);
+					changes.push(existing
+						? { op: 'update', oldRow: existing, newRow: op.row }
+						: { op: 'insert', newRow: op.row });
 					break;
 				}
 			}
 		}
+		return changes;
 	}
 
 	// --- Schema Operations (simplified with inherited BTrees) ---

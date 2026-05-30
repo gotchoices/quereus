@@ -223,17 +223,99 @@ create materialized view bad_expr as select id, v + 1 as v1 from g;
 -- error: it projects a computed/expression column
 
 -- ===================================
--- 8. MV-over-MV is rejected at create (cascade deferred). A write to a backing
---    table bypasses the DML-executor hook that fires row-time maintenance, so a
---    dependent MV would silently serve stale rows — the gate closes this.
+-- 8. MV-over-MV cascade. A materialized view whose source is itself another MV's
+--    backing table is accepted: `building/select.ts` rewrites the inner-MV reference
+--    to its backing table, so the outer MV's source base IS the inner MV's backing
+--    base and the existing `rowTimeBySource[backingBase]` index records the
+--    producer→consumer edge. A source write maintains the inner MV's backing, whose
+--    effective per-row change is routed onward to the outer MV — recursively,
+--    synchronously, DAG-ordered, atomic within the statement.
 -- ===================================
 
-create table mvsrc (id integer primary key, x integer);
-insert into mvsrc values (1, 10);
-create materialized view mv_base as select id, x from mvsrc;
--- a materialized view whose body reads another materialized view is rejected
-create materialized view mv_over as select id, x from mv_base;
--- error: materialized views over materialized views
+-- 2-level chain c2 over c1 over c. insert / update / delete reflect in BOTH levels
+-- with no refresh.
+create table c (id integer primary key, x integer);
+insert into c values (1, 10), (2, 20);
+create materialized view c1 as select id, x from c;
+create materialized view c2 as select id, x from c1;
+select id, x from c1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select id, x from c2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- insert cascades to both levels
+insert into c values (3, 30);
+select id, x from c2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- update of a projected column cascades to both levels (delete-old/upsert-new at each)
+update c set x = 99 where id = 2;
+select id, x from c1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99},{"id":3,"x":30}]
+select id, x from c2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99},{"id":3,"x":30}]
+
+-- delete cascades to both levels
+delete from c where id = 1;
+select id, x from c2 order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30}]
+
+-- Predicate transition through the chain. The inner MV filters x>0; the outer is a
+-- plain passthrough of the inner. An update moving a row out of the inner predicate
+-- removes it from BOTH levels; the reverse re-adds it to both.
+create table pc (id integer primary key, x integer);
+insert into pc values (1, 5), (2, 7);
+create materialized view pc1 as select id, x from pc where x > 0;
+create materialized view pc2 as select id, x from pc1;
+select id, x from pc2 order by id;
+→ [{"id":1,"x":5},{"id":2,"x":7}]
+
+-- id=1 leaves the inner scope (x>0 → x=-1) → removed at level 2 as well
+update pc set x = -1 where id = 1;
+select id, x from pc1 order by id;
+→ [{"id":2,"x":7}]
+select id, x from pc2 order by id;
+→ [{"id":2,"x":7}]
+
+-- reverse: id=1 re-enters the inner scope → re-added to both
+update pc set x = 5 where id = 1;
+select id, x from pc2 order by id;
+→ [{"id":1,"x":5},{"id":2,"x":7}]
+
+-- 3-level chain proves arbitrary depth and DAG order (each level fully written
+-- before its consumer runs).
+create table d (id integer primary key, x integer);
+create materialized view d1 as select id, x from d;
+create materialized view d2 as select id, x from d1;
+create materialized view d3 as select id, x from d2;
+insert into d values (1, 100);
+select id, x from d3 order by id;
+→ [{"id":1,"x":100}]
+update d set x = 200 where id = 1;
+select id, x from d3 order by id;
+→ [{"id":1,"x":200}]
+delete from d where id = 1;
+select id, x from d3 order by id;
+→ []
+
+-- Mid-transaction visibility through the chain + whole-chain atomic rollback. The
+-- new row is visible at the deepest level before commit (reads-own-writes rides the
+-- per-statement backing connections), and rollback reverts every level in lockstep.
+create table tx (id integer primary key, x integer);
+create materialized view tx1 as select id, x from tx;
+create materialized view tx2 as select id, x from tx1;
+insert into tx values (1, 1);
+
+begin;
+insert into tx values (2, 2);
+select id, x from tx2 order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2}]
+rollback;
+-- both levels reverted together
+select id, x from tx2 order by id;
+→ [{"id":1,"x":1}]
+select id, x from tx1 order by id;
+→ [{"id":1,"x":1}]
 
 -- ===================================
 -- 9. DROP detaches the row-time plan — the dropped name stops resolving, a source

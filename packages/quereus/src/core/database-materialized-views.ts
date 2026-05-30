@@ -39,7 +39,7 @@ import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import { getBackingManager } from '../runtime/emit/materialized-view-helpers.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
-import type { MaintenanceOp, MemoryTableManager } from '../vtab/memory/layer/manager.js';
+import type { BackingRowChange, MaintenanceOp, MemoryTableManager } from '../vtab/memory/layer/manager.js';
 import { MemoryVirtualTableConnection } from '../vtab/memory/connection.js';
 import type { MemoryTableConnection } from '../vtab/memory/layer/connection.js';
 import type { ScanPlan } from '../vtab/memory/layer/scan-plan.js';
@@ -199,24 +199,68 @@ export class MaterializedViewManager {
 	 * projection of the changed row) and applies it to the backing table's pending
 	 * transaction layer through the connection a `select` from the MV would use —
 	 * so the write is visible mid-transaction and rides the coordinated commit.
+	 *
+	 * **MV-over-MV cascade.** A backing write is itself a row-write that every MV
+	 * reading *that backing table* must see. When a plan's backing base has its own
+	 * dependents (`rowTimeBySource[backingBase]` non-empty), each effective
+	 * {@link BackingRowChange} the write produced is routed back through this method,
+	 * recursively. The dependency graph is acyclic (a consumer MV requires its
+	 * producer MV to already exist at create time), so this synchronous depth-first
+	 * recursion is DAG-ordered — a producer's backing is fully written before its
+	 * consumers run — and the whole chain commits/rolls-back atomically on the live
+	 * transaction. The leaf fast path (`!rowTimeBySource.has(backingBase)`) keeps a
+	 * non-chained MV at exactly today's cost (one map lookup, no recursion). `depth`
+	 * feeds the structural-cycle backstop in {@link assertCascadeDepth}.
 	 */
 	async maintainRowTime(
 		sourceBase: string,
-		change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
+		change: BackingRowChange,
+		depth = 0,
 	): Promise<void> {
 		const keys = this.rowTimeBySource.get(sourceBase.toLowerCase());
 		if (!keys || keys.size === 0) return;
 		for (const key of keys) {
 			const plan = this.rowTime.get(key);
-			if (plan) await this.applyRowTimeChange(plan, change);
+			if (!plan) continue;
+			const backingChanges = await this.applyRowTimeChange(plan, change);
+			if (backingChanges.length === 0) continue;
+			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
+			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
+			this.assertCascadeDepth(depth + 1, backingBase);
+			for (const bc of backingChanges) {
+				await this.maintainRowTime(backingBase, bc, depth + 1);
+			}
 		}
 	}
 
-	/** Compute and apply one plan's per-row backing delta. */
+	/**
+	 * Defense-in-depth backstop for the cascade. Cycles are structurally impossible
+	 * (a consumer MV can only be created once its producer exists, and an MV's source
+	 * set is fixed at create), so a valid chain descends at most once per registered
+	 * row-time MV. A depth beyond that count signals a structural impossibility (a
+	 * cycle) — fail loud with `INTERNAL` naming the backing base rather than overflow
+	 * the stack. This should never fire.
+	 */
+	private assertCascadeDepth(depth: number, backingBase: string): void {
+		if (depth > this.rowTime.size) {
+			throw new QuereusError(
+				`materialized-view cascade exceeded maximum depth (${this.rowTime.size}) at backing `
+					+ `'${backingBase}' — a row-time dependency cycle should be structurally impossible`,
+				StatusCode.INTERNAL,
+			);
+		}
+	}
+
+	/**
+	 * Compute one plan's per-row backing delta, apply it, and return the
+	 * **effective** {@link BackingRowChange}(s) the backing layer realized (so the
+	 * cascade can drive this plan's own dependents). An out-of-scope row (or a delete
+	 * of an absent backing key) yields no change.
+	 */
 	private async applyRowTimeChange(
 		plan: RowTimeMaintenancePlan,
-		change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
-	): Promise<void> {
+		change: BackingRowChange,
+	): Promise<BackingRowChange[]> {
 		const inScope = (row: Row): boolean => plan.predicate === undefined || plan.predicate.evaluate(row) === true;
 		const project = (row: Row): Row => plan.projectionSourceCols.map(sc => row[sc]) as Row;
 		const keyOf = (backingRow: Row): BTreeKeyForPrimary =>
@@ -237,7 +281,7 @@ export class MaterializedViewManager {
 			if (inScope(oldR)) ops.push({ kind: 'delete-key', key: keyOf(project(oldR)) });
 			if (inScope(newR)) ops.push({ kind: 'upsert', row: project(newR) });
 		}
-		if (ops.length === 0) return;
+		if (ops.length === 0) return [];
 
 		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
 		if (!backing) {
@@ -248,7 +292,7 @@ export class MaterializedViewManager {
 		}
 		const manager = getBackingManager(backing);
 		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`);
-		manager.applyMaintenanceToLayer(connection, ops);
+		return manager.applyMaintenanceToLayer(connection, ops);
 	}
 
 	/**
@@ -281,8 +325,15 @@ export class MaterializedViewManager {
 	 * (no aggregate / join / DISTINCT / set op / recursive CTE / TVF / LIMIT/OFFSET),
 	 * a **passthrough** projection (every backing column resolves to a source column
 	 * via attribute provenance) that covers every source PK column, and a partial
-	 * WHERE evaluable on a single source row. MV-over-MV bodies (a source that is
-	 * itself another MV's backing table) are rejected — cascade is deferred.
+	 * WHERE evaluable on a single source row.
+	 *
+	 * The single source may itself be another MV's backing table (an MV-over-MV body):
+	 * `building/select.ts` rewrites a reference to `mv1` into a `TableReference` against
+	 * `mv1`'s backing table, so the source base is `mv1`'s backing base and the same
+	 * eligibility checks evaluate against the (keyed `memory`) backing schema unchanged.
+	 * A write to `mv1` then drives `mv2` via the cascade in {@link maintainRowTime} — no
+	 * separate dependency structure: the existing `rowTimeBySource[backingBase]` index
+	 * already records the producer→consumer edge the moment `mv2` registers.
 	 */
 	private buildRowTimePlan(mv: MaterializedViewSchema): RowTimeMaintenancePlan {
 		const db = this.ctx as unknown as Database;
@@ -308,15 +359,10 @@ export class MaterializedViewManager {
 		const sourceSchema = tableRef.tableSchema;
 		const sourceBase = `${sourceSchema.schemaName}.${sourceSchema.name}`.toLowerCase();
 
-		// Reject MV-over-MV (cascade deferred). A write to a backing table goes through
-		// the privileged `applyMaintenanceToLayer` path, NOT the DML-executor hook that
-		// fires row-time maintenance — so a dependent MV would never be maintained and
-		// would silently serve stale rows. Backing names carry the reserved `_mv_` prefix.
-		if (this.ctx.schemaManager.getMaterializedViewByBackingTable(sourceSchema.schemaName, sourceSchema.name)) {
-			reject(`its source '${sourceBase}' is itself a materialized view's backing table; `
-				+ `materialized views over materialized views are not yet supported `
-				+ `(see materialized-view-rowtime-mv-over-mv-cascade)`);
-		}
+		// NOTE: an MV-over-MV body (a source that is itself another MV's backing table)
+		// is no longer rejected here. The cascade in `maintainRowTime` drives dependents
+		// of a backing write recursively (DAG-ordered, atomic within the statement); the
+		// eligibility checks below evaluate against the keyed backing schema unchanged.
 
 		// Row-collapsing / fan-out / unbounded shapes break one-source-row →
 		// one-backing-row, so write-through could not be a pure projection.

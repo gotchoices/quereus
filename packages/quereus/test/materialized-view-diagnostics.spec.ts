@@ -153,13 +153,22 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		});
 	}
 
-	it('rejects a materialized view over a materialized view with the MV-over-MV tail', async () => {
+	// MV-over-MV is no longer rejected — the cascade (database-materialized-views.ts)
+	// maintains a chain synchronously. Creating an MV whose body reads another MV
+	// SUCCEEDS, and a later source write cascades through the inner MV's backing into
+	// the outer MV with no refresh.
+	it('accepts a materialized view over a materialized view and cascades source writes through it', async () => {
 		await db.exec('create materialized view mv_base as select id, v from g;');
-		const err = await captureError('create materialized view mv_over as select id, v from mv_base;');
-		expect(err.message).to.contain('cannot be materialized');
-		expect(err.message).to.contain('materialized views over materialized views are not yet supported');
-		// Never leaks the hidden backing-table name to the user.
-		expect(err.message).to.not.contain('_mv_mv_over');
+		await db.exec('create materialized view mv_over as select id, v from mv_base;');
+		expect(db.schemaManager.getMaterializedView('main', 'mv_over'), 'MV-over-MV registered').to.not.be.undefined;
+
+		// A source insert cascades through mv_base's backing into mv_over.
+		await db.exec('insert into g values (2, 200, 7);');
+		const rows: Record<string, unknown>[] = [];
+		for await (const row of db.eval('select id, v from mv_over order by id')) {
+			rows.push(row);
+		}
+		expect(rows).to.deep.equal([{ id: 1, v: 5 }, { id: 2, v: 7 }]);
 	});
 });
 

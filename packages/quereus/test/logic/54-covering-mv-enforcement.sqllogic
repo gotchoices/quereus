@@ -142,3 +142,44 @@ insert into man values (2, 5, 5);
 -- error: UNIQUE constraint failed
 select id, x, y from man order by id;
 → [{"id":1,"x":5,"y":5}]
+
+-- ===================================
+-- 7. Covering MV that is ALSO a chain link. The level-1 MV `cix` is the covering
+--    structure enforcing UNIQUE(x,y) on `ct`; it is itself the source of a level-2
+--    MV `cix2`. UNIQUE enforcement still routes through the level-1 covering MV
+--    (intra-statement reads-own-writes on its backing), and each level-1 backing
+--    write cascades to the level-2 MV so it stays row-time consistent — including a
+--    full statement rollback when a later row aborts. (A constraint proved by a
+--    *downstream* MV — the prover seeing through the chain to the base table — is the
+--    lens layer's concern, tracked in `lens-prover-and-attachment`; this case covers
+--    the in-reach level-1 covering MV whose backing then cascades.)
+-- ===================================
+
+create table ct (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view cix as select x, y, id from ct order by x, y;
+create materialized view cix2 as select x, y, id from cix;
+insert into ct values (1, 5, 5);
+
+-- the level-2 MV reflects the cascade from the first insert
+select x, y, id from cix2 order by x, y;
+→ [{"x":5,"y":5,"id":1}]
+
+-- ABORT: an intra-statement duplicate (x,y)=(7,7) is detected via the covering MV;
+-- the whole statement rolls back, leaving the cascaded level-2 MV consistent too.
+insert into ct values (10, 7, 7), (11, 7, 7);
+-- error: UNIQUE constraint failed
+select x, y, id from cix2 order by x, y;
+→ [{"x":5,"y":5,"id":1}]
+
+-- OR IGNORE: the first new row lands and cascades to level 2; the intra-statement
+-- duplicate is skipped (the covering MV's backing reflects the earlier same-statement
+-- row), so level 2 ends with exactly the surviving rows.
+insert or ignore into ct values (10, 7, 7), (11, 7, 7);
+select x, y, id from cix2 order by x, y;
+→ [{"x":5,"y":5,"id":1},{"x":7,"y":7,"id":10}]
+
+-- a plain duplicate against a committed row is still rejected by the covering MV
+insert into ct values (12, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from ct order by id;
+→ [{"id":1,"x":5,"y":5},{"id":10,"x":7,"y":7}]
