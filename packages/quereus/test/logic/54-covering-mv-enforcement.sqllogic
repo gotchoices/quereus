@@ -183,3 +183,31 @@ insert into ct values (12, 5, 5);
 -- error: UNIQUE constraint failed
 select id, x, y from ct order by id;
 → [{"id":1,"x":5,"y":5},{"id":10,"x":7,"y":7}]
+
+-- ===================================
+-- 8. Covering MV that ALSO carries a deterministic computed column
+--    (materialized-view-rowtime-expression-projections). The UC columns and PK stay
+--    passthrough (so the prover still links it as the covering structure and the
+--    source PK is recoverable for conflict resolution); the extra computed column is
+--    just stored and maintained alongside. Enforcement (ABORT / REPLACE) is unchanged,
+--    and the computed column tracks the surviving row through a REPLACE eviction.
+-- ===================================
+
+create table ce (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view ce_ix as select x, y, id, x + y as sxy from ce order by x, y;
+insert into ce values (1, 5, 5);
+select x, y, id, sxy from ce_ix order by x, y;
+→ [{"x":5,"y":5,"id":1,"sxy":10}]
+
+-- default ABORT through the covering MV (the extra computed column does not perturb
+-- the inverse PK/UC map, which reads only the passthrough projectors)
+insert into ce values (2, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from ce order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR REPLACE: id=1 evicted, id=10 lands; the computed sxy is maintained for the
+-- surviving row
+insert or replace into ce values (10, 5, 5);
+select id, x, y from ce order by id;
+→ [{"id":10,"x":5,"y":5}]

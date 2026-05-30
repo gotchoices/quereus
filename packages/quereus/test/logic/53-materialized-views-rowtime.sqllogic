@@ -218,9 +218,17 @@ create materialized view bad_rec as with recursive r(n) as (select 1 union all s
 create materialized view bad_nopk as select v from g;
 -- error: it does not project source primary-key column 'id'
 
--- non-passthrough (computed/expression) projected column
-create materialized view bad_expr as select id, v + 1 as v1 from g;
--- error: it projects a computed/expression column
+-- non-DETERMINISTIC projected expression column — rejected on determinism (a row-time
+-- backing value must be reproducible from the source row), a DISTINCT diagnostic from
+-- the shape rejection below: a deterministic expression column (e.g. v + 1) is now
+-- ACCEPTED (see §19), so this asserts the determinism gate specifically.
+create materialized view bad_nondet as select id, random() as r from g;
+-- error: non-deterministic expression column 'r'
+
+-- deterministic but NOT single-row evaluable: a correlated scalar subquery in the
+-- projection — rejected on SHAPE, steering to a plain view.
+create materialized view bad_subq as select id, (select g.v) as vv from g;
+-- error: containing a subquery
 
 -- ===================================
 -- 8. MV-over-MV cascade. A materialized view whose source is itself another MV's
@@ -585,3 +593,77 @@ insert into bd values (2, -3);
 delete from bd where id = 2;
 select x, id from bd_ix order by id;
 → [{"x":5,"id":1}]
+
+-- ===================================
+-- 19. Deterministic expression-projection columns
+--     (materialized-view-rowtime-expression-projections). A backing output column may
+--     be a deterministic scalar expression over the single source row (arithmetic,
+--     deterministic functions, CASE, CAST, ‖) — still a pure per-row projection
+--     (O(log n), no body re-execution): each source write evaluates project(row) for
+--     the computed columns, so they stay consistent under insert / update / delete
+--     exactly as a plain view would. PK columns stay passthrough; the computed columns
+--     are not part of the backing key.
+-- ===================================
+
+create table ev (id integer primary key, v integer, name text);
+insert into ev values (1, 10, 'Alice'), (2, 20, 'Bob');
+
+-- arithmetic + deterministic-function projection columns over a single source
+create materialized view ev_ix as select id, v + 1 as v1, abs(v) as av, lower(name) as ln from ev;
+
+-- computed columns equal the body at create time (MV ≡ faster view)
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":11,"av":10,"ln":"alice"},{"id":2,"v1":21,"av":20,"ln":"bob"}]
+
+-- INSERT: the new row's computed columns appear (negative v exercises abs)
+insert into ev values (3, -5, 'CARA');
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":11,"av":10,"ln":"alice"},{"id":2,"v1":21,"av":20,"ln":"bob"},{"id":3,"v1":-4,"av":5,"ln":"cara"}]
+
+-- UPDATE of a source column the expressions read: EVERY computed column tracks it
+-- (reads-own-writes), not just passthrough columns
+update ev set v = 100, name = 'Zed' where id = 1;
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":101,"av":100,"ln":"zed"},{"id":2,"v1":21,"av":20,"ln":"bob"},{"id":3,"v1":-4,"av":5,"ln":"cara"}]
+
+-- DELETE removes the backing row (and its computed columns) entirely
+delete from ev where id = 2;
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":101,"av":100,"ln":"zed"},{"id":3,"v1":-4,"av":5,"ln":"cara"}]
+
+-- CASE / CAST / ‖ concat projection forms are accepted (the runtime evaluates them,
+-- so a computed backing value is byte-for-byte what `select <body>` produces)
+create materialized view ev_ix2 as
+  select id, case when v > 0 then 'pos' else 'neg' end as sign, cast(v as text) as vt, name || '!' as nx from ev;
+select id, sign, vt, nx from ev_ix2 order by id;
+→ [{"id":1,"sign":"pos","vt":"100","nx":"Zed!"},{"id":3,"sign":"neg","vt":"-5","nx":"CARA!"}]
+
+-- ===================================
+-- 20. Expression columns under a partial WHERE — key-changing update and
+--     predicate-scope transitions. The backing key is the passthrough (order-by + PK)
+--     columns; the computed columns ride each delete-old/upsert-new exactly like the
+--     passthrough payload does.
+-- ===================================
+
+create table evp (id integer primary key, v integer, name text);
+insert into evp values (1, 5, 'aa'), (2, -3, 'bb'), (3, 8, 'cc');
+create materialized view evp_ix as select id, v, v * 10 as v10, upper(name) as un from evp where v > 0 order by v;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":1,"v":5,"v10":50,"un":"AA"},{"id":3,"v":8,"v10":80,"un":"CC"}]
+
+-- in-scope key-changing update (v is the leading backing key AND read by v10): old key
+-- deleted, new upserted, and v10 tracks the new value
+update evp set v = 6 where id = 1;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":1,"v":6,"v10":60,"un":"AA"},{"id":3,"v":8,"v10":80,"un":"CC"}]
+
+-- predicate-scope transition IN: id=2 enters scope (v -3 → 4); its computed columns appear
+update evp set v = 4 where id = 2;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":2,"v":4,"v10":40,"un":"BB"},{"id":1,"v":6,"v10":60,"un":"AA"},{"id":3,"v":8,"v10":80,"un":"CC"}]
+
+-- predicate-scope transition OUT: id=3 leaves scope (v 8 → -1); its backing row (and
+-- computed columns) disappear
+update evp set v = -1 where id = 3;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":2,"v":4,"v10":40,"un":"BB"},{"id":1,"v":6,"v10":60,"un":"AA"}]

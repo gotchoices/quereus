@@ -50,6 +50,19 @@ const SHAPES: readonly BodyShape[] = [
 	// Passthrough whose maintenance is exercised primarily by key-changing UPDATEs (the
 	// generator below mutates `id` itself).
 	{ label: 'passthrough exercised by key-changing UPDATEs', body: 'select id, a from src' },
+	// --- Deterministic expression-projection columns (materialized-view-rowtime-
+	//     expression-projections). The PK stays passthrough; the computed columns must
+	//     equal the live body's value after every mutation, proving maintenance evaluates
+	//     project(row) (not just permutes columns). ---
+	// Arithmetic computed columns alongside the PK.
+	{ label: 'arithmetic expression columns', body: 'select id, a + 1 as a1, b * 2 as b2 from src' },
+	// Deterministic function + CAST computed columns (abs over a value that straddles 0).
+	{ label: 'function + cast expression columns', body: 'select id, abs(a - 5) as aa, cast(b as text) as bt from src' },
+	// CASE expression column.
+	{ label: 'CASE expression column', body: 'select id, case when k > 5 then a else b end as cab from src' },
+	// Expression column UNDER a partial WHERE — computed value must track rows moving in
+	// and out of the `k > 5` scope (predicate-scope transitions) and key-changing updates.
+	{ label: 'expression column + partial WHERE (predicate-scope transitions)', body: 'select id, a, a * b as ab from src where k > 5' },
 ];
 
 /** One random source mutation. Key-changing updates rewrite the PK itself; collisions

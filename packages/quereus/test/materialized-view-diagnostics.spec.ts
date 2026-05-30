@@ -142,7 +142,11 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		['OFFSET', 'select id, v from g order by id limit 5 offset 2', 'its body uses LIMIT/OFFSET'],
 		['recursive-CTE-only (reads no base table)', 'with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r', 'its body reads no source table'],
 		['drops a source PK column', 'select v from g', "it does not project source primary-key column 'id'"],
-		['computed/expression column', 'select id, v + 1 as v1 from g', 'it projects a computed/expression column'],
+		// A computed/expression projection column is now ACCEPTED (see the positive case
+		// below); only a NON-deterministic one (determinism tail) or a non-single-row
+		// form (subquery shape tail) is rejected.
+		['non-deterministic projection', 'select id, random() as r from g', "non-deterministic expression column 'r'"],
+		['subquery projection (cross-row)', 'select id, (select g.v) as vv from g', 'containing a subquery'],
 	];
 
 	for (const [label, body, tail] of cases) {
@@ -152,6 +156,29 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 			expect(err.message, `${label}: distinctive tail`).to.contain(tail);
 		});
 	}
+
+	// A deterministic expression projection column (arithmetic / function) over the
+	// single source is now ACCEPTED and maintained as a pure per-row projection
+	// (materialized-view-rowtime-expression-projections). PK stays passthrough; the
+	// computed columns track source writes exactly as a plain view would.
+	it('accepts a deterministic expression projection column and maintains it on source writes', async () => {
+		await db.exec('create materialized view ev as select id, v + 1 as v1, abs(v) as av from g;');
+		expect(db.schemaManager.getMaterializedView('main', 'ev'), 'expression-projection MV registered').to.not.be.undefined;
+
+		const read = async (): Promise<Record<string, unknown>[]> => {
+			const rows: Record<string, unknown>[] = [];
+			for await (const row of db.eval('select id, v1, av from ev order by id')) rows.push(row);
+			return rows;
+		};
+		expect(await read()).to.deep.equal([{ id: 1, v1: 6, av: 5 }]);
+
+		await db.exec('insert into g values (2, 200, -8);');
+		await db.exec('update g set v = 100 where id = 1;');
+		expect(await read()).to.deep.equal([{ id: 1, v1: 101, av: 100 }, { id: 2, v1: -7, av: 8 }]);
+
+		await db.exec('delete from g where id = 1;');
+		expect(await read()).to.deep.equal([{ id: 2, v1: -7, av: 8 }]);
+	});
 
 	// MV-over-MV is no longer rejected — the cascade (database-materialized-views.ts)
 	// maintains a chain synchronously. Creating an MV whose body reads another MV

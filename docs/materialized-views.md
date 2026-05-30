@@ -151,13 +151,20 @@ optimized/analyzed body, a superset of the coverage prover's shape in
 - a row-preserving **linear** body `TableReference → optional Filter → Project →
   optional Sort` — **no** aggregate, set operation, `DISTINCT`, recursive CTE,
   table-valued function, or `LIMIT`/`OFFSET`;
-- a **passthrough** projection — every output column forwards a source column
-  (a bare column reference or a simple rename); a computed/expression column
-  (e.g. `v + 1`) is rejected, since maintenance is a pure column permutation of
-  the changed row (deterministic projected expressions are deferred to
-  `materialized-view-rowtime-expression-projections`);
-- the projection includes **every** PK column of `T`, so each source row maps to a
-  unique backing key (and the backing key identifies the source row);
+- a **passthrough or deterministic-expression** projection — each output column is
+  either a passthrough source column (a bare column reference or a simple rename) or a
+  **deterministic scalar expression** over the single source row (e.g. `v + 1`,
+  `lower(name)`, `case`/`cast`); a non-deterministic projection (`random()`, `now()`,
+  …) is rejected on *determinism* and a non-single-row form (a subquery / cross-row
+  reference) on *shape*. Either way maintenance stays a pure per-row function of the
+  changed row — `project(row)` copies the passthrough columns and evaluates the
+  expression columns via the runtime, so a computed backing value is byte-for-byte what
+  `select <body>` would produce (`materialized-view-rowtime-expression-projections`);
+- the projection includes **every** PK column of `T` **as a passthrough column**, so
+  each source row maps to a unique backing key (and the backing key identifies the
+  source row); every backing-key column (the body's `order by` columns + the logical
+  PK) must likewise be passthrough — a computed column may never land in the backing
+  key, which the inverse-projection conflict map and the btree key both depend on;
 - a partial `WHERE`, if present, evaluable on a single source row (compiled via
   `compilePredicate`; subqueries / cross-row references are rejected).
 
@@ -205,7 +212,7 @@ Write-through (`put` semantics on an MV) is future work
 ## Maintenance (row-time, per-statement)
 
 For each materialized view the manager caches a `MaintenancePlan`
-(projection column map + backing PK + optional predicate), keyed by source base.
+(per-column projectors + backing PK + optional predicate), keyed by source base.
 This shipped covering-index plan is now the `'inverse-projection'` arm of the
 `MaintenancePlan` tagged union (the former private `RowTimeMaintenancePlan`, lifted
 verbatim — `incremental-maintenance-plan-abstraction`); the union's `'full-rebuild'`
@@ -216,7 +223,9 @@ correctness oracle for this arm is the maintenance-equivalence property harness
 (`test/incremental/maintenance-equivalence.spec.ts`): for every eligible body shape
 it asserts `read(MV) == evaluate(body)` after each random source mutation and after
 rollback. The per-row backing delta is a **pure projection of the changed row** — no
-body re-execution, no scan, no compiled residual:
+body re-execution, no scan, no compiled residual. `project(r)` copies the passthrough
+columns and evaluates each deterministic-expression column against the single changed
+row (reusing the runtime, so the value matches `select <body>` exactly):
 
 | source op | maintenance |
 |---|---|

@@ -13,11 +13,12 @@
  *  2. **Row-time write-through** (`maintainRowTime`) — the backing table is kept
  *     consistent *synchronously* with each source row-write, driven from the
  *     runtime DML boundary (not at COMMIT). Each MV is gated at create to the
- *     covering-index shape (a single row-preserving source whose body is a
- *     passthrough projection covering every source PK column), so each source row
- *     maps to exactly one backing row and maintenance is a pure projection of the
- *     changed row — delete the old image's backing key, upsert the new image's
- *     backing row; no body re-execution, no scan. The write targets the backing
+ *     covering-index shape (a single row-preserving source whose body projects every
+ *     source PK column as a passthrough column, with non-key columns optionally a
+ *     deterministic scalar expression over the row), so each source row maps to exactly
+ *     one backing row and maintenance is a pure projection of the changed row — delete
+ *     the old image's backing key, upsert the new image's backing row; no body
+ *     re-execution, no scan. The write targets the backing
  *     table's *pending* transaction layer through the same connection a `select`
  *     from the MV uses, so the change is visible mid-transaction (reads-own-writes)
  *     and is committed/rolled-back in lockstep with the source write by the
@@ -31,8 +32,14 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { BlockNode } from '../planner/nodes/block.js';
-import { PlanNode, type ScalarPlanNode } from '../planner/nodes/plan-node.js';
+import { PlanNode, type ScalarPlanNode, type RowDescriptor, isRelationalNode } from '../planner/nodes/plan-node.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
+import { checkDeterministic } from '../planner/validation/determinism-validator.js';
+import { emitPlanNode } from '../runtime/emitters.js';
+import { EmissionContext } from '../runtime/emission-context.js';
+import { Scheduler } from '../runtime/scheduler.js';
+import { RowContextMap } from '../runtime/context-helpers.js';
+import type { RuntimeContext } from '../runtime/types.js';
 import { AggregateNode } from '../planner/nodes/aggregate-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
@@ -99,11 +106,26 @@ export type MaintenancePlan =
 /**
  * The shipped covering-index maintenance arm (the former `RowTimeMaintenancePlan`,
  * verbatim). Per source row-write the backing delta is a pure projection of the
- * changed row: project the source row to a backing row (a column permutation —
- * passthrough columns only), key it by the backing physical PK, and (if the partial
- * predicate admits it) delete the old image / upsert the new image. No body
- * re-execution, no scan — see `docs/materialized-views.md` § Row-time refresh.
+ * changed row: project the source row to a backing row (a per-column projector —
+ * passthrough columns *and* deterministic scalar expressions over the source row),
+ * key it by the backing physical PK, and (if the partial predicate admits it) delete
+ * the old image / upsert the new image. No body re-execution, no scan — see
+ * `docs/materialized-views.md` § Row-time refresh.
  */
+/**
+ * How a single backing output column is derived from the changed source row — a pure
+ * per-row (per-statement) function. `'passthrough'` copies a source column (the column
+ * permutation that *every* PK / UNIQUE-covered column must use, so the backing key and
+ * the inverse-projection conflict map are recoverable); `'expr'` evaluates a
+ * deterministic scalar expression over the source row (a non-key derived column —
+ * `materialized-view-rowtime-expression-projections`). `eval` is the runtime-compiled
+ * evaluator (see {@link compileSourceRowEvaluator}), so a computed backing value is
+ * exactly what `select <body>` would produce.
+ */
+export type BackingProjector =
+	| { readonly kind: 'passthrough'; readonly sourceCol: number }
+	| { readonly kind: 'expr'; readonly eval: (sourceRow: Row) => SqlValue };
+
 /**
  * Common identity + cost-gate fields shared by every {@link MaintenancePlan} arm.
  * `chosenStrategy` / `sourceStats` are set once by the create-time cost gate
@@ -129,10 +151,13 @@ export interface InverseProjectionPlan extends MaintenancePlanCommon {
 	readonly kind: 'inverse-projection';
 	/** Backing-table physical primary-key definition (the column order the btree keys on). */
 	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
-	/** `projectionSourceCols[j]` = the source column index supplying backing output
-	 *  column `j`. A pure passthrough permutation (every backing column resolves to a
-	 *  source column via attribute provenance — eligibility rejects expression columns). */
-	projectionSourceCols: number[];
+	/** `projectors[j]` derives backing output column `j` from the changed source row —
+	 *  either a passthrough copy of a source column or a deterministic scalar expression
+	 *  over the source row. Every PK / backing-key column is `'passthrough'` (eligibility
+	 *  rejects a computed column that lands in the backing key); non-key columns may be
+	 *  `'expr'`. {@link MaterializedViewManager.lookupCoveringConflicts} reads only the
+	 *  passthrough projectors for its inverse (source↔backing) map. */
+	projectors: BackingProjector[];
 	/** Partial-WHERE predicate evaluated on a single source row; absent ⇒ every row
 	 *  is in scope. A source row contributes a backing row only when this is
 	 *  unambiguously TRUE (mirrors partial-UNIQUE / partial-index semantics). */
@@ -370,7 +395,8 @@ export class MaterializedViewManager {
 		change: BackingRowChange,
 	): Promise<BackingRowChange[]> {
 		const inScope = (row: Row): boolean => plan.predicate === undefined || plan.predicate.evaluate(row) === true;
-		const project = (row: Row): Row => plan.projectionSourceCols.map(sc => row[sc]) as Row;
+		const project = (row: Row): Row =>
+			plan.projectors.map(p => p.kind === 'passthrough' ? row[p.sourceCol] : p.eval(row)) as Row;
 		const keyOf = (backingRow: Row): BTreeKeyForPrimary =>
 			buildPrimaryKeyFromValues(plan.backingPkDefinition.map(d => backingRow[d.index]), plan.backingPkDefinition);
 
@@ -431,9 +457,10 @@ export class MaterializedViewManager {
 	 * row-preserving source `T` with a primary key, a linear
 	 * `TableReference → optional Filter → Project → optional Sort` body
 	 * (no aggregate / join / DISTINCT / set op / recursive CTE / TVF / LIMIT/OFFSET),
-	 * a **passthrough** projection (every backing column resolves to a source column
-	 * via attribute provenance) that covers every source PK column, and a partial
-	 * WHERE evaluable on a single source row.
+	 * a projection that resolves every source PK column (and every backing-key column) to
+	 * a **passthrough** source column — non-key columns may instead be a **deterministic
+	 * scalar expression** over the source row (`materialized-view-rowtime-expression-
+	 * projections`) — and a partial WHERE evaluable on a single source row.
 	 *
 	 * The single source may itself be another MV's backing table (an MV-over-MV body):
 	 * `building/select.ts` rewrites a reference to `mv1` into a `TableReference` against
@@ -467,9 +494,10 @@ export class MaterializedViewManager {
 		const reject = (detail: string): never => {
 			throw new QuereusError(
 				`materialized view '${mv.name}' cannot be materialized: ${detail}. `
-					+ `A materialized view must be row-time maintainable — a passthrough projection of a `
-					+ `single keyed source. For this body, use a plain 'create view' (live re-evaluation) `
-					+ `or 'create table ... as <body>' (a one-off snapshot)`,
+					+ `A materialized view must be row-time maintainable — a passthrough or `
+					+ `deterministic-expression projection of a single keyed source. For this body, use a `
+					+ `plain 'create view' (live re-evaluation) or 'create table ... as <body>' (a one-off `
+					+ `snapshot)`,
 				StatusCode.UNSUPPORTED,
 			);
 		};
@@ -511,35 +539,81 @@ export class MaterializedViewManager {
 			);
 		}
 
-		// Passthrough projection: every backing output column must forward a source
-		// column (attribute-id provenance), making maintenance a pure column
-		// permutation of the changed row.
+		// Projection classification: each backing output column is either a passthrough
+		// source column (a pure permutation entry) or a deterministic scalar expression
+		// over the single source row. A passthrough makes maintenance a column copy; an
+		// expression column evaluates `project(sourceRow)` via the runtime (still a pure
+		// per-row function — O(log n), no body re-execution). PK / backing-key columns
+		// must stay passthrough (the backing key and the inverse-projection conflict map
+		// depend on it); non-key columns may be computed.
 		const sourceAttrToCol = new Map<number, number>();
-		tableRef.getAttributes().forEach((a, i) => sourceAttrToCol.set(a.id, i));
+		const sourceDescriptor: RowDescriptor = [];
+		tableRef.getAttributes().forEach((a, i) => {
+			sourceAttrToCol.set(a.id, i);
+			sourceDescriptor[a.id] = i;
+		});
 		const producingByAttrId = collectProducingExprs(analyzed);
 		const rootAttrs = relationalAttributes(analyzed);
 		if (!rootAttrs) reject('its body produced no relational output');
 
-		const projectionSourceCols: number[] = [];
+		const projectors: BackingProjector[] = [];
 		for (let outCol = 0; outCol < rootAttrs!.length; outCol++) {
 			const attr = rootAttrs![outCol];
 			const sourceCol = attr ? resolveSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
-			if (sourceCol === undefined) {
-				reject('it projects a computed/expression column (only passthrough source columns are supported)');
+			if (sourceCol !== undefined) {
+				projectors.push({ kind: 'passthrough', sourceCol });
+				continue;
 			}
-			projectionSourceCols.push(sourceCol!);
+			// Computed column: a deterministic scalar over the source row. Reject a
+			// non-deterministic producer (determinism diagnostic) before checking shape,
+			// so `random()` fails on *determinism* and a deterministic-but-unsupported
+			// form fails on *shape* — distinct diagnostics.
+			const colName = attr?.name ?? `#${outCol}`;
+			const producing = attr ? producingByAttrId.get(attr.id) : undefined;
+			if (!producing) {
+				reject(`it projects output column '${colName}' with no resolvable source expression`);
+			}
+			const det = checkDeterministic(producing!);
+			if (!det.valid) {
+				reject(`it projects a non-deterministic expression column '${colName}' (${det.expression}); `
+					+ `a row-time backing value must be reproducible from the source row`);
+			}
+			assertSingleRowEvaluable(producing!, sourceDescriptor, colName, reject);
+			let evalFn: (row: Row) => SqlValue;
+			try {
+				evalFn = compileSourceRowEvaluator(db, producing!, sourceDescriptor);
+			} catch (e) {
+				reject(`it projects expression column '${colName}' in a form that is not row-time `
+					+ `maintainable (${e instanceof Error ? e.message : String(e)})`);
+			}
+			projectors.push({ kind: 'expr', eval: evalFn! });
 		}
 
-		// Every source PK column must be projected so the backing key is a
-		// deterministic function of the source row (and identifies that row).
-		const projected = new Set(projectionSourceCols);
+		// Every source PK column must be projected as a passthrough column so the backing
+		// key is a deterministic identity of the source row that `lookupCoveringConflicts`
+		// can invert. A PK column produced only via an expression (or not at all) breaks
+		// that recovery.
+		const passthroughSourceCols = new Set(
+			projectors.flatMap(p => p.kind === 'passthrough' ? [p.sourceCol] : []),
+		);
 		for (const pk of sourcePkCols) {
-			if (!projected.has(pk)) {
-				reject(`it does not project source primary-key column '${sourceSchema.columns[pk]?.name ?? pk}'`);
+			if (!passthroughSourceCols.has(pk)) {
+				reject(`it does not project source primary-key column '${sourceSchema.columns[pk]?.name ?? pk}' `
+					+ `as a passthrough column`);
 			}
 		}
 
 		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+
+		// A computed column may never land in the backing primary key: the btree keys on
+		// it and `lookupCoveringConflicts` recovers the source PK from it, both of which
+		// require a passthrough source-column identity.
+		for (const d of backingPkDefinition) {
+			if (projectors[d.index]?.kind !== 'passthrough') {
+				reject(`its backing primary key includes computed column '${backing.columns[d.index]?.name ?? d.index}' `
+					+ `(backing-key columns must be passthrough source columns)`);
+			}
+		}
 
 		// Partial WHERE must be evaluable on a single source row (no subqueries /
 		// cross-row references). `compilePredicate` throws on unsupported forms.
@@ -565,7 +639,7 @@ export class MaterializedViewManager {
 		// The general-bodies ticket widens `soundStrategies` and activates the reject-at-create
 		// / degrade-to-rebuild machinery in planner/cost/index.ts once the other arms are wired.
 		const soundStrategies: MaintenanceStrategy[] = ['inverse-projection'];
-		const sourceStats = this.estimateMaintenanceStats(sourceSchema, projectionSourceCols.length, predicate !== undefined);
+		const sourceStats = this.estimateMaintenanceStats(sourceSchema, projectors.length, predicate !== undefined);
 		// Create-time change-cardinality estimate: ~1% of the source per statement (typical OLTP).
 		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
@@ -589,7 +663,7 @@ export class MaterializedViewManager {
 			chosenStrategy,
 			sourceStats,
 			backingPkDefinition,
-			projectionSourceCols,
+			projectors,
 			predicate,
 		};
 	}
@@ -722,11 +796,15 @@ export class MaterializedViewManager {
 		if (!sourceSchema) return [];
 
 		// Inverse projection: source column index → backing column index (first
-		// occurrence). `projectionSourceCols[j]` is the source column behind backing
-		// column `j`, so this reverses it.
+		// occurrence). Only the passthrough projectors carry a source-column identity
+		// (a computed `'expr'` column has no inverse), and the eligibility gate forces
+		// every PK / UNIQUE-covered column to be passthrough, so conflict resolution is
+		// unaffected by any extra computed columns the body also projects.
 		const sourceColToBacking = new Map<number, number>();
-		plan.projectionSourceCols.forEach((sc, backingCol) => {
-			if (!sourceColToBacking.has(sc)) sourceColToBacking.set(sc, backingCol);
+		plan.projectors.forEach((p, backingCol) => {
+			if (p.kind === 'passthrough' && !sourceColToBacking.has(p.sourceCol)) {
+				sourceColToBacking.set(p.sourceCol, backingCol);
+			}
 		});
 
 		const ucBackingCols: number[] = [];
@@ -901,4 +979,72 @@ function relationalAttributes(block: BlockNode): ReturnType<TableReferenceNode['
 		if (typeof child.getAttributes === 'function') return child.getAttributes();
 	}
 	return undefined;
+}
+
+/**
+ * Reject a computed projection expression that cannot be evaluated as a pure function
+ * of the changed source row: a subquery / relational subtree (cross-row), or a column
+ * reference that does not resolve to a source column (a correlated / outer reference).
+ * This is the "shape" gate distinct from the determinism gate — a determinism failure
+ * is caught earlier by `checkDeterministic`.
+ */
+function assertSingleRowEvaluable(
+	expr: ScalarPlanNode,
+	sourceDescriptor: RowDescriptor,
+	colName: string,
+	reject: (detail: string) => never,
+): void {
+	const visit = (node: PlanNode): void => {
+		if (node !== expr && isRelationalNode(node)) {
+			reject(`it projects expression column '${colName}' containing a subquery `
+				+ `(only single-row scalar expressions over the source are row-time maintainable)`);
+		}
+		if (node instanceof ColumnReferenceNode && sourceDescriptor[node.attributeId] === undefined) {
+			reject(`it projects expression column '${colName}' referencing a value outside the source row`);
+		}
+		for (const child of node.getChildren()) visit(child as unknown as PlanNode);
+	};
+	visit(expr);
+}
+
+/**
+ * Compile a deterministic scalar plan node into a per-source-row evaluator by reusing
+ * the runtime: emit the node once, then run it against a row context that maps each
+ * source attribute id to its column index in the changed row. Reusing the runtime
+ * (rather than a hand-rolled scalar interpreter) guarantees a computed backing value is
+ * byte-for-byte what `select <body>` would produce — the materialized-view ≡ view
+ * contract. The gated forms (deterministic scalars over a single row, no subqueries —
+ * see {@link assertSingleRowEvaluable}) resolve synchronously; a Promise result would
+ * signal an unsupported async form and is surfaced loudly rather than silently awaited.
+ */
+function compileSourceRowEvaluator(
+	db: Database,
+	expr: ScalarPlanNode,
+	sourceDescriptor: RowDescriptor,
+): (row: Row) => SqlValue {
+	const instruction = emitPlanNode(expr, new EmissionContext(db));
+	const scheduler = new Scheduler(instruction);
+	const context = new RowContextMap();
+	let currentRow: Row = [];
+	// Installed once; the getter reads the closed-over `currentRow`, refreshed per call.
+	context.set(sourceDescriptor, () => currentRow);
+	const rctx: RuntimeContext = {
+		db,
+		stmt: undefined,
+		params: {},
+		context,
+		tableContexts: new Map(),
+		enableMetrics: false,
+	};
+	return (row: Row): SqlValue => {
+		currentRow = row;
+		const result = scheduler.run(rctx);
+		if (result instanceof Promise) {
+			throw new QuereusError(
+				'a row-time projection expression evaluated asynchronously (unexpected for a gated single-row scalar)',
+				StatusCode.INTERNAL,
+			);
+		}
+		return result as SqlValue;
+	};
 }
