@@ -97,6 +97,8 @@ export class EagerPrefetchNode extends PlanNode implements UnaryRelationalNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// Same rows in the same order ⇒ inclusion dependencies pass through too.
+			inds: sourcePhysical?.inds,
 			monotonicOn: sourcePhysical?.monotonicOn,
 			// accessCapabilities/rangeBoundedOn are access-path-local — a
 			// pass-through node sits between the leaf iterator and the consumer,

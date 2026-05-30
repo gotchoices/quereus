@@ -8,7 +8,7 @@ import { quereusError } from '../../common/errors.js';
 import type { JoinCapable, PredicateSourceCapable } from '../framework/characteristics.js';
 import { mergeJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds, type EquiJoinPair } from './join-utils.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
 
 /**
@@ -113,6 +113,7 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
 			domainConstraints: fdResult.domainConstraints,
+			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftAttrs.length),
 		};
 	}
 

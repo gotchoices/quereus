@@ -172,6 +172,11 @@ export class SeqScanNode extends TableAccessNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// A full scan preserves the table reference's seeded INDs. (Even a
+			// row-reducing seek would preserve a per-row inclusion claim — the
+			// subset of surviving rows still satisfies it — so this is safe across
+			// every access node here.)
+			inds: sourcePhysical?.inds,
 		};
 		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
 		return out;
@@ -252,6 +257,8 @@ export class IndexScanNode extends TableAccessNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// INDs survive the scan (a per-row inclusion claim holds on any subset).
+			inds: sourcePhysical?.inds,
 			...lifted,
 		};
 		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
@@ -383,6 +390,8 @@ export class IndexSeekNode extends TableAccessNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// A row-reducing seek still preserves the per-row inclusion claim.
+			inds: sourcePhysical?.inds,
 			...lifted,
 		} as Partial<PhysicalProperties>;
 		if (this.rangeBoundedOn) base.rangeBoundedOn = this.rangeBoundedOn;

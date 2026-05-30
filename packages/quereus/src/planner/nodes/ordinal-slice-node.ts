@@ -78,6 +78,8 @@ export class OrdinalSliceNode extends PlanNode implements UnaryRelationalNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// Slicing a prefix only removes rows — the per-row inclusion claim survives.
+			inds: sourcePhysical?.inds,
 			monotonicOn: sourcePhysical?.monotonicOn,
 		};
 	}

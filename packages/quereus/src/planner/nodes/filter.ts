@@ -128,6 +128,8 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			// Domains pass through unchanged. Intersecting with the filter predicate
 			// is deferred to the predicate-contradiction-detection ticket.
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// Row removal preserves a per-row inclusion claim, so INDs pass through.
+			inds: sourcePhysical?.inds,
 		};
 	}
 

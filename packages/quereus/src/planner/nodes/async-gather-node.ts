@@ -530,6 +530,11 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		// crossProduct: fold pairwise — identical to N applications of
 		// JoinNode(cross). Each child's FDs hold on its slice of the output row;
 		// concatenation preserves them after shifting column indices.
+		//
+		// INDs could shift+merge here exactly like FDs (a cross product preserves
+		// each child's per-row inclusion claims). Deferred — no consumer reads
+		// `inds` in this wave, so we leave it undefined rather than carry it
+		// through AsyncGather. Revisit when a consumer lands.
 		let fds: ReadonlyArray<FunctionalDependency> = childrenPhysical[0].fds ?? [];
 		let equiv: ReadonlyArray<ReadonlyArray<number>> = childrenPhysical[0].equivClasses ?? [];
 		let bindings: ReadonlyArray<ConstantBinding> = childrenPhysical[0].constantBindings ?? [];

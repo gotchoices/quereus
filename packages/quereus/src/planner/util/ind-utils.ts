@@ -22,7 +22,7 @@
 
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
-import type { RelationalPlanNode } from '../nodes/plan-node.js';
+import type { InclusionDependency, RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { AliasNode } from '../nodes/alias-node.js';
@@ -110,16 +110,92 @@ export function lookupCoveringFK(
 		}
 		if (!aligned) continue;
 
-		let nullable = false;
-		for (const colIdx of fk.columns) {
-			if (!childSchema.columns[colIdx]?.notNull) {
-				nullable = true;
-				break;
-			}
-		}
-		return { fk, nullable };
+		return { fk, nullable: fkChildNullable(childSchema, fk) };
 	}
 	return undefined;
+}
+
+/**
+ * True iff any child column of `fk` is nullable on `childSchema`. The single
+ * source of the FK-nullability bit: both `lookupCoveringFK` (as
+ * `CoveringFKMatch.nullable`) and the IND seeding in `TableReferenceNode`
+ * consume it, so the rule helper and the propagated property cannot diverge.
+ *
+ * A nullable child column means the FK→parent inclusion only guarantees the
+ * non-null FK rows have a parent (a NULL FK row is excluded — `nullRejecting`).
+ */
+export function fkChildNullable(
+	childSchema: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+): boolean {
+	for (const colIdx of fk.columns) {
+		if (!childSchema.columns[colIdx]?.notNull) return true;
+	}
+	return false;
+}
+
+/**
+ * Seed one inclusion dependency per declared FK on `childSchema` whose
+ * referenced columns are exactly the primary key of the parent table. The
+ * propagated companion to `lookupCoveringFK` — it mirrors that helper's FK→PK
+ * validation (the FK must cover the whole PK and every referenced column must be
+ * a PK column) so a malformed FK referencing non-PK columns never seeds an IND
+ * against the PK.
+ *
+ * `cols` are the FK child column indices, which equal output indices at a
+ * `TableReferenceNode` (output = table columns 1:1) — `cols[i]` pairs
+ * positionally with `targetCols[i]`. `nullRejecting` is the shared
+ * `fkChildNullable` bit. Parent schemas are resolved through `findParent`; an FK
+ * whose parent cannot be resolved, has no PK, or has a mismatched PK seeds
+ * nothing.
+ */
+export function seedTableForeignKeyInds(
+	childSchema: TableSchema,
+	findParent: (tableName: string, schemaName: string) => TableSchema | undefined,
+): InclusionDependency[] {
+	const fks = childSchema.foreignKeys;
+	if (!fks || fks.length === 0) return [];
+
+	const inds: InclusionDependency[] = [];
+	for (const fk of fks) {
+		const parentSchemaName = fk.referencedSchema ?? childSchema.schemaName;
+		const parent = findParent(fk.referencedTable, parentSchemaName);
+		if (!parent) continue;
+
+		const pkDef = parent.primaryKeyDefinition;
+		if (pkDef.length === 0) continue;
+		if (fk.columns.length !== pkDef.length) continue;
+
+		let refCols: ReadonlyArray<number>;
+		try {
+			refCols = resolveReferencedColumns(fk, parent);
+		} catch {
+			continue;
+		}
+		if (refCols.length !== fk.columns.length) continue;
+
+		// Every referenced column must be a PK column — mirror lookupCoveringFK's
+		// defensive cross-check so a malformed FK referencing non-PK columns never
+		// seeds an IND against the PK.
+		const pkColSet = new Set(pkDef.map(p => p.index));
+		let allPk = true;
+		for (const rc of refCols) {
+			if (!pkColSet.has(rc)) { allPk = false; break; }
+		}
+		if (!allPk) continue;
+
+		inds.push({
+			cols: fk.columns.slice(),
+			target: {
+				kind: 'table',
+				schema: parent.schemaName,
+				table: parent.name,
+				targetCols: refCols.slice(),
+			},
+			nullRejecting: fkChildNullable(childSchema, fk),
+		});
+	}
+	return inds;
 }
 
 /**

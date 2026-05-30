@@ -6,7 +6,7 @@
  */
 
 import { createLogger } from '../../common/logger.js';
-import type { ConstantBinding, ConstantValue, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, PhysicalProperties, ScalarPlanNode } from '../nodes/plan-node.js';
+import type { ConstantBinding, ConstantValue, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, InclusionDependency, IndTarget, PhysicalProperties, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { BetweenNode, BinaryOpNode, CastNode, CollateNode, LiteralNode, UnaryOpNode } from '../nodes/scalar.js';
@@ -1722,4 +1722,137 @@ export function shiftDomainConstraints(
 ): DomainConstraint[] {
 	if (offset === 0) return domains.slice();
 	return domains.map(domain => ({ ...domain, column: domain.column + offset }));
+}
+
+// ---------------------------------------------------------------------------
+// InclusionDependency helpers
+// ---------------------------------------------------------------------------
+
+export type { InclusionDependency, IndTarget };
+
+/**
+ * Per-node cap on the number of INDs we materialize, mirroring
+ * `MAX_FDS_PER_NODE`. A safety valve for pathological plans; truncations are
+ * logged under the `quereus:planner:fd` logger like the FD/binding/domain caps.
+ */
+export const MAX_INDS_PER_NODE = 64;
+
+function sameOrderedList(a: readonly number[], b: readonly number[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+function indTargetsEqual(a: IndTarget, b: IndTarget): boolean {
+	if (a.kind !== b.kind) return false;
+	if (a.kind === 'table' && b.kind === 'table') {
+		return a.schema === b.schema && a.table === b.table && sameOrderedList(a.targetCols, b.targetCols);
+	}
+	if (a.kind === 'relation' && b.kind === 'relation') {
+		return a.relationId === b.relationId && sameOrderedList(a.targetCols, b.targetCols);
+	}
+	return false;
+}
+
+/**
+ * Structural equality for IND dedup. `cols` and `target.targetCols` are
+ * compared as *ordered* lists — the positional pairing between them is
+ * load-bearing (`cols[i]` is the child column matched to `targetCols[i]`), so a
+ * reordering is a different fact and must not collapse. Stricter than
+ * `fdsEqual`'s set comparison; over-keeping a reordered twin is harmless
+ * (redundancy, capped), whereas collapsing distinct facts would lose an IND.
+ */
+function indsEqual(a: InclusionDependency, b: InclusionDependency): boolean {
+	return a.nullRejecting === b.nullRejecting
+		&& sameOrderedList(a.cols, b.cols)
+		&& indTargetsEqual(a.target, b.target);
+}
+
+export interface AddIndOptions {
+	cap?: number;
+}
+
+/**
+ * Add a single IND, skipping it when a structurally-equal entry (per
+ * `indsEqual`) already exists. Enforces the per-node cap; truncations are
+ * logged. Mirrors `addFd` minus the determinant-subsumption logic (an IND has
+ * no determinant/dependent split to subsume).
+ */
+export function addInd(
+	inds: ReadonlyArray<InclusionDependency>,
+	next: InclusionDependency,
+	opts: AddIndOptions = {},
+): InclusionDependency[] {
+	const result = inds.slice();
+	if (!result.some(existing => indsEqual(existing, next))) {
+		result.push(next);
+	}
+	return enforceIndCap(result, opts);
+}
+
+function enforceIndCap(
+	inds: InclusionDependency[],
+	opts: AddIndOptions,
+): InclusionDependency[] {
+	const cap = opts.cap ?? MAX_INDS_PER_NODE;
+	if (inds.length <= cap) return inds;
+	const kept = inds.slice(0, cap);
+	log('IND cap reached: dropped %d IND(s) from %d', inds.length - kept.length, inds.length);
+	return kept;
+}
+
+/** Merge two IND lists: concat with structural dedup via `addInd`, capped. */
+export function mergeInds(
+	a: ReadonlyArray<InclusionDependency>,
+	b: ReadonlyArray<InclusionDependency>,
+	opts: AddIndOptions = {},
+): InclusionDependency[] {
+	let result: InclusionDependency[] = a.slice();
+	for (const ind of b) {
+		result = addInd(result, ind, opts);
+	}
+	return result;
+}
+
+/**
+ * Project INDs through a column mapping (oldCol → newCol). An IND's `cols` is
+ * **all-or-nothing**: drop the IND when ANY of its `cols` loses its mapping (the
+ * relation no longer carries the witnessing columns) — there is no partial-
+ * dependent survival as in `projectFds`. Survivors have their `cols` remapped to
+ * output indices; `target.targetCols` index into the *target* relation, NOT this
+ * relation's output, so they are NOT remapped. Result is deduped + capped.
+ */
+export function projectInds(
+	inds: ReadonlyArray<InclusionDependency>,
+	mapping: ReadonlyMap<number, number>,
+): InclusionDependency[] {
+	const out: InclusionDependency[] = [];
+	for (const ind of inds) {
+		const newCols: number[] = [];
+		let miss = false;
+		for (const c of ind.cols) {
+			const m = mapping.get(c);
+			if (m === undefined) { miss = true; break; }
+			newCols.push(m);
+		}
+		if (miss) continue;
+		out.push({ cols: newCols, target: ind.target, nullRejecting: ind.nullRejecting });
+	}
+	return mergeInds([], out);
+}
+
+/**
+ * Shift each IND's `cols` by `offset` (mirrors `shiftFds` for join column
+ * translation). `target.targetCols` are target-relative ⇒ NOT shifted.
+ */
+export function shiftInds(
+	inds: ReadonlyArray<InclusionDependency>,
+	offset: number,
+): InclusionDependency[] {
+	if (offset === 0) return inds.slice();
+	return inds.map(ind => ({
+		cols: ind.cols.map(c => c + offset),
+		target: ind.target,
+		nullRejecting: ind.nullRejecting,
+	}));
 }

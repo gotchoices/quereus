@@ -100,12 +100,13 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		return {
 			estimatedRows: this.estimatedRows,
 			ordering,
-			// Sort doesn't change which rows are in the relation — FDs/ECs/bindings
-			// propagate unchanged.
+			// Sort doesn't change which rows are in the relation — FDs/ECs/bindings/
+			// INDs propagate unchanged.
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			inds: sourcePhysical?.inds,
 			monotonicOn,
 		};
 	}

@@ -1,6 +1,7 @@
 import type { BaseType, ScalarType, RelationType } from '../../common/datatype.js';
-import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint } from './plan-node.js';
+import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency } from './plan-node.js';
 import { addFd, closeConstantBindingsOverEcs, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
+import { seedTableForeignKeyInds } from '../util/ind-utils.js';
 import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
 import { getPartialUniqueGuardedFds } from '../analysis/partial-unique-extraction.js';
 import { getAssertionHoistedConstraints } from '../analysis/assertion-hoist-cache.js';
@@ -190,11 +191,23 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			domainConstraints = mergeDomainConstraints(domainConstraints, hoisted.domainConstraints);
 		}
 
+		// Seed inclusion dependencies from declared foreign keys whose referenced
+		// columns are the parent's primary key. Output indices equal table column
+		// indices here, so the FK child columns are used verbatim as `cols`. Needs
+		// the schema manager to resolve parent tables; when absent (isolated test
+		// construction) no INDs are seeded.
+		let inds: ReadonlyArray<InclusionDependency> = [];
+		if (this.schemaManager !== undefined) {
+			const sm = this.schemaManager;
+			inds = seedTableForeignKeyInds(this.tableSchema, (t, s) => sm.findTable(t, s));
+		}
+
 		const out: Partial<PhysicalProperties> = {};
 		if (fds.length > 0) out.fds = fds;
 		if (equivClasses.length > 0) out.equivClasses = equivClasses;
 		if (constantBindings.length > 0) out.constantBindings = constantBindings;
 		if (domainConstraints.length > 0) out.domainConstraints = domainConstraints;
+		if (inds.length > 0) out.inds = inds;
 		// Concurrency safety: read-only subtree over a module that tolerates
 		// concurrent calls. The base PlanNode `physical` getter ANDs children's
 		// `concurrencySafe` automatically; here we set the leaf value.

@@ -9,7 +9,7 @@ import type { JoinCapable, PredicateSourceCapable } from '../framework/character
 import { hashJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinFds, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinFds, propagateJoinInds, type EquiJoinPair } from './join-utils.js';
 
 export type { EquiJoinPair } from './join-utils.js';
 
@@ -104,6 +104,7 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
 			domainConstraints: fdResult.domainConstraints,
+			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftAttrs.length),
 		};
 	}
 

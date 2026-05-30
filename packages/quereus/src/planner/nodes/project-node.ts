@@ -4,7 +4,7 @@ import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
-import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { formatProjection } from '../../util/plan-formatter.js';
 import { ColumnReferenceNode } from './reference.js';
@@ -251,6 +251,9 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		}
 		const projectedBindings = projectConstantBindings(sourcePhysical?.constantBindings ?? [], map);
 		const projectedDomains = projectDomainConstraints(sourcePhysical?.domainConstraints ?? [], map);
+		// INDs project all-or-nothing through the same column map: an IND survives
+		// only when every witnessing column is still present in the output.
+		const projectedInds = projectInds(sourcePhysical?.inds ?? [], map);
 
 		return {
 			estimatedRows: this.source.estimatedRows,
@@ -260,6 +263,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			equivClasses: projectedEquiv.length > 0 ? projectedEquiv : undefined,
 			constantBindings: projectedBindings.length > 0 ? projectedBindings : undefined,
 			domainConstraints: projectedDomains.length > 0 ? projectedDomains : undefined,
+			inds: projectedInds.length > 0 ? projectedInds : undefined,
 		};
 	}
 

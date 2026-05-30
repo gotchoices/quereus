@@ -75,6 +75,10 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 			equivClasses: src.equivClasses,
 			constantBindings: src.constantBindings,
 			domainConstraints: src.domainConstraints,
+			// Bit-for-bit pass-through includes the inclusion-dependency set — without
+			// this the INDs seeded at the table reference would be lost at the module
+			// boundary in every plan that wraps the access path in a Retrieve.
+			inds: src.inds,
 		};
 	}
 

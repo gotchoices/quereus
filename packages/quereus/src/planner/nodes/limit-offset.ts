@@ -125,6 +125,8 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// Slicing rows keeps a per-row inclusion claim — INDs pass through.
+			inds: sourcePhysical?.inds,
 			// LIMIT/OFFSET preserves monotonicOn — slicing a sorted prefix preserves ordering.
 			monotonicOn: sourcePhysical?.monotonicOn,
 		};

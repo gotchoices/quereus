@@ -54,6 +54,51 @@ export interface FunctionalDependency {
 }
 
 /**
+ * An inclusion dependency (IND): a guarantee that for every row of THIS
+ * relation, the tuple formed by `cols` exists in another relation's
+ * `target.targetCols`. The *propagated* companion to the FK-declaration-bound
+ * helpers in `planner/util/ind-utils.ts` — see `docs/optimizer.md` section
+ * "Inclusion Dependency Tracking" for the seeding source and per-operator
+ * propagation table.
+ *
+ * Asserts *existence* of a tuple in another relation — strictly weaker than,
+ * and orthogonal to, an FD's *determination* of columns within this relation. A
+ * false IND (**over-claim**) is unsound: it asserts a row exists that does not,
+ * which would silently mis-prove coverage downstream. A missing IND
+ * (**under-claim**) only forgoes an optimization. Therefore every propagation
+ * rule is conservative — drop when unsure.
+ */
+export interface InclusionDependency {
+  /** Output-column indices on THIS relation whose tuple is guaranteed to exist in `target`. */
+  readonly cols: readonly number[];
+  readonly target: IndTarget;
+  /**
+   * true: a NULL in any of `cols` excludes that row from the guarantee (MATCH
+   * SIMPLE / nullable FK). false: total — every row's `cols` tuple is present in
+   * the target.
+   */
+  readonly nullRejecting: boolean;
+}
+
+/**
+ * The referenced side of an {@link InclusionDependency}. `targetCols` index
+ * into the *target* relation (NOT this relation's output), so projection/shift
+ * never remap them.
+ *
+ * - `table`: `child.cols ⊆ table.targetCols`, where `targetCols` is a key of
+ *   that table. The FK-seeded form the coverage prover (Wave 2) reasons over.
+ * - `relation`: a basis relation addressed by a stable symbolic id the lens
+ *   compiler mints — reserved for the Wave-3 lens existence-anchor injection. No
+ *   producer mints it in this wave; the variant exists so the surface is
+ *   enforcement-ready (an obligation/discharge consumer can ride it later
+ *   without raising the propagation bar — obligations come from the
+ *   authoritative declaration, never from the propagated set).
+ */
+export type IndTarget =
+  | { readonly kind: 'table'; readonly schema: string; readonly table: string; readonly targetCols: readonly number[] }
+  | { readonly kind: 'relation'; readonly relationId: string; readonly targetCols: readonly number[] };
+
+/**
  * Origin of an inferred constraint (FD / binding / domain). Optional and
  * informational — dedup helpers in `fd-utils.ts` compare structural fields
  * only, so identical constraints from different sources collapse to one and
@@ -216,6 +261,22 @@ export interface PhysicalProperties {
    * intersection across constraints is deferred to a follow-up ticket.
    */
   domainConstraints?: ReadonlyArray<DomainConstraint>;
+
+  /**
+   * Inclusion dependencies that hold over the output stream: for each entry,
+   * every row's `cols` tuple is guaranteed to exist in another relation's
+   * `targetCols` (subject to `nullRejecting`). Seeded from declared foreign keys
+   * at the table reference and propagated through joins/projections with
+   * conservative drops — see `planner/util/fd-utils.ts` for the
+   * merge/project/shift helpers and `docs/optimizer.md` section "Inclusion
+   * Dependency Tracking".
+   *
+   * Asserts *existence* of a tuple in another relation — strictly weaker than,
+   * and orthogonal to, an FD's *determination* of columns within this relation
+   * (`fds`). No consumer reads this surface yet; it is a parallel derivation
+   * surface for the coverage prover (Wave 2) and lens existence anchors (Wave 3).
+   */
+  inds?: ReadonlyArray<InclusionDependency>;
 
   /**
    * Attributes the relation is monotonically ordered on. Stronger than `ordering`:

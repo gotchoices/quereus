@@ -91,6 +91,8 @@ export class DistinctNode extends PlanNode implements UnaryRelationalNode {
       equivClasses: sourcePhysical?.equivClasses,
       constantBindings: sourcePhysical?.constantBindings,
       domainConstraints: sourcePhysical?.domainConstraints,
+      // Deduplication only removes rows — a per-row inclusion claim survives.
+      inds: sourcePhysical?.inds,
     };
   }
 

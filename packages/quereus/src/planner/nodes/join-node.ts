@@ -12,7 +12,7 @@ import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
 import { ColumnReferenceNode } from './reference.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
 
@@ -131,6 +131,7 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
 			domainConstraints: fdResult.domainConstraints,
+			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftType.columns.length),
 		};
 	}
 

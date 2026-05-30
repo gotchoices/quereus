@@ -1,4 +1,4 @@
-import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
+import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, InclusionDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
 import type { JoinType } from './join-node.js';
 import type { RelationType, ColRef } from '../../common/datatype.js';
 import {
@@ -7,9 +7,11 @@ import {
 	mergeConstantBindings,
 	mergeDomainConstraints,
 	mergeEquivClasses, mergeFds,
+	mergeInds,
 	shiftConstantBindings,
 	shiftDomainConstraints,
 	shiftEquivClasses, shiftFds,
+	shiftInds,
 	superkeyToFd,
 } from '../util/fd-utils.js';
 
@@ -265,6 +267,51 @@ export function propagateJoinFds(
 		default:
 			return {};
 	}
+}
+
+/**
+ * Propagate inclusion dependencies through a join operator. The IND analogue of
+ * `propagateJoinFds` — it MUST stay consistent with that function and
+ * `analyzeJoinKeyCoverage`.
+ *
+ * INDs assert per-row existence in another relation, so a NULL-padded side can
+ * violate the claim and is dropped conservatively:
+ * - inner / cross: union of left INDs and `shiftInds(right, leftColumnCount)`.
+ * - left (preserved = left): keep left INDs; drop the right side's INDs (the
+ *   right columns are NULL-padded for unmatched left rows).
+ * - right (preserved = right): keep `shiftInds(right, leftColumnCount)`; drop left.
+ * - semi / anti: keep left INDs only (right columns are not in the output).
+ * - full: drop both (either side can be NULL-padded).
+ */
+export function propagateJoinInds(
+	joinType: JoinType,
+	leftPhys: PhysicalProperties | undefined,
+	rightPhys: PhysicalProperties | undefined,
+	leftColumnCount: number,
+): ReadonlyArray<InclusionDependency> | undefined {
+	const leftInds = leftPhys?.inds ?? [];
+	const rightInds = rightPhys?.inds ?? [];
+
+	let result: ReadonlyArray<InclusionDependency>;
+	switch (joinType) {
+		case 'inner':
+		case 'cross':
+			result = mergeInds(leftInds, shiftInds(rightInds, leftColumnCount));
+			break;
+		case 'left':
+		case 'semi':
+		case 'anti':
+			result = leftInds.slice();
+			break;
+		case 'right':
+			result = shiftInds(rightInds, leftColumnCount);
+			break;
+		case 'full':
+		default:
+			result = [];
+			break;
+	}
+	return result.length > 0 ? result : undefined;
 }
 
 /**

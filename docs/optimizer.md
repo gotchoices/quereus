@@ -1407,6 +1407,49 @@ Bindings are closed over equivalence classes: at every node that contributes bin
 
 `domainConstraints` propagate alongside `constantBindings` using the same projection / shift / drop rules: pass-through nodes (Filter, Distinct, Alias, Window, Sort, Limit, scan family) inherit them unchanged; Project/Returning/Aggregate keep only constraints whose column maps to an output column; inner/cross joins concat with shift; LEFT/RIGHT outer keep only the preserved side; FULL outer and SetOperation drop everything. Filter does **not** intersect domains with the filter predicate yet — that intersection is deferred to the predicate-contradiction-detection ticket. Multiple constraints on the same column may coexist (no implicit intersection at this layer).
 
+#### Inclusion Dependency Tracking
+
+An **inclusion dependency** (IND) is a fourth dependency-family member of `PhysicalProperties`, sitting beside `fds` / `equivClasses` / `constantBindings` / `domainConstraints`. Where an FD asserts *determination within* this relation, an IND asserts *existence in another* relation: for every row of this node, the tuple formed by `cols` is guaranteed to appear in another relation's `targetCols`. It is strictly weaker than, and orthogonal to, an FD.
+
+```typescript
+interface InclusionDependency {
+  readonly cols: readonly number[];     // output-column indices on THIS relation
+  readonly target: IndTarget;
+  readonly nullRejecting: boolean;      // true ⇒ a NULL in any `cols` excludes that row from the guarantee
+}
+
+type IndTarget =
+  // child.cols ⊆ table.targetCols, where targetCols is a key of that table. The FK-seeded form.
+  | { readonly kind: 'table'; readonly schema: string; readonly table: string; readonly targetCols: readonly number[] }
+  // Reserved for the lens existence-anchor injection; no producer mints it yet.
+  | { readonly kind: 'relation'; readonly relationId: string; readonly targetCols: readonly number[] };
+```
+
+`cols[i]` pairs *positionally* with `target.targetCols[i]`. `targetCols` index into the **target** relation, never this node's output, so projection and join-shift never remap them.
+
+**Seeding source.** `TableReferenceNode` seeds one IND per declared foreign key whose referenced columns are exactly the parent's primary key (`seedTableForeignKeyInds` in `util/ind-utils.ts`): `cols` = the FK child columns (which equal output indices at a table reference), `target` = `{ table, schema, targetCols: parent PK }`, and `nullRejecting` = **(any FK child column nullable)** — the *same* bit `lookupCoveringFK` computes as `CoveringFKMatch.nullable`, factored into the shared `fkChildNullable` helper so the rule helper and the seeded property cannot diverge. A malformed FK referencing non-PK columns seeds nothing (mirrors `lookupCoveringFK`'s defensive PK cross-check).
+
+**Soundness boundary (load-bearing).** A false IND (**over-claim**) is unsound — it asserts a row exists that does not, which would silently mis-prove coverage downstream. A missing IND (**under-claim**) only forgoes an optimization (the fallback path runs — safe). Therefore **every propagation rule is conservative: drop when unsure.** This matches the coverage prover's "a false `Covers` is unsound ⇒ be conservative" bar and the RI-trust assumption `ind-utils.ts` already makes (declared FKs treated as hard inclusion dependencies; `pragma foreign_keys` defaults on). The `test/optimizer/inclusion-dependencies.spec.ts` property/law harness is the empirical backstop: for representative optimized plans it materializes each relational node and asserts every propagated IND actually holds (each row's `cols` projection, excluding NULL-rejected rows, is present in the target's `targetCols` projection) — the IND analogue of the Key Soundness harness.
+
+**Enforcement readiness.** Admitting a future runtime *enforcement* consumer (one that discharges an FK/lens obligation by checking the propagated set) does **not** raise the propagation bar, because enforcement obligations come from the authoritative FK/lens *declaration*, never from the propagated set. The propagated IND can only ever *add* a discharge opportunity (skip a redundant check) — and an under-claim there just runs the check. That asymmetry is why `IndTarget` already carries the `relation` variant (for the Wave-3 lens existence-anchor injection) even though no producer mints it this wave: the surface is enforcement-ready without any propagation rule having to be sound-for-enforcement.
+
+**Per-operator propagation** (helpers `projectInds` / `shiftInds` / `mergeInds` / `addInd` in `util/fd-utils.ts`, capped at `MAX_INDS_PER_NODE = 64`; join branch table in `propagateJoinInds`, `nodes/join-utils.ts`):
+
+| Operator                                                       | INDs                                                                                                                                       |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `TableReferenceNode`                                           | Seed one IND per declared FK→parent-PK (see *Seeding source* above).                                                                       |
+| Scan family / `RetrieveNode` / `FilterNode` / `AliasNode` / `SortNode` / `DistinctNode` / `LimitOffsetNode` / `OrdinalSliceNode` / `EagerPrefetchNode` | Pass through unchanged. Row removal (filter, dedup, limit/slice, a row-reducing seek) preserves a per-row inclusion claim, so the claim survives on the surviving subset; `RetrieveNode` is a bit-for-bit boundary marker (without its pass-through the seeded INDs would be lost at every module boundary). |
+| `ProjectNode` / `ReturningNode`                                | `projectInds`: **all-or-nothing** — drop an IND when *any* of its `cols` is projected away (no partial-dependent survival, unlike `projectFds`); remap survivors' `cols` to output indices; `target.targetCols` are **not** remapped. |
+| Join (inner / cross)                                           | `union(leftInds, shiftInds(rightInds, leftCols))`.                                                                                         |
+| Join (left)                                                    | Keep left INDs; **drop** the null-padded right side's INDs.                                                                                |
+| Join (right)                                                   | Keep `shiftInds(rightInds, leftCols)`; drop left.                                                                                          |
+| Join (semi / anti)                                             | Keep left INDs only (right columns are not in the output).                                                                                 |
+| Join (full)                                                    | Drop both (either side can be NULL-padded).                                                                                                |
+| `AggregateNode` / `SetOperationNode` / `WindowNode`            | Emit none — these reshape relational identity.                                                                                             |
+| `AsyncGatherNode` (crossProduct)                               | Could shift+merge like FDs, but **deferred** this wave (no consumer) — left undefined with a code comment.                                 |
+
+**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. No consumer reads `PhysicalProperties.inds` yet; it exists for the coverage prover (Wave 2, `coverage-prover-ind-derived-no-row-loss`) and the lens existence-anchor injection (Wave 3, `lens-multi-source-decomposition`). See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction) for the on-demand helpers and rules.
+
 #### Check-derived contributions
 
 Declared `CHECK` constraints contribute to the table reference's physical properties in addition to declared keys. The walker (`planner/analysis/check-extraction.ts`, cached per `TableSchema` via `WeakMap`) recognizes a small set of syntactic shapes per check and decomposes through `AND`:
@@ -1616,12 +1659,15 @@ The federated-vtab payoff: each fold removes a remote round-trip to the parent t
 
 The anti-join-to-empty rewrite emits `EmptyRelationNode` carrying L's attribute IDs and `RelationType`. Downstream the const-fold pass (`rule-empty-relation-folding`, Structural priority 27) cascades that emptiness up through immediate Filter / Project / Sort / LimitOffset / Distinct / inner-or-cross-or-semi-anti joins; see "Empty-relation folding" below.
 
-> **IND promotion note.** INDs are not yet a propagated dependency-family member of
-> `PhysicalProperties` — only FK-declared INDs are exploited by the three rules above,
-> via on-demand helpers in `util/ind-utils.ts`. Promotion to a first-class propagated
-> surface (so downstream rules can read the IND set without re-walking FK declarations)
-> is under design in `optimizer-inclusion-dependency-property`; the on-demand `ind-utils`
-> helpers are retained as the interim surface.
+> **IND promotion note.** INDs are now *also* a first-class propagated dependency-family
+> member of `PhysicalProperties` (`inds`) — seeded from declared FKs at the table
+> reference and propagated through joins/projections; see § [Inclusion Dependency
+> Tracking](#inclusion-dependency-tracking) above. That propagated set is a **parallel
+> derivation surface**, not a migration: the three rules above still consume the FK
+> *declaration* directly via the on-demand `util/ind-utils.ts` helpers (they need the
+> nullability split and positional composite pairing a coarse `child ⊆ parent` fact does
+> not carry). No consumer reads `inds` yet — Wave 1 is plumbing + a soundness harness; the
+> coverage prover (Wave 2) and lens existence anchors (Wave 3) are the first readers.
 
 ### Fan-out lookup join (FK→PK + 1:n cross)
 
