@@ -1803,14 +1803,22 @@ describe('Property-Based Tests', () => {
 		});
 
 		// --- Singleton equivalence law ---
-		// The three channels that encode the ≤1-row fact must never disagree: the
-		// empty key `[]` surfaced by `keysOf`, the `∅ → all_cols` FD detected by
+		// Pins the read-surface reconciliation of the ≤1-row fact: the empty key
+		// `[]` surfaced by `keysOf`, the `∅ → all_cols` FD detected by
 		// `hasSingletonFd`, and the node-level predicate `isAtMostOneRow`
-		// (= `isUnique([])`). A future producer that emits one channel without the
-		// others — an `isSet`/empty-key claim with no FD, or the converse — breaks
-		// an implication below. These are pure plan-level facts (no materialization
-		// needed), so the law walks every relational node in the optimized tree,
-		// not only the emittable ones Tier 2 can isolate.
+		// (= `isUnique([])`). On today's surface the three are derivation-linked
+		// (`keysOf` consults `hasSingletonFd`; `isAtMostOneRow` consults `keysOf`),
+		// so both implications below hold *by construction* — the law is a
+		// regression guard against a future refactor of `keysOf` / `isUnique` /
+		// `hasSingletonFd` that breaks their mutual reconciliation, NOT a check on
+		// producers. In particular it does **not** flag a node that encodes ≤1-row
+		// via only a declared empty key in `RelationType.keys` and no FD
+		// (`PragmaNode`, `SingleRowNode`, … do exactly that and pass): `keysOf`
+		// surfaces their declared `[]`, so `isAtMostOneRow` agrees. Pinning the
+		// declared-key vs FD channels *independently* is tracked separately. These
+		// are pure plan-level facts (no materialization needed), so the law walks
+		// every relational node in the optimized tree, not only the emittable ones
+		// Tier 2 can isolate.
 		function checkSingletonEquivalence(label: string, node: RelationalPlanNode): void {
 			const colCount = node.getType().columns.length;
 			const atMostOne = isAtMostOneRow(node);

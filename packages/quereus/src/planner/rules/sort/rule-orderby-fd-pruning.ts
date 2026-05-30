@@ -13,7 +13,7 @@
  * the trailing key cannot reorder anything.
  *
  * Whole-Sort elimination (degenerate empty-key case): a source proven to hold
- * ≤1 row (the empty key `[]` present in `keysOf`, i.e. `isUnique([], source)`)
+ * ≤1 row (the empty key `[]` present in `keysOf`, i.e. `isAtMostOneRow(source)`)
  * is trivially totally ordered, so the *entire* ORDER BY is a no-op regardless
  * of how many keys it has — even a single-key sort. The rule drops the SortNode
  * outright (returns its source) before the trailing-key logic runs. This is the
