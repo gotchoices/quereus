@@ -207,3 +207,161 @@ export function chooseCheapest<T>(options: Array<{ cost: number; option: T }>): 
 		current.cost < min.cost ? current : min
 	).option;
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Backward (maintenance-direction) cost surface
+ *
+ * The formulas above estimate forward (read-direction) cost. Row-time
+ * materialized-view maintenance needs the *backward* cost: how expensive it is to
+ * keep an MV's backing table consistent as its source changes. `maintenanceCost`
+ * is that judgment; the create-time gate (`buildMaintenancePlan` in
+ * core/database-materialized-views.ts) picks the cheapest structurally-sound
+ * strategy via `selectMaintenanceStrategy`. See docs/incremental-maintenance.md.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The maintenance strategies the incremental substrate names. Mirrors
+ * `MaintenancePlan['kind']` in core/database-materialized-views.ts (the maintenance
+ * arms reference this type for their `kind`/`chosenStrategy` fields).
+ */
+export type MaintenanceStrategy = 'inverse-projection' | 'residual-recompute' | 'full-rebuild';
+
+/**
+ * Source row count above which a per-write `'full-rebuild'` is pathological under the
+ * synchronous (row-time, in-transaction) policy: every DML statement on the source
+ * would trigger a full scan of it. A body whose only sound strategy is `'full-rebuild'`
+ * over a source larger than this is rejected at view-create time rather than degraded
+ * per write (see {@link isFullRebuildPathological}).
+ */
+export const MAINTENANCE_REBUILD_ROW_THRESHOLD = 10_000;
+
+/**
+ * Defensive no-stats fallback multiplier for the `'residual-recompute'` arm. The gate
+ * normally threads DeltaExecutor's `deltaPerRowFallbackRatio` (DEFAULT_TUNING, currently
+ * 0.5) through {@link MaintenanceSourceStats.fallbackRatio}; this literal is only used
+ * when a caller omits it, and is kept equal to that default so the no-stats path is
+ * unchanged from the legacy ratio heuristic.
+ */
+const DEFAULT_RESIDUAL_FALLBACK_RATIO = 0.5;
+
+/**
+ * Inputs to {@link maintenanceCost}, assembled at view-create time from the forward
+ * optimizer and the `StatsProvider` (`planner/stats/index.ts`). `tableRows` /
+ * `distinctGroupsEstimate` come from `StatsProvider.tableRows` / `distinctValues`;
+ * `forwardBodyCost` is the read-direction cost of the full view body; `fallbackRatio`
+ * is `optimizer.tuning.deltaPerRowFallbackRatio`, used only on the no-stats path.
+ */
+export interface MaintenanceSourceStats {
+	/** Estimated source row count (StatsProvider.tableRows). */
+	tableRows: number;
+	/** Estimated distinct groups/keys per change (StatsProvider.distinctValues); absent ⇒ no-stats path. */
+	distinctGroupsEstimate?: number;
+	/** Forward (read-direction) cost of the full view body. */
+	forwardBodyCost: number;
+	/** No-stats fallback multiplier; the gate supplies tuning.deltaPerRowFallbackRatio. */
+	fallbackRatio?: number;
+}
+
+/**
+ * Backward (maintenance-direction) cost of applying `strategy` to `changeCardinality`
+ * distinct changed rows/groups against a source described by `stats`. Lower is cheaper.
+ *
+ * This is the single cost judgment the row-time maintenance gate uses to choose among
+ * the structurally sound strategies for a body. It is a planning-time decision, and is
+ * re-checked per write only for the residual → rebuild demotion ({@link shouldDegradeToRebuild}).
+ *
+ *  - `'inverse-projection'`: O(1) per changed row — an index seek plus reprojection.
+ *    Always the cheapest arm for the covering-index shapes it is eligible for; never demoted.
+ *  - `'residual-recompute'`: recompute the key-filtered residual body once per changed
+ *    group. With stats, costed against rows-per-group (tableRows / distinctGroupsEstimate);
+ *    with no stats, falls back to the legacy `deltaPerRowFallbackRatio` heuristic so
+ *    behaviour is unchanged on the no-stats path.
+ *  - `'full-rebuild'`: re-evaluate the whole body once — the always-correct floor,
+ *    independent of changeCardinality.
+ */
+export function maintenanceCost(
+	strategy: MaintenanceStrategy,
+	changeCardinality: number,
+	stats: MaintenanceSourceStats,
+): number {
+	switch (strategy) {
+		case 'inverse-projection':
+			return changeCardinality * (COST_CONSTANTS.INDEX_SEEK_PER_ROW + COST_CONSTANTS.PROJECT_PER_ROW);
+		case 'residual-recompute':
+			return changeCardinality * residualCostPerGroup(stats);
+		case 'full-rebuild':
+			return stats.forwardBodyCost;
+		default: {
+			// A new strategy must extend this switch; never-assignment makes that a
+			// compile error rather than a silent mis-cost. Falls back to the rebuild floor.
+			const exhaustiveCheck: never = strategy;
+			void exhaustiveCheck;
+			return stats.forwardBodyCost;
+		}
+	}
+}
+
+/**
+ * Cost of recomputing the key-filtered residual body for a single changed group. With
+ * stats present this is a filtered, reprojected scan of one group's rows
+ * (tableRows / distinctGroupsEstimate). With stats absent it reproduces the legacy
+ * `deltaPerRowFallbackRatio` heuristic (forwardBodyCost × ratio) so the no-stats path
+ * is byte-for-byte the previous behaviour.
+ */
+function residualCostPerGroup(stats: MaintenanceSourceStats): number {
+	const haveStats =
+		stats.distinctGroupsEstimate !== undefined &&
+		stats.distinctGroupsEstimate > 0 &&
+		stats.tableRows > 0;
+	if (!haveStats) {
+		const ratio = stats.fallbackRatio ?? DEFAULT_RESIDUAL_FALLBACK_RATIO;
+		return stats.forwardBodyCost * ratio;
+	}
+	const rowsPerGroup = stats.tableRows / stats.distinctGroupsEstimate!;
+	return rowsPerGroup * (COST_CONSTANTS.SEQ_SCAN_PER_ROW + COST_CONSTANTS.FILTER_PER_ROW + COST_CONSTANTS.PROJECT_PER_ROW);
+}
+
+/**
+ * Choose the cheapest structurally-sound maintenance strategy at create time: argmin
+ * over `soundStrategies` of {@link maintenanceCost}. `soundStrategies` is the set the
+ * soundness analysis admits for the body shape; `'full-rebuild'` is always sound and
+ * acts as the floor, so an empty list resolves to it.
+ */
+export function selectMaintenanceStrategy(
+	soundStrategies: readonly MaintenanceStrategy[],
+	changeCardinality: number,
+	stats: MaintenanceSourceStats,
+): MaintenanceStrategy {
+	if (soundStrategies.length === 0) return 'full-rebuild';
+	return chooseCheapest(soundStrategies.map(strategy => ({
+		cost: maintenanceCost(strategy, changeCardinality, stats),
+		option: strategy,
+	})));
+}
+
+/**
+ * True when a per-write `'full-rebuild'` is pathological under the synchronous policy:
+ * the source is large and the body costs more than a full scan of it, so every DML
+ * write would scan the whole source. The gate uses this to reject-at-create when
+ * `'full-rebuild'` is a body's only sound strategy.
+ */
+export function isFullRebuildPathological(stats: MaintenanceSourceStats): boolean {
+	const fullScanCost = stats.tableRows * COST_CONSTANTS.SEQ_SCAN_PER_ROW;
+	return stats.tableRows > MAINTENANCE_REBUILD_ROW_THRESHOLD && stats.forwardBodyCost > fullScanCost;
+}
+
+/**
+ * Per-write demotion test for the `'residual-recompute'` arm: at the DML boundary the
+ * actual `changeCardinality` of the current statement may spike above the
+ * residual ↔ rebuild crossover, at which point a single `'full-rebuild'` for that
+ * statement is cheaper. Returns true when the driver should set `degradeToRebuild` for
+ * this statement only (the stored strategy is retained for later, lower-cardinality writes).
+ * Stateless by design, so a subsequent low-cardinality statement naturally reverts.
+ */
+export function shouldDegradeToRebuild(
+	changeCardinality: number,
+	stats: MaintenanceSourceStats,
+): boolean {
+	return maintenanceCost('residual-recompute', changeCardinality, stats) >
+		maintenanceCost('full-rebuild', changeCardinality, stats);
+}

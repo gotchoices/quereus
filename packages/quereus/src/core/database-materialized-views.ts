@@ -37,6 +37,14 @@ import { AggregateNode } from '../planner/nodes/aggregate-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
+import {
+	selectMaintenanceStrategy,
+	seqScanCost,
+	filterCost,
+	projectCost,
+	type MaintenanceSourceStats,
+	type MaintenanceStrategy,
+} from '../planner/cost/index.js';
 import { getBackingManager } from '../runtime/emit/materialized-view-helpers.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
@@ -47,11 +55,15 @@ import type { ScanPlan } from '../vtab/memory/layer/scan-plan.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
 import { compareSqlValues } from '../util/comparison.js';
 import type { MaterializedViewSchema } from '../schema/view.js';
-import type { UniqueConstraintSchema } from '../schema/table.js';
+import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { Database } from './database.js';
 import type * as AST from '../parser/ast.js';
 
 const log = createLogger('core:materialized-views');
+
+/** Fallback source row estimate when the StatsProvider has no count (mirrors the
+ *  optimizer's naive default). Only feeds the create-time maintenance cost gate. */
+const DEFAULT_SOURCE_ROWS = 1000;
 
 /**
  * Database internals the materialized-view manager needs. Mirrors
@@ -92,14 +104,29 @@ export type MaintenancePlan =
  * predicate admits it) delete the old image / upsert the new image. No body
  * re-execution, no scan — see `docs/materialized-views.md` § Row-time refresh.
  */
-export interface InverseProjectionPlan {
-	readonly kind: 'inverse-projection';
+/**
+ * Common identity + cost-gate fields shared by every {@link MaintenancePlan} arm.
+ * `chosenStrategy` / `sourceStats` are set once by the create-time cost gate
+ * ({@link MaterializedViewManager.buildMaintenancePlan}, via `selectMaintenanceStrategy`)
+ * and are not re-evaluated per write, except for the residual → rebuild demotion
+ * (`shouldDegradeToRebuild`; dormant until the residual arm is reachable).
+ */
+interface MaintenancePlanCommon {
 	/** The MV this plan maintains. */
 	mv: MaterializedViewSchema;
 	/** Lowercased `schema.table` of the single source `T`. */
 	sourceBase: string;
 	backingSchema: string;
 	backingTableName: string;
+	/** Strategy the cost gate chose: argmin `maintenanceCost` over the body's sound strategies. */
+	chosenStrategy: MaintenanceStrategy;
+	/** Create-time cost inputs (StatsProvider + forward optimizer), retained so the DML
+	 *  boundary can re-cost residual vs. rebuild against the actual changeCardinality. */
+	sourceStats: MaintenanceSourceStats;
+}
+
+export interface InverseProjectionPlan extends MaintenancePlanCommon {
+	readonly kind: 'inverse-projection';
 	/** Backing-table physical primary-key definition (the column order the btree keys on). */
 	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
 	/** `projectionSourceCols[j]` = the source column index supplying backing output
@@ -119,12 +146,8 @@ export interface InverseProjectionPlan {
  * inverse projection would cost more than a wholesale rebuild. Carries only the
  * common identity fields; the rebuild re-derives everything else from the MV body.
  */
-export interface FullRebuildPlan {
+export interface FullRebuildPlan extends MaintenancePlanCommon {
 	readonly kind: 'full-rebuild';
-	mv: MaterializedViewSchema;
-	sourceBase: string;
-	backingSchema: string;
-	backingTableName: string;
 }
 
 /**
@@ -136,12 +159,8 @@ export interface FullRebuildPlan {
  * `degradeToRebuild` escape flag (fall back to full rebuild when the residual cannot
  * be parameterized).
  */
-export interface ResidualRecomputePlan {
+export interface ResidualRecomputePlan extends MaintenancePlanCommon {
 	readonly kind: 'residual-recompute';
-	mv: MaterializedViewSchema;
-	sourceBase: string;
-	backingSchema: string;
-	backingTableName: string;
 	binding: BindingMode;
 	degradeToRebuild: boolean;
 }
@@ -424,9 +443,15 @@ export class MaterializedViewManager {
 	 * separate dependency structure: the existing `rowTimeBySource[backingBase]` index
 	 * already records the producer→consumer edge the moment `mv2` registers.
 	 *
-	 * Returns only the `'inverse-projection'` arm of {@link MaintenancePlan} — the shape
-	 * allowlist is unchanged from `buildRowTimePlan`. The cost gate (1.6) and
-	 * general-bodies (3) tickets extend this to route the other arms.
+	 * Eligibility is a *cost choice* among the body's structurally-sound strategies
+	 * ({@link selectMaintenanceStrategy}): for the covering-index shape these are
+	 * `'inverse-projection'` and the `'full-rebuild'` floor, and inverse projection is
+	 * always cheapest — so this still only ever returns the `'inverse-projection'` arm
+	 * today, now annotated with the chosen strategy and its cost inputs ({@link MaintenanceSourceStats}).
+	 * The synchronous degrade-vs-reject split lives here too: a body whose cheapest sound
+	 * strategy is a pathological per-write full rebuild ({@link isFullRebuildPathological}) is
+	 * rejected at create. The general-bodies (3) ticket widens the sound set so the other
+	 * arms become reachable.
 	 */
 	private buildMaintenancePlan(mv: MaterializedViewSchema): MaintenancePlan {
 		const db = this.ctx as unknown as Database;
@@ -522,16 +547,85 @@ export class MaterializedViewManager {
 			}
 		}
 
+		// ── Cost gate (incremental-maintenance-cost-gate) ──
+		// The checks above establish soundness for the covering-index shape, whose only
+		// structurally-sound maintenance strategy is 'inverse-projection' (O(1) per changed
+		// row). Per the cost model inverse projection is never demoted to 'full-rebuild' for
+		// an eligible shape — 'full-rebuild' is the always-correct floor for bodies where
+		// inverse projection is NOT sound (which materialized-view-rowtime-general-bodies
+		// adds), so it is not a competitor here. Eligibility is thus a cost choice among the
+		// sound strategies (argmin maintenanceCost); for this shape it resolves to
+		// inverse-projection while recording the choice + the cost inputs the runtime reuses.
+		// The general-bodies ticket widens `soundStrategies` and activates the reject-at-create
+		// / degrade-to-rebuild machinery in planner/cost/index.ts once the other arms are wired.
+		const soundStrategies: MaintenanceStrategy[] = ['inverse-projection'];
+		const sourceStats = this.estimateMaintenanceStats(sourceSchema, projectionSourceCols.length, predicate !== undefined);
+		// Create-time change-cardinality estimate: ~1% of the source per statement (typical OLTP).
+		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
+		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
+
+		// Defensive: only 'inverse-projection' is wired today. A different choice would mean
+		// `soundStrategies` grew without the corresponding apply-arm — fail loud rather than
+		// register an unexecutable plan. Unreachable until the general-bodies ticket lands.
+		if (chosenStrategy !== 'inverse-projection') {
+			throw new QuereusError(
+				`Internal error: cost gate selected unwired strategy '${chosenStrategy}' for materialized view '${mv.name}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+
 		return {
 			kind: 'inverse-projection',
 			mv,
 			sourceBase,
 			backingSchema: mv.schemaName,
 			backingTableName: mv.backingTableName,
+			chosenStrategy,
+			sourceStats,
 			backingPkDefinition,
 			projectionSourceCols,
 			predicate,
 		};
+	}
+
+	/**
+	 * Assemble {@link MaintenanceSourceStats} for the cost gate from the optimizer's
+	 * StatsProvider and tuning. `tableRows` / `distinctGroupsEstimate` come from the
+	 * provider (heuristic defaults when absent); `forwardBodyCost` is estimated from the
+	 * forward cost helpers (a scan + optional filter + projection of the source — the
+	 * covering-index body shape); `fallbackRatio` carries the detection kernel's
+	 * `deltaPerRowFallbackRatio` for the no-stats residual path.
+	 */
+	private estimateMaintenanceStats(
+		sourceSchema: TableSchema,
+		projectionCount: number,
+		hasPredicate: boolean,
+	): MaintenanceSourceStats {
+		const optimizer = this.ctx.optimizer;
+		const statsProvider = optimizer.getStats();
+		const tableRows = statsProvider.tableRows(sourceSchema) ?? DEFAULT_SOURCE_ROWS;
+		const forwardBodyCost =
+			seqScanCost(tableRows)
+			+ (hasPredicate ? filterCost(tableRows) : 0)
+			+ projectCost(tableRows, projectionCount);
+		const stats: MaintenanceSourceStats = {
+			tableRows,
+			forwardBodyCost,
+			fallbackRatio: optimizer.tuning.deltaPerRowFallbackRatio,
+		};
+		// `distinctValues` is an optional, per-column StatsProvider method. For the
+		// covering-index shape the source PK is the grouping key; a single-column PK
+		// yields a usable distinct-groups estimate (which only feeds the never-chosen-here
+		// residual cost). Multi-column PKs leave it unset → residual takes the no-stats path.
+		const pkDef = sourceSchema.primaryKeyDefinition;
+		if (pkDef.length === 1 && statsProvider.distinctValues) {
+			const pkColName = sourceSchema.columns[pkDef[0].index]?.name;
+			if (pkColName !== undefined) {
+				const distinct = statsProvider.distinctValues(sourceSchema, pkColName);
+				if (distinct !== undefined) stats.distinctGroupsEstimate = distinct;
+			}
+		}
+		return stats;
 	}
 
 	/* ──────────────── row-time covering enforcement ──────────────── */

@@ -30,13 +30,16 @@ covering structure answers it.
 > *change-scope* analysis for `Database.watch` source projection (the cached
 > `sourceScope`); they just do not ride the delta-execution kernel.
 >
-> A design-spike (`incremental-maintenance-substrate-spike`) is reconsidering whether
-> this kernel and the row-time MV maintenance path should converge on one shared
-> `MaintenancePlan` abstraction plus a backward (maintenance-direction) cost gate —
-> and whether a Z-set / DBSP-style delta circuit is worth adopting for harder body
-> shapes. The synchronous, in-transaction *application policy* for materialized views
-> is **not** in question; only the shared representation and cost model are. No outcome
-> is assumed here until the spike lands.
+> A design-spike (`incremental-maintenance-substrate-spike`) named two convergence
+> points: a shared `MaintenancePlan` abstraction and a backward (maintenance-direction)
+> cost gate — and asked whether a Z-set / DBSP-style delta circuit is worth adopting for
+> harder body shapes. The synchronous, in-transaction *application policy* for materialized
+> views is **not** in question; only the shared representation and cost model are. Both
+> named convergence points have now landed: `incremental-maintenance-plan-abstraction`
+> introduced the `MaintenancePlan` union, and `incremental-maintenance-cost-gate` added the
+> backward `maintenanceCost(...)` surface (`planner/cost/index.ts`) — MV eligibility is now
+> a cost choice among structurally-sound strategies (`selectMaintenanceStrategy`), not a hard
+> shape allowlist. The Z-set / DBSP question remains open.
 >
 > **MV-over-MV cascade.** A materialized view whose source is another MV's backing table
 > is maintained synchronously in the same row-time pass, *not* through this kernel. A
@@ -127,10 +130,13 @@ COMMIT-time evaluation.
 
 `DeltaExecutor` iterates registered subscriptions, computes the per-relation binding
 tuples via `getChangedTuples(base, columnIndices, pkIndices)`, and calls each
-subscription's `apply`. **Cost fallback:** if the number of distinct binding tuples
-exceeds `tuning.deltaPerRowFallbackRatio × estimatedRows(base)`, the kernel demotes
-that relation to global re-evaluation (always correct — it just recomputes more than
-the minimum).
+subscription's `apply`. **Cost fallback (detection kernel only):** if the number of
+distinct binding tuples exceeds `tuning.deltaPerRowFallbackRatio × estimatedRows(base)`,
+the kernel demotes that relation to global re-evaluation (always correct — it just
+recomputes more than the minimum). This ratio governs the **detection kernel**
+(assertions and watchers) only; row-time materialized-view maintenance instead uses the
+backward `maintenanceCost(...)` surface (`planner/cost/index.ts`), reusing this value as
+the stats-absent fallback multiplier in its `'residual-recompute'` formula.
 
 The kernel runs only at top-level COMMIT — savepoints are seen indirectly via the
 merged change log. How an `apply` exception is handled is the **consumer's** choice,
@@ -264,8 +270,12 @@ const dispose = deltaExecutor.register({
 - **Per-subscription residual cache.** Plan-shape generation is consumer-specific
   (violation-query SQL vs. a watch residual). A shared cache would have to negotiate
   eviction.
-- **Cost fallback by ratio.** The current threshold (`0.5`) is a first cut; a real
-  cost comparator is a follow-up.
+- **Cost fallback by ratio (detection kernel).** The threshold (`0.5`) is a first cut
+  for the assertion/watcher kernel. The materialized-view maintenance "real cost
+  comparator" has since landed (`incremental-maintenance-cost-gate`): the backward
+  `maintenanceCost(...)` surface (`planner/cost/index.ts`) chooses among structurally
+  sound strategies and reuses this ratio only as the stats-absent fallback. The kernel
+  keeping the ratio is deliberate — a full cost comparator there is still a follow-up.
 
 ## Cross-references
 
