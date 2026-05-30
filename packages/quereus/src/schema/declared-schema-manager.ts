@@ -1,8 +1,17 @@
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
+import type { LensDeploymentSnapshot } from './lens.js';
 
 const log = createLogger('schema:declared');
+
+/** A rotated pair of lens deployment snapshots for one logical schema. */
+export interface LensSnapshotPair {
+	/** The deploy before `current` — the backfill differ's "prior basis". */
+	previous?: LensDeploymentSnapshot;
+	/** The most recent deploy. */
+	current?: LensDeploymentSnapshot;
+}
 
 /**
  * Manages declared schemas and their associated seed data
@@ -12,6 +21,14 @@ export class DeclaredSchemaManager {
 	private seedData: Map<string, Map<string, SqlValue[][]>> = new Map(); // schemaName -> tableName -> rows
 	/** Lens blocks keyed by *logical* schema name (the `for X` of `declare lens for X over Y`). */
 	private lensDeclarations: Map<string, AST.DeclareLensStmt> = new Map();
+	/**
+	 * Rotated lens deployment snapshots keyed by *logical* schema name. Each
+	 * `apply schema X` rotates (`previous = current; current = fresh`), so the
+	 * prior deploy survives one re-apply — the source of truth the
+	 * `quereus_basis_backfill` differ diffs (see `docs/lens.md`
+	 * § The deployed basis representation).
+	 */
+	private deployedLensSnapshots: Map<string, LensSnapshotPair> = new Map();
 
 	/**
 	 * Stores a declared schema
@@ -79,6 +96,7 @@ export class DeclaredSchemaManager {
 		this.declaredSchemas.delete(schemaName.toLowerCase());
 		this.seedData.delete(schemaName.toLowerCase());
 		this.lensDeclarations.delete(schemaName.toLowerCase());
+		this.deployedLensSnapshots.delete(schemaName.toLowerCase());
 		log('Removed declared schema: %s', schemaName);
 	}
 
@@ -95,6 +113,23 @@ export class DeclaredSchemaManager {
 	/** Retrieves the lens block declared for a logical schema, if any. */
 	getLensDeclaration(logicalSchemaName: string): AST.DeclareLensStmt | undefined {
 		return this.lensDeclarations.get(logicalSchemaName.toLowerCase());
+	}
+
+	/**
+	 * Rotates a freshly-built lens deployment snapshot in: the prior `current`
+	 * becomes `previous`, dropping the snapshot from two deploys ago. A first
+	 * deploy leaves `previous` undefined (⇒ no backfill rows).
+	 */
+	rotateDeployedLensSnapshot(logicalSchemaName: string, snapshot: LensDeploymentSnapshot): void {
+		const key = logicalSchemaName.toLowerCase();
+		const previous = this.deployedLensSnapshots.get(key)?.current;
+		this.deployedLensSnapshots.set(key, { previous, current: snapshot });
+		log('Rotated lens deployment snapshot for: %s', logicalSchemaName);
+	}
+
+	/** Retrieves the rotated `{ previous, current }` snapshot pair for a logical schema, if any. */
+	getDeployedLensSnapshots(logicalSchemaName: string): LensSnapshotPair | undefined {
+		return this.deployedLensSnapshots.get(logicalSchemaName.toLowerCase());
 	}
 }
 

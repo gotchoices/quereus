@@ -17,6 +17,8 @@ import * as AST from "../../parser/ast.js";
 import { astToString } from "../../emit/ast-stringify.js";
 import { GlobalScope } from "../../planner/scopes/global.js";
 import { ParameterScope } from "../../planner/scopes/param.js";
+import { computeBasisBackfill } from "../../schema/basis-backfill.js";
+import { computeSchemaHash } from "../../schema/schema-hasher.js";
 import type { PlanningContext } from "../../planner/planning-context.js";
 import { BuildTimeDependencyTracker } from "../../planner/planning-context.js";
 import { buildBlock } from "../../planner/building/block.js";
@@ -766,6 +768,87 @@ export const effectiveLensFunc = createIntegratedTableValuedFunction(
 		const anchor = slot.advertisement?.storage?.anchorRelationId ?? null;
 		for (const p of slot.columnProvenance) {
 			yield [p.logicalColumn, p.source, p.advertisedBy ?? null, anchor, effectiveSql];
+		}
+	}
+);
+
+// Basis re-decomposition backfill introspection: per-new-basis-relation backfill
+// DDL the engine generates for a pure re-decomposition, tagged engine-generated
+// vs app-supplied (docs/lens.md § The deployed basis representation).
+//
+// Sequencing contract (the generated SQL reads the PRIOR get-body over the PRIOR
+// basis tables, which must still hold data when the app runs it):
+//   1. apply schema Y — migrate the basis (new members created; prior members
+//      retained, not dropped — they are the backfill source).
+//   2. apply schema X — recompile the lens (rotates the snapshot; `previous` now
+//      holds the prior get-body).
+//   3. select * from quereus_basis_backfill('x') — run the re-decomposition /
+//      partial `backfill_sql`; supply app data for missing / needs-data rows.
+//   4. GC the now-detached prior basis members when convenient (out of scope).
+export const basisBackfillFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_basis_backfill',
+		numArgs: 1,
+		deterministic: false, // Depends on the rotated deployment-snapshot pair.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'basis_relation', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// 're-decomposition' | 'partial' | 'needs-data'
+				{ name: 'category', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// The generated insert…select…from(<prior get>); NULL when needs-data.
+				{ name: 'backfill_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// Comma-joined basis columns the engine backfills.
+				{ name: 'generated_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// Comma-joined basis columns the application must supply (empty for re-decomposition).
+				{ name: 'missing_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'reason', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string') {
+			throw new QuereusError('quereus_basis_backfill(logical_schema) requires a string argument', StatusCode.ERROR);
+		}
+
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_basis_backfill: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_basis_backfill: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+
+		// The rotated snapshot pair is the source of truth — robust to the lens
+		// already pointing at the new basis. With no `previous` (a first deploy, or
+		// nothing deployed) there is nothing to backfill.
+		const snaps = db.declaredSchemaManager.getDeployedLensSnapshots(schemaArg);
+		if (!snaps?.previous || !snaps.current) return;
+
+		// Recompute the live basis hash so a basis that drifted out-of-band since
+		// the last lens deploy surfaces as a per-row warning rather than silently
+		// generating a stale backfill.
+		const basisDeclared = snaps.current.basisSchemaName
+			? db.declaredSchemaManager.getDeclaredSchema(snaps.current.basisSchemaName)
+			: undefined;
+		const liveBasisHash = basisDeclared ? computeSchemaHash(basisDeclared) : undefined;
+
+		const rows = computeBasisBackfill(snaps.previous, snaps.current, liveBasisHash);
+		for (const r of rows) {
+			yield [
+				r.logicalTable,
+				r.basisRelation,
+				r.category,
+				r.backfillSql,
+				r.generatedColumns.join(', '),
+				r.missingColumns.join(', '),
+				r.reason,
+			];
 		}
 	}
 );

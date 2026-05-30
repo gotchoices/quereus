@@ -122,6 +122,81 @@ export interface LensSlot {
 }
 
 /**
+ * How one basis relation backs a logical table under a deployed lens: every
+ * `(basisColumn → logicalColumn)` pair it supplies, including shared join-key
+ * columns threaded across the decomposition's members (so a split member that
+ * carries the key — but does not project it — is still backfillable). Captured in
+ * the per-deploy {@link LensTableSnapshot} (see `docs/lens.md` § The deployed
+ * basis representation).
+ */
+export interface LensRelationBacking {
+	/**
+	 * Stable relation id — the advertisement member `relationId` when an
+	 * advertisement backs this relation, else `schema.table` (lowercased). Used to
+	 * group columns into basis relations and to detect surrogate members.
+	 */
+	relationId: string;
+	/** The concrete basis relation (original case). */
+	basisRelation: { schema: string; table: string };
+	/**
+	 * `basisColumn` (original case) → `logicalColumn` (original case, as the prior
+	 * get-body spells it — what the backfill selects from the prior-get subquery).
+	 */
+	columns: ReadonlyArray<{ basisColumn: string; logicalColumn: string }>;
+}
+
+/**
+ * The per-logical-table record inside a {@link LensDeploymentSnapshot}: enough
+ * to re-read the prior `get` over the prior basis and to diff the basis
+ * decomposition against the next deploy.
+ */
+export interface LensTableSnapshot {
+	/** Logical table name (original declaration case). */
+	logicalTable: string;
+	/**
+	 * The compiled `get` body deployed for this table — `prior_lens.get(prior_basis)`.
+	 * Stored as the AST (the snapshot is in-memory, alongside the declared-schema
+	 * ASTs); `astToString(getBody)` recovers the SQL the backfill wraps as a
+	 * subquery. Held by reference to the slot's `compiledBody`, which is never
+	 * mutated after deploy.
+	 */
+	getBody: AST.SelectStmt;
+	/** Non-hidden logical columns, declaration order (original case). */
+	logicalColumns: readonly string[];
+	/** basis-relation key (`schema.table`, lowercased) → how it backs the table. */
+	relationBacking: ReadonlyMap<string, LensRelationBacking>;
+	/**
+	 * When a surrogate-keyed decomposition advertisement backs this table, the
+	 * basis-relation keys (`schema.table`, lowercased) of its surrogate members.
+	 * Used to defer an unsound multi-member surrogate split (threading one
+	 * surrogate across members is `lens-multi-source-put-fanout`'s concern).
+	 * Absent for a logical-tuple key / name-match.
+	 */
+	surrogateMemberKeys?: ReadonlySet<string>;
+}
+
+/**
+ * The persisted, hash-coded record of one logical schema's lens deployment over
+ * its basis — the "deployed basis representation" `docs/lens.md` § Deployment
+ * requires. Captured by `deployLogicalSchema` on each successful `apply schema X`
+ * and rotated (previous ← current) so the prior deploy survives one re-apply,
+ * letting the backfill differ diff `previous → current`.
+ */
+export interface LensDeploymentSnapshot {
+	/** Basis schema name this deploy aligned against. */
+	basisSchemaName: string;
+	/**
+	 * `computeSchemaHash` of the basis declared schema at deploy time. The
+	 * migration-safety record: a later deploy / introspection can confirm the
+	 * basis still matches the one last deployed against, and a mismatch is a
+	 * diagnosable "basis drifted out-of-band" condition.
+	 */
+	basisHash: string;
+	/** Lowercased logical table name → its snapshot. */
+	tables: ReadonlyMap<string, LensTableSnapshot>;
+}
+
+/**
  * Collects the logical spec's constraints into the verbatim
  * {@link LogicalConstraint} list stored on the lens slot. The primary key is
  * always included (even the empty / singleton key — see `docs/lens.md`

@@ -7,7 +7,9 @@ import type * as AST from '../parser/ast.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { astToString } from '../emit/ast-stringify.js';
-import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance } from './lens.js';
+import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance,
+	type LensRelationBacking, type LensTableSnapshot, type LensDeploymentSnapshot } from './lens.js';
+import { computeSchemaHash } from './schema-hasher.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { createLogger } from '../common/logger.js';
 import type { MappingAdvertisement, DecompositionMember } from '../vtab/mapping-advertisement.js';
@@ -180,6 +182,238 @@ export function deployLogicalSchema(
 		logicalSchema.addView(view);
 		log('Deployed lens for %s.%s over %s', logicalSchemaName, slot.logicalTable.name, slot.defaultBasis.schemaName);
 	}
+
+	// Capture + rotate the deployed-basis snapshot AFTER a successful catalog
+	// mutation, so an aborted re-apply leaves the prior snapshot untouched. The
+	// snapshot is the source of truth the `quereus_basis_backfill` differ reads
+	// (docs/lens.md § The deployed basis representation).
+	const snapshot = buildDeploymentSnapshot(db, compiled, basis, logicalSchemaName);
+	db.declaredSchemaManager.rotateDeployedLensSnapshot(logicalSchemaName, snapshot);
+}
+
+/**
+ * Builds the {@link LensDeploymentSnapshot} for a just-completed deploy: per
+ * logical table, the compiled get-body, its non-hidden logical columns, and the
+ * per-column basis backing (relation + column) derived from the effective body.
+ * Also records `basisHash = computeSchemaHash(basis declared schema)` — the
+ * migration-safety record. An empty deploy (every logical table removed, no
+ * basis resolved) yields an empty-tables snapshot that still rotates, so the
+ * detach is reflected.
+ */
+function buildDeploymentSnapshot(
+	db: Database,
+	compiled: ReadonlyArray<{ slot: LensSlot; view: ViewSchema }>,
+	basis: { schema: Schema; schemaName: string } | undefined,
+	logicalSchemaName: string,
+): LensDeploymentSnapshot {
+	const priorBasisName = db.declaredSchemaManager.getDeployedLensSnapshots(logicalSchemaName)?.current?.basisSchemaName;
+	const basisSchemaName = basis?.schemaName ?? priorBasisName ?? '';
+	const basisDeclared = basisSchemaName
+		? db.declaredSchemaManager.getDeclaredSchema(basisSchemaName)
+		: undefined;
+	const basisHash = basisDeclared ? computeSchemaHash(basisDeclared) : '';
+
+	const tables = new Map<string, LensTableSnapshot>();
+	if (basis) {
+		for (const { slot } of compiled) {
+			const relationBacking = deriveRelationBacking(slot.compiledBody, slot.columnProvenance, basis, db.schemaManager);
+			const logicalColumns = slot.columnProvenance.filter(p => p.source !== 'hidden').map(p => p.logicalColumn);
+			const surrogateMemberKeys = deriveSurrogateMemberKeys(slot, basis);
+			tables.set(slot.logicalTable.name.toLowerCase(), {
+				logicalTable: slot.logicalTable.name,
+				getBody: slot.compiledBody,
+				logicalColumns,
+				relationBacking,
+				surrogateMemberKeys,
+			});
+		}
+	}
+	return { basisSchemaName, basisHash, tables };
+}
+
+/** Lowercased `schema.table` identity for an override source's basis relation. */
+function sourceRelKey(src: OverrideSource): string {
+	return `${src.table.schemaName.toLowerCase()}.${src.table.name.toLowerCase()}`;
+}
+
+/**
+ * Derives, per basis relation, the `(basisColumn → logicalColumn)` pairs it backs
+ * for one compiled effective body — the record a later re-decomposition diffs and
+ * backfills (docs/lens.md § The deployed basis representation). Two contributions:
+ *
+ * 1. **Projection.** The body's projection is exactly the non-hidden logical
+ *    columns, in declaration order (see `compileDefaultBody` / `compileOverrideBody`);
+ *    each plain column reference resolves to its FROM source. A computed
+ *    (non-column) projection has no single basis backing and is omitted.
+ * 2. **Shared join keys.** A columnar split joins its members on a shared key but
+ *    projects it only once (from the anchor). The other members carry the key
+ *    column too and must be backfilled with it, else a `not null` key fails. So
+ *    every join-key column equated to a *projected* logical column is threaded to
+ *    its member, mapped to that logical column.
+ */
+function deriveRelationBacking(
+	body: AST.SelectStmt,
+	provenance: ReadonlyArray<LensColumnProvenance>,
+	basis: { schema: Schema; schemaName: string },
+	schemaManager: SchemaManager,
+): Map<string, LensRelationBacking> {
+	const { sources } = collectOverrideSources(body.from, basis.schemaName, schemaManager);
+	const byRef = new Map<string, OverrideSource>();
+	for (const s of sources) byRef.set(s.refName.toLowerCase(), s);
+	const single = sources.length === 1 ? sources[0] : undefined;
+
+	const result = new Map<string, LensRelationBacking>();
+	const add = (src: OverrideSource, basisColumn: string, logicalColumn: string): void => {
+		const key = sourceRelKey(src);
+		let rb = result.get(key);
+		if (!rb) {
+			rb = { relationId: key, basisRelation: { schema: src.table.schemaName, table: src.table.name }, columns: [] };
+			result.set(key, rb);
+		}
+		const cols = rb.columns as Array<{ basisColumn: string; logicalColumn: string }>;
+		if (!cols.some(c => c.basisColumn.toLowerCase() === basisColumn.toLowerCase())) {
+			cols.push({ basisColumn, logicalColumn });
+		}
+	};
+
+	// 1. Projection.
+	const projected: Array<{ logical: string; src: OverrideSource; basisColumn: string }> = [];
+	const nonHidden = provenance.filter(p => p.source !== 'hidden');
+	for (let i = 0; i < nonHidden.length && i < body.columns.length; i++) {
+		const rc = body.columns[i];
+		if (rc.type !== 'column') continue;
+		const expr = rc.expr;
+		if (expr.type !== 'column') continue; // computed → no single backing relation
+		const colExpr = expr as AST.ColumnExpr;
+		const src = colExpr.table ? byRef.get(colExpr.table.toLowerCase()) : single;
+		if (!src) continue; // unqualified ref over a multi-source FROM, or an opaque source
+		projected.push({ logical: nonHidden[i].logicalColumn, src, basisColumn: colExpr.name });
+		add(src, colExpr.name, nonHidden[i].logicalColumn);
+	}
+
+	// 2. Shared join keys — thread each equated key column to a projected logical column.
+	for (const cls of collectJoinKeyEquivalences(body.from, basis.schemaName, schemaManager)) {
+		let logical: string | undefined;
+		for (const m of cls) {
+			const proj = projected.find(p => sourceRelKey(p.src) === sourceRelKey(m.src)
+				&& p.basisColumn.toLowerCase() === m.column.toLowerCase());
+			if (proj) { logical = proj.logical; break; }
+		}
+		if (!logical) continue; // key not surfaced as a logical column → leave to multi-source
+		for (const m of cls) add(m.src, m.column, logical);
+	}
+
+	return result;
+}
+
+/** One member of a join-key equivalence class: a basis source's key column. */
+interface KeyMember {
+	src: OverrideSource;
+	/** The basis column name (original case) on `src` that the join equates. */
+	column: string;
+}
+
+/**
+ * Collects join-key equivalence classes from a body's FROM. Each `using (cols)`
+ * join contributes, per column, the equated key columns across its left/right
+ * subtree sources; each `on a.x = b.y` conjunct contributes that pair. Overlapping
+ * classes are harmless — threading dedups per relation.
+ */
+function collectJoinKeyEquivalences(
+	from: ReadonlyArray<AST.FromClause> | undefined,
+	basisSchemaName: string,
+	schemaManager: SchemaManager,
+): KeyMember[][] {
+	const classes: KeyMember[][] = [];
+	if (!from) return classes;
+
+	const resolveTableSources = (node: AST.FromClause): OverrideSource[] => {
+		const out: OverrideSource[] = [];
+		const walk = (n: AST.FromClause): void => {
+			if (n.type === 'table') {
+				const schemaName = n.table.schema ?? basisSchemaName;
+				const tbl = schemaManager.getSchema(schemaName)?.getTable(n.table.name);
+				if (tbl) out.push({ table: tbl, refName: n.alias ?? tbl.name });
+			} else if (n.type === 'join') {
+				walk(n.left);
+				walk(n.right);
+			}
+		};
+		walk(node);
+		return out;
+	};
+
+	const memberFor = (src: OverrideSource, colName: string): KeyMember | undefined => {
+		const idx = src.table.columnIndexMap.get(colName.toLowerCase());
+		if (idx === undefined) return undefined;
+		return { src, column: src.table.columns[idx].name };
+	};
+
+	const walkJoin = (node: AST.FromClause): void => {
+		if (node.type !== 'join') return;
+		walkJoin(node.left);
+		walkJoin(node.right);
+		const subtree = [...resolveTableSources(node.left), ...resolveTableSources(node.right)];
+		if (node.columns) {
+			// USING (cols): equate each named column across every subtree source carrying it.
+			for (const col of node.columns) {
+				const members = subtree.map(s => memberFor(s, col)).filter((m): m is KeyMember => m !== undefined);
+				if (members.length > 1) classes.push(members);
+			}
+		} else if (node.condition) {
+			// ON a.x = b.y [and ...]: best-effort equality-conjunct extraction.
+			const byRef = new Map<string, OverrideSource>();
+			for (const s of subtree) byRef.set(s.refName.toLowerCase(), s);
+			for (const [left, right] of collectEqualityPairs(node.condition)) {
+				if (!left.table || !right.table) continue;
+				const ls = byRef.get(left.table.toLowerCase());
+				const rs = byRef.get(right.table.toLowerCase());
+				if (!ls || !rs) continue;
+				const lm = memberFor(ls, left.name);
+				const rm = memberFor(rs, right.name);
+				if (lm && rm) classes.push([lm, rm]);
+			}
+		}
+	};
+	for (const f of from) walkJoin(f);
+	return classes;
+}
+
+/** Extracts `col = col` conjuncts from an ON condition (best-effort, AND-only). */
+function collectEqualityPairs(expr: AST.Expression): Array<[AST.ColumnExpr, AST.ColumnExpr]> {
+	const pairs: Array<[AST.ColumnExpr, AST.ColumnExpr]> = [];
+	const walk = (e: AST.Expression): void => {
+		if (e.type !== 'binary') return;
+		const bin = e as AST.BinaryExpr;
+		if (bin.operator.toUpperCase() === 'AND') {
+			walk(bin.left);
+			walk(bin.right);
+		} else if (bin.operator === '=' && bin.left.type === 'column' && bin.right.type === 'column') {
+			pairs.push([bin.left as AST.ColumnExpr, bin.right as AST.ColumnExpr]);
+		}
+	};
+	walk(expr);
+	return pairs;
+}
+
+/**
+ * The basis-relation keys (`schema.table`, lowercased) of a slot's surrogate-keyed
+ * decomposition members, or undefined when there is no advertisement / the shared
+ * key is a logical-tuple. Lets the differ defer an unsound multi-member surrogate
+ * split (see `docs/lens.md` § The Default Mapper — evaluate-once-and-thread).
+ */
+function deriveSurrogateMemberKeys(
+	slot: LensSlot,
+	basis: { schema: Schema; schemaName: string },
+): ReadonlySet<string> | undefined {
+	const storage = slot.advertisement?.storage;
+	if (!storage || storage.sharedKey.kind !== 'surrogate') return undefined;
+	const keys = new Set<string>();
+	for (const m of storage.members) {
+		const schemaName = (m.relation.schema || basis.schemaName).toLowerCase();
+		keys.add(`${schemaName}.${m.relation.table.toLowerCase()}`);
+	}
+	return keys;
 }
 
 /**

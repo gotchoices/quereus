@@ -228,6 +228,54 @@ Migrations require a stable record of *what is deployed*, so that augmentations 
 
 A useful subset of that backfill obligation is **engine-expressible rather than fully delegated**. When the new basis can be populated by running the new lens `get` over the prior basis — a pure re-decomposition such as a split or merge that introduces no information the prior basis lacks — the differ can emit the backfill as generated DDL, the same shape as the one-shot derivation of [Computed and Generated Columns](#computed-and-generated-columns). Only backfills that need data the prior basis does not contain remain the application's to supply. The obligation thus splits cleanly: re-decompositions the engine can generate from the lens itself, genuinely new information the application provides.
 
+#### The lens deployment snapshot
+
+The deployed representation is persisted per logical schema as a **lens deployment snapshot** (`src/schema/lens.ts`, `LensDeploymentSnapshot`), captured by `deployLogicalSchema` on each successful `apply schema X` and **rotated** (`previous ← current`) in the `DeclaredSchemaManager`, so the prior deploy survives exactly one re-apply. The snapshot is the **source of truth** the backfill differ diffs — robust to the lens already pointing at the new basis, because it records the *prior* compiled `get` rather than re-deriving from live catalog timing. Per logical table it holds:
+
+- `getBody` — the compiled `get` body deployed for the table (`prior_lens.get(prior_basis)`), wrapped as the backfill's `from (<prior get>)` subquery;
+- `logicalColumns` — the non-hidden logical columns (declaration order), used to test reconstructibility;
+- `relationBacking` — per basis relation, the `(basisColumn → logicalColumn)` pairs it backs, derived from the body's projection **plus shared join-key threading** (a columnar split joins its members on a shared key but projects it once; the other members carry the key column and must be backfilled with it);
+- `basisHash` — `computeSchemaHash` of the basis declared schema at deploy time (reused, not re-implemented). This is the migration-safety record: a later deploy or introspection confirms the basis still matches the one last deployed against, and a mismatch is a diagnosable **basis-drifted-out-of-band** condition surfaced (not silently proceeded past) as a `reason` warning.
+
+A first deploy leaves `previous` undefined ⇒ no backfill rows; an unchanged re-apply introduces no new basis relations ⇒ no backfill rows.
+
+#### Classification — re-decomposition vs needs-data
+
+For each **new** basis relation `R` (one the prior lens did not back) the differ (`src/schema/basis-backfill.ts`, `computeBasisBackfill`) classifies each of `R`'s columns:
+
+- **reconstructible** — its logical column was produced by the prior get-body (`∈ previous.logicalColumns`); the engine generates its backfill.
+- **new** — absent from the prior deploy; the prior basis has no data, so the **application supplies it**.
+- A basis column that maps to **no** logical column (e.g. a surrogate-key default) is naturally absent from `relationBacking` and so is **omitted** from the projection — the basis default mints it.
+
+The per-relation category is then `re-decomposition` (every column reconstructible → fully engine-generated), `partial` (some reconstructible → engine generates those, lists the rest as `missing`), or `needs-data` (none → entirely the application's). Threading one *surrogate* shared key across the members of a multi-relation split (evaluate-once-and-thread) is `lens-multi-source-put-fanout`'s concern; a multi-member surrogate split emits a `needs-data` deferred-note row rather than an unsound insert.
+
+#### `quereus_basis_backfill(logical_schema)`
+
+The classified rows are introspected by the integrated TVF `quereus_basis_backfill(logical_schema)` (`src/func/builtins/explain.ts`), mirroring `quereus_effective_lens`: it requires `schema.kind === 'logical'`, loads the rotated snapshot pair (yielding nothing with no `previous`), and yields one row per new basis relation, ordered by logical table then basis relation:
+
+| column | meaning |
+|---|---|
+| `logical_table` | the logical table the basis relation backs |
+| `basis_relation` | `schema.table` of the new basis member |
+| `category` | `re-decomposition` · `partial` · `needs-data` |
+| `backfill_sql` | the generated `insert … select … from (<prior get>)` for the reconstructible columns; `NULL` when `needs-data` |
+| `generated_columns` | comma-joined basis columns the engine backfills |
+| `missing_columns` | comma-joined basis columns the application must supply (empty for `re-decomposition`) |
+| `reason` | human note: classification rationale, surrogate omissions, basis-hash-drift warning |
+
+Consistent with the **ingredient model** (the engine generates and classifies the backfill DDL; it does not auto-run a coordinated migration), the application fetches the rows, runs the engine-generated ones, and supplies its own for the rest — the same shape as the `diff schema X` → app-runs-the-DDL flow.
+
+#### Sequencing contract
+
+The generated `backfill_sql` reads the **prior** get-body over the **prior** basis tables, which must still hold data when the app runs it. The required order for a re-decomposition deploy:
+
+1. `apply schema Y` — migrate the basis (new member tables created; **prior members retained**, not dropped — they are the backfill source).
+2. `apply schema X` — recompile the lens over the new basis (rotates the snapshot; `previous` now holds the prior get-body).
+3. `select * from quereus_basis_backfill('x')` — fetch rows; run the `re-decomposition` / `partial` `backfill_sql`; supply app data for `missing_columns` / `needs-data` rows.
+4. GC the now-detached prior basis members when convenient (out of scope here).
+
+Because the backfill reads the persisted prior get-body (not the live `X.T` view), step 3 is robust to the lens already pointing at the new basis — the snapshot, not catalog timing, is the source of truth.
+
 ## Relationship to Materialized Views
 
 Indexes are a basis-layer concern, expressed as **materialized views**: a materialized view with an `order by` describes a clustered/ordered structure — an index. A unique *constraint* is a logical claim (it lives in the logical schema); the *index* that covers it is a basis-layer materialized view. The two legitimately sit at opposite ends of the stack, and the lens carries the constraint down to a level where it is enforceable while the index attaches at basis.
@@ -281,7 +329,7 @@ Status legend: **shipped** (landed by `lens-foundation-and-default-mapper`) / **
 - **shipped** — `src/parser/parser.ts` + `src/parser/ast.ts` + `src/emit/ast-stringify.ts` — parse `declare logical schema X { ... }` (the `LOGICAL` contextual keyword sets `DeclareSchemaStmt.isLogical`) **and `declare lens for X over Y { view T as <select> [hiding (...)] }`** (the `DeclareLensStmt` sibling statement), each round-tripping back to DDL. `declare lens` is hashed (behaviorally) by `computeSchemaHash`.
 - **shipped** — `src/schema/lens-compiler.ts` — the default **name-based aligner** (single-source, v1) **plus the per-attribute sparse-override merger** (override-covered columns ⊕ default-mapper gap-fill ⊖ `hiding`, with the hide-trap / partial-cross-basis-join fidelity boundary erroring rather than guessing) and the **explicit `over Y` basis binding** (which resolves the default-basis ambiguity — `inferDefaultBasis` is consulted only when no lens block is declared). The composition is recomputed (re-read from source) on every `apply schema X` (`runtime/emit/schema-declarative.ts`). `quereus_effective_lens(schema, table)` (`func/builtins/explain.ts`) introspects the result. **pending** — n-way decomposition (decomposition ticket); routing attached constraints to enforcement (prover ticket — an MV/lens here is **read-correct, write-unsound** for logical-constraint enforcement).
 - **pending** — `src/schema/lens-prover.ts` — proves the compiled body's FD / key / domain surface conforms to the logical spec (the PutGet / GetPut completeness checks); reports unproven obligations. Until it lands, **type/nullability conformance is not gated** and the attached constraints are stored verbatim, not yet routed to enforcement.
-- **shipped (partial)** — `src/schema/schema-differ.ts`, `src/schema/schema-hasher.ts` — kind-aware diffing (logical per-table diff is attach/detach-lens, never a basis-table drop; the logical-removals-do-not-drop-basis asymmetry), and the schema hash covers the schema kind + logical declarations. **pending** — the deployed-basis hash record / engine-emitted re-decomposition backfill DDL (`lens-re-decomposition-backfill-ddl`).
+- **shipped** — `src/schema/schema-differ.ts`, `src/schema/schema-hasher.ts` — kind-aware diffing (logical per-table diff is attach/detach-lens, never a basis-table drop; the logical-removals-do-not-drop-basis asymmetry), and the schema hash covers the schema kind + logical declarations. The deployed-basis hash record + engine-emitted re-decomposition backfill DDL landed in `lens-re-decomposition-backfill-ddl`: the persisted, hash-coded **lens deployment snapshot** (`src/schema/lens.ts`, rotated in `DeclaredSchemaManager`, captured by `deployLogicalSchema`), the re-decomposition classifier / generator (`src/schema/basis-backfill.ts`), and the `quereus_basis_backfill(logical_schema)` introspection TVF (`src/func/builtins/explain.ts`) — see [The deployed basis representation](#the-deployed-basis-representation). **pending** — threading one surrogate across the members of a multi-relation split (`lens-multi-source-put-fanout`); echoing the backfill summary into the prover's deploy report; GC of detached prior basis storage (app-driven).
 - **shipped (protocol only)** — Module mapping advertisement (`lens-module-mapping-advertisement`) — the typed descriptor a module exposes (`src/vtab/mapping-advertisement.ts`), the optional `VirtualTableModule.getMappingAdvertisements(db, basisSchema)` hook, the reserved `quereus.lens.decomp.*` tag family + shared `buildAdvertisementsFromTags` builder (`src/schema/reserved-tags.ts`, `src/schema/mapping-advertisement-tags.ts`) the generic memory/store modules return, and the lens-compiler **resolution + validation + slot storage + introspection** seam (`resolveAdvertisement` in `src/schema/lens-compiler.ts` stores the resolved primary-storage advertisement on `LensSlot.advertisement` / auxiliaries on `LensSlot.auxiliaryAccess`; `quereus_effective_lens` surfaces advertisement-backed provenance). **pending** — the n-way join synthesis + put fan-out that *consume* a resolved advertisement, plus advertisement-driven gap-fill execution (`lens-multi-source-decomposition`); the v1 name-match / override body producer is **unchanged** by the protocol — an advertisement is stored, not yet synthesized.
 
 The lens layer introduces no new runtime: at execution time a logical table is an inlined view, driven by the existing optimizer, [view updateability](view-updateability.md), and [materialized-view](materialized-views.md) machinery. All lens-specific behavior is compile-time validate / generate / attach.
