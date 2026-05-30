@@ -827,10 +827,23 @@ export class MaterializedViewManager {
 	 *
 	 * Reads-own-writes: the scan resolves to the backing table's coordinated
 	 * connection (the same one {@link maintainRowTime} writes), so the backing
-	 * reflects all prior rows of the statement. v1 is a full layer scan of the
-	 * backing (always the `memory` module regardless of the source module); a
-	 * backing-PK prefix scan is a sound later optimization (see
-	 * `docs/materialized-views.md` § Covering structures).
+	 * reflects all prior rows of the statement. The backing is always the `memory`
+	 * module regardless of the source module.
+	 *
+	 * The conflict check is a **backing-PK prefix scan** keyed on `newRow`'s UC
+	 * values — O(log n + matches) rather than the former O(n) full backing scan.
+	 * Soundness rests on the covering-index shape: the body's `order by` columns are
+	 * a permutation of the UC columns ({@link buildMaintenancePlan} eligibility +
+	 * the coverage prover), and they seed the leading backing-PK columns
+	 * (`computeBackingPrimaryKey`), so the leading `k = uc.columns.length` backing-PK
+	 * columns are exactly the UC columns. {@link tryBuildCoveringPrefix} builds the
+	 * equality prefix in backing-PK column order; the scan seeks to it and
+	 * early-terminates when the leading columns stop matching. It falls back to a
+	 * full scan whenever the fast-path gate fails (non-BINARY collation, or a
+	 * leading-prefix shape that does not lead with exactly the UC columns) — the
+	 * full scan re-compares with the source collation, so the fallback is
+	 * collation-correct. Either way the result is only a *candidate* set: the caller
+	 * validates each against the live source row.
 	 */
 	async lookupCoveringConflicts(
 		mv: MaterializedViewSchema,
@@ -882,7 +895,16 @@ export class MaterializedViewManager {
 		const startLayer = connection.pendingTransactionLayer ?? connection.readLayer;
 
 		const conflicts: Array<{ pk: SqlValue[]; row?: Row }> = [];
-		const scanPlan: ScanPlan = { indexName: 'primary', descending: false };
+		// Fast path: a backing-PK prefix scan keyed on `newRow`'s UC values. The
+		// covering-index shape guarantees the leading backing-PK columns are the UC
+		// columns, so this seeks to the matching block and early-terminates instead of
+		// scanning the whole backing. `undefined` ⇒ the gate failed (non-binary
+		// collation / unexpected shape) and we fall back to the full layer scan, which
+		// re-compares with the source collation and is therefore collation-correct.
+		const equalityPrefix = this.tryBuildCoveringPrefix(plan, uc, sourceSchema, newRow);
+		const scanPlan: ScanPlan = equalityPrefix
+			? { indexName: 'primary', descending: false, equalityPrefix }
+			: { indexName: 'primary', descending: false };
 		for await (const backingRow of manager.scanLayer(startLayer, scanPlan)) {
 			let match = true;
 			for (let k = 0; k < uc.columns.length; k++) {
@@ -906,9 +928,82 @@ export class MaterializedViewManager {
 		}
 		return conflicts;
 	}
+
+	/**
+	 * Build the backing-PK equality prefix for a covering-conflict scan, or
+	 * `undefined` to fall back to the full backing scan.
+	 *
+	 * The covering-index shape guarantees the body's `order by` columns are a
+	 * permutation of the UC columns and that they seed the leading backing-PK columns
+	 * (`computeBackingPrimaryKey`). So the leading `k = uc.columns.length` backing-PK
+	 * columns are exactly the UC columns (as a set, possibly reordered by `order by`).
+	 * The returned prefix is keyed in **backing-PK column order** (not `uc.columns`
+	 * order), so a permuting `order by` still seeks to the right block:
+	 * `prefix[i] = newRow[ sourceCol(backingPkDefinition[i]) ]`.
+	 *
+	 * Returns `undefined` (full-scan fallback) when any holds:
+	 *  - fewer than `k` backing-PK columns, or a leading column is not a passthrough
+	 *    of a source column (defensive — the covering shape guarantees passthrough);
+	 *  - the leading `k` backing-PK columns do not map to **exactly** the UC
+	 *    source-column set (defensive guard against a non-UC-leading structure);
+	 *  - any leading backing-PK column, or its source UC column, has a **non-BINARY**
+	 *    collation. This is a *soundness* gate, not a perf choice: the prefix seek's
+	 *    early-termination compares with plain `compareSqlValues` (binary), while the
+	 *    backing btree orders the PK by its declared collation and the UNIQUE
+	 *    constraint conflicts by the source collation. Under a non-binary collation
+	 *    the binary early-termination could `break` before a collated-equal /
+	 *    binary-different conflict, missing it. The full-scan fallback re-compares
+	 *    with the source collation, so it stays collation-correct.
+	 *
+	 * DESC-leading prefixes are admitted: equality on a column makes its order
+	 * direction irrelevant to *grouping* (the binary-equal rows stay contiguous), and
+	 * `scanLayer`'s `equalityPrefix` seek + ascending walk lands at the group start
+	 * for either direction (verified by the `order by … desc` enforcement test).
+	 */
+	private tryBuildCoveringPrefix(
+		plan: InverseProjectionPlan,
+		uc: UniqueConstraintSchema,
+		sourceSchema: TableSchema,
+		newRow: Row,
+	): SqlValue[] | undefined {
+		const k = uc.columns.length;
+		const backingPk = plan.backingPkDefinition;
+		if (backingPk.length < k) return undefined;
+
+		const ucSourceCols = new Set(uc.columns);
+		const leadingSourceCols = new Set<number>();
+		const prefix: SqlValue[] = [];
+		for (let i = 0; i < k; i++) {
+			const d = backingPk[i];
+			const projector = plan.projectors[d.index];
+			if (!projector || projector.kind !== 'passthrough') return undefined;
+			// Soundness: both the backing-PK column (btree ordering / early-termination)
+			// and its source UC column (UNIQUE semantics) must be BINARY for the binary
+			// prefix-equality scan to neither over- nor under-match.
+			if (!isBinaryCollation(d.collation)) return undefined;
+			const sourceCol = projector.sourceCol;
+			if (!isBinaryCollation(sourceSchema.columns[sourceCol]?.collation)) return undefined;
+			leadingSourceCols.add(sourceCol);
+			prefix.push(newRow[sourceCol]);
+		}
+
+		// The leading `k` backing-PK columns must be exactly the UC source columns.
+		if (leadingSourceCols.size !== ucSourceCols.size) return undefined;
+		for (const c of ucSourceCols) {
+			if (!leadingSourceCols.has(c)) return undefined;
+		}
+		return prefix;
+	}
 }
 
 /* ─────────────────────────── helpers ─────────────────────────── */
+
+/** True for the default (binary) collation: an absent name or a case-insensitive
+ *  `BINARY`. Non-binary collations gate off the prefix-scan fast path (see
+ *  {@link MaterializedViewManager.tryBuildCoveringPrefix}). */
+function isBinaryCollation(collation: string | undefined): boolean {
+	return collation === undefined || collation.toUpperCase() === 'BINARY';
+}
 
 function mvKey(schemaName: string, name: string): string {
 	return `${schemaName}.${name}`.toLowerCase();

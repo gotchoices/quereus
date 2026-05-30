@@ -32,14 +32,13 @@ covering structure answers it.
 >
 > A design-spike (`incremental-maintenance-substrate-spike`) named two convergence
 > points: a shared `MaintenancePlan` abstraction and a backward (maintenance-direction)
-> cost gate — and asked whether a Z-set / DBSP-style delta circuit is worth adopting for
-> harder body shapes. The synchronous, in-transaction *application policy* for materialized
+> cost gate. The synchronous, in-transaction *application policy* for materialized
 > views is **not** in question; only the shared representation and cost model are. Both
 > named convergence points have now landed: `incremental-maintenance-plan-abstraction`
 > introduced the `MaintenancePlan` union, and `incremental-maintenance-cost-gate` added the
 > backward `maintenanceCost(...)` surface (`planner/cost/index.ts`) — MV eligibility is now
 > a cost choice among structurally-sound strategies (`selectMaintenanceStrategy`), not a hard
-> shape allowlist. The Z-set / DBSP question remains open.
+> shape allowlist.
 >
 > **MV-over-MV cascade.** A materialized view whose source is another MV's backing table
 > is maintained synchronously in the same row-time pass, *not* through this kernel. A

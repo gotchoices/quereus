@@ -1033,4 +1033,79 @@ describe('row-time covering enforcement', () => {
 		await db.exec('insert into t values (1, 5, 5)');
 		await expectThrows(() => db.exec('insert into t values (2, 5, 5)'), 'UNIQUE constraint failed: t (x, y)');
 	});
+
+	// ── Backing-PK prefix scan (covering-mv-enforcement-prefix-scan-and-preference) ──
+	// `lookupCoveringConflicts` keys a prefix scan on the UC values rather than a full
+	// backing scan. These exercise the early-termination, backing-PK column ordering,
+	// collation fallback, and DESC seek. (The whole suite above also now runs through
+	// the prefix scan — its composite `order by x, y` covers the ASC happy path.)
+
+	it('prefix narrows correctly: a shared partial prefix is not a false conflict', async () => {
+		// Rows sharing x=1 but differing in y must NOT collide — the prefix scan must
+		// early-terminate within the x-block, not report the whole block as conflicts.
+		await freshCovered(['insert into t values (1, 1, 1), (2, 1, 2), (3, 2, 1)']);
+		// (1,3) shares x=1 with two backing rows but no (1,3) exists ⇒ succeeds.
+		await db.exec('insert into t values (4, 1, 3)');
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 4 }]);
+		// (1,2) duplicates id=2 ⇒ ABORT.
+		await expectThrows(() => db.exec('insert into t values (5, 1, 2)'), 'UNIQUE constraint failed: t (x, y)');
+	});
+
+	it('prefix conflict recovers the correct source PK among rows sharing a prefix', async () => {
+		// Of the rows sharing x=1, the (1,2) conflict must recover id=2 (not id=1).
+		// REPLACE evicts exactly the recovered source row, leaving the others intact.
+		await freshCovered(['insert into t values (1, 1, 1), (2, 1, 2), (3, 2, 1)']);
+		await db.exec('insert or replace into t values (9, 1, 2)');
+		expect(await selectAll('select * from t order by id')).to.deep.equal([
+			{ id: 1, x: 1, y: 1 }, { id: 3, x: 2, y: 1 }, { id: 9, x: 1, y: 2 },
+		]);
+	});
+
+	it('UC-permuted order-by: the prefix is built in backing-PK order, not uc.columns order', async () => {
+		// `order by y, x` ⇒ the backing PK leads with (y, x). A prefix built in uc
+		// (x, y) order would seek to the wrong block and miss the conflict. The (5,7)
+		// duplicate must still be caught; a swapped (7,5) is a DISTINCT key.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, x integer not null, y integer not null, unique (x, y))');
+		await db.exec('create materialized view ix as select x, y, id from t order by y, x');
+		await db.exec('insert into t values (1, 5, 7)');
+		// (7,5) is a different (x,y) ⇒ no conflict.
+		await db.exec('insert into t values (2, 7, 5)');
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 2 }]);
+		// (5,7) duplicates id=1 ⇒ conflict (missed if the prefix used uc order).
+		await expectThrows(() => db.exec('insert into t values (3, 5, 7)'), 'UNIQUE constraint failed: t (x, y)');
+	});
+
+	it('non-binary collation bypasses the prefix fast path: the candidate generator stays collation-correct', async () => {
+		// A NOCASE leading column would make a binary prefix scan miss a collated-equal /
+		// binary-different conflict ('Foo' vs 'foo'), so `tryBuildCoveringPrefix` bails and
+		// `lookupCoveringConflicts` uses the full scan, which re-compares with the source
+		// collation. We assert the *candidate generator* (`_lookupCoveringConflicts`, the
+		// surface this ticket changes) still surfaces the conflicting source PK. NOTE: the
+		// end-to-end UNIQUE *enforcement* still nets to BINARY at the downstream validator
+		// (`checkUniqueViaMaterializedView`) — a separate, pre-existing soundness gap tracked
+		// by `unique-constraint-honors-column-collation` — so this checks the generator only.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, name text collate NOCASE, unique (name))');
+		await db.exec('create materialized view ix as select name, id from t order by name');
+		await db.exec("insert into t values (1, 'Foo')");
+		const mv = db.schemaManager.getMaterializedView('main', 'ix')!;
+		const uc = db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
+		// New row (id=2, name='foo') vs the backing ('Foo', id=1): a binary prefix scan
+		// would early-terminate and return []; the collation-correct full scan returns id=1.
+		const conflicts = await db._lookupCoveringConflicts(mv, uc, [2, 'foo'], [2]);
+		expect(conflicts.map(c => c.pk)).to.deep.equal([[1]]);
+	});
+
+	it('DESC-leading covering MV: the prefix seek still resolves conflicts', async () => {
+		// `order by x desc` ⇒ the backing PK leads with x DESC. The equalityPrefix seek
+		// must still land on the matching block under the descending physical order.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, x integer not null, unique (x))');
+		await db.exec('create materialized view ix as select x, id from t order by x desc');
+		await db.exec('insert into t values (1, 5)');
+		await db.exec('insert into t values (2, 6)'); // different x ⇒ ok
+		await expectThrows(() => db.exec('insert into t values (3, 5)'), 'UNIQUE constraint failed: t (x)');
+		expect(await selectAll('select * from t order by id')).to.deep.equal([{ id: 1, x: 5 }, { id: 2, x: 6 }]);
+	});
 });

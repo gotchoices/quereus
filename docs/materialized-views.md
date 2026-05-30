@@ -511,20 +511,49 @@ and returns the `materialized-view` covering variant **in preference to** the
 `memory-index` auto-index. `checkSingleUniqueConstraint`'s `materialized-view` arm
 then point-looks-up the covering MV's backing table
 (`Database._lookupCoveringConflicts`, reads-own-writes through the backing's
-coordinated connection — v1 is a full backing scan; a backing-PK prefix scan is a
-sound later optimization in `covering-mv-enforcement-prefix-scan-and-preference`) and
-recovers each conflicting **source** PK from the MV projection so REPLACE / IGNORE /
-ABORT resolve against the correct source row.
+coordinated connection) and recovers each conflicting **source** PK from the MV
+projection so REPLACE / IGNORE / ABORT resolve against the correct source row.
 
-**The preference tradeoff.** With a linked covering MV present, the covering MV — not
-the auto-index — answers conflict resolution. The auto-index remains maintained but
-*unconsulted* (a redundant read-answering copy). For *physical* schemas this makes
-the MV path live and testable in v1 (the auto-index always exists, so the MV path is
-otherwise unreachable); it becomes the *sole* enforcement structure in the
-**logical-schema** world (the lens layer), where the auto-index is retired. Whether
-the MV should outrank the auto-index for physical schemas (an O(n) backing scan vs an
-O(log n) probe until the prefix scan lands) is revisited in
-`covering-mv-enforcement-prefix-scan-and-preference`.
+The conflict check is a **backing-PK prefix scan** (O(log n + matches)), not a full
+backing scan. The body's `order by` columns are a permutation of the UC columns (the
+coverage prover's Ordering rule) and they seed the leading backing-PK columns
+(`computeBackingPrimaryKey`), so the leading `k = uc.columns.length` backing-PK
+columns are exactly the UC columns. `lookupCoveringConflicts` (`tryBuildCoveringPrefix`)
+builds the equality prefix in **backing-PK column order** (keyed `prefix[i] =
+newRow[sourceCol(backingPkDefinition[i])]`, so a permuting `order by` still seeks to
+the right block), and `scanLayer`'s `equalityPrefix` seek early-terminates when the
+leading columns stop matching. The fast path is taken only when the leading `k`
+backing-PK columns map to exactly the UC source-column set **and** every leading
+column (backing PK *and* its source UC column) is **BINARY**-collated; otherwise it
+falls back to the full layer scan. The collation gate is a *soundness* requirement,
+not a perf choice: the prefix seek's early-termination and `planAppliesToKey` compare
+with plain `compareSqlValues` (binary), while the backing btree orders by the declared
+collation and the UNIQUE constraint conflicts by the source collation — under a
+non-binary collation a binary `break` could skip a collated-equal / binary-different
+conflict. The full-scan fallback re-compares with the source collation, so it stays
+collation-correct. DESC-leading prefixes use the fast path (equality on a column makes
+its direction irrelevant to grouping; the seek + ascending walk lands at the group
+start either way). Either path yields only *candidates*; the caller validates each
+against the live source row.
+
+**The preference tradeoff (decided: MV stays in preference).** With a linked covering
+MV present, the covering MV — not the auto-index — answers conflict resolution. The
+auto-index remains maintained but *unconsulted* (a redundant read-answering copy). For
+*physical* schemas this makes the MV path live and testable (the auto-index always
+exists, so the MV path is otherwise unreachable); it becomes the *sole* enforcement
+structure in the **logical-schema** world (the lens layer), where the auto-index is
+retired. The MV outranking the auto-index for physical schemas is now defensible: the
+backing-PK prefix scan above makes the MV's UNIQUE check O(log n + matches) — the same
+asymptotics as the auto-index probe — so the former O(n) backing scan (an O(n²)
+bulk-insert regression) is gone. The residual cost is a bounded constant factor
+(backing-connection resolution, amortized per statement via `BackingConnectionCache`
+on the maintenance path and re-resolved deterministically on the cold enforcement
+path; plus per-candidate live-source validation) plus the maintained-but-unconsulted
+auto-index. Keeping the MV in preference (rather than flipping to auto-index-wins
+behind a tuning flag) avoids a flag and keeps the MV enforcement path exercised on
+physical schemas — identical to the sole enforcement path the lens world will use.
+Revisit the flip only if profiling shows the constant factor matters on physical
+workloads.
 
 **The eviction-maintenance edge.** A REPLACE evicts the conflicting **source** row
 directly on the source storage (memory transaction layer / store delete), which
@@ -580,8 +609,7 @@ The following extensions build on this substrate:
   design-spike reconsidering *how* the next maintenance shapes are built: it unifies
   this row-time inverse-projection path and the post-commit `DeltaExecutor` binding
   kernel under one `MaintenancePlan` abstraction, adds a backward
-  (maintenance-direction) cost gate, and decides via a bounded proof-of-concept whether
-  a Z-set / DBSP-style delta circuit is worth adopting for the harder shapes. The
+  (maintenance-direction) cost gate. The
   spike's outcome is not yet decided; the general-bodies item below is retargeted to
   build on its abstraction once it lands.
 - **Row-time general bodies** (`materialized-view-rowtime-general-bodies`) — extend
@@ -596,10 +624,12 @@ The following extensions build on this substrate:
   sync with source writes.
 - **Backing-module pluggability** — honor `USING <module>(...)` so the stored relation
   can live in a module other than the in-memory table.
-- **Covering-structure enforcement follow-ups** — backing-PK prefix scan + the
-  physical-schema preference decision
-  (`covering-mv-enforcement-prefix-scan-and-preference`) and isolation-layer routing
-  (`covering-mv-isolation-layer-enforcement-routing`).
+- **Covering-structure enforcement follow-ups** — the backing-PK prefix scan and the
+  physical-schema preference decision are **delivered** (MV stays in preference, now
+  O(log n) via the prefix scan). Remaining: thread per-column collation into
+  `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`) so non-binary
+  covering MVs also use the prefix scan instead of the full-scan fallback, and
+  isolation-layer routing (`covering-mv-isolation-layer-enforcement-routing`).
 - **Lens / layered schemas** — indexes and set-level constraint enforcement expressed
   as covering materialized views in the basis layer. See
   [Lenses and Layered Schemas](lens.md).
