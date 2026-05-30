@@ -156,7 +156,15 @@ function skewedDataArb(spec: TableSpec, count: number): fc.Arbitrary<SqlValue[][
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('Property-Based Planner/Optimizer Tests', () => {
+describe('Property-Based Planner/Optimizer Tests', function () {
+
+	// These are fast-check-heavy suites: each `it` drives dozens of property
+	// runs that each spin up a Database, load rows, and plan/run queries. In
+	// isolation individual cases run well under a second, but under the default
+	// 2000ms mocha timeout they can slip past the budget when the host is under
+	// CPU contention (e.g. the full-monorepo test run). Give the whole suite a
+	// generous per-test budget; the stress sub-suite below overrides it higher.
+	this.timeout(30_000);
 
 	// -----------------------------------------------------------------------
 	// Property 1: Semantic equivalence under optimizer rules
