@@ -374,7 +374,7 @@ estimatedRows: (operands) => {
 
 Non-deterministic or trace-only TVFs (`execution_trace`, `row_trace`, `stack_trace`, `scheduler_program`, `schema_size`, `explain_assertion`, `schema`) skip advertisement.
 
-**Relevant to materialized-view maintenance (deferred shape).** The TVF `relationalAdvertisement` (`keys` / `isSet`) is the surface a lateral-TVF row-time materialized-view body would consume to bound a fan-out (`base t cross join lateral json_each(t.arr) je`): a base-row change maps to many backing rows that a prefix-delete + recomputed-fan-out maintenance would need to prove set on the backing PK. This shape is **not** in the current row-time eligibility gate — it is deferred to `materialized-view-rowtime-general-bodies`. The reason it would need the advertisement *directly* is that `combineJoinKeys` (`planner/util/key-utils.ts`) returns `[]` for a keyless cross/lateral join — it never forms the **product key** `(leftKey ∪ shiftedRightKey)`, so `keysOf` cannot surface the keyed cross-product key. Teaching `combineJoinKeys` to emit keyed cross-product join keys is the general fix, filed as the backlog item `optimizer-keyed-cross-product-join-keys`. See [Materialized Views](materialized-views.md).
+**Relevant to materialized-view maintenance (deferred shape).** The TVF `relationalAdvertisement` (`keys` / `isSet`) is the surface a lateral-TVF row-time materialized-view body would consume to bound a fan-out (`base t cross join lateral json_each(t.arr) je`): a base-row change maps to many backing rows that a prefix-delete + recomputed-fan-out maintenance would need to prove set on the backing PK. This shape is **not** in the current row-time eligibility gate — it is deferred to `materialized-view-rowtime-general-bodies`. `combineJoinKeys` (`planner/util/key-utils.ts`) now forms the **product key** `(leftKey ∪ shiftedRightKey)` for a keyed cross/lateral join (when both sides are keyed and neither is equi-covered), so `keysOf` surfaces the keyed cross-product key — see [Keyed cross/inner (and lateral) product keys](#keyed-crossinner-and-lateral-product-keys). The remaining lateral-TVF consumption work (proving a recomputed fan-out set on the backing PK) is tracked by `materialized-view-rowtime-general-bodies`. See [Materialized Views](materialized-views.md).
 
 ### Constant Folding Subsystem
 
@@ -1833,7 +1833,7 @@ SELECT * FROM t WHERE qty < 0;
 
 * `projectKeys(keys, columnMapping)` pushes keys through `ProjectNode` / `ReturningNode`.
 * `combineJoinKeys(leftKeys, rightKeys, joinType, leftColumnCount, equiPairs?)` combines logical `RelationType.keys` across joins:
-  * **INNER / CROSS**: coverage-gated, mirroring `analyzeJoinKeyCoverage` — left's keys survive only when `equiPairs` cover a right-side key (each left row matches ≤ 1 right row), and right's keys (shifted) survive only when `equiPairs` cover a left-side key. A key=key join covers both; a bare cross join covers neither (returns empty — full-product set-ness is carried by `isSet`). An unconditional union would over-claim: `ta CROSS JOIN tb` repeats `ta`'s PK once per `tb` row.
+  * **INNER / CROSS**: coverage-gated, mirroring `analyzeJoinKeyCoverage` — left's keys survive only when `equiPairs` cover a right-side key (each left row matches ≤ 1 right row), and right's keys (shifted) survive only when `equiPairs` cover a left-side key. A key=key join covers both. When neither side is covered but **both** sides are keyed (a bare cross join, or an inner join whose predicate touches no key), the result is keyed by the **composite product key** `(leftKey ∪ rightKey-shifted)` — see [Keyed cross/inner (and lateral) product keys](#keyed-crossinner-and-lateral-product-keys). One lex-min product key is emitted (blow-up containment); full-row set-ness is additionally carried by `isSet`. An unconditional union of both sides' individual keys would over-claim: `ta CROSS JOIN tb` repeats `ta`'s PK once per `tb` row, so `ta`'s PK alone is not a key of the product — only the *pair* is.
   * **LEFT**: when `equiPairs` cover any right-side key, left's keys survive (each left row matches ≤ 1 right row); otherwise empty. Right's keys never survive (NULL-padded right columns break uniqueness).
   * **RIGHT**: symmetric — when `equiPairs` cover any left-side key, right's keys (shifted) survive.
   * **FULL**: empty (both sides can be NULL-padded).
@@ -2368,3 +2368,37 @@ Quereus uses a **characteristic-based** optimization pipeline that leverages the
 - Clear separation of concerns between different optimization phases
 - Predictable rule application order based on logical properties
 
+
+## Keyed cross/inner (and lateral) product keys
+
+`combineJoinKeys` (logical `RelationType.keys`) and `analyzeJoinKeyCoverage` →
+`propagateJoinFds` (physical FDs) both derive keys for joins. For an
+`inner`/`cross` join where **neither** side's key is covered by the equi-predicate
+(a bare cross join, or an inner join whose predicate touches no key) but **both**
+sides advertise a non-empty unique key, the relational product is itself keyed by
+the pair `(leftKey, rightKey)`: each `(leftKey-value, rightKey-value)` combination
+occurs at most once, because `inner`/`cross` only *removes* `(leftRow, rightRow)`
+pairs, never duplicates one. These layers now emit that composite product key
+`(leftKey ∪ rightKey-shifted-by-leftColumnCount)`, so `keysOf` surfaces a real
+column key for the product (used by DISTINCT elimination, covering proofs, and MV
+backing-PK derivation) instead of falling back to all-columns. Full-row set-ness
+is *additionally* carried by `RelationType.isSet`.
+
+Policy and gating:
+
+- **One key per node (blow-up containment).** Exactly one product key is emitted:
+  the lex-min key from each side — fewest columns, ties broken by lowest
+  first-column index — concatenated. This bounds growth to ≤1 new key per join
+  node regardless of how many alternative keys each side carries, keeping chained
+  joins tractable.
+- **Gate.** The product key fires only when (1) the join is `inner`/`cross`,
+  (2) neither the right-key-covered nor the left-key-covered survivor branch fired
+  (an equi-join that covers one side already yields that side's individual key),
+  and (3) both sides have a non-empty key. A ≤1-row side carries only the empty
+  key, which already trips a survivor branch and yields `undefined` from the
+  lex-min selection, so the ≤1-row case keeps its existing behavior and never
+  reaches the product key.
+
+Equi-join (one-side-covered), `left`/`right`/`full` outer, `semi`/`anti`, and the
+≤1-row (`∅ → all-cols`) paths are unchanged — the product key is confined to the
+previously-empty "both keyed, neither covered" gap.

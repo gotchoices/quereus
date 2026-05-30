@@ -185,6 +185,32 @@ function dedupeKeys(keys: ColRef[][]): ColRef[][] {
 }
 
 /**
+ * Select the "lex-min" key from a list of keys: the one with the fewest columns,
+ * ties broken by the lowest first-column index. Empty keys (≤1-row markers) are
+ * skipped, and `undefined` is returned when there is no non-empty key. Used to
+ * bound join-product key blow-up to a single key per side.
+ *
+ * Generic over the key element via an index accessor so the same logic serves
+ * both the ColRef form (`combineJoinKeys`) and the column-index form
+ * (`analyzeJoinKeyCoverage`).
+ */
+function selectLexMinKey<K>(
+	keys: ReadonlyArray<ReadonlyArray<K>>,
+	indexOf: (el: K) => number,
+): ReadonlyArray<K> | undefined {
+	let best: ReadonlyArray<K> | undefined;
+	for (const key of keys) {
+		if (key.length === 0) continue;
+		if (best === undefined
+			|| key.length < best.length
+			|| (key.length === best.length && indexOf(key[0]) < indexOf(best[0]))) {
+			best = key;
+		}
+	}
+	return best;
+}
+
+/**
  * Combine unique keys across a join (logical `RelationType.keys` form).
  *
  * Soundness mirrors `analyzeJoinKeyCoverage`: a side's key survives the join
@@ -236,15 +262,41 @@ export function combineJoinKeys(
 			const rightEqSet = new Set<number>((equiPairs ?? []).map(p => p.right));
 			// Left's keys survive only when each left row matches ≤ 1 right row,
 			// i.e. the equi-pairs cover a right-side key (or right is ≤1-row).
-			if (joinPairsCoverKey(rightKeys, rightEqSet)) {
+			const leftKeysSurvive = joinPairsCoverKey(rightKeys, rightEqSet);
+			if (leftKeysSurvive) {
 				for (const key of leftKeys) {
 					result.push(key.map(c => ({ index: c.index, desc: c.desc })));
 				}
 			}
 			// Symmetrically for the right side.
-			if (joinPairsCoverKey(leftKeys, leftEqSet)) {
+			const rightKeysSurvive = joinPairsCoverKey(leftKeys, leftEqSet);
+			if (rightKeysSurvive) {
 				for (const key of rightKeys) {
 					result.push(key.map(c => ({ index: c.index + leftColumnCount, desc: c.desc })));
+				}
+			}
+			// True relational product: when NEITHER side's key is covered by the
+			// equi-predicate (a bare cross join, or an inner join whose predicate
+			// touches no key) but BOTH sides advertise a non-empty key, the pair
+			// (leftKey, rightKey) is itself unique on the product — leftKey is
+			// unique on the left, rightKey on the right, and inner/cross only
+			// removes (leftRow, rightRow) pairs, never duplicates one, so each
+			// (leftKey-value, rightKey-value) combination occurs at most once.
+			// Emit exactly ONE product key (the lex-min from each side) so growth
+			// is bounded to ≤1 new key per join node regardless of how many keys
+			// each side carries. A ≤1-row side has only the empty key, which makes
+			// joinPairsCoverKey vacuously true above (so the survivor branch already
+			// fired) and also makes selectLexMinKey return undefined, so the ≤1-row
+			// case never reaches a product key. Full-row set-ness of the product is
+			// carried separately by RelationType.isSet.
+			if (!leftKeysSurvive && !rightKeysSurvive) {
+				const leftPick = selectLexMinKey(leftKeys, c => c.index);
+				const rightPick = selectLexMinKey(rightKeys, c => c.index);
+				if (leftPick && rightPick) {
+					result.push([
+						...leftPick.map(c => ({ index: c.index, desc: c.desc })),
+						...rightPick.map(c => ({ index: c.index + leftColumnCount, desc: c.desc })),
+					]);
 				}
 			}
 			// When both sides are ≤1-row their empty keys both push through above,
@@ -391,6 +443,23 @@ export function analyzeJoinKeyCoverage(
 		// Cardinality reduction: when a key is covered, result rows ≤ the other side's rows
 		if (rightKeyCovered && typeof leftRows === 'number') estimatedRows = leftRows;
 		if (leftKeyCovered && typeof rightRows === 'number') estimatedRows = (estimatedRows === undefined) ? rightRows : Math.min(estimatedRows, rightRows);
+
+		// True relational product (mirrors combineJoinKeys): neither side's key is
+		// covered by the equi-predicate, yet both sides are keyed, so the composite
+		// (leftKey + rightKey-shifted) is itself unique - each (leftKey, rightKey)
+		// pair occurs at most once (inner/cross only removes pairs, never
+		// duplicates). Emit ONE lex-min product key to bound blow-up to one new key
+		// per node. A 1-row side carries only the empty key, so selectLexMinKey
+		// returns undefined for it and the composite is skipped (the singleton
+		// branch above already handles that case). rightKeysShifted is already
+		// shifted; propagateJoinFds materializes this as the composite-key FD.
+		if (!leftKeyCovered && !rightKeyCovered) {
+			const leftPick = selectLexMinKey(leftKeys, i => i);
+			const rightPick = selectLexMinKey(rightKeysShifted, i => i);
+			if (leftPick && rightPick) {
+				preservedKeys.push([...leftPick, ...rightPick]);
+			}
+		}
 	} else if (joinType === 'left') {
 		// LEFT outer: left's keys survive (and left's rowcount caps the output) iff
 		// the equi-pairs cover a right-side unique key — each left row then matches
