@@ -249,6 +249,8 @@ For each **new** basis relation `R` (one the prior lens did not back) the differ
 
 The per-relation category is then `re-decomposition` (every column reconstructible → fully engine-generated), `partial` (some reconstructible → engine generates those, lists the rest as `missing`), or `needs-data` (none → entirely the application's). Threading one *surrogate* shared key across the members of a multi-relation split (evaluate-once-and-thread) is `lens-multi-source-put-fanout`'s concern; a multi-member surrogate split emits a `needs-data` deferred-note row rather than an unsound insert.
 
+> **Known limitation (`lens-partial-backfill-not-null-classification`):** a `partial` row's generated `backfill_sql` is a key-only skeleton `insert` that leaves the `missing` columns NULL for the application to `UPDATE`. Because Quereus columns are **NOT NULL by default**, running that skeleton insert verbatim fails an unguarded NOT NULL constraint whenever a `missing` column is NOT NULL with no default. Until that ticket lands, treat `partial` `backfill_sql` as runnable only when the `missing` columns are nullable or defaulted; otherwise the application owns the whole insert.
+
 #### `quereus_basis_backfill(logical_schema)`
 
 The classified rows are introspected by the integrated TVF `quereus_basis_backfill(logical_schema)` (`src/func/builtins/explain.ts`), mirroring `quereus_effective_lens`: it requires `schema.kind === 'logical'`, loads the rotated snapshot pair (yielding nothing with no `previous`), and yields one row per new basis relation, ordered by logical table then basis relation:

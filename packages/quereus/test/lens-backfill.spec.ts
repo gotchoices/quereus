@@ -19,6 +19,20 @@ async function rows(db: Database, sql: string): Promise<Array<Record<string, unk
 	return out;
 }
 
+async function expectThrows(fn: () => Promise<unknown>, matcher?: RegExp): Promise<void> {
+	let threw = false;
+	try {
+		await fn();
+	} catch (e) {
+		threw = true;
+		if (matcher) {
+			const msg = e instanceof Error ? e.message : String(e);
+			expect(msg, `error message should match ${matcher}`).to.match(matcher);
+		}
+	}
+	expect(threw, 'expected the operation to throw').to.be.true;
+}
+
 /** Lowercase the `schema.table` basis_relation for casing-insensitive assertions. */
 function rel(r: Record<string, unknown>): string {
 	return String(r.basis_relation).toLowerCase();
@@ -140,6 +154,114 @@ describe('lens backfill: new column needs application data', () => {
 			// The engine generates only the reconstructible (id) projection — the
 			// insert column list and select are exactly `id`; it never fabricates `color`.
 			expect(String(color.backfill_sql).toLowerCase()).to.match(/insert into \S+ \(id\) select id from/);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens backfill: partial backfill runs end-to-end', () => {
+	// The generated `partial` SQL inserts a key-only skeleton, leaving the new
+	// column NULL for the app to UPDATE. That skeleton insert is only runnable
+	// when the new column is NULLABLE — Quereus columns are NOT NULL by default,
+	// so `color` is declared `null` here. The NOT-NULL-default case (where the
+	// skeleton insert would fail an unguarded NOT NULL constraint) is the known
+	// limitation tracked by `lens-partial-backfill-not-null-classification`.
+	it('runs the engine skeleton insert, then the app supplies the new column; the relation round-trips', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Src { id integer primary key, vin text, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Src values (1, 'AAA', 120), (2, 'BBB', 90)");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, vin, speed from y.Src }');
+			await db.exec('apply schema x'); // snapshot 1 (prior basis = Src)
+
+			// Re-decompose into CarCore + CarPerf (pure) plus a NEW CarColor member
+			// carrying `color` (nullable), which the prior basis never held.
+			await db.exec('declare schema y { table Src { id integer primary key, vin text, speed integer } table CarCore { id integer primary key, vin text } table CarPerf { id integer primary key, speed integer } table CarColor { id integer primary key, color text null } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text, speed integer, color text null } }');
+			await db.exec('declare lens for x over y { view Car as select c.id, c.vin, p.speed, k.color from y.CarCore c join y.CarPerf p using (id) join y.CarColor k using (id) }');
+			await db.exec('apply schema x'); // snapshot 2
+
+			const bf = await rows(db, "select * from quereus_basis_backfill('x') order by basis_relation");
+			// Run every engine-generated backfill (re-decomposition + the partial skeleton).
+			for (const r of bf) if (r.backfill_sql) await db.exec(String(r.backfill_sql));
+
+			// The partial skeleton populated CarColor's key with NULL color — so the
+			// inner join now yields a row per logical tuple, color left for the app.
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
+				{ id: 1, vin: 'AAA', speed: 120, color: null },
+				{ id: 2, vin: 'BBB', speed: 90, color: null },
+			]);
+
+			// The application supplies the genuinely-new column.
+			await db.exec("update y.CarColor set color = 'red' where id = 1");
+			await db.exec("update y.CarColor set color = 'blue' where id = 2");
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
+				{ id: 1, vin: 'AAA', speed: 120, color: 'red' },
+				{ id: 2, vin: 'BBB', speed: 90, color: 'blue' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens backfill: rename re-decomposition', () => {
+	it('emits an engine-generated backfill for a renamed single-source basis relation', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Src { id integer primary key, vin text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Src values (1, 'AAA'), (2, 'BBB')");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text } }');
+			await db.exec('declare lens for x over y { view Car as select id, vin from y.Src }');
+			await db.exec('apply schema x'); // snapshot 1 (prior basis = Src)
+			const before = await rows(db, 'select * from x.Car order by id');
+
+			// Rename: add Vehicle, RETAIN Src (the backfill source), re-point the lens.
+			await db.exec('declare schema y { table Src { id integer primary key, vin text } table Vehicle { id integer primary key, vin text } }');
+			await db.exec('apply schema y');
+			await db.exec('declare lens for x over y { view Car as select id, vin from y.Vehicle }');
+			await db.exec('apply schema x'); // snapshot 2 (new basis = Vehicle)
+
+			const bf = await rows(db, "select * from quereus_basis_backfill('x')");
+			expect(bf.length).to.equal(1);
+			expect(rel(bf[0])).to.equal('y.vehicle');
+			expect(bf[0].category).to.equal('re-decomposition');
+			expect(String(bf[0].generated_columns)).to.equal('id, vin');
+			expect(String(bf[0].backfill_sql).toLowerCase()).to.contain('src');
+
+			expect(await rows(db, 'select * from x.Car')).to.deep.equal([]);
+			await db.exec(String(bf[0].backfill_sql));
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal(before);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens backfill: argument guards', () => {
+	it('errors on a non-logical (basis) schema, an unknown schema, and a non-string argument', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Car { id integer primary key, vin text } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text } }');
+			await db.exec('apply schema x');
+
+			// `y` is a deployed basis schema — not logical.
+			await expectThrows(() => rows(db, "select * from quereus_basis_backfill('y')"), /not a logical schema/i);
+			// `main` exists but is not logical either.
+			await expectThrows(() => rows(db, "select * from quereus_basis_backfill('main')"), /not a logical schema/i);
+			// An unknown schema name.
+			await expectThrows(() => rows(db, "select * from quereus_basis_backfill('nope')"), /not found/i);
+			// A non-string argument.
+			await expectThrows(() => rows(db, "select * from quereus_basis_backfill(42)"), /string argument/i);
 		} finally {
 			await db.close();
 		}
