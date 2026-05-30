@@ -407,3 +407,31 @@ select id, c, status from p7k order by id;
 → [{"id":1,"c":"A","status":"active"},{"id":2,"c":"B","status":"archived"},{"id":4,"c":"A","status":"active"}]
 
 drop table p7k;
+
+-- =====================================================
+-- 8. Bare-value predicate truthiness matches the engine (isTruthy).
+--    A bare-column WHERE uses numeric truthiness, so non-numeric text
+--    ('abc') is FALSE (out of scope) while numeric-nonzero text ('1')
+--    is TRUE (in scope) — the same rule the Filter / runtime path uses.
+--    A prior divergence treated any non-empty string as truthy; this
+--    pins the corrected, engine-aligned semantics.
+-- =====================================================
+create table p_bare (id integer primary key, flag text, code text);
+create unique index ix_p_bare on p_bare(code) where flag;
+
+-- 'abc' is non-numeric → predicate FALSE → row is OUT of the partial scope.
+insert into p_bare values (1, 'abc', 'X');
+-- Same code, also out of scope → allowed (would be a UNIQUE error under the old
+-- "any non-empty string is truthy" rule).
+insert into p_bare values (2, 'abc', 'X');
+
+-- '1' coerces to 1 → predicate TRUE → row is IN scope and claims code 'Y'.
+insert into p_bare values (3, '1', 'Y');
+-- Same code inside scope → rejected.
+insert into p_bare values (4, '1', 'Y');
+-- error: UNIQUE
+
+select id, code from p_bare order by id;
+→ [{"id":1,"code":"X"},{"id":2,"code":"X"},{"id":3,"code":"Y"}]
+
+drop table p_bare;

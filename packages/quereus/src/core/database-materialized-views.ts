@@ -57,6 +57,7 @@ import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import type { BackingRowChange, MaintenanceOp, MemoryTableManager } from '../vtab/memory/layer/manager.js';
 import { MemoryVirtualTableConnection } from '../vtab/memory/connection.js';
+import type { VirtualTableConnection } from '../vtab/connection.js';
 import type { MemoryTableConnection } from '../vtab/memory/layer/connection.js';
 import type { ScanPlan } from '../vtab/memory/layer/scan-plan.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
@@ -83,6 +84,9 @@ export interface MaterializedViewManagerContext {
 
 	_buildPlan(statements: AST.Statement[]): import('./database.js').BuildPlanResult;
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
+	/** Backing-connection resolution for row-time write-through (see {@link MaterializedViewManager.getBackingConnection}). */
+	getConnectionsForTable(tableName: string): VirtualTableConnection[];
+	registerConnection(connection: VirtualTableConnection): Promise<void>;
 }
 
 /**
@@ -426,24 +430,20 @@ export class MaterializedViewManager {
 	): Promise<BackingRowChange[]> {
 		const inScope = (row: Row): boolean => plan.predicate === undefined || plan.predicate.evaluate(row) === true;
 		const project = (row: Row): Row =>
-			plan.projectors.map(p => p.kind === 'passthrough' ? row[p.sourceCol] : p.eval(row)) as Row;
+			plan.projectors.map(p => p.kind === 'passthrough' ? row[p.sourceCol] : p.eval(row));
 		const keyOf = (backingRow: Row): BTreeKeyForPrimary =>
 			buildPrimaryKeyFromValues(plan.backingPkDefinition.map(d => backingRow[d.index]), plan.backingPkDefinition);
 
 		const ops: MaintenanceOp[] = [];
 		if (change.op === 'insert') {
-			const r = change.newRow!;
-			if (inScope(r)) ops.push({ kind: 'upsert', row: project(r) });
+			if (inScope(change.newRow)) ops.push({ kind: 'upsert', row: project(change.newRow) });
 		} else if (change.op === 'delete') {
-			const r = change.oldRow!;
-			if (inScope(r)) ops.push({ kind: 'delete-key', key: keyOf(project(r)) });
+			if (inScope(change.oldRow)) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
 		} else {
 			// UPDATE: delete the old image if it was in scope, upsert the new image if
 			// it is — covers predicate-scope transitions and key-changing updates.
-			const oldR = change.oldRow!;
-			const newR = change.newRow!;
-			if (inScope(oldR)) ops.push({ kind: 'delete-key', key: keyOf(project(oldR)) });
-			if (inScope(newR)) ops.push({ kind: 'upsert', row: project(newR) });
+			if (inScope(change.oldRow)) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
+			if (inScope(change.newRow)) ops.push({ kind: 'upsert', row: project(change.newRow) });
 		}
 		if (ops.length === 0) return [];
 
@@ -484,8 +484,7 @@ export class MaterializedViewManager {
 		const cacheKey = qualifiedName.toLowerCase();
 		const cached = cache?.get(cacheKey);
 		if (cached) return cached;
-		const db = this.ctx as unknown as Database;
-		for (const c of db.getConnectionsForTable(qualifiedName)) {
+		for (const c of this.ctx.getConnectionsForTable(qualifiedName)) {
 			if (c instanceof MemoryVirtualTableConnection) {
 				const mc = c.getMemoryConnection();
 				if (mc.tableManager === manager) {
@@ -496,7 +495,7 @@ export class MaterializedViewManager {
 		}
 		const memConn = manager.connect();
 		const vtabConn = new MemoryVirtualTableConnection(qualifiedName, memConn);
-		await db.registerConnection(vtabConn);
+		await this.ctx.registerConnection(vtabConn);
 		cache?.set(cacheKey, memConn);
 		return memConn;
 	}
@@ -566,9 +565,14 @@ export class MaterializedViewManager {
 		// of a backing write recursively (DAG-ordered, atomic within the statement); the
 		// eligibility checks below evaluate against the keyed backing schema unchanged.
 
-		// Row-collapsing / fan-out / unbounded shapes break one-source-row →
+		// Row-collapsing / fan-out / cross-row / unbounded shapes break one-source-row →
 		// one-backing-row, so write-through could not be a pure projection.
 		if (findAggregate(analyzed)) reject('its body uses an aggregate');
+		// A window function reads across the partition, so a backing column would depend on
+		// other source rows — not a pure per-row projection. It is already caught structurally
+		// by the passthrough/single-row-expression projection check below, but reject it
+		// explicitly here for a clear diagnostic.
+		if (containsNodeType(analyzed, PlanNodeType.Window)) reject('its body uses a window function');
 		if (containsAnyJoin(analyzed)) reject('its body contains a join');
 		if (containsNodeType(analyzed, PlanNodeType.Distinct)) reject('its body uses DISTINCT');
 		if (containsNodeType(analyzed, PlanNodeType.SetOperation)) reject('its body uses a set operation (union/intersect/except)');

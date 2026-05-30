@@ -16,6 +16,7 @@ import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActions, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
 import type { BackingConnectionCache } from '../../core/database-materialized-views.js';
+import type { BackingRowChange } from '../../vtab/memory/layer/manager.js';
 
 /**
  * Module-scope counter producing unique statement-savepoint names across
@@ -86,7 +87,7 @@ function emitAutoDataEvent(
 async function maintainRowTimeStructures(
 	ctx: RuntimeContext,
 	tableKey: string,
-	change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
+	change: BackingRowChange,
 	cache: BackingConnectionCache,
 ): Promise<void> {
 	if (!ctx.db._hasRowTimeCoveringStructures(tableKey)) return;
@@ -456,6 +457,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		backingConnCache: BackingConnectionCache,
 	): Promise<Row | undefined> {
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
+		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
 
 		let mutationStatement: string | undefined;
 		if (vtab.wantStatements) {
@@ -489,12 +491,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 					const existingKeyValues = pkColumnIndicesInSchema.map(idx => result.existingRow![idx]);
 					ctx.db._recordUpdate(
-						`${tableSchema.schemaName}.${tableSchema.name}`,
+						tableKey,
 						result.existingRow!,
 						updateResult.updatedRow,
 						pkColumnIndicesInSchema,
 					);
-					await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
+					await maintainRowTimeStructures(ctx, tableKey,
 						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow }, backingConnCache);
 					await executeForeignKeyActions(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow);
 
@@ -524,7 +526,6 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			return undefined;
 		}
 
-		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
 		const replacedRow = result.replacedRow;
 
 		if (replacedRow) {
@@ -591,6 +592,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
+		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
 
 		// Extract primary key values from the OLD row (these identify which row to update)
 		const keyValues: SqlValue[] = pkColumnIndicesInSchema.map(pkColIdx => {
@@ -649,11 +651,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		if (result.replacedRow) {
 			const evictedKeyValues = pkColumnIndicesInSchema.map(idx => result.replacedRow![idx]);
 			ctx.db._recordDelete(
-				`${tableSchema.schemaName}.${tableSchema.name}`,
+				tableKey,
 				result.replacedRow,
 				pkColumnIndicesInSchema,
 			);
-			await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
+			await maintainRowTimeStructures(ctx, tableKey,
 				{ op: 'delete', oldRow: result.replacedRow }, backingConnCache);
 			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', result.replacedRow);
 			if (needsAutoEvents) {
@@ -664,12 +666,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Track change (UPDATE): pass full rows so the change capture can
 		// project the columns any active subscription cares about.
 		ctx.db._recordUpdate(
-			`${tableSchema.schemaName}.${tableSchema.name}`,
+			tableKey,
 			oldRow,
 			newRow,
 			pkColumnIndicesInSchema,
 		);
-		await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
+		await maintainRowTimeStructures(ctx, tableKey,
 			{ op: 'update', oldRow, newRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
@@ -727,6 +729,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		backingConnCache: BackingConnectionCache,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
+		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
 
 		const keyValues: SqlValue[] = pkColumnIndicesInSchema.map(pkColIdx => {
 			if (pkColIdx >= oldRow.length) {
@@ -768,11 +771,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Track change (DELETE): record OLD row + PK indices so capture
 		// can project the columns subscribers care about.
 		ctx.db._recordDelete(
-			`${tableSchema.schemaName}.${tableSchema.name}`,
+			tableKey,
 			oldRow,
 			pkColumnIndicesInSchema,
 		);
-		await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
+		await maintainRowTimeStructures(ctx, tableKey,
 			{ op: 'delete', oldRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)

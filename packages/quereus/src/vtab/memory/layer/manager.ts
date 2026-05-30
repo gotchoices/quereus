@@ -77,12 +77,16 @@ export type MaintenanceOp =
  * `BackingRowChange` back through `maintainRowTime(B.backingBase, change)`. It is the
  * same shape as the inbound source change by design (unify, don't duplicate) — see
  * `core/database-materialized-views.ts` § cascade.
+ *
+ * A discriminated union over `op`: an `insert` carries only the new image, a `delete`
+ * only the old, an `update` both. The maintenance hook narrows on `op` rather than
+ * non-null-asserting `oldRow`/`newRow`, so a mis-paired hook site fails at compile time
+ * rather than at runtime.
  */
-export interface BackingRowChange {
-	op: 'insert' | 'update' | 'delete';
-	oldRow?: Row;
-	newRow?: Row;
-}
+export type BackingRowChange =
+	| { op: 'insert'; oldRow?: undefined; newRow: Row }
+	| { op: 'delete'; oldRow: Row; newRow?: undefined }
+	| { op: 'update'; oldRow: Row; newRow: Row };
 
 /** Origin + structure name for a UNIQUE constraint's implicit covering structure. */
 export interface ImplicitCoveringStructure {

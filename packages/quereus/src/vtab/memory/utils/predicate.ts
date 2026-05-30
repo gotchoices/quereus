@@ -1,9 +1,22 @@
 import type { Expression } from '../../../parser/ast.js';
 import type { ColumnSchema } from '../../../schema/column.js';
 import type { Row, SqlValue } from '../../../common/types.js';
-import { compareSqlValues } from '../../../util/comparison.js';
+import { compareSqlValues, isTruthy } from '../../../util/comparison.js';
 import { QuereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
+
+/**
+ * SQL three-valued truthiness of a predicate value. NULL stays unknown (`null`);
+ * every other value collapses to the engine's canonical {@link isTruthy} — so a
+ * partial index / UNIQUE / materialized-view predicate scopes rows exactly as the
+ * Filter / runtime path does (numeric-string coercion: `'abc'`, `'0'`, blobs ⇒
+ * false). Previously these compiled predicates used a divergent "non-(`false`|`0`|
+ * `0n`|`''`) ⇒ true" rule, which disagreed with the query engine for bare
+ * string / blob values.
+ */
+function predicateTruthy(v: SqlValue): boolean | null {
+	return v === null ? null : isTruthy(v);
+}
 
 /**
  * Compiled partial-index predicate. Walks a Row, returning SQL three-valued
@@ -41,13 +54,7 @@ export function compilePredicate(
 	const referencedColumns = new Set<number>();
 	const evaluator = compileExpression(expr, columnIndexMap, referencedColumns);
 
-	const evaluate = (row: Row): boolean | null => {
-		const v = evaluator(row);
-		if (v === null) return null;
-		// SQL truthiness: false / 0 / '' / 0n -> false; anything else -> true.
-		if (v === false || v === 0 || v === 0n || v === '') return false;
-		return true;
-	};
+	const evaluate = (row: Row): boolean | null => predicateTruthy(evaluator(row));
 
 	return { evaluate, referencedColumns };
 }
@@ -153,10 +160,8 @@ function compileUnary(
 			return (row) => operand(row) !== null;
 		case 'NOT':
 			return (row) => {
-				const v = operand(row);
-				if (v === null) return null;
-				if (v === false || v === 0 || v === 0n || v === '') return true;
-				return false;
+				const t = predicateTruthy(operand(row));
+				return t === null ? null : !t;
 			};
 		case '+':
 			return (row) => {
@@ -194,20 +199,22 @@ function compileBinary(
 
 	switch (op) {
 		case 'AND':
+			// Three-valued AND: any FALSE ⇒ false (short-circuit); else any NULL ⇒ null.
 			return (row) => {
-				const a = left(row);
-				if (a === false || a === 0 || a === 0n || a === '') return false;
-				const b = right(row);
-				if (b === false || b === 0 || b === 0n || b === '') return false;
+				const a = predicateTruthy(left(row));
+				if (a === false) return false;
+				const b = predicateTruthy(right(row));
+				if (b === false) return false;
 				if (a === null || b === null) return null;
 				return true;
 			};
 		case 'OR':
+			// Three-valued OR: any TRUE ⇒ true (short-circuit); else any NULL ⇒ null.
 			return (row) => {
-				const a = left(row);
-				if (a !== null && a !== false && a !== 0 && a !== 0n && a !== '') return true;
-				const b = right(row);
-				if (b !== null && b !== false && b !== 0 && b !== 0n && b !== '') return true;
+				const a = predicateTruthy(left(row));
+				if (a === true) return true;
+				const b = predicateTruthy(right(row));
+				if (b === true) return true;
 				if (a === null || b === null) return null;
 				return false;
 			};

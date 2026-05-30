@@ -56,6 +56,7 @@ import { TransactionManager, type TransactionManagerContext } from './database-t
 import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { MaterializedViewManager, type BackingConnectionCache } from './database-materialized-views.js';
+import type { BackingRowChange } from '../vtab/memory/layer/manager.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
 import { Table } from './table-handle.js';
@@ -1757,7 +1758,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  surface deliberately exposes only the two-arg form. */
 	public async _maintainRowTimeCoveringStructures(
 		sourceBase: string,
-		change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
+		change: BackingRowChange,
 		cache?: BackingConnectionCache,
 	): Promise<void> {
 		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache);

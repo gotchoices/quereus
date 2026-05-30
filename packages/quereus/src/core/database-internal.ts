@@ -9,6 +9,7 @@
  */
 
 import type { VirtualTableConnection } from '../vtab/connection.js';
+import type { BackingRowChange } from '../vtab/memory/layer/manager.js';
 import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaterializedViewSchema } from '../schema/view.js';
@@ -122,6 +123,6 @@ export interface DatabaseInternal {
 	 */
 	_maintainRowTimeCoveringStructures(
 		sourceBase: string,
-		change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
+		change: BackingRowChange,
 	): Promise<void>;
 }
