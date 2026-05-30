@@ -251,3 +251,27 @@ create materialized view rr_ix as select x, y, id from rr order by x, y;
 insert or replace into rr values (1, 7, 7), (2, 7, 7);
 select id, x, y from rr order by id;
 → [{"id":2,"x":7,"y":7}]
+
+-- ===================================
+-- 10. Per-statement batching must preserve covering-UNIQUE enforcement visibility on the
+--    UPDATE path too (materialized-view-rowtime-per-statement-batching). The update
+--    generator owns the same per-statement BackingConnectionCache as insert, and a
+--    covering UNIQUE is enforced inside the source vtab's update path
+--    (manager.performUpdate → checkUniqueConstraints → checkUniqueViaMaterializedView,
+--    scanning the MV backing). §9 covered only INSERT; this guards UPDATE.
+--
+--    A single bulk UPDATE moves id=1 and id=2 onto the SAME covered value. Whichever
+--    row is processed second has its enforcement scan observe the first row's
+--    same-statement backing write and the whole statement aborts — order-independent
+--    (were the connection cache to hide the earlier same-statement update, both rows
+--    would silently reach x=100). Asserts source end-state only (store-safe).
+-- ===================================
+
+create table ub (id integer primary key, x integer not null, unique (x));
+create materialized view ub_ix as select x, id from ub order by x;
+insert into ub values (1, 1), (2, 2), (3, 3);
+
+update ub set x = 100 where id in (1, 2);
+-- error: UNIQUE constraint failed
+select id, x from ub order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2},{"id":3,"x":3}]
