@@ -440,6 +440,51 @@ describe('lens backfill: snapshot rotation + basis-hash drift', () => {
 	});
 });
 
+describe('lens backfill: re-decomposition blocked by an unmapped NOT-NULL no-default column', () => {
+	// The relation-level runnability check walks the member's *full* schema, so a
+	// NOT-NULL no-default basis column the lens maps to NO logical column — one that
+	// never appears in the (basisColumn → logicalColumn) pairs — still blocks the
+	// skeleton. Every *mapped* column (id, vin) is reconstructible, so the category
+	// is re-decomposition and missing_columns is empty; but the skeleton would omit
+	// the required unmapped column and fail an unguarded NOT NULL constraint, so
+	// backfill_sql is nulled out and the app owns the insert. This is the edge a
+	// per-pair form (one inspecting only the mapped columns) would have missed.
+	it('nulls out backfill_sql when an unmapped member column is NOT NULL with no default', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Src { id integer primary key, vin text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Src values (1, 'AAA'), (2, 'BBB')");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, vin text } }');
+			await db.exec('declare lens for x over y { view Car as select id, vin from y.Src }');
+			await db.exec('apply schema x'); // snapshot 1
+			const before = await rows(db, 'select * from x.Car order by id');
+
+			await db.exec('declare schema y { table Src { id integer primary key, vin text } table CarThing { id integer primary key, vin text, required_extra text } }');
+			await db.exec('apply schema y');
+			await db.exec('declare lens for x over y { view Car as select id, vin from y.CarThing }');
+			await db.exec('apply schema x'); // snapshot 2
+
+			const bf = await rows(db, "select * from quereus_basis_backfill('x')");
+			expect(bf.length).to.equal(1);
+			const r = bf[0];
+			expect(rel(r)).to.equal('y.carthing');
+			expect(r.category).to.equal('re-decomposition');
+			expect(String(r.generated_columns)).to.equal('id, vin');
+			expect(String(r.missing_columns)).to.equal('');
+			expect(r.backfill_sql, 'skeleton omitting an unmapped NOT-NULL no-default column must be nulled out').to.be.null;
+			expect(String(r.reason).toLowerCase()).to.contain('not null');
+			expect(String(r.reason).toLowerCase()).to.contain('required_extra');
+
+			await db.exec("insert into y.CarThing values (1, 'AAA', 'x'), (2, 'BBB', 'y')");
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal(before);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens backfill: surrogate omission (single relation)', () => {
 	it('omits a basis surrogate-key default column from the projection; the relation round-trips', async () => {
 		const db = new Database();
