@@ -211,3 +211,43 @@ select id, x, y from ce order by id;
 insert or replace into ce values (10, 5, 5);
 select id, x, y from ce order by id;
 → [{"id":10,"x":5,"y":5}]
+
+-- ===================================
+-- 9. Per-statement maintenance batching must NOT hide an earlier same-statement row
+--    from a later row's enforcement scan (materialized-view-rowtime-per-statement-
+--    batching). The batching change amortizes the backing-connection *resolution* over
+--    the statement but still applies each row's maintenance immediately, so a later row
+--    in the SAME bulk statement sees every earlier row's backing entry. These cases are
+--    the regression guard for that invariant: a duplicate buried deep in a bulk INSERT,
+--    and an intra-statement OR REPLACE, both resolve against the just-written rows.
+-- ===================================
+
+create table bb (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view bb_ix as select x, y, id from bb order by x, y;
+insert into bb values (100, 1, 1);
+
+-- ABORT: a LATER row (#5) duplicates an EARLIER row of the SAME statement (#3). The
+-- covering MV's backing reflects rows 1..4 written earlier this statement, so the
+-- duplicate is detected and the WHOLE statement rolls back — neither the bulk rows
+-- nor any backing delta survive (only the pre-existing row remains).
+insert into bb values (1, 10, 10), (2, 20, 20), (3, 30, 30), (4, 40, 40), (5, 30, 30);
+-- error: UNIQUE constraint failed
+select id, x, y from bb order by id;
+→ [{"id":100,"x":1,"y":1}]
+
+-- OR IGNORE: rows 1..4 land and are maintained; row 5 (the intra-statement duplicate
+-- of row 3, seen via the backing) is skipped. The surviving set proves the earlier
+-- same-statement row was visible to the later row's enforcement scan.
+insert or ignore into bb values (1, 10, 10), (2, 20, 20), (3, 30, 30), (4, 40, 40), (5, 30, 30);
+select id, x, y from bb order by id;
+→ [{"id":1,"x":10,"y":10},{"id":2,"x":20,"y":20},{"id":3,"x":30,"y":30},{"id":4,"x":40,"y":40},{"id":100,"x":1,"y":1}]
+
+-- OR REPLACE: an intra-statement duplicate evicts the just-written earlier same-statement
+-- row (recovered from the backing this statement wrote) and the later row lands. Two rows
+-- of one statement share (x,y)=(7,7): row 1 (id=1) is written, then row 2 (id=2) collides
+-- with it and REPLACE evicts id=1 — end state is id=2 only.
+create table rr (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view rr_ix as select x, y, id from rr order by x, y;
+insert or replace into rr values (1, 7, 7), (2, 7, 7);
+select id, x, y from rr order by id;
+→ [{"id":2,"x":7,"y":7}]

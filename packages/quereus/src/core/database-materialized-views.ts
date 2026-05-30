@@ -190,6 +190,26 @@ export interface ResidualRecomputePlan extends MaintenancePlanCommon {
 	degradeToRebuild: boolean;
 }
 
+/**
+ * Per-statement cache of resolved backing {@link MemoryTableConnection}s, keyed by the
+ * lowercased backing `schema.table`. Created **once per DML generator run** (one
+ * statement) and threaded through the maintenance path so the backing-connection
+ * resolution — a scan over *all* the Database's active connections in
+ * {@link MaterializedViewManager.getBackingConnection} — is paid once per
+ * (statement, backing) instead of once per source row. This amortizes the dominant
+ * per-row overhead of a bulk `insert`/`update`/`delete` over a covered table.
+ *
+ * It is purely a resolution cache: each row's ops are still applied **immediately** to
+ * the cached connection's pending transaction layer (per-row apply), so a later
+ * same-statement row's enforcement scan (`lookupCoveringConflicts`) still observes every
+ * earlier row's backing write. There is no deferred/end-of-statement op flush — see
+ * `docs/materialized-views.md` § Synchronous, transactional, per-statement. Because the
+ * cache is scoped to one generator run, the connection it holds cannot be torn down
+ * mid-statement; the cold enforcement/eviction paths that omit the cache re-resolve the
+ * *same* connection deterministically, so reads-own-writes is unaffected.
+ */
+export type BackingConnectionCache = Map<string, MemoryTableConnection>;
+
 export class MaterializedViewManager {
 	private unsubscribeSchemaChanges: (() => void) | null = null;
 
@@ -308,10 +328,18 @@ export class MaterializedViewManager {
 	 * transaction. The leaf fast path (`!rowTimeBySource.has(backingBase)`) keeps a
 	 * non-chained MV at exactly today's cost (one map lookup, no recursion). `depth`
 	 * feeds the structural-cycle backstop in {@link assertCascadeDepth}.
+	 *
+	 * `cache` is the optional per-statement {@link BackingConnectionCache}: when the
+	 * DML boundary supplies one, every backing (this plan's and each cascade level's)
+	 * resolves its connection at most once for the whole statement. The cascade threads
+	 * the same cache through, so a multi-level chain amortizes each level's resolution
+	 * too. Omitted by the cold enforcement/eviction callers, which re-resolve the same
+	 * connection deterministically.
 	 */
 	async maintainRowTime(
 		sourceBase: string,
 		change: BackingRowChange,
+		cache?: BackingConnectionCache,
 		depth = 0,
 	): Promise<void> {
 		const keys = this.rowTimeBySource.get(sourceBase.toLowerCase());
@@ -319,13 +347,13 @@ export class MaterializedViewManager {
 		for (const key of keys) {
 			const plan = this.rowTime.get(key);
 			if (!plan) continue;
-			const backingChanges = await this.applyMaintenancePlan(plan, change);
+			const backingChanges = await this.applyMaintenancePlan(plan, change, cache);
 			if (backingChanges.length === 0) continue;
 			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
 			this.assertCascadeDepth(depth + 1, backingBase);
 			for (const bc of backingChanges) {
-				await this.maintainRowTime(backingBase, bc, depth + 1);
+				await this.maintainRowTime(backingBase, bc, cache, depth + 1);
 			}
 		}
 	}
@@ -359,10 +387,11 @@ export class MaterializedViewManager {
 	private async applyMaintenancePlan(
 		plan: MaintenancePlan,
 		change: BackingRowChange,
+		cache?: BackingConnectionCache,
 	): Promise<BackingRowChange[]> {
 		switch (plan.kind) {
 			case 'inverse-projection':
-				return this.applyInverseProjection(plan, change);
+				return this.applyInverseProjection(plan, change, cache);
 			case 'full-rebuild':
 			case 'residual-recompute':
 				throw new QuereusError(
@@ -393,6 +422,7 @@ export class MaterializedViewManager {
 	private async applyInverseProjection(
 		plan: InverseProjectionPlan,
 		change: BackingRowChange,
+		cache?: BackingConnectionCache,
 	): Promise<BackingRowChange[]> {
 		const inScope = (row: Row): boolean => plan.predicate === undefined || plan.predicate.evaluate(row) === true;
 		const project = (row: Row): Row =>
@@ -425,7 +455,7 @@ export class MaterializedViewManager {
 			);
 		}
 		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`);
+		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
 		return manager.applyMaintenanceToLayer(connection, ops);
 	}
 
@@ -436,18 +466,38 @@ export class MaterializedViewManager {
 	 * a freshly created connection is registered with the Database so the
 	 * coordinated commit/rollback covers its pending layer in lockstep with the
 	 * source write.
+	 *
+	 * When an optional per-statement {@link BackingConnectionCache} is supplied, the
+	 * scan over the Database's active connections (the dominant per-row cost on a bulk
+	 * write) is paid once per (statement, backing): a hit returns the cached connection
+	 * directly, and a miss caches whichever connection the scan resolves — or the one it
+	 * lazily creates + registers. Caching the resolved/created connection is sound
+	 * because the scan is deterministic within a statement (nothing interleaves between
+	 * a statement's rows to change which connection a `select` from the MV picks), so the
+	 * cache holds exactly what an uncached re-resolution would return.
 	 */
-	private async getBackingConnection(manager: MemoryTableManager, qualifiedName: string): Promise<MemoryTableConnection> {
+	private async getBackingConnection(
+		manager: MemoryTableManager,
+		qualifiedName: string,
+		cache?: BackingConnectionCache,
+	): Promise<MemoryTableConnection> {
+		const cacheKey = qualifiedName.toLowerCase();
+		const cached = cache?.get(cacheKey);
+		if (cached) return cached;
 		const db = this.ctx as unknown as Database;
 		for (const c of db.getConnectionsForTable(qualifiedName)) {
 			if (c instanceof MemoryVirtualTableConnection) {
 				const mc = c.getMemoryConnection();
-				if (mc.tableManager === manager) return mc;
+				if (mc.tableManager === manager) {
+					cache?.set(cacheKey, mc);
+					return mc;
+				}
 			}
 		}
 		const memConn = manager.connect();
 		const vtabConn = new MemoryVirtualTableConnection(qualifiedName, memConn);
 		await db.registerConnection(vtabConn);
+		cache?.set(cacheKey, memConn);
 		return memConn;
 	}
 

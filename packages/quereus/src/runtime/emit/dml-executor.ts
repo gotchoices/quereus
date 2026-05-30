@@ -15,6 +15,7 @@ import { sqlValuesEqual } from '../../util/comparison.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActions, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
+import type { BackingConnectionCache } from '../../core/database-materialized-views.js';
 
 /**
  * Module-scope counter producing unique statement-savepoint names across
@@ -76,14 +77,20 @@ function emitAutoDataEvent(
  * covering MV's backing table within the same transaction (visible mid-statement;
  * committed/rolled-back in lockstep with this write) — see
  * `core/database-materialized-views.ts` § row-time write-through.
+ *
+ * `cache` is the per-statement {@link BackingConnectionCache} the generator owns: it
+ * amortizes the backing-connection resolution over the whole statement (one scan per
+ * backing instead of one per source row) while still applying each row's ops
+ * immediately, so within-statement enforcement visibility is unchanged.
  */
 async function maintainRowTimeStructures(
 	ctx: RuntimeContext,
 	tableKey: string,
 	change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
+	cache: BackingConnectionCache,
 ): Promise<void> {
 	if (!ctx.db._hasRowTimeCoveringStructures(tableKey)) return;
-	await ctx.db._maintainRowTimeCoveringStructures(tableKey, change);
+	await ctx.db._maintainRowTimeCoveringStructures(tableKey, change, cache);
 }
 
 /**
@@ -419,10 +426,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
+		// Per-statement backing-connection cache: resolve each covering MV's backing
+		// connection once for the whole statement rather than once per source row.
+		const backingConnCache: BackingConnectionCache = new Map();
+
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
 		yield* runWithStatementSavepoints(ctx, vtab, rows, isFailMode, (flatRow) =>
 			processInsertRow(
-				ctx, vtab, needsAutoEvents, flatRow, contextRow, runtimeUpsertClauses, upsertEvaluators,
+				ctx, vtab, needsAutoEvents, flatRow, contextRow, runtimeUpsertClauses, upsertEvaluators, backingConnCache,
 			),
 		);
 	}
@@ -442,6 +453,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		contextRow: Row | undefined,
 		runtimeUpsertClauses: RuntimeUpsertClause[] | undefined,
 		upsertEvaluators: UpsertEvaluator[],
+		backingConnCache: BackingConnectionCache,
 	): Promise<Row | undefined> {
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
 
@@ -483,7 +495,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						pkColumnIndicesInSchema,
 					);
 					await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
-						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow });
+						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow }, backingConnCache);
 					await executeForeignKeyActions(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow);
 
 					if (needsAutoEvents) {
@@ -518,7 +530,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		if (replacedRow) {
 			const newKeyValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
 			ctx.db._recordUpdate(tableKey, replacedRow, newRow, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow });
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow }, backingConnCache);
 			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', replacedRow);
 
 			if (needsAutoEvents) {
@@ -533,7 +545,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		} else {
 			const pkValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
 			ctx.db._recordInsert(tableKey, newRow, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'insert', newRow });
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'insert', newRow }, backingConnCache);
 
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'insert', pkValues, undefined, [...newRow]);
@@ -552,9 +564,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
+		// Per-statement backing-connection cache (see runInsert).
+		const backingConnCache: BackingConnectionCache = new Map();
+
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
 		yield* runWithStatementSavepoints(ctx, vtab, rows, isFailMode, (flatRow) =>
-			processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow),
+			processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache),
 		);
 	}
 
@@ -572,6 +587,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		needsAutoEvents: boolean,
 		flatRow: Row,
 		contextRow: Row | undefined,
+		backingConnCache: BackingConnectionCache,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
@@ -638,7 +654,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				pkColumnIndicesInSchema,
 			);
 			await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
-				{ op: 'delete', oldRow: result.replacedRow });
+				{ op: 'delete', oldRow: result.replacedRow }, backingConnCache);
 			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', result.replacedRow);
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...result.replacedRow]);
@@ -654,7 +670,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			pkColumnIndicesInSchema,
 		);
 		await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
-			{ op: 'update', oldRow, newRow });
+			{ op: 'update', oldRow, newRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
 		await executeForeignKeyActions(ctx.db, tableSchema, 'update', oldRow, newRow);
@@ -685,9 +701,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
+		// Per-statement backing-connection cache (see runInsert).
+		const backingConnCache: BackingConnectionCache = new Map();
+
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
 		yield* runWithStatementSavepoints(ctx, vtab, rows, isFailMode, (flatRow) =>
-			processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow),
+			processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache),
 		);
 	}
 
@@ -705,6 +724,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		needsAutoEvents: boolean,
 		flatRow: Row,
 		contextRow: Row | undefined,
+		backingConnCache: BackingConnectionCache,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 
@@ -753,7 +773,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			pkColumnIndicesInSchema,
 		);
 		await maintainRowTimeStructures(ctx, `${tableSchema.schemaName}.${tableSchema.name}`,
-			{ op: 'delete', oldRow });
+			{ op: 'delete', oldRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
 		await executeForeignKeyActions(ctx.db, tableSchema, 'delete', oldRow);

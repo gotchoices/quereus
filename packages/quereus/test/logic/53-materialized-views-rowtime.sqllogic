@@ -667,3 +667,73 @@ select id, v, v10, un from evp_ix order by v;
 update evp set v = -1 where id = 3;
 select id, v, v10, un from evp_ix order by v;
 → [{"id":2,"v":4,"v10":40,"un":"BB"},{"id":1,"v":6,"v10":60,"un":"AA"}]
+
+-- ===================================
+-- 21. Per-statement maintenance batching (materialized-view-rowtime-per-statement-
+--     batching). A bulk insert/update/delete resolves each covering MV's backing
+--     connection ONCE per statement (a per-generator-run cache) and applies every
+--     row's backing delta immediately to that one connection's pending layer. This
+--     asserts the amortized path is behaviorally identical to per-row maintenance:
+--     all rows of a bulk statement land in the backing, a bulk update moves every
+--     key, a bulk delete removes every matching backing row, and a statement/txn
+--     rollback reverts the whole bulk backing delta in lockstep.
+-- ===================================
+
+create table blk (id integer primary key, x integer);
+create materialized view blk_ix as select x, id from blk order by x, id;
+
+-- bulk INSERT of many rows in ONE statement: every row's backing maintenance
+-- accumulates on the per-statement cached backing connection.
+insert into blk values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+select x, id from blk_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3},{"x":40,"id":4},{"x":50,"id":5}]
+
+-- bulk UPDATE in ONE statement moves every projected backing key (delete-old/upsert-new
+-- per row); the PK tiebreak keeps the backing keys distinct so none collide.
+update blk set x = x + 100;
+select x, id from blk_ix order by x;
+→ [{"x":110,"id":1},{"x":120,"id":2},{"x":130,"id":3},{"x":140,"id":4},{"x":150,"id":5}]
+
+-- bulk DELETE in ONE statement removes exactly the matching backing rows
+delete from blk where id <= 3;
+select x, id from blk_ix order by x;
+→ [{"x":140,"id":4},{"x":150,"id":5}]
+
+-- a transaction rollback reverts a bulk statement's whole backing delta in lockstep
+begin;
+insert into blk values (6, 60), (7, 70), (8, 80);
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":80,"id":8},{"x":140,"id":4},{"x":150,"id":5}]
+rollback;
+select x, id from blk_ix order by x;
+→ [{"x":140,"id":4},{"x":150,"id":5}]
+
+-- reads-own-writes BETWEEN statements within one explicit transaction: each bulk
+-- statement's maintenance is visible to the next statement's read (the property
+-- per-statement batching must preserve), and the whole transaction commits in lockstep.
+begin;
+insert into blk values (6, 60), (7, 70);
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":140,"id":4},{"x":150,"id":5}]
+update blk set x = 200 where id = 4;
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":150,"id":5},{"x":200,"id":4}]
+commit;
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":150,"id":5},{"x":200,"id":4}]
+
+-- bulk write through a 2-level chain in ONE statement: the per-statement cache is
+-- keyed by backing base, so it holds BOTH the inner and outer backing connections and
+-- every cascade level amortizes. Insert/update/delete reflect at the deepest level.
+create table bc (id integer primary key, x integer);
+create materialized view bc1 as select id, x from bc;
+create materialized view bc2 as select id, x from bc1;
+insert into bc values (1, 1), (2, 2), (3, 3), (4, 4);
+select id, x from bc2 order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2},{"id":3,"x":3},{"id":4,"x":4}]
+update bc set x = x * 10;
+select id, x from bc2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30},{"id":4,"x":40}]
+delete from bc where id in (2, 4);
+select id, x from bc2 order by id;
+→ [{"id":1,"x":10},{"id":3,"x":30}]

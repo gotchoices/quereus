@@ -279,11 +279,34 @@ synchronous guard (`_hasRowTimeCoveringStructures`) makes this a no-op fast path
 for tables no materialized view reads, so non-covered writes pay effectively
 nothing.
 
-Deltas are **batched per statement** rather than flushed strictly per row: a bulk
-`insert`/`update`/`delete` accumulates its backing ops and flushes once at the
-statement boundary, amortizing the backing-connection/layer lookup over the whole
-statement. Reads-own-writes still holds *between* statements within a transaction —
-the property that matters — without paying per-row maintenance overhead on bulk DML.
+Maintenance is **amortized per statement without deferring visibility**. The DML
+generator owns a per-statement `BackingConnectionCache` (a `Map<backingBase,
+MemoryTableConnection>` created at generator entry): each covering MV's backing
+connection is resolved **once per (statement, backing)** — paying the scan over the
+Database's active connections (`getBackingConnection`) once for a bulk
+`insert`/`update`/`delete` instead of once per source row — and a multi-level cascade
+amortizes each level's backing too (the cache is keyed by backing base). Each row's
+ops are still applied **immediately** to that connection's pending layer (per-row apply
+on the *cached* connection), **not** buffered for an end-of-statement flush.
+
+> **Enforcement-visibility invariant — do not "optimize" this into a correctness bug.**
+> Covering-MV UNIQUE enforcement runs *inside* the source vtab's `update()`
+> (`checkUniqueViaMaterializedView` → `Database._lookupCoveringConflicts`) and **scans
+> the backing table**, relying on it reflecting *every prior row of the same statement*.
+> Because v1 amortizes only the connection *resolution* and keeps **per-row apply**, a
+> later same-statement row's enforcement scan always observes an earlier row's backing
+> write — e.g. `insert into t values (1,'a'),(2,'a')` over a covering `unique(x)` detects
+> the intra-statement duplicate (regression-guarded in `54-covering-mv-enforcement.sqllogic`
+> § 9). A true end-of-statement op-coalescing buffer would break this *unless*
+> `lookupCoveringConflicts` unioned the not-yet-flushed buffer (or the buffer flushed
+> before every enforcement read); v1 deliberately avoids that hazard by not buffering.
+
+Reads-own-writes therefore holds both **within** a statement (the enforcement scan above)
+and **between** statements within a transaction — without paying the per-row
+connection-resolution overhead on bulk DML. The cold enforcement/eviction paths
+(`lookupCoveringConflicts`, the memory/store REPLACE-eviction maintenance) omit the cache
+and re-resolve the *same* connection deterministically, so they observe and contribute to
+the same statement's backing state.
 
 The backing write is routed through the **same `MemoryTableConnection` a `select`
 from the MV would use** in this transaction (obtained/registered lazily). The

@@ -55,7 +55,7 @@ import {
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
-import { MaterializedViewManager } from './database-materialized-views.js';
+import { MaterializedViewManager, type BackingConnectionCache } from './database-materialized-views.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
 import { Table } from './table-handle.js';
@@ -1747,12 +1747,20 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  its own effects. Drives a per-row backing delta through the backing table's
 	 *  coordinated transactional connection (reads-own-writes within the txn;
 	 *  committed/rolled-back in lockstep with the source write). See
-	 *  `database-materialized-views.ts` § row-time write-through. */
+	 *  `database-materialized-views.ts` § row-time write-through.
+	 *
+	 *  `cache` is the optional per-statement {@link BackingConnectionCache} the DML
+	 *  generator threads in so the backing-connection resolution is amortized over the
+	 *  whole statement (one scan per backing, not one per source row). The cold
+	 *  eviction callers (memory `checkUniqueViaMaterializedView`, store-table.ts) omit
+	 *  it and re-resolve the same connection deterministically — the `DatabaseInternal`
+	 *  surface deliberately exposes only the two-arg form. */
 	public async _maintainRowTimeCoveringStructures(
 		sourceBase: string,
 		change: { op: 'insert' | 'update' | 'delete'; oldRow?: Row; newRow?: Row },
+		cache?: BackingConnectionCache,
 	): Promise<void> {
-		await this.materializedViewManager.maintainRowTime(sourceBase, change);
+		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache);
 	}
 
 	/** @internal Resolve the linked, `row-time`, enforcement-ready covering MV for a
