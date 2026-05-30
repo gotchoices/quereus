@@ -8,7 +8,9 @@ import type { Row, SqlValue } from '../src/common/types.js';
 import { Parser } from '../src/parser/parser.js';
 import { QuereusError } from '../src/common/errors.js';
 import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
-import { keysOf } from '../src/planner/util/fd-utils.js';
+import { keysOf, isUnique } from '../src/planner/util/fd-utils.js';
+import { deriveViewColumns } from '../src/planner/analysis/update-lineage.js';
+import type * as AST from '../src/parser/ast.js';
 import { type PlanNode, type RelationalPlanNode, isRelationalNode } from '../src/planner/nodes/plan-node.js';
 import { EmissionContext } from '../src/runtime/emission-context.js';
 import { emitPlanNode } from '../src/runtime/emitters.js';
@@ -1798,6 +1800,417 @@ describe('Property-Based Tests', () => {
 			// Sanity: across the shape zoo at least some inner nodes must have
 			// materialized, or the tier is silently a no-op.
 			expect(checkedNodes, `Tier 2 checked no inner nodes (skipped ${skippedNodes})`).to.be.greaterThan(0);
+		});
+	});
+
+	// --- 16. View Round-Trip Laws ---
+	// The backward-direction dual of Key Soundness. Key Soundness keeps the
+	// FORWARD relational walk honest (claimed keys / isSet never over-claim on
+	// materialized rows). This block keeps the BACKWARD walk that drives view
+	// write-through (`analysis/update-lineage.ts` → the Phase-1 rewrite in
+	// `building/view-mutation.ts`) in lock-step with those forward FD facts, over
+	// the single-source projection-and-filter shape the backward walk admits today.
+	//
+	// Three laws, per docs/view-updateability.md § "Round-Trip Laws and the
+	// Derived Backward Walk":
+	//   - PutGet  — a mutation through the view never escapes the view predicate;
+	//               computed columns are read-only (rejected, not silently dropped).
+	//   - GetPut  — reading a row and writing the same values back is a no-op on
+	//               the base table.
+	//   - Lineage — the backward lineage (`deriveViewColumns`) agrees with the
+	//               forward FD facts (`keysOf` / `isUnique`): forward keys are
+	//               base-writable and reconstruct the base identifying predicate.
+	//
+	// Structured exactly like Key Soundness: pure law cores plus a negative
+	// self-test that proves each core reds on an injected violation.
+	describe('View Round-Trip Laws', () => {
+		type BaseRow = { id: number; a: number; b: number };
+
+		/** One output column of a planned view body, by backward lineage. */
+		interface ModelCol {
+			readonly name: string;
+			/** lowercased base column name, or undefined when the column is computed. */
+			readonly base?: string;
+		}
+
+		// The view-body zoo: the single-source projection-and-filter shapes the
+		// `93.x-view-mutation*` corpus exercises. `src`/`q` thread an optional base
+		// alias so the alias-qualified body (the alias-qualifier-leak regression
+		// shape) is covered. `pk` flags whether the body exposes the base PK as a
+		// writable column (needed for a row-identifying predicate).
+		interface Shape {
+			readonly label: string;
+			readonly src: string;
+			readonly q: string;
+			readonly proj: string;
+			readonly pk: boolean;
+		}
+		const SHAPES: readonly Shape[] = [
+			{ label: 'star',     src: 't',      q: '',   proj: '*',                                 pk: true },
+			{ label: 'explicit', src: 't',      q: '',   proj: 'id, a, b',                          pk: true },
+			{ label: 'rename',   src: 't',      q: '',   proj: 'id as vid, a as va, b as vb',       pk: true },
+			{ label: 'computed', src: 't',      q: '',   proj: 'id, a, b + 1 as bp',                pk: true },
+			{ label: 'dropkey',  src: 't',      q: '',   proj: 'a, b',                              pk: false },
+			{ label: 'alias',    src: 't as x', q: 'x.', proj: 'x.id as aid, x.a as aa, x.b as ab', pk: true },
+		];
+
+		/** Build the view-body SQL; `k` (when defined) adds an equality filter on `a`. */
+		function buildBody(s: Shape, k: number | undefined): string {
+			const where = k === undefined ? '' : ` where ${s.q}a = ${k}`;
+			return `select ${s.proj} from ${s.src}${where}`;
+		}
+
+		const rowArb = fc.record({
+			id: fc.integer({ min: 1, max: 8 }),
+			a: fc.integer({ min: 1, max: 3 }),
+			b: fc.integer({ min: 1, max: 3 }),
+		});
+		const filterArb = fc.option(fc.integer({ min: 1, max: 3 }), { nil: undefined });
+
+		async function createBase(): Promise<void> {
+			// `a` / `b` are nullable so a computed-column insert (which omits the
+			// computed base column) is not a NOT NULL violation — Quereus columns
+			// are NOT NULL unless declared `null`.
+			await db.exec('create table t (id integer primary key, a integer null, b integer null) using memory');
+		}
+
+		/** Replace `t` with the generated rows, deduped by PK; returns the kept rows. */
+		async function seedBase(rows: BaseRow[]): Promise<BaseRow[]> {
+			await db.exec('delete from t');
+			const seen = new Set<number>();
+			const kept: BaseRow[] = [];
+			for (const r of rows) {
+				if (seen.has(r.id)) continue;
+				seen.add(r.id);
+				await db.exec(`insert into t values (${r.id}, ${r.a}, ${r.b})`);
+				kept.push(r);
+			}
+			return kept;
+		}
+
+		async function readBase(): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const row of db.eval('select id, a, b from t order by id')) {
+				out.push(row as Record<string, SqlValue>);
+			}
+			return out;
+		}
+
+		/** Plan the body standalone and return its top relational node (physical attached). */
+		function planBody(body: string): RelationalPlanNode {
+			const block = db.getPlan(body) as unknown as { getRelations(): readonly RelationalPlanNode[] };
+			return block.getRelations()[0];
+		}
+
+		/** The backward view-column model, straight off the shipped lineage surface. */
+		function viewModel(body: string): ModelCol[] {
+			const sel = new Parser().parse(body) as unknown as AST.SelectStmt;
+			const baseTable = db.schemaManager.getTable('main', 't')!;
+			return deriveViewColumns(sel, baseTable).map(vc => ({
+				name: vc.name,
+				base: vc.lineage.kind === 'base' ? vc.lineage.baseColumnName.toLowerCase() : undefined,
+			}));
+		}
+
+		/** Stable per-cell signature (mirrors Key Soundness `tupleSig`). */
+		function cellSig(v: SqlValue): string {
+			if (v === null || v === undefined) return 'N';
+			if (v instanceof Uint8Array) return 'B:' + Array.from(v).join('.');
+			return typeof v + ':' + String(v);
+		}
+
+		/** Convert a positional base row to a name-keyed record. */
+		function toRecord(r: BaseRow): Record<string, SqlValue> {
+			return { id: r.id, a: r.a, b: r.b };
+		}
+
+		/**
+		 * Positional core shared by PutGet (base post-state vs predicate-honest
+		 * oracle) and GetPut (base unchanged): throws when the two row multisets
+		 * differ on `cols`. Order-insensitive — compares sorted signatures.
+		 */
+		function assertRowsEqual(
+			label: string,
+			actual: readonly Record<string, SqlValue>[],
+			expected: readonly Record<string, SqlValue>[],
+			cols: readonly string[],
+		): void {
+			const sig = (rows: readonly Record<string, SqlValue>[]) =>
+				rows.map(r => cols.map(c => cellSig(r[c])).join('|')).sort();
+			const a = sig(actual);
+			const e = sig(expected);
+			if (a.length !== e.length || a.some((s, i) => s !== e[i])) {
+				throw new Error(`round-trip violation on ${label}: base/image diff\n  expected ${JSON.stringify(e)}\n  actual   ${JSON.stringify(a)}`);
+			}
+		}
+
+		/**
+		 * Pure core of the forward/backward lineage-agreement law. Throws on the
+		 * first disagreement between the backward lineage (`model`) and the forward
+		 * FD facts (`keys` + `forwardIsSuperkey`):
+		 *   (A) every column in a forward key is `base`-writable — a computed
+		 *       column in a forward key would have no backward identifying predicate;
+		 *   (B) a forward key, traced to base columns plus the filter constants,
+		 *       reconstructs the base PK (the row-identifying predicate);
+		 *   (C) a base PK that fully survives projection is advertised as a forward
+		 *       key — the backward walk's identifying key is not lost forward.
+		 */
+		function assertLineageAgreement(
+			label: string,
+			model: readonly ModelCol[],
+			basePk: readonly string[],
+			filterConstBase: readonly string[],
+			keys: readonly (readonly number[])[],
+			forwardIsSuperkey: (idx: number[]) => boolean,
+		): void {
+			for (const key of keys) {
+				const baseCols = new Set<string>(filterConstBase);
+				for (const i of key) {
+					const m = model[i];
+					if (!m || m.base === undefined) {
+						throw new Error(`lineage disagreement on ${label}: forward key [${key}] includes non-base column '${m?.name ?? i}' (no backward identifying predicate)`);
+					}
+					baseCols.add(m.base);
+				}
+				for (const pk of basePk) {
+					if (!baseCols.has(pk)) {
+						throw new Error(`lineage disagreement on ${label}: forward key [${key}] does not reconstruct base PK column '${pk}'`);
+					}
+				}
+			}
+
+			const survivingPk: number[] = [];
+			const covered = new Set<string>();
+			model.forEach((m, i) => {
+				if (m.base !== undefined && basePk.includes(m.base)) {
+					survivingPk.push(i);
+					covered.add(m.base);
+				}
+			});
+			const fullySurvives = basePk.length > 0 && basePk.every(pk => covered.has(pk));
+			if (fullySurvives && !forwardIsSuperkey(survivingPk)) {
+				throw new Error(`lineage disagreement on ${label}: base PK survives projection as [${survivingPk}] but the forward walk does not advertise it as a key`);
+			}
+		}
+
+		// ----- negative self-tests: each law core reds on an injected violation -----
+		it('the round-trip law cores fail loudly on injected violations', () => {
+			// PutGet: a base row outside the predicate vanished from the post-state.
+			expect(() => assertRowsEqual('injected-widening',
+				[{ id: 1, a: 1, b: 1 }],
+				[{ id: 1, a: 1, b: 1 }, { id: 2, a: 2, b: 2 }],
+				['id', 'a', 'b'],
+			)).to.throw(/round-trip violation/);
+
+			// GetPut: a write-back perturbed a base column (spurious diff).
+			expect(() => assertRowsEqual('injected-getput',
+				[{ id: 1, a: 1, b: 9 }],
+				[{ id: 1, a: 1, b: 1 }],
+				['id', 'a', 'b'],
+			)).to.throw(/round-trip violation/);
+
+			// Lineage (A): a forward key claims a computed column.
+			expect(() => assertLineageAgreement('injected-computed-key',
+				[{ name: 'id', base: 'id' }, { name: 'bp' }],
+				['id'], [], [[1]], () => true,
+			)).to.throw(/lineage disagreement/);
+
+			// Lineage (C): the base PK survives but the forward walk lost the key.
+			expect(() => assertLineageAgreement('injected-lost-key',
+				[{ name: 'id', base: 'id' }, { name: 'a', base: 'a' }],
+				['id'], [], [], () => false,
+			)).to.throw(/lineage disagreement/);
+
+			// The honest case does not throw.
+			expect(() => assertLineageAgreement('honest',
+				[{ name: 'id', base: 'id' }, { name: 'a', base: 'a' }],
+				['id'], [], [[0]], () => true,
+			)).to.not.throw();
+		});
+
+		// ----- computed read-only + LIMIT/OFFSET/DISTINCT widening guards -----
+		it('computed view columns are read-only, and LIMIT/OFFSET/DISTINCT bodies reject rather than widen', async () => {
+			await createBase();
+			await db.exec('insert into t values (1, 1, 1), (2, 2, 2), (3, 3, 3)');
+
+			async function expectReject(sql: string, reason: string): Promise<void> {
+				let err: unknown;
+				try { await db.exec(sql); } catch (e) { err = e; }
+				if (err === undefined) throw new Error(`expected '${sql}' to be rejected (${reason}) but it succeeded`);
+				const got = (err as { mutationDiagnostic?: { reason?: string } }).mutationDiagnostic?.reason;
+				if (got !== undefined) {
+					expect(got).to.equal(reason, `wrong diagnostic for '${sql}': ${(err as Error).message}`);
+				} else {
+					expect((err as Error).message).to.match(/cannot write through view|read-only|non-invertible/i);
+				}
+			}
+
+			// A computed (non-invertible) column is read-only: a write is rejected
+			// with `no-inverse`, not silently dropped.
+			await db.exec('create view cv as select id, a, b + 1 as bp from t');
+			await expectReject('update cv set bp = 100 where id = 1', 'no-inverse');
+			// The base column under it stays writable through the same view.
+			await db.exec('update cv set a = 7 where id = 1');
+			expect((await readBase()).find(r => r.id === 1)!.a).to.equal(7);
+
+			// LIMIT / OFFSET / DISTINCT bodies are rejected — a mutation would escape
+			// the windowed / collapsed view (the write-widening regression made law).
+			await db.exec('create view lim_v as select * from t limit 2');
+			await expectReject('delete from lim_v where id = 1', 'unsupported-limit');
+			await db.exec('create view off_v as select * from t limit 100 offset 1');
+			await expectReject('delete from off_v where id = 1', 'unsupported-limit');
+			await db.exec('create view dis_v as select distinct a, b from t');
+			await expectReject('update dis_v set b = 9 where a = 1', 'unsupported-distinct');
+		});
+
+		// ----- Law 1: PutGet (write-then-read) -----
+		it('PutGet: a view mutation never escapes the view predicate', async () => {
+			await createBase();
+
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArb, { minLength: 0, maxLength: 10 }),
+				fc.constantFrom(...SHAPES),
+				filterArb,
+				fc.constantFrom('insert', 'update', 'delete'),
+				fc.integer({ min: 1, max: 8 }),   // id-predicate value
+				fc.integer({ min: 1, max: 3 }),   // a-predicate value (key-dropping shape)
+				fc.integer({ min: 10, max: 20 }), // update assignment value
+				async (rows, shape, k, op, idPred, aPred, nv) => {
+					// INSERT needs a writable base PK to mint the new row.
+					fc.pre(!(op === 'insert' && !shape.pk));
+
+					const kept = await seedBase(rows);
+					const body = buildBody(shape, k);
+					await db.exec('drop view if exists v');
+					await db.exec(`create view v as ${body}`);
+
+					const model = viewModel(body);
+					const writable = model.filter(m => m.base !== undefined);
+					const writableNames = writable.map(m => m.name);
+					const vis = (av: SqlValue): boolean => k === undefined || av === k;
+
+					/** get(baseAfter): the writable-column image the view should expose. */
+					async function assertViewImage(label: string, baseAfter: Record<string, SqlValue>[]): Promise<void> {
+						const expected = baseAfter.filter(r => vis(r.a)).map(r => {
+							const o: Record<string, SqlValue> = {};
+							for (const m of writable) o[m.name] = r[m.base!];
+							return o;
+						});
+						const actual: Record<string, SqlValue>[] = [];
+						for await (const row of db.eval(`select ${writableNames.join(', ')} from v`)) {
+							actual.push(row as Record<string, SqlValue>);
+						}
+						assertRowsEqual(`${label} [view image]`, actual, expected, writableNames);
+					}
+
+					if (op === 'delete') {
+						const pvc = model.find(m => m.base === 'id') ?? model.find(m => m.base === 'a')!;
+						const pcol = pvc.base as 'id' | 'a';
+						const pval = pcol === 'id' ? idPred : aPred;
+						const hit = (r: BaseRow): boolean => r[pcol] === pval && vis(r.a);
+						const expected = kept.filter(r => !hit(r)).map(toRecord);
+						await db.exec(`delete from v where ${pvc.name} = ${pval}`);
+						const after = await readBase();
+						assertRowsEqual(`PutGet/delete ${shape.label} k=${k}`, after, expected, ['id', 'a', 'b']);
+						await assertViewImage(`PutGet/delete ${shape.label} k=${k}`, after);
+					} else if (op === 'update') {
+						const pvc = model.find(m => m.base === 'id') ?? model.find(m => m.base === 'a')!;
+						const pcol = pvc.base as 'id' | 'a';
+						const pval = pcol === 'id' ? idPred : aPred;
+						const tvc = model.find(m => m.base !== undefined && m.base !== 'id' && m.name !== pvc.name)!;
+						const tBase = tvc.base as 'a' | 'b';
+						const hit = (r: BaseRow): boolean => r[pcol] === pval && vis(r.a);
+						const expected = kept.map(r => {
+							const o = toRecord(r);
+							if (hit(r)) o[tBase] = nv;
+							return o;
+						});
+						await db.exec(`update v set ${tvc.name} = ${nv} where ${pvc.name} = ${pval}`);
+						const after = await readBase();
+						assertRowsEqual(`PutGet/update ${shape.label} k=${k}`, after, expected, ['id', 'a', 'b']);
+						await assertViewImage(`PutGet/update ${shape.label} k=${k}`, after);
+					} else {
+						// insert (pk shapes only — fc.pre filtered the rest)
+						const fresh = kept.reduce((mx, r) => Math.max(mx, r.id), 0) + 1;
+						const value = (base: string): number => base === 'id' ? fresh : base === 'a' ? (k ?? 1) : 2;
+						const vals = writable.map(m => value(m.base!));
+						await db.exec(`insert into v (${writableNames.join(', ')}) values (${vals.join(', ')})`);
+						const newRow: Record<string, SqlValue> = {
+							id: fresh,
+							a: writable.some(m => m.base === 'a') ? (k ?? 1) : null,
+							b: writable.some(m => m.base === 'b') ? 2 : null,
+						};
+						const expected = [...kept.map(toRecord), newRow];
+						const after = await readBase();
+						assertRowsEqual(`PutGet/insert ${shape.label} k=${k}`, after, expected, ['id', 'a', 'b']);
+						await assertViewImage(`PutGet/insert ${shape.label} k=${k}`, after);
+					}
+				},
+			), { numRuns: 50 });
+		});
+
+		// ----- Law 2: GetPut (read-then-write-back) -----
+		it('GetPut: writing read values back through the view leaves the base unchanged', async () => {
+			await createBase();
+			const pkShapes = SHAPES.filter(s => s.pk);
+
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArb, { minLength: 0, maxLength: 10 }),
+				fc.constantFrom(...pkShapes),
+				filterArb,
+				async (rows, shape, k) => {
+					await seedBase(rows);
+					const body = buildBody(shape, k);
+					await db.exec('drop view if exists v');
+					await db.exec(`create view v as ${body}`);
+
+					const model = viewModel(body);
+					const pkCol = model.find(m => m.base === 'id')!;
+					const writableNonPk = model.filter(m => m.base !== undefined && m.base !== 'id');
+					if (writableNonPk.length === 0) return;
+					const writableNames = model.filter(m => m.base !== undefined).map(m => m.name);
+
+					const viewRows: Record<string, SqlValue>[] = [];
+					for await (const row of db.eval(`select ${writableNames.join(', ')} from v`)) {
+						viewRows.push(row as Record<string, SqlValue>);
+					}
+					fc.pre(viewRows.length > 0);
+					const r = viewRows[0];
+
+					const before = await readBase();
+					const sets = writableNonPk.map(m => `${m.name} = ${String(r[m.name])}`).join(', ');
+					await db.exec(`update v set ${sets} where ${pkCol.name} = ${String(r[pkCol.name])}`);
+					const after = await readBase();
+					assertRowsEqual(`GetPut ${shape.label} k=${k}`, after, before, ['id', 'a', 'b']);
+				},
+			), { numRuns: 50 });
+		});
+
+		// ----- Law 3: forward/backward lineage agreement (the structural crux) -----
+		it('forward/backward lineage agreement holds across the view-body zoo', async () => {
+			await createBase();
+			const baseTable = db.schemaManager.getTable('main', 't')!;
+			const basePk = baseTable.primaryKeyDefinition.map(pk => baseTable.columns[pk.index].name.toLowerCase());
+
+			await fc.assert(fc.asyncProperty(
+				fc.constantFrom(...SHAPES),
+				filterArb,
+				async (shape, k) => {
+					const body = buildBody(shape, k);
+					const root = planBody(body);
+					const cols = root.getType().columns.map(c => c.name);
+					const keys = keysOf(root);
+					const model = viewModel(body);
+
+					// The forward output and the backward model must be column-aligned.
+					if (model.length !== cols.length) {
+						throw new Error(`lineage disagreement on ${body}: backward model has ${model.length} columns, forward plan has ${cols.length}`);
+					}
+
+					const filterConstBase = k === undefined ? [] : ['a'];
+					assertLineageAgreement(body, model, basePk, filterConstBase, keys, idx => isUnique(idx, root));
+				},
+			), { numRuns: 50 });
 		});
 	});
 

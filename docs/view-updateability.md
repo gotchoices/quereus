@@ -515,6 +515,21 @@ a planned tree that surfaces it. It lands first and standalone as
 engine surface), then `view-mutation-plan-node-substrate` extends the same block to
 the planned multi-source tree as it threads each operator's backward method.
 
+> **Landed (Tier A).** The single-source projection-and-filter Tier A of this block
+> has shipped as `describe('View Round-Trip Laws')` in `test/property.spec.ts` — the
+> backward-direction soundness net, the dual of the forward-direction **Key
+> Soundness** block in the same file. It exercises the view-body zoo (bare `select *`,
+> explicit / rename projection, computed column, equality-filter, alias-qualified
+> body) over random base seeds, with `numRuns: 50` per law and a pure law core +
+> negative self-test mirroring Key Soundness. Lineage agreement is realized as: every
+> forward key (`keysOf` / `isUnique`) is `base`-writable and, traced through
+> `deriveViewColumns` plus the σ filter-constants, reconstructs the base PK, and a
+> fully-surviving base PK is advertised as a forward key. The behavioral laws restrict
+> to the shapes the Phase-1 rewrite admits; `LIMIT`/`OFFSET`/`DISTINCT` bodies are
+> asserted to *reject* (never silently widen). `view-mutation-plan-node-substrate`
+> threads each operator's backward method against this same block as it extends the
+> zoo to the planned multi-source tree.
+
 ### The predicate-honest complement
 
 The § Philosophy fan-out makes the **complement** — what a write holds fixed, i.e.
