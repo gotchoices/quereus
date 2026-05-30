@@ -15,6 +15,7 @@ import type { FunctionalDependency, PhysicalProperties, RelationalPlanNode } fro
 import type { ColRef, RelationType } from '../src/common/datatype.js';
 import type { MaterializedViewSchema } from '../src/schema/view.js';
 import { parseSelect } from '../src/parser/index.js';
+import type * as AST from '../src/parser/ast.js';
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
 
 async function freshDb(ddl: string[]): Promise<Database> {
@@ -589,6 +590,86 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		}
 	});
 
+});
+
+/**
+ * Cross-schema qualifier resolution — the prover's ORDER BY / WHERE qualifier
+ * matching is (schema, table)-aware, so a `schema.table.col` term whose *table*
+ * name collides with `T`'s but whose *schema* denotes a different schema does NOT
+ * mis-map onto base `T`'s same-named column (which would be a false Covers). See
+ * the coverage-prover module doc § cross-schema.
+ *
+ * This path is unreachable from SQL: the binder rejects every 3-part
+ * `schema.table.column` reference in expression context before a plan (let alone
+ * an MV) exists, so the 3-part ORDER BY term is **hand-built** and the prover is
+ * exercised at its boundary only (`proveCoverage` reads `mv.selectAst` directly,
+ * without re-binding). The two SQL-reachable orderings — bare `uc` and 2-part
+ * `t.uc` (the `schema: undefined` case) — both correctly resolve to base `T`'s
+ * column, so they are the regression floor.
+ *
+ * Fixture: base `main.t (id pk, uc not null, lkref not null, unique(uc))`
+ * left-joined to lookup `s2.t (pkid pk, uc not null)`. Both tables are named `t`
+ * and both carry a `uc` column, so a schema-blind qualifier match would collide.
+ * The join is 1:1 (LEFT join with base on the preserving side; the lookup is keyed
+ * on its own PK ⇒ no fan-out), so the body covers `unique(uc)` exactly when the
+ * ORDER BY is a base-`T` `uc` ordering.
+ */
+describe('coverage prover — cross-schema qualifier resolution (defense-in-depth)', () => {
+	const BODY = 'select t.uc, t.id from t left join s2.t on lkref = pkid order by uc';
+
+	async function freshCrossSchema(): Promise<Database> {
+		const db = await freshDb([
+			'create table t (id integer primary key, uc integer not null, lkref integer not null, unique (uc))',
+		]);
+		db.schemaManager.addSchema('s2');
+		await db.exec('create table s2.t (pkid integer primary key, uc integer not null)');
+		return db;
+	}
+
+	/**
+	 * Proves `BODY` against base `main.t`'s `unique(uc)` with a single hand-built
+	 * ORDER BY term `{ type: 'column', name: 'uc', table: 't', schema }` — the
+	 * 3-part form SQL cannot produce. `root` comes from the real (plannable) body;
+	 * only the stub `selectAst`'s ORDER BY is replaced with the schema-qualified term.
+	 */
+	function proveWithOrderSchema(db: Database, schema: string | undefined): CoverageResult {
+		const selectAst = parseSelect(BODY) as AST.SelectStmt;
+		const orderExpr: AST.ColumnExpr = { type: 'column', name: 'uc', table: 't', schema };
+		selectAst.orderBy = [{ expr: orderExpr, direction: 'asc' }];
+		const mvStub = { selectAst } as unknown as MaterializedViewSchema;
+		const table = db.schemaManager.getTable('main', 't')!;
+		const uc = table.uniqueConstraints![0];
+		return proveCoverage(bodyRoot(db, BODY), mvStub, uc, table);
+	}
+
+	it('lookup-schema-qualified (s2.t.uc) does NOT cover — ordering-mismatch (the fix)', async () => {
+		const db = await freshCrossSchema();
+		try {
+			const result = proveWithOrderSchema(db, 's2');
+			expect(result.covers, 'a lookup-schema-qualified ORDER BY must not mis-map onto base T').to.be.false;
+			if (!result.covers) expect(result.reason).to.equal('ordering-mismatch');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('base-schema-qualified (main.t.uc) still covers — positive cross-schema', async () => {
+		const db = await freshCrossSchema();
+		try {
+			expect(proveWithOrderSchema(db, 'main').covers, 'a correctly base-qualified ORDER BY covers').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('schema-absent (the reachable bare/2-part path) is unchanged — covers (regression floor)', async () => {
+		const db = await freshCrossSchema();
+		try {
+			expect(proveWithOrderSchema(db, undefined).covers, 'a 2-part t.uc ordering still covers').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('introspection hiding', () => {

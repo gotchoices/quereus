@@ -103,6 +103,20 @@
  * `line_items ⋈ products on l.sku = p.sku`) now covers, instead of being rejected
  * by the former bare-name collision guard.
  *
+ * **Cross-schema qualifier resolution is (schema, table)-aware.** Qualifier
+ * matching keys on the reference's `(schema, table)` pair, not its table name
+ * alone: a `schema.table.col` ORDER BY / WHERE term whose *table* name equals
+ * `T`'s but whose *schema* denotes a different schema (e.g. a lookup `s2.t` joined
+ * against base `main.t`, both named `t`) resolves to `undefined` instead of
+ * collapsing onto base `T`'s same-named column and yielding a false `Covers`. This
+ * is **defense-in-depth**: the binder rejects *every* 3-part `schema.table.column`
+ * reference in expression context before the prover runs (see
+ * `AliasedScope.resolveSymbol` / `resolveColumn`), so a real materialized view can
+ * never carry such a term — the guard is reachable only by feeding `proveCoverage`
+ * a hand-built `selectAst` (which is what the dedicated unit test does). The two
+ * SQL-reachable orderings (`order by uc` bare, `order by t.uc` 2-part) both
+ * resolve to base `T`'s column, a genuine cover, and are unchanged.
+ *
  * **Join elimination, not handled here.** When the optimizer eliminates a
  * key-preserving lookup join (lookup columns unprojected + FK→PK alignment, see
  * `rule-join-elimination.ts`) the body collapses to a single-source chain and the
@@ -735,10 +749,17 @@ function proveJoinNoFanout(
  * Builds the qualifier-aware {@link ColumnIndexResolver} the AST ORDER BY / WHERE
  * checks use to map a column reference to a base-table `T` column index:
  *
- *  - **Qualified** (`alias.col` / `table.col`) — a `T` column only when the
- *    qualifier denotes `T`'s reference (its alias, or its table name when
- *    unaliased, collected from the body FROM clause). A qualifier denoting a
- *    lookup source (or any unknown qualifier) yields `undefined`.
+ *  - **Qualified** (`alias.col` / `table.col` / `schema.table.col`) — a `T`
+ *    column only when the qualifier denotes `T`'s reference (its alias, or its
+ *    table name when unaliased, collected from the body FROM clause) *and*, when
+ *    the reference also carries a `schema` qualifier, that schema is `T`'s schema.
+ *    Matching is thus (schema, table)-aware: a `schema.table.col` whose table
+ *    name collides with `T`'s but whose schema denotes a different schema resolves
+ *    to `undefined` rather than mis-mapping onto a same-named `T` column. A bare
+ *    `table.col` keeps today's table-name match (the unqualified schema is
+ *    resolved against the schema search path at plan time, so `t.col` still
+ *    denotes `T`). A qualifier denoting a lookup source (or any unknown qualifier)
+ *    yields `undefined`.
  *  - **Unqualified** (`col`) — a `T` column only when `T` has it *and* no
  *    lookup-side column shares the name (`lookupNames`). An ambiguous bare name
  *    would be a plan-time error for a real body, but resolving to `undefined`
@@ -756,10 +777,15 @@ function makeBodyColumnResolver(
 	lookupNames: ReadonlySet<string>,
 ): ColumnIndexResolver {
 	const tQualifiers = collectBaseTableQualifiers(selectAst, baseTable);
+	const baseSchema = baseTable.schemaName.toLowerCase();
 	return (expr) => {
 		const ref = columnRefParts(expr);
 		if (ref === undefined) return undefined;
 		if (ref.qualifier !== undefined) {
+			// (schema, table)-aware: a present schema must denote `T`'s schema; an
+			// absent schema falls back to the table-name match (the schema search path
+			// resolves the bare qualifier to `T` at plan time).
+			if (ref.schema !== undefined && ref.schema !== baseSchema) return undefined;
 			return tQualifiers.has(ref.qualifier) ? baseTable.columnIndexMap.get(ref.name) : undefined;
 		}
 		if (lookupNames.has(ref.name)) return undefined;
@@ -768,15 +794,22 @@ function makeBodyColumnResolver(
 }
 
 /**
- * The `(qualifier?, name)` of a column reference (both lowercased), or `undefined`
- * when `expr` is not a column reference the prover resolves. A `ColumnExpr`
- * carries an optional `table` qualifier; a bare `IdentifierExpr` has none, and a
+ * The `(schema?, qualifier?, name)` of a column reference (all lowercased), or
+ * `undefined` when `expr` is not a column reference the prover resolves. A
+ * `ColumnExpr` carries an optional `table` qualifier *and* an optional `schema`
+ * qualifier — both are surfaced so qualifier matching can be (schema, table)-aware
+ * (see `makeBodyColumnResolver`). A bare `IdentifierExpr` has neither, and a
  * schema-qualified identifier is rejected (matches `columnIndexFromExpr`).
+ *
+ * Note: the binder rejects every 3-part `schema.table.column` reference before a
+ * plan (let alone an MV) exists (see the module doc § cross-schema), so a present
+ * `schema` here is only reachable through a hand-built `selectAst` — the resolver
+ * still honors it for defense-in-depth.
  */
-function columnRefParts(expr: AST.Expression): { qualifier?: string; name: string } | undefined {
+function columnRefParts(expr: AST.Expression): { schema?: string; qualifier?: string; name: string } | undefined {
 	if (expr.type === 'column') {
 		const c = expr as AST.ColumnExpr;
-		return { qualifier: c.table?.toLowerCase(), name: c.name.toLowerCase() };
+		return { schema: c.schema?.toLowerCase(), qualifier: c.table?.toLowerCase(), name: c.name.toLowerCase() };
 	}
 	if (expr.type === 'identifier') {
 		const id = expr as AST.IdentifierExpr;
