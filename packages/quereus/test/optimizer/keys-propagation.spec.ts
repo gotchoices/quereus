@@ -331,6 +331,18 @@ describe('Key propagation and estimatedRows reduction', () => {
 				expect(indices(out)).to.deep.equal([[0], [2]]);
 			});
 
+			it('INNER covering only ONE side → survivor key only, NO composite (gate)', () => {
+				// Equi-pair {1,0} covers the RIGHT key {0} (so left's key survives) but
+				// NOT the left key {0} (right's key does not survive). Exactly one side
+				// is covered, so the product-key gate (`!leftSurvive && !rightSurvive`)
+				// stays OFF — emitting a composite here would double-count the fan-out
+				// the covered side already accounts for. Result is the survivor alone.
+				const leftKeys: ColRef[][] = [[{ index: 0 }]];
+				const rightKeys: ColRef[][] = [[{ index: 0 }]];
+				const out = combineJoinKeys(leftKeys, rightKeys, 'inner', 2, [{ left: 1, right: 0 }]);
+				expect(indices(out)).to.deep.equal([[0]]);
+			});
+
 			it('INNER without coverage (equi-pair on a non-key column) → composite product key', () => {
 				// Equi-pair binds left col 1 = right col 1, neither of which is the
 				// key (col 0). Neither side's key is covered, so neither survives on
