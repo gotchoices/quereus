@@ -207,8 +207,12 @@ describe('Reserved tag registry', () => {
 	});
 
 	describe('RESERVED_TAGS table', () => {
-		it('is frozen', () => {
+		it('is deeply frozen (array, each spec, and each spec.sites)', () => {
 			expect(Object.isFrozen(RESERVED_TAGS)).to.equal(true);
+			for (const spec of RESERVED_TAGS) {
+				expect(Object.isFrozen(spec), `spec ${JSON.stringify(spec.key)} frozen`).to.equal(true);
+				expect(Object.isFrozen(spec.sites), `spec ${JSON.stringify(spec.key)} sites frozen`).to.equal(true);
+			}
 		});
 
 		it('seeds all seven documented keys', () => {

@@ -74,7 +74,8 @@ export type TagValueSchema =
 export interface ReservedTagSpec {
 	/** Either an exact key, or a template with one `<segment>` placeholder. */
 	readonly key: string | { readonly template: string };
-	readonly sites: ReadonlySet<TagSite>;
+	/** The sites this key is legal at. A frozen list (membership via `includes`). */
+	readonly sites: readonly TagSite[];
 	readonly valueSchema: TagValueSchema;
 	readonly description: string;
 }
@@ -103,43 +104,45 @@ export interface TagDiagnostic {
 }
 
 /**
- * The reserved-tag spec table — frozen, transcribed directly from the doc
- * tables. Each entry cites its doc source. The two downstream tickets
+ * The reserved-tag spec table — deeply frozen (the array, each spec entry, and
+ * each entry's `sites` list are immutable, so this shared module singleton can
+ * never be mutated by a consumer), transcribed directly from the doc tables.
+ * Each entry cites its doc source. The two downstream tickets
  * (`3-lens-prover-and-constraint-attachment` Phase C, `view-mutation-plan-node-substrate`
  * Phase 2) consume this rather than re-declaring the namespace.
  */
-export const RESERVED_TAGS: readonly ReservedTagSpec[] = Object.freeze([
+const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// --- quereus.update.* : view-mutation propagation overrides ---
 	{
-		// docs/view-updateability.md:274
+		// docs/view-updateability.md:284
 		key: 'quereus.update.target',
 		sites: siteSet('view-ddl', 'union-branch', 'join', 'dml-stmt'),
 		valueSchema: 'csv-of-identifiers',
 		description: 'Restrict propagation to the listed base relation(s)/branch(es).',
 	},
 	{
-		// docs/view-updateability.md:275
+		// docs/view-updateability.md:285
 		key: 'quereus.update.exclude',
 		sites: siteSet('view-ddl', 'union-branch', 'join', 'dml-stmt'),
 		valueSchema: 'csv-of-identifiers',
 		description: 'Exclude the listed branches (the inverse of target).',
 	},
 	{
-		// docs/view-updateability.md:276
+		// docs/view-updateability.md:286
 		key: { template: 'quereus.update.default_for.<column>' },
 		sites: siteSet('view-ddl', 'projection'),
 		valueSchema: 'expression',
 		description: 'Default expression for insert through the view when the column is omitted.',
 	},
 	{
-		// docs/view-updateability.md:277, 165, 220
+		// docs/view-updateability.md:287, 165, 220
 		key: 'quereus.update.delete_via',
 		sites: siteSet('union-branch', 'join'),
 		valueSchema: { enum: DELETE_VIA_VALUES },
 		description: 'For except: left_delete (default) or right_insert; for joins: the side whose deletion realizes the view-level delete.',
 	},
 	{
-		// docs/view-updateability.md:278
+		// docs/view-updateability.md:288
 		key: 'quereus.update.policy',
 		sites: siteSet('view-ddl'),
 		valueSchema: { enum: UPDATE_POLICY_VALUES },
@@ -160,7 +163,11 @@ export const RESERVED_TAGS: readonly ReservedTagSpec[] = Object.freeze([
 		valueSchema: 'string',
 		description: 'Declare an expected lookup/ordering access pattern on a column.',
 	},
-]);
+];
+
+export const RESERVED_TAGS: readonly ReservedTagSpec[] = Object.freeze(
+	RESERVED_TAG_SPECS.map(spec => Object.freeze(spec)),
+);
 
 /**
  * The value type a reserved key resolves to, keyed off the literal key. Enum
@@ -200,7 +207,7 @@ export function validateReservedTags(
 			diagnostics.push(unknownReservedTag(key, site));
 			continue;
 		}
-		if (!matched.spec.sites.has(site)) {
+		if (!matched.spec.sites.includes(site)) {
 			diagnostics.push(tagNotAllowedHere(key, site, matched.spec));
 			continue;
 		}
@@ -291,8 +298,9 @@ function templatePrefix(template: string): string {
 	return idx < 0 ? template : template.slice(0, idx);
 }
 
-function siteSet(...sites: TagSite[]): ReadonlySet<TagSite> {
-	return new Set(sites);
+/** A frozen, genuinely-immutable list of legal sites for one spec. */
+function siteSet(...sites: TagSite[]): readonly TagSite[] {
+	return Object.freeze(sites);
 }
 
 // === internal: value-schema validation ===
@@ -404,7 +412,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 }
 
 function tagNotAllowedHere(key: string, site: TagSite, spec: ReservedTagSpec): TagDiagnostic {
-	const allowed = Array.from(spec.sites).map(siteLabel).join(', ');
+	const allowed = spec.sites.map(siteLabel).join(', ');
 	return {
 		reason: 'tag-not-allowed-here',
 		severity: 'error',
