@@ -226,3 +226,28 @@ delete from outer_mv where id = 1;
 -- the rejected writes changed nothing; the chain is intact
 select id, x from outer_mv order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================
+-- 10. Plain view over a materialized view — the same guard's broader reach. A plain
+--     `view ... select ... from <mv>` resolves its body source to the MV's backing
+--     table at plan time, so a write-through would target that read-only backing.
+--     Write-through is rejected with the same diagnostic as the MV-over-MV case
+--     (this closes a pre-existing latent hole, not just the MV path). Reads through
+--     the plain view are unaffected.
+-- ===================================
+
+-- inner_mv from §9 still holds {1,10},{2,20}
+create view pv as select id, x from inner_mv;
+select id, x from pv order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+insert into pv (id, x) values (4, 40);
+-- error: reads a materialized view
+update pv set x = 99 where id = 1;
+-- error: reads a materialized view
+delete from pv where id = 1;
+-- error: reads a materialized view
+
+-- the rejected writes changed nothing
+select id, x from pv order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
