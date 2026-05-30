@@ -44,7 +44,8 @@ export type TagSite =
 	| 'union-branch'        // a compound-set branch tag
 	| 'dml-stmt'            // INSERT/UPDATE/DELETE ... WITH (...) statement-level tag
 	| 'logical-table'       // tags on a declared logical TableSchema
-	| 'logical-constraint'; // tags on a logical RowConstraint/Unique/ForeignKey schema
+	| 'logical-constraint'  // tags on a logical RowConstraint/Unique/ForeignKey schema
+	| 'physical-table';     // tags on a physical (basis) TableSchema — e.g. quereus.lens.decomp.*
 
 /** Closed value set for `quereus.update.delete_via` (docs/view-updateability.md:277). */
 export const DELETE_VIA_VALUES = ['left_delete', 'right_insert', 'parent'] as const;
@@ -53,6 +54,17 @@ export type DeleteViaValue = typeof DELETE_VIA_VALUES[number];
 /** Closed value set for `quereus.update.policy` (docs/view-updateability.md:278). */
 export const UPDATE_POLICY_VALUES = ['strict', 'lenient'] as const;
 export type UpdatePolicyValue = typeof UPDATE_POLICY_VALUES[number];
+
+/** Closed value set for `quereus.lens.decomp.role.<id>` (docs/lens.md § The Default Mapper). */
+export const DECOMP_ROLE_VALUES = ['primary-storage', 'auxiliary-access'] as const;
+/** Closed value set for `quereus.lens.decomp.presence.<id>`. */
+export const DECOMP_PRESENCE_VALUES = ['mandatory', 'optional'] as const;
+/** Closed value set for `quereus.lens.decomp.keykind.<id>`. */
+export const DECOMP_KEYKIND_VALUES = ['surrogate', 'logical-tuple'] as const;
+/** Closed value set for `quereus.lens.decomp.generator.<id>` (a surrogate generator strategy). */
+export const DECOMP_GENERATOR_VALUES = ['integer-auto', 'uuid7', 'callback'] as const;
+/** Closed value set for `quereus.lens.decomp.gencadence.<id>`. */
+export const DECOMP_CADENCE_VALUES = ['per-row', 'per-statement'] as const;
 
 /**
  * The shape a reserved tag's value must satisfy. Validation here is purely
@@ -162,6 +174,82 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		sites: siteSet('logical-table'),
 		valueSchema: 'string',
 		description: 'Declare an expected lookup/ordering access pattern on a column.',
+	},
+	// --- quereus.lens.decomp.* : module mapping-advertisement facts on basis tables ---
+	// A generic module (memory/store) assembles a MappingAdvertisement from these
+	// reserved tags on its basis tables via `buildAdvertisementsFromTags`
+	// (docs/lens.md § The Default Mapper). Each decomposition `<id>`'s facts are
+	// distributed across its member basis tables. The facet leads the key so each
+	// is a single-placeholder template the registry validates (shape/site only —
+	// the builder does the id/facet sub-parsing and the resolver does structural
+	// validation). All sit at the `physical-table` site.
+	{
+		key: { template: 'quereus.lens.decomp.logical.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: 'string',
+		description: 'Logical table the decomposition <id> backs (declared on each member; resolver checks consistency).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.role.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: { enum: DECOMP_ROLE_VALUES },
+		description: 'Role of decomposition <id>: primary-storage (drives put) or auxiliary-access (read-path only).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.anchor.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: 'string',
+		description: 'Existence-anchor relationId of decomposition <id> (must equal the advertisement id and be a member).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.member.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: 'string',
+		description: 'This table\'s member relationId within decomposition <id> (defaults to the table name when absent).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.presence.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: { enum: DECOMP_PRESENCE_VALUES },
+		description: 'This member\'s presence in decomposition <id>: mandatory (inner-join) or optional (outer-join).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.keykind.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: { enum: DECOMP_KEYKIND_VALUES },
+		description: 'Shared-key kind of decomposition <id>: surrogate (requires a generator) or logical-tuple.',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.key.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: 'csv-of-identifiers',
+		description: 'This member\'s shared-key column(s) within decomposition <id> (the equi-join columns).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.generator.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: { enum: DECOMP_GENERATOR_VALUES },
+		description: 'Surrogate generator strategy for decomposition <id> (required when keykind is surrogate).',
+	},
+	{
+		key: { template: 'quereus.lens.decomp.gencadence.<id>' },
+		sites: siteSet('physical-table'),
+		valueSchema: { enum: DECOMP_CADENCE_VALUES },
+		description: 'Surrogate generator cadence for decomposition <id>: per-row or per-statement.',
+	},
+	{
+		// Remainder captured whole as `<id>.<logicalColumn>`; the builder sub-parses it.
+		key: { template: 'quereus.lens.decomp.col.<id_dot_column>' },
+		sites: siteSet('physical-table'),
+		valueSchema: 'string',
+		description: 'Basis column on THIS member backing logical column <logicalColumn> of decomposition <id>.',
+	},
+	{
+		// Remainder captured whole as `<id>.<entity|attribute|value>`.
+		key: { template: 'quereus.lens.decomp.pivot.<id_dot_facet>' },
+		sites: siteSet('physical-table'),
+		valueSchema: 'string',
+		description: 'EAV pivot column (entity/attribute/value) on THIS member for decomposition <id>.',
 	},
 ];
 
@@ -407,7 +495,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>`,
+		suggestion: `Recognized keys: quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key,generator,gencadence}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 
@@ -449,6 +537,7 @@ function siteLabel(site: TagSite): string {
 		case 'dml-stmt': return 'a DML statement';
 		case 'logical-table': return 'a logical table';
 		case 'logical-constraint': return 'a logical constraint';
+		case 'physical-table': return 'a basis table';
 	}
 }
 

@@ -26,8 +26,10 @@ import type {
 	ModuleCapabilities,
 	SchemaChangeInfo,
 	ColumnSchema,
+	Schema,
+	MappingAdvertisement,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -123,6 +125,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			secondaryIndexes: true,
 			rangeScans: true,
 		};
+	}
+
+	/**
+	 * Generic-module mapping advertisements: assembled from the `quereus.lens.decomp.*`
+	 * reserved tags on this basis schema's tables. Returns `[]` when the schema has no
+	 * such tags, leaving the lens default mapper on its name-match path.
+	 * See `docs/lens.md` § The Default Mapper.
+	 */
+	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
+		return buildAdvertisementsFromTags(basisSchema);
 	}
 
 	/**

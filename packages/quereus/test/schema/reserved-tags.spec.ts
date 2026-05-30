@@ -215,8 +215,12 @@ describe('Reserved tag registry', () => {
 			}
 		});
 
-		it('seeds all seven documented keys', () => {
-			expect(RESERVED_TAGS).to.have.length(7);
+		it('seeds all documented keys (update + lens advisory + lens decomposition families)', () => {
+			// 5 quereus.update.* + 2 quereus.lens.{ack,access} + 11 quereus.lens.decomp.* = 18.
+			expect(RESERVED_TAGS).to.have.length(18);
+			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
+			expect(keys).to.include('quereus.lens.decomp.role.<id>');
+			expect(keys).to.include('quereus.lens.decomp.col.<id_dot_column>');
 		});
 	});
 });

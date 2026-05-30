@@ -1390,7 +1390,16 @@ export function createTableInfoFromNode(node: RelationalPlanNode, relationName?:
 	const candidateKeys = keysOf(node as unknown as KeyRel).map(k => [...k]);
 
 	const relName = relationName || node.toString();
-	const relationKey = `${relName}#${node.id ?? 'unknown'}`;
+	// Canonicalize the instance key to lowercase. SQL identifiers are
+	// case-insensitive, and every other relation-key builder in the
+	// change-scope pipeline lowercases (`change-scope.ts` relKeyFor,
+	// `binding-extractor.ts` collectTableRefs, `collectRelationKeysBeneath`,
+	// `key-filter.ts`). Leaving this one un-lowercased meant a table whose
+	// name isn't already lowercase (e.g. `Entity`) produced a relationKey
+	// that no other site matched — so `analyzeRowSpecific`'s classification
+	// and `extractConstraintsForTable`'s filter both missed, silently
+	// widening every single-PK equality select to a whole-table scope.
+	const relationKey = `${relName.toLowerCase()}#${node.id ?? 'unknown'}`;
 
 	return {
 		relationName: relName,

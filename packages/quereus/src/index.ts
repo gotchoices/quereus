@@ -186,6 +186,24 @@ import './runtime/register.js';
 export type { VirtualTableModule } from './vtab/module.js';
 export type { ModuleCapabilities, IsolationCapableTable } from './vtab/capabilities.js';
 
+// Schema type (needed by external modules implementing getMappingAdvertisements)
+export type { Schema } from './schema/schema.js';
+
+// Module mapping-advertisement protocol (lens default mapper — docs/lens.md)
+export type {
+	MappingAdvertisement,
+	StorageShape,
+	BasisRelationRef,
+	DecompositionMember,
+	LogicalColumnMapping,
+	SharedKey,
+	SharedKeyGenerator,
+	AccessForm,
+	AccessShape,
+	AttributePivot,
+} from './vtab/mapping-advertisement.js';
+export { buildAdvertisementsFromTags } from './schema/mapping-advertisement-tags.js';
+
 // Re-export plugin manifest types (for plugin authors, but not the loader)
 export type {
 	PluginManifest,

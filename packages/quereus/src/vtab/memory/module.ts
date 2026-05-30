@@ -11,6 +11,9 @@ import { AccessPlanBuilder, validateAccessPlan } from '../best-access-plan.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, PredicateConstraint } from '../best-access-plan.js';
 import type { VTableEventEmitter } from '../events.js';
 import type { ModuleCapabilities } from '../capabilities.js';
+import type { MappingAdvertisement } from '../mapping-advertisement.js';
+import type { Schema } from '../../schema/schema.js';
+import { buildAdvertisementsFromTags } from '../../schema/mapping-advertisement-tags.js';
 
 const logger = createMemoryTableLoggers('module');
 
@@ -113,6 +116,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			secondaryIndexes: true,
 			rangeScans: true,
 		};
+	}
+
+	/**
+	 * Generic-module mapping advertisements: assembled from the `quereus.lens.decomp.*`
+	 * reserved tags on this basis schema's tables. Returns `[]` for a schema with no
+	 * such tags (the common case), leaving the lens default mapper on its name-match
+	 * path. See `docs/lens.md` § The Default Mapper.
+	 */
+	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
+		return buildAdvertisementsFromTags(basisSchema);
 	}
 
 	/**

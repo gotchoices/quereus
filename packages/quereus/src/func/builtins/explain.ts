@@ -728,6 +728,13 @@ export const effectiveLensFunc = createIntegratedTableValuedFunction(
 			columns: [
 				{ name: 'logical_column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'source', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// Advertisement-backed provenance: the member relationId of the resolved
+				// primary-storage decomposition that backs this column, or NULL when the
+				// column is name-match / override-only (docs/lens.md § The Default Mapper).
+				{ name: 'advertised_member', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// The resolved decomposition's anchor relationId (= advertisement id), or
+				// NULL when no advertisement backs this logical table.
+				{ name: 'advertisement_anchor', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'effective_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 			],
 			keys: [],
@@ -752,10 +759,13 @@ export const effectiveLensFunc = createIntegratedTableValuedFunction(
 		}
 
 		// Repeat the composed body on every row (symmetry with query_plan), so a
-		// single SELECT surfaces both the per-column provenance and the SQL.
+		// single SELECT surfaces both the per-column provenance and the SQL. The
+		// advertisement columns surface the resolved decomposition (if any) that
+		// backs each logical column — additive to the existing provenance rows.
 		const effectiveSql = astToString(slot.compiledBody);
+		const anchor = slot.advertisement?.storage?.anchorRelationId ?? null;
 		for (const p of slot.columnProvenance) {
-			yield [p.logicalColumn, p.source, effectiveSql];
+			yield [p.logicalColumn, p.source, p.advertisedBy ?? null, anchor, effectiveSql];
 		}
 	}
 );

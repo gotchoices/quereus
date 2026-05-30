@@ -10,6 +10,8 @@ import { astToString } from '../emit/ast-stringify.js';
 import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance } from './lens.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { createLogger } from '../common/logger.js';
+import type { MappingAdvertisement, DecompositionMember } from '../vtab/mapping-advertisement.js';
+import type { AnyVirtualTableModule } from '../vtab/module.js';
 
 const log = createLogger('schema:lens-compiler');
 
@@ -78,13 +80,27 @@ export function deployLogicalSchema(
 	// Compile everything FIRST (basis alignment can throw — name mismatch, etc.).
 	// Only after every table aligns successfully do we mutate the catalog, so a
 	// failed re-apply leaves the existing lens state untouched (atomic deploy).
+	// Module mapping advertisements are collected once per deploy (the first time a
+	// basis is resolved) and filtered per logical table by the resolver.
+	let allAdvertisements: MappingAdvertisement[] | undefined;
+
 	const compiled: Array<{ slot: LensSlot; view: ViewSchema }> = [];
 	for (const item of declaredSchema.items) {
 		if (item.type !== 'declaredTable') continue;
 
 		basis ??= resolveBasis();
+		allAdvertisements ??= collectAdvertisements(db, basis.schema);
 		const logicalTable = schemaManager.buildLogicalTableSchema(item.tableStmt, logicalSchema.name);
 		const override = overridesByTable.get(logicalTable.name.toLowerCase());
+
+		// Resolve (collect → select primary → validate) the advertisement BEFORE body
+		// compilation, so a malformed advertisement aborts the deploy atomically. The
+		// resolved advertisement is **stored** on the slot, not yet synthesized — the
+		// v1 name-match / override body producer below is unchanged by this ticket;
+		// `lens-multi-source-decomposition` reads the slot to build the n-way body.
+		const { advertisement, auxiliaryAccess } = resolveAdvertisement(
+			allAdvertisements, logicalTable, basis, db, logicalSchemaName, override !== undefined,
+		);
 
 		let compiledBody: AST.SelectStmt;
 		let provenance: LensColumnProvenance[];
@@ -96,11 +112,25 @@ export function deployLogicalSchema(
 			provenance = merged.provenance;
 			hiding = merged.hiding.size > 0 ? merged.hiding : undefined;
 			effectiveColumns = merged.effectiveColumns;
+			// Override ⊕ advertisement composition (docs/lens.md § Override-vs-advertisement):
+			// a *sparse* override (one that relies on gap-fill) must not re-anchor or
+			// reference relations outside the advertised decomposition. A *full*
+			// hand-authored override (no gap-fill) bypasses the advertisement and is
+			// not conflict-checked. Gap-fill *execution* from the advertisement lands
+			// in `lens-multi-source-decomposition`; this ticket validates the conflict.
+			if (advertisement && provenance.some(p => p.source === 'default')) {
+				validateOverrideAdvertisementConflict(
+					advertisement, override, basis.schemaName, schemaManager, logicalSchemaName, logicalTable.name,
+				);
+			}
 		} else {
 			compiledBody = compileDefaultBody(logicalTable, logicalSchemaName, basis.schema, basis.schemaName);
 			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
 			effectiveColumns = logicalTable.columns.map(c => c.name);
 		}
+
+		// Annotate provenance with advertisement-backed member info (introspection).
+		if (advertisement) annotateProvenanceWithAdvertisement(provenance, advertisement);
 
 		const slot: LensSlot = {
 			logicalTable,
@@ -110,6 +140,8 @@ export function deployLogicalSchema(
 			compiledBody,
 			columnProvenance: provenance,
 			attachedConstraints: buildLogicalConstraints(logicalTable),
+			advertisement,
+			auxiliaryAccess,
 		};
 
 		// PoC: validate the reserved `quereus.*` tag namespace shape + site on the
@@ -526,4 +558,350 @@ function gapFillError(
 	}
 	// Single-source hide-via-gap-fill trap (docs/lens.md § D3).
 	return `lens: override for logical table '${logicalSchemaName}.${logicalName}' leaves column '${colName}' uncovered and ${sourceDesc} to gap-fill from (the hide-via-gap-fill trap) — add it to the override projection or list it in hiding(...)`;
+}
+
+// ===========================================================================
+// Module mapping advertisement resolution (docs/lens.md § The Default Mapper)
+// ===========================================================================
+//
+// The protocol seam: a virtual-table module advertises how a set of its basis
+// relations decomposes a logical table (columnar split / EAV / column-family /
+// nd-tree). This compiler **resolves** (collects + selects the single primary +
+// validates) and **stores** the advertisement on the lens slot; it does NOT
+// synthesize the n-way body — that is `lens-multi-source-decomposition`, which
+// reads `slot.advertisement`. Validation aborts the deploy atomically (before
+// any catalog mutation), aggregating every problem with a named site, matching
+// the contract `validateLensTags` already follows.
+
+/**
+ * Collects the mapping advertisements every module owning ≥1 table in `basis`
+ * recognizes, deduplicated by the advertisement `id`. A generic module
+ * (memory/store) returns tag-derived advertisements; a generic module that scans
+ * the whole schema may be hit once per distinct module instance, so the same
+ * tag-derived advertisement can appear twice — the `id` dedup collapses those.
+ */
+function collectAdvertisements(db: Database, basis: Schema): MappingAdvertisement[] {
+	const modules = new Set<AnyVirtualTableModule>();
+	for (const table of basis.getAllTables()) {
+		if (table.vtabModule) modules.add(table.vtabModule);
+	}
+	const byId = new Map<string, MappingAdvertisement>();
+	for (const module of modules) {
+		const ads = module.getMappingAdvertisements?.(db, basis) ?? [];
+		for (const ad of ads) {
+			if (!byId.has(ad.id)) byId.set(ad.id, ad);
+		}
+	}
+	return Array.from(byId.values());
+}
+
+/**
+ * Resolves the advertisements for one logical table: filters to the table,
+ * selects the single `primary-storage` (accommodation #5 — two is an error),
+ * keeps the rest as `auxiliary-access`, and validates the primary's structural
+ * coherence. Returns the resolved slot fields; throws (aggregated) on any
+ * validation failure so the deploy aborts before catalog mutation.
+ *
+ * `hasOverride` relaxes the per-column coverage check: when an override exists
+ * its own coverage validation (`compileOverrideBody`) owns the column-coverage
+ * verdict, so the advertisement is only checked for internal coherence.
+ */
+function resolveAdvertisement(
+	all: ReadonlyArray<MappingAdvertisement>,
+	logicalTable: TableSchema,
+	basis: { schema: Schema; schemaName: string },
+	db: Database,
+	logicalSchemaName: string,
+	hasOverride: boolean,
+): { advertisement?: MappingAdvertisement; auxiliaryAccess?: ReadonlyArray<MappingAdvertisement> } {
+	const lower = logicalTable.name.toLowerCase();
+	const matching = all.filter(a => a.logicalTable.toLowerCase() === lower);
+	if (matching.length === 0) return {};
+
+	const primaries = matching.filter(a => a.role === 'primary-storage');
+	const auxiliaries = matching.filter(a => a.role === 'auxiliary-access');
+
+	const errors: string[] = [];
+	if (primaries.length > 1) {
+		errors.push(
+			`has ${primaries.length} primary-storage advertisements (${primaries.map(p => `'${p.id}'`).join(', ')}); at most one is allowed`,
+		);
+	}
+	const advertisement = primaries[0];
+	if (advertisement) {
+		validatePrimaryAdvertisement(advertisement, logicalTable, basis, db, hasOverride, errors);
+	}
+	for (const aux of auxiliaries) {
+		validateAuxiliaryAdvertisement(aux, basis, db, errors);
+	}
+
+	if (errors.length > 0) {
+		throw new QuereusError(
+			`lens: advertisement for logical table '${logicalSchemaName}.${logicalTable.name}' is invalid: ${errors.join('; ')}`,
+			StatusCode.ERROR,
+		);
+	}
+
+	return {
+		advertisement,
+		auxiliaryAccess: auxiliaries.length > 0 ? auxiliaries : undefined,
+	};
+}
+
+/**
+ * Validates a `primary-storage` advertisement's structural coherence. Each check
+ * pushes a sited message to `errors` (aggregated by the caller); none mutate the
+ * catalog. See `docs/lens.md` § The Default Mapper for the field semantics.
+ */
+function validatePrimaryAdvertisement(
+	ad: MappingAdvertisement,
+	logicalTable: TableSchema,
+	basis: { schema: Schema; schemaName: string },
+	db: Database,
+	hasOverride: boolean,
+	errors: string[],
+): void {
+	const storage = ad.storage;
+	if (!storage) {
+		errors.push(`role 'primary-storage' requires a storage shape`);
+		return;
+	}
+	// The IND existence-anchor contract: id == anchorRelationId (so the INDs the
+	// synthesis ticket injects, with IndTarget.kind:'relation'.relationId, and the
+	// join it builds agree on the anchor).
+	if (ad.id !== storage.anchorRelationId) {
+		errors.push(`advertisement id '${ad.id}' must equal storage.anchorRelationId '${storage.anchorRelationId}'`);
+	}
+
+	const memberByRelationId = new Map<string, DecompositionMember>();
+	for (const member of storage.members) memberByRelationId.set(member.relationId, member);
+
+	if (!memberByRelationId.has(storage.anchorRelationId)) {
+		errors.push(`anchor '${storage.anchorRelationId}' is not among the members (${storage.members.map(m => `'${m.relationId}'`).join(', ') || 'none'})`);
+	}
+
+	// Resolve each member's basis table; validate column / pivot existence.
+	const memberTables = new Map<string, TableSchema>();
+	for (const member of storage.members) {
+		const table = resolveBasisRelation(db, member, basis);
+		if (!table) {
+			errors.push(`member '${member.relationId}' references basis relation '${member.relation.schema}.${member.relation.table}', which does not exist`);
+			continue;
+		}
+		memberTables.set(member.relationId, table);
+
+		for (const mapping of member.columns) {
+			for (const refName of collectColumnRefNames(mapping.basisExpr)) {
+				if (!table.columnIndexMap.has(refName.toLowerCase())) {
+					errors.push(`member '${member.relationId}' maps logical column '${mapping.logicalColumn}' to basis expression referencing column '${refName}', which does not exist on '${table.name}'`);
+				}
+			}
+		}
+		if (member.attributePivot) {
+			for (const [role, col] of [
+				['entity', member.attributePivot.entityColumn],
+				['attribute', member.attributePivot.attributeColumn],
+				['value', member.attributePivot.valueColumn],
+			] as const) {
+				if (!table.columnIndexMap.has(col.toLowerCase())) {
+					errors.push(`member '${member.relationId}' attributePivot ${role} column '${col}' does not exist on '${table.name}'`);
+				}
+			}
+		}
+	}
+
+	// Shared key: surrogate ⇒ generator present; logical-tuple ⇒ generator absent
+	// AND each member's key columns match the logical PK arity.
+	const sharedKey = storage.sharedKey;
+	if (sharedKey.kind === 'surrogate' && !sharedKey.generator) {
+		errors.push(`shared key is 'surrogate' but no generator is declared`);
+	}
+	if (sharedKey.kind === 'logical-tuple') {
+		if (sharedKey.generator) {
+			errors.push(`shared key is 'logical-tuple' but a generator is declared (a logical-tuple key collapses surrogate generation)`);
+		}
+		const pkArity = logicalTable.primaryKeyDefinition.length;
+		for (const member of storage.members) {
+			const keyCols = sharedKey.keyColumnsByRelation.get(member.relationId);
+			if (keyCols && keyCols.length !== pkArity) {
+				errors.push(`shared key is 'logical-tuple' but member '${member.relationId}' has ${keyCols.length} key column(s), not the logical primary key's arity (${pkArity})`);
+			}
+		}
+	}
+
+	// keyColumnsByRelation covers every member and each named column exists.
+	for (const member of storage.members) {
+		const keyCols = sharedKey.keyColumnsByRelation.get(member.relationId);
+		if (keyCols === undefined) {
+			errors.push(`shared key has no key columns for member '${member.relationId}'`);
+			continue;
+		}
+		const table = memberTables.get(member.relationId);
+		if (!table) continue; // already reported as a missing relation
+		for (const col of keyCols) {
+			if (!table.columnIndexMap.has(col.toLowerCase())) {
+				errors.push(`shared key column '${col}' for member '${member.relationId}' does not exist on '${table.name}'`);
+			}
+		}
+	}
+
+	// Column coverage (only when there is no override — an override's own coverage
+	// validation owns the verdict otherwise). Every logical column must be backed
+	// by exactly one member mapping, or by an EAV pivot member, or be coverable by
+	// name-match against the basis. Otherwise the advertisement claims the table
+	// but leaves the column unbacked and uncovered → error, naming the column.
+	if (!hasOverride) {
+		const backedBy = buildColumnBackingMap(storage);
+		const hasEavMember = storage.members.some(m => m.attributePivot);
+		const nameMatchTable = basis.schema.getTable(logicalTable.name);
+		for (const col of logicalTable.columns) {
+			const lc = col.name.toLowerCase();
+			if (backedBy.get(lc) === 'ambiguous') {
+				errors.push(`logical column '${col.name}' is backed by more than one member mapping (must be exactly one)`);
+				continue;
+			}
+			if (backedBy.has(lc)) continue; // exactly one member maps it
+			if (hasEavMember) continue;      // an EAV pivot member backs it generically
+			if (nameMatchTable?.columnIndexMap.has(lc)) continue; // left to name-match
+			errors.push(`logical column '${col.name}' is left unbacked by the advertisement and is not coverable by name-match (cover it with a member mapping, an EAV pivot, or a name-matching basis column)`);
+		}
+	}
+}
+
+/**
+ * Minimal validation for an `auxiliary-access` advertisement: every member
+ * relation must resolve. The access-shape planner consumer is deferred (backlog
+ * `lens-access-shape-path-selection`), so its predicate forms are stored
+ * unvalidated here.
+ */
+function validateAuxiliaryAdvertisement(
+	ad: MappingAdvertisement,
+	basis: { schema: Schema; schemaName: string },
+	db: Database,
+	errors: string[],
+): void {
+	if (!ad.storage) return; // an auxiliary may carry access-only shape
+	for (const member of ad.storage.members) {
+		if (!resolveBasisRelation(db, member, basis)) {
+			errors.push(`auxiliary advertisement '${ad.id}' member '${member.relationId}' references basis relation '${member.relation.schema}.${member.relation.table}', which does not exist`);
+		}
+	}
+}
+
+/**
+ * Builds `logicalColumn(lower) -> member relationId | 'ambiguous'` from the
+ * explicit per-member column mappings (EAV pivots are handled separately by the
+ * caller). A column mapped by two members is `'ambiguous'`.
+ */
+function buildColumnBackingMap(storage: NonNullable<MappingAdvertisement['storage']>): Map<string, string | 'ambiguous'> {
+	const backedBy = new Map<string, string | 'ambiguous'>();
+	for (const member of storage.members) {
+		for (const mapping of member.columns) {
+			const lc = mapping.logicalColumn.toLowerCase();
+			backedBy.set(lc, backedBy.has(lc) ? 'ambiguous' : member.relationId);
+		}
+	}
+	return backedBy;
+}
+
+/** Resolves a member's {@link BasisRelationRef} to a concrete basis table. */
+function resolveBasisRelation(
+	db: Database,
+	member: DecompositionMember,
+	basis: { schema: Schema; schemaName: string },
+): TableSchema | undefined {
+	const schemaName = member.relation.schema || basis.schemaName;
+	const schema = schemaName.toLowerCase() === basis.schemaName.toLowerCase()
+		? basis.schema
+		: db.schemaManager.getSchema(schemaName);
+	return schema?.getTable(member.relation.table);
+}
+
+/**
+ * Annotates each provenance entry with the member `relationId` that backs its
+ * logical column, when the resolved advertisement maps it. Explicit mappings win;
+ * a column with no explicit mapping is attributed to the sole EAV pivot member
+ * when one exists. Surfaced by `quereus_effective_lens`.
+ */
+function annotateProvenanceWithAdvertisement(
+	provenance: LensColumnProvenance[],
+	ad: MappingAdvertisement,
+): void {
+	const storage = ad.storage;
+	if (!storage) return;
+	const backedBy = buildColumnBackingMap(storage);
+	const eavMembers = storage.members.filter(m => m.attributePivot);
+	const soleEav = eavMembers.length === 1 ? eavMembers[0].relationId : undefined;
+	for (const p of provenance) {
+		if (p.source === 'hidden') continue;
+		const explicit = backedBy.get(p.logicalColumn.toLowerCase());
+		if (explicit && explicit !== 'ambiguous') {
+			p.advertisedBy = explicit;
+		} else if (soleEav) {
+			p.advertisedBy = soleEav;
+		}
+	}
+}
+
+/**
+ * Override ⊕ advertisement conflict (docs/lens.md § Override-vs-advertisement
+ * composition): a *sparse* override (one that relies on gap-fill) may correct an
+ * advertised column mapping, but must NOT re-anchor or reference basis relations
+ * outside the advertised decomposition. Every introspectable basis-table source
+ * in the override's FROM must be one of the advertisement's member relations;
+ * otherwise the developer is silently re-anchoring and must instead author a full
+ * hand-authored body (which bypasses the advertisement entirely). Opaque sources
+ * (subquery / function) are not introspectable and do not trip the check.
+ */
+function validateOverrideAdvertisementConflict(
+	ad: MappingAdvertisement,
+	override: AST.LensOverride,
+	basisSchemaName: string,
+	schemaManager: SchemaManager,
+	logicalSchemaName: string,
+	logicalName: string,
+): void {
+	const storage = ad.storage;
+	if (!storage) return;
+	const memberRelations = new Set(
+		storage.members.map(m => `${(m.relation.schema || basisSchemaName).toLowerCase()}.${m.relation.table.toLowerCase()}`),
+	);
+	const { sources } = collectOverrideSources(override.select.from, basisSchemaName, schemaManager);
+	for (const src of sources) {
+		const key = `${src.table.schemaName.toLowerCase()}.${src.table.name.toLowerCase()}`;
+		if (!memberRelations.has(key)) {
+			throw new QuereusError(
+				`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${src.table.schemaName}.${src.table.name}', which is not part of the advertised decomposition (anchor '${storage.anchorRelationId}', members: ${storage.members.map(m => `'${m.relation.table}'`).join(', ')}); a partial override may not re-anchor or change the shared key — cover every logical column explicitly to author a full body that bypasses the advertisement, or align the override's FROM with the decomposition`,
+				StatusCode.ERROR,
+			);
+		}
+	}
+}
+
+/**
+ * Collects the names of every `column` reference in a basis expression (a
+ * best-effort reflective walk). Used to validate that an advertisement's
+ * `basisExpr` references columns that actually exist on its member relation.
+ */
+function collectColumnRefNames(expr: AST.Expression): string[] {
+	const names: string[] = [];
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.type === 'column' && typeof (node as AST.ColumnExpr).name === 'string') {
+			names.push((node as AST.ColumnExpr).name);
+		}
+		for (const key of Object.keys(node)) {
+			const value = (node as unknown as Record<string, unknown>)[key];
+			if (!value) continue;
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					if (item && typeof item === 'object' && 'type' in item) stack.push(item as AST.AstNode);
+				}
+			} else if (typeof value === 'object' && 'type' in (value as object)) {
+				stack.push(value as AST.AstNode);
+			}
+		}
+	}
+	return names;
 }

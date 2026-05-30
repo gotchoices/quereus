@@ -93,6 +93,25 @@ describe('analyzeChangeScope', () => {
 			expect(scope.unboundParameters).to.deep.equal([]);
 		});
 
+		it('single-PK equality on a NON-lowercase table name still yields a rows scope', async () => {
+			// Regression for the relation-key casing bug: every relation-key
+			// builder in the change-scope pipeline lowercases EXCEPT the one in
+			// `createTableInfoFromNode`, which left the key un-lowercased. For a
+			// table whose name isn't already lowercase (`Entity`), the classifier
+			// key (`...Entity#id`) no longer matched the binding-extractor /
+			// analyzer keys (`...entity#id`), so `analyzeRowSpecific` and
+			// `extractConstraintsForTable` both missed and the watch silently
+			// widened to whole-table (or dropped entirely). Asserting on a
+			// capitalized name pins the fix; a lowercase name passes either way.
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT) USING memory');
+			const scope = scopeFor(db, 'select name from Entity where id = ?', [200]);
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.scope.kind).to.equal('rows');
+			const r = w.scope as Extract<WatchScope, { kind: 'rows' }>;
+			expect(r.key).to.deep.equal(['id']);
+			expect(r.values).to.deep.equal([[200]]);
+		});
+
 		it('row binding whose values cannot be decoded falls back to full (soundness)', async () => {
 			await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 			// Equality of the PK against a non-literal/non-parameter expression

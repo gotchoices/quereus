@@ -6,6 +6,8 @@ import type { TableSchema, IndexSchema } from '../schema/table.js'; // Add impor
 import type { BestAccessPlanRequest, BestAccessPlanResult } from './best-access-plan.js';
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { ModuleCapabilities } from './capabilities.js';
+import type { MappingAdvertisement } from './mapping-advertisement.js';
+import type { Schema } from '../schema/schema.js';
 
 /**
  * Base interface for module-specific configuration passed to create/connect.
@@ -225,6 +227,25 @@ export interface VirtualTableModule<
 	 * Used for runtime capability discovery.
 	 */
 	getCapabilities?(): ModuleCapabilities;
+
+	/**
+	 * Optional. Returns the logical→basis decompositions this module recognizes
+	 * over the given basis schema (see {@link MappingAdvertisement}). A dedicated
+	 * module (columnar/EAV/nd-tree) synthesizes them from its own knowledge; a
+	 * generic module (memory/store) delegates to the shared tag builder
+	 * (`buildAdvertisementsFromTags`) over its tables' reserved
+	 * `quereus.lens.decomp.*` tags. Consulted by the lens compiler's resolver
+	 * (`schema/lens-compiler.ts`). Omit ⇒ name-match only (today's behavior).
+	 *
+	 * The method is **module-level given the basis schema** (not per-table): a
+	 * module spans many tables and a decomposition spans many relations, so it
+	 * returns every decomposition it recognizes and the resolver indexes them.
+	 * Presence of the method is the capability — no `ModuleCapabilities` flag.
+	 */
+	getMappingAdvertisements?(
+		db: Database,
+		basisSchema: Schema,
+	): readonly MappingAdvertisement[];
 
 	/**
 	 * Alter an existing table's structure. Called by ALTER TABLE for

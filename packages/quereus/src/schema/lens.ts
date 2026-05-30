@@ -6,6 +6,7 @@ import type {
 	ForeignKeyConstraintSchema,
 	PrimaryKeyColumnDefinition,
 } from './table.js';
+import type { MappingAdvertisement } from '../vtab/mapping-advertisement.js';
 
 /**
  * Lens layer — per-logical-table mapping slots.
@@ -55,6 +56,13 @@ export type LogicalConstraint =
 export interface LensColumnProvenance {
 	logicalColumn: string;
 	source: 'override' | 'default' | 'hidden';
+	/**
+	 * When a resolved primary-storage advertisement backs this logical column, the
+	 * member `relationId` that backs it (the existence anchor for an EAV pivot).
+	 * `undefined` ⇒ name-match / override-only provenance (no advertisement). Set by
+	 * the lens compiler's `resolveAdvertisement`; surfaced by `quereus_effective_lens`.
+	 */
+	advertisedBy?: string;
 }
 
 /**
@@ -95,6 +103,22 @@ export interface LensSlot {
 	 * prover ticket (`lens-prover-and-constraint-attachment`); stored as-is here.
 	 */
 	attachedConstraints: ReadonlyArray<LogicalConstraint>;
+	/**
+	 * The resolved primary-storage advertisement, when a module advertised a
+	 * decomposition for this logical table (see {@link MappingAdvertisement}).
+	 * Resolved + validated by the lens compiler's `resolveAdvertisement` and stored
+	 * here; consumed by `lens-multi-source-decomposition` to synthesize the n-way
+	 * `get` join + `put` fan-out. `undefined` ⇒ name-match / single-source (the v1
+	 * path). NOTE: this ticket **stores** the advertisement; the v1 body producer
+	 * (name-match / override) is unchanged — synthesis lands in the follow-up.
+	 */
+	advertisement?: MappingAdvertisement;
+	/**
+	 * Auxiliary access-path advertisements for this logical table (nd-tree, vector,
+	 * covering structures). Stored here; the planner path-selection consumer is
+	 * deferred (backlog `lens-access-shape-path-selection`).
+	 */
+	auxiliaryAccess?: ReadonlyArray<MappingAdvertisement>;
 }
 
 /**
