@@ -316,6 +316,28 @@ apply schema X;
 
 The override projection covers some columns (by output name); the default mapper gap-fills the rest from the override's `FROM`; `hiding (...)` omits columns from both the effective body and the registered view. `over Y` is the explicit basis (it resolves the auto-inference ambiguity that arises with multiple physical bases). Inspect the composed result with `quereus_effective_lens(schema, table)`. See [Lenses and Layered Schemas](lens.md) for the full model — including the v1 name-based / re-read-from-source merge and the gap-fill fidelity boundary.
 
+#### Acknowledging lens advisories (`quereus.lens.ack.*` / `quereus.lens.policy.*`)
+
+At `apply schema X` the lens prover emits **coded, sited advisories** (`lens.no-backing-index`, `lens.no-answering-structure`, `lens.partial-override`) onto the deploy report. A developer accepts one in source with a reserved tag on the logical table (or a constraint), so the suppression is version-controlled and reviewable rather than an out-of-band suppress-list:
+
+```sql
+declare logical schema X {
+  table Car (id int primary key, vin text, unique (vin))
+    with tags (
+      -- acknowledge the no-backing-index advisory for the vin constraint:
+      "quereus.lens.ack.no-backing-index:vin" = 'low-write table; commit-time scan accepted',
+      -- (optional) force a conscious decision on that code for this table:
+      "quereus.lens.policy.require-ack" = 'lens.no-backing-index'
+    );
+}
+```
+
+- **`quereus.lens.ack.<code>[:<target>]`** — acknowledges the advisory whose `<code>` (the `lens.`-stripped advisory code) it names; the optional `:<target>` narrows to a column/constraint. The value is a **required rationale**; an empty rationale still suppresses but surfaces an empty-rationale meta-warning on the report.
+  - **Fingerprint / re-surface (anti-fatigue).** The rationale may carry a trailing `#fp=<digest>` token — the recorded fingerprint of the advisory's coarse facts (constraint columns, covering-structure presence, a **banded** cardinality, the backing relation). A bare rationale (no `#fp=`) is honored *unconditionally* (record-on-first-sight). When a recorded fingerprint stops matching the recomputed one (constraint columns change, a covering structure drops, the cardinality crosses a band — `empty`/`small`<1e3/`medium`<1e6/`large`/`unknown`), the advisory **re-surfaces** flagged "previously acknowledged; situation changed". The token round-trips through DDL export (it is part of the tag value string).
+- **`quereus.lens.policy.error-on` / `quereus.lens.policy.require-ack`** — a per-logical-table escalation policy (CSV of advisory codes, **default-empty**). `error-on` codes are always hard errors an ack cannot suppress; `require-ack` codes are hard errors only when *un*-acknowledged (a valid ack clears them). Escalation errors abort the deploy atomically alongside the prover's blocking errors.
+
+The deploy summary tallies `acknowledged: N` (`LensDeployReport.acknowledged.length`); `select * from quereus_lens_advisories('x')` expands the full list — one row per advisory with its `status` (`active` / `re-surfaced` / `acknowledged` / `acknowledged-unconditional`), rationale, and current/recorded fingerprints. All `quereus.lens.*` tag shape/site validation lives in the typed registry `src/schema/reserved-tags.ts`.
+
 ### Migration Order
 
 `generateMigrationDDL` produces DDL in a fixed order:

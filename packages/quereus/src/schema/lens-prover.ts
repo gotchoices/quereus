@@ -7,6 +7,7 @@ import { proveEffectiveKeyUnique } from '../planner/analysis/coverage-prover.js'
 import { astToString } from '../emit/ast-stringify.js';
 import { PhysicalType } from '../types/logical-type.js';
 import { getReservedTagByTemplate } from './reserved-tags.js';
+import type { AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:lens-prover');
@@ -88,6 +89,12 @@ export interface LensDiagnostic {
 	readonly site: LensDiagnosticSite;
 	readonly message: string;
 	readonly fingerprintInputs?: FingerprintInputs;
+	/**
+	 * Set by the acknowledgment governance (`lens-ack.ts`) when a previously
+	 * acknowledged advisory re-surfaced because its recorded fingerprint no longer
+	 * matches the freshly computed one. The message is annotated accordingly.
+	 */
+	readonly resurfaced?: boolean;
 }
 
 /** A reference to the basis covering structure routing a set-level constraint. */
@@ -124,7 +131,19 @@ export type ConstraintObligation = { readonly constraint: LogicalConstraint } & 
  */
 export interface LensDeployReport {
 	readonly errors: LensDiagnostic[];
+	/**
+	 * Advisories shown by default — un-acknowledged ones plus any that re-surfaced
+	 * (`resurfaced: true`) plus empty-rationale meta-warnings. Acknowledged
+	 * advisories are removed (and tallied in {@link acknowledged}).
+	 */
 	readonly warnings: LensDiagnostic[];
+	/**
+	 * Advisories an in-source `quereus.lens.ack.<code>` tag suppressed from the
+	 * default report. The deploy summary tallies `acknowledged: N` (=
+	 * `acknowledged.length`) and the `quereus_lens_advisories` TVF expands them on
+	 * demand (`docs/lens.md` § Acknowledging advisories). Produced by `lens-ack.ts`.
+	 */
+	readonly acknowledged: AcknowledgedAdvisory[];
 	/** Lowercased logical table name → its constraint obligations. */
 	readonly obligationsByTable: ReadonlyMap<string, ReadonlyArray<ConstraintObligation>>;
 }

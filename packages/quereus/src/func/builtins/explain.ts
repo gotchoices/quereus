@@ -853,6 +853,68 @@ export const basisBackfillFunc = createIntegratedTableValuedFunction(
 	}
 );
 
+// Lens advisory governance introspection: the **expand** path for the deploy
+// summary's `acknowledged: N` tally (docs/lens.md § Acknowledging advisories).
+// One row per advisory of the last deploy of a logical schema — active ones, the
+// ones an in-source `quereus.lens.ack.<code>` tag suppressed, and any that
+// re-surfaced because their recorded fingerprint no longer matches.
+export const lensAdvisoriesFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_lens_advisories',
+		numArgs: 1,
+		deterministic: false, // Depends on the current lens deploy report.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'code', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'constraint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// 'active' | 're-surfaced' | 'acknowledged' | 'acknowledged-unconditional'
+				{ name: 'status', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'rationale', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'current_fingerprint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'recorded_fingerprint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'message', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string') {
+			throw new QuereusError('quereus_lens_advisories(logical_schema) requires a string argument', StatusCode.ERROR);
+		}
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_lens_advisories: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_lens_advisories: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+		const report = db.declaredSchemaManager.getDeployedLensReport(schemaArg);
+		if (!report) return; // never deployed (or a blocked deploy left no report)
+
+		// Default-report rows (un-acknowledged + re-surfaced), then the expanded
+		// acknowledged ones. Each row is grouped by its logical table + code.
+		for (const w of report.warnings) {
+			yield [
+				w.site.table, w.code, w.site.constraint ?? null, w.site.column ?? null,
+				w.resurfaced ? 're-surfaced' : 'active', null, null, null, w.message,
+			];
+		}
+		for (const a of report.acknowledged) {
+			yield [
+				a.site.table, a.code, a.site.constraint ?? null, a.site.column ?? null,
+				a.unconditional ? 'acknowledged-unconditional' : 'acknowledged',
+				a.rationale, a.currentFingerprint, a.recordedFingerprint ?? null, a.message,
+			];
+		}
+	}
+);
+
 // Explain assertion analysis and prepared parameterization (pre-physical)
 export const explainAssertionFunc = createIntegratedTableValuedFunction(
 	{

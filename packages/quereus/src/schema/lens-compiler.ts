@@ -12,6 +12,7 @@ import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance,
 import { computeSchemaHash } from './schema-hasher.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { proveLens, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
+import { applyAckGovernance, resolveEscalationPolicy, type AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
 import type { MappingAdvertisement, DecompositionMember } from '../vtab/mapping-advertisement.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
@@ -93,6 +94,7 @@ export function deployLogicalSchema(
 	// preserving the existing atomic-deploy property. Warnings flow to the report.
 	const proveErrors: LensDiagnostic[] = [];
 	const proveWarnings: LensDiagnostic[] = [];
+	const acknowledged: AcknowledgedAdvisory[] = [];
 	const obligationsByTable = new Map<string, ReadonlyArray<ConstraintObligation>>();
 	for (const item of declaredSchema.items) {
 		if (item.type !== 'declaredTable') continue;
@@ -167,8 +169,17 @@ export function deployLogicalSchema(
 		const prove = proveLens(slot, db);
 		slot.obligations = prove.obligations;
 		slot.readOnly = prove.readOnly;
-		proveErrors.push(...prove.errors);
-		proveWarnings.push(...prove.warnings);
+
+		// Acknowledgment + escalation governance (docs/lens.md § Acknowledging
+		// advisories). Coded+sited advisories the prover emitted become
+		// acknowledgeable in source (the `quereus.lens.ack.<code>` tag, with a
+		// recorded fingerprint that re-surfaces them on material change), and the
+		// per-table escalation policy promotes specific codes to blocking errors.
+		// Escalation errors aggregate with the prover's and throw atomically below.
+		const governance = applyAckGovernance(slot, prove.warnings, resolveEscalationPolicy(logicalTable));
+		proveErrors.push(...prove.errors, ...governance.errors);
+		proveWarnings.push(...governance.warnings);
+		acknowledged.push(...governance.acknowledged);
 		obligationsByTable.set(logicalTable.name.toLowerCase(), prove.obligations);
 
 		const view: ViewSchema = {
@@ -223,7 +234,7 @@ export function deployLogicalSchema(
 	// advisories). `apply schema` returning these as result rows is deferred to that
 	// ticket (converting the universally-used void statement to relational is a
 	// separate, high-blast-radius change); the report is fully produced here.
-	const report: LensDeployReport = { errors: [], warnings: proveWarnings, obligationsByTable };
+	const report: LensDeployReport = { errors: [], warnings: proveWarnings, acknowledged, obligationsByTable };
 	db.declaredSchemaManager.setDeployedLensReport(logicalSchemaName, report);
 	return report;
 }

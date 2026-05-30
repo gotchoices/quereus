@@ -175,6 +175,24 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		valueSchema: 'string',
 		description: 'Declare an expected lookup/ordering access pattern on a column.',
 	},
+	// --- quereus.lens.policy.* : per-(logical-table) advisory escalation policy ---
+	// A comma-separated list of advisory codes (e.g. `lens.no-backing-index`) the
+	// project promotes beyond advisory. Codes carry dots and hyphens, so the value
+	// is `string` (free CSV) rather than `csv-of-identifiers`. Read by the ack
+	// governance (`lens-ack.ts`) after the prover runs; default-empty when absent.
+	// See `docs/lens.md` § Acknowledging advisories (Escalation policy).
+	{
+		key: 'quereus.lens.policy.error-on',
+		sites: siteSet('logical-table'),
+		valueSchema: 'string',
+		description: 'CSV of advisory codes that are always a hard error; an ack cannot suppress them.',
+	},
+	{
+		key: 'quereus.lens.policy.require-ack',
+		sites: siteSet('logical-table'),
+		valueSchema: 'string',
+		description: 'CSV of advisory codes whose un-acknowledged instances are a hard error (a valid ack clears).',
+	},
 	// --- quereus.lens.decomp.* : module mapping-advertisement facts on basis tables ---
 	// A generic module (memory/store) assembles a MappingAdvertisement from these
 	// reserved tags on its basis tables via `buildAdvertisementsFromTags`
@@ -495,7 +513,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key,generator,gencadence}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key,generator,gencadence}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 
