@@ -1052,6 +1052,63 @@ select id, value from ltw_fan order by id, value;
 → [{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
 
 -- ===================================
+-- 23.5 NOCASE base-PK lateral-TVF fan-out — the prefix-delete arm under a NON-binary base
+--      primary key. `delete-by-prefix` early-terminates its prefix scan on a BINARY compare
+--      (scan-layer.ts) while the backing btree orders the base-PK prefix by its NOCASE
+--      collation. Sound for this arm: the backing base-PK column inherits the source PK
+--      collation and source-PK uniqueness collapses each NOCASE class to one binary value, so
+--      a base row's fan-out rows are binary-homogeneous and contiguous. A case-only PK rewrite
+--      ('apple' → 'APPLE', the SAME PK under NOCASE) re-keys the whole slice to the new bytes.
+--      (prefix-delete-noncase-collation-regression-test)
+-- ===================================
+
+create table ltc (id text collate NOCASE primary key, n integer);
+insert into ltc values ('apple', 2), ('Banana', 3), ('cherry', 0);
+create materialized view ltc_fan as select ltc.id, f.value from ltc cross join lateral generate_series(1, ltc.n) f;
+
+-- MV equals the body at create: apple → {1,2}, Banana → {1,2,3}, cherry (n=0) → empty.
+select id, value from ltc_fan order by id, value;
+→ [{"id":"apple","value":1},{"id":"apple","value":2},{"id":"Banana","value":1},{"id":"Banana","value":2},{"id":"Banana","value":3}]
+
+-- INSERT a new base slice whose binary value ('Date'=0x44) sorts BEFORE the existing
+-- NOCASE-earlier 'apple' (0x61) slice — the maintained backing must still place it correctly.
+insert into ltc values ('Date', 2);
+select id, value from ltc_fan where id = 'Date' order by value;
+→ [{"id":"Date","value":1},{"id":"Date","value":2}]
+
+-- UPDATE GROWS the fan-out (n: 2 → 4): old slice deleted by prefix, new fan-out upserted.
+update ltc set n = 4 where id = 'apple';
+select id, value from ltc_fan where id = 'apple' order by value;
+→ [{"id":"apple","value":1},{"id":"apple","value":2},{"id":"apple","value":3},{"id":"apple","value":4}]
+
+-- UPDATE SHRINKS the fan-out (n: 3 → 1): stale tail rows removed by the prefix delete.
+update ltc set n = 1 where id = 'Banana';
+select id, value from ltc_fan where id = 'Banana' order by value;
+→ [{"id":"Banana","value":1}]
+
+-- A case-only base-PK rewrite ('apple' → 'APPLE') is the SAME PK under NOCASE, but rewrites
+-- the stored bytes the backing keys on: the old-byte slice is deleted by prefix and re-fanned
+-- under the new bytes. A NOCASE `where id = 'apple'` still finds it (now stored 'APPLE').
+update ltc set id = 'APPLE' where id = 'apple';
+select id, value from ltc_fan where id = 'apple' order by value;
+→ [{"id":"APPLE","value":1},{"id":"APPLE","value":2},{"id":"APPLE","value":3},{"id":"APPLE","value":4}]
+
+-- DELETE removes the whole fan-out slice; a lowercase literal matches the stored 'Banana'
+-- under NOCASE.
+delete from ltc where id = 'banana';
+select id, value from ltc_fan where id = 'Banana' order by value;
+→ []
+
+-- Mid-transaction visibility + rollback reverts the slice in lockstep (reads-own-writes).
+begin;
+insert into ltc values ('elder', 3);
+select id, value from ltc_fan where id = 'elder' order by value;
+→ [{"id":"elder","value":1},{"id":"elder","value":2},{"id":"elder","value":3}]
+rollback;
+select id, value from ltc_fan where id = 'elder' order by value;
+→ []
+
+-- ===================================
 -- 24. 1:1 inner-join bodies (`select T.pk…, P.col from T join P on T.fk = P.id`) — the
 --     join-residual arm. T's NOT-NULL FK to P's PK makes the inner join provably 1:1 on T
 --     (no row loss via referential integrity, no fan-out via P's unique PK), so the backing

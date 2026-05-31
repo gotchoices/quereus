@@ -1618,6 +1618,29 @@ export class MaterializedViewManager {
 			if (sc === undefined || !basePkSet.has(sc)) {
 				reject('its backing primary key does not lead with the base source primary key (the base PK must be the leading prefix of the composite product key — an `order by` over the fan-out that reorders it is not row-time maintainable)');
 			}
+			// Soundness precondition for the binary prefix scan (the property
+			// `prefix-delete-noncase-collation-regression-test` locks in): the backing base-PK
+			// column MUST inherit the source PK column's collation. The btree orders this prefix
+			// by `d.collation`, but `delete-by-prefix` early-terminates the prefix scan on a
+			// BINARY compare (scan-layer.ts) — sound ONLY because source-PK uniqueness under that
+			// collation collapses each collation class to a single binary value, so a base row's
+			// fan-out rows are binary-homogeneous and contiguous. A backing collation MORE
+			// permissive than the source's would let collation-equal/binary-different base rows
+			// interleave and break that. The backing column derives its collation from the body
+			// relation's type (deriveBackingShape), so a mismatch is an internal derivation bug —
+			// fail loud rather than register an unsound plan.
+			const backingColl = normalizeCollation(d.collation);
+			const sourceColl = normalizeCollation(sourceSchema.columns[sc!]?.collation);
+			if (backingColl !== sourceColl) {
+				throw new QuereusError(
+					`Internal error: materialized view '${mv.name}' backing base-PK column `
+						+ `'${backing.columns[d.index]?.name ?? d.index}' has collation '${backingColl}' but its source `
+						+ `primary-key column '${sourceSchema.columns[sc!]?.name ?? sc}' has collation '${sourceColl}'; `
+						+ `the prefix-delete arm's binary prefix scan requires the backing base-PK column to inherit the `
+						+ `source PK collation (see scan-layer.ts early-termination)`,
+					StatusCode.INTERNAL,
+				);
+			}
 			leadingSourceCols.add(sc!);
 			backingPrefixSourceCols.push(sc!);
 		}
@@ -2038,6 +2061,13 @@ export class MaterializedViewManager {
  *  {@link MaterializedViewManager.tryBuildCoveringPrefix}). */
 function isBinaryCollation(collation: string | undefined): boolean {
 	return collation === undefined || collation.toUpperCase() === 'BINARY';
+}
+
+/** Canonical upper-case collation name (absent ⇒ `BINARY`). Used to compare a backing-PK
+ *  column's collation against its source PK column's at plan-build (see
+ *  {@link MaterializedViewManager.buildLateralTvfPrefixDeletePlan}). */
+function normalizeCollation(collation: string | undefined): string {
+	return (collation ?? 'BINARY').toUpperCase();
 }
 
 function mvKey(schemaName: string, name: string): string {

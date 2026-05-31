@@ -140,6 +140,27 @@ covering structure answers it.
 > **same** per-row bookkeeping (secondary indexes, change tracking) the point `delete-key`
 > arm uses. The op is therefore the prefix-keyed analogue of `delete-key` — one base row's
 > fan-out replaced as a unit.
+>
+> **Non-binary base-PK collation soundness.** `delete-by-prefix` early-terminates its prefix
+> scan on a **binary** value compare (`scan-layer.ts` / `plan-filter.ts`), but the backing
+> btree orders the base-PK prefix by the column's **declared collation**. These agree for the
+> default `BINARY` collation; for a non-binary base PK (e.g. `text collate nocase`) they only
+> agree because of two facts: (1) the backing base-PK column **inherits** the source PK
+> column's collation (`deriveBackingShape` carries the body relation's `collationName`
+> through), so the btree orders the prefix exactly as the value the delete is built from; and
+> (2) source-PK **uniqueness** under that collation collapses each collation class to a single
+> binary value, so all of a base row's fan-out rows carry a byte-identical leading value and
+> form one contiguous, binary-homogeneous slice — no collation-equal/binary-different base
+> rows can interleave. (This is why the arm does **not** gate off non-binary collation the way
+> `lookupCoveringConflicts`/`tryBuildCoveringPrefix` does: that fast path keys off a UNIQUE
+> constraint, which *can* hold collation-equal/binary-different rows, whereas the base PK
+> cannot.) `applyPrefixDelete` always builds the delete prefix from the changed row's exact
+> stored value (`row[sc]`), never a case-folded variant, so it stays within the safe case;
+> `buildLateralTvfPrefixDeletePlan` asserts fact (1) at plan-build (backing base-PK collation
+> == source PK collation) so a future derivation regression fails loud rather than silently
+> under-/over-deleting. Locked in by `prefix-delete-noncase-collation-regression-test`
+> (layer-level unit cases + a NOCASE-base-PK equivalence suite + `53-…-rowtime.sqllogic`
+> §23.5).
 
 ## Pipeline at a glance
 

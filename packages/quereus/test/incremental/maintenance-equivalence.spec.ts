@@ -230,6 +230,106 @@ defineEquivalenceSuite('Materialized-view maintenance equivalence (single-source
 defineEquivalenceSuite('Materialized-view maintenance equivalence (lateral-TVF fan-out shapes)', LATERAL_TVF_SHAPES);
 
 /**
+ * Lateral-TVF fan-out (`'prefix-delete'`) under a NON-binary (`text collate NOCASE`)
+ * **base primary key** — the one collation shape the integer-PK fan-out suite above never
+ * reaches. The `delete-by-prefix` primitive the arm deletes a base row's whole fan-out
+ * slice with early-terminates its prefix scan on a *binary* compare (`scan-layer.ts`),
+ * while the backing btree orders the base-PK prefix by the column's NOCASE collation. This
+ * is reasoned sound for this arm — the backing base-PK column inherits the source PK
+ * collation, and source-PK uniqueness collapses each NOCASE class to a single binary value,
+ * so a base row's fan-out rows are binary-homogeneous and contiguous — and this suite is the
+ * end-to-end exercise of that reasoning that the prior harness lacked.
+ *
+ * The id space is a small set of single letters in BOTH cases (`a`/`A`, `b`/`B`, …) so the
+ * random mutations routinely:
+ *   - collide under NOCASE (insert `'A'` while `'a'` exists → tolerated CONSTRAINT, the
+ *     PK-uniqueness collapse);
+ *   - rewrite the PK case-only (`update … set id='A' where id='a'` — the *same* PK under
+ *     NOCASE, which still moves the stored byte value the backing keys on);
+ *   - move the whole prefix (`'a' → 'b'`) and grow/shrink/empty the fan-out (`n` straddles 0).
+ * Letters chosen so NOCASE order ≠ binary order is irrelevant to the oracle, but it ensures
+ * the maintained backing exercises the NOCASE-ordered btree under the binary prefix delete.
+ * The oracle re-runs the same body live; maintained backing and live body must agree as
+ * multisets mid-transaction (reads-own-writes) and after rollback.
+ */
+describe('Materialized-view maintenance equivalence (lateral-TVF fan-out, NOCASE base PK)', () => {
+	let db: Database;
+	const body = 'select t.id, f.value from t cross join lateral generate_series(1, t.n) f';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id text collate NOCASE primary key, n integer)');
+		// Committed seed straddling the empty-fan-out boundary (cherry n=0 → no backing rows).
+		await db.exec("insert into t (id, n) values ('apple', 2), ('Banana', 3), ('cherry', 0)");
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+
+	afterEach(async () => { await db.close(); });
+
+	type TextMutation =
+		| { readonly kind: 'insert'; readonly id: string; readonly n: number }
+		| { readonly kind: 'update'; readonly id: string; readonly n: number }
+		| { readonly kind: 'updateKey'; readonly oldId: string; readonly newId: string; readonly n: number }
+		| { readonly kind: 'delete'; readonly id: string };
+
+	// Single letters in both cases — `'a'`/`'A'` are the SAME PK under NOCASE, so inserts
+	// collide and key-changes are sometimes case-only rewrites, sometimes real moves.
+	const idArb = fc.constantFrom('a', 'A', 'b', 'B', 'c', 'C', 'd');
+	// `n` straddles 0 so a fan-out can grow, shrink, or empty (generate_series(1, n≤0) → 0 rows).
+	const nArb = fc.integer({ min: -1, max: 4 });
+
+	const textMutationArb: fc.Arbitrary<TextMutation> = fc.oneof(
+		fc.record({ kind: fc.constant('insert' as const), id: idArb, n: nArb }),
+		fc.record({ kind: fc.constant('update' as const), id: idArb, n: nArb }),
+		fc.record({ kind: fc.constant('updateKey' as const), oldId: idArb, newId: idArb, n: nArb }),
+		fc.record({ kind: fc.constant('delete' as const), id: idArb }),
+	);
+
+	const textSqlFor = (m: TextMutation): string => {
+		switch (m.kind) {
+			case 'insert': return `insert into t (id, n) values ('${m.id}', ${m.n})`;
+			case 'update': return `update t set n = ${m.n} where id = '${m.id}'`;
+			case 'updateKey': return `update t set id = '${m.newId}', n = ${m.n} where id = '${m.oldId}'`;
+			case 'delete': return `delete from t where id = '${m.id}'`;
+		}
+	};
+
+	it('read(MV) == evaluate(body) across random NOCASE-PK mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(textMutationArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, textSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 60 });
+	});
+
+	it('a case-only base-PK rewrite (same NOCASE PK) re-keys the whole fan-out slice', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		// 'apple' → 'APPLE' is the SAME PK under NOCASE but a different stored byte value the
+		// backing keys on: the old slice is deleted by prefix and the new fan-out upserted, so
+		// every backing row's id must now read the new byte value 'APPLE' and none read 'apple'.
+		await db.exec("update t set id = 'APPLE' where id = 'apple'");
+		await assertEquivalent(db, body, 'after case-only rewrite');
+		// Distinct stored id byte-values: lowercase 'apple' is gone (re-keyed), 'APPLE' present,
+		// 'Banana' untouched (cherry n=0 contributes no backing rows). canonRow is byte-exact.
+		const ids = await readMultiset(db, 'select distinct id from mv');
+		expect(ids, 'old-case slice re-keyed to the new byte value').to.deep.equal(
+			[canonRow(['APPLE']), canonRow(['Banana'])].sort(),
+		);
+	});
+});
+
+/**
  * 1:1 inner-join body (`select t.id, t.fk, p.name from t join p on t.fk = p.id`) maintained
  * by the `'join-residual'` arm. T's NOT-NULL FK `t.fk → p.id` makes the inner join provably
  * 1:1 on T (no row loss via enforced referential integrity, no fan-out via p's unique PK),
