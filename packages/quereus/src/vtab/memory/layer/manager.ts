@@ -214,7 +214,10 @@ export class MemoryTableManager {
 				indexName = uc.name ?? `_uc_${colNames.join('_')}`;
 				newIndexes.push({
 					name: indexName,
-					columns: uc.columns.map(colIdx => ({ index: colIdx })),
+					// Carry each column's declared collation so the auto-index — and the
+					// `checkUniqueViaIndex` path it backs — enforces UNIQUE under the column's
+					// collation (e.g. NOCASE) rather than defaulting to BINARY.
+					columns: uc.columns.map(colIdx => ({ index: colIdx, collation: this.tableSchema.columns[colIdx]?.collation })),
 					predicate: uc.predicate,
 				});
 				added = true;
@@ -1136,7 +1139,7 @@ export class MemoryTableManager {
 			// Validate against the live source row: skip stale backing candidates.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every(col => compareSqlValues(newRowData[col], conflictingRow[col]) === 0)) continue;
+			if (!uc.columns.every(col => compareSqlValues(newRowData[col], conflictingRow[col], schema.columns[col].collation) === 0)) continue;
 
 			if (onConflict === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
@@ -1185,7 +1188,7 @@ export class MemoryTableManager {
 			if (predicate && predicate.evaluate(existingRow) !== true) continue;
 
 			const allMatch = uc.columns.every(
-				colIdx => compareSqlValues(newRowData[colIdx], existingRow[colIdx]) === 0
+				colIdx => compareSqlValues(newRowData[colIdx], existingRow[colIdx], schema.columns[colIdx].collation) === 0
 			);
 			if (!allMatch) continue;
 

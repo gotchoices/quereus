@@ -1280,9 +1280,11 @@ describe('row-time covering enforcement', () => {
 		// `lookupCoveringConflicts` uses the full scan, which re-compares with the source
 		// collation. We assert the *candidate generator* (`_lookupCoveringConflicts`, the
 		// surface this ticket changes) still surfaces the conflicting source PK. NOTE: the
-		// end-to-end UNIQUE *enforcement* still nets to BINARY at the downstream validator
-		// (`checkUniqueViaMaterializedView`) — a separate, pre-existing soundness gap tracked
-		// by `unique-constraint-honors-column-collation` — so this checks the generator only.
+		// end-to-end UNIQUE *enforcement* now also honors the column collation at the
+		// downstream validator (`checkUniqueViaMaterializedView` and the auto-index path),
+		// fixed by `unique-constraint-honors-column-collation`; that end-to-end behavior is
+		// covered by `test/logic/102.2-unique-collation.sqllogic`. This case checks the
+		// generator only.
 		db = new Database();
 		await db.exec('create table t (id integer primary key, name text collate NOCASE, unique (name))');
 		await db.exec('create materialized view ix as select name, id from t order by name');

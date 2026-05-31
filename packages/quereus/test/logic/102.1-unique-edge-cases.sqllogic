@@ -2,10 +2,19 @@
 -- UNIQUE constraint scenarios beyond 102-unique-constraints.sqllogic.
 
 -- ===================================
--- 1. UNIQUE with COLLATE NOCASE on TEXT is rejected at DDL
---    Quereus does not support 'nocase' collation on TEXT columns
---    (see AGENTS.md: "COLLATE NOCASE on TEXT isn't supported in
---    UNIQUE / index contexts").
+-- 1. COLLATE with the LOWERCASE spelling `nocase` is rejected at DDL.
+--    This is NOT "UNIQUE doesn't support collation" — it is a collation-name
+--    case-sensitivity quirk: `validateColumnSchema` checks the requested name
+--    against `TEXT_TYPE.supportedCollations = ['BINARY','NOCASE','RTRIM']` with a
+--    case-sensitive `includes`, so lowercase `nocase` fails to match and is
+--    rejected with a message that happens to contain "not supported". The
+--    canonical UPPERCASE `NOCASE` is accepted, and UNIQUE over a `collate NOCASE`
+--    column now enforces case-insensitively (auto-index + every conflict
+--    validator honor the column collation — see
+--    unique-constraint-honors-column-collation, regression-tested in
+--    102.2-unique-collation.sqllogic). Normalizing the lowercase spelling is a
+--    separate, still-open concern, so these blocks keep asserting the current
+--    rejection of the lowercase form.
 -- ===================================
 
 create table t_uci (id integer primary key, email text collate nocase unique);
@@ -13,7 +22,8 @@ create table t_uci (id integer primary key, email text collate nocase unique);
 
 drop table if exists t_uci;
 
--- composite UNIQUE with NOCASE on a TEXT member is rejected the same way
+-- composite UNIQUE with the lowercase `nocase` spelling on a TEXT member is
+-- rejected the same way (same collation-name case-sensitivity quirk)
 create table t_uci2 (
 	id integer primary key,
 	a text collate nocase,

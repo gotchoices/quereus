@@ -1067,6 +1067,7 @@ export class StoreTable extends VirtualTable {
 			? this.coordinator.getPendingOpsForStore(store)
 			: null;
 		const constrainedCols = uc.columns;
+		const schema = this.tableSchema!;
 
 		const matches = (candidate: Row): { pk: SqlValue[]; row: Row } | null => {
 			const pk = this.extractPK(candidate);
@@ -1074,7 +1075,8 @@ export class StoreTable extends VirtualTable {
 				if (this.keysEqual(pk, skip)) return null;
 			}
 			for (const idx of constrainedCols) {
-				if (compareSqlValues(newRow[idx], candidate[idx]) !== 0) return null;
+				// Compare under the column's declared collation (e.g. NOCASE), not BINARY.
+				if (compareSqlValues(newRow[idx], candidate[idx], schema.columns[idx].collation) !== 0) return null;
 			}
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
 			if (predicate && predicate.evaluate(candidate) !== true) return null;
@@ -1125,7 +1127,8 @@ export class StoreTable extends VirtualTable {
 			const liveRow = await this.readLiveRowByPk(cand.pk);
 			if (!liveRow) continue; // stale backing candidate (source row gone)
 			if (selfPks.some(pk => this.keysEqual(pk, cand.pk))) continue;
-			if (uc.columns.some(c => compareSqlValues(newRow[c], liveRow[c]) !== 0)) continue;
+			// Re-validate under each column's declared collation (e.g. NOCASE), not BINARY.
+			if (uc.columns.some(c => compareSqlValues(newRow[c], liveRow[c], this.tableSchema!.columns[c].collation) !== 0)) continue;
 			if (predicate && predicate.evaluate(liveRow) !== true) continue;
 			return { pk: cand.pk, row: liveRow };
 		}

@@ -1082,7 +1082,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 			const matches = constrainedCols.every(idx => {
 				if (newRow[idx] === null || underlyingRow[idx] === null) return false;
-				return compareSqlValues(newRow[idx], underlyingRow[idx]) === 0;
+				// Compare under the column's declared collation (e.g. NOCASE), not BINARY,
+				// so a UNIQUE over a collated column is enforced against committed rows
+				// through the isolation merge path (unique-constraint-honors-column-collation).
+				return compareSqlValues(newRow[idx], underlyingRow[idx], this.tableSchema!.columns[idx].collation) === 0;
 			});
 			if (!matches) continue;
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.

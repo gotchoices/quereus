@@ -307,4 +307,62 @@ describe('StoreTable UNIQUE constraints', () => {
 			expect(deletes.map(d => d.key)).to.deep.equal([[1]]);
 		});
 	});
+
+	// A UNIQUE over a column declared with a non-binary collation must be enforced under
+	// that collation, not BINARY (unique-constraint-honors-column-collation). Exercised on
+	// the direct store module (no isolation overlay) so both StoreTable conflict scanners
+	// are covered: findUniqueConflict (no covering MV) and findUniqueConflictViaCoveringMv
+	// (covering MV present). The isolation-wrapped logic sweep covers the merge path
+	// (isolated-table.findMergedUniqueConflict) separately.
+	describe('collation-aware UNIQUE (honors column collation)', () => {
+		it('NOCASE UNIQUE rejects a case-insensitive duplicate (plain scan path)', async () => {
+			await db.exec(`CREATE TABLE nc (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE, UNIQUE (x)) USING store`);
+			await db.exec(`INSERT INTO nc VALUES (1, 'abc')`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`INSERT INTO nc VALUES (2, 'ABC')`);
+			} catch (e) { err = e as Error; }
+			expect(err, 'a NOCASE-equal duplicate must be rejected, not stored as BINARY-distinct').to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+			expect(await collect(db, `SELECT count(*) AS n FROM nc`)).to.deep.equal([{ n: 1 }]);
+
+			// A value that is NOT NOCASE-equal still inserts (guard against over-matching).
+			await db.exec(`INSERT INTO nc VALUES (3, 'abd')`);
+			expect(await collect(db, `SELECT id, x FROM nc ORDER BY id`)).to.deep.equal([
+				{ id: 1, x: 'abc' }, { id: 3, x: 'abd' },
+			]);
+		});
+
+		it('NOCASE UNIQUE rejects a case-insensitive duplicate through the covering MV path', async () => {
+			await db.exec(`CREATE TABLE ncm (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE, UNIQUE (x)) USING store`);
+			await db.exec(`CREATE MATERIALIZED VIEW ncm_ix AS SELECT x, id FROM ncm ORDER BY x`);
+			await db.exec(`INSERT INTO ncm VALUES (1, 'abc')`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`INSERT INTO ncm VALUES (2, 'ABC')`);
+			} catch (e) { err = e as Error; }
+			expect(err).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+			expect(await collect(db, `SELECT count(*) AS n FROM ncm`)).to.deep.equal([{ n: 1 }]);
+
+			// OR REPLACE through the covering MV evicts the recovered (id=1) source row.
+			await db.exec(`INSERT OR REPLACE INTO ncm VALUES (10, 'ABC')`);
+			expect(await collect(db, `SELECT id, x FROM ncm ORDER BY id`)).to.deep.equal([{ id: 10, x: 'ABC' }]);
+		});
+
+		it('RTRIM UNIQUE rejects a trailing-space duplicate (generality)', async () => {
+			await db.exec(`CREATE TABLE rt (id INTEGER PRIMARY KEY, x TEXT COLLATE RTRIM, UNIQUE (x)) USING store`);
+			await db.exec(`INSERT INTO rt VALUES (1, 'abc')`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`INSERT INTO rt VALUES (2, 'abc   ')`);
+			} catch (e) { err = e as Error; }
+			expect(err).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+			expect(await collect(db, `SELECT count(*) AS n FROM rt`)).to.deep.equal([{ n: 1 }]);
+		});
+	});
 });
