@@ -219,6 +219,50 @@ export type DomainConstraint =
 	};
 
 /**
+ * Backward update-provenance of one output attribute — the derived dual of the
+ * forward FD walk (`docs/view-updateability.md` § The Update Site Model). Each
+ * operator's backward method produces these by *reading* the forward
+ * `PhysicalProperties.fds` it already emitted, never by re-deriving a parallel
+ * walk. The plan-node-threaded generalization of `analysis/update-lineage.ts`'s
+ * `ViewColumnLineage`, extended with the invertible-transform chain, the
+ * outer-join `null-extended` case, and a machine-readable base reference.
+ *
+ * - `base` — traces to a base-table column through a chain of invertible scalar
+ *   transforms. `inverse` (when present) maps a written value back to the base
+ *   column's value; identity (absent) when the projection is a bare column /
+ *   rename. `domain`, when present, is conjoined into the row-identifying
+ *   predicate (sourced from an `inverse` profile's `domain`).
+ * - `computed` — output of a non-invertible expression (or a generated column);
+ *   read-only. Writes are rejected with the `no-inverse` diagnostic.
+ * - `null-extended` — potentially null-extended by an outer join; a write needs
+ *   materialization of the missing side (later phase). `guard` is the join
+ *   predicate, `inner` the un-extended site on the non-preserved base.
+ */
+export type UpdateSite =
+	| {
+			readonly kind: 'base';
+			/** Producing `TableReferenceNode`'s plan-node id (numeric) — the relation discriminator for multi-source bodies. */
+			readonly table: number;
+			readonly baseColumn: string;
+			readonly inverse?: (written: Expression) => Expression;
+			readonly domain?: Expression;
+		}
+	| { readonly kind: 'computed'; readonly expr: Expression }
+	| { readonly kind: 'null-extended'; readonly guard: Expression; readonly inner: UpdateSite };
+
+/**
+ * Per-attribute insert-default provenance — the value used when an `insert`
+ * through the relation omits the column. Sourced from constant-FD selection
+ * predicates (`constant-fd`), declared base-column defaults (`base-default`),
+ * or a `quereus.update.default_for` tag (`tag-default`). The value is symbolic
+ * (literal, parameter, or context binding).
+ */
+export interface AttributeDefault {
+	readonly kind: 'constant-fd' | 'base-default' | 'tag-default';
+	readonly value: Expression;
+}
+
+/**
  * Physical properties that execution nodes can provide or require
  */
 export interface PhysicalProperties {
@@ -277,6 +321,23 @@ export interface PhysicalProperties {
    * surface for the coverage prover (Wave 2) and lens existence anchors (Wave 3).
    */
   inds?: ReadonlyArray<InclusionDependency>;
+
+  /**
+   * Per-output-attribute backward update provenance — the *derived dual* of
+   * `fds`. Populated by the TableReference / Project / Filter / Join backward
+   * methods, each reading this same node's forward `fds` rather than
+   * re-deriving its own. Keyed by `Attribute.id` (matching sibling per-attribute
+   * maps). Consumed by the view-mutation orchestrator; surfaced through
+   * `query_plan()` / EXPLAIN as a bounded `$map` summary. See `UpdateSite`.
+   */
+  updateLineage?: ReadonlyMap<number, UpdateSite>;
+
+  /**
+   * Per-attribute insert-default provenance (constant-FD selection defaults,
+   * declared base defaults, `default_for` tags). Keyed by `Attribute.id`.
+   * Companion to `updateLineage` — what fills an omitted insert column.
+   */
+  attributeDefaults?: ReadonlyMap<number, AttributeDefault>;
 
   /**
    * Attributes the relation is monotonically ordered on. Stronger than `ordering`:

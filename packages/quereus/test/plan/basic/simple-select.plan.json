@@ -41,7 +41,44 @@
                       }
                     ],
                     "idempotent": true,
-                    "readonly": true
+                    "readonly": true,
+                    "updateLineage": {
+                      "$map": [
+                        [
+                          "0",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "id"
+                          }
+                        ],
+                        [
+                          "1",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "name"
+                          }
+                        ],
+                        [
+                          "2",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "age"
+                          }
+                        ],
+                        [
+                          "3",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "dept_id"
+                          }
+                        ]
+                      ],
+                      "size": 4
+                    }
                   }
                 }
               ],
@@ -100,7 +137,44 @@
                     "desc": false
                   }
                 ],
-                "readonly": true
+                "readonly": true,
+                "updateLineage": {
+                  "$map": [
+                    [
+                      "0",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "id"
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "name"
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "age"
+                      }
+                    ],
+                    [
+                      "3",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "dept_id"
+                      }
+                    ]
+                  ],
+                  "size": 4
+                }
               }
             },
             {
@@ -194,7 +268,44 @@
                 "desc": false
               }
             ],
-            "readonly": true
+            "readonly": true,
+            "updateLineage": {
+              "$map": [
+                [
+                  "0",
+                  {
+                    "kind": "base",
+                    "table": 4,
+                    "baseColumn": "id"
+                  }
+                ],
+                [
+                  "1",
+                  {
+                    "kind": "base",
+                    "table": 4,
+                    "baseColumn": "name"
+                  }
+                ],
+                [
+                  "2",
+                  {
+                    "kind": "base",
+                    "table": 4,
+                    "baseColumn": "age"
+                  }
+                ],
+                [
+                  "3",
+                  {
+                    "kind": "base",
+                    "table": 4,
+                    "baseColumn": "dept_id"
+                  }
+                ]
+              ],
+              "size": 4
+            }
           }
         },
         {
@@ -279,7 +390,28 @@
             "desc": false
           }
         ],
-        "readonly": true
+        "readonly": true,
+        "updateLineage": {
+          "$map": [
+            [
+              "0",
+              {
+                "kind": "base",
+                "table": 4,
+                "baseColumn": "id"
+              }
+            ],
+            [
+              "1",
+              {
+                "kind": "base",
+                "table": 4,
+                "baseColumn": "name"
+              }
+            ]
+          ],
+          "size": 2
+        }
       }
     }
   ],

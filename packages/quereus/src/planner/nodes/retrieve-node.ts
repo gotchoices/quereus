@@ -79,6 +79,9 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 			// this the INDs seeded at the table reference would be lost at the module
 			// boundary in every plan that wraps the access path in a Retrieve.
 			inds: src.inds,
+			// Backward update-lineage is part of the bit-for-bit pass-through.
+			updateLineage: src.updateLineage,
+			attributeDefaults: src.attributeDefaults,
 		};
 	}
 

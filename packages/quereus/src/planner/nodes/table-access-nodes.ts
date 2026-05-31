@@ -177,6 +177,12 @@ export class SeqScanNode extends TableAccessNode {
 			// subset of surviving rows still satisfies it — so this is safe across
 			// every access node here.)
 			inds: sourcePhysical?.inds,
+			// Backward update-lineage passes through the module-boundary access node
+			// unchanged (columns and attribute ids are identical to the table
+			// reference) — without this the seeded lineage would be lost the moment
+			// the optimizer wraps the table in an access node.
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 		};
 		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
 		return out;
@@ -259,6 +265,9 @@ export class IndexScanNode extends TableAccessNode {
 			domainConstraints: sourcePhysical?.domainConstraints,
 			// INDs survive the scan (a per-row inclusion claim holds on any subset).
 			inds: sourcePhysical?.inds,
+			// Pass the backward update-lineage through the access boundary unchanged.
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 			...lifted,
 		};
 		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
@@ -392,6 +401,9 @@ export class IndexSeekNode extends TableAccessNode {
 			domainConstraints: sourcePhysical?.domainConstraints,
 			// A row-reducing seek still preserves the per-row inclusion claim.
 			inds: sourcePhysical?.inds,
+			// Pass the backward update-lineage through the access boundary unchanged.
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 			...lifted,
 		} as Partial<PhysicalProperties>;
 		if (this.rangeBoundedOn) base.rangeBoundedOn = this.rangeBoundedOn;

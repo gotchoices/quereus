@@ -9,6 +9,7 @@ import { PredicateCapable, type PredicateSourceCapable } from '../framework/char
 import { createTableInfoFromNode, extractConstraints } from '../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
+import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
 
 /**
  * Represents a filter operation (WHERE clause).
@@ -130,6 +131,16 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			domainConstraints: sourcePhysical?.domainConstraints,
 			// Row removal preserves a per-row inclusion claim, so INDs pass through.
 			inds: sourcePhysical?.inds,
+			// Backward update-lineage: filter preserves columns, so `updateLineage`
+			// passes through; insert defaults gain a `constant-fd` entry for every
+			// column the forward pass pinned constant (read off `constantBindings`,
+			// NOT a re-scan of the predicate AST).
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: deriveFilterAttributeDefaults(
+				sourcePhysical?.attributeDefaults,
+				sourceAttrs,
+				constantBindings,
+			),
 		};
 	}
 

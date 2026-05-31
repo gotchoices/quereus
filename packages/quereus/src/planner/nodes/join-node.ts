@@ -13,6 +13,7 @@ import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
 import { ColumnReferenceNode } from './reference.js';
 import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { deriveJoinUpdateLineage } from '../analysis/update-lineage.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
 
@@ -124,6 +125,18 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			leftType.columns.length, totalCols, result.preservedKeys,
 		);
 
+		// Backward update-lineage: compose per-source lineage along the join FDs
+		// the forward pass computed (output attribute ids are preserved per side,
+		// so the maps merge directly). Outer joins wrap the non-preserved side's
+		// sites `null-extended` under the join predicate — annotation only; write
+		// materialization is a later phase.
+		const { updateLineage, attributeDefaults } = deriveJoinUpdateLineage(
+			this.joinType,
+			leftPhys?.updateLineage, rightPhys?.updateLineage,
+			leftPhys?.attributeDefaults, rightPhys?.attributeDefaults,
+			this.condition?.expression,
+		);
+
 		return {
 			estimatedRows: result.estimatedRows,
 			monotonicOn: propagateJoinMonotonicOn(this.joinType, leftPhys, rightPhys, attrIdPairs),
@@ -132,6 +145,8 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			constantBindings: fdResult.constantBindings,
 			domainConstraints: fdResult.domainConstraints,
 			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftType.columns.length),
+			updateLineage,
+			attributeDefaults,
 		};
 	}
 

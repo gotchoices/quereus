@@ -1,5 +1,5 @@
 import type { BaseType, ScalarType, RelationType } from '../../common/datatype.js';
-import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency } from './plan-node.js';
+import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency, type UpdateSite, type AttributeDefault } from './plan-node.js';
 import { addFd, closeConstantBindingsOverEcs, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
 import { seedTableForeignKeyInds } from '../util/ind-utils.js';
 import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
@@ -208,6 +208,29 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		if (constantBindings.length > 0) out.constantBindings = constantBindings;
 		if (domainConstraints.length > 0) out.domainConstraints = domainConstraints;
 		if (inds.length > 0) out.inds = inds;
+
+		// Backward update-lineage seed (the derived dual of the forward FDs above):
+		// every output attribute traces to its own base column; generated columns
+		// are read-only at every level (`computed`); declared column defaults seed
+		// `attributeDefaults`. `table` is this node's numeric plan-node id — the
+		// relation discriminator the orchestrator uses across multi-source bodies
+		// (a self-join produces two TableReferenceNodes with distinct ids).
+		const attrs = this.getAttributes();
+		const tableId = Number(this.id);
+		const updateLineage = new Map<number, UpdateSite>();
+		const attributeDefaults = new Map<number, AttributeDefault>();
+		this.tableSchema.columns.forEach((col, i) => {
+			const attr = attrs[i];
+			if (!attr) return;
+			if (col.generated) {
+				updateLineage.set(attr.id, { kind: 'computed', expr: col.generatedExpr ?? { type: 'column', name: col.name } });
+			} else {
+				updateLineage.set(attr.id, { kind: 'base', table: tableId, baseColumn: col.name });
+				if (col.defaultValue) attributeDefaults.set(attr.id, { kind: 'base-default', value: col.defaultValue });
+			}
+		});
+		if (updateLineage.size > 0) out.updateLineage = updateLineage;
+		if (attributeDefaults.size > 0) out.attributeDefaults = attributeDefaults;
 		// Concurrency safety: read-only subtree over a module that tolerates
 		// concurrent calls. The base PlanNode `physical` getter ANDs children's
 		// `concurrencySafe` automatically; here we set the leaf value.

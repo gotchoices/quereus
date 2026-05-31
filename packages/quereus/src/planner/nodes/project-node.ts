@@ -13,6 +13,7 @@ import { StatusCode } from '../../common/types.js';
 import { ProjectionCapable } from '../framework/characteristics.js';
 import type { PhysicalProperties } from './plan-node.js';
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
+import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
 
 export interface Projection {
 	node: ScalarPlanNode;
@@ -255,6 +256,17 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		// only when every witnessing column is still present in the output.
 		const projectedInds = projectInds(sourcePhysical?.inds ?? [], map);
 
+		// Backward update-lineage: thread each output column's UpdateSite from the
+		// child along the invertible-transform chain (`scalar-invertibility`),
+		// reading the child's lineage rather than re-deriving — the derived dual of
+		// the forward key/FD projection above.
+		const { updateLineage, attributeDefaults } = deriveProjectUpdateLineage(
+			this.projections,
+			this.getAttributes(),
+			sourcePhysical?.updateLineage,
+			sourcePhysical?.attributeDefaults,
+		);
+
 		return {
 			estimatedRows: this.source.estimatedRows,
 			ordering: projectOrdering(sourcePhysical?.ordering, map),
@@ -264,6 +276,8 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			constantBindings: projectedBindings.length > 0 ? projectedBindings : undefined,
 			domainConstraints: projectedDomains.length > 0 ? projectedDomains : undefined,
 			inds: projectedInds.length > 0 ? projectedInds : undefined,
+			updateLineage,
+			attributeDefaults,
 		};
 	}
 

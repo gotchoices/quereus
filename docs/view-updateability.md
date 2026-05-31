@@ -21,15 +21,30 @@ view-specific runtime. The shipped lineage model lives in
 `planner/analysis/update-lineage.ts` and `planner/analysis/scalar-invertibility.ts`.
 
 The plan-node-threaded `updateLineage` / `AttributeDefault` surface on
-`PhysicalProperties` (§ Implementation Surface) and a `ViewMutationNode`
-orchestrator over reused `DmlExecutorNode`s are the **multi-source Phase-2
-foundation** and are intentionally not wired yet — for the single-source case the
-AST rewrite is complete and an orchestrator over one base op adds no behavior. The
-retire-or-keep decision for this substrate is settled under
-`view-mutation-plan-node-substrate`: the AST rewrite is **retired** in favor of the
-substrate, which becomes the single propagation path for all view mutations (its
-single-source case is the trivial one-base-op path); `building/view-mutation.ts` is
-removed once parity is proven.
+`PhysicalProperties` (§ Implementation Surface) **has landed** as the *annotation
+layer* — `view-mutation-physical-lineage` threads it as the derived dual of each
+operator's forward FD walk (TableReference / Project / Filter / Join, plus
+pass-through on the access / Retrieve / Alias boundary nodes), surfaces it through
+`query_plan()`, and exposes the predicate-honest complement (`viewComplement`).
+It is consumed by **nothing yet**: the `ViewMutationNode` orchestrator over reused
+`DmlExecutorNode`s that *walks* this surface to emit base ops is the remaining
+**multi-source Phase-2** piece and is intentionally not wired — for the
+single-source case the AST rewrite is complete and an orchestrator over one base
+op adds no behavior. The retire-or-keep decision for this substrate is settled
+under `view-mutation-plan-node-substrate`: the AST rewrite is **retired** in favor
+of the substrate, which becomes the single propagation path for all view
+mutations (its single-source case is the trivial one-base-op path);
+`building/view-mutation.ts` is removed once parity is proven.
+
+> **Surface authority.** `updateLineage` is computed in `computePhysical`, so it
+> is available on the **logical** operator tree (Project / Filter / Join /
+> TableReference) the substrate walks. It survives optimization through the
+> pass-through boundary nodes (access scans, Retrieve, Alias) but **not** through
+> operators that rewrite structure (physical `HashJoin` / `MergeJoin`, aggregates,
+> set-ops, Sort/Limit/Distinct), which do not yet thread it. EXPLAIN /
+> `query_plan()` therefore shows full lineage for single-source projection-filter
+> shapes and on every TableReference; a join's optimized top node shows degraded
+> (`computed`) lineage. The logical operator tree is authoritative.
 
 **Write-through materialized views** are **delivered** for the passthrough /
 projection-filter shape (`materialized-view-dml-write-through`): DML targeting an MV
@@ -426,8 +441,19 @@ Diagnostics include a suggestion when one applies — for instance, `no-default`
 
 ## Implementation Surface
 
-- `src/planner/nodes/plan-node.ts` — `updateLineage: ReadonlyMap<AttributeId, UpdateSite>` on every relational `PlanNode`.
-- `src/planner/analysis/update-lineage.ts` — single-pass lineage computation; runs in the physical-property phase alongside FD propagation.
+- `src/planner/nodes/plan-node.ts` — `updateLineage?: ReadonlyMap<AttributeId, UpdateSite>` and
+  `attributeDefaults?: ReadonlyMap<AttributeId, AttributeDefault>` on `PhysicalProperties` (**landed**).
+  Threaded as `computePhysical` overrides on TableReference / Project / Filter / Join, and passed
+  through the access / Retrieve / Alias boundary nodes.
+- `src/planner/analysis/update-lineage.ts` — the backward-walk helpers
+  (`deriveProjectUpdateLineage` / `deriveFilterAttributeDefaults` / `deriveJoinUpdateLineage`), each
+  *reading* the node's already-emitted forward `fds` / `constantBindings`; plus the AST-level Phase-1
+  `deriveViewColumns` and its plan-node reader `viewColumnsFromUpdateLineage`. Runs in the
+  physical-property phase alongside FD propagation.
+- `src/planner/analysis/scalar-invertibility.ts` — the law-gated `InvertibilityProfile` registry
+  (`classifyInvertibility`) and the recursive `traceInvertibleColumn` that composes the inverse chain.
+- `src/planner/analysis/view-complement.ts` — `viewComplement(node)` / `complementOf`, the
+  predicate-honest complement derived off the backward walk (for the lens prover).
 - `src/planner/mutation/propagate.ts` — visitor that walks a relation tree with a `MutationRequest` and emits `BaseOp[]`. One method per operator type, mirroring `runtime/emit/`.
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
 - `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order and accumulates `returning` rows.
@@ -552,8 +578,10 @@ projection-and-filter case the complement is:
 expressed in the same FD/predicate vocabulary as the forward walk. With the complement
 in hand the lens prover's *Round-trip (lens laws)* check becomes **computed**, not an
 enumerated checklist: **GetPut** holds iff `put` leaves the complement fixed, and
-**PutGet** holds iff `get ∘ put` reproduces the written view image. The substrate
-exposes this object; `3-lens-prover-and-constraint-attachment` consumes it.
+**PutGet** holds iff `get ∘ put` reproduces the written view image. The annotation
+layer exposes this object (`analysis/view-complement.ts` — `viewComplement(node)` /
+`complementOf`, **landed**); the lens prover (`schema/lens-prover.ts`,
+`proveRoundTrip` seam) is the consumer that rides onto it.
 
 ## Background
 

@@ -9,9 +9,10 @@ import { Parser } from '../src/parser/parser.js';
 import { QuereusError } from '../src/common/errors.js';
 import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
 import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner/util/fd-utils.js';
-import { deriveViewColumns } from '../src/planner/analysis/update-lineage.js';
+import { deriveViewColumns, viewColumnsFromUpdateLineage } from '../src/planner/analysis/update-lineage.js';
+import { viewComplement } from '../src/planner/analysis/view-complement.js';
 import type * as AST from '../src/parser/ast.js';
-import { type PlanNode, type RelationalPlanNode, isRelationalNode } from '../src/planner/nodes/plan-node.js';
+import { type PlanNode, type RelationalPlanNode, type UpdateSite, isRelationalNode } from '../src/planner/nodes/plan-node.js';
 import { EmissionContext } from '../src/runtime/emission-context.js';
 import { emitPlanNode } from '../src/runtime/emitters.js';
 import { Scheduler } from '../src/runtime/scheduler.js';
@@ -2282,6 +2283,159 @@ describe('Property-Based Tests', () => {
 					assertLineageAgreement(body, model, basePk, filterConstBase, keys, idx => isUnique(idx, root));
 				},
 			), { numRuns: 50 });
+		});
+
+		// ----- Law 4: static forward/backward lineage agreement over PLANNED bodies -----
+		// The plan-node-threaded dual of Law 3: instead of the AST `deriveViewColumns`
+		// model, this reads the `PhysicalProperties.updateLineage` the four operators
+		// (TableReference / Project / Filter / Join) now thread as the derived dual of
+		// their forward FD walk, and cross-checks it against `keysOf`. It is *static*
+		// (plan-only, no mutation execution), so it covers the inner join — whose
+		// dynamic multi-source propagation lands with the orchestrator. Reads the
+		// LOGICAL plan (`_buildPlan`), where the clean operator tree sits directly atop
+		// itself; the optimizer rewrites Join → physical HashJoin and inserts access /
+		// alias nodes, which is not the operator structure the orchestrator walks.
+
+		/** Plan the body and return its top LOGICAL relational node (pre-optimization). */
+		function planLogicalBody(body: string): RelationalPlanNode {
+			const ast = new Parser().parse(body) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			return (plan as unknown as { getRelations(): readonly RelationalPlanNode[] }).getRelations()[0];
+		}
+
+		/** A site is base-writable iff it bottoms out at a base column (through outer-join null-extension). */
+		function isBaseWritableSite(site: UpdateSite | undefined): boolean {
+			if (!site) return false;
+			if (site.kind === 'base') return true;
+			if (site.kind === 'null-extended') return isBaseWritableSite(site.inner);
+			return false;
+		}
+
+		/**
+		 * Pure core: the plan `updateLineage` agrees with the forward `keysOf`.
+		 *   (totality) every output column carries an `updateLineage` entry;
+		 *   (A)        every column in a forward key is base-writable — a computed
+		 *              column in a forward key would have no backward identifying
+		 *              predicate.
+		 */
+		function assertPlanLineageAgreement(
+			label: string,
+			attrs: readonly { readonly id: number; readonly name: string }[],
+			keys: readonly (readonly number[])[],
+			lineage: ReadonlyMap<number, UpdateSite> | undefined,
+		): void {
+			for (const attr of attrs) {
+				if (!lineage || !lineage.has(attr.id)) {
+					throw new Error(`plan lineage disagreement on ${label}: output column '${attr.name}' has no updateLineage entry`);
+				}
+			}
+			for (const key of keys) {
+				for (const colIdx of key) {
+					const attr = attrs[colIdx];
+					if (!attr) continue;
+					if (!isBaseWritableSite(lineage?.get(attr.id))) {
+						throw new Error(`plan lineage disagreement on ${label}: forward key [${key}] includes non-base column '${attr.name}'`);
+					}
+				}
+			}
+		}
+
+		// negative self-test: the plan-lineage core reds on injected violations.
+		it('the plan-lineage law core fails loudly on injected violations', () => {
+			const baseId: UpdateSite = { kind: 'base', table: 1, baseColumn: 'id' };
+			const baseA: UpdateSite = { kind: 'base', table: 1, baseColumn: 'a' };
+			const computed: UpdateSite = { kind: 'computed', expr: { type: 'column', name: 'bp' } };
+
+			// (A) a forward key claims a computed column.
+			expect(() => assertPlanLineageAgreement('injected-computed-key',
+				[{ id: 10, name: 'id' }, { id: 11, name: 'bp' }],
+				[[1]],
+				new Map<number, UpdateSite>([[10, baseId], [11, computed]]),
+			)).to.throw(/plan lineage disagreement/);
+
+			// (totality) a column with no lineage entry.
+			expect(() => assertPlanLineageAgreement('injected-missing',
+				[{ id: 10, name: 'id' }], [], new Map(),
+			)).to.throw(/no updateLineage entry/);
+
+			// honest case does not throw.
+			expect(() => assertPlanLineageAgreement('honest',
+				[{ id: 10, name: 'id' }, { id: 11, name: 'a' }],
+				[[0]],
+				new Map<number, UpdateSite>([[10, baseId], [11, baseA]]),
+			)).to.not.throw();
+		});
+
+		it('forward/backward plan lineage agreement holds over planned bodies (incl. inner join)', async () => {
+			await createBase();
+
+			// Single-source zoo, optionally equality-filtered.
+			for (const shape of SHAPES) {
+				for (const k of [undefined, 2] as const) {
+					const body = buildBody(shape, k);
+					const node = planLogicalBody(body);
+					const attrs = node.getAttributes?.() ?? [];
+					assertPlanLineageAgreement(`${shape.label} k=${String(k)}`, attrs, keysOf(node), node.physical.updateLineage);
+				}
+			}
+
+			// Key-preserving (FK-style) inner join: j1.id is a key of the join (j2.id
+			// is unique and equi-bound to j1.t2id), and each output column traces to a
+			// base column on its owning side.
+			await db.exec('create table tj2 (id integer primary key, c integer null) using memory');
+			await db.exec('create table tj1 (id integer primary key, t2id integer null, a integer null) using memory');
+			const joinBody = 'select j1.id as id, j1.a as a, j2.c as c from tj1 j1 join tj2 j2 on j2.id = j1.t2id';
+			const jnode = planLogicalBody(joinBody);
+			const jattrs = jnode.getAttributes?.() ?? [];
+			assertPlanLineageAgreement('inner-join', jattrs, keysOf(jnode), jnode.physical.updateLineage);
+			const jlineage = jnode.physical.updateLineage;
+			expect(jattrs.length).to.equal(3);
+			expect(jattrs.every(a => jlineage?.get(a.id)?.kind === 'base'),
+				'every inner-join output column traces to a base column').to.equal(true);
+		});
+
+		// ----- deriveViewColumns ⇄ updateLineage parity (the reader-over-lineage check) -----
+		it('viewColumnsFromUpdateLineage agrees with deriveViewColumns on the writable set', async () => {
+			await createBase();
+			const baseTable = db.schemaManager.getTable('main', 't')!;
+			for (const shape of SHAPES) {
+				for (const k of [undefined, 2] as const) {
+					const body = buildBody(shape, k);
+					const sel = new Parser().parse(body) as unknown as AST.SelectStmt;
+					const astCols = deriveViewColumns(sel, baseTable);
+					const node = planLogicalBody(body);
+					const planCols = viewColumnsFromUpdateLineage(node.getAttributes?.() ?? [], node.physical.updateLineage);
+					expect(planCols.length).to.equal(astCols.length, `column count for "${body}"`);
+					astCols.forEach((ac, i) => {
+						const pc = planCols[i];
+						expect(pc.name.toLowerCase()).to.equal(ac.name.toLowerCase(), `name[${i}] for "${body}"`);
+						expect(pc.lineage.kind).to.equal(ac.lineage.kind, `kind[${i}] (${pc.name}) for "${body}"`);
+						if (ac.lineage.kind === 'base' && pc.lineage.kind === 'base') {
+							expect(pc.lineage.baseColumnName.toLowerCase())
+								.to.equal(ac.lineage.baseColumnName.toLowerCase(), `base col[${i}] for "${body}"`);
+						}
+					});
+				}
+			}
+		});
+
+		// ----- predicate-honest complement -----
+		it('viewComplement exposes the projected-away base columns and the σ residual', async () => {
+			await createBase();
+			// Drops `b`, filters on `a`: the complement is the hidden column `b` plus
+			// the σ residual `a = 2`.
+			const node = planLogicalBody('select id, a from t where a = 2');
+			const comp = viewComplement(node);
+			const hidden = comp.hiddenColumns.map(h => h.column.toLowerCase());
+			expect(hidden).to.include('b');
+			expect(hidden).to.not.include('id');
+			expect(hidden).to.not.include('a');
+			expect(comp.residualPredicate, 'σ residual present').to.not.equal(undefined);
+
+			// A bare `select *` with no filter has an empty complement (nothing held fixed).
+			const full = viewComplement(planLogicalBody('select * from t'));
+			expect(full.hiddenColumns.length).to.equal(0);
+			expect(full.residualPredicate).to.equal(undefined);
 		});
 	});
 
