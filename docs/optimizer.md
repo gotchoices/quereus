@@ -1421,7 +1421,7 @@ interface InclusionDependency {
 type IndTarget =
   // child.cols ⊆ table.targetCols, where targetCols is a key of that table. The FK-seeded form.
   | { readonly kind: 'table'; readonly schema: string; readonly table: string; readonly targetCols: readonly number[] }
-  // Reserved for the lens existence-anchor injection; no producer mints it yet.
+  // Minted by the lens existence-anchor injection (lens-multi-source-ind-injection).
   | { readonly kind: 'relation'; readonly relationId: string; readonly targetCols: readonly number[] };
 ```
 
@@ -1670,7 +1670,20 @@ The anti-join-to-empty rewrite emits `EmptyRelationNode` carrying L's attribute 
 > *declaration* directly via the on-demand `util/ind-utils.ts` helpers (they need the
 > nullability split and positional composite pairing a coarse `child ⊆ parent` fact does
 > not carry). No consumer reads `inds` yet — Wave 1 is plumbing + a soundness harness; the
-> coverage prover (Wave 2) and lens existence anchors (Wave 3) are the first readers.
+> coverage prover (Wave 2) reads the FK-seeded `kind:'table'` INDs; the lens
+> existence-anchor injection (Wave 3, `lens-multi-source-ind-injection`) is the first
+> `kind:'relation'` producer. For a primary-storage mapping advertisement, the lens
+> compiler (`computeExistenceAnchorInds` in `schema/lens-compiler.ts`) mints one IND
+> per **mandatory**, non-anchor, non-EAV member — `cols` = the member's shared-key
+> indices, `target = { kind:'relation', relationId: <anchor>, targetCols }`,
+> `nullRejecting:false` (total existence). Optional members (outer-joined), EAV pivots
+> (never inner-joined), and the empty-key singleton inject nothing — any would
+> over-claim. The surrogate join carries no declared SQL FK, so `seedTableForeignKeyInds`
+> is blind to it; the fact is recorded on `LensSlot.injectedInds` and read by the lens
+> prover off the slot, **not** seeded at the member scan (the body is planned before the
+> slot is committed, so a scan-time seed would never reach the prover). The trade-off:
+> the relation-IND is visible only to the prover (its sole intended consumer), not the
+> general optimizer.
 
 ### Fan-out lookup join (FK→PK + 1:n cross)
 

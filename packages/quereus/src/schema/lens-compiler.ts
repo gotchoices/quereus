@@ -16,6 +16,8 @@ import { applyAckGovernance, resolveEscalationPolicy, type AcknowledgedAdvisory 
 import { createLogger } from '../common/logger.js';
 import type { MappingAdvertisement, DecompositionMember, StorageShape } from '../vtab/mapping-advertisement.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
+import type { InclusionDependency } from '../planner/nodes/plan-node.js';
+import { addInd, MAX_INDS_PER_NODE } from '../planner/util/fd-utils.js';
 
 const log = createLogger('schema:lens-compiler');
 
@@ -149,6 +151,16 @@ export function deployLogicalSchema(
 		// Annotate provenance with advertisement-backed member info (introspection).
 		if (advertisement) annotateProvenanceWithAdvertisement(provenance, advertisement);
 
+		// Inject the existence-anchor IND surface from a primary-storage
+		// advertisement (lens-multi-source-ind-injection): one relation-IND per
+		// mandatory non-anchor member, threaded to the prover via the slot so the
+		// mandatory inner-joins are provably row-loss-free and the put fan-out is
+		// sound against a derived existence fact. See docs/lens.md § The module
+		// mapping advertisement and docs/optimizer.md § Inclusion Dependency Tracking.
+		const injectedInds = advertisement
+			? computeExistenceAnchorInds(advertisement, basis, db)
+			: [];
+
 		const slot: LensSlot = {
 			logicalTable,
 			defaultBasis: { schemaName: basis.schemaName },
@@ -159,6 +171,7 @@ export function deployLogicalSchema(
 			attachedConstraints: buildLogicalConstraints(logicalTable),
 			advertisement,
 			auxiliaryAccess,
+			injectedInds: injectedInds.length > 0 ? injectedInds : undefined,
 		};
 
 		// PoC: validate the reserved `quereus.*` tag namespace shape + site on the
@@ -804,6 +817,93 @@ function compileDecompositionBody(
 	}
 
 	return { type: 'select', columns, from: [from] };
+}
+
+/**
+ * Computes the existence-anchor inclusion dependencies for a decomposition
+ * (`lens-multi-source-ind-injection`, docs/lens.md § The module mapping
+ * advertisement). For each **mandatory**, non-anchor, non-EAV member, injects one
+ * IND asserting the member's shared-key tuple is included in the existence
+ * anchor's key — the propagated fact that lets the prover discharge the no-row-loss
+ * / put-soundness obligation against a threaded existence fact rather than
+ * re-deriving decomposition structure. The surrogate join carries no declared SQL
+ * FK, so `seedTableForeignKeyInds` / `lookupCoveringFK` are structurally blind to
+ * it; this is the `IndTarget.kind:'relation'` producer reserved by Wave 1.
+ *
+ * Soundness (over-claim is unsound — Wave 1's § Enforcement readiness):
+ * - **mandatory only** — an optional member is outer-joined; its absence is
+ *   exactly what the outer join preserves, so an IND would over-claim.
+ * - **total only** (`nullRejecting:false`) — a mandatory member's existence is
+ *   total: every logical row has it.
+ * - **EAV pivots excluded** — they are projected as correlated subqueries, never
+ *   inner-joined, so there is no row-loss obligation to discharge.
+ * - **empty key → none** — a singleton (`primary key ()`) has no witnessing key
+ *   tuple; existence is the anchor's own 0-or-1-row property.
+ *
+ * `cols` are the member's shared-key column indices on its basis relation (= the
+ * member scan's output indices, 1:1); `target.targetCols` the anchor's key column
+ * indices on the anchor's basis relation; `relationId` is the anchor (`=
+ * advertisement.id = StorageShape.anchorRelationId`, the resolver-validated
+ * identity). Member/anchor key columns pair positionally, matching the
+ * get-synthesis equi-join. Uses `addInd` + `MAX_INDS_PER_NODE` for dedup/cap
+ * consistency with the Wave-1 FK seeding.
+ */
+function computeExistenceAnchorInds(
+	advertisement: MappingAdvertisement,
+	basis: { schema: Schema; schemaName: string },
+	db: Database,
+): InclusionDependency[] {
+	const storage = advertisement.storage;
+	if (!storage) return [];
+
+	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
+	if (!anchor) return []; // validated at resolution; defensive
+	const anchorTable = resolveBasisRelation(db, anchor, basis);
+	if (!anchorTable) return []; // validated at resolution; defensive
+	const anchorKeyIdx = mapKeyColumnsToIndices(
+		storage.sharedKey.keyColumnsByRelation.get(anchor.relationId) ?? [],
+		anchorTable,
+	);
+	// Empty anchor key (singleton / `primary key ()`): no witnessing tuple to thread.
+	if (!anchorKeyIdx || anchorKeyIdx.length === 0) return [];
+
+	let inds: InclusionDependency[] = [];
+	for (const member of storage.members) {
+		if (member.relationId === anchor.relationId) continue;
+		if (member.presence !== 'mandatory') continue; // optional → outer-joined → no IND (over-claim guard)
+		if (member.attributePivot) continue; // EAV pivot → projected as subquery, never inner-joined
+		const memberTable = resolveBasisRelation(db, member, basis);
+		if (!memberTable) continue; // validated at resolution; defensive
+		const memberKeyIdx = mapKeyColumnsToIndices(
+			storage.sharedKey.keyColumnsByRelation.get(member.relationId) ?? [],
+			memberTable,
+		);
+		if (!memberKeyIdx) continue;
+		// Pair positionally up to the shorter list (matching the get-synthesis equi-join).
+		const n = Math.min(memberKeyIdx.length, anchorKeyIdx.length);
+		if (n === 0) continue; // member has no key tuple to witness inclusion
+		inds = addInd(inds, {
+			cols: memberKeyIdx.slice(0, n),
+			target: { kind: 'relation', relationId: anchor.relationId, targetCols: anchorKeyIdx.slice(0, n) },
+			nullRejecting: false,
+		}, { cap: MAX_INDS_PER_NODE });
+	}
+	return inds;
+}
+
+/**
+ * Maps shared-key column names to their indices on `table`, preserving order.
+ * Returns undefined if any column is missing — the advertisement validator
+ * already guarantees existence, so this is a defensive guard.
+ */
+function mapKeyColumnsToIndices(keys: readonly string[], table: TableSchema): number[] | undefined {
+	const idx: number[] = [];
+	for (const k of keys) {
+		const i = table.columnIndexMap.get(k.toLowerCase());
+		if (i === undefined) return undefined;
+		idx.push(i);
+	}
+	return idx;
 }
 
 /** A FROM `table` source for one decomposition member, aliased by its relationId. */

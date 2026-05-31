@@ -8,6 +8,7 @@ import type {
 } from './table.js';
 import type { MappingAdvertisement } from '../vtab/mapping-advertisement.js';
 import type { ConstraintObligation } from './lens-prover.js';
+import type { InclusionDependency } from '../planner/nodes/plan-node.js';
 
 /**
  * Lens layer — per-logical-table mapping slots.
@@ -137,6 +138,20 @@ export interface LensSlot {
 	 * deferred (backlog `lens-access-shape-path-selection`).
 	 */
 	auxiliaryAccess?: ReadonlyArray<MappingAdvertisement>;
+	/**
+	 * Existence-anchor inclusion dependencies injected from a primary-storage
+	 * advertisement (`lens-multi-source-ind-injection`): one IND per mandatory,
+	 * non-anchor, non-EAV decomposition member, asserting the member's shared-key
+	 * tuple is included in the existence anchor's key (`IndTarget.kind:'relation'`,
+	 * `relationId === advertisement.id === StorageShape.anchorRelationId`). Threads
+	 * the mandatory-existence fact to the prover via the slot rather than seeding it
+	 * at the member scan (which would not reach the prover — the body is planned
+	 * before the slot is committed). See docs/lens.md § The module mapping
+	 * advertisement and docs/optimizer.md § Inclusion Dependency Tracking (Wave 3).
+	 * Absent when no advertisement backs the table, or the decomposition has only
+	 * optional members / an empty (singleton) key.
+	 */
+	readonly injectedInds?: ReadonlyArray<InclusionDependency>;
 }
 
 /**

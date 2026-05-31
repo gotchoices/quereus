@@ -24,6 +24,8 @@ import type {
 	MappingAdvertisement,
 	LogicalColumnMapping,
 } from '../src/vtab/mapping-advertisement.js';
+import type { LensSlot } from '../src/schema/lens.js';
+import type { InclusionDependency } from '../src/planner/nodes/plan-node.js';
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
 	const out: Array<Record<string, unknown>> = [];
@@ -836,6 +838,200 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			expect(await rows(db, 'select * from x.Car where maxSpeed = 180 order by id')).to.deep.equal([
 				{ id: 1, make: 'Honda', maxSpeed: 180 },
 			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)', () => {
+	/** Narrows a relation-target IND, failing the test if it is anything else. */
+	function relTarget(i: InclusionDependency): { relationId: string; targetCols: readonly number[] } {
+		expect(i.target.kind, 'expected a kind:relation IND target').to.equal('relation');
+		const t = i.target as Extract<InclusionDependency['target'], { kind: 'relation' }>;
+		return { relationId: t.relationId, targetCols: t.targetCols };
+	}
+
+	/**
+	 * A 2-member columnar Car split — Car_core (anchor) + Car_perf — with the perf
+	 * member's presence parameterized, over basis `main`. Logical-tuple key on `id`.
+	 */
+	function carAd(perfPresence: 'mandatory' | 'optional'): MappingAdvertisement {
+		return {
+			id: 'Car_core',
+			logicalTable: 'Car',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'Car_core',
+				members: [
+					{ relationId: 'Car_core', relation: { schema: 'main', table: 'Car_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('make', 'make')] },
+					{ relationId: 'Car_perf', relation: { schema: 'main', table: 'Car_perf' }, presence: perfPresence, columns: [colMap('maxSpeed', 'speed')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Car_core', ['id']], ['Car_perf', ['id']]) },
+			},
+		};
+	}
+
+	/** Deploys a Car decomposition over the standard Car_core/Car_perf basis and returns the slot. */
+	async function deployCar(db: Database, ad: MappingAdvertisement): Promise<LensSlot> {
+		const mod = new AdvertisingModule();
+		mod.ads = [ad];
+		db.registerModule('admod', mod);
+		await db.exec('create table Car_core (id integer primary key, make text) using admod');
+		await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
+		await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+		await db.exec('apply schema x');
+		return db.schemaManager.getSchema('x')!.getLensSlot('Car')!;
+	}
+
+	it('injects one existence-anchor IND per mandatory member (cols = member key, target = anchor, total)', async () => {
+		const db = new Database();
+		try {
+			const slot = await deployCar(db, carAd('mandatory'));
+			const inds = slot.injectedInds ?? [];
+			expect(inds, 'one IND for the single mandatory non-anchor member').to.have.length(1);
+			const ind = inds[0];
+			// `cols` are Car_perf's key column indices on its own basis relation (id @ 0).
+			expect(ind.cols).to.deep.equal([0]);
+			// Total existence — a mandatory member backs every logical row.
+			expect(ind.nullRejecting).to.equal(false);
+			// Target is the anchor relation, keyed by its key column indices (id @ 0).
+			const t = relTarget(ind);
+			expect(t.relationId).to.equal('Car_core');
+			expect(t.targetCols).to.deep.equal([0]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the injected relationId equals advertisement.id === storage.anchorRelationId (anchor contract)', async () => {
+		const db = new Database();
+		try {
+			const slot = await deployCar(db, carAd('mandatory'));
+			const ad = slot.advertisement!;
+			const t = relTarget((slot.injectedInds ?? [])[0]);
+			// The resolver validates id === anchorRelationId; the IND must agree with both
+			// so the injected fact and the get-synthesis join name the same anchor.
+			expect(ad.id).to.equal(ad.storage!.anchorRelationId);
+			expect(t.relationId).to.equal(ad.id);
+			expect(t.relationId).to.equal(ad.storage!.anchorRelationId);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an optional member injects no IND (over-claim guard — its absence is what the outer join preserves)', async () => {
+		const db = new Database();
+		try {
+			const slot = await deployCar(db, carAd('optional'));
+			expect(slot.injectedInds ?? [], 'optional member ⇒ no relation-IND').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a singleton (primary key ()) decomposition injects no IND (empty key — no witnessing tuple)', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Cfg_exists',
+				logicalTable: 'Config',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Cfg_exists',
+					members: [
+						{ relationId: 'Cfg_exists', relation: { schema: 'main', table: 'Cfg_exists' }, presence: 'mandatory', columns: [] },
+						// A *mandatory* value member with an empty shared key: even so, the empty
+						// key means there is no tuple to thread, so no IND is injected.
+						{ relationId: 'Cfg_kv', relation: { schema: 'main', table: 'Cfg_kv' }, presence: 'mandatory', columns: [colMap('theme', 'theme'), colMap('lang', 'lang')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Cfg_exists', []], ['Cfg_kv', []]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Cfg_exists (tag integer primary key) using admod');
+			await db.exec('create table Cfg_kv (theme text, lang text, primary key ()) using admod');
+			await db.exec('declare logical schema x { table Config { theme text, lang text, primary key () } }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Config')!;
+			expect(slot.injectedInds ?? [], 'empty (singleton) key ⇒ no relation-IND').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a surrogate split injects per-member surrogate columns (cols/targetCols index each relation, spelled differently)', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Doc_core',
+				logicalTable: 'Doc',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Doc_core',
+					members: [
+						{ relationId: 'Doc_core', relation: { schema: 'main', table: 'Doc_core' }, presence: 'mandatory', columns: [colMap('docKey', 'doc_key'), colMap('title', 'title')] },
+						{ relationId: 'Doc_body', relation: { schema: 'main', table: 'Doc_body' }, presence: 'mandatory', columns: [colMap('body', 'body')] },
+					],
+					sharedKey: {
+						kind: 'surrogate',
+						keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']]),
+						generator: { strategy: 'integer-auto', cadence: 'per-row' },
+					},
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Doc_core (sid integer primary key, doc_key text, title text) using admod');
+			await db.exec('create table Doc_body (doc_sid integer primary key, body text) using admod');
+			await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Doc')!;
+			const inds = slot.injectedInds ?? [];
+			expect(inds).to.have.length(1);
+			// cols index Doc_body (doc_sid @ 0); targetCols index Doc_core (sid @ 0).
+			expect(inds[0].cols).to.deep.equal([0]);
+			const t = relTarget(inds[0]);
+			expect(t.relationId).to.equal('Doc_core');
+			expect(t.targetCols).to.deep.equal([0]);
+			expect(inds[0].nullRejecting).to.equal(false);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('injects one IND per mandatory member when several are present (3-member split)', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Car_core',
+				logicalTable: 'Car',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Car_core',
+					members: [
+						{ relationId: 'Car_core', relation: { schema: 'main', table: 'Car_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('make', 'make')] },
+						{ relationId: 'Car_perf', relation: { schema: 'main', table: 'Car_perf' }, presence: 'mandatory', columns: [colMap('maxSpeed', 'speed')] },
+						{ relationId: 'Car_trim', relation: { schema: 'main', table: 'Car_trim' }, presence: 'optional', columns: [colMap('trim', 'trim')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Car_core', ['id']], ['Car_perf', ['id']], ['Car_trim', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Car_core (id integer primary key, make text) using admod');
+			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
+			await db.exec('create table Car_trim (id integer primary key, trim text) using admod');
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer, trim text } }');
+			await db.exec('apply schema x');
+
+			const inds = db.schemaManager.getSchema('x')!.getLensSlot('Car')!.injectedInds ?? [];
+			// Only Car_perf is mandatory + non-anchor; Car_trim is optional ⇒ excluded.
+			expect(inds).to.have.length(1);
+			expect(relTarget(inds[0]).relationId).to.equal('Car_core');
 		} finally {
 			await db.close();
 		}
