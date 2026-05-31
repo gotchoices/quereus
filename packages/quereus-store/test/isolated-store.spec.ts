@@ -297,6 +297,39 @@ describe('Isolated Store Module', () => {
 	});
 
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
+		it('UNIQUE-value swap across two rows within one txn commits (no stale-underlying false positive)', async () => {
+			// Regression: isolation-merged-unique-stale-underlying-false-positive.
+			await db.exec(`CREATE TABLE sw (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO sw VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE sw SET email = 'tmp' WHERE id = 1`); // frees 'a'
+			await db.exec(`UPDATE sw SET email = 'a'   WHERE id = 2`); // id=2 holds 'a', frees 'b'
+			await db.exec(`UPDATE sw SET email = 'b'   WHERE id = 1`); // 'b' free in merged view
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM sw ORDER BY id`));
+			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
+		});
+
+		it('partial-UNIQUE value swap (both rows in predicate scope) commits within one txn', async () => {
+			// Exercises the merged-row predicate evaluation in findMergedUniqueConflict
+			// (isolation-merged-unique-stale-underlying-false-positive): the partial predicate
+			// must be evaluated against the overlay (merged) row, not the stale committed value.
+			await db.exec(`CREATE TABLE psw (id INTEGER PRIMARY KEY, email TEXT NOT NULL, active INTEGER NOT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX psw_email_active ON psw (email) WHERE active = 1`);
+			await db.exec(`INSERT INTO psw VALUES (1, 'a', 1), (2, 'b', 1)`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE psw SET email = 'tmp' WHERE id = 1`);
+			await db.exec(`UPDATE psw SET email = 'a'   WHERE id = 2`);
+			await db.exec(`UPDATE psw SET email = 'b'   WHERE id = 1`);
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM psw ORDER BY id`));
+			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
+		});
+
 		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
 
 		beforeEach(async () => {

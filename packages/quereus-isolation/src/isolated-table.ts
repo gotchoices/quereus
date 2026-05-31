@@ -1080,17 +1080,26 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			const overlayRow = await this.getOverlayRow(overlay, pk);
 			if (overlayRow && overlayRow[tombstoneIndex] === 1) continue;
 
+			// When a non-tombstone overlay entry supersedes this committed row, the
+			// row's current merged-view value is the overlay's — not the stale
+			// underlying value. Evaluate the UNIQUE columns (and any partial
+			// predicate) against the merged row so a candidate that was moved off
+			// the value earlier in this txn no longer counts as a conflict
+			// (isolation-merged-unique-stale-underlying-false-positive). The overlay
+			// row carries the appended tombstone column; strip it back to schema shape.
+			const mergedRow: Row = overlayRow ? (overlayRow.slice(0, tombstoneIndex) as Row) : underlyingRow;
+
 			const matches = constrainedCols.every(idx => {
-				if (newRow[idx] === null || underlyingRow[idx] === null) return false;
+				if (newRow[idx] === null || mergedRow[idx] === null) return false;
 				// Compare under the column's declared collation (e.g. NOCASE), not BINARY,
 				// so a UNIQUE over a collated column is enforced against committed rows
 				// through the isolation merge path (unique-constraint-honors-column-collation).
-				return compareSqlValues(newRow[idx], underlyingRow[idx], this.tableSchema!.columns[idx].collation) === 0;
+				return compareSqlValues(newRow[idx], mergedRow[idx], this.tableSchema!.columns[idx].collation) === 0;
 			});
 			if (!matches) continue;
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
-			if (predicate && predicate.evaluate(underlyingRow) !== true) continue;
-			return { pk, row: underlyingRow };
+			if (predicate && predicate.evaluate(mergedRow) !== true) continue;
+			return { pk, row: mergedRow };
 		}
 		return null;
 	}
@@ -1237,6 +1246,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 							values: entry.dataRow,
 							oldKeyValues: entry.pk,
 							preCoerced: true,
+							trustedWrite: true,
 						});
 						this.assertFlushWriteOk(result, 'update', entry.pk);
 					} else {
@@ -1244,6 +1254,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 							operation: 'insert',
 							values: entry.dataRow,
 							preCoerced: true,
+							trustedWrite: true,
 						});
 						this.assertFlushWriteOk(result, 'insert', entry.pk);
 					}

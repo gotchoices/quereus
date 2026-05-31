@@ -633,7 +633,19 @@ export class StoreTable extends VirtualTable {
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
 				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
 				const existing = await store.get(key);
-				if (existing) {
+				if (args.trustedWrite) {
+					// Trusted flush insert: the overlay flush routes existing PKs to
+					// update (via rowExistsInUnderlying), so a row already present here
+					// is an isolation-layer invariant violation. Fail loudly rather than
+					// silently overwrite — the flush try/catch rolls back and rethrows
+					// (isolation-merged-unique-stale-underlying-false-positive).
+					if (existing) {
+						throw new QuereusError(
+							`Trusted flush insert on '${this.tableName}' hit an existing PK; the overlay flush should route existing PKs to update. This indicates an isolation-layer invariant violation.`,
+							StatusCode.INTERNAL,
+						);
+					}
+				} else if (existing) {
 					if (pkEffective === ConflictResolution.IGNORE) {
 						return { status: 'ok', row: undefined };
 					}
@@ -652,15 +664,19 @@ export class StoreTable extends VirtualTable {
 				// onConflict so checkUniqueConstraints can resolve each UC's own
 				// defaultConflict independently of the PK's default. Secondary-UNIQUE
 				// REPLACE evictions accumulate in `evicted` for the executor pipeline.
+				// Skipped for trusted flush writes: the overlay already validated the
+				// final state and a value-swap cycle cannot pass a row-by-row re-check.
 				const evicted: Row[] = [];
-				const ucResult = await this.checkUniqueConstraints(
-					inTransaction,
-					coerced,
-					[pk],
-					args.onConflict,
-					evicted,
-				);
-				if (ucResult) return ucResult;
+				if (!args.trustedWrite) {
+					const ucResult = await this.checkUniqueConstraints(
+						inTransaction,
+						coerced,
+						[pk],
+						args.onConflict,
+						evicted,
+					);
+					if (ucResult) return ucResult;
+				}
 
 				const oldRow = existing ? deserializeRow(existing) : null;
 				const serializedRow = serializeRow(coerced);
@@ -734,8 +750,11 @@ export class StoreTable extends VirtualTable {
 				// (consumed by the executor for ON DELETE cascade/SET NULL of the
 				// row at the new PK). Read through the coordinator so an evictee
 				// written earlier in the same transaction is visible.
+				// Skipped for trusted flush writes — the overlay flush never changes a
+				// row's PK (oldKeyValues and the row's PK columns are the same overlay
+				// entry), so pkChanged is false there; the guard makes the intent explicit.
 				let replacedAtNewPk: Row | null = null;
-				if (pkChanged) {
+				if (pkChanged && !args.trustedWrite) {
 					const existingAtNew = await store.get(newKey);
 					if (existingAtNew) {
 						if (pkEffective === ConflictResolution.IGNORE) {
@@ -760,8 +779,12 @@ export class StoreTable extends VirtualTable {
 				// row we're moving. Pass the original statement-level onConflict so
 				// each UC's own defaultConflict can be resolved independently.
 				const selfPks: SqlValue[][] = pkChanged ? [oldPk, newPk] : [oldPk];
-				const shouldCheckUniques = pkChanged
-					|| (oldRow ? this.uniqueColumnsChanged(oldRow, coerced) : true);
+				// Skip the UNIQUE re-check for trusted flush writes: the overlay
+				// merged-view check already validated the final state, and a value-swap
+				// cycle cannot pass a row-by-row logical-UNIQUE re-check
+				// (isolation-merged-unique-stale-underlying-false-positive).
+				const shouldCheckUniques = !args.trustedWrite
+					&& (pkChanged || (oldRow ? this.uniqueColumnsChanged(oldRow, coerced) : true));
 				// Secondary-UNIQUE REPLACE evictions accumulate for the executor pipeline.
 				const evicted: Row[] = [];
 				if (shouldCheckUniques) {

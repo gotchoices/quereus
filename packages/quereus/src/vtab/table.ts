@@ -33,6 +33,15 @@ export interface UpdateArgs {
 	 * JSON scalar strings).
 	 */
 	preCoerced?: boolean;
+	/**
+	 * If true, the caller has already validated all PK/UNIQUE constraints for the
+	 * final committed state; the vtab should skip its own constraint re-checks and
+	 * just persist the row (plus index/event maintenance). Used only by the
+	 * isolation overlay→underlying flush, where the merged-view pre-checks are the
+	 * sole authority and a value-swap cycle cannot be applied row-by-row without a
+	 * transient duplicate that logical UNIQUE enforcement would wrongly reject.
+	 */
+	trustedWrite?: boolean;
 }
 
 /**
