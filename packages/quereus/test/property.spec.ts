@@ -13,6 +13,7 @@ import { deriveViewColumns, viewColumnsFromUpdateLineage } from '../src/planner/
 import { viewComplement } from '../src/planner/analysis/view-complement.js';
 import type * as AST from '../src/parser/ast.js';
 import { type PlanNode, type RelationalPlanNode, type UpdateSite, type AttributeDefault, isRelationalNode } from '../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../src/planner/nodes/plan-node-type.js';
 import { EmissionContext } from '../src/runtime/emission-context.js';
 import { emitPlanNode } from '../src/runtime/emitters.js';
 import { Scheduler } from '../src/runtime/scheduler.js';
@@ -1816,10 +1817,10 @@ describe('Property-Based Tests', () => {
 		// via only a declared empty key in `RelationType.keys` and no FD
 		// (`PragmaNode`, `SingleRowNode`, … do exactly that and pass): `keysOf`
 		// surfaces their declared `[]`, so `isAtMostOneRow` agrees. Pinning the
-		// declared-key vs FD channels *independently* is tracked separately. These
-		// are pure plan-level facts (no materialization needed), so the law walks
-		// every relational node in the optimized tree, not only the emittable ones
-		// Tier 2 can isolate.
+		// declared-key vs FD channels *independently* is the job of the
+		// `checkIndependentSingletonChannels` law below. These are pure plan-level
+		// facts (no materialization needed), so the law walks every relational node
+		// in the optimized tree, not only the emittable ones Tier 2 can isolate.
 		function checkSingletonEquivalence(label: string, node: RelationalPlanNode): void {
 			const colCount = node.getType().columns.length;
 			const atMostOne = isAtMostOneRow(node);
@@ -1830,6 +1831,35 @@ describe('Property-Based Tests', () => {
 			// (b) the `∅ → all_cols` FD ⇒ canonical ≤1-row truth.
 			if (hasSingletonFd(node.physical?.fds, colCount) && !atMostOne) {
 				throw new Error(`singleton disagreement: ∅→all_cols FD present but isAtMostOneRow is false on ${label}`);
+			}
+		}
+
+		// --- Independent-channel singleton law ---
+		// `checkSingletonEquivalence` above is green by construction (`keysOf`
+		// consults `hasSingletonFd`; `isAtMostOneRow` consults `keysOf`), so it
+		// guards the read surface, not producers. This law instead reads the two
+		// *independent* producer channels a ≤1-row fact lives on — the declared
+		// empty key in `RelationType.keys` and the `∅ → all_cols` singleton FD in
+		// `physical.fds` — directly, so it CAN fail on producer drift (e.g. a node
+		// that declares `keys: [[]]` but forgets the FD, the exact `PragmaNode`
+		// shape this law was added for).
+		//
+		// Invariant (forward only): a node declaring the empty key on ≥1 column
+		// must back it with the singleton FD. Zero-column nodes are the documented
+		// carve-out — the FD has no dependents and is unrepresentable, so the claim
+		// rides `estimatedRows`/`isSet` (see `SingleRowNode`). The reverse
+		// (FD ⇒ declared empty key) is deliberately NOT asserted: derived nodes
+		// (Filter over a covered key, LIMIT 1, scalar aggregate, …) add the FD
+		// physically without rewriting their inherited logical `keys`, so the FD
+		// channel is legitimately richer than the declared-key channel.
+		function declaredEmptyKeyOf(node: RelationalPlanNode): boolean {
+			return node.getType().keys.some(k => k.length === 0);
+		}
+		function checkIndependentSingletonChannels(label: string, node: RelationalPlanNode): void {
+			const colCount = node.getType().columns.length;
+			if (colCount === 0) return; // zero-column carve-out
+			if (declaredEmptyKeyOf(node) && !hasSingletonFd(node.physical?.fds, colCount)) {
+				throw new Error(`independent-channel drift: ${label} declares the empty key but lacks the ∅→all_cols FD`);
 			}
 		}
 
@@ -1845,7 +1875,12 @@ describe('Property-Based Tests', () => {
 					await seedTables(rowsA, rowsB);
 					const block = db.getPlan(q) as unknown as PlanNode;
 					for (const node of collectRelationalNodes(block)) {
-						checkSingletonEquivalence(`${node.nodeType}[${node.id}] of \`${q}\``, node);
+						const label = `${node.nodeType}[${node.id}] of \`${q}\``;
+						checkSingletonEquivalence(label, node);
+						// The forward independent-channel law also holds over the corpus.
+						// (Vacuous today — no corpus query yields a ≤1-row producer — but a
+						// regression guard if the shape zoo grows.)
+						checkIndependentSingletonChannels(label, node);
 						checkedNodes++;
 					}
 				},
@@ -1853,6 +1888,69 @@ describe('Property-Based Tests', () => {
 
 			// Sanity: the walk must actually have examined nodes.
 			expect(checkedNodes, 'singleton-equivalence law checked no nodes').to.be.greaterThan(0);
+		});
+
+		it('the independent-channel check fails loudly on a declared-empty-key producer with no FD', () => {
+			// Mirror the `checkNoOverClaim` negative self-test: prove the law reds on
+			// an injected drift, so a future green run means real agreement, not a
+			// vacuous check. Stubs satisfy the slice the check reads (getType + physical).
+			const drifted = {
+				getType: () => ({ columns: [{}, {}], keys: [[]] }),
+				physical: { fds: undefined },
+			} as unknown as RelationalPlanNode;
+			expect(() => checkIndependentSingletonChannels('injected', drifted)).to.throw(/independent-channel drift/);
+
+			// Honest: empty key backed by the singleton `∅ → all_cols` FD.
+			const honest = {
+				getType: () => ({ columns: [{}, {}], keys: [[]] }),
+				physical: { fds: [{ determinants: [], dependents: [0, 1] }] },
+			} as unknown as RelationalPlanNode;
+			expect(() => checkIndependentSingletonChannels('honest', honest)).to.not.throw();
+
+			// Zero-column carve-out: declared empty key with no FD is allowed.
+			const zeroCol = {
+				getType: () => ({ columns: [], keys: [[]] }),
+				physical: {},
+			} as unknown as RelationalPlanNode;
+			expect(() => checkIndependentSingletonChannels('zero-col', zeroCol)).to.not.throw();
+		});
+
+		it('independent singleton channels: a declared empty key implies the ∅→all_cols FD on leaf producers', async () => {
+			await createTables();
+
+			// Statements whose plans contain the leaf ≤1-row producers (and the bare
+			// ANALYZE bag) the producer reconciliation touches. `db.getPlan` parses →
+			// builds → optimizes, and `physical.fds` materializes lazily on access.
+			const cases = [
+				{ sql: 'pragma default_vtab_module', type: PlanNodeType.Pragma, key: true, fd: true },
+				{ sql: 'analyze ta', type: PlanNodeType.Analyze, key: true, fd: true },
+				{ sql: 'analyze', type: PlanNodeType.Analyze, key: false, fd: false },
+				{ sql: 'explain schema main', type: PlanNodeType.ExplainSchema, key: true, fd: true },
+			];
+
+			// Forward law over every relational node in each plan. `select 1` adds the
+			// SingleRow (zero-column carve-out) and project-inherited-empty-key shapes.
+			let checkedNodes = 0;
+			for (const sql of [...cases.map(c => c.sql), 'select 1']) {
+				const block = db.getPlan(sql) as unknown as PlanNode;
+				for (const node of collectRelationalNodes(block)) {
+					checkIndependentSingletonChannels(`${node.nodeType}[${node.id}] of \`${sql}\``, node);
+					checkedNodes++;
+				}
+			}
+			expect(checkedNodes, 'independent-channel law checked no nodes').to.be.greaterThan(0);
+
+			// Concrete per-producer witnesses: the named node exists and BOTH channels
+			// agree in the expected direction (this is what gives the law its teeth —
+			// removing the FD reconciliation from any producer reds the `fd` assertion).
+			for (const { sql, type, key, fd } of cases) {
+				const nodes = collectRelationalNodes(db.getPlan(sql) as unknown as PlanNode);
+				const target = nodes.find(n => n.nodeType === type);
+				expect(target, `expected a ${type} node in plan of \`${sql}\``).to.not.equal(undefined);
+				const colCount = target!.getType().columns.length;
+				expect(declaredEmptyKeyOf(target!), `${type} of \`${sql}\` declared-empty-key channel`).to.equal(key);
+				expect(hasSingletonFd(target!.physical?.fds, colCount), `${type} of \`${sql}\` singleton-FD channel`).to.equal(fd);
+			}
 		});
 	});
 

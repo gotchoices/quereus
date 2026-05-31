@@ -239,6 +239,20 @@ export class TableLiteralNode extends PlanNode implements ZeroAryRelationalNode 
 		return [];
 	}
 
+	computePhysical(): Partial<PhysicalProperties> {
+		// Const-folding preserves the source's logical `type` (declared keys + isSet)
+		// but drops its physical FDs. A ≤1-row literal therefore keeps the declared
+		// empty key with no matching `∅ → all_cols` FD unless we re-emit it here —
+		// the same independent-channel drift the leaf ≤1-row producers reconcile.
+		// Detect ≤1-row via the materialized row count (mirrors `ValuesNode`).
+		const colCount = this.getType().columns.length;
+		if (this.rowCount !== undefined && this.rowCount <= 1) {
+			const fds = addSingletonFd([], colCount);
+			return { estimatedRows: this.rowCount, fds: fds.length > 0 ? fds : undefined };
+		}
+		return { estimatedRows: this.rowCount };
+	}
+
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
 		if (newChildren.length > 0) {
 			throw new Error('TableLiteralNode does not accept children');
