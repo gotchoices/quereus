@@ -325,6 +325,24 @@ describe('lens ack: escalation policy', () => {
 		}
 	});
 
+	it('validates per-code: a valid sibling in the CSV cannot mask a typo (both error-on entries checked)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// One recognized code + one typo in a single CSV. The recognized code must
+			// not short-circuit validation — the typo still blocks the deploy, named.
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, unique (email)) with tags ("quereus.lens.policy.error-on" = 'lens.no-backing-index,lens.no-backing-indx') }`);
+			await expectThrows(
+				() => db.exec('apply schema x'),
+				/unknown advisory code 'lens\.no-backing-indx'.*never match/s,
+			);
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('lens.pk-not-reconstructible is a recognized policy code even where it is not currently emitted', async () => {
 		const db = new Database();
 		try {
