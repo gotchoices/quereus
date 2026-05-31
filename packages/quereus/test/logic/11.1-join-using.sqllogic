@@ -67,4 +67,18 @@ select cu_a.id as aid, cu_a.name as aname, cu_b.id as bid from cu_a join cu_b us
 
 drop table cu_a;
 drop table cu_b;
--- COLLATE NOCASE on TEXT columns isn't supported by Quereus; that branch removed.
+
+-- USING with COLLATE NOCASE TEXT keys folds case: the join honors the columns'
+-- collation, so 'BOB' matches 'bob'
+-- (unique-collation-name-case-insensitive-normalization).
+create table cn_a (id integer primary key, name text collate nocase);
+create table cn_b (id integer primary key, name text collate nocase);
+
+insert into cn_a values (1, 'alice'), (2, 'BOB'), (3, 'carol');
+insert into cn_b values (10, 'alice'), (20, 'bob'), (30, 'carol');
+
+select cn_a.id as aid, cn_a.name as aname, cn_b.id as bid from cn_a join cn_b using (name) order by cn_a.id;
+→ [{"aid":1,"aname":"alice","bid":10},{"aid":2,"aname":"BOB","bid":20},{"aid":3,"aname":"carol","bid":30}]
+
+drop table cn_a;
+drop table cn_b;

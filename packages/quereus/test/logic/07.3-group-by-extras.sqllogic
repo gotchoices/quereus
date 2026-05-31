@@ -60,13 +60,23 @@ select grp as g from gx group by grp order by g;
 
 drop table gx;
 
--- COLLATE NOCASE written in lowercase on a TEXT column is accepted at DDL
--- (the name normalizes to canonical NOCASE). Confirm create + basic usage
+-- COLLATE NOCASE written in lowercase on a TEXT column is accepted at DDL (the
+-- name normalizes to canonical NOCASE), and GROUP BY / DISTINCT over that column
+-- honor the column's collation — case-variant values fold into a single group
 -- (unique-collation-name-case-insensitive-normalization).
 create table gn (id integer primary key, name text collate nocase, val integer);
-insert into gn values (1, 'Hello', 10), (2, 'world', 20);
-select name from gn order by id;
-→ [{"name":"Hello"},{"name":"world"}]
+insert into gn values (1, 'Hello', 10), (2, 'HELLO', 20), (3, 'world', 5);
+
+-- GROUP BY folds 'Hello'/'HELLO' under NOCASE into one group. lower(name) keeps
+-- the assertion independent of which case-variant the engine picks as the group
+-- representative.
+select lower(name) as ln, count(*) as c, sum(val) as s from gn group by name order by ln;
+→ [{"ln":"hello","c":2,"s":30},{"ln":"world","c":1,"s":5}]
+
+-- count(distinct) honors the same collation: the two case-variants count as one.
+select count(distinct name) as n from gn;
+→ [{"n":2}]
+
 drop table gn;
 
 -- GROUP BY a CASE expression
