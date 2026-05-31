@@ -124,6 +124,15 @@ export function ruleGroupByFdSimplification(node: PlanNode, context: OptContext)
 		}
 	}
 
+	// Never collapse a grouped aggregate to a scalar (empty-GROUP-BY) aggregate:
+	// that would emit one row over an empty input instead of zero. This happens
+	// when every grouping column is constant-pinned (e.g. `where a = 0 and k = 6`),
+	// so FD propagation gives each an empty-determinant FD (`{} → col`) and
+	// `minimalCover` satisfies them all from `{}`, draining the cover. Removing the
+	// last group key changes the query's cardinality contract, which is never sound.
+	// Keep at least one grouping column.
+	if (keptGroupBy.length === 0) return null;
+
 	// Synthesize picker MIN aggregates for each dropped column, in original order.
 	const minSchema = context.db._findFunction('min', 1);
 	if (!minSchema || !isAggregateFunctionSchema(minSchema)) {
