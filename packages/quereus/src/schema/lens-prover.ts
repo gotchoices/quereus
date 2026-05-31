@@ -44,17 +44,42 @@ const log = createLogger('schema:lens-prover');
  * commit-time scan and warn) rather than guessing.
  */
 
-/** Stable diagnostic codes (see `docs/lens.md` § Coverage checklist). */
-export type LensCheckCode =
+/**
+ * Error-severity diagnostic codes — already hard errors that block the deploy
+ * before ack/escalation governance runs, so they are *not* valid escalation
+ * policy targets (see `docs/lens.md` § Coverage checklist).
+ */
+export type LensErrorCode =
 	| 'lens.uncovered-column'
 	| 'lens.type-mismatch'
 	| 'lens.nullability-mismatch'
 	| 'lens.unrealizable-constraint'
-	| 'lens.pk-not-reconstructible'
 	| 'lens.non-invertible'
-	| 'lens.no-backing-index'
-	| 'lens.no-answering-structure'
-	| 'lens.partial-override';
+	| 'lens.unknown-policy-code';
+
+/**
+ * The warning-severity advisory codes that flow through ack/escalation
+ * governance (`lens-ack.ts`). This is the single authoritative source of the
+ * governable vocabulary: a policy (`error-on` / `require-ack`) may legitimately
+ * name any of these, and only these. Keeping the list here means it cannot drift
+ * from what the prover actually emits.
+ */
+const ADVISORY_CODE_LIST = [
+	'lens.pk-not-reconstructible',
+	'lens.no-backing-index',
+	'lens.no-answering-structure',
+	'lens.partial-override',
+] as const;
+
+/** An advisory (warning-severity) code — see {@link ADVISORY_CODE_LIST}. */
+export type LensAdvisoryCode = typeof ADVISORY_CODE_LIST[number];
+
+/** The advisory codes a policy may escalate, as a runtime set (drift-locked by a unit test). */
+export const ACKNOWLEDGEABLE_ADVISORY_CODES: ReadonlySet<LensAdvisoryCode> =
+	new Set(ADVISORY_CODE_LIST);
+
+/** Stable diagnostic codes (see `docs/lens.md` § Coverage checklist). */
+export type LensCheckCode = LensErrorCode | LensAdvisoryCode;
 
 /** The logical site a diagnostic concerns (table / constraint / column). */
 export interface LensDiagnosticSite {

@@ -2,6 +2,7 @@ import type { SqlValue } from '../common/types.js';
 import type { TableSchema } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type { LensDiagnostic, LensDiagnosticSite, FingerprintInputs } from './lens-prover.js';
+import { ACKNOWLEDGEABLE_ADVISORY_CODES } from './lens-prover.js';
 import { getReservedTag, getReservedTagByTemplate } from './reserved-tags.js';
 import { fnv1aHash, toBase64Url } from '../util/hash.js';
 
@@ -303,10 +304,59 @@ function matchAck(advisory: LensDiagnostic, acks: readonly ParsedAck[]): ParsedA
 // ---------------------------------------------------------------------------
 
 /**
+ * The recognized escalation-policy code bases — every advisory code that can flow
+ * through governance, normalized through {@link advisoryCodeBase} so it compares
+ * against a policy's bare/`lens.`-prefixed forms exactly as the resolved policy set
+ * stores them. A policy entry whose base is absent here names no real advisory and
+ * would silently fail open, so {@link applyAckGovernance} rejects it.
+ */
+const RECOGNIZED_ADVISORY_BASES: ReadonlySet<string> =
+	new Set([...ACKNOWLEDGEABLE_ADVISORY_CODES].map(advisoryCodeBase));
+
+/** The recognized advisory codes (full `lens.<base>` form), for diagnostics. */
+const RECOGNIZED_ADVISORY_CODES_DISPLAY = [...ACKNOWLEDGEABLE_ADVISORY_CODES].join(', ');
+
+/**
+ * Emits one error {@link LensDiagnostic} for each policy code that names no real
+ * advisory — a typo'd or stale escalation entry that would otherwise silently fail
+ * open (the deploy stays advisory while the author believes they hardened it). The
+ * resolved policy holds normalized bases; the full `lens.<base>` form is
+ * reconstructed for the message. Validated against the *vocabulary*, independent of
+ * whether any advisory currently fires (pre-empting a not-yet-triggered but
+ * recognized code is valid and must NOT error).
+ */
+function validatePolicyCodes(slot: LensSlot, policy: EscalationPolicy): LensDiagnostic[] {
+	const errors: LensDiagnostic[] = [];
+	const check = (bases: ReadonlySet<string>, tag: 'error-on' | 'require-ack'): void => {
+		for (const base of bases) {
+			if (RECOGNIZED_ADVISORY_BASES.has(base)) continue;
+			errors.push(unknownPolicyCodeError(slot, tag, base));
+		}
+	};
+	check(policy.errorOn, 'error-on');
+	check(policy.requireAck, 'require-ack');
+	return errors;
+}
+
+/** The deploy-blocking diagnostic for an unrecognized escalation policy code. */
+function unknownPolicyCodeError(slot: LensSlot, tag: 'error-on' | 'require-ack', base: string): LensDiagnostic {
+	const table = slot.logicalTable.name;
+	return {
+		code: 'lens.unknown-policy-code',
+		severity: 'error',
+		site: { table },
+		message: `lens: escalation policy tag 'quereus.lens.policy.${tag}' on '${table}' references unknown advisory code '${ADVISORY_CODE_PREFIX}${base}' — it will never match and the escalation silently does nothing; recognized codes: ${RECOGNIZED_ADVISORY_CODES_DISPLAY}`,
+		resurfaced: false,
+	};
+}
+
+/**
  * Applies ack-suppression, fingerprint re-surfacing, and the escalation policy to
  * one slot's prover warnings. Pure analysis — does not mutate the slot or report.
  *
- * Order per advisory:
+ * First validates the policy codes against the advisory vocabulary
+ * ({@link validatePolicyCodes}) — an unrecognized code is a deploy-blocking error,
+ * never a silent no-op. Then, order per advisory:
  *  1. **error-on** wins first — the code is a hard error regardless of any ack.
  *  2. Otherwise match an ack. No ack ⇒ the advisory stays in the default report.
  *  3. A matched ack with a recorded fingerprint that *mismatches* the freshly
@@ -325,7 +375,10 @@ export function applyAckGovernance(
 	const acks = collectAcks(slot);
 	const outWarnings: LensDiagnostic[] = [];
 	const acknowledged: AcknowledgedAdvisory[] = [];
-	const errors: LensDiagnostic[] = [];
+	// Up front: reject policy entries naming no real advisory code (a typo/stale
+	// code that would silently fail open). Validated against the vocabulary,
+	// independent of whether any advisory below actually fires.
+	const errors: LensDiagnostic[] = validatePolicyCodes(slot, policy);
 
 	for (const w of warnings) {
 		const codeBase = advisoryCodeBase(w.code);

@@ -18,6 +18,7 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { computeAdvisoryFingerprint } from '../src/schema/lens-ack.js';
 import type { LensDeployReport } from '../src/schema/lens-prover.js';
+import { ACKNOWLEDGEABLE_ADVISORY_CODES } from '../src/schema/lens-prover.js';
 import { astToString } from '../src/emit/ast-stringify.js';
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
@@ -263,6 +264,91 @@ describe('lens ack: escalation policy', () => {
 		} finally {
 			await db.close();
 		}
+	});
+
+	it('error-on naming an unknown advisory code is a hard deploy error (anti fail-open), not a silent no-op', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// Typo'd code: the author intends to escalate `lens.no-backing-index` but
+			// misspells it. The escalation would silently fail open — so it must throw.
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, unique (email)) with tags ("quereus.lens.policy.error-on" = 'lens.no-backing-indx') }`);
+			await expectThrows(
+				() => db.exec('apply schema x'),
+				/unknown advisory code 'lens\.no-backing-indx'.*never match/s,
+			);
+			// A blocked deploy records no report (mirrors the require-ack case).
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('require-ack naming an unknown advisory code is a hard deploy error too', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null, unique (email)) with tags ("quereus.lens.policy.require-ack" = 'lens.bogus-code') }`);
+			await expectThrows(
+				() => db.exec('apply schema x'),
+				/quereus\.lens\.policy\.require-ack.*unknown advisory code 'lens\.bogus-code'/s,
+			);
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a recognized code (bare or `lens.`-prefixed) is NOT treated as unknown — the throw is the escalation error', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// Both forms must pass the unknown-code check and throw the *escalation*
+			// error (require-ack), never an unknown-code error.
+			for (const code of ['no-backing-index', 'lens.no-backing-index']) {
+				await db.exec(`declare logical schema x { table u (id integer primary key, email text null, unique (email)) with tags ("quereus.lens.policy.require-ack" = '${code}') }`);
+				let msg = '';
+				try {
+					await db.exec('apply schema x');
+				} catch (e) {
+					msg = e instanceof Error ? e.message : String(e);
+				}
+				expect(msg, `recognized code '${code}' throws`).to.not.equal('');
+				expect(msg, `recognized code '${code}' is not an unknown-code error`).to.not.match(/unknown advisory code/);
+				expect(msg, `recognized code '${code}' is the escalation error`).to.match(/require-ack|no-backing-index/);
+			}
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('lens.pk-not-reconstructible is a recognized policy code even where it is not currently emitted', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// A plain pass-through table emits no pk-not-reconstructible advisory, but
+			// pre-empting the (recognized) code with error-on must NOT raise unknown-code.
+			await db.exec(`declare logical schema x { table u (id integer primary key, email text null) with tags ("quereus.lens.policy.error-on" = 'lens.pk-not-reconstructible') }`);
+			await db.exec('apply schema x'); // succeeds: recognized, not currently triggered
+			expect(report(db).warnings.some(w => /unknown advisory code/.test(w.message)), 'no unknown-code diagnostic').to.equal(false);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens ack: advisory vocabulary (drift guard)', () => {
+	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the four governable warning codes', () => {
+		expect([...ACKNOWLEDGEABLE_ADVISORY_CODES].sort()).to.deep.equal([
+			'lens.no-answering-structure',
+			'lens.no-backing-index',
+			'lens.partial-override',
+			'lens.pk-not-reconstructible',
+		]);
 	});
 });
 
