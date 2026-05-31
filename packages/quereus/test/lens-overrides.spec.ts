@@ -421,6 +421,26 @@ describe('lens overrides: body-shape validation', () => {
 		}
 	});
 
+	// Defect 5, non-FROM subquery arm: a cross-basis table in a `where … in
+	// (subquery)` position is not a FROM source at all, so neither the top-level
+	// FROM walk nor gap-fill would ever see it — only the reflective whole-body
+	// walk reaches it. Pins that the check covers expression subqueries, not just
+	// FROM/subquery-source positions.
+	it('errors on a cross-basis table inside a where-in subquery', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare schema z { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema z');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from y.CarCore where id in (select id from z.CarCore) }');
+			await expectThrows(() => db.exec('apply schema x'), /outside the declared basis|references basis relation 'z/i);
+		} finally {
+			await db.close();
+		}
+	});
+
 	// Defect 3 guard must NOT over-reject: a computed projection term that *is*
 	// aliased maps to a logical column, and an uncovered logical column is still
 	// gap-filled from the basis. This pins the boundary so a future tightening of
