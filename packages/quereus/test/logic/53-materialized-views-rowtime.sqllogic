@@ -201,6 +201,20 @@ create table g2 (id integer primary key, w integer);
 create materialized view bad_join as select g.id, g.v from g join g2 on g.k = g2.w;
 -- error: is not a provably 1:1 row-preserving join
 
+-- A provably-1:1 FK join WITH a WHERE clause — a partial join body is deferred in v1 (the
+-- lookup-side reverse residual is upsert-only, sound only when join membership is
+-- predicate-independent). Rejected on the WHERE gate, before the 1:1 proof.
+create table jwp (id integer primary key, name text);
+create table jwt (id integer primary key, fk integer not null references jwp(id));
+create materialized view bad_join_where as select jwt.id, jwp.name from jwt join jwp on jwt.fk = jwp.id where jwp.name > 'm';
+-- error: its join body has a WHERE clause
+
+-- The same provably-1:1 FK join as an OUTER (left) join — the lookup-side reverse residual
+-- filters the lookup side, which would drop an outer join's null-extended rows, so an outer
+-- 1:1 join is deferred in v1.
+create materialized view bad_join_outer as select jwt.id, jwp.name from jwt left join jwp on jwt.fk = jwp.id;
+-- error: its body uses an outer join
+
 -- set-operation body over two tables — multi-source, NOT the "set operation" tail
 -- (the union references g and g2, so the source-count check trips first).
 create materialized view bad_union as select id, v from g union select id, w from g2;
@@ -1166,5 +1180,13 @@ select id, fk, name from jmv where id = 50;
 
 -- A lookup INSERT with no referencing driving row is a no-op for the MV.
 insert into jp values (9, 'zara');
+select id, fk, name from jmv order by id;
+→ [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- A lookup DELETE of an unreferenced lookup row is likewise a no-op (upsert-only reverse
+-- residual: the deleted key joins no driving row, so the residual is empty — no backing row
+-- to refresh or remove). RI blocks deleting a referenced lookup row, so this is the only
+-- admissible lookup-delete shape.
+delete from jp where id = 9;
 select id, fk, name from jmv order by id;
 → [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]

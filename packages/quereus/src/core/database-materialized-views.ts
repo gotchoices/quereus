@@ -1421,7 +1421,7 @@ export class MaterializedViewManager {
 	 * True iff `row`'s backing primary-key columns equal `keyVals` (the affected binding
 	 * key, in `backingPkDefinition` order), under each column's collation. Used to keep
 	 * only the residual row(s) belonging to the recomputed key — see
-	 * {@link applyResidualRecompute}.
+	 * {@link applyForwardResidual}.
 	 */
 	private residualRowMatchesKey(plan: ForwardResidualPlan, row: Row, keyVals: readonly SqlValue[]): boolean {
 		for (let i = 0; i < plan.backingPkDefinition.length; i++) {
