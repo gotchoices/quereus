@@ -206,6 +206,38 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
+	describe('quereus.update.* statement-site coverage (override surface)', () => {
+		// docs/view-updateability.md § Tags shows statement-level examples:
+		//   update v with ("quereus.update.target" = 'base_a') ...
+		//   insert into v with ("quereus.update.default_for.created" = epoch_ms('now')) ...
+		//   delete from v with ("quereus.update.delete_via" = 'right_insert') ...
+		// target / exclude / default_for / delete_via are legal at the dml-stmt site so a
+		// statement can override the view-level routing; policy stays view-DDL only.
+		it('accepts target at a DML statement site', () => {
+			expect(check({ 'quereus.update.target': 'base_a' }, 'dml-stmt')).to.have.length(0);
+		});
+
+		it('accepts exclude at a DML statement site', () => {
+			expect(check({ 'quereus.update.exclude': 'base_b' }, 'dml-stmt')).to.have.length(0);
+		});
+
+		it('accepts default_for at a DML statement site (matches the doc insert example)', () => {
+			expect(check({ 'quereus.update.default_for.created': "epoch_ms('now')" }, 'dml-stmt')).to.have.length(0);
+		});
+
+		it('accepts delete_via at a DML statement site (matches the doc delete example)', () => {
+			expect(check({ 'quereus.update.delete_via': 'right_insert' }, 'dml-stmt')).to.have.length(0);
+		});
+
+		it('keeps default_for / delete_via out of unrelated (lens-only) sites', () => {
+			// physical-table is a lens-only site; the update overrides never apply there.
+			expect(check({ 'quereus.update.default_for.created': "epoch_ms('now')" }, 'physical-table'))
+				.to.have.length(1);
+			expect(check({ 'quereus.update.delete_via': 'left_delete' }, 'physical-table'))
+				.to.have.length(1);
+		});
+	});
+
 	describe('RESERVED_TAGS table', () => {
 		it('is deeply frozen (array, each spec, and each spec.sites)', () => {
 			expect(Object.isFrozen(RESERVED_TAGS)).to.equal(true);

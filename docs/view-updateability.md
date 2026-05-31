@@ -305,8 +305,8 @@ is a hard **error**; a malformed value is an error too, except an empty
 |---|---|---|
 | `"quereus.update.target"` | view DDL, branch of `union`/`intersect`/`except`, join side, dml statement | Restrict propagation to the listed relation(s). Value is a comma-separated list of base table names or branch identifiers. |
 | `"quereus.update.exclude"` | same | Exclude the listed branches; the inverse of `target`. |
-| `"quereus.update.default_for.<column>"` | view DDL, projection | Default expression for `insert` through the view when the column is omitted. The expression may reference any surviving column. |
-| `"quereus.update.delete_via"` | `except`, join | For `except`: `'left_delete'` (default) or `'right_insert'`. For joins: pick the side whose deletion realizes the view-level delete. |
+| `"quereus.update.default_for.<column>"` | view DDL, projection, dml statement | Default expression for `insert` through the view when the column is omitted. The expression may reference any surviving column. A statement-level binding overrides the view-level default for that statement's duration. |
+| `"quereus.update.delete_via"` | `except`, join, dml statement | For `except`: `'left_delete'` (default) or `'right_insert'`. For joins: pick the side whose deletion realizes the view-level delete. A statement-level binding overrides the branch/join default for that statement's duration. |
 | `"quereus.update.policy"` | view DDL | `strict` (reject any ambiguity) or `lenient` (default; predicate-honest fan-out). |
 
 Tags compose with the predicate-driven dispatch: predicates always run first, narrowing the candidate set; tags then further restrict, or — for `default_for` — supply missing values. Tags can never broaden the candidate set beyond what predicates allow.

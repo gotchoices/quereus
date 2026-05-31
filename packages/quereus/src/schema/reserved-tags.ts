@@ -140,18 +140,23 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		description: 'Exclude the listed branches (the inverse of target).',
 	},
 	{
-		// docs/view-updateability.md:286
+		// docs/view-updateability.md:286 (view DDL / projection) + :318
+		// (statement-level `insert into v with ("quereus.update.default_for.created" = …)`).
+		// The statement site supplies a per-statement omitted-insert default that
+		// overrides the view-level default for that statement's duration.
 		key: { template: 'quereus.update.default_for.<column>' },
-		sites: siteSet('view-ddl', 'projection'),
+		sites: siteSet('view-ddl', 'projection', 'dml-stmt'),
 		valueSchema: 'expression',
-		description: 'Default expression for insert through the view when the column is omitted.',
+		description: 'Default expression for insert through the view when the column is omitted (view DDL, projection, or per-statement).',
 	},
 	{
-		// docs/view-updateability.md:287, 165, 220
+		// docs/view-updateability.md:287, 165, 220 (except branch / join) + :319
+		// (statement-level `delete from v with ("quereus.update.delete_via" = …)`),
+		// which overrides the branch/join default for that statement's duration.
 		key: 'quereus.update.delete_via',
-		sites: siteSet('union-branch', 'join'),
+		sites: siteSet('union-branch', 'join', 'dml-stmt'),
 		valueSchema: { enum: DELETE_VIA_VALUES },
-		description: 'For except: left_delete (default) or right_insert; for joins: the side whose deletion realizes the view-level delete.',
+		description: 'For except: left_delete (default) or right_insert; for joins: the side whose deletion realizes the view-level delete. May also be pinned per-statement.',
 	},
 	{
 		// docs/view-updateability.md:288
