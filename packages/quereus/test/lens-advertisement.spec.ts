@@ -250,6 +250,26 @@ describe('lens advertisement: validation errors (atomic, before catalog mutation
 		);
 	});
 
+	it('surrogate shared key with inconsistent per-member arity (would silently under-join)', async () => {
+		const ad = columnarSplit();
+		await expectBadAdvertisement(
+			{
+				...ad,
+				storage: {
+					...ad.storage!,
+					sharedKey: {
+						kind: 'surrogate',
+						// Anchor T_core has 1 key column; T_b declares 2 — the positional
+						// equi-join would pair by Math.min and silently under-join.
+						keyColumnsByRelation: keyMap(['T_core', ['id']], ['T_b', ['id', 'b']], ['T_c', ['id']]),
+						generator: { strategy: 'integer-auto', cadence: 'per-row' },
+					},
+				},
+			},
+			/surrogate.*member 'T_b' has 2 key column.*arity \(1\)/i,
+		);
+	});
+
 	it('claims the table but leaves a logical column unbacked and uncovered', async () => {
 		const db = new Database();
 		try {
@@ -734,6 +754,88 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			// FROM omits Item_ext; `extra` (backed by Item_ext) cannot gap-fill — error precisely.
 			await db.exec("declare lens for x over main { view Item as select id from main.Item_core }");
 			await expectThrows(() => db.exec('apply schema x'), /column 'extra'.*backing member 'Item_ext' is absent from the override's FROM/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('write-rejected: a multi-source join body is read-correct but not updateable (insert/update/delete error)', async () => {
+		// The write direction is the sibling tickets (`lens-multi-source-put-fanout` /
+		// `-ind-injection`). Until they land, a join body is NOT a single-source
+		// updatable projection, so view-updateability must reject DML through it. Pin
+		// that boundary so a future change can't silently present a multi-source table
+		// as writable without wiring the put fan-out.
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Car_core',
+				logicalTable: 'Car',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Car_core',
+					members: [
+						{ relationId: 'Car_core', relation: { schema: 'main', table: 'Car_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('make', 'make')] },
+						{ relationId: 'Car_perf', relation: { schema: 'main', table: 'Car_perf' }, presence: 'optional', columns: [colMap('maxSpeed', 'speed')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Car_core', ['id']], ['Car_perf', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Car_core (id integer primary key, make text) using admod');
+			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
+			await db.exec("insert into Car_core values (1, 'Honda')");
+			await db.exec('insert into Car_perf values (1, 180)');
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('apply schema x');
+
+			// All three DML directions are rejected by view-updateability (the body's
+			// top operator is a Join, not a single-source projection).
+			await expectThrows(() => db.exec("insert into x.Car (id, make, maxSpeed) values (2, 'Mazda', 200)"), /not updateable|cannot write through/i);
+			await expectThrows(() => db.exec("update x.Car set make = 'X' where id = 1"), /not updateable|cannot write through/i);
+			await expectThrows(() => db.exec('delete from x.Car where id = 1'), /not updateable|cannot write through/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('optional member: the outer join survives a non-null-rejecting filter on the optional column', async () => {
+		// The classic outer-join-to-inner pitfall: a WHERE on the optional column must
+		// not let the optimizer rewrite the synthesized `left join` back to an inner
+		// join. `is null` is not null-rejecting, so the anchor-only row must survive;
+		// a null-rejecting predicate (`= 180`) correctly excludes it.
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Car_core',
+				logicalTable: 'Car',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Car_core',
+					members: [
+						{ relationId: 'Car_core', relation: { schema: 'main', table: 'Car_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('make', 'make')] },
+						{ relationId: 'Car_perf', relation: { schema: 'main', table: 'Car_perf' }, presence: 'optional', columns: [colMap('maxSpeed', 'speed')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Car_core', ['id']], ['Car_perf', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Car_core (id integer primary key, make text) using admod');
+			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
+			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
+			await db.exec('insert into Car_perf values (1, 180)'); // car 2 has NO perf row
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('apply schema x');
+
+			// Non-null-rejecting filter: the anchor-only row (car 2) survives.
+			expect(await rows(db, 'select * from x.Car where maxSpeed is null order by id')).to.deep.equal([
+				{ id: 2, make: 'Mazda', maxSpeed: null },
+			]);
+			// Null-rejecting filter: only the joined row qualifies (correct exclusion).
+			expect(await rows(db, 'select * from x.Car where maxSpeed = 180 order by id')).to.deep.equal([
+				{ id: 1, make: 'Honda', maxSpeed: 180 },
+			]);
 		} finally {
 			await db.close();
 		}

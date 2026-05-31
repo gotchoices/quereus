@@ -1478,8 +1478,24 @@ function validatePrimaryAdvertisement(
 	// Shared key: surrogate ⇒ generator present; logical-tuple ⇒ generator absent
 	// AND each member's key columns match the logical PK arity.
 	const sharedKey = storage.sharedKey;
-	if (sharedKey.kind === 'surrogate' && !sharedKey.generator) {
-		errors.push(`shared key is 'surrogate' but no generator is declared`);
+	if (sharedKey.kind === 'surrogate') {
+		if (!sharedKey.generator) {
+			errors.push(`shared key is 'surrogate' but no generator is declared`);
+		}
+		// A surrogate is not tied to the logical PK arity, but the equi-join pairs
+		// each member's key columns positionally with the anchor's, so they must all
+		// share one arity. Validate it here: an under-arity member would otherwise
+		// silently under-join (`buildKeyEquiJoin` pairs by `Math.min`) rather than
+		// error, multiplying rows instead of stitching them.
+		const anchorArity = sharedKey.keyColumnsByRelation.get(storage.anchorRelationId)?.length;
+		if (anchorArity !== undefined) {
+			for (const member of storage.members) {
+				const keyCols = sharedKey.keyColumnsByRelation.get(member.relationId);
+				if (keyCols && keyCols.length !== anchorArity) {
+					errors.push(`shared key is 'surrogate' but member '${member.relationId}' has ${keyCols.length} key column(s), not the anchor '${storage.anchorRelationId}' surrogate arity (${anchorArity})`);
+				}
+			}
+		}
 	}
 	if (sharedKey.kind === 'logical-tuple') {
 		if (sharedKey.generator) {
