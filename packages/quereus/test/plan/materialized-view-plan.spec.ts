@@ -112,9 +112,13 @@ describe('Materialized view stale invalidation of cached plans', () => {
 		await stmt.finalize();
 	});
 
-	// The unconditional-emit facet: a plan compiled *while the MV is already stale*
-	// is equally vulnerable to a SUBSEQUENT incompatible source change. The emit must
-	// fire on every qualifying source change, not only the false→true transition.
+	// A plan compiled *while the MV is already stale* must still be invalidated by a
+	// SUBSEQUENT incompatible source change. NOTE: this is covered by the build-time
+	// guard recording a *direct* dependency on the source table during the
+	// while-stale re-validation — it does NOT, on its own, exercise the
+	// `emitBackingInvalidation` synthetic event (it passes even if that emit is
+	// removed entirely). The synthetic emit is exercised by the not-stale-at-compile
+	// case (the first test) and by the MV-over-MV cascade test below.
 	it('re-validates a plan compiled while already stale on a later incompatible change', async () => {
 		await db.exec(`
 			create table t2 (x integer primary key, y text);
@@ -133,13 +137,55 @@ describe('Materialized view stale invalidation of cached plans', () => {
 		expect(await drain(stmt.iterateRows())).to.deep.equal([[1, 'a']]);
 
 		// A SUBSEQUENT incompatible change must invalidate the already-cached,
-		// compiled-while-stale plan — only the *unconditional* emit covers this (the
-		// false→true stale transition already happened on the first, compatible alter).
+		// compiled-while-stale plan. The while-stale re-validation above recorded a
+		// direct dependency on `t2`, so this real `table_modified` on `t2` matches it.
 		await db.exec('alter table t2 drop column y;');
 
 		await stmt.reset();
 		const cachedErr = await captureError(stmt.iterateRows());
 		expect(cachedErr, 'compiled-while-stale plan must re-validate on the later incompatible change').to.not.be.undefined;
+		expect(cachedErr!.message).to.match(/stale/i);
+
+		await stmt.finalize();
+	});
+
+	/**
+	 * MV-over-MV cascade. A consumer MV (`mv2`) reads a producer MV (`mv1`) — its
+	 * source *is* `mv1`'s backing table `_mv_mv1`. An incompatible change to the
+	 * original source `t` marks `mv1` stale and emits the synthetic backing event for
+	 * `_mv_mv1`, which matches `mv2`'s `sourceTables` and cascades staleness +
+	 * invalidation down the producer→consumer DAG. Without `emitBackingInvalidation`
+	 * the cascade never reaches `mv2` (it would stay non-stale) and a cached
+	 * `select from mv2` would serve stale rows. The `mv2` reference re-validates its
+	 * body (`select from mv1`), which recursively re-hits `mv1`'s stale guard — so a
+	 * structurally-incompatible source change surfaces as a staleness error, not a
+	 * silent frozen snapshot.
+	 */
+	it('cascades staleness + cached-plan invalidation down an MV-over-MV chain', async () => {
+		await db.exec(`
+			create table t (x integer primary key, y text);
+			insert into t values (1, 'a');
+			create materialized view mv1 as select x, y from t;
+			create materialized view mv2 as select x, y from mv1;
+		`);
+		const mv1 = db.schemaManager.getMaterializedView('main', 'mv1');
+		const mv2 = db.schemaManager.getMaterializedView('main', 'mv2');
+
+		// Cache a plan for `select from mv2` while nothing is stale (so the only
+		// recorded dependency is mv2's backing table `_mv_mv2`).
+		const stmt = db.prepare('select x, y from mv2 order by x');
+		expect(await drain(stmt.iterateRows())).to.deep.equal([[1, 'a']]);
+
+		// Incompatible change to the *original* source cascades down the chain.
+		await db.exec('alter table t drop column y;');
+		expect(mv1?.stale, 'producer mv1 marked stale by the source change').to.equal(true);
+		expect(mv2?.stale, 'consumer mv2 marked stale by the synthetic backing cascade').to.equal(true);
+
+		// The cached mv2 plan must recompile and surface the staleness diagnostic
+		// (mv2's guard recursively re-validates mv1's now-broken body).
+		await stmt.reset();
+		const cachedErr = await captureError(stmt.iterateRows());
+		expect(cachedErr, 'cached mv2 plan invalidated by the cascade').to.not.be.undefined;
 		expect(cachedErr!.message).to.match(/stale/i);
 
 		await stmt.finalize();

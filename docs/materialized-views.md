@@ -520,19 +520,25 @@ snapshot and source writes are not propagated.
 apply-failure recovery existed only for the asynchronous on-commit model, which
 row-time replaces — transactional maintenance has nothing to diverge.)
 
-**Cached-plan invalidation.** A `select … from mv` resolves to a `TableReference`
-against the backing table `_mv_<name>`, so a compiled prepared statement's only
-schema dependency is the backing table — which the *source* change event never
-names. To keep a cached plan from re-running the backing scan and bypassing the
-build-time guard, the `MaterializedViewManager` emits a **synthetic
-`table_modified` event for the MV's backing table** on every qualifying source
-change (not only the first one that flips `stale` false→true — a plan compiled
-while the MV is *already* stale must still be invalidated by a *subsequent*
-incompatible change). The statement's schema-dependency listener matches that
-event, drops its cached plan, and the next execution recompiles → re-hits the
-guard. The event names the backing table, so it cascades correctly down an
-MV-over-MV chain (acyclic — no infinite loop) and is a no-op for the manager's own
-source-tracking listener on a plain MV.
+**Cached-plan invalidation.** A `select … from mv` compiled while the MV is **not
+stale** resolves to a `TableReference` against the backing table `_mv_<name>`, so
+the compiled prepared statement's only schema dependency is the backing table —
+which the *source* change event never names. To keep that cached plan from
+re-running the backing scan and bypassing the build-time guard, the
+`MaterializedViewManager` emits a **synthetic `table_modified` event for the MV's
+backing table** on every qualifying source change. The statement's
+schema-dependency listener matches that event, drops its cached plan, and the next
+execution recompiles → re-hits the guard. The event names the backing table, so it
+cascades correctly down an MV-over-MV chain (acyclic — no infinite loop) and is a
+no-op for the manager's own source-tracking listener on a plain MV.
+
+The emit fires per qualifying source change rather than only on the `stale`
+false→true transition. The unconditional firing is what re-propagates the cascade
+down an MV-over-MV chain; for the *single-level* compiled-while-stale case it is
+defensive redundancy rather than a strict requirement — a plan compiled while the
+MV is already stale carries a **direct** dependency on the source table (the
+while-stale build-time re-validation resolves and records it), so a later source
+change invalidates it through the ordinary dependency path even without the emit.
 
 ## Change-scope projection
 

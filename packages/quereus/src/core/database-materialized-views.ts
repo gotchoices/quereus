@@ -324,9 +324,14 @@ export class MaterializedViewManager {
 						this.releaseRowTime(mvKey(mv.schemaName, mv.name));
 						// Invalidate any cached prepared-statement plan reading this MV's
 						// backing table so it recompiles and re-hits the build-time `stale`
-						// guard (see emitBackingInvalidation). Unconditional per qualifying
-						// event (NOT gated on the !stale transition) so a plan compiled while
-						// the MV is already stale is invalidated by a *subsequent* change too.
+						// guard (see emitBackingInvalidation). This is load-bearing for a plan
+						// compiled while the MV was NOT stale: its only schema dependency is the
+						// backing table, which the source event never names. (A plan compiled
+						// while already stale instead carries a direct dependency on the source —
+						// the while-stale build-time re-validation resolves and records it — so
+						// the emit is defensive redundancy there, not a correctness requirement.)
+						// Emitting per qualifying event (rather than only on the false→true
+						// transition) also re-propagates the cascade down an MV-over-MV chain.
 						this.emitBackingInvalidation(mv);
 					}
 				}
@@ -341,14 +346,18 @@ export class MaterializedViewManager {
 	 * prepared-statement plan that reads the backing table directly invalidates →
 	 * recompiles → re-hits the build-time `stale` guard in `building/select.ts`.
 	 *
-	 * A `select … from mv` resolves to a `TableReference` against `_mv_<name>`, so the
-	 * compiled `Statement`'s only schema dependency is the backing table. The *source*
-	 * change event that (re)marked the MV stale never names the backing table, so
-	 * without this emit the cached plan would re-run the backing scan and serve stale
-	 * rows against a structurally-changed source — bypassing the guard a fresh prepare
-	 * would hit. The `Statement` listener maps `table_*` → `'table'` and matches on
-	 * type + objectName (+ optional schemaName) only, ignoring the payload, so the
-	 * backing `TableSchema` is passed as both old/new.
+	 * A `select … from mv` compiled while the MV was NOT stale resolves to a
+	 * `TableReference` against `_mv_<name>`, so its only schema dependency is the
+	 * backing table. The *source* change event that marks the MV stale never names the
+	 * backing table, so without this emit the cached plan would re-run the backing scan
+	 * and serve stale rows against a structurally-changed source — bypassing the guard a
+	 * fresh prepare would hit. (A plan compiled while the MV is *already* stale is
+	 * separately safe: the while-stale build-time re-validation resolves the body's
+	 * source tables and records them as direct statement dependencies, so a later source
+	 * change invalidates it without this emit — verified by the regression suite, which
+	 * stays green even with the emit removed for that case.) The `Statement` listener
+	 * maps `table_*` → `'table'` and matches on type + objectName (+ optional schemaName)
+	 * only, ignoring the payload, so the backing `TableSchema` is passed as both old/new.
 	 *
 	 * Safety: the event names the backing table (`_mv_<name>`), so this manager's own
 	 * listener treats it as a no-op for a plain MV (a backing table is not in any plain
@@ -360,7 +369,11 @@ export class MaterializedViewManager {
 	 */
 	private emitBackingInvalidation(mv: MaterializedViewSchema): void {
 		const backing = this.ctx.schemaManager.getTable(mv.schemaName, mv.backingTableName);
-		if (!backing) return;
+		if (!backing) {
+			log('Skipping backing invalidation for %s.%s: backing table %s not found (MV already broken)',
+				mv.schemaName, mv.name, mv.backingTableName);
+			return;
+		}
 		this.ctx.schemaManager.getChangeNotifier().notifyChange({
 			type: 'table_modified',
 			schemaName: mv.schemaName,
