@@ -1,44 +1,68 @@
-<!-- resume-note -->
-RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-05-31T08:27:48.084Z (agent: claude)
-  Log file: C:\projects\quereus\tickets\.logs\lens-multi-source-put-fanout.implement.2026-05-31T08-27-48-083Z.log
-Read the log to see what was done. Resume where it left off.
-If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
-<!-- /resume-note -->
-description: The `put` direction of n-way decomposition — propagate a logical-table mutation (insert / update / delete) as an ordered fan-out across every basis member of the decomposition, with a shared key that may be a surrogate supplied by a basis default and **evaluated once per logical row and threaded** across all branches so members agree on identity, optional members handled per outer-join semantics, and the singleton degenerate case. Rides the view-mutation plan-node substrate (the multi-source put path) and the evaluate-once-and-thread mutation-context cadences. Consumes the existence facts from `lens-multi-source-ind-injection` for put soundness. Design source: `docs/lens.md` § "The Default Mapper" (shared-key surrogate, evaluate-once-and-thread, singleton).
-prereq: lens-multi-source-get-synthesis, lens-multi-source-ind-injection, view-mutation-physical-lineage, view-mutation-substrate-orchestrator
+description: The `put` direction of n-way decomposition — propagate a logical-table mutation (insert / update / delete) as an ordered fan-out across every basis member of the decomposition, with a shared key that may be a surrogate supplied by a basis default and **evaluated once per logical row and threaded** across all branches so members agree on identity, optional members handled per outer-join semantics, and the singleton degenerate case. Rides the view-mutation substrate (`ViewMutationNode` / `propagate()` / multi-element `BaseOp[]`) and the evaluate-once-and-thread mutation-context cadences. Consumes the existence facts from `lens-multi-source-ind-injection` for put soundness. Design source: `docs/lens.md` § "The Default Mapper" (shared-key surrogate, evaluate-once-and-thread, singleton).
+prereq: lens-multi-source-get-synthesis, lens-multi-source-ind-injection, view-mutation-substrate-core, view-mutation-multisource-innerjoin
 files: packages/quereus/src/schema/lens-compiler.ts, packages/quereus/src/vtab/mapping-advertisement.ts, packages/quereus/src/planner/mutation/propagate.ts, packages/quereus/src/planner/nodes/view-mutation-node.ts, packages/quereus/src/runtime/emit/view-mutation.ts, packages/quereus/src/planner/building/insert.ts, packages/quereus/src/planner/building/update.ts, packages/quereus/src/planner/building/delete.ts, docs/lens.md, docs/view-updateability.md
 ----
 
-<!-- held-note (2026-05-30) -->
-> **HELD in implement/ — hard-prereq substrate not yet built. Not started; no code written.**
+<!-- prereq-correction (2026-05-31) -->
+> **PREREQ CORRECTED — was mis-dispatched; this ticket should defer, not run yet.**
 >
-> This ticket's entire fan-out is a consumer of the view-mutation substrate
-> (`propagate()` planned-body → `BaseOp[]` visitor, `ViewMutationNode` orchestrator,
-> `runtime/emit/view-mutation.ts`). That substrate **does not exist in the codebase yet**
-> (verified 2026-05-30):
-> - `planner/mutation/propagate.ts` holds only the single-source `classifyViewBody`
->   classifier (it returns `unsupported-join` for >1 base table); there is no
->   `propagate()` visitor, `MutationRequest`, or `BaseOp` type anywhere in `src`.
-> - `planner/nodes/view-mutation-node.ts` and `runtime/emit/view-mutation.ts` do **not** exist.
-> - The live write path is the Phase-1 AST rewrite (`planner/building/view-mutation.ts`,
->   `rewriteViewInsert/Update/Delete`), which explicitly rejects multi-source fan-out.
+> A run on 2026-05-31 verified the codebase. Two corrections vs the prior notes
+> (which were written against superseded slugs and a transient empty-filesystem
+> read — ignore any earlier "substrate/lens absent" claim; that was a tooling
+> artifact, not reality):
 >
-> The substrate is produced by **`view-mutation-substrate-orchestrator`** (and its prereq
-> **`view-mutation-physical-lineage`**), both still unbuilt in `implement/`. The ticket
-> forbids re-inventing the sequencer, and building the substrate here would be doing two
-> other tickets' entire scope — so this work cannot start until they land.
+> 1. **The lens read/advertisement half is LANDED** (in `complete/`, code verified):
+>    `vtab/mapping-advertisement.ts` defines `MappingAdvertisement` / `StorageShape`
+>    (`anchorRelationId`, `members[]`, `sharedKey`) / `DecompositionMember`
+>    (`presence:'mandatory'|'optional'`, `columns`, `attributePivot`) / `SharedKey`
+>    (`kind:'surrogate'|'logical-tuple'`, `keyColumnsByRelation`, `generator?`) /
+>    `SharedKeyGenerator` (`strategy:'integer-auto'|'uuid7'|'callback'`,
+>    `cadence:'per-row'|'per-statement'`, `expr?`). `schema/lens-compiler.ts` carries
+>    `compileDecompositionBody` (the n-way `get` join synthesis) and
+>    `computeExistenceAnchorInds` (the IND injection this put consumes). `LensSlot`
+>    (`schema/lens.ts`) exposes `advertisement`, `injectedInds`, `readOnly`,
+>    `columnProvenance`, `compiledBody`. So the read body + advertisement + INDs this
+>    ticket builds on **exist** — re-verify the exact field names before use, but the
+>    "Current state" section below is accurate.
 >
-> **Why it was dispatched prematurely:** the `prereq:` header named the stale slug
-> `view-mutation-plan-node-substrate`, which matches no ticket file (the substrate was
-> decomposed/renamed into the two slugs above), so the runner's automatic cross-stage
-> gating did not defer it. The header is now corrected to the real substrate slugs, so
-> the runner will defer this ticket until that chain clears (this is the sanctioned
-> "prereq still in implement → deferred automatically" path, not a `blocked/` case).
+> 2. **The write substrate is IN FLIGHT in `implement/`, under new slugs.** The old
+>    `view-mutation-substrate-orchestrator` slug (named in the prior prereq header,
+>    matching no file → the runner could not gate on it → this ticket got
+>    mis-dispatched) was decomposed into three implement/ tickets:
+>      - `view-mutation-substrate-core` (3.1) — generalizes `propagate.ts` into a
+>        `propagate(ctx, view, req): BaseOp[]` producer, adds `ViewMutationNode`
+>        (`planner/nodes/view-mutation-node.ts`) + emitter
+>        (`runtime/emit/view-mutation.ts`), retires the single-source AST rewrite
+>        (`building/view-mutation.ts` is deleted), defines `BaseOp`.
+>      - `view-mutation-multisource-innerjoin` (3.2) — planned-body walk emitting
+>        **multi-element** `BaseOp[]`, emitter sequencing (FK order, conflict
+>        composition, RETURNING-through-view), `MutationRequest`, and crucially the
+>        **shared-surrogate mutation-context threading** (per-row/per-statement key
+>        resolved at the envelope before fan-out) — the exact mechanism this ticket's
+>        surrogate threading rides.
+>      - `view-mutation-tag-override-surface` (3.4) — the `quereus.update.*` override
+>        surface; **not** a hard prereq here (the decomposition fan-out is
+>        advertisement-driven, not tag-driven), and it is numbered so it runs before
+>        this unnumbered ticket anyway.
+>    `view-mutation-physical-lineage` (the lineage annotation layer) is **complete**.
 >
-> **To resume (once the substrate lands):** delete this note and implement Phases A–D
-> below against the substrate's *actual* `BaseOp` / `ViewMutationNode` / `propagate()` API
-> (adapt to whatever shape it shipped with, per the ticket's own guidance below).
+> The prereq header now names the real in-flight substrate slugs, so the runner's
+> automatic cross-stage gating will **defer** this ticket until
+> `view-mutation-substrate-core` + `view-mutation-multisource-innerjoin` land — the
+> sanctioned "prereq still in implement → deferred automatically" path, **not** a
+> `blocked/` case. This ticket is intentionally left UNNUMBERED so it runs after all
+> numbered (3.x) substrate tickets and satisfies the prereq-sequence rule for both
+> the numbered (3.1/3.2) and the completed-unnumbered (lens) prereqs.
+>
+> **To resume once the substrate lands:** delete this note and implement Phases A–D
+> against the substrate's *actual* `BaseOp` / `MutationRequest` / `ViewMutationNode`
+> / `propagate()` surface (adapt to whatever shape 3.1/3.2 shipped — see their tickets
+> for the settled `BaseOp` / `MutationRequest` shapes).
+>
+> **Environment note:** on this Windows host the Bash tool may intermittently see an
+> empty tree (`ls`/`grep` return nothing though files exist). Prefer the Read / Glob /
+> Grep tools / PowerShell / the code-search index for file ops, build, and test.
+<!-- /prereq-correction -->
 
 ## Scope
 
@@ -50,42 +74,52 @@ ticket flips that: a mutation through such a logical table fans out to every mem
 basis relation as an ordered set of base ops, with the shared key threaded so all
 members agree on row identity.
 
-This is fundamentally a consumer of the **view-mutation plan-node substrate**
-(`view-mutation-plan-node-substrate`): that ticket retires the Phase-1 AST rewrite
-and makes `propagate.ts` + `ViewMutationNode` the single propagation path for all
-view mutations, sequencing multiple base ops with conflict composition, FK
-ordering, and RETURNING capture. The decomposition put is exactly a multi-source
-case of that substrate — this ticket supplies the **advertisement-driven fan-out
-shape and the surrogate generation/threading**; the substrate supplies the
-orchestration mechanism. (Hard prereq: without the substrate there is no
-multi-base-op sequencer to fan out into.)
+This is fundamentally a consumer of the **view-mutation substrate**
+(`view-mutation-substrate-core` + `view-mutation-multisource-innerjoin`): those
+tickets retire the Phase-1 AST rewrite and make `propagate.ts` + `ViewMutationNode`
+the single propagation path for all view mutations, sequencing multiple base ops with
+conflict composition, FK ordering, and RETURNING capture. The decomposition put is
+exactly a multi-source case of that substrate — this ticket supplies the
+**advertisement-driven fan-out shape and the surrogate generation/threading**; the
+substrate supplies the orchestration mechanism. (Hard prereq: without the substrate
+there is no multi-base-op sequencer to fan out into.)
 
 ## Why the substrate is a hard prereq (not a hint)
 
-`docs/view-updateability.md` and the substrate ticket are explicit: the Phase-1
+`docs/view-updateability.md` and the substrate tickets are explicit: the Phase-1
 AST rewrite "does not generalize — it drives off `selectAst` and cannot sequence
 more than one base op." Multi-source put has no other host. So this ticket designs
 *as if* the substrate has landed (per the tess prereq rule) and builds the
 decomposition-specific fan-out on top of `ViewMutationNode` / `propagate.ts`. If
 the substrate's surface differs at implement time from what is sketched below,
-adapt the fan-out to the substrate's actual `BaseOp` / orchestrator API rather than
-re-inventing a sequencer.
+adapt the fan-out to the substrate's actual `BaseOp` / `MutationRequest` / orchestrator
+API rather than re-inventing a sequencer.
 
-## Current state (verified, do not re-discover)
+## Current state (verified 2026-05-31)
 
-- `packages/quereus/src/schema/lens-compiler.ts` — `slot.advertisement`
-  (`StorageShape`) carries the fan-out shape: `members[]` (each `presence`,
-  `columns[]`/`attributePivot`), `anchorRelationId`, and `sharedKey`
-  (`kind:'surrogate'|'logical-tuple'`, `keyColumnsByRelation`, `generator?`).
+- `packages/quereus/src/vtab/mapping-advertisement.ts` — the advertisement carried on
+  `slot.advertisement` (`MappingAdvertisement.storage: StorageShape`) holds the fan-out
+  shape: `members[]` (each `relationId`, `relation:{schema,table}`,
+  `presence:'mandatory'|'optional'`, `columns[]?:{logical,basis}`, `attributePivot?`),
+  `anchorRelationId`, and `sharedKey` (`kind:'surrogate'|'logical-tuple'`,
+  `keyColumnsByRelation: Record<relationId, string[]>`, `generator?`).
   `SharedKeyGenerator` carries `strategy:'integer-auto'|'uuid7'|'callback'`,
-  `cadence:'per-row'|'per-statement'`, optional `expr`.
+  `cadence:'per-row'|'per-statement'`, optional `expr` (SQL text for `callback`).
+- `packages/quereus/src/schema/lens-compiler.ts` — `compileDecompositionBody` already
+  synthesizes the n-way `get` join (anchor-rooted left-deep; mandatory inner-joined,
+  optional outer-joined; EAV pivots as subqueries) and `computeExistenceAnchorInds`
+  injects the per-member existence INDs (`LensSlot.injectedInds`). The put fan-out
+  mirrors this read shape in reverse.
 - `packages/quereus/src/planner/building/{insert,update,delete}.ts` — view-mediated
-  DML resolves the view and (post-substrate) propagates through `propagate.ts`. The
-  mutation-context plumbing (`stmt.contextValues` + `tableSchema.mutationContext`,
-  `mutationContextValues` map, `contextAttributes`) is the **statement-level
-  evaluate-once** seam: a value bound once and reused across the statement
-  (`dml-executor.ts` `contextEvaluatorInstructions` evaluates each context value
-  once). This is the existing substrate the per-statement surrogate cadence rides.
+  DML dispatch. **NOTE:** `view-mutation-substrate-core` reroutes these three sites
+  from `return buildXStmt(ctx, rewriteViewX(...))` (the AST rewrite, now deleted) to
+  building a `ViewMutationNode` via `propagate()`. Build this ticket on the post-3.1
+  dispatch, not the old rewrite. The mutation-context plumbing (`stmt.contextValues` +
+  `tableSchema.mutationContext`, `mutationContextValues` map, `contextAttributes`,
+  runtime `evaluateContextRow` in `runtime/emit/dml-executor.ts`) is the
+  **statement-level evaluate-once** seam that `view-mutation-multisource-innerjoin`
+  extends into the per-row shared-surrogate envelope — the per-statement surrogate
+  cadence rides this directly; the per-row cadence rides 3.2's per-row envelope.
 - The IND existence facts from `lens-multi-source-ind-injection` prove every
   logical row exists in each mandatory member — the put fan-out relies on this to
   emit a mandatory member's insert/update without a defensive existence probe and
@@ -133,10 +167,12 @@ When `sharedKey.kind === 'surrogate'`:
     member insert's key column(s).
   - `cadence:'per-row'` → mint a distinct value per produced logical row, evaluated
     once *before* fan-out for that row, then threaded to every member insert for that
-    row. This is the row-scoped analogue of the statement-level seam; if the
-    substrate exposes a per-row computed-binding slot, use it; otherwise introduce a
-    per-row surrogate evaluator in `ViewMutationNode` that runs before the member ops
-    and publishes the value to each.
+    row. This is the row-scoped analogue of the statement-level seam; reuse the
+    per-row shared-surrogate envelope that `view-mutation-multisource-innerjoin`
+    establishes (the single captured per-row value resolved at the envelope BEFORE
+    propagation reaches the branches), publishing the value to each member op. If 3.2
+    exposes a per-row computed-binding slot, use it; otherwise extend it in
+    `ViewMutationNode`.
 - **Strategy:** `integer-auto` / `uuid7` / `callback` map to the basis default
   expression (`generator.expr` for `callback`, or the engine's built-in generator
   for `integer-auto`/`uuid7`). A **non-deterministic** generator (`uuid7()`,
@@ -198,16 +234,16 @@ IND.
 ## TODO
 
 ### Phase A — fan-out shape (consume the substrate)
-- In `propagate.ts` (the substrate's visitor), recognize a logical-table body backed by `slot.advertisement` and emit the member fan-out `BaseOp[]`: anchor-rooted, mandatory always, optional conditioned on supplied values; per-column routing via `buildColumnBackingMap`.
+- In `propagate.ts` (the substrate's visitor, post-3.1/3.2), recognize a logical-table body backed by `slot.advertisement` and emit the member fan-out `BaseOp[]`: anchor-rooted, mandatory always, optional conditioned on supplied values; per-column routing via `buildColumnBackingMap` (the advertisement's `member.columns` logical→basis map).
 - Map insert/update/delete to the member-op shapes (incl. the optional-component presence transitions, restricted with a clear diagnostic if the substrate cannot yet compose insert-or-delete within an update fan-out).
 
 ### Phase B — surrogate generation + threading
-- Implement evaluate-once-and-thread: `per-statement` via the mutation-context evaluate-once seam; `per-row` via a per-row surrogate evaluator in `ViewMutationNode` published to every member op.
+- Implement evaluate-once-and-thread: `per-statement` via the mutation-context evaluate-once seam; `per-row` via the per-row shared-surrogate envelope from `view-mutation-multisource-innerjoin`, published to every member op.
 - Map `generator.strategy` to the basis default expression / built-in generator; honor non-determinism policy (reuse nondeterministic-schema-expression handling); ensure change-capture records the resolved value.
 - `logical-tuple` key: thread the logical PK to each member, no generation.
 
 ### Phase C — soundness + singleton
-- Consume the injected IND so mandatory-member ops skip per-member existence probes; assert no O(n) fallback when the IND is present.
+- Consume the injected IND (`LensSlot.injectedInds` / `computeExistenceAnchorInds`) so mandatory-member ops skip per-member existence probes; assert no O(n) fallback when the IND is present.
 - Singleton: unconditional member ops over the empty key; existence anchor lets the all-null singleton exist.
 
 ### Phase D — docs + tests
