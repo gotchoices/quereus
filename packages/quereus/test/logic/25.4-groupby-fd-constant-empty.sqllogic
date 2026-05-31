@@ -26,6 +26,15 @@ select a, k, count(*) as c, sum(b) as s from t where a = 7 and k = 9 group by a,
 select k, count(*) as c, sum(a) as s from t where k = 6 group by k;
 → []
 
+-- Mixed: one constant-pinned column (`a`, dropped via the `{} -> a` FD and
+-- re-emitted as MIN(a)) plus one free column (`b`, kept as the surviving group
+-- key). Confirmed by plan dump to rewrite to `group by b -> min(a), count(*)`.
+-- Over an EMPTY match (`a = 0` matches no row) the surviving key still gates row
+-- production, so the result is zero rows — the partial-drop path must not
+-- resurrect the spurious-row bug.
+select a, b, count(*) as c from t where a = 0 group by a, b;
+→ []
+
 drop table t;
 
 -- Partial-drop coverage: the guard must only trigger when ALL grouping columns
