@@ -1042,4 +1042,52 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 			await db.close();
 		}
 	});
+
+	it('distinct per-side key ordinals: cols pick the anchor ordinal, targetCols the member ordinal (value-level direction guard)', async () => {
+		// Every other fixture keys both relations at column 0, so `cols`/`targetCols`
+		// are both `[0]` and a re-swap is caught only by `target.relationId`. Here the
+		// shared surrogate sits at a *different* ordinal on each side — anchor `sid` @ 2,
+		// member `body_sid` @ 0 — so the index *values* themselves discriminate
+		// direction: `cols` must be the anchor's ordinal `[2]` and `targetCols` the
+		// member's `[0]`. A direction swap back to `member ⊆ anchor` would flip these to
+		// `cols=[0]`/`targetCols=[2]` and fail here independently of the relationId guard.
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Doc_core',
+				logicalTable: 'Doc',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Doc_core',
+					members: [
+						{ relationId: 'Doc_core', relation: { schema: 'main', table: 'Doc_core' }, presence: 'mandatory', columns: [colMap('docKey', 'doc_key'), colMap('title', 'title')] },
+						{ relationId: 'Doc_body', relation: { schema: 'main', table: 'Doc_body' }, presence: 'mandatory', columns: [colMap('body', 'body')] },
+					],
+					sharedKey: {
+						kind: 'surrogate',
+						keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['body_sid']]),
+						generator: { strategy: 'integer-auto', cadence: 'per-row' },
+					},
+				},
+			}];
+			db.registerModule('admod', mod);
+			// Anchor surrogate `sid` at ordinal 2 (not 0); member surrogate `body_sid` at ordinal 0.
+			await db.exec('create table Doc_core (doc_key text, title text, sid integer primary key) using admod');
+			await db.exec('create table Doc_body (body_sid integer primary key, body text) using admod');
+			await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
+			await db.exec('apply schema x');
+
+			const inds = db.schemaManager.getSchema('x')!.getLensSlot('Doc')!.injectedInds ?? [];
+			expect(inds).to.have.length(1);
+			// cols index Doc_core, the anchor (sid @ 2); targetCols index Doc_body, the member (body_sid @ 0).
+			expect(inds[0].cols).to.deep.equal([2]);
+			const t = relTarget(inds[0]);
+			expect(t.relationId).to.equal('Doc_body');
+			expect(t.targetCols).to.deep.equal([0]);
+			expect(inds[0].nullRejecting).to.equal(false);
+		} finally {
+			await db.close();
+		}
+	});
 });

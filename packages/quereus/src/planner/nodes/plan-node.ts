@@ -88,11 +88,14 @@ export interface InclusionDependency {
  * - `table`: `child.cols ⊆ table.targetCols`, where `targetCols` is a key of
  *   that table. The FK-seeded form the coverage prover (Wave 2) reasons over.
  * - `relation`: a basis relation addressed by a stable symbolic id the lens
- *   compiler mints — reserved for the Wave-3 lens existence-anchor injection. No
- *   producer mints it in this wave; the variant exists so the surface is
- *   enforcement-ready (an obligation/discharge consumer can ride it later
- *   without raising the propagation bar — obligations come from the
- *   authoritative declaration, never from the propagated set).
+ *   compiler mints — the Wave-3 lens existence-anchor injection
+ *   (`computeExistenceAnchorInds` in `schema/lens-compiler.ts`) mints it, one per
+ *   mandatory non-anchor member (`anchor.key ⊆ member.key`), recorded on
+ *   `LensSlot.injectedInds` and read by the lens prover off the slot — it does not
+ *   ride the general per-operator IND propagation. The variant keeps the surface
+ *   enforcement-ready (an obligation/discharge consumer can ride it later without
+ *   raising the propagation bar — obligations come from the authoritative
+ *   declaration, never from the propagated set).
  */
 export type IndTarget =
   | { readonly kind: 'table'; readonly schema: string; readonly table: string; readonly targetCols: readonly number[] }
