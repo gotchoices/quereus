@@ -71,7 +71,6 @@ drop table p_gen;
 -- ===================================
 
 create table p_nc (id integer primary key, code text collate nocase unique not null);
--- error: not supported
 
 drop table if exists p_nc;
 

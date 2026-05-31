@@ -1,4 +1,5 @@
 import { Schema, type SchemaKind } from './schema.js';
+import { normalizeCollationName } from '../util/comparison.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
 import type { Database } from '../core/database.js';
 import type { TableSchema, RowConstraintSchema, IndexSchema, IndexColumnSchema, MutationContextDefinition, ForeignKeyConstraintSchema, UniqueConstraintSchema } from './table.js';
@@ -1435,7 +1436,7 @@ export class SchemaManager {
 			return {
 				index: tableColIndex,
 				desc: indexedCol.direction === 'desc',
-				collation: indexedCol.collation || tableColSchema.collation
+				collation: normalizeCollationName(indexedCol.collation || tableColSchema.collation || 'BINARY')
 			};
 		});
 

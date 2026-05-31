@@ -2,37 +2,64 @@
 -- UNIQUE constraint scenarios beyond 102-unique-constraints.sqllogic.
 
 -- ===================================
--- 1. COLLATE with the LOWERCASE spelling `nocase` is rejected at DDL.
---    This is NOT "UNIQUE doesn't support collation" — it is a collation-name
---    case-sensitivity quirk: `validateColumnSchema` checks the requested name
---    against `TEXT_TYPE.supportedCollations = ['BINARY','NOCASE','RTRIM']` with a
---    case-sensitive `includes`, so lowercase `nocase` fails to match and is
---    rejected with a message that happens to contain "not supported". The
---    canonical UPPERCASE `NOCASE` is accepted, and UNIQUE over a `collate NOCASE`
---    column now enforces case-insensitively (auto-index + every conflict
---    validator honor the column collation — see
---    unique-constraint-honors-column-collation, regression-tested in
---    102.2-unique-collation.sqllogic). Normalizing the lowercase spelling is a
---    separate, still-open concern, so these blocks keep asserting the current
---    rejection of the lowercase form.
+-- 1. COLLATE with the LOWERCASE spelling `nocase` is NORMALIZED at DDL.
+--    SQLite treats collation names case-insensitively; Quereus normalizes the
+--    requested name to its canonical uppercase form in columnDefToSchema and
+--    validates against TEXT_TYPE.supportedCollations = ['BINARY','NOCASE','RTRIM']
+--    case-insensitively, so lowercase `nocase` is equivalent to `NOCASE`. A
+--    `collate nocase unique` column is therefore accepted and enforces
+--    case-insensitively (see unique-constraint-honors-column-collation /
+--    102.2-unique-collation.sqllogic). An UNKNOWN collation is still rejected,
+--    now with explicit "Unknown collation" wording (pinned below).
 -- ===================================
 
 create table t_uci (id integer primary key, email text collate nocase unique);
--- error: not supported
+insert into t_uci values (1, 'abc');
 
-drop table if exists t_uci;
+-- the lowercase `nocase` spelling normalizes to NOCASE, so a case-variant
+-- duplicate is a UNIQUE violation under case-insensitive comparison
+insert into t_uci values (2, 'ABC');
+-- error: UNIQUE constraint failed: t_uci (email)
+
+select count(*) as n from t_uci;
+→ [{"n":1}]
+
+-- a value that is NOT NOCASE-equal still inserts
+insert into t_uci values (3, 'abd');
+select id, email from t_uci order by id;
+→ [{"id":1,"email":"abc"},{"id":3,"email":"abd"}]
+
+drop table t_uci;
 
 -- composite UNIQUE with the lowercase `nocase` spelling on a TEXT member is
--- rejected the same way (same collation-name case-sensitivity quirk)
+-- likewise accepted; the `a` member folds case under the normalized NOCASE
 create table t_uci2 (
 	id integer primary key,
 	a text collate nocase,
 	b text,
 	unique (a, b)
 );
--- error: not supported
+insert into t_uci2 values (1, 'abc', 'x');
 
-drop table if exists t_uci2;
+-- 'a' matches case-insensitively and 'b' matches under BINARY -> composite conflict
+insert into t_uci2 values (2, 'ABC', 'x');
+-- error: UNIQUE constraint failed: t_uci2
+
+select count(*) as n from t_uci2;
+→ [{"n":1}]
+
+-- a genuinely distinct 'a' still inserts (proves no over-matching)
+insert into t_uci2 values (3, 'xyz', 'x');
+select count(*) as n from t_uci2;
+→ [{"n":2}]
+
+drop table t_uci2;
+
+-- an UNKNOWN collation name is still rejected at DDL, now with explicit wording
+create table t_ucbad (id integer primary key, x text collate frobnicate);
+-- error: Unknown collation
+
+drop table if exists t_ucbad;
 
 -- ===================================
 -- 2. UNIQUE constraint error message identifies the violated column

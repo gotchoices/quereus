@@ -61,7 +61,6 @@ create table t_col (id integer primary key, name text);
 insert into t_col values (1, 'Alice'), (2, 'BOB');
 
 alter table t_col add column nick text null collate nocase;
--- error: not supported
 
 drop table t_col;
 

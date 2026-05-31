@@ -99,6 +99,18 @@ export function resolveCollation(collationName: string): CollationFunction {
 	return func;
 }
 
+/**
+ * Normalizes a collation name to its canonical form (trimmed, uppercase).
+ * SQLite treats collation names case-insensitively; the registry and resolvers
+ * all key on the uppercase name, so this yields the SQLite-canonical spelling
+ * used for DDL validation and downstream comparisons.
+ * @param name The collation name as written
+ * @returns The canonical (trimmed, uppercase) collation name
+ */
+export function normalizeCollationName(name: string): string {
+	return name.trim().toUpperCase();
+}
+
 /** Represents SQLite storage classes for comparison purposes */
 enum StorageClass {
 	NULL = 0,

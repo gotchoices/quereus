@@ -1,4 +1,5 @@
 import type { ColumnSchema } from './column.js';
+import { normalizeCollationName } from '../util/comparison.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { Expression } from '../parser/ast.js';
@@ -188,13 +189,17 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 				schema.defaultValue = constraint.expr ?? null;
 				break;
 			case 'collate': {
-				schema.collation = constraint.collation ?? 'BINARY';
-				if (constraint.collation && logicalType.supportedCollations &&
-					!logicalType.supportedCollations.includes(constraint.collation)) {
-					throw new QuereusError(
-						`Collation '${constraint.collation}' is not supported for type '${logicalType.name}' on column '${def.name}'`,
-						StatusCode.ERROR
-					);
+				if (constraint.collation) {
+					const normalized = normalizeCollationName(constraint.collation);
+					if (logicalType.supportedCollations && !logicalType.supportedCollations.includes(normalized)) {
+						throw new QuereusError(
+							`Unknown collation '${constraint.collation}' for type '${logicalType.name}' on column '${def.name}' (expected one of: ${logicalType.supportedCollations.join(', ')})`,
+							StatusCode.ERROR
+						);
+					}
+					schema.collation = normalized;
+				} else {
+					schema.collation = 'BINARY';
 				}
 				break;
 			}

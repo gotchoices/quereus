@@ -60,10 +60,14 @@ select grp as g from gx group by grp order by g;
 
 drop table gx;
 
--- GROUP BY with COLLATE NOCASE on a TEXT column is not supported by Quereus
--- (engine emits a clear rejection at table creation time).
+-- COLLATE NOCASE written in lowercase on a TEXT column is accepted at DDL
+-- (the name normalizes to canonical NOCASE). Confirm create + basic usage
+-- (unique-collation-name-case-insensitive-normalization).
 create table gn (id integer primary key, name text collate nocase, val integer);
--- error: Collation 'nocase' is not supported
+insert into gn values (1, 'Hello', 10), (2, 'world', 20);
+select name from gn order by id;
+→ [{"name":"Hello"},{"name":"world"}]
+drop table gn;
 
 -- GROUP BY a CASE expression
 create table gc (id integer primary key, val integer);
