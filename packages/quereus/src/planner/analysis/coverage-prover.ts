@@ -296,63 +296,17 @@ export function proveCoverage(
 		return notCovers('shape');
 	}
 
-	// ---- Shape: walk down to the constrained base table `T`. Single-source
-	//      pass-throughs (Filter + physical access nodes) are transparent links;
-	//      a binary join is descended into `T`'s side iff `T` is on the join's
-	//      row-preserving side (the no-row-loss obligation). Reject aggregation,
-	//      DISTINCT, set operations, FanOutLookupJoin, AsofScan, … as `shape`.
-	//      The *predicate* is taken from the AST below (the optimizer may absorb
-	//      a WHERE into an index range seek and drop the FilterNode, so the plan
-	//      is not a faithful predicate source). The topmost join (if any) is
-	//      captured for the fan-out gate — see `proveJoinNoFanout`. ----
-	let tableRef: TableReferenceNode | undefined;
-	let topJoin: RelationalPlanNode | undefined;
-	let node: RelationalPlanNode | undefined = root;
-	while (node) {
-		if (node instanceof TableReferenceNode) {
-			tableRef = node;
-			break;
-		}
-		if (BINARY_JOIN_TYPES.has(node.nodeType) && CapabilityDetectors.isJoin(node)) {
-			const left: RelationalPlanNode = node.getLeftSource();
-			const right: RelationalPlanNode = node.getRightSource();
-			const joinType = node.getJoinType();
-			const leftHasT = subtreeContainsConstrainedTable(left, baseTable);
-			const rightHasT = subtreeContainsConstrainedTable(right, baseTable);
-			// `T` on both sides (self-join) or neither ⇒ ambiguous / not our table.
-			if (leftHasT === rightHasT) return notCovers('shape');
-			const tSide: RelationalPlanNode = leftHasT ? left : right;
-			const lookupSide: RelationalPlanNode = leftHasT ? right : left;
-			// No row loss: `T` must keep every governed row. Two sound paths:
-			//  - row-preservation — `T` on the preserving side of an outer join
-			//    (`left`→left subtree, `right`→right subtree); or
-			//  - referential integrity — an `inner`/`cross` join whose equi-pairs are
-			//    a NOT-NULL FK from `T` to the lookup table's PK, so enforced RI makes
-			//    every `T` row match exactly one lookup row (`innerJoinRetainsConstrainedTable`).
-			// Every other join type/position drops or duplicates governed `T` rows.
-			const rowPreserving = (leftHasT && joinType === 'left') || (rightHasT && joinType === 'right');
-			if (!rowPreserving) {
-				const fkRetained = (joinType === 'inner' || joinType === 'cross')
-					&& innerJoinRetainsConstrainedTable(node, tSide, lookupSide, baseTable, opts.structuralOnly === true);
-				if (!fkRetained) return notCovers('shape');
-			}
-			if (topJoin === undefined) topJoin = node;
-			node = tSide;
-			continue;
-		}
-		if (node instanceof FilterNode || PASS_THROUGH.has(node.nodeType)) {
-			const relations: readonly RelationalPlanNode[] = node.getRelations();
-			if (relations.length !== 1) return notCovers('shape');
-			node = relations[0];
-			continue;
-		}
-		return notCovers('shape');
-	}
-	if (!tableRef) return notCovers('shape');
-	if (tableRef.tableSchema.name.toLowerCase() !== baseTable.name.toLowerCase()
-		|| tableRef.tableSchema.schemaName.toLowerCase() !== baseTable.schemaName.toLowerCase()) {
-		return notCovers('shape');
-	}
+	// ---- Shape: walk down to the constrained base table `T` via the shared
+	//      descent (`walkToConstrainedBase`) — single-source pass-throughs are
+	//      transparent links and a binary join is descended into `T`'s side iff
+	//      it provably keeps every governed `T` row (the no-row-loss obligation).
+	//      The topmost join (if any) is captured for the fan-out gate below. The
+	//      *predicate* is taken from the AST further down (the optimizer may absorb
+	//      a WHERE into an index range seek and drop the FilterNode). ----
+	const walk = walkToConstrainedBase(root, baseTable, opts);
+	if (!walk.ok) return notCovers(walk.reason);
+	const tableRef = walk.tableRef;
+	const topJoin = walk.topJoin;
 
 	// ---- Projection coverage: map output attributes back to base columns via
 	//      stable attribute IDs (a bare column reference preserves the source
@@ -410,6 +364,110 @@ export function proveCoverage(
 	//      NULL-excluded). The WHERE is read from the AST (see shape note). ----
 	const bodyWhere = mv.selectAst.type === 'select' ? mv.selectAst.where : undefined;
 	return provePredicateAlignment(bodyWhere, uc, baseTable, resolveBodyColumn);
+}
+
+/**
+ * Outcome of {@link walkToConstrainedBase} / {@link proveOneToOneJoin}: the leaf
+ * `TableReferenceNode` over `baseTable` plus the topmost join descended through
+ * (`undefined` for a single-source chain), or a structural failure reason.
+ */
+export type WalkResult =
+	| { ok: true; tableRef: TableReferenceNode; topJoin: RelationalPlanNode | undefined }
+	| { ok: false; reason: CoverageFailureReason };
+
+/**
+ * Walk `root` down to the constrained base table `T`, proving **no row loss**
+ * at every join descended through. Single-source pass-throughs (Filter + the
+ * physical access nodes in {@link PASS_THROUGH}) are transparent links; a binary
+ * join is descended into `T`'s side iff `T` provably keeps every governed row:
+ *
+ *  - **row-preservation** — `T` on the preserving side of an outer join
+ *    (`left`→left subtree, `right`→right subtree); or
+ *  - **referential integrity** — an `inner`/`cross` join whose equi-pairs are a
+ *    NOT-NULL FK / non-null IND from `T` to the lookup table's PK, so enforced RI
+ *    makes every `T` row match exactly one lookup row
+ *    (`innerJoinRetainsConstrainedTable`).
+ *
+ * Every other join type/position (a fanning lookup, `semi`/`anti`, `full`, `T`
+ * on the dropping side, a self-join, aggregation/DISTINCT/set-op) returns
+ * `{ ok: false, reason: 'shape' }`. The **no-fan-out** (≤1) obligation is NOT
+ * checked here — callers run {@link proveJoinNoFanout} on the returned `topJoin`
+ * (see {@link proveOneToOneJoin}); `proveCoverage` keeps its own fan-out gate so
+ * its diagnostic ordering is unchanged. Shared by `proveCoverage` and the
+ * materialized-view 1:1-join gate so the join soundness logic lives in one place.
+ */
+export function walkToConstrainedBase(
+	root: RelationalPlanNode,
+	baseTable: TableSchema,
+	opts: ProveCoverageOptions = {},
+): WalkResult {
+	let tableRef: TableReferenceNode | undefined;
+	let topJoin: RelationalPlanNode | undefined;
+	let node: RelationalPlanNode | undefined = root;
+	while (node) {
+		if (node instanceof TableReferenceNode) {
+			tableRef = node;
+			break;
+		}
+		if (BINARY_JOIN_TYPES.has(node.nodeType) && CapabilityDetectors.isJoin(node)) {
+			const left: RelationalPlanNode = node.getLeftSource();
+			const right: RelationalPlanNode = node.getRightSource();
+			const joinType = node.getJoinType();
+			const leftHasT = subtreeContainsConstrainedTable(left, baseTable);
+			const rightHasT = subtreeContainsConstrainedTable(right, baseTable);
+			// `T` on both sides (self-join) or neither ⇒ ambiguous / not our table.
+			if (leftHasT === rightHasT) return { ok: false, reason: 'shape' };
+			const tSide: RelationalPlanNode = leftHasT ? left : right;
+			const lookupSide: RelationalPlanNode = leftHasT ? right : left;
+			const rowPreserving = (leftHasT && joinType === 'left') || (rightHasT && joinType === 'right');
+			if (!rowPreserving) {
+				const fkRetained = (joinType === 'inner' || joinType === 'cross')
+					&& innerJoinRetainsConstrainedTable(node, tSide, lookupSide, baseTable, opts.structuralOnly === true);
+				if (!fkRetained) return { ok: false, reason: 'shape' };
+			}
+			if (topJoin === undefined) topJoin = node;
+			node = tSide;
+			continue;
+		}
+		if (node instanceof FilterNode || PASS_THROUGH.has(node.nodeType)) {
+			const relations: readonly RelationalPlanNode[] = node.getRelations();
+			if (relations.length !== 1) return { ok: false, reason: 'shape' };
+			node = relations[0];
+			continue;
+		}
+		return { ok: false, reason: 'shape' };
+	}
+	if (!tableRef) return { ok: false, reason: 'shape' };
+	if (tableRef.tableSchema.name.toLowerCase() !== baseTable.name.toLowerCase()
+		|| tableRef.tableSchema.schemaName.toLowerCase() !== baseTable.schemaName.toLowerCase()) {
+		return { ok: false, reason: 'shape' };
+	}
+	return { ok: true, tableRef, topJoin };
+}
+
+/**
+ * Prove that `root`'s body is **provably 1:1 on `baseTable`** — exactly one
+ * output row per governed `T` row. Composes the two independent obligations the
+ * coverage prover splits a 1:1 join into: no-row-loss (≥1, via
+ * {@link walkToConstrainedBase}'s descent) and no-fan-out (≤1, via
+ * {@link proveJoinNoFanout} on the captured `topJoin`). For a single-source body
+ * (no join) the fan-out gate is vacuous and this succeeds iff the chain walks to
+ * `T`. The materialized-view 1:1-join gate calls this on the analyzed body to
+ * admit a join shape; `proveCoverage` reuses the same primitives directly so the
+ * join soundness logic is not duplicated.
+ */
+export function proveOneToOneJoin(
+	root: RelationalPlanNode,
+	baseTable: TableSchema,
+	opts: ProveCoverageOptions = {},
+): WalkResult {
+	const walk = walkToConstrainedBase(root, baseTable, opts);
+	if (!walk.ok) return walk;
+	if (walk.topJoin !== undefined) {
+		const noFanout = proveJoinNoFanout(walk.topJoin, walk.tableRef, baseTable);
+		if (!noFanout.covers) return { ok: false, reason: noFanout.reason };
+	}
+	return walk;
 }
 
 /**
@@ -865,7 +923,7 @@ function lookupColumnNames(
  * (`makeBodyColumnResolver`), which made the former bare-name collision guard
  * unnecessary.
  */
-function proveJoinNoFanout(
+export function proveJoinNoFanout(
 	topJoin: RelationalPlanNode,
 	tableRef: TableReferenceNode,
 	baseTable: TableSchema,

@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-05-31T08:29:01.738Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\temporal-filter-raw-literal-comparison-test.implement.2026-05-31T08-29-01-736Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Pin in the sqllogic corpus that a pushed-down temporal (DATE/DATETIME/TIME) comparison literal is compared RAW (BINARY, no canonicalization) against the stored canonical value. A future planner change that inserted literal canonicalization for temporal operands (a temporal cast-insertion arm, or a parsed/canonicalized seek-key value) would silently start matching a non-canonical literal, with no test failing today. Add non-canonical-literal filter cases so the native engine's no-canonicalization contract is bound by an automated test.
 files:
   - packages/quereus/test/logic/98-temporal-edge-cases.sqllogic (add the new section here)

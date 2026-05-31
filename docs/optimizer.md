@@ -1449,7 +1449,7 @@ type IndTarget =
 | `AggregateNode` / `SetOperationNode` / `WindowNode`            | Emit none — these reshape relational identity.                                                                                             |
 | `AsyncGatherNode` (crossProduct)                               | Could shift+merge like FDs, but **deferred** this wave (no consumer) — left undefined with a code comment.                                 |
 
-**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. The **first consumer** of `PhysicalProperties.inds` is the coverage prover (Wave 2, `coverage-prover-ind-derived-no-row-loss`): its inner/cross no-row-loss obligation tries the propagated IND surface first and falls back to the structural `lookupCoveringFK` check (see § [Coverage proving](#coverage-proving) below). The lens existence-anchor injection (Wave 3, `lens-multi-source-decomposition`) is the next, minting `kind:'relation'` targets. See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction) for the on-demand helpers and rules.
+**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. The **first consumer** of `PhysicalProperties.inds` is the coverage prover (Wave 2, `coverage-prover-ind-derived-no-row-loss`): its inner/cross no-row-loss obligation tries the propagated IND surface first and falls back to the structural `lookupCoveringFK` check (see § [Coverage proving](#coverage-proving) below). The lens existence-anchor injection (Wave 3, `lens-multi-source-ind-injection`) mints the `kind:'relation'` targets (`anchor.key ⊆ member.key` per mandatory member — recorded on the slot for the lens prover, not the general optimizer). See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction) for the on-demand helpers and rules.
 
 #### Check-derived contributions
 
@@ -1672,18 +1672,29 @@ The anti-join-to-empty rewrite emits `EmptyRelationNode` carrying L's attribute 
 > not carry). No consumer reads `inds` yet — Wave 1 is plumbing + a soundness harness; the
 > coverage prover (Wave 2) reads the FK-seeded `kind:'table'` INDs; the lens
 > existence-anchor injection (Wave 3, `lens-multi-source-ind-injection`) is the first
-> `kind:'relation'` producer. For a primary-storage mapping advertisement, the lens
-> compiler (`computeExistenceAnchorInds` in `schema/lens-compiler.ts`) mints one IND
-> per **mandatory**, non-anchor, non-EAV member — `cols` = the member's shared-key
-> indices, `target = { kind:'relation', relationId: <anchor>, targetCols }`,
-> `nullRejecting:false` (total existence). Optional members (outer-joined), EAV pivots
-> (never inner-joined), and the empty-key singleton inject nothing — any would
-> over-claim. The surrogate join carries no declared SQL FK, so `seedTableForeignKeyInds`
-> is blind to it; the fact is recorded on `LensSlot.injectedInds` and read by the lens
-> prover off the slot, **not** seeded at the member scan (the body is planned before the
-> slot is committed, so a scan-time seed would never reach the prover). The trade-off:
-> the relation-IND is visible only to the prover (its sole intended consumer), not the
-> general optimizer.
+> `kind:'relation'` producer. For a primary-storage advertisement's **synthesized
+> decomposition body**, the lens compiler (`computeExistenceAnchorInds` in
+> `schema/lens-compiler.ts`) mints one IND per **mandatory**, non-anchor, non-EAV
+> member asserting `anchor.key ⊆ member.key` — `cols` = the **anchor's** shared-key
+> indices, `target = { kind:'relation', relationId: <member>, targetCols: <member's
+> shared-key indices> }`, `nullRejecting:false` (total existence). The direction is
+> load-bearing: `compileDecompositionBody` roots the left-deep join at the anchor and
+> inner-joins each mandatory member, so the no-row-loss obligation is "no anchor row is
+> dropped", which the consumer discharges from an IND **on the anchor**
+> (`anchor.key ⊆ member.key`). `presence:'mandatory'` ("every logical row has it")
+> guarantees exactly that totality; the converse (`member ⊆ anchor`) is intentionally
+> **not** asserted because no stated property guarantees member→anchor referential
+> integrity — emitting it would over-claim (an orphan mandatory-member row is filtered
+> by the inner join, leaving the converse false). Optional members (outer-joined), EAV
+> pivots (never inner-joined), and the empty-key singleton inject nothing — any would
+> over-claim. Injection is gated to the synthesized-decomposition body: a full
+> hand-authored override / single-source default body carries no advertised
+> `anchor ⋈ member` join, so it injects nothing. The surrogate join carries no declared
+> SQL FK, so `seedTableForeignKeyInds` is blind to it; the fact is recorded on
+> `LensSlot.injectedInds` and read by the lens prover off the slot, **not** seeded at
+> the member scan (the body is planned before the slot is committed, so a scan-time seed
+> would never reach the prover). The trade-off: the relation-IND is visible only to the
+> prover (its sole intended consumer), not the general optimizer.
 
 ### Fan-out lookup join (FK→PK + 1:n cross)
 

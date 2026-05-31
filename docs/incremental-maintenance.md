@@ -51,11 +51,11 @@ covering structure answers it.
 > uniformly. (`incremental-maintenance-plan-abstraction` landed the first step of the
 > fold: `applyRowTimeChange` is now `applyMaintenancePlan`, which dispatches on
 > `MaintenancePlan.kind`; the cascade flow is unchanged: `applyMaintenancePlan` →
-> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Three arms are
+> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Four arms are
 > wired today: `'inverse-projection'` (the covering-index shape), `'residual-recompute'`
-> (single-source aggregates, below), and `'prefix-delete'` (single-source lateral-TVF
-> fan-out, below). All are gated by the maintenance-equivalence property harness
-> `test/incremental/maintenance-equivalence.spec.ts`.)
+> (single-source aggregates, below), `'prefix-delete'` (single-source lateral-TVF
+> fan-out, below), and `'join-residual'` (1:1 inner/cross join, below). All are gated by the
+> maintenance-equivalence property harness `test/incremental/maintenance-equivalence.spec.ts`.)
 >
 > **The `'residual-recompute'` arm — the synchronous analogue of the assertion
 > residual path.** A single-source aggregate body (`select g1,…, agg(…) from T [where
@@ -75,8 +75,38 @@ covering structure answers it.
 > and NEW groups; an emptied group's residual returns zero rows, so the delete-without-
 > upsert removes its backing row. Per-row recompute is correct without per-statement
 > batching — every change to a group recomputes it from live state, so the last write
-> wins. (The 1:1 row-preserving join shape reuses this same kernel with a `'row'`/`'pk'`
-> binding in a follow-on ticket.)
+> wins.
+>
+> **The `'join-residual'` arm — the same kernel with a `'row'`/`'pk'` binding, plus a
+> reverse residual for the lookup side.** A **1:1 row-preserving inner/cross join** body
+> (`select … from T join P on T.fk = P.id`, where `T` contributes *exactly one* MV row per
+> governed `T` row — proven by the coverage prover's shared `proveOneToOneJoin`: no row loss
+> via NOT-NULL FK→PK referential integrity, no fan-out via `isUnique(T.pk)` at the join
+> frame) is maintained on the **same residual kernel** as the aggregate arm, with the binding
+> set to `T`'s PK (`'row'`/`'pk'`). The 1:1 join collapses the composite product key `keysOf`
+> advertises to `T`'s PK, so the backing is keyed on `T`'s PK and each changed `T` row maps to
+> one backing row. A write to `T` (the **driving** side) is therefore identical to a size-1
+> group: delete the old backing slice keyed on `T.pk`, run the `T`-keyed residual (`… where
+> T.pk = :pk0`, ≤1 joined row), upsert — driven by the *same* `applyForwardResidual` the
+> aggregate arm uses.
+>
+> The join arm's distinct problem is the **lookup side (`P`)**: the MV's `sourceTables`
+> includes `P`, so a write to `P` fires maintenance too, but the forward residual is keyed on
+> `T`'s PK and one `P` row joins *many* `T` rows. The plan therefore carries a **second
+> residual keyed on `P`'s PK** (the body with `injectKeyFilter` applied on `P` instead of
+> `T`): for a `P` change it runs `… where P.pk = :pk0` against live state, returning every
+> currently-joined row — each carrying its `T.pk` backing key — and **upserts** each. **No
+> delete is needed**, and that is the soundness crux: with an inner/cross join + enforced RI
+> and no lookup-referencing `WHERE` (rejected at create), the *set* of `T` rows joined to a
+> given `P` row is `{ T : T.fk = P.pk }`, determined entirely by `T.fk` (a `T` column a `P`
+> write cannot change). So a `P` change only re-derives the lookup-projected columns of
+> existing backing rows (an upsert at the unchanged `T.pk`), never adds or removes one. A
+> `T`-side membership change is the forward path's job. The plan is registered under **both**
+> source bases (`rowTimeBySource[T]` *and* `rowTimeBySource[P]`), and `maintainRowTime` passes
+> the changed base to `applyMaintenancePlan` so it routes to the forward (`T`) or reverse
+> (`P`) path. Outer joins are deferred (filtering `P` for the reverse residual would drop
+> their null-extended rows); a partial `WHERE` and a **fanning** (non-1:1) keyed join are
+> deferred too.
 >
 > **The `'prefix-delete'` arm — point-keyed vs prefix-keyed slice replacement.** A
 > single-source lateral-TVF fan-out body (`select T.pk…, f.* from T cross join lateral

@@ -119,6 +119,11 @@ export function deployLogicalSchema(
 		let provenance: LensColumnProvenance[];
 		let hiding: ReadonlySet<string> | undefined;
 		let effectiveColumns: string[];
+		// Whether the body came from `compileDecompositionBody` (the synthesized
+		// n-way decomposition). Only that body actually carries the advertised
+		// `anchor ⋈ member` joins the existence-anchor IND describes, so it is the
+		// only body the IND injection may attach to (R2 gate below).
+		let fromDecomposition = false;
 		if (override) {
 			const merged = compileOverrideBody(logicalTable, logicalSchemaName, basis.schemaName, schemaManager, override, advertisement);
 			compiledBody = merged.body;
@@ -142,6 +147,7 @@ export function deployLogicalSchema(
 			compiledBody = compileDecompositionBody(logicalTable, logicalSchemaName, basis, advertisement, db);
 			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
 			effectiveColumns = logicalTable.columns.map(c => c.name);
+			fromDecomposition = true;
 		} else {
 			compiledBody = compileDefaultBody(logicalTable, logicalSchemaName, basis.schema, basis.schemaName);
 			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
@@ -157,8 +163,16 @@ export function deployLogicalSchema(
 		// mandatory inner-joins are provably row-loss-free and the put fan-out is
 		// sound against a derived existence fact. See docs/lens.md § The module
 		// mapping advertisement and docs/optimizer.md § Inclusion Dependency Tracking.
-		const injectedInds = advertisement
-			? computeExistenceAnchorInds(advertisement, basis, db)
+		//
+		// Gated (R2) to the synthesized-decomposition body: only
+		// `compileDecompositionBody` emits the advertised `anchor ⋈ member` joins the
+		// IND describes. A full hand-authored override and the single-source default
+		// body carry no such join, so injecting there would describe joins absent from
+		// `compiledBody` — leave `injectedInds` undefined. (The future sparse-override
+		// gap-fill body — `lens-multi-source-decomposition` — will carry the joins too;
+		// extend the gate to it then.)
+		const injectedInds = fromDecomposition
+			? computeExistenceAnchorInds(advertisement!, basis, db)
 			: [];
 
 		const slot: LensSlot = {
@@ -823,14 +837,30 @@ function compileDecompositionBody(
  * Computes the existence-anchor inclusion dependencies for a decomposition
  * (`lens-multi-source-ind-injection`, docs/lens.md § The module mapping
  * advertisement). For each **mandatory**, non-anchor, non-EAV member, injects one
- * IND asserting the member's shared-key tuple is included in the existence
- * anchor's key — the propagated fact that lets the prover discharge the no-row-loss
- * / put-soundness obligation against a threaded existence fact rather than
- * re-deriving decomposition structure. The surrogate join carries no declared SQL
- * FK, so `seedTableForeignKeyInds` / `lookupCoveringFK` are structurally blind to
- * it; this is the `IndTarget.kind:'relation'` producer reserved by Wave 1.
+ * IND asserting the existence **anchor's** shared-key tuple is included in that
+ * member's key — the propagated fact that lets the prover discharge the
+ * no-row-loss obligation of the anchor-rooted inner join against a threaded
+ * existence fact rather than re-deriving decomposition structure. The surrogate
+ * join carries no declared SQL FK, so `seedTableForeignKeyInds` / `lookupCoveringFK`
+ * are structurally blind to it; this is the `IndTarget.kind:'relation'` producer
+ * reserved by Wave 1.
  *
- * Soundness (over-claim is unsound — Wave 1's § Enforcement readiness):
+ * Direction + soundness. `compileDecompositionBody` builds a left-deep join
+ * **rooted at the anchor**, inner-joining each mandatory member (`anchor ⋈ member`);
+ * the logical entities are the anchor rows (one per logical row). The no-row-loss
+ * obligation the prover discharges is therefore "no anchor row is dropped"
+ * (`tSide = anchor`, `lookup = member`), which it reads from an IND **on the
+ * anchor** of the form `anchor.key ⊆ member.key`. `presence:'mandatory'` ("every
+ * logical row has it") guarantees exactly that: every anchor (= logical) row has a
+ * matching member row on the shared key ⇒ `anchor.key ⊆ member.key`, total
+ * (`nullRejecting:false`) — exactly the existence fact the anchor-rooted inner
+ * join's row-preservation obligation needs. The converse (`member ⊆ anchor`) is
+ * **intentionally not asserted**: no stated property guarantees member→anchor
+ * referential integrity, so emitting it would over-claim (a mandatory-member row
+ * whose key is absent from the anchor is simply filtered by the inner join — reads
+ * stay correct, but the converse fact would be false).
+ *
+ * Guards (over-claim is unsound — Wave 1's § Enforcement readiness):
  * - **mandatory only** — an optional member is outer-joined; its absence is
  *   exactly what the outer join preserves, so an IND would over-claim.
  * - **total only** (`nullRejecting:false`) — a mandatory member's existence is
@@ -840,13 +870,13 @@ function compileDecompositionBody(
  * - **empty key → none** — a singleton (`primary key ()`) has no witnessing key
  *   tuple; existence is the anchor's own 0-or-1-row property.
  *
- * `cols` are the member's shared-key column indices on its basis relation (= the
- * member scan's output indices, 1:1); `target.targetCols` the anchor's key column
- * indices on the anchor's basis relation; `relationId` is the anchor (`=
- * advertisement.id = StorageShape.anchorRelationId`, the resolver-validated
- * identity). Member/anchor key columns pair positionally, matching the
- * get-synthesis equi-join. Uses `addInd` + `MAX_INDS_PER_NODE` for dedup/cap
- * consistency with the Wave-1 FK seeding.
+ * `cols` are the **anchor's** shared-key column indices on the anchor's basis
+ * relation; `target.targetCols` the **member's** key column indices on the member's
+ * basis relation; `target.relationId` is the member (not the anchor). Anchor/member
+ * key columns pair positionally, matching the get-synthesis equi-join. Uses `addInd`
+ * + `MAX_INDS_PER_NODE` for dedup/cap consistency with the Wave-1 FK seeding;
+ * multiple mandatory members produce distinct INDs (same `cols` = anchor key,
+ * different `target.relationId`), so dedup is unaffected.
  */
 function computeExistenceAnchorInds(
 	advertisement: MappingAdvertisement,
@@ -882,9 +912,12 @@ function computeExistenceAnchorInds(
 		// Pair positionally up to the shorter list (matching the get-synthesis equi-join).
 		const n = Math.min(memberKeyIdx.length, anchorKeyIdx.length);
 		if (n === 0) continue; // member has no key tuple to witness inclusion
+		// `anchor.key ⊆ member.key`, total: THIS = anchor (cols = anchor key indices),
+		// target = the MEMBER (the totality direction `mandatory` guarantees and the
+		// anchor-rooted inner join's no-row-loss obligation consumes). See doc above.
 		inds = addInd(inds, {
-			cols: memberKeyIdx.slice(0, n),
-			target: { kind: 'relation', relationId: anchor.relationId, targetCols: anchorKeyIdx.slice(0, n) },
+			cols: anchorKeyIdx.slice(0, n),
+			target: { kind: 'relation', relationId: member.relationId, targetCols: memberKeyIdx.slice(0, n) },
 			nullRejecting: false,
 		}, { cap: MAX_INDS_PER_NODE });
 	}

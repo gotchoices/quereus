@@ -218,6 +218,28 @@ This is maintained by a **by-prefix delete** of the base row's whole fan-out sli
 one base row owns many backing rows sharing the base-PK prefix, so the slice is replaced
 as a unit rather than a single point key.
 
+A fourth eligible shape is the **1:1 row-preserving inner/cross join**
+(`materialized-view-rowtime-residual-join`):
+
+- a body `select … from T join P on T.fk = P.id` over **two** base tables where the driving
+  table `T` contributes **exactly one** MV row per governed `T` row, proven by the coverage
+  prover's shared `proveOneToOneJoin` — **no row loss** via a NOT-NULL FK→PK inclusion
+  dependency under enforced referential integrity, and **no fan-out** via `isUnique(T.pk)` at
+  the join frame. A **fanning** (non-1:1) join is rejected on *shape*;
+- an **inner** or **cross** join only — an outer join is deferred (the lookup-side reverse
+  residual filters `P`, which would drop its null-extended rows);
+- **no aggregate** over the join, and (in v1) **no `WHERE`** — a partial / lookup-referencing
+  predicate is deferred (the lookup-side maintenance is upsert-only, sound only when join
+  membership is predicate-independent);
+- the backing primary key is exactly `T`'s PK (the 1:1 join collapses the composite product
+  key `keysOf` advertises to `T`'s PK — a real column key, not the all-columns fallback), so
+  each `T` row maps to one backing row;
+- deterministic projections (the residual must reproduce `select <body>`).
+
+This reuses the residual kernel of the aggregate arm with a `'row'`/`'pk'` binding on `T`,
+plus a second residual keyed on `P` for lookup-side writes (see
+[Maintenance § join-residual](#maintenance-row-time-per-statement)).
+
 Any other body is **rejected at create** with a shape-specific diagnostic that
 names the unsupported feature and steers the user to a plain `view` (for live
 re-evaluation) or `create table … as <body>` (for a one-off snapshot). There is no
@@ -228,14 +250,15 @@ escape-hatch policy that accepts an ineligible body.
 > effectively unreachable for memory tables. The relevant create-time failure is
 > "projection drops a source PK column."
 
-Single-source aggregates (`group by` over bare columns) and single-source lateral-TVF
-fan-out are now **accepted** (the residual-recompute and prefix-delete shapes above). The
-shape still deferred to a follow-on ticket — a **fanning keyed join** (a non-1:1
-inner/cross join, the natural next consumer of the same by-prefix machinery: it shares the
-by-prefix delete + product key, differing only in that the "fan-out residual" is the join
-rather than a TVF) — is rejected today, as is the 1:1 row-preserving join arm
-(`materialized-view-rowtime-residual-join`). Recursion and set operations are out of the
-row-time model entirely (no bounded per-write residual).
+Single-source aggregates (`group by` over bare columns), single-source lateral-TVF
+fan-out, and **1:1 row-preserving inner/cross joins** are now **accepted** (the
+residual-recompute, prefix-delete, and join-residual shapes above). The shapes still
+deferred to a follow-on ticket are a **fanning keyed join** (a non-1:1 inner/cross join, the
+natural next consumer of the same by-prefix machinery: it shares the by-prefix delete +
+product key, differing only in that the "fan-out residual" is the join rather than a TVF),
+and the 1:1-join refinements — an **outer** 1:1 join and a **partial-`WHERE`** join body.
+Recursion and set operations are out of the row-time model entirely (no bounded per-write
+residual).
 
 ## Query resolution
 
@@ -292,13 +315,14 @@ synchronously regardless of which boundary the write entered through.
 
 ## Maintenance (row-time, per-statement)
 
-For each materialized view the manager caches a `MaintenancePlan`, keyed by source
-base, and dispatches on its `kind`. Three arms are wired today: `'inverse-projection'`
-(the covering-index shape), `'residual-recompute'` (single-source aggregates), and
-`'prefix-delete'` (single-source lateral-TVF fan-out). The union's `'full-rebuild'` arm
-remains reserved for the cost gate (`incremental-maintenance-cost-gate`) and is
-unreachable today. The correctness oracle for these arms is the maintenance-equivalence
-property harness
+For each materialized view the manager caches a `MaintenancePlan`, indexed by every
+source base it reads (a single base for the single-source arms; both the driving and
+lookup base for the 1:1-join arm), and dispatches on its `kind`. Four arms are wired
+today: `'inverse-projection'` (the covering-index shape), `'residual-recompute'`
+(single-source aggregates), `'prefix-delete'` (single-source lateral-TVF fan-out), and
+`'join-residual'` (1:1 inner/cross join). The union's `'full-rebuild'` arm remains reserved
+for the cost gate (`incremental-maintenance-cost-gate`) and is unreachable today. The
+correctness oracle for these arms is the maintenance-equivalence property harness
 (`test/incremental/maintenance-equivalence.spec.ts`): for every eligible body shape it
 asserts `read(MV) == evaluate(body)` after each random source mutation and after
 rollback.
@@ -395,6 +419,54 @@ The natural next consumer of this same machinery is a **fanning keyed join** (a 
 inner/cross join): it shares the by-prefix delete + composite product key, differing only
 in that the "fan-out residual" is the join rather than a TVF. It is deferred to a
 follow-on ticket.
+
+### `'join-residual'` (1:1 inner/cross join shape)
+
+A **1:1 row-preserving inner/cross join** (`select … from T join P on T.fk = P.id`) reuses
+the residual-recompute kernel with a `'row'`/`'pk'` binding on the driving table `T` whose
+PK keys the backing. The plan is **indexed under both source bases** (`rowTimeBySource[T]`
+*and* `rowTimeBySource[P]`); `maintainRowTime` passes the changed base to
+`applyMaintenancePlan`, which routes a `T` write to the **forward** path and a `P` write to
+the **reverse** path.
+
+**Driving side (`T`) — the forward path.** Identical to a size-1 group in the aggregate arm,
+driven by the *same* `applyForwardResidual`: per changed `T` row, delete the old backing
+slice keyed on `T`'s PK, run the `T`-keyed residual (`… where T.pk = :pk0`, the body with
+`injectKeyFilter` applied on `T`) against live state, and upsert the recomputed row.
+
+| source op | affected key(s) | maintenance |
+|---|---|---|
+| insert `r` | NEW `T.pk` of `r` | delete (no-op); run residual (the one joined row); upsert |
+| delete `r` | OLD `T.pk` of `r` | delete; run residual (zero rows, `T` row gone → no upsert) |
+| update `old→new` | OLD ∪ NEW `T.pk` (deduped) | per key: delete; run residual; upsert |
+
+An FK-moving `UPDATE` (changing `T.fk`, not `T.pk`) recomputes the same `T.pk` slice against
+the new lookup row; a PK-changing `UPDATE` recomputes both the OLD and NEW `T.pk`.
+
+**Lookup side (`P`) — the reverse path.** A write to `P` cannot be keyed on `T`'s PK (one `P`
+row joins many `T` rows), so the plan carries a **second residual keyed on `P`'s PK** (the
+body with `injectKeyFilter` applied on `P`). Per changed `P` key (OLD ∪ NEW, deduped) it runs
+`… where P.pk = :pk0` against live state — returning every currently-joined row, each carrying
+its `T.pk` backing key — and **upserts** each. **No delete is performed.**
+
+| source op | affected key(s) | maintenance |
+|---|---|---|
+| insert `p` | NEW `P.pk` | run reverse residual (zero rows if no `T` references it → no-op) |
+| delete `p` | OLD `P.pk` | run reverse residual (RI-admissible only when childless → zero rows) |
+| update `old→new` | OLD ∪ NEW `P.pk` (deduped) | run reverse residual; upsert each joined row |
+
+The upsert-only reverse path is sound because, for an inner/cross join with enforced RI and
+no lookup-referencing `WHERE`, the *set* of `T` rows joined to a given `P` row is
+`{ T : T.fk = P.pk }` — determined entirely by `T.fk` (a `T` column a `P` write cannot
+change). So a `P` change only re-derives the lookup-projected columns of existing backing
+rows (an upsert at the unchanged `T.pk`), never adds or removes one. A `T`-side membership
+change is the forward path's job; the two paths fire independently and, reading live state,
+converge under last-write-wins exactly as the other residual arms do.
+
+The join soundness predicates (`proveOneToOneJoin` = the no-row-loss descent +
+`proveJoinNoFanout`) are **factored out of `coverage-prover.ts`** and shared by the base-table
+coverage prover and this MV gate, so the 1:1-join logic lives in one place. Outer joins, a
+partial `WHERE`, and a fanning (non-1:1) keyed join are deferred.
 
 ### MV-over-MV cascade
 
@@ -836,11 +908,14 @@ The following extensions build on this substrate:
   **single-source lateral-TVF fan-out** is **delivered**
   (`materialized-view-rowtime-prefix-delete-lateral-tvf`, the `'prefix-delete'` arm: a
   by-prefix delete of the base row's fan-out + a re-fan residual, keyed by the composite
-  product key). The remaining shapes — **inner/cross-join row-preserving (1:1) bodies**
-  (`materialized-view-rowtime-residual-join`, reusing the residual primitive with a
-  `'row'`/`'pk'` binding) and a **fanning keyed join** (a non-1:1 inner/cross join that
-  reuses the prefix-delete by-prefix machinery, the join standing in for the TVF fan-out)
-  — are rejected today.
+  product key). **Inner/cross-join row-preserving (1:1) bodies** are also **delivered**
+  (`materialized-view-rowtime-residual-join`, the `'join-residual'` arm: the residual kernel
+  with a `'row'`/`'pk'` binding on the driving table, plus a second `P`-keyed residual for
+  lookup-side writes; the join soundness predicates `proveOneToOneJoin` are now shared with
+  the coverage prover). The remaining join shapes — a **fanning keyed join** (a non-1:1
+  inner/cross join that reuses the prefix-delete by-prefix machinery, the join standing in
+  for the TVF fan-out), an **outer** 1:1 join, and a **partial-`WHERE`** join body — are
+  rejected today.
 - **Concurrent refresh** (`materialized-view-concurrent-refresh`) — overlapping
   refreshes and refresh-while-read beyond today's atomic base-layer swap.
 - **Write-through DML** — **delivered** (`materialized-view-dml-write-through`): DML

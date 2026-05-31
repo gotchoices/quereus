@@ -145,8 +145,8 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		['order by aggregate (non-group-key backing PK)', 'select k, sum(v) as s from g group by k order by sum(v)', 'which is not a GROUP BY source column'],
 		// A computed group-by key (no source-column index to key the backing on) is rejected.
 		['computed GROUP BY key', 'select k + 1 as kk, count(*) as c from g group by k + 1', 'its GROUP BY includes a computed expression'],
-		['join (multi-source)', 'select g.id, g.v from g join g2 on g.id = g2.id', 'its body reads more than one source table (joins are not supported)'],
-		['self-join (multi-source)', 'select a.id, a.v from g a join g b on a.id = b.id', 'its body reads more than one source table (joins are not supported)'],
+		['join (not provably 1:1, no FK)', 'select g.id, g.v from g join g2 on g.id = g2.id', 'is not a provably 1:1 row-preserving join'],
+		['self-join (not row-time maintainable)', 'select a.id, a.v from g a join g b on a.id = b.id', 'is a self-join'],
 		['union over two tables (multi-source, NOT set-op)', 'select id, v from g union select id, w from g2', 'its body reads more than one source table (joins are not supported)'],
 		['WHERE subquery over another table (multi-source)', 'select id, v from g where v in (select w from g2)', 'its body reads more than one source table (joins are not supported)'],
 		['DISTINCT (single source)', 'select distinct v from g', 'its body uses DISTINCT'],

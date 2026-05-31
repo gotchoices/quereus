@@ -83,7 +83,11 @@ export interface DecompositionMember {
 	readonly relation: BasisRelationRef;
 	/**
 	 * `mandatory` ⇒ inner-joined onto the anchor (every logical row has it);
-	 * `optional` ⇒ outer-joined (a logical row may lack it).
+	 * `optional` ⇒ outer-joined (a logical row may lack it). "Every logical row has
+	 * it" is the `anchor.key ⊆ member.key` totality the existence-anchor IND encodes
+	 * (`computeExistenceAnchorInds` in `schema/lens-compiler.ts`) — the property the
+	 * producer relies on to discharge the anchor-rooted inner join's no-row-loss
+	 * obligation.
 	 */
 	readonly presence: 'mandatory' | 'optional';
 	/**

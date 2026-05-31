@@ -884,37 +884,42 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 		return db.schemaManager.getSchema('x')!.getLensSlot('Car')!;
 	}
 
-	it('injects one existence-anchor IND per mandatory member (cols = member key, target = anchor, total)', async () => {
+	it('injects one existence-anchor IND per mandatory member (cols = anchor key, target = member, total)', async () => {
 		const db = new Database();
 		try {
 			const slot = await deployCar(db, carAd('mandatory'));
 			const inds = slot.injectedInds ?? [];
 			expect(inds, 'one IND for the single mandatory non-anchor member').to.have.length(1);
 			const ind = inds[0];
-			// `cols` are Car_perf's key column indices on its own basis relation (id @ 0).
+			// `cols` are Car_core's (the anchor's) key column indices on its own basis relation (id @ 0).
 			expect(ind.cols).to.deep.equal([0]);
-			// Total existence — a mandatory member backs every logical row.
+			// Total existence — every logical (= anchor) row has the mandatory member.
 			expect(ind.nullRejecting).to.equal(false);
-			// Target is the anchor relation, keyed by its key column indices (id @ 0).
+			// Target is the mandatory non-anchor *member* relation, keyed by its key column indices (id @ 0).
 			const t = relTarget(ind);
-			expect(t.relationId).to.equal('Car_core');
+			expect(t.relationId).to.equal('Car_perf');
 			expect(t.targetCols).to.deep.equal([0]);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('the injected relationId equals advertisement.id === storage.anchorRelationId (anchor contract)', async () => {
+	it('the injected target is a non-anchor mandatory member while cols address the anchor key (direction-swap guard)', async () => {
 		const db = new Database();
 		try {
 			const slot = await deployCar(db, carAd('mandatory'));
 			const ad = slot.advertisement!;
-			const t = relTarget((slot.injectedInds ?? [])[0]);
-			// The resolver validates id === anchorRelationId; the IND must agree with both
-			// so the injected fact and the get-synthesis join name the same anchor.
-			expect(ad.id).to.equal(ad.storage!.anchorRelationId);
-			expect(t.relationId).to.equal(ad.id);
-			expect(t.relationId).to.equal(ad.storage!.anchorRelationId);
+			const ind = (slot.injectedInds ?? [])[0];
+			const t = relTarget(ind);
+			// The injected fact is `anchor.key ⊆ member.key`: the THIS-side (`cols`) is the
+			// anchor and the target is the *member* — explicitly NOT the anchor. Pinning the
+			// target to a non-anchor member makes a future accidental direction swap (back to
+			// the unsound `member ⊆ anchor`) fail loudly here.
+			expect(ad.id).to.equal(ad.storage!.anchorRelationId); // resolver invariant, unchanged
+			expect(t.relationId).to.equal('Car_perf');
+			expect(t.relationId).to.not.equal(ad.storage!.anchorRelationId);
+			// `cols` index the anchor's key (id @ 0 on Car_core), pairing positionally with the member key.
+			expect(ind.cols).to.deep.equal([0]);
 		} finally {
 			await db.close();
 		}
@@ -992,10 +997,10 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Doc')!;
 			const inds = slot.injectedInds ?? [];
 			expect(inds).to.have.length(1);
-			// cols index Doc_body (doc_sid @ 0); targetCols index Doc_core (sid @ 0).
+			// cols index Doc_core, the anchor (sid @ 0); targetCols index Doc_body, the member (doc_sid @ 0).
 			expect(inds[0].cols).to.deep.equal([0]);
 			const t = relTarget(inds[0]);
-			expect(t.relationId).to.equal('Doc_core');
+			expect(t.relationId).to.equal('Doc_body');
 			expect(t.targetCols).to.deep.equal([0]);
 			expect(inds[0].nullRejecting).to.equal(false);
 		} finally {
@@ -1031,7 +1036,8 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 			const inds = db.schemaManager.getSchema('x')!.getLensSlot('Car')!.injectedInds ?? [];
 			// Only Car_perf is mandatory + non-anchor; Car_trim is optional ⇒ excluded.
 			expect(inds).to.have.length(1);
-			expect(relTarget(inds[0]).relationId).to.equal('Car_core');
+			// Target is the mandatory non-anchor member (Car_perf), not the anchor (Car_core).
+			expect(relTarget(inds[0]).relationId).to.equal('Car_perf');
 		} finally {
 			await db.close();
 		}

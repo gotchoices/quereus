@@ -193,10 +193,13 @@ insert into g values (1, 100, 5);
 create materialized view bad_scalar_agg as select count(*) as c, sum(v) as sv from g;
 -- error: scalar aggregate with no GROUP BY
 
--- join body (multi-source: the source-count check fires before the join check)
+-- join body that is NOT provably 1:1 — no NOT-NULL foreign key from the driving side to
+-- the lookup PK, and the lookup join key (g2.w) is non-unique, so the join can fan out.
+-- The join-residual arm rejects it on SHAPE, steering to a plain view. (A provably-1:1
+-- FK join is now ACCEPTED — see §24.)
 create table g2 (id integer primary key, w integer);
-create materialized view bad_join as select g.id, g.v from g join g2 on g.id = g2.id;
--- error: its body reads more than one source table
+create materialized view bad_join as select g.id, g.v from g join g2 on g.k = g2.w;
+-- error: is not a provably 1:1 row-preserving join
 
 -- set-operation body over two tables — multi-source, NOT the "set operation" tail
 -- (the union references g and g2, so the source-count check trips first).
@@ -1047,3 +1050,64 @@ select id, value from ltw_fan order by id, value;
 update ltw set k = 2 where id = 1;
 select id, value from ltw_fan order by id, value;
 → [{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
+
+-- ===================================
+-- 24. 1:1 inner-join bodies (`select T.pk…, P.col from T join P on T.fk = P.id`) — the
+--     join-residual arm. T's NOT-NULL FK to P's PK makes the inner join provably 1:1 on T
+--     (no row loss via referential integrity, no fan-out via P's unique PK), so the backing
+--     is keyed on T's PK. A write to the driving table T recomputes its one joined row
+--     (forward, T-PK-keyed residual); a write to the lookup table P refreshes every joined
+--     row referencing it (reverse, P-PK-keyed residual, upsert-only — inner-join + RI
+--     membership is fixed by T.fk). (materialized-view-rowtime-residual-join)
+-- ===================================
+
+create table jp (id integer primary key, name text);
+insert into jp values (1, 'alice'), (2, 'bob'), (3, 'carol');
+create table jt (id integer primary key, fk integer not null references jp(id));
+insert into jt values (10, 1), (20, 1), (30, 2);
+create materialized view jmv as select jt.id, jt.fk, jp.name from jt join jp on jt.fk = jp.id;
+
+-- MV equals the body at create time (jt 10 & 20 both reference jp 1).
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":1,"name":"alice"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"bob"}]
+
+-- INSERT a driving (jt) row → its one joined row appears (forward residual).
+insert into jt values (40, 3);
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":1,"name":"alice"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"bob"},{"id":40,"fk":3,"name":"carol"}]
+
+-- UPDATE a driving row's FK → it re-joins to the new lookup row (reads-own-writes).
+update jt set fk = 2 where id = 10;
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":2,"name":"bob"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"bob"},{"id":40,"fk":3,"name":"carol"}]
+
+-- LOOKUP-side UPDATE (jp.name) → every joined backing row referencing it is refreshed
+-- (reverse residual upserts each, no delete).
+update jp set name = 'BOB' where id = 2;
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":2,"name":"BOB"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- DELETE a driving row → its joined backing row disappears (removed-join-row).
+delete from jt where id = 20;
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- Key-changing UPDATE of the driving PK moves the backing row to the new key.
+update jt set id = 11 where id = 10;
+select id, fk, name from jmv order by id;
+→ [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- Mid-transaction visibility + rollback reverts both sides in lockstep.
+begin;
+insert into jp values (4, 'dave');
+insert into jt values (50, 4);
+select id, fk, name from jmv where id = 50;
+→ [{"id":50,"fk":4,"name":"dave"}]
+rollback;
+select id, fk, name from jmv where id = 50;
+→ []
+
+-- A lookup INSERT with no referencing driving row is a no-op for the MV.
+insert into jp values (9, 'zara');
+select id, fk, name from jmv order by id;
+→ [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]

@@ -32,7 +32,7 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { BlockNode } from '../planner/nodes/block.js';
-import { PlanNode, type ScalarPlanNode, type RowDescriptor, isRelationalNode } from '../planner/nodes/plan-node.js';
+import { PlanNode, type ScalarPlanNode, type RowDescriptor, type RelationalPlanNode, isRelationalNode } from '../planner/nodes/plan-node.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { emitPlanNode } from '../runtime/emitters.js';
@@ -48,6 +48,8 @@ import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import { injectKeyFilter } from '../planner/analysis/key-filter.js';
+import { proveOneToOneJoin } from '../planner/analysis/coverage-prover.js';
+import { CapabilityDetectors } from '../planner/framework/characteristics.js';
 import {
 	selectMaintenanceStrategy,
 	seqScanCost,
@@ -109,7 +111,29 @@ export type MaintenancePlan =
 	| InverseProjectionPlan
 	| FullRebuildPlan
 	| ResidualRecomputePlan
-	| PrefixDeletePlan;
+	| PrefixDeletePlan
+	| JoinResidualPlan;
+
+/**
+ * Structural subset of the fields the forward (driving-source) residual-recompute
+ * apply path reads — shared by the aggregate {@link ResidualRecomputePlan} and the
+ * 1:1-join {@link JoinResidualPlan} so both drive {@link MaterializedViewManager.applyForwardResidual}
+ * unchanged. For an aggregate the forward key is the group key (`'gk'`); for a join
+ * it is the driving table `T`'s PK (`'pk'`).
+ */
+interface ForwardResidualPlan {
+	mv: MaterializedViewSchema;
+	backingSchema: string;
+	backingTableName: string;
+	/** Cached scheduler for the key-filtered residual (the body with `injectKeyFilter`
+	 *  applied on the driving source). Re-run per affected key, bound through the live txn. */
+	residualScheduler: Scheduler;
+	bindParamPrefix: 'gk' | 'pk';
+	/** Source-column indices of the forward binding key (group columns / `T`'s PK columns). */
+	bindColumns: number[];
+	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	backingPkSourceCols: number[];
+}
 
 /**
  * The shipped covering-index maintenance arm (the former `RowTimeMaintenancePlan`,
@@ -274,6 +298,49 @@ export interface PrefixDeletePlan extends MaintenancePlanCommon {
 }
 
 /**
+ * The 1:1 row-preserving **inner/cross join** arm: a body
+ * `select … from T join P on T.fk = P.id` where `T` contributes **exactly one** MV row
+ * per governed `T` row (proven by {@link proveOneToOneJoin} — no row loss via NOT-NULL
+ * FK→PK referential integrity, no fan-out via `isUnique(T.pk)` at the join frame). The
+ * backing is keyed on `T`'s PK (the composite product key `keysOf` advertises across the
+ * 1:1 join collapses to `T`'s PK), so each changed `T` row maps to one backing row.
+ *
+ * Reuses the residual kernel of {@link ResidualRecomputePlan} on its **driving (`T`)**
+ * side via {@link ForwardResidualPlan}: a `T`-keyed (`'pk'`) residual recomputes the one
+ * joined row for a changed `T` row (delete old backing slice → run residual → upsert),
+ * identical to a `'row'`-binding aggregate of size 1. `applyForwardResidual` drives it.
+ *
+ * The **lookup (`P`)** side is the join arm's distinct problem: the MV's `sourceTables`
+ * includes `P`, so a write to `P` also fires maintenance, but the forward residual is
+ * keyed on `T`'s PK and a `P` row joins *many* `T` rows. This plan therefore carries a
+ * **second residual keyed on `P`'s PK** (`lookupResidualScheduler`): for a `P` change it
+ * runs `… where P.pk = :pk0` against live state, returning every currently-joined row
+ * (each carrying its `T.pk` backing key), and **upserts** each. No delete is needed —
+ * with an inner join + enforced RI and no lookup-referencing WHERE (rejected at build),
+ * the *set* of `T` rows joined to a given `P` row is determined by `T.fk` (a `T` column,
+ * unchanged by a `P` write), so a `P` change only refreshes the lookup-projected columns
+ * of existing backing rows, never adds/removes a backing row. See
+ * `docs/incremental-maintenance.md` § join-residual and the soundness note in
+ * {@link MaterializedViewManager.applyLookupResidual}.
+ */
+export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidualPlan {
+	readonly kind: 'join-residual';
+	/** Substrate parity: the driving `T`'s `'row'`/PK binding. */
+	binding: BindingMode;
+	degradeToRebuild: boolean;
+	bindParamPrefix: 'pk';
+	/** Lowercased `schema.table` of the lookup source `P` (distinct from `sourceBase` = `T`). */
+	lookupBase: string;
+	/** Cached scheduler for the lookup-keyed residual (the body with `injectKeyFilter`
+	 *  applied on `P`, `'pk'` prefix). Re-run per affected `P` key; returns the joined rows. */
+	lookupResidualScheduler: Scheduler;
+	/** Source-`P` PK column indices (the lookup key). The affected key tuple for a `P`
+	 *  change is `lookupBindColumns.map(c => changedRow[c])`, bound to `pk{i}`. */
+	lookupBindColumns: number[];
+	lookupBindParamPrefix: 'pk';
+}
+
+/**
  * Per-statement cache of resolved backing {@link MemoryTableConnection}s, keyed by the
  * lowercased backing `schema.table`. Created **once per DML generator run** (one
  * statement) and threaded through the maintenance path so the backing-connection
@@ -400,9 +467,14 @@ export class MaterializedViewManager {
 		this.releaseRowTime(key);
 		const plan = this.buildMaintenancePlan(mv); // throws on ineligible shape
 		this.rowTime.set(key, plan);
-		let set = this.rowTimeBySource.get(plan.sourceBase);
-		if (!set) { set = new Set(); this.rowTimeBySource.set(plan.sourceBase, set); }
-		set.add(key);
+		// Index the plan under every source base it reads. Single-source arms index
+		// under `sourceBase` only; the 1:1-join arm also indexes under the lookup base
+		// so a write to `P` fires maintenance too (handled by the reverse residual).
+		for (const base of planSourceBases(plan)) {
+			let set = this.rowTimeBySource.get(base);
+			if (!set) { set = new Set(); this.rowTimeBySource.set(base, set); }
+			set.add(key);
+		}
 		log('Registered row-time materialized view %s.%s', mv.schemaName, mv.name);
 	}
 
@@ -426,10 +498,12 @@ export class MaterializedViewManager {
 		const plan = this.rowTime.get(key);
 		if (!plan) return;
 		this.rowTime.delete(key);
-		const set = this.rowTimeBySource.get(plan.sourceBase);
-		if (set) {
-			set.delete(key);
-			if (set.size === 0) this.rowTimeBySource.delete(plan.sourceBase);
+		for (const base of planSourceBases(plan)) {
+			const set = this.rowTimeBySource.get(base);
+			if (set) {
+				set.delete(key);
+				if (set.size === 0) this.rowTimeBySource.delete(base);
+			}
 		}
 	}
 
@@ -478,12 +552,13 @@ export class MaterializedViewManager {
 		cache?: BackingConnectionCache,
 		depth = 0,
 	): Promise<void> {
-		const keys = this.rowTimeBySource.get(sourceBase.toLowerCase());
+		const changedBase = sourceBase.toLowerCase();
+		const keys = this.rowTimeBySource.get(changedBase);
 		if (!keys || keys.size === 0) return;
 		for (const key of keys) {
 			const plan = this.rowTime.get(key);
 			if (!plan) continue;
-			const backingChanges = await this.applyMaintenancePlan(plan, change, cache);
+			const backingChanges = await this.applyMaintenancePlan(plan, change, changedBase, cache);
 			if (backingChanges.length === 0) continue;
 			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
@@ -524,15 +599,18 @@ export class MaterializedViewManager {
 	private async applyMaintenancePlan(
 		plan: MaintenancePlan,
 		change: BackingRowChange,
+		changedBase: string,
 		cache?: BackingConnectionCache,
 	): Promise<BackingRowChange[]> {
 		switch (plan.kind) {
 			case 'inverse-projection':
 				return this.applyInverseProjection(plan, change, cache);
 			case 'residual-recompute':
-				return this.applyResidualRecompute(plan, change, cache);
+				return this.applyForwardResidual(plan, change, cache);
 			case 'prefix-delete':
 				return this.applyPrefixDelete(plan, change, cache);
+			case 'join-residual':
+				return this.applyJoinResidual(plan, change, changedBase, cache);
 			case 'full-rebuild':
 				throw new QuereusError(
 					`materialized view '${plan.mv.name}': '${plan.kind}' maintenance is not yet wired `
@@ -691,7 +769,12 @@ export class MaterializedViewManager {
 		// references or a TVF node — caught here and by the node-type checks below.)
 		const tableRefs = [...collectTableRefs(analyzed).values()];
 		if (tableRefs.length === 0) reject('its body reads no source table');
-		if (tableRefs.length > 1) reject('its body reads more than one source table (joins are not supported)');
+		// A multi-source body is admitted ONLY as a provably-1:1 binary join (the join arm
+		// below). Any other multi-source body (e.g. a 2-table set operation) is rejected here
+		// so its diagnostic stays the source-count tail rather than a downstream reason.
+		if (tableRefs.length > 1 && !containsAnyJoin(analyzed)) {
+			reject('its body reads more than one source table (joins are not supported)');
+		}
 		const tableRef = tableRefs[0];
 		const sourceSchema = tableRef.tableSchema;
 		const sourceBase = `${sourceSchema.schemaName}.${sourceSchema.name}`.toLowerCase();
@@ -720,13 +803,20 @@ export class MaterializedViewManager {
 		// the builder soundness-checks the rest of the shape (single TVF/join, advertised
 		// composite product key, base PK leading the backing PK, deterministic fan-out).
 		if (containsNodeType(analyzed, PlanNodeType.TableFunctionCall)) {
+			if (tableRefs.length !== 1) {
+				reject('its body joins a lateral table-valued function to more than one base source table');
+			}
 			return this.buildLateralTvfPrefixDeletePlan(mv, analyzed, tableRef, sourceBase, reject);
 		}
 
-		// Joins are single-source-incompatible for the covering-index and aggregate arms;
-		// the lateral-TVF fan-out (above) is the only admitted join shape. A non-TVF
-		// lateral subquery join over `T` alone still rejects here.
-		if (containsAnyJoin(analyzed)) reject('its body contains a join');
+		// Provably-1:1 inner/cross join (`select … from T join P on T.fk = P.id`) →
+		// join-residual arm. A fanning (non-1:1) join, an outer join, a >2-source join, an
+		// aggregate over a join, or a partial WHERE is rejected inside the builder with a
+		// shape diagnostic. (The lateral-TVF fan-out above is matched first because it also
+		// surfaces a join node.)
+		if (containsAnyJoin(analyzed)) {
+			return this.buildJoinResidualPlan(mv, analyzed, tableRefs, reject);
+		}
 
 		// Single-source aggregate (`group by` over bare columns) → residual-recompute arm.
 		// Each changed source row belongs to exactly one group; maintaining the MV means
@@ -1016,6 +1106,185 @@ export class MaterializedViewManager {
 	}
 
 	/**
+	 * Build a `'join-residual'` plan for a provably-1:1 row-preserving **inner/cross join**
+	 * body (`select … from T join P on T.fk = P.id`), or throw via `reject` with a shape
+	 * diagnostic. The driving table `T` is the one whose PK the optimizer surfaced as the
+	 * backing key (the 1:1 join collapses the composite product key to `T`'s PK); the other
+	 * base ref is the lookup `P`. See {@link JoinResidualPlan} and
+	 * `docs/incremental-maintenance.md` § join-residual.
+	 *
+	 * Soundness gates: exactly two base tables; an aggregate over the join is rejected (a
+	 * different shape); **no WHERE** (a partial / lookup-referencing predicate is deferred —
+	 * see the lookup-side soundness note in {@link applyLookupResidual}); the backing PK is
+	 * exactly `T`'s PK projected as passthrough columns (so each changed `T` row maps to one
+	 * backing row and the reverse residual's rows carry the backing key); the join is
+	 * provably 1:1 on `T` ({@link proveOneToOneJoin} — no row loss via NOT-NULL FK→PK RI, no
+	 * fan-out via the join-frame `isUnique(T.pk)`); the join is **inner/cross** (an outer join
+	 * would make the lookup-side reverse residual unsound — filtering `P` drops the
+	 * null-extended rows); and deterministic projections.
+	 */
+	private buildJoinResidualPlan(
+		mv: MaterializedViewSchema,
+		analyzed: BlockNode,
+		tableRefs: TableReferenceNode[],
+		reject: (detail: string) => never,
+	): MaintenancePlan {
+		if (tableRefs.length !== 2) {
+			reject('its body reads more than two source tables (only a 1:1 binary join is row-time maintainable)');
+		}
+		if (findAggregate(analyzed)) {
+			reject('its body aggregates over a join (not row-time maintainable in v1)');
+		}
+		// A partial / lookup-referencing WHERE is deferred: the lookup-side reverse residual
+		// is upsert-only, sound only when join membership is predicate-independent.
+		if (mv.selectAst.type === 'select' && mv.selectAst.where !== undefined) {
+			reject('its join body has a WHERE clause (a partial join body is not row-time maintainable in v1; use a plain view)');
+		}
+
+		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+
+		const rootAttrs = relationalAttributes(analyzed);
+		if (!rootAttrs) reject('its body produced no relational output');
+		const producingByAttrId = collectProducingExprs(analyzed);
+
+		// Per-base-ref attribute → source-column maps. `T` and `P` are bare
+		// TableReferenceNodes (output-col index == source-col index).
+		const refInfos = tableRefs.map(ref => {
+			const attrToCol = new Map<number, number>();
+			ref.getAttributes().forEach((a, i) => attrToCol.set(a.id, i));
+			return { ref, attrToCol };
+		});
+
+		// Identify the driving table `T` as the one every backing-PK column resolves to, and
+		// map each backing-PK column to its `T` source column (the delete key the forward arm
+		// builds). A backing-PK column resolving to neither ref — or columns spanning both —
+		// means the backing is not keyed on a single source's PK (the join is not provably
+		// 1:1, or `keysOf` fell back to all-columns): reject.
+		let tIndex: number | undefined;
+		const backingPkSourceCols: number[] = [];
+		for (const d of backingPkDefinition) {
+			const attr = rootAttrs![d.index];
+			let resolvedRef: number | undefined;
+			let resolvedCol: number | undefined;
+			for (let i = 0; i < refInfos.length; i++) {
+				const sc = attr ? resolveTransitiveSourceCol(attr.id, refInfos[i].attrToCol, producingByAttrId) : undefined;
+				if (sc !== undefined) { resolvedRef = i; resolvedCol = sc; break; }
+			}
+			if (resolvedRef === undefined) {
+				reject('its backing primary key includes a column not projected from a single source table (the join is not provably 1:1 on one source — use a plain view)');
+			}
+			if (tIndex === undefined) tIndex = resolvedRef;
+			else if (tIndex !== resolvedRef) {
+				reject('its backing primary key spans both join sources (not a 1:1 join keyed on one source)');
+			}
+			backingPkSourceCols.push(resolvedCol!);
+		}
+		if (tIndex === undefined) reject('its body produced no backing key');
+
+		const tRef = refInfos[tIndex!].ref;
+		const pRef = refInfos[tIndex! === 0 ? 1 : 0].ref;
+		const tSchema = tRef.tableSchema;
+		const pSchema = pRef.tableSchema;
+		const sourceBase = `${tSchema.schemaName}.${tSchema.name}`.toLowerCase();
+		const lookupBase = `${pSchema.schemaName}.${pSchema.name}`.toLowerCase();
+		if (sourceBase === lookupBase) {
+			reject('its body is a self-join (not row-time maintainable)');
+		}
+
+		// The backing key must be EXACTLY the driving source's PK (each `T` row → one backing
+		// row). `keysOf` surfaced `T.pk` for the 1:1 join; verify it resolved to a real PK key
+		// (not the all-columns fallback) by set-equality with `T`'s declared PK.
+		const tPkCols = tSchema.primaryKeyDefinition.map(d => d.index);
+		if (tPkCols.length === 0) reject(`its driving source '${sourceBase}' has no primary key`);
+		const backingPkSet = new Set(backingPkSourceCols);
+		if (backingPkSet.size !== tPkCols.length || !tPkCols.every(c => backingPkSet.has(c))) {
+			reject('its backing primary key is not exactly the driving source primary key (the join is not provably 1:1 — use a plain view)');
+		}
+
+		// Prove the join is 1:1 on `T` (no row loss + no fan-out), reusing the coverage
+		// prover's shared join predicates over the analyzed body.
+		const root = rootRelationalNode(analyzed);
+		if (!root) reject('its body produced no relational output');
+		const proof = proveOneToOneJoin(root!, tSchema);
+		if (!proof.ok) {
+			reject(proof.reason === 'fanout'
+				? 'its join can fan out — one driving row may match many lookup rows (a fanning keyed join is not row-time maintainable in v1; use a plain view)'
+				: 'its body is not a provably 1:1 row-preserving join (only an inner/cross join on a NOT-NULL foreign key to the lookup primary key is row-time maintainable; use a plain view)');
+		}
+
+		// Restrict to inner/cross: the lookup-side reverse residual filters `P`, which would
+		// drop an outer join's null-extended rows (unsound). An outer 1:1 join is deferred.
+		const topJoin = proof.topJoin;
+		const joinType = topJoin && CapabilityDetectors.isJoin(topJoin) ? topJoin.getJoinType() : undefined;
+		if (joinType !== 'inner' && joinType !== 'cross') {
+			reject('its body uses an outer join (only an inner/cross 1:1 join is row-time maintainable in v1; use a plain view)');
+		}
+
+		// Determinism: the residual must reproduce exactly what `select <body>` returns, so a
+		// volatile projection (random()/now()/volatile UDF) is rejected.
+		for (const attr of rootAttrs!) {
+			const producing = attr ? producingByAttrId.get(attr.id) : undefined;
+			if (!producing) continue; // a bare passthrough column has no producing expr to check
+			const det = checkDeterministic(producing);
+			if (!det.valid) {
+				reject(`it projects a non-deterministic expression (${det.expression}); a row-time backing value must be reproducible from the source rows`);
+			}
+		}
+
+		// Forward (`T`) residual: the body with `T.pk = :pk0 AND …` injected on `T`. Recomputes
+		// the one joined row for a changed `T` row (delegated to `applyForwardResidual`).
+		const tRelKey = `${sourceBase}#${tRef.id ?? 'unknown'}`;
+		const forwardResidual = this.compileResidual(analyzed, tRelKey, tPkCols, 'pk', reject);
+
+		// Reverse (`P`) residual: the body with `P.pk = :pk0 AND …` injected on `P`. Drives
+		// lookup-side maintenance — finds every joined row referencing a changed `P` row.
+		const pPkCols = pSchema.primaryKeyDefinition.map(d => d.index);
+		if (pPkCols.length === 0) reject(`its lookup source '${lookupBase}' has no primary key`);
+		const pRelKey = `${lookupBase}#${pRef.id ?? 'unknown'}`;
+		const reverseResidual = this.compileResidual(analyzed, pRelKey, pPkCols, 'pk', reject);
+
+		// ── Cost gate (parity with the other residual arms) ──
+		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
+		const sourceStats = this.estimateMaintenanceStats(tSchema, backing.columns.length, /*hasPredicate*/ false);
+		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
+		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
+		if (chosenStrategy !== 'residual-recompute') {
+			throw new QuereusError(
+				`Internal error: cost gate selected unwired strategy '${chosenStrategy}' for materialized view '${mv.name}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		return {
+			kind: 'join-residual',
+			mv,
+			sourceBase,
+			backingSchema: mv.schemaName,
+			backingTableName: mv.backingTableName,
+			chosenStrategy,
+			sourceStats,
+			binding: { kind: 'row', keyColumns: [...tPkCols] },
+			degradeToRebuild: false,
+			residualScheduler: forwardResidual,
+			bindParamPrefix: 'pk',
+			bindColumns: tPkCols,
+			backingPkDefinition,
+			backingPkSourceCols,
+			lookupBase,
+			lookupResidualScheduler: reverseResidual,
+			lookupBindColumns: pPkCols,
+			lookupBindParamPrefix: 'pk',
+		};
+	}
+
+	/**
 	 * Compile the key-filtered residual for a binding into a reusable {@link Scheduler}:
 	 * the analyzed body with a key-equality filter injected on `T`'s `TableReferenceNode`
 	 * (parameterized `${paramPrefix}0…`), then optimized + emitted. Mirrors the assertion
@@ -1074,22 +1343,27 @@ export class MaterializedViewManager {
 	}
 
 	/**
-	 * Compute a `'residual-recompute'` plan's per-row backing delta and apply it: derive
-	 * the affected binding key(s) from the changed row (OLD ∪ NEW, deduped), and for each —
-	 * delete the old backing slice for that key, re-run the key-filtered residual against
-	 * live source state, and upsert the recomputed slice (0 or 1 rows). An emptied group
-	 * (residual returns nothing) leaves only the delete, removing the stale backing row.
-	 * Returns the effective {@link BackingRowChange}(s) the backing layer realized, for the
-	 * MV-over-MV cascade.
+	 * Compute a **forward** key-filtered residual plan's per-row backing delta and apply it:
+	 * derive the affected binding key(s) from the changed row (OLD ∪ NEW, deduped), and for
+	 * each — delete the old backing slice for that key, re-run the key-filtered residual
+	 * against live source state, and upsert the recomputed slice. An emptied slice (residual
+	 * returns nothing) leaves only the delete, removing the stale backing row. Returns the
+	 * effective {@link BackingRowChange}(s) the backing layer realized, for the MV-over-MV
+	 * cascade.
 	 *
-	 * Per-row recompute is correct without per-statement batching: every change to a group
-	 * triggers a full recompute of that group from live (reads-own-writes) state, so the
-	 * last change to touch a group writes the authoritative backing row. Batching/dedup
+	 * Shared by the single-source aggregate (`'residual-recompute'`, group key, ≤1 row per
+	 * key) and the 1:1-join (`'join-residual'`, the driving table `T`'s PK, exactly the one
+	 * joined row per key) arms — both bind on the forward driving source via
+	 * {@link ForwardResidualPlan}; the only difference is the binding (group vs PK).
+	 *
+	 * Per-row recompute is correct without per-statement batching: every change to a key
+	 * triggers a full recompute of that key's slice from live (reads-own-writes) state, so
+	 * the last change to touch a key writes the authoritative backing row. Batching/dedup
 	 * across a whole statement is an affordability optimization deferred with the
 	 * statement-flush boundary (see the ticket handoff).
 	 */
-	private async applyResidualRecompute(
-		plan: ResidualRecomputePlan,
+	private async applyForwardResidual(
+		plan: ForwardResidualPlan,
 		change: BackingRowChange,
 		cache?: BackingConnectionCache,
 	): Promise<BackingRowChange[]> {
@@ -1149,12 +1423,87 @@ export class MaterializedViewManager {
 	 * only the residual row(s) belonging to the recomputed key — see
 	 * {@link applyResidualRecompute}.
 	 */
-	private residualRowMatchesKey(plan: ResidualRecomputePlan, row: Row, keyVals: readonly SqlValue[]): boolean {
+	private residualRowMatchesKey(plan: ForwardResidualPlan, row: Row, keyVals: readonly SqlValue[]): boolean {
 		for (let i = 0; i < plan.backingPkDefinition.length; i++) {
 			const d = plan.backingPkDefinition[i];
 			if (compareSqlValues(row[d.index], keyVals[i], d.collation) !== 0) return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Dispatch a `'join-residual'` plan on **which source changed**. A write to the driving
+	 * table `T` (`changedBase === plan.sourceBase`) is the forward case — recompute the one
+	 * joined row keyed on `T`'s PK, identical to a size-1 `'row'`-binding residual — so it
+	 * delegates straight to {@link applyForwardResidual} (delete old backing slice → run the
+	 * `T`-keyed residual → upsert). A write to the lookup table `P` is the reverse case,
+	 * handled by {@link applyLookupResidual}.
+	 */
+	private async applyJoinResidual(
+		plan: JoinResidualPlan,
+		change: BackingRowChange,
+		changedBase: string,
+		cache?: BackingConnectionCache,
+	): Promise<BackingRowChange[]> {
+		if (changedBase === plan.sourceBase) {
+			return this.applyForwardResidual(plan, change, cache);
+		}
+		return this.applyLookupResidual(plan, change, cache);
+	}
+
+	/**
+	 * Maintain a `'join-residual'` MV for a **lookup-side (`P`)** change: refresh the joined
+	 * rows referencing each affected `P` key. Derive the affected `P` key(s) from the changed
+	 * row (OLD ∪ NEW, deduped on `P`'s PK), and for each run the lookup-keyed residual
+	 * (`… where P.pk = :pk0`) against live source state — returning every currently-joined
+	 * row, each carrying its `T.pk` backing key — and **upsert** each.
+	 *
+	 * **No delete is performed, and that is sound.** For an inner/cross join with enforced
+	 * RI and no lookup-referencing WHERE (both required at build), the *set* of backing rows
+	 * referencing a given `P` row is `{ T : T.fk = P.pk }`, determined entirely by `T.fk` (a
+	 * `T` column the `P` write cannot change). So a `P` change can only re-derive the
+	 * lookup-projected columns of those existing backing rows (an upsert at the unchanged
+	 * `T.pk` key), never add or remove one: a `P` insert with no referencing `T` rows yields
+	 * an empty residual (no-op); a `P` delete is only admissible (RI) when no `T` references
+	 * it (empty residual); a `P` payload update upserts the affected rows with the new value.
+	 * A `T`-side membership change (insert/delete/FK-move) is the *forward* path's job and
+	 * fires its own maintenance. Returns the effective {@link BackingRowChange}(s) for the
+	 * MV-over-MV cascade. Per-row recompute is correct without batching for the same
+	 * last-write-wins-against-live-state reason as {@link applyForwardResidual}.
+	 */
+	private async applyLookupResidual(
+		plan: JoinResidualPlan,
+		change: BackingRowChange,
+		cache?: BackingConnectionCache,
+	): Promise<BackingRowChange[]> {
+		// Distinct affected lookup keys (OLD ∪ NEW), deduped on `P`'s PK values.
+		const affected = new Map<string, SqlValue[]>();
+		const addFrom = (row: Row): void => {
+			const keyTuple = plan.lookupBindColumns.map(c => row[c]);
+			const dedupKey = canonKeyValues(keyTuple);
+			if (!affected.has(dedupKey)) affected.set(dedupKey, keyTuple);
+		};
+		if (change.op === 'insert') addFrom(change.newRow);
+		else if (change.op === 'delete') addFrom(change.oldRow);
+		else { addFrom(change.oldRow); addFrom(change.newRow); }
+
+		const ops: MaintenanceOp[] = [];
+		for (const keyTuple of affected.values()) {
+			const recomputed = await this.runResidual(plan.lookupResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
+			for (const row of recomputed) ops.push({ kind: 'upsert', row });
+		}
+		if (ops.length === 0) return [];
+
+		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const manager = getBackingManager(backing);
+		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return manager.applyMaintenanceToLayer(connection, ops);
 	}
 
 	/**
@@ -1342,7 +1691,7 @@ export class MaterializedViewManager {
 	 * recomputes-and-upserts (its prefix delete is a no-op). Returns the effective
 	 * {@link BackingRowChange}(s) the backing layer realized, for the MV-over-MV cascade.
 	 *
-	 * Structurally the same as {@link applyResidualRecompute}, differing only in the
+	 * Structurally the same as {@link applyForwardResidual}, differing only in the
 	 * **prefix** delete (one base row owns N backing rows sharing the prefix) and the
 	 * **N-row** residual. Per-row recompute is correct without per-statement batching: the
 	 * residual reads live (reads-own-writes) state, so the last write to a base key produces
@@ -1695,6 +2044,16 @@ function mvKey(schemaName: string, name: string): string {
 	return `${schemaName}.${name}`.toLowerCase();
 }
 
+/** Every source base (lowercased `schema.table`) a plan must be indexed under in
+ *  `rowTimeBySource`. Single-source arms read one base; the 1:1-join arm also reads
+ *  the lookup base, so a write to `P` fires maintenance too. */
+function planSourceBases(plan: MaintenancePlan): string[] {
+	if (plan.kind === 'join-residual' && plan.lookupBase !== plan.sourceBase) {
+		return [plan.sourceBase, plan.lookupBase];
+	}
+	return [plan.sourceBase];
+}
+
 /** Canonical, order-stable, bigint-safe string for a key tuple — used to dedup the
  *  distinct affected backing keys of a single change in the residual-recompute arm. */
 function canonKeyValues(values: readonly SqlValue[]): string {
@@ -1869,6 +2228,18 @@ function relationalAttributes(block: BlockNode): ReturnType<TableReferenceNode['
 	for (let i = children.length - 1; i >= 0; i--) {
 		const child = children[i] as unknown as { getAttributes?: () => ReturnType<TableReferenceNode['getAttributes']> };
 		if (typeof child.getAttributes === 'function') return child.getAttributes();
+	}
+	return undefined;
+}
+
+/** The root relational node of a block's final relational statement — the node whose
+ *  attributes {@link relationalAttributes} reads — or `undefined`. Feeds the shared
+ *  coverage-prover join predicates ({@link proveOneToOneJoin}) for the join-residual arm. */
+function rootRelationalNode(block: BlockNode): RelationalPlanNode | undefined {
+	const children = block.getChildren();
+	for (let i = children.length - 1; i >= 0; i--) {
+		const child = children[i] as unknown as PlanNode;
+		if (isRelationalNode(child)) return child as unknown as RelationalPlanNode;
 	}
 	return undefined;
 }

@@ -141,15 +141,22 @@ export interface LensSlot {
 	/**
 	 * Existence-anchor inclusion dependencies injected from a primary-storage
 	 * advertisement (`lens-multi-source-ind-injection`): one IND per mandatory,
-	 * non-anchor, non-EAV decomposition member, asserting the member's shared-key
-	 * tuple is included in the existence anchor's key (`IndTarget.kind:'relation'`,
-	 * `relationId === advertisement.id === StorageShape.anchorRelationId`). Threads
-	 * the mandatory-existence fact to the prover via the slot rather than seeding it
-	 * at the member scan (which would not reach the prover — the body is planned
-	 * before the slot is committed). See docs/lens.md § The module mapping
-	 * advertisement and docs/optimizer.md § Inclusion Dependency Tracking (Wave 3).
-	 * Absent when no advertisement backs the table, or the decomposition has only
-	 * optional members / an empty (singleton) key.
+	 * non-anchor, non-EAV decomposition member, asserting the existence **anchor's**
+	 * shared-key tuple is included in that member's key — `anchor.key ⊆ member.key`,
+	 * total (`IndTarget.kind:'relation'`, `cols` = anchor key indices,
+	 * `target.relationId` = the member). This is the totality direction
+	 * `presence:'mandatory'` ("every logical row has it") guarantees, and the exact
+	 * existence fact the anchor-rooted inner join's no-row-loss obligation needs; the
+	 * converse (`member ⊆ anchor`) is intentionally not asserted (no stated property
+	 * guarantees member→anchor referential integrity). Threads the mandatory-existence
+	 * fact to the prover via the slot rather than seeding it at the member scan (which
+	 * would not reach the prover — the body is planned before the slot is committed).
+	 * Only computed for the synthesized-decomposition body (not a full hand-authored
+	 * override or the single-source default body). See docs/lens.md § The module
+	 * mapping advertisement and docs/optimizer.md § Inclusion Dependency Tracking
+	 * (Wave 3). Absent when no advertisement backs the table, the body is not the
+	 * synthesized decomposition, or the decomposition has only optional members / an
+	 * empty (singleton) key.
 	 */
 	readonly injectedInds?: ReadonlyArray<InclusionDependency>;
 }

@@ -103,13 +103,17 @@ function sqlFor(m: Mutation): string {
  * `INTERNAL` from maintenance) propagates and fails the property — that is the bug
  * class this harness is built to catch.
  */
-async function applyMutation(db: Database, m: Mutation): Promise<void> {
+async function execTolerant(db: Database, sql: string): Promise<void> {
 	try {
-		await db.exec(sqlFor(m));
+		await db.exec(sql);
 	} catch (e) {
 		if (e instanceof QuereusError && e.code === StatusCode.CONSTRAINT) return;
 		throw e;
 	}
+}
+
+async function applyMutation(db: Database, m: Mutation): Promise<void> {
+	await execTolerant(db, sqlFor(m));
 }
 
 /** Canonical, order-stable serialization of a single result row's values. Rows are
@@ -224,6 +228,111 @@ const LATERAL_TVF_SHAPES: readonly BodyShape[] = [
 defineEquivalenceSuite('Materialized-view maintenance equivalence (covering-index shapes)', SHAPES);
 defineEquivalenceSuite('Materialized-view maintenance equivalence (single-source aggregate shapes)', AGGREGATE_SHAPES);
 defineEquivalenceSuite('Materialized-view maintenance equivalence (lateral-TVF fan-out shapes)', LATERAL_TVF_SHAPES);
+
+/**
+ * 1:1 inner-join body (`select t.id, t.fk, p.name from t join p on t.fk = p.id`) maintained
+ * by the `'join-residual'` arm. T's NOT-NULL FK `t.fk → p.id` makes the inner join provably
+ * 1:1 on T (no row loss via enforced referential integrity, no fan-out via p's unique PK),
+ * so the backing is keyed on T's PK and each T row maps to one backing row.
+ *
+ * Random mutations drive BOTH sources: t inserts / FK-moving updates / key-changing updates
+ * / deletes exercise the forward (T-PK-keyed) residual; p inserts / name updates / deletes
+ * exercise the reverse (P-PK-keyed) lookup residual (upsert-only — inner-join + RI membership
+ * is determined by `t.fk`, so a p write only re-derives the joined `name`). FK violations (a
+ * `t.fk` with no matching p, a p delete with referencing children, or a colliding key-change)
+ * surface as tolerated CONSTRAINT errors, statement-atomic on both source and backing. The
+ * oracle re-runs the same join body live; the maintained backing must equal it as a multiset,
+ * mid-transaction (reads-own-writes) and after rollback.
+ */
+describe('Materialized-view maintenance equivalence (1:1 inner-join shape)', () => {
+	let db: Database;
+	const body = 'select t.id, t.fk, p.name from t join p on t.fk = p.id';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, name text)');
+		await db.exec('create table t (id integer primary key, fk integer not null references p(id))');
+		// Committed seed: p ids 1..4, t rows referencing them (two share fk=1).
+		await db.exec("insert into p (id, name) values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')");
+		await db.exec('insert into t (id, fk) values (1, 1), (2, 1), (3, 2), (4, 3)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+
+	afterEach(async () => { await db.close(); });
+
+	type JoinMutation =
+		| { readonly kind: 't-insert'; readonly id: number; readonly fk: number }
+		| { readonly kind: 't-updateFk'; readonly id: number; readonly fk: number }
+		| { readonly kind: 't-updateKey'; readonly oldId: number; readonly newId: number; readonly fk: number }
+		| { readonly kind: 't-delete'; readonly id: number }
+		| { readonly kind: 'p-insert'; readonly id: number; readonly name: string }
+		| { readonly kind: 'p-updateName'; readonly id: number; readonly name: string }
+		| { readonly kind: 'p-delete'; readonly id: number };
+
+	const tIdArb = fc.integer({ min: 1, max: 6 });
+	// fk sometimes references a missing p (→ tolerated FK violation) and sometimes a new p.
+	const fkArb = fc.integer({ min: 1, max: 8 });
+	const newPArb = fc.integer({ min: 5, max: 8 });
+	const nameArb = fc.constantFrom('a', 'b', 'c', 'd', 'e', 'z');
+
+	const joinMutationArb: fc.Arbitrary<JoinMutation> = fc.oneof(
+		fc.record({ kind: fc.constant('t-insert' as const), id: tIdArb, fk: fkArb }),
+		fc.record({ kind: fc.constant('t-updateFk' as const), id: tIdArb, fk: fkArb }),
+		fc.record({ kind: fc.constant('t-updateKey' as const), oldId: tIdArb, newId: tIdArb, fk: fkArb }),
+		fc.record({ kind: fc.constant('t-delete' as const), id: tIdArb }),
+		fc.record({ kind: fc.constant('p-insert' as const), id: newPArb, name: nameArb }),
+		fc.record({ kind: fc.constant('p-updateName' as const), id: fc.integer({ min: 1, max: 8 }), name: nameArb }),
+		fc.record({ kind: fc.constant('p-delete' as const), id: newPArb }),
+	);
+
+	const joinSqlFor = (m: JoinMutation): string => {
+		switch (m.kind) {
+			case 't-insert': return `insert into t (id, fk) values (${m.id}, ${m.fk})`;
+			case 't-updateFk': return `update t set fk = ${m.fk} where id = ${m.id}`;
+			case 't-updateKey': return `update t set id = ${m.newId}, fk = ${m.fk} where id = ${m.oldId}`;
+			case 't-delete': return `delete from t where id = ${m.id}`;
+			case 'p-insert': return `insert into p (id, name) values (${m.id}, '${m.name}')`;
+			case 'p-updateName': return `update p set name = '${m.name}' where id = ${m.id}`;
+			case 'p-delete': return `delete from p where id = ${m.id}`;
+		}
+	};
+
+	it('read(MV) == evaluate(body) across random t/p mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(joinMutationArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, joinSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 60 });
+	});
+
+	it('a removed join row (delete of a t row) drops exactly its backing row', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		expect((await readMultiset(db, 'select * from mv')).length, 'baseline row count').to.equal(4);
+		// Delete t id=2 (fk=1). Its joined row disappears; the other fk=1 row (id=1) stays.
+		await db.exec('delete from t where id = 2');
+		await assertEquivalent(db, body, 'after removed join row');
+		expect((await readMultiset(db, 'select * from mv')).length, 'after t-delete row count').to.equal(3);
+	});
+
+	it('a lookup-side (p) name update refreshes every joined backing row for that p', async () => {
+		await db.exec("update p set name = 'A!' where id = 1");
+		await assertEquivalent(db, body, 'after p name update');
+		// Both t rows with fk=1 (ids 1 and 2) must now read p.name = 'A!'.
+		const rows = await readMultiset(db, "select id from mv where name = 'A!'");
+		expect(rows.length, "rows referencing updated p name").to.equal(2);
+	});
+});
 
 /** Minimal reach into the manager's private plan map so a stubbed-arm plan can be
  *  routed through the real DML maintenance path. The map key is lowercase
