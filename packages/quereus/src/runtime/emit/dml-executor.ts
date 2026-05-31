@@ -584,6 +584,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	): Promise<void> {
 		if (!evictedRows || evictedRows.length === 0) return;
 		for (const evicted of evictedRows) {
+			// RESTRICT / NO ACTION enforcement for the eviction's would-be delete.
+			// The substrate already physically removed the evicted row inside
+			// vtab.update(), so there is no pre-mutation point. Run the transitive
+			// RESTRICT scan post-eviction (the child rows it keys off remain) and,
+			// on a violation, throw — runWithStatementSavepoints rolls back the
+			// statement savepoint, unwinding both the eviction and the writing row.
+			// Mirrors the pre-check processDeleteRow runs for a plain DELETE.
+			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', evicted);
 			const evictedKeyValues = pkColumnIndicesInSchema.map(idx => evicted[idx]);
 			ctx.db._recordDelete(tableKey, evicted, pkColumnIndicesInSchema);
 			await maintainRowTimeStructures(ctx, tableKey, { op: 'delete', oldRow: evicted }, backingConnCache);

@@ -908,13 +908,23 @@ pipeline still runs uniformly (`internal-eviction-reporting`):
   and covering-MV backing maintenance — uniformly across the memory, store, and
   isolation substrates, none of which re-drive the pipeline themselves.
 
-`processEvictions` fires the FK *actions* (`CASCADE` / `SET NULL` / `SET DEFAULT`) but
-not the `RESTRICT` / `NO ACTION` pre-check that `processDeleteRow` runs via
-`assertTransitiveRestrictsForParentMutation` — the substrate has already deleted the
-evicted row before reporting it, so there is no pre-mutation point at which to block.
-An eviction of a row referenced by a `RESTRICT` (or default `NO ACTION`) child thus
-proceeds silently and orphans the child, where SQLite fails the statement. Tracked in
-`eviction-restrict-fk-enforcement`.
+`processEvictions` enforces FK `RESTRICT` / `NO ACTION` for the eviction's would-be
+delete alongside the FK *actions* (`CASCADE` / `SET NULL` / `SET DEFAULT`). The substrate
+has already physically removed the evicted row inside `vtab.update()`, so there is no
+pre-mutation point at which to block; instead the helper runs the transitive RESTRICT scan
+(`assertTransitiveRestrictsForParentMutation`) **post-eviction** — the child rows the scan
+keys off remain, so `select 1 from child where fk = ?` still answers correctly — and, on a
+violation, throws. `runWithStatementSavepoints` then rolls back the statement-scope
+savepoint (`__stmt_atomic_N`, opened before the row loop), unwinding both the substrate's
+eviction and the writing row. (Evictions only occur under REPLACE resolution, which is
+never `OR FAIL`, so the non-FAIL statement-savepoint branch always applies.) The surfaced
+error is the `FOREIGN KEY constraint failed: DELETE on '<parent>' violates RESTRICT from
+'<child>'` form — not the plan-time `CHECK constraint failed: _fk_...` form — since the
+plan-time parent-side FK check is absent for internal evictions. Enforced on the key-based
+memory, direct-store, and isolation-wrapped substrates. Rowid-chained backends (lamina) are
+out of scope: the transitive recursion reads children at call time and, post-eviction, the
+parent value is gone, so a deeper cascade may not resolve — mirroring the documented
+SET-DEFAULT recursion gap and no regression beyond status quo.
 
 ### Implementation Guidelines for Emitter Authors
 
