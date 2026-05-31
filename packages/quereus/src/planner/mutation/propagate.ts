@@ -1,7 +1,13 @@
+import type * as AST from '../../parser/ast.js';
+import type { PlanningContext } from '../planning-context.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { isRelationalNode, type PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
+import { buildTableReference } from '../building/table.js';
 import type { MutationDiagnosticReason } from './mutation-diagnostic.js';
+import { rewriteViewInsert, rewriteViewUpdate, rewriteViewDelete, type MutableViewLike } from './single-source.js';
+
+export type { MutableViewLike } from './single-source.js';
 
 /**
  * Mutation propagation classifier — the dual of `binding-extractor` /
@@ -18,8 +24,8 @@ import type { MutationDiagnosticReason } from './mutation-diagnostic.js';
  * fan-out is Phase 2+.
  *
  * `Sort` / `Limit` / `Distinct` are tolerated *here* only so the walk can reach
- * the base table through them; the AST-driven rewrite layer
- * (`building/view-mutation.ts`) separately rejects `LIMIT`/`OFFSET`/`DISTINCT`
+ * the base table through them; the single-source rewrite layer
+ * (`mutation/single-source.ts`) separately rejects `LIMIT`/`OFFSET`/`DISTINCT`
  * bodies, since a predicate-conjoin cannot faithfully reproduce a row-count
  * window or duplicate-collapse (a mutation would otherwise escape the window).
  *
@@ -131,4 +137,60 @@ export function classifyViewBody(body: RelationalPlanNode): ViewBodyClassificati
 	}
 
 	return { kind: 'single-source', baseTable: tableRefs[0] };
+}
+
+/**
+ * A single resolved base-table operation a view/MV mutation decomposes into.
+ *
+ * For the single-source spine, `propagate` emits exactly one of these whose
+ * `.statement` is the base-table DML the retired AST rewrite used to re-plan.
+ * The builder (`building/view-mutation-builder.ts`) re-plans each `.statement`
+ * through the ordinary base-table builder and wraps the results in a
+ * `ViewMutationNode`. Multi-source fan-out (more than one base op, FK-ordered)
+ * is the next phase and rides this same list.
+ */
+export interface BaseOp {
+	/** The resolved base table this op targets. */
+	readonly table: TableReferenceNode;
+	readonly op: 'insert' | 'update' | 'delete';
+	/** Base-table DML to build (already rewritten out of view terms). */
+	readonly statement: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt;
+}
+
+/** The view-mediated mutation to decompose. */
+export type MutationRequest =
+	| { readonly op: 'insert'; readonly stmt: AST.InsertStmt }
+	| { readonly op: 'update'; readonly stmt: AST.UpdateStmt }
+	| { readonly op: 'delete'; readonly stmt: AST.DeleteStmt };
+
+/** Resolve the base table named by a rewritten base-table DML statement. */
+function resolveBaseTable(
+	ctx: PlanningContext,
+	statement: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt,
+): TableReferenceNode {
+	return buildTableReference({ type: 'table', table: statement.table }, ctx).tableRef;
+}
+
+/**
+ * Decompose a view-/MV-mediated mutation into an ordered list of base-table
+ * operations — the single propagation path for all view mutations. The
+ * single-source projection-and-filter spine reuses the relocated rewrite
+ * (`single-source.ts`) to produce exactly one `BaseOp`; multi-source fan-out is
+ * the next phase and returns more entries.
+ */
+export function propagate(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): BaseOp[] {
+	switch (req.op) {
+		case 'insert': {
+			const statement = rewriteViewInsert(ctx, req.stmt, view);
+			return [{ table: resolveBaseTable(ctx, statement), op: 'insert', statement }];
+		}
+		case 'update': {
+			const statement = rewriteViewUpdate(ctx, req.stmt, view);
+			return [{ table: resolveBaseTable(ctx, statement), op: 'update', statement }];
+		}
+		case 'delete': {
+			const statement = rewriteViewDelete(ctx, req.stmt, view);
+			return [{ table: resolveBaseTable(ctx, statement), op: 'delete', statement }];
+		}
+	}
 }

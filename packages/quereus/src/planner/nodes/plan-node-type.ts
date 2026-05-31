@@ -26,6 +26,7 @@ export enum PlanNodeType {
   Update = 'Update',
   UpdateExecutor = 'UpdateExecutor',
   Delete = 'Delete',
+  ViewMutation = 'ViewMutation',  // Wraps the ordered base-table DML subtrees a view/MV mutation decomposes into
   ConstraintCheck = 'ConstraintCheck',
   CreateTable = 'CreateTable',
   DropTable = 'DropTable',

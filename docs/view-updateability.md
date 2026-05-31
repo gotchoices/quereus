@@ -11,14 +11,23 @@ actually shipped:
 | **Phase 1b** | Per-statement mutation-context threading through the view boundary (one captured value stamped across every base row of the statement). Single-base per-row generator cadence rides the base table's column defaults. | **Shipped (single-base)** |
 | Phases 2–7 | Multi-source / outer joins, set-ops, aggregates, RETURNING-through-views, nested/recursive CTE bodies, the `quereus.update.*` tag override surface, shared-surrogate fan-out threading. | Not shipped — rejected at plan time with a structured diagnostic. |
 
-**Implementation note (Phase 1).** Phase 1 ships as an AST-level rewrite in
-`planner/building/view-mutation.ts`: a view-targeted DML whose body classifies as
-a single-source projection-and-filter (gate in `planner/mutation/propagate.ts`) is
-rewritten to target the base table and re-planned through the ordinary base-table
-builder. All constraint / conflict / FK / mutation-context machinery — and
-`getChangeScope()` / `Database.watch` — are therefore reused verbatim with no
-view-specific runtime. The shipped lineage model lives in
-`planner/analysis/update-lineage.ts` and `planner/analysis/scalar-invertibility.ts`.
+**Implementation note (Phase 1).** Phase 1 ships **via the view-mutation
+substrate** (single-source = one base op). A view-targeted DML whose body
+classifies as a single-source projection-and-filter (gate in
+`planner/mutation/propagate.ts`) is **decomposed** by `propagate(ctx, view, req)`
+into an ordered `BaseOp[]` — exactly one for the single-source spine — whose
+`.statement` is the equivalent base-table DML. `planner/building/view-mutation-builder.ts`
+re-plans each base op through the ordinary base-table builder and wraps the
+results in a `ViewMutationNode` (`planner/nodes/view-mutation-node.ts`, emitter
+`runtime/emit/view-mutation.ts`). The single-source rewrite itself lives in
+`planner/mutation/single-source.ts`. All constraint / conflict / FK /
+mutation-context machinery — and `getChangeScope()` / `Database.watch` — are
+therefore reused verbatim with no view-specific runtime (the wrapped subtree is
+byte-identical to what the retired AST rewrite re-planned). The standalone AST
+rewrite (`planner/building/view-mutation.ts`) is **removed**; the substrate is
+the single propagation path for all view mutations. The shipped lineage model
+lives in `planner/analysis/update-lineage.ts` and
+`planner/analysis/scalar-invertibility.ts`.
 
 The plan-node-threaded `updateLineage` / `AttributeDefault` surface on
 `PhysicalProperties` (§ Implementation Surface) **has landed** as the *annotation
@@ -26,15 +35,16 @@ layer* — `view-mutation-physical-lineage` threads it as the derived dual of ea
 operator's forward FD walk (TableReference / Project / Filter / Join, plus
 pass-through on the access / Retrieve / Alias boundary nodes), surfaces it through
 `query_plan()`, and exposes the predicate-honest complement (`viewComplement`).
-It is consumed by **nothing yet**: the `ViewMutationNode` orchestrator over reused
-`DmlExecutorNode`s that *walks* this surface to emit base ops is the remaining
-**multi-source Phase-2** piece and is intentionally not wired — for the
-single-source case the AST rewrite is complete and an orchestrator over one base
-op adds no behavior. The retire-or-keep decision for this substrate is settled
-under `view-mutation-plan-node-substrate`: the AST rewrite is **retired** in favor
-of the substrate, which becomes the single propagation path for all view
-mutations (its single-source case is the trivial one-base-op path);
-`building/view-mutation.ts` is removed once parity is proven.
+The `ViewMutationNode` substrate **has landed** as the single propagation path
+for all view mutations: the single-source case decomposes to exactly one base op
+(parity-equivalent to the retired AST rewrite). What the `updateLineage`
+annotation surface is **not yet** consumed by is the **multi-source** backward
+walk — the substrate emitting *more than one* FD/EC-driven base op for a join /
+set-op body — which is the remaining Phase-2 piece. The retire-or-keep decision
+is settled under `view-mutation-plan-node-substrate`: the AST rewrite is
+**retired** in favor of the substrate; `building/view-mutation.ts` has been
+removed (the single-source rewrite it held now lives in
+`planner/mutation/single-source.ts`, behind `propagate`).
 
 > **Surface authority.** `updateLineage` is computed in `computePhysical`, so it
 > is available on the **logical** operator tree (Project / Filter / Join /
@@ -48,7 +58,7 @@ mutations (its single-source case is the trivial one-base-op path);
 
 **Write-through materialized views** are **delivered** for the passthrough /
 projection-filter shape (`materialized-view-dml-write-through`): DML targeting an MV
-name is rewritten to its source table and re-planned through this same Phase-1 rewrite,
+name is routed through this same substrate (rewritten to its source table, one base op),
 then the row-time maintenance hook syncs the backing within the statement
 (reads-own-writes; rollback in lockstep). The MV path inherits the per-column lineage
 rules verbatim — passthrough/rename columns are writeable, computed columns are
@@ -454,9 +464,11 @@ Diagnostics include a suggestion when one applies — for instance, `no-default`
   (`classifyInvertibility`) and the recursive `traceInvertibleColumn` that composes the inverse chain.
 - `src/planner/analysis/view-complement.ts` — `viewComplement(node)` / `complementOf`, the
   predicate-honest complement derived off the backward walk (for the lens prover).
-- `src/planner/mutation/propagate.ts` — visitor that walks a relation tree with a `MutationRequest` and emits `BaseOp[]`. One method per operator type, mirroring `runtime/emit/`.
+- `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed** for the single-source spine (one base op via `single-source.ts`); the multi-source walk (one method per operator type, mirroring `runtime/emit/`) is Phase-2. Also hosts `classifyViewBody`.
+- `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.**
+- `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.**
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
-- `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order and accumulates `returning` rows.
+- `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. **Landed** (side-effect only; accumulating `returning` rows lands with RETURNING-through-view).
 - `src/schema/view.ts` — `ViewSchema.effectiveTargets`, `ViewSchema.defaultsForColumn`, populated at view-creation time.
 
 Each surface mirrors a one-to-one correspondence with an existing engine surface: lineage parallels FDs, propagation parallels emission, and view metadata parallels table metadata. No new subsystem is introduced — view updateability is the existing FD / EC / predicate-normalization infrastructure consulted in the mutation direction.

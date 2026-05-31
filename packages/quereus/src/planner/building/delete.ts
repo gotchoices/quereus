@@ -20,7 +20,7 @@ import { buildConstraintChecks } from './constraint-builder.js';
 import { buildParentSideFKChecks } from './foreign-key-builder.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
-import { rewriteViewDelete } from './view-mutation.js';
+import { buildViewMutation } from './view-mutation-builder.js';
 
 export function buildDeleteStmt(
   ctx: PlanningContext,
@@ -43,7 +43,8 @@ export function buildDeleteStmt(
   const deleteView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
     ?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
   if (deleteView) {
-    return buildDeleteStmt(contextWithSchemaPath, rewriteViewDelete(contextWithSchemaPath, stmt, deleteView));
+    // Route through the view-mutation substrate (single-source = one base op).
+    return buildViewMutation(contextWithSchemaPath, deleteView, { op: 'delete', stmt });
   }
 
   const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);

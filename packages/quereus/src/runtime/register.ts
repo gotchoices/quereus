@@ -64,6 +64,7 @@ import { emitAsyncGather } from './emit/async-gather.js';
 import { emitFanOutLookupJoin } from './emit/fanout-lookup-join.js';
 import { emitReturning } from './emit/returning.js';
 import { emitSink } from './emit/sink.js';
+import { emitViewMutation } from './emit/view-mutation.js';
 import { emitBetween } from './emit/between.js';
 import { emitRetrieve } from './emit/retrieve.js';
 import { emitRemoteQuery } from './emit/remote-query.js';
@@ -187,4 +188,7 @@ export function registerEmitters() {
 
 	// Sink emitter
 	registerEmitter(PlanNodeType.Sink, emitSink as EmitterFunc);
+
+	// View-/MV-mediated mutation substrate emitter
+	registerEmitter(PlanNodeType.ViewMutation, emitViewMutation as EmitterFunc);
 }

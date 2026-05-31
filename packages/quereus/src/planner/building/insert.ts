@@ -27,7 +27,7 @@ import { buildChildSideFKChecks } from './foreign-key-builder.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
-import { rewriteViewInsert } from './view-mutation.js';
+import { buildViewMutation } from './view-mutation-builder.js';
 
 /**
  * Creates a uniform row expansion projection that maps any relational source
@@ -385,7 +385,10 @@ export function buildInsertStmt(
 	const insertView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
 		?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
 	if (insertView) {
-		return buildInsertStmt(contextWithSchemaPath, rewriteViewInsert(contextWithSchemaPath, stmt, insertView));
+		// Route through the view-mutation substrate: decompose to base op(s) and
+		// re-plan each through the base-table builder, wrapped in a ViewMutationNode.
+		// Single-source = one base op (byte-identical to the retired rewrite).
+		return buildViewMutation(contextWithSchemaPath, insertView, { op: 'insert', stmt });
 	}
 
 	const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);

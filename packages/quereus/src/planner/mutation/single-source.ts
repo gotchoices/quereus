@@ -5,13 +5,14 @@ import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import { sqlValuesEqual } from '../../util/comparison.js';
-import { buildSelectStmt } from './select.js';
-import { classifyViewBody } from '../mutation/propagate.js';
-import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
+import { buildSelectStmt } from '../building/select.js';
+import { classifyViewBody } from './propagate.js';
+import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.js';
 
 /**
- * View-mediated DML rewriting (Phase 1 — single-source projection-and-filter).
+ * Single-source view-mediated DML rewriting (the single-source spine of the
+ * view-mutation substrate).
  *
  * When an INSERT / UPDATE / DELETE targets a view whose body is a single-source
  * projection-and-filter, these helpers analyse the body and produce an
@@ -19,6 +20,11 @@ import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.j
  * is then planned by the ordinary base-table builder, so all constraint /
  * conflict / RETURNING / FK / mutation-context machinery is reused verbatim and
  * `getChangeScope()` / `Database.watch` see the base write with no extra wiring.
+ *
+ * These produce exactly one {@link import('./propagate.js').BaseOp} per call;
+ * `propagate()` wraps the result and the builder (`building/view-mutation-builder.ts`)
+ * re-plans it into a `ViewMutationNode`. Multi-source fan-out (more than one
+ * base op) is the next phase.
  *
  * The same rewrite drives **materialized-view write-through**: every MV is
  * (post row-time consolidation) a single-source projection-and-filter — a strict
@@ -31,8 +37,7 @@ import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.j
  * `schemaName` / `selectAst` / `columns`. See `docs/materialized-views.md`
  * § Write boundary and `docs/view-updateability.md`.
  *
- * Multi-source fan-out, the `ViewMutationNode` orchestrator, and
- * RETURNING-through-views are later phases — rejected here with a structured
+ * RETURNING-through-views is a later phase — rejected here with a structured
  * diagnostic.
  */
 
@@ -42,7 +47,7 @@ import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.j
  * lets MV write-through reuse the plain-view rewrite verbatim, with no MV-shaped
  * special-casing in the three builders.
  */
-interface MutableViewLike {
+export interface MutableViewLike {
 	readonly name: string;
 	readonly schemaName: string;
 	readonly selectAst: AST.QueryExpr;
@@ -461,7 +466,7 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
 	};
 }
 
-/** RETURNING through a view is Phase 6 — reject it explicitly for now. */
+/** RETURNING through a view is a later phase — reject it explicitly for now. */
 function rejectReturning(returning: AST.ResultColumn[] | undefined, view: MutableViewLike): void {
 	if (returning && returning.length > 0) {
 		raiseMutationDiagnostic({

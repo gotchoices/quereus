@@ -20,7 +20,7 @@ import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builde
 import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
-import { rewriteViewUpdate } from './view-mutation.js';
+import { buildViewMutation } from './view-mutation-builder.js';
 
 export function buildUpdateStmt(
   ctx: PlanningContext,
@@ -43,7 +43,8 @@ export function buildUpdateStmt(
   const updateView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
     ?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
   if (updateView) {
-    return buildUpdateStmt(contextWithSchemaPath, rewriteViewUpdate(contextWithSchemaPath, stmt, updateView));
+    // Route through the view-mutation substrate (single-source = one base op).
+    return buildViewMutation(contextWithSchemaPath, updateView, { op: 'update', stmt });
   }
 
   const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
