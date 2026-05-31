@@ -79,3 +79,70 @@ select id, email from p4 order by id;
 → [{"id":2,"email":"q@x"}]
 select cid, pid from c4 order by cid;
 → []
+
+-- ===================================
+-- 5. TRANSITIVE depth-2: eviction's CASCADE child has its own RESTRICT grandchild.
+--    The post-eviction scan recurses through the (not-yet-cascaded) child and the
+--    grandchild's RESTRICT blocks the whole statement. Proves the transitive walk —
+--    not just the direct scan — fires for evictions.
+-- ===================================
+
+create table p5 (id integer primary key, email text not null, unique (email));
+create table c5 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p5(id) on delete cascade);
+create table g5 (gid integer primary key, cid integer not null,
+                 foreign key (cid) references c5(cid) on delete restrict);
+insert into p5 values (1, 'r@x');
+insert into c5 values (40, 1);
+insert into g5 values (400, 40);
+
+-- evicting p5(id=1) would CASCADE-delete c5(40), but g5(400) RESTRICTs that -> whole statement fails
+insert or replace into p5 values (2, 'r@x');
+-- error: constraint failed
+
+-- nothing changed at any depth
+select id, email from p5 order by id;
+→ [{"id":1,"email":"r@x"}]
+select cid, pid from c5 order by cid;
+→ [{"cid":40,"pid":1}]
+select gid, cid from g5 order by gid;
+→ [{"gid":400,"cid":40}]
+
+-- POSITIVE companion: when the grandchild also CASCADEs, the depth-2 eviction succeeds.
+create table p6 (id integer primary key, email text not null, unique (email));
+create table c6 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p6(id) on delete cascade);
+create table g6 (gid integer primary key, cid integer not null,
+                 foreign key (cid) references c6(cid) on delete cascade);
+insert into p6 values (1, 's@x');
+insert into c6 values (50, 1);
+insert into g6 values (500, 50);
+
+insert or replace into p6 values (2, 's@x');
+select id, email from p6 order by id;
+→ [{"id":2,"email":"s@x"}]
+select cid, pid from c6 order by cid;
+→ []
+select gid, cid from g6 order by gid;
+→ []
+
+-- ===================================
+-- 6. MULTI-ROW statement atomicity: a RESTRICT-violating eviction in a multi-row INSERT
+--    unwinds the WHOLE statement (the prior, otherwise-valid row too), matching SQLite.
+-- ===================================
+
+create table p7 (id integer primary key, email text not null, unique (email));
+create table c7 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p7(id) on delete restrict);
+insert into p7 values (1, 't@x');
+insert into c7 values (60, 1);
+
+-- row (3,'u@x') is fine; row (2,'t@x') evicts the RESTRICTed id=1 -> entire statement rolls back
+insert or replace into p7 values (3, 'u@x'), (2, 't@x');
+-- error: constraint failed
+
+-- id=3 must NOT have been inserted (statement-scope unwind, not just the failing row)
+select id, email from p7 order by id;
+→ [{"id":1,"email":"t@x"}]
+select cid, pid from c7 order by cid;
+→ [{"cid":60,"pid":1}]
