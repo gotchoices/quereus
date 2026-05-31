@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -183,6 +183,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			isolation: true,
 			savepoints: true,
 		};
+	}
+
+	/**
+	 * Forwards mapping-advertisement discovery to the underlying module.
+	 *
+	 * The lens compiler's advertisement resolver reaches a basis table's
+	 * `vtabModule` — which is this wrapper when a memory/store basis is isolated —
+	 * and calls the optional `getMappingAdvertisements` hook. A decomposition's
+	 * storage/access shape is a property of the underlying basis relations and is
+	 * isolation-transparent (the overlay does not change the decomposition shape),
+	 * so a straight delegate is correct. Without this forward, `quereus.lens.decomp.*`
+	 * tags on isolation-wrapped basis tables are silently dropped and a logical
+	 * table over the decomposition fails body compilation with "no basis backing".
+	 */
+	getMappingAdvertisements(db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
+		return this.underlying.getMappingAdvertisements?.(db, basisSchema) ?? [];
 	}
 
 	/**
