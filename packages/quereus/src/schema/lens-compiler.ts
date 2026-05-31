@@ -14,7 +14,7 @@ import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { proveLens, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
 import { applyAckGovernance, resolveEscalationPolicy, type AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
-import type { MappingAdvertisement, DecompositionMember } from '../vtab/mapping-advertisement.js';
+import type { MappingAdvertisement, DecompositionMember, StorageShape } from '../vtab/mapping-advertisement.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 
 const log = createLogger('schema:lens-compiler');
@@ -118,7 +118,7 @@ export function deployLogicalSchema(
 		let hiding: ReadonlySet<string> | undefined;
 		let effectiveColumns: string[];
 		if (override) {
-			const merged = compileOverrideBody(logicalTable, logicalSchemaName, basis.schemaName, schemaManager, override);
+			const merged = compileOverrideBody(logicalTable, logicalSchemaName, basis.schemaName, schemaManager, override, advertisement);
 			compiledBody = merged.body;
 			provenance = merged.provenance;
 			hiding = merged.hiding.size > 0 ? merged.hiding : undefined;
@@ -134,6 +134,12 @@ export function deployLogicalSchema(
 					advertisement, override, basis.schemaName, schemaManager, logicalSchemaName, logicalTable.name,
 				);
 			}
+		} else if (advertisement) {
+			// A resolved primary-storage advertisement → synthesize the n-way `get`
+			// join body from the decomposition (docs/lens.md § The Default Mapper).
+			compiledBody = compileDecompositionBody(logicalTable, logicalSchemaName, basis, advertisement, db);
+			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
+			effectiveColumns = logicalTable.columns.map(c => c.name);
 		} else {
 			compiledBody = compileDefaultBody(logicalTable, logicalSchemaName, basis.schema, basis.schemaName);
 			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
@@ -666,6 +672,335 @@ export function compileDefaultBody(
 	};
 }
 
+// ===========================================================================
+// n-way decomposition synthesis (docs/lens.md § The Default Mapper)
+// ===========================================================================
+//
+// When a logical table is backed by a resolved primary-storage advertisement,
+// the body producer synthesizes the `get` join instead of the single-source
+// name aligner: a left-deep equi-join rooted at the existence anchor, mandatory
+// members inner-joined and optional members outer-joined, EAV pivot members
+// projected as correlated scalar subqueries (not joined), and the projection
+// resolving each logical column to its advertised backing expression. Read
+// direction only — the `put` fan-out + IND injection are sibling tickets; a
+// multi-source body remains write-rejected by view-updateability.
+
+/**
+ * Synthesizes the n-way `get` body for a logical table backed by a resolved
+ * primary-storage advertisement.
+ *
+ * The synthesized FROM is a left-deep join tree rooted at `anchorRelationId`:
+ * every other non-EAV member is inner-joined (`presence:'mandatory'`) or
+ * outer-joined (`presence:'optional'`) onto the anchor via a positional
+ * key-equi-join over `sharedKey.keyColumnsByRelation`. Optional members are
+ * outer-joined so a logical row missing an optional component survives with that
+ * component's columns null (inner-joining everywhere would silently drop rows).
+ *
+ * The empty-key (singleton) case is not a special path: an empty per-member key
+ * column list makes the equi-join conjunction vacuously true (`on 1 = 1`), so a
+ * `primary key ()` table over a 0-or-1-row anchor reads 0-or-1 row.
+ *
+ * EAV pivot members are NOT join members (joining a triple store would multiply
+ * rows); each EAV-backed logical column is projected as a correlated scalar
+ * subquery keyed by the attribute literal.
+ */
+function compileDecompositionBody(
+	logicalTable: TableSchema,
+	logicalSchemaName: string,
+	basis: { schema: Schema; schemaName: string },
+	advertisement: MappingAdvertisement,
+	db: Database,
+): AST.SelectStmt {
+	const storage = advertisement.storage;
+	if (!storage) {
+		// A primary advertisement always carries a storage shape (validated at
+		// resolution); guard defensively rather than emit an unsound body.
+		throw new QuereusError(
+			`lens: decomposition for logical table '${logicalSchemaName}.${logicalTable.name}' has a primary advertisement with no storage shape`,
+			StatusCode.ERROR,
+		);
+	}
+	const logicalName = logicalTable.name;
+
+	// Resolve every member's basis table (re-resolved here for the synthesized
+	// FROM's actual table name + schema casing; existence is validated already).
+	const memberTables = new Map<string, TableSchema>();
+	for (const member of storage.members) {
+		const table = resolveBasisRelation(db, member, basis);
+		if (!table) {
+			throw new QuereusError(
+				`lens: decomposition for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${member.relation.schema}.${member.relation.table}' (member '${member.relationId}'), which does not exist`,
+				StatusCode.ERROR,
+			);
+		}
+		memberTables.set(member.relationId, table);
+	}
+
+	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
+	if (!anchor) {
+		throw new QuereusError(
+			`lens: decomposition for logical table '${logicalSchemaName}.${logicalName}' names anchor '${storage.anchorRelationId}', which is not among the members`,
+			StatusCode.ERROR,
+		);
+	}
+	const anchorTable = memberTables.get(anchor.relationId)!;
+	const anchorKeys = storage.sharedKey.keyColumnsByRelation.get(anchor.relationId) ?? [];
+
+	// The join set: the anchor (root) + every non-EAV member. EAV pivot members
+	// back columns via a correlated subquery, never a join.
+	const joinedMembers = new Set<string>([anchor.relationId]);
+	for (const member of storage.members) {
+		if (member.relationId === anchor.relationId) continue;
+		if (member.attributePivot) continue; // EAV → subquery, not joined
+		joinedMembers.add(member.relationId);
+	}
+
+	// Build the left-deep join tree, anchor first.
+	let from: AST.FromClause = memberTableSource(anchorTable, basis.schemaName, anchor.relationId);
+	for (const member of storage.members) {
+		if (!joinedMembers.has(member.relationId) || member.relationId === anchor.relationId) continue;
+		const memberTable = memberTables.get(member.relationId)!;
+		const memberKeys = storage.sharedKey.keyColumnsByRelation.get(member.relationId) ?? [];
+		from = {
+			type: 'join',
+			joinType: member.presence === 'mandatory' ? 'inner' : 'left',
+			left: from,
+			right: memberTableSource(memberTable, basis.schemaName, member.relationId),
+			condition: buildKeyEquiJoin(anchor.relationId, anchorKeys, member.relationId, memberKeys),
+		};
+	}
+
+	// Projection: each logical column → its advertised backing expression.
+	const aliasOf = (relationId: string): string | undefined =>
+		joinedMembers.has(relationId) ? relationId : undefined;
+	const eavAnchor = anchorKeys.length > 0
+		? { alias: anchor.relationId, keyColumn: anchorKeys[0] }
+		: undefined;
+
+	const columns: AST.ResultColumn[] = [];
+	for (const col of logicalTable.columns) {
+		const res = resolveAdvertisedColumn(col.name, storage, basis.schemaName, aliasOf, eavAnchor);
+		let expr: AST.Expression;
+		if (res.kind === 'expr') {
+			expr = res.expr;
+		} else if (res.kind === 'unreachable') {
+			throw new QuereusError(
+				`lens: decomposition for logical table '${logicalSchemaName}.${logicalName}' maps column '${col.name}' to member '${res.member}', which is not part of the synthesized join (an EAV pivot member backs columns through its attribute pivot, not a direct column mapping)`,
+				StatusCode.ERROR,
+			);
+		} else {
+			// Name-match against a join member (anchor first), qualified by the
+			// member's alias — the decomposition analogue of the single-source path.
+			const nm = nameMatchAgainstMembers(col.name, storage, memberTables, joinedMembers, anchor.relationId);
+			if (!nm) {
+				throw new QuereusError(
+					`lens: decomposition for logical table '${logicalSchemaName}.${logicalName}' cannot resolve column '${col.name}': it is not mapped by any advertised member, not EAV-backed, and no decomposition member has a same-named column`,
+					StatusCode.ERROR,
+				);
+			}
+			expr = nm;
+		}
+		columns.push({ type: 'column', expr, alias: col.name });
+	}
+
+	return { type: 'select', columns, from: [from] };
+}
+
+/** A FROM `table` source for one decomposition member, aliased by its relationId. */
+function memberTableSource(table: TableSchema, basisSchemaName: string, alias: string): AST.TableSource {
+	return {
+		type: 'table',
+		table: { type: 'identifier', name: table.name, schema: table.schemaName || basisSchemaName },
+		alias,
+	};
+}
+
+/**
+ * Builds the per-member key-equi-join ON condition: a positional conjunction of
+ * `member.kᵢ = anchor.kᵢ` over the two relations' shared-key column lists (paired
+ * by index, since a surrogate may be spelled differently per relation). An empty
+ * key column list (the `primary key ()` singleton) yields the vacuously-true
+ * `1 = 1` — no singleton-specific branch (docs/lens.md § The Default Mapper).
+ */
+function buildKeyEquiJoin(
+	anchorAlias: string,
+	anchorKeys: readonly string[],
+	memberAlias: string,
+	memberKeys: readonly string[],
+): AST.Expression {
+	const n = Math.min(anchorKeys.length, memberKeys.length);
+	const eqs: AST.Expression[] = [];
+	for (let i = 0; i < n; i++) {
+		eqs.push({
+			type: 'binary',
+			operator: '=',
+			left: { type: 'column', name: memberKeys[i], table: memberAlias } as AST.ColumnExpr,
+			right: { type: 'column', name: anchorKeys[i], table: anchorAlias } as AST.ColumnExpr,
+		} as AST.BinaryExpr);
+	}
+	if (eqs.length === 0) {
+		// Singleton / empty key: vacuously true (`on 1 = 1`).
+		return {
+			type: 'binary',
+			operator: '=',
+			left: { type: 'literal', value: 1 } as AST.LiteralExpr,
+			right: { type: 'literal', value: 1 } as AST.LiteralExpr,
+		} as AST.BinaryExpr;
+	}
+	return eqs.reduce((acc, e) => ({ type: 'binary', operator: 'AND', left: acc, right: e }) as AST.BinaryExpr);
+}
+
+/** How {@link resolveAdvertisedColumn} resolved one logical column. */
+type AdvertisedColumnResolution =
+	/** Resolved to a backing expression (member mapping or EAV subquery). */
+	| { kind: 'expr'; expr: AST.Expression }
+	/** The backing member exists but is not reachable from the caller's FROM. */
+	| { kind: 'unreachable'; member: string }
+	/** The advertisement does not back the column → caller falls back to name-match. */
+	| { kind: 'none' };
+
+/**
+ * Resolves one logical column to its advertised backing expression, re-qualified
+ * to the caller-supplied alias for the backing member. Shared by the pure
+ * decomposition body (`compileDecompositionBody`) and the override gap-fill path
+ * (`compileOverrideBody`), so both honor the same precedence:
+ *
+ * 1. **Explicit per-member mapping** wins → the mapped `basisExpr`, re-qualified
+ *    to the member's alias. When the member is not reachable from the caller's
+ *    FROM (`aliasOf` returns undefined), reports `unreachable`.
+ * 2. **EAV attribute pivot** (exactly one pivot member + an entity correlation
+ *    key) → a correlated scalar subquery keyed by the attribute literal.
+ * 3. Otherwise `none` — the caller falls back to its own name-match path.
+ *
+ * Matches `annotateProvenanceWithAdvertisement`'s attribution order (explicit
+ * mapping, then the sole EAV member), so the synthesized projection and the
+ * `quereus_effective_lens` provenance stay consistent.
+ */
+function resolveAdvertisedColumn(
+	logicalColumn: string,
+	storage: StorageShape,
+	basisSchemaName: string,
+	aliasOf: (relationId: string) => string | undefined,
+	eavAnchor: { alias: string; keyColumn: string } | undefined,
+): AdvertisedColumnResolution {
+	const lc = logicalColumn.toLowerCase();
+
+	// 1. Explicit per-member mapping.
+	for (const member of storage.members) {
+		const mapping = member.columns.find(m => m.logicalColumn.toLowerCase() === lc);
+		if (!mapping) continue;
+		const alias = aliasOf(member.relationId);
+		if (!alias) return { kind: 'unreachable', member: member.relationId };
+		return { kind: 'expr', expr: requalifyColumnRefs(mapping.basisExpr, alias) };
+	}
+
+	// 2. EAV attribute pivot — a correlated scalar subquery keyed by the attribute
+	//    literal (only with exactly one pivot member + an entity correlation key).
+	const eavMembers = storage.members.filter(m => m.attributePivot);
+	if (eavMembers.length === 1 && eavAnchor) {
+		return { kind: 'expr', expr: buildEavSubquery(eavMembers[0], logicalColumn, basisSchemaName, eavAnchor) };
+	}
+
+	// 3. Not advertised → caller falls back to name-match.
+	return { kind: 'none' };
+}
+
+/**
+ * Builds the correlated scalar subquery for one EAV-backed logical column:
+ * `(select p.<value> from <pivot> p where p.<entity> = anchor.<key> and
+ *   p.<attribute> = '<logicalColumn>')`. Keeps every EAV column independently
+ * nullable (a logical row may have a triple for some attributes and not others)
+ * and rides the existing scalar-subquery read path with no new runtime.
+ */
+function buildEavSubquery(
+	pivot: DecompositionMember,
+	logicalColumn: string,
+	basisSchemaName: string,
+	eavAnchor: { alias: string; keyColumn: string },
+): AST.SubqueryExpr {
+	const piv = pivot.attributePivot!;
+	const pivotAlias = pivot.relationId;
+	const pivotSchema = pivot.relation.schema || basisSchemaName;
+	const query: AST.SelectStmt = {
+		type: 'select',
+		columns: [{ type: 'column', expr: { type: 'column', name: piv.valueColumn, table: pivotAlias } as AST.ColumnExpr }],
+		from: [{
+			type: 'table',
+			table: { type: 'identifier', name: pivot.relation.table, schema: pivotSchema },
+			alias: pivotAlias,
+		}],
+		where: {
+			type: 'binary',
+			operator: 'AND',
+			left: {
+				type: 'binary',
+				operator: '=',
+				left: { type: 'column', name: piv.entityColumn, table: pivotAlias } as AST.ColumnExpr,
+				right: { type: 'column', name: eavAnchor.keyColumn, table: eavAnchor.alias } as AST.ColumnExpr,
+			} as AST.BinaryExpr,
+			right: {
+				type: 'binary',
+				operator: '=',
+				left: { type: 'column', name: piv.attributeColumn, table: pivotAlias } as AST.ColumnExpr,
+				right: { type: 'literal', value: logicalColumn } as AST.LiteralExpr,
+			} as AST.BinaryExpr,
+		} as AST.BinaryExpr,
+	};
+	return { type: 'subquery', query } as AST.SubqueryExpr;
+}
+
+/**
+ * Deep-clones a member's `basisExpr` and re-qualifies every `column` reference in
+ * it to `alias` (the member's alias in the synthesized FROM). The stored mapping
+ * references the member's own columns, possibly bare or self-qualified; this
+ * rewrites them all to the alias so the projection is unambiguous over the join.
+ * Reuses the reflective walk shape of `collectColumnRefNames`, rewriting rather
+ * than collecting.
+ */
+function requalifyColumnRefs(expr: AST.Expression, alias: string): AST.Expression {
+	const rewrite = (node: unknown): unknown => {
+		if (Array.isArray(node)) return node.map(rewrite);
+		if (node && typeof node === 'object' && 'type' in (node as object)) {
+			const src = node as Record<string, unknown>;
+			const out: Record<string, unknown> = {};
+			for (const key of Object.keys(src)) out[key] = rewrite(src[key]);
+			if (src.type === 'column') {
+				out.table = alias;
+				out.schema = undefined;
+			}
+			return out;
+		}
+		return node;
+	};
+	return rewrite(expr) as AST.Expression;
+}
+
+/**
+ * Resolves a name-match logical column against the decomposition's join members
+ * (anchor first, then advertisement order): the first member whose basis table
+ * carries a same-named column, qualified by that member's alias. Returns
+ * undefined when no join member has the column (the caller errors precisely).
+ */
+function nameMatchAgainstMembers(
+	logicalColumn: string,
+	storage: StorageShape,
+	memberTables: ReadonlyMap<string, TableSchema>,
+	joinedMembers: ReadonlySet<string>,
+	anchorRelationId: string,
+): AST.ColumnExpr | undefined {
+	const lc = logicalColumn.toLowerCase();
+	const order = [anchorRelationId, ...storage.members.map(m => m.relationId).filter(id => id !== anchorRelationId)];
+	for (const relationId of order) {
+		if (!joinedMembers.has(relationId)) continue;
+		const table = memberTables.get(relationId);
+		const idx = table?.columnIndexMap.get(lc);
+		if (idx !== undefined) {
+			return { type: 'column', name: table!.columns[idx].name, table: relationId };
+		}
+	}
+	return undefined;
+}
+
 /**
  * Indexes a lens block's overrides by lowercased logical-table name, validating
  * that each names a logical table the declaration actually carries. The check
@@ -724,6 +1059,7 @@ function compileOverrideBody(
 	basisSchemaName: string,
 	schemaManager: SchemaManager,
 	override: AST.LensOverride,
+	advertisement?: MappingAdvertisement,
 ): { body: AST.SelectStmt; provenance: LensColumnProvenance[]; hiding: ReadonlySet<string>; effectiveColumns: string[] } {
 	const select = override.select;
 	const logicalName = logicalTable.name;
@@ -752,6 +1088,21 @@ function compileOverrideBody(
 	// tracked so a gap that actually needs them errors precisely.
 	const { sources, hasOpaqueSource } = collectOverrideSources(select.from, basisSchemaName, schemaManager);
 	const qualify = sources.length > 1;
+
+	// Advertisement-driven gap-fill needs to map an advertised member relationId to
+	// its reference name (alias / table name) in the override's FROM. A member the
+	// override's FROM does not include resolves to undefined (gap-fill then falls
+	// back to name-match, or errors precisely).
+	const overrideSourceByRel = new Map<string, string>();
+	for (const s of sources) {
+		overrideSourceByRel.set(`${s.table.schemaName.toLowerCase()}.${s.table.name.toLowerCase()}`, s.refName);
+	}
+	const overrideAliasOf = (relationId: string): string | undefined => {
+		const member = advertisement?.storage?.members.find(m => m.relationId === relationId);
+		if (!member) return undefined;
+		const key = `${(member.relation.schema || basisSchemaName).toLowerCase()}.${member.relation.table.toLowerCase()}`;
+		return overrideSourceByRel.get(key);
+	};
 
 	// Coverage map: lowercased output-column name -> the expression producing it.
 	const coverage = new Map<string, AST.Expression>();
@@ -801,14 +1152,39 @@ function compileOverrideBody(
 			composed.push({ type: 'column', expr: coveredExpr, alias: col.name });
 			provenance.push({ logicalColumn: col.name, source: 'override' });
 		} else {
-			const ref = gapFillRef(col.name, sources, qualify);
-			if (!ref) {
-				throw new QuereusError(
-					gapFillError(logicalSchemaName, logicalName, col.name, sources, hasOpaqueSource),
-					StatusCode.ERROR,
-				);
+			// Advertisement-driven gap-fill (richer than name-match): resolve the
+			// uncovered column against the advertised member mapping, re-qualified to
+			// its alias in the override's FROM. Fall back to today's FROM name-match
+			// when the advertisement does not back it; error precisely when the
+			// advertisement backs it from a member the FROM omits and name-match
+			// cannot reach it either (the same fidelity-boundary discipline as gapFillError).
+			let resolved: AST.Expression | undefined;
+			let unreachableMember: string | undefined;
+			if (advertisement?.storage) {
+				const res = resolveAdvertisedColumn(col.name, advertisement.storage, basisSchemaName, overrideAliasOf, undefined);
+				if (res.kind === 'expr') {
+					resolved = res.expr;
+				} else if (res.kind === 'unreachable') {
+					unreachableMember = res.member;
+				}
 			}
-			composed.push({ type: 'column', expr: ref, alias: col.name });
+			if (!resolved) {
+				const ref = gapFillRef(col.name, sources, qualify);
+				if (ref) {
+					resolved = ref;
+				} else if (unreachableMember) {
+					throw new QuereusError(
+						`lens: override for logical table '${logicalSchemaName}.${logicalName}' leaves column '${col.name}' to advertisement gap-fill, but its backing member '${unreachableMember}' is absent from the override's FROM; cover it explicitly or include the member relation in the FROM`,
+						StatusCode.ERROR,
+					);
+				} else {
+					throw new QuereusError(
+						gapFillError(logicalSchemaName, logicalName, col.name, sources, hasOpaqueSource),
+						StatusCode.ERROR,
+					);
+				}
+			}
+			composed.push({ type: 'column', expr: resolved, alias: col.name });
 			provenance.push({ logicalColumn: col.name, source: 'default' });
 		}
 		effectiveColumns.push(col.name);

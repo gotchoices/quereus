@@ -16,8 +16,10 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
+import { astToString } from '../src/emit/ast-stringify.js';
 import type { Database as DatabaseType } from '../src/core/database.js';
 import type { Schema } from '../src/schema/schema.js';
+import type * as AST from '../src/parser/ast.js';
 import type {
 	MappingAdvertisement,
 	LogicalColumnMapping,
@@ -430,6 +432,308 @@ describe('lens advertisement: introspection', () => {
 				{ logical_column: 'c', advertised_member: 'T_c', advertisement_anchor: 'T_core' },
 				{ logical_column: 'id', advertised_member: 'T_core', advertisement_anchor: 'T_core' },
 			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens advertisement: get synthesis (n-way decomposition)', () => {
+	it('columnar split: inner-joins mandatory members and recomposes rows', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Car_core',
+				logicalTable: 'Car',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Car_core',
+					members: [
+						{ relationId: 'Car_core', relation: { schema: 'main', table: 'Car_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('make', 'make')] },
+						{ relationId: 'Car_perf', relation: { schema: 'main', table: 'Car_perf' }, presence: 'mandatory', columns: [colMap('maxSpeed', 'speed')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Car_core', ['id']], ['Car_perf', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Car_core (id integer primary key, make text) using admod');
+			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
+			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
+			await db.exec('insert into Car_perf values (1, 180), (2, 240)');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('apply schema x');
+
+			// Synthesized body is an inner join on id (mandatory member).
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Car')!;
+			const top = slot.compiledBody.from![0] as AST.JoinClause;
+			expect(top.type).to.equal('join');
+			expect(top.joinType).to.equal('inner');
+
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
+				{ id: 1, make: 'Honda', maxSpeed: 180 },
+				{ id: 2, make: 'Mazda', maxSpeed: 240 },
+			]);
+
+			// The effective SQL (quereus_effective_lens) shows the join.
+			const eff = await rows(db, "select distinct effective_sql from quereus_effective_lens('x', 'Car')");
+			expect(String(eff[0].effective_sql)).to.match(/inner join/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('optional component: outer-joins and preserves a row missing the optional member', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Car_core',
+				logicalTable: 'Car',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Car_core',
+					members: [
+						{ relationId: 'Car_core', relation: { schema: 'main', table: 'Car_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('make', 'make')] },
+						{ relationId: 'Car_perf', relation: { schema: 'main', table: 'Car_perf' }, presence: 'optional', columns: [colMap('maxSpeed', 'speed')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Car_core', ['id']], ['Car_perf', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Car_core (id integer primary key, make text) using admod');
+			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
+			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
+			await db.exec('insert into Car_perf values (1, 180)'); // car 2 has NO perf row
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Car')!;
+			expect((slot.compiledBody.from![0] as AST.JoinClause).joinType).to.equal('left');
+
+			// The load-bearing correctness property: car 2 survives with maxSpeed null —
+			// it is NOT dropped (the inner-join-drops-rows regression).
+			expect(await rows(db, 'select * from x.Car order by id')).to.deep.equal([
+				{ id: 1, make: 'Honda', maxSpeed: 180 },
+				{ id: 2, make: 'Mazda', maxSpeed: null },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('singleton (primary key ()): on-true join reads 0-or-1 row with nulls when only the anchor exists', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Cfg_exists',
+				logicalTable: 'Config',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Cfg_exists',
+					members: [
+						{ relationId: 'Cfg_exists', relation: { schema: 'main', table: 'Cfg_exists' }, presence: 'mandatory', columns: [] },
+						{ relationId: 'Cfg_kv', relation: { schema: 'main', table: 'Cfg_kv' }, presence: 'optional', columns: [colMap('theme', 'theme'), colMap('lang', 'lang')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Cfg_exists', []], ['Cfg_kv', []]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Cfg_exists (tag integer primary key) using admod'); // existence anchor (0-or-1 row)
+			await db.exec('create table Cfg_kv (theme text, lang text, primary key ()) using admod');
+			await db.exec('insert into Cfg_exists values (1)'); // anchor present, no kv row
+
+			await db.exec('declare logical schema x { table Config { theme text, lang text, primary key () } }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Config')!;
+			const top = slot.compiledBody.from![0] as AST.JoinClause;
+			expect(top.type).to.equal('join');
+			expect(top.joinType).to.equal('left');
+			// Empty key ⇒ vacuously-true ON condition (no singleton-specific branch).
+			expect(astToString(top.condition!)).to.equal('1 = 1');
+
+			// Only the existence anchor present → exactly one row, every column null.
+			expect(await rows(db, 'select * from x.Config')).to.deep.equal([{ theme: null, lang: null }]);
+
+			// A kv row joins on true (0-or-1 row each ⇒ 0-or-1 result row).
+			await db.exec("insert into Cfg_kv values ('dark', 'en')");
+			expect(await rows(db, 'select * from x.Config')).to.deep.equal([{ theme: 'dark', lang: 'en' }]);
+
+			// No anchor row → zero rows (existence collapses).
+			await db.exec('delete from Cfg_exists');
+			expect(await rows(db, 'select * from x.Config')).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('EAV pivot: each logical column reads via a correlated scalar subquery on the attribute literal', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Prof_exists',
+				logicalTable: 'Profile',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Prof_exists',
+					members: [
+						{ relationId: 'Prof_exists', relation: { schema: 'main', table: 'Prof_exists' }, presence: 'mandatory', columns: [colMap('id', 'id')] },
+						{ relationId: 'Prof_eav', relation: { schema: 'main', table: 'Prof_eav' }, presence: 'optional', columns: [], attributePivot: { entityColumn: 'entity', attributeColumn: 'attr', valueColumn: 'val' } },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Prof_exists', ['id']], ['Prof_eav', ['entity']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Prof_exists (id integer primary key) using admod');
+			await db.exec('create table Prof_eav (entity integer, attr text, val text, primary key (entity, attr)) using admod');
+			await db.exec('insert into Prof_exists values (1), (2)');
+			// entity 2 has a nick triple but no city triple.
+			await db.exec("insert into Prof_eav values (1, 'nick', 'Ada'), (1, 'city', 'London'), (2, 'nick', 'Bob')");
+
+			await db.exec('declare logical schema x { table Profile { id integer primary key, nick text, city text } }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Profile')!;
+			// The EAV pivot member is NOT joined: the anchor is the sole FROM source.
+			expect(slot.compiledBody.from!.length).to.equal(1);
+			expect(slot.compiledBody.from![0].type).to.equal('table');
+			// nick / city are correlated scalar subqueries.
+			expect((slot.compiledBody.columns[1] as AST.ResultColumnExpr).expr.type).to.equal('subquery');
+			expect((slot.compiledBody.columns[2] as AST.ResultColumnExpr).expr.type).to.equal('subquery');
+
+			expect(await rows(db, 'select * from x.Profile order by id')).to.deep.equal([
+				{ id: 1, nick: 'Ada', city: 'London' },
+				{ id: 2, nick: 'Bob', city: null }, // missing triple → null
+			]);
+
+			// Provenance attributes the EAV-backed columns to the pivot member.
+			const prov = await rows(db, "select logical_column, advertised_member from quereus_effective_lens('x', 'Profile') order by logical_column");
+			expect(prov).to.deep.equal([
+				{ logical_column: 'city', advertised_member: 'Prof_eav' },
+				{ logical_column: 'id', advertised_member: 'Prof_exists' },
+				{ logical_column: 'nick', advertised_member: 'Prof_eav' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('surrogate key: equi-joins per-member surrogate columns positionally; the logical key projects as a value column', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Doc_core',
+				logicalTable: 'Doc',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Doc_core',
+					members: [
+						{ relationId: 'Doc_core', relation: { schema: 'main', table: 'Doc_core' }, presence: 'mandatory', columns: [colMap('docKey', 'doc_key'), colMap('title', 'title')] },
+						{ relationId: 'Doc_body', relation: { schema: 'main', table: 'Doc_body' }, presence: 'mandatory', columns: [colMap('body', 'body')] },
+					],
+					sharedKey: {
+						kind: 'surrogate',
+						keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']]),
+						generator: { strategy: 'integer-auto', cadence: 'per-row' },
+					},
+				},
+			}];
+			db.registerModule('admod', mod);
+			// The surrogate is spelled differently per relation (sid vs doc_sid); the
+			// logical key (docKey) is carried as an ordinary value column on Doc_core.
+			await db.exec('create table Doc_core (sid integer primary key, doc_key text, title text) using admod');
+			await db.exec('create table Doc_body (doc_sid integer primary key, body text) using admod');
+			await db.exec("insert into Doc_core values (100, 'k1', 'First'), (101, 'k2', 'Second')");
+			await db.exec("insert into Doc_body values (100, 'body one'), (101, 'body two')");
+
+			await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
+			await db.exec('apply schema x');
+
+			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Doc')!;
+			const top = slot.compiledBody.from![0] as AST.JoinClause;
+			expect(top.joinType).to.equal('inner');
+			// The equi-join pairs the per-member surrogate columns positionally.
+			expect(astToString(top.condition!)).to.equal('Doc_body.doc_sid = Doc_core.sid');
+
+			expect(await rows(db, 'select * from x.Doc order by docKey')).to.deep.equal([
+				{ docKey: 'k1', title: 'First', body: 'body one' },
+				{ docKey: 'k2', title: 'Second', body: 'body two' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('advertisement-driven gap-fill: a sparse override gap-fills uncovered columns from the advertised member mapping (not name-match)', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Item_core',
+				logicalTable: 'Item',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Item_core',
+					members: [
+						{ relationId: 'Item_core', relation: { schema: 'main', table: 'Item_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('name', 'name'), colMap('caption', 'cap')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Item_core', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			// 'caption' maps to the renamed basis column 'cap' — a name-match for 'caption' would FAIL.
+			await db.exec('create table Item_core (id integer primary key, name text, cap text) using admod');
+			await db.exec("insert into Item_core values (1, 'widget', 'Hello')");
+
+			await db.exec('declare logical schema x { table Item { id integer primary key, name text, caption text } }');
+			// Sparse override covers id + name; caption gap-fills from the advertisement (cap), not name-match.
+			await db.exec("declare lens for x over main { view Item as select id, name from main.Item_core }");
+			await db.exec('apply schema x');
+
+			const prov = await rows(db, "select logical_column, source from quereus_effective_lens('x', 'Item') order by logical_column");
+			expect(prov).to.deep.equal([
+				{ logical_column: 'caption', source: 'default' }, // gap-filled from the advertisement member mapping (cap)
+				{ logical_column: 'id', source: 'override' },
+				{ logical_column: 'name', source: 'override' },
+			]);
+
+			expect(await rows(db, 'select * from x.Item')).to.deep.equal([{ id: 1, name: 'widget', caption: 'Hello' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('advertisement-driven gap-fill: errors precisely when an uncovered column needs a member absent from the override FROM', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Item_core',
+				logicalTable: 'Item',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Item_core',
+					members: [
+						{ relationId: 'Item_core', relation: { schema: 'main', table: 'Item_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('caption', 'cap')] },
+						{ relationId: 'Item_ext', relation: { schema: 'main', table: 'Item_ext' }, presence: 'optional', columns: [colMap('extra', 'ex')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Item_core', ['id']], ['Item_ext', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Item_core (id integer primary key, cap text) using admod');
+			await db.exec('create table Item_ext (id integer primary key, ex text) using admod');
+
+			await db.exec('declare logical schema x { table Item { id integer primary key, caption text, extra text } }');
+			// FROM omits Item_ext; `extra` (backed by Item_ext) cannot gap-fill — error precisely.
+			await db.exec("declare lens for x over main { view Item as select id from main.Item_core }");
+			await expectThrows(() => db.exec('apply schema x'), /column 'extra'.*backing member 'Item_ext' is absent from the override's FROM/i);
 		} finally {
 			await db.close();
 		}
