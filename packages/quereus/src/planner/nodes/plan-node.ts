@@ -256,6 +256,13 @@ export type UpdateSite =
  * predicates (`constant-fd`), declared base-column defaults (`base-default`),
  * or a `quereus.update.default_for` tag (`tag-default`). The value is symbolic
  * (literal, parameter, or context binding).
+ *
+ * NOTE for the consumer: `value` lives in the **base** column's domain, not the
+ * projected output domain. When the owning `UpdateSite` is `base` with an
+ * `inverse` (a transformed column such as `b + 1`), an omitted-column insert sets
+ * the base column to `value` directly (no written view value exists to invert),
+ * so the projected column reads back as the forward transform of `value`. The
+ * orchestrator owns this interpretation and cross-op default precedence.
  */
 export interface AttributeDefault {
 	readonly kind: 'constant-fd' | 'base-default' | 'tag-default';

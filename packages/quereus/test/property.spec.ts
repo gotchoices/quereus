@@ -12,7 +12,7 @@ import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner
 import { deriveViewColumns, viewColumnsFromUpdateLineage } from '../src/planner/analysis/update-lineage.js';
 import { viewComplement } from '../src/planner/analysis/view-complement.js';
 import type * as AST from '../src/parser/ast.js';
-import { type PlanNode, type RelationalPlanNode, type UpdateSite, isRelationalNode } from '../src/planner/nodes/plan-node.js';
+import { type PlanNode, type RelationalPlanNode, type UpdateSite, type AttributeDefault, isRelationalNode } from '../src/planner/nodes/plan-node.js';
 import { EmissionContext } from '../src/runtime/emission-context.js';
 import { emitPlanNode } from '../src/runtime/emitters.js';
 import { Scheduler } from '../src/runtime/scheduler.js';
@@ -2417,6 +2417,101 @@ describe('Property-Based Tests', () => {
 					});
 				}
 			}
+		});
+
+		// ----- scalar invertibility registry (the widened backward transform chain) -----
+		// The agreement law only constrains KEY columns, and the parity reader collapses
+		// `base`-with-inverse to `computed`; neither actually exercises the new
+		// `classifyInvertibility` / `traceInvertibleColumn` profiles. This test reads the
+		// planned `UpdateSite` directly and checks the inverse the registry composed.
+		it('invertibility registry composes inverses for ±k / no-op cast / collate, opaque otherwise', async () => {
+			await createBase();
+
+			/** The single projected output column's UpdateSite. */
+			function soleSite(body: string): UpdateSite {
+				const node = planLogicalBody(body);
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, `single output column for "${body}"`).to.equal(1);
+				const site = node.physical.updateLineage?.get(attrs[0].id);
+				expect(site, `updateLineage entry for "${body}"`).to.not.equal(undefined);
+				return site!;
+			}
+
+			/** Apply a base site's inverse to a marker literal and return the AST. */
+			function invOf(site: UpdateSite, marker: number): AST.Expression {
+				expect(site.kind).to.equal('base');
+				const base = site as Extract<UpdateSite, { kind: 'base' }>;
+				expect(base.baseColumn.toLowerCase()).to.equal('b');
+				expect(base.inverse, 'inverse present').to.not.equal(undefined);
+				return base.inverse!({ type: 'literal', value: marker });
+			}
+
+			// `b + 1` → base 'b', inverse w ↦ w - 1.
+			const add = invOf(soleSite('select b + 1 as bp from t'), 99) as AST.BinaryExpr;
+			expect(add.type).to.equal('binary');
+			expect(add.operator).to.equal('-');
+			expect((add.left as AST.LiteralExpr).value).to.equal(99);
+
+			// `b - 5` → base 'b', inverse w ↦ w + 5.
+			const sub = invOf(soleSite('select b - 5 as bm from t'), 99) as AST.BinaryExpr;
+			expect(sub.operator).to.equal('+');
+
+			// `10 - b` → base 'b', inverse w ↦ 10 - w (constant-on-left subtraction).
+			const rsub = invOf(soleSite('select 10 - b as rb from t'), 99) as AST.BinaryExpr;
+			expect(rsub.operator).to.equal('-');
+			expect((rsub.left as AST.LiteralExpr).value).to.equal(10);
+
+			// chain `(b + 1) + 2` → inverse w ↦ (w - 2) - 1 (outer transform undone first).
+			const chain = invOf(soleSite('select (b + 1) + 2 as bc from t'), 99) as AST.BinaryExpr;
+			expect(chain.operator).to.equal('-');
+			expect((chain.right as AST.LiteralExpr).value).to.equal(1);
+			expect((chain.left as AST.BinaryExpr).operator).to.equal('-');
+			expect(((chain.left as AST.BinaryExpr).right as AST.LiteralExpr).value).to.equal(2);
+
+			// no-op cast (same logical type) → base 'b', identity (no inverse).
+			const noop = soleSite('select cast(b as integer) as cb from t');
+			expect(noop.kind).to.equal('base');
+			expect((noop as Extract<UpdateSite, { kind: 'base' }>).inverse).to.equal(undefined);
+
+			// collate is value-preserving → base 'b', identity.
+			const coll = soleSite('select b collate nocase as cc from t');
+			expect(coll.kind).to.equal('base');
+			expect((coll as Extract<UpdateSite, { kind: 'base' }>).inverse).to.equal(undefined);
+
+			// opaque: multi-column (`a + b`), non-registry op (`b * 2`), float `k` (`b + 1.5`).
+			expect(soleSite('select a + b as ab from t').kind).to.equal('computed');
+			expect(soleSite('select b * 2 as b2 from t').kind).to.equal('computed');
+			expect(soleSite('select b + 1.5 as bf from t').kind).to.equal('computed');
+		});
+
+		// ----- attributeDefaults (insert-default provenance) -----
+		// The whole `attributeDefaults` surface — `base-default` seeded at the table
+		// reference, `constant-fd` added at the filter (the extractFilterConstants
+		// replacement), carry-through at the project — is otherwise untested.
+		it('attributeDefaults seeds base-default and constant-fd provenance', async () => {
+			await createBase();
+
+			/** The AttributeDefault for the named output column, or undefined. */
+			function defaultFor(body: string, colName: string): AttributeDefault | undefined {
+				const node = planLogicalBody(body);
+				const attr = (node.getAttributes?.() ?? []).find(a => a.name.toLowerCase() === colName.toLowerCase());
+				return attr ? node.physical.attributeDefaults?.get(attr.id) : undefined;
+			}
+
+			// constant-fd: `where a = 2` pins `a`, surviving the projection.
+			const cfd = defaultFor('select id, a from t where a = 2', 'a');
+			expect(cfd, 'constant-fd default on filtered column').to.not.equal(undefined);
+			expect(cfd!.kind).to.equal('constant-fd');
+			expect((cfd!.value as AST.LiteralExpr).value).to.equal(2);
+
+			// no filter → no constant-fd default.
+			expect(defaultFor('select id, a from t', 'a')).to.equal(undefined);
+
+			// base-default: a declared column default seeds `base-default` at the table ref.
+			await db.exec('create table tdef (id integer primary key, a integer null default 7) using memory');
+			const bdef = defaultFor('select id, a from tdef', 'a');
+			expect(bdef, 'base-default from declared default').to.not.equal(undefined);
+			expect(bdef!.kind).to.equal('base-default');
 		});
 
 		// ----- predicate-honest complement -----

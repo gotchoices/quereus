@@ -13,8 +13,11 @@ import type * as AST from '../../parser/ast.js';
  * - `hiddenColumns` — base columns present in the base relation(s) but absent
  *   from the view image (no `updateLineage` entry traces to them), keyed by the
  *   producing `TableReferenceNode`'s id and base column name.
- * - `residualPredicate` — the negation-free residual of the view predicate (the
- *   σ conjuncts that constrain base rows the view never surfaces).
+ * - `residualPredicate` — the conjunction of the body's σ predicates (the
+ *   conjuncts that constrain base rows the view never surfaces). Within the
+ *   supported conjunctive-σ shape this is already negation-free; the accessor
+ *   conjoins the raw `FilterNode` predicates verbatim and performs no
+ *   normalization, so an out-of-envelope `not`/`<>` predicate is carried as-is.
  *
  * With this object the lens prover's *Round-trip (lens laws)* check becomes
  * computed (GetPut ⇔ `put` leaves the complement fixed; PutGet ⇔ `get ∘ put`
