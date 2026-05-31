@@ -1,7 +1,37 @@
 description: The `put` direction of n-way decomposition — propagate a logical-table mutation (insert / update / delete) as an ordered fan-out across every basis member of the decomposition, with a shared key that may be a surrogate supplied by a basis default and **evaluated once per logical row and threaded** across all branches so members agree on identity, optional members handled per outer-join semantics, and the singleton degenerate case. Rides the view-mutation plan-node substrate (the multi-source put path) and the evaluate-once-and-thread mutation-context cadences. Consumes the existence facts from `lens-multi-source-ind-injection` for put soundness. Design source: `docs/lens.md` § "The Default Mapper" (shared-key surrogate, evaluate-once-and-thread, singleton).
-prereq: lens-multi-source-get-synthesis, lens-multi-source-ind-injection, view-mutation-plan-node-substrate
+prereq: lens-multi-source-get-synthesis, lens-multi-source-ind-injection, view-mutation-physical-lineage, view-mutation-substrate-orchestrator
 files: packages/quereus/src/schema/lens-compiler.ts, packages/quereus/src/vtab/mapping-advertisement.ts, packages/quereus/src/planner/mutation/propagate.ts, packages/quereus/src/planner/nodes/view-mutation-node.ts, packages/quereus/src/runtime/emit/view-mutation.ts, packages/quereus/src/planner/building/insert.ts, packages/quereus/src/planner/building/update.ts, packages/quereus/src/planner/building/delete.ts, docs/lens.md, docs/view-updateability.md
 ----
+
+<!-- held-note (2026-05-30) -->
+> **HELD in implement/ — hard-prereq substrate not yet built. Not started; no code written.**
+>
+> This ticket's entire fan-out is a consumer of the view-mutation substrate
+> (`propagate()` planned-body → `BaseOp[]` visitor, `ViewMutationNode` orchestrator,
+> `runtime/emit/view-mutation.ts`). That substrate **does not exist in the codebase yet**
+> (verified 2026-05-30):
+> - `planner/mutation/propagate.ts` holds only the single-source `classifyViewBody`
+>   classifier (it returns `unsupported-join` for >1 base table); there is no
+>   `propagate()` visitor, `MutationRequest`, or `BaseOp` type anywhere in `src`.
+> - `planner/nodes/view-mutation-node.ts` and `runtime/emit/view-mutation.ts` do **not** exist.
+> - The live write path is the Phase-1 AST rewrite (`planner/building/view-mutation.ts`,
+>   `rewriteViewInsert/Update/Delete`), which explicitly rejects multi-source fan-out.
+>
+> The substrate is produced by **`view-mutation-substrate-orchestrator`** (and its prereq
+> **`view-mutation-physical-lineage`**), both still unbuilt in `implement/`. The ticket
+> forbids re-inventing the sequencer, and building the substrate here would be doing two
+> other tickets' entire scope — so this work cannot start until they land.
+>
+> **Why it was dispatched prematurely:** the `prereq:` header named the stale slug
+> `view-mutation-plan-node-substrate`, which matches no ticket file (the substrate was
+> decomposed/renamed into the two slugs above), so the runner's automatic cross-stage
+> gating did not defer it. The header is now corrected to the real substrate slugs, so
+> the runner will defer this ticket until that chain clears (this is the sanctioned
+> "prereq still in implement → deferred automatically" path, not a `blocked/` case).
+>
+> **To resume (once the substrate lands):** delete this note and implement Phases A–D
+> below against the substrate's *actual* `BaseOp` / `ViewMutationNode` / `propagate()` API
+> (adapt to whatever shape it shipped with, per the ticket's own guidance below).
 
 ## Scope
 
