@@ -297,6 +297,17 @@ describe('Isolated Store Module', () => {
 	});
 
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+		});
+
+		afterEach(async () => {
+			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
 		it('UNIQUE-value swap across two rows within one txn commits (no stale-underlying false positive)', async () => {
 			// Regression: isolation-merged-unique-stale-underlying-false-positive.
 			await db.exec(`CREATE TABLE sw (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
@@ -328,17 +339,6 @@ describe('Isolated Store Module', () => {
 
 			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM psw ORDER BY id`));
 			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
-		});
-
-		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
-
-		beforeEach(async () => {
-			isolatedModule = createIsolatedStoreModule({ provider });
-			db.registerModule('store', isolatedModule);
-		});
-
-		afterEach(async () => {
-			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
 		});
 
 		it('INSERT with PK that collides with underlying row throws constraint error', async () => {

@@ -205,6 +205,14 @@ This is analogous to LSM-tree merge or 3-way merge in version control.
    delete must free the constrained value before the colliding write is applied, or the
    underlying module rejects the write on a UNIQUE conflict. Each PK appears at most once
    in the overlay, so reordering across PKs never inverts a same-PK delete/insert pair.
+   The insert/update flushes are issued as **trusted writes** (`trustedWrite: true`): the
+   underlying module skips its own per-write PK/UNIQUE re-enforcement and just persists the
+   already-validated final state. This is required because a value-swap cycle (e.g. two rows
+   exchanging a UNIQUE value within one txn) has no conflict-free row-by-row apply order — an
+   intermediate row would transiently duplicate a UNIQUE value and a naive per-write check
+   would wrongly reject it. The merged-view pre-checks are therefore the sole authority for
+   the final committed state; secondary-index maintenance still runs incrementally per write,
+   and a transient duplicate index value is harmless because index keys are suffixed with the PK.
    Any `constraint` result returned by an underlying `update()` here is a violated
    invariant (the merged-view pre-checks should have resolved it before commit) and is
    thrown as an INTERNAL error rather than silently swallowed.
@@ -406,8 +414,12 @@ For each declared non-PK UNIQUE constraint:
   identity via a `WeakMap`, so the hot write path doesn't recompile.
 - Scan the underlying table for a row matching on all constrained columns,
   excluding the writer's own PK(s) and any PK currently tombstoned in the
-  overlay. For partial UNIQUE, candidates whose row does not satisfy the
-  predicate are also skipped.
+  overlay. When a non-tombstone overlay entry supersedes a scanned committed
+  row, the constrained columns **and** the partial predicate are evaluated
+  against the *merged* (overlay) row — not the stale underlying value — so a
+  candidate moved off the value earlier in the same txn no longer counts as a
+  conflict (and one moved *onto* the value correctly does). For partial UNIQUE,
+  candidates whose merged row does not satisfy the predicate are also skipped.
 - ABORT returns the constraint result; IGNORE no-ops; REPLACE writes a
   tombstone for the conflicting underlying PK so the row is evicted at flush,
   then continues.
