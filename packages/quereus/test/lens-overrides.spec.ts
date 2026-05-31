@@ -321,6 +321,106 @@ describe('lens overrides: body-shape validation', () => {
 		}
 	});
 
+	// Defect 5, subquery-source arm: a full-coverage override whose FROM is a
+	// subquery source naming a *different* existing schema leaves no gap-fill to
+	// trip the basis-reachability error, so only the reflective whole-body walk
+	// catches the silent re-anchor.
+	it('errors on a cross-basis table inside a subquery source', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare schema z { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema z');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from (select * from z.CarCore) sub }');
+			await expectThrows(() => db.exec('apply schema x'), /outside the declared basis|references basis relation 'z/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 5, nested-CTE arm: a cross-basis table buried in a CTE body inside a
+	// subquery source is reached by the reflective walk (which descends `with`
+	// CTE bodies), even though the CTE *reference* `c` is a bare, in-scope name.
+	it('errors on a cross-basis table inside a nested CTE body', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare schema z { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema z');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from (with c as (select * from z.CarCore) select * from c) sub }');
+			await expectThrows(() => db.exec('apply schema x'), /outside the declared basis|references basis relation 'z/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 5 guard must NOT over-reject: a subquery source over the *basis*
+	// schema is a legitimate body shape and must still deploy. This pins that the
+	// whole-body walk only rejects cross-basis tables, not nested subqueries per se.
+	it('accepts a subquery source over the basis schema', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from (select * from y.CarCore) sub }');
+			await db.exec('apply schema x');
+			const cols = await rows(db, "select logical_column, source from quereus_effective_lens('x', 'Car') order by logical_column");
+			expect(cols).to.deep.equal([
+				{ logical_column: 'id', source: 'override' },
+				{ logical_column: 'speed', source: 'override' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 5, compound-leg arm: a compound (`union`) leg nested inside a subquery
+	// source carries the cross-basis table on a type-less `{ op, select }` wrapper,
+	// so only a walk that descends into *every* nested object (not just nodes with
+	// a `type` discriminant) reaches it. A top-level compound body is rejected at
+	// parse time, but nested in a subquery source it is a legal shape.
+	it('errors on a cross-basis table inside a nested compound leg', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare schema z { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema z');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from (select id, speed from y.CarCore union all select id, speed from z.CarCore) sub }');
+			await expectThrows(() => db.exec('apply schema x'), /outside the declared basis|references basis relation 'z/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Defect 5 guard, CTE arm: a CTE over the *basis* deploys. The body references
+	// the CTE by its bare name `c`; the whole-body walk must not mistake that bare
+	// in-scope name for a cross-basis relation (the schema-qualified-only invariant
+	// that lets the check skip CTE-name tracking).
+	it('accepts a CTE over the basis schema (bare CTE ref not flagged)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from (with c as (select * from y.CarCore) select * from c) sub }');
+			await db.exec('apply schema x');
+			const cols = await rows(db, "select logical_column, source from quereus_effective_lens('x', 'Car') order by logical_column");
+			expect(cols).to.deep.equal([
+				{ logical_column: 'id', source: 'override' },
+				{ logical_column: 'speed', source: 'override' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	// Defect 3 guard must NOT over-reject: a computed projection term that *is*
 	// aliased maps to a logical column, and an uncovered logical column is still
 	// gap-filled from the basis. This pins the boundary so a future tightening of

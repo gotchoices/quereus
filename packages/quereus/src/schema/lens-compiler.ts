@@ -1200,7 +1200,7 @@ function compileOverrideBody(
 	// Every FROM source the override names must live in the declared basis — an
 	// override referencing a *different* existing schema (e.g. `Z.Foo` while the
 	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
-	validateOverrideBasisSources(select.from, basisSchemaName, logicalSchemaName, logicalName);
+	validateOverrideBasisSources(select, basisSchemaName, logicalSchemaName, logicalName);
 
 	const hidden = new Set((override.hiding ?? []).map(h => h.toLowerCase()));
 	// `hiding (...)` names that match no logical column are silently a no-op (a
@@ -1365,53 +1365,56 @@ function collectOverrideSources(
 }
 
 /**
- * Validates that every introspectable `table` source in an override's FROM tree
- * resolves to the declared basis schema. A table qualified with a *different*
- * existing schema would otherwise bind there silently (re-anchoring the lens off
- * its `over Y` basis); reject it at deploy time. Unqualified tables default to
- * the basis and are fine; tables qualified with the basis name are fine.
+ * Validates that every `table` source reachable from an override's body resolves
+ * to the declared basis schema. A table qualified with a *different* existing
+ * schema would otherwise bind there silently (re-anchoring the lens off its
+ * `over Y` basis); reject it at deploy time. Unqualified tables default to the
+ * basis and are fine; tables qualified with the basis name are fine.
  *
- * KNOWN GAP: opaque sources (subquery / function) are not descended into, so a
- * cross-basis table hidden inside a subquery FROM (e.g.
- * `from (select * from z.Foo)`) is NOT caught here. The gap-fill error path only
- * catches it when some logical column is left uncovered; a subquery override that
- * covers every logical column explicitly still re-anchors silently. Closing this
- * requires walking nested subquery FROM trees (and excluding their CTE names) —
- * tracked by `lens-override-subquery-cross-basis`. Mirrors
- * `collectOverrideSources`'s FROM walk but does not share it (that helper is also
- * used where re-anchoring is allowed).
+ * The walk is reflective over the entire override `select` AST, so it descends
+ * into subquery-source FROM trees, function-source argument subqueries, `with`
+ * CTE bodies, compound (`union`/`intersect`/…) legs, and scalar/`where`/`in`/
+ * `exists` subqueries — a cross-basis `z.Foo` in any of those nested positions is
+ * flagged too, not only top-level `table`/`join` sources. Descent is *not* gated
+ * on a `type` discriminant: some containers that hold nested SELECTs are plain
+ * wrappers without one — notably `compound` (`{ op, select }`) and `orderBy`
+ * clauses — so a type-gated walk would skip the tables nested under them.
+ *
+ * No CTE-name / alias scope tracking is needed. The check fires only on a `table`
+ * node carrying an explicit, non-basis *schema qualifier*; CTE references and
+ * FROM aliases are always bare (SQL has no `schema.cte` form) and the compiler
+ * resolves a bare FROM table to the basis (see `collectOverrideSources`), so a
+ * bare name is always either the basis or a CTE — never a cross-basis relation.
+ * Only a schema-qualified table can be cross-basis, and that can never name a
+ * CTE/alias, so the walk needs no in-scope-name set to avoid false positives.
  */
 function validateOverrideBasisSources(
-	from: ReadonlyArray<AST.FromClause> | undefined,
+	select: AST.SelectStmt,
 	basisSchemaName: string,
 	logicalSchemaName: string,
 	logicalName: string,
 ): void {
-	if (!from) return;
 	const lowerBasis = basisSchemaName.toLowerCase();
-	const walk = (node: AST.FromClause): void => {
-		switch (node.type) {
-			case 'table': {
-				const schema = node.table.schema;
-				if (schema && schema.toLowerCase() !== lowerBasis) {
-					throw new QuereusError(
-						`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${schema}.${node.table.name}' outside the declared basis '${basisSchemaName}' (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
-						StatusCode.ERROR,
-					);
-				}
-				break;
+	const stack: unknown[] = [select];
+	while (stack.length > 0) {
+		const node = stack.pop();
+		if (!node || typeof node !== 'object') continue;
+		if ((node as AST.AstNode).type === 'table') {
+			const source = node as AST.TableSource;
+			const schema = source.table.schema;
+			if (schema && schema.toLowerCase() !== lowerBasis) {
+				throw new QuereusError(
+					`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${schema}.${source.table.name}' outside the declared basis '${basisSchemaName}' (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
+					StatusCode.ERROR,
+				);
 			}
-			case 'join': {
-				walk(node.left);
-				walk(node.right);
-				break;
-			}
-			default:
-				// subquerySource / functionSource — not introspectable in v1.
-				break;
 		}
-	};
-	for (const f of from) walk(f);
+		// Reflective descent: push every nested object/array element. Arrays are
+		// transparent here — Object.values yields their elements.
+		for (const value of Object.values(node as Record<string, unknown>)) {
+			if (value && typeof value === 'object') stack.push(value);
+		}
+	}
 }
 
 /** Output name a result column contributes: its alias, or the bare column name. */
