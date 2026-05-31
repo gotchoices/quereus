@@ -107,3 +107,48 @@ select count(*) as n from tr;
 insert into tr values (3, 'abcd');
 select id, x from tr order by id;
 → [{"id":1,"x":"abc"},{"id":3,"x":"abcd"}]
+
+-- ===================================
+-- 6. Composite UNIQUE with a mix of NOCASE + BINARY members — each member is
+--    compared under its OWN declared collation (per-column threading), not a
+--    single table-wide collation. The NOCASE member folds case; the BINARY
+--    member does not.
+-- ===================================
+
+create table tcomp (id integer primary key, a text collate NOCASE, b text collate BINARY, unique (a, b));
+insert into tcomp values (1, 'abc', 'xyz');
+
+-- both members match under their own collations (a: NOCASE-equal, b: BINARY-equal) → conflict
+insert into tcomp values (2, 'ABC', 'xyz');
+-- error: UNIQUE constraint failed: tcomp
+
+select count(*) as n from tcomp;
+→ [{"n":1}]
+
+-- a matches under NOCASE but b differs under BINARY ('XYZ' != 'xyz'), so the composite
+-- key is distinct and the row inserts — proves the BINARY member is NOT case-folded
+insert into tcomp values (3, 'ABC', 'XYZ');
+select id, a, b from tcomp order by id;
+→ [{"id":1,"a":"abc","b":"xyz"},{"id":3,"a":"ABC","b":"XYZ"}]
+
+-- ===================================
+-- 7. UPDATE onto a NOCASE-equal value is rejected (the conflict validators back
+--    UPDATE as well as INSERT). Guards the UPDATE path, not just INSERT.
+-- ===================================
+
+create table tu (id integer primary key, x text collate NOCASE, unique (x));
+insert into tu values (1, 'abc');
+insert into tu values (2, 'def');
+
+-- moving id=2's value onto a NOCASE-equal of id=1's value collides
+update tu set x = 'ABC' where id = 2;
+-- error: UNIQUE constraint failed: tu
+
+-- the aborted UPDATE left both rows unchanged
+select id, x from tu order by id;
+→ [{"id":1,"x":"abc"},{"id":2,"x":"def"}]
+
+-- updating onto a genuinely distinct value still succeeds
+update tu set x = 'xyz' where id = 2;
+select id, x from tu order by id;
+→ [{"id":1,"x":"abc"},{"id":2,"x":"xyz"}]
