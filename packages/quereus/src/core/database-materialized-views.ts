@@ -322,11 +322,51 @@ export class MaterializedViewManager {
 						// detach it. The MV reads "stale" until refreshed or recreated,
 						// which re-registers it.
 						this.releaseRowTime(mvKey(mv.schemaName, mv.name));
+						// Invalidate any cached prepared-statement plan reading this MV's
+						// backing table so it recompiles and re-hits the build-time `stale`
+						// guard (see emitBackingInvalidation). Unconditional per qualifying
+						// event (NOT gated on the !stale transition) so a plan compiled while
+						// the MV is already stale is invalidated by a *subsequent* change too.
+						this.emitBackingInvalidation(mv);
 					}
 				}
 			} else if (event.type === 'materialized_view_removed') {
 				this.releaseRowTime(mvKey(event.schemaName, event.objectName));
 			}
+		});
+	}
+
+	/**
+	 * Emit a synthetic `table_modified` event for `mv`'s backing table so any cached
+	 * prepared-statement plan that reads the backing table directly invalidates →
+	 * recompiles → re-hits the build-time `stale` guard in `building/select.ts`.
+	 *
+	 * A `select … from mv` resolves to a `TableReference` against `_mv_<name>`, so the
+	 * compiled `Statement`'s only schema dependency is the backing table. The *source*
+	 * change event that (re)marked the MV stale never names the backing table, so
+	 * without this emit the cached plan would re-run the backing scan and serve stale
+	 * rows against a structurally-changed source — bypassing the guard a fresh prepare
+	 * would hit. The `Statement` listener maps `table_*` → `'table'` and matches on
+	 * type + objectName (+ optional schemaName) only, ignoring the payload, so the
+	 * backing `TableSchema` is passed as both old/new.
+	 *
+	 * Safety: the event names the backing table (`_mv_<name>`), so this manager's own
+	 * listener treats it as a no-op for a plain MV (a backing table is not in any plain
+	 * MV's `sourceTables`); for an MV-over-MV chain it conservatively cascades staleness
+	 * down the producer→consumer DAG (acyclic — a consumer requires its producer to
+	 * pre-exist), so the nested notification terminates. The backing table still exists
+	 * even when the source was dropped; if its lookup unexpectedly fails the MV is
+	 * already in a broken state — skip the emit rather than fabricate a partial event.
+	 */
+	private emitBackingInvalidation(mv: MaterializedViewSchema): void {
+		const backing = this.ctx.schemaManager.getTable(mv.schemaName, mv.backingTableName);
+		if (!backing) return;
+		this.ctx.schemaManager.getChangeNotifier().notifyChange({
+			type: 'table_modified',
+			schemaName: mv.schemaName,
+			objectName: mv.backingTableName,
+			oldObject: backing,
+			newObject: backing,
 		});
 	}
 

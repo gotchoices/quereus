@@ -508,7 +508,9 @@ snapshot and source writes are not propagated.
 - On the next **reference**, a stale MV re-validates its body against the current
   source schemas. If the body no longer plans, the reference errors with a staleness
   diagnostic ("a source changed in an incompatible way — drop and recreate") rather
-  than serving rows against a broken definition.
+  than serving rows against a broken definition. This guard runs at **build time** (in
+  `building/select.ts`), so it only protects a freshly-planned reference; cached
+  prepared-statement plans are forced back through it by the invalidation below.
 - On the next successful **refresh** (or a drop-and-recreate), the stale flag is
   cleared, the backing snapshot is rebuilt, *and* the detached row-time plan is
   **re-registered** — so subsequent source writes resume propagating. (Re-registration
@@ -516,10 +518,21 @@ snapshot and source writes are not propagated.
 
 `stale` is the **only** MV read-state flag. (The `diverged` flag and the two-tier
 apply-failure recovery existed only for the asynchronous on-commit model, which
-row-time replaces — transactional maintenance has nothing to diverge.) A known
-limitation: a prepared statement planned *before* an MV went stale keeps its cached
-plan and bypasses the re-validation until forced to recompile — tracked in
-`materialized-view-state-flags-bypass-cached-plans`.
+row-time replaces — transactional maintenance has nothing to diverge.)
+
+**Cached-plan invalidation.** A `select … from mv` resolves to a `TableReference`
+against the backing table `_mv_<name>`, so a compiled prepared statement's only
+schema dependency is the backing table — which the *source* change event never
+names. To keep a cached plan from re-running the backing scan and bypassing the
+build-time guard, the `MaterializedViewManager` emits a **synthetic
+`table_modified` event for the MV's backing table** on every qualifying source
+change (not only the first one that flips `stale` false→true — a plan compiled
+while the MV is *already* stale must still be invalidated by a *subsequent*
+incompatible change). The statement's schema-dependency listener matches that
+event, drops its cached plan, and the next execution recompiles → re-hits the
+guard. The event names the backing table, so it cascades correctly down an
+MV-over-MV chain (acyclic — no infinite loop) and is a no-op for the manager's own
+source-tracking listener on a plain MV.
 
 ## Change-scope projection
 
