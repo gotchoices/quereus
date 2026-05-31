@@ -425,6 +425,64 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	describe('INSERT OR REPLACE co-occurrence: PK collision AND secondary-UNIQUE collision', () => {
+		// Regression for the isolation-layer commit-flush ordering bug
+		// (isolation-replace-pk-and-unique-cooccurrence): an INSERT OR REPLACE whose
+		// new row collides on the PRIMARY KEY with one underlying row AND on a secondary
+		// UNIQUE with a DIFFERENT underlying row. Pre-fix, flushOverlayToUnderlying
+		// applied the pk=5 update (which still collided on UNIQUE with the not-yet-deleted
+		// pk=9 row) before the pk=9 tombstone, and silently swallowed the underlying
+		// store's returned constraint result — so the new value was dropped and pk=5
+		// kept its OLD value. The flush now applies deletes before inserts/updates and
+		// throws on any swallowed constraint result. This path is store/isolation-only:
+		// the memory module short-circuits the secondary-UNIQUE check on a PK collision,
+		// so it never reaches the flush and would not evict pk=9 (a separate, documented
+		// gap) — which is why this lives here and not in the dual-mode 55 sqllogic file.
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			db.setOption('default_vtab_module', 'store');
+			await db.exec(`PRAGMA foreign_keys = true`);
+		});
+
+		afterEach(async () => {
+			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
+		it('keeps the new values at the PK slot and evicts the secondary-UNIQUE conflict', async () => {
+			await db.exec(`CREATE TABLE p5 (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO p5 VALUES (5, 'old'), (9, 'dup')`);
+
+			// pk=5 collides on PK with p5(5,'old'); 'dup' collides on UNIQUE(email) with p5(9,'dup').
+			await db.exec(`INSERT OR REPLACE INTO p5 VALUES (5, 'dup')`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT id, email FROM p5 ORDER BY id'));
+			// The PK slot takes the NEW value; the secondary-UNIQUE conflict (pk=9) is evicted.
+			expect(rows.map((r: any) => [r.id, r.email])).to.deep.equal([[5, 'dup']]);
+		});
+
+		it('cascades FK ON DELETE for BOTH the evicted secondary-UNIQUE row and the replaced PK row', async () => {
+			await db.exec(`CREATE TABLE p5 (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`CREATE TABLE c5 (cid INTEGER PRIMARY KEY, pid INTEGER NOT NULL, FOREIGN KEY (pid) REFERENCES p5(id) ON DELETE CASCADE) USING store`);
+			await db.exec(`INSERT INTO p5 VALUES (5, 'old'), (9, 'dup')`);
+			await db.exec(`INSERT INTO c5 VALUES (50, 5), (90, 9)`);
+
+			await db.exec(`INSERT OR REPLACE INTO p5 VALUES (5, 'dup')`);
+
+			const parents = await asyncIterableToArray(db.eval('SELECT id, email FROM p5 ORDER BY id'));
+			expect(parents.map((r: any) => [r.id, r.email])).to.deep.equal([[5, 'dup']]);
+
+			// Both children cascade away: pk=9 via the secondary-UNIQUE eviction, and pk=5's
+			// child because INSERT OR REPLACE on a PK collision deletes the prior row
+			// (replacedRow) — the executor fires its FK ON DELETE actions, matching SQLite's
+			// "REPLACE = delete-then-insert" semantics.
+			const children = await asyncIterableToArray(db.eval('SELECT cid, pid FROM c5 ORDER BY cid'));
+			expect(children).to.deep.equal([]);
+		});
+	});
+
 	describe('column-level ON CONFLICT default (defaultConflict)', () => {
 		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
 

@@ -1,5 +1,5 @@
-import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, isUpdateOk, IndexConstraintOp, ConflictResolution, compilePredicate } from '@quereus/quereus';
+import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, RowOp } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, isUpdateOk, isConstraintViolation, IndexConstraintOp, ConflictResolution, compilePredicate, QuereusError, StatusCode } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -1203,36 +1203,49 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 		if (overlayEntries.length === 0) return;
 
+		// Apply deletes (tombstones) before inserts/updates so a write that collides
+		// on a secondary UNIQUE with a row being deleted in this same flush sees the
+		// slot freed first (e.g. INSERT OR REPLACE that both replaces a PK-colliding
+		// row AND evicts a different row on a secondary UNIQUE). Each PK appears at
+		// most once in the overlay, so there is no same-PK delete-then-insert pair
+		// this reordering could invert; sort() is stable in V8/Node, preserving the
+		// original PK order within each group.
+		const ordered = [...overlayEntries].sort((a, b) =>
+			(a.isTombstone === b.isTombstone ? 0 : a.isTombstone ? -1 : 1));
+
 		// Begin a transaction on the underlying table for the flush
 		await this.underlyingTable.begin?.();
 
 		try {
 			// Apply all overlay entries to underlying
-			for (const entry of overlayEntries) {
+			for (const entry of ordered) {
 				if (entry.isTombstone) {
 					// Delete from underlying
-					await this.underlyingTable.update({
+					const result = await this.underlyingTable.update({
 						operation: 'delete',
 						values: undefined,
 						oldKeyValues: entry.pk,
 					});
+					this.assertFlushWriteOk(result, 'delete', entry.pk);
 				} else {
 					// Check if row exists in underlying to decide insert vs update
 					const existsInUnderlying = await this.rowExistsInUnderlying(entry.pk);
 
 					if (existsInUnderlying) {
-						await this.underlyingTable.update({
+						const result = await this.underlyingTable.update({
 							operation: 'update',
 							values: entry.dataRow,
 							oldKeyValues: entry.pk,
 							preCoerced: true,
 						});
+						this.assertFlushWriteOk(result, 'update', entry.pk);
 					} else {
-						await this.underlyingTable.update({
+						const result = await this.underlyingTable.update({
 							operation: 'insert',
 							values: entry.dataRow,
 							preCoerced: true,
 						});
+						this.assertFlushWriteOk(result, 'insert', entry.pk);
 					}
 				}
 			}
@@ -1243,6 +1256,25 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			// Rollback underlying on error
 			await this.underlyingTable.rollback?.();
 			throw error;
+		}
+	}
+
+	/**
+	 * Asserts that an underlying write performed during the commit flush succeeded.
+	 *
+	 * The overlay's merged-view pre-checks ({@link checkMergedPKConflict} /
+	 * {@link checkMergedUniqueConstraints}) resolve every constraint before commit, so a
+	 * `constraint` result returned here means a real invariant was violated *after* those
+	 * checks. Historically this result was discarded, silently dropping the colliding
+	 * write and surfacing as data corruption. Convert it into a loud INTERNAL error; the
+	 * caller's try/catch rolls back the underlying flush transaction and rethrows.
+	 */
+	private assertFlushWriteOk(result: UpdateResult, operation: RowOp, pk: SqlValue[]): void {
+		if (isConstraintViolation(result)) {
+			throw new QuereusError(
+				`Isolation flush ${operation} on '${this.tableName}' (pk=[${pk.join(', ')}]) hit a ${result.constraint} constraint: ${result.message ?? 'no message'}. The overlay merged-view pre-checks should have resolved this before commit; this indicates an isolation-layer invariant violation.`,
+				StatusCode.INTERNAL,
+			);
 		}
 	}
 

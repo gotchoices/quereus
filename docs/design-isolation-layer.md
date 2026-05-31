@@ -198,7 +198,16 @@ This is analogous to LSM-tree merge or 3-way merge in version control.
 ### Commit
 
 1. Collect all changes from overlay
-2. Apply to underlying module via `update()` calls
+2. Apply to underlying module via `update()` calls, **tombstones (deletes) first,
+   then inserts/updates**. The ordering matters when one commit both writes a row and
+   evicts a different row on a shared secondary UNIQUE (e.g. an `INSERT OR REPLACE` that
+   replaces a PK-colliding row *and* evicts a UNIQUE-colliding row at another PK): the
+   delete must free the constrained value before the colliding write is applied, or the
+   underlying module rejects the write on a UNIQUE conflict. Each PK appears at most once
+   in the overlay, so reordering across PKs never inverts a same-PK delete/insert pair.
+   Any `constraint` result returned by an underlying `update()` here is a violated
+   invariant (the merged-view pre-checks should have resolved it before commit) and is
+   thrown as an INTERNAL error rather than silently swallowed.
 3. Call `underlyingConnection.commit()`
 4. Clear overlay state
 
