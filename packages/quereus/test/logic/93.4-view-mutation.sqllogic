@@ -271,7 +271,9 @@ create view ax_three as
 update ax_three set pv = 9 where cid = 2;
 -- error: cannot write through
 
--- DELETE through a join with no provable FK -> ambiguous (no delete_via yet).
+-- DELETE through a join with no provable FK and no resolving tag -> ambiguous
+-- under the default lenient policy (a delete_via / target override resolves it,
+-- exercised in the override-surface section below).
 create table ax_x (xid integer primary key, v integer);
 create table ax_y (yid integer primary key, v integer);
 insert into ax_x values (1, 5);
@@ -279,3 +281,146 @@ insert into ax_y values (5, 9);
 create view ax_nofk as select x.xid as xid, y.yid as yid from ax_x x join ax_y y on y.yid = x.v;
 delete from ax_nofk where xid = 1;
 -- error: cannot delete through view
+
+-- ===================================
+-- Phase 3.4: the `quereus.update.*` tag override surface.
+-- target / exclude / delete_via / policy / default_for — read + site-validated
+-- through the typed reserved-tag registry, merged statement-over-view.
+-- See docs/view-updateability.md § Tags: The Override Surface.
+-- ===================================
+
+-- --- default_for: statement-level omitted-insert default (single-source) ---
+create table df_t (id integer primary key, created integer, note text);
+create view df_v as select id, note from df_t;
+
+-- `created` is projected away by the view; the statement-level default_for tag
+-- supplies it (ahead of the base column's own default).
+insert into df_v with tags ("quereus.update.default_for.created" = '777') values (5, 'x');
+select * from df_t order by id;
+→ [{"id":5,"created":777,"note":"x"}]
+
+-- --- default_for: view-level default, overridden statement-over-view ---
+create table df2 (id integer primary key, created integer);
+create view df2_v as select id from df2 with tags ("quereus.update.default_for.created" = '111');
+
+-- view-level default_for supplies the omitted column.
+insert into df2_v values (1);
+select * from df2 order by id;
+→ [{"id":1,"created":111}]
+
+-- statement-level default_for overrides the view-level one for this statement.
+insert into df2_v with tags ("quereus.update.default_for.created" = '222') values (2);
+select * from df2 order by id;
+→ [{"id":1,"created":111},{"id":2,"created":222}]
+
+-- a default_for naming a column that is neither a view nor a base column -> error.
+insert into df2_v with tags ("quereus.update.default_for.nope" = '0') values (3);
+-- error: not a column
+
+-- --- target / exclude: narrow a multi-source delete to one side ---
+create table tg_x (xid integer primary key, v integer, lx text);
+create table tg_y (yid integer primary key, ly text);
+insert into tg_x values (1, 5, 'x1'), (2, 6, 'x2');
+insert into tg_y values (5, 'y5'), (6, 'y6');
+create view tg_jv as
+    select x.xid as xid, x.lx as lx, y.ly as ly from tg_x x join tg_y y on y.yid = x.v;
+select * from tg_jv order by xid;
+→ [{"xid":1,"lx":"x1","ly":"y5"},{"xid":2,"lx":"x2","ly":"y6"}]
+
+-- target narrows the (no-FK ambiguous) delete to tg_x: only tg_x loses the row.
+delete from tg_jv with tags ("quereus.update.target" = 'tg_x') where xid = 1;
+select xid from tg_x order by xid;
+→ [{"xid":2}]
+select yid from tg_y order by yid;
+→ [{"yid":5},{"yid":6}]
+
+-- exclude tg_x routes the same shape to the OTHER side (tg_y); xid=2 joins y.yid=6.
+delete from tg_jv with tags ("quereus.update.exclude" = 'tg_x') where xid = 2;
+select yid from tg_y order by yid;
+→ [{"yid":5}]
+select xid from tg_x order by xid;
+→ [{"xid":2}]
+
+-- target naming a table not in the join -> sited tag-target-not-found.
+delete from tg_jv with tags ("quereus.update.target" = 'nope') where xid = 2;
+-- error: not a base table of the join
+
+-- target/exclude excluding a side an UPDATE assigns -> structured conflict.
+update tg_jv with tags ("quereus.update.exclude" = 'tg_x') set lx = 'z' where xid = 2;
+-- error: excludes that table
+
+-- --- delete_via: pick the deletion side explicitly ---
+create table dv_l (lid integer primary key, v integer);
+create table dv_r (rid integer primary key, w integer);
+insert into dv_l values (1, 5), (2, 6);
+insert into dv_r values (5, 50), (6, 60);
+create view dv_jv as select l.lid as lid, r.rid as rid from dv_l l join dv_r r on r.rid = l.v;
+
+-- delete_via='left_delete' picks the left join source (dv_l); dv_r is untouched.
+delete from dv_jv with tags ("quereus.update.delete_via" = 'left_delete') where lid = 1;
+select lid from dv_l order by lid;
+→ [{"lid":2}]
+select rid from dv_r order by rid;
+→ [{"rid":5},{"rid":6}]
+
+-- delete_via='parent' picks the FK-parent side; ON DELETE CASCADE removes the child.
+create table dvp_parent (pid integer primary key, lbl text);
+create table dvp_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references dvp_parent(pid) on delete cascade);
+insert into dvp_parent values (10, 'P10'), (20, 'P20');
+insert into dvp_child values (1, 10, 'a'), (2, 20, 'b');
+create view dvp_jv as
+    select c.cid as cid, c.note as note, p.lbl as lbl
+    from dvp_child c join dvp_parent p on p.pid = c.pref;
+delete from dvp_jv with tags ("quereus.update.delete_via" = 'parent') where cid = 1;
+select pid from dvp_parent order by pid;
+→ [{"pid":20}]
+select cid from dvp_child order by cid;
+→ [{"cid":2}]
+
+-- --- policy: strict refuses to guess; lenient auto-routes (FK-child default) ---
+create table pol_parent (pid integer primary key, lbl text);
+create table pol_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references pol_parent(pid));
+insert into pol_parent values (10, 'P10'), (20, 'P20');
+insert into pol_child values (1, 10, 'a'), (2, 20, 'b');
+
+-- lenient (default): the FK join delete auto-routes to the FK-child side.
+create view pol_lenient as
+    select c.cid as cid, c.note as note, p.lbl as lbl
+    from pol_child c join pol_parent p on p.pid = c.pref;
+delete from pol_lenient where cid = 1;
+select cid from pol_child order by cid;
+→ [{"cid":2}]
+select pid from pol_parent order by pid;
+→ [{"pid":10},{"pid":20}]
+
+-- strict (view-level policy tag): the same delete is rejected — strict will not
+-- guess the deletion side even when an FK proves one.
+create view pol_strict as
+    select c.cid as cid, c.note as note, p.lbl as lbl
+    from pol_child c join pol_parent p on p.pid = c.pref
+    with tags ("quereus.update.policy" = 'strict');
+delete from pol_strict where cid = 2;
+-- error: policy
+
+-- an explicit target (narrowing to one side) resolves the strict ambiguity.
+delete from pol_strict with tags ("quereus.update.target" = 'pol_child') where cid = 2;
+select cid from pol_child order by cid;
+→ []
+
+-- --- sited diagnostics for malformed reserved tags ---
+
+-- unknown reserved key on a DML statement -> sited error.
+update tg_jv with tags ("quereus.update.taget" = 'tg_x') set lx = 'z' where xid = 2;
+-- error: unknown reserved tag
+
+-- mis-sited reserved key on a DML statement (policy is view-DDL-only) -> error.
+delete from tg_jv with tags ("quereus.update.policy" = 'strict') where xid = 2;
+-- error: not allowed
+
+-- unknown reserved key declared on the VIEW DDL -> surfaces (sited) at mutation.
+create table bvu (id integer primary key, x integer);
+create view bvu_v as select id from bvu with tags ("quereus.update.taget" = 'bvu');
+insert into bvu_v values (1);
+-- error: unknown reserved tag

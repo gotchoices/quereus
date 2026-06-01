@@ -14,6 +14,8 @@ export type MutationDiagnosticReason =
 	| 'predicate-contradiction'    // insert violates the view's selection at plan time (Filter)
 	| 'recursive-cte'              // recursive CTE as mutation target
 	| 'tag-target-not-found'       // tag references unknown branch/table
+	| 'tag-conflict'               // target/exclude excludes a side the statement must write
+	| 'policy-strict-ambiguity'    // quereus.update.policy=strict rejects a residual fan-out ambiguity
 	// --- "not yet shipped" body-shape rejections (Phase 2+) ---
 	| 'unsupported-join'           // join body — Phase 2 / 4
 	| 'unsupported-aggregate'      // aggregate / grouping body

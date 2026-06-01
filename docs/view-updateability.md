@@ -10,7 +10,8 @@ actually shipped:
 | **Phase 1** | Single-source projection-and-filter views: `insert` / `update` / `delete` route to the base table. Constant-FD defaults from equality selection predicates, base-column defaults, identity/rename projection lineage, `OR`-clause conflict resolution, and the `no-inverse` / `predicate-contradiction` / `recursive-cte` / body-shape diagnostics. | **Shipped** |
 | **Phase 1b** | Per-statement mutation-context threading through the view boundary (one captured value stamped across every base row of the statement). Single-base per-row generator cadence rides the base table's column defaults. | **Shipped (single-base)** |
 | **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
-| Phase 2b+ | Multi-source **insert** (the shared join key is not a view column → needs the per-row shared-surrogate mutation-context envelope), **RETURNING-through-views**, outer joins, set-ops, aggregates, nested/recursive CTE bodies, the `quereus.update.*` tag override surface (incl. `delete_via`), composite-key and `> 2`-table joins, self-joins, cross-source `set` values. | Not shipped — rejected at plan time with a structured diagnostic. |
+| **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. | **Shipped** (the lenient predicate-honest *multi-side delete fan-out* is deferred — see § Inner Join) |
+| Phase 2b+ | Multi-source **insert** (the shared join key is not a view column → needs the per-row shared-surrogate mutation-context envelope), **RETURNING-through-views**, outer joins, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values. | Not shipped — rejected at plan time with a structured diagnostic. |
 
 **Implementation note (Phase 1).** Phase 1 ships **via the view-mutation
 substrate** (single-source = one base op). A view-targeted DML whose body
@@ -199,10 +200,11 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > from <join> where <predicate>)` — which reconstructs the row-identifying predicate
 > even when the owning side's PK is hidden by the projection. The base statement is
 > lowered back to AST so the ordinary base-table builders (and all their constraint
-> / conflict / FK machinery) are reused verbatim. **Still rejected:** multi-source
-> `insert` (shared-surrogate, below), composite-PK or `> 2`-table joins, self-joins,
-> cross-source `set` values, `select *` join bodies, and the `delete_via` tag
-> override (the FK-many default is the only delete policy until the tag surface lands).
+> / conflict / FK machinery) are reused verbatim. The `quereus.update.*` tag
+> override surface (`target` / `exclude` / `delete_via` / `policy`) is **shipped**
+> (Phase 3.4 — see § Tags). **Still rejected:** multi-source `insert`
+> (shared-surrogate, below), composite-PK or `> 2`-table joins, self-joins,
+> cross-source `set` values, and `select *` join bodies.
 
 The lineage of an inner-join output column traces unambiguously to one of the two child relations (EC propagation makes column membership precise even for equi-join columns).
 
@@ -210,12 +212,24 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 
 **Inserts** require values for both sides' `not null`-without-default columns and must satisfy the join predicate. The two child inserts execute FK-parent before FK-child where the dependency is provable; otherwise the order is unspecified. The join predicate, combined with the inserted values, supplies missing join-key columns on either side via EC.
 
-**Deletes** are inherently ambiguous — removing the joined row requires deleting from at least one side. The default rule:
+**Deletes** are inherently ambiguous — removing the joined row requires deleting from at least one side. The resolution (tags compose *after* the predicate dispatch — they only restrict the candidate sides, never broaden them):
 
-- If exactly one side's row participates in *only* this joined row (provable when that side's PK is uniquely covered by the row-identifying predicate and that PK does not appear in any other surviving join), delete from that side.
-- Otherwise, delete from the side named by the `delete_via` tag on the join, or — absent a tag — from every side, the predicate-honest reading of "make this row not exist".
+- `quereus.update.target` / `exclude` (CSV of base-table names) first narrow the candidate sides.
+- An explicit `quereus.update.delete_via` then picks a side: `'parent'` selects the FK-parent (requires a declared foreign key), `'left_delete'` the left join source. (`'right_insert'` is an `except`-branch value with no join meaning.)
+- Absent an explicit side tag: if `target`/`exclude` already left exactly one side, that side; else if a declared foreign key proves the FK-many (child) side, that side (the common FK-style default — deletes the child, leaving the parent in place; the inverse is `with tags ("quereus.update.delete_via" = 'parent')`); else the delete is **ambiguous**.
 
-For the common FK-style 1-to-many join, this default deletes from the many side, leaving the parent in place. Users who want the inverse attach `with tags ("quereus.update.delete_via" = 'parent')`.
+> **Shipped behavior vs. intent.** An *ambiguous* delete (two candidate sides, no
+> foreign key, no resolving tag) is **rejected** with a structured diagnostic
+> directing the user to a `delete_via` / `target` override. Under
+> `quereus.update.policy = 'strict'` the engine rejects *any* unresolved
+> multi-side delete — it will not even fall back to the FK-many heuristic. The
+> default `lenient` policy keeps the FK-many fallback. The doc's maximal lenient
+> reading — *delete from every side* ("make this row not exist") — is **deferred**:
+> a join's two base deletes each address rows via a subquery over the join, and
+> the view-mutation substrate runs base ops sequentially against live state, so
+> the second delete would re-evaluate the join after the first already removed its
+> matching rows. A correct multi-side fan-out needs snapshot-consistent base-op
+> execution (or eager key materialization), tracked separately.
 
 ### Outer Joins
 
@@ -329,8 +343,13 @@ spec, its position checked against the key's legal `TagSite` set (`view-ddl`,
 (`csv-of-identifiers`, an enum, an `expression`, …). An unknown or mis-sited key
 is a hard **error**; a malformed value is an error too, except an empty
 `quereus.lens.ack` rationale, which is only a **warning**. The rows below are the
-`quereus.update.*` seeds — the registry validates their shape/site; their Effect
-(semantics) is realized by the view-mutation override surface, not the registry:
+`quereus.update.*` seeds — the registry validates their shape/site; their **Effect
+(semantics) is realized by the view-mutation override surface** (Phase 3.4 —
+collection + merge in `planner/mutation/mutation-tags.ts`, consumption in
+`planner/mutation/{single-source,multi-source}.ts`), not the registry. Tags are
+collected at two sites: the view DDL (`ViewSchema.tags`, validated `view-ddl`) and
+the DML statement (`WITH TAGS (...)` → `stmt.tags`, validated `dml-stmt`); a sited
+diagnostic is raised before any base op is built:
 
 | Tag | Where | Effect |
 |---|---|---|
@@ -342,15 +361,15 @@ is a hard **error**; a malformed value is an error too, except an empty
 
 Tags compose with the predicate-driven dispatch: predicates always run first, narrowing the candidate set; tags then further restrict, or — for `default_for` — supply missing values. Tags can never broaden the candidate set beyond what predicates allow.
 
-Statement-level tags appear in a `with (...)` clause on the statement:
+Statement-level tags appear in a `with tags (...)` clause on the statement (the same `with tags` surface as DDL — see [SQL Reference §Tags](sql.md#tags)). It sits where a `with context (...)` clause would (before `set` / the `values` source / `where`, or trailing):
 
 ```sql
-update v with ("quereus.update.target" = 'base_a') set col = 1 where ...;
-insert into v with ("quereus.update.default_for.created" = epoch_ms('now')) values (...);
-delete from v with ("quereus.update.delete_via" = 'right_insert') where ...;
+update v with tags ("quereus.update.target" = 'base_a') set col = 1 where ...;
+insert into v with tags ("quereus.update.default_for.created" = 'epoch_ms(''now'')') values (...);
+delete from v with tags ("quereus.update.delete_via" = 'left_delete') where ...;
 ```
 
-Statement-level tags override view-level tags for the duration of the statement.
+A `default_for` value is a TEXT **expression** (parsed as SQL), so a non-literal must be SQL-quoted as shown. Statement-level tags override view-level tags for the duration of the statement.
 
 ## Multi-Base-Table Mutations
 
@@ -459,7 +478,9 @@ interface MutationDiagnostic {
     | 'recursive-cte'                   // recursive CTE in mutation target
     | 'aggregate-target'                // aggregate-shaped column written
     | 'null-extended-create-conflict'   // outer-join materialization blocked
-    | 'tag-target-not-found'            // tag references unknown branch/table
+    | 'tag-target-not-found'            // target/exclude/default_for/delete_via names an unknown branch/table/column
+    | 'tag-conflict'                    // target/exclude excludes a side the statement must write
+    | 'policy-strict-ambiguity'         // policy=strict rejects an unresolved multi-side delete
     | 'predicate-contradiction';        // statement's predicate is unsatisfiable
   planNodeId: number;
   column?: string;

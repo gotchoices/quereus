@@ -425,15 +425,20 @@ export class Parser {
 			this.consume(TokenType.RPAREN, "Expected ')' after column list.");
 		}
 
-		// Parse mutation context assignments if present (after column list, before VALUES/SELECT)
-		// Note: Can also appear after VALUES/SELECT via parseTrailingWithClauses
+		// Parse mutation context assignments and/or tags if present (after column
+		// list, before VALUES/SELECT). Either may also appear trailing (after
+		// VALUES/SELECT) via parseTrailingWithClauses.
 		let contextValues: AST.ContextAssignment[] | undefined;
-		if (this.matchKeyword('WITH')) {
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
 			if (this.matchKeyword('CONTEXT')) {
 				contextValues = this.parseContextAssignments();
+			} else if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
 			} else {
-				// Not a WITH CONTEXT clause, backtrack
+				// Not a WITH CONTEXT / WITH TAGS clause, backtrack
 				this.current--;
+				break;
 			}
 		}
 
@@ -486,6 +491,13 @@ export class Parser {
 			}
 			contextValues = trailingClauses.contextValues;
 		}
+		if (trailingClauses.tags) {
+			if (tags) {
+				throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+			}
+			tags = trailingClauses.tags;
+			lastConsumedToken = this.previous(); // After tags
+		}
 		const schemaPath = trailingClauses.schemaPath;
 		if (schemaPath) {
 			lastConsumedToken = this.previous(); // After schema path
@@ -508,6 +520,7 @@ export class Parser {
 			returning,
 			contextValues,
 			schemaPath,
+			tags,
 			loc: _createLoc(startToken, lastConsumedToken),
 		};
 	}
@@ -2033,14 +2046,19 @@ export class Parser {
 	private updateStatement(startToken: Token, _withClause?: AST.WithClause): AST.UpdateStmt {
 		const table = this.tableIdentifier();
 
-		// Parse mutation context assignments if present (can also appear after WHERE)
+		// Parse mutation context assignments and/or tags if present (either may also
+		// appear trailing, after WHERE, via parseTrailingWithClauses).
 		let contextValues: AST.ContextAssignment[] | undefined;
-		if (this.matchKeyword('WITH')) {
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
 			if (this.matchKeyword('CONTEXT')) {
 				contextValues = this.parseContextAssignments();
+			} else if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
 			} else {
-				// Not a WITH CONTEXT clause, backtrack
+				// Not a WITH CONTEXT / WITH TAGS clause, backtrack
 				this.current--;
+				break;
 			}
 		}
 
@@ -2065,6 +2083,12 @@ export class Parser {
 			}
 			contextValues = trailingClauses.contextValues;
 		}
+		if (trailingClauses.tags) {
+			if (tags) {
+				throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+			}
+			tags = trailingClauses.tags;
+		}
 		const schemaPath = trailingClauses.schemaPath;
 
 		// Parse RETURNING clause if present
@@ -2074,7 +2098,7 @@ export class Parser {
 		}
 
 		const endToken = this.previous();
-		return { type: 'update', table, assignments, where, returning, contextValues, schemaPath, loc: _createLoc(startToken, endToken) };
+		return { type: 'update', table, assignments, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
 	}
 
 	/** @internal */
@@ -2082,14 +2106,19 @@ export class Parser {
 		this.matchKeyword('FROM');
 		const table = this.tableIdentifier();
 
-		// Parse mutation context assignments if present (can also appear after WHERE)
+		// Parse mutation context assignments and/or tags if present (either may also
+		// appear trailing, after WHERE, via parseTrailingWithClauses).
 		let contextValues: AST.ContextAssignment[] | undefined;
-		if (this.matchKeyword('WITH')) {
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
 			if (this.matchKeyword('CONTEXT')) {
 				contextValues = this.parseContextAssignments();
+			} else if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
 			} else {
-				// Not a WITH CONTEXT clause, backtrack
+				// Not a WITH CONTEXT / WITH TAGS clause, backtrack
 				this.current--;
+				break;
 			}
 		}
 
@@ -2106,6 +2135,12 @@ export class Parser {
 			}
 			contextValues = trailingClauses.contextValues;
 		}
+		if (trailingClauses.tags) {
+			if (tags) {
+				throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+			}
+			tags = trailingClauses.tags;
+		}
 		const schemaPath = trailingClauses.schemaPath;
 
 		// Parse RETURNING clause if present
@@ -2115,7 +2150,7 @@ export class Parser {
 		}
 
 		const endToken = this.previous();
-		return { type: 'delete', table, where, returning, contextValues, schemaPath, loc: _createLoc(startToken, endToken) };
+		return { type: 'delete', table, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
 	}
 
 	/** @internal */

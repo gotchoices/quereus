@@ -9,6 +9,8 @@ import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.js';
+import { readDefaultFor, type ReservedTagMap } from './mutation-tags.js';
+import { parseExpressionString } from '../../parser/index.js';
 
 /**
  * Single-source view-mediated DML rewriting (the single-source spine of the
@@ -52,6 +54,8 @@ export interface MutableViewLike {
 	readonly schemaName: string;
 	readonly selectAst: AST.QueryExpr;
 	readonly columns?: ReadonlyArray<string>;
+	/** View-level metadata tags — the `view-ddl` site of the override surface. */
+	readonly tags?: Readonly<Record<string, SqlValue>>;
 }
 
 /** A base column pinned to a constant by the view's selection predicate. */
@@ -340,6 +344,26 @@ function requireBaseColumn(vc: ViewColumn): string {
 	return vc.lineage.baseColumnName;
 }
 
+/**
+ * Resolve a `default_for.<col>` column name to its base column. The name may be
+ * a base column (the documented `default_for.created` case, where the column is
+ * projected away by the view) or a view column with `base` lineage. An unknown
+ * name is a structured `tag-target-not-found` — a typo must fail loudly, not
+ * silently no-op.
+ */
+function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: MutableViewLike): string {
+	const baseCol = analysis.baseTable.columns.find(c => c.name.toLowerCase() === colName);
+	if (baseCol) return baseCol.name;
+	const vc = analysis.viewColumns.find(c => c.name.toLowerCase() === colName);
+	if (vc && vc.lineage.kind === 'base') return vc.lineage.baseColumnName;
+	raiseMutationDiagnostic({
+		reason: 'tag-target-not-found',
+		column: colName,
+		table: view.name,
+		message: `cannot write through view '${view.name}': 'quereus.update.default_for.${colName}' names column '${colName}', which is not a column of the view or its base table '${analysis.baseTable.name}'`,
+	});
+}
+
 /** Build a substitution fn that remaps view column references to base terms. */
 function remapper(analysis: ViewAnalysis): (col: AST.ColumnExpr) => AST.Expression | undefined {
 	return (col) => analysis.columnMap.get(col.name.toLowerCase());
@@ -347,7 +371,7 @@ function remapper(analysis: ViewAnalysis): (col: AST.ColumnExpr) => AST.Expressi
 
 // --- INSERT ---------------------------------------------------------------
 
-export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike): AST.InsertStmt {
+export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike, tags?: ReservedTagMap): AST.InsertStmt {
 	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 
@@ -363,6 +387,9 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 	// user-supplied literal that contradicts the pin is rejected at plan time.
 	const appendColumns: string[] = [];
 	const appendExprs: AST.Expression[] = [];
+	const isSupplied = (baseCol: string): boolean =>
+		baseColumns.some(b => b.toLowerCase() === baseCol.toLowerCase())
+		|| appendColumns.some(b => b.toLowerCase() === baseCol.toLowerCase());
 	for (const fc of analysis.filterConstants) {
 		const idx = baseColumns.findIndex(b => b.toLowerCase() === fc.baseColumnName.toLowerCase());
 		if (idx >= 0) {
@@ -371,6 +398,17 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 			appendColumns.push(fc.baseColumnName);
 			appendExprs.push(fc.valueExpr);
 		}
+	}
+
+	// `quereus.update.default_for.<col>` supplies an omitted-insert default ahead
+	// of the base column's declared default (docs/view-updateability.md §Projection
+	// step 5, § Tags). It fills only a column the insert and the constant-FD chain
+	// left omitted — an explicit user value or a stronger predicate pin wins.
+	for (const [colName, exprText] of readDefaultFor(tags)) {
+		const baseCol = resolveDefaultForColumn(analysis, colName, view);
+		if (isSupplied(baseCol)) continue;
+		appendColumns.push(baseCol);
+		appendExprs.push(parseExpressionString(exprText));
 	}
 
 	const finalColumns = [...baseColumns, ...appendColumns];

@@ -584,6 +584,11 @@ export function insertToString(stmt: AST.InsertStmt): string {
 		}
 	}
 
+	if (stmt.tags) {
+		const tagsClause = tagsClauseToString(stmt.tags).trimStart();
+		if (tagsClause) parts.push(tagsClause);
+	}
+
 	if (stmt.returning && stmt.returning.length > 0) {
 		const returning = stmt.returning.map(col => {
 			if (col.type === 'all') {
@@ -655,6 +660,11 @@ export function updateToString(stmt: AST.UpdateStmt): string {
 		parts.push('where', expressionToString(stmt.where));
 	}
 
+	if (stmt.tags) {
+		const tagsClause = tagsClauseToString(stmt.tags).trimStart();
+		if (tagsClause) parts.push(tagsClause);
+	}
+
 	if (stmt.returning && stmt.returning.length > 0) {
 		const returning = stmt.returning.map(col => {
 			if (col.type === 'all') {
@@ -689,6 +699,11 @@ export function deleteToString(stmt: AST.DeleteStmt): string {
 
 	if (stmt.where) {
 		parts.push('where', expressionToString(stmt.where));
+	}
+
+	if (stmt.tags) {
+		const tagsClause = tagsClauseToString(stmt.tags).trimStart();
+		if (tagsClause) parts.push(tagsClause);
 	}
 
 	if (stmt.returning && stmt.returning.length > 0) {
