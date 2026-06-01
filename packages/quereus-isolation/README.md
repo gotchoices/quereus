@@ -86,6 +86,8 @@ The isolation layer operates at the **row level**, merging query results from tw
 
 **Lazy overlay creation** — No memory overhead until the first write in a transaction.
 
+**Transparent hook forwarding** — `IsolationModule` is a wrapper, so the engine/planner/lens machinery reaches *it* (the registered module) rather than the underlying. Optional `VirtualTableModule` hooks whose behavior is isolation-transparent are forwarded straight through to the underlying: `getMappingAdvertisements` (decomposition shape), `getBestAccessPlan` (index awareness), and the `beginSchemaBatch` / `endSchemaBatch` APPLY SCHEMA batch hooks (single-substrate-commit batching of migration DDL). Hooks whose underlying value would *misdescribe* the wrapped behavior are intentionally **not** forwarded: `getCapabilities` is augmented with `isolation`/`savepoints` rather than passed through verbatim; `supports` (full-query push-down) is suppressed so the overlay always sees every row to merge; and `concurrencyMode` / `expectedLatencyMs` are left at their conservative defaults (`serial` / `0`) so the parallel runtime never issues concurrent calls that would corrupt overlay-merge state.
+
 **Configurable overlay module** — Use memory for fast transactions, or persistent storage for large transactions:
 
 ```typescript

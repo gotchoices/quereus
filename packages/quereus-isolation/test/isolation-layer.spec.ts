@@ -1241,6 +1241,59 @@ describe('IsolationModule', () => {
 			// reaching here without throwing is the assertion
 		});
 
+		it('reaches the underlying through a real APPLY SCHEMA under isolation', async () => {
+			// End-to-end floor: register the wrapper as a real module, run an actual
+			// `apply schema`, and prove (a) APPLY SCHEMA's registered-module loop
+			// reaches the IsolationModule wrapper, and (b) the underlying observes an
+			// active batch when its `create` callbacks fire during the loop. The
+			// direct-call unit tests above prove the forward in isolation; this proves
+			// the wiring the forward exists for.
+			let batchActive = false;
+			const beginCalls: string[] = [];
+			const endCalls: { schemaName: string; error?: unknown }[] = [];
+			const createsDuringBatch: { table: string; active: boolean }[] = [];
+			class RecordingModule extends MemoryTableModule {
+				async beginSchemaBatch(_callDb: unknown, schemaName: string) {
+					beginCalls.push(schemaName);
+					batchActive = true;
+				}
+				async endSchemaBatch(_callDb: unknown, schemaName: string, error?: unknown) {
+					endCalls.push({ schemaName, error });
+					batchActive = false;
+				}
+				override async create(callDb: any, tableSchema: any) {
+					createsDuringBatch.push({ table: tableSchema.name, active: batchActive });
+					return super.create(callDb, tableSchema);
+				}
+			}
+			const isolatedModule = new IsolationModule({ underlying: new RecordingModule() });
+			db.registerModule('isolated', isolatedModule);
+			db.setDefaultVtabName('isolated');
+
+			await db.exec(`
+				declare schema main {
+					table t1 (
+						id integer primary key
+					)
+					table t2 (
+						id integer primary key
+					)
+				}
+			`);
+			await db.exec('apply schema main;');
+
+			// Exactly one begin/end pair reached the underlying via the wrapper.
+			expect(beginCalls).to.deep.equal(['main']);
+			expect(endCalls).to.deep.equal([{ schemaName: 'main', error: undefined }]);
+			// Both table creates ran while the batch was open (single-commit window).
+			expect(createsDuringBatch).to.deep.equal([
+				{ table: 't1', active: true },
+				{ table: 't2', active: true },
+			]);
+			// Batch closed after the loop.
+			expect(batchActive).to.be.false;
+		});
+
 		it('forwards getCapabilities while layering isolation guarantees', () => {
 			const underlying = {
 				...new MemoryTableModule(),
