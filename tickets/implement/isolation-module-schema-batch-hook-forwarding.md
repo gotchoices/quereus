@@ -1,6 +1,7 @@
 description: `IsolationModule` does not forward the optional `beginSchemaBatch`/`endSchemaBatch` module hooks to its underlying module. APPLY SCHEMA's migration loop iterates the *registered* modules and fires these hooks on whatever module owns the table — which is the `IsolationModule` wrapper when a basis is isolated. Because the wrapper neither implements nor forwards them, a batching-capable underlying module silently loses single-commit batching of APPLY SCHEMA under isolation. Future-facing: no production module (memory/store) implements these hooks today, so there is zero observable effect until one does (e.g. a store module that folds APPLY SCHEMA into one substrate commit). Same silent-degradation class as `lens-isolation-module-advertisement-forwarding`.
 prereq:
 files: packages/quereus-isolation/src/isolation-module.ts, packages/quereus/src/vtab/module.ts, packages/quereus/src/runtime/emit/schema-declarative.ts, packages/quereus-isolation/test/isolation-layer.spec.ts
+effort: low
 ----
 
 ## Problem

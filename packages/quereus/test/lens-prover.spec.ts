@@ -317,6 +317,23 @@ describe('lens prover: unenforceable conflict action (commit-time set-level)', (
 		}
 	});
 
+	it('a commit-time multi-column PK whose NON-FIRST column carries column-level `not null on conflict replace` blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			// `ColumnSchema.defaultConflict` is set by `not null on conflict X` too, not just a
+			// column-level PK. The PK conflict action resolves to the column-level default on
+			// ANY PK column (per `resolvePkDefaultConflict` / the precedence doc'd on
+			// `TableSchema.primaryKeyDefaultConflict`), so the prover must scan every PK column,
+			// not just the first — else a REPLACE declared on a non-first PK column slips through.
+			await db.exec('declare schema y { table t (id integer primary key, a integer, b text) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (a integer, b text not null on conflict replace, id integer, primary key (a, b)) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('`on conflict abort` on a commit-time key deploys clean (ABORT is consistent with detection-only)', async () => {
 		const db = new Database();
 		try {

@@ -1,5 +1,6 @@
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema } from './table.js';
+import { resolvePkDefaultConflict } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type * as AST from '../parser/ast.js';
 import type { FunctionalDependency, GuardClause, GuardPredicate, RelationalPlanNode } from '../planner/nodes/plan-node.js';
@@ -537,11 +538,13 @@ function constraintLabel(constraint: LogicalConstraint): string {
  * {@link classifyKeyConstraint}'s `lens.unenforceable-conflict-action` block.
  *
  *  - `unique` → the constraint's own `defaultConflict`.
- *  - `primaryKey` → table-level `PRIMARY KEY (...) ON CONFLICT <action>`
- *    (`TableSchema.primaryKeyDefaultConflict`), else the first PK column's
- *    column-level `ColumnSchema.defaultConflict` — mirroring the precedence
- *    documented on `TableSchema.primaryKeyDefaultConflict`. The PK's action is
- *    NOT on the `LogicalConstraint` node, so it must be read off `ctx.table`.
+ *  - `primaryKey` → {@link resolvePkDefaultConflict}: table-level
+ *    `PRIMARY KEY (...) ON CONFLICT <action>` (`TableSchema.primaryKeyDefaultConflict`),
+ *    else the column-level `ColumnSchema.defaultConflict` on **any** PK column —
+ *    the precedence the runtime resolvers actually use, so the deploy-time check
+ *    agrees with what a duplicate would resolve to. A non-first PK column's
+ *    `not null on conflict replace` counts (it sets `defaultConflict` too); the
+ *    PK's action is NOT on the `LogicalConstraint` node, so it must come from `ctx.table`.
  *
  * Returns undefined when no action is declared (⇒ ABORT, which the scan honors).
  */
@@ -549,11 +552,8 @@ function effectiveKeyDefaultConflict(ctx: ProveContext, constraint: LogicalConst
 	switch (constraint.kind) {
 		case 'unique':
 			return constraint.constraint.defaultConflict;
-		case 'primaryKey': {
-			if (ctx.table.primaryKeyDefaultConflict !== undefined) return ctx.table.primaryKeyDefaultConflict;
-			const firstPkIndex = constraint.columns[0]?.index;
-			return firstPkIndex !== undefined ? ctx.table.columns[firstPkIndex]?.defaultConflict : undefined;
-		}
+		case 'primaryKey':
+			return resolvePkDefaultConflict(ctx.table);
 		default:
 			return undefined;
 	}

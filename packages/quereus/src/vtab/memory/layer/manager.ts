@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict } from '../../../schema/table.js';
 import { type BTreeKeyForPrimary } from '../types.js';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer } from './base.js';
@@ -1978,18 +1978,3 @@ export class MemoryTableManager {
 	}
 }
 
-/**
- * Resolves the per-constraint default conflict action for PK conflicts.
- * Prefers the table-level `PRIMARY KEY (...) ON CONFLICT <action>` clause
- * (the constraint's own declaration) over any column-level `defaultConflict`
- * declared on a PK column (which primarily targets that column's own
- * constraints and only acts as a fallback for PK conflicts).
- */
-function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | undefined {
-	if (schema.primaryKeyDefaultConflict !== undefined) return schema.primaryKeyDefaultConflict;
-	for (const def of schema.primaryKeyDefinition) {
-		const col = schema.columns[def.index];
-		if (col && col.defaultConflict !== undefined) return col.defaultConflict;
-	}
-	return undefined;
-}

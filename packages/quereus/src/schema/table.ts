@@ -553,6 +553,29 @@ export function findPKDefinition(
 	};
 }
 
+/**
+ * Resolves the per-constraint default conflict action for PK conflicts, per the
+ * precedence documented on {@link TableSchema.primaryKeyDefaultConflict}:
+ * table-level `PRIMARY KEY (...) ON CONFLICT <action>` first, else the
+ * column-level `defaultConflict` on **any** PK column (set by a column-level
+ * `primary key` / `not null` / `null` `ON CONFLICT` clause). Returns undefined
+ * when no action is declared (⇒ the statement-level OR, else ABORT, applies).
+ *
+ * The single in-package source for this rule (used by the memory-layer runtime
+ * resolver and the lens prover's deploy-time soundness check, so the two agree
+ * on what a duplicate would resolve to). The separate `quereus-isolation` and
+ * `quereus-store` packages carry structurally identical copies for their own
+ * boundaries; consolidating those across packages is tracked separately.
+ */
+export function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | undefined {
+	if (schema.primaryKeyDefaultConflict !== undefined) return schema.primaryKeyDefaultConflict;
+	for (const def of schema.primaryKeyDefinition) {
+		const col = schema.columns[def.index];
+		if (col?.defaultConflict !== undefined) return col.defaultConflict;
+	}
+	return undefined;
+}
+
 function findConstraintPKDefinition(
 	columns: readonly ColumnSchema[],
 	constraints: readonly TableConstraint[] | undefined
