@@ -545,3 +545,91 @@ describe('lens decomposition put: INSERT fan-out (singleton)', () => {
 		}
 	});
 });
+
+/**
+ * Review-pass regression coverage for shapes the implement pass flagged as
+ * untested boundaries (treat the implementer's tests as a floor).
+ */
+describe('lens decomposition put: INSERT fan-out (edge cases)', () => {
+	// EAV with a MIXED-CASE logical attribute column — the write must store the
+	// attribute spelled as the column is declared (the read matches the literal by
+	// exact value, no case-fold), so a round-trip recovers it.
+	function eavMixedAd(): MappingAdvertisement {
+		return {
+			id: 'M_core', logicalTable: 'M', role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'M_core',
+				members: [
+					{ relationId: 'M_core', relation: { schema: 'main', table: 'M_core' }, presence: 'mandatory', columns: [colMap('id', 'id')] },
+					{ relationId: 'M_eav', relation: { schema: 'main', table: 'M_eav' }, presence: 'optional', columns: [],
+						attributePivot: { entityColumn: 'eid', attributeColumn: 'attr', valueColumn: 'val' } },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['M_core', ['id']], ['M_eav', ['eid']]) },
+			},
+		};
+	}
+
+	it('an EAV write stores the declared (mixed) case attribute and reads it back', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [eavMixedAd()];
+			db.registerModule('mmod', mod);
+			await db.exec('create table M_core (id integer primary key) using mmod');
+			await db.exec('create table M_eav (eid integer, attr text, val integer, primary key (eid, attr)) using mmod');
+			await db.exec('declare logical schema x { table M { id integer primary key, City integer } }');
+			await db.exec('apply schema x');
+
+			await db.exec('insert into x.M (id, City) values (1, 555)');
+			// The attribute literal preserves the declared case (not lowercased).
+			expect(await rows(db, 'select eid, attr, val from main.M_eav')).to.deep.equal([{ eid: 1, attr: 'City', val: 555 }]);
+			expect(await rows(db, 'select * from x.M order by id')).to.deep.equal([{ id: 1, City: 555 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a mid-fan-out member failure rolls the whole statement back (atomic, anchor included)', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [split()];
+			db.registerModule('atomicmod', mod);
+			await db.exec('create table T_core (id integer primary key, a integer) using atomicmod');
+			await db.exec('create table T_b (id integer primary key, b integer) using atomicmod');
+			await db.exec('create table T_c (id integer primary key, c integer) using atomicmod');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('apply schema x');
+			// Pre-seed ONLY T_b at id=7, so the anchor (T_core) insert succeeds but the
+			// second member (T_b) insert collides on its PK mid-fan-out.
+			await db.exec('insert into main.T_b values (7, 700)');
+
+			await expectThrows(() => db.exec('insert into x.T (id, a, b, c) values (7, 70, 777, 7000)'), /constraint|unique|primary/i);
+			// Nothing persists: the anchor row that inserted first is rolled back too.
+			expect(await rows(db, 'select * from main.T_core where id = 7')).to.deep.equal([]);
+			expect(await rows(db, 'select * from main.T_c where id = 7')).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('omitting a mandatory member NOT NULL column is rejected with no partial write', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [split()];
+			db.registerModule('nnmod', mod);
+			await db.exec('create table T_core (id integer primary key, a integer) using nnmod');
+			await db.exec('create table T_b (id integer primary key, b integer not null) using nnmod');
+			await db.exec('create table T_c (id integer primary key, c integer) using nnmod');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('apply schema x');
+			// `b` (mandatory member T_b, NOT NULL, no default) is omitted — caught at
+			// analysis time, before any base op fires.
+			await expectThrows(() => db.exec('insert into x.T (id, a) values (5, 50)'), /NOT NULL with no default|no value reaches it/i);
+			expect(await rows(db, 'select * from main.T_core')).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});

@@ -1,7 +1,7 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
-import type { RelationType } from '../../common/datatype.js';
+import type { RelationType, ScalarType } from '../../common/datatype.js';
 import type { RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
@@ -185,34 +185,7 @@ function withTags(req: MutationRequest, tags: MutationRequest['tags']): Mutation
 function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
 	const plan = analyzeMultiSourceInsert(ctx, view, stmt);
 
-	// Envelope leading columns = the supplied view columns (positional with the
-	// user source). A minted surrogate is appended as one more column.
-	const envelopeAttrs: Attribute[] = plan.suppliedColumns.map(col => ({
-		id: PlanNode.nextAttrId(),
-		name: col.name,
-		type: col.type,
-		sourceRelation: 'envelope',
-	}));
-	if (plan.mint) {
-		envelopeAttrs.push({
-			id: PlanNode.nextAttrId(),
-			name: '__shared_key',
-			type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: false },
-			sourceRelation: 'envelope',
-		});
-	}
-	const envelopeType: RelationType = {
-		typeClass: 'relation',
-		isReadOnly: true,
-		isSet: false,
-		columns: envelopeAttrs.map(a => ({ name: a.name, type: a.type })),
-		keys: [],
-		rowConstraints: [],
-	};
-
-	// The shared descriptor stitches each base op's EnvelopeScanNode to the rows the
-	// ViewMutation emitter materializes.
-	const descriptor: TableDescriptor = {};
+	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.mint);
 
 	const baseOps = plan.orderedSides.map(side => {
 		const scan = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
@@ -246,14 +219,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 	});
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-
-	let mint: MutationEnvelope['mint'] | undefined;
-	if (plan.mint) {
-		const seedExpr = parseExpressionString(
-			`coalesce((select max(${quoteIdent(plan.mint.seedColumn)}) from ${qualifiedTable(plan.mint.seedTable.tableSchema.schemaName, plan.mint.seedTable.tableSchema.name)}), 0)`,
-		);
-		mint = { seed: buildExpression(ctx, seedExpr) as ScalarPlanNode };
-	}
+	const mint = buildSeedMint(ctx, plan.mint);
 
 	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
 }
@@ -277,15 +243,35 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	const storage = decompositionStorage(ctx, view)!; // guaranteed by the caller's gate
 	const plan = analyzeDecompositionInsert(ctx, view, storage, stmt);
 
-	// Envelope leading columns = the supplied logical columns; a minted surrogate is
-	// appended as one more column (positional with `analyzeDecompositionInsert`).
-	const envelopeAttrs: Attribute[] = plan.suppliedColumns.map(col => ({
+	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.mint);
+
+	const baseOps = plan.ops.map(op =>
+		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op));
+
+	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
+	const mint = buildSeedMint(ctx, plan.mint);
+
+	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
+}
+
+/**
+ * Build the shared envelope shape both insert fan-outs ride: the leading columns
+ * are the supplied logical/view columns (positional with the user source), plus a
+ * trailing `__shared_key` column when a surrogate is minted. The descriptor is the
+ * stitch every base op's `EnvelopeScanNode` shares with the rows the `ViewMutation`
+ * emitter materializes once.
+ */
+function buildEnvelopeShape(
+	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
+	hasMint: boolean,
+): { envelopeAttrs: Attribute[]; envelopeType: RelationType; descriptor: TableDescriptor } {
+	const envelopeAttrs: Attribute[] = suppliedColumns.map(col => ({
 		id: PlanNode.nextAttrId(),
 		name: col.name,
 		type: col.type,
 		sourceRelation: 'envelope',
 	}));
-	if (plan.mint) {
+	if (hasMint) {
 		envelopeAttrs.push({
 			id: PlanNode.nextAttrId(),
 			name: '__shared_key',
@@ -301,25 +287,25 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 		keys: [],
 		rowConstraints: [],
 	};
+	return { envelopeAttrs, envelopeType, descriptor: {} };
+}
 
-	// The shared descriptor stitches every member op's EnvelopeScanNode to the rows
-	// the ViewMutation emitter materializes.
-	const descriptor: TableDescriptor = {};
-
-	const baseOps = plan.ops.map(op =>
-		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op));
-
-	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-
-	let mint: MutationEnvelope['mint'] | undefined;
-	if (plan.mint) {
-		const seedExpr = parseExpressionString(
-			`coalesce((select max(${quoteIdent(plan.mint.seedColumn)}) from ${qualifiedTable(plan.mint.seedTable.tableSchema.schemaName, plan.mint.seedTable.tableSchema.name)}), 0)`,
-		);
-		mint = { seed: buildExpression(ctx, seedExpr) as ScalarPlanNode, cadence: plan.mint.cadence };
-	}
-
-	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
+/**
+ * Build the `MutationEnvelope.mint` from an analysis' surrogate descriptor (or
+ * `undefined` when the shared key is supplied, not minted). The seed is
+ * `coalesce(max(<anchor.key>), 0)` evaluated once before fan-out — it observes the
+ * pre-mutation state. The optional cadence (`per-row` / `per-statement`) is
+ * threaded through; the multi-source insert leaves it absent (⇒ `per-row`).
+ */
+function buildSeedMint(
+	ctx: PlanningContext,
+	mintSpec: { readonly seedTable: { tableSchema: { schemaName: string; name: string } }; readonly seedColumn: string; readonly cadence?: 'per-row' | 'per-statement' } | undefined,
+): MutationEnvelope['mint'] | undefined {
+	if (!mintSpec) return undefined;
+	const seedExpr = parseExpressionString(
+		`coalesce((select max(${quoteIdent(mintSpec.seedColumn)}) from ${qualifiedTable(mintSpec.seedTable.tableSchema.schemaName, mintSpec.seedTable.tableSchema.name)}), 0)`,
+	);
+	return { seed: buildExpression(ctx, seedExpr) as ScalarPlanNode, cadence: mintSpec.cadence };
 }
 
 /**
