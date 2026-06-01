@@ -260,6 +260,131 @@ describe('lens prover: blocking errors', () => {
 	});
 });
 
+describe('lens prover: unenforceable conflict action (commit-time set-level)', () => {
+	it('a commit-time unique declaring `on conflict replace` blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			// No basis covering structure for `email` ⇒ the logical unique is commit-time,
+			// which can only ABORT — the declared REPLACE can never be honored.
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+			// Atomic: the blocked deploy left no report behind.
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a commit-time unique declaring `on conflict ignore` blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict ignore) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a commit-time table-level PK declaring `on conflict replace` blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			// Basis keys on `id`; the logical table re-keys on `code` (reconstructible but
+			// not basis-proved, no covering MV) ⇒ the PK is commit-time set-level.
+			await db.exec('declare schema y { table t (id integer primary key, code text) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (code text, id integer, primary key (code) on conflict replace) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a commit-time column-level PK declaring `on conflict replace` blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			// The PK conflict action lives on the column (`ColumnSchema.defaultConflict`),
+			// not the table — the prover must read it off `ctx.table`, not the constraint node.
+			await db.exec('declare schema y { table t (id integer primary key, code text) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (code text primary key on conflict replace, id integer) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('`on conflict abort` on a commit-time key deploys clean (ABORT is consistent with detection-only)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict abort) }');
+			await db.exec('apply schema x'); // no throw
+
+			const o = findObligation(slot(db, 'u'), 'unique');
+			expect(o.kind === 'enforced-set-level' && o.mode, 'still commit-time').to.equal('commit-time');
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('no declared conflict action on a commit-time key deploys clean', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x'); // no throw — the existing default-action path
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('`on conflict replace` on a row-time key (covering MV present) deploys clean — row-time can honor it', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema y');
+			// A covering MV upgrades the logical unique to row-time, which IS
+			// conflict-resolution-capable — the deploy-time error must NOT fire.
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await db.exec('apply schema x'); // no throw
+
+			const o = findObligation(slot(db, 'u'), 'unique');
+			expect(o.kind === 'enforced-set-level' && o.mode, 'row-time via covering MV').to.equal('row-time');
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('locks the partial-UNIQUE invariant — a logical unique declaration carries no predicate', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			// The declaration surface never synthesizes a partial-UNIQUE predicate (only
+			// `CREATE UNIQUE INDEX ... WHERE` does); the commit-time count synthesis relies
+			// on this — the defensive deploy-time guard exists only for if it ever changes.
+			const uc = slot(db, 'u').attachedConstraints.find(c => c.kind === 'unique');
+			expect(uc, 'a unique constraint is attached').to.not.be.undefined;
+			expect(uc!.kind === 'unique' && uc!.constraint.predicate, 'no partial predicate').to.equal(undefined);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens prover: read-only (key reconstructibility)', () => {
 	it('a non-reconstructible PK deploys read-only and rejects mutation at the lens boundary', async () => {
 		const db = new Database();

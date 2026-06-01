@@ -10,6 +10,7 @@ import { PhysicalType } from '../types/logical-type.js';
 import { getReservedTagByTemplate } from './reserved-tags.js';
 import type { AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
+import { ConflictResolution } from '../common/constants.js';
 
 const log = createLogger('schema:lens-prover');
 
@@ -66,6 +67,7 @@ export type LensErrorCode =
 	| 'lens.type-mismatch'
 	| 'lens.nullability-mismatch'
 	| 'lens.unrealizable-constraint'
+	| 'lens.unenforceable-conflict-action'
 	| 'lens.non-invertible'
 	| 'lens.unknown-policy-code';
 
@@ -529,6 +531,35 @@ function constraintLabel(constraint: LogicalConstraint): string {
 }
 
 /**
+ * The effective constraint-level default conflict action a duplicate key would
+ * resolve to absent a statement-level OR clause. The commit-time set-level scan
+ * can only ABORT, so a key declaring REPLACE / IGNORE here cannot honor it — see
+ * {@link classifyKeyConstraint}'s `lens.unenforceable-conflict-action` block.
+ *
+ *  - `unique` → the constraint's own `defaultConflict`.
+ *  - `primaryKey` → table-level `PRIMARY KEY (...) ON CONFLICT <action>`
+ *    (`TableSchema.primaryKeyDefaultConflict`), else the first PK column's
+ *    column-level `ColumnSchema.defaultConflict` — mirroring the precedence
+ *    documented on `TableSchema.primaryKeyDefaultConflict`. The PK's action is
+ *    NOT on the `LogicalConstraint` node, so it must be read off `ctx.table`.
+ *
+ * Returns undefined when no action is declared (⇒ ABORT, which the scan honors).
+ */
+function effectiveKeyDefaultConflict(ctx: ProveContext, constraint: LogicalConstraint): ConflictResolution | undefined {
+	switch (constraint.kind) {
+		case 'unique':
+			return constraint.constraint.defaultConflict;
+		case 'primaryKey': {
+			if (ctx.table.primaryKeyDefaultConflict !== undefined) return ctx.table.primaryKeyDefaultConflict;
+			const firstPkIndex = constraint.columns[0]?.index;
+			return firstPkIndex !== undefined ? ctx.table.columns[firstPkIndex]?.defaultConflict : undefined;
+		}
+		default:
+			return undefined;
+	}
+}
+
+/**
  * Classifies a key constraint (primary key / unique). Empty key ⇒ vacuous
  * (singleton).
  *
@@ -601,6 +632,39 @@ function classifyKeyConstraint(
 			message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) has no basis covering structure — it enforces via an O(n) commit-time scan. Add an explicit basis covering materialized view (order by the constraint columns) to upgrade to row-time enforcement; row-time conflict resolution (insert or replace / or ignore) requires that structure and is otherwise rejected.`,
 			fingerprintInputs: buildFingerprint(ctx, columnNames, false),
 		});
+
+		// A commit-time scan can only ABORT. A constraint-level `on conflict
+		// replace`/`ignore` (the PK's via `ctx.table`, a UNIQUE's via its own
+		// `defaultConflict`) is an action the scan can never honor — an unsound
+		// schema. Block it at deploy here rather than silently over-ABORTing per
+		// write: the statement-level gate (`rejectLensSetLevelConflictResolution`)
+		// only inspects `req.stmt.onConflict`, so the constraint-level channel never
+		// reaches it. ABORT / FAIL / ROLLBACK (and no declared action) are fine.
+		const effectiveConflict = effectiveKeyDefaultConflict(ctx, constraint);
+		if (effectiveConflict === ConflictResolution.REPLACE || effectiveConflict === ConflictResolution.IGNORE) {
+			errors.push({
+				code: 'lens.unenforceable-conflict-action',
+				severity: 'error',
+				site: { table: ctx.table.name, constraint: label },
+				message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) declares 'on conflict replace/ignore' but has no basis covering structure, so the action cannot be honored (a commit-time scan can only ABORT). Add a basis covering materialized view (order by the key columns) to upgrade to row-time enforcement, or drop the conflict action.`,
+			});
+		}
+
+		// Defensive (close-before-reachable): the commit-time count synthesis
+		// (`synthesizeUniqueCountExpr`) counts ALL logical rows matching the key — it
+		// does not scope by a partial-UNIQUE predicate, so a partial logical UNIQUE
+		// would over-count and falsely ABORT an out-of-scope duplicate. A logical
+		// declaration never sets `predicate` today (only `CREATE UNIQUE INDEX … WHERE`
+		// does, a path the declaration surface never takes), so this guards an
+		// invariant rather than a reachable case — reject loudly if it ever opens.
+		if (constraint.kind === 'unique' && constraint.constraint.predicate !== undefined) {
+			errors.push({
+				code: 'lens.unrealizable-constraint',
+				severity: 'error',
+				site: { table: ctx.table.name, constraint: label },
+				message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) is a partial UNIQUE (declares a predicate), which is unsupported for commit-time set-level enforcement (the O(n) count scan cannot scope by the partial predicate). Add a basis covering materialized view to upgrade to row-time enforcement, or remove the partial predicate.`,
+			});
+		}
 	}
 	return { constraint, kind: 'enforced-set-level', mode: 'commit-time' };
 }
