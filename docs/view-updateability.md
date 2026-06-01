@@ -12,7 +12,8 @@ actually shipped:
 | **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
 | **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. | **Shipped** (the lenient predicate-honest *multi-side delete fan-out* is deferred — see § Inner Join) |
 | **Phase 2b** | Multi-source **key-preserving inner-join `insert`** write-through, plus the per-row **shared-surrogate mutation-context envelope** it requires. The shared join key is not a view column, so an insert mints a surrogate **once per produced logical row at the envelope, before propagation fans out**, and threads the one captured value into both base inserts (FK-parent before FK-child). The key is either **directly supplied** (a view column maps to a join-key base column) or **minted** (`integer-auto` / `per-row`: `seed + ordinal`, `seed = max(anchor.key)` captured once). Realized by materializing the augmented source once (`ViewMutationNode.envelope` + `EnvelopeScanNode`) so every base op reads the identical rows. | **Shipped (two-table inner join)** |
-| Phase 2b+ | **RETURNING-through-views**, outer-join / optional-member insert, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values, `declared-default`-expression and non-integer surrogate generators, multi-source-`insert` `default_for`. | Not shipped — rejected at plan time with a structured diagnostic. |
+| **Phase 3.7** | **RETURNING-through-views.** `insert` / `update` / `delete … returning` returns rows projected through the **view's** column list, evaluated against the post-mutation base state (computed view columns re-evaluated). Single-source: the clause is rewritten into base terms and rides the base op's RETURNING (NEW for insert/update, OLD for delete) — `ViewMutationNode` becomes relational and surfaces it. Multi-source inner-join `update` / `delete`: the rows are produced by a re-query of the view restricted to the mutation's predicate (captured before a delete, after an update). `returning *` expands to the view's columns. | **Shipped (single-source all ops; multi-source update / delete)** |
+| Phase 2b+ | Multi-source-**`insert`** RETURNING (needs the minted surrogate threaded into the projection), outer-join / optional-member insert, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values, `declared-default`-expression and non-integer surrogate generators, multi-source-`insert` `default_for`. | Not shipped — rejected at plan time with a structured diagnostic. |
 
 **Implementation note (Phase 1).** Phase 1 ships **via the view-mutation
 substrate** (single-source = one base op). A view-targeted DML whose body
@@ -46,10 +47,12 @@ key-preserving inner-join `update` / `delete` case** (`planner/mutation/multi-so
 a join body routes here, where the planned body's `updateLineage` decides each
 output column's owning base table and a subquery over the join body reconstructs
 the per-side row-identifying predicate (lowered back to AST so the base builders
-are reused untouched). What the surface is **not yet** consumed by is the
-multi-source **insert** (which needs the shared-surrogate mutation-context
-envelope), RETURNING-through-views, and the broader join shapes (outer / set-op /
-aggregate / `> 2`-table / self-join), all still rejected. The retire-or-keep
+are reused untouched). RETURNING through a multi-source `update` / `delete` is
+supported via a re-query of the view (see § `returning` Clauses); the per-side
+base ops carry no RETURNING. What the surface is **not yet** consumed by is the
+multi-source **insert** RETURNING (which needs the shared-surrogate key threaded
+into the projection) and the broader join shapes (outer / set-op / aggregate /
+`> 2`-table / self-join), all still rejected. The retire-or-keep
 decision is settled under `view-mutation-plan-node-substrate`: the AST rewrite is
 **retired** in favor of the substrate; `building/view-mutation.ts` has been
 removed (the single-source rewrite it held now lives in
@@ -71,8 +74,8 @@ name is routed through this same substrate (rewritten to its source table, one b
 then the row-time maintenance hook syncs the backing within the statement
 (reads-own-writes; rollback in lockstep). The MV path inherits the per-column lineage
 rules verbatim — passthrough/rename columns are writeable, computed columns are
-read-only (`no-inverse`), and RETURNING is rejected (`returning-through-view`) until the
-RETURNING phase lands. An MV whose source is *itself* a materialized view is rejected
+read-only (`no-inverse`), and RETURNING is supported (single-source, so the rewritten
+clause rides the base op). An MV whose source is *itself* a materialized view is rejected
 for write-through (its rewrite would target a read-only backing table). See
 [docs/materialized-views.md § Write boundary](materialized-views.md#write-boundary-write-through).
 
@@ -441,15 +444,41 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 
 ## `returning` Clauses
 
-> **Not yet shipped.** RETURNING through a view (single- or multi-source) is
-> rejected with the `returning-through-view` diagnostic. Supporting it requires
-> promoting `ViewMutationNode` to a relational node, capturing the post-mutation
-> view image, and revisiting the `block.ts` result-shadowing exclusion. Tracked by
-> `view-mutation-returning-through-view`.
+`insert`, `update`, and `delete` through a view support `returning`. The returned rows are projected through the **view's** column list, not the base tables'. The engine evaluates the view body against the post-mutation state to produce returning rows — equivalently, against the captured per-operation results, since the view's lineage maps base rows back to view rows. `returning` columns of `computed` lineage (a view-level computed expression) are evaluated against the post-mutation base values. `returning *` expands to the view's column list.
 
-`insert`, `update`, and `delete` through a view support `returning`. The returned rows are projected through the **view's** column list, not the base tables'. The engine evaluates the view body against the post-mutation state to produce returning rows — equivalently, against the captured per-operation results, since the view's lineage maps base rows back to view rows.
-
-`returning` columns of `computed` lineage (a view-level computed expression) are evaluated against the post-mutation base values.
+> **Shipped (single-source all ops; multi-source inner-join `update` / `delete`).**
+> When a view mutation carries a `returning` clause, `ViewMutationNode` is
+> **relational** — its row type / attributes are the view's projected columns — and
+> the `block.ts` result-shadowing exclusion (which drops void view mutations from a
+> block's result, alongside `Sink`) admits it. There are two mechanisms:
+>
+> - **Single-source** (`planner/mutation/single-source.ts`, `rewriteViewReturning`):
+>   the clause is rewritten into base terms — each view-column reference substituted
+>   to its base-term lineage, the user's view-spelling preserved as the result-column
+>   name — and attached to the rewritten base statement, so the base op's own
+>   RETURNING machinery yields the rows. Unqualified columns bind to NEW for
+>   insert/update and OLD for delete, so the result is the post-mutation (or, for
+>   delete, the deleted) view image; computed view columns re-evaluate against those
+>   base values. The (sole) base op is now a relational `ReturningNode` and the
+>   substrate surfaces it. This is robust against an update that changes a predicate
+>   column (it reads NEW/OLD, not a re-query). MV write-through inherits it verbatim.
+>
+> - **Multi-source** inner-join `update` / `delete` (`building/view-mutation-builder.ts`,
+>   `buildMultiSourceReturning`): the view row spans both base tables, so it is not
+>   recoverable from the per-side base ops. The rows come from a **re-query of the
+>   view** restricted to the mutation's predicate — `select <returning> from <view>
+>   [where <user where>]` — captured **before** the base ops fire for a delete (the
+>   rows are about to disappear) or **after** for an update (the post-mutation
+>   image), threaded as `ViewMutationNode.returning` with a `returningTiming` of
+>   `pre`/`post`. *Limitation:* the post-mutation update re-query matches by the user
+>   predicate, so an update that **changes a predicate column** will not recapture
+>   that row (a per-row capture would be needed); the single-source path has no such
+>   limitation.
+>
+> **Not yet shipped:** multi-source (join) **insert** RETURNING — the minted shared
+> surrogate is not yet threaded into a RETURNING projection — is rejected with the
+> `returning-through-view` diagnostic. RETURNING through a decomposition-backed
+> logical table is likewise still rejected.
 
 ## Mutation Context
 
@@ -618,9 +647,9 @@ boundary, so `view_info()` walks `getAllViews()` only.
 - `src/planner/nodes/envelope-scan-node.ts` / `src/runtime/emit/envelope-scan.ts` — the leaf that scans the shared-surrogate envelope rows from `rctx.tableContexts` (set by the `ViewMutation` emitter before fan-out). **Landed.**
 - `src/planner/building/view-mutation-builder.ts` — `buildViewMutation` routes a multi-source inner-join `insert` to `buildMultiSourceInsert`, which builds the envelope source (the user VALUES/SELECT), one base insert per side (each sourcing a projection over an `EnvelopeScanNode`, re-planned through `buildInsertStmt`'s new `preBuiltSource` seam), and the `max(anchor.key)` seed. **Landed.**
 - `src/planner/mutation/decomposition.ts` — the **advertisement-driven** put fan-out for an n-way decomposition lens (`propagateDecomposition`, `lens-multi-source-put-fanout`). **Partially landed:** DELETE across every member (anchor-last, anchor-only predicate) and UPDATE routed to the mandatory non-EAV member backing each column. INSERT (`unsupported-decomposition-insert`), a non-anchor-member predicate (`unsupported-decomposition-predicate`), an optional/EAV/key UPDATE (`unsupported-decomposition-update`), and composite shared keys (`unsupported-decomposition-key`) are deferred onto absent substrate (the shared-surrogate insert envelope / snapshot-consistent multi-member execution).
-- `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.**
+- `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.** The node is **relational** when a `returning` clause is present (`resultRelation()` is the separate multi-source re-query `returning` child, else a relational base op); the builder's `buildMultiSourceReturning` builds the multi-source re-query (with `returningTiming` `pre`/`post`).
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
-- `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. For a multi-source insert it first materializes `plan.envelope` once (the shared-surrogate envelope), evaluating the seed and minting `seed + ordinal` per row, then stashes the rows in `rctx.tableContexts` for the base ops' `EnvelopeScanNode`s. **Landed** (side-effect only; accumulating `returning` rows lands with RETURNING-through-view).
+- `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. For a multi-source insert it first materializes `plan.envelope` once (the shared-surrogate envelope), evaluating the seed and minting `seed + ordinal` per row, then stashes the rows in `rctx.tableContexts` for the base ops' `EnvelopeScanNode`s. **Landed.** For a `returning` mutation it materializes and yields the view-projected rows: a relational base op (single-source) is drained and surfaced, or the separate `returning` re-query is captured before (delete) / after (update) the base ops.
 - `src/schema/view.ts` — `ViewSchema.effectiveTargets`, `ViewSchema.defaultsForColumn`, populated at view-creation time.
 - `src/func/builtins/schema.ts` — the `view_info()` TVF (§ Information Schema Surface): a read-only static projection over the planned body's `updateLineage` / `attributeDefaults` + base-column flags. Reads the backward surface; threads no new state.
 

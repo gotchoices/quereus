@@ -11,7 +11,7 @@ import { buildDeleteStmt } from '../../src/planner/building/delete.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { ViewMutationNode } from '../../src/planner/nodes/view-mutation-node.js';
 import type { DmlExecutorNode } from '../../src/planner/nodes/dml-executor-node.js';
-import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { isRelationalNode, type PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
 
 /**
@@ -80,9 +80,21 @@ describe('View Mutation Substrate (single-source parity)', () => {
 		assertSingleSourceSubstrate(buildDeleteStmt(ctx, ast), 't');
 	});
 
-	it('keeps RETURNING-through-view rejected through the substrate', async () => {
+	it('builds a relational ViewMutationNode for single-source RETURNING-through-view', async () => {
 		const ctx = await ctxFor();
-		const ast = new Parser().parseAll(`insert into gv (id, name) values (1, 'bob') returning id`)[0] as AST.InsertStmt;
-		expect(() => buildInsertStmt(ctx, ast)).to.throw(/returning/i);
+		const ast = new Parser().parseAll(`insert into gv (id, name) values (1, 'bob') returning id, name`)[0] as AST.InsertStmt;
+		const plan = buildInsertStmt(ctx, ast);
+		expect(plan.nodeType).to.equal(PlanNodeType.ViewMutation);
+		const vm = plan as ViewMutationNode;
+		// The node is relational: its row type / attributes are the view-projected
+		// RETURNING columns (named as the user wrote them).
+		expect(vm.getType().typeClass).to.equal('relation');
+		expect(vm.getAttributes().map(a => a.name)).to.deep.equal(['id', 'name']);
+		// Single-source: the RETURNING rides the (sole) base op, which is now relational.
+		expect(vm.returning, 'no separate re-query node for single-source').to.equal(undefined);
+		expect(vm.baseOps.some(op => isRelationalNode(op)), 'base op carries the RETURNING projection').to.equal(true);
+		// And it still wraps the real base-table DmlExecutorNode on the base table.
+		const dml = findDmlExecutor(vm);
+		expect(dml!.table.tableSchema.name).to.equal('t');
 	});
 });

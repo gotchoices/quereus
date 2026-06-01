@@ -130,16 +130,17 @@ select id, label from d order by id;
 → [{"id":2,"label":"b"}]
 
 -- ===================================
--- 6. RETURNING through an MV is rejected (inherited from view updateability — the
---    RETURNING-through-views phase is not shipped). When it lands, the MV path picks
---    it up for free.
+-- 6. RETURNING through an MV is shipped (inherited from view updateability — an MV
+--    is a single-source projection, so the rewrite carries the RETURNING onto the
+--    base op). The deleted view-projected row is returned (`*` → all view columns,
+--    OLD image).
 -- ===================================
 
 create table r (id integer primary key, x integer);
 insert into r values (1, 10);
 create materialized view rv as select id, x from r;
 delete from rv where id = 1 returning *;
--- error: returning through view
+→ [{"id":1,"x":10}]
 
 -- ===================================
 -- 7. Deterministic expression column is read-only (inherited per-column lineage):

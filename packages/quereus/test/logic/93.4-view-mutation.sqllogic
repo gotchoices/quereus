@@ -188,9 +188,13 @@ create view ms_jv_c as
 update ms_jv_c set banner = 'z' where cid = 1;
 -- error: read-only
 
--- RETURNING through a join view is not yet supported.
-delete from ms_jv where cid = 1 returning cid;
--- error: RETURNING through view
+-- RETURNING through a multi-source (join) delete is SHIPPED. The view row spans
+-- both base tables, so it is produced by a re-query of the view captured BEFORE
+-- the base delete fires; the deleted view-projected row is returned. (cid=1 joins
+-- pid=10 → label 'P10x' from the earlier parent update; note 'A' from the child
+-- update.)
+delete from ms_jv where cid = 1 returning cid, note, label;
+→ [{"cid":1,"note":"A","label":"P10x"}]
 
 -- ===================================
 -- Phase 2: adversarial coverage (qualifier rewriting, body-WHERE conjunction,
@@ -675,3 +679,89 @@ create view bk_v as select a.k as ka, b.k as kb, a.av as av, b.bv as bv
     from bk_a a join bk_b b on b.k = a.k;
 insert into bk_v (ka, kb, av, bv) values (5, 7, 'a', 'b');
 -- error: shared join key is exposed by more than one view column
+
+-- ===================================
+-- RETURNING through a view (single- and multi-source).
+-- The returned rows are projected through the VIEW's column list (not the base
+-- tables'), evaluated against the post-mutation base state — so a computed view
+-- column re-evaluates against the post-mutation base values, a renamed view column
+-- keeps its view-spelling, and `returning *` expands to the view's columns.
+-- See docs/view-updateability.md § `returning` Clauses.
+-- ===================================
+
+-- --- (a) single-source: rename + computed view columns, all three ops ---
+-- empv renames base id/name, exposes base rate, and a computed `doubled` = rate*2.
+create table emp (id integer primary key, name text, rate integer);
+create view empv as
+    select id as eid, name as ename, rate as ratev, rate * 2 as doubled from emp;
+-- run
+
+-- INSERT returns the view-projected NEW row; `doubled` evaluated post-insert.
+insert into empv (eid, ename, ratev) values (1, 'Ann', 5)
+    returning eid, ename, ratev, doubled;
+→ [{"eid":1,"ename":"Ann","ratev":5,"doubled":10}]
+
+-- UPDATE returns the view-projected NEW row; `doubled` re-evaluated post-update.
+update empv set ratev = 7 where eid = 1 returning eid, ratev, doubled;
+→ [{"eid":1,"ratev":7,"doubled":14}]
+
+-- a multi-row insert returns one row per inserted row, in insertion order; the
+-- computed column is evaluated per row.
+insert into empv (eid, ename, ratev) values (2, 'B', 1), (3, 'C', 2)
+    returning eid, doubled;
+→ [{"eid":2,"doubled":2},{"eid":3,"doubled":4}]
+
+-- DELETE returns the view-projected OLD (deleted) row; computed col over OLD vals.
+delete from empv where eid = 1 returning eid, ename, doubled;
+→ [{"eid":1,"ename":"Ann","doubled":14}]
+
+-- the surviving rows confirm only eid=1 was deleted.
+select eid, ratev from empv order by eid;
+→ [{"eid":2,"ratev":1},{"eid":3,"ratev":2}]
+
+-- --- (b) single-source filter view: a selection-predicate default appears in
+--         RETURNING (the appended constant is part of the inserted NEW row), and
+--         `returning *` expands to the view's column list ---
+create table men2 (name text primary key, color text);
+create view greenmen2 as select name, color from men2 where color = 'green';
+-- run
+
+insert into greenmen2 (name) values ('Bob') returning name, color;
+→ [{"name":"Bob","color":"green"}]
+
+insert into greenmen2 (name) values ('Carl') returning *;
+→ [{"name":"Carl","color":"green"}]
+
+-- --- (c) multi-source inner-join: update/delete RETURNING returns the joined,
+--         view-projected rows (a re-query of the view; update reads the
+--         post-mutation image, delete captures the pre-delete image) ---
+create table rp (pid integer primary key, label text);
+create table rc (cid integer primary key, pref integer, note text,
+    foreign key (pref) references rp(pid));
+insert into rp values (10, 'P10'), (20, 'P20');
+insert into rc values (1, 10, 'a'), (2, 20, 'b');
+create view rjoin as
+    select c.cid as cid, c.note as note, p.label as label
+    from rc c join rp p on p.pid = c.pref;
+-- run
+
+-- update a child-owned column; the returned view row reflects the post-update note.
+update rjoin set note = 'A' where cid = 1 returning cid, note, label;
+→ [{"cid":1,"note":"A","label":"P10"}]
+
+-- update a parent-owned column (label is owned by rp, whose PK the projection
+-- hides — identified through the join); the returned view row reflects it.
+update rjoin set label = 'P20x' where cid = 2 returning cid, note, label;
+→ [{"cid":2,"note":"b","label":"P20x"}]
+
+-- update touching BOTH sides; the re-query returns the fully post-mutation row.
+update rjoin set note = 'Z', label = 'P10z' where cid = 1 returning cid, note, label;
+→ [{"cid":1,"note":"Z","label":"P10z"}]
+
+-- `returning *` through the join view expands to the view's columns.
+delete from rjoin where cid = 1 returning *;
+→ [{"cid":1,"note":"Z","label":"P10z"}]
+
+-- the delete removed only the cid=1 child row; cid=2 remains.
+select cid, note, label from rjoin order by cid;
+→ [{"cid":2,"note":"b","label":"P20x"}]

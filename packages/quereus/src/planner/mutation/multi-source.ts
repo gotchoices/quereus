@@ -516,7 +516,10 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 // --- UPDATE ---------------------------------------------------------------
 
 function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
-	rejectReturning(view, stmt.returning);
+	// RETURNING through a multi-source update is supported, but the rows are not
+	// recoverable from the per-side base ops (the view row spans both tables), so
+	// the builder (`view-mutation-builder.ts`) supplies them via a re-query of the
+	// view; the base ops themselves carry no RETURNING.
 
 	// `target` / `exclude` narrow the writable base set (compose AFTER predicate
 	// dispatch — they only restrict, never broaden). For an update the side set is
@@ -600,7 +603,9 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 // --- DELETE ---------------------------------------------------------------
 
 function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
-	rejectReturning(view, stmt.returning);
+	// RETURNING through a multi-source delete is supported via a re-query of the
+	// view captured *before* the base delete fires (the builder); the base op
+	// itself carries no RETURNING.
 
 	const sideIndex = chooseDeleteSide(view, analysis, tags);
 	const side = analysis.sides[sideIndex];
@@ -917,12 +922,19 @@ function cloneFromClause(fc: AST.FromClause): AST.FromClause {
 	}
 }
 
+/**
+ * RETURNING through a multi-source **insert** is not yet supported: it would need
+ * the per-row minted shared surrogate threaded into the projected rows, which the
+ * envelope materialization does not yet expose to a RETURNING projection. Reject
+ * with a structured diagnostic (single- and multi-source update/delete RETURNING
+ * are supported; see the builder).
+ */
 function rejectReturning(view: MutableViewLike, returning: AST.ResultColumn[] | undefined): void {
 	if (returning && returning.length > 0) {
 		raiseMutationDiagnostic({
 			reason: 'returning-through-view',
 			table: view.name,
-			message: `RETURNING through view '${view.name}' is not yet supported`,
+			message: `RETURNING through a multi-source (join) insert into view '${view.name}' is not yet supported`,
 		});
 	}
 }

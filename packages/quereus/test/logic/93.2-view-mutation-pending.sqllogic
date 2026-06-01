@@ -55,11 +55,16 @@ create view vp as select id, name from t where id = 1;
 insert into vp (id, name) values (2, 'x');
 -- error: contradicts its selection predicate
 
--- RETURNING through a view is Phase 6.
-create view vr as select id, name from t;
-
-insert into vr (id, name) values (3, 'y') returning id;
--- error: RETURNING through view
+-- RETURNING through a view is SHIPPED (see 93.4-view-mutation.sqllogic § RETURNING).
+-- Single-source insert/update/delete RETURNING (incl. computed view columns) and
+-- multi-source inner-join update/delete RETURNING are supported. Only a
+-- multi-source (join) INSERT … RETURNING is still rejected:
+create table jt1 (id integer primary key, a integer);
+create table jt2 (id integer primary key, c integer);
+create view rjv as select t1.id as id, t1.a as a, t2.c as c
+    from jt1 t1 join jt2 t2 on t2.id = t1.id;
+insert into rjv (id, a, c) values (1, 2, 3) returning id;
+-- error: RETURNING through a multi-source
 
 -- LIMIT body: the predicate-conjoin rewrite cannot reproduce the row-count
 -- window, so a mutation could escape it. Reject rather than widen the write.

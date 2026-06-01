@@ -1,10 +1,13 @@
 import type { Scope } from '../scopes/scope.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type PhysicalProperties, type TableDescriptor, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type PhysicalProperties, type TableDescriptor, type Attribute, isRelationalNode } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
-import type { ScalarType } from '../../common/datatype.js';
+import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+
+/** When a separate {@link ViewMutationNode.returning} relation is captured. */
+export type ReturningTiming = 'pre' | 'post';
 
 /**
  * The **shared-surrogate mutation envelope** for a multi-source view INSERT.
@@ -46,9 +49,24 @@ export interface MutationEnvelope {
  * its rows in context, then drives the base ops, each of which reads the shared
  * surrogate back through an `EnvelopeScanNode`.
  *
- * Like {@link SinkNode}, a view mutation is a side-effect statement reporting the
- * affected-row count, not a relation — RETURNING-through-view is rejected. The
- * emitter drains each child base op in list order and yields nothing.
+ * **RETURNING-through-view.** A view mutation with a `returning` clause yields the
+ * view-projected post-mutation rows, so the node is **relational** (its row type /
+ * attributes are the view's projected columns). There are two shapes:
+ *   - *single-source*: the RETURNING clause is rewritten into base terms and
+ *     attached to the (sole) base op, which then plans to a relational
+ *     `ReturningNode`. No separate {@link returning} child — the emitter surfaces
+ *     that base op's rows (NEW for insert/update, OLD for delete — post-mutation by
+ *     construction). {@link returning} is undefined; {@link resultRelation} finds
+ *     the relational base op.
+ *   - *multi-source* update/delete: the view row spans both base tables, so the
+ *     rows are produced by a separate {@link returning} relation — a re-query of
+ *     the view restricted to the mutation's predicate — evaluated **before** the
+ *     base ops for a delete (the rows are about to disappear) or **after** for an
+ *     update ({@link returningTiming}).
+ *
+ * Without a `returning` clause the node is a void side-effect statement (like
+ * {@link SinkNode}): the emitter drains each base op in list order and yields
+ * nothing, and {@link getType} reports the scalar affected-row shape.
  */
 export class ViewMutationNode extends PlanNode {
 	override readonly nodeType = PlanNodeType.ViewMutation;
@@ -57,14 +75,18 @@ export class ViewMutationNode extends PlanNode {
 		scope: Scope,
 		/**
 		 * Ordered base-table DML subtrees the view/MV mutation decomposes into.
-		 * Single-source = exactly one (the retired-rewrite output, wrapped).
+		 * Single-source = exactly one (the retired-rewrite output, wrapped). When a
+		 * single-source mutation carries RETURNING, that one base op is a relational
+		 * `ReturningNode` (the rewritten view-projected clause).
 		 */
 		public readonly baseOps: readonly PlanNode[],
 		/**
-		 * RETURNING projection over the base ops — reserved for the
-		 * RETURNING-through-view phase. Unused while RETURNING-through-view is
-		 * rejected; when it lands it must also be threaded through
-		 * `getChildren`/`withChildren`.
+		 * Separate RETURNING relation producing the view-projected rows — set only
+		 * for a **multi-source** update/delete RETURNING (the view row spans both
+		 * base tables, so a re-query of the view supplies it). Single-source
+		 * RETURNING leaves this undefined and surfaces the relational base op
+		 * instead. When set, it is threaded through `getChildren`/`getRelations`/
+		 * `withChildren` and drives `getType`/`getAttributes`.
 		 */
 		public readonly returning?: RelationalPlanNode,
 		/**
@@ -72,6 +94,13 @@ export class ViewMutationNode extends PlanNode {
 		 * single-source spines and multi-source update/delete).
 		 */
 		public readonly envelope?: MutationEnvelope,
+		/**
+		 * When {@link returning} is set, whether it is captured `pre` (before the
+		 * base ops — a delete, whose rows vanish) or `post` (after — an update,
+		 * whose post-mutation image the re-query reads). Ignored when `returning`
+		 * is undefined.
+		 */
+		public readonly returningTiming?: ReturningTiming,
 	) {
 		super(scope, baseOps.reduce((cost, op) => cost + op.getTotalCost(), 0.1));
 		if (baseOps.length === 0) {
@@ -79,16 +108,36 @@ export class ViewMutationNode extends PlanNode {
 		}
 	}
 
-	getType(): ScalarType {
-		// A view mutation is a side-effect statement: like SinkNode it reports the
-		// affected-row count. (RETURNING-through-view, which would make this
-		// relational, is rejected.)
+	/**
+	 * The relation whose rows this mutation yields, or `undefined` when it is a
+	 * void side-effect statement. A separate {@link returning} re-query wins;
+	 * otherwise a relational base op (single-source RETURNING rewritten onto the
+	 * base op) is surfaced.
+	 */
+	resultRelation(): RelationalPlanNode | undefined {
+		if (this.returning) return this.returning;
+		return this.baseOps.find(isRelationalNode);
+	}
+
+	getType(): RelationType | ScalarType {
+		const result = this.resultRelation();
+		if (result) {
+			// RETURNING-through-view: the row type is the view's projected columns.
+			return result.getType();
+		}
+		// A void view mutation is a side-effect statement: like SinkNode it reports
+		// the affected-row count.
 		return {
 			typeClass: 'scalar',
 			isReadOnly: true,
 			logicalType: INTEGER_TYPE,
 			nullable: false,
 		};
+	}
+
+	/** The view-projected RETURNING attributes, or `[]` for a void mutation. */
+	getAttributes(): readonly Attribute[] {
+		return this.resultRelation()?.getAttributes() ?? [];
 	}
 
 	/** Extra (non-base-op) plan children: the envelope source + optional surrogate seed. */
@@ -100,44 +149,62 @@ export class ViewMutationNode extends PlanNode {
 	}
 
 	getChildren(): readonly PlanNode[] {
-		return [...this.baseOps, ...this.envelopeChildren()];
+		// Order: base ops, then the optional RETURNING re-query, then the envelope
+		// children. `withChildren` slices back in this same order.
+		return [
+			...this.baseOps,
+			...(this.returning ? [this.returning] : []),
+			...this.envelopeChildren(),
+		];
 	}
 
 	getRelations(): readonly RelationalPlanNode[] {
 		// Mirrors BlockNode: the base ops are Sink-topped DML statements, not
 		// relational inputs, so they are excluded here (the optimizer and the
 		// change-scope / binding walks descend via getChildren). A relational base
-		// op — a future RETURNING op — would surface.
-		return this.baseOps.filter(isRelationalNode);
+		// op — a single-source RETURNING op — surfaces, as does the separate
+		// multi-source RETURNING re-query, so the attribute-provenance walk treats
+		// this node's forwarded RETURNING attributes as forwarded (not originated).
+		const rels = this.baseOps.filter(isRelationalNode);
+		if (this.returning) rels.push(this.returning);
+		return rels;
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
-		const n = this.baseOps.length;
-		const newBaseOps = newChildren.slice(0, n);
-		const newEnvChildren = newChildren.slice(n);
+		let cursor = this.baseOps.length;
+		const newBaseOps = newChildren.slice(0, cursor);
+
+		let newReturning = this.returning;
+		if (this.returning) {
+			newReturning = newChildren[cursor] as RelationalPlanNode;
+			cursor += 1;
+		}
 
 		let newEnvelope = this.envelope;
 		if (this.envelope) {
-			const [newSource, newSeed] = newEnvChildren;
+			const newSource = newChildren[cursor] as RelationalPlanNode;
+			cursor += 1;
+			const newSeed = this.envelope.mint ? newChildren[cursor] as ScalarPlanNode : undefined;
 			newEnvelope = {
-				source: newSource as RelationalPlanNode,
+				source: newSource,
 				descriptor: this.envelope.descriptor,
-				mint: this.envelope.mint ? { seed: newSeed as ScalarPlanNode } : undefined,
+				mint: this.envelope.mint ? { seed: newSeed! } : undefined,
 			};
 		}
 
 		const unchanged = newChildren.length === this.getChildren().length
 			&& newBaseOps.every((child, i) => child === this.baseOps[i])
+			&& newReturning === this.returning
 			&& (!this.envelope || (newEnvelope!.source === this.envelope.source
 				&& newEnvelope!.mint?.seed === this.envelope.mint?.seed));
 		if (unchanged) {
 			return this;
 		}
-		return new ViewMutationNode(this.scope, newBaseOps, this.returning, newEnvelope);
+		return new ViewMutationNode(this.scope, newBaseOps, newReturning, newEnvelope, this.returningTiming);
 	}
 
 	get estimatedRows(): number | undefined {
-		return 1;
+		return this.resultRelation()?.estimatedRows ?? 1;
 	}
 
 	computePhysical(): Partial<PhysicalProperties> {
@@ -150,10 +217,15 @@ export class ViewMutationNode extends PlanNode {
 
 	override toString(): string {
 		const env = this.envelope ? ` +envelope${this.envelope.mint ? '(mint)' : ''}` : '';
-		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env})`;
+		const ret = this.resultRelation() ? ` returning${this.returning ? `(${this.returningTiming})` : ''}` : '';
+		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env}${ret})`;
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
-		return { baseOps: this.baseOps.length, envelope: this.envelope ? (this.envelope.mint ? 'mint' : 'shared') : undefined };
+		return {
+			baseOps: this.baseOps.length,
+			envelope: this.envelope ? (this.envelope.mint ? 'mint' : 'shared') : undefined,
+			returning: this.resultRelation() ? (this.returning ? `requery(${this.returningTiming})` : 'base-op') : undefined,
+		};
 	}
 }

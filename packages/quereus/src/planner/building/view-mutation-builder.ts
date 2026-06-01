@@ -54,7 +54,59 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// writes no NEW row, so a CHECK is moot there.
 	const extraConstraints = req.op === 'delete' ? [] : lensRowLocalConstraints(ctx, view);
 	const children = baseOps.map(op => buildBaseOp(ctx, op, extraConstraints));
-	return new ViewMutationNode(ctx.scope, children);
+
+	// RETURNING-through-view. Single-source already embedded the (rewritten)
+	// RETURNING onto its base op (it now plans to a relational ReturningNode the
+	// substrate surfaces), so nothing more is needed there. A **multi-source**
+	// update/delete cannot recover the view row from its per-side base ops, so the
+	// rows come from a re-query of the view restricted to the mutation's predicate
+	// (built below); a delete captures it *before* the base ops fire (its rows are
+	// about to vanish), an update *after* (the post-mutation image).
+	const { returning, returningTiming } = buildMultiSourceReturning(ctx, view, req);
+	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming);
+}
+
+/**
+ * Build the separate RETURNING relation for a **multi-source** update/delete (the
+ * only path where the view row is not recoverable from the base ops). It is a
+ * re-query of the view restricted to the user predicate — `select <returning>
+ * from <view> [where <user where>]` — so the projected columns resolve naturally
+ * against the view (computed columns re-evaluated against the post-mutation base
+ * state). Returns `{}` (no returning) for the absent-clause case, for single-
+ * source (handled by the embedded base-op RETURNING), and for decomposition-
+ * backed logical tables (whose RETURNING stays rejected by `propagate`).
+ *
+ * Timing fragility: the post-mutation update re-query matches by the user
+ * predicate, so an update that *changes* a predicate column will not recapture
+ * that row (a per-row capture would be needed). The single-source path is robust
+ * (it reads NEW/OLD); the multi-source re-query is the documented v1 shape.
+ */
+function buildMultiSourceReturning(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	req: MutationRequest,
+): { returning?: RelationalPlanNode; returningTiming?: 'pre' | 'post' } {
+	const returningCols = req.stmt.returning;
+	if (!returningCols || returningCols.length === 0) return {};
+	if (req.op === 'insert') return {}; // single-source insert embeds; multi-source insert is rejected upstream
+	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return {};
+
+	const selectAst: AST.SelectStmt = {
+		type: 'select',
+		columns: [...returningCols],
+		from: [{ type: 'table', table: { type: 'identifier', name: view.name, schema: view.schemaName } }],
+		where: req.stmt.where,
+		loc: req.stmt.loc,
+	};
+	const node = buildSelectStmt(ctx, selectAst);
+	if (!isRelationalNode(node)) {
+		raiseMutationDiagnostic({
+			reason: 'returning-through-view',
+			table: view.name,
+			message: `cannot project RETURNING through view '${view.name}': the re-query did not produce a relation`,
+		});
+	}
+	return { returning: node, returningTiming: req.op === 'delete' ? 'pre' : 'post' };
 }
 
 /**

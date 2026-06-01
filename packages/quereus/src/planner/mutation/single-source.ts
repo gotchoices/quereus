@@ -11,6 +11,7 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { deriveViewColumns, type ViewColumn } from '../analysis/update-lineage.js';
 import { readDefaultFor, type ReservedTagMap } from './mutation-tags.js';
 import { parseExpressionString } from '../../parser/index.js';
+import { expressionToString } from '../../emit/ast-stringify.js';
 
 /**
  * Single-source view-mediated DML rewriting (the single-source spine of the
@@ -39,8 +40,11 @@ import { parseExpressionString } from '../../parser/index.js';
  * `schemaName` / `selectAst` / `columns`. See `docs/materialized-views.md`
  * § Write boundary and `docs/view-updateability.md`.
  *
- * RETURNING-through-views is a later phase — rejected here with a structured
- * diagnostic.
+ * RETURNING-through-views is supported: {@link rewriteViewReturning} rewrites the
+ * clause into base terms and attaches it to the rewritten base statement, so the
+ * base op's own RETURNING machinery yields the view-projected post-mutation rows
+ * (insert/update against NEW, delete against OLD; computed view columns
+ * re-evaluated against the post-mutation base values).
  */
 
 /**
@@ -683,7 +687,6 @@ function remapper(analysis: ViewAnalysis): (col: AST.ColumnExpr) => AST.Expressi
 // --- INSERT ---------------------------------------------------------------
 
 export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike, tags?: ReservedTagMap): AST.InsertStmt {
-	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 
 	// Target view columns: explicit list, or all non-generated view columns.
@@ -747,6 +750,7 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 		onConflict: stmt.onConflict,
 		upsertClauses: stmt.upsertClauses,
 		contextValues: stmt.contextValues,
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
@@ -772,7 +776,6 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 // --- UPDATE ---------------------------------------------------------------
 
 export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike): AST.UpdateStmt {
-	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
 	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view);
@@ -791,6 +794,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		assignments,
 		where,
 		contextValues: stmt.contextValues,
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
@@ -799,7 +803,6 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 // --- DELETE ---------------------------------------------------------------
 
 export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike): AST.DeleteStmt {
-	rejectReturning(stmt.returning, view);
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
 	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view);
@@ -812,18 +815,58 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
 		table: tableIdentifier(analysis.baseTable),
 		where,
 		contextValues: stmt.contextValues,
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
 }
 
-/** RETURNING through a view is a later phase — reject it explicitly for now. */
-function rejectReturning(returning: AST.ResultColumn[] | undefined, view: MutableViewLike): void {
-	if (returning && returning.length > 0) {
-		raiseMutationDiagnostic({
-			reason: 'returning-through-view',
-			table: view.name,
-			message: `RETURNING through view '${view.name}' is not yet supported (phase 6)`,
-		});
+/**
+ * Rewrite a view-mediated RETURNING clause into base terms so it rides the base
+ * op's own RETURNING machinery. The returned rows are projected through the
+ * **view's** column list (not the base table's): each view-column reference is
+ * substituted to its base-term lineage and the user's view-term output name is
+ * preserved as the result-column alias. The base builder then evaluates the
+ * clause against NEW (insert/update) or OLD (delete), i.e. the post-mutation
+ * (or, for delete, the deleted) base row — so computed view columns re-evaluate
+ * against the post-mutation base values. `returning *` expands to every view
+ * column. Returns `undefined` for an absent/empty clause.
+ *
+ * OLD/NEW qualifiers on a view-column reference are not honored through a view
+ * (the qualifier is dropped, so the base op's default NEW/OLD binding applies);
+ * the documented surface is unqualified / view-qualified view columns.
+ */
+export function rewriteViewReturning(
+	ctx: PlanningContext,
+	returning: AST.ResultColumn[] | undefined,
+	analysis: ViewAnalysis,
+	view: MutableViewLike,
+): AST.ResultColumn[] | undefined {
+	if (!returning || returning.length === 0) return undefined;
+	const substitute = remapper(analysis);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view);
+	const out: AST.ResultColumn[] = [];
+	for (const rc of returning) {
+		if (rc.type === 'all') {
+			// RETURNING * (or `view.*`) → every view column, projected through its
+			// base-term lineage and named by the view column.
+			for (const vc of analysis.viewColumns) {
+				const baseExpr = analysis.columnMap.get(vc.name.toLowerCase());
+				if (baseExpr) out.push({ type: 'column', expr: cloneExpr(baseExpr), alias: vc.name });
+			}
+			continue;
+		}
+		// Preserve the user's view-term output name BEFORE rewriting to base terms,
+		// so the result column is named as written (the view column / its alias),
+		// not the underlying base column.
+		const alias = rc.alias ?? deriveReturningName(rc.expr);
+		out.push({ type: 'column', expr: transformExpr(rc.expr, substitute, descend), alias });
 	}
+	return out;
+}
+
+/** The output name for an unaliased RETURNING expression (view-term spelling). */
+function deriveReturningName(expr: AST.Expression): string {
+	if (expr.type === 'column') return expr.table ? `${expr.table}.${expr.name}` : expr.name;
+	return expressionToString(expr);
 }
