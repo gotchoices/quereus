@@ -632,7 +632,7 @@ match the SQL-standard convention):
 | `schema` | schema name (`main`, `temp`, …). |
 | `name` | view name. |
 | `is_insertable_into` | `'YES'` if every `not null`-without-declared-default, non-generated base column of every reachable base has a recoverable value — projected, or a recoverable default (constant-FD selection pin / declared base default / `default_for`). |
-| `is_updatable` | `'YES'` if at least one output column has `base` lineage. Per-column updateability is reserved for the parked backlog ticket (below). |
+| `is_updatable` | `'YES'` if at least one output column has `base` lineage. Per-column updateability — which *specific* columns are writable — is exposed by the companion `column_info(name)` TVF (below). |
 | `is_deletable` | `'YES'` if the row-identifying predicate is constructible at every base reachable from the view — operationally, every reachable base's PK columns are exposed through `base` lineage. |
 | `effective_targets` | JSON array of base-table names that mutations through the view may touch by default (`'[]'` when none). |
 
@@ -673,11 +673,61 @@ defaultable set directly.)
 Materialized views are **not** enumerated: they are read-only at the user-write
 boundary, so `view_info()` walks `getAllViews()` only.
 
-> **Per-column updateability (parked).** `information_schema.columns.is_updatable`
-> — per-column updateability for every view (and base table) — is parked in
-> `tickets/backlog/view-column-updateability-surface.md`: it touches the
-> base-table introspection surface (`table_info`) too and is independently
-> shippable, so it is deferred out of the view-level surface above.
+### Per-column updateability — `column_info(name)`
+
+`information_schema.columns.is_updatable` — per-column updateability for every
+view *and* base table — is the engine-idiomatic companion to `view_info()`:
+`view_info : schema()` :: `column_info : table_info`. It takes a **required**
+target (a base-table or view name; unlike `view_info`'s optional filter) and
+emits one row per output column:
+
+```sql
+column_info('my_table')  -- one row per base-table column
+column_info('my_view')   -- one row per view output column
+```
+
+| Column | Meaning |
+|---|---|
+| `schema` | schema name (`main`, `temp`, …) the object resolved in. |
+| `name` | the table / view name. |
+| `cid` | column ordinal (0-based). Base table: column index. View: output-attribute index. Matches `table_info.cid` for a base table. |
+| `column_name` | the column's output name (the view's alias spelling for a renamed column). |
+| `is_updatable` | `'YES'` if a write to this column propagates to a base column (a `base` `UpdateSite`); `'NO'` if read-only (computed / generated / un-threaded lineage). |
+| `base_table` | owning base-table name for an updatable column; `null` for a read-only column. The per-column trace companion to `view_info.effective_targets`. |
+| `base_column` | owning base-column name for an updatable column; `null` for a read-only column. |
+
+**Static derivation.** For a **base table**, a column is updatable iff it is not
+`generated` (generated columns are computed/read-only — § Interaction with
+Constraints) — `base_table`/`base_column` are the column itself. For a **view**,
+the body is planned *logically* (the same `_buildPlan` path as `view_info()`, to
+preserve the operator tree that threads `updateLineage`) and each output
+attribute's backward `updateLineage` site is read: a `base` site (unwrapped
+through `null-extended`) resolving to its producing `TableReferenceNode` is
+`'YES'` with its base trace; everything else (`computed`, un-threaded, or a
+site that fails to resolve) is `'NO'` with `null` trace. No dry-run mutation, no
+new planner pass — the surface gains accuracy automatically as later phases
+thread more lineage (a view column fed by an un-threaded operator reads `'NO'`,
+the conservative, honest reading). Every `is_updatable='NO'` row carries `null`
+`base_table`/`base_column`.
+
+The `'YES'`/`'NO'` text encoding matches `information_schema.columns.is_updatable`
+and the `view_info` flags — deliberately **not** `table_info`'s integer `0`/`1`.
+
+**Materialized views** resolve to neither path — their user-facing name is not a
+`getView` hit (MVs live in a separate catalog) nor, by that name, a `_findTable`
+hit (the backing table is the reserved `_mv_<name>`) — so `column_info('an_mv')`
+throws not-found, consistent with `view_info` excluding MVs (read-only at the
+write boundary).
+
+**Why a dedicated TVF, not a `table_info` extension.** `table_info(name)`
+resolves base tables only (it reads `_findTable`); views live in a separate
+catalog map and carry none of the per-column metadata (`notnull` / `pk` /
+`dflt_value` / `collation` / `generated`) `table_info` emits. Extending
+`table_info` to views would force a whole second path that plans a view body and
+synthesizes every such field — over-coupling base-table introspection to body
+planning. A dedicated `column_info(name)` resolves *either* kind uniformly,
+emits only the column-granular updateability facts, and churns zero `table_info`
+goldens.
 
 ## Implementation Surface
 
@@ -704,7 +754,7 @@ boundary, so `view_info()` walks `getAllViews()` only.
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
 - `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. For a multi-source insert it first materializes `plan.envelope` once (the shared-surrogate envelope), evaluating the seed and minting `seed + ordinal` per row, then stashes the rows in `rctx.tableContexts` for the base ops' `EnvelopeScanNode`s. **Landed.** For a `returning` mutation it materializes and yields the view-projected rows: a relational base op (single-source) is drained and surfaced, or the separate `returning` re-query is captured before (delete) / after (update) the base ops.
 - `src/schema/view.ts` — `ViewSchema.effectiveTargets`, `ViewSchema.defaultsForColumn`, populated at view-creation time.
-- `src/func/builtins/schema.ts` — the `view_info()` TVF (§ Information Schema Surface): a read-only static projection over the planned body's `updateLineage` / `attributeDefaults` + base-column flags. Reads the backward surface; threads no new state.
+- `src/func/builtins/schema.ts` — the `view_info()` and `column_info(name)` TVFs (§ Information Schema Surface): read-only static projections over the planned body's `updateLineage` / `attributeDefaults` + base-column flags. `view_info()` is the view-level summary; `column_info(name)` is its column-granular companion, resolving either a base table (`!generated` per column) or a view (per-attribute `updateLineage`). Both read the backward surface; neither threads new state.
 
 Each surface mirrors a one-to-one correspondence with an existing engine surface: lineage parallels FDs, propagation parallels emission, and view metadata parallels table metadata. No new subsystem is introduced — view updateability is the existing FD / EC / predicate-normalization infrastructure consulted in the mutation direction.
 

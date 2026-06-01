@@ -680,6 +680,20 @@ function collectBodyNodes(root: RelationalPlanNode): RelationalPlanNode[] {
 }
 
 /**
+ * Index every `TableReferenceNode` in a planned body by its numeric node id.
+ * Shared by `deriveViewInfo` and `deriveColumnInfo`: an UpdateSite's `table`
+ * field is the producing reference's id, which both surfaces resolve back to a
+ * base-table name through this map.
+ */
+function buildTableRefsById(nodes: RelationalPlanNode[]): Map<number, TableReferenceNode> {
+	const tableRefsById = new Map<number, TableReferenceNode>();
+	for (const n of nodes) {
+		if (n instanceof TableReferenceNode) tableRefsById.set(Number(n.id), n);
+	}
+	return tableRefsById;
+}
+
+/**
  * True when any collected body node carries a `null-extended` lineage site —
  * the signature of a LEFT/RIGHT/FULL outer-join body (`deriveJoinUpdateLineage`
  * wraps the non-preserved side `null-extended`). `propagateMultiSource` rejects
@@ -733,10 +747,7 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// multi-source positive case (`ms_jv`) is untouched.
 	if (hasNullExtendedLineage(nodes)) return CONSERVATIVE_VIEW_INFO;
 
-	const tableRefsById = new Map<number, TableReferenceNode>();
-	for (const n of nodes) {
-		if (n instanceof TableReferenceNode) tableRefsById.set(Number(n.id), n);
-	}
+	const tableRefsById = buildTableRefsById(nodes);
 
 	// Output-column lineage: effective targets, the per-table set of base columns
 	// exposed by the projection, and the is_updatable flag (≥1 output column with
@@ -904,6 +915,178 @@ export const viewInfoFunc = createIntegratedTableValuedFunction(
 					jsonStringify(info.effectiveTargets),
 				] as Row;
 			}
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// column_info(name): per-column updateability surface.
+//
+// The column-granular companion to `view_info()` — the engine-idiomatic
+// realization of `docs/view-updateability.md` § Information Schema Surface's
+// `information_schema.columns.is_updatable`, covering every column of every base
+// table and plain (non-materialized) view. `view_info : schema()` ::
+// `column_info : table_info`.
+//
+// A dedicated TVF (not a `table_info` extension): `table_info` resolves base
+// tables only (`_findTable`), whereas views live in a separate catalog map and
+// carry none of the per-column metadata `table_info` emits. `column_info`
+// resolves *either* a base table or a view and emits only the column-granular
+// updateability facts, uniformly.
+//
+// Every value is derived **statically**: a base column's `is_updatable` is just
+// `!generated`; a view column's is read from the planned body's backward
+// `updateLineage` (the same substrate `view_info()` reads) — no dry-run
+// mutation, no new planner pass.
+// ---------------------------------------------------------------------------
+
+/** Per-column updateability facts for one emitted `column_info` row (pre-encoding). */
+interface ColumnInfoRow {
+	readonly schema: string;
+	readonly objectName: string;
+	readonly cid: number;
+	readonly columnName: string;
+	readonly isUpdatable: boolean;
+	readonly baseTable: string | null;
+	readonly baseColumn: string | null;
+}
+
+/**
+ * Derive the per-column updateability rows for a base table or plain view.
+ *
+ * **Base table** (`_findTable` hit) — every non-generated column is trivially a
+ * `base` write target; generated columns are computed/read-only. The `schema`
+ * comes straight off the resolved `TableSchema.schemaName`.
+ *
+ * **Plain view** (first `getView` hit across schemas, main→temp→attached order
+ * mirroring `_findTable`) — plan the body **logically** (via `_buildPlan`, not
+ * `getPlan`, for the same lineage-preservation reason as `deriveViewInfo`) and
+ * read each output attribute's backward `updateLineage` site. A `base` site
+ * (unwrapped through `null-extended`) that resolves to a `TableReferenceNode`
+ * is updatable and carries its base table/column trace; everything else is
+ * read-only with `null` trace.
+ *
+ * Throws `'<name>' not found` when neither resolves (parity with `table_info`'s
+ * required-target posture — `column_info` takes a *required* name, unlike
+ * `view_info`'s optional filter). A view body that fails to plan or yields no
+ * relational output produces *no rows* (logged) — the conservative, never-throw
+ * posture `view_info` takes, but at row granularity there is no all-`NO` row to
+ * emit. Materialized views resolve to neither path (their backing table is the
+ * reserved `_mv_<name>`), so an MV name throws not-found — consistent with
+ * `view_info` excluding MVs.
+ */
+function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
+	// Base table first (mirrors table_info's `_findTable`-only resolution).
+	const table = db._findTable(name);
+	if (table) {
+		return table.columns.map((col, i): ColumnInfoRow => {
+			const updatable = !col.generated;
+			return {
+				schema: table.schemaName,
+				objectName: table.name,
+				cid: i,
+				columnName: col.name,
+				isUpdatable: updatable,
+				baseTable: updatable ? table.name : null,
+				baseColumn: updatable ? col.name : null,
+			};
+		});
+	}
+
+	// View fallback: first `getView` hit across schemas (main → temp → attached,
+	// the insertion order `_getAllSchemas` yields — same order `_findTable` uses).
+	let view: ViewSchema | undefined;
+	let schemaName: string | undefined;
+	for (const schemaInstance of db.schemaManager._getAllSchemas()) {
+		const v = schemaInstance.getView(name);
+		if (v) { view = v; schemaName = schemaInstance.name; break; }
+	}
+	if (!view || schemaName === undefined) {
+		throw new QuereusError(`'${name}' not found`, StatusCode.ERROR);
+	}
+
+	try {
+		const { plan } = db._buildPlan([view.selectAst as AST.Statement]);
+		const root = plan.getRelations()[0];
+		if (!root) return [];
+
+		const tableRefsById = buildTableRefsById(collectBodyNodes(root));
+		const rootLineage = root.physical?.updateLineage;
+
+		const attrs = root.getAttributes();
+		const rows: ColumnInfoRow[] = [];
+		for (let i = 0; i < attrs.length; i++) {
+			const attr = attrs[i];
+			const bs = baseSiteOf(rootLineage?.get(attr.id));
+			const ref = bs ? tableRefsById.get(bs.table) : undefined;
+			// Updatable iff a base site resolves to a producing TableReferenceNode.
+			// A base id without a resolved ref should not happen (root lineage ids
+			// come from the collected nodes); fail conservative if it does.
+			const updatable = !!(bs && ref);
+			rows.push({
+				schema: schemaName,
+				objectName: view.name,
+				cid: i,
+				columnName: attr.name,
+				isUpdatable: updatable,
+				baseTable: updatable ? ref!.tableSchema.name : null,
+				baseColumn: updatable ? bs!.baseColumn : null,
+			});
+		}
+		return rows;
+	} catch (error) {
+		// A body that fails to plan (stale source, unsupported shape) yields no
+		// rows rather than throwing the whole TVF — logged so a genuinely
+		// unexpected failure is not silently swallowed.
+		log('column_info: no rows for view %s.%s: %s', schemaName, view.name,
+			error instanceof Error ? error.message : String(error));
+		return [];
+	}
+}
+
+// Per-column updateability function (table-valued function)
+export const columnInfoFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'column_info',
+		numArgs: 1,
+		deterministic: false, // Schema (and therefore lineage) can change
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'schema', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'cid', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'column_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'is_updatable', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'base_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'base_column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// `cid` (column 2) is the column ordinal — unique per emitted row.
+			keys: [[{ index: 2 }]],
+		},
+	},
+	async function* (db: Database, tableName: SqlValue): AsyncIterable<Row> {
+		if (typeof tableName !== 'string') {
+			throw new QuereusError('column_info() requires a table or view name string argument', StatusCode.ERROR);
+		}
+
+		for (const r of deriveColumnInfo(db, tableName)) {
+			yield [
+				r.schema,
+				r.objectName,
+				r.cid,
+				r.columnName,
+				yesNo(r.isUpdatable),
+				r.baseTable,
+				r.baseColumn,
+			] as Row;
 		}
 	}
 );
