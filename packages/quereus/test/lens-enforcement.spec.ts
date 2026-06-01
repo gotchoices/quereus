@@ -45,6 +45,17 @@ function slot(db: Database, table: string): LensSlot {
 	return s!;
 }
 
+/**
+ * The `mode` of every `enforced-set-level` obligation on a slot. Lets a test pin
+ * the prover's *classification* — `row-time` vs `commit-time` — rather than only
+ * the collector's output, which is `[]` for `row-time`, `proved`, AND `vacuous`
+ * keys alike and so cannot, on its own, distinguish a genuine row-time key from a
+ * key the body already proves.
+ */
+function setLevelModes(s: LensSlot): string[] {
+	return (s.obligations ?? []).flatMap(o => (o.kind === 'enforced-set-level' ? [o.mode] : []));
+}
+
 async function rows(db: Database, sql: string): Promise<unknown[]> {
 	const out: unknown[] = [];
 	for await (const r of db.eval(sql)) out.push(r);
@@ -698,6 +709,11 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 		const db = new Database();
 		try {
 			await deployRowTimeUniqueLens(db);
+			// Pin the classification itself, not just the collector: the unique(email)
+			// must be `enforced-set-level` `row-time` (the covering MV answers it). A
+			// `proved` key would also pass the two assertions below, so without this
+			// the suite could silently exercise a proved key instead of a row-time one.
+			expect(setLevelModes(slot(db, 'u')), 'unique classifies row-time').to.deep.equal(['row-time']);
 			// The commit-time count-subquery collector is the wrong class for a row-time
 			// key: detection + resolution ride the basis UC's covering-MV path, not this.
 			expect(collectLensSetLevelConstraints(slot(db, 'u')), 'row-time unique ⇒ []').to.deep.equal([]);
@@ -825,6 +841,7 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			await db.exec('apply schema x');
 
 			// No commit-time obligation — the row-time covering MV over `mail` answers it.
+			expect(setLevelModes(slot(db, 'u')), 'rename classifies row-time').to.deep.equal(['row-time']);
 			expect(collectLensSetLevelConstraints(slot(db, 'u')), 'rename row-time ⇒ []').to.deep.equal([]);
 
 			await db.exec(`insert into x.u (id, email) values (1, 'a@x')`);
@@ -839,21 +856,31 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 		}
 	});
 
-	it('re-keyed PK — logical PK on a non-basis-PK column backed by basis `unique(code)` + MV: detection + replace work', async () => {
+	it('re-keyed PK over a basis `unique(code)` is PROVED (not row-time) yet still resolves detection + replace through the basis key', async () => {
 		const db = new Database();
 		try {
-			// Basis `code` is NOT NULL (a PK is not NULL-distinct), unique, with a full
-			// covering MV `order by code` — so the logical PK re-keyed onto `code` classifies
-			// row-time, backed by the basis UC's covering-MV enforcement path.
+			// A logical PK is NOT NULL, so when the basis carries a matching NOT-NULL
+			// `unique(code)` the body *proves* the key outright ⇒ obligation `proved`,
+			// never `enforced-set-level`. A row-time PK is therefore unreachable for a
+			// faithful single-source projection: a basis UNIQUE+NOT-NULL proves it, and
+			// with no basis UNIQUE it falls to a `commit-time` scan (covered in the
+			// commit-time suite's re-keyed-PK case). The covering MV here is incidental.
+			// What this still pins: a re-keyed PK backed by a basis key resolves detection
+			// AND `or replace` end-to-end through that basis key (no lens code, as for the
+			// row-time class — both ride the basis structure).
 			await db.exec('declare schema y { table t (id integer primary key, code text, unique (code)) }');
 			await db.exec('apply schema y');
 			await db.exec('create materialized view y.ix_t_code as select code, id from y.t order by code');
-			// Logical re-keys the PK onto `code`, which the basis proves unique via the
-			// covering MV ⇒ row-time, not commit-time.
 			await db.exec('declare logical schema x { table t (code text primary key, id integer) }');
 			await db.exec('apply schema x');
 
-			expect(collectLensSetLevelConstraints(slot(db, 't')), 're-keyed row-time PK ⇒ []').to.deep.equal([]);
+			// The body proves the key ⇒ no set-level obligation at all (not row-time).
+			expect(setLevelModes(slot(db, 't')), 're-keyed PK over basis unique ⇒ proved, no set-level obligation').to.deep.equal([]);
+			expect(
+				(slot(db, 't').obligations ?? []).some(o => o.kind === 'proved' && o.constraint.kind === 'primaryKey'),
+				'the PK is classified proved',
+			).to.be.true;
+			expect(collectLensSetLevelConstraints(slot(db, 't')), 'proved PK ⇒ []').to.deep.equal([]);
 
 			await db.exec(`insert into x.t (code, id) values ('A', 1)`);
 			await db.exec(`insert into x.t (code, id) values ('B', 2)`);
@@ -861,6 +888,60 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			// Replace evicts the old code='A' row and lands the new one.
 			await db.exec(`insert or replace into x.t (code, id) values ('A', 9)`);
 			expect(await rows(db, `select id from x.t where code = 'A'`)).to.deep.equal([{ id: 9 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('composite row-time key — detection ABORTs a duplicate tuple, `or replace` resolves it (NULL-distinct holds)', async () => {
+		const db = new Database();
+		try {
+			// A two-column unique answered by a covering MV over both columns classifies
+			// row-time, so the basis UC's covering-MV path enforces the composite key with
+			// no lens code (the corner the source ticket flagged as untested).
+			await db.exec('declare schema y { table t (id integer primary key, a integer null, b integer null, unique (a, b)) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_t_ab as select a, b, id from y.t where a is not null and b is not null order by a, b');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer null, b integer null, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 't')), 'composite key classifies row-time').to.deep.equal(['row-time']);
+
+			await db.exec('insert into x.t (id, a, b) values (1, 1, 2)');
+			// A duplicate composite tuple ABORTs.
+			await expectThrows(() => db.exec('insert into x.t (id, a, b) values (2, 1, 2)'), /unique|constraint/i);
+			// REPLACE on the composite conflict evicts the prior row and lands the new one.
+			await db.exec('insert or replace into x.t (id, a, b) values (9, 1, 2)');
+			expect(await rows(db, 'select id from x.t where a = 1 and b = 2')).to.deep.equal([{ id: 9 }]);
+			// Any-NULL component ⇒ NULL-distinct, both accepted.
+			await db.exec('insert into x.t (id, a, b) values (10, 1, null)');
+			await db.exec('insert into x.t (id, a, b) values (11, 1, null)');
+			expect(await rows(db, 'select count(*) as n from x.t where a = 1 and b is null')).to.deep.equal([{ n: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('`on conflict (key) do update` upsert resolves through a row-time key — updates the existing row, no new row', async () => {
+		const db = new Database();
+		try {
+			// An upsert with a DO UPDATE action (vs. the DO NOTHING covered above) against a
+			// row-time key: the basis UC's covering-MV resolution applies the update to the
+			// conflicting row rather than inserting a duplicate. The other untested corner
+			// the source ticket called out.
+			await db.exec('declare schema y { table u (id integer primary key, email text null, n integer null, unique (email)) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, n integer null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 'u')), 'upsert target classifies row-time').to.deep.equal(['row-time']);
+
+			await db.exec(`insert into x.u (id, email, n) values (1, 'a@x', 10)`);
+			// The conflicting key triggers DO UPDATE on the existing row (id stays 1, n→77);
+			// no second row is inserted.
+			await db.exec(`insert into x.u (id, email, n) values (2, 'a@x', 99) on conflict (email) do update set n = 77`);
+			expect(await rows(db, 'select id, email, n from x.u order by id')).to.deep.equal([{ id: 1, email: 'a@x', n: 77 }]);
 		} finally {
 			await db.close();
 		}
@@ -874,6 +955,8 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
 			await db.exec('declare logical schema x { table u (id integer primary key, email text null, val integer, constraint nonneg check (val >= 0), unique (email)) }');
 			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 'u')), 'the unique classifies row-time').to.deep.equal(['row-time']);
 
 			await db.exec(`insert into x.u (id, email, val) values (1, 'a@x', 5)`);
 			// Row-local check ABORTs a bad row.
@@ -904,6 +987,8 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			// this is the intended conservative behavior (the commit-time key genuinely cannot
 			// replace-resolve), even though `email` alone is row-time-capable.
 			expect(hasCommitTimeSetLevelObligation(slot(db, 'u')), 'commit-time obligation present').to.be.true;
+			// Both classes genuinely co-exist on the slot (email row-time, code commit-time).
+			expect(setLevelModes(slot(db, 'u')).slice().sort(), 'one row-time + one commit-time key').to.deep.equal(['commit-time', 'row-time']);
 			await expectThrows(() => db.exec(`insert or replace into x.u (id, email, code) values (1, 'a@x', 'A')`), /covering|commit-time scan|conflict/i);
 		} finally {
 			await db.close();
