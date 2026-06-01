@@ -7,6 +7,8 @@ import { buildTableReference } from '../building/table.js';
 import type { MutationDiagnosticReason } from './mutation-diagnostic.js';
 import { rewriteViewInsert, rewriteViewUpdate, rewriteViewDelete, type MutableViewLike } from './single-source.js';
 import { isJoinBody, propagateMultiSource } from './multi-source.js';
+import { propagateDecomposition } from './decomposition.js';
+import type { StorageShape } from '../../vtab/mapping-advertisement.js';
 import type { ReservedTagMap } from './mutation-tags.js';
 
 export type { MutableViewLike } from './single-source.js';
@@ -172,6 +174,24 @@ export type MutationRequest =
 	| { readonly op: 'update'; readonly stmt: AST.UpdateStmt; readonly tags?: ReservedTagMap }
 	| { readonly op: 'delete'; readonly stmt: AST.DeleteStmt; readonly tags?: ReservedTagMap };
 
+/**
+ * The decomposition storage shape to fan a mutation out across, or `undefined`
+ * when the target is not a decomposition-backed logical table.
+ *
+ * Gated to the **synthesized** get body: a `primary-storage` advertisement with
+ * no `declare lens` override means the registered body is exactly the
+ * `compileDecompositionBody` join (`schema/lens-compiler.ts`), so the
+ * advertisement faithfully describes its members. A plain view / MV / name-match
+ * lens has no slot or no storage advertisement ⇒ `undefined` (unchanged path); an
+ * overridden lens carries a hand-authored body the advertisement does not
+ * describe, so it stays on the generic path too.
+ */
+function decompositionStorage(ctx: PlanningContext, view: MutableViewLike): StorageShape | undefined {
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	if (!slot || slot.override || slot.advertisement?.role !== 'primary-storage') return undefined;
+	return slot.advertisement.storage;
+}
+
 /** Resolve the base table named by a rewritten base-table DML statement. */
 function resolveBaseTable(
 	ctx: PlanningContext,
@@ -194,6 +214,16 @@ function resolveBaseTable(
  * diagnosed-and-rejected with a structured reason.
  */
 export function propagate(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): BaseOp[] {
+	// A logical table backed by a decomposition advertisement is registered as a
+	// view whose body is the synthesized `anchor ⋈ members` join. Routing it
+	// through the generic two-table join path below would be unsound (that path
+	// picks a single delete side, caps at two tables, and rejects the outer joins
+	// optional members ride). Intercept it and fan out off the advertisement.
+	const storage = decompositionStorage(ctx, view);
+	if (storage) {
+		return propagateDecomposition(ctx, view, storage, req);
+	}
+
 	// A join body decomposes through the multi-source planned-body walk; a
 	// single-table body through the single-source spine. The peek is a cheap AST
 	// check that builds no plan, so the single-source path is unchanged in cost.

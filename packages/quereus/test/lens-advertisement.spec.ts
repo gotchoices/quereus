@@ -761,12 +761,11 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 		}
 	});
 
-	it('write-rejected: a multi-source join body is read-correct but not updateable (insert/update/delete error)', async () => {
-		// The write direction is the sibling tickets (`lens-multi-source-put-fanout` /
-		// `-ind-injection`). Until they land, a join body is NOT a single-source
-		// updatable projection, so view-updateability must reject DML through it. Pin
-		// that boundary so a future change can't silently present a multi-source table
-		// as writable without wiring the put fan-out.
+	it('put fan-out: a decomposition body is update/delete-through, with insert deferred onto the surrogate envelope', async () => {
+		// `lens-multi-source-put-fanout` wires the advertisement-driven put fan-out
+		// (`planner/mutation/decomposition.ts`): a decomposition body routes off the
+		// generic join path to a member fan-out. DELETE/UPDATE ship; INSERT defers onto
+		// the shared-surrogate insert envelope (`view-mutation-shared-surrogate-insert`).
 		const db = new Database();
 		try {
 			const mod = new AdvertisingModule();
@@ -786,16 +785,22 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			db.registerModule('admod', mod);
 			await db.exec('create table Car_core (id integer primary key, make text) using admod');
 			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
-			await db.exec("insert into Car_core values (1, 'Honda')");
+			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
 			await db.exec('insert into Car_perf values (1, 180)');
 			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
 			await db.exec('apply schema x');
 
-			// All three DML directions are rejected by view-updateability (the body's
-			// top operator is a Join, not a single-source projection).
-			await expectThrows(() => db.exec("insert into x.Car (id, make, maxSpeed) values (2, 'Mazda', 200)"), /not updateable|cannot write through/i);
-			await expectThrows(() => db.exec("update x.Car set make = 'X' where id = 1"), /not updateable|cannot write through/i);
-			await expectThrows(() => db.exec('delete from x.Car where id = 1'), /not updateable|cannot write through/i);
+			// INSERT is deferred onto the shared-surrogate mutation-context envelope.
+			await expectThrows(() => db.exec("insert into x.Car (id, make, maxSpeed) values (3, 'Ford', 200)"), /shared-surrogate mutation-context envelope/i);
+
+			// UPDATE of an anchor-backed column fans out to that member.
+			await db.exec("update x.Car set make = 'Acura' where id = 1");
+			expect(await rows(db, 'select make from main.Car_core where id = 1')).to.deep.equal([{ make: 'Acura' }]);
+
+			// DELETE fans out to every member (anchor + optional).
+			await db.exec('delete from x.Car where id = 1');
+			expect(await rows(db, 'select id from main.Car_core order by id')).to.deep.equal([{ id: 2 }]);
+			expect(await rows(db, 'select id from main.Car_perf order by id')).to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
