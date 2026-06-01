@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import type { LensSlot } from '../../schema/lens.js';
+import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
 import type { RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
@@ -34,9 +34,20 @@ const log = createLogger('planner:lens-enforcement');
  * basis-term `EXISTS` existence check against the schema-qualified logical parent,
  * routed through the same constraint pipeline. Because the synthesized check
  * contains an `EXISTS`, the pipeline auto-defers it to commit — matching physical
- * child-side FK timing. Set-level (`unique` / primary key) obligations are NOT
- * handled here — they enforce via a covering-structure / commit-time scan, a
- * separate path. `proved` / `vacuous` need no enforcement.
+ * child-side FK timing.
+ *
+ * The `enforced-set-level` obligation with `mode: 'commit-time'` (a logical
+ * `unique` / primary key with no basis covering structure) is the third class
+ * handled here (see {@link collectLensSetLevelConstraints}): each becomes a
+ * deferred `(select count(*) from <logicalView> as _u where _u.lk = NEW.bk …) <= 1`
+ * CHECK over the logical key columns (logical names inside the subquery, basis
+ * names on the `NEW.*` side). Because it contains a scalar subquery the pipeline
+ * auto-defers it to commit, where the logical view reflects the post-mutation
+ * basis: a unique key sees count `1` (itself) and a duplicate count `≥ 2` ⇒ ABORT.
+ * Detection-only (no covering structure ⇒ O(n) per changed row); the row-time
+ * variant (`enforced-set-level` `mode: 'row-time'`, which unlocks conflict
+ * resolution) enforces via the covering structure on a separate path and is NOT
+ * handled here. `proved` / `vacuous` need no enforcement.
  */
 
 /** Marker tag stamped on a routed basis-term constraint so its lens origin is visible. */
@@ -183,4 +194,133 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 		});
 	}
 	return constraints;
+}
+
+/** The logical key column indices forming a primary-key / unique constraint. */
+function setLevelKeyColumns(c: Extract<LogicalConstraint, { kind: 'primaryKey' | 'unique' }>): readonly number[] {
+	return c.kind === 'primaryKey' ? c.columns.map(col => col.index) : c.constraint.columns;
+}
+
+/** The routed-constraint name for a set-level key (mirrors the FK `lens:fk:<name>` convention). */
+function setLevelConstraintName(c: Extract<LogicalConstraint, { kind: 'primaryKey' | 'unique' }>): string {
+	if (c.kind === 'primaryKey') return 'lens:pk';
+	return c.constraint.name ? `lens:unique:${c.constraint.name}` : 'lens:unique';
+}
+
+/**
+ * Builds the deferred count-subquery uniqueness predicate for one logical key:
+ *
+ *   (select count(*) from <logicalSchema>.<logicalTable> as _u
+ *      where _u.lk1 = NEW.bk1 and … and _u.lkn = NEW.bkn) <= 1
+ *
+ * The subquery FROM is the **logical view** (schema-qualified + aliased `_u`), so
+ * `_u.<logicalCol>` resolves against the registered logical relation while
+ * `NEW.<basisCol>` is the basis write row (a correlated reference resolved from the
+ * surrounding constraint scope, exactly as the FK `EXISTS` resolves `NEW.*`). The
+ * `count(*)` is a `count` with empty args — `astToString` renders it `count(*)` and
+ * the planner treats it as the row-count aggregate. The contained scalar subquery
+ * makes the constraint pipeline auto-defer the check to commit. NULL key columns
+ * fall out for free: `_u.lk = NEW.bk` is `NULL` (never true) when either side is
+ * NULL, so a NULL-key row is never counted — SQL UNIQUE's NULL-distinct rule.
+ */
+function synthesizeUniqueCountExpr(
+	logicalSchema: string,
+	logicalTable: string,
+	keyColumns: ReadonlyArray<{ logicalColumn: string; basisColumn: string }>,
+): AST.Expression {
+	const alias = '_u';
+	const conditions: AST.Expression[] = keyColumns.map(({ logicalColumn, basisColumn }) => ({
+		type: 'binary',
+		operator: '=',
+		left: { type: 'column', name: logicalColumn, table: alias } as AST.ColumnExpr,
+		right: { type: 'column', name: basisColumn, table: 'NEW' } as AST.ColumnExpr,
+	} as AST.BinaryExpr));
+
+	const whereExpr = conditions.reduce((acc, cond) => ({
+		type: 'binary',
+		operator: 'AND',
+		left: acc,
+		right: cond,
+	} as AST.BinaryExpr));
+
+	const subquery: AST.SelectStmt = {
+		type: 'select',
+		columns: [{ type: 'column', expr: { type: 'function', name: 'count', args: [] } as AST.FunctionExpr }],
+		from: [{
+			type: 'table',
+			table: { type: 'identifier', name: logicalTable, schema: logicalSchema },
+			alias,
+		} as AST.TableSource],
+		where: whereExpr,
+	};
+
+	return {
+		type: 'binary',
+		operator: '<=',
+		left: { type: 'subquery', query: subquery } as AST.SubqueryExpr,
+		right: { type: 'literal', value: 1 } as AST.LiteralExpr,
+	} as AST.BinaryExpr;
+}
+
+/**
+ * Builds the deferred set-level uniqueness CHECK constraints a lens write must
+ * enforce (the write side of the prover's `enforced-set-level` `commit-time`
+ * obligation). For each commit-time set-level key (no basis covering structure) it
+ * synthesizes the count-subquery `<= 1` predicate via {@link synthesizeUniqueCountExpr},
+ * with the logical key columns mapped to their basis columns on the `NEW.*` side
+ * (via the slot's reconstructible projection) and kept logical inside the subquery
+ * (they resolve against the registered logical view). The result is tagged with
+ * {@link LENS_BOUNDARY_ATTACHED_TAG} and routed through the basis write's constraint
+ * pipeline, where the contained scalar subquery auto-defers it to commit.
+ *
+ * Only the `commit-time` mode is emitted: a `row-time` key enforces through its
+ * covering structure on a separate path, and `proved` / `vacuous` keys need no
+ * enforcement. Returns `[]` when the slot is un-proved (`obligations` undefined) or
+ * carries no commit-time set-level key — the common case, so a non-lens / plain
+ * view / proved-key write pays nothing. DELETE never introduces a duplicate, so the
+ * caller restricts this to insert/update.
+ */
+export function collectLensSetLevelConstraints(slot: LensSlot): RowConstraintSchema[] {
+	if (!slot.obligations || slot.obligations.length === 0) return [];
+	const map = logicalToBasisColumnMap(slot);
+	const logicalSchemaName = slot.logicalTable.schemaName;
+	const logicalTableName = slot.logicalTable.name;
+	const constraints: RowConstraintSchema[] = [];
+	for (const obligation of slot.obligations) {
+		if (obligation.kind !== 'enforced-set-level' || obligation.mode !== 'commit-time') continue;
+		const c = obligation.constraint;
+		if (c.kind !== 'primaryKey' && c.kind !== 'unique') continue;
+		const logicalColumns = setLevelKeyColumns(c);
+		// The empty (singleton) key classifies `vacuous`, never commit-time set-level;
+		// guard defensively so an empty WHERE is never synthesized.
+		if (logicalColumns.length === 0) continue;
+		// Each logical key column → its basis column for the NEW.* side. A column the
+		// prover proved reconstructible maps; otherwise it falls back to the logical
+		// name (a non-reconstructible key would have made the table read-only — no
+		// write reaches here — but the fallback keeps the synthesis total).
+		const keyColumns = logicalColumns.map(li => {
+			const logicalColumn = slot.logicalTable.columns[li]?.name ?? `#${li}`;
+			return { logicalColumn, basisColumn: map.get(logicalColumn.toLowerCase()) ?? logicalColumn };
+		});
+		constraints.push({
+			name: setLevelConstraintName(c),
+			expr: synthesizeUniqueCountExpr(logicalSchemaName, logicalTableName, keyColumns),
+			// A duplicate is only introduced by an insert or a key-changing update;
+			// a delete cannot create one (and is excluded by the caller anyway).
+			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
+			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
+		});
+	}
+	return constraints;
+}
+
+/**
+ * Whether the slot carries any `enforced-set-level` `commit-time` obligation — the
+ * detection-only set-level class. The view-mutation builder consults this to reject
+ * `or replace` / `or ignore` (and matching upserts), which the commit-time scan
+ * cannot honor (row-time conflict resolution needs a covering structure). Returns
+ * `false` for a non-lens / plain view / proved- or row-time-keyed slot.
+ */
+export function hasCommitTimeSetLevelObligation(slot: LensSlot): boolean {
+	return (slot.obligations ?? []).some(o => o.kind === 'enforced-set-level' && o.mode === 'commit-time');
 }

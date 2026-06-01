@@ -34,11 +34,16 @@ const log = createLogger('schema:lens-prover');
  *  - **obligations + readOnly** — per-constraint enforcement classification and
  *    the writable-or-read-only verdict, recorded on the {@link LensSlot}. The
  *    *live* per-write enforcement wiring (`lens-constraint-enforcement-wiring`)
- *    consumes these: the row-local check pipeline and child-side FK existence
- *    check are shipped (`planner/mutation/lens-enforcement.ts` — the `enforced-fk`
- *    obligation is realized as a deferred basis-term `EXISTS` against the logical
- *    parent, gated by the `foreign_keys` pragma); set-level existence routing
- *    remains a follow-up. This module proves, classifies, and blocks/advises.
+ *    consumes these: the row-local check pipeline, the child-side FK existence
+ *    check, and the set-level commit-time uniqueness scan are shipped
+ *    (`planner/mutation/lens-enforcement.ts` — the `enforced-fk` obligation is a
+ *    deferred basis-term `EXISTS` against the logical parent gated by the
+ *    `foreign_keys` pragma; the `enforced-set-level` `commit-time` obligation is a
+ *    deferred `(select count(*) … ) <= 1` count-subquery CHECK over the logical key,
+ *    detection-only — `or replace`/`or ignore` against such a key is rejected). The
+ *    `enforced-set-level` `row-time` write path (covering structure, conflict-
+ *    resolution-capable) remains a follow-up. This module proves, classifies, and
+ *    blocks/advises.
  *
  * Soundness over completeness: a false error blocks a sound deploy, so every
  * check is conservative — when a fact cannot be established (e.g. the body fails

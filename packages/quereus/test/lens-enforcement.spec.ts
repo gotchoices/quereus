@@ -19,6 +19,7 @@ import { astToString } from '../src/emit/ast-stringify.js';
 import {
 	collectLensRowLocalConstraints,
 	collectLensForeignKeyConstraints,
+	collectLensSetLevelConstraints,
 	LENS_BOUNDARY_ATTACHED_TAG,
 } from '../src/planner/mutation/lens-enforcement.js';
 import type { LensSlot } from '../src/schema/lens.js';
@@ -457,6 +458,218 @@ describe('lens enforcement: child-side FK existence at the write boundary', () =
 			expect(exprSql, 'an EXISTS existence check').to.match(/exists/i);
 			expect(exprSql, 'over the qualified logical parent').to.match(/parent/i);
 			expect(exprSql, 'references the basis child column NEW.pid').to.match(/\bpid\b/i);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens enforcement: set-level (unique / PK) commit-time at the write boundary', () => {
+	it('a logical unique with no covering structure ABORTs a duplicate at commit (NULL-distinct)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			// Two distinct emails ⇒ ok.
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x'), (2, 'b@x')`);
+			// A second insert that duplicates an existing email ⇒ ABORT at commit.
+			await expectThrows(() => db.exec(`insert into x.u (id, email) values (3, 'a@x')`), /unique|constraint/i);
+			// The original survives — the duplicating insert rolled back.
+			expect(await rows(db, `select id from x.u where email = 'a@x'`)).to.deep.equal([{ id: 1 }]);
+			// Two NULL emails are both accepted (SQL UNIQUE is NULL-distinct).
+			await db.exec('insert into x.u (id, email) values (4, null)');
+			await db.exec('insert into x.u (id, email) values (5, null)');
+			expect(await rows(db, 'select count(*) as n from x.u where email is null')).to.deep.equal([{ n: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a re-keyed PK (commit-time set-level) ABORTs a duplicate logical key', async () => {
+		const db = new Database();
+		try {
+			// Basis keys on `id`; the logical table re-keys on `code` — reconstructible but
+			// not basis-proved ⇒ the PK routes to a commit-time set-level scan.
+			await db.exec('declare schema y { table t (id integer primary key, code text) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (code text primary key, id integer) }');
+			await db.exec('apply schema x');
+
+			await db.exec(`insert into x.t (code, id) values ('A', 1)`);
+			await db.exec(`insert into x.t (code, id) values ('B', 2)`); // distinct code ⇒ ok
+			// Duplicate code (distinct basis id, so the basis PK does not catch it) ⇒ ABORT.
+			await expectThrows(() => db.exec(`insert into x.t (code, id) values ('A', 3)`), /primary|unique|constraint/i);
+			expect(await rows(db, `select id from x.t where code = 'A'`)).to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the synthesized count check references the basis column on NEW and the logical column inside the subquery (rename override)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, mail text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('declare lens for x over y { view u as select id, mail as email from y.u }');
+			await db.exec('apply schema x');
+
+			const routed = collectLensSetLevelConstraints(slot(db, 'u'));
+			expect(routed.length, 'one routed set-level check').to.equal(1);
+			expect(routed[0].tags?.[LENS_BOUNDARY_ATTACHED_TAG], 'boundary marker present').to.equal(true);
+			expect(routed[0].name, 'anonymous unique ⇒ lens:unique').to.equal('lens:unique');
+			const exprSql = astToString(routed[0].expr);
+			expect(exprSql, 'a count(*) existence-count check').to.match(/count\(\*\)/i);
+			expect(exprSql, 'compared <= 1').to.match(/<=\s*1/);
+			expect(exprSql, 'NEW side uses the basis column `mail`').to.match(/\bmail\b/i);
+			expect(exprSql, 'subquery side keeps the logical column `email`').to.match(/\bemail\b/i);
+
+			// And it enforces in basis terms: a duplicate email aborts; the basis stores `mail`.
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x')`);
+			await expectThrows(() => db.exec(`insert into x.u (id, email) values (2, 'a@x')`), /unique|constraint/i);
+			expect(await rows(db, 'select mail from y.u where id = 1')).to.deep.equal([{ mail: 'a@x' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a composite unique key: all-/any-NULL tuples allowed, a fully-non-NULL duplicate ABORTs', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer null, b integer null, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			// (1, NULL) twice ⇒ both allowed (the b=NULL term makes the equality NULL, never counted).
+			await db.exec('insert into x.t (id, a, b) values (1, 1, null)');
+			await db.exec('insert into x.t (id, a, b) values (2, 1, null)');
+			expect(await rows(db, 'select count(*) as n from x.t where a = 1 and b is null')).to.deep.equal([{ n: 2 }]);
+			// (1, 2) twice ⇒ the second ABORTs.
+			await db.exec('insert into x.t (id, a, b) values (3, 1, 2)');
+			await expectThrows(() => db.exec('insert into x.t (id, a, b) values (4, 1, 2)'), /unique|constraint/i);
+			expect(await rows(db, 'select count(*) as n from x.t where a = 1 and b = 2')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an UPDATE that creates a duplicate ABORTs; one that keeps the key unique succeeds', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x'), (2, 'b@x')`);
+			// Update row 2's key to collide with row 1 ⇒ ABORT (row 2 unchanged).
+			await expectThrows(() => db.exec(`update x.u set email = 'a@x' where id = 2`), /unique|constraint/i);
+			expect(await rows(db, 'select email from x.u where id = 2')).to.deep.equal([{ email: 'b@x' }]);
+			// Update to a still-unique key ⇒ ok.
+			await db.exec(`update x.u set email = 'c@x' where id = 2`);
+			expect(await rows(db, 'select email from x.u where id = 2')).to.deep.equal([{ email: 'c@x' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an intra-statement duplicate (two new rows sharing the key) ABORTs the whole statement', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			await expectThrows(() => db.exec(`insert into x.u (id, email) values (1, 'dup'), (2, 'dup')`), /unique|constraint/i);
+			expect(await rows(db, 'select count(*) as n from x.u')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('deferred timing — a transient duplicate resolved before commit commits cleanly; still-duplicate ABORTs', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x')`);
+
+			// Transiently duplicate, then resolved by deleting the original before commit.
+			await db.exec('begin');
+			await db.exec(`insert into x.u (id, email) values (2, 'a@x')`); // dup at this point
+			await db.exec('delete from x.u where id = 1'); // resolves it
+			await db.exec('commit');
+			expect(await rows(db, `select id from x.u where email = 'a@x'`)).to.deep.equal([{ id: 2 }]);
+
+			// A state still duplicate at commit ABORTs.
+			await expectThrows(async () => {
+				await db.exec('begin');
+				await db.exec(`insert into x.u (id, email) values (3, 'a@x')`); // collides with id=2
+				await db.exec('commit');
+			}, /unique|constraint/i);
+			// id=2's row is the only 'a@x' (the failed txn rolled back).
+			expect(await rows(db, `select id from x.u where email = 'a@x'`)).to.deep.equal([{ id: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects `or replace` / `or ignore` / upsert against a commit-time set-level key; `or abort` / plain insert pass', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+
+			await expectThrows(() => db.exec(`insert or ignore into x.u (id, email) values (1, 'a@x')`), /covering|commit-time scan|conflict/i);
+			await expectThrows(() => db.exec(`insert or replace into x.u (id, email) values (1, 'a@x')`), /covering|commit-time scan|conflict/i);
+			await expectThrows(() => db.exec(`insert into x.u (id, email) values (1, 'a@x') on conflict (email) do nothing`), /covering|commit-time scan|conflict/i);
+
+			// `or abort` and a plain insert are NOT rejected (still subject to the duplicate check).
+			await db.exec(`insert or abort into x.u (id, email) values (1, 'a@x')`);
+			await db.exec(`insert into x.u (id, email) values (2, 'b@x')`);
+			expect(await rows(db, 'select count(*) as n from x.u')).to.deep.equal([{ n: 2 }]);
+			// The duplicate check still bites under `or abort`.
+			await expectThrows(() => db.exec(`insert or abort into x.u (id, email) values (3, 'a@x')`), /unique|constraint/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a proved key (faithful projection of the basis PK) ⇒ collector returns [], write unaffected', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, val integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, val integer) }');
+			await db.exec('apply schema x');
+			expect(collectLensSetLevelConstraints(slot(db, 't')), 'proved PK ⇒ []').to.deep.equal([]);
+			await db.exec('insert into x.t (id, val) values (1, 7)');
+			expect(await rows(db, 'select val from x.t where id = 1')).to.deep.equal([{ val: 7 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a row-time key (a non-stale basis covering MV answers it) ⇒ collector returns [] (only commit-time emits)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema y');
+			// Explicit basis covering MV over the UNIQUE columns ⇒ the unique classifies row-time.
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema x');
+			expect(collectLensSetLevelConstraints(slot(db, 'u')), 'row-time unique ⇒ []').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}

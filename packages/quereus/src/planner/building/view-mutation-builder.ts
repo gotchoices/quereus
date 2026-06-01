@@ -10,7 +10,8 @@ import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/dec
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { collectMutationTags } from '../mutation/mutation-tags.js';
-import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints } from '../mutation/lens-enforcement.js';
+import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints, collectLensSetLevelConstraints, hasCommitTimeSetLevelObligation } from '../mutation/lens-enforcement.js';
+import { ConflictResolution } from '../../common/constants.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
@@ -55,6 +56,13 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 		return buildMultiSourceInsert(ctx, view, req.stmt);
 	}
 
+	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
+	// covering structure) enforces via an O(n) deferred count scan, which cannot
+	// perform `or replace` / `or ignore` (row-time conflict resolution needs the
+	// covering structure). Reject those up front so a write that would silently
+	// ABORT-at-commit instead of skipping/replacing is caught with a clear diagnostic.
+	rejectLensSetLevelConflictResolution(ctx, view, req);
+
 	const baseOps = propagate(ctx, view, withTags(req, tags));
 	// Lens row-local enforcement: when the target is a lens-backed logical table,
 	// its prover-classified `enforced-row-local` CHECK obligations (rewritten to
@@ -67,10 +75,16 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// against the schema-qualified logical parent — gated by the `foreign_keys`
 	// pragma exactly like the physical child-side FK, so a lens write enforces the
 	// logical FK with matching gating + commit-time timing even when the basis
-	// carries no such FK. DELETE writes no NEW child row, so neither class applies.
+	// carries no such FK.
+	// Lens set-level enforcement (the `enforced-set-level` `commit-time` obligation):
+	// each logical unique / primary key with no basis covering structure rides the
+	// same seam as a deferred `(select count(*) … ) <= 1` count-subquery CHECK over
+	// the logical key columns — auto-deferred to commit, where a duplicate logical
+	// key sees count ≥ 2 ⇒ ABORT. DELETE writes no NEW row and can introduce no
+	// duplicate, so none of the three classes apply there.
 	const extraConstraints = req.op === 'delete'
 		? []
-		: [...lensRowLocalConstraints(ctx, view), ...lensForeignKeyConstraints(ctx, view)];
+		: [...lensRowLocalConstraints(ctx, view), ...lensForeignKeyConstraints(ctx, view), ...lensSetLevelConstraints(ctx, view)];
 	const children = baseOps.map(op => buildBaseOp(ctx, op, extraConstraints));
 
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
@@ -172,6 +186,48 @@ function lensForeignKeyConstraints(ctx: PlanningContext, view: MutableViewLike):
 	if (!ctx.db.options.getBooleanOption('foreign_keys')) return [];
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	return slot ? collectLensForeignKeyConstraints(slot, ctx.schemaManager) : [];
+}
+
+/**
+ * The lens set-level (`unique` / primary key) count-subquery constraints for a
+ * view-mediated write, or `[]` when the target is not a lens-backed logical table
+ * or the lens has no commit-time set-level obligation (a proved / row-time key, a
+ * plain view / MV). No pragma gate — set-level uniqueness is not a `foreign_keys`
+ * concern.
+ */
+function lensSetLevelConstraints(ctx: PlanningContext, view: MutableViewLike): RowConstraintSchema[] {
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	return slot ? collectLensSetLevelConstraints(slot) : [];
+}
+
+/**
+ * Reject a conflict-resolution write the commit-time set-level scan cannot honor.
+ * The detection-only count scan (no basis covering structure) can only ABORT on a
+ * duplicate; it cannot replace or skip the offending row — that requires the
+ * row-time covering structure (the sibling `lens-set-level-rowtime-enforcement`).
+ * So an `insert or replace` / `or ignore` (or any upsert) against a logical table
+ * with a commit-time set-level key is rejected up front rather than silently
+ * ABORTing at commit instead of replacing/skipping. `or abort` / `or fail` /
+ * `or rollback` (and a plain insert) are fine — they ABORT, consistent with
+ * detection-only. UPDATE carries no statement-level OR clause, so only INSERT is
+ * gated. Upsert matching the key is awkward to disambiguate, so v1 conservatively
+ * rejects **any** upsert when a commit-time set-level obligation is present.
+ */
+function rejectLensSetLevelConflictResolution(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): void {
+	if (req.op !== 'insert') return;
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	if (!slot || !hasCommitTimeSetLevelObligation(slot)) return;
+
+	const reject = (clause: string): never => raiseMutationDiagnostic({
+		reason: 'lens-set-level-conflict-resolution',
+		table: view.name,
+		message: `cannot ${clause} through lens-backed table '${view.name}': its logical unique/primary key has no basis covering structure, so it enforces via an O(n) commit-time scan that cannot perform row-time conflict resolution`,
+		suggestion: 'Add a basis covering materialized view (order by the key columns) to upgrade the key to row-time enforcement, or use a plain insert (which ABORTs on a duplicate).',
+	});
+
+	if (req.stmt.onConflict === ConflictResolution.REPLACE) reject('insert or replace');
+	if (req.stmt.onConflict === ConflictResolution.IGNORE) reject('insert or ignore');
+	if (req.stmt.upsertClauses && req.stmt.upsertClauses.length > 0) reject('upsert (on conflict do …)');
 }
 
 /** Attach the merged override tags to the request (discriminant preserved). */
