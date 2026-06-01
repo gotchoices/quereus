@@ -121,3 +121,77 @@ insert into evt_v with context now_ms = 12345 values (1), (2);
 
 select * from evt order by id;
 → [{"id":1,"created":12345},{"id":2,"created":12345}]
+
+-- ===================================
+-- Phase 2: Multi-source key-preserving inner join — update / delete write-through.
+-- The body is a two-table inner equi-join; writes route per owning base side via
+-- a subquery over the join body (the row-identifying predicate). The owning side
+-- can be the table whose PK the projection hides (ms_parent below).
+-- See docs/view-updateability.md § Inner Join, § Multi-Base-Table Mutations.
+-- ===================================
+
+create table ms_parent (pid integer primary key, label text);
+create table ms_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references ms_parent(pid));
+insert into ms_parent values (10, 'P10'), (20, 'P20');
+insert into ms_child values (1, 10, 'a'), (2, 10, 'b'), (3, 20, 'c');
+
+create view ms_jv as
+    select c.cid as cid, c.note as note, p.label as label
+    from ms_child c join ms_parent p on p.pid = c.pref;
+
+-- read-through over the join
+select * from ms_jv order by cid;
+→ [{"cid":1,"note":"a","label":"P10"},{"cid":2,"note":"b","label":"P10"},{"cid":3,"note":"c","label":"P20"}]
+
+-- UPDATE routed to the child side only (note is owned by ms_child).
+update ms_jv set note = 'A' where cid = 1;
+select cid, pref, note from ms_child order by cid;
+→ [{"cid":1,"pref":10,"note":"A"},{"cid":2,"pref":10,"note":"b"},{"cid":3,"pref":20,"note":"c"}]
+
+-- UPDATE routed to the parent side (label is owned by ms_parent, whose PK is
+-- hidden by the projection — identified through the join). cid=1 joins pid=10.
+update ms_jv set label = 'P10x' where cid = 1;
+select * from ms_parent order by pid;
+→ [{"pid":10,"label":"P10x"},{"pid":20,"label":"P20"}]
+
+-- the parent update is visible to every child row joining pid=10.
+select * from ms_jv order by cid;
+→ [{"cid":1,"note":"A","label":"P10x"},{"cid":2,"note":"b","label":"P10x"},{"cid":3,"note":"c","label":"P20"}]
+
+-- UPDATE touching BOTH sides -> two ordered base ops (FK-parent before FK-child).
+update ms_jv set note = 'C', label = 'P20x' where cid = 3;
+select cid, note from ms_child order by cid;
+→ [{"cid":1,"note":"A"},{"cid":2,"note":"b"},{"cid":3,"note":"C"}]
+select * from ms_parent order by pid;
+→ [{"pid":10,"label":"P10x"},{"pid":20,"label":"P20x"}]
+
+-- DELETE routes to the FK-many (child) side by default; the parent stays in place.
+delete from ms_jv where cid = 2;
+select cid from ms_child order by cid;
+→ [{"cid":1},{"cid":3}]
+select pid from ms_parent order by pid;
+→ [{"pid":10},{"pid":20}]
+
+-- the deleted child row is gone from the view.
+select cid from ms_jv order by cid;
+→ [{"cid":1},{"cid":3}]
+
+-- ===================================
+-- Multi-source rejections (still diagnosed-and-rejected this phase).
+-- ===================================
+
+-- A computed (non-invertible) join column is read-only.
+create view ms_jv_c as
+    select c.cid as cid, p.label || '!' as banner
+    from ms_child c join ms_parent p on p.pid = c.pref;
+update ms_jv_c set banner = 'z' where cid = 1;
+-- error: read-only
+
+-- INSERT through a join view needs the shared-surrogate context (later phase).
+insert into ms_jv (cid, note, label) values (9, 'q', 'P10x');
+-- error: multi-source
+
+-- RETURNING through a join view is not yet supported.
+delete from ms_jv where cid = 1 returning cid;
+-- error: RETURNING through view

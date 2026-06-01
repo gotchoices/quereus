@@ -9,7 +9,8 @@ actually shipped:
 |---|---|---|
 | **Phase 1** | Single-source projection-and-filter views: `insert` / `update` / `delete` route to the base table. Constant-FD defaults from equality selection predicates, base-column defaults, identity/rename projection lineage, `OR`-clause conflict resolution, and the `no-inverse` / `predicate-contradiction` / `recursive-cte` / body-shape diagnostics. | **Shipped** |
 | **Phase 1b** | Per-statement mutation-context threading through the view boundary (one captured value stamped across every base row of the statement). Single-base per-row generator cadence rides the base table's column defaults. | **Shipped (single-base)** |
-| Phases 2–7 | Multi-source / outer joins, set-ops, aggregates, RETURNING-through-views, nested/recursive CTE bodies, the `quereus.update.*` tag override surface, shared-surrogate fan-out threading. | Not shipped — rejected at plan time with a structured diagnostic. |
+| **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
+| Phase 2b+ | Multi-source **insert** (the shared join key is not a view column → needs the per-row shared-surrogate mutation-context envelope), **RETURNING-through-views**, outer joins, set-ops, aggregates, nested/recursive CTE bodies, the `quereus.update.*` tag override surface (incl. `delete_via`), composite-key and `> 2`-table joins, self-joins, cross-source `set` values. | Not shipped — rejected at plan time with a structured diagnostic. |
 
 **Implementation note (Phase 1).** Phase 1 ships **via the view-mutation
 substrate** (single-source = one base op). A view-targeted DML whose body
@@ -37,11 +38,17 @@ pass-through on the access / Retrieve / Alias boundary nodes), surfaces it throu
 `query_plan()`, and exposes the predicate-honest complement (`viewComplement`).
 The `ViewMutationNode` substrate **has landed** as the single propagation path
 for all view mutations: the single-source case decomposes to exactly one base op
-(parity-equivalent to the retired AST rewrite). What the `updateLineage`
-annotation surface is **not yet** consumed by is the **multi-source** backward
-walk — the substrate emitting *more than one* FD/EC-driven base op for a join /
-set-op body — which is the remaining Phase-2 piece. The retire-or-keep decision
-is settled under `view-mutation-plan-node-substrate`: the AST rewrite is
+(parity-equivalent to the retired AST rewrite). The **multi-source** backward
+walk — the substrate emitting *more than one* base op — **has landed for the
+key-preserving inner-join `update` / `delete` case** (`planner/mutation/multi-source.ts`):
+a join body routes here, where the planned body's `updateLineage` decides each
+output column's owning base table and a subquery over the join body reconstructs
+the per-side row-identifying predicate (lowered back to AST so the base builders
+are reused untouched). What the surface is **not yet** consumed by is the
+multi-source **insert** (which needs the shared-surrogate mutation-context
+envelope), RETURNING-through-views, and the broader join shapes (outer / set-op /
+aggregate / `> 2`-table / self-join), all still rejected. The retire-or-keep
+decision is settled under `view-mutation-plan-node-substrate`: the AST rewrite is
 **retired** in favor of the substrate; `building/view-mutation.ts` has been
 removed (the single-source rewrite it held now lives in
 `planner/mutation/single-source.ts`, behind `propagate`).
@@ -182,6 +189,20 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 - **Deletes** propagate to the child with `parent_predicate ∧ user_predicate`.
 
 ### Inner Join
+
+> **Shipped (Phase 2a) — `update` / `delete` only.** A two-table inner equi-join
+> body decomposes through `planner/mutation/multi-source.ts`. Each output column is
+> routed to its owning base table by the planned body's `updateLineage`; an
+> `update` emits one base `update` per touched side (FK-parent before FK-child),
+> and a `delete` emits one base `delete` on the FK-many (child) side. Both identify
+> rows by a **subquery over the join body** — `<owning>.<pk> in (select <alias>.<pk>
+> from <join> where <predicate>)` — which reconstructs the row-identifying predicate
+> even when the owning side's PK is hidden by the projection. The base statement is
+> lowered back to AST so the ordinary base-table builders (and all their constraint
+> / conflict / FK machinery) are reused verbatim. **Still rejected:** multi-source
+> `insert` (shared-surrogate, below), composite-PK or `> 2`-table joins, self-joins,
+> cross-source `set` values, `select *` join bodies, and the `delete_via` tag
+> override (the FK-many default is the only delete policy until the tag surface lands).
 
 The lineage of an inner-join output column traces unambiguously to one of the two child relations (EC propagation makes column membership precise even for equi-join columns).
 
@@ -363,6 +384,12 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 
 ## `returning` Clauses
 
+> **Not yet shipped.** RETURNING through a view (single- or multi-source) is
+> rejected with the `returning-through-view` diagnostic. Supporting it requires
+> promoting `ViewMutationNode` to a relational node, capturing the post-mutation
+> view image, and revisiting the `block.ts` result-shadowing exclusion. Tracked by
+> `view-mutation-returning-through-view`.
+
 `insert`, `update`, and `delete` through a view support `returning`. The returned rows are projected through the **view's** column list, not the base tables'. The engine evaluates the view body against the post-mutation state to produce returning rows — equivalently, against the captured per-operation results, since the view's lineage maps base rows back to view rows.
 
 `returning` columns of `computed` lineage (a view-level computed expression) are evaluated against the post-mutation base values.
@@ -377,6 +404,15 @@ Bindings have two cadences:
 
 - **Per-statement** — a captured `now`, a bound parameter. Evaluated once; stable across every row and every base operation the statement emits (transaction-time semantics).
 - **Per-row** — a sequence, a surrogate allocator. Evaluated once *per top-level row produced*, so a multi-row insert mints a distinct value per row. The captured context records the per-row values, preserving replay.
+
+> **Not yet shipped (the shared-surrogate worked example below).** Multi-source
+> `insert` and per-row shared-surrogate threading across sibling base ops are
+> rejected today (`unsupported-multisource-insert`): the mutation context is
+> currently per-base-op, so there is no envelope that resolves one `next_rid()`
+> per row and shares it across both base inserts. Tracked by
+> `view-mutation-multisource-insert`. Multi-source `update` / `delete` (shipped)
+> do not need this: they address existing rows by a subquery over the join, not by
+> minting a shared key.
 
 When a per-row generated value also serves as a **join key shared across base tables** — the surrogate that an n-way decomposition joins on — the single captured per-row value threads through every branch of the fan-out. Because it is resolved at the envelope *before* propagation reaches the branches, every branch references one already-captured binding: there is no "which branch generates first" ordering question, and the branches cannot diverge. This is what makes an insert into a relation backed by a shared-surrogate decomposition well-defined — one generation, captured, shared across the fan-out.
 
@@ -464,8 +500,9 @@ Diagnostics include a suggestion when one applies — for instance, `no-default`
   (`classifyInvertibility`) and the recursive `traceInvertibleColumn` that composes the inverse chain.
 - `src/planner/analysis/view-complement.ts` — `viewComplement(node)` / `complementOf`, the
   predicate-honest complement derived off the backward walk (for the lens prover).
-- `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed** for the single-source spine (one base op via `single-source.ts`); the multi-source walk (one method per operator type, mirroring `runtime/emit/`) is Phase-2. Also hosts `classifyViewBody`.
+- `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed.** A single-table body routes to the single-source spine (`single-source.ts`); a join body routes to the multi-source walk (`multi-source.ts`). Also hosts `classifyViewBody`.
 - `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.**
+- `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition (`propagateMultiSource`), reading the planned body's `updateLineage` to emit an ordered multi-element `BaseOp[]` for `update` / `delete`, lowered to AST. **Landed** (insert rejected with `unsupported-multisource-insert`).
 - `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.**
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
 - `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. **Landed** (side-effect only; accumulating `returning` rows lands with RETURNING-through-view).

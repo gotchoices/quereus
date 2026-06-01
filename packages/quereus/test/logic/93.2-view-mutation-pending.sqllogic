@@ -26,10 +26,20 @@ create view vu as select id from t union all select id from t2;
 insert into vu (id) values (1);
 -- error: cannot write through view
 
--- Join body (multi-source) — Phase 2.
+-- Join body (multi-source inner join): update / delete write-through is SHIPPED
+-- (see 93.4-view-mutation.sqllogic). INSERT through a join still rejects — the
+-- shared join key is not a view column (needs the per-row shared-surrogate
+-- mutation context, a later phase).
 create view vj as select t.id as tid from t join t2 on t.id = t2.id;
 
-update vj set tid = 9 where tid = 1;
+insert into vj (tid) values (9);
+-- error: multi-source
+
+-- Outer (left) join body: a non-preserved-side write needs row materialization,
+-- which is a later phase — still rejected.
+create view voj as select t.id as tid, t2.name as n2 from t left join t2 on t.id = t2.id;
+
+update voj set n2 = 'q' where tid = 1;
 -- error: cannot write through view
 
 -- VALUES body: no base-table lineage.

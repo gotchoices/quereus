@@ -88,7 +88,7 @@ function flattenAnd(expr: AST.Expression): AST.Expression[] {
 }
 
 /** Conjoin two optional predicates with AND. */
-function combineAnd(a: AST.Expression | undefined, b: AST.Expression | undefined): AST.Expression | undefined {
+export function combineAnd(a: AST.Expression | undefined, b: AST.Expression | undefined): AST.Expression | undefined {
 	if (a && b) return { type: 'binary', operator: 'AND', left: a, right: b };
 	return a ?? b;
 }
@@ -99,7 +99,7 @@ function combineAnd(a: AST.Expression | undefined, b: AST.Expression | undefined
  * (the replacement is already in base terms). Subqueries are passed through
  * un-rewritten — a Phase-1 limitation noted in the docs.
  */
-function transformExpr(
+export function transformExpr(
 	expr: AST.Expression,
 	substitute: (col: AST.ColumnExpr) => AST.Expression | undefined,
 ): AST.Expression {
@@ -150,7 +150,7 @@ function transformExpr(
 }
 
 /** Deep structural clone of an expression. */
-function cloneExpr(expr: AST.Expression): AST.Expression {
+export function cloneExpr(expr: AST.Expression): AST.Expression {
 	return transformExpr(expr, () => undefined);
 }
 

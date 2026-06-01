@@ -1,7 +1,18 @@
 description: The `put` direction of n-way decomposition — propagate a logical-table mutation (insert / update / delete) as an ordered fan-out across every basis member of the decomposition, with a shared key that may be a surrogate supplied by a basis default and **evaluated once per logical row and threaded** across all branches so members agree on identity, optional members handled per outer-join semantics, and the singleton degenerate case. Rides the view-mutation substrate (`ViewMutationNode` / `propagate()` / multi-element `BaseOp[]`) and the evaluate-once-and-thread mutation-context cadences. Consumes the existence facts from `lens-multi-source-ind-injection` for put soundness. Design source: `docs/lens.md` § "The Default Mapper" (shared-key surrogate, evaluate-once-and-thread, singleton).
-prereq: lens-multi-source-get-synthesis, lens-multi-source-ind-injection, view-mutation-substrate-core, view-mutation-multisource-innerjoin
+prereq: lens-multi-source-get-synthesis, lens-multi-source-ind-injection, view-mutation-substrate-core, view-mutation-multisource-innerjoin, view-mutation-shared-surrogate-insert
 files: packages/quereus/src/schema/lens-compiler.ts, packages/quereus/src/vtab/mapping-advertisement.ts, packages/quereus/src/planner/mutation/propagate.ts, packages/quereus/src/planner/nodes/view-mutation-node.ts, packages/quereus/src/runtime/emit/view-mutation.ts, packages/quereus/src/planner/building/insert.ts, packages/quereus/src/planner/building/update.ts, packages/quereus/src/planner/building/delete.ts, docs/lens.md, docs/view-updateability.md
 ----
+
+<!-- prereq-update (2026-05-31): surrogate envelope moved to a dedicated ticket -->
+> **The per-row shared-surrogate envelope this ticket rides is NOT in 3.2.**
+> `view-mutation-multisource-innerjoin` (3.2) shipped multi-source **update / delete** only and
+> **deferred** multi-source insert + the per-row shared-surrogate mutation-context envelope to
+> `view-mutation-shared-surrogate-insert` (3.6, in `implement/`). That follow-on builds the
+> evaluate-once-per-row-and-thread surface (both `per-statement` and `per-row` cadences) this
+> ticket's surrogate threading consumes — so it is now a prereq. Build the fan-out against the
+> envelope 3.6 ships, not against 3.2. (3.2's `multi-source.ts` decomposition + `ViewMutationNode`
+> sequencing emitter is still the host for the fan-out shape; only the surrogate envelope moved.)
+<!-- /prereq-update -->
 
 <!-- prereq-correction (2026-05-31) -->
 > **PREREQ CORRECTED — was mis-dispatched; this ticket should defer, not run yet.**

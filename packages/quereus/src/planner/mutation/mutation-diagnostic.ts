@@ -24,6 +24,9 @@ export type MutationDiagnosticReason =
 	| 'no-base-lineage'            // VALUES body / no reachable base table
 	| 'nested-view'                // body sources another view / CTE (inline-propagation deferred)
 	| 'unsupported-source'         // INSERT source shape we cannot thread filter defaults through yet
+	| 'unsupported-multisource-insert' // INSERT into a join view — needs the shared-surrogate context (later phase)
+	| 'cross-source-assignment'    // UPDATE value references a base table other than the column it assigns
+	| 'delete-ambiguous'           // DELETE through a join with no provable FK-child and no delete_via tag
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
 	| 'lens-read-only';            // logical table whose PK is not reconstructible at the lens boundary
 

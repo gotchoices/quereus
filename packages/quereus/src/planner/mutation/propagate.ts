@@ -6,6 +6,7 @@ import { TableReferenceNode } from '../nodes/reference.js';
 import { buildTableReference } from '../building/table.js';
 import type { MutationDiagnosticReason } from './mutation-diagnostic.js';
 import { rewriteViewInsert, rewriteViewUpdate, rewriteViewDelete, type MutableViewLike } from './single-source.js';
+import { isJoinBody, propagateMultiSource } from './multi-source.js';
 
 export type { MutableViewLike } from './single-source.js';
 
@@ -173,12 +174,25 @@ function resolveBaseTable(
 
 /**
  * Decompose a view-/MV-mediated mutation into an ordered list of base-table
- * operations — the single propagation path for all view mutations. The
- * single-source projection-and-filter spine reuses the relocated rewrite
- * (`single-source.ts`) to produce exactly one `BaseOp`; multi-source fan-out is
- * the next phase and returns more entries.
+ * operations — the single propagation path for all view mutations.
+ *
+ * - A **single-source** projection-and-filter spine reuses the relocated rewrite
+ *   (`single-source.ts`) to produce exactly one `BaseOp`.
+ * - A **two-table key-preserving inner join** body routes to the planned-body
+ *   walk (`multi-source.ts`), which reads `updateLineage` to emit an ordered
+ *   multi-element `BaseOp[]` for `update` / `delete` (insert is a later phase).
+ *
+ * Broader shapes (outer joins, set-ops, aggregates, > 2 tables) stay
+ * diagnosed-and-rejected with a structured reason.
  */
 export function propagate(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): BaseOp[] {
+	// A join body decomposes through the multi-source planned-body walk; a
+	// single-table body through the single-source spine. The peek is a cheap AST
+	// check that builds no plan, so the single-source path is unchanged in cost.
+	if (isJoinBody(view.selectAst)) {
+		return propagateMultiSource(ctx, view, req);
+	}
+
 	switch (req.op) {
 		case 'insert': {
 			const statement = rewriteViewInsert(ctx, req.stmt, view);

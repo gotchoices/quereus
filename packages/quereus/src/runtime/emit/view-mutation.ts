@@ -1,33 +1,53 @@
 import type { ViewMutationNode } from '../../planner/nodes/view-mutation-node.js';
 import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
-import type { RuntimeValue } from '../../common/types.js';
+import type { RuntimeValue, OutputValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { emitPlanNode } from '../emitters.js';
+import { emitCallFromPlan } from '../emitters.js';
+import { isAsyncIterable } from '../utils.js';
 
 /**
  * Emit a view-/MV-mediated mutation.
  *
- * Each child is a fully-built base-table DML subtree (Sink-topped for the
- * non-RETURNING single-source spine). The children are passed as params, so the
- * scheduler evaluates them — draining each Sink fires its base write — in list
- * order before this instruction runs. For the single-source spine there is
- * exactly one child, so this degenerates to driving that one base op.
+ * Each base op is a fully-built base-table DML subtree (Sink-topped for the
+ * non-RETURNING spine). They are emitted as **callbacks** (`emitCallFromPlan`
+ * wraps each subtree in its own sub-program) rather than bare params, then this
+ * instruction's `run` invokes them **sequentially**, awaiting each to completion
+ * before starting the next.
  *
- * RETURNING-through-view is rejected until 3.2, so the node is a side-effect
- * statement: it yields nothing. The block emitter treats it like a Sink for
- * result selection.
+ * This sequencing is load-bearing for multi-source decomposition: the scheduler
+ * kicks off sibling params concurrently (it does not await one before starting
+ * the next — see `Scheduler.runAsync`), so a bare-param fan-out would interleave
+ * the base writes and lose the FK-parent-before-child ordering that `propagate`
+ * decided. Driving the callbacks in list order here makes the emitted order the
+ * executed order. For the single-source spine there is exactly one base op, so
+ * this degenerates to driving that one to completion (parity with the prior
+ * single-param form).
+ *
+ * RETURNING-through-view is rejected until a later phase, so every base op is a
+ * side-effect statement that yields nothing and this node yields nothing; the
+ * block emitter treats it like a Sink for result selection.
  */
 export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): Instruction {
-	const children = plan.baseOps.map(op => emitPlanNode(op, ctx));
+	const callbacks = plan.baseOps.map(op => emitCallFromPlan(op, ctx));
 
-	function run(_rctx: RuntimeContext, ..._args: RuntimeValue[]): null {
-		// Side effects already fired via the param children (the base ops).
+	async function run(rctx: RuntimeContext, ...cbs: RuntimeValue[]): Promise<null> {
+		for (const cb of cbs) {
+			// Each callback is `(ctx) => program.run(ctx)` — run the base op's
+			// sub-program to completion before advancing to the next base op.
+			const result = (cb as (c: RuntimeContext) => OutputValue)(rctx);
+			const resolved = result instanceof Promise ? await result : result;
+			// A Sink-topped base op resolves to null; defensively drain a relational
+			// result (a future RETURNING op) so its writes fire before the next op.
+			if (isAsyncIterable(resolved)) {
+				for await (const _row of resolved) { /* drain side effects */ }
+			}
+		}
 		return null;
 	}
 
 	return {
-		params: children,
+		params: callbacks,
 		run: run as InstructionRun,
-		note: `viewMutation(${children.length} base op${children.length === 1 ? '' : 's'})`,
+		note: `viewMutation(${callbacks.length} base op${callbacks.length === 1 ? '' : 's'})`,
 	};
 }

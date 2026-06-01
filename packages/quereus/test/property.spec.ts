@@ -2630,6 +2630,124 @@ describe('Property-Based Tests', () => {
 			expect(full.hiddenColumns.length).to.equal(0);
 			expect(full.residualPredicate).to.equal(undefined);
 		});
+
+		// ----- Multi-source (key-preserving inner join): dynamic PutGet / GetPut -----
+		// The derived-put acceptance gate for the inner-join backward method. A
+		// two-table FK join view, written through `update` / `delete`, must reflect
+		// exactly the mutation's effect on the writable columns across BOTH base
+		// tables, and never perturb a base row outside the join (an unjoined child).
+		// Insert-through-join is a later phase (shared-surrogate context), so it is
+		// not exercised here. Mirrors the single-source PutGet/GetPut above.
+		describe('multi-source inner join', () => {
+			type Parent = { pp: number; pv: number };
+			type Child = { cc: number; pr: number; cv: number };
+
+			async function createJoinBase(): Promise<void> {
+				// FK declared (so the delete_via walk proves the child side) but
+				// enforcement off, so a dangling child (an unjoined row the inner join
+				// hides) can exist — that is the row PutGet must never touch.
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists jv');
+				await db.exec('drop table if exists jchild');
+				await db.exec('drop table if exists jparent');
+				await db.exec('create table jparent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table jchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references jparent(pp)) using memory');
+				await db.exec('create view jv as select c.cc as cc, c.cv as cv, p.pv as pv from jchild c join jparent p on p.pp = c.pr');
+			}
+
+			async function seedJoin(parents: Parent[], children: Child[]): Promise<{ parents: Parent[]; children: Child[] }> {
+				await db.exec('delete from jchild');
+				await db.exec('delete from jparent');
+				const pSeen = new Set<number>(); const pk: Parent[] = [];
+				for (const p of parents) {
+					if (pSeen.has(p.pp)) continue;
+					pSeen.add(p.pp);
+					await db.exec(`insert into jparent values (${p.pp}, ${p.pv})`);
+					pk.push(p);
+				}
+				const cSeen = new Set<number>(); const ck: Child[] = [];
+				for (const c of children) {
+					if (cSeen.has(c.cc)) continue;
+					cSeen.add(c.cc);
+					await db.exec(`insert into jchild values (${c.cc}, ${c.pr}, ${c.cv})`);
+					ck.push(c);
+				}
+				return { parents: pk, children: ck };
+			}
+
+			async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+				const out: Record<string, SqlValue>[] = [];
+				for await (const row of db.eval(sql)) out.push(row as Record<string, SqlValue>);
+				return out;
+			}
+
+			const parentArb = fc.array(fc.record({ pp: fc.integer({ min: 1, max: 5 }), pv: fc.integer({ min: 1, max: 9 }) }), { maxLength: 5 });
+			const childArb = fc.array(fc.record({
+				cc: fc.integer({ min: 1, max: 9 }),
+				pr: fc.integer({ min: 1, max: 6 }),   // 6 > max parent pp, so some children are unjoined
+				cv: fc.integer({ min: 1, max: 9 }),
+			}), { maxLength: 10 });
+
+			it('PutGet: an update/delete through a join view never escapes the join, across both bases', async () => {
+				await createJoinBase();
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					fc.constantFrom('update-child', 'update-parent', 'delete'),
+					fc.integer({ min: 1, max: 9 }),    // cc predicate value K
+					fc.integer({ min: 10, max: 20 }),  // assignment value NV (disjoint from seeds)
+					async (parents, children, op, K, NV) => {
+						const { parents: P, children: C } = await seedJoin(parents, children);
+						const ppSet = new Set(P.map(p => p.pp));
+						const joined = (c: Child): boolean => ppSet.has(c.pr);
+
+						let oChildren = C.map(c => ({ ...c }));
+						let oParents = P.map(p => ({ ...p }));
+						if (op === 'update-child') {
+							await db.exec(`update jv set cv = ${NV} where cc = ${K}`);
+							oChildren = oChildren.map(c => (c.cc === K && joined(c)) ? { ...c, cv: NV } : c);
+						} else if (op === 'update-parent') {
+							await db.exec(`update jv set pv = ${NV} where cc = ${K}`);
+							const target = C.find(c => c.cc === K && joined(c));
+							if (target) oParents = oParents.map(p => p.pp === target.pr ? { ...p, pv: NV } : p);
+						} else {
+							await db.exec(`delete from jv where cc = ${K}`);
+							oChildren = oChildren.filter(c => !(c.cc === K && joined(c)));
+						}
+
+						assertRowsEqual(`PutGet/${op} child`, await readRows('select cc, pr, cv from jchild'),
+							oChildren.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), ['cc', 'pr', 'cv']);
+						assertRowsEqual(`PutGet/${op} parent`, await readRows('select pp, pv from jparent'),
+							oParents.map(p => ({ pp: p.pp, pv: p.pv })), ['pp', 'pv']);
+
+						// get(baseAfter): the view image is exactly the joined children paired
+						// with the post-state parent value.
+						const pvAfter = new Map(oParents.map(p => [p.pp, p.pv]));
+						const expectedView = oChildren.filter(c => ppSet.has(c.pr))
+							.map(c => ({ cc: c.cc, cv: c.cv, pv: pvAfter.get(c.pr)! }));
+						assertRowsEqual(`PutGet/${op} view image`, await readRows('select cc, cv, pv from jv'),
+							expectedView, ['cc', 'cv', 'pv']);
+					},
+				), { numRuns: 60 });
+			});
+
+			it('GetPut: writing read values back through the join view leaves both bases unchanged', async () => {
+				await createJoinBase();
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					async (parents, children) => {
+						await seedJoin(parents, children);
+						const view = await readRows('select cc, cv, pv from jv');
+						fc.pre(view.length > 0);
+						const r = view[0];
+						const beforeC = await readRows('select cc, pr, cv from jchild');
+						const beforeP = await readRows('select pp, pv from jparent');
+						await db.exec(`update jv set cv = ${String(r.cv)}, pv = ${String(r.pv)} where cc = ${String(r.cc)}`);
+						assertRowsEqual('GetPut child', await readRows('select cc, pr, cv from jchild'), beforeC, ['cc', 'pr', 'cv']);
+						assertRowsEqual('GetPut parent', await readRows('select pp, pv from jparent'), beforeP, ['pp', 'pv']);
+					},
+				), { numRuns: 60 });
+			});
+		});
 	});
 
 });
