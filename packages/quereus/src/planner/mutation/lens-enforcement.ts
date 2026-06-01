@@ -1,8 +1,9 @@
 import type * as AST from '../../parser/ast.js';
 import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
-import type { RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
-import { RowOpFlag } from '../../schema/table.js';
+import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema } from '../../schema/table.js';
+import { RowOpFlag, resolveReferencedColumns } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
+import { resolveSlotBasisSource } from '../../schema/lens-prover.js';
 import { transformExpr } from './single-source.js';
 import { synthesizeFKExistsExpr } from '../building/foreign-key-builder.js';
 import { createLogger } from '../../common/logger.js';
@@ -150,6 +151,159 @@ function resolveLogicalReferencedColumns(
 }
 
 /**
+ * Whether the lens body is a faithful, **non-row-reducing** projection of its
+ * single basis source — every basis row maps 1:1 to a logical row, so the logical
+ * relation's row set equals the basis relation's on any projected column. True iff
+ * none of the row-reducing clauses are present. `orderBy` is row-preserving (it
+ * reorders, never drops) and is ignored; `from` single-sourcedness is established
+ * separately by {@link resolveSlotBasisSource} returning the basis table.
+ */
+function isNonRowReducingProjection(body: AST.SelectStmt): boolean {
+	return body.where === undefined
+		&& (body.groupBy === undefined || body.groupBy.length === 0)
+		&& body.having === undefined
+		&& !body.distinct
+		&& body.limit === undefined
+		&& body.offset === undefined
+		&& body.union === undefined
+		&& body.compound === undefined
+		&& body.withClause === undefined;
+}
+
+/** Encodes a `(childCol, parentCol)` basis index pair as an order-independent set key. */
+function pairKey(childCol: number, parentCol: number): string {
+	return `${childCol}:${parentCol}`;
+}
+
+/**
+ * The `(basisChildCol → basisParentCol)` index pair-set of the logical FK, mapped
+ * through the child and parent slots' reconstructible projections, or `undefined`
+ * when any column is not a plain basis-column projection (a name-only fallback, or
+ * an unresolved index) — which disqualifies elision. Implements redundancy
+ * conditions (1) and the parent half of (2): every logical FK child column maps
+ * with no transform to a `basisChild` column, and every logical referenced column
+ * maps with no transform to a `basisParent` column.
+ */
+function mappedFkBasisPairs(
+	slot: LensSlot,
+	fk: ForeignKeyConstraintSchema,
+	parentSlot: LensSlot,
+	logicalParentColumns: readonly string[],
+	basisChild: TableSchema,
+	basisParent: TableSchema,
+): Set<string> | undefined {
+	const childMap = logicalToBasisColumnMap(slot);
+	const parentMap = logicalToBasisColumnMap(parentSlot);
+	const pairs = new Set<string>();
+	for (let i = 0; i < fk.columns.length; i++) {
+		const childLogical = slot.logicalTable.columns[fk.columns[i]]?.name;
+		if (childLogical === undefined) return undefined;
+		const childBasisName = childMap.get(childLogical.toLowerCase());
+		if (childBasisName === undefined) return undefined; // name-only fallback ⇒ not value-preserving
+		const childBasisCol = basisChild.columnIndexMap.get(childBasisName.toLowerCase());
+		if (childBasisCol === undefined) return undefined;
+
+		const parentBasisName = parentMap.get(logicalParentColumns[i].toLowerCase());
+		if (parentBasisName === undefined) return undefined; // parent col not a plain projection
+		const parentBasisCol = basisParent.columnIndexMap.get(parentBasisName.toLowerCase());
+		if (parentBasisCol === undefined) return undefined;
+
+		pairs.add(pairKey(childBasisCol, parentBasisCol));
+	}
+	return pairs.size > 0 ? pairs : undefined;
+}
+
+/**
+ * Whether `basisChild` declares an FK whose unordered `(childCol → parentCol)`
+ * index pair-set equals `mappedPairs` and references `basisParent` (schema + name).
+ * Implements redundancy condition (2): the basis write's own `buildChildSideFKChecks`
+ * already enforces this FK, so a matching one subsumes the lens-level check. The
+ * comparison is an unordered *set* of index pairs (mirrors `lookupCoveringFK`'s
+ * positional `equiMap` reasoning) — a permuted basis FK (same columns, different
+ * pairing) yields a different pair-set and must NOT match; a partial FK fails the
+ * arity check.
+ */
+function basisCarriesEquivalentFk(
+	basisChild: TableSchema,
+	basisParent: TableSchema,
+	mappedPairs: ReadonlySet<string>,
+): ForeignKeyConstraintSchema | undefined {
+	for (const bfk of basisChild.foreignKeys ?? []) {
+		if (bfk.referencedTable.toLowerCase() !== basisParent.name.toLowerCase()) continue;
+		const bfkParentSchema = (bfk.referencedSchema ?? basisChild.schemaName).toLowerCase();
+		if (bfkParentSchema !== basisParent.schemaName.toLowerCase()) continue;
+		if (bfk.columns.length !== mappedPairs.size) continue;
+		let refCols: readonly number[];
+		try {
+			refCols = resolveReferencedColumns(bfk, basisParent);
+		} catch {
+			continue;
+		}
+		if (refCols.length !== bfk.columns.length) continue;
+		const bfkPairs = new Set<string>();
+		for (let j = 0; j < bfk.columns.length; j++) {
+			bfkPairs.add(pairKey(bfk.columns[j], refCols[j]));
+		}
+		if (bfkPairs.size === mappedPairs.size && [...mappedPairs].every(p => bfkPairs.has(p))) {
+			return bfk;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Whether the lens-level child-side FK check for `fk` is **provably** redundant
+ * with an equivalent FK the basis child write already enforces via
+ * `buildChildSideFKChecks` — so the lens-level `EXISTS` is pure double-enforcement
+ * cost (`docs/lens.md` § Constraint Attachment). All three conditions must hold;
+ * **any** gap (multi-source child, non-plain mapping, missing/permuted basis FK, no
+ * parent lens slot, a parent body that might filter rows) returns `false`, defaulting
+ * to enforce — a false `true` would silently drop enforcement (a soundness hole).
+ *
+ *  1. **Single-source, value-preserving child mapping** — the child slot resolves to
+ *     one basis child table and every logical FK child column maps with no transform
+ *     to a plain basis child column.
+ *  2. **Equivalent basis FK** — `basisChild` carries an FK whose unordered
+ *     `(basisChildCol → basisParentCol)` pair-set equals the mapped one, referencing
+ *     the basis parent (this also requires every referenced column to map plainly).
+ *  3. **Row-set equivalence of the referenced relation** — the logical parent's lens
+ *     slot resolves and its compiled body is a faithful, non-row-reducing projection
+ *     of the basis parent, so the logical parent's row set ⊇ the basis parent's on the
+ *     referenced columns (the basis check therefore implies the lens check).
+ *
+ * Returns the subsuming basis FK (for the elision log) or `undefined` to enforce.
+ */
+function lensForeignKeyRedundant(
+	slot: LensSlot,
+	fk: ForeignKeyConstraintSchema,
+	referencedSchema: string,
+	logicalParentColumns: readonly string[],
+	schemaManager: SchemaManager,
+): ForeignKeyConstraintSchema | undefined {
+	// (1) single-source child basis table.
+	const basisChild = resolveSlotBasisSource(slot, schemaManager);
+	if (!basisChild) return undefined;
+
+	// (3) parent lens slot + its single basis source must resolve; defer the
+	// row-set-equivalence clause check until after the cheap structural checks.
+	const parentSlot = schemaManager.getSchema(referencedSchema)?.getLensSlot(fk.referencedTable);
+	if (!parentSlot) return undefined;
+	const basisParent = resolveSlotBasisSource(parentSlot, schemaManager);
+	if (!basisParent) return undefined;
+
+	// (1) + parent half of (2): map every FK column pair to plain basis columns.
+	const mappedPairs = mappedFkBasisPairs(slot, fk, parentSlot, logicalParentColumns, basisChild, basisParent);
+	if (!mappedPairs) return undefined;
+
+	// (3) the logical parent is a faithful, non-row-reducing projection of the basis
+	// parent (a `where` / join / aggregation makes it a strict subset ⇒ not provable).
+	if (!isNonRowReducingProjection(parentSlot.compiledBody)) return undefined;
+
+	// (2) an equivalent basis FK subsumes the lens-level check.
+	return basisCarriesEquivalentFk(basisChild, basisParent, mappedPairs);
+}
+
+/**
  * Builds the basis-term child-side FK existence constraints a lens write must
  * enforce (the write side of the prover's `enforced-fk` obligation). For each FK
  * obligation it synthesizes a MATCH SIMPLE-guarded `EXISTS` against the
@@ -159,6 +313,15 @@ function resolveLogicalReferencedColumns(
  * tagged with {@link LENS_BOUNDARY_ATTACHED_TAG} and routed through the basis
  * write's constraint pipeline, where the contained `EXISTS` auto-defers it to commit
  * — matching physical child-side FK gating + timing.
+ *
+ * v1 **double-enforces by design**: the lens check is emitted even when the basis
+ * carries the equivalent FK (always sound). The bounded optimization here elides the
+ * lens-level check **only when it is provably redundant** with a basis FK the
+ * re-planned basis write already enforces (see {@link lensForeignKeyRedundant}) —
+ * every uncertain case still double-enforces. Redundancy is decided against the
+ * *current* basis FK set (read here, not stored on the obligation) so the elision is
+ * exactly as sound as the physical `buildChildSideFKChecks`, which also reads the
+ * basis FKs at plan time.
  *
  * Gated by the caller on the `foreign_keys` pragma. Returns `[]` when the slot is
  * un-proved (`obligations` undefined) or carries no FK obligation — the common case.
@@ -181,6 +344,15 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 		if (parentColumns.length !== fk.columns.length) {
 			log('lens FK %s: parent column count (%d) != child column count (%d); skipping',
 				fk.name ?? '<anon>', parentColumns.length, fk.columns.length);
+			continue;
+		}
+		// Elide the lens-level check when the basis child write provably already
+		// enforces an equivalent FK (every uncertain case still double-enforces).
+		const subsuming = lensForeignKeyRedundant(slot, fk, referencedSchema, parentColumns, schemaManager);
+		if (subsuming) {
+			log('lens FK %s on %s: elided — provably subsumed by basis FK %s referencing %s (the re-planned basis write enforces it)',
+				fk.name ?? '<anon>', slot.logicalTable.name,
+				subsuming.name ?? '<anon>', subsuming.referencedTable);
 			continue;
 		}
 		// Rewrite each FK child column index → logical name → basis column. A column

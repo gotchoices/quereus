@@ -1,4 +1,5 @@
 import type { Database } from '../core/database.js';
+import type { SchemaManager } from './manager.js';
 import type { TableSchema, UniqueConstraintSchema } from './table.js';
 import { resolvePkDefaultConflict } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
@@ -266,7 +267,7 @@ function buildProveContext(slot: LensSlot, db: Database): ProveContext {
 		outputColumns,
 		outputIndex,
 		root: planBody(db, slot.compiledBody),
-		basisSource: resolveSingleBasisSource(db, slot.compiledBody, basisSchemaName),
+		basisSource: resolveSingleBasisSource(db.schemaManager, slot.compiledBody, basisSchemaName),
 		basisSchemaName,
 	};
 }
@@ -307,13 +308,25 @@ function planBody(db: Database, body: AST.SelectStmt): RelationalPlanNode | unde
 }
 
 /** The single basis `table` source of a body, or undefined for a multi-source / opaque FROM. */
-function resolveSingleBasisSource(db: Database, body: AST.SelectStmt, basisSchemaName: string): TableSchema | undefined {
+function resolveSingleBasisSource(schemaManager: SchemaManager, body: AST.SelectStmt, basisSchemaName: string): TableSchema | undefined {
 	const from = body.from;
 	if (!from || from.length !== 1) return undefined;
 	const node = from[0];
 	if (node.type !== 'table') return undefined;
 	const schemaName = node.table.schema ?? basisSchemaName;
-	return db.schemaManager.getSchema(schemaName)?.getTable(node.table.name);
+	return schemaManager.getSchema(schemaName)?.getTable(node.table.name);
+}
+
+/**
+ * The single basis `table` source of a lens slot's compiled body, or undefined for
+ * a multi-source / opaque FROM — the exported slot-level entry point. Reused by the
+ * lens FK-redundancy detector (`planner/mutation/lens-enforcement.ts`) so it walks
+ * the same single-source `from` the prover does, resolving a bare table name against
+ * the slot's own default basis schema. Reads only the catalog, so it is safe over a
+ * lightweight (un-planned) caller.
+ */
+export function resolveSlotBasisSource(slot: LensSlot, schemaManager: SchemaManager): TableSchema | undefined {
+	return resolveSingleBasisSource(schemaManager, slot.compiledBody, slot.defaultBasis.schemaName);
 }
 
 // ---------------------------------------------------------------------------
@@ -987,7 +1000,7 @@ function buildLiteProveContext(slot: LensSlot, db: Database): ProveContext {
 		outputColumns,
 		outputIndex,
 		root: undefined,
-		basisSource: resolveSingleBasisSource(db, slot.compiledBody, basisSchemaName),
+		basisSource: resolveSingleBasisSource(db.schemaManager, slot.compiledBody, basisSchemaName),
 		basisSchemaName,
 	};
 }

@@ -476,6 +476,136 @@ describe('lens enforcement: child-side FK existence at the write boundary', () =
 	});
 });
 
+describe('lens enforcement: child-side FK basis-redundancy elision', () => {
+	it('elides the lens FK when the basis carries the equivalent FK over a faithful default parent (no correctness change)', async () => {
+		const db = new Database();
+		try {
+			// Basis declares the SAME FK (child.pid → parent.id); the logical bodies are
+			// the faithful default projection ⇒ the basis write's own child-side FK check
+			// subsumes the lens-level one, so the collector elides it.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager), 'redundant lens FK elided').to.deep.equal([]);
+
+			// No correctness change: a dangling insert still ABORTs — now via the basis FK
+			// the re-planned basis write enforces.
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await expectThrows(() => db.exec('insert into x.child (id, pid) values (10, 99)'), /fk|constraint|foreign/i);
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10')).to.deep.equal([{ n: 0 }]);
+			// A satisfying insert and a NULL FK both still behave correctly.
+			await db.exec('insert into x.child (id, pid) values (11, 1)');
+			await db.exec('insert into x.child (id, pid) values (12, null)');
+			expect(await rows(db, 'select id, pid from x.child where id in (11, 12) order by id')).to.deep.equal([{ id: 11, pid: 1 }, { id: 12, pid: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a composite FK elides when the basis carries the equivalent composite FK (same pair-set)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager), 'equivalent composite basis FK elides').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a permuted basis composite FK (references parent(py, px)) does NOT elide — double-enforces', async () => {
+		const db = new Database();
+		try {
+			// Basis FK pairs (a→py, b→px); the logical FK pairs (a→px, b→py). The pair-sets
+			// differ ⇒ the basis FK is NOT equivalent ⇒ the lens-level check is retained.
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_perm foreign key (a, b) references parent(py, px)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager).length, 'permuted basis FK ⇒ retained').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('no basis FK ⇒ enforce (does not over-elide)', async () => {
+		const db = new Database();
+		try {
+			// Basis has NO FK ⇒ the basis write enforces nothing ⇒ the lens-level check
+			// must be retained, and a dangling insert must still ABORT.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager).length, 'no basis FK ⇒ lens check retained').to.equal(1);
+			await db.exec('insert into y.child values (500, 999)'); // basis accepts dangling (no basis FK)
+			await expectThrows(() => db.exec('insert into x.child (id, pid) values (10, 99)'), /fk_pid|constraint|foreign/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a parent override with a `where` ⇒ does NOT elide (row-set-equivalence fails); a basis-only value still ABORTs', async () => {
+		const db = new Database();
+		try {
+			// The basis carries the equivalent FK, but the logical parent is a strict
+			// subset of the basis parent (filtered `where id > 0`), so the basis check does
+			// NOT imply the lens check — the lens-level check MUST be retained. This is the
+			// soundness-critical case.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('declare lens for x over y { view parent as select id, name from y.parent where id > 0 }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager).length, 'filtered parent ⇒ lens check retained').to.equal(1);
+
+			// A value that exists in the BASIS parent but is filtered OUT of the logical
+			// parent (id = -5) passes the basis FK yet must ABORT at the lens (no logical
+			// parent row id = -5).
+			await db.exec(`insert into y.parent (id, name) values (-5, 'neg'), (1, 'pos')`);
+			await expectThrows(() => db.exec('insert into x.child (id, pid) values (10, -5)'), /fk_pid|constraint|foreign/i);
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10')).to.deep.equal([{ n: 0 }]);
+			// A value present in the logical parent (id = 1) succeeds.
+			await db.exec('insert into x.child (id, pid) values (11, 1)');
+			expect(await rows(db, 'select pid from x.child where id = 11')).to.deep.equal([{ pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a rename override on the child still elides when the basis FK is on the basis column', async () => {
+		const db = new Database();
+		try {
+			// Child maps logical `pid` → basis `basis_pid`; the basis FK is on `basis_pid`.
+			// Condition (1) holds (plain rename), so the mapped pair-set equals the basis
+			// FK's ⇒ elide. The parent is the faithful default projection.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, basis_pid integer null, constraint fk foreign key (basis_pid) references parent(id)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('declare lens for x over y { view child as select id, basis_pid as pid from y.child }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager), 'rename-over-basis-FK elides').to.deep.equal([]);
+
+			// Still enforces via the basis FK: dangling ABORTs, satisfied succeeds.
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await expectThrows(() => db.exec('insert into x.child (id, pid) values (10, 99)'), /fk|constraint|foreign/i);
+			await db.exec('insert into x.child (id, pid) values (11, 1)');
+			expect(await rows(db, 'select basis_pid from y.child where id = 11')).to.deep.equal([{ basis_pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens enforcement: set-level (unique / PK) commit-time at the write boundary', () => {
 	it('a logical unique with no covering structure ABORTs a duplicate at commit (NULL-distinct)', async () => {
 		const db = new Database();
