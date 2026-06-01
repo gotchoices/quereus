@@ -45,6 +45,22 @@ create view adults_bare as select name, age from adults where country = 'US';
 select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('adults_bare');
 → [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"adults\"]"}]
 
+-- The crux, load-bearing: the projected-away pinned column is NOT NULL with no
+-- declared default, so insertability hinges ENTIRELY on the whole-spine
+-- constant-FD recovery (the pin lives on the Filter, below the projection that
+-- drops the column). Without it, this would be 'NO' — contrast nn_unpinned below.
+create table nn_adults (name text primary key, age integer, country text not null);
+create view nn_pinned as select name, age from nn_adults where country = 'US';
+select is_insertable_into, is_deletable, effective_targets from view_info('nn_pinned');
+→ [{"is_insertable_into":"YES","is_deletable":"YES","effective_targets":"[\"nn_adults\"]"}]
+
+-- Negative control: same not-null projected-away column, but UNPINNED (no
+-- predicate) → no recoverable value → not insertable. Isolates the pin as the
+-- sole cause of the 'YES' above.
+create view nn_unpinned as select name, age from nn_adults;
+select is_insertable_into, is_deletable, effective_targets from view_info('nn_unpinned');
+→ [{"is_insertable_into":"NO","is_deletable":"YES","effective_targets":"[\"nn_adults\"]"}]
+
 -- ===================================================================
 -- Constant-FD default with `select *` (the column survives the projection).
 -- ===================================================================
@@ -73,6 +89,20 @@ create table req (id integer primary key, name text, extra text);
 create view req_v as select id, name from req;
 select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('req_v');
 → [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"req\"]"}]
+
+-- ===================================================================
+-- Correlated scalar subquery in the projection: the inner table is reached
+-- only through a SCALAR child, never `getRelations()`, so it must NOT appear
+-- in effective_targets nor rescue the outer not-null `req` via the whole-spine
+-- defaultable walk (its base id is distinct and never an effective target).
+-- Only the outer `subq_outer` is a target; `req` stays unrecoverable → NO.
+-- ===================================================================
+create table subq_outer (id integer primary key, req text not null);
+create table subq_inner (k integer primary key, v text);
+create view subq_v as
+    select id, (select v from subq_inner where k = id) as note from subq_outer;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('subq_v');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"subq_outer\"]"}]
 
 -- ===================================================================
 -- Computed-only body: a non-invertible expression → wholly read-only.
