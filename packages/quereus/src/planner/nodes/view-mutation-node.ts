@@ -10,20 +10,26 @@ import { StatusCode } from '../../common/types.js';
 export type ReturningTiming = 'pre' | 'post';
 
 /**
- * The per-row identity-capture side input for a multi-source **update** RETURNING
- * (docs/view-updateability.md § `returning` Clauses).
+ * The up-front base-PK identity capture side input for a multi-source **update**
+ * (docs/view-updateability.md § Inner Join, § `returning` Clauses).
  *
  * `source` selects each affected view row's base-PK identities `(k0, k1)`; the
  * emitter materializes it **before** the base ops run and stashes the rows in
- * `rctx.tableContexts` under {@link descriptor}. The post-mutation
- * {@link ViewMutationNode.returning} re-query reads them back through an
- * `InternalRecursiveCTERefNode` carrying the same `descriptor`, so it re-projects
- * exactly the updated logical rows by captured identity — even when the update
- * rewrote the column its own WHERE filtered on. Parallel to {@link MutationEnvelope}
- * (the insert surrogate), but on the relational RETURNING branch rather than the
- * void/return-null branch.
+ * `rctx.tableContexts` under {@link descriptor}. Both readers scan it back through
+ * an `InternalRecursiveCTERefNode` carrying the same `descriptor`:
+ *   - when the update assigns **both** sides, each per-side base op's identifying
+ *     `in`-subquery (`<pk> in (select k<side> from __vmupd_keys)`), so the FK-parent
+ *     op cannot rewrite a predicate column out from under the FK-child op; and
+ *   - when the update carries RETURNING, the post-mutation
+ *     {@link ViewMutationNode.returning} re-query, re-projecting exactly the updated
+ *     logical rows by captured identity — even when the update rewrote the column
+ *     its own WHERE filtered on.
+ *
+ * Materialized whenever present (a both-sides update without RETURNING still needs
+ * it for the base ops), so it is independent of the RETURNING branch. Parallel to
+ * {@link MutationEnvelope} (the insert surrogate).
  */
-export interface ReturningCapture {
+export interface IdentityCapture {
 	readonly source: RelationalPlanNode;
 	readonly descriptor: TableDescriptor;
 }
@@ -130,13 +136,15 @@ export class ViewMutationNode extends PlanNode {
 		 */
 		public readonly returningTiming?: ReturningTiming,
 		/**
-		 * The per-row identity-capture side input for a multi-source **update**
-		 * RETURNING (timing `post`): its `source` is materialized into context
-		 * before the base ops run, and {@link returning} reads it back by
-		 * `descriptor` to re-project the updated rows by captured identity. Absent
-		 * for single-source, multi-source delete (`pre`), and the void/insert paths.
+		 * The up-front base-PK identity capture for a multi-source **update**: its
+		 * `source` is materialized into context **before** the base ops run, and read
+		 * back by `descriptor` by the both-sides base ops' identifying subqueries
+		 * and/or the post-mutation {@link returning} re-query. Set whenever a
+		 * multi-source update assigns both sides (⇒ more than one base op) or carries
+		 * RETURNING; absent for single-source, multi-source delete (`pre`), and the
+		 * void/insert paths.
 		 */
-		public readonly returningCapture?: ReturningCapture,
+		public readonly identityCapture?: IdentityCapture,
 	) {
 		super(scope, baseOps.reduce((cost, op) => cost + op.getTotalCost(), 0.1));
 		if (baseOps.length === 0) {
@@ -191,7 +199,7 @@ export class ViewMutationNode extends PlanNode {
 		return [
 			...this.baseOps,
 			...(this.returning ? [this.returning] : []),
-			...(this.returningCapture ? [this.returningCapture.source] : []),
+			...(this.identityCapture ? [this.identityCapture.source] : []),
 			...this.envelopeChildren(),
 		];
 	}
@@ -206,6 +214,8 @@ export class ViewMutationNode extends PlanNode {
 		// The identity-capture source (like the envelope source) is a side input
 		// materialized into context, not part of this node's forwarded output, so it
 		// is excluded — only reachable via getChildren for optimization/withChildren.
+		// (Holds for the both-sides void update too: its base ops are Sink-topped, so
+		// the node stays void and the capture source is never a forwarded relation.)
 		const rels = this.baseOps.filter(isRelationalNode);
 		if (this.returning) rels.push(this.returning);
 		return rels;
@@ -221,11 +231,11 @@ export class ViewMutationNode extends PlanNode {
 			cursor += 1;
 		}
 
-		let newCapture = this.returningCapture;
-		if (this.returningCapture) {
+		let newCapture = this.identityCapture;
+		if (this.identityCapture) {
 			const newCaptureSource = newChildren[cursor] as RelationalPlanNode;
 			cursor += 1;
-			newCapture = { source: newCaptureSource, descriptor: this.returningCapture.descriptor };
+			newCapture = { source: newCaptureSource, descriptor: this.identityCapture.descriptor };
 		}
 
 		let newEnvelope = this.envelope;
@@ -243,7 +253,7 @@ export class ViewMutationNode extends PlanNode {
 		const unchanged = newChildren.length === this.getChildren().length
 			&& newBaseOps.every((child, i) => child === this.baseOps[i])
 			&& newReturning === this.returning
-			&& (!this.returningCapture || newCapture!.source === this.returningCapture.source)
+			&& (!this.identityCapture || newCapture!.source === this.identityCapture.source)
 			&& (!this.envelope || (newEnvelope!.source === this.envelope.source
 				&& newEnvelope!.mint?.seed === this.envelope.mint?.seed));
 		if (unchanged) {
@@ -266,7 +276,7 @@ export class ViewMutationNode extends PlanNode {
 
 	override toString(): string {
 		const env = this.envelope ? ` +envelope${this.envelope.mint ? '(mint)' : ''}` : '';
-		const cap = this.returningCapture ? ' +capture' : '';
+		const cap = this.identityCapture ? ' +capture' : '';
 		const ret = this.resultRelation() ? ` returning${this.returning ? `(${this.returningTiming})` : ''}` : '';
 		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env}${cap}${ret})`;
 	}
@@ -275,7 +285,7 @@ export class ViewMutationNode extends PlanNode {
 		return {
 			baseOps: this.baseOps.length,
 			envelope: this.envelope ? (this.envelope.mint ? 'mint' : 'shared') : undefined,
-			returningCapture: this.returningCapture ? 'identity' : undefined,
+			identityCapture: this.identityCapture ? 'identity' : undefined,
 			returning: this.resultRelation() ? (this.returning ? `requery(${this.returningTiming})` : 'base-op') : undefined,
 		};
 	}

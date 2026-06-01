@@ -3,9 +3,9 @@ import type { PlanningContext } from '../planning-context.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
-import { ViewMutationNode, type MutationEnvelope, type ReturningCapture } from '../nodes/view-mutation-node.js';
+import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, buildMultiSourceUpdateReturning, isJoinBody } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, buildMultiSourceUpdateKeyCapture, buildMultiSourceUpdateReturning, makeMultiSourceUpdateKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceUpdateKeyCapture } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -98,18 +98,68 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 			...lensSetLevelConstraints(ctx, view),
 			...lensParentSideForeignKeyConstraints(ctx, view, RowOpFlag.UPDATE),
 		];
-	const children = baseOps.map(op => buildBaseOp(ctx, op, extraConstraints));
+	// Multi-source UPDATE identity capture (docs/view-updateability.md § Inner Join):
+	// an update that assigns BOTH base sides (⇒ more than one base op) — or carries
+	// RETURNING — captures each affected view row's base-PK identities ONCE up-front,
+	// *before* any base op mutates. The both-sides base ops read their identifying
+	// values back from that captured set (so the FK-parent op can't rewrite a
+	// predicate column out from under the FK-child op's identifying subquery), and the
+	// RETURNING re-query re-projects by captured identity. Built once and shared.
+	const keyCapture = buildUpdateIdentityCapture(ctx, view, req, baseOps);
+	// Both-sides base ops resolve `select k<side> from __vmupd_keys` against the
+	// context-backed key relation — inject a fresh key ref per op (sharing the one
+	// descriptor) into each op's planning `cteNodes`. A single-side base op (the
+	// single-side + RETURNING case) uses the live join-body subquery, so it needs no
+	// injection.
+	const injectKeyRef = !!keyCapture && baseOps.length > 1;
+	const children = baseOps.map(op =>
+		buildBaseOp(injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx, op, extraConstraints));
 
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
 	// RETURNING onto its base op (it now plans to a relational ReturningNode the
 	// substrate surfaces), so nothing more is needed there. A **multi-source**
 	// update/delete cannot recover the view row from its per-side base ops: a delete
 	// re-queries the view *before* the base ops fire (its rows are about to vanish);
-	// an update captures each affected row's base-PK identity *before* the base ops,
-	// then re-queries the join body *after* restricted to those identities (robust
-	// against an update that rewrites its own predicate column).
-	const { returning, returningTiming, returningCapture } = buildMultiSourceReturning(ctx, view, req);
-	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming, returningCapture);
+	// an update re-queries the join body *after* restricted to the captured identities
+	// (robust against an update that rewrites its own predicate column).
+	const { returning, returningTiming } = buildMultiSourceReturning(ctx, view, req, keyCapture);
+	const identityCapture = keyCapture ? { source: keyCapture.source, descriptor: keyCapture.descriptor } : undefined;
+	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming, identityCapture);
+}
+
+/**
+ * Build the shared up-front identity capture for a multi-source UPDATE when it is
+ * needed: an update through a two-table inner-join view that either assigns BOTH
+ * base sides (⇒ more than one base op — the FK-parent/FK-child ordering-hazard case)
+ * or carries a RETURNING clause (the re-query reads the captured identities).
+ * `undefined` otherwise — a single-side no-RETURNING update keeps the live join-body
+ * subquery, and inserts / deletes / decomposition-backed tables / single-source
+ * spines never capture.
+ */
+function buildUpdateIdentityCapture(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	req: MutationRequest,
+	baseOps: readonly BaseOp[],
+): MultiSourceUpdateKeyCapture | undefined {
+	if (req.op !== 'update') return undefined;
+	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return undefined;
+	const hasReturning = !!req.stmt.returning && req.stmt.returning.length > 0;
+	if (baseOps.length <= 1 && !hasReturning) return undefined;
+	return buildMultiSourceUpdateKeyCapture(ctx, view, req.stmt);
+}
+
+/**
+ * A planning context whose `cteNodes` resolves `__vmupd_keys` to a freshly-minted
+ * context-backed key relation (over the shared capture descriptor), so a both-sides
+ * base op's `select k<side> from __vmupd_keys` identifying subquery reads the
+ * materialized capture rows. A fresh ref per call keeps each base op's subtree from
+ * sharing a node instance.
+ */
+function withKeyCapture(ctx: PlanningContext, capture: MultiSourceUpdateKeyCapture): PlanningContext {
+	const cteNodes = new Map(ctx.cteNodes ?? []);
+	cteNodes.set(MS_UPDATE_KEYS_CTE, makeMultiSourceUpdateKeyRef(ctx.scope, capture));
+	return { ...ctx, cteNodes };
 }
 
 /**
@@ -121,12 +171,13 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
  * RETURNING stays rejected by `propagate`).
  *
  * Two shapes, by op:
- *  - **UPDATE** uses per-row identity capture (`buildMultiSourceUpdateReturning`):
- *    capture each affected row's base-PK identity *before* the base ops, re-query
- *    the join body *after* restricted to those identities (`returningTiming: 'post'`,
- *    plus a {@link ReturningCapture}). This is robust against an update that rewrites
- *    a column its own WHERE filters on — the captured identity still matches even
- *    though the changed row no longer satisfies the predicate.
+ *  - **UPDATE** re-queries the join body *after* the base ops, restricted to the
+ *    `keyCapture` identities captured *before* them (`returningTiming: 'post'`;
+ *    `buildMultiSourceUpdateReturning`). This is robust against an update that
+ *    rewrites a column its own WHERE filters on — the captured identity still matches
+ *    even though the changed row no longer satisfies the predicate. The capture is
+ *    built (and materialized) by {@link buildViewMutation} and shared with the
+ *    both-sides base ops, so it is passed in rather than rebuilt here.
  *  - **DELETE** re-queries the view restricted to the user predicate, captured `pre`
  *    (before the base op fires — the rows still match the predicate and are about to
  *    vanish), so the projected columns resolve naturally against the view.
@@ -135,15 +186,18 @@ function buildMultiSourceReturning(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	req: MutationRequest,
-): { returning?: RelationalPlanNode; returningTiming?: 'pre' | 'post'; returningCapture?: ReturningCapture } {
+	keyCapture: MultiSourceUpdateKeyCapture | undefined,
+): { returning?: RelationalPlanNode; returningTiming?: 'pre' | 'post' } {
 	const returningCols = req.stmt.returning;
 	if (!returningCols || returningCols.length === 0) return {};
 	if (req.op === 'insert') return {}; // single-source insert embeds; multi-source insert is rejected upstream
 	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return {};
 
 	if (req.op === 'update') {
-		const { source, descriptor, returning } = buildMultiSourceUpdateReturning(ctx, view, req.stmt);
-		return { returning, returningTiming: 'post', returningCapture: { source, descriptor } };
+		// keyCapture is guaranteed present here: buildUpdateIdentityCapture builds it
+		// whenever a multi-source update carries RETURNING (same gating conditions).
+		const returning = buildMultiSourceUpdateReturning(ctx, view, req.stmt, keyCapture!);
+		return { returning, returningTiming: 'post' };
 	}
 
 	// DELETE: re-query the view (predicate-restricted) captured `pre`.

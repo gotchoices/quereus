@@ -177,6 +177,30 @@ select pid from ms_parent order by pid;
 select cid from ms_jv order by cid;
 → [{"cid":1},{"cid":3}]
 
+-- BOTH-sides update predicated on the FK-PARENT's reassigned column, NO RETURNING —
+-- the base-decomposition ordering clash. The FK-parent op runs first and rewrites
+-- `label`; a live re-query of the join body would then find no 'P10' row, so the
+-- FK-child op's identifying subquery would match nothing and silently drop the child
+-- update. The up-front identity capture pins children 1,2 before any base op mutates,
+-- so BOTH sides land. See view-mutation-multisource-both-sides-predicate-clash.
+create table pc_parent (pid integer primary key, label text);
+create table pc_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references pc_parent(pid));
+insert into pc_parent values (10, 'P10'), (20, 'P20');
+insert into pc_child values (1, 10, 'a'), (2, 10, 'a'), (3, 20, 'b');
+create view pc_jv as
+    select c.cid as cid, c.note as note, p.label as label
+    from pc_child c join pc_parent p on p.pid = c.pref;
+
+update pc_jv set note = 'B', label = 'PY' where label = 'P10';
+-- children 1,2 (pref 10) get note 'B'; parent 10 gets label 'PY' — neither dropped.
+select cid, note from pc_child order by cid;
+→ [{"cid":1,"note":"B"},{"cid":2,"note":"B"},{"cid":3,"note":"b"}]
+select pid, label from pc_parent order by pid;
+→ [{"pid":10,"label":"PY"},{"pid":20,"label":"P20"}]
+select cid, note, label from pc_jv order by cid;
+→ [{"cid":1,"note":"B","label":"PY"},{"cid":2,"note":"B","label":"PY"},{"cid":3,"note":"b","label":"P20"}]
+
 -- ===================================
 -- Multi-source rejections (still diagnosed-and-rejected this phase).
 -- ===================================
@@ -961,22 +985,24 @@ update rjoin2 set note = 'A' where note = 'a' returning cid, note, label;
 update rjoin2 set label = 'PX' where label = 'P10' returning cid, note, label;
 → [{"cid":1,"note":"A","label":"PX"},{"cid":2,"note":"A","label":"PX"}]
 
--- BOTH sides assigned (child note + parent label), predicated on the CHILD column
--- the update also rewrites. Capture identifies cid 1,2 up-front; both per-side base
--- ops target them, and the re-query re-projects the fully post-mutation rows.
--- NOTE: predicating this on the *parent's* reassigned column (e.g. `where label =
--- 'PX'`) instead hits a separate base-decomposition ordering limitation — the FK-
--- parent op rewrites the predicate column before the FK-child op's identifying
--- subquery runs, so the child side silently no-ops (affects non-RETURNING multi-
--- source updates too). The RETURNING capture mechanism is unaffected; see
--- docs/view-updateability.md § `returning` and the
--- view-mutation-multisource-both-sides-predicate-clash fix ticket.
-update rjoin2 set note = 'B', label = 'PY' where note = 'A' returning cid, note, label;
+-- BOTH sides assigned (child note + parent label), predicated on the PARENT's
+-- reassigned column (`label = 'PX'`) — the clash this fix closes. The FK-parent op
+-- rewrites `label` before the FK-child op's identifying subquery runs, so a live
+-- re-query of the join body would find no 'PX' row and the child side would silently
+-- no-op; the up-front identity capture pins cid 1,2 so BOTH per-side ops land and the
+-- re-query re-projects the fully post-mutation rows.
+update rjoin2 set note = 'B', label = 'PY' where label = 'PX' returning cid, note, label;
 → [{"cid":1,"note":"B","label":"PY"},{"cid":2,"note":"B","label":"PY"}]
 
--- `returning *` through the join update with a predicate-clash on the child column.
-update rjoin2 set note = 'C' where note = 'B' returning *;
-→ [{"cid":1,"note":"C","label":"PY"},{"cid":2,"note":"C","label":"PY"}]
+-- BOTH sides assigned, predicated on the CHILD column the update also rewrites
+-- (`note = 'B'` → 'C', plus `label` → 'PZ'); the capture identifies cid 1,2 the same
+-- way regardless of which side's reassigned column the predicate filters on.
+update rjoin2 set note = 'C', label = 'PZ' where note = 'B' returning cid, note, label;
+→ [{"cid":1,"note":"C","label":"PZ"},{"cid":2,"note":"C","label":"PZ"}]
+
+-- `returning *` through the join update, single-side child predicate-clash.
+update rjoin2 set note = 'E' where note = 'C' returning *;
+→ [{"cid":1,"note":"E","label":"PZ"},{"cid":2,"note":"E","label":"PZ"}]
 
 -- --- (e) multi-source update RETURNING edge cases: push-out-of-filter (NEW
 --         semantics), renamed + computed view columns through the capture re-query

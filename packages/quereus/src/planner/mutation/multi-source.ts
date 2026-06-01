@@ -1,5 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
+import type { Scope } from '../scopes/scope.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { isRelationalNode, PlanNode, type RelationalPlanNode, type UpdateSite, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
@@ -53,6 +54,20 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  *   `select *` join bodies, and cross-side `set` value references — each a
  *   precise diagnostic.
  */
+
+/**
+ * The shared identity-capture CTE name + its `(k0, k1)` column names for a
+ * multi-source UPDATE. Each affected view row's base-PK identities are
+ * materialized ONCE — *before* any base op fires — into `rctx.tableContexts` under
+ * a shared descriptor. When an update assigns **both** sides, each per-side base op
+ * reads its identifying values back from this set (`<pk> in (select k<side> from
+ * __vmupd_keys)`) instead of a live re-query of the join body, so the FK-parent op
+ * cannot rewrite a predicate column out from under the FK-child op's identifying
+ * subquery (a mutation-order-independent identity). The same capture backs the
+ * UPDATE RETURNING re-query (docs/view-updateability.md § Inner Join, § `returning`).
+ */
+export const MS_UPDATE_KEYS_CTE = '__vmupd_keys';
+export const MS_UPDATE_KEY_COLUMNS = ['k0', 'k1'] as const;
 
 // --- shape model ----------------------------------------------------------
 
@@ -603,6 +618,20 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 	// conjoined with the view body's own WHERE.
 	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
 
+	// When an update assigns BOTH base sides the per-side base ops run sequentially
+	// against live state, so a live-subquery identifier — re-evaluated *after* the
+	// earlier (FK-parent) op already mutated — loses every row whose WHERE filters on
+	// a column that op reassigns (the FK-child side then silently no-ops). Instead
+	// both ops read their identifying values from the up-front identity capture the
+	// builder materializes ONCE before any base op fires (`<pk> in (select k<side>
+	// from __vmupd_keys)`), a mutation-order-independent set, so neither op can lose
+	// rows to the other's writes. A single-side update has no such ordering hazard
+	// (the lone op re-queries before it mutates), so it keeps the live join-body
+	// subquery — preserving all the nested-subquery-descent correctness the e1/e2/
+	// g/h/… cases lock in. The builder pairs this with the matching capture +
+	// `__vmupd_keys` cteNode injection (gated on `baseOps.length > 1`).
+	const bothSidesAssigned = perSide[0].length > 0 && perSide[1].length > 0;
+
 	// Order parent-before-child where the FK is provable (matches insert ordering
 	// intent and avoids surprising mid-statement FK states); arbitrary otherwise.
 	const order = orderSides(analysis.sides);
@@ -622,7 +651,9 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 		const where: AST.InExpr = {
 			type: 'in',
 			expr: { type: 'column', name: pk },
-			subquery: buildIdentifyingSubquery(analysis, side, pk, idPredicate),
+			subquery: bothSidesAssigned
+				? buildCapturedKeySubquery(sideIndex)
+				: buildIdentifyingSubquery(analysis, side, pk, idPredicate),
 		};
 		const statement: AST.UpdateStmt = {
 			type: 'update',
@@ -648,52 +679,88 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 	return ops;
 }
 
-// --- UPDATE RETURNING (per-row identity capture) --------------------------
+/**
+ * `select k<sideIndex> from __vmupd_keys` — read this side's captured base-PK
+ * identities back from the up-front materialized key set (the both-sides-assigned
+ * UPDATE path; see {@link MS_UPDATE_KEYS_CTE}). The builder injects `__vmupd_keys`
+ * into the base op's planning `cteNodes` (resolving to the context-backed key
+ * relation), so this is read by descriptor rather than re-querying the join body.
+ */
+function buildCapturedKeySubquery(sideIndex: number): AST.SelectStmt {
+	return {
+		type: 'select',
+		columns: [{ type: 'column', expr: { type: 'column', name: MS_UPDATE_KEY_COLUMNS[sideIndex] } }],
+		from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE } }],
+	};
+}
+
+// --- UPDATE identity capture (shared by both-sides base ops + RETURNING) ---
 
 /**
- * Build the per-row identity-capture RETURNING substrate for a multi-source
- * (two-table inner-join) UPDATE (docs/view-updateability.md § `returning`
- * Clauses). A post-mutation re-query that matched by the *user predicate* cannot
- * recapture a row whose predicate column the update itself rewrote (the changed
- * row no longer matches). Instead we capture each affected view row's base-PK
- * identity `(k0, k1)` **before** the base ops fire, then re-query the join body
- * **after** the mutation restricted to those captured identities — so a row the
- * update pushed out of the view's filter is still returned (matching single-source
- * NEW semantics).
+ * The up-front base-PK identity capture for a multi-source (two-table inner-join)
+ * UPDATE (docs/view-updateability.md § Inner Join, § `returning`). Built ONCE and
+ * shared between the both-sides base ops' identifying subqueries and (when present)
+ * the RETURNING re-query.
  *
- * Returns:
  *  - `source`: the capture SELECT `select s0.pk0 as k0, s1.pk1 as k1 from <body>
- *    where <idPredicate>` — the emitter materializes it into context **before** the
- *    base ops run.
+ *    where <idPredicate>` — the emitter materializes it into `rctx.tableContexts`
+ *    under {@link descriptor} **before** any base op runs.
  *  - `descriptor`: the identity stitch shared between the materialized capture rows
- *    and the {@link InternalRecursiveCTERefNode} the re-query reads them back through.
- *  - `returning`: the post-mutation re-query — the view-spelled, base-term RETURNING
- *    projection over the join body, filtered by `exists (select 1 from __vmret_keys
- *    k where k.k0 = s0.pk0 and k.k1 = s1.pk1)`. It keeps only the structural join
- *    ON-condition (in the body FROM); the body/user WHERE is intentionally NOT
- *    re-applied.
- *
+ *    and every {@link InternalRecursiveCTERefNode} that reads them back.
+ *  - `keyColumns`: the `(k0, k1)` column shape each reader mints a key ref over.
+ */
+export interface MultiSourceUpdateKeyCapture {
+	readonly source: RelationalPlanNode;
+	readonly descriptor: TableDescriptor;
+	readonly keyColumns: readonly { readonly name: string; readonly type: ScalarType }[];
+}
+
+/**
+ * Mint a context-backed key relation (`InternalRecursiveCTERefNode`) over a
+ * capture's descriptor — what a both-sides base op's identifying `in`-subquery or
+ * the RETURNING re-query's EXISTS scans `__vmupd_keys` through. Fresh attribute ids
+ * per call (each ref lives in its own subtree); the **descriptor** identity is what
+ * ties it to the rows the emitter materializes.
+ */
+export function makeMultiSourceUpdateKeyRef(scope: Scope, capture: MultiSourceUpdateKeyCapture): InternalRecursiveCTERefNode {
+	const keyAttrs: Attribute[] = capture.keyColumns.map(c => ({
+		id: PlanNode.nextAttrId(),
+		name: c.name,
+		type: c.type,
+		sourceRelation: MS_UPDATE_KEYS_CTE,
+	}));
+	const keyRelType: RelationType = {
+		typeClass: 'relation',
+		isReadOnly: true,
+		isSet: false,
+		columns: capture.keyColumns.map(c => ({ name: c.name, type: c.type })),
+		keys: [],
+		rowConstraints: [],
+	};
+	return new InternalRecursiveCTERefNode(scope, MS_UPDATE_KEYS_CTE, keyAttrs, keyRelType, capture.descriptor);
+}
+
+/**
+ * Build the up-front identity capture: each affected view row's base-PK identities
+ * `(k0, k1)`, by the same identifying predicate the base ops route on (user WHERE →
+ * base ∧ body WHERE). `preserveInputColumns=false` ⇒ the output is exactly
+ * `[k0, k1]`, positionally aligned to the key columns every reader scans back.
  * Requires a **single-column PK on both** join sides (the captured identity is both
  * sides' PKs); a composite-PK side is rejected with `unsupported-join` by
  * {@link requireSingleColumnPk}.
  */
-export function buildMultiSourceUpdateReturning(
+export function buildMultiSourceUpdateKeyCapture(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	stmt: AST.UpdateStmt,
-): { source: RelationalPlanNode; descriptor: TableDescriptor; returning: RelationalPlanNode } {
+): MultiSourceUpdateKeyCapture {
 	const analysis = analyzeJoinView(ctx, view);
-	const returningCols = stmt.returning!;
 	const [side0, side1] = analysis.sides;
 	const pk0 = requireSingleColumnPk(view, side0);
 	const pk1 = requireSingleColumnPk(view, side1);
 	const pk0Type = columnScalarType(columnByName(side0.schema, pk0));
 	const pk1Type = columnScalarType(columnByName(side1.schema, pk1));
 
-	// (1) Capture source: the affected view rows' base-PK identities, by the same
-	// identifying predicate the base ops route on (user WHERE → base ∧ body WHERE).
-	// preserveInputColumns=false ⇒ the output is exactly `[k0, k1]`, positionally
-	// aligned to the key ref's attributes the re-query reads back from context.
 	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
 	const captureAst: AST.SelectStmt = {
 		type: 'select',
@@ -707,38 +774,54 @@ export function buildMultiSourceUpdateReturning(
 	const source = buildSelectStmt(ctx, captureAst, new Map(), false);
 	if (!isRelationalNode(source)) {
 		raiseMutationDiagnostic({
-			reason: 'returning-through-view',
+			reason: 'no-base-lineage',
 			table: view.name,
-			message: `cannot project RETURNING through view '${view.name}': the identity-capture query did not produce a relation`,
+			message: `cannot write through view '${view.name}': the identity-capture query did not produce a relation`,
 		});
 	}
 
-	// (2) The context-backed key relation the re-query's EXISTS scans. Its descriptor
-	// identity is shared with the rows the emitter materializes (the working-table-in-
-	// context pattern recursive CTEs / the insert envelope reuse).
-	const descriptor: TableDescriptor = {};
-	const keyAttrs: Attribute[] = [
-		{ id: PlanNode.nextAttrId(), name: 'k0', type: pk0Type, sourceRelation: '__vmret_keys' },
-		{ id: PlanNode.nextAttrId(), name: 'k1', type: pk1Type, sourceRelation: '__vmret_keys' },
-	];
-	const keyRelType: RelationType = {
-		typeClass: 'relation',
-		isReadOnly: true,
-		isSet: false,
-		columns: [{ name: 'k0', type: pk0Type }, { name: 'k1', type: pk1Type }],
-		keys: [],
-		rowConstraints: [],
+	return {
+		source,
+		descriptor: {},
+		keyColumns: [{ name: 'k0', type: pk0Type }, { name: 'k1', type: pk1Type }],
 	};
-	const keyRef = new InternalRecursiveCTERefNode(ctx.scope, '__vmret_keys', keyAttrs, keyRelType, descriptor);
+}
 
-	// (4) Post re-query: project the view-spelled, base-term RETURNING columns against
-	// the post-mutation join body, restricted to the captured identities by EXISTS.
+/**
+ * Build the post-mutation RETURNING re-query for a multi-source UPDATE
+ * (docs/view-updateability.md § `returning`). A re-query that matched by the *user
+ * predicate* cannot recapture a row whose predicate column the update itself
+ * rewrote (the changed row no longer matches), so this matches by the captured
+ * **identity** instead: project the view-spelled, base-term RETURNING columns over
+ * the post-mutation join body, restricted to the captured identities by `exists
+ * (select 1 from __vmupd_keys k where k.k0 = s0.pk0 and k.k1 = s1.pk1)` — so a row
+ * the update pushed *out* of the view's filter (or whose predicate column it
+ * rewrote) is still returned (single-source NEW semantics). It keeps only the
+ * structural join ON-condition; the body/user WHERE is intentionally NOT re-applied.
+ *
+ * Reads the shared {@link MultiSourceUpdateKeyCapture} the builder materializes
+ * before the base ops fire (via its own freshly-minted key ref over the same
+ * descriptor).
+ */
+export function buildMultiSourceUpdateReturning(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	stmt: AST.UpdateStmt,
+	capture: MultiSourceUpdateKeyCapture,
+): RelationalPlanNode {
+	const analysis = analyzeJoinView(ctx, view);
+	const returningCols = stmt.returning!;
+	const [side0, side1] = analysis.sides;
+	const pk0 = requireSingleColumnPk(view, side0);
+	const pk1 = requireSingleColumnPk(view, side1);
+
+	const keyRef = makeMultiSourceUpdateKeyRef(ctx.scope, capture);
 	const existsPredicate: AST.Expression = {
 		type: 'exists',
 		subquery: {
 			type: 'select',
 			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
-			from: [{ type: 'table', table: { type: 'identifier', name: '__vmret_keys' }, alias: 'k' }],
+			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
 			where: combineAnd(
 				{ type: 'binary', operator: '=', left: { type: 'column', name: 'k0', table: 'k' }, right: { type: 'column', name: pk0, table: side0.alias } },
 				{ type: 'binary', operator: '=', left: { type: 'column', name: 'k1', table: 'k' }, right: { type: 'column', name: pk1, table: side1.alias } },
@@ -751,7 +834,7 @@ export function buildMultiSourceUpdateReturning(
 		from: analysis.sel.from!.map(cloneFromClause),
 		where: existsPredicate,
 	};
-	const returning = buildSelectStmt(ctx, requeryAst, new Map([['__vmret_keys', keyRef]]), false);
+	const returning = buildSelectStmt(ctx, requeryAst, new Map([[MS_UPDATE_KEYS_CTE, keyRef]]), false);
 	if (!isRelationalNode(returning)) {
 		raiseMutationDiagnostic({
 			reason: 'returning-through-view',
@@ -760,7 +843,7 @@ export function buildMultiSourceUpdateReturning(
 		});
 	}
 
-	return { source, descriptor, returning };
+	return returning;
 }
 
 /**

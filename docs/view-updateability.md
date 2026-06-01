@@ -269,17 +269,24 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > body decomposes through `planner/mutation/multi-source.ts`. Each output column is
 > routed to its owning base table by the planned body's `updateLineage`; an
 > `update` emits one base `update` per touched side (FK-parent before FK-child),
-> and a `delete` emits one base `delete` on the FK-many (child) side. Both identify
-> rows by a **subquery over the join body** — `<owning>.<pk> in (select <alias>.<pk>
-> from <join> where <predicate>)` — which reconstructs the row-identifying predicate
-> even when the owning side's PK is hidden by the projection. The base statement is
-> lowered back to AST so the ordinary base-table builders (and all their constraint
-> / conflict / FK machinery) are reused verbatim. The `quereus.update.*` tag
-> override surface (`target` / `exclude` / `delete_via` / `policy`) is **shipped**
-> (Phase 3.4 — see § Tags). Multi-source **`insert`** is **shipped** (Phase 2b —
-> the shared-surrogate envelope, below). **Still rejected:** composite-PK or
-> `> 2`-table joins, self-joins, cross-source `set` values, and `select *` join
-> bodies.
+> and a `delete` emits one base `delete` on the FK-many (child) side. A **single-side**
+> update (and the delete) identifies rows by a **subquery over the join body** —
+> `<owning>.<pk> in (select <alias>.<pk> from <join> where <predicate>)` — which
+> reconstructs the row-identifying predicate even when the owning side's PK is hidden
+> by the projection. A **both-sides** update instead captures each affected view
+> row's base-PK identities `(k0, k1)` **once up-front** (before any base op mutates)
+> and routes *each* per-side op through that captured set (`<pk> in (select k<side>
+> from __vmupd_keys)`) — a mutation-order-independent identity, so the FK-parent op
+> cannot rewrite a predicate column out from under the FK-child op's identifying
+> re-query (the **eager key materialization** the delete note below anticipates;
+> reuses the per-row identity-capture plumbing the UPDATE RETURNING path ships). The
+> base statement is lowered back to AST so the ordinary base-table builders (and all
+> their constraint / conflict / FK machinery) are reused verbatim. The
+> `quereus.update.*` tag override surface (`target` / `exclude` / `delete_via` /
+> `policy`) is **shipped** (Phase 3.4 — see § Tags). Multi-source **`insert`** is
+> **shipped** (Phase 2b — the shared-surrogate envelope, below). **Still rejected:**
+> composite-PK or `> 2`-table joins, self-joins, cross-source `set` values, and
+> `select *` join bodies.
 
 The lineage of an inner-join output column traces unambiguously to one of the two child relations (EC propagation makes column membership precise even for equi-join columns).
 
@@ -473,6 +480,16 @@ Order of execution within the statement:
 2. Within an FK-equivalence class, order is unspecified.
 3. All operations see a consistent pre-statement snapshot of the database; intermediate effects are visible only via the trailing constraint pass at end-of-statement.
 
+> **Shipped (two-table inner join).** The substrate runs the per-side base ops
+> sequentially against *live* state, so the pre-statement-snapshot guarantee (3) is
+> realized for **row identification** by **eager key materialization**: a both-sides
+> `update` captures each affected view row's base-PK identities `(k0, k1)` **once,
+> before any base op fires**, and routes both per-side ops through that captured set
+> (§ Inner Join). The FK-parent op therefore cannot rewrite a predicate column out
+> from under the FK-child op's row identification — both ops target the same
+> pre-mutation set regardless of execution order. (The general n-base, snapshot-
+> consistent multi-side *delete* fan-out remains deferred; see § Inner Join — Deletes.)
+
 Constraint enforcement runs at end-of-statement under the prevailing conflict-resolution mode (see [Conflict Resolution](sql.md#conflict-resolution-or-clause)). Deferred CHECKs run at commit per the assertion framework.
 
 `Statement.getChangeScope()` (see [Change-scope Documentation](change-scope.md)) reports the union of all base-table operations a prepared statement may emit, providing accurate dependency information for reactive consumers even when the statement targets a complex view.
@@ -522,15 +539,15 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >     predicate — `select <returning> from <view> [where <user where>]` — captured
 >     **before** the base op fires (the rows still match the predicate and are about
 >     to disappear).
->   - **`update`** (`post`, with a `returningCapture`): **per-row identity capture**
->     (`planner/mutation/multi-source.ts` `buildMultiSourceUpdateReturning`). Each
+>   - **`update`** (`post`, with an `identityCapture`): **up-front identity capture**
+>     (`planner/mutation/multi-source.ts` `buildMultiSourceUpdateKeyCapture`). Each
 >     affected view row's **base-PK identities** `(k0, k1)` are captured **before** the
 >     base ops fire (`select s0.pk0 as k0, s1.pk1 as k1 from <body> where <idPredicate>`,
 >     materialized into `rctx.tableContexts` under a shared descriptor — the same
 >     working-table-in-context plumbing recursive CTEs / the insert envelope reuse).
 >     **After** the base ops, the join body is re-queried, projecting the view-spelled
 >     base-term RETURNING columns restricted to those captured identities
->     (`… where exists (select 1 from __vmret_keys k where k.k0 = s0.pk0 and k.k1 =
+>     (`… where exists (select 1 from __vmupd_keys k where k.k0 = s0.pk0 and k.k1 =
 >     s1.pk1)`, via an `InternalRecursiveCTERefNode` over the descriptor). Because the
 >     match is on captured **identity** (not the now-stale user predicate), this is
 >     robust against an update that **rewrites a column its own WHERE filters on** —
@@ -538,18 +555,20 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >     (matching single-source NEW semantics). The re-query keeps only the structural
 >     join ON-condition; it does **not** re-apply the body/user WHERE. Requires a
 >     single-column PK on **both** join sides (the captured identity is both sides'
->     PKs); a composite-PK side is rejected with `unsupported-join`.
+>     PKs); a composite-PK side is rejected with `unsupported-join`. The **same**
+>     `__vmupd_keys` capture also drives a both-sides update's per-side base ops (§
+>     Inner Join), so a both-sides update *with* RETURNING materializes it exactly
+>     once — shared between the base ops and this re-query.
 >
 >   *Residual edges (out of scope, documented):* an update that changes a **base PK**
 >   or the **join-key / FK** column determining which rows join breaks the captured
 >   `(k0, k1)` identity, so such a row drops from RETURNING (these columns are
->   generally not writable through the supported view shapes). Separately, a
->   multi-source update that assigns **both** sides while predicating on the
->   FK-parent's reassigned column drops the FK-child's base mutation (the parent op
->   rewrites the predicate column before the child op's identifying subquery runs) —
->   a base-decomposition ordering bug independent of RETURNING capture
->   (`view-mutation-multisource-both-sides-predicate-clash`). The single-source path
->   has no such limitations (it reads NEW/OLD).
+>   generally not writable through the supported view shapes). The single-source path
+>   has no such limitation (it reads NEW/OLD). A both-sides update that predicates on
+>   the FK-parent's reassigned column **no longer** drops the FK-child's base mutation
+>   — the up-front `(k0, k1)` capture now backs the per-side base ops too, so the
+>   former `view-mutation-multisource-both-sides-predicate-clash` ordering bug is
+>   closed (§ Inner Join, § Multi-Base-Table Mutations).
 >
 > **Not yet shipped:** multi-source (join) **insert** RETURNING — the minted shared
 > surrogate is not yet threaded into a RETURNING projection — is rejected with the
