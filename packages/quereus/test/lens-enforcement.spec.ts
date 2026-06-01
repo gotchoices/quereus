@@ -604,6 +604,35 @@ describe('lens enforcement: child-side FK basis-redundancy elision', () => {
 			await db.close();
 		}
 	});
+
+	it('an UPDATE through an elided FK still ABORTs a dangling value (the basis FK fires on update too)', async () => {
+		const db = new Database();
+		try {
+			// Same elide setup as the first case. The elision drops the lens-level check
+			// for INSERT *and* UPDATE alike (the collector runs once per write-plan, the
+			// returned `[]` covers both ops). Pin that re-keying a child to a dangling FK
+			// value is still rejected — by the basis FK the re-planned basis update enforces.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema x');
+
+			expect(collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager), 'redundant lens FK elided').to.deep.equal([]);
+
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// UPDATE to a dangling parent (no row id = 99) must ABORT via the basis FK.
+			await expectThrows(() => db.exec('update x.child set pid = 99 where id = 10'), /fk|constraint|foreign/i);
+			expect(await rows(db, 'select pid from x.child where id = 10'), 'failed update rolled back').to.deep.equal([{ pid: 1 }]);
+			// UPDATE to another valid parent (id = 2) succeeds; updating to NULL succeeds.
+			await db.exec('update x.child set pid = 2 where id = 10');
+			expect(await rows(db, 'select pid from x.child where id = 10')).to.deep.equal([{ pid: 2 }]);
+			await db.exec('update x.child set pid = null where id = 10');
+			expect(await rows(db, 'select pid from x.child where id = 10')).to.deep.equal([{ pid: null }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens enforcement: set-level (unique / PK) commit-time at the write boundary', () => {
