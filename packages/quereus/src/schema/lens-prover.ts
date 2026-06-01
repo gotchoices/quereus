@@ -533,9 +533,11 @@ function constraintLabel(constraint: LogicalConstraint): string {
 
 /**
  * The effective constraint-level default conflict action a duplicate key would
- * resolve to absent a statement-level OR clause. The commit-time set-level scan
- * can only ABORT, so a key declaring REPLACE / IGNORE here cannot honor it — see
- * {@link classifyKeyConstraint}'s `lens.unenforceable-conflict-action` block.
+ * resolve to absent a statement-level OR clause. A key declaring REPLACE / IGNORE
+ * here is rejected at deploy when the realizing path cannot honor it: the
+ * commit-time set-level scan can only ABORT (see {@link classifyKeyConstraint}),
+ * and the row-time path honors the *basis* UC's action, not the logical key's
+ * (see {@link rejectRowTimeConflictAction}) — both raise `lens.unenforceable-conflict-action`.
  *
  *  - `unique` → the constraint's own `defaultConflict`.
  *  - `primaryKey` → {@link resolvePkDefaultConflict}: table-level
@@ -557,6 +559,11 @@ function effectiveKeyDefaultConflict(ctx: ProveContext, constraint: LogicalConst
 		default:
 			return undefined;
 	}
+}
+
+/** Render a conflict action for a sited message; an absent action resolves to ABORT. */
+function conflictActionName(action: ConflictResolution | undefined): string {
+	return ConflictResolution[action ?? ConflictResolution.ABORT].toLowerCase();
 }
 
 /**
@@ -619,9 +626,10 @@ function classifyKeyConstraint(
 
 	// Not proved → enforced set-level. Row-time iff a basis row-time covering
 	// structure answers it (a non-stale covering MV); commit-time otherwise.
-	const structure = findBasisCoveringStructure(ctx, logicalColumns);
-	if (structure) {
-		return { constraint, kind: 'enforced-set-level', mode: 'row-time', structure };
+	const covering = findBasisCovering(ctx, logicalColumns);
+	if (covering) {
+		rejectRowTimeConflictAction(ctx, constraint, covering, label, columnNames, readOnly, errors);
+		return { constraint, kind: 'enforced-set-level', mode: 'row-time', structure: covering.ref };
 	}
 
 	if (!readOnly) {
@@ -670,6 +678,45 @@ function classifyKeyConstraint(
 }
 
 /**
+ * Row-time sibling of the commit-time `lens.unenforceable-conflict-action` block.
+ * A row-time key is enforced by re-planning the lens write against the basis UC,
+ * whose conflict action resolves as `statement-OR ?? basis-uc.defaultConflict ??
+ * ABORT` (the memory / isolation / store resolvers all agree) — the *logical*
+ * key's own `defaultConflict` is never consulted in that re-plan. So a logical
+ * `on conflict replace`/`ignore` the backing basis UC does NOT itself carry is
+ * silently dropped to ABORT at write time (with no statement-level OR), violating
+ * the declared action. Reject it at deploy, mirroring the commit-time channel.
+ *
+ * Fires only when the logical effective action is REPLACE / IGNORE *and* differs
+ * from the basis UC's own `defaultConflict`: when they match, the basis UC already
+ * resolves the declared action for free (the documented remediation), so there is
+ * nothing to reject. ABORT / FAIL / ROLLBACK (and no declared action) never reject
+ * — consistent with the commit-time block, which only rejects REPLACE / IGNORE.
+ * Gated on `!readOnly`: a read-only table never writes, so the action is moot.
+ */
+function rejectRowTimeConflictAction(
+	ctx: ProveContext,
+	constraint: LogicalConstraint,
+	covering: BasisCovering,
+	label: string,
+	columnNames: readonly string[],
+	readOnly: boolean,
+	errors: LensDiagnostic[],
+): void {
+	if (readOnly) return;
+	const effectiveConflict = effectiveKeyDefaultConflict(ctx, constraint);
+	if (effectiveConflict !== ConflictResolution.REPLACE && effectiveConflict !== ConflictResolution.IGNORE) return;
+	if (effectiveConflict === covering.uc.defaultConflict) return; // basis UC honors it for free
+
+	errors.push({
+		code: 'lens.unenforceable-conflict-action',
+		severity: 'error',
+		site: { table: ctx.table.name, constraint: label },
+		message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) declares 'on conflict ${conflictActionName(effectiveConflict)}', but its backing basis UNIQUE/PK (covering structure '${covering.ref.name}') resolves a duplicate to '${conflictActionName(covering.uc.defaultConflict)}' — the row-time write path honors the basis UC's action, not the logical key's, so the declared action would be silently dropped. Declare the matching 'on conflict ${conflictActionName(effectiveConflict)}' on the basis UNIQUE/PK, or drop the logical conflict action.`,
+	});
+}
+
+/**
  * Classifies a `check` constraint. A check referencing a column with no write
  * path (computed / hidden) is unrealizable (error). Otherwise it is row-local —
  * evaluable on the projected row at the write boundary. (Vacuous-by-body-predicate
@@ -701,21 +748,6 @@ function classifyCheckConstraint(
 // Basis covering-structure resolution (row-time vs commit-time)
 // ---------------------------------------------------------------------------
 
-/**
- * Finds a basis covering structure that answers a logical key constraint: maps
- * each logical column → its basis column (via the single-source body projection),
- * finds a matching basis UNIQUE constraint, and returns a row-time covering MV
- * reference when one is linked (`coveringStructureName` / `_findRowTimeCoveringStructure`).
- *
- * Conservative: a multi-source body, an unmapped column, or a missing basis
- * UC/structure all yield `undefined` (⇒ commit-time scan). The retired auto-index
- * is deliberately NOT consulted for a logical schema — the explicit covering MV
- * is the sole row-time structure (`docs/lens.md` § Constraint Attachment).
- */
-function findBasisCoveringStructure(ctx: ProveContext, logicalColumns: readonly number[]): CoveringStructureRef | undefined {
-	return findBasisCovering(ctx, logicalColumns)?.ref;
-}
-
 /** The matching basis UC and the row-time covering structure that answers it. */
 interface BasisCovering {
 	readonly ref: CoveringStructureRef;
@@ -724,9 +756,20 @@ interface BasisCovering {
 
 /**
  * Resolves the basis covering structure AND the basis UNIQUE constraint backing a
- * logical key, factored out of {@link findBasisCoveringStructure} so the plan-time
- * FD re-validation ({@link computeLensAssertedKeyFds}) can re-confirm currency and
- * inspect the basis UC's partial predicate against the *current* catalog. Reads no
+ * logical key: maps each logical column → its basis column (via the single-source
+ * body projection), finds a matching basis UNIQUE constraint, and returns a
+ * row-time covering MV reference (`coveringStructureName` /
+ * `_findRowTimeCoveringStructure`) together with that basis UC. Returning the UC
+ * lets two callers inspect it: {@link classifyKeyConstraint}'s row-time
+ * conflict-action check (via {@link rejectRowTimeConflictAction} — the basis UC's
+ * `defaultConflict` is the action the write path actually honors) and the
+ * plan-time FD re-validation ({@link computeLensAssertedKeyFds}, which re-confirms
+ * currency and the basis UC's partial predicate against the *current* catalog).
+ *
+ * Conservative: a multi-source body, an unmapped column, or a missing basis
+ * UC/structure all yield `undefined` (⇒ commit-time scan). The retired auto-index
+ * is deliberately NOT consulted for a logical schema — the explicit covering MV is
+ * the sole row-time structure (`docs/lens.md` § Constraint Attachment). Reads no
  * `ctx.root`, so it is safe over a lightweight (un-planned) context.
  */
 function findBasisCovering(ctx: ProveContext, logicalColumns: readonly number[]): BasisCovering | undefined {

@@ -363,13 +363,16 @@ describe('lens prover: unenforceable conflict action (commit-time set-level)', (
 		}
 	});
 
-	it('`on conflict replace` on a row-time key (covering MV present) deploys clean — row-time can honor it', async () => {
+	it('`on conflict replace` on a row-time key with a MATCHING basis-UC action deploys clean — the basis UC honors it', async () => {
 		const db = new Database();
 		try {
-			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email)) }');
+			// A covering MV upgrades the logical unique to row-time. Row-time resolves the
+			// conflict action from the *basis* UC, not the logical key — so the declared
+			// REPLACE is honored only when the basis UC declares the same REPLACE. With the
+			// matching action the deploy-time error must NOT fire (a NON-matching basis UC is
+			// rejected — see the row-time unenforceable-conflict-action suite below).
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
 			await db.exec('apply schema y');
-			// A covering MV upgrades the logical unique to row-time, which IS
-			// conflict-resolution-capable — the deploy-time error must NOT fire.
 			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
 			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
 			await db.exec('apply schema x'); // no throw
@@ -396,6 +399,98 @@ describe('lens prover: unenforceable conflict action (commit-time set-level)', (
 			const uc = slot(db, 'u').attachedConstraints.find(c => c.kind === 'unique');
 			expect(uc, 'a unique constraint is attached').to.not.be.undefined;
 			expect(uc!.kind === 'unique' && uc!.constraint.predicate, 'no partial predicate').to.equal(undefined);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens prover: unenforceable conflict action (row-time set-level)', () => {
+	/**
+	 * A row-time key is enforced by re-planning the lens write against the basis UC,
+	 * whose conflict action resolves as `statement-OR ?? basis-uc.defaultConflict ??
+	 * ABORT` — the *logical* key's own action is never consulted. So a logical
+	 * `on conflict replace`/`ignore` the backing basis UC does NOT itself carry would
+	 * be silently dropped to ABORT at write time. Symmetric with the commit-time
+	 * channel, the prover rejects it at deploy; a *matching* basis-UC action deploys
+	 * clean (the basis UC honors it for free).
+	 */
+	it('a row-time unique declaring `on conflict replace` over a non-matching basis UC blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema y');
+			// The covering MV makes the logical unique row-time, but the basis UC carries no
+			// conflict action (resolves ABORT) ⇒ the declared REPLACE can never be honored.
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+			// Atomic: the blocked deploy left no report behind.
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a row-time unique declaring `on conflict ignore` over a non-matching basis UC blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict ignore) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a row-time unique whose action MATCHES the basis UC (`replace` / `replace`) deploys clean', async () => {
+		const db = new Database();
+		try {
+			// The basis UC declares the same REPLACE the logical key wants ⇒ the row-time
+			// re-plan resolves REPLACE from the basis UC for free; nothing to reject.
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await db.exec('apply schema x'); // no throw
+
+			const o = findObligation(slot(db, 'u'), 'unique');
+			expect(o.kind === 'enforced-set-level' && o.mode, 'row-time via covering MV').to.equal('row-time');
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a row-time unique whose action MISMATCHES the basis UC (logical `replace`, basis `ignore`) blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			// The basis UC would IGNORE, not REPLACE — the declared REPLACE is still dropped,
+			// so a non-trivial *difference* (not merely "basis has none") must also reject.
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email) on conflict ignore) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('`on conflict abort` (effective ABORT) on a row-time key deploys clean — only REPLACE/IGNORE reject', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email)) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict abort) }');
+			await db.exec('apply schema x'); // no throw — ABORT is the row-time path's own resolution
+
+			const o = findObligation(slot(db, 'u'), 'unique');
+			expect(o.kind === 'enforced-set-level' && o.mode, 'still row-time').to.equal('row-time');
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}

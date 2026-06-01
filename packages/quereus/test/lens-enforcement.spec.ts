@@ -994,4 +994,34 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			await db.close();
 		}
 	});
+
+	it('a matching basis-UC `on conflict replace` honors REPLACE on a plain duplicate insert (the verified remediation)', async () => {
+		const db = new Database();
+		try {
+			// The remediation for the dropped-action gap (`lens-set-level-rowtime-logical-
+			// conflict-action-not-honored`): declare the matching REPLACE on the *basis* UC.
+			// The row-time re-plan then resolves REPLACE from the basis UC's `defaultConflict`
+			// (`statement-OR ?? uc.defaultConflict ?? ABORT`), so a plain (no statement-OR)
+			// duplicate insert REPLACEs through the lens. (The deploy-time prover requires
+			// this matching action — a logical `on conflict replace` over a no-action basis UC
+			// is rejected; see lens-prover.spec.ts's row-time conflict-action suite.)
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict replace) }');
+			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 'u')), 'classifies row-time').to.deep.equal(['row-time']);
+
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x')`);
+			// A plain duplicate insert (no statement-level OR) REPLACEs via the basis UC's
+			// declared REPLACE — evicts id=1, lands id=2.
+			await db.exec(`insert into x.u (id, email) values (2, 'a@x')`);
+			expect(await rows(db, `select id from x.u where email = 'a@x'`)).to.deep.equal([{ id: 2 }]);
+			expect(await rows(db, `select id from y.u where email = 'a@x'`)).to.deep.equal([{ id: 2 }]);
+			expect(await rows(db, 'select count(*) as n from x.u')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
