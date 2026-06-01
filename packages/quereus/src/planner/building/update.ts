@@ -13,7 +13,7 @@ import { AliasedScope } from '../scopes/aliased.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
-import { RowOpFlag } from '../../schema/table.js';
+import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ReturningNode } from '../nodes/returning-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
@@ -25,6 +25,14 @@ import { buildViewMutation } from './view-mutation-builder.js';
 export function buildUpdateStmt(
   ctx: PlanningContext,
   stmt: AST.UpdateStmt,
+  /**
+   * Extra row-local CHECK constraints to enforce, already resolved in the target
+   * table's column space — set only when the view-mutation substrate re-plans a
+   * lens write onto its basis table (the logical `enforced-row-local` obligations
+   * rewritten to basis terms; see `planner/mutation/lens-enforcement.ts`). Empty
+   * for ordinary updates.
+   */
+  extraConstraints: ReadonlyArray<RowConstraintSchema> = [],
 ): PlanNode {
   // Block DML on committed pseudo-schema
   if (isCommittedSchemaRef(stmt.table.schema)) {
@@ -180,7 +188,8 @@ export function buildUpdateStmt(
     oldAttributes,
     newAttributes,
     flatRowDescriptor,
-    contextAttributes
+    contextAttributes,
+    extraConstraints
   );
 
   // Build FK constraint checks if foreign_keys pragma is enabled

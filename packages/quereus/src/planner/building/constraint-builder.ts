@@ -32,7 +32,14 @@ export function buildConstraintChecks(
   oldAttributes: Attribute[],
   newAttributes: Attribute[],
   _flatRowDescriptor: RowDescriptor,
-  contextAttributes: Attribute[] = []
+  contextAttributes: Attribute[] = [],
+  /**
+   * Extra CHECK constraints to enforce alongside the table's own — already
+   * resolved in this table's column space. The lens layer threads its logical
+   * `enforced-row-local` checks (rewritten from logical→basis terms) through here
+   * so they fire on a write through the lens (see `planner/mutation/lens-enforcement.ts`).
+   */
+  additionalConstraints: ReadonlyArray<RowConstraintSchema> = []
 ): ConstraintCheck[] {
   // Build attribute ID mappings for column registration
   const newAttrIdByCol: Record<string, number> = {};
@@ -52,8 +59,8 @@ export function buildConstraintChecks(
     }
   });
 
-  // Filter constraints by operation
-  const applicableConstraints = tableSchema.checkConstraints
+  // Filter constraints by operation (the table's own plus any threaded extras)
+  const applicableConstraints = [...tableSchema.checkConstraints, ...additionalConstraints]
     .filter(constraint => shouldCheckConstraint(constraint, operation));
 
   // Build expression nodes for each constraint
