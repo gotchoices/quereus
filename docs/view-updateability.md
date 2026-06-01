@@ -471,9 +471,13 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >   rows are about to disappear) or **after** for an update (the post-mutation
 >   image), threaded as `ViewMutationNode.returning` with a `returningTiming` of
 >   `pre`/`post`. *Limitation:* the post-mutation update re-query matches by the user
->   predicate, so an update that **changes a predicate column** will not recapture
->   that row (a per-row capture would be needed); the single-source path has no such
->   limitation.
+>   predicate, so an update that **changes a column its own WHERE filters on** could
+>   not be recaptured (the changed row no longer matches the predicate). Rather than
+>   silently return the wrong/empty set, that exact shape is **rejected** with the
+>   `returning-through-view` diagnostic; correct per-row capture is a follow-up. A
+>   multi-source `delete` (captured `pre`) and an update predicated on a column it does
+>   not assign have no such hazard. The single-source path has no such limitation at
+>   all (it reads NEW/OLD).
 >
 > **Not yet shipped:** multi-source (join) **insert** RETURNING — the minted shared
 > surrogate is not yet threaded into a RETURNING projection — is rejected with the

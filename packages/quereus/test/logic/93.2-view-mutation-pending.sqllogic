@@ -66,6 +66,16 @@ create view rjv as select t1.id as id, t1.a as a, t2.c as c
 insert into rjv (id, a, c) values (1, 2, 3) returning id;
 -- error: RETURNING through a multi-source
 
+-- A multi-source UPDATE that rewrites a column its own WHERE predicate filters on
+-- cannot be recaptured by the post-mutation re-query (the changed row no longer
+-- matches), so it is rejected loudly rather than silently returning the wrong set.
+-- (An update predicated on a *different* column, and a multi-source DELETE — which
+-- captures the pre-delete image — are supported; see 93.4 § RETURNING.)
+insert into jt1 values (5, 50);
+insert into jt2 values (5, 500);
+update rjv set a = 99 where a = 50 returning id, a, c;
+-- error: which its own WHERE predicate filters on
+
 -- LIMIT body: the predicate-conjoin rewrite cannot reproduce the row-count
 -- window, so a mutation could escape it. Reject rather than widen the write.
 create view vlim as select id, name from t limit 5;

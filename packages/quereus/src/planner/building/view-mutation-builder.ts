@@ -77,9 +77,12 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
  * backed logical tables (whose RETURNING stays rejected by `propagate`).
  *
  * Timing fragility: the post-mutation update re-query matches by the user
- * predicate, so an update that *changes* a predicate column will not recapture
- * that row (a per-row capture would be needed). The single-source path is robust
- * (it reads NEW/OLD); the multi-source re-query is the documented v1 shape.
+ * predicate, so an update that *changes a column its own WHERE filters on* could
+ * not be recaptured (the changed row no longer matches). Rather than silently
+ * mis-capture, that exact shape is rejected here (see the guard below); correct
+ * per-row capture is a follow-up. The single-source path is robust (it reads
+ * NEW/OLD); a DELETE captures `pre` and an update on a non-assigned predicate
+ * column are both safe.
  */
 function buildMultiSourceReturning(
 	ctx: PlanningContext,
@@ -90,6 +93,25 @@ function buildMultiSourceReturning(
 	if (!returningCols || returningCols.length === 0) return {};
 	if (req.op === 'insert') return {}; // single-source insert embeds; multi-source insert is rejected upstream
 	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return {};
+
+	// An UPDATE whose post-mutation re-query matches by the user predicate cannot
+	// recapture a row whose predicate column the update itself changed (the changed
+	// row no longer matches), so RETURNING would silently yield the wrong/empty set.
+	// Reject loudly rather than mis-capture; correct per-row capture is a follow-up
+	// (`view-mutation-multi-source-update-returning-perrow`). A DELETE captures
+	// `pre` (before the change) so it has no such hazard.
+	if (req.op === 'update' && req.stmt.where) {
+		const predicateCols = new Set(collectColumnRefNames(req.stmt.where).map(n => n.toLowerCase()));
+		const clash = req.stmt.assignments.find(a => predicateCols.has(a.column.toLowerCase()));
+		if (clash) {
+			raiseMutationDiagnostic({
+				reason: 'returning-through-view',
+				table: view.name,
+				column: clash.column,
+				message: `cannot project RETURNING through multi-source view '${view.name}': the update assigns column '${clash.column}', which its own WHERE predicate filters on — the post-mutation re-query cannot recapture the changed rows (per-row capture is not yet implemented)`,
+			});
+		}
+	}
 
 	const selectAst: AST.SelectStmt = {
 		type: 'select',
@@ -269,6 +291,36 @@ function assertSourceArity(view: MutableViewLike, got: number, expected: number)
 			message: `cannot insert through view '${view.name}': the source supplies ${got} value(s) but ${expected} view column(s) are targeted`,
 		});
 	}
+}
+
+/**
+ * Collect the names of every `column` reference in an expression (best-effort
+ * reflective walk; mirrors the private helpers in `schema/lens-compiler.ts` and
+ * `schema/lens-prover.ts`). Used to detect an update that rewrites a column its
+ * own WHERE predicate filters on — the one shape the multi-source re-query cannot
+ * recapture.
+ */
+function collectColumnRefNames(expr: AST.Expression): string[] {
+	const names: string[] = [];
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.type === 'column' && typeof (node as AST.ColumnExpr).name === 'string') {
+			names.push((node as AST.ColumnExpr).name);
+		}
+		for (const key of Object.keys(node)) {
+			const value = (node as unknown as Record<string, unknown>)[key];
+			if (!value) continue;
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					if (item && typeof item === 'object' && 'type' in item) stack.push(item as AST.AstNode);
+				}
+			} else if (typeof value === 'object' && 'type' in (value as object)) {
+				stack.push(value as AST.AstNode);
+			}
+		}
+	}
+	return names;
 }
 
 function quoteIdent(name: string): string {
