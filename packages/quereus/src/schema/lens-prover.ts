@@ -32,10 +32,12 @@ const log = createLogger('schema:lens-prover');
  *    § Coverage checklist.
  *  - **obligations + readOnly** — per-constraint enforcement classification and
  *    the writable-or-read-only verdict, recorded on the {@link LensSlot}. The
- *    *live* per-write enforcement wiring (row-local check pipeline, set-level
- *    existence routing, FK DeltaExecutor) is a follow-up
- *    (`lens-constraint-enforcement-wiring`); this ticket proves, classifies, and
- *    blocks/advises.
+ *    *live* per-write enforcement wiring (`lens-constraint-enforcement-wiring`)
+ *    consumes these: the row-local check pipeline and child-side FK existence
+ *    check are shipped (`planner/mutation/lens-enforcement.ts` — the `enforced-fk`
+ *    obligation is realized as a deferred basis-term `EXISTS` against the logical
+ *    parent, gated by the `foreign_keys` pragma); set-level existence routing
+ *    remains a follow-up. This module proves, classifies, and blocks/advises.
  *
  * Soundness over completeness: a false error blocks a sound deploy, so every
  * check is conservative — when a fact cannot be established (e.g. the body fails

@@ -12,12 +12,17 @@ import { createLogger } from '../../common/logger.js';
 const log = createLogger('planner:fk-builder');
 
 /**
- * Builds a SELECT 1 FROM <table> WHERE <col pairs joined by AND> subquery AST.
- * Shared by both EXISTS and NOT EXISTS FK checks.
+ * Builds a SELECT 1 FROM [<schema>.]<table> WHERE <col pairs joined by AND>
+ * subquery AST. Shared by both EXISTS and NOT EXISTS FK checks. `fromSchema`
+ * qualifies the FROM relation so it resolves regardless of the surrounding
+ * search path — the lens FK collector passes the logical schema so the parent
+ * resolves to the registered logical view even though the routed constraint is
+ * built under the basis schema path.
  */
 function synthesizeFKSubquery(
 	fromTableName: string,
 	columnPairs: Array<{ leftTable: string; leftCol: string; rightTable: string; rightCol: string }>,
+	fromSchema?: string,
 ): AST.SelectStmt {
 	const conditions: AST.Expression[] = columnPairs.map(({ leftTable, leftCol, rightTable, rightCol }) => ({
 		type: 'binary',
@@ -40,10 +45,56 @@ function synthesizeFKSubquery(
 		columns: [{ type: 'column', expr: { type: 'literal', value: 1 } as AST.LiteralExpr }],
 		from: [{
 			type: 'table',
-			table: { type: 'identifier', name: fromTableName },
+			table: { type: 'identifier', name: fromTableName, schema: fromSchema },
 		} as AST.TableSource],
 		where: whereExpr,
 	};
+}
+
+/**
+ * Assembles the MATCH SIMPLE-guarded child-side FK existence expression:
+ *
+ *   ( <q>.<child1> IS NULL OR … OR
+ *     EXISTS(SELECT 1 FROM [<schema>.]<parent> WHERE <parent>.<ref_i> = <q>.<child_i> …) )
+ *
+ * The child column names are taken verbatim — the physical builder passes the
+ * child table's own column names; the lens collector passes basis-rewritten
+ * names. The parent column names are the referenced-column names (logical names
+ * for the lens, which resolve against the logical view named by `fromSchema`).
+ * Shared by the physical child-side FK check and the lens FK collector so the
+ * synthesis lives in exactly one place.
+ */
+export function synthesizeFKExistsExpr(
+	parentTableName: string,
+	parentColumns: readonly string[],
+	childColumns: readonly string[],
+	qualifier: 'NEW' | 'OLD',
+	fromSchema?: string,
+): AST.Expression {
+	const pairs = childColumns.map((childCol, i) => ({
+		leftTable: parentTableName,
+		leftCol: parentColumns[i],
+		rightTable: qualifier,
+		rightCol: childCol,
+	}));
+
+	const existsExpr: AST.ExistsExpr = {
+		type: 'exists',
+		subquery: synthesizeFKSubquery(parentTableName, pairs, fromSchema),
+	};
+
+	// MATCH SIMPLE (SQL default): FK is satisfied when any referencing column is NULL.
+	// Wrap EXISTS with OR-chained IS NULL guards to skip the subquery in that case.
+	const nullGuards: AST.UnaryExpr[] = childColumns.map((childCol) => ({
+		type: 'unary',
+		operator: 'IS NULL',
+		expr: { type: 'column', name: childCol, table: qualifier } as AST.ColumnExpr,
+	}));
+
+	return nullGuards.reduceRight<AST.Expression>(
+		(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
+		existsExpr,
+	);
 }
 
 /**
@@ -59,30 +110,13 @@ function synthesizeExistsCheck(
 	parentColIndices: number[],
 	qualifier: 'new' | 'old',
 ): AST.Expression {
-	const qualifierUpper = qualifier.toUpperCase();
-	const pairs = fk.columns.map((childColIdx, i) => ({
-		leftTable: parentTable.name,
-		leftCol: parentTable.columns[parentColIndices[i]].name,
-		rightTable: qualifierUpper,
-		rightCol: childTable.columns[childColIdx].name,
-	}));
-
-	const existsExpr: AST.ExistsExpr = {
-		type: 'exists',
-		subquery: synthesizeFKSubquery(parentTable.name, pairs),
-	};
-
-	// MATCH SIMPLE (SQL default): FK is satisfied when any referencing column is NULL.
-	// Wrap EXISTS with OR-chained IS NULL guards to skip the subquery in that case.
-	const nullGuards: AST.UnaryExpr[] = fk.columns.map((childColIdx) => ({
-		type: 'unary',
-		operator: 'IS NULL',
-		expr: { type: 'column', name: childTable.columns[childColIdx].name, table: qualifierUpper } as AST.ColumnExpr,
-	}));
-
-	return nullGuards.reduceRight<AST.Expression>(
-		(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
-		existsExpr,
+	const parentColumns = parentColIndices.map(i => parentTable.columns[i].name);
+	const childColumns = fk.columns.map(childColIdx => childTable.columns[childColIdx].name);
+	return synthesizeFKExistsExpr(
+		parentTable.name,
+		parentColumns,
+		childColumns,
+		qualifier.toUpperCase() as 'NEW' | 'OLD',
 	);
 }
 

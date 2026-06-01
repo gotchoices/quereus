@@ -10,7 +10,7 @@ import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/dec
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { collectMutationTags } from '../mutation/mutation-tags.js';
-import { collectLensRowLocalConstraints } from '../mutation/lens-enforcement.js';
+import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints } from '../mutation/lens-enforcement.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
@@ -62,7 +62,15 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// the write through the lens even when the basis carries no such check. A
 	// plain view / MV has no lens slot ⇒ no extras (unchanged behavior). DELETE
 	// writes no NEW row, so a CHECK is moot there.
-	const extraConstraints = req.op === 'delete' ? [] : lensRowLocalConstraints(ctx, view);
+	// Lens FK enforcement (the `enforced-fk` obligation): each logical FK rides the
+	// same `extraConstraints` seam as a deferred basis-term `EXISTS` existence check
+	// against the schema-qualified logical parent — gated by the `foreign_keys`
+	// pragma exactly like the physical child-side FK, so a lens write enforces the
+	// logical FK with matching gating + commit-time timing even when the basis
+	// carries no such FK. DELETE writes no NEW child row, so neither class applies.
+	const extraConstraints = req.op === 'delete'
+		? []
+		: [...lensRowLocalConstraints(ctx, view), ...lensForeignKeyConstraints(ctx, view)];
 	const children = baseOps.map(op => buildBaseOp(ctx, op, extraConstraints));
 
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
@@ -150,6 +158,20 @@ function buildMultiSourceReturning(
 function lensRowLocalConstraints(ctx: PlanningContext, view: MutableViewLike): RowConstraintSchema[] {
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	return slot ? collectLensRowLocalConstraints(slot) : [];
+}
+
+/**
+ * The lens child-side FK existence constraints for a view-mediated write, or `[]`
+ * when the target is not a lens-backed logical table or the `foreign_keys` pragma
+ * is off. Gating on the pragma mirrors the physical child-side FK builder
+ * (`buildChildSideFKChecks` is only called when `foreign_keys` is true), so the
+ * lens enforces FKs under exactly the same switch — never adding enforcement the
+ * physical path would not.
+ */
+function lensForeignKeyConstraints(ctx: PlanningContext, view: MutableViewLike): RowConstraintSchema[] {
+	if (!ctx.db.options.getBooleanOption('foreign_keys')) return [];
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	return slot ? collectLensForeignKeyConstraints(slot, ctx.schemaManager) : [];
 }
 
 /** Attach the merged override tags to the request (discriminant preserved). */

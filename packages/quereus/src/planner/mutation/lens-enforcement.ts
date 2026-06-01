@@ -1,8 +1,10 @@
 import type * as AST from '../../parser/ast.js';
 import type { LensSlot } from '../../schema/lens.js';
-import type { RowConstraintSchema } from '../../schema/table.js';
+import type { RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
+import type { SchemaManager } from '../../schema/manager.js';
 import { transformExpr } from './single-source.js';
+import { synthesizeFKExistsExpr } from '../building/foreign-key-builder.js';
 
 /**
  * Lens row-local constraint enforcement (the write side of the lens prover's
@@ -24,9 +26,14 @@ import { transformExpr } from './single-source.js';
  * effect: a logical CHECK fires at the lens write even when the basis carries no
  * such check.
  *
- * Set-level (`unique` / primary key) and `enforced-fk` obligations are NOT handled
- * here — they enforce via an existence lookup (covering structure / commit-time
- * `DeltaExecutor` scan), a separate path. `proved` / `vacuous` need no enforcement.
+ * The `enforced-fk` obligation is also handled here (see
+ * {@link collectLensForeignKeyConstraints}): each logical FK becomes a deferred,
+ * basis-term `EXISTS` existence check against the schema-qualified logical parent,
+ * routed through the same constraint pipeline. Because the synthesized check
+ * contains an `EXISTS`, the pipeline auto-defers it to commit — matching physical
+ * child-side FK timing. Set-level (`unique` / primary key) obligations are NOT
+ * handled here — they enforce via a covering-structure / commit-time scan, a
+ * separate path. `proved` / `vacuous` need no enforcement.
  */
 
 /** Marker tag stamped on a routed basis-term constraint so its lens origin is visible. */
@@ -92,6 +99,73 @@ export function collectLensRowLocalConstraints(slot: LensSlot): RowConstraintSch
 			name: source.name ? `lens:${source.name}` : 'lens:check',
 			expr: rewriteToBasisTerms(source.expr, map),
 			// A logical CHECK guards the row being written: insert and update only.
+			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
+			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
+		});
+	}
+	return constraints;
+}
+
+/**
+ * Resolves a logical FK's referenced (parent) column **names** — the terms the
+ * synthesized `EXISTS` subquery filters the parent on. The names resolve against
+ * the registered logical parent view, so logical names are correct here. Prefers
+ * the FK's stored `referencedColumnNames` (populated for every declared FK); when
+ * a bare `references parent` (no column list) leaves them empty, falls back to the
+ * parent logical table's primary-key column names (resolved via the parent's lens
+ * slot, or a plain table lookup as a backstop).
+ */
+function resolveLogicalReferencedColumns(
+	fk: ForeignKeyConstraintSchema,
+	referencedSchema: string,
+	schemaManager: SchemaManager,
+): string[] {
+	if (fk.referencedColumnNames && fk.referencedColumnNames.length > 0) {
+		return [...fk.referencedColumnNames];
+	}
+	const parent = schemaManager.getSchema(referencedSchema)?.getLensSlot(fk.referencedTable)?.logicalTable
+		?? schemaManager.findTable(fk.referencedTable, referencedSchema);
+	if (!parent) return [];
+	return parent.primaryKeyDefinition.map(pk => parent.columns[pk.index]?.name).filter((n): n is string => n !== undefined);
+}
+
+/**
+ * Builds the basis-term child-side FK existence constraints a lens write must
+ * enforce (the write side of the prover's `enforced-fk` obligation). For each FK
+ * obligation it synthesizes a MATCH SIMPLE-guarded `EXISTS` against the
+ * schema-qualified logical parent relation, with the child (NEW) columns rewritten
+ * from logical to basis terms via the slot's reconstructible projection; the parent
+ * side stays in logical terms (it resolves against the logical view). The result is
+ * tagged with {@link LENS_BOUNDARY_ATTACHED_TAG} and routed through the basis
+ * write's constraint pipeline, where the contained `EXISTS` auto-defers it to commit
+ * — matching physical child-side FK gating + timing.
+ *
+ * Gated by the caller on the `foreign_keys` pragma. Returns `[]` when the slot is
+ * un-proved (`obligations` undefined) or carries no FK obligation — the common case.
+ */
+export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: SchemaManager): RowConstraintSchema[] {
+	if (!slot.obligations || slot.obligations.length === 0) return [];
+	const map = logicalToBasisColumnMap(slot);
+	const logicalSchemaName = slot.logicalTable.schemaName;
+	const constraints: RowConstraintSchema[] = [];
+	for (const obligation of slot.obligations) {
+		if (obligation.kind !== 'enforced-fk') continue;
+		if (obligation.constraint.kind !== 'foreignKey') continue;
+		const fk = obligation.constraint.constraint;
+		const referencedSchema = fk.referencedSchema ?? logicalSchemaName;
+		const parentColumns = resolveLogicalReferencedColumns(fk, referencedSchema, schemaManager);
+		// Rewrite each FK child column index → logical name → basis column. A column
+		// the prover proved reconstructible maps; otherwise it falls back to the logical
+		// name (the prover would have errored on a non-reconstructible FK child column).
+		const childColumns = fk.columns.map(childIdx => {
+			const logicalName = slot.logicalTable.columns[childIdx]?.name ?? `#${childIdx}`;
+			return map.get(logicalName.toLowerCase()) ?? logicalName;
+		});
+		const expr = synthesizeFKExistsExpr(fk.referencedTable, parentColumns, childColumns, 'NEW', referencedSchema);
+		constraints.push({
+			name: fk.name ? `lens:fk:${fk.name}` : 'lens:fk',
+			expr,
+			// Child-side FK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});

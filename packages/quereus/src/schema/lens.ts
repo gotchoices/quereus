@@ -111,8 +111,10 @@ export interface LensSlot {
 	 * populated post-prove in the lens compiler. `undefined` before the prover
 	 * runs. 1:1 with {@link attachedConstraints} in order. The *live* per-write
 	 * enforcement that consumes these is `lens-constraint-enforcement-wiring`: the
-	 * row-local check pipeline is shipped (`planner/mutation/lens-enforcement.ts`);
-	 * set-level existence routing + FK `DeltaExecutor` remain pending follow-ups.
+	 * row-local check pipeline and child-side FK existence check are shipped
+	 * (`planner/mutation/lens-enforcement.ts` — the FK obligation becomes a deferred
+	 * basis-term `EXISTS` against the logical parent, gated by the `foreign_keys`
+	 * pragma); set-level existence routing remains a pending follow-up.
 	 */
 	obligations?: ReadonlyArray<ConstraintObligation>;
 	/**
