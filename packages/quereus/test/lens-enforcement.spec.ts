@@ -159,3 +159,78 @@ describe('lens enforcement: row-local CHECK at the write boundary', () => {
 		}
 	});
 });
+
+describe('lens enforcement: row-local CHECK — multi-column / aliasing / conflict resolution', () => {
+	it('a check over two renamed logical columns rewrites both to their basis terms', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, lo integer, hi integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, constraint ord check (a <= b)) }');
+			await db.exec('declare lens for x over y { view t as select id, lo as a, hi as b from y.t }');
+			await db.exec('apply schema x');
+
+			await expectThrows(() => db.exec('insert into x.t (id, a, b) values (1, 5, 2)'), /ord|constraint/i);
+			await db.exec('insert into x.t (id, a, b) values (2, 2, 5)');
+			expect(await rows(db, 'select a, b from x.t where id = 2')).to.deep.equal([{ a: 2, b: 5 }]);
+			// The rewrite landed in basis terms (lo/hi), so the basis row reflects the mapping.
+			expect(await rows(db, 'select lo, hi from y.t where id = 2')).to.deep.equal([{ lo: 2, hi: 5 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a column-swapping override rewrites each logical column independently (no double-substitution)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, p integer, q integer) }');
+			await db.exec('apply schema y');
+			// logical a ← basis q, logical b ← basis p (a swap); the check `a > b` must
+			// rewrite to `q > p`, NOT collapse under re-substitution.
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, constraint gt check (a > b)) }');
+			await db.exec('declare lens for x over y { view t as select id, q as a, p as b from y.t }');
+			await db.exec('apply schema x');
+
+			await db.exec('insert into x.t (id, a, b) values (1, 10, 1)');
+			expect(await rows(db, 'select p, q from y.t where id = 1')).to.deep.equal([{ p: 1, q: 10 }]);
+			await expectThrows(() => db.exec('insert into x.t (id, a, b) values (2, 1, 10)'), /gt|constraint/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('OR IGNORE skips a row that violates the lens row-local check (no throw, not inserted)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, val integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, val integer, constraint nonneg check (val >= 0)) }');
+			await db.exec('apply schema x');
+
+			// The synthetic constraint inherits statement-level conflict handling via the
+			// basis ConstraintCheckNode: OR IGNORE silently drops the offending row.
+			await db.exec('insert or ignore into x.t (id, val) values (1, -5)');
+			expect(await rows(db, 'select count(*) as n from x.t')).to.deep.equal([{ n: 0 }]);
+			// A satisfying row in the same shape still lands.
+			await db.exec('insert or ignore into x.t (id, val) values (2, 5)');
+			expect(await rows(db, 'select val from x.t where id = 2')).to.deep.equal([{ val: 5 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('OR REPLACE still aborts on a lens row-local CHECK violation (REPLACE resolves uniqueness/NOT NULL, not CHECK)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, val integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, val integer, constraint nonneg check (val >= 0)) }');
+			await db.exec('apply schema x');
+
+			await expectThrows(() => db.exec('insert or replace into x.t (id, val) values (1, -5)'), /nonneg|constraint/i);
+			expect(await rows(db, 'select count(*) as n from x.t')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});

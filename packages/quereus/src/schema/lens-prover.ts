@@ -392,7 +392,7 @@ function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[]): v
  * boundary — each PK column maps to a plain (invertible) basis column projection.
  * When it is not (a computed / hidden / aggregated PK column), the table is
  * **read-only**: reads still work, but any mutation errors at the lens
- * (`view-mutation.ts` raises). This is not a deploy-blocking error — the table
+ * (`planner/mutation/single-source.ts` `analyzeView` raises). This is not a deploy-blocking error — the table
  * deploys read-only — so it surfaces as a warning, and `readOnly` is set on the
  * slot. The empty (singleton) PK is vacuously reconstructible.
  *

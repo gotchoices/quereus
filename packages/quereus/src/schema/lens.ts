@@ -110,14 +110,15 @@ export interface LensSlot {
 	 * Per-constraint enforcement classification, produced by `proveLens` and
 	 * populated post-prove in the lens compiler. `undefined` before the prover
 	 * runs. 1:1 with {@link attachedConstraints} in order. The *live* per-write
-	 * enforcement that consumes these (row-local check pipeline, set-level
-	 * existence routing, FK DeltaExecutor) lands in `lens-constraint-enforcement-wiring`.
+	 * enforcement that consumes these is `lens-constraint-enforcement-wiring`: the
+	 * row-local check pipeline is shipped (`planner/mutation/lens-enforcement.ts`);
+	 * set-level existence routing + FK `DeltaExecutor` remain pending follow-ups.
 	 */
 	obligations?: ReadonlyArray<ConstraintObligation>;
 	/**
 	 * Whether the logical table is read-only — its primary key is not
 	 * reconstructible at the lens boundary, so reads work but any mutation errors
-	 * at the lens (`planner/building/view-mutation.ts` raises). Set by `proveLens`;
+	 * at the lens (`planner/mutation/single-source.ts` `analyzeView` raises). Set by `proveLens`;
 	 * `undefined`/`false` ⇒ writable. See `docs/lens.md` § Coverage checklist
 	 * (Key reconstructibility).
 	 */
