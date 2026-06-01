@@ -1185,6 +1185,62 @@ describe('IsolationModule', () => {
 			expect(result).to.deep.equal([]);
 		});
 
+		it('forwards beginSchemaBatch/endSchemaBatch to the underlying module', async () => {
+			// APPLY SCHEMA fires these hooks on the registered module (the wrapper
+			// when isolated). A batching-capable underlying must receive begin/end so
+			// it can fold the migration into a single substrate commit. A missing
+			// forward silently degrades to per-DDL commits.
+			const beginCalls: { schemaName: string }[] = [];
+			const endCalls: { schemaName: string; error?: unknown }[] = [];
+			const underlying = {
+				...new MemoryTableModule(),
+				async beginSchemaBatch(_callDb: unknown, schemaName: string) {
+					beginCalls.push({ schemaName });
+				},
+				async endSchemaBatch(_callDb: unknown, schemaName: string, error?: unknown) {
+					endCalls.push({ schemaName, error });
+				},
+			} as any;
+			const isolatedModule = new IsolationModule({ underlying });
+
+			await isolatedModule.beginSchemaBatch(db, 'main');
+			await isolatedModule.endSchemaBatch(db, 'main', undefined);
+
+			expect(beginCalls).to.deep.equal([{ schemaName: 'main' }]);
+			expect(endCalls).to.deep.equal([{ schemaName: 'main', error: undefined }]);
+		});
+
+		it('endSchemaBatch forwards the loop error to the underlying', async () => {
+			const endCalls: { error?: unknown }[] = [];
+			const sentinelError = new Error('migration failed');
+			const underlying = {
+				...new MemoryTableModule(),
+				async endSchemaBatch(_callDb: unknown, _schemaName: string, error?: unknown) {
+					endCalls.push({ error });
+				},
+			} as any;
+			const isolatedModule = new IsolationModule({ underlying });
+
+			await isolatedModule.endSchemaBatch(db, 'main', sentinelError);
+			expect(endCalls).to.deep.equal([{ error: sentinelError }]);
+		});
+
+		it('no-ops when the underlying module does not implement the batch hooks', async () => {
+			// The optional-call (`?.`) must not throw when the underlying omits the
+			// hooks — APPLY SCHEMA's loop guard would otherwise never reach here, but
+			// the wrapper must remain safe to invoke directly.
+			const underlying = {
+				...new MemoryTableModule(),
+				beginSchemaBatch: undefined,
+				endSchemaBatch: undefined,
+			} as any;
+			const isolatedModule = new IsolationModule({ underlying });
+
+			await isolatedModule.beginSchemaBatch(db, 'main');
+			await isolatedModule.endSchemaBatch(db, 'main');
+			// reaching here without throwing is the assertion
+		});
+
 		it('forwards getCapabilities while layering isolation guarantees', () => {
 			const underlying = {
 				...new MemoryTableModule(),

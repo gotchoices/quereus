@@ -202,6 +202,36 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Forwards APPLY SCHEMA's batch-begin signal to the underlying module.
+	 *
+	 * APPLY SCHEMA's migration loop fires `beginSchemaBatch`/`endSchemaBatch`
+	 * on the *registered* module that owns each table — which is this wrapper
+	 * when a basis is isolated. A batching-capable underlying module folds the
+	 * whole APPLY SCHEMA into a single substrate commit by opening a batch here
+	 * that its subsequent create/destroy/alter callbacks (which IsolationModule
+	 * forwards to the underlying) join. Without this forward the underlying is
+	 * never reached and silently falls back to per-DDL commits.
+	 *
+	 * This is a straight delegate to the underlying: APPLY SCHEMA migrations are
+	 * DDL against the underlying substrate, not staged data writes, so the
+	 * per-connection overlays do not participate. Overlays hold uncommitted
+	 * *data* writes inside a user transaction; schema DDL does not route through
+	 * them, so there is nothing for the overlay/commit lifecycle to flush as
+	 * part of the batch.
+	 */
+	async beginSchemaBatch(db: Database, schemaName: string): Promise<void> {
+		await this.underlying.beginSchemaBatch?.(db, schemaName);
+	}
+
+	/**
+	 * Forwards APPLY SCHEMA's batch-end signal to the underlying module.
+	 * See `beginSchemaBatch` for why a straight delegate is correct.
+	 */
+	async endSchemaBatch(db: Database, schemaName: string, error?: unknown): Promise<void> {
+		await this.underlying.endSchemaBatch?.(db, schemaName, error);
+	}
+
+	/**
 	 * Delegates access plan selection to the underlying module.
 	 * This ensures the query planner knows about indexes and can generate
 	 * appropriate FilterInfo for index scans.
