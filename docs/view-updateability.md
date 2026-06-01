@@ -189,6 +189,25 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 - **Inserts** conjoin the selection's predicate into the existence predicate. If the inserted values contradict the selection (provable at plan time via constant folding and EC), the engine rejects with a diagnostic. If they satisfy the predicate, the row is inserted into the base and is visible through the relation. If satisfiability is unknown at plan time, the insert proceeds; visibility is decided by base data. Constant bindings produced by the selection (e.g., `where color = 'green'` ⇒ FD `∅ → color = 'green'`) are picked up by the projection's insert defaulting rule (§Projection), so omitting the constrained column from the insert is permitted and the value is supplied automatically.
 - **Deletes** propagate to the child with `parent_predicate ∧ user_predicate`.
 
+> **View columns nested inside a predicate / assigned-value subquery.** A
+> view-column reference inside a `subquery` / `exists` / `in`-subquery operand of
+> the user predicate (or a `set` value) is rewritten to its base-term lineage
+> just like a top-level reference — `mutation/single-source.ts`'s `transformExpr`
+> descends into the operand via `transformQueryExpr` (the multi-source spine
+> threads the same descent through `substituteViewColumns`). The descent is
+> **scope-aware**: a reference is substituted only when it is genuinely correlated
+> to the outer view row — qualified by the view name, or unqualified and *not*
+> shadowed by a column some source local to the subquery introduces. A
+> base-alias-qualified reference, or a name a subquery-local source defines
+> (`… in (select note from src)` where `src.note` exists), is left untouched. When
+> the subquery's source columns cannot be resolved statically (a `select *`
+> subquery source, a table-valued function, an embedded data-modifying subquery),
+> the descent cannot prove a nested reference is correlated and rejects it with the
+> structured `unsupported-subquery-correlation` diagnostic rather than risk a
+> silent mis-bind. (Before this, such a nested reference was passed through
+> un-rewritten and could silently re-bind to a same-named base column — a silent
+> wrong write.)
+
 ### Inner Join
 
 > **Shipped (Phase 2a) — `update` / `delete` only.** A two-table inner equi-join
@@ -559,7 +578,7 @@ boundary, so `view_info()` walks `getAllViews()` only.
 - `src/planner/analysis/view-complement.ts` — `viewComplement(node)` / `complementOf`, the
   predicate-honest complement derived off the backward walk (for the lens prover).
 - `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed.** A decomposition-backed logical table (a `primary-storage` advertisement, no override) routes to the advertisement-driven fan-out (`decomposition.ts`); a single-table body routes to the single-source spine (`single-source.ts`); a join body routes to the multi-source walk (`multi-source.ts`). Also hosts `classifyViewBody`.
-- `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.**
+- `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.** Also hosts the shared expression machinery both spines use: `transformExpr` (now with a `descend` hook into `subquery` / `exists` / `in`-subquery operands), the deep `cloneExpr` / `cloneQueryExpr`, and the scope-aware `transformQueryExpr` / `makeViewColumnDescend` that rewrite view-column references nested inside a predicate / assigned-value subquery to their base-term lineage (§ Selection).
 - `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition (`propagateMultiSource`), reading the planned body's `updateLineage` to emit an ordered multi-element `BaseOp[]` for `update` / `delete`, lowered to AST. **Landed** (insert rejected with `unsupported-multisource-insert`).
 - `src/planner/mutation/decomposition.ts` — the **advertisement-driven** put fan-out for an n-way decomposition lens (`propagateDecomposition`, `lens-multi-source-put-fanout`). **Partially landed:** DELETE across every member (anchor-last, anchor-only predicate) and UPDATE routed to the mandatory non-EAV member backing each column. INSERT (`unsupported-decomposition-insert`), a non-anchor-member predicate (`unsupported-decomposition-predicate`), an optional/EAV/key UPDATE (`unsupported-decomposition-update`), and composite shared keys (`unsupported-decomposition-key`) are deferred onto absent substrate (the shared-surrogate insert envelope / snapshot-consistent multi-member execution).
 - `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.**

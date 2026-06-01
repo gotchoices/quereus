@@ -6,7 +6,7 @@ import { TableReferenceNode } from '../nodes/reference.js';
 import { buildSelectStmt } from '../building/select.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { transformExpr, cloneExpr, combineAnd } from './single-source.js';
+import { transformExpr, cloneExpr, combineAnd, makeViewColumnDescend, mapQueryExprUniform } from './single-source.js';
 import { readPolicy, readDeleteVia, readTargetNames, readExcludeNames, type ReservedTagMap } from './mutation-tags.js';
 import type { DeleteViaValue } from '../../schema/reserved-tags.js';
 
@@ -100,8 +100,8 @@ export function propagateMultiSource(ctx: PlanningContext, view: MutableViewLike
 	// surfaces the precise shape reason before the op-specific handling.
 	const analysis = analyzeJoinView(ctx, view);
 	switch (req.op) {
-		case 'update': return decomposeUpdate(view, analysis, req.stmt, req.tags);
-		case 'delete': return decomposeDelete(view, analysis, req.stmt, req.tags);
+		case 'update': return decomposeUpdate(ctx, view, analysis, req.stmt, req.tags);
+		case 'delete': return decomposeDelete(ctx, view, analysis, req.stmt, req.tags);
 		case 'insert':
 			raiseMutationDiagnostic({
 				reason: 'unsupported-multisource-insert',
@@ -287,7 +287,7 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 
 // --- UPDATE ---------------------------------------------------------------
 
-function decomposeUpdate(view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
+function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
 	rejectReturning(view, stmt.returning);
 
 	// `target` / `exclude` narrow the writable base set (compose AFTER predicate
@@ -314,7 +314,7 @@ function decomposeUpdate(view: MutableViewLike, analysis: JoinViewAnalysis, stmt
 		// qualifier (the base UPDATE targets that table directly). A reference to
 		// the other side cannot be expressed as a single-table SET — reject.
 		const baseValue = stripSideQualifier(
-			substituteViewColumns(asg.value, analysis.viewColToBaseRef, view),
+			substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view),
 			view, side, other,
 		);
 		perSide[out.sideIndex].push({ column: out.baseColumn, value: baseValue });
@@ -322,7 +322,7 @@ function decomposeUpdate(view: MutableViewLike, analysis: JoinViewAnalysis, stmt
 
 	// Shared identifying predicate: the user WHERE rewritten to base terms,
 	// conjoined with the view body's own WHERE.
-	const idPredicate = buildIdentifyingPredicate(analysis, stmt.where, view);
+	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
 
 	// Order parent-before-child where the FK is provable (matches insert ordering
 	// intent and avoids surprising mid-statement FK states); arbitrary otherwise.
@@ -371,13 +371,13 @@ function decomposeUpdate(view: MutableViewLike, analysis: JoinViewAnalysis, stmt
 
 // --- DELETE ---------------------------------------------------------------
 
-function decomposeDelete(view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
+function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
 	rejectReturning(view, stmt.returning);
 
 	const sideIndex = chooseDeleteSide(view, analysis, tags);
 	const side = analysis.sides[sideIndex];
 	const pk = requireSingleColumnPk(view, side);
-	const idPredicate = buildIdentifyingPredicate(analysis, stmt.where, view);
+	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
 	const where: AST.InExpr = {
 		type: 'in',
 		expr: { type: 'column', name: pk },
@@ -542,11 +542,12 @@ function applyTargetExclude(
  * in base terms). Either may be absent.
  */
 function buildIdentifyingPredicate(
+	ctx: PlanningContext,
 	analysis: JoinViewAnalysis,
 	userWhere: AST.Expression | undefined,
 	view: MutableViewLike,
 ): AST.Expression | undefined {
-	const userBase = userWhere ? substituteViewColumns(userWhere, analysis.viewColToBaseRef, view) : undefined;
+	const userBase = userWhere ? substituteViewColumns(ctx, userWhere, analysis.viewColToBaseRef, view) : undefined;
 	const bodyWhere = analysis.sel.where ? cloneExpr(analysis.sel.where) : undefined;
 	return combineAnd(userBase, bodyWhere);
 }
@@ -574,25 +575,35 @@ function buildIdentifyingSubquery(
 /**
  * Substitute references to view columns (unqualified, or qualified by the view's
  * own name) with their base-term replacement expression. References already
- * qualified by a base alias are left untouched.
+ * qualified by a base alias are left untouched. A view-column reference nested
+ * inside a `subquery` / `exists` / `in`-subquery operand is rewritten too, via
+ * the scope-aware {@link makeViewColumnDescend} descent — the base-term
+ * replacements are alias-qualified (`p.label`), so they correlate correctly to
+ * the join body that becomes the FROM of the generated identifying subquery.
  */
 function substituteViewColumns(
+	ctx: PlanningContext,
 	expr: AST.Expression,
 	viewColToBaseRef: ReadonlyMap<string, AST.Expression>,
 	view: MutableViewLike,
 ): AST.Expression {
 	const viewName = view.name.toLowerCase();
+	const descend = makeViewColumnDescend(ctx, viewColToBaseRef, view.name, view);
 	return transformExpr(expr, (col) => {
 		if (col.table && col.table.toLowerCase() !== viewName) return undefined;
 		const repl = viewColToBaseRef.get(col.name.toLowerCase());
 		return repl ? cloneExpr(repl) : undefined;
-	});
+	}, descend);
 }
 
 /**
  * Strip the owning side's alias qualifier from a base-term assignment value (so
  * it targets the single-table UPDATE directly), rejecting any reference to the
- * other side (which a single-table SET cannot express).
+ * other side (which a single-table SET cannot express). The strip is threaded
+ * into any subquery embedded in the value (the qualifier rule is purely about a
+ * column's own table qualifier, so it applies uniformly at every nesting depth);
+ * a nested owning-side reference is correlated to the target row of the lowered
+ * UPDATE just like a top-level one.
  */
 function stripSideQualifier(
 	expr: AST.Expression,
@@ -602,7 +613,7 @@ function stripSideQualifier(
 ): AST.Expression {
 	const owningQuals = new Set([owning.alias, owning.schema.name.toLowerCase()]);
 	const otherQuals = new Set([other.alias, other.schema.name.toLowerCase()]);
-	return transformExpr(expr, (col) => {
+	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
 		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
 		if (otherQuals.has(t)) {
@@ -615,7 +626,8 @@ function stripSideQualifier(
 		}
 		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		return undefined;
-	});
+	};
+	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
 }
 
 // --- helpers --------------------------------------------------------------

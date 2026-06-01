@@ -459,3 +459,126 @@ create view sst_v as select id, note from sst
 insert into sst_v values (1, 'a');
 select * from sst order by id;
 → [{"id":1,"note":"a"}]
+
+-- ===================================
+-- View-column references nested inside subquery / exists / in-subquery operands
+-- of a user predicate (or assigned value) are descended into and rewritten to
+-- their base-term lineage — scope-aware, so a subquery-local same-named column is
+-- left alone and an unresolvable source is rejected, not silently mis-bound.
+-- See docs/view-updateability.md § Selection.
+-- ===================================
+
+-- --- (a) the repro: a correlated view-column ref inside EXISTS, over a base table
+--         that ALSO has a same-named base column (silent-mis-bind hazard) ---
+-- The view renames base `lbl` to the view column `note`; base table `sq_c` also
+-- has a literal `note` column. `note` inside EXISTS is the VIEW column (= base
+-- `lbl`); it must substitute to `lbl`, not re-bind to base `sq_c.note`.
+create table sq_c (cid integer primary key, note text, lbl text);
+create table sq_other (k text);
+insert into sq_c values (1, 'BASE_NOTE_1', 'LBL_1'), (2, 'BASE_NOTE_2', 'LBL_2');
+insert into sq_other values ('LBL_1');
+create view sq_jv as select cid as cid, lbl as note from sq_c;
+
+update sq_jv set note = 'CHANGED' where exists (select 1 from sq_other o where o.k = note);
+-- cid=1 (lbl LBL_1, present in sq_other) matches -> its `lbl` becomes CHANGED; the
+-- silent no-op (predicate re-bound to base `note`, absent from sq_other) is gone.
+select cid, note, lbl from sq_c order by cid;
+→ [{"cid":1,"note":"BASE_NOTE_1","lbl":"CHANGED"},{"cid":2,"note":"BASE_NOTE_2","lbl":"LBL_2"}]
+-- the write is visible through the view (view col `note` = base `lbl`).
+select * from sq_jv order by cid;
+→ [{"cid":1,"note":"CHANGED"},{"cid":2,"note":"LBL_2"}]
+
+-- --- (b) a correlated view-column ref inside an in (select ... where ...) ---
+-- `category` is the view column (= base `grp`); referenced unqualified inside the
+-- IN-subquery (whose source has no same-named column) it correlates to the outer
+-- view row and must substitute to `grp`.
+create table sq_in_t (id integer primary key, grp text, mark text);
+create table sq_in_map (g text, allowed_id integer);
+insert into sq_in_t values (1, 'G1', 'x'), (2, 'G2', 'y'), (3, 'G1', 'z');
+insert into sq_in_map values ('G1', 1), ('G1', 3);
+create view sq_in_v as select id as id, grp as category, mark as mark from sq_in_t;
+
+update sq_in_v set mark = 'M' where id in (select allowed_id from sq_in_map where g = category);
+select id, grp, mark from sq_in_t order by id;
+→ [{"id":1,"grp":"G1","mark":"M"},{"id":2,"grp":"G2","mark":"y"},{"id":3,"grp":"G1","mark":"M"}]
+
+-- --- (c) a subquery-local same-named column must NOT be substituted ---
+-- The view renames base `lbl` to view column `note`; the subquery source
+-- `sq_sh_src` has its OWN `note` column. `note` inside `in (select note from
+-- sq_sh_src)` is sq_sh_src.note (subquery-local) — it must stay local. The
+-- top-level left `note` is the view column and substitutes to base `lbl`.
+create table sq_sh_t (tid integer primary key, lbl text, payload text);
+create table sq_sh_src (note text);
+insert into sq_sh_t values (1, 'L1', 'p1'), (2, 'L2', 'p2');
+insert into sq_sh_src values ('L1');
+create view sq_sh_v as select tid as tid, lbl as note, payload as payload from sq_sh_t;
+
+update sq_sh_v set payload = 'P' where note in (select note from sq_sh_src);
+-- lbl in ('L1') -> only tid=1; if the inner `note` had been wrongly substituted to
+-- `lbl`, the subquery `select lbl from sq_sh_src` would not even resolve.
+select tid, lbl, payload from sq_sh_t order by tid;
+→ [{"tid":1,"lbl":"L1","payload":"P"},{"tid":2,"lbl":"L2","payload":"p2"}]
+
+-- --- (d) a subquery referencing NO view column still works unchanged ---
+create table sq_none_t (id integer primary key, val text);
+create table sq_none_ok (flag integer);
+insert into sq_none_t values (1, 'a'), (2, 'b');
+insert into sq_none_ok values (1);
+create view sq_none_v as select id as id, val as val from sq_none_t;
+
+update sq_none_v set val = 'Z' where exists (select 1 from sq_none_ok where flag = 1);
+select id, val from sq_none_t order by id;
+→ [{"id":1,"val":"Z"},{"id":2,"val":"Z"}]
+
+-- --- (e1) multi-source join view: a view-col ref nested in a subquery in the user
+--          WHERE is routed to the correct (alias-qualified) base term ---
+-- `label` is owned by the parent side (p.label); referenced inside EXISTS it
+-- substitutes to `p.label`, correlating to the join body of the identifying
+-- subquery. The update routes to the child side (note is owned by sq_jc).
+create table sq_jp (pid integer primary key, label text);
+create table sq_jc (cid integer primary key, pref integer, note text,
+    foreign key (pref) references sq_jp(pid));
+create table sq_allow (lab text);
+insert into sq_jp values (10, 'P10'), (20, 'P20');
+insert into sq_jc values (1, 10, 'a'), (2, 20, 'b'), (3, 10, 'c');
+insert into sq_allow values ('P10');
+create view sq_jv2 as select c.cid as cid, c.note as note, p.label as label
+    from sq_jc c join sq_jp p on p.pid = c.pref;
+
+update sq_jv2 set note = 'HIT' where exists (select 1 from sq_allow where lab = label);
+select cid, note from sq_jc order by cid;
+→ [{"cid":1,"note":"HIT"},{"cid":2,"note":"b"},{"cid":3,"note":"HIT"}]
+
+-- --- (e2) multi-source: a view-col ref nested in a subquery in a SET value ---
+-- The SET value is a correlated scalar subquery keyed on the OWNING-side view
+-- column `note` (= c.note); the descent substitutes it to `c.note` and the
+-- owning-side qualifier is stripped through the subquery so it correlates to the
+-- target row of the lowered child UPDATE.
+create table sq_e2_jp (pid integer primary key, label text);
+create table sq_e2_jc (cid integer primary key, pref integer, note text,
+    foreign key (pref) references sq_e2_jp(pid));
+create table sq_e2_lookup (k text, v text);
+insert into sq_e2_jp values (10, 'P10');
+insert into sq_e2_jc values (1, 10, 'a'), (2, 10, 'b');
+insert into sq_e2_lookup values ('a', 'AA'), ('b', 'BB');
+create view sq_e2_v as select c.cid as cid, c.note as note, p.label as label
+    from sq_e2_jc c join sq_e2_jp p on p.pid = c.pref;
+
+update sq_e2_v set note = (select v from sq_e2_lookup where k = note) where cid = 1;
+select cid, note from sq_e2_jc order by cid;
+→ [{"cid":1,"note":"AA"},{"cid":2,"note":"b"}]
+
+-- --- (f) conservative reject: a `select *` subquery source can't be resolved, so
+--         a nested unqualified view-column ref can't be proven correlated ---
+create table sq_f_t (id integer primary key, lbl text);
+create table sq_f_aux (x text);
+insert into sq_f_t values (1, 'L1');
+insert into sq_f_aux values ('L1');
+create view sq_f_v as select id as id, lbl as tag from sq_f_t;
+
+update sq_f_v set tag = 'X' where exists (select 1 from (select * from sq_f_aux) as s where s.x = tag);
+-- error: cannot write through
+
+-- a table-valued-function subquery source is unresolvable the same way -> reject.
+update sq_f_v set tag = 'X' where exists (select 1 from table_info('sq_f_t') as ti where ti.name = tag);
+-- error: cannot write through
