@@ -1,6 +1,7 @@
 description: IsolationModule does not forward `getMappingAdvertisements` to its underlying module, so when a memory/store basis table is wrapped by isolation, the lens compiler's advertisement resolver silently sees no decompositions (tag-derived `quereus.lens.decomp.*` advertisements are dropped). Harmless today (the synthesis consumer doesn't exist yet and an absent advertisement just falls back to the name-match path), but it will silently disable multi-source decomposition under isolation once `lens-multi-source-decomposition` lands.
 prereq:
 files: packages/quereus-isolation/src/isolation-module.ts, packages/quereus/src/schema/lens-compiler.ts, packages/quereus/src/vtab/module.ts
+effort: low
 ----
 
 ## Problem

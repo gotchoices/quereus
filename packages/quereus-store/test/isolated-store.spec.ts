@@ -341,6 +341,71 @@ describe('Isolated Store Module', () => {
 			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
 		});
 
+		it('PK-changing UPDATE reusing a PK tombstoned earlier in the same txn commits', async () => {
+			// Regression: isolation-overlay-pk-change-tombstone-reuse-conflict.
+			// Moving a row onto a PK that was vacated earlier in the SAME txn must
+			// overwrite the overlay tombstone there, not collide with it.
+			await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO t VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t SET id = 9 WHERE id = 1`); // frees PK 1 (overlay tombstones PK 1)
+			await db.exec(`UPDATE t SET id = 1 WHERE id = 2`); // reuse freed PK 1
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, name FROM t ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'b'], [9, 'a']]);
+		});
+
+		it('two-row PK swap via a temporary PK commits with names swapped', async () => {
+			// Regression: isolation-overlay-pk-change-tombstone-reuse-conflict.
+			await db.exec(`CREATE TABLE sw2 (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO sw2 VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE sw2 SET id = 99 WHERE id = 1`); // frees PK 1
+			await db.exec(`UPDATE sw2 SET id = 1  WHERE id = 2`); // reuse freed PK 1, frees PK 2
+			await db.exec(`UPDATE sw2 SET id = 2  WHERE id = 99`); // reuse freed PK 2
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, name FROM sw2 ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'b'], [2, 'a']]);
+		});
+
+		it('PK-changing UPDATE onto a PK holding a LIVE overlay row still raises a constraint error', async () => {
+			// The tombstone special-case must not weaken genuine PK-conflict detection:
+			// a live overlay row at the destination PK is a real duplicate.
+			await db.exec(`CREATE TABLE tlive (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO tlive VALUES (1, 'a')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO tlive VALUES (3, 'c')`); // live overlay row at PK 3
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`UPDATE tlive SET id = 3 WHERE id = 1`); // collides with live PK 3
+			} catch (e) { err = e as Error; }
+			expect(err?.message.toLowerCase()).to.include('unique constraint');
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('PK reuse combined with a freed secondary-UNIQUE value within one txn commits', async () => {
+			// A PK reuse where the relocated row also takes a UNIQUE value freed in the
+			// same txn must commit — exercises the merged-view UNIQUE check and the
+			// trusted-write flush together with the tombstone-reuse PK write.
+			await db.exec(`CREATE TABLE tu (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO tu VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE tu SET id = 9, email = 'tmp' WHERE id = 1`); // frees PK 1 and email 'a'
+			await db.exec(`UPDATE tu SET id = 1, email = 'a'   WHERE id = 2`); // reuse PK 1 and email 'a'
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM tu ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.email])).to.deep.equal([[1, 'a'], [9, 'tmp']]);
+		});
+
 		it('INSERT with PK that collides with underlying row throws constraint error', async () => {
 			await db.exec(`CREATE TABLE t_pk (id INTEGER PRIMARY KEY, val TEXT) USING store`);
 			await db.exec(`INSERT INTO t_pk VALUES (1, 'original')`);

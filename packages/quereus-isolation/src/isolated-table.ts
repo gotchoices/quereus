@@ -735,11 +735,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						// correctly when updating a value inserted in the same transaction.
 						await overlay.update({ operation: 'delete', values: undefined, oldKeyValues: targetPK });
 						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
-						const result = await overlay.update({
-							operation: 'insert',
-							values: overlayRow,
-							onConflict: effectiveOR,
-						});
+						// Reuse a tombstone already at newPK (a PK freed earlier in this txn)
+						// instead of colliding with it — see writeRelocatedRow.
+						const result = await this.writeRelocatedRow(overlay, newPK, overlayRow, tombstoneIndex, effectiveOR);
 						const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
 						return this.attachEvicted(this.attachReplacedUnderlying(stripped, pkOutcome.replacedUnderlyingRow), evicted, tombstoneIndex);
 					}
@@ -772,11 +770,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
 					}
 
-					const result = await overlay.update({
-						operation: 'insert',
-						values: overlayRow,
-						onConflict: effectiveOR,
-					});
+					// On a PK-change, reuse a tombstone already at newPK (a PK freed earlier
+					// in this txn) instead of colliding with it — see writeRelocatedRow.
+					// A same-PK update has no overlay row at newPK (=== targetPK), so the
+					// helper's insert path matches the prior behavior.
+					const result = pkChanged
+						? await this.writeRelocatedRow(overlay, newPK, overlayRow, tombstoneIndex, effectiveOR)
+						: await overlay.update({ operation: 'insert', values: overlayRow, onConflict: effectiveOR });
 					const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
 					return this.attachEvicted(this.attachReplacedUnderlying(stripped, replacedUnderlyingRow), evicted, tombstoneIndex);
 				}
@@ -1001,6 +1001,46 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return row;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Writes a relocated row at `newPK` in the overlay for a PK-changing UPDATE.
+	 *
+	 * If the overlay already holds a **tombstone** at newPK (a PK that was freed
+	 * earlier in this same transaction), overwrite it via `operation: 'update'`
+	 * rather than `operation: 'insert'` — the overlay is itself a StoreTable whose
+	 * insert path treats a tombstone row at the target key as a live PK conflict
+	 * and would throw `_overlay_<table> PK`. Overwriting the tombstone is the
+	 * logical reuse of the freed PK. This mirrors the plain-INSERT tombstone
+	 * conversion (~the `existingRow[tombstoneIndex] === 1` branch in `update`).
+	 *
+	 * A **live** overlay row at newPK is already rejected upstream by
+	 * {@link checkMergedPKConflict} (which returns its terminating constraint
+	 * result) and by the existing-overlay-row PK-conflict branch, so reaching here
+	 * with a non-tombstone overlay row should not happen; if it ever does, fall
+	 * through to insert and let the overlay enforce the genuine conflict.
+	 */
+	private async writeRelocatedRow(
+		overlay: VirtualTable,
+		newPK: SqlValue[],
+		overlayRow: SqlValue[],
+		tombstoneIndex: number,
+		effectiveOR: ConflictResolution | undefined,
+	): Promise<UpdateResult> {
+		const existingAtNewPK = await this.getOverlayRow(overlay, newPK);
+		if (existingAtNewPK && existingAtNewPK[tombstoneIndex] === 1) {
+			return overlay.update({
+				operation: 'update',
+				values: overlayRow,
+				oldKeyValues: newPK,
+				onConflict: effectiveOR,
+			});
+		}
+		return overlay.update({
+			operation: 'insert',
+			values: overlayRow,
+			onConflict: effectiveOR,
+		});
 	}
 
 	private async insertTombstoneForPK(overlay: VirtualTable, pk: SqlValue[], tombstoneIndex: number): Promise<void> {
