@@ -5,6 +5,9 @@ import { RowOpFlag } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import { transformExpr } from './single-source.js';
 import { synthesizeFKExistsExpr } from '../building/foreign-key-builder.js';
+import { createLogger } from '../../common/logger.js';
+
+const log = createLogger('planner:lens-enforcement');
 
 /**
  * Lens row-local constraint enforcement (the write side of the lens prover's
@@ -154,6 +157,15 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 		const fk = obligation.constraint.constraint;
 		const referencedSchema = fk.referencedSchema ?? logicalSchemaName;
 		const parentColumns = resolveLogicalReferencedColumns(fk, referencedSchema, schemaManager);
+		// Parity with the physical child-side builder's count-mismatch guard: if the
+		// parent columns cannot be resolved to the same arity as the child columns
+		// (an unresolvable parent ⇒ `[]`, or a malformed FK the prover did not catch),
+		// skip rather than synthesize an `EXISTS` with `undefined` parent column names.
+		if (parentColumns.length !== fk.columns.length) {
+			log('lens FK %s: parent column count (%d) != child column count (%d); skipping',
+				fk.name ?? '<anon>', parentColumns.length, fk.columns.length);
+			continue;
+		}
 		// Rewrite each FK child column index → logical name → basis column. A column
 		// the prover proved reconstructible maps; otherwise it falls back to the logical
 		// name (the prover would have errored on a non-reconstructible FK child column).

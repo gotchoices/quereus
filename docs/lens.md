@@ -203,7 +203,7 @@ At compile the prover walks every logical aspect and confirms it is mapped to, a
 
 | Check | Advisory |
 |---|---|
-| **No backing index for a set-level constraint** | A `unique` / primary key (or FK existence) with no basis covering structure is enforced by the O(n) commit-time `DeltaExecutor` scan. The prover warns and recommends a basis covering index (a materialized view with `order by` over the constraint columns), noting that row-time conflict resolution (`insert or replace` / `or ignore`) *requires* that structure and is otherwise rejected. |
+| **No backing index for a set-level constraint** | A `unique` / primary key with no basis covering structure is enforced by the O(n) commit-time `DeltaExecutor` scan. The prover warns and recommends a basis covering index (a materialized view with `order by` over the constraint columns), noting that row-time conflict resolution (`insert or replace` / `or ignore`) *requires* that structure and is otherwise rejected. (A child-side FK existence check is *not* covered by this advisory: it is a synthesized `EXISTS` whose equality predicate the optimizer pushes into a basis index seek when one answers it, degrading to an O(n) scan otherwise — see the Foreign key bullet above.) |
 | **No answering structure for a declared access pattern** | If the logical schema (or its tags) declares an expected lookup/ordering with no basis ordering or index to serve it, the prover warns that reads will scan. |
 | **Partial override** | When an override covers only some columns of a table and the remainder took the default alignment, the prover emits an informational note listing the gap-filled columns, so the generated portion is visible. |
 

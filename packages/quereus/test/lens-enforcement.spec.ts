@@ -418,6 +418,33 @@ describe('lens enforcement: child-side FK existence at the write boundary', () =
 		}
 	});
 
+	it('a bare `references parent` (no column list) falls back to the parent PK', async () => {
+		// The common FK idiom omits the parent column list, so the parser leaves
+		// `referencedColumnNames` empty and the collector must resolve the parent
+		// logical table's PK (`id`) via the fallback path. Distinct PK/non-PK column
+		// names on the parent ensure the fallback picks the PK, not a positional guess.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (pk_id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (pk_id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent) }');
+			await db.exec('apply schema x');
+
+			// The fallback resolves the parent column to its PK name `pk_id`.
+			const routed = collectLensForeignKeyConstraints(slot(db, 'child'), db.schemaManager);
+			expect(routed.length, 'one routed FK check').to.equal(1);
+			expect(astToString(routed[0].expr), 'parent side filters on the PK column').to.match(/pk_id/i);
+
+			// And it actually enforces: dangling aborts, satisfied succeeds.
+			await expectThrows(() => db.exec('insert into x.child (id, pid) values (10, 99)'), /fk_pid|constraint|foreign/i);
+			await db.exec(`insert into x.parent (pk_id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (11, 1)');
+			expect(await rows(db, 'select pid from x.child where id = 11')).to.deep.equal([{ pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('unit: the collector returns one boundary-tagged EXISTS over the qualified logical parent', async () => {
 		const db = new Database();
 		try {

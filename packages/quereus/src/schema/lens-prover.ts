@@ -138,7 +138,9 @@ export interface CoveringStructureRef {
  *  - `enforced-set-level` — an existence lookup. `row-time` when a covering
  *    structure answers it (O(log n), conflict-resolution-capable); `commit-time`
  *    otherwise (O(n) `DeltaExecutor` scan, detection-only).
- *  - `enforced-fk` — cross-relation existence, commit-time `DeltaExecutor`.
+ *  - `enforced-fk` — cross-relation existence, realized at the lens boundary as a
+ *    deferred synthesized `EXISTS` against the logical parent (gated by the
+ *    `foreign_keys` pragma, auto-deferred to commit; `planner/mutation/lens-enforcement.ts`).
  *  - `vacuous` — body + predicate make it trivially satisfied.
  */
 export type ConstraintObligation = { readonly constraint: LogicalConstraint } & (
