@@ -1148,4 +1148,56 @@ describe('IsolationModule', () => {
 			expect(rows.map((r: any) => [r.a, r.b])).to.deep.equal([[2, 200]]);
 		});
 	});
+
+	describe('capability forwarding', () => {
+		// IsolationModule is a transparent wrapper: optional capability hooks that
+		// decomposition/lens (and the planner) consult must reach the underlying
+		// module. A missing forward is a silent-degradation footgun — e.g. a dropped
+		// getMappingAdvertisements silently disables tag-derived decomposition under
+		// isolation. These tests pin the forwards so a future hook is not forgotten.
+
+		it('forwards getMappingAdvertisements to the underlying module', () => {
+			const sentinel = [{ decompositionId: 'quereus.lens.decomp.test' }] as any;
+			let received: { db: unknown; basis: unknown } | undefined;
+			const underlying = {
+				...new MemoryTableModule(),
+				getMappingAdvertisements(callDb: unknown, basisSchema: unknown) {
+					received = { db: callDb, basis: basisSchema };
+					return sentinel;
+				},
+			} as any;
+			const isolatedModule = new IsolationModule({ underlying });
+
+			const basis = { name: 'main' } as any;
+			const result = isolatedModule.getMappingAdvertisements(db, basis);
+
+			expect(result).to.equal(sentinel);
+			expect(received?.db).to.equal(db);
+			expect(received?.basis).to.equal(basis);
+		});
+
+		it('returns [] when the underlying module does not implement the hook', () => {
+			// The optional-call fallback (`?. ... ?? []`) must yield an empty list
+			// rather than undefined when the underlying module omits the hook.
+			const underlying = { ...new MemoryTableModule(), getMappingAdvertisements: undefined } as any;
+			const isolatedModule = new IsolationModule({ underlying });
+			const result = isolatedModule.getMappingAdvertisements(db, { name: 'main' } as any);
+			expect(result).to.deep.equal([]);
+		});
+
+		it('forwards getCapabilities while layering isolation guarantees', () => {
+			const underlying = {
+				...new MemoryTableModule(),
+				getCapabilities() {
+					return { supportsPushDown: true } as any;
+				},
+			} as any;
+			const isolatedModule = new IsolationModule({ underlying });
+
+			const caps = isolatedModule.getCapabilities() as any;
+			expect(caps.supportsPushDown).to.be.true; // underlying capability preserved
+			expect(caps.isolation).to.be.true; // isolation guarantee layered on
+			expect(caps.savepoints).to.be.true;
+		});
+	});
 });
