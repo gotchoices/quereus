@@ -406,6 +406,22 @@ describe('Isolated Store Module', () => {
 			expect(rows.map((r: any) => [r.id, r.email])).to.deep.equal([[1, 'a'], [9, 'tmp']]);
 		});
 
+		it('PK-changing UPDATE reusing a PK freed by a DELETE earlier in the same txn commits', async () => {
+			// The reusable overlay tombstone can originate from an explicit DELETE, not just
+			// a PK-change. writeRelocatedRow keys off the tombstone flag regardless of origin,
+			// so relocating a row onto a deleted PK must overwrite that tombstone, not collide.
+			await db.exec(`CREATE TABLE td (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO td VALUES (1, 'a'), (3, 'c')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM td WHERE id = 3`);        // tombstones PK 3 in the overlay
+			await db.exec(`UPDATE td SET id = 3 WHERE id = 1`);  // relocate onto the freed PK 3
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, name FROM td ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[3, 'a']]);
+		});
+
 		it('INSERT with PK that collides with underlying row throws constraint error', async () => {
 			await db.exec(`CREATE TABLE t_pk (id INTEGER PRIMARY KEY, val TEXT) USING store`);
 			await db.exec(`INSERT INTO t_pk VALUES (1, 'original')`);
