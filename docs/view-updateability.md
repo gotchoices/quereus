@@ -495,16 +495,53 @@ Diagnostics include a suggestion when one applies — for instance, `no-default`
 
 ## Information Schema Surface
 
-`information_schema.views` exposes per-view propagation summaries:
+The SQL-standard intent is `information_schema.views`. Quereus has no
+`information_schema` namespace and no registered `sqlite_schema` — every
+introspection surface is a **table-valued function** (`schema()`,
+`table_info(name)`, `foreign_key_info(name)`, …; see
+`func/builtins/schema.ts`). The engine-idiomatic realization of
+`information_schema.views` is therefore a TVF in that same family:
+
+```sql
+view_info()          -- one row per plain (non-materialized) view, all schemas
+view_info('my_view') -- the single matching view (optional name filter)
+```
+
+Each row exposes the per-view propagation summary (`'YES'` / `'NO'` text to
+match the SQL-standard convention):
 
 | Column | Meaning |
 |---|---|
-| `is_insertable_into` | `'YES'` if every `not null`-without-default base column has a recoverable value via FD / EC / `default_for`. |
-| `is_updatable` | `'YES'` if at least one output column has `base` lineage. Per-column updateability lives in `information_schema.columns.is_updatable`. |
-| `is_deletable` | `'YES'` if the row-identifying predicate is constructible at every base reachable from the view. |
-| `effective_targets` | JSON array of base tables that mutations through the view may touch by default. |
+| `schema` | schema name (`main`, `temp`, …). |
+| `name` | view name. |
+| `is_insertable_into` | `'YES'` if every `not null`-without-declared-default, non-generated base column of every reachable base has a recoverable value — projected, or a recoverable default (constant-FD selection pin / declared base default / `default_for`). |
+| `is_updatable` | `'YES'` if at least one output column has `base` lineage. Per-column updateability is reserved for the parked backlog ticket (below). |
+| `is_deletable` | `'YES'` if the row-identifying predicate is constructible at every base reachable from the view — operationally, every reachable base's PK columns are exposed through `base` lineage. |
+| `effective_targets` | JSON array of base-table names that mutations through the view may touch by default (`'[]'` when none). |
 
-`information_schema.columns.is_updatable` reports per-column updateability for every view (and base table) in the catalog. Values are computed at schema-attachment time and refreshed when the underlying schema changes.
+**Static derivation, not a dry run.** Every column is derived statically from
+the planned view body's backward `updateLineage` / `attributeDefaults` (§ The
+Update Site Model, § Implementation Surface) plus the base-table
+not-null/default/generated flags — `view_info()` never executes a probe
+mutation. The body is planned *logically* (it preserves the
+Project/Filter/Join/TableReference operator tree that threads `updateLineage`;
+the optimizer degrades a join's top-node lineage to `computed`), the same way
+the view-mutation substrate plans it — so `effective_targets` agrees with the
+base set `propagate()` reaches. The substrate's `propagate()` insert / delete
+paths remain the authoritative *dynamic* check; the static surface is the
+conservative reading (a body whose lineage is not yet threaded — VALUES /
+aggregate / set-op / recursive-CTE / wholly-computed — yields the conservative
+all-`NO` / `'[]'` row, never an error). The surface gains accuracy as later
+phases thread more lineage, with no rework here.
+
+Materialized views are **not** enumerated: they are read-only at the user-write
+boundary, so `view_info()` walks `getAllViews()` only.
+
+> **Per-column updateability (parked).** `information_schema.columns.is_updatable`
+> — per-column updateability for every view (and base table) — is parked in
+> `tickets/backlog/view-column-updateability-surface.md`: it touches the
+> base-table introspection surface (`table_info`) too and is independently
+> shippable, so it is deferred out of the view-level surface above.
 
 ## Implementation Surface
 
@@ -528,6 +565,7 @@ Diagnostics include a suggestion when one applies — for instance, `no-default`
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
 - `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. **Landed** (side-effect only; accumulating `returning` rows lands with RETURNING-through-view).
 - `src/schema/view.ts` — `ViewSchema.effectiveTargets`, `ViewSchema.defaultsForColumn`, populated at view-creation time.
+- `src/func/builtins/schema.ts` — the `view_info()` TVF (§ Information Schema Surface): a read-only static projection over the planned body's `updateLineage` / `attributeDefaults` + base-column flags. Reads the backward surface; threads no new state.
 
 Each surface mirrors a one-to-one correspondence with an existing engine surface: lineage parallels FDs, propagation parallels emission, and view metadata parallels table metadata. No new subsystem is introduced — view updateability is the existing FD / EC / predicate-normalization infrastructure consulted in the mutation direction.
 

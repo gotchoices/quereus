@@ -14,6 +14,13 @@ import { FunctionFlags } from "../../common/constants.js";
 import { RowOpFlag } from "../../schema/table.js";
 import { jsonStringify } from "../../util/serialization.js";
 import { expressionToString } from "../../emit/ast-stringify.js";
+import { createLogger } from "../../common/logger.js";
+import type * as AST from "../../parser/ast.js";
+import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
+import { TableReferenceNode } from "../../planner/nodes/reference.js";
+import type { ViewSchema } from "../../schema/view.js";
+
+const log = createLogger('func:view_info');
 
 /**
  * Encodes a tag bag as a JSON object string. Returns null when there are no
@@ -596,6 +603,240 @@ export const functionInfoFunc = createIntegratedTableValuedFunction(
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		} catch (error: any) {
 			yield ['error', -1, 'error', 0, 0, `Failed to get function info: ${error.message}`];
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// view_info(): per-view updateability surface.
+//
+// The engine-idiomatic realization of `docs/view-updateability.md`
+// § Information Schema Surface's `information_schema.views`: a read-only TVF
+// (consistent with the `*_info` introspection family) projecting the four
+// view-level updateability columns over plain (non-materialized) views.
+//
+// Every value is derived **statically** from the planned view body's backward
+// `updateLineage` / `attributeDefaults` (threaded onto `PhysicalProperties` by
+// the view-mutation lineage pass) plus the base-table not-null/default/generated
+// flags — no dry-run mutation. The substrate's `propagate()` insert / delete
+// paths remain the authoritative *dynamic* check; this surface is the
+// conservative static reading (cross-checked by test, not invoked here).
+// ---------------------------------------------------------------------------
+
+/** Derived view-level updateability facts (pre-`'YES'`/`'NO'` encoding). */
+interface ViewInfoRow {
+	readonly isInsertableInto: boolean;
+	readonly isUpdatable: boolean;
+	readonly isDeletable: boolean;
+	/** Distinct base-table names reachable by default, sorted for determinism. */
+	readonly effectiveTargets: string[];
+}
+
+/** The conservative all-`NO` / `[]` row for a body with no recoverable base lineage. */
+const CONSERVATIVE_VIEW_INFO: ViewInfoRow = {
+	isInsertableInto: false,
+	isUpdatable: false,
+	isDeletable: false,
+	effectiveTargets: [],
+};
+
+/** SQL-standard `'YES'`/`'NO'` text encoding for a boolean updateability flag. */
+function yesNo(value: boolean): string {
+	return value ? 'YES' : 'NO';
+}
+
+/**
+ * Unwrap an outer-join `null-extended` site to its underlying base reference.
+ * Returns the producing `TableReferenceNode` id + base column for a `base` site
+ * (directly or beneath any number of `null-extended` wrappers), else `undefined`
+ * (a `computed` / leaf-less site).
+ */
+function baseSiteOf(site: UpdateSite | undefined): { readonly table: number; readonly baseColumn: string } | undefined {
+	let s = site;
+	while (s && s.kind === 'null-extended') s = s.inner;
+	return s && s.kind === 'base' ? { table: s.table, baseColumn: s.baseColumn } : undefined;
+}
+
+/** Every relational node in the planned body (deduped), root-first. */
+function collectBodyNodes(root: RelationalPlanNode): RelationalPlanNode[] {
+	const out: RelationalPlanNode[] = [];
+	const seen = new Set<RelationalPlanNode>();
+	const visit = (n: RelationalPlanNode): void => {
+		if (seen.has(n)) return;
+		seen.add(n);
+		out.push(n);
+		for (const child of n.getRelations()) visit(child);
+	};
+	visit(root);
+	return out;
+}
+
+/**
+ * Derive the four view-level updateability columns statically from the planned
+ * view body. The **logical** tree is used deliberately (via `_buildPlan`, not
+ * `getPlan`): it preserves the Project/Filter/Join/TableReference operator
+ * structure that threads `updateLineage`, whereas the optimizer degrades a join's
+ * top-node lineage to `computed` (docs/view-updateability.md § surface authority).
+ * This mirrors the view-mutation substrate (`planner/mutation/*`), which plans the
+ * body logically for the same reason — so `effective_targets` agrees with the
+ * base set `propagate()` reaches.
+ *
+ * Re-plans on every call (same re-plan-on-read posture as `deriveBackingShape`);
+ * caching is a later optimization.
+ */
+function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
+	const { plan } = db._buildPlan([view.selectAst as AST.Statement]);
+	const root = plan.getRelations()[0];
+	if (!root) return CONSERVATIVE_VIEW_INFO;
+
+	const nodes = collectBodyNodes(root);
+	const tableRefsById = new Map<number, TableReferenceNode>();
+	for (const n of nodes) {
+		if (n instanceof TableReferenceNode) tableRefsById.set(Number(n.id), n);
+	}
+
+	// Output-column lineage: effective targets, the per-table set of base columns
+	// exposed by the projection, and the is_updatable flag (≥1 output column with
+	// base lineage — docs: "at least one output column has base lineage").
+	const rootLineage = root.physical?.updateLineage;
+	const targetIds = new Set<number>();
+	const exposed = new Map<number, Set<string>>();
+	let anyBase = false;
+	for (const attr of root.getAttributes()) {
+		const bs = baseSiteOf(rootLineage?.get(attr.id));
+		if (!bs) continue;
+		anyBase = true;
+		targetIds.add(bs.table);
+		const set = exposed.get(bs.table) ?? new Set<string>();
+		set.add(bs.baseColumn.toLowerCase());
+		exposed.set(bs.table, set);
+	}
+
+	// No base lineage at the root ⇒ wholly read-only (VALUES / aggregate / set-op /
+	// computed-only / recursive-CTE body). The conservative row falls straight out.
+	if (targetIds.size === 0) return CONSERVATIVE_VIEW_INFO;
+
+	// Defaultable base columns: every (node, attribute) carrying an insert default
+	// (`constant-fd` selection pin, declared `base-default`, `tag-default`),
+	// resolved through THAT node's own lineage back to a base column. Walking the
+	// whole spine — not just the root — recovers a *projected-away* constant-FD
+	// column (e.g. `select name from t where color = 'green'`, where `color`'s
+	// default lives on the Filter, below the projection that drops it).
+	const defaultable = new Map<number, Set<string>>();
+	for (const n of nodes) {
+		const nl = n.physical?.updateLineage;
+		const nd = n.physical?.attributeDefaults;
+		if (!nl || !nd) continue;
+		for (const attrId of nd.keys()) {
+			const bs = baseSiteOf(nl.get(attrId));
+			if (!bs) continue;
+			const set = defaultable.get(bs.table) ?? new Set<string>();
+			set.add(bs.baseColumn.toLowerCase());
+			defaultable.set(bs.table, set);
+		}
+	}
+
+	const targetNames = new Set<string>();
+	let isDeletable = true;
+	let isInsertableInto = true;
+	for (const id of targetIds) {
+		const ref = tableRefsById.get(id);
+		if (!ref) {
+			// A base-site id with no resolved TableReferenceNode should not happen
+			// (root lineage ids come from the nodes we collected); fail conservative.
+			isDeletable = false;
+			isInsertableInto = false;
+			continue;
+		}
+		const tbl = ref.tableSchema;
+		targetNames.add(tbl.name);
+		const exp = exposed.get(id) ?? new Set<string>();
+		const def = defaultable.get(id) ?? new Set<string>();
+
+		// Deletable iff every PK column of this base is exposed through base lineage
+		// (so `pk = <view value>` is constructible). A keyless base is undeletable.
+		const pkCols = tbl.primaryKeyDefinition.map(pk => tbl.columns[pk.index].name.toLowerCase());
+		if (pkCols.length === 0 || !pkCols.every(c => exp.has(c))) isDeletable = false;
+
+		// Insertable iff every not-null-without-declared-default, non-generated base
+		// column has a recoverable value: projected (exposed) or carries an insert
+		// default. Generated columns are computed/auto; nullable columns take null;
+		// declared-default columns supply themselves.
+		for (const col of tbl.columns) {
+			if (col.generated || !col.notNull || col.defaultValue != null) continue;
+			const name = col.name.toLowerCase();
+			if (!exp.has(name) && !def.has(name)) {
+				isInsertableInto = false;
+				break;
+			}
+		}
+	}
+
+	return {
+		isInsertableInto,
+		isUpdatable: anyBase,
+		isDeletable,
+		effectiveTargets: [...targetNames].sort(),
+	};
+}
+
+// View updateability function (table-valued function)
+export const viewInfoFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'view_info',
+		numArgs: -1,
+		deterministic: false, // Schema (and therefore lineage) can change
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'schema', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'is_insertable_into', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'is_updatable', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'is_deletable', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'effective_targets', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// Composite (schema, name): a view is unique per (schema, name) — guards
+			// against same-named views across schemas (main / temp / …).
+			keys: [[{ index: 0 }, { index: 1 }]],
+		},
+	},
+	async function* (db: Database, filterName?: SqlValue): AsyncIterable<Row> {
+		const nameFilter = (typeof filterName === 'string') ? filterName.toLowerCase() : null;
+
+		for (const schemaInstance of db.schemaManager._getAllSchemas()) {
+			for (const view of schemaInstance.getAllViews()) {
+				if (nameFilter !== null && view.name.toLowerCase() !== nameFilter) continue;
+
+				let info: ViewInfoRow;
+				try {
+					info = deriveViewInfo(db, view);
+				} catch (error) {
+					// Per-view conservative fallback: a body that fails to plan (stale
+					// source, unsupported shape) yields the all-`NO` / `[]` row rather
+					// than throwing the whole TVF. Logged so a genuinely unexpected
+					// failure is not silently swallowed.
+					log('conservative row for view %s.%s: %s', schemaInstance.name, view.name,
+						error instanceof Error ? error.message : String(error));
+					info = CONSERVATIVE_VIEW_INFO;
+				}
+
+				yield [
+					schemaInstance.name,
+					view.name,
+					yesNo(info.isInsertableInto),
+					yesNo(info.isUpdatable),
+					yesNo(info.isDeletable),
+					jsonStringify(info.effectiveTargets),
+				] as Row;
+			}
 		}
 	}
 );

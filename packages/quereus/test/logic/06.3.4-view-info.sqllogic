@@ -1,0 +1,141 @@
+-- 06.3.4-view-info.sqllogic — view_info() per-view updateability surface.
+-- The engine-idiomatic realization of docs/view-updateability.md
+-- § Information Schema Surface (information_schema.views → view_info() TVF).
+-- Columns: schema, name, is_insertable_into, is_updatable, is_deletable,
+-- effective_targets (JSON array of base-table names). Values are 'YES'/'NO'.
+
+-- ===================================================================
+-- Identity single-source view: every column projected → fully mutable.
+-- ===================================================================
+
+create table t (id integer primary key, name text);
+create view v_identity as select id, name from t;
+
+select schema, name from view_info('v_identity');
+→ [{"schema":"main","name":"v_identity"}]
+
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('v_identity');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"t\"]"}]
+
+-- ===================================================================
+-- Rename projection: base lineage survives the alias rename.
+-- ===================================================================
+
+create view v_rename as select id as user_id, name as full_name from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('v_rename');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"t\"]"}]
+
+-- ===================================================================
+-- Projected-away PK: still updatable, but not deletable (no row identity)
+-- and not insertable (the not-null PK has no recoverable value).
+-- ===================================================================
+
+create view v_no_pk as select name from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('v_no_pk');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"t\"]"}]
+
+-- ===================================================================
+-- Constant-FD default for a PROJECTED-AWAY column: `country` is dropped by
+-- the projection but pinned to 'US' by the selection predicate, so an insert
+-- can recover it → insertable even though it is omitted.
+-- ===================================================================
+
+create table adults (name text primary key, age integer, country text);
+create view adults_bare as select name, age from adults where country = 'US';
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('adults_bare');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"adults\"]"}]
+
+-- ===================================================================
+-- Constant-FD default with `select *` (the column survives the projection).
+-- ===================================================================
+
+create table men (name text primary key, color text);
+create view greenmen as select * from men where color = 'green';
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('greenmen');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"men\"]"}]
+
+-- ===================================================================
+-- Declared base-column default survives projection: the omitted `name`
+-- column has a DEFAULT, so it is not a not-null-without-default worry.
+-- ===================================================================
+
+create table u (id integer primary key, name text default 'unknown');
+create view u_v as select id from u;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('u_v');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"u\"]"}]
+
+-- ===================================================================
+-- Not-null-without-default base column not projected → not insertable.
+-- (`extra` is not projected, has no default, and no predicate pin.)
+-- ===================================================================
+
+create table req (id integer primary key, name text, extra text);
+create view req_v as select id, name from req;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('req_v');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"req\"]"}]
+
+-- ===================================================================
+-- Computed-only body: a non-invertible expression → wholly read-only.
+-- ===================================================================
+
+create view computed_v as select name || '!' as banner from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('computed_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- VALUES body: no base-table lineage → wholly read-only.
+-- ===================================================================
+
+create view values_v as values (1, 2), (3, 4);
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('values_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Aggregate body: aggregate output is read-only at the column level.
+-- ===================================================================
+
+create view agg_v as select count(*) as n from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('agg_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Recursive-CTE body: read-only; no recoverable base lineage.
+-- ===================================================================
+
+create view rec_v as
+    with recursive c(n) as (select 1 union all select n + 1 from c where n < 3)
+    select n from c;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('rec_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Multi-source key-preserving inner join: both base tables are effective
+-- targets and the view is updatable; but the parent PK (pid) is hidden by
+-- the projection → not deletable at every base, and the child's not-null
+-- `pref` is unrecoverable → not insertable. (per-base rules)
+-- ===================================================================
+
+create table ms_parent (pid integer primary key, label text);
+create table ms_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references ms_parent(pid));
+create view ms_jv as
+    select c.cid as cid, c.note as note, p.label as label
+    from ms_child c join ms_parent p on p.pid = c.pref;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('ms_jv');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"ms_child\",\"ms_parent\"]"}]
+
+-- ===================================================================
+-- Name filter vs. full enumeration.
+-- ===================================================================
+
+-- A name filter returns exactly the one matching row.
+select count(*) as c from view_info('ms_jv');
+→ [{"c":1}]
+
+-- An unknown name filter returns nothing.
+select count(*) as c from view_info('does_not_exist');
+→ [{"c":0}]
+
+-- The 0-arg form enumerates every view (spot-check two distinct names).
+select name from view_info() where name in ('v_identity', 'ms_jv') order by name;
+→ [{"name":"ms_jv"},{"name":"v_identity"}]
