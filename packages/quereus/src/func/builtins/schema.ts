@@ -19,6 +19,7 @@ import type * as AST from "../../parser/ast.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { readDefaultFor } from "../../planner/mutation/mutation-tags.js";
+import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
 import type { ViewSchema } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -1024,6 +1025,18 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		// together (see `baseSiteOf`'s forward-looking note).
 		const outerJoin = hasNullExtendedLineage(nodes);
 
+		// Non-inner-join shape gate (Divergence 3): cross / `> 2`-table / self-join
+		// bodies never null-extend (only LEFT/RIGHT/FULL do), so they carry strict-
+		// `base` lineage and slip past `outerJoin`. `propagate()` rejects every join
+		// shape but a single two-table inner equi-join (`isDecomposableJoinBody`, the
+		// boolean shadow of `collectInnerJoinSources`), so without this gate
+		// `baseSiteOf` resolves their bases and over-reports `is_updatable = 'YES'`.
+		// The shape check subsumes the `outerJoin` gate for join bodies (it also
+		// rejects `joinType !== 'inner'`); both are kept as parallel, defense-in-depth
+		// gates mirroring `deriveViewInfo`'s structure — `outerJoin` reads lineage,
+		// this reads the AST shape.
+		const unsupportedJoinShape = isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst);
+
 		const tableRefsById = buildTableRefsById(nodes);
 		const rootLineage = root.physical?.updateLineage;
 
@@ -1031,7 +1044,7 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		const rows: ColumnInfoRow[] = [];
 		for (let i = 0; i < attrs.length; i++) {
 			const attr = attrs[i];
-			const bs = outerJoin ? undefined : baseSiteOf(rootLineage?.get(attr.id));
+			const bs = (outerJoin || unsupportedJoinShape) ? undefined : baseSiteOf(rootLineage?.get(attr.id));
 			const ref = bs ? tableRefsById.get(bs.table) : undefined;
 			// Updatable iff a base site resolves to a producing TableReferenceNode.
 			// A base id without a resolved ref should not happen (root lineage ids

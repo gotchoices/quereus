@@ -111,6 +111,44 @@ update oj_left set av = 'z' where aid = 1;
 -- error: cannot write through view
 
 -- ===================================================================
+-- Non-inner / multi-table join bodies (Divergence 3): cross join and a
+-- > 2-table inner join. These shapes never null-extend (only LEFT/RIGHT/FULL
+-- do — deriveJoinUpdateLineage), so they carry strict-`base` lineage and slip
+-- past the outer-join gate. But propagate() rejects every join shape but a
+-- single two-table inner equi-join (collectInnerJoinSources), so column_info
+-- must report every output column is_updatable='NO' with null trace, agreeing
+-- with view_info()'s conservative row and with what a real mutation accepts.
+--
+-- Comma / implicit joins are NOT tested here: a multi-source comma FROM is
+-- rejected at view-creation time (the builder rejects multiple FROM sources), so
+-- such a view never exists to reach column_info — there is no buildable case.
+-- ===================================================================
+
+create table ra (aid integer primary key, av text);
+create table rb (bid integer primary key, bv text);
+create table rc (cid integer primary key, cv text);
+
+-- Cross join (two-table, no ON): every column 'NO' / null.
+create view cross_v as select a.aid as aid, a.av as av, b.bv as bv
+    from ra a cross join rb b;
+select cid, column_name, is_updatable, base_table, base_column from column_info('cross_v');
+→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"av","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Surface agrees with propagate(): a mutation through the cross-join view is rejected.
+update cross_v set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- 3-table inner join (> 2 base tables): also strict-`base` lineage. All 'NO' / null.
+create view three_v as select a.aid as aid, a.av as av, b.bv as bv, c.cv as cv
+    from ra a join rb b on b.bid = a.aid join rc c on c.cid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('three_v');
+→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"av","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"column_name":"cv","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Surface agrees with propagate(): a mutation through the 3-table-join view is rejected.
+update three_v set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- ===================================================================
 -- Unknown name throws (mirrors table_info's required-target posture).
 -- ===================================================================
 

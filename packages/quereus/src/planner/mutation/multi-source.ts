@@ -96,6 +96,50 @@ export function isJoinBody(selectAst: AST.QueryExpr): boolean {
 }
 
 /**
+ * Non-throwing AST shape check — the boolean shadow of {@link collectInnerJoinSources}'s
+ * acceptance: `true` iff the body is a single explicit two-table INNER join with
+ * an ON predicate over two **distinct plain base tables** (the exact multi-source
+ * shape `propagate()` decomposes). Every other multi-table body — cross / outer /
+ * comma (implicit) / `> 2`-table / subquery- or function-source / self-join —
+ * returns `false`.
+ *
+ * Shared with the static updateability surfaces (`deriveViewInfo` /
+ * `deriveColumnInfo` in `func/builtins/schema.ts`): they gate on this so they
+ * agree with what a real mutation through the view accepts, rather than reading
+ * `updateLineage` (which carries strict-`base` sites for cross / `> 2`-table
+ * bodies — only LEFT/RIGHT/FULL outer joins null-extend — and would otherwise
+ * over-report `is_updatable = 'YES'`). The throwing `collectInnerJoinSources`
+ * stays the substrate's source of truth; this mirrors only its AST-level shape
+ * gate (it does not re-check DISTINCT/LIMIT/`select *`/PK, which are deeper
+ * semantic rejects handled downstream).
+ */
+export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
+	if (selectAst.type !== 'select' || !selectAst.from) return false;
+	const from = selectAst.from;
+	if (from.length !== 1 || from[0].type !== 'join') return false;
+
+	const tables: AST.TableSource[] = [];
+	const visit = (fc: AST.FromClause): boolean => {
+		switch (fc.type) {
+			case 'table':
+				tables.push(fc);
+				return true;
+			case 'join':
+				if (fc.joinType !== 'inner' || !fc.condition) return false;
+				return visit(fc.left) && visit(fc.right);
+			default:
+				return false; // subquery / function source — not a plain base table
+		}
+	};
+	if (!visit(from[0])) return false;
+
+	// Exactly two distinct base tables (a self-join references one table under two
+	// alias-bound sites, which the substrate also rejects).
+	if (tables.length !== 2) return false;
+	return tables[0].table.name.toLowerCase() !== tables[1].table.name.toLowerCase();
+}
+
+/**
  * Decompose a multi-source (two-table inner-join) view mutation into an ordered
  * `BaseOp[]`. Throws a structured diagnostic for any unsupported shape.
  */

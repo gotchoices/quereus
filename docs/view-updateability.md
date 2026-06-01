@@ -718,6 +718,20 @@ as `view_info` short-circuits it to all-`NO`/`[]`, rather than unwrapping
 `'YES'`. The two surfaces agree with each other and with the dynamic truth; when
 per-side write materialization lands and the gate softens, both relax together.
 
+**Non-inner-join shape gate (Divergence 3).** Cross joins and `> 2`-table joins
+(and self-joins) never null-extend — only LEFT/RIGHT/FULL do — so they carry
+strict-`base` lineage and slip past the outer-join gate, yet `propagate()` rejects
+every join shape but a *single two-table inner equi-join* (`collectInnerJoinSources`).
+Both surfaces therefore also gate on a non-throwing AST shape check —
+`isDecomposableJoinBody` (the boolean shadow of `collectInnerJoinSources`, in
+`planner/mutation/multi-source.ts`): a body that `isJoinBody` but not
+`isDecomposableJoinBody` short-circuits to the conservative all-`NO` reading.
+This subsumes the outer-join gate for join bodies (it also rejects
+`joinType !== 'inner'`); the two are kept as parallel, defense-in-depth gates
+(one reads lineage, one reads the AST). Comma/implicit join bodies need no gate
+here — the view builder rejects a multi-source comma FROM at `create view` time,
+so such a view never reaches these surfaces.
+
 The `'YES'`/`'NO'` text encoding matches `information_schema.columns.is_updatable`
 and the `view_info` flags — deliberately **not** `table_info`'s integer `0`/`1`.
 
