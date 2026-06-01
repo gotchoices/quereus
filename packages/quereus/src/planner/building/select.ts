@@ -23,6 +23,8 @@ import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { ValuesNode } from '../nodes/values-node.js';
 import { createLogger } from '../../common/logger.js';
 import { AliasNode } from '../nodes/alias-node.js';
+import { AssertedKeysNode } from '../nodes/asserted-keys-node.js';
+import { computeLensAssertedKeyFds } from '../../schema/lens-prover.js';
 
 // Import decomposed functionality
 import { buildWithContext } from './select-context.js';
@@ -429,6 +431,21 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 						};
 					});
 					viewSelectNode = new ProjectNode(parentContext.scope, viewSelectNode, projections);
+				}
+
+				// Lens boundary: contribute the declared logical key(s) the lens proves
+				// or actively enforces as FDs the compiled body alone may not surface
+				// (docs/lens.md § Constraint Attachment; docs/optimizer.md § Functional
+				// Dependency Tracking). Only a logical schema's lens slot yields any —
+				// a plain view / MV has none, so this never affects ordinary views. The
+				// node wraps the view's ProjectNode (whose output indices == the lens
+				// prover's non-hidden output-index space), inside the optional AliasNode.
+				const lensSlot = parentContext.db.schemaManager.getSchema(viewSchema.schemaName)?.getLensSlot(viewSchema.name);
+				if (lensSlot) {
+					const assertedFds = computeLensAssertedKeyFds(lensSlot, parentContext.db);
+					if (assertedFds.length > 0) {
+						viewSelectNode = new AssertedKeysNode(parentContext.scope, viewSelectNode, assertedFds);
+					}
 				}
 
 				// Wrap with AliasNode if aliased to update relationName on attributes

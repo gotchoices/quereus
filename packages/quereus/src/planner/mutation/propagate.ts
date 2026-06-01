@@ -47,6 +47,11 @@ const PASSTHROUGH_NODES: ReadonlySet<PlanNodeType> = new Set([
 	PlanNodeType.Sort,
 	PlanNodeType.LimitOffset,
 	PlanNodeType.Alias,
+	// A lens-boundary FD marker is row-preserving and single-source; tolerated so
+	// a lens-over-lens body walk can reach the base table through it. (The
+	// standard lens mutation walks the compiled body over basis tables, where
+	// this node never appears — see docs/lens.md § FD contribution.)
+	PlanNodeType.AssertedKeys,
 ]);
 
 export interface SingleSourceDecomposition {

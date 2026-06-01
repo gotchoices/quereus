@@ -24,6 +24,7 @@ import { emitCTE } from './emit/cte.js';
 import { emitCTEReference } from './emit/cte-reference.js';
 import { emitInternalRecursiveCTERef } from './emit/internal-recursive-cte-ref.js';
 import { emitAlias } from './emit/alias.js';
+import { emitAssertedKeys } from './emit/asserted-keys.js';
 import { emitInsert } from './emit/insert.js';
 import { emitUpdate } from './emit/update.js';
 import { emitDmlExecutor } from './emit/dml-executor.js';
@@ -99,6 +100,7 @@ export function registerEmitters() {
 	// Relational emitters (mix of logical and physical for now)
 	registerEmitter(PlanNodeType.Block, emitBlock as EmitterFunc);
 	registerEmitter(PlanNodeType.Alias, emitAlias as EmitterFunc);
+	registerEmitter(PlanNodeType.AssertedKeys, emitAssertedKeys as EmitterFunc);
 	registerEmitter(PlanNodeType.CTEReference, emitCTEReference as EmitterFunc);
 	registerEmitter(PlanNodeType.InternalRecursiveCTERef, emitInternalRecursiveCTERef as EmitterFunc);
 	registerEmitter(PlanNodeType.Retrieve, emitRetrieve as EmitterFunc);

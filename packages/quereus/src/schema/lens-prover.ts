@@ -1,8 +1,9 @@
 import type { Database } from '../core/database.js';
-import type { TableSchema } from './table.js';
+import type { TableSchema, UniqueConstraintSchema } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type * as AST from '../parser/ast.js';
-import type { RelationalPlanNode } from '../planner/nodes/plan-node.js';
+import type { FunctionalDependency, GuardClause, GuardPredicate, RelationalPlanNode } from '../planner/nodes/plan-node.js';
+import { addFd, superkeyToFd } from '../planner/util/fd-utils.js';
 import { proveEffectiveKeyUnique } from '../planner/analysis/coverage-prover.js';
 import { astToString } from '../emit/ast-stringify.js';
 import { PhysicalType } from '../types/logical-type.js';
@@ -242,13 +243,7 @@ function buildProveContext(slot: LensSlot, db: Database): ProveContext {
 	const logicalColIndex = new Map<string, number>();
 	table.columns.forEach((c, i) => logicalColIndex.set(c.name.toLowerCase(), i));
 
-	const outputColumns: string[] = [];
-	const outputIndex = new Map<string, number>();
-	for (const p of slot.columnProvenance) {
-		if (p.source === 'hidden') continue;
-		outputIndex.set(p.logicalColumn.toLowerCase(), outputColumns.length);
-		outputColumns.push(p.logicalColumn);
-	}
+	const { outputIndex, outputColumns } = buildOutputIndex(slot);
 
 	const basisSchemaName = slot.defaultBasis.schemaName;
 	return {
@@ -262,6 +257,26 @@ function buildProveContext(slot: LensSlot, db: Database): ProveContext {
 		basisSource: resolveSingleBasisSource(db, slot.compiledBody, basisSchemaName),
 		basisSchemaName,
 	};
+}
+
+/**
+ * The non-hidden output-index map for a lens slot: logical column name (lower) →
+ * body-output column index, plus the columns in declaration order. The single
+ * source of truth for the body's output-column-index space — shared by
+ * {@link buildProveContext} and {@link computeLensAssertedKeyFds} so the two can
+ * never drift (the FD-contribution columns must land in exactly the space the
+ * prover proved its keys in). Hidden columns are skipped — they are absent from
+ * the registered view and the inlined ProjectNode alike.
+ */
+function buildOutputIndex(slot: LensSlot): { outputIndex: Map<string, number>; outputColumns: string[] } {
+	const outputColumns: string[] = [];
+	const outputIndex = new Map<string, number>();
+	for (const p of slot.columnProvenance) {
+		if (p.source === 'hidden') continue;
+		outputIndex.set(p.logicalColumn.toLowerCase(), outputColumns.length);
+		outputColumns.push(p.logicalColumn);
+	}
+	return { outputIndex, outputColumns };
 }
 
 /**
@@ -625,6 +640,23 @@ function classifyCheckConstraint(
  * is the sole row-time structure (`docs/lens.md` § Constraint Attachment).
  */
 function findBasisCoveringStructure(ctx: ProveContext, logicalColumns: readonly number[]): CoveringStructureRef | undefined {
+	return findBasisCovering(ctx, logicalColumns)?.ref;
+}
+
+/** The matching basis UC and the row-time covering structure that answers it. */
+interface BasisCovering {
+	readonly ref: CoveringStructureRef;
+	readonly uc: UniqueConstraintSchema;
+}
+
+/**
+ * Resolves the basis covering structure AND the basis UNIQUE constraint backing a
+ * logical key, factored out of {@link findBasisCoveringStructure} so the plan-time
+ * FD re-validation ({@link computeLensAssertedKeyFds}) can re-confirm currency and
+ * inspect the basis UC's partial predicate against the *current* catalog. Reads no
+ * `ctx.root`, so it is safe over a lightweight (un-planned) context.
+ */
+function findBasisCovering(ctx: ProveContext, logicalColumns: readonly number[]): BasisCovering | undefined {
 	const basis = ctx.basisSource;
 	if (!basis) return undefined;
 
@@ -647,7 +679,7 @@ function findBasisCoveringStructure(ctx: ProveContext, logicalColumns: readonly 
 	// MV does NOT qualify — claiming row-time there would be unsound, so we fall
 	// through to the commit-time scan.
 	const rowTime = ctx.db._findRowTimeCoveringStructure(basis.schemaName, basis.name, matching);
-	return rowTime ? { kind: 'materialized-view', name: rowTime.name } : undefined;
+	return rowTime ? { ref: { kind: 'materialized-view', name: rowTime.name }, uc: matching } : undefined;
 }
 
 /** The basis column index a logical column maps to under a single-source body, or undefined. */
@@ -657,6 +689,191 @@ function mappedBasisColumn(ctx: ProveContext, logicalColumn: string, basis: Tabl
 	const rc = ctx.slot.compiledBody.columns[oi];
 	if (rc?.type !== 'column' || rc.expr.type !== 'column') return undefined;
 	return basis.columnIndexMap.get((rc.expr as AST.ColumnExpr).name.toLowerCase());
+}
+
+// ---------------------------------------------------------------------------
+// Read-side: declared-key FD contribution to the optimizer (the inlined-view
+// boundary). See docs/lens.md § Constraint Attachment and docs/optimizer.md
+// § Functional Dependency Tracking.
+// ---------------------------------------------------------------------------
+
+/**
+ * The declared logical keys a lens *proves* or *actively enforces*, encoded as
+ * physical functional dependencies in the body's **output**-column-index space,
+ * for the optimizer to consume at the inlined-view boundary
+ * (`planner/nodes/asserted-keys-node.ts`, wired in `planner/building/select.ts`).
+ *
+ * Soundness is gated by the prover's per-constraint {@link ConstraintObligation}
+ * kind — a false key FD is a *correctness* defect (it can make
+ * DISTINCT/join-elimination/order-by-pruning drop real rows), so the gate
+ * under-claims exactly like every other FD-propagation rule:
+ *
+ *  - `proved`   — the body intrinsically guarantees the key (the same FD surface
+ *    the optimizer derives locally); contribute the **unconditional** key FD.
+ *    Redundant-but-harmless when local propagation already surfaces it (`addFd`
+ *    subsumes), load-bearing when the inlining context loses it.
+ *  - `vacuous`  — the empty (singleton) key; contribute `∅ → all_cols` (≤1-row).
+ *  - `enforced-set-level` `row-time` — a covering structure enforces uniqueness
+ *    per row-write, but only over the **non-null** tuples a plain (NULL-skipping)
+ *    UNIQUE governs — SQL UNIQUE permits multiple all-/any-NULL rows, so the key
+ *    is conditionally unique. Contribute a **guarded** FD `key → others
+ *    [guard: key IS NOT NULL]` (the same shape a partial UNIQUE emits), and only
+ *    when the covering structure re-validates against the *current* catalog (it
+ *    can be dropped / go stale out-of-band between deploys) and the backing basis
+ *    UC is non-partial (so NULL-skip is the *entire* uniqueness scope).
+ *  - `enforced-set-level` `commit-time` — **excluded**. Detection-only at commit;
+ *    a duplicate can transiently exist mid-statement (read-own-writes / Halloween),
+ *    so assuming the FD mid-statement is unsound.
+ *  - `enforced-row-local` / `enforced-fk` — not uniqueness facts; excluded.
+ *
+ * Returns the (deduped) FD list, or `[]` when nothing is contributable — the
+ * wiring site inlines no node for an empty list (plain views / MVs / unenforced
+ * keys produce none).
+ */
+export function computeLensAssertedKeyFds(slot: LensSlot, db: Database): FunctionalDependency[] {
+	if (!slot.obligations || slot.obligations.length === 0) return [];
+
+	const { outputIndex, outputColumns } = buildOutputIndex(slot);
+	const outColCount = outputColumns.length;
+	if (outColCount === 0) return [];
+
+	let fds: FunctionalDependency[] = [];
+	for (const ob of slot.obligations) {
+		const fd = assertedFdForObligation(ob, slot, db, outputIndex, outColCount);
+		if (fd) fds = addFd(fds, fd);
+	}
+	return fds;
+}
+
+/** The asserted key FD for one obligation, or undefined when it contributes none. */
+function assertedFdForObligation(
+	ob: ConstraintObligation,
+	slot: LensSlot,
+	db: Database,
+	outputIndex: ReadonlyMap<string, number>,
+	outColCount: number,
+): FunctionalDependency | undefined {
+	const c = ob.constraint;
+	if (c.kind !== 'primaryKey' && c.kind !== 'unique') return undefined; // not a key fact
+
+	switch (ob.kind) {
+		case 'vacuous':
+			// The empty (singleton) key ⇒ `∅ → all_cols` (≤1-row). superkeyToFd([], n)
+			// is the canonical encoding.
+			return superkeyToFd([], outColCount);
+		case 'proved':
+			// The body unconditionally guarantees the key. Contribute it unconditionally.
+			return encodeKeyFd(logicalKeyColumns(c), slot.logicalTable, outputIndex, outColCount, undefined);
+		case 'enforced-set-level': {
+			if (ob.mode !== 'row-time') return undefined; // commit-time gated out (unsound mid-statement)
+			const logicalCols = logicalKeyColumns(c);
+			// Re-validate the covering structure against the current catalog (currency)
+			// and require a non-partial basis UC (so IS-NOT-NULL is the full scope).
+			if (!revalidateRowTime(slot, db, logicalCols)) return undefined;
+			const guard = buildNotNullGuard(logicalCols, slot.logicalTable, outputIndex);
+			if (!guard) return undefined; // no nullable key column ⇒ would be `proved`, not row-time; skip
+			return encodeKeyFd(logicalCols, slot.logicalTable, outputIndex, outColCount, guard);
+		}
+		default:
+			return undefined; // enforced-row-local / enforced-fk
+	}
+}
+
+/** The logical column indices forming a primary-key / unique constraint. */
+function logicalKeyColumns(c: Extract<LogicalConstraint, { kind: 'primaryKey' | 'unique' }>): readonly number[] {
+	return c.kind === 'primaryKey' ? c.columns.map(col => col.index) : c.constraint.columns;
+}
+
+/**
+ * Encode `key → others` over the body's output columns. Maps each logical key
+ * column → its non-hidden output index; a key column with no output index
+ * (hidden / not emitted) makes the key inexpressible (⇒ undefined). The
+ * all-columns key has no non-trivial FD encoding (`superkeyToFd` ⇒ undefined) and
+ * is skipped (v1). When `guard` is supplied the FD activates only under a
+ * surrounding predicate that entails it (the nullable / partial-UNIQUE case).
+ */
+function encodeKeyFd(
+	logicalColumns: readonly number[],
+	table: TableSchema,
+	outputIndex: ReadonlyMap<string, number>,
+	outColCount: number,
+	guard: GuardPredicate | undefined,
+): FunctionalDependency | undefined {
+	const outCols: number[] = [];
+	for (const li of logicalColumns) {
+		const name = table.columns[li]?.name;
+		const oi = name !== undefined ? outputIndex.get(name.toLowerCase()) : undefined;
+		if (oi === undefined) return undefined; // hidden / not emitted ⇒ not in the readable relation
+		outCols.push(oi);
+	}
+	const fd = superkeyToFd(outCols, outColCount);
+	if (!fd) return undefined;
+	return guard ? { ...fd, guard } : fd;
+}
+
+/**
+ * The `key IS NOT NULL` guard for a conditionally-unique (NULL-skipping) key — one
+ * `is-null negated:true` clause per **nullable** key column (a NOT-NULL column
+ * needs none; the guard checker discharges it from type info). Returns undefined
+ * when every key column is already NOT NULL — that key is unconditional and would
+ * have classified `proved`, so a row-time obligation over it is skipped defensively.
+ */
+function buildNotNullGuard(
+	logicalColumns: readonly number[],
+	table: TableSchema,
+	outputIndex: ReadonlyMap<string, number>,
+): GuardPredicate | undefined {
+	const clauses: GuardClause[] = [];
+	for (const li of logicalColumns) {
+		const col = table.columns[li];
+		if (!col) return undefined;
+		if (col.notNull) continue;
+		const oi = outputIndex.get(col.name.toLowerCase());
+		if (oi === undefined) return undefined;
+		clauses.push({ kind: 'is-null', column: oi, negated: true });
+	}
+	return clauses.length > 0 ? { clauses } : undefined;
+}
+
+/**
+ * Re-confirm at plan time that a row-time obligation's covering structure is
+ * still valid: a covering MV can be dropped or go stale out-of-band between
+ * deploys (the basis is a physical schema whose DDL does not re-run the prover),
+ * so the deploy-time snapshot must be re-validated. Also requires the backing
+ * basis UC to be **non-partial** — a partial UNIQUE (`… where P`) makes the
+ * uniqueness scope `P`, not merely NULL-skip, which the IS-NOT-NULL guard would
+ * not capture. Cheap: re-resolves the covering structure against the current
+ * catalog without re-planning the body.
+ */
+function revalidateRowTime(slot: LensSlot, db: Database, logicalColumns: readonly number[]): boolean {
+	const ctx = buildLiteProveContext(slot, db);
+	const covering = findBasisCovering(ctx, logicalColumns);
+	return covering !== undefined && covering.uc.predicate === undefined;
+}
+
+/**
+ * A lightweight prove context for plan-time covering re-resolution — every field
+ * {@link findBasisCovering} reads, with `root` left undefined (the body is NOT
+ * re-planned; the covering resolver is plan-independent). Keeps the per-read cost
+ * to a couple of map builds + a catalog lookup.
+ */
+function buildLiteProveContext(slot: LensSlot, db: Database): ProveContext {
+	const table = slot.logicalTable;
+	const logicalColIndex = new Map<string, number>();
+	table.columns.forEach((c, i) => logicalColIndex.set(c.name.toLowerCase(), i));
+	const { outputIndex, outputColumns } = buildOutputIndex(slot);
+	const basisSchemaName = slot.defaultBasis.schemaName;
+	return {
+		slot,
+		db,
+		table,
+		logicalColIndex,
+		outputColumns,
+		outputIndex,
+		root: undefined,
+		basisSource: resolveSingleBasisSource(db, slot.compiledBody, basisSchemaName),
+		basisSchemaName,
+	};
 }
 
 // ---------------------------------------------------------------------------

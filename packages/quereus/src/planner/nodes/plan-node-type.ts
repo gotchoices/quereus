@@ -80,6 +80,7 @@ export enum PlanNodeType {
 
   // Special relational nodes
   Alias = 'Alias',  // Wraps a relation with an alias for relationName
+  AssertedKeys = 'AssertedKeys',  // Pass-through carrying lens-asserted declared-key FDs onto the inlined-view boundary
   Values = 'Values',
 	TableLiteral = "TableLiteral",
   EnvelopeScan = 'EnvelopeScan',  // Scans the shared-surrogate mutation envelope (multi-source view insert)

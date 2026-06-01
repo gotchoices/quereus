@@ -254,6 +254,9 @@ const PASS_THROUGH: ReadonlySet<PlanNodeType> = new Set([
 	PlanNodeType.Project,
 	PlanNodeType.Retrieve,
 	PlanNodeType.Alias,
+	// A lens-boundary marker is a pure row-preserving single-source pass-through
+	// (it only contributes FDs); transparent to the coverage shape walk.
+	PlanNodeType.AssertedKeys,
 	PlanNodeType.SeqScan,
 	PlanNodeType.IndexScan,
 	PlanNodeType.IndexSeek,
