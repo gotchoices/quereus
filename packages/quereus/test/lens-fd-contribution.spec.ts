@@ -190,6 +190,41 @@ describe('lens FD contribution: the soundness gate (computeLensAssertedKeyFds)',
 			await db.close();
 		}
 	});
+
+	it('composite row-time — a multi-column nullable unique emits one IS NOT NULL guard clause per column', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table u (id integer primary key, a text null, b text null, label text null, unique (a, b)) }');
+			await db.exec('apply schema y');
+			// Covering MV over both UC columns (NULL-skipped on each) + source PK.
+			await db.exec('create materialized view y.ix_u_ab as select a, b, id from y.u where a is not null and b is not null order by a, b');
+			await db.exec('declare logical schema x { table u (id integer primary key, a text null, b text null, label text null, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			const list = fds(db, 'u');
+			// unique(a, b) (cols 1, 2) → guarded `{a,b} → {id, label}` with a per-column
+			// IS NOT NULL clause (a composite NULL-skipping UNIQUE is unique only over
+			// rows where EVERY key column is non-null — `buildNotNullGuard` emits one
+			// clause per nullable member).
+			const abFd = fdByDeterminants(list, [1, 2]);
+			expect(abFd, 'an FD determined by the composite key (cols 1, 2)').to.not.be.undefined;
+			expect([...abFd!.dependents].sort()).to.deep.equal([0, 3]);
+			expect(abFd!.guard, 'composite row-time key is conditionally unique (guarded)').to.not.be.undefined;
+			const clauses = [...abFd!.guard!.clauses].sort((c1, c2) =>
+				(c1.kind === 'is-null' ? c1.column : -1) - (c2.kind === 'is-null' ? c2.column : -1));
+			expect(clauses).to.deep.equal([
+				{ kind: 'is-null', column: 1, negated: true },
+				{ kind: 'is-null', column: 2, negated: true },
+			]);
+
+			// The proved PK still contributes an unconditional `id → others`.
+			const pkFd = fdByDeterminants(list, [0]);
+			expect(pkFd, 'the proved PK FD').to.not.be.undefined;
+			expect(pkFd!.guard, 'proved PK is unconditional').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens FD contribution: end-to-end optimizer behavior', () => {
