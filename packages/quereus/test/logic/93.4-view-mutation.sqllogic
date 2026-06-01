@@ -708,6 +708,52 @@ delete from cd_v where exists (select 1 from cd_src where tag = note);
 select id, lbl from cd_base order by id;
 → [{"id":2,"lbl":"B"}]
 
+-- --- (n) lineage-subquery taint reject — unresolvable FROM *inside* the computed
+--          lineage term itself (distinct from blocks (e)/(f), which taint the USER
+--          subquery). The deep correlation-qualifier descends into the lineage
+--          subquery and must prove which names its own FROM introduces in order to
+--          know whether the bare `id` correlates out to the base row. The nested
+--          `(select * from cn_oth)` source makes those names unresolvable, so the
+--          qualifier rejects loudly rather than guess and risk a silent wrong write.
+create table cn_base (id integer primary key, lbl text);
+create table cn_oth (fk integer, x text);
+create table cn_src (id integer, tag text);
+insert into cn_base values (1, 'A');
+create view cn_v as select id as id, lbl as lbl,
+    (select x from (select * from cn_oth) as s where s.fk = id) as note from cn_base;
+
+update cn_v set lbl = 'X' where exists (select 1 from cn_src where tag = note);
+-- error: not statically resolvable
+
+-- --- (o) the deep qualifier's SHADOW logic, isolated from its base-column gate ---
+-- Blocks (k)/(l)/(m) only ever exercise the base-column GATE: the lineage subquery's
+-- local columns (cv_oth.fk / .x) are excluded from qualification simply because they
+-- are not columns of the base table. The `shadowed`-set accumulation inside
+-- qualifyCorrelatedBaseRefsQuery is only the *deciding* factor when a lineage-local
+-- column name ALSO collides with a base column name — then the base-column gate alone
+-- would wrongly qualify it, and only the shadow set keeps it local. Here so_oth has
+-- its own `id` (colliding with so_base.id). The lineage `(select x from so_oth where
+-- link = k and id = 1)` filters so_oth by its OWN id (=1) and correlates on `k`. The
+-- shadow set must keep `id` bound to so_oth.id (local literal filter) while qualifying
+-- only `k` to so_base.k. If `id` were (wrongly) qualified to so_base.id, the local
+-- `id = 1` filter would vanish (becoming the per-row-constant so_base.id = 1) and the
+-- subquery would select so_oth's first link-matching row ('Q') instead of 'P' — so the
+-- EXISTS against so_src(tag='P') would no longer match row 1. Asserts row 1 writes.
+create table so_base (id integer primary key, k integer, lbl text);
+create table so_oth (id integer, link integer, x text);
+create table so_src (id integer, tag text);
+insert into so_base values (1, 10, 'A'), (2, 20, 'B');
+insert into so_oth values (3, 10, 'Q'), (1, 10, 'P');
+insert into so_src values (99, 'P');
+create view so_v as select id as id, k as k, lbl as lbl,
+    (select x from so_oth where link = k and id = 1) as note from so_base;
+
+update so_v set lbl = 'HIT' where exists (select 1 from so_src where tag = note);
+-- base row1 (k=10): so_oth where link=10 and so_oth.id=1 -> 'P', matches so_src -> writes.
+-- base row2 (k=20): no link=20 row -> note NULL -> kept.
+select id, lbl from so_base order by id;
+→ [{"id":1,"lbl":"HIT"},{"id":2,"lbl":"B"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so an insert mints a
