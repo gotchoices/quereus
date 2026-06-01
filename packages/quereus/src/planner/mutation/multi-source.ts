@@ -188,6 +188,20 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		return { name, sideIndex, baseColumn: out.baseColumn, type: columnScalarType(baseCol), isKey };
 	});
 
+	// The shared key is a single value threaded into both sides. If the view exposes
+	// it more than once (both sides of the equi-join key, or the same side's key
+	// twice), an insert cannot honor divergent supplied values without either
+	// breaking the join invariant or silently dropping one — reject, directing the
+	// user to supply the shared key through a single view column.
+	const suppliedKeys = supplied.filter(s => s.isKey);
+	if (suppliedKeys.length > 1) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': the shared join key is exposed by more than one view column (${suppliedKeys.map(s => `'${s.name}'`).join(', ')}); supply it through a single view column`,
+		});
+	}
+
 	// The shared key is either directly supplied (a supplied view column maps to a
 	// join-key base column) or minted once per row at the envelope.
 	const suppliedKeyIndex = supplied.findIndex(s => s.isKey);

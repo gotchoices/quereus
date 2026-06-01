@@ -240,7 +240,10 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 > from the single `a.col = b.col` ON predicate) is **directly supplied** when a view
 > column maps to it, otherwise **minted** at the envelope (§ Mutation Context). A
 > `not null` base column with neither a supplied value nor a declared default raises
-> `no-default`; a computed target column raises `no-inverse`. **Still rejected:**
+> `no-default`; a computed target column raises `no-inverse`. The shared key must
+> be exposed by **at most one** view column — a body projecting both sides of the
+> equi-join key is over-specified for an insert (it could not honor divergent
+> supplied values) and raises `unsupported-join`. **Still rejected:**
 > outer-join / optional-member inserts (the worked example's `left join` shape — the
 > insert path requires an INNER join in v1), composite-PK or `> 2`-table joins,
 > self-joins, a non-integer surrogate that is not directly supplied, a

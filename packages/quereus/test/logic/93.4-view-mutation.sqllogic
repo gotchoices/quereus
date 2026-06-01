@@ -665,3 +665,13 @@ create view cm_v as select a.k as k, a.av + 1 as bumped, b.bv as bv
     from cm_a a join cm_b b on b.k = a.k;
 insert into cm_v (bumped, bv) values (5, 6);
 -- error: non-invertible
+
+-- --- (f) the shared key exposed by more than one view column (both sides of the
+--         equi-join key) is over-specified: an insert cannot honor divergent
+--         supplied values, so it is rejected rather than silently dropping one ---
+create table bk_a (k integer primary key, av text);
+create table bk_b (k integer primary key, bv text);
+create view bk_v as select a.k as ka, b.k as kb, a.av as av, b.bv as bv
+    from bk_a a join bk_b b on b.k = a.k;
+insert into bk_v (ka, kb, av, bv) values (5, 7, 'a', 'b');
+-- error: shared join key is exposed by more than one view column
