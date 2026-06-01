@@ -18,6 +18,7 @@ import { createLogger } from "../../common/logger.js";
 import type * as AST from "../../parser/ast.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
+import { readDefaultFor } from "../../planner/mutation/mutation-tags.js";
 import type { ViewSchema } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -646,10 +647,17 @@ function yesNo(value: boolean): string {
 }
 
 /**
- * Unwrap an outer-join `null-extended` site to its underlying base reference.
- * Returns the producing `TableReferenceNode` id + base column for a `base` site
- * (directly or beneath any number of `null-extended` wrappers), else `undefined`
+ * Resolve an UpdateSite to its underlying base reference: the producing
+ * `TableReferenceNode` id + base column for a `base` site, else `undefined`
  * (a `computed` / leaf-less site).
+ *
+ * The `null-extended` unwrap is now defensive only: `deriveViewInfo`
+ * short-circuits any body carrying a `null-extended` site to the conservative
+ * row (`hasNullExtendedLineage`) *before* this is reached, so on a cleared body
+ * this only ever sees plain `base` sites and the unwrap is a no-op. It is
+ * retained for the future per-side relaxation — when outer-join write
+ * materialization lands and the gate softens to per-side writability, this will
+ * again resolve the preserved side's base for `effective_targets` membership.
  */
 function baseSiteOf(site: UpdateSite | undefined): { readonly table: number; readonly baseColumn: string } | undefined {
 	let s = site;
@@ -672,6 +680,32 @@ function collectBodyNodes(root: RelationalPlanNode): RelationalPlanNode[] {
 }
 
 /**
+ * True when any collected body node carries a `null-extended` lineage site —
+ * the signature of a LEFT/RIGHT/FULL outer-join body (`deriveJoinUpdateLineage`
+ * wraps the non-preserved side `null-extended`). `propagateMultiSource` rejects
+ * the *entire* outer join today (`collectInnerJoinSources` accepts only inner
+ * equi-joins, on either side), so such a body supports no mutation at all;
+ * `deriveViewInfo` short-circuits it to the conservative row to agree with
+ * `propagate()`. Walks the whole spine — not just the root — because an outer
+ * join whose non-preserved columns are all projected away still carries the
+ * `null-extended` sites on the `JoinNode`'s own lineage.
+ */
+function hasNullExtendedLineage(nodes: RelationalPlanNode[]): boolean {
+	for (const n of nodes) {
+		const l = n.physical?.updateLineage;
+		if (l) for (const site of l.values()) if (site.kind === 'null-extended') return true;
+	}
+	return false;
+}
+
+/** Record `baseColumn` (lowercased) as defaultable for base table `table`. */
+function addDefaultable(map: Map<number, Set<string>>, table: number, baseColumn: string): void {
+	const set = map.get(table) ?? new Set<string>();
+	set.add(baseColumn.toLowerCase());
+	map.set(table, set);
+}
+
+/**
  * Derive the four view-level updateability columns statically from the planned
  * view body. The **logical** tree is used deliberately (via `_buildPlan`, not
  * `getPlan`): it preserves the Project/Filter/Join/TableReference operator
@@ -690,6 +724,15 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	if (!root) return CONSERVATIVE_VIEW_INFO;
 
 	const nodes = collectBodyNodes(root);
+
+	// Outer-join gate (Divergence 2): a body carrying any `null-extended` site is
+	// a LEFT/RIGHT/FULL outer join, which `propagate()` rejects wholesale today
+	// (both sides). Short-circuit to the conservative row before the target walk
+	// so `view_info()` agrees with the dynamic truth, regardless of which columns
+	// the projection keeps. Inner-join bodies never null-extend, so the
+	// multi-source positive case (`ms_jv`) is untouched.
+	if (hasNullExtendedLineage(nodes)) return CONSERVATIVE_VIEW_INFO;
+
 	const tableRefsById = new Map<number, TableReferenceNode>();
 	for (const n of nodes) {
 		if (n instanceof TableReferenceNode) tableRefsById.set(Number(n.id), n);
@@ -730,10 +773,34 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		for (const attrId of nd.keys()) {
 			const bs = baseSiteOf(nl.get(attrId));
 			if (!bs) continue;
-			const set = defaultable.get(bs.table) ?? new Set<string>();
-			set.add(bs.baseColumn.toLowerCase());
-			defaultable.set(bs.table, set);
+			addDefaultable(defaultable, bs.table, bs.baseColumn);
 		}
+	}
+
+	// View-level `default_for.<col>` tags (Divergence 1): the `tag-default`
+	// provenance is never threaded onto `PhysicalProperties` (it is consumed only
+	// in the rewrite), so this body is planned without the view's tags and the
+	// walk above misses it. Fold each tag column into `defaultable` directly,
+	// mirroring `resolveDefaultForColumn` — a base column of a reachable target
+	// (the common projected-away case) or a visible view-output column with base
+	// lineage. Unlike the rewrite, an unresolvable name is silently skipped: a
+	// read-only introspection surface stays on its never-throw posture (the
+	// per-view try/catch would otherwise collapse the row to all-`NO`).
+	for (const colName of readDefaultFor(view.tags).keys()) {
+		let resolved = false;
+		for (const id of targetIds) {
+			const match = tableRefsById.get(id)?.tableSchema.columns
+				.find(c => c.name.toLowerCase() === colName);
+			if (match) {
+				addDefaultable(defaultable, id, match.name);
+				resolved = true;
+			}
+		}
+		if (resolved) continue;
+
+		const attr = root.getAttributes().find(a => a.name.toLowerCase() === colName);
+		const bs = attr && baseSiteOf(rootLineage?.get(attr.id));
+		if (bs) addDefaultable(defaultable, bs.table, bs.baseColumn);
 	}
 
 	const targetNames = new Set<string>();

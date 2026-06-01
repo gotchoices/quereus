@@ -625,6 +625,25 @@ aggregate / set-op / recursive-CTE / wholly-computed — yields the conservative
 all-`NO` / `'[]'` row, never an error). The surface gains accuracy as later
 phases thread more lineage, with no rework here.
 
+**Outer-join contract.** A body carrying any `null-extended` lineage site —
+i.e. a `LEFT` / `RIGHT` / `FULL` outer join (`deriveJoinUpdateLineage` wraps the
+non-preserved side `null-extended`) — yields the conservative all-`NO` / `'[]'`
+row, *regardless of which columns the projection keeps*. This is a deliberate
+today-truth gate, not a thread-more-lineage gap: `propagate()` rejects an
+outer-join body **wholesale** today — `multi-source.ts`'s
+`collectInnerJoinSources` accepts only two-table inner equi-joins, so neither
+the preserved nor the non-preserved side is writable — and the static surface
+must agree with that dynamic truth (reporting `'YES'` here would be a
+dangerous YES-when-NO over-report). The gate is body-level (any `null-extended`
+site anywhere in the planned spine) rather than per-column precisely because the
+preserved side is also unwritable today. When outer-join write materialization
+lands, relax this to per-side writability — the preserved side becomes writable
+and only the not-yet-materialized null-extended side stays gated. (`default_for`
+recovery, listed under `is_insertable_into` above, is honored from a view's own
+`with tags (…)` DDL: the `tag-default` provenance is not threaded onto the
+physical surface, so `deriveViewInfo` folds the view-level tags into its
+defaultable set directly.)
+
 Materialized views are **not** enumerated: they are read-only at the user-write
 boundary, so `view_info()` walks `getAllViews()` only.
 
