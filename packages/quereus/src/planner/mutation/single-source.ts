@@ -273,21 +273,109 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
 }
 
 /**
- * Qualify every UNQUALIFIED column reference at the top level of `expr` with
- * `qualifier` (the lowered statement's base table name). Used only on a
- * single-source substituted base term emitted INSIDE a subquery operand: an
- * unqualified base term there would re-bind to a same-named source the subquery's
- * own FROM introduces (innermost SQL scoping) instead of correlating to the outer
- * UPDATE/DELETE target row. Qualifying it with the base table name — which is
- * exactly the table named by the lowered statement, with no synthesised alias —
- * makes it correlate to the outer row regardless of what the subquery FROM
- * defines. Shallow by design (mirrors {@link normalizeBaseRefs}): it does NOT
- * descend into a nested subquery within the replacement, because a lineage term's
- * own scalar subquery has its own scope. Already-qualified references are left
- * untouched. Returns a fresh tree (does not mutate the shared `columnMap` entry).
+ * Build the closure that correlation-qualifies a substituted base *term* emitted
+ * INSIDE a subquery operand of a single-source rewrite. An unqualified base term
+ * there would re-bind to a same-named source the subquery's own FROM introduces
+ * (innermost SQL scoping) instead of correlating to the outer UPDATE/DELETE target
+ * row. Qualifying it with the base table name — which is exactly the table named
+ * by the lowered statement, with no synthesised alias — makes it correlate to the
+ * outer row regardless of what the subquery FROM defines.
+ *
+ * The qualification is **scope-aware and DEEP** (see {@link qualifyCorrelatedBaseRefs}):
+ * it qualifies a base-table column at the replacement's top level, and descends
+ * into a nested scalar subquery WITHIN the replacement (a computed lineage term
+ * such as `(select x from oth where fk = id)`), qualifying only the lineage's own
+ * correlation refs — a base column not shadowed by the lineage subquery's own FROM
+ * — and leaving the lineage's genuinely-local columns alone. The multi-source
+ * spine passes no qualifier (its terms are already alias-qualified — `p.label`).
+ *
+ * Returns a fresh tree (does not mutate the shared `columnMap` entry).
  */
-function qualifyUnqualifiedRefs(expr: AST.Expression, qualifier: string): AST.Expression {
-	return transformExpr(expr, (col) => col.table ? undefined : { ...col, table: qualifier });
+function makeBaseQualifier(
+	ctx: PlanningContext,
+	baseTable: TableSchema,
+): (repl: AST.Expression) => AST.Expression {
+	const baseCols = new Set(baseTable.columns.map(c => c.name.toLowerCase()));
+	const noShadow: ReadonlySet<string> = new Set<string>();
+	return (repl) => qualifyCorrelatedBaseRefs(ctx, repl, baseTable.name, baseCols, noShadow);
+}
+
+/**
+ * Scope-aware DEEP correlation-qualify of a substituted base term. Mirrors the
+ * `collectFromColumnNames` / `shadowed` logic of {@link transformQueryExpr}, but
+ * the substitute predicate qualifies an unqualified BASE column rather than
+ * substituting a view column:
+ *
+ * - An unqualified ref that is a base-table column AND not in `shadowed` is the
+ *   lineage's own correlation to the outer row → qualify it with `qualifier`.
+ * - An already-qualified ref, a non-base name (a lineage-local column such as the
+ *   `x` / `fk` a nested subquery's own FROM introduces), or a shadowed name is
+ *   left untouched.
+ *
+ * Restricting to base columns changes nothing for a `normalizeBaseRefs`-normalized
+ * lineage (whose top-level refs are all base columns) and is the principled gate:
+ * only the view's own base-term lineage is correlation-qualified, never a column
+ * a nested source genuinely owns.
+ */
+function qualifyCorrelatedBaseRefs(
+	ctx: PlanningContext,
+	expr: AST.Expression,
+	qualifier: string,
+	baseCols: ReadonlySet<string>,
+	shadowed: ReadonlySet<string>,
+): AST.Expression {
+	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
+		if (col.table) return undefined;
+		const name = col.name.toLowerCase();
+		if (shadowed.has(name) || !baseCols.has(name)) return undefined;
+		return { ...col, table: qualifier };
+	};
+	const descend = (q: AST.QueryExpr): AST.QueryExpr => qualifyCorrelatedBaseRefsQuery(ctx, q, qualifier, baseCols, shadowed);
+	return transformExpr(expr, substitute, descend);
+}
+
+/**
+ * Descend a nested `QueryExpr` within a substituted base term, qualifying the
+ * lineage's own correlation refs while leaving columns a local source owns alone.
+ * A `select`'s FROM column names join the `shadowed` set for its clauses and any
+ * subquery nested in them; a sibling compound / union leg keeps the incoming
+ * `shadowed`. When a nested FROM is unresolvable (`collectFromColumnNames` returns
+ * `null` — a `select *` source / TVF / CTE), shadowing cannot be proven, so the
+ * term is rejected rather than risk an over- or under-qualify silent wrong write
+ * (consistent with the {@link transformQueryExpr} taint philosophy; unreachable
+ * for a `base`-kind lineage, whose replacement has no nested FROM).
+ */
+function qualifyCorrelatedBaseRefsQuery(
+	ctx: PlanningContext,
+	query: AST.QueryExpr,
+	qualifier: string,
+	baseCols: ReadonlySet<string>,
+	shadowed: ReadonlySet<string>,
+): AST.QueryExpr {
+	if (query.type === 'values') {
+		// No FROM — value rows correlate to the enclosing scope unchanged.
+		const onExpr = (e: AST.Expression): AST.Expression => qualifyCorrelatedBaseRefs(ctx, e, qualifier, baseCols, shadowed);
+		return { ...query, values: query.values.map(row => row.map(onExpr)) };
+	}
+	if (query.type !== 'select') {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-subquery-correlation',
+			message: `cannot correlation-qualify a view lineage term: a data-modifying subquery (INSERT/UPDATE/DELETE) within it cannot be analysed`,
+		});
+	}
+	const sel = query;
+	const local = collectFromColumnNames(ctx, sel.from);
+	if (local === null) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-subquery-correlation',
+			message: `cannot write through view: a computed column's lineage contains a correlated subquery whose source columns are not statically resolvable (a 'select *' / table-valued function / unresolved source), so its correlation cannot be proven; restructure the view body`,
+		});
+	}
+	const innerShadow = new Set<string>([...shadowed, ...local]);
+	const onExpr = (e: AST.Expression): AST.Expression => qualifyCorrelatedBaseRefs(ctx, e, qualifier, baseCols, innerShadow);
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => qualifyCorrelatedBaseRefsQuery(ctx, q, qualifier, baseCols, innerShadow);
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => qualifyCorrelatedBaseRefsQuery(ctx, q, qualifier, baseCols, shadowed);
+	return rebuildSelect(sel, onExpr, onNested, onLeg);
 }
 
 // --- view-column descent into subquery operands ---------------------------
@@ -327,16 +415,17 @@ function makeViewSubstitute(
 	shadowed: ReadonlySet<string>,
 	tainted: boolean,
 	view: MutableViewLike,
-	baseQualifier?: string,
+	baseQualify?: (repl: AST.Expression) => AST.Expression,
 ): (col: AST.ColumnExpr) => AST.Expression | undefined {
-	// When a replacement is emitted inside a subquery operand, qualify its
-	// unqualified base terms with `baseQualifier` so they correlate to the outer
-	// (UPDATE/DELETE target) row rather than re-binding to a same-named local
-	// source. Returns a fresh tree, never the shared `columnMap` entry.
+	// When a replacement is emitted inside a subquery operand, correlation-qualify
+	// its base terms (scope-aware and deep — see {@link makeBaseQualifier}) so they
+	// bind to the outer (UPDATE/DELETE target) row rather than re-binding to a
+	// same-named local source. Returns a fresh tree, never the shared `columnMap`
+	// entry.
 	const resolve = (name: string): AST.Expression | undefined => {
 		const repl = columnMap.get(name);
-		if (!repl || baseQualifier === undefined) return repl;
-		return qualifyUnqualifiedRefs(repl, baseQualifier);
+		if (!repl || !baseQualify) return repl;
+		return baseQualify(repl);
 	};
 	return (col) => {
 		const name = col.name.toLowerCase();
@@ -375,12 +464,12 @@ export function transformQueryExpr(
 	shadowed: ReadonlySet<string>,
 	tainted: boolean,
 	view: MutableViewLike,
-	baseQualifier?: string,
+	baseQualify?: (repl: AST.Expression) => AST.Expression,
 ): AST.QueryExpr {
 	if (query.type === 'values') {
 		// No FROM — the value rows correlate to the enclosing scope unchanged.
-		const substitute = makeViewSubstitute(columnMap, viewName, shadowed, tainted, view, baseQualifier);
-		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view, baseQualifier);
+		const substitute = makeViewSubstitute(columnMap, viewName, shadowed, tainted, view, baseQualify);
+		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view, baseQualify);
 		const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, descend);
 		return { ...query, values: query.values.map(row => row.map(onExpr)) };
 	}
@@ -404,14 +493,14 @@ export function transformQueryExpr(
 		? shadowed
 		: new Set<string>([...shadowed, ...local]);
 
-	const substitute = makeViewSubstitute(columnMap, viewName, innerShadow, scopeTainted, view, baseQualifier);
+	const substitute = makeViewSubstitute(columnMap, viewName, innerShadow, scopeTainted, view, baseQualify);
 	// A subquery nested inside this select's clauses / FROM sees this select's FROM,
 	// so it inherits `innerShadow` / `scopeTainted`.
-	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, innerShadow, scopeTainted, view, baseQualifier);
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, innerShadow, scopeTainted, view, baseQualify);
 	// A compound / union leg is a SIBLING select correlating to the SAME outer scope
 	// as this one — it does NOT see this select's FROM, so it keeps the incoming
 	// `shadowed` / `tainted`.
-	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view, baseQualifier);
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view, baseQualify);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
 	return rebuildSelect(sel, onExpr, onNested, onLeg);
 }
@@ -423,23 +512,23 @@ export function transformQueryExpr(
  * base-term lineage. `columnMap` is the view-col (lowercase) → base-term map;
  * `viewName` is the view's own name (so a `view.col` qualifier is recognised).
  *
- * `baseQualifier` is the single-source lowered statement's base table name. When
- * set, an unqualified base term substituted INSIDE a subquery operand is qualified
- * with it (via {@link qualifyUnqualifiedRefs}) so it correlates to the outer
- * UPDATE/DELETE target row rather than re-binding to a same-named subquery-local
- * source. The single-source rewriters pass `analysis.baseTable.name`; the
- * multi-source spine passes `undefined` (its base terms are already
- * alias-qualified — `p.label` — so they correlate without re-qualification).
+ * `baseQualify` is the single-source lowered statement's correlation qualifier
+ * (built by {@link makeBaseQualifier} from the base table). When set, a base term
+ * substituted INSIDE a subquery operand is correlation-qualified (scope-aware and
+ * deep) so it binds to the outer UPDATE/DELETE target row rather than re-binding to
+ * a same-named subquery-local source. The single-source rewriters pass it; the
+ * multi-source spine passes `undefined` (its base terms are already alias-qualified
+ * — `p.label` — so they correlate without re-qualification).
  */
 export function makeViewColumnDescend(
 	ctx: PlanningContext,
 	columnMap: ReadonlyMap<string, AST.Expression>,
 	viewName: string,
 	view: MutableViewLike,
-	baseQualifier?: string,
+	baseQualify?: (repl: AST.Expression) => AST.Expression,
 ): (query: AST.QueryExpr) => AST.QueryExpr {
 	const lcView = viewName.toLowerCase();
-	return (query) => transformQueryExpr(ctx, query, columnMap, lcView, new Set<string>(), false, view, baseQualifier);
+	return (query) => transformQueryExpr(ctx, query, columnMap, lcView, new Set<string>(), false, view, baseQualify);
 }
 
 /**
@@ -816,7 +905,7 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike): AST.UpdateStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, analysis.baseTable.name);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
 
 	const assignments = stmt.assignments.map(asg => ({
 		column: requireBaseColumn(findViewColumn(analysis, asg.column, view)),
@@ -843,7 +932,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike): AST.DeleteStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, analysis.baseTable.name);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
 
 	const userWhere = stmt.where ? transformExpr(stmt.where, substitute, descend) : undefined;
 	const where = combineAnd(userWhere, analysis.filterPredicate ? cloneExpr(analysis.filterPredicate) : undefined);
@@ -882,7 +971,7 @@ export function rewriteViewReturning(
 ): AST.ResultColumn[] | undefined {
 	if (!returning || returning.length === 0) return undefined;
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, analysis.baseTable.name);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
 	const out: AST.ResultColumn[] = [];
 	for (const rc of returning) {
 		if (rc.type === 'all') {

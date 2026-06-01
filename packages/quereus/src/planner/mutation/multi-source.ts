@@ -857,7 +857,7 @@ function buildIdentifyingSubquery(
  * the scope-aware {@link makeViewColumnDescend} descent — the base-term
  * replacements are alias-qualified (`p.label`), so they correlate correctly to
  * the join body that becomes the FROM of the generated identifying subquery.
- * Hence no `baseQualifier` is threaded into the descent (that single-source-only
+ * Hence no `baseQualify` is threaded into the descent (that single-source-only
  * re-qualification would be redundant here, and there is no single base-table
  * correlation name to use against a two-source join body).
  */

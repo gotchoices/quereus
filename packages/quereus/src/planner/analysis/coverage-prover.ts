@@ -760,6 +760,14 @@ function innerJoinRetainsConstrainedTable(
 	if (!equiPairs || equiPairs.length === 0) return false;
 
 	// Shared precondition: the lookup side must expose the parent's full row set.
+	// COMPLETENESS LIMITATION (bushy lookup side, under-claim-safe): a bushy
+	// `T ⋈ (M ⋈ P)` makes `lookupSide` a join, so `resolveFullScanTableRef` returns
+	// undefined and the two-hop cover is silently lost (falls back to structural ⇒
+	// NotCovers). The empty-table PoC stays left-deep empirically, so this is
+	// unreachable today; a cost-based reorder on real statistics could go bushy. To
+	// extend: prove no-row-loss when the bushy lookup side carries a matching IND
+	// surface, or normalize the join to left-deep before proving — either path must
+	// preserve the over-claim-free guarantee.
 	const lookupRef = resolveFullScanTableRef(lookupSide);
 	if (!lookupRef) return false;
 
@@ -866,6 +874,12 @@ function indDerivedNoRowLoss(
 	const lookupSchema = lookupRef.tableSchema.schemaName.toLowerCase();
 	const lookupTable = lookupRef.tableSchema.name.toLowerCase();
 
+	// COMPLETENESS LIMITATION (single-IND match, under-claim-safe): this matches
+	// *one* IND to *all* of the join's equi-pairs. A join whose equi-pairs are
+	// jointly covered by two INDs (no single IND covers them) abstains here. To
+	// extend: admit when a *set* of INDs jointly set-covers the equi-pairs, provided
+	// every contributing IND is non-nullRejecting and targets the same lookup-parent
+	// key. Under-claim only — never produces a false Covers.
 	for (const ind of inds) {
 		if (ind.nullRejecting) continue;
 		if (ind.target.kind !== 'table') continue;

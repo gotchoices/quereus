@@ -653,6 +653,61 @@ delete from d1_v where exists (select 1 from d1_aux where k = note);
 select id, lbl from d1_t order by id;
 → [{"id":2,"lbl":"B"}]
 
+-- --- (k) computed lineage whose base term is itself a correlated subquery, the
+--          DEEP collision: the substituted term must be qualified INSIDE its own
+--          nested subquery, not just at its top level ---
+-- The view column `note` is a correlated scalar subquery (select x from cv_oth
+-- where fk = id); its correlation `id` is cv_base.id. Referenced inside the user
+-- EXISTS subquery `select 1 from cv_src where tag = note` — and cv_src ALSO has an
+-- `id` column — a SHALLOW qualifier left the lineage's own inner `id` unqualified,
+-- so it re-bound to cv_src.id (=99); cv_oth has no fk=99, so `note` evaluated NULL
+-- and the EXISTS was false for EVERY outer row (a silent no-op). The deep
+-- scope-aware qualifier rewrites the term to (select x from cv_oth where fk =
+-- cv_base.id), correlating to the outer target row regardless of the user FROM.
+create table cv_base (id integer primary key, lbl text);
+create table cv_oth (fk integer, x text);
+create table cv_src (id integer, tag text);
+insert into cv_base values (1, 'A'), (2, 'B');
+insert into cv_oth values (1, 'AA'), (2, 'BB');
+insert into cv_src values (99, 'AA');
+create view cv_v as select id as id, lbl as lbl,
+    (select x from cv_oth where fk = id) as note from cv_base;
+
+update cv_v set lbl = 'CHANGED' where exists (select 1 from cv_src where tag = note);
+-- cv_base.id=1 -> note 'AA', present in cv_src -> row 1 writes; id=2 -> 'BB', absent -> kept.
+select id, lbl from cv_base order by id;
+→ [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"B"}]
+
+-- --- (l) negative control — no over-qualify ---
+-- Same computed-lineage view, but the user subquery FROM (cv_ok) has NO `id`, so
+-- it does NOT shadow the lineage's correlation column. The lineage's genuinely-
+-- local `fk` / `x` (owned by cv_oth, shadowed inside the lineage subquery, and not
+-- base columns of cv_base) must stay local — if the deep qualifier wrongly
+-- qualified them to cv_base.fk / cv_base.x the subquery would error (cv_base has no
+-- such columns) or mis-evaluate. cv_ok holds only the row-1 match.
+create table cv_ok (tag text);
+insert into cv_ok values ('AA');
+
+update cv_v set lbl = 'OK' where exists (select 1 from cv_ok where tag = note);
+select id, lbl from cv_base order by id;
+→ [{"id":1,"lbl":"OK"},{"id":2,"lbl":"B"}]
+
+-- --- (m) DELETE variant — the delete path threads the same deep qualifier ---
+-- The (k) repro shape on the delete path, confirming rewriteViewDelete threads the
+-- correlation qualifier through its subquery descent too. Only row 1 deletes.
+create table cd_base (id integer primary key, lbl text);
+create table cd_oth (fk integer, x text);
+create table cd_src (id integer, tag text);
+insert into cd_base values (1, 'A'), (2, 'B');
+insert into cd_oth values (1, 'AA'), (2, 'BB');
+insert into cd_src values (99, 'AA');
+create view cd_v as select id as id, lbl as lbl,
+    (select x from cd_oth where fk = id) as note from cd_base;
+
+delete from cd_v where exists (select 1 from cd_src where tag = note);
+select id, lbl from cd_base order by id;
+→ [{"id":2,"lbl":"B"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so an insert mints a

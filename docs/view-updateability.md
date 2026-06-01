@@ -212,23 +212,46 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > un-rewritten and could silently re-bind to a same-named base column — a silent
 > wrong write.)
 >
-> **Single-source: the substituted base *term* is correlation-qualified.** Deciding
-> *whether* to substitute is only half the fix. The single-source rewrite renames a
-> view column to a bare base term (`note` → `lbl`), and an *unqualified* `lbl`
-> emitted inside a subquery operand re-binds, by ordinary innermost-scope SQL rules,
-> to a same-named source the subquery's own FROM introduces — not to the outer
-> UPDATE/DELETE target row. So the single-source descent qualifies the substituted
-> term with the base table name (`p1_t.lbl`, via `qualifyUnqualifiedRefs` threaded as
-> `baseQualifier` through `makeViewColumnDescend` → `transformQueryExpr` →
-> `makeViewSubstitute`), which is exactly the table named by the lowered statement
-> (no synthesised alias), so it correlates to the outer row regardless of what the
-> subquery FROM defines. This is applied **only** on the subquery-descent path: the
-> top-level user WHERE / SET and the RETURNING projection columns resolve against the
-> lowered statement's single source unqualified, and the multi-source spine passes no
-> `baseQualifier` because its terms are already alias-qualified (`p.label`) and there
-> is no single base-table correlation name. Only a *substituted* term (a view column)
-> is qualified — a bare base-name reference (`lbl`) is never a view column, so a
-> subquery-local source that genuinely defines it keeps binding locally, unchanged.
+> **Single-source: the substituted base *term* is correlation-qualified — deeply.**
+> Deciding *whether* to substitute is only half the fix. The single-source rewrite
+> renames a view column to a base term, and an *unqualified* base ref emitted inside
+> a subquery operand re-binds, by ordinary innermost-scope SQL rules, to a same-named
+> source the subquery's own FROM introduces — not to the outer UPDATE/DELETE target
+> row. So the single-source descent correlation-qualifies the substituted term with
+> the base table name (`p1_t.lbl`), which is exactly the table named by the lowered
+> statement (no synthesised alias), so it correlates to the outer row regardless of
+> what the subquery FROM defines.
+>
+> The qualification is **scope-aware and DEEP** — it is not enough to qualify the
+> term's *top-level* refs. A computed column's base-term lineage can itself be (or
+> contain) a correlated scalar subquery: `note = (select x from oth where fk = id)`,
+> whose own correlation `id` lives one level down. If only the top level were
+> qualified, that nested `id` would stay unqualified and, emitted inside a user
+> subquery whose FROM also introduces an `id`, re-bind to the innermost local source
+> — a silent wrong write. So `makeBaseQualifier` builds a `baseQualify` closure that
+> `qualifyCorrelatedBaseRefs` runs over the whole replacement, mirroring the
+> `collectFromColumnNames` / `shadowed` logic of `transformQueryExpr`: at each nested
+> `select` the lineage subquery's own FROM column names join a `shadowed` set, and an
+> unqualified ref is qualified **only if** it is a base-table column AND not shadowed.
+> So in `(select x from oth where fk = id)`, `x` / `fk` (shadowed by `oth`) stay
+> local while `id` (a base column, not shadowed) is qualified to `<base>.id`,
+> correlating the lineage to the outer target row. Restricting to base columns is a
+> no-op for a `normalizeBaseRefs`-normalized lineage (whose top-level refs are all
+> base columns) and is the principled gate that leaves a genuinely-local column
+> alone. If a nested FROM is unresolvable (`select *` / TVF / CTE — `collectFromColumnNames`
+> returns `null`), shadowing cannot be proven, so the term is **rejected** with
+> `unsupported-subquery-correlation` rather than risk an over- or under-qualify
+> silent wrong write (consistent with the user-subquery-side taint philosophy).
+>
+> The closure threads as `baseQualify` through `makeViewColumnDescend` →
+> `transformQueryExpr` → `makeViewSubstitute`. It is applied **only** on the
+> subquery-descent path: the top-level user WHERE / SET and the RETURNING projection
+> columns resolve against the lowered statement's single source unqualified, and the
+> multi-source spine passes no `baseQualify` because its terms are already
+> alias-qualified (`p.label`) and there is no single base-table correlation name.
+> Only a *substituted* term (a view column) is qualified — a bare base-name reference
+> (`lbl`) is never a view column, so a subquery-local source that genuinely defines
+> it keeps binding locally, unchanged.
 >
 > *Known corner (unfixed):* if the subquery FROM names the **same base table**
 > (`update p1_v … where exists (select 1 from p1_t where …)`), the base-table-name
@@ -236,7 +259,8 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > an inherent SQL self-reference scoping ambiguity the single-source lowering (no
 > alias on the target) cannot disambiguate. This is no worse than the pre-fix
 > behaviour and is rare; a future hardening could synthesise an alias on the lowered
-> target.
+> target. (The deep scope-aware qualification above is orthogonal to this corner —
+> it fixes WHETHER nested refs get qualified, not WHICH name they are qualified with.)
 
 ### Inner Join
 
