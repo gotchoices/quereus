@@ -119,9 +119,11 @@ update oj_left set av = 'z' where aid = 1;
 -- must report every output column is_updatable='NO' with null trace, agreeing
 -- with view_info()'s conservative row and with what a real mutation accepts.
 --
--- Comma / implicit joins are NOT tested here: a multi-source comma FROM is
--- rejected at view-creation time (the builder rejects multiple FROM sources), so
--- such a view never exists to reach column_info — there is no buildable case.
+-- Comma / implicit joins are NOT tested here: the SELECT builder rejects ANY
+-- multiple-FROM-source body ("SELECT with multiple FROM sources (joins) not
+-- supported"), so a comma-join view can never be created to reach column_info —
+-- there is no buildable case. Self-joins, by contrast, ARE buildable (one table
+-- under two alias-bound sites) and are covered below.
 -- ===================================================================
 
 create table ra (aid integer primary key, av text);
@@ -146,6 +148,18 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 
 -- Surface agrees with propagate(): a mutation through the 3-table-join view is rejected.
 update three_v set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- Self-join (one table under two alias-bound sites): isDecomposableJoinBody
+-- rejects it (collectInnerJoinSources cannot resolve which side a column owns
+-- when both sides are the same table), so every column reads 'NO' / null.
+create view self_v as select a.aid as aid, b.av as bv
+    from ra a join ra b on b.aid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('self_v');
+→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Surface agrees with propagate(): a mutation through the self-join view is rejected.
+update self_v set bv = 'z' where aid = 1;
 -- error: cannot write through view
 
 -- ===================================================================
