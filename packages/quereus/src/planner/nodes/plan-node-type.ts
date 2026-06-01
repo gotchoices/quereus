@@ -82,6 +82,7 @@ export enum PlanNodeType {
   Alias = 'Alias',  // Wraps a relation with an alias for relationName
   Values = 'Values',
 	TableLiteral = "TableLiteral",
+  EnvelopeScan = 'EnvelopeScan',  // Scans the shared-surrogate mutation envelope (multi-source view insert)
   SingleRow = 'SingleRow',  // For SELECT without FROM
   TableFunctionCall = 'TableFunctionCall',
 

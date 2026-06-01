@@ -32,6 +32,7 @@ import { emitProject } from './emit/project.js';
 import { emitColumnReference } from './emit/column-reference.js';
 import { emitArrayIndex } from './emit/array-index.js';
 import { emitValues, emitSingleRow, emitTableLiteral } from './emit/values.js';
+import { emitEnvelopeScan } from './emit/envelope-scan.js';
 import { emitFilter } from './emit/filter.js';
 import { emitDistinct } from './emit/distinct.js';
 import { emitScalarFunctionCall } from './emit/scalar-function.js';
@@ -112,6 +113,7 @@ export function registerEmitters() {
 
 	registerEmitter(PlanNodeType.Values, emitValues as EmitterFunc);
 	registerEmitter(PlanNodeType.TableLiteral, emitTableLiteral as EmitterFunc);
+	registerEmitter(PlanNodeType.EnvelopeScan, emitEnvelopeScan as EmitterFunc);
 	registerEmitter(PlanNodeType.SingleRow, emitSingleRow as EmitterFunc);
 	registerEmitter(PlanNodeType.Filter, emitFilter as EmitterFunc);
 	registerEmitter(PlanNodeType.Project, emitProject as EmitterFunc);

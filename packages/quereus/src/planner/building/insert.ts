@@ -372,6 +372,17 @@ export function buildInsertStmt(
 	 * (see `planner/mutation/lens-enforcement.ts`). Empty for ordinary inserts.
 	 */
 	extraConstraints: ReadonlyArray<RowConstraintSchema> = [],
+	/**
+	 * A pre-built relational source to use instead of building one from
+	 * `stmt.source`. Set only by the multi-source view-insert decomposition, which
+	 * feeds each base insert a projection over the shared-surrogate envelope
+	 * (`EnvelopeScanNode`) rather than the user's VALUES/SELECT. Its output
+	 * attributes are positional with `stmt.columns`. When set, `stmt.source` is
+	 * ignored (a placeholder), but every other facet of the statement (target
+	 * columns, ON CONFLICT, mutation context, constraint/FK/default machinery) is
+	 * built exactly as for an ordinary insert.
+	 */
+	preBuiltSource?: RelationalPlanNode,
 ): PlanNode {
 	// Apply schema path from statement if present
 	const contextWithSchemaPath = stmt.schemaPath
@@ -485,7 +496,12 @@ export function buildInsertStmt(
 	}
 
 	let sourceNode: RelationalPlanNode;
-	switch (stmt.source.type) {
+	if (preBuiltSource) {
+		// Multi-source view-insert decomposition: the source is a projection over the
+		// shared-surrogate envelope, already aligned positionally to targetColumns.
+		sourceNode = preBuiltSource;
+		checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
+	} else switch (stmt.source.type) {
 		case 'values': {
 			// Bare VALUES — no source-side column type-check; the row-expansion
 			// projection handles column-count and per-column type coercion.

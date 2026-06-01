@@ -26,14 +26,15 @@ create view vu as select id from t union all select id from t2;
 insert into vu (id) values (1);
 -- error: cannot write through view
 
--- Join body (multi-source inner join): update / delete write-through is SHIPPED
--- (see 93.4-view-mutation.sqllogic). INSERT through a join still rejects — the
--- shared join key is not a view column (needs the per-row shared-surrogate
--- mutation context, a later phase).
+-- Join body (multi-source inner join): update / delete AND insert write-through
+-- are SHIPPED (see 93.4-view-mutation.sqllogic). This view projects only the
+-- shared key `tid`, so an insert supplying just `tid` leaves both base tables'
+-- NOT NULL `name` columns (no default) unfilled — a `no-default` rejection naming
+-- the obstructing base column, not a blanket "insert not supported".
 create view vj as select t.id as tid from t join t2 on t.id = t2.id;
 
 insert into vj (tid) values (9);
--- error: multi-source
+-- error: no default
 
 -- Outer (left) join body: a non-preserved-side write needs row materialization,
 -- which is a later phase — still rejected.

@@ -57,6 +57,11 @@ const EXPECTED_FORK_POLICY = {
  */
 const TABLE_CONTEXTS_MUTATION_ALLOWLIST = new Set<string>([
 	'src/runtime/emit/recursive-cte.ts',
+	// Multi-source view INSERT: stashes the shared-surrogate envelope rows under a
+	// unique descriptor before driving the base ops, deletes it in `finally`. Same
+	// working-table pattern as recursive-cte, and `tableContexts` is `forked` (each
+	// fork owns its copy), so the unique-key add/remove never perturbs a sibling.
+	'src/runtime/emit/view-mutation.ts',
 ]);
 
 /**

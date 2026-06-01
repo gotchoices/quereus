@@ -1,7 +1,10 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema } from '../../schema/table.js';
+import type { ColumnSchema } from '../../schema/column.js';
 import { isRelationalNode, type PlanNode, type RelationalPlanNode, type UpdateSite } from '../nodes/plan-node.js';
+import type { ScalarType } from '../../common/datatype.js';
+import { PhysicalType } from '../../types/logical-type.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { buildSelectStmt } from '../building/select.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
@@ -37,10 +40,13 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  * already proves a key over — so a side whose own PK is hidden by the projection
  * (`tj2.id` above) is still addressable.
  *
+ * Multi-source **`insert`** (Phase 2b) is analysed here (`analyzeMultiSourceInsert`)
+ * but *built* by `building/view-mutation-builder.ts` (`buildMultiSourceInsert`),
+ * because it needs the plan-level shared-surrogate envelope rather than an AST
+ * `BaseOp`: the shared join key is not a view column, so it is minted once per row
+ * at the envelope and threaded into both base inserts (§ Mutation Context).
+ *
  * **Deferred, rejected here with a structured diagnostic (later phases):**
- * - multi-source `insert` — the shared join key is not a view column; it needs
- *   the per-row shared-surrogate mutation-context envelope (a new runtime
- *   surface). Rejected `unsupported-multisource-insert`.
  * - outer / cross / set-op / aggregate / window bodies — `unsupported-*`.
  * - `> 2` base tables, self-joins, composite-PK sides, comma (implicit) joins,
  *   `select *` join bodies, and cross-side `set` value references — each a
@@ -103,12 +109,220 @@ export function propagateMultiSource(ctx: PlanningContext, view: MutableViewLike
 		case 'update': return decomposeUpdate(ctx, view, analysis, req.stmt, req.tags);
 		case 'delete': return decomposeDelete(ctx, view, analysis, req.stmt, req.tags);
 		case 'insert':
+			// Insert needs the plan-level shared-surrogate envelope, so it is built
+			// directly by `building/view-mutation-builder.ts` (`buildMultiSourceInsert`,
+			// off `analyzeMultiSourceInsert` below), not lowered to AST BaseOps here.
+			// `buildViewMutation` routes a join insert there before `propagate` runs,
+			// so this case is unreachable on the supported path.
 			raiseMutationDiagnostic({
 				reason: 'unsupported-multisource-insert',
 				table: view.name,
-				message: `cannot write through view '${view.name}': insert into a multi-source (join) view needs the per-row shared-surrogate mutation context, which is a later phase`,
+				message: `internal: multi-source insert must be built via buildMultiSourceInsert, not propagate`,
 			});
 	}
+}
+
+// --- INSERT (shared-surrogate envelope analysis) --------------------------
+
+/**
+ * One base side of a multi-source insert, fully resolved: the base columns it
+ * writes (shared key first, then the supplied view columns it owns) and, for
+ * each, the index into the materialized envelope row supplying the value.
+ */
+export interface MsInsertSide {
+	readonly table: TableReferenceNode;
+	readonly schema: TableSchema;
+	readonly targetColumns: readonly string[];
+	readonly envelopeIndices: readonly number[];
+}
+
+/**
+ * The plan-agnostic decomposition of a multi-source inner-join INSERT, consumed
+ * by `buildMultiSourceInsert`. The **envelope** is the per-row augmented source:
+ * its leading columns are the supplied view columns (`suppliedColumns`, in
+ * user-source order), optionally followed by a minted surrogate shared key
+ * (`mint`). Each side reads its values back out of that one materialized
+ * envelope, so a generated key is minted exactly once per row and threaded
+ * across both base inserts (docs/view-updateability.md § Mutation Context).
+ */
+export interface MsInsertAnalysis {
+	readonly suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[];
+	/** Sides ordered FK-parent before FK-child (the FK-safe insert order). */
+	readonly orderedSides: readonly MsInsertSide[];
+	/** Set when the shared key is not directly supplied — mint `seed + ordinal`. */
+	readonly mint?: { readonly seedTable: TableReferenceNode; readonly seedColumn: string };
+}
+
+/**
+ * Decompose a two-table key-preserving inner-join INSERT into the per-side base
+ * inserts plus the shared-surrogate envelope they fan out from. Throws a
+ * structured diagnostic for any unsupported shape (computed target column, a
+ * not-null base column with no value, a non-equi-join key, …).
+ */
+export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): MsInsertAnalysis {
+	rejectReturning(view, stmt.returning);
+	const analysis = analyzeJoinView(ctx, view);
+	const { sides, outColumns } = analysis;
+	const keyColumns = extractJoinKeyColumns(view, analysis.sel, sides);
+
+	// Supplied view columns: the explicit list, or every writable view output column.
+	const suppliedNames = stmt.columns && stmt.columns.length > 0
+		? stmt.columns
+		: outColumns.filter(c => c.writable).map(c => c.name);
+
+	interface Supplied { readonly name: string; readonly sideIndex: number; readonly baseColumn: string; readonly type: ScalarType; readonly isKey: boolean; }
+	const supplied: Supplied[] = suppliedNames.map((rawName): Supplied => {
+		const name = rawName.toLowerCase();
+		const out = outColumns.find(c => c.name === name);
+		if (!out || !out.writable || out.sideIndex === undefined || !out.baseColumn) {
+			raiseMutationDiagnostic({
+				reason: 'no-inverse',
+				column: rawName,
+				table: view.name,
+				message: `cannot insert through view '${view.name}': column '${rawName}' is computed (non-invertible) or not a base column, so it cannot receive an inserted value`,
+			});
+		}
+		const sideIndex = out.sideIndex;
+		const baseCol = columnByName(sides[sideIndex].schema, out.baseColumn);
+		const isKey = out.baseColumn.toLowerCase() === keyColumns[sideIndex].toLowerCase();
+		return { name, sideIndex, baseColumn: out.baseColumn, type: columnScalarType(baseCol), isKey };
+	});
+
+	// The shared key is either directly supplied (a supplied view column maps to a
+	// join-key base column) or minted once per row at the envelope.
+	const suppliedKeyIndex = supplied.findIndex(s => s.isKey);
+	let mint: MsInsertAnalysis['mint'] | undefined;
+	let keyEnvelopeIndex: number;
+	if (suppliedKeyIndex >= 0) {
+		keyEnvelopeIndex = suppliedKeyIndex;
+	} else {
+		keyEnvelopeIndex = supplied.length; // the minted column is appended last
+		const anchorIndex = anchorSideIndex(sides);
+		const anchorKeyCol = columnByName(sides[anchorIndex].schema, keyColumns[anchorIndex]);
+		requireIntegerSurrogate(view, sides[anchorIndex].schema, anchorKeyCol);
+		mint = { seedTable: sides[anchorIndex].table, seedColumn: keyColumns[anchorIndex] };
+	}
+
+	// Per-side: the shared key (every side) plus the supplied view columns it owns.
+	const sideSpecs: MsInsertSide[] = sides.map((side, sideIndex): MsInsertSide => {
+		const targetColumns: string[] = [keyColumns[sideIndex]];
+		const envelopeIndices: number[] = [keyEnvelopeIndex];
+		supplied.forEach((s, idx) => {
+			if (s.sideIndex !== sideIndex || s.isKey) return; // the key is already threaded above
+			targetColumns.push(s.baseColumn);
+			envelopeIndices.push(idx);
+		});
+		assertNoMissingNotNull(view, side.schema, targetColumns);
+		return { table: side.table, schema: side.schema, targetColumns, envelopeIndices };
+	});
+
+	const order = orderSides(sides);
+	return {
+		suppliedColumns: supplied.map(s => ({ name: s.name, type: s.type })),
+		orderedSides: order.map(i => sideSpecs[i]),
+		mint,
+	};
+}
+
+/**
+ * The per-side shared-key base columns of a two-table inner equi-join, aligned to
+ * `sides` by index. Requires a single `a.col = b.col` ON predicate naming one
+ * column on each side (the surrogate the decomposition stitches on).
+ */
+function extractJoinKeyColumns(view: MutableViewLike, sel: AST.SelectStmt, sides: readonly [JoinSide, JoinSide]): [string, string] {
+	const join = sel.from?.[0];
+	if (!join || join.type !== 'join' || !join.condition) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': the join must carry an explicit ON predicate naming the shared key`,
+		});
+	}
+	const cond = join.condition;
+	if (cond.type !== 'binary' || cond.operator !== '=' || cond.left.type !== 'column' || cond.right.type !== 'column') {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': only a single equi-join 'a.col = b.col' identifies the shared key for an insert (composite / expression join keys are a later phase)`,
+		});
+	}
+	const sideOf = (col: AST.ColumnExpr): number => {
+		const qualifier = col.table?.toLowerCase();
+		if (qualifier === undefined) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-join',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': the join key column '${col.name}' must be qualified by its base table/alias`,
+			});
+		}
+		const idx = sides.findIndex(s => s.alias === qualifier || s.schema.name.toLowerCase() === qualifier);
+		if (idx < 0) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-join',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': the join key references '${qualifier}', which is not a base table of the join`,
+			});
+		}
+		return idx;
+	};
+	const leftSide = sideOf(cond.left);
+	const rightSide = sideOf(cond.right);
+	if (leftSide === rightSide) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': the join key must relate the two distinct base tables`,
+		});
+	}
+	const keys: [string, string] = ['', ''];
+	keys[leftSide] = cond.left.name;
+	keys[rightSide] = cond.right.name;
+	return keys;
+}
+
+/** The side whose key seeds a minted surrogate: the FK-parent, else the left source. */
+function anchorSideIndex(sides: readonly [JoinSide, JoinSide]): number {
+	const child = fkChildIndex(sides);
+	return child === undefined ? 0 : 1 - child;
+}
+
+/** Reject a not-null base column with no declared default that no envelope value covers. */
+function assertNoMissingNotNull(view: MutableViewLike, schema: TableSchema, targetColumns: readonly string[]): void {
+	const covered = new Set(targetColumns.map(c => c.toLowerCase()));
+	for (const col of schema.columns) {
+		if (col.generated || !col.notNull || col.defaultValue !== null) continue;
+		if (covered.has(col.name.toLowerCase())) continue;
+		raiseMutationDiagnostic({
+			reason: 'no-default',
+			column: col.name,
+			table: view.name,
+			message: `cannot insert through view '${view.name}': base table '${schema.name}' column '${col.name}' is NOT NULL with no default and no value supplied through the view`,
+		});
+	}
+}
+
+/** The surrogate generator (`integer-auto`) mints integers — reject a non-integer key. */
+function requireIntegerSurrogate(view: MutableViewLike, schema: TableSchema, keyCol: ColumnSchema): void {
+	if (keyCol.logicalType.physicalType !== PhysicalType.INTEGER) {
+		raiseMutationDiagnostic({
+			reason: 'no-default',
+			column: keyCol.name,
+			table: view.name,
+			message: `cannot insert through view '${view.name}': the shared key '${schema.name}.${keyCol.name}' is not supplied and is not an integer surrogate the engine can auto-generate; supply the key as a view column`,
+		});
+	}
+}
+
+function columnByName(schema: TableSchema, name: string): ColumnSchema {
+	const col = schema.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
+	if (!col) {
+		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: schema.name, column: name, message: `column '${name}' not found on base table '${schema.name}'` });
+	}
+	return col;
+}
+
+function columnScalarType(col: ColumnSchema): ScalarType {
+	return { typeClass: 'scalar', logicalType: col.logicalType, nullable: !col.notNull, isReadOnly: false };
 }
 
 // --- analysis -------------------------------------------------------------

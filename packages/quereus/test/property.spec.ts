@@ -2747,6 +2747,52 @@ describe('Property-Based Tests', () => {
 					},
 				), { numRuns: 60 });
 			});
+
+			// ----- Multi-source insert: the shared-surrogate envelope (PutGet) -----
+			// jv hides the shared key (jparent.pp = jchild.pr), so an insert mints a
+			// surrogate ONCE per produced row and threads it into BOTH base inserts:
+			// jparent(pp=mint, pv) + jchild(cc, pr=mint, cv). The FK-parent is written
+			// first. Asserts both bases agree on the minted key and the new logical row
+			// surfaces through the view, with no existing row perturbed.
+			it('PutGet: insert through a join view mints one shared key per row, threaded across both bases', async () => {
+				await createJoinBase();
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					fc.integer({ min: 1, max: 9 }),  // pv for the inserted logical row
+					fc.integer({ min: 1, max: 9 }),  // cv for the inserted logical row
+					async (parents, children, pvNew, cvNew) => {
+						const { parents: P, children: C } = await seedJoin(parents, children);
+						const ccNew = 100; // fresh child PK (outside the child arb's 1..9 range)
+
+						// The surrogate mints `max(jparent.pp) + 1` (the FK-parent anchor),
+						// captured once before the fan-out.
+						const ppValues = P.map(p => p.pp);
+						const mintedPp = (ppValues.length === 0 ? 0 : Math.max(...ppValues)) + 1;
+
+						await db.exec(`insert into jv (cc, cv, pv) values (${ccNew}, ${cvNew}, ${pvNew})`);
+
+						// jparent: the old parents plus the minted (mintedPp, pvNew).
+						assertRowsEqual('insert parent', await readRows('select pp, pv from jparent'),
+							[...P.map(p => ({ pp: p.pp, pv: p.pv })), { pp: mintedPp, pv: pvNew }], ['pp', 'pv']);
+
+						// jchild: the old children plus the new (ccNew, pr=mintedPp, cvNew).
+						assertRowsEqual('insert child', await readRows('select cc, pr, cv from jchild'),
+							[...C.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), { cc: ccNew, pr: mintedPp, cv: cvNew }], ['cc', 'pr', 'cv']);
+
+						// View image: every child whose parent now exists (the minted parent
+						// can adopt a previously-dangling child whose pr equals mintedPp),
+						// paired with that parent's pv, plus the inserted logical row.
+						const ppSet = new Set<number>([...ppValues, mintedPp]);
+						const pvAfter = new Map<number, number>([...P.map(p => [p.pp, p.pv] as [number, number]), [mintedPp, pvNew]]);
+						const expectedView = [
+							...C.filter(c => ppSet.has(c.pr)).map(c => ({ cc: c.cc, cv: c.cv, pv: pvAfter.get(c.pr)! })),
+							{ cc: ccNew, cv: cvNew, pv: pvNew },
+						];
+						assertRowsEqual('insert view image', await readRows('select cc, cv, pv from jv'),
+							expectedView, ['cc', 'cv', 'pv']);
+					},
+				), { numRuns: 60 });
+			});
 		});
 	});
 

@@ -11,7 +11,8 @@ actually shipped:
 | **Phase 1b** | Per-statement mutation-context threading through the view boundary (one captured value stamped across every base row of the statement). Single-base per-row generator cadence rides the base table's column defaults. | **Shipped (single-base)** |
 | **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
 | **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. | **Shipped** (the lenient predicate-honest *multi-side delete fan-out* is deferred — see § Inner Join) |
-| Phase 2b+ | Multi-source **insert** (the shared join key is not a view column → needs the per-row shared-surrogate mutation-context envelope), **RETURNING-through-views**, outer joins, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values. | Not shipped — rejected at plan time with a structured diagnostic. |
+| **Phase 2b** | Multi-source **key-preserving inner-join `insert`** write-through, plus the per-row **shared-surrogate mutation-context envelope** it requires. The shared join key is not a view column, so an insert mints a surrogate **once per produced logical row at the envelope, before propagation fans out**, and threads the one captured value into both base inserts (FK-parent before FK-child). The key is either **directly supplied** (a view column maps to a join-key base column) or **minted** (`integer-auto` / `per-row`: `seed + ordinal`, `seed = max(anchor.key)` captured once). Realized by materializing the augmented source once (`ViewMutationNode.envelope` + `EnvelopeScanNode`) so every base op reads the identical rows. | **Shipped (two-table inner join)** |
+| Phase 2b+ | **RETURNING-through-views**, outer-join / optional-member insert, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values, `declared-default`-expression and non-integer surrogate generators, multi-source-`insert` `default_for`. | Not shipped — rejected at plan time with a structured diagnostic. |
 
 **Implementation note (Phase 1).** Phase 1 ships **via the view-mutation
 substrate** (single-source = one base op). A view-targeted DML whose body
@@ -221,15 +222,30 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > lowered back to AST so the ordinary base-table builders (and all their constraint
 > / conflict / FK machinery) are reused verbatim. The `quereus.update.*` tag
 > override surface (`target` / `exclude` / `delete_via` / `policy`) is **shipped**
-> (Phase 3.4 — see § Tags). **Still rejected:** multi-source `insert`
-> (shared-surrogate, below), composite-PK or `> 2`-table joins, self-joins,
-> cross-source `set` values, and `select *` join bodies.
+> (Phase 3.4 — see § Tags). Multi-source **`insert`** is **shipped** (Phase 2b —
+> the shared-surrogate envelope, below). **Still rejected:** composite-PK or
+> `> 2`-table joins, self-joins, cross-source `set` values, and `select *` join
+> bodies.
 
 The lineage of an inner-join output column traces unambiguously to one of the two child relations (EC propagation makes column membership precise even for equi-join columns).
 
 **Updates** route per-column to the side that owns each column. A `set` clause assigning columns from both sides produces two child operations executed atomically. The row-identifying predicate for each child is the projection of the join's row-identifying predicate onto that child's key columns.
 
 **Inserts** require values for both sides' `not null`-without-default columns and must satisfy the join predicate. The two child inserts execute FK-parent before FK-child where the dependency is provable; otherwise the order is unspecified. The join predicate, combined with the inserted values, supplies missing join-key columns on either side via EC.
+
+> **Shipped (Phase 2b) — two-table inner join.** A multi-source insert decomposes
+> through `building/view-mutation-builder.ts` (`buildMultiSourceInsert`, off
+> `planner/mutation/multi-source.ts` `analyzeMultiSourceInsert`). Each supplied view
+> column routes to its owning side by `updateLineage`; the shared join key (read
+> from the single `a.col = b.col` ON predicate) is **directly supplied** when a view
+> column maps to it, otherwise **minted** at the envelope (§ Mutation Context). A
+> `not null` base column with neither a supplied value nor a declared default raises
+> `no-default`; a computed target column raises `no-inverse`. **Still rejected:**
+> outer-join / optional-member inserts (the worked example's `left join` shape — the
+> insert path requires an INNER join in v1), composite-PK or `> 2`-table joins,
+> self-joins, a non-integer surrogate that is not directly supplied, a
+> `declared-default`-expression generator, `default_for` on a multi-source insert,
+> and `select *` join bodies.
 
 **Deletes** are inherently ambiguous — removing the joined row requires deleting from at least one side. The resolution (tags compose *after* the predicate dispatch — they only restrict the candidate sides, never broaden them):
 
@@ -443,14 +459,30 @@ Bindings have two cadences:
 - **Per-statement** — a captured `now`, a bound parameter. Evaluated once; stable across every row and every base operation the statement emits (transaction-time semantics).
 - **Per-row** — a sequence, a surrogate allocator. Evaluated once *per top-level row produced*, so a multi-row insert mints a distinct value per row. The captured context records the per-row values, preserving replay.
 
-> **Not yet shipped (the shared-surrogate worked example below).** Multi-source
-> `insert` and per-row shared-surrogate threading across sibling base ops are
-> rejected today (`unsupported-multisource-insert`): the mutation context is
-> currently per-base-op, so there is no envelope that resolves one `next_rid()`
-> per row and shares it across both base inserts. Tracked by
-> `view-mutation-shared-surrogate-insert`. Multi-source `update` / `delete` (shipped)
-> do not need this: they address existing rows by a subquery over the join, not by
-> minting a shared key.
+> **Shipped (Phase 2b — the shared-surrogate worked example below).** A
+> multi-source `insert` resolves the shared key once per produced logical row **at
+> the envelope, before propagation fans out**, and threads the single captured value
+> into both base inserts. The envelope is realized as a **materialized augmented
+> source**: `ViewMutationNode.envelope` holds the per-row source (the supplied view
+> columns); the `ViewMutation` emitter drains it once into an array, appends the
+> minted key per row, and stashes the rows in `rctx.tableContexts`; each base op
+> reads them back through an `EnvelopeScanNode` (the recursive-CTE working-table
+> pattern), so every branch observes the identical row — there is no
+> "which branch generates first" question. The generator is `integer-auto` /
+> `per-row` (`SharedKeyGenerator` in `vtab/mapping-advertisement.ts`): `seed +
+> ordinal`, where `seed = max(anchor.key)` is evaluated **once** before fan-out (so
+> it observes the pre-mutation state) and the 1-based ordinal makes each row's key
+> distinct. The anchor is the FK-parent (else the left source). The same envelope is
+> the surface `lens-multi-source-put-fanout` (`decomposition.ts`) rides for its
+> `cadence: 'per-row'` / `'per-statement'` threading. Multi-source `update` /
+> `delete` do not need this: they address existing rows by a subquery over the join,
+> not by minting a shared key.
+>
+> A genuinely non-deterministic per-row generator (a `declared-default` expression
+> like `next_rid()`, a real allocator) would ride the same envelope unchanged — its
+> per-row value captured once into the materialized rows and recorded for replay —
+> but v1 ships only the `integer-auto` strategy; `declared-default`-expression and
+> non-integer surrogates are deferred (the key must then be directly supplied).
 
 When a per-row generated value also serves as a **join key shared across base tables** — the surrogate that an n-way decomposition joins on — the single captured per-row value threads through every branch of the fan-out. Because it is resolved at the envelope *before* propagation reaches the branches, every branch references one already-captured binding: there is no "which branch generates first" ordering question, and the branches cannot diverge. This is what makes an insert into a relation backed by a shared-surrogate decomposition well-defined — one generation, captured, shared across the fan-out.
 
@@ -579,11 +611,13 @@ boundary, so `view_info()` walks `getAllViews()` only.
   predicate-honest complement derived off the backward walk (for the lens prover).
 - `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed.** A decomposition-backed logical table (a `primary-storage` advertisement, no override) routes to the advertisement-driven fan-out (`decomposition.ts`); a single-table body routes to the single-source spine (`single-source.ts`); a join body routes to the multi-source walk (`multi-source.ts`). Also hosts `classifyViewBody`.
 - `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.** Also hosts the shared expression machinery both spines use: `transformExpr` (now with a `descend` hook into `subquery` / `exists` / `in`-subquery operands), the deep `cloneExpr` / `cloneQueryExpr`, and the scope-aware `transformQueryExpr` / `makeViewColumnDescend` that rewrite view-column references nested inside a predicate / assigned-value subquery to their base-term lineage (§ Selection).
-- `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition (`propagateMultiSource`), reading the planned body's `updateLineage` to emit an ordered multi-element `BaseOp[]` for `update` / `delete`, lowered to AST. **Landed** (insert rejected with `unsupported-multisource-insert`).
+- `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition. `propagateMultiSource` reads the planned body's `updateLineage` to emit an ordered multi-element `BaseOp[]` for `update` / `delete`, lowered to AST. `analyzeMultiSourceInsert` (Phase 2b) decomposes an `insert`: it routes each supplied view column to its owning side, reads the shared key off the single-equi-join ON predicate, decides directly-supplied-vs-mint, FK-orders the sides, and raises `no-default` / `no-inverse` for an uncoverable side. **Landed.**
+- `src/planner/nodes/envelope-scan-node.ts` / `src/runtime/emit/envelope-scan.ts` — the leaf that scans the shared-surrogate envelope rows from `rctx.tableContexts` (set by the `ViewMutation` emitter before fan-out). **Landed.**
+- `src/planner/building/view-mutation-builder.ts` — `buildViewMutation` routes a multi-source inner-join `insert` to `buildMultiSourceInsert`, which builds the envelope source (the user VALUES/SELECT), one base insert per side (each sourcing a projection over an `EnvelopeScanNode`, re-planned through `buildInsertStmt`'s new `preBuiltSource` seam), and the `max(anchor.key)` seed. **Landed.**
 - `src/planner/mutation/decomposition.ts` — the **advertisement-driven** put fan-out for an n-way decomposition lens (`propagateDecomposition`, `lens-multi-source-put-fanout`). **Partially landed:** DELETE across every member (anchor-last, anchor-only predicate) and UPDATE routed to the mandatory non-EAV member backing each column. INSERT (`unsupported-decomposition-insert`), a non-anchor-member predicate (`unsupported-decomposition-predicate`), an optional/EAV/key UPDATE (`unsupported-decomposition-update`), and composite shared keys (`unsupported-decomposition-key`) are deferred onto absent substrate (the shared-surrogate insert envelope / snapshot-consistent multi-member execution).
 - `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.**
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
-- `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. **Landed** (side-effect only; accumulating `returning` rows lands with RETURNING-through-view).
+- `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. For a multi-source insert it first materializes `plan.envelope` once (the shared-surrogate envelope), evaluating the seed and minting `seed + ordinal` per row, then stashes the rows in `rctx.tableContexts` for the base ops' `EnvelopeScanNode`s. **Landed** (side-effect only; accumulating `returning` rows lands with RETURNING-through-view).
 - `src/schema/view.ts` — `ViewSchema.effectiveTargets`, `ViewSchema.defaultsForColumn`, populated at view-creation time.
 - `src/func/builtins/schema.ts` — the `view_info()` TVF (§ Information Schema Surface): a read-only static projection over the planned body's `updateLineage` / `attributeDefaults` + base-column flags. Reads the backward surface; threads no new state.
 

@@ -186,7 +186,7 @@ export type MutationRequest =
  * overridden lens carries a hand-authored body the advertisement does not
  * describe, so it stays on the generic path too.
  */
-function decompositionStorage(ctx: PlanningContext, view: MutableViewLike): StorageShape | undefined {
+export function decompositionStorage(ctx: PlanningContext, view: MutableViewLike): StorageShape | undefined {
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	if (!slot || slot.override || slot.advertisement?.role !== 'primary-storage') return undefined;
 	return slot.advertisement.storage;

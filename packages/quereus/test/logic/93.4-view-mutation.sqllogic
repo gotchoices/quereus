@@ -188,10 +188,6 @@ create view ms_jv_c as
 update ms_jv_c set banner = 'z' where cid = 1;
 -- error: read-only
 
--- INSERT through a join view needs the shared-surrogate context (later phase).
-insert into ms_jv (cid, note, label) values (9, 'q', 'P10x');
--- error: multi-source
-
 -- RETURNING through a join view is not yet supported.
 delete from ms_jv where cid = 1 returning cid;
 -- error: RETURNING through view
@@ -582,3 +578,90 @@ update sq_f_v set tag = 'X' where exists (select 1 from (select * from sq_f_aux)
 -- a table-valued-function subquery source is unresolvable the same way -> reject.
 update sq_f_v set tag = 'X' where exists (select 1 from table_info('sq_f_t') as ti where ti.name = tag);
 -- error: cannot write through
+
+-- ===================================
+-- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
+-- envelope). The shared join key is not a view column, so an insert mints a
+-- surrogate ONCE per produced logical row at the envelope and threads the one
+-- captured value into both base inserts (so the branches agree on identity).
+-- Sides are written FK-parent-before-FK-child. See docs/view-updateability.md
+-- § Inner Join (Inserts), § Mutation Context (the worked example + cadences).
+-- ===================================
+
+-- --- (a) the worked example: two base tables sharing a surrogate `rid` the view
+--         hides; one minted `rid` per row, shared across both base inserts ---
+create table u_core (rid integer primary key, name text);
+create table u_contact (rid integer primary key, email text);
+create view appuser as
+    select c.name as name, k.email as email
+    from u_core c join u_contact k on k.rid = c.rid;
+
+insert into appuser (name, email) values ('Ada', 'ada@x.io'), ('Lin', 'lin@x.io');
+
+-- Exactly one generation per row (rid 1 then 2), shared across both base inserts
+-- of that row, distinct across rows.
+select rid, name from u_core order by rid;
+→ [{"rid":1,"name":"Ada"},{"rid":2,"name":"Lin"}]
+select rid, email from u_contact order by rid;
+→ [{"rid":1,"email":"ada@x.io"},{"rid":2,"email":"lin@x.io"}]
+
+-- The write is visible through the view.
+select name, email from appuser order by name;
+→ [{"name":"Ada","email":"ada@x.io"},{"name":"Lin","email":"lin@x.io"}]
+
+-- --- (b) the surrogate mints above existing keys; FK-parent inserted before the
+--         FK-child, so the child's shared key references a parent that exists ---
+create table msi_parent (pp integer primary key, pv integer null);
+create table msi_child (cc integer primary key, pr integer null, cv integer null,
+    foreign key (pr) references msi_parent(pp));
+create view msi_jv as
+    select c.cc as cc, c.cv as cv, p.pv as pv
+    from msi_child c join msi_parent p on p.pp = c.pr;
+-- a pre-existing parent so the minted surrogate must clear it.
+insert into msi_parent values (40, 400);
+
+insert into msi_jv (cc, cv, pv) values (1, 11, 111);
+-- minted pp = max(40)+1 = 41, shared as msi_child.pr.
+select pp, pv from msi_parent order by pp;
+→ [{"pp":40,"pv":400},{"pp":41,"pv":111}]
+select cc, pr, cv from msi_child order by cc;
+→ [{"cc":1,"pr":41,"cv":11}]
+select cc, cv, pv from msi_jv order by cc;
+→ [{"cc":1,"cv":11,"pv":111}]
+
+-- a multi-row insert mints a DISTINCT surrogate per row, each shared across both sides.
+insert into msi_jv (cc, cv, pv) values (2, 22, 222), (3, 33, 333);
+select pp, pv from msi_parent order by pp;
+→ [{"pp":40,"pv":400},{"pp":41,"pv":111},{"pp":42,"pv":222},{"pp":43,"pv":333}]
+select cc, pr, cv from msi_child order by cc;
+→ [{"cc":1,"pr":41,"cv":11},{"cc":2,"pr":42,"cv":22},{"cc":3,"pr":43,"cv":33}]
+
+-- --- (c) directly-supplied shared key: the view exposes the join key, so no
+--         surrogate is minted — the supplied value threads to both sides ---
+create table dk_a (k integer primary key, av text);
+create table dk_b (k integer primary key, bv text);
+create view dk_v as select m.k as k, m.av as av, s.bv as bv
+    from dk_a m join dk_b s on s.k = m.k;
+
+insert into dk_v (k, av, bv) values (7, 'a7', 'b7'), (9, 'a9', 'b9');
+select k, av from dk_a order by k;
+→ [{"k":7,"av":"a7"},{"k":9,"av":"a9"}]
+select k, bv from dk_b order by k;
+→ [{"k":7,"bv":"b7"},{"k":9,"bv":"b9"}]
+select k, av, bv from dk_v order by k;
+→ [{"k":7,"av":"a7","bv":"b7"},{"k":9,"av":"a9","bv":"b9"}]
+
+-- --- (d) a NOT NULL base column with no default and no supplied value -> rejected ---
+create table nd_main (k integer primary key, must_have text not null);
+create table nd_side (k integer primary key, sv text);
+create view nd_v as select m.k as k, s.sv as sv from nd_main m join nd_side s on s.k = m.k;
+insert into nd_v (sv) values ('x');
+-- error: no default
+
+-- --- (e) a computed (non-invertible) target column is not insertable ---
+create table cm_a (k integer primary key, av integer);
+create table cm_b (k integer primary key, bv integer);
+create view cm_v as select a.k as k, a.av + 1 as bumped, b.bv as bv
+    from cm_a a join cm_b b on b.k = a.k;
+insert into cm_v (bumped, bv) values (5, 6);
+-- error: non-invertible
