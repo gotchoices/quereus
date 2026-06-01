@@ -1,7 +1,17 @@
 description: Extend the coverage prover's IND-derived no-row-loss path (Wave 2) to two completeness cases it currently abstains on — a bushy (join-shaped) lookup side, and a join whose equi-pairs span two INDs. Both are safe under-claims today (a missed cover only forgoes an optimization), so this is a future optimization-completeness gain, not a correctness fix. Only becomes observable once a runtime consumer drives a join-bodied covering MV (Wave-3 lens enforcement).
-prereq: lens-multi-source-decomposition
+prereq:
 files: packages/quereus/src/planner/analysis/coverage-prover.ts, packages/quereus/test/covering-structure.spec.ts
 ----
+
+> **Backlog rationale (not blocked).** The multi-source decomposition this once
+> named as a prereq (`lens-multi-source-decomposition`) was an umbrella that landed
+> split across `lens-multi-source-{get-synthesis,put-fanout,put-insert-fanout,ind-injection}`
+> + `coverage-prover-multi-source-bodies` (all complete). The prover work here is
+> standalone and testable now (force the bushy plan shape). It stays in backlog only
+> because it is an **under-claim-safe completeness optimization** targeting bushy /
+> two-IND join shapes the optimizer does not produce naturally today — no observable
+> benefit until a cost-based reorder yields those shapes and a runtime consumer drives
+> a join-bodied covering MV. Promote when either condition becomes real.
 
 ## Background
 

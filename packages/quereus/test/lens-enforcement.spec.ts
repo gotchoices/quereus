@@ -1024,4 +1024,30 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			await db.close();
 		}
 	});
+
+	it('a matching basis-UC `on conflict ignore` honors IGNORE on a plain duplicate insert (keeps the original)', async () => {
+		const db = new Database();
+		try {
+			// IGNORE travels a different row-time branch than REPLACE: the duplicate is
+			// silently dropped and the *original* row is kept (no eviction). Mirror the
+			// matching-REPLACE remediation but with IGNORE on both the basis and logical UC.
+			await db.exec('declare schema y { table u (id integer primary key, email text null, unique (email) on conflict ignore) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_u_email as select email, id from y.u where email is not null order by email');
+			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email) on conflict ignore) }');
+			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 'u')), 'classifies row-time').to.deep.equal(['row-time']);
+
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x')`);
+			// A plain duplicate insert (no statement-level OR) is IGNOREd via the basis UC's
+			// declared IGNORE — the original id=1 is kept, id=2 is dropped.
+			await db.exec(`insert into x.u (id, email) values (2, 'a@x')`);
+			expect(await rows(db, `select id from x.u where email = 'a@x'`)).to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, `select id from y.u where email = 'a@x'`)).to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.u')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
