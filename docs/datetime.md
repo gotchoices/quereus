@@ -51,6 +51,19 @@ converted to UTC before the zone information is discarded. The SQL functions
 listed above retain their existing lenient behavior; only the column-type
 `parse` performs this canonicalization.
 
+Canonicalization applies **only to the stored value**, not to a comparison
+literal on the read/filter path. A literal in a predicate (`WHERE ts = '…'`) is
+compared **raw** (BINARY, byte-for-byte) against the stored canonical value — it
+is not parsed or canonicalized first. So a non-canonical literal that denotes the
+*same instant* as a stored row does **not** match: `WHERE ts = '2017-07-14T02:40:00Z'`
+returns nothing against a row stored as the bare `'2017-07-14T02:40:00'`, even
+though both name the same time; only the bare canonical literal
+`'2017-07-14T02:40:00'` matches. Range predicates likewise order raw, so the bare
+form (a strict prefix of the `Z`-suffixed form) sorts below it. To match reliably,
+write the literal in the column's canonical shape (or wrap it so it is stored/cast
+first). This raw-comparison contract is pinned by the `dt_filter` / `d_filter` /
+`t_filter` cases in `test/logic/98-temporal-edge-cases.sqllogic`.
+
 ### Strict Parsing (Epoch Functions)
 
 The `epoch_s`, `epoch_ms`, and `epoch_s_frac` functions use **strict parsing** to avoid the ambiguity inherent in lenient numeric parsing. They accept only:
