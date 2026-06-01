@@ -272,6 +272,24 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
 	);
 }
 
+/**
+ * Qualify every UNQUALIFIED column reference at the top level of `expr` with
+ * `qualifier` (the lowered statement's base table name). Used only on a
+ * single-source substituted base term emitted INSIDE a subquery operand: an
+ * unqualified base term there would re-bind to a same-named source the subquery's
+ * own FROM introduces (innermost SQL scoping) instead of correlating to the outer
+ * UPDATE/DELETE target row. Qualifying it with the base table name — which is
+ * exactly the table named by the lowered statement, with no synthesised alias —
+ * makes it correlate to the outer row regardless of what the subquery FROM
+ * defines. Shallow by design (mirrors {@link normalizeBaseRefs}): it does NOT
+ * descend into a nested subquery within the replacement, because a lineage term's
+ * own scalar subquery has its own scope. Already-qualified references are left
+ * untouched. Returns a fresh tree (does not mutate the shared `columnMap` entry).
+ */
+function qualifyUnqualifiedRefs(expr: AST.Expression, qualifier: string): AST.Expression {
+	return transformExpr(expr, (col) => col.table ? undefined : { ...col, table: qualifier });
+}
+
 // --- view-column descent into subquery operands ---------------------------
 //
 // `transformExpr` rewrites a view-column reference at the top level of a user
@@ -309,11 +327,21 @@ function makeViewSubstitute(
 	shadowed: ReadonlySet<string>,
 	tainted: boolean,
 	view: MutableViewLike,
+	baseQualifier?: string,
 ): (col: AST.ColumnExpr) => AST.Expression | undefined {
+	// When a replacement is emitted inside a subquery operand, qualify its
+	// unqualified base terms with `baseQualifier` so they correlate to the outer
+	// (UPDATE/DELETE target) row rather than re-binding to a same-named local
+	// source. Returns a fresh tree, never the shared `columnMap` entry.
+	const resolve = (name: string): AST.Expression | undefined => {
+		const repl = columnMap.get(name);
+		if (!repl || baseQualifier === undefined) return repl;
+		return qualifyUnqualifiedRefs(repl, baseQualifier);
+	};
 	return (col) => {
 		const name = col.name.toLowerCase();
 		if (col.table) {
-			return col.table.toLowerCase() === viewName ? columnMap.get(name) : undefined;
+			return col.table.toLowerCase() === viewName ? resolve(name) : undefined;
 		}
 		if (shadowed.has(name)) return undefined;
 		if (!columnMap.has(name)) return undefined;
@@ -325,7 +353,7 @@ function makeViewSubstitute(
 				message: `cannot write through view '${view.name}': the reference '${col.name}' inside a subquery cannot be proven correlated to the view because the subquery's source columns are not statically resolvable (a 'select *' / table-valued function / unresolved source); qualify the reference with its base table or alias, or restructure the predicate`,
 			});
 		}
-		return columnMap.get(name);
+		return resolve(name);
 	};
 }
 
@@ -347,11 +375,12 @@ export function transformQueryExpr(
 	shadowed: ReadonlySet<string>,
 	tainted: boolean,
 	view: MutableViewLike,
+	baseQualifier?: string,
 ): AST.QueryExpr {
 	if (query.type === 'values') {
 		// No FROM — the value rows correlate to the enclosing scope unchanged.
-		const substitute = makeViewSubstitute(columnMap, viewName, shadowed, tainted, view);
-		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view);
+		const substitute = makeViewSubstitute(columnMap, viewName, shadowed, tainted, view, baseQualifier);
+		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view, baseQualifier);
 		const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, descend);
 		return { ...query, values: query.values.map(row => row.map(onExpr)) };
 	}
@@ -375,14 +404,14 @@ export function transformQueryExpr(
 		? shadowed
 		: new Set<string>([...shadowed, ...local]);
 
-	const substitute = makeViewSubstitute(columnMap, viewName, innerShadow, scopeTainted, view);
+	const substitute = makeViewSubstitute(columnMap, viewName, innerShadow, scopeTainted, view, baseQualifier);
 	// A subquery nested inside this select's clauses / FROM sees this select's FROM,
 	// so it inherits `innerShadow` / `scopeTainted`.
-	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, innerShadow, scopeTainted, view);
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, innerShadow, scopeTainted, view, baseQualifier);
 	// A compound / union leg is a SIBLING select correlating to the SAME outer scope
 	// as this one — it does NOT see this select's FROM, so it keeps the incoming
 	// `shadowed` / `tainted`.
-	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view);
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformQueryExpr(ctx, q, columnMap, viewName, shadowed, tainted, view, baseQualifier);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
 	return rebuildSelect(sel, onExpr, onNested, onLeg);
 }
@@ -393,15 +422,24 @@ export function transformQueryExpr(
  * a `subquery` / `exists` / `in`-subquery operand is rewritten scope-aware to its
  * base-term lineage. `columnMap` is the view-col (lowercase) → base-term map;
  * `viewName` is the view's own name (so a `view.col` qualifier is recognised).
+ *
+ * `baseQualifier` is the single-source lowered statement's base table name. When
+ * set, an unqualified base term substituted INSIDE a subquery operand is qualified
+ * with it (via {@link qualifyUnqualifiedRefs}) so it correlates to the outer
+ * UPDATE/DELETE target row rather than re-binding to a same-named subquery-local
+ * source. The single-source rewriters pass `analysis.baseTable.name`; the
+ * multi-source spine passes `undefined` (its base terms are already
+ * alias-qualified — `p.label` — so they correlate without re-qualification).
  */
 export function makeViewColumnDescend(
 	ctx: PlanningContext,
 	columnMap: ReadonlyMap<string, AST.Expression>,
 	viewName: string,
 	view: MutableViewLike,
+	baseQualifier?: string,
 ): (query: AST.QueryExpr) => AST.QueryExpr {
 	const lcView = viewName.toLowerCase();
-	return (query) => transformQueryExpr(ctx, query, columnMap, lcView, new Set<string>(), false, view);
+	return (query) => transformQueryExpr(ctx, query, columnMap, lcView, new Set<string>(), false, view, baseQualifier);
 }
 
 /**
@@ -778,7 +816,7 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike): AST.UpdateStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, analysis.baseTable.name);
 
 	const assignments = stmt.assignments.map(asg => ({
 		column: requireBaseColumn(findViewColumn(analysis, asg.column, view)),
@@ -805,7 +843,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike): AST.DeleteStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, analysis.baseTable.name);
 
 	const userWhere = stmt.where ? transformExpr(stmt.where, substitute, descend) : undefined;
 	const where = combineAnd(userWhere, analysis.filterPredicate ? cloneExpr(analysis.filterPredicate) : undefined);
@@ -844,7 +882,7 @@ export function rewriteViewReturning(
 ): AST.ResultColumn[] | undefined {
 	if (!returning || returning.length === 0) return undefined;
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view);
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, analysis.baseTable.name);
 	const out: AST.ResultColumn[] = [];
 	for (const rc of returning) {
 		if (rc.type === 'all') {

@@ -583,6 +583,59 @@ update sq_f_v set tag = 'X' where exists (select 1 from (select * from sq_f_aux)
 update sq_f_v set tag = 'X' where exists (select 1 from table_info('sq_f_t') as ti where ti.name = tag);
 -- error: cannot write through
 
+-- --- (g) the substituted base term itself collides with a subquery-local source ---
+-- The view renames base `lbl` to view column `note`; the EXISTS subquery FROM
+-- (p1_aux) ALSO has an `lbl` column. `note` is the view column = base `p1_t.lbl`,
+-- correlated to the outer row. An UNQUALIFIED substituted base term (`lbl`) inside
+-- the subquery would re-bind to p1_aux.lbl (innermost scope) — making the predicate
+-- the uncorrelated p1_aux.k = p1_aux.lbl, true for the ('Q','Q') row, so EVERY outer
+-- row would pass (a silent wrong write). Single-source descent qualifies the term to
+-- p1_t.lbl, so the predicate is the correlated p1_aux.k = p1_t.lbl -> only row 1.
+create table p1_t (id integer primary key, lbl text);
+create table p1_aux (k text, lbl text);
+insert into p1_t values (1, 'A'), (2, 'B');
+insert into p1_aux values ('A', 'X'), ('Q', 'Q');
+create view p1_v as select id as id, lbl as note from p1_t;
+
+update p1_v set note = 'CHANGED' where exists (select 1 from p1_aux where k = note);
+select id, lbl from p1_t order by id;
+→ [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"B"}]
+
+-- --- (h) `where lbl = note`: the literal base name AND the substituted term collide ---
+-- The literal `lbl` binds the subquery-local p2_aux.lbl (it is not a view column,
+-- so it is never substituted); `note` is the view column = base p2_t.lbl. Without
+-- qualification both collapse to p2_aux.lbl, making the predicate the always-true
+-- p2_aux.lbl = p2_aux.lbl. The substituted term is qualified to p2_t.lbl, so the
+-- predicate is the correlated p2_aux.lbl = p2_t.lbl -> only the matching row 1.
+create table p2_t (id integer primary key, lbl text);
+create table p2_aux (k text, lbl text);
+insert into p2_t values (1, 'A'), (2, 'B');
+insert into p2_aux values ('A', 'A'), ('Q', 'Q');
+create view p2_v as select id as id, lbl as note from p2_t;
+
+update p2_v set note = 'CHANGED' where exists (select 1 from p2_aux where lbl = note);
+select id, lbl from p2_t order by id;
+→ [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"B"}]
+
+-- --- (i) negative control on the BASE name: a bare base-name ref to a genuine
+--          subquery-local source must STAY local (analogous to (c), on `lbl`) ---
+-- The view renames base `lbl` to `note`; the EXISTS subquery source nc_src has its
+-- OWN `lbl` column plus an `ok` flag. The bare `lbl` inside the subquery is
+-- nc_src.lbl (never a view column, so never substituted/qualified); `note` is the
+-- view column, qualified to the correlated nc_t.lbl. The predicate selects the
+-- nc_src row whose lbl matches the outer row and tests its `ok`. If the fix wrongly
+-- qualified the local `lbl` to nc_t.lbl, the predicate would degrade to the
+-- always-true nc_t.lbl = nc_t.lbl and ok = 1 -> both rows would write.
+create table nc_t (id integer primary key, lbl text);
+create table nc_src (lbl text, ok integer);
+insert into nc_t values (1, 'L1'), (2, 'L2');
+insert into nc_src values ('L1', 1), ('L2', 0);
+create view nc_v as select id as id, lbl as note from nc_t;
+
+update nc_v set note = 'CHANGED' where exists (select 1 from nc_src where lbl = note and ok = 1);
+select id, lbl from nc_t order by id;
+→ [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"L2"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so an insert mints a

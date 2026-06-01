@@ -211,6 +211,32 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > silent mis-bind. (Before this, such a nested reference was passed through
 > un-rewritten and could silently re-bind to a same-named base column — a silent
 > wrong write.)
+>
+> **Single-source: the substituted base *term* is correlation-qualified.** Deciding
+> *whether* to substitute is only half the fix. The single-source rewrite renames a
+> view column to a bare base term (`note` → `lbl`), and an *unqualified* `lbl`
+> emitted inside a subquery operand re-binds, by ordinary innermost-scope SQL rules,
+> to a same-named source the subquery's own FROM introduces — not to the outer
+> UPDATE/DELETE target row. So the single-source descent qualifies the substituted
+> term with the base table name (`p1_t.lbl`, via `qualifyUnqualifiedRefs` threaded as
+> `baseQualifier` through `makeViewColumnDescend` → `transformQueryExpr` →
+> `makeViewSubstitute`), which is exactly the table named by the lowered statement
+> (no synthesised alias), so it correlates to the outer row regardless of what the
+> subquery FROM defines. This is applied **only** on the subquery-descent path: the
+> top-level user WHERE / SET and the RETURNING projection columns resolve against the
+> lowered statement's single source unqualified, and the multi-source spine passes no
+> `baseQualifier` because its terms are already alias-qualified (`p.label`) and there
+> is no single base-table correlation name. Only a *substituted* term (a view column)
+> is qualified — a bare base-name reference (`lbl`) is never a view column, so a
+> subquery-local source that genuinely defines it keeps binding locally, unchanged.
+>
+> *Known corner (unfixed):* if the subquery FROM names the **same base table**
+> (`update p1_v … where exists (select 1 from p1_t where …)`), the base-table-name
+> qualifier (`p1_t.lbl`) binds to the innermost local `p1_t`, not the outer target —
+> an inherent SQL self-reference scoping ambiguity the single-source lowering (no
+> alias on the target) cannot disambiguate. This is no worse than the pre-fix
+> behaviour and is rare; a future hardening could synthesise an alias on the lowered
+> target.
 
 ### Inner Join
 
