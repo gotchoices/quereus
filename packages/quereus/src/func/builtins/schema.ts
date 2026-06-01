@@ -1010,14 +1010,28 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		const root = plan.getRelations()[0];
 		if (!root) return [];
 
-		const tableRefsById = buildTableRefsById(collectBodyNodes(root));
+		const nodes = collectBodyNodes(root);
+
+		// Outer-join gate (mirrors `deriveViewInfo`'s Divergence 2): a body carrying
+		// any `null-extended` site is a LEFT/RIGHT/FULL outer join, which
+		// `propagate()` rejects wholesale today (both sides — `collectInnerJoinSources`
+		// accepts only inner equi-joins), so *every* column is non-updatable. Without
+		// this gate `baseSiteOf` would unwrap `null-extended` to the inner base and
+		// over-report a preserved-side column as `'YES'` even though no write through
+		// the view is accepted — disagreeing with both `view_info()` (which short-
+		// circuits the same body to all-`NO`) and the dynamic truth. When per-side
+		// write materialization lands and the gate softens, both surfaces relax
+		// together (see `baseSiteOf`'s forward-looking note).
+		const outerJoin = hasNullExtendedLineage(nodes);
+
+		const tableRefsById = buildTableRefsById(nodes);
 		const rootLineage = root.physical?.updateLineage;
 
 		const attrs = root.getAttributes();
 		const rows: ColumnInfoRow[] = [];
 		for (let i = 0; i < attrs.length; i++) {
 			const attr = attrs[i];
-			const bs = baseSiteOf(rootLineage?.get(attr.id));
+			const bs = outerJoin ? undefined : baseSiteOf(rootLineage?.get(attr.id));
 			const ref = bs ? tableRefsById.get(bs.table) : undefined;
 			// Updatable iff a base site resolves to a producing TableReferenceNode.
 			// A base id without a resolved ref should not happen (root lineage ids

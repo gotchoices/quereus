@@ -701,14 +701,22 @@ column_info('my_view')   -- one row per view output column
 Constraints) — `base_table`/`base_column` are the column itself. For a **view**,
 the body is planned *logically* (the same `_buildPlan` path as `view_info()`, to
 preserve the operator tree that threads `updateLineage`) and each output
-attribute's backward `updateLineage` site is read: a `base` site (unwrapped
-through `null-extended`) resolving to its producing `TableReferenceNode` is
-`'YES'` with its base trace; everything else (`computed`, un-threaded, or a
-site that fails to resolve) is `'NO'` with `null` trace. No dry-run mutation, no
-new planner pass — the surface gains accuracy automatically as later phases
-thread more lineage (a view column fed by an un-threaded operator reads `'NO'`,
-the conservative, honest reading). Every `is_updatable='NO'` row carries `null`
-`base_table`/`base_column`.
+attribute's backward `updateLineage` site is read: a plain `base` site resolving
+to its producing `TableReferenceNode` is `'YES'` with its base trace; everything
+else (`computed`, un-threaded, or a site that fails to resolve) is `'NO'` with
+`null` trace. No dry-run mutation, no new planner pass — the surface gains
+accuracy automatically as later phases thread more lineage (a view column fed by
+an un-threaded operator reads `'NO'`, the conservative, honest reading). Every
+`is_updatable='NO'` row carries `null` `base_table`/`base_column`.
+
+**Outer-join gate (shared with `view_info`'s Divergence 2).** A body carrying any
+`null-extended` site is a LEFT/RIGHT/FULL outer join, which `propagate()` rejects
+wholesale today (both sides — `collectInnerJoinSources` accepts only inner
+equi-joins). `column_info` short-circuits such a body to all-`NO`/`null` exactly
+as `view_info` short-circuits it to all-`NO`/`[]`, rather than unwrapping
+`null-extended` to the inner base and over-reporting a preserved-side column as
+`'YES'`. The two surfaces agree with each other and with the dynamic truth; when
+per-side write materialization lands and the gate softens, both relax together.
 
 The `'YES'`/`'NO'` text encoding matches `information_schema.columns.is_updatable`
 and the `view_info` flags — deliberately **not** `table_info`'s integer `0`/`1`.

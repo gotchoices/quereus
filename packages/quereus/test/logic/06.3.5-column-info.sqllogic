@@ -89,6 +89,28 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 → [{"cid":0,"column_name":"n","is_updatable":"NO","base_table":null,"base_column":null}]
 
 -- ===================================================================
+-- Outer-join body: every column reports is_updatable='NO' with null trace,
+-- mirroring view_info's Divergence 2 gate. An outer join wraps the non-preserved
+-- side `null-extended`; collectInnerJoinSources rejects the WHOLE join (both
+-- sides), so propagate() accepts no write through the view. column_info must NOT
+-- unwrap `null-extended` and over-report a preserved-side column as 'YES' — it
+-- short-circuits the same body deriveViewInfo does. Both the preserved-side
+-- columns (aid, av) and the null-extended column (bv) read 'NO'.
+-- ===================================================================
+
+create table oj_a (aid integer primary key, av text);
+create table oj_b (bid integer primary key, bv text);
+create view oj_left as
+    select a.aid as aid, a.av as av, b.bv as bv
+    from oj_a a left join oj_b b on b.bid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('oj_left');
+→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"av","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Surface agrees with propagate(): a mutation through the outer-join view is rejected.
+update oj_left set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- ===================================================================
 -- Unknown name throws (mirrors table_info's required-target posture).
 -- ===================================================================
 
