@@ -154,6 +154,12 @@ create view ms_jv as
 select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('ms_jv');
 → [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"ms_child\",\"ms_parent\"]"}]
 
+-- Surface agrees with propagate(): the two-table inner equi-join accepts a write
+-- (the positive control for the Divergence 3 shape gate below — isDecomposableJoinBody
+-- keeps this exact shape writable, unlike the cross / > 2-table shapes). No row
+-- matches, so the routed base update is a clean no-op rather than an error.
+update ms_jv set note = 'x' where cid = 999;
+
 -- ===================================================================
 -- Divergence 1 — view-level `default_for` rescues insertability. `created` is a
 -- not-null, no-declared-default base column projected away by the view; a
@@ -225,6 +231,53 @@ create view oj_full as
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_full');
 → [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Divergence 3 — non-inner / multi-table join bodies report conservative and
+-- agree with propagate(). Cross joins and > 2-table inner joins never null-extend
+-- (only LEFT/RIGHT/FULL do — deriveJoinUpdateLineage), so they carry strict-`base`
+-- lineage and slip past the Divergence-2 outer-join gate above. Without the AST
+-- shape gate (isJoinBody && !isDecomposableJoinBody) deriveViewInfo would resolve
+-- their bases and over-report is_updatable='YES' (with both tables in
+-- effective_targets). propagate() rejects every join shape but a single two-table
+-- inner equi-join (collectInnerJoinSources), so the surface must report the
+-- conservative all-`NO`/`[]` row — cross-checked below against a real (rejected)
+-- mutation through each view.
+--
+-- Comma / implicit join bodies are NOT tested here: a multi-source comma FROM
+-- never plans (buildSelectStmt rejects multiple FROM sources), so such a body is
+-- never introspected with base lineage — there is no buildable case. The shape
+-- gate still covers it defensively (isDecomposableJoinBody requires a single JOIN
+-- FROM), so it stays conservative if that ever becomes plannable.
+-- ===================================================================
+
+create table xj_a (aid integer primary key, av text);
+create table xj_b (bid integer primary key, bv text);
+create table xj_c (cid integer primary key, cv text);
+
+-- Cross join (two-table, no ON): strict-`base` lineage, but unwritable.
+create view xj_cross as
+    select a.aid as aid, a.av as av, b.bv as bv
+    from xj_a a cross join xj_b b;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('xj_cross');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the cross-join view is rejected.
+update xj_cross set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- Three-table inner join (> 2 base tables): also strict-`base` lineage, unwritable.
+create view xj_three as
+    select a.aid as aid, a.av as av, b.bv as bv, c.cv as cv
+    from xj_a a join xj_b b on b.bid = a.aid join xj_c c on c.cid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('xj_three');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the 3-table-join view is rejected.
+update xj_three set av = 'z' where aid = 1;
+-- error: cannot write through view
 
 -- ===================================================================
 -- Name filter vs. full enumeration.

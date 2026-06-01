@@ -748,6 +748,21 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// multi-source positive case (`ms_jv`) is untouched.
 	if (hasNullExtendedLineage(nodes)) return CONSERVATIVE_VIEW_INFO;
 
+	// Non-inner-join shape gate (Divergence 3): cross / comma (implicit) / `> 2`-table
+	// / self-join bodies never null-extend (only LEFT/RIGHT/FULL do — see
+	// `deriveJoinUpdateLineage`), so they carry strict-`base` lineage and slip past the
+	// outer-join gate above. `propagate()` rejects every join shape but a single
+	// two-table inner equi-join (`isDecomposableJoinBody`, the boolean shadow of
+	// `collectInnerJoinSources`), so without this gate the target walk below resolves
+	// their bases and over-reports `is_updatable = 'YES'` (and possibly
+	// insertable/deletable). Mirrors the same gate in `deriveColumnInfo`: this reads
+	// the AST shape, `hasNullExtendedLineage` reads lineage — kept parallel as
+	// defense-in-depth. The two-table inner equi-join positive case (`ms_jv`) is not a
+	// match (`isDecomposableJoinBody` accepts it) and stays writable.
+	if (isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst)) {
+		return CONSERVATIVE_VIEW_INFO;
+	}
+
 	const tableRefsById = buildTableRefsById(nodes);
 
 	// Output-column lineage: effective targets, the per-table set of base columns
