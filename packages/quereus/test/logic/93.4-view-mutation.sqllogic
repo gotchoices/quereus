@@ -636,6 +636,23 @@ update nc_v set note = 'CHANGED' where exists (select 1 from nc_src where lbl = 
 select id, lbl from nc_t order by id;
 → [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"L2"}]
 
+-- --- (j) DELETE descent: same collision as (g) on the delete path ---
+-- The delete rewrite threads the same base-table qualifier into the subquery
+-- descent. The view renames base `lbl` to `note`; the EXISTS subquery FROM
+-- (d1_aux) ALSO has an `lbl`. Without qualification the substituted base term
+-- would re-bind to d1_aux.lbl, making the predicate the uncorrelated
+-- d1_aux.k = d1_aux.lbl (true for ('Q','Q')) -> every outer row would delete (a
+-- silent wrong delete). Qualified to d1_t.lbl, only the matching row 1 deletes.
+create table d1_t (id integer primary key, lbl text);
+create table d1_aux (k text, lbl text);
+insert into d1_t values (1, 'A'), (2, 'B');
+insert into d1_aux values ('A', 'X'), ('Q', 'Q');
+create view d1_v as select id as id, lbl as note from d1_t;
+
+delete from d1_v where exists (select 1 from d1_aux where k = note);
+select id, lbl from d1_t order by id;
+→ [{"id":2,"lbl":"B"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so an insert mints a
