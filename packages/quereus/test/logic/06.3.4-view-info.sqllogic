@@ -245,10 +245,12 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets
 -- mutation through each view.
 --
 -- Comma / implicit join bodies are NOT tested here: a multi-source comma FROM
--- never plans (buildSelectStmt rejects multiple FROM sources), so such a body is
--- never introspected with base lineage — there is no buildable case. The shape
--- gate still covers it defensively (isDecomposableJoinBody requires a single JOIN
--- FROM), so it stays conservative if that ever becomes plannable.
+-- never produces a buildable view — with aliases (from a x, b y) it is a parse
+-- error, and without aliases the select builder rejects multiple FROM sources —
+-- so such a body is never introspected with base lineage; there is no buildable
+-- case. The shape gate still covers it defensively (isDecomposableJoinBody
+-- requires a single JOIN FROM), so it stays conservative if that ever becomes
+-- plannable.
 -- ===================================================================
 
 create table xj_a (aid integer primary key, av text);
@@ -277,6 +279,24 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets
 
 -- Surface agrees with propagate(): a write through the 3-table-join view is rejected.
 update xj_three set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- Self-join (two alias-bound sites on one table): a single explicit INNER join
+-- with ON, but the two sides resolve to the *same* base table, which
+-- isDecomposableJoinBody rejects (distinct-table-name check) — mirroring
+-- collectInnerJoinSources, which rejects a self-join wholesale. This is the only
+-- buildable case that exercises that branch (cross / > 2-table fail earlier
+-- checks), so it pins the surface to conservative for a shape that is otherwise
+-- a structurally valid two-table inner join.
+create view xj_self as
+    select a.aid as aid, a.av as av, b.av as av2
+    from xj_a a join xj_a b on b.aid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('xj_self');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the self-join view is rejected.
+update xj_self set av = 'z' where aid = 1;
 -- error: cannot write through view
 
 -- ===================================================================

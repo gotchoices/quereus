@@ -753,8 +753,11 @@ Both surfaces therefore also gate on a non-throwing AST shape check —
 This subsumes the outer-join gate for join bodies (it also rejects
 `joinType !== 'inner'`); the two are kept as parallel, defense-in-depth gates
 (one reads lineage, one reads the AST). Comma/implicit join bodies need no gate
-here — the view builder rejects a multi-source comma FROM at `create view` time,
-so such a view never reaches these surfaces.
+here in practice — a multi-source comma FROM never produces a buildable view: with
+aliases (`from a x, b y`) it is a *parse* error, and without aliases the select
+builder rejects multiple FROM sources — so such a view never reaches these surfaces.
+The shape check (`isDecomposableJoinBody` requires a single JOIN FROM) still covers
+it defensively should a comma FROM ever become plannable.
 
 The `'YES'`/`'NO'` text encoding matches `information_schema.columns.is_updatable`
 and the `view_info` flags — deliberately **not** `table_info`'s integer `0`/`1`.
