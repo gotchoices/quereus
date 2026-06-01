@@ -936,3 +936,44 @@ delete from rjoin where cid = 1 returning *;
 -- the delete removed only the cid=1 child row; cid=2 remains.
 select cid, note, label from rjoin order by cid;
 → [{"cid":2,"note":"b","label":"P20x"}]
+
+-- --- (d) multi-source update RETURNING where the predicate filters on a column the
+--         update rewrites — per-row identity capture (the changed rows no longer
+--         match the predicate, but their captured identity does). Two children per
+--         parent so a parent-side update returns multiple rows; ascending memory-vtab
+--         scan order is deterministic. See docs/view-updateability.md § `returning`.
+create table rp2 (pid integer primary key, label text);
+create table rc2 (cid integer primary key, pref integer, note text,
+    foreign key (pref) references rp2(pid));
+insert into rp2 values (10, 'P10'), (20, 'P20');
+insert into rc2 values (1, 10, 'a'), (2, 10, 'a'), (3, 20, 'b');
+create view rjoin2 as
+    select c.cid as cid, c.note as note, p.label as label
+    from rc2 c join rp2 p on p.pid = c.pref;
+-- run
+
+-- predicate on the rewritten CHILD column: cid 1,2 (note='a') update to 'A'.
+update rjoin2 set note = 'A' where note = 'a' returning cid, note, label;
+→ [{"cid":1,"note":"A","label":"P10"},{"cid":2,"note":"A","label":"P10"}]
+
+-- predicate on a PARENT-owned column the update rewrites (label='P10' → pid 10 →
+-- children 1,2). Parent label becomes 'PX'; both children re-projected.
+update rjoin2 set label = 'PX' where label = 'P10' returning cid, note, label;
+→ [{"cid":1,"note":"A","label":"PX"},{"cid":2,"note":"A","label":"PX"}]
+
+-- BOTH sides assigned (child note + parent label), predicated on the CHILD column
+-- the update also rewrites. Capture identifies cid 1,2 up-front; both per-side base
+-- ops target them, and the re-query re-projects the fully post-mutation rows.
+-- NOTE: predicating this on the *parent's* reassigned column (e.g. `where label =
+-- 'PX'`) instead hits a separate base-decomposition ordering limitation — the FK-
+-- parent op rewrites the predicate column before the FK-child op's identifying
+-- subquery runs, so the child side silently no-ops (affects non-RETURNING multi-
+-- source updates too). The RETURNING capture mechanism is unaffected; see
+-- docs/view-updateability.md § `returning` and the
+-- view-mutation-multisource-both-sides-predicate-clash fix ticket.
+update rjoin2 set note = 'B', label = 'PY' where note = 'A' returning cid, note, label;
+→ [{"cid":1,"note":"B","label":"PY"},{"cid":2,"note":"B","label":"PY"}]
+
+-- `returning *` through the join update with a predicate-clash on the child column.
+update rjoin2 set note = 'C' where note = 'B' returning *;
+→ [{"cid":1,"note":"C","label":"PY"},{"cid":2,"note":"C","label":"PY"}]

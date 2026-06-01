@@ -3,9 +3,9 @@ import type { PlanningContext } from '../planning-context.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
-import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
+import { ViewMutationNode, type MutationEnvelope, type ReturningCapture } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, isJoinBody } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, buildMultiSourceUpdateReturning, isJoinBody } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -103,61 +103,50 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
 	// RETURNING onto its base op (it now plans to a relational ReturningNode the
 	// substrate surfaces), so nothing more is needed there. A **multi-source**
-	// update/delete cannot recover the view row from its per-side base ops, so the
-	// rows come from a re-query of the view restricted to the mutation's predicate
-	// (built below); a delete captures it *before* the base ops fire (its rows are
-	// about to vanish), an update *after* (the post-mutation image).
-	const { returning, returningTiming } = buildMultiSourceReturning(ctx, view, req);
-	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming);
+	// update/delete cannot recover the view row from its per-side base ops: a delete
+	// re-queries the view *before* the base ops fire (its rows are about to vanish);
+	// an update captures each affected row's base-PK identity *before* the base ops,
+	// then re-queries the join body *after* restricted to those identities (robust
+	// against an update that rewrites its own predicate column).
+	const { returning, returningTiming, returningCapture } = buildMultiSourceReturning(ctx, view, req);
+	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming, returningCapture);
 }
 
 /**
- * Build the separate RETURNING relation for a **multi-source** update/delete (the
- * only path where the view row is not recoverable from the base ops). It is a
- * re-query of the view restricted to the user predicate — `select <returning>
- * from <view> [where <user where>]` — so the projected columns resolve naturally
- * against the view (computed columns re-evaluated against the post-mutation base
- * state). Returns `{}` (no returning) for the absent-clause case, for single-
- * source (handled by the embedded base-op RETURNING), and for decomposition-
- * backed logical tables (whose RETURNING stays rejected by `propagate`).
+ * Build the separate RETURNING substrate for a **multi-source** update/delete (the
+ * only path where the view row is not recoverable from the base ops). Returns `{}`
+ * (no returning) for the absent-clause case, for single-source (handled by the
+ * embedded base-op RETURNING), for insert (single-source embeds; multi-source insert
+ * is rejected upstream), and for decomposition-backed logical tables (whose
+ * RETURNING stays rejected by `propagate`).
  *
- * Timing fragility: the post-mutation update re-query matches by the user
- * predicate, so an update that *changes a column its own WHERE filters on* could
- * not be recaptured (the changed row no longer matches). Rather than silently
- * mis-capture, that exact shape is rejected here (see the guard below); correct
- * per-row capture is a follow-up. The single-source path is robust (it reads
- * NEW/OLD); a DELETE captures `pre` and an update on a non-assigned predicate
- * column are both safe.
+ * Two shapes, by op:
+ *  - **UPDATE** uses per-row identity capture (`buildMultiSourceUpdateReturning`):
+ *    capture each affected row's base-PK identity *before* the base ops, re-query
+ *    the join body *after* restricted to those identities (`returningTiming: 'post'`,
+ *    plus a {@link ReturningCapture}). This is robust against an update that rewrites
+ *    a column its own WHERE filters on — the captured identity still matches even
+ *    though the changed row no longer satisfies the predicate.
+ *  - **DELETE** re-queries the view restricted to the user predicate, captured `pre`
+ *    (before the base op fires — the rows still match the predicate and are about to
+ *    vanish), so the projected columns resolve naturally against the view.
  */
 function buildMultiSourceReturning(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	req: MutationRequest,
-): { returning?: RelationalPlanNode; returningTiming?: 'pre' | 'post' } {
+): { returning?: RelationalPlanNode; returningTiming?: 'pre' | 'post'; returningCapture?: ReturningCapture } {
 	const returningCols = req.stmt.returning;
 	if (!returningCols || returningCols.length === 0) return {};
 	if (req.op === 'insert') return {}; // single-source insert embeds; multi-source insert is rejected upstream
 	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return {};
 
-	// An UPDATE whose post-mutation re-query matches by the user predicate cannot
-	// recapture a row whose predicate column the update itself changed (the changed
-	// row no longer matches), so RETURNING would silently yield the wrong/empty set.
-	// Reject loudly rather than mis-capture; correct per-row capture is a follow-up
-	// (`view-mutation-multi-source-update-returning-perrow`). A DELETE captures
-	// `pre` (before the change) so it has no such hazard.
-	if (req.op === 'update' && req.stmt.where) {
-		const predicateCols = new Set(collectColumnRefNames(req.stmt.where).map(n => n.toLowerCase()));
-		const clash = req.stmt.assignments.find(a => predicateCols.has(a.column.toLowerCase()));
-		if (clash) {
-			raiseMutationDiagnostic({
-				reason: 'returning-through-view',
-				table: view.name,
-				column: clash.column,
-				message: `cannot project RETURNING through multi-source view '${view.name}': the update assigns column '${clash.column}', which its own WHERE predicate filters on — the post-mutation re-query cannot recapture the changed rows (per-row capture is not yet implemented)`,
-			});
-		}
+	if (req.op === 'update') {
+		const { source, descriptor, returning } = buildMultiSourceUpdateReturning(ctx, view, req.stmt);
+		return { returning, returningTiming: 'post', returningCapture: { source, descriptor } };
 	}
 
+	// DELETE: re-query the view (predicate-restricted) captured `pre`.
 	const selectAst: AST.SelectStmt = {
 		type: 'select',
 		columns: [...returningCols],
@@ -173,7 +162,7 @@ function buildMultiSourceReturning(
 			message: `cannot project RETURNING through view '${view.name}': the re-query did not produce a relation`,
 		});
 	}
-	return { returning: node, returningTiming: req.op === 'delete' ? 'pre' : 'post' };
+	return { returning: node, returningTiming: 'pre' };
 }
 
 /**
@@ -534,36 +523,6 @@ function assertSourceArity(view: MutableViewLike, got: number, expected: number)
 			message: `cannot insert through view '${view.name}': the source supplies ${got} value(s) but ${expected} view column(s) are targeted`,
 		});
 	}
-}
-
-/**
- * Collect the names of every `column` reference in an expression (best-effort
- * reflective walk; mirrors the private helpers in `schema/lens-compiler.ts` and
- * `schema/lens-prover.ts`). Used to detect an update that rewrites a column its
- * own WHERE predicate filters on — the one shape the multi-source re-query cannot
- * recapture.
- */
-function collectColumnRefNames(expr: AST.Expression): string[] {
-	const names: string[] = [];
-	const stack: AST.AstNode[] = [expr as AST.AstNode];
-	while (stack.length > 0) {
-		const node = stack.pop()!;
-		if (node.type === 'column' && typeof (node as AST.ColumnExpr).name === 'string') {
-			names.push((node as AST.ColumnExpr).name);
-		}
-		for (const key of Object.keys(node)) {
-			const value = (node as unknown as Record<string, unknown>)[key];
-			if (!value) continue;
-			if (Array.isArray(value)) {
-				for (const item of value) {
-					if (item && typeof item === 'object' && 'type' in item) stack.push(item as AST.AstNode);
-				}
-			} else if (typeof value === 'object' && 'type' in (value as object)) {
-				stack.push(value as AST.AstNode);
-			}
-		}
-	}
-	return names;
 }
 
 function quoteIdent(name: string): string {

@@ -44,10 +44,13 @@ type Callback = (ctx: RuntimeContext) => OutputValue;
  *   - *single-source*: the RETURNING clause was rewritten onto the (sole) base op,
  *     which plans to a relational `ReturningNode`. `run` drains every base op and
  *     surfaces that one's rows (NEW for insert/update, OLD for delete).
- *   - *multi-source* update/delete: `plan.returning` is a separate re-query of the
- *     view. A delete captures it **before** the base ops fire (`returningTiming ===
- *     'pre'` — the rows are about to disappear); an update captures it **after**
- *     (the post-mutation image).
+ *   - *multi-source* update/delete: `plan.returning` is a separate re-query. A
+ *     delete captures it **before** the base ops fire (`returningTiming === 'pre'` —
+ *     the rows are about to disappear). An update (`'post'`) materializes
+ *     `plan.returningCapture` — each affected row's base-PK identities — into context
+ *     **before** the base ops, then the re-query reads the post-mutation join body
+ *     restricted to those captured identities (so a row the update pushed out of the
+ *     view filter, or whose predicate column it rewrote, is still returned).
  *
  * Without a `returning` clause every base op is a side-effect statement that
  * yields nothing and this node yields nothing; the block emitter treats it like a
@@ -69,14 +72,22 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	const relationalBaseIdx = plan.baseOps.findIndex(op => isRelationalNode(op));
 	const returningTiming = plan.returningTiming;
 
+	// The per-row identity-capture side input for a multi-source UPDATE RETURNING:
+	// its rows are materialized into context (under this descriptor) BEFORE the base
+	// ops run, and the post-mutation re-query reads them back by identity.
+	const capture = plan.returningCapture;
+	const captureDescriptor = capture?.descriptor;
+
 	// Params follow the same order `ViewMutationNode.getChildren` threads them in:
-	// base-op callbacks, then the optional RETURNING re-query, then the envelope
-	// source + optional surrogate seed — so the scheduler resolves every
-	// sub-program before `run`.
+	// base-op callbacks, then the optional RETURNING re-query, then the optional
+	// identity-capture source, then the envelope source + optional surrogate seed —
+	// so the scheduler resolves every sub-program before `run`.
 	const params: Instruction[] = [...baseOpInstructions];
 	let cursor = baseOpCount;
 	let returningIdx = -1;
 	if (plan.returning) { returningIdx = cursor++; params.push(emitCallFromPlan(plan.returning, ctx)); }
+	let captureIdx = -1;
+	if (capture) { captureIdx = cursor++; params.push(emitCallFromPlan(capture.source, ctx)); }
 	let envSourceIdx = -1;
 	if (envelope) { envSourceIdx = cursor++; params.push(emitCallFromPlan(envelope.source, ctx)); }
 	let seedIdx = -1;
@@ -140,7 +151,23 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 				await drainBaseOps(rctx, baseCbs);
 				return arrayIterable(rows);
 			}
-			// update: mutate first, then re-query reads the post-mutation image.
+			// update (post). With per-row identity capture, materialize the captured
+			// base-PK identities into context BEFORE the base ops, then the re-query
+			// reads the post-mutation image restricted to those captured identities
+			// (robust against an update that rewrites its own predicate column). The
+			// context entry is removed in `finally` so it never leaks past the statement.
+			if (captureIdx >= 0 && captureDescriptor) {
+				const captureRows = await collectRows((args[captureIdx] as Callback)(rctx));
+				rctx.tableContexts.set(captureDescriptor, () => arrayIterable(captureRows));
+				try {
+					await drainBaseOps(rctx, baseCbs);
+					return arrayIterable(await collectRows(returningCb(rctx)));
+				} finally {
+					rctx.tableContexts.delete(captureDescriptor);
+				}
+			}
+			// update without capture (no multi-source path produces this today):
+			// mutate first, then the re-query reads the post-mutation image.
 			await drainBaseOps(rctx, baseCbs);
 			return arrayIterable(await collectRows(returningCb(rctx)));
 		}
@@ -175,7 +202,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		return null;
 	}
 
-	const retNote = plan.returning ? ` +returning(${returningTiming})` : relationalBaseIdx >= 0 ? ' +returning' : '';
+	const retNote = plan.returning ? ` +returning(${returningTiming}${capture ? '+capture' : ''})` : relationalBaseIdx >= 0 ? ' +returning' : '';
 	return {
 		params,
 		run: run as InstructionRun,

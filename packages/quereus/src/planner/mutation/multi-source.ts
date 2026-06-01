@@ -2,10 +2,11 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
-import { isRelationalNode, type PlanNode, type RelationalPlanNode, type UpdateSite } from '../nodes/plan-node.js';
-import type { ScalarType } from '../../common/datatype.js';
+import { isRelationalNode, PlanNode, type RelationalPlanNode, type UpdateSite, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
+import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import { TableReferenceNode } from '../nodes/reference.js';
+import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { buildSelectStmt } from '../building/select.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
@@ -67,6 +68,8 @@ interface JoinSide {
 interface OutColumn {
 	/** Output (view) column name, lowercased. */
 	readonly name: string;
+	/** Output (view) column name in its original display spelling (for `returning *`). */
+	readonly displayName: string;
 	/** Index into `sides` of the owning base table (base-writable columns only). */
 	readonly sideIndex?: number;
 	/** Owning base column name (base-writable columns only). */
@@ -471,7 +474,8 @@ function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewA
 	const outColumns: OutColumn[] = [];
 	projections.forEach((rc, i) => {
 		const attr = attrs[i];
-		const outName = (view.columns?.[i] ?? attr.name).toLowerCase();
+		const displayName = view.columns?.[i] ?? attr.name;
+		const outName = displayName.toLowerCase();
 		// The projection's source expression is already in base terms (it lives in
 		// the body's own FROM scope), so it is the substitution target for user
 		// predicates/assignments written against this view column.
@@ -481,9 +485,9 @@ function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewA
 		const writableBase = identityBaseSite(site);
 		if (writableBase) {
 			const sideIndex = sideByTableId.get(writableBase.table);
-			outColumns.push({ name: outName, sideIndex, baseColumn: writableBase.baseColumn, writable: sideIndex !== undefined });
+			outColumns.push({ name: outName, displayName, sideIndex, baseColumn: writableBase.baseColumn, writable: sideIndex !== undefined });
 		} else {
-			outColumns.push({ name: outName, writable: false });
+			outColumns.push({ name: outName, displayName, writable: false });
 		}
 	});
 
@@ -642,6 +646,160 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 		});
 	}
 	return ops;
+}
+
+// --- UPDATE RETURNING (per-row identity capture) --------------------------
+
+/**
+ * Build the per-row identity-capture RETURNING substrate for a multi-source
+ * (two-table inner-join) UPDATE (docs/view-updateability.md § `returning`
+ * Clauses). A post-mutation re-query that matched by the *user predicate* cannot
+ * recapture a row whose predicate column the update itself rewrote (the changed
+ * row no longer matches). Instead we capture each affected view row's base-PK
+ * identity `(k0, k1)` **before** the base ops fire, then re-query the join body
+ * **after** the mutation restricted to those captured identities — so a row the
+ * update pushed out of the view's filter is still returned (matching single-source
+ * NEW semantics).
+ *
+ * Returns:
+ *  - `source`: the capture SELECT `select s0.pk0 as k0, s1.pk1 as k1 from <body>
+ *    where <idPredicate>` — the emitter materializes it into context **before** the
+ *    base ops run.
+ *  - `descriptor`: the identity stitch shared between the materialized capture rows
+ *    and the {@link InternalRecursiveCTERefNode} the re-query reads them back through.
+ *  - `returning`: the post-mutation re-query — the view-spelled, base-term RETURNING
+ *    projection over the join body, filtered by `exists (select 1 from __vmret_keys
+ *    k where k.k0 = s0.pk0 and k.k1 = s1.pk1)`. It keeps only the structural join
+ *    ON-condition (in the body FROM); the body/user WHERE is intentionally NOT
+ *    re-applied.
+ *
+ * Requires a **single-column PK on both** join sides (the captured identity is both
+ * sides' PKs); a composite-PK side is rejected with `unsupported-join` by
+ * {@link requireSingleColumnPk}.
+ */
+export function buildMultiSourceUpdateReturning(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	stmt: AST.UpdateStmt,
+): { source: RelationalPlanNode; descriptor: TableDescriptor; returning: RelationalPlanNode } {
+	const analysis = analyzeJoinView(ctx, view);
+	const returningCols = stmt.returning!;
+	const [side0, side1] = analysis.sides;
+	const pk0 = requireSingleColumnPk(view, side0);
+	const pk1 = requireSingleColumnPk(view, side1);
+	const pk0Type = columnScalarType(columnByName(side0.schema, pk0));
+	const pk1Type = columnScalarType(columnByName(side1.schema, pk1));
+
+	// (1) Capture source: the affected view rows' base-PK identities, by the same
+	// identifying predicate the base ops route on (user WHERE → base ∧ body WHERE).
+	// preserveInputColumns=false ⇒ the output is exactly `[k0, k1]`, positionally
+	// aligned to the key ref's attributes the re-query reads back from context.
+	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
+	const captureAst: AST.SelectStmt = {
+		type: 'select',
+		columns: [
+			{ type: 'column', expr: { type: 'column', name: pk0, table: side0.alias }, alias: 'k0' },
+			{ type: 'column', expr: { type: 'column', name: pk1, table: side1.alias }, alias: 'k1' },
+		],
+		from: analysis.sel.from!.map(cloneFromClause),
+		where: idPredicate,
+	};
+	const source = buildSelectStmt(ctx, captureAst, new Map(), false);
+	if (!isRelationalNode(source)) {
+		raiseMutationDiagnostic({
+			reason: 'returning-through-view',
+			table: view.name,
+			message: `cannot project RETURNING through view '${view.name}': the identity-capture query did not produce a relation`,
+		});
+	}
+
+	// (2) The context-backed key relation the re-query's EXISTS scans. Its descriptor
+	// identity is shared with the rows the emitter materializes (the working-table-in-
+	// context pattern recursive CTEs / the insert envelope reuse).
+	const descriptor: TableDescriptor = {};
+	const keyAttrs: Attribute[] = [
+		{ id: PlanNode.nextAttrId(), name: 'k0', type: pk0Type, sourceRelation: '__vmret_keys' },
+		{ id: PlanNode.nextAttrId(), name: 'k1', type: pk1Type, sourceRelation: '__vmret_keys' },
+	];
+	const keyRelType: RelationType = {
+		typeClass: 'relation',
+		isReadOnly: true,
+		isSet: false,
+		columns: [{ name: 'k0', type: pk0Type }, { name: 'k1', type: pk1Type }],
+		keys: [],
+		rowConstraints: [],
+	};
+	const keyRef = new InternalRecursiveCTERefNode(ctx.scope, '__vmret_keys', keyAttrs, keyRelType, descriptor);
+
+	// (4) Post re-query: project the view-spelled, base-term RETURNING columns against
+	// the post-mutation join body, restricted to the captured identities by EXISTS.
+	const existsPredicate: AST.Expression = {
+		type: 'exists',
+		subquery: {
+			type: 'select',
+			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
+			from: [{ type: 'table', table: { type: 'identifier', name: '__vmret_keys' }, alias: 'k' }],
+			where: combineAnd(
+				{ type: 'binary', operator: '=', left: { type: 'column', name: 'k0', table: 'k' }, right: { type: 'column', name: pk0, table: side0.alias } },
+				{ type: 'binary', operator: '=', left: { type: 'column', name: 'k1', table: 'k' }, right: { type: 'column', name: pk1, table: side1.alias } },
+			),
+		},
+	};
+	const requeryAst: AST.SelectStmt = {
+		type: 'select',
+		columns: buildReturningProjection(ctx, view, analysis, returningCols),
+		from: analysis.sel.from!.map(cloneFromClause),
+		where: existsPredicate,
+	};
+	const returning = buildSelectStmt(ctx, requeryAst, new Map([['__vmret_keys', keyRef]]), false);
+	if (!isRelationalNode(returning)) {
+		raiseMutationDiagnostic({
+			reason: 'returning-through-view',
+			table: view.name,
+			message: `cannot project RETURNING through view '${view.name}': the post-mutation re-query did not produce a relation`,
+		});
+	}
+
+	return { source, descriptor, returning };
+}
+
+/**
+ * Lower a multi-source UPDATE's RETURNING result columns to base terms over the
+ * join body, preserving the **view spelling** of each output column. A bare view-
+ * column ref substitutes to its base term aliased to the column's written spelling
+ * (so a renamed view col `eid`→base `id` still surfaces as `eid`); a computed
+ * RETURNING expression has its nested view-column refs substituted; `returning *`
+ * expands to every view output column's base term aliased to its display name.
+ */
+function buildReturningProjection(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	analysis: JoinViewAnalysis,
+	returningCols: readonly AST.ResultColumn[],
+): AST.ResultColumn[] {
+	const out: AST.ResultColumn[] = [];
+	for (const rc of returningCols) {
+		if (rc.type === 'all') {
+			for (const col of analysis.outColumns) {
+				const baseExpr = analysis.viewColToBaseRef.get(col.name);
+				if (!baseExpr) {
+					raiseMutationDiagnostic({
+						reason: 'returning-through-view',
+						table: view.name,
+						message: `cannot expand 'returning *' through view '${view.name}': no base term for column '${col.displayName}'`,
+					});
+				}
+				out.push({ type: 'column', expr: cloneExpr(baseExpr), alias: col.displayName });
+			}
+		} else {
+			const substituted = substituteViewColumns(ctx, rc.expr, analysis.viewColToBaseRef, view);
+			// Preserve the user's view spelling as the output name: an explicit alias
+			// wins; a bare column ref keeps its own name; otherwise leave it unnamed.
+			const alias = rc.alias ?? (rc.expr.type === 'column' ? rc.expr.name : undefined);
+			out.push({ type: 'column', expr: substituted, alias });
+		}
+	}
+	return out;
 }
 
 // --- DELETE ---------------------------------------------------------------

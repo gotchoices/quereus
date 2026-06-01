@@ -10,6 +10,25 @@ import { StatusCode } from '../../common/types.js';
 export type ReturningTiming = 'pre' | 'post';
 
 /**
+ * The per-row identity-capture side input for a multi-source **update** RETURNING
+ * (docs/view-updateability.md § `returning` Clauses).
+ *
+ * `source` selects each affected view row's base-PK identities `(k0, k1)`; the
+ * emitter materializes it **before** the base ops run and stashes the rows in
+ * `rctx.tableContexts` under {@link descriptor}. The post-mutation
+ * {@link ViewMutationNode.returning} re-query reads them back through an
+ * `InternalRecursiveCTERefNode` carrying the same `descriptor`, so it re-projects
+ * exactly the updated logical rows by captured identity — even when the update
+ * rewrote the column its own WHERE filtered on. Parallel to {@link MutationEnvelope}
+ * (the insert surrogate), but on the relational RETURNING branch rather than the
+ * void/return-null branch.
+ */
+export interface ReturningCapture {
+	readonly source: RelationalPlanNode;
+	readonly descriptor: TableDescriptor;
+}
+
+/**
  * The **shared-surrogate mutation envelope** for a multi-source view INSERT.
  *
  * `source` is the per-row augmented source (the supplied view columns) — built
@@ -110,6 +129,14 @@ export class ViewMutationNode extends PlanNode {
 		 * is undefined.
 		 */
 		public readonly returningTiming?: ReturningTiming,
+		/**
+		 * The per-row identity-capture side input for a multi-source **update**
+		 * RETURNING (timing `post`): its `source` is materialized into context
+		 * before the base ops run, and {@link returning} reads it back by
+		 * `descriptor` to re-project the updated rows by captured identity. Absent
+		 * for single-source, multi-source delete (`pre`), and the void/insert paths.
+		 */
+		public readonly returningCapture?: ReturningCapture,
 	) {
 		super(scope, baseOps.reduce((cost, op) => cost + op.getTotalCost(), 0.1));
 		if (baseOps.length === 0) {
@@ -158,11 +185,13 @@ export class ViewMutationNode extends PlanNode {
 	}
 
 	getChildren(): readonly PlanNode[] {
-		// Order: base ops, then the optional RETURNING re-query, then the envelope
-		// children. `withChildren` slices back in this same order.
+		// Order: base ops, then the optional RETURNING re-query, then the optional
+		// identity-capture source, then the envelope children. `withChildren` slices
+		// back in this same order.
 		return [
 			...this.baseOps,
 			...(this.returning ? [this.returning] : []),
+			...(this.returningCapture ? [this.returningCapture.source] : []),
 			...this.envelopeChildren(),
 		];
 	}
@@ -174,6 +203,9 @@ export class ViewMutationNode extends PlanNode {
 		// op — a single-source RETURNING op — surfaces, as does the separate
 		// multi-source RETURNING re-query, so the attribute-provenance walk treats
 		// this node's forwarded RETURNING attributes as forwarded (not originated).
+		// The identity-capture source (like the envelope source) is a side input
+		// materialized into context, not part of this node's forwarded output, so it
+		// is excluded — only reachable via getChildren for optimization/withChildren.
 		const rels = this.baseOps.filter(isRelationalNode);
 		if (this.returning) rels.push(this.returning);
 		return rels;
@@ -187,6 +219,13 @@ export class ViewMutationNode extends PlanNode {
 		if (this.returning) {
 			newReturning = newChildren[cursor] as RelationalPlanNode;
 			cursor += 1;
+		}
+
+		let newCapture = this.returningCapture;
+		if (this.returningCapture) {
+			const newCaptureSource = newChildren[cursor] as RelationalPlanNode;
+			cursor += 1;
+			newCapture = { source: newCaptureSource, descriptor: this.returningCapture.descriptor };
 		}
 
 		let newEnvelope = this.envelope;
@@ -204,12 +243,13 @@ export class ViewMutationNode extends PlanNode {
 		const unchanged = newChildren.length === this.getChildren().length
 			&& newBaseOps.every((child, i) => child === this.baseOps[i])
 			&& newReturning === this.returning
+			&& (!this.returningCapture || newCapture!.source === this.returningCapture.source)
 			&& (!this.envelope || (newEnvelope!.source === this.envelope.source
 				&& newEnvelope!.mint?.seed === this.envelope.mint?.seed));
 		if (unchanged) {
 			return this;
 		}
-		return new ViewMutationNode(this.scope, newBaseOps, newReturning, newEnvelope, this.returningTiming);
+		return new ViewMutationNode(this.scope, newBaseOps, newReturning, newEnvelope, this.returningTiming, newCapture);
 	}
 
 	get estimatedRows(): number | undefined {
@@ -226,14 +266,16 @@ export class ViewMutationNode extends PlanNode {
 
 	override toString(): string {
 		const env = this.envelope ? ` +envelope${this.envelope.mint ? '(mint)' : ''}` : '';
+		const cap = this.returningCapture ? ' +capture' : '';
 		const ret = this.resultRelation() ? ` returning${this.returning ? `(${this.returningTiming})` : ''}` : '';
-		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env}${ret})`;
+		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env}${cap}${ret})`;
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
 		return {
 			baseOps: this.baseOps.length,
 			envelope: this.envelope ? (this.envelope.mint ? 'mint' : 'shared') : undefined,
+			returningCapture: this.returningCapture ? 'identity' : undefined,
 			returning: this.resultRelation() ? (this.returning ? `requery(${this.returningTiming})` : 'base-op') : undefined,
 		};
 	}

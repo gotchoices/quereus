@@ -12,7 +12,7 @@ actually shipped:
 | **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
 | **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. | **Shipped** (the lenient predicate-honest *multi-side delete fan-out* is deferred — see § Inner Join) |
 | **Phase 2b** | Multi-source **key-preserving inner-join `insert`** write-through, plus the per-row **shared-surrogate mutation-context envelope** it requires. The shared join key is not a view column, so an insert mints a surrogate **once per produced logical row at the envelope, before propagation fans out**, and threads the one captured value into both base inserts (FK-parent before FK-child). The key is either **directly supplied** (a view column maps to a join-key base column) or **minted** (`integer-auto` / `per-row`: `seed + ordinal`, `seed = max(anchor.key)` captured once). Realized by materializing the augmented source once (`ViewMutationNode.envelope` + `EnvelopeScanNode`) so every base op reads the identical rows. | **Shipped (two-table inner join)** |
-| **Phase 3.7** | **RETURNING-through-views.** `insert` / `update` / `delete … returning` returns rows projected through the **view's** column list, evaluated against the post-mutation base state (computed view columns re-evaluated). Single-source: the clause is rewritten into base terms and rides the base op's RETURNING (NEW for insert/update, OLD for delete) — `ViewMutationNode` becomes relational and surfaces it. Multi-source inner-join `update` / `delete`: the rows are produced by a re-query of the view restricted to the mutation's predicate (captured before a delete, after an update). `returning *` expands to the view's columns. | **Shipped (single-source all ops; multi-source update / delete)** |
+| **Phase 3.7** | **RETURNING-through-views.** `insert` / `update` / `delete … returning` returns rows projected through the **view's** column list, evaluated against the post-mutation base state (computed view columns re-evaluated). Single-source: the clause is rewritten into base terms and rides the base op's RETURNING (NEW for insert/update, OLD for delete) — `ViewMutationNode` becomes relational and surfaces it. Multi-source inner-join `delete`: a re-query of the view restricted to the mutation's predicate, captured `pre`. Multi-source inner-join `update`: **per-row identity capture** — each affected view row's base-PK identities `(k0, k1)` are captured `pre`, then the join body is re-queried `post` restricted to those captured identities (robust against an update that rewrites a column its own WHERE filters on). `returning *` expands to the view's columns. | **Shipped (single-source all ops; multi-source update / delete)** |
 | Phase 2b+ | Multi-source-**`insert`** RETURNING (needs the minted surrogate threaded into the projection), outer-join / optional-member insert, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values, `declared-default`-expression and non-integer surrogate generators, multi-source-`insert` `default_for`. | Not shipped — rejected at plan time with a structured diagnostic. |
 
 **Implementation note (Phase 1).** Phase 1 ships **via the view-mutation
@@ -47,9 +47,10 @@ key-preserving inner-join `update` / `delete` case** (`planner/mutation/multi-so
 a join body routes here, where the planned body's `updateLineage` decides each
 output column's owning base table and a subquery over the join body reconstructs
 the per-side row-identifying predicate (lowered back to AST so the base builders
-are reused untouched). RETURNING through a multi-source `update` / `delete` is
-supported via a re-query of the view (see § `returning` Clauses); the per-side
-base ops carry no RETURNING. What the surface is **not yet** consumed by is the
+are reused untouched). RETURNING through a multi-source `delete` is supported via a
+re-query of the view, and through a multi-source `update` via per-row identity
+capture (see § `returning` Clauses); the per-side base ops carry no RETURNING. What
+the surface is **not yet** consumed by is the
 multi-source **insert** RETURNING (which needs the shared-surrogate key threaded
 into the projection) and the broader join shapes (outer / set-op / aggregate /
 `> 2`-table / self-join), all still rejected. The retire-or-keep
@@ -515,19 +516,40 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >
 > - **Multi-source** inner-join `update` / `delete` (`building/view-mutation-builder.ts`,
 >   `buildMultiSourceReturning`): the view row spans both base tables, so it is not
->   recoverable from the per-side base ops. The rows come from a **re-query of the
->   view** restricted to the mutation's predicate — `select <returning> from <view>
->   [where <user where>]` — captured **before** the base ops fire for a delete (the
->   rows are about to disappear) or **after** for an update (the post-mutation
->   image), threaded as `ViewMutationNode.returning` with a `returningTiming` of
->   `pre`/`post`. *Limitation:* the post-mutation update re-query matches by the user
->   predicate, so an update that **changes a column its own WHERE filters on** could
->   not be recaptured (the changed row no longer matches the predicate). Rather than
->   silently return the wrong/empty set, that exact shape is **rejected** with the
->   `returning-through-view` diagnostic; correct per-row capture is a follow-up. A
->   multi-source `delete` (captured `pre`) and an update predicated on a column it does
->   not assign have no such hazard. The single-source path has no such limitation at
->   all (it reads NEW/OLD).
+>   recoverable from the per-side base ops. Two mechanisms, threaded as
+>   `ViewMutationNode.returning` with a `returningTiming`:
+>   - **`delete`** (`pre`): a **re-query of the view** restricted to the mutation's
+>     predicate — `select <returning> from <view> [where <user where>]` — captured
+>     **before** the base op fires (the rows still match the predicate and are about
+>     to disappear).
+>   - **`update`** (`post`, with a `returningCapture`): **per-row identity capture**
+>     (`planner/mutation/multi-source.ts` `buildMultiSourceUpdateReturning`). Each
+>     affected view row's **base-PK identities** `(k0, k1)` are captured **before** the
+>     base ops fire (`select s0.pk0 as k0, s1.pk1 as k1 from <body> where <idPredicate>`,
+>     materialized into `rctx.tableContexts` under a shared descriptor — the same
+>     working-table-in-context plumbing recursive CTEs / the insert envelope reuse).
+>     **After** the base ops, the join body is re-queried, projecting the view-spelled
+>     base-term RETURNING columns restricted to those captured identities
+>     (`… where exists (select 1 from __vmret_keys k where k.k0 = s0.pk0 and k.k1 =
+>     s1.pk1)`, via an `InternalRecursiveCTERefNode` over the descriptor). Because the
+>     match is on captured **identity** (not the now-stale user predicate), this is
+>     robust against an update that **rewrites a column its own WHERE filters on** —
+>     and a row the update pushed *out* of the view's filter is still returned
+>     (matching single-source NEW semantics). The re-query keeps only the structural
+>     join ON-condition; it does **not** re-apply the body/user WHERE. Requires a
+>     single-column PK on **both** join sides (the captured identity is both sides'
+>     PKs); a composite-PK side is rejected with `unsupported-join`.
+>
+>   *Residual edges (out of scope, documented):* an update that changes a **base PK**
+>   or the **join-key / FK** column determining which rows join breaks the captured
+>   `(k0, k1)` identity, so such a row drops from RETURNING (these columns are
+>   generally not writable through the supported view shapes). Separately, a
+>   multi-source update that assigns **both** sides while predicating on the
+>   FK-parent's reassigned column drops the FK-child's base mutation (the parent op
+>   rewrites the predicate column before the child op's identifying subquery runs) —
+>   a base-decomposition ordering bug independent of RETURNING capture
+>   (`view-mutation-multisource-both-sides-predicate-clash`). The single-source path
+>   has no such limitations (it reads NEW/OLD).
 >
 > **Not yet shipped:** multi-source (join) **insert** RETURNING — the minted shared
 > surrogate is not yet threaded into a RETURNING projection — is rejected with the
