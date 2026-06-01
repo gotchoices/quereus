@@ -542,10 +542,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return this.underlyingTable.comparePrimaryKey.bind(this.underlyingTable);
 		}
 
-		// Fallback to default comparator
+		// Fallback to default comparator. Compare under each PK column's declared
+		// collation (e.g. NOCASE), not BINARY: the merge aligns overlay and underlying
+		// entries by this comparator to decide shadowing, and the underlying store keys
+		// rows collation-aware. A binary comparator would treat a case-only-updated
+		// overlay row ('APPLE') and the underlying row it shadows ('apple') as distinct
+		// keys, surfacing BOTH in a scan instead of the overlay shadowing the underlying.
+		const pkDef = this.tableSchema?.primaryKeyDefinition;
 		return (a: SqlValue[], b: SqlValue[]) => {
 			for (let i = 0; i < a.length; i++) {
-				const cmp = compareSqlValues(a[i], b[i]);
+				const collation = pkDef ? this.tableSchema!.columns[pkDef[i].index].collation : undefined;
+				const cmp = compareSqlValues(a[i], b[i], collation);
 				if (cmp !== 0) return cmp;
 			}
 			return 0;
@@ -989,8 +996,15 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 	private keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
 		if (a.length !== b.length) return false;
+		// Compare under each PK column's declared collation, not BINARY. The underlying
+		// store keys rows collation-aware (e.g. a NOCASE text PK), so a case-only PK
+		// rewrite ('apple' → 'APPLE') is the SAME logical key. A binary comparison here
+		// would mis-classify it as a PK relocation, then resolve the "new" key back to the
+		// same physical underlying row and raise a false UNIQUE PK conflict.
+		const pkDef = this.tableSchema?.primaryKeyDefinition;
 		for (let i = 0; i < a.length; i++) {
-			if (compareSqlValues(a[i], b[i]) !== 0) return false;
+			const collation = pkDef ? this.tableSchema!.columns[pkDef[i].index].collation : undefined;
+			if (compareSqlValues(a[i], b[i], collation) !== 0) return false;
 		}
 		return true;
 	}

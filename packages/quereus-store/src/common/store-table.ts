@@ -740,7 +740,14 @@ export class StoreTable extends VirtualTable {
 				const oldRowData = await store.get(oldKey);
 				const oldRow = oldRowData ? deserializeRow(oldRowData) : null;
 
-				const pkChanged = !this.keysEqual(oldPk, newPk);
+				// A PK "change" only relocates the row when the ENCODED key differs.
+				// Under a non-binary PK collation (e.g. NOCASE) a case-only rewrite
+				// ('apple' → 'APPLE') keeps the same physical key, so it is an in-place
+				// update, not a relocation. Comparing raw values via keysEqual would
+				// mis-classify it as a move and then false-detect a PK conflict against
+				// the row's own existing entry at newKey (== oldKey). The encoded keys
+				// are the storage layer's source of truth (mirrors the rekey path above).
+				const pkChanged = !bytesEqual(oldKey, newKey);
 
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
 				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
