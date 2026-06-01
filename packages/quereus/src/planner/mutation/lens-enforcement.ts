@@ -44,10 +44,16 @@ const log = createLogger('planner:lens-enforcement');
  * names on the `NEW.*` side). Because it contains a scalar subquery the pipeline
  * auto-defers it to commit, where the logical view reflects the post-mutation
  * basis: a unique key sees count `1` (itself) and a duplicate count `≥ 2` ⇒ ABORT.
- * Detection-only (no covering structure ⇒ O(n) per changed row); the row-time
+ * Detection-only (no covering structure ⇒ O(n) per changed row). The row-time
  * variant (`enforced-set-level` `mode: 'row-time'`, which unlocks conflict
- * resolution) enforces via the covering structure on a separate path and is NOT
- * handled here. `proved` / `vacuous` need no enforcement.
+ * resolution) is **delivered without any code here**: by the prover's own
+ * precondition a row-time obligation is backed by a matching **basis `UNIQUE` +
+ * non-stale row-time covering MV**, and the single-source spine re-plans the lens
+ * write to that basis table (in basis terms), so the basis UC's physical
+ * enforcement-through-covering-MV path (`vtab/memory/layer/manager.ts`
+ * `checkUniqueViaMaterializedView`) fires for free — an O(log n) existence lookup
+ * that honors `ABORT` / `IGNORE` / `REPLACE`. That is why this collector emits
+ * nothing for row-time. `proved` / `vacuous` need no enforcement.
  */
 
 /** Marker tag stamped on a routed basis-term constraint so its lens origin is visible. */
@@ -273,9 +279,12 @@ function synthesizeUniqueCountExpr(
  * {@link LENS_BOUNDARY_ATTACHED_TAG} and routed through the basis write's constraint
  * pipeline, where the contained scalar subquery auto-defers it to commit.
  *
- * Only the `commit-time` mode is emitted: a `row-time` key enforces through its
- * covering structure on a separate path, and `proved` / `vacuous` keys need no
- * enforcement. Returns `[]` when the slot is un-proved (`obligations` undefined) or
+ * Only the `commit-time` mode is emitted: a `row-time` key is already enforced by
+ * the basis `UNIQUE` it is (by the classifier's precondition) backed by — the
+ * single-source re-plan reaches that basis UC, whose covering-MV enforcement path
+ * does the O(log n) lookup and honors the conflict action, so no constraint is
+ * synthesized here. `proved` / `vacuous` keys need no enforcement. Returns `[]`
+ * when the slot is un-proved (`obligations` undefined) or
  * carries no commit-time set-level key — the common case, so a non-lens / plain
  * view / proved-key write pays nothing. DELETE never introduces a duplicate, so the
  * caller restricts this to insert/update.

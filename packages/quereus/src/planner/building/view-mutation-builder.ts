@@ -58,9 +58,11 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 
 	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
 	// covering structure) enforces via an O(n) deferred count scan, which cannot
-	// perform `or replace` / `or ignore` (row-time conflict resolution needs the
-	// covering structure). Reject those up front so a write that would silently
-	// ABORT-at-commit instead of skipping/replacing is caught with a clear diagnostic.
+	// perform `or replace` / `or ignore`. Reject those up front so a write that would
+	// silently ABORT-at-commit instead of skipping/replacing is caught with a clear
+	// diagnostic. A row-time key (backed by a basis UNIQUE + covering MV) is NOT
+	// gated — its basis UC's covering-MV enforcement resolves the conflict action for
+	// free (`lens-set-level-rowtime-enforcement`, delivered).
 	rejectLensSetLevelConflictResolution(ctx, view, req);
 
 	const baseOps = propagate(ctx, view, withTags(req, tags));
@@ -203,9 +205,12 @@ function lensSetLevelConstraints(ctx: PlanningContext, view: MutableViewLike): R
 /**
  * Reject a conflict-resolution write the commit-time set-level scan cannot honor.
  * The detection-only count scan (no basis covering structure) can only ABORT on a
- * duplicate; it cannot replace or skip the offending row — that requires the
- * row-time covering structure (the sibling `lens-set-level-rowtime-enforcement`).
- * So an `insert or replace` / `or ignore` (or any upsert) against a logical table
+ * duplicate; it cannot replace or skip the offending row — that requires a row-time
+ * covering structure. A **row-time** key (backed by a basis `UNIQUE` + covering MV)
+ * is *not* gated here: it carries no commit-time obligation, so the basis UC's
+ * covering-MV enforcement resolves `or replace` / `or ignore` for free
+ * (`lens-set-level-rowtime-enforcement`, delivered). Only the commit-time class is
+ * rejected. So an `insert or replace` / `or ignore` (or any upsert) against a logical table
  * with a commit-time set-level key is rejected up front rather than silently
  * ABORTing at commit instead of replacing/skipping. `or abort` / `or fail` /
  * `or rollback` (and a plain insert) are fine — they ABORT, consistent with

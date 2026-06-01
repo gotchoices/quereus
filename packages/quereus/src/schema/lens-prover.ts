@@ -42,8 +42,12 @@ const log = createLogger('schema:lens-prover');
  *    deferred `(select count(*) … ) <= 1` count-subquery CHECK over the logical key,
  *    detection-only — `or replace`/`or ignore` against such a key is rejected). The
  *    `enforced-set-level` `row-time` write path (covering structure, conflict-
- *    resolution-capable) remains a follow-up. This module proves, classifies, and
- *    blocks/advises.
+ *    resolution-capable) is **delivered** with no dedicated lens code: by this
+ *    classifier's own precondition a row-time key is backed by a matching basis
+ *    `UNIQUE` + non-stale covering MV, and the single-source re-plan reaches that
+ *    basis UC, whose physical enforcement-through-covering-MV path does the
+ *    O(log n) lookup and honors `ABORT`/`IGNORE`/`REPLACE` for free. This module
+ *    proves, classifies, and blocks/advises.
  *
  * Soundness over completeness: a false error blocks a sound deploy, so every
  * check is conservative — when a fact cannot be established (e.g. the body fails
