@@ -195,3 +195,87 @@ insert into ms_jv (cid, note, label) values (9, 'q', 'P10x');
 -- RETURNING through a join view is not yet supported.
 delete from ms_jv where cid = 1 returning cid;
 -- error: RETURNING through view
+
+-- ===================================
+-- Phase 2: adversarial coverage (qualifier rewriting, body-WHERE conjunction,
+-- column-list overrides, and the remaining shape rejections).
+-- ===================================
+
+create table ax_parent (pid integer primary key, pv integer);
+create table ax_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references ax_parent(pid));
+insert into ax_parent values (10, 100), (20, 200);
+insert into ax_child values (1, 10, 'a'), (2, 20, 'b');
+
+-- Swapped projection: the view column `pv` maps to the CHILD pk (ax_child.cid)
+-- and the view column `cid` maps to the PARENT value (ax_parent.pv). A write must
+-- route by lineage, not by name. `where cid = 100` filters on ax_parent.pv=100.
+create view ax_swap as
+    select p.pv as cid, c.cid as pv from ax_child c join ax_parent p on p.pid = c.pref;
+select * from ax_swap order by pv;
+→ [{"cid":100,"pv":1},{"cid":200,"pv":2}]
+update ax_swap set pv = 7 where cid = 100;
+select cid, pref from ax_child order by cid;
+→ [{"cid":2,"pref":20},{"cid":7,"pref":10}]
+select pid, pv from ax_parent order by pid;
+→ [{"pid":10,"pv":100},{"pid":20,"pv":200}]
+
+-- View-name-qualified predicate (jv.col) resolves to the base term.
+create view ax_q as select c.cid as cid, c.note as note from ax_child c join ax_parent p on p.pid = c.pref;
+update ax_q set note = 'z' where ax_q.cid = 7;
+select cid, note from ax_child order by cid;
+→ [{"cid":2,"note":"b"},{"cid":7,"note":"z"}]
+
+-- The view body's own WHERE is conjoined: a predicate-less write only touches the
+-- rows the body exposes (children whose parent pv > 150, i.e. pref = 20).
+create view ax_filt as
+    select c.cid as cid, c.note as note from ax_child c join ax_parent p on p.pid = c.pref where p.pv > 150;
+select cid from ax_filt order by cid;
+→ [{"cid":2}]
+update ax_filt set note = 'F';
+select cid, note from ax_child order by cid;
+→ [{"cid":2,"note":"F"},{"cid":7,"note":"z"}]
+
+-- Explicit view column-list override (create view v (a,b) as ...): writes route by
+-- the override name to the underlying lineage.
+create view ax_named (k, n) as select c.cid, c.note from ax_child c join ax_parent p on p.pid = c.pref;
+update ax_named set n = 'g' where k = 7;
+select cid, note from ax_child order by cid;
+→ [{"cid":2,"note":"F"},{"cid":7,"note":"g"}]
+
+-- Composite-PK side -> rejected (identifying predicate needs a single-column key).
+create table ax_comp (c1 integer, c2 integer, pref integer, note text,
+    primary key (c1, c2), foreign key (pref) references ax_parent(pid));
+create view ax_jv_comp as
+    select x.c1 as c1, x.note as note, p.pv as pv from ax_comp x join ax_parent p on p.pid = x.pref;
+update ax_jv_comp set note = 'q' where c1 = 1;
+-- error: cannot write through
+
+-- Cross-source SET value (assign a column from the other base table) -> rejected.
+create view ax_jv_x as
+    select c.cid as cid, c.note as note, p.pv as pv from ax_child c join ax_parent p on p.pid = c.pref;
+update ax_jv_x set note = pv where cid = 2;
+-- error: cannot write through
+
+-- Self-join body -> rejected.
+create table ax_emp (id integer primary key, mgr integer, v integer);
+create view ax_self as select e.id as id, m.v as mv from ax_emp e join ax_emp m on m.id = e.mgr;
+update ax_self set mv = 9 where id = 1;
+-- error: cannot write through
+
+-- Three-table join -> rejected.
+create table ax_b (bid integer primary key, v integer);
+create view ax_three as
+    select c.cid as cid, p.pv as pv, b.v as bv
+    from ax_child c join ax_parent p on p.pid = c.pref join ax_b b on b.bid = c.cid;
+update ax_three set pv = 9 where cid = 2;
+-- error: cannot write through
+
+-- DELETE through a join with no provable FK -> ambiguous (no delete_via yet).
+create table ax_x (xid integer primary key, v integer);
+create table ax_y (yid integer primary key, v integer);
+insert into ax_x values (1, 5);
+insert into ax_y values (5, 9);
+create view ax_nofk as select x.xid as xid, y.yid as yid from ax_x x join ax_y y on y.yid = x.v;
+delete from ax_nofk where xid = 1;
+-- error: cannot delete through view

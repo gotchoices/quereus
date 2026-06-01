@@ -410,7 +410,7 @@ Bindings have two cadences:
 > rejected today (`unsupported-multisource-insert`): the mutation context is
 > currently per-base-op, so there is no envelope that resolves one `next_rid()`
 > per row and shares it across both base inserts. Tracked by
-> `view-mutation-multisource-insert`. Multi-source `update` / `delete` (shipped)
+> `view-mutation-shared-surrogate-insert`. Multi-source `update` / `delete` (shipped)
 > do not need this: they address existing rows by a subquery over the join, not by
 > minting a shared key.
 
