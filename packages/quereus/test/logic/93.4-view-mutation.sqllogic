@@ -977,3 +977,48 @@ update rjoin2 set note = 'B', label = 'PY' where note = 'A' returning cid, note,
 -- `returning *` through the join update with a predicate-clash on the child column.
 update rjoin2 set note = 'C' where note = 'B' returning *;
 → [{"cid":1,"note":"C","label":"PY"},{"cid":2,"note":"C","label":"PY"}]
+
+-- --- (e) multi-source update RETURNING edge cases: push-out-of-filter (NEW
+--         semantics), renamed + computed view columns through the capture re-query
+--         projection, and empty-match. See docs/view-updateability.md § `returning`.
+
+-- push-out-of-filter: a join view WITH a body WHERE. An update that moves a row
+-- OUT of the view's filter must still be RETURNED (the capture matches by identity,
+-- not the now-stale predicate — single-source NEW semantics; the re-query does not
+-- re-apply the body/user WHERE).
+create table fp (pid integer primary key, label text);
+create table fc (cid integer primary key, pref integer, note text,
+    foreign key (pref) references fp(pid));
+insert into fp values (10, 'P10');
+insert into fc values (1, 10, 'keep'), (2, 10, 'keep');
+create view fjoin as
+    select c.cid as cid, c.note as note, p.label as label
+    from fc c join fp p on p.pid = c.pref where c.note = 'keep';
+-- run
+
+update fjoin set note = 'gone' where cid = 1 returning cid, note, label;
+→ [{"cid":1,"note":"gone","label":"P10"}]
+
+-- the row is now out of the view filter (note != 'keep'), so the view no longer
+-- shows it; only cid=2 remains visible.
+select cid, note, label from fjoin order by cid;
+→ [{"cid":2,"note":"keep","label":"P10"}]
+
+-- renamed (id←cid, quantity←qty, label←lbl) + computed (dbl = qty*2) view columns
+-- surface under their VIEW spelling, computed re-evaluated post-update.
+create table rp3 (pid integer primary key, lbl text);
+create table rc3 (cid integer primary key, pref integer, qty integer,
+    foreign key (pref) references rp3(pid));
+insert into rp3 values (10, 'P10');
+insert into rc3 values (1, 10, 5);
+create view rjoin3 as
+    select c.cid as id, c.qty as quantity, c.qty * 2 as dbl, p.lbl as label
+    from rc3 c join rp3 p on p.pid = c.pref;
+-- run
+
+update rjoin3 set quantity = 8 where id = 1 returning id, quantity, dbl, label;
+→ [{"id":1,"quantity":8,"dbl":16,"label":"P10"}]
+
+-- empty match returns an empty set (EXISTS over zero captured identities), not an error.
+update rjoin3 set quantity = 9 where id = 999 returning id, quantity;
+→ []

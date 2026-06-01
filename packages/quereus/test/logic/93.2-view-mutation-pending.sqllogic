@@ -70,6 +70,25 @@ insert into rjv (id, a, c) values (1, 2, 3) returning id;
 -- is now SHIPPED via per-row identity capture — see 93.4 § RETURNING (d). The
 -- former loud rejection for that shape has been removed.)
 
+-- Per-row identity capture stitches on BOTH sides' single-column PKs, so a
+-- multi-source UPDATE … RETURNING through a join view whose (even non-written)
+-- side has a composite PK is rejected. (The update WITHOUT returning, identified
+-- only by the written side's PK, is unaffected — this is a RETURNING-only limit;
+-- the diagnostic is the shared single-column-key message.)
+create table cpp (a integer, b integer, label text, primary key (a, b));
+create table cpc (cid integer primary key, ra integer, rb integer, note text);
+insert into cpp values (1, 1, 'L');
+insert into cpc values (10, 1, 1, 'n');
+create view cppv as select c.cid as cid, c.note as note, p.label as label
+    from cpc c join cpp p on p.a = c.ra and p.b = c.rb;
+update cppv set note = 'N' where cid = 10 returning cid, note;
+-- error: composite primary key
+
+-- the same update WITHOUT returning still works (identified by the child PK alone).
+update cppv set note = 'N' where cid = 10;
+select cid, note, label from cppv order by cid;
+→ [{"cid":10,"note":"N","label":"L"}]
+
 -- LIMIT body: the predicate-conjoin rewrite cannot reproduce the row-count
 -- window, so a mutation could escape it. Reject rather than widen the write.
 create view vlim as select id, name from t limit 5;
