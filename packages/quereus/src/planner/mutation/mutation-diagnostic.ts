@@ -33,7 +33,7 @@ export type MutationDiagnosticReason =
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
 	| 'lens-read-only'             // logical table whose PK is not reconstructible at the lens boundary
 	// --- decomposition (lens multi-source put) fan-out, advertisement-driven ---
-	| 'unsupported-decomposition-insert'    // INSERT into a decomposition — rides the shared-surrogate envelope (view-mutation-shared-surrogate-insert)
+	| 'unsupported-decomposition-insert'    // internal guard: a decomposition INSERT is built via buildDecompositionInsert (envelope), not propagate
 	| 'unsupported-decomposition-update'    // UPDATE targets an optional/EAV/key column whose write needs insert/delete branching (deferred)
 	| 'unsupported-decomposition-predicate' // a decomposition DELETE/UPDATE WHERE references a non-anchor member — needs snapshot-consistent multi-member execution (deferred)
 	| 'unsupported-decomposition-key';      // a decomposition member has a composite/absent shared key (v1 is single-column)

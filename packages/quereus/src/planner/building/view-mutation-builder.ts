@@ -6,6 +6,9 @@ import type { RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
 import { analyzeMultiSourceInsert, isJoinBody } from '../mutation/multi-source.js';
+import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
+import { FilterNode } from '../nodes/filter.js';
+import { RegisteredScope } from '../scopes/registered.js';
 import { collectMutationTags } from '../mutation/mutation-tags.js';
 import { collectLensRowLocalConstraints } from '../mutation/lens-enforcement.js';
 import { buildInsertStmt } from './insert.js';
@@ -37,11 +40,18 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// base op is built — atomic). The decomposers read the merged map off the req.
 	const tags = collectMutationTags(view, req.stmt);
 
+	// A decomposition INSERT fans out one insert per member off the same shared-
+	// surrogate envelope, materialized once and read back per member through an
+	// `EnvelopeScanNode` — the plan-level form the AST `BaseOp[]` model cannot
+	// express. Build it directly (the dual of the multi-source insert below).
+	if (req.op === 'insert' && decompositionStorage(ctx, view)) {
+		return buildDecompositionInsert(ctx, view, req.stmt);
+	}
+
 	// Multi-source inner-join INSERT needs the plan-level shared-surrogate envelope
 	// (a materialized augmented source the sibling base inserts fan out from), which
-	// the AST-level `BaseOp[]` model cannot express — build it directly. A
-	// decomposition-backed logical table keeps its own (still-deferred) fan-out path.
-	if (req.op === 'insert' && !decompositionStorage(ctx, view) && isJoinBody(view.selectAst)) {
+	// the AST-level `BaseOp[]` model cannot express — build it directly.
+	if (req.op === 'insert' && isJoinBody(view.selectAst)) {
 		return buildMultiSourceInsert(ctx, view, req.stmt);
 	}
 
@@ -246,6 +256,139 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 	}
 
 	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
+}
+
+/**
+ * Build the shared-surrogate envelope substrate for an INSERT through a
+ * decomposition-backed logical table (docs/lens.md § The Default Mapper,
+ * docs/view-updateability.md § Mutation Context). The dual of
+ * `buildMultiSourceInsert`, generalized from two FK-ordered sides to an n-way,
+ * anchor-first member fan-out with optional / EAV members.
+ *
+ * `analyzeDecompositionInsert` yields the per-member base inserts plus the envelope
+ * shape. We build the **envelope source** (the user's VALUES/SELECT, columns = the
+ * supplied logical columns), one **base insert per op** (each sourcing from a
+ * projection — over a presence `FilterNode` for an optional/EAV op — of the shared
+ * `EnvelopeScanNode`), and the **surrogate seed** when the shared key is minted.
+ * Every member reads the same materialized envelope, so a generated key is minted
+ * once per produced row and threaded identically across the fan-out.
+ */
+function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
+	const storage = decompositionStorage(ctx, view)!; // guaranteed by the caller's gate
+	const plan = analyzeDecompositionInsert(ctx, view, storage, stmt);
+
+	// Envelope leading columns = the supplied logical columns; a minted surrogate is
+	// appended as one more column (positional with `analyzeDecompositionInsert`).
+	const envelopeAttrs: Attribute[] = plan.suppliedColumns.map(col => ({
+		id: PlanNode.nextAttrId(),
+		name: col.name,
+		type: col.type,
+		sourceRelation: 'envelope',
+	}));
+	if (plan.mint) {
+		envelopeAttrs.push({
+			id: PlanNode.nextAttrId(),
+			name: '__shared_key',
+			type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: false },
+			sourceRelation: 'envelope',
+		});
+	}
+	const envelopeType: RelationType = {
+		typeClass: 'relation',
+		isReadOnly: true,
+		isSet: false,
+		columns: envelopeAttrs.map(a => ({ name: a.name, type: a.type })),
+		keys: [],
+		rowConstraints: [],
+	};
+
+	// The shared descriptor stitches every member op's EnvelopeScanNode to the rows
+	// the ViewMutation emitter materializes.
+	const descriptor: TableDescriptor = {};
+
+	const baseOps = plan.ops.map(op =>
+		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op));
+
+	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
+
+	let mint: MutationEnvelope['mint'] | undefined;
+	if (plan.mint) {
+		const seedExpr = parseExpressionString(
+			`coalesce((select max(${quoteIdent(plan.mint.seedColumn)}) from ${qualifiedTable(plan.mint.seedTable.tableSchema.schemaName, plan.mint.seedTable.tableSchema.name)}), 0)`,
+		);
+		mint = { seed: buildExpression(ctx, seedExpr) as ScalarPlanNode, cadence: plan.mint.cadence };
+	}
+
+	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
+}
+
+/**
+ * Build one member base insert of a decomposition fan-out: a projection over the
+ * shared `EnvelopeScanNode` (key + supplied values, or an EAV triple), re-planned
+ * through the ordinary base-table builder so every constraint / conflict / FK /
+ * default rule is reused. An optional / EAV op first passes the envelope through a
+ * presence `FilterNode` so only rows that supply the component materialize a row.
+ */
+function buildDecompositionMemberInsert(
+	ctx: PlanningContext,
+	stmt: AST.InsertStmt,
+	descriptor: TableDescriptor,
+	envelopeAttrs: Attribute[],
+	envelopeType: RelationType,
+	op: DecompInsertOp,
+): PlanNode {
+	let source: RelationalPlanNode = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
+
+	if (op.presenceGateIndices.length > 0) {
+		source = new FilterNode(ctx.scope, source, buildPresenceGate(ctx, envelopeAttrs, op.presenceGateIndices));
+	}
+
+	const projections: Projection[] = op.columns.map((col): Projection => {
+		if (col.literal !== undefined) {
+			// EAV attribute literal — a constant per row, no envelope column.
+			const node = buildExpression(ctx, { type: 'literal', value: col.literal } as AST.LiteralExpr) as ScalarPlanNode;
+			return { node, alias: col.baseColumn };
+		}
+		const envIdx = col.envelopeIndex!;
+		const attr = envelopeAttrs[envIdx];
+		const ref = new ColumnReferenceNode(ctx.scope, { type: 'column', name: attr.name }, attr.type, attr.id, envIdx);
+		return { node: ref, alias: col.baseColumn };
+	});
+	// preserveInputColumns=false → output is exactly the picked columns, positionally
+	// aligned to the member insert's target columns.
+	const projectedSource = new ProjectNode(ctx.scope, source, projections, undefined, undefined, false);
+
+	const memberInsert: AST.InsertStmt = {
+		type: 'insert',
+		table: { type: 'identifier', name: op.schema.name, schema: op.schema.schemaName },
+		columns: op.columns.map(c => c.baseColumn),
+		source: { type: 'values', values: [] }, // placeholder — ignored when preBuiltSource is set
+		onConflict: stmt.onConflict,
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	// Lens row-local CHECK enforcement on a decomposition insert is deferred (the
+	// logical check cannot be unambiguously routed to a single member's basis terms);
+	// matches the multi-source insert path, which also passes no extra constraints.
+	return buildInsertStmt(ctx, memberInsert, [], projectedSource);
+}
+
+/**
+ * Build the per-row presence predicate gating an optional / EAV member insert:
+ * `<col> is not null [or <col> is not null …]` over the envelope columns named by
+ * `gateIndices`. Resolved against a scope registering the envelope attributes (by
+ * their stable ids), so the predicate reads the materialized envelope rows.
+ */
+function buildPresenceGate(ctx: PlanningContext, envelopeAttrs: Attribute[], gateIndices: readonly number[]): ScalarPlanNode {
+	const gateScope = new RegisteredScope(ctx.scope);
+	envelopeAttrs.forEach((attr, i) => {
+		gateScope.registerSymbol(attr.name.toLowerCase(), (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
+	});
+	const predicateSql = gateIndices.map(i => `${quoteIdent(envelopeAttrs[i].name)} is not null`).join(' or ');
+	const ast = parseExpressionString(predicateSql);
+	return buildExpression({ ...ctx, scope: gateScope }, ast) as ScalarPlanNode;
 }
 
 /**

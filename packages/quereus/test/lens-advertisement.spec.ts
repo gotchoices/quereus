@@ -761,11 +761,11 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 		}
 	});
 
-	it('put fan-out: a decomposition body is update/delete-through, with insert deferred onto the surrogate envelope', async () => {
-		// `lens-multi-source-put-fanout` wires the advertisement-driven put fan-out
-		// (`planner/mutation/decomposition.ts`): a decomposition body routes off the
-		// generic join path to a member fan-out. DELETE/UPDATE ship; INSERT defers onto
-		// the shared-surrogate insert envelope (`view-mutation-shared-surrogate-insert`).
+	it('put fan-out: a decomposition body is insert/update/delete-through', async () => {
+		// `lens-multi-source-put-fanout` + `lens-multi-source-put-insert-fanout` wire the
+		// advertisement-driven put fan-out (`planner/mutation/decomposition.ts`): a
+		// decomposition body routes off the generic join path to a member fan-out for
+		// INSERT (off the shared-surrogate envelope), UPDATE, and DELETE.
 		const db = new Database();
 		try {
 			const mod = new AdvertisingModule();
@@ -790,17 +790,21 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
 			await db.exec('apply schema x');
 
-			// INSERT is deferred onto the shared-surrogate mutation-context envelope.
-			await expectThrows(() => db.exec("insert into x.Car (id, make, maxSpeed) values (3, 'Ford', 200)"), /shared-surrogate mutation-context envelope/i);
+			// INSERT fans out to every member (anchor + optional), threading the logical PK.
+			await db.exec("insert into x.Car (id, make, maxSpeed) values (3, 'Ford', 200)");
+			expect(await rows(db, 'select * from main.Car_core where id = 3')).to.deep.equal([{ id: 3, make: 'Ford' }]);
+			expect(await rows(db, 'select * from main.Car_perf where id = 3')).to.deep.equal([{ id: 3, speed: 200 }]);
+			expect(await rows(db, 'select * from x.Car where id = 3')).to.deep.equal([{ id: 3, make: 'Ford', maxSpeed: 200 }]);
 
 			// UPDATE of an anchor-backed column fans out to that member.
 			await db.exec("update x.Car set make = 'Acura' where id = 1");
 			expect(await rows(db, 'select make from main.Car_core where id = 1')).to.deep.equal([{ make: 'Acura' }]);
 
-			// DELETE fans out to every member (anchor + optional).
+			// DELETE fans out to every member (anchor + optional). id=3 (just inserted)
+			// survives; id=1's anchor + perf rows are removed.
 			await db.exec('delete from x.Car where id = 1');
-			expect(await rows(db, 'select id from main.Car_core order by id')).to.deep.equal([{ id: 2 }]);
-			expect(await rows(db, 'select id from main.Car_perf order by id')).to.deep.equal([]);
+			expect(await rows(db, 'select id from main.Car_core order by id')).to.deep.equal([{ id: 2 }, { id: 3 }]);
+			expect(await rows(db, 'select id from main.Car_perf order by id')).to.deep.equal([{ id: 3 }]);
 		} finally {
 			await db.close();
 		}

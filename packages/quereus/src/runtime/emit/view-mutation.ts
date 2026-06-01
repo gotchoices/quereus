@@ -60,6 +60,9 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	const envelope = plan.envelope;
 	const descriptor = envelope?.descriptor;
 	const doMint = !!envelope?.mint;
+	// `per-statement` binds one surrogate for the whole statement (stable across
+	// rows); `per-row` (default) makes each row distinct (`seed + ordinal`).
+	const perStatementMint = envelope?.mint?.cadence === 'per-statement';
 
 	// The relational base op carrying a single-source RETURNING (the rewritten,
 	// view-projected clause), or -1. Mutually exclusive with `plan.returning`.
@@ -116,7 +119,10 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 			let ordinal = 0;
 			for await (const row of resolved as AsyncIterable<Row>) {
 				ordinal += 1;
-				rows.push(doMint ? ([...row, (seedValue + ordinal) as SqlValue] as Row) : (row as Row));
+				// per-statement: one surrogate bound for the statement (`seed + 1` for
+				// every row); per-row: `seed + ordinal` (distinct per produced row).
+				const minted = (perStatementMint ? seedValue + 1 : seedValue + ordinal) as SqlValue;
+				rows.push(doMint ? ([...row, minted] as Row) : (row as Row));
 			}
 		}
 		return rows;

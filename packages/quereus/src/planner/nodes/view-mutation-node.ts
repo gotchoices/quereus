@@ -18,17 +18,26 @@ export type ReturningTiming = 'pre' | 'post';
  * so the fan-out shares one set of rows.
  *
  * When `mint` is present the emitter appends a generated shared key as the last
- * envelope column: a per-row surrogate `seed + ordinal` where `seed` is evaluated
- * exactly once (pre-fan-out) — the `integer-auto` / `per-row` cadence of
- * `docs/view-updateability.md` § Mutation Context. The single captured value is
- * threaded into every base insert of that row, so the branches cannot diverge.
+ * envelope column. `seed` is evaluated exactly once (pre-fan-out — it observes the
+ * pre-mutation state). The minted value depends on the {@link mint.cadence}:
+ * `per-row` (default) makes each row distinct (`seed + 1-based ordinal`);
+ * `per-statement` binds once for the whole statement (`seed + 1` for every row —
+ * `docs/view-updateability.md` § Mutation Context cadences). The single captured
+ * value is threaded into every base insert of that row, so the branches cannot
+ * diverge.
  */
 export interface MutationEnvelope {
 	readonly source: RelationalPlanNode;
 	readonly descriptor: TableDescriptor;
 	readonly mint?: {
-		/** Surrogate base, evaluated once before fan-out; minted value = seed + 1-based ordinal. */
+		/** Surrogate base, evaluated once before fan-out. */
 		readonly seed: ScalarPlanNode;
+		/**
+		 * `per-row` (default) ⇒ minted value = `seed + 1-based ordinal` (distinct per
+		 * row); `per-statement` ⇒ `seed + 1` bound once for the statement (stable
+		 * across rows). Absent ⇒ `per-row` (the multi-source insert's only cadence).
+		 */
+		readonly cadence?: 'per-row' | 'per-statement';
 	};
 }
 
@@ -188,7 +197,7 @@ export class ViewMutationNode extends PlanNode {
 			newEnvelope = {
 				source: newSource,
 				descriptor: this.envelope.descriptor,
-				mint: this.envelope.mint ? { seed: newSeed! } : undefined,
+				mint: this.envelope.mint ? { seed: newSeed!, cadence: this.envelope.mint.cadence } : undefined,
 			};
 		}
 

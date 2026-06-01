@@ -6,15 +6,20 @@
  * registered as a view whose body is the synthesized `anchor ⋈ members` join;
  * `propagate()` routes its writes to the advertisement-driven fan-out
  * (`planner/mutation/decomposition.ts`) instead of the generic two-table join
- * path. This ticket ships the **substrate-independent** half of that fan-out:
+ * path. Shipped fan-out:
  *
  * - DELETE across every member (anchor-last, anchor-only predicate).
  * - UPDATE routed to the mandatory, non-EAV member backing each column.
+ * - INSERT one per member (anchor first) off the shared-surrogate envelope
+ *   (`view-mutation-shared-surrogate-insert`): a surrogate minted once per row and
+ *   threaded (`integer-auto`, per-row / per-statement), or a logical-tuple PK
+ *   threaded straight through; optional members gated per-row on a supplied value;
+ *   EAV pivots emit one triple per supplied attribute; singleton over the empty key.
  *
- * INSERT, a non-anchor-predicate DELETE/UPDATE, and an optional/EAV/key UPDATE
- * are deferred onto substrate not yet present (the shared-surrogate insert
- * envelope / snapshot-consistent multi-member execution) and asserted to raise a
- * precise diagnostic here.
+ * Still deferred onto absent substrate (asserted to raise a precise diagnostic): a
+ * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution),
+ * an optional/EAV/key UPDATE transition (per-row insert-or-delete branching), and
+ * non-integer surrogate generators.
  */
 
 import { expect } from 'chai';
@@ -301,17 +306,240 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 			await db.close();
 		}
 	});
+
+	it('insert materializes the anchor row plus one triple per supplied non-null attribute', async () => {
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('insert into x.E (id, p, q) values (3, 33, 34)');
+			expect(await rows(db, 'select id from main.E_core order by id')).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
+			expect(await rows(db, 'select eid, attr, val from main.E_eav where eid = 3 order by attr')).to.deep.equal([
+				{ eid: 3, attr: 'p', val: 33 }, { eid: 3, attr: 'q', val: 34 },
+			]);
+			expect(await rows(db, 'select * from x.E order by id')).to.deep.equal([
+				{ id: 1, p: 11, q: 12 }, { id: 2, p: 21, q: null }, { id: 3, p: 33, q: 34 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('insert writes no triple for a null attribute value (the read yields null)', async () => {
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('insert into x.E (id, p, q) values (4, 44, null)');
+			expect(await rows(db, 'select eid, attr, val from main.E_eav where eid = 4 order by attr')).to.deep.equal([
+				{ eid: 4, attr: 'p', val: 44 }, // no 'q' triple
+			]);
+			expect(await rows(db, 'select * from x.E order by id')).to.deep.equal([
+				{ id: 1, p: 11, q: 12 }, { id: 2, p: 21, q: null }, { id: 4, p: 44, q: null },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
-describe('lens decomposition put: INSERT (deferred)', () => {
-	it('raises the shared-surrogate-envelope diagnostic', async () => {
+describe('lens decomposition put: INSERT fan-out (logical-tuple)', () => {
+	it('fans an insert out to every member, threading the logical PK', async () => {
 		const db = new Database();
 		try {
 			await setup(db);
-			await expectThrows(
-				() => db.exec('insert into x.T (id, a, b) values (3, 30, 300)'),
-				/shared-surrogate mutation-context envelope/i,
-			);
+			await db.exec('insert into x.T (id, a, b, c) values (3, 30, 300, 3000)');
+			expect(await rows(db, 'select * from main.T_core where id = 3')).to.deep.equal([{ id: 3, a: 30 }]);
+			expect(await rows(db, 'select * from main.T_b where id = 3')).to.deep.equal([{ id: 3, b: 300 }]);
+			expect(await rows(db, 'select * from main.T_c where id = 3')).to.deep.equal([{ id: 3, c: 3000 }]);
+			expect(await rows(db, 'select * from x.T where id = 3')).to.deep.equal([{ id: 3, a: 30, b: 300, c: 3000 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('omitting the optional component materializes no optional member row', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('insert into x.T (id, a, b) values (4, 40, 400)'); // no c
+			expect(await rows(db, 'select id from main.T_c order by id')).to.deep.equal([{ id: 1 }]); // only the seeded c
+			expect(await rows(db, 'select * from x.T where id = 4')).to.deep.equal([{ id: 4, a: 40, b: 400, c: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('per-row presence gate: an explicit-null optional value materializes no member row, a non-null one does', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('insert into x.T (id, a, b, c) values (5, 50, 500, null), (6, 60, 600, 6000)');
+			expect(await rows(db, 'select id, c from main.T_c order by id')).to.deep.equal([
+				{ id: 1, c: 1000 }, { id: 6, c: 6000 }, // row 5 (null c) is absent
+			]);
+			expect(await rows(db, 'select * from x.T where id in (5, 6) order by id')).to.deep.equal([
+				{ id: 5, a: 50, b: 500, c: null }, { id: 6, a: 60, b: 600, c: 6000 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('inserting an unbacked logical column raises a precise diagnostic', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			await expectThrows(() => db.exec('insert into x.T (id, nope) values (9, 1)'), /not backed by any decomposition member/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('omitting the logical-tuple shared key is rejected (no generator)', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			await expectThrows(() => db.exec('insert into x.T (a, b) values (70, 700)'), /shared key.*is not supplied|must be provided/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('insert or replace composes across every member op', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			// id=1 exists on all three members; replace fans out to each.
+			await db.exec('insert or replace into x.T (id, a, b, c) values (1, 999, 9990, 99900)');
+			expect(await rows(db, 'select * from x.T where id = 1')).to.deep.equal([{ id: 1, a: 999, b: 9990, c: 99900 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Surrogate decomposition: anchor Doc_core(sid pk, doc_key, title) + Doc_body
+ * (doc_sid pk, body), joined on a surrogate spelled `sid`/`doc_sid`, generated
+ * `integer-auto`. The logical key `docKey` is an ordinary value column.
+ */
+function surrogateAd(cadence: 'per-row' | 'per-statement'): MappingAdvertisement {
+	return {
+		id: 'Doc_core',
+		logicalTable: 'Doc',
+		role: 'primary-storage',
+		storage: {
+			anchorRelationId: 'Doc_core',
+			members: [
+				{ relationId: 'Doc_core', relation: { schema: 'main', table: 'Doc_core' }, presence: 'mandatory', columns: [colMap('docKey', 'doc_key'), colMap('title', 'title')] },
+				{ relationId: 'Doc_body', relation: { schema: 'main', table: 'Doc_body' }, presence: 'mandatory', columns: [colMap('body', 'body')] },
+			],
+			sharedKey: {
+				kind: 'surrogate',
+				keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']]),
+				generator: { strategy: 'integer-auto', cadence },
+			},
+		},
+	};
+}
+
+async function setupSurrogate(db: Database, cadence: 'per-row' | 'per-statement'): Promise<void> {
+	const mod = new AdvertisingModule();
+	mod.ads = [surrogateAd(cadence)];
+	db.registerModule('docmod', mod);
+	await db.exec('create table Doc_core (sid integer primary key, doc_key text, title text) using docmod');
+	await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docmod');
+	await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
+	await db.exec('apply schema x');
+	await db.exec("insert into main.Doc_core values (100, 'k1', 'First'), (101, 'k2', 'Second')");
+	await db.exec("insert into main.Doc_body values (100, 'b1'), (101, 'b2')");
+}
+
+describe('lens decomposition put: INSERT fan-out (surrogate)', () => {
+	it('per-row: mints one surrogate per row, threaded across members, distinct per row', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogate(db, 'per-row');
+			await db.exec("insert into x.Doc (docKey, title, body) values ('k3', 'T3', 'B3'), ('k4', 'T4', 'B4')");
+			// seed = max(sid) = 101 → minted 102, 103 (per-row, distinct).
+			expect(await rows(db, 'select sid, doc_key from main.Doc_core order by sid')).to.deep.equal([
+				{ sid: 100, doc_key: 'k1' }, { sid: 101, doc_key: 'k2' }, { sid: 102, doc_key: 'k3' }, { sid: 103, doc_key: 'k4' },
+			]);
+			// Each minted sid is identical on the Doc_body side (one generation, threaded).
+			expect(await rows(db, 'select doc_sid, body from main.Doc_body order by doc_sid')).to.deep.equal([
+				{ doc_sid: 100, body: 'b1' }, { doc_sid: 101, body: 'b2' }, { doc_sid: 102, body: 'B3' }, { doc_sid: 103, body: 'B4' },
+			]);
+			expect(await rows(db, 'select * from x.Doc order by docKey')).to.deep.equal([
+				{ docKey: 'k1', title: 'First', body: 'b1' }, { docKey: 'k2', title: 'Second', body: 'b2' },
+				{ docKey: 'k3', title: 'T3', body: 'B3' }, { docKey: 'k4', title: 'T4', body: 'B4' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('per-statement: a single row mints one surrogate (seed + 1), threaded across members', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogate(db, 'per-statement');
+			await db.exec("insert into x.Doc (docKey, title, body) values ('k3', 'T3', 'B3')");
+			expect(await rows(db, 'select sid, doc_key from main.Doc_core where sid >= 102')).to.deep.equal([{ sid: 102, doc_key: 'k3' }]);
+			expect(await rows(db, 'select doc_sid, body from main.Doc_body where doc_sid >= 102')).to.deep.equal([{ doc_sid: 102, body: 'B3' }]);
+			expect(await rows(db, "select * from x.Doc where docKey = 'k3'")).to.deep.equal([{ docKey: 'k3', title: 'T3', body: 'B3' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('per-statement: a multi-row insert binds one key for the whole statement → collides atomically', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogate(db, 'per-statement');
+			// Both rows mint the same surrogate (seed + 1 = 102); the second member insert
+			// collides on the PK, the statement aborts, and nothing persists.
+			await expectThrows(() => db.exec("insert into x.Doc (docKey, title, body) values ('k3', 'T3', 'B3'), ('k4', 'T4', 'B4')"), /constraint|unique|primary/i);
+			expect(await rows(db, 'select sid from main.Doc_core order by sid')).to.deep.equal([{ sid: 100 }, { sid: 101 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Singleton (`primary key ()`): two value-carrying members joined on `1 = 1`, no
+ * key to thread. Inserts are unconditional over the empty key.
+ */
+function singletonAd(): MappingAdvertisement {
+	return {
+		id: 'Cfg_a',
+		logicalTable: 'Cfg',
+		role: 'primary-storage',
+		storage: {
+			anchorRelationId: 'Cfg_a',
+			members: [
+				{ relationId: 'Cfg_a', relation: { schema: 'main', table: 'Cfg_a' }, presence: 'mandatory', columns: [colMap('theme', 'theme')] },
+				{ relationId: 'Cfg_b', relation: { schema: 'main', table: 'Cfg_b' }, presence: 'mandatory', columns: [colMap('lang', 'lang')] },
+			],
+			sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Cfg_a', []], ['Cfg_b', []]) },
+		},
+	};
+}
+
+describe('lens decomposition put: INSERT fan-out (singleton)', () => {
+	it('writes each member unconditionally over the empty key', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [singletonAd()];
+			db.registerModule('cfgmod', mod);
+			await db.exec('create table Cfg_a (theme text, primary key ()) using cfgmod');
+			await db.exec('create table Cfg_b (lang text, primary key ()) using cfgmod');
+			await db.exec('declare logical schema x { table Cfg { theme text, lang text, primary key () } }');
+			await db.exec('apply schema x');
+
+			await db.exec("insert into x.Cfg (theme, lang) values ('dark', 'en')");
+			expect(await rows(db, 'select theme from main.Cfg_a')).to.deep.equal([{ theme: 'dark' }]);
+			expect(await rows(db, 'select lang from main.Cfg_b')).to.deep.equal([{ lang: 'en' }]);
+			expect(await rows(db, 'select * from x.Cfg')).to.deep.equal([{ theme: 'dark', lang: 'en' }]);
 		} finally {
 			await db.close();
 		}
