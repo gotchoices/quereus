@@ -237,6 +237,23 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.Upd
 		}
 		return { relationId: member.relationId, basisColumn: mapping.basisExpr.name, value: rewriteAssignedValue(view, shape, member, asg.value) };
 	}
+	// An EAV pivot member backs its logical columns as attribute *rows*, not via
+	// `member.columns` (the get body projects them as correlated scalar subqueries,
+	// not join columns), so the loop above never matches them. Detect that here off
+	// the projection map: a logical column the get body projects as a non-column
+	// expression is EAV-served (writing it is an insert-or-delete of a triple — the
+	// deferred component fan-out), whereas a column the body never projects is a
+	// name that is simply not part of the decomposition.
+	const projected = shape.viewColToBaseRef.get(logical);
+	if (projected && projected.type !== 'column') {
+		const eav = shape.storage.members.find(m => m.attributePivot);
+		raiseMutationDiagnostic({
+			reason: 'unsupported-decomposition-update',
+			column: asg.column,
+			table: view.name,
+			message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by ${eav ? `an EAV pivot member ('${eav.relationId}')` : 'a computed projection'}; materializing/removing that component needs the insert/delete fan-out (deferred)`,
+		});
+	}
 	raiseMutationDiagnostic({
 		reason: 'no-inverse',
 		column: asg.column,

@@ -199,6 +199,24 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		}
 	});
 
+	it('allows a self-member value reference but rejects a cross-member one', async () => {
+		// A SET value may read the column's own member (rewritten + alias-stripped to
+		// a bare reference on the per-member UPDATE), but a reference to a *different*
+		// member is a cross-source assignment a single-table SET cannot express.
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('update x.T set b = b + 1 where id = 1');           // self-member: T_b.b
+			expect(await rows(db, 'select b from main.T_b where id = 1')).to.deep.equal([{ b: 101 }]);
+			await db.exec('update x.T set a = a * 2 where id = 2');           // self-member: T_core.a
+			expect(await rows(db, 'select a from main.T_core where id = 2')).to.deep.equal([{ a: 40 }]);
+			await expectThrows(() => db.exec('update x.T set a = b + 1 where id = 1'), /cross-member assignment/i); // anchor <- non-anchor
+			await expectThrows(() => db.exec('update x.T set b = a + 1 where id = 1'), /cross-member assignment/i); // non-anchor <- anchor
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('defers an update to an optional member', async () => {
 		const db = new Database();
 		try {
@@ -260,6 +278,25 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 			await db.exec('delete from x.E where id = 1');
 			expect(await rows(db, 'select id from main.E_core order by id')).to.deep.equal([{ id: 2 }]);
 			expect(await rows(db, 'select eid, attr from main.E_eav order by eid, attr')).to.deep.equal([{ eid: 2, attr: 'p' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('defers an update of an EAV-served column with the pivot diagnostic (not a bare no-inverse)', async () => {
+		// An EAV column is projected by the get body as a correlated subquery, never a
+		// member `columns` entry, so the value-routing loop cannot match it. It must
+		// still defer with the EAV-pivot reason (writing it is an insert/delete of a
+		// triple) — distinct from a genuine non-column, which stays a plain no-inverse.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await expectThrows(() => db.exec('update x.E set p = 99 where id = 1'), /EAV pivot member/i);
+			await expectThrows(() => db.exec('update x.E set notacol = 1 where id = 1'), /not backed by any decomposition member/i);
+			// Atomic: the deferred writes left every triple intact.
+			expect(await rows(db, 'select eid, attr, val from main.E_eav order by eid, attr')).to.deep.equal([
+				{ eid: 1, attr: 'p', val: 11 }, { eid: 1, attr: 'q', val: 12 }, { eid: 2, attr: 'p', val: 21 },
+			]);
 		} finally {
 			await db.close();
 		}
