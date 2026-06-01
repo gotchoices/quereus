@@ -424,3 +424,38 @@ create table bvu (id integer primary key, x integer);
 create view bvu_v as select id from bvu with tags ("quereus.update.taget" = 'bvu');
 insert into bvu_v values (1);
 -- error: unknown reserved tag
+
+-- ===================================
+-- Phase 3.4: adversarial edges (review pass) — precedence, conflicting tags,
+-- the except-only delete_via value on a join, and the single-source no-op.
+-- ===================================
+
+-- --- default_for precedence: an explicit supply of the column wins ---
+-- The view projects `created`, so a statement that supplies it explicitly must
+-- override the view-level default_for; an omitted insert still takes the default.
+create table dfp (id integer primary key, created integer);
+create view dfp_v as select id, created from dfp
+    with tags ("quereus.update.default_for.created" = '111');
+insert into dfp_v (id, created) values (1, 999);
+insert into dfp_v (id) values (2);
+select * from dfp order by id;
+→ [{"id":1,"created":999},{"id":2,"created":111}]
+
+-- --- delete_via='right_insert' is an except-only value -> rejected for a join ---
+delete from dv_jv with tags ("quereus.update.delete_via" = 'right_insert') where lid = 2;
+-- error: except
+
+-- --- target + delete_via that disagree -> structured tag-conflict ---
+-- target pins dv_r, but delete_via='left_delete' picks dv_l (excluded) -> conflict.
+delete from dv_jv with tags ("quereus.update.target" = 'dv_r', "quereus.update.delete_via" = 'left_delete') where lid = 2;
+-- error: excludes it
+
+-- --- single-source view carrying a routing tag: a documented no-op ---
+-- target/exclude only narrow a multi-source base set; on a single-source view the
+-- tag is inert and an unknown name is NOT existence-checked (per the contract).
+create table sst (id integer primary key, note text);
+create view sst_v as select id, note from sst
+    with tags ("quereus.update.target" = 'not_a_real_table');
+insert into sst_v values (1, 'a');
+select * from sst order by id;
+→ [{"id":1,"note":"a"}]
