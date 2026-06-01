@@ -98,6 +98,44 @@ export function synthesizeFKExistsExpr(
 }
 
 /**
+ * Assembles the parent-side FK non-existence expression:
+ *
+ *   not exists (select 1 from [<schema>.]<child> where <child>.<childCol_i> = <q>.<parentCol_i> …)
+ *
+ * The dual of {@link synthesizeFKExistsExpr}: the physical parent-side RESTRICT
+ * check passes the child table's own column names and the parent's referenced
+ * column names off the `TableSchema`s (no `fromSchema`); the lens parent-side
+ * collector passes the logical child column names, the parent's referenced
+ * columns rewritten to basis terms, and the logical child schema as `fromSchema`
+ * so the child relation resolves to the registered logical view regardless of the
+ * basis search path the routed constraint is built under. Shared so the
+ * `NOT EXISTS` synthesis lives in exactly one place.
+ */
+export function synthesizeFKNotExistsExpr(
+	childTableName: string,
+	childColumns: readonly string[],
+	parentColumns: readonly string[],
+	qualifier: 'NEW' | 'OLD',
+	fromSchema?: string,
+): AST.UnaryExpr {
+	const pairs = childColumns.map((childCol, i) => ({
+		leftTable: childTableName,
+		leftCol: childCol,
+		rightTable: qualifier,
+		rightCol: parentColumns[i],
+	}));
+
+	return {
+		type: 'unary',
+		operator: 'NOT',
+		expr: {
+			type: 'exists',
+			subquery: synthesizeFKSubquery(childTableName, pairs, fromSchema),
+		} as AST.ExistsExpr,
+	};
+}
+
+/**
  * Synthesizes an EXISTS(...) AST expression that checks whether a matching row
  * exists in the parent table for the given FK columns.
  *
@@ -132,21 +170,10 @@ function synthesizeNotExistsCheck(
 	parentTable: TableSchema,
 	parentColIndices: number[],
 ): AST.UnaryExpr {
-	const pairs = fk.columns.map((childColIdx, i) => ({
-		leftTable: childTable.name,
-		leftCol: childTable.columns[childColIdx].name,
-		rightTable: 'OLD',
-		rightCol: parentTable.columns[parentColIndices[i]].name,
-	}));
-
-	return {
-		type: 'unary',
-		operator: 'NOT',
-		expr: {
-			type: 'exists',
-			subquery: synthesizeFKSubquery(childTable.name, pairs),
-		} as AST.ExistsExpr,
-	};
+	const childColumns = fk.columns.map(childColIdx => childTable.columns[childColIdx].name);
+	const parentColumns = parentColIndices.map(idx => parentTable.columns[idx].name);
+	// Physical path: child/parent names off the `TableSchema`s, no `fromSchema`.
+	return synthesizeFKNotExistsExpr(childTable.name, childColumns, parentColumns, 'OLD');
 }
 
 /**

@@ -5,7 +5,7 @@ import { RowOpFlag, resolveReferencedColumns } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import { resolveSlotBasisSource } from '../../schema/lens-prover.js';
 import { transformExpr } from './single-source.js';
-import { synthesizeFKExistsExpr } from '../building/foreign-key-builder.js';
+import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('planner:lens-enforcement');
@@ -370,6 +370,137 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
+	}
+	return constraints;
+}
+
+/**
+ * The parent-side UPDATE short-circuit guard:
+ *
+ *   ( (OLD.p1 = NEW.p1 and … and OLD.pn = NEW.pn) or <NOT EXISTS over OLD> )
+ *
+ * Reproduces the physical parent-side UPDATE short-circuit (`emit/constraint-check.ts`
+ * skips the `NOT EXISTS` when no referenced parent column changed) — a **correctness**
+ * requirement, not just perf: a plain `NOT EXISTS` over OLD values would reject a benign
+ * update that does not touch the referenced columns but whose key a child still
+ * references. Plain `=` (not a null-safe `IS`) is intentional: every NULL case falls
+ * through the guard to the `NOT EXISTS`, which itself passes for a NULL OLD key (MATCH
+ * SIMPLE). DELETE never gets this guard — there NEW is all-NULL so `OLD = NEW` is NULL
+ * and `NULL or <false NOT EXISTS>` evaluates to NULL, which the deferred-constraint
+ * check (`value === false || value === 0`) does not treat as a failure, silently
+ * dropping a valid RESTRICT rejection (hence op-specific synthesis).
+ */
+function buildParentSideUpdateGuard(parentBasisColumns: readonly string[], notExists: AST.Expression): AST.Expression {
+	const equalities: AST.Expression[] = parentBasisColumns.map(col => ({
+		type: 'binary',
+		operator: '=',
+		left: { type: 'column', name: col, table: 'OLD' } as AST.ColumnExpr,
+		right: { type: 'column', name: col, table: 'NEW' } as AST.ColumnExpr,
+	} as AST.BinaryExpr));
+	const guard = equalities.reduce((acc, eq) => ({
+		type: 'binary',
+		operator: 'AND',
+		left: acc,
+		right: eq,
+	} as AST.BinaryExpr));
+	return { type: 'binary', operator: 'OR', left: guard, right: notExists } as AST.BinaryExpr;
+}
+
+/**
+ * Builds the parent-side FK non-existence constraints a lens write through a logical
+ * **parent** must enforce — the cross-slot dual of {@link collectLensForeignKeyConstraints}
+ * and the lens analogue of `buildParentSideFKChecks`. The physical parent-side builder
+ * discovers FKs by scanning declared `TableSchema.foreignKeys` on basis tables; a logical
+ * FK lives only on the **child** slot's `enforced-fk` obligation (on no basis table), so
+ * this collector walks every schema's lens slots and, for each child slot whose FK
+ * references `parentSlot`'s logical table (name + resolved schema, case-insensitive),
+ * synthesizes one `NOT EXISTS(SELECT 1 FROM <childLogical> WHERE <child>.<childCol> =
+ * OLD.<parentBasisCol> …)` against the schema-qualified logical child relation.
+ *
+ * The child columns stay **logical** (they resolve against the registered logical child
+ * view named in the FROM). The parent's referenced columns are rewritten **logical→basis**
+ * via the parent slot's reconstructible projection, because the `OLD.*` / `NEW.*` side is
+ * the parent's basis write row. For DELETE the expression is the plain `NOT EXISTS`; for
+ * UPDATE it is wrapped in the {@link buildParentSideUpdateGuard} short-circuit. The result
+ * is tagged {@link LENS_BOUNDARY_ATTACHED_TAG}, masked to the requested op, and routed
+ * through the basis write's constraint pipeline, where the contained `EXISTS` auto-defers
+ * it to commit (the accepted v1 timing — identical ABORT outcome, symmetric with the
+ * already-shipped child-side).
+ *
+ * Action gate: only `restrict` (on the op-appropriate `onDelete` / `onUpdate`) emits —
+ * **matching `buildParentSideFKChecks` exactly**; CASCADE / SET NULL / SET DEFAULT through
+ * the lens are out of scope (backlog). v1 **double-enforces** (sound: both the lens-level
+ * check and any equivalent basis parent-side check reject the same condition); parent-side
+ * basis-redundancy elision is a backlog follow-up.
+ *
+ * Gated by the caller on the `foreign_keys` pragma (mirroring the child-side). Returns
+ * `[]` for a multi-source / decomposition parent (its `OLD.*` is not one basis row — a
+ * documented single-source-spine boundary, decided here via {@link resolveSlotBasisSource}),
+ * for a non-referenced parent, and for an un-proved slot.
+ */
+export function collectLensParentSideForeignKeyConstraints(
+	parentSlot: LensSlot,
+	schemaManager: SchemaManager,
+	operation: RowOpFlag.DELETE | RowOpFlag.UPDATE,
+): RowConstraintSchema[] {
+	// Single-source spine: the parent-side constraint rides the parent's basis base op,
+	// so OLD.* / NEW.* must be exactly one basis row. A multi-source / decomposition
+	// parent (an opaque or multi-table FROM) routes nothing extra (documented boundary).
+	if (!resolveSlotBasisSource(parentSlot, schemaManager)) return [];
+
+	const parentMap = logicalToBasisColumnMap(parentSlot);
+	const parentLogicalName = parentSlot.logicalTable.name;
+	const parentLogicalSchema = parentSlot.logicalTable.schemaName;
+
+	const constraints: RowConstraintSchema[] = [];
+	for (const schema of schemaManager._getAllSchemas()) {
+		for (const childSlot of schema.getAllLensSlots()) {
+			if (!childSlot.obligations || childSlot.obligations.length === 0) continue;
+			const childLogicalSchema = childSlot.logicalTable.schemaName;
+			for (const obligation of childSlot.obligations) {
+				if (obligation.kind !== 'enforced-fk') continue;
+				if (obligation.constraint.kind !== 'foreignKey') continue;
+				const fk = obligation.constraint.constraint;
+				const referencedSchema = fk.referencedSchema ?? childLogicalSchema;
+				// This FK must reference *this* parent slot's logical table (name + schema).
+				if (fk.referencedTable.toLowerCase() !== parentLogicalName.toLowerCase()) continue;
+				if (referencedSchema.toLowerCase() !== parentLogicalSchema.toLowerCase()) continue;
+				// Action gate — mirror buildParentSideFKChecks exactly: only RESTRICT
+				// synthesizes a parent-side check (cascades handled elsewhere; out of scope here).
+				const action = operation === RowOpFlag.DELETE ? fk.onDelete : fk.onUpdate;
+				if (action !== 'restrict') continue;
+				// Parent referenced columns (logical), rewritten logical→basis through the
+				// parent slot's projection for the OLD/NEW correlation side. Parity with the
+				// child-side count-mismatch guard: skip a malformed / unresolvable FK rather
+				// than synthesize a `NOT EXISTS` with `undefined` parent column names.
+				const parentLogicalColumns = resolveLogicalReferencedColumns(fk, referencedSchema, schemaManager);
+				if (parentLogicalColumns.length !== fk.columns.length) {
+					log('lens parent-side FK %s: parent column count (%d) != child column count (%d); skipping',
+						fk.name ?? '<anon>', parentLogicalColumns.length, fk.columns.length);
+					continue;
+				}
+				const parentBasisColumns = parentLogicalColumns.map(name => parentMap.get(name.toLowerCase()) ?? name);
+				// Child FK columns stay logical — they resolve against the schema-qualified
+				// logical child view named in the NOT EXISTS FROM.
+				const childColumns = fk.columns.map(childIdx => childSlot.logicalTable.columns[childIdx]?.name ?? `#${childIdx}`);
+				const notExists = synthesizeFKNotExistsExpr(
+					childSlot.logicalTable.name,
+					childColumns,
+					parentBasisColumns,
+					'OLD',
+					childLogicalSchema,
+				);
+				const expr = operation === RowOpFlag.DELETE
+					? notExists
+					: buildParentSideUpdateGuard(parentBasisColumns, notExists);
+				constraints.push({
+					name: fk.name ? `lens:fk:parent:${fk.name}` : 'lens:fk:parent',
+					expr,
+					operations: operation,
+					tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
+				});
+			}
+		}
 	}
 	return constraints;
 }

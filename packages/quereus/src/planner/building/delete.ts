@@ -12,7 +12,7 @@ import { AliasedScope } from '../scopes/aliased.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
-import { RowOpFlag } from '../../schema/table.js';
+import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ReturningNode } from '../nodes/returning-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
@@ -25,6 +25,15 @@ import { buildViewMutation } from './view-mutation-builder.js';
 export function buildDeleteStmt(
   ctx: PlanningContext,
   stmt: AST.DeleteStmt,
+  /**
+   * Extra row constraints to enforce alongside the table's own — already resolved
+   * in the target table's column space. Set only when the view-mutation substrate
+   * re-plans a lens write onto its basis table: the lens **parent-side** FK
+   * `NOT EXISTS` checks (the cross-slot dual of the child-side FK) ride this seam so
+   * a delete through a logical parent enforces the RESTRICT existence check against
+   * the logical child (see `planner/mutation/lens-enforcement.ts`).
+   */
+  additionalConstraints: ReadonlyArray<RowConstraintSchema> = [],
 ): PlanNode {
   // Block DML on committed pseudo-schema
   if (isCommittedSchemaRef(stmt.table.schema)) {
@@ -144,7 +153,8 @@ export function buildDeleteStmt(
     oldAttributes,
     newAttributes,
     flatRowDescriptor,
-    contextAttributes
+    contextAttributes,
+    additionalConstraints
   );
 
   // Build parent-side FK constraint checks if foreign_keys pragma is enabled

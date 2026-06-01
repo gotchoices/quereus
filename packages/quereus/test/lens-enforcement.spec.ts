@@ -19,10 +19,12 @@ import { astToString } from '../src/emit/ast-stringify.js';
 import {
 	collectLensRowLocalConstraints,
 	collectLensForeignKeyConstraints,
+	collectLensParentSideForeignKeyConstraints,
 	collectLensSetLevelConstraints,
 	hasCommitTimeSetLevelObligation,
 	LENS_BOUNDARY_ATTACHED_TAG,
 } from '../src/planner/mutation/lens-enforcement.js';
+import { RowOpFlag } from '../src/schema/table.js';
 import type { LensSlot } from '../src/schema/lens.js';
 
 async function expectThrows(fn: () => Promise<unknown>, matcher?: RegExp): Promise<void> {
@@ -1205,6 +1207,224 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			expect(await rows(db, `select id from x.u where email = 'a@x'`)).to.deep.equal([{ id: 1 }]);
 			expect(await rows(db, `select id from y.u where email = 'a@x'`)).to.deep.equal([{ id: 1 }]);
 			expect(await rows(db, 'select count(*) as n from x.u')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens enforcement: parent-side FK RESTRICT at the write boundary', () => {
+	/**
+	 * Deploys a basis schema with **no** FK and a logical schema declaring the FK on
+	 * the *child* referencing the *parent*. The basis holds the data; the logical FK
+	 * exists only at the lens boundary, so it is the lens — not the basis — that must
+	 * enforce the **parent side**: a delete/update of a logical parent runs the
+	 * RESTRICT existence check against the logical child. `foreign_keys` defaults on.
+	 */
+	async function deployParentFkLens(db: Database): Promise<void> {
+		await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+		await db.exec('apply schema y');
+		await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+		await db.exec('apply schema x');
+	}
+
+	it('the core gap — deleting a referenced logical parent ABORTs through the lens though the basis has no FK; an unreferenced parent deletes', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkLens(db);
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)'); // child references parent 1
+			// Deleting the referenced parent (id=1) would orphan child 10 ⇒ ABORT at commit.
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk_/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'referenced parent survives').to.deep.equal([{ n: 1 }]);
+			// Deleting an unreferenced parent (id=2) succeeds.
+			await db.exec('delete from x.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 2')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an UPDATE of the referenced key that orphans a child ABORTs', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkLens(db);
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// Re-key the referenced parent 1→99 ⇒ child 10 dangles ⇒ ABORT (guard false ⇒ NOT EXISTS runs).
+			await expectThrows(() => db.exec('update x.parent set id = 99 where id = 1'), /constraint|foreign|fk_/i);
+			expect(await rows(db, 'select id from x.parent'), 'key change rolled back').to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an UPDATE of a non-referenced parent column succeeds even while a child references it (the short-circuit guard)', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkLens(db);
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// The referenced key (id) is unchanged ⇒ the `OLD.id = NEW.id` guard is true ⇒ the
+			// NOT EXISTS is skipped ⇒ a benign rename of `name` is allowed (correctness, not perf:
+			// a plain NOT EXISTS over OLD would wrongly reject this).
+			await db.exec(`update x.parent set name = 'renamed' where id = 1`);
+			expect(await rows(db, 'select name from x.parent where id = 1')).to.deep.equal([{ name: 'renamed' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a composite FK enforces the parent side — delete/update of the referenced composite key ABORTs; an unreferenced one succeeds', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'a'), (3, 4, 'b')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2)'); // references (1,2)
+
+			// Deleting the referenced composite key ⇒ ABORT.
+			await expectThrows(() => db.exec('delete from x.parent where px = 1 and py = 2'), /constraint|foreign|fk_/i);
+			// Re-keying the referenced composite key ⇒ ABORT.
+			await expectThrows(() => db.exec('update x.parent set px = 9 where px = 1 and py = 2'), /constraint|foreign|fk_/i);
+			// Deleting an unreferenced composite parent ⇒ succeeds.
+			await db.exec('delete from x.parent where px = 3 and py = 4');
+			expect(await rows(db, 'select count(*) as n from x.parent where px = 3')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a rename override on the parent rewrites OLD to basis terms and still enforces', async () => {
+		const db = new Database();
+		try {
+			// Logical parent column `id` ← basis `parent_id`; the OLD.<basis> rewrite must
+			// resolve against the parent's basis write row.
+			await db.exec('declare schema y { table parent (parent_id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('declare lens for x over y { view parent as select parent_id as id, name from y.parent }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk_/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 1 }]);
+
+			// The synthesized constraint correlates on the BASIS parent column.
+			const routed = collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE);
+			expect(routed.length, 'one routed parent-side check').to.equal(1);
+			const exprSql = astToString(routed[0].expr);
+			expect(exprSql, 'OLD side uses the basis parent column `parent_id`').to.match(/parent_id/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the foreign_keys pragma gates the parent side — off ⇒ deleting a referenced parent is accepted', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkLens(db);
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('pragma foreign_keys = false');
+			// No synthesized parent-side check ⇒ the referenced parent deletes (orphaning the
+			// child), matching the physical parent-side FK gate.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a multi-source parent is a documented no-op — the collector emits nothing and a delete/update does not throw a planner error', async () => {
+		const db = new Database();
+		try {
+			// `parent` maps to a two-table inner join (basis FK pb→pa makes the join delete
+			// unambiguous). Its OLD.* is not one basis row, so the parent-side collector emits
+			// nothing — the documented single-source-spine boundary.
+			await db.exec('declare schema y { table pa (id integer primary key, a text); table pb (id integer primary key references pa(id), b text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, a text, b text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('declare lens for x over y { view parent as select pa.id, pa.a, pb.b from y.pa join y.pb on pa.id = pb.id }');
+			await db.exec('apply schema x');
+
+			// The cross-slot collector finds the child FK referencing `parent`, but the
+			// multi-source parent has no single basis spine ⇒ [] for both ops.
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE), 'multi-source parent ⇒ no DELETE constraint').to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE), 'multi-source parent ⇒ no UPDATE constraint').to.deep.equal([]);
+
+			// Seed the basis directly, reference it from a child, and assert delete/update
+			// through the multi-source parent does not throw a planner error.
+			await db.exec(`insert into y.pa (id, a) values (1, 'a1'), (2, 'a2')`);
+			await db.exec(`insert into y.pb (id, b) values (1, 'b1'), (2, 'b2')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec(`update x.parent set a = 'A1' where id = 1`); // does not throw
+			await db.exec('delete from x.parent where id = 2'); // does not throw
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('unit: the collector returns one boundary-tagged NOT EXISTS over the qualified logical child (DELETE vs UPDATE forms)', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkLens(db);
+
+			// DELETE form: a plain NOT EXISTS over the schema-qualified logical child,
+			// OLD-correlated on the basis parent column, masked to DELETE.
+			const del = collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE);
+			expect(del.length).to.equal(1);
+			expect(del[0].tags?.[LENS_BOUNDARY_ATTACHED_TAG], 'boundary marker present').to.equal(true);
+			expect(del[0].operations, 'DELETE mask').to.equal(RowOpFlag.DELETE);
+			expect(del[0].name).to.equal('lens:fk:parent:fk_pid');
+			const delSql = astToString(del[0].expr);
+			expect(delSql, 'a NOT EXISTS non-existence check').to.match(/not exists/i);
+			expect(delSql, 'over the qualified logical child').to.match(/child/i);
+			expect(delSql, 'OLD-correlated on the basis parent column').to.match(/old\b/i);
+			expect(delSql, 'no UPDATE short-circuit guard on DELETE').to.not.match(/new\b/i);
+
+			// UPDATE form: same NOT EXISTS wrapped in the `(OLD.p = NEW.p …) or …` short-circuit, masked to UPDATE.
+			const upd = collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE);
+			expect(upd.length).to.equal(1);
+			expect(upd[0].operations, 'UPDATE mask').to.equal(RowOpFlag.UPDATE);
+			const updSql = astToString(upd[0].expr);
+			expect(updSql, 'NOT EXISTS retained').to.match(/not exists/i);
+			expect(updSql, 'OLD = NEW short-circuit guard').to.match(/old\.\w+\s*=\s*new\.\w+/i);
+			expect(updSql, 'disjoined with `or`').to.match(/\bor\b/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a non-referenced parent returns [] for both ops', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table solo (id integer primary key, v integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table solo (id integer primary key, v integer) }');
+			await db.exec('apply schema x');
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'solo'), db.schemaManager, RowOpFlag.DELETE)).to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'solo'), db.schemaManager, RowOpFlag.UPDATE)).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('composes with the child side — both directions enforce on the same schema', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkLens(db);
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			// Child side: a dangling insert ABORTs.
+			await expectThrows(() => db.exec('insert into x.child (id, pid) values (10, 99)'), /constraint|foreign|fk_/i);
+			// A satisfying child lands.
+			await db.exec('insert into x.child (id, pid) values (11, 1)');
+			// Parent side: deleting the now-referenced parent ABORTs.
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk_/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 1 }]);
 		} finally {
 			await db.close();
 		}

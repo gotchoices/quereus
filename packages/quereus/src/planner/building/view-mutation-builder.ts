@@ -2,7 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
-import type { RowConstraintSchema } from '../../schema/table.js';
+import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
 import { analyzeMultiSourceInsert, isJoinBody } from '../mutation/multi-source.js';
@@ -10,7 +10,7 @@ import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/dec
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { collectMutationTags } from '../mutation/mutation-tags.js';
-import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints, collectLensSetLevelConstraints, hasCommitTimeSetLevelObligation } from '../mutation/lens-enforcement.js';
+import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints, collectLensParentSideForeignKeyConstraints, collectLensSetLevelConstraints, hasCommitTimeSetLevelObligation } from '../mutation/lens-enforcement.js';
 import { ConflictResolution } from '../../common/constants.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -83,10 +83,21 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// same seam as a deferred `(select count(*) … ) <= 1` count-subquery CHECK over
 	// the logical key columns — auto-deferred to commit, where a duplicate logical
 	// key sees count ≥ 2 ⇒ ABORT. DELETE writes no NEW row and can introduce no
-	// duplicate, so none of the three classes apply there.
+	// duplicate, so the three child/write classes do not apply there.
+	// Lens parent-side FK enforcement (the cross-slot dual of the child-side FK): a
+	// delete/update of a logical *parent* through the lens runs the RESTRICT existence
+	// check against the logical *child*, synthesized as a deferred `NOT EXISTS` and
+	// routed through the same seam — gated on `foreign_keys`. It fires on DELETE and
+	// UPDATE (the only ops that can orphan a child), so it is the *sole* extra for a
+	// delete and joins the row-local/child-FK/set-level list (UPDATE-masked) otherwise.
 	const extraConstraints = req.op === 'delete'
-		? []
-		: [...lensRowLocalConstraints(ctx, view), ...lensForeignKeyConstraints(ctx, view), ...lensSetLevelConstraints(ctx, view)];
+		? lensParentSideForeignKeyConstraints(ctx, view, RowOpFlag.DELETE)
+		: [
+			...lensRowLocalConstraints(ctx, view),
+			...lensForeignKeyConstraints(ctx, view),
+			...lensSetLevelConstraints(ctx, view),
+			...lensParentSideForeignKeyConstraints(ctx, view, RowOpFlag.UPDATE),
+		];
 	const children = baseOps.map(op => buildBaseOp(ctx, op, extraConstraints));
 
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
@@ -188,6 +199,26 @@ function lensForeignKeyConstraints(ctx: PlanningContext, view: MutableViewLike):
 	if (!ctx.db.options.getBooleanOption('foreign_keys')) return [];
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	return slot ? collectLensForeignKeyConstraints(slot, ctx.schemaManager) : [];
+}
+
+/**
+ * The lens **parent-side** FK non-existence constraints for a view-mediated
+ * delete/update, or `[]` when the target is not a lens-backed logical table or the
+ * `foreign_keys` pragma is off. The target view's slot is the FK *parent*; the
+ * collector discovers logical FKs on *other* slots that reference it and synthesizes
+ * a deferred `NOT EXISTS` over the logical child per RESTRICT (`operation` selects the
+ * DELETE vs UPDATE form). Pragma-gated symmetrically with {@link lensForeignKeyConstraints}
+ * — the lens enforces parent-side FKs under the same switch as the physical
+ * `buildParentSideFKChecks`.
+ */
+function lensParentSideForeignKeyConstraints(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	operation: RowOpFlag.DELETE | RowOpFlag.UPDATE,
+): RowConstraintSchema[] {
+	if (!ctx.db.options.getBooleanOption('foreign_keys')) return [];
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	return slot ? collectLensParentSideForeignKeyConstraints(slot, ctx.schemaManager, operation) : [];
 }
 
 /**
@@ -545,10 +576,12 @@ function qualifiedTable(schema: string, table: string): string {
 
 /**
  * Re-plan one base op through the matching base-table builder. `extraConstraints`
- * carries the lens row-local CHECKs (basis terms) to merge into the insert/update
- * pipeline; a delete needs none. For the single-source spine there is exactly one
- * base op, so the constraints route unambiguously onto it; multi-source put
- * fan-out (which would route per member) is a later phase and is write-rejected
+ * carries the lens-routed CHECKs (basis terms) to merge into the per-row check
+ * pipeline: row-local / child-FK / set-level for insert+update, and the parent-side
+ * FK `NOT EXISTS` for update **and delete** (a delete can orphan a logical child, so
+ * the delete base op now threads them too). For the single-source spine there is
+ * exactly one base op, so the constraints route unambiguously onto it; multi-source
+ * put fan-out (which would route per member) is a later phase and is write-rejected
  * upstream, so the constraints never reach an ambiguous fan-out here.
  */
 function buildBaseOp(ctx: PlanningContext, op: BaseOp, extraConstraints: ReadonlyArray<RowConstraintSchema>): PlanNode {
@@ -558,6 +591,6 @@ function buildBaseOp(ctx: PlanningContext, op: BaseOp, extraConstraints: Readonl
 		case 'update':
 			return buildUpdateStmt(ctx, op.statement as AST.UpdateStmt, extraConstraints);
 		case 'delete':
-			return buildDeleteStmt(ctx, op.statement as AST.DeleteStmt);
+			return buildDeleteStmt(ctx, op.statement as AST.DeleteStmt, extraConstraints);
 	}
 }
