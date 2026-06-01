@@ -201,6 +201,32 @@ select pid, label from pc_parent order by pid;
 select cid, note, label from pc_jv order by cid;
 → [{"cid":1,"note":"B","label":"PY"},{"cid":2,"note":"B","label":"PY"},{"cid":3,"note":"b","label":"P20"}]
 
+-- BOTH-sides predicate clash through a view whose BODY carries its own WHERE.
+-- The capture's identifying predicate is (user WHERE ∧ body WHERE), evaluated
+-- BEFORE any base op mutates, so the body filter applies to the pre-mutation image.
+-- bw_child 2 is hidden (active=0) yet shares parent pid 10 with the visible cid 1:
+-- the capture pins per-CHILD-PK (only cid 1), so the FK-parent op rewriting `label`
+-- on pid 10 leaves cid 2's note untouched even though both children share that parent.
+create table bw_parent (pid integer primary key, label text);
+create table bw_child (cid integer primary key, pref integer, note text, active integer,
+    foreign key (pref) references bw_parent(pid));
+insert into bw_parent values (10, 'P10'), (20, 'P20');
+insert into bw_child values (1, 10, 'a', 1), (2, 10, 'a', 0), (3, 20, 'b', 1);
+create view bw_jv as
+    select c.cid as cid, c.note as note, p.label as label
+    from bw_child c join bw_parent p on p.pid = c.pref
+    where c.active = 1;
+
+update bw_jv set note = 'B', label = 'PY' where label = 'P10';
+-- Visible row matching label='P10' is only cid 1; cid 2 (active=0) is outside the
+-- body filter so it is not captured and keeps note 'a'.
+select cid, note from bw_child order by cid;
+→ [{"cid":1,"note":"B"},{"cid":2,"note":"a"},{"cid":3,"note":"b"}]
+select pid, label from bw_parent order by pid;
+→ [{"pid":10,"label":"PY"},{"pid":20,"label":"P20"}]
+select cid, note, label from bw_jv order by cid;
+→ [{"cid":1,"note":"B","label":"PY"},{"cid":3,"note":"b","label":"P20"}]
+
 -- ===================================
 -- Multi-source rejections (still diagnosed-and-rejected this phase).
 -- ===================================
