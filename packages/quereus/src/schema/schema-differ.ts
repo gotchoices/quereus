@@ -151,7 +151,7 @@ export function computeSchemaDiff(
 	// rather than being masked by a rename conflict. Sites per Decision 3:
 	// table → physical-table (also the basis-table/advertisement position),
 	// column → physical-column, view / materialized view → view-ddl,
-	// index → physical-index, named constraint → physical-constraint.
+	// index → physical-index, table constraint (named or not) → physical-constraint.
 	// Assertions carry no `tags` field (no site). The rename hints
 	// (quereus.id / quereus.previous_name) are first-class specs valid at each of
 	// these physical sites; an MV's hint validates (over-permissive: the differ
@@ -166,7 +166,15 @@ export function computeSchemaDiff(
 					tagDiagnostics.push(...validateReservedTags(col.tags, 'physical-column'));
 				}
 				for (const c of item.tableStmt.constraints ?? []) {
-					if (c.name) tagDiagnostics.push(...validateReservedTags(c.tags, 'physical-constraint'));
+					// Validate every table constraint's tags, named or not. A table-level
+					// constraint consumes a trailing `WITH TAGS` unconditionally (the
+					// parser only defers it to the column for *unnamed inline column*
+					// constraints), so an unnamed table constraint CAN carry a reserved
+					// tag — gating validation on `c.name` would leave a typo there as a
+					// silent no-op, the exact escape the unified hard-error posture
+					// exists to close. Rename detection still keys off named constraints
+					// only; this is validation-only and harmless on unnamed ones.
+					tagDiagnostics.push(...validateReservedTags(c.tags, 'physical-constraint'));
 				}
 				break;
 			case 'declaredView':

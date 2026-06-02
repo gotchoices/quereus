@@ -270,5 +270,30 @@ describe('Schema Differ', () => {
 			);
 			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
 		});
+
+		it('throws on a typo in an UNNAMED table-constraint tag (table-level WITH TAGS is consumed even unnamed)', () => {
+			// A table-level constraint consumes its trailing `WITH TAGS` whether or
+			// not it is named, so an unnamed constraint can carry a reserved tag.
+			// Validation must not gate on the constraint name, else a typo here is a
+			// silent no-op — the exact escape the unified hard-error posture closes.
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key, a integer, b integer, unique (a, b) with tags ("quereus.update.taget" = 'x') } }`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /unknown reserved tag/i);
+		});
+
+		it('surfaces a tag typo BEFORE a rename conflict (validation precedes rename resolution)', () => {
+			// Determinism guarantee: when a schema carries BOTH a reserved-tag typo
+			// AND a rename conflict (declared name and previous_name resolving to two
+			// distinct actuals), the tag error must win — tag validation runs before
+			// the throw-y rename resolution. Without that ordering this would throw
+			// the rename-conflict error instead.
+			const declared = parseDeclaredSchema(
+				`declare schema main { table customer { id integer primary key, name text with tags ("quereus.taget" = 'oops') } with tags ("quereus.previous_name" = 'client') }`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog([catalogTable('client', 'id'), catalogTable('customer', 'id')])))
+				.to.throw(QuereusError, /unknown reserved tag/i);
+		});
 	});
 });
