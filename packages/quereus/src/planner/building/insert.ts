@@ -383,6 +383,14 @@ export function buildInsertStmt(
 	 * built exactly as for an ordinary insert.
 	 */
 	preBuiltSource?: RelationalPlanNode,
+	/**
+	 * Whether this insert is the basis-table spine of a write routed through a lens
+	 * view (the view-mutation builder sets it when the target view resolves to a lens
+	 * slot). Threaded onto the {@link DmlExecutorNode} so the runtime parent-side
+	 * **logical** FK machinery fires only for lens-routed writes — see that node's
+	 * `lensRouted` field. Default `false` for ordinary base-table inserts.
+	 */
+	lensRouted = false,
 ): PlanNode {
 	// Apply schema path from statement if present
 	const contextWithSchemaPath = stmt.schemaPath
@@ -658,7 +666,8 @@ export function buildInsertStmt(
 		mutationContextValues.size > 0 ? mutationContextValues : undefined,
 		contextAttributes.length > 0 ? contextAttributes : undefined,
 		contextDescriptor,
-		upsertClausePlans
+		upsertClausePlans,
+		lensRouted
 	);
 
 	const resultNode: RelationalPlanNode = dmlExecutorNode;

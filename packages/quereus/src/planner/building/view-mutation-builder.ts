@@ -133,8 +133,15 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// (sharing the one capture descriptor) into each op's planning `cteNodes`. Non
 	// multi-source paths build no capture, so this is a no-op there.
 	const injectKeyRef = !!keyCapture;
+	// A write through a *lens* view (a lens slot exists for it) is the only view-mutation
+	// the runtime parent-side **logical** FK machinery applies to — the same predicate the
+	// lens*Constraints collectors above use. Plain updatable view / MV write-through lowers
+	// to a basis write too, but has no lens slot ⇒ `lensRouted = false` ⇒ basis-only FK
+	// semantics. Threaded onto each single-source-spine base op's DmlExecutorNode so the
+	// runtime can distinguish a lens-routed basis write from a basis-direct one.
+	const isLensWrite = !!ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	const children = baseOps.map(op =>
-		buildBaseOp(injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx, op, extraConstraints));
+		buildBaseOp(injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx, op, extraConstraints, isLensWrite));
 
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
 	// RETURNING onto its base op (it now plans to a relational ReturningNode the
@@ -415,6 +422,10 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 			schemaPath: stmt.schemaPath,
 			loc: stmt.loc,
 		};
+		// Leaves `lensRouted = false` (default): a multi-source parent resolves to no
+		// single basis spine, so the runtime parent-side cascade reverse-map never matches
+		// it — the marker would have no effect. The single-source spine (`buildBaseOp`) is
+		// the only place it is load-bearing. Do not "fix" this omission.
 		return buildInsertStmt(ctx, sideInsert, [], source);
 	});
 
@@ -557,6 +568,9 @@ function buildDecompositionMemberInsert(
 	// Lens row-local CHECK enforcement on a decomposition insert is deferred (the
 	// logical check cannot be unambiguously routed to a single member's basis terms);
 	// matches the multi-source insert path, which also passes no extra constraints.
+	// Leaves `lensRouted = false` (default) for the same reason as the multi-source
+	// path: a decomposition parent has no single basis spine for the runtime parent-side
+	// cascade reverse-map to match, so the marker is moot here. Do not "fix" this.
 	return buildInsertStmt(ctx, memberInsert, [], projectedSource);
 }
 
@@ -640,13 +654,18 @@ function qualifiedTable(schema: string, table: string): string {
  * put fan-out (which would route per member) is a later phase and is write-rejected
  * upstream, so the constraints never reach an ambiguous fan-out here.
  */
-function buildBaseOp(ctx: PlanningContext, op: BaseOp, extraConstraints: ReadonlyArray<RowConstraintSchema>): PlanNode {
+function buildBaseOp(
+	ctx: PlanningContext,
+	op: BaseOp,
+	extraConstraints: ReadonlyArray<RowConstraintSchema>,
+	lensRouted: boolean,
+): PlanNode {
 	switch (op.op) {
 		case 'insert':
-			return buildInsertStmt(ctx, op.statement as AST.InsertStmt, extraConstraints);
+			return buildInsertStmt(ctx, op.statement as AST.InsertStmt, extraConstraints, undefined, lensRouted);
 		case 'update':
-			return buildUpdateStmt(ctx, op.statement as AST.UpdateStmt, extraConstraints);
+			return buildUpdateStmt(ctx, op.statement as AST.UpdateStmt, extraConstraints, lensRouted);
 		case 'delete':
-			return buildDeleteStmt(ctx, op.statement as AST.DeleteStmt, extraConstraints);
+			return buildDeleteStmt(ctx, op.statement as AST.DeleteStmt, extraConstraints, lensRouted);
 	}
 }

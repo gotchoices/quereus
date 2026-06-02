@@ -34,6 +34,14 @@ export function buildDeleteStmt(
    * the logical child (see `planner/mutation/lens-enforcement.ts`).
    */
   additionalConstraints: ReadonlyArray<RowConstraintSchema> = [],
+  /**
+   * Whether this delete is the basis-table spine of a write routed through a lens
+   * view (the view-mutation builder sets it when the target view resolves to a lens
+   * slot). Threaded onto the {@link DmlExecutorNode} so the runtime parent-side
+   * **logical** FK machinery fires only for lens-routed writes — see that node's
+   * `lensRouted` field. Default `false` for ordinary base-table deletes.
+   */
+  lensRouted = false,
 ): PlanNode {
   // Block DML on committed pseudo-schema
   if (isCommittedSchemaRef(stmt.table.schema)) {
@@ -210,7 +218,9 @@ export function buildDeleteStmt(
     undefined, // onConflict not used for DELETE
     mutationContextValues.size > 0 ? mutationContextValues : undefined,
     contextAttributes.length > 0 ? contextAttributes : undefined,
-    contextDescriptor
+    contextDescriptor,
+    undefined, // upsertClauses — DELETE has none
+    lensRouted
   );
 
   const resultNode: RelationalPlanNode = dmlExecutorNode;

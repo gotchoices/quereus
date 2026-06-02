@@ -33,6 +33,14 @@ export function buildUpdateStmt(
    * for ordinary updates.
    */
   extraConstraints: ReadonlyArray<RowConstraintSchema> = [],
+  /**
+   * Whether this update is the basis-table spine of a write routed through a lens
+   * view (the view-mutation builder sets it when the target view resolves to a lens
+   * slot). Threaded onto the {@link DmlExecutorNode} so the runtime parent-side
+   * **logical** FK machinery fires only for lens-routed writes — see that node's
+   * `lensRouted` field. Default `false` for ordinary base-table updates.
+   */
+  lensRouted = false,
 ): PlanNode {
   // Block DML on committed pseudo-schema
   if (isCommittedSchemaRef(stmt.table.schema)) {
@@ -362,7 +370,9 @@ export function buildUpdateStmt(
       undefined, // onConflict — UPDATE has no statement-level OR clause
       mutationContextValues.size > 0 ? mutationContextValues : undefined,
       contextAttributes.length > 0 ? contextAttributes : undefined,
-      contextDescriptor
+      contextDescriptor,
+      undefined, // upsertClauses — UPDATE has none
+      lensRouted
     );
 
     // Return the RETURNING results from the executed update
@@ -409,7 +419,9 @@ export function buildUpdateStmt(
     undefined, // onConflict — UPDATE has no statement-level OR clause
     mutationContextValues.size > 0 ? mutationContextValues : undefined,
     contextAttributes.length > 0 ? contextAttributes : undefined,
-    contextDescriptor
+    contextDescriptor,
+    undefined, // upsertClauses — UPDATE has none
+    lensRouted
   );
 
   return new SinkNode(updateCtx.scope, updateExecutorNode, 'update');

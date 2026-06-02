@@ -49,6 +49,20 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     public readonly contextAttributes?: Attribute[], // Mutation context attributes
     public readonly contextDescriptor?: RowDescriptor, // Mutation context row descriptor
     public readonly upsertClauses?: UpsertClausePlan[], // UPSERT clause plans for INSERT operations
+    /**
+     * Plan-time marker: this executor is the basis-table spine of a write *routed
+     * through a lens view* (set by the view-mutation builder when the target view
+     * resolves to a lens slot). The runtime **parent-side logical FK** machinery —
+     * the lens cascade walker, the lens RESTRICT pre-check, and the divergent-basis-FK
+     * suppression — fires ONLY when this is true, so a basis-direct write bears solely
+     * its physical (basis-declared) FK semantics. This makes the runtime side
+     * consistent with the plan-time lens RESTRICT collector and the logical CHECK
+     * collector, which already attach at the lens boundary only. Default `false`:
+     * ordinary base-table DML, a plain updatable view / MV write-through (no lens
+     * slot), and the multi-source / decomposition insert fan-out (no single basis
+     * spine) all leave it unset.
+     */
+    public readonly lensRouted: boolean = false,
   ) {
     super(scope);
   }
@@ -86,7 +100,8 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       return this;
     }
 
-    // Create new instance
+    // Create new instance. lensRouted MUST be carried forward, or the optimizer
+    // drops the lens-routed parent-side FK semantics on any node rebuild.
     return new DmlExecutorNode(
       this.scope,
       newSource,
@@ -96,7 +111,8 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       this.mutationContextValues,
       this.contextAttributes,
       this.contextDescriptor,
-      this.upsertClauses
+      this.upsertClauses,
+      this.lensRouted
     );
   }
 
@@ -117,6 +133,10 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
 
     if (this.onConflict) {
       props.onConflict = this.onConflict;
+    }
+
+    if (this.lensRouted) {
+      props.lensRouted = true;
     }
 
     if (this.upsertClauses && this.upsertClauses.length > 0) {

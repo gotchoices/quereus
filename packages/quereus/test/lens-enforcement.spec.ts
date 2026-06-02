@@ -33,6 +33,15 @@ import {
 } from '../src/schema/lens-fk-discovery.js';
 import { resolveSlotBasisSource } from '../src/schema/lens-prover.js';
 import type { LensSlot } from '../src/schema/lens.js';
+import { Parser } from '../src/parser/parser.js';
+import { BuildTimeDependencyTracker, type PlanningContext } from '../src/planner/planning-context.js';
+import { GlobalScope } from '../src/planner/scopes/global.js';
+import { ParameterScope } from '../src/planner/scopes/param.js';
+import { buildDeleteStmt } from '../src/planner/building/delete.js';
+import { PlanNodeType } from '../src/planner/nodes/plan-node-type.js';
+import type { DmlExecutorNode } from '../src/planner/nodes/dml-executor-node.js';
+import { isRelationalNode, type PlanNode } from '../src/planner/nodes/plan-node.js';
+import type * as AST from '../src/parser/ast.js';
 
 async function expectThrows(fn: () => Promise<unknown>, matcher?: RegExp): Promise<void> {
 	let threw = false;
@@ -2771,6 +2780,232 @@ describe('lens enforcement: parent-side FK RESTRICT over a non-restrict basis (r
 			await db.exec('delete from x.parent where id = 1');
 			expect(await rows(db, 'select count(*) as n from x.parent'), 'parent deleted').to.deep.equal([{ n: 0 }]);
 			expect(await rows(db, 'select count(*) as n from x.mid'), 'mid cascade-deleted').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens enforcement: parent-side FK is lens-routed-only (basis-direct DML bears only basis FKs)', () => {
+	// The runtime parent-side *logical* FK machinery (the cascade walker, the lens RESTRICT
+	// pre-check, and the divergent-basis-FK suppression) is keyed off a plan-time `lensRouted`
+	// marker, so it fires ONLY for a write routed through the lens view — never for a write
+	// straight to the basis table. This makes the runtime side consistent with the plan-time
+	// lens RESTRICT collector and logical CHECK, which already attach at the lens boundary only.
+
+	/** Canonical cascade shape: the basis carries NO FK; the action lives only on the logical FK. */
+	async function deployCascadeLens(db: Database, fkTail: string): Promise<void> {
+		await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+		await db.exec('apply schema y');
+		await db.exec(`declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) ${fkTail}) }`);
+		await db.exec('apply schema x');
+	}
+
+	/** Divergent shape: basis child carries action `B`, logical child re-declares it with `L ≠ B`. */
+	async function deployDivergentLens(db: Database, basisFkTail: string, logicalFkTail: string): Promise<void> {
+		await db.exec(`declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) ${basisFkTail}) }`);
+		await db.exec('apply schema y');
+		await db.exec(`declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) ${logicalFkTail}) }`);
+		await db.exec('apply schema x');
+	}
+
+	/** RESTRICT-over-non-restrict-basis shape: basis non-restrict FK, logical FK bare ⇒ RESTRICT. */
+	async function deployRestrictOverBasis(db: Database, basisFkTail: string): Promise<void> {
+		await db.exec(`declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) ${basisFkTail}) }`);
+		await db.exec('apply schema y');
+		await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+		await db.exec('apply schema x');
+	}
+
+	/** Depth-first search for the first DmlExecutorNode in a plan subtree. */
+	function findDmlExecutor(node: PlanNode): DmlExecutorNode | undefined {
+		if (node.nodeType === PlanNodeType.UpdateExecutor) return node as DmlExecutorNode;
+		for (const child of node.getChildren()) {
+			const found = findDmlExecutor(child);
+			if (found) return found;
+		}
+		return undefined;
+	}
+
+	it('CASCADE does NOT fire on a basis-direct delete (the headline gap); the same delete through the lens cascades', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, 'on delete cascade');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (20, 2)');
+
+			// Basis-direct: delete y.parent(1). The basis has no FK and the logical cascade is
+			// gated off ⇒ the child survives (orphaned), NOT cascade-deleted.
+			await db.exec('delete from y.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from y.child where id = 10'), 'basis child survives a basis-direct parent delete').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10'), 'lens view reflects the surviving basis child').to.deep.equal([{ n: 1 }]);
+
+			// Contrast — the same delete through the lens DOES cascade.
+			await db.exec('delete from x.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from x.child where id = 20'), 'lens-routed delete cascades the child away').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from y.child where id = 20'), 'basis child cascade-deleted too').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('CASCADE still fires through the lens (unchanged-path regression guard)', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, 'on delete cascade');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'lens cascade still removes the children').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('runtime lens RESTRICT does NOT fire on a basis-direct delete (the basis action governs instead)', async () => {
+		const db = new Database();
+		try {
+			// Logical RESTRICT over a basis `on delete cascade`.
+			await deployRestrictOverBasis(db, 'on delete cascade on update cascade');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+
+			// Through the lens, the RESTRICT pre-check ABORTs the referenced parent delete.
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent survives the lens RESTRICT').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10'), 'child survives the lens RESTRICT').to.deep.equal([{ n: 1 }]);
+
+			// Basis-direct: the lens RESTRICT pre-check is gated off, so the parent delete
+			// succeeds and the *basis* CASCADE fires per the basis action.
+			await db.exec('delete from y.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from y.parent where id = 1'), 'basis-direct delete succeeds (no lens RESTRICT)').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from y.child where id = 10'), 'basis CASCADE removed the child').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('divergent-suppression soundness — a basis-direct delete applies the basis action (not suppressed into a no-op)', async () => {
+		const db = new Database();
+		try {
+			// Logical SET NULL over basis CASCADE: through the lens the logical action wins
+			// (suppressing the basis CASCADE), but a basis-direct write must NOT be suppressed.
+			await deployDivergentLens(db, 'on delete cascade on update cascade', 'on delete set null on update set null');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (20, 2)');
+
+			// Through the lens: logical SET NULL wins ⇒ child 10 nulled, not deleted.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'lens-routed delete: logical SET NULL wins').to.deep.equal([{ id: 10, pid: null }]);
+
+			// Basis-direct: the divergent suppression is gated off ⇒ the basis CASCADE applies
+			// and deletes the child. This is the soundness hole the lensRouted gate closes:
+			// without it, the basis FK would be suppressed yet the lens walker also gated off,
+			// leaving NO action at all (an orphaned survivor).
+			await db.exec('delete from y.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from x.child where id = 20'), 'basis-direct delete applies the basis CASCADE (physical FK no longer suppressed)').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from y.child where id = 20')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE — cascade lens: a basis-direct re-key does not cascade; the same re-key through the lens does', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, 'on update cascade');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (20, 2)');
+
+			// Lens-routed re-key cascades the child FK.
+			await db.exec('update x.parent set id = 9 where id = 2');
+			expect(await rows(db, 'select id, pid from x.child where id = 20'), 'lens-routed re-key cascades the child FK').to.deep.equal([{ id: 20, pid: 9 }]);
+
+			// Basis-direct re-key: no FK on the basis and the lens cascade gated off ⇒ the child
+			// FK is left untouched (now dangling).
+			await db.exec('update y.parent set id = 7 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'basis-direct re-key does not cascade the child').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE — divergent lens: a basis-direct re-key applies the basis CASCADE; the same re-key through the lens applies the logical SET NULL', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentLens(db, 'on delete cascade on update cascade', 'on delete set null on update set null');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (20, 2)');
+
+			// Lens-routed re-key: logical SET NULL wins ⇒ child 10 nulled (not re-keyed).
+			await db.exec('update x.parent set id = 8 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'lens-routed re-key: logical SET NULL wins').to.deep.equal([{ id: 10, pid: null }]);
+
+			// Basis-direct re-key: the divergent suppression is gated off ⇒ the basis CASCADE
+			// re-keys the child FK.
+			await db.exec('update y.parent set id = 9 where id = 2');
+			expect(await rows(db, 'select id, pid from x.child where id = 20'), 'basis-direct re-key applies the basis CASCADE (not suppressed)').to.deep.equal([{ id: 20, pid: 9 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('transitive — a lens-routed parent delete cascades through a logical grandchild; a basis-direct one does not', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (id integer primary key); table child (id integer primary key, pid integer null); table grandchild (id integer primary key, cid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete cascade); table grandchild (id integer primary key, cid integer null, constraint fk_g foreign key (cid) references child(id) on delete cascade) }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.parent (id) values (1), (2)');
+			await db.exec('insert into x.child (id, pid) values (10, 1), (20, 2)');
+			await db.exec('insert into x.grandchild (id, cid) values (100, 10), (200, 20)');
+
+			// Lens-routed: the re-entry path fires the next level's logical cascade, all the way down.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10'), 'child cascade-deleted').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.grandchild where id = 100'), 'grandchild cascade-deleted transitively').to.deep.equal([{ n: 0 }]);
+
+			// Basis-direct: no logical-only FK fires at any level ⇒ child and grandchild survive.
+			await db.exec('delete from y.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from y.child where id = 20'), 'child survives a basis-direct parent delete').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select count(*) as n from y.grandchild where id = 200'), 'grandchild untouched (logical-only FK does not fire basis-direct)').to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('plan-node regression: a lens-routed delete sets lensRouted, and DmlExecutorNode.withChildren preserves it', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, 'on delete cascade');
+
+			// Plan a delete through the lens parent (without executing) and locate the basis-spine
+			// DmlExecutorNode — it must carry the plan-time lensRouted marker.
+			const ctx: PlanningContext = {
+				db,
+				schemaManager: db.schemaManager,
+				parameters: {},
+				scope: new ParameterScope(new GlobalScope(db.schemaManager)),
+				cteNodes: new Map(),
+				schemaDependencies: new BuildTimeDependencyTracker(),
+				schemaCache: new Map(),
+				cteReferenceCache: new Map(),
+				outputScopes: new Map(),
+			};
+			const ast = new Parser().parseAll('delete from x.parent where id = 1')[0] as AST.DeleteStmt;
+			const exec = findDmlExecutor(buildDeleteStmt(ctx, ast));
+			expect(exec, 'a DmlExecutorNode is present in the lens-routed plan').to.not.equal(undefined);
+			expect(exec!.lensRouted, 'lens-routed basis delete carries the marker').to.equal(true);
+			expect(exec!.getLogicalAttributes().lensRouted, 'marker surfaced for debug visibility').to.equal(true);
+
+			// withChildren rebuild (a distinct relational child) must carry the marker forward —
+			// else the optimizer would drop the lens-routed FK semantics on any node rebuild.
+			const innerChild = exec!.source.getChildren()[0];
+			expect(isRelationalNode(innerChild), 'inner child is relational').to.equal(true);
+			const rebuilt = exec!.withChildren([innerChild]) as DmlExecutorNode;
+			expect(rebuilt, 'withChildren produced a new instance').to.not.equal(exec);
+			expect(rebuilt.lensRouted, 'lensRouted survives a withChildren rebuild').to.equal(true);
 		} finally {
 			await db.close();
 		}

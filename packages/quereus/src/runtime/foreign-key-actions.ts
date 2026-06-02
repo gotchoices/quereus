@@ -28,6 +28,10 @@ const log = createLogger('runtime:fk-actions');
  * @param operation 'delete' or 'update'
  * @param oldRow The old row values from the parent table
  * @param newRow The new row values (undefined for delete)
+ * @param lensRouted Whether this basis write was routed through a lens view. The
+ *   divergent-basis-FK suppression (a logical FK overriding the physical basis action)
+ *   applies ONLY then; a basis-direct write (`false`) bears its physical basis FK action
+ *   unsuppressed — see {@link executeForeignKeyActionsAndLens}.
  * @param visitedTables Set of table names already visited (for cycle detection)
  */
 export async function executeForeignKeyActions(
@@ -36,6 +40,7 @@ export async function executeForeignKeyActions(
 	operation: 'delete' | 'update',
 	oldRow: Row,
 	newRow?: Row,
+	lensRouted = false,
 	visitedTables?: Set<string>,
 ): Promise<void> {
 	if (!db.options.getBooleanOption('foreign_keys')) return;
@@ -53,8 +58,12 @@ export async function executeForeignKeyActions(
 
 	// Basis FKs a divergent non-RESTRICT logical FK overrides — their physical action is
 	// suppressed here so the logical action (fired by the lens walker) governs alone.
-	// Cheap-empty when no lens slot is backed by `parentTable` (the common non-lens case).
-	const suppressed = basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager);
+	// ONLY for a lens-routed write: a basis-direct write bears no logical FK semantics, so
+	// its physical basis action must run unsuppressed (else the cascade is dropped entirely
+	// once the lens walker is gated off). Cheap-empty otherwise.
+	const suppressed = lensRouted
+		? basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager)
+		: new Set<ForeignKeyConstraintSchema>();
 
 	try {
 		// Find all child tables with FKs referencing this parent
@@ -106,8 +115,12 @@ export async function executeForeignKeyActions(
  * and then the logical dual {@link executeLensForeignKeyActions} (the same actions
  * over a *logical* FK that lives only on a lens slot's `enforced-fk` obligation). A
  * single wrapper keeps the two sites from drifting — wherever a basis row write fires
- * physical FK actions, the logical cascade fires too. The lens half is a cheap early
- * return when `foreign_keys` is off or no lens slot is backed by `parentTable`.
+ * physical FK actions, the logical cascade fires too. The physical half is unconditional;
+ * the logical half fires ONLY for a write routed through a lens view (`lensRouted`), so a
+ * basis-direct write bears solely its physical (basis-declared) FK semantics — consistent
+ * with the plan-time lens RESTRICT collector and logical CHECK, which attach at the lens
+ * boundary only. The lens half is a further cheap early return when `foreign_keys` is off
+ * or no lens slot is backed by `parentTable`.
  */
 export async function executeForeignKeyActionsAndLens(
 	db: Database,
@@ -115,9 +128,12 @@ export async function executeForeignKeyActionsAndLens(
 	operation: 'delete' | 'update',
 	oldRow: Row,
 	newRow?: Row,
+	lensRouted = false,
 ): Promise<void> {
-	await executeForeignKeyActions(db, parentTable, operation, oldRow, newRow);
-	await executeLensForeignKeyActions(db, parentTable, operation, oldRow, newRow);
+	await executeForeignKeyActions(db, parentTable, operation, oldRow, newRow, lensRouted);
+	if (lensRouted) {
+		await executeLensForeignKeyActions(db, parentTable, operation, oldRow, newRow);
+	}
 }
 
 /**
@@ -141,6 +157,17 @@ export async function executeForeignKeyActionsAndLens(
  *      child's projected new row.
  *   3. Cycle detection via a `visited` set keyed by
  *      `${schemaName}.${tableName}` (matches the existing walker's key).
+ *
+ * `lensRouted` gates the two *logical* FK steps: the lens RESTRICT pre-check (step 1b)
+ * and the divergent-basis-FK suppression (in step 1 and step 2). It is `true` only for a
+ * write routed through a lens view, and is carried UNCHANGED into the recursion: the
+ * nested levels form the transitive closure of *this* write, so a lens-routed top means
+ * the whole closure inherits logical FK semantics. This is required to catch a logical
+ * RESTRICT below an *agreeing* basis cascade — that basis cascade runs as a basis-direct
+ * write at runtime (which never fires the deeper lens RESTRICT) and the agreeing lens
+ * cascade is elided (so it never re-enters through the child view either), leaving this
+ * pre-walk as the sole enforcer. A basis-direct top write passes `false`, so the whole
+ * recursion stays basis-only.
  */
 export async function assertTransitiveRestrictsForParentMutation(
 	db: Database,
@@ -148,9 +175,10 @@ export async function assertTransitiveRestrictsForParentMutation(
 	operation: 'delete' | 'update',
 	oldRow: Row,
 	newRow?: Row,
+	lensRouted = false,
 	visited?: Set<string>,
 ): Promise<void> {
-	log('TRANSITIVE entry: parent=%s op=%s fk-pragma=%o', parentTable.name, operation, db.options.getBooleanOption('foreign_keys'));
+	log('TRANSITIVE entry: parent=%s op=%s lensRouted=%o fk-pragma=%o', parentTable.name, operation, lensRouted, db.options.getBooleanOption('foreign_keys'));
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
 	const visitedSet = visited ?? new Set<string>();
@@ -159,17 +187,24 @@ export async function assertTransitiveRestrictsForParentMutation(
 	visitedSet.add(parentKey);
 
 	try {
-		// Step 1: direct RESTRICT scan for this parent.
+		// Step 1: direct RESTRICT scan for this parent. The divergent-basis-FK suppression
+		// inside it applies only when this top-level write is lens-routed (a basis-direct
+		// write bears its physical basis RESTRICT unsuppressed).
 		log('TRANSITIVE step1: parent=%s op=%s', parentTable.name, operation);
-		await assertNoRestrictedChildrenForParentMutation(db, parentTable, operation, oldRow, newRow);
+		await assertNoRestrictedChildrenForParentMutation(db, parentTable, operation, oldRow, newRow, lensRouted);
 
 		// Step 1b: lens RESTRICT pre-check — the logical dual, keyed off the *logical* FK
 		// action. Fired here (pre-basis-op, riding the same pre-mutation timing) so a logical
 		// RESTRICT over a non-restrict basis FK observes the pre-cascade child state, which a
-		// deferred commit-time `NOT EXISTS` cannot. Direct (non-recursive): transitivity
-		// through basis cascades rides this enclosing walk (a nested basis cascade re-enters
-		// the DML executor and re-fires this walker — and the lens scan — at the next level).
-		await assertLensRestrictsForParentMutation(db, parentTable, operation, oldRow, newRow);
+		// deferred commit-time `NOT EXISTS` cannot. ONLY for a lens-routed write — a logical FK
+		// governs only writes through the lens; a basis-direct write bears no logical RESTRICT.
+		// Direct (non-recursive): transitivity through basis cascades rides this enclosing walk
+		// (a nested basis cascade re-enters the DML executor as a basis-direct write — its own
+		// `lensRouted = false`; a genuine logical cascade re-enters through the child *view* and
+		// gets a fresh `lensRouted = true`, so logical transitivity is preserved either way).
+		if (lensRouted) {
+			await assertLensRestrictsForParentMutation(db, parentTable, operation, oldRow, newRow);
+		}
 
 		// Step 2: recurse through cascading children that would propagate a
 		// referenced-column change. For each FK whose action would rewrite or
@@ -182,8 +217,11 @@ export async function assertTransitiveRestrictsForParentMutation(
 		// Basis cascading FKs a divergent non-RESTRICT logical FK overrides — skip them in
 		// the recursion: the physical cascade they walk will not run (the logical action
 		// replaces it), and the logical action's own transitivity is enforced when its
-		// child-view DML re-enters this walk at the next level.
-		const suppressed = basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager);
+		// child-view DML re-enters this walk at the next level. ONLY for a lens-routed write
+		// (else the basis cascade governs unsuppressed and must be walked).
+		const suppressed = lensRouted
+			? basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager)
+			: new Set<ForeignKeyConstraintSchema>();
 
 		for (const schema of db.schemaManager._getAllSchemas()) {
 			for (const childTable of schema.getAllTables()) {
@@ -270,8 +308,19 @@ export async function assertTransitiveRestrictsForParentMutation(
 								continue;
 							}
 
+							// Recurse carrying the SAME `lensRouted`: the nested levels are the
+							// transitive closure of *this* write, so when the top-level write is
+							// lens-routed every level inherits the logical FK semantics. This is
+							// load-bearing for a logical RESTRICT sitting below an *agreeing*
+							// basis cascade (basis + logical both cascade): at runtime that basis
+							// cascade executes as a basis-direct write — which does NOT fire the
+							// deeper lens RESTRICT — and the agreeing lens cascade is elided, so it
+							// never re-enters through the child view either. The ONLY place that
+							// deeper RESTRICT is caught is this pre-walk recursing with the lens flag
+							// still set. For a basis-direct top-level write `lensRouted` is already
+							// false, so the recursion correctly stays basis-only throughout.
 							await assertTransitiveRestrictsForParentMutation(
-								db, childTable, childOp, childOldRow as Row, childNewRow, visitedSet,
+								db, childTable, childOp, childOldRow as Row, childNewRow, lensRouted, visitedSet,
 							);
 						}
 					} finally {
@@ -299,6 +348,10 @@ export async function assertTransitiveRestrictsForParentMutation(
  * No-op when `foreign_keys` is off, when no FK references this parent table
  * with action `'restrict'`, when any old referenced value is NULL (MATCH SIMPLE),
  * or — for UPDATE — when no referenced parent column changed.
+ *
+ * `lensRouted` gates the divergent-basis-FK suppression: only a write through the lens
+ * lets a divergent non-RESTRICT logical FK override (suppress) the basis RESTRICT. A
+ * basis-direct write (`false`) enforces its physical basis RESTRICT unsuppressed.
  */
 export async function assertNoRestrictedChildrenForParentMutation(
 	db: Database,
@@ -306,6 +359,7 @@ export async function assertNoRestrictedChildrenForParentMutation(
 	operation: 'delete' | 'update',
 	oldRow: Row,
 	newRow?: Row,
+	lensRouted = false,
 ): Promise<void> {
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
@@ -314,8 +368,11 @@ export async function assertNoRestrictedChildrenForParentMutation(
 
 	// Basis RESTRICT FKs a divergent non-RESTRICT logical FK overrides — their RESTRICT
 	// pre-check is suppressed so the parent mutation a logical cascade must complete is
-	// not aborted. Cheap-empty when no lens slot is backed by `parentTable`.
-	const suppressed = basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager);
+	// not aborted. ONLY for a lens-routed write: a basis-direct write bears no logical FK
+	// semantics, so its physical basis RESTRICT must stand unsuppressed. Cheap-empty otherwise.
+	const suppressed = lensRouted
+		? basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager)
+		: new Set<ForeignKeyConstraintSchema>();
 
 	for (const schema of db.schemaManager._getAllSchemas()) {
 		for (const childTable of schema.getAllTables()) {

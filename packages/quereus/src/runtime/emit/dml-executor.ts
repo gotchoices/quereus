@@ -498,7 +498,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					);
 					await maintainRowTimeStructures(ctx, tableKey,
 						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow }, backingConnCache);
-					await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow);
+					await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow, plan.lensRouted);
 
 					if (needsAutoEvents) {
 						const changedColumns: string[] = [];
@@ -537,7 +537,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			const newKeyValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
 			ctx.db._recordUpdate(tableKey, replacedRow, newRow, pkColumnIndicesInSchema);
 			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow }, backingConnCache);
-			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', replacedRow);
+			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', replacedRow, undefined, plan.lensRouted);
 
 			if (needsAutoEvents) {
 				const changedColumns: string[] = [];
@@ -591,6 +591,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// on a violation, throw — runWithStatementSavepoints rolls back the
 			// statement savepoint, unwinding both the eviction and the writing row.
 			// Mirrors the pre-check processDeleteRow runs for a plain DELETE.
+			//
+			// lensRouted = false (the default) on both FK calls: an internal REPLACE
+			// eviction is a physical basis effect (a row at another PK the substrate
+			// removed to resolve a non-PK UNIQUE conflict), not a write through the
+			// lens, so it bears only physical (basis-declared) FK semantics.
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', evicted);
 			const evictedKeyValues = pkColumnIndicesInSchema.map(idx => evicted[idx]);
 			ctx.db._recordDelete(tableKey, evicted, pkColumnIndicesInSchema);
@@ -661,7 +666,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// BEFORE vtab.update — needed for rowid-mode backends (lamina)
 		// where post-mutation OLD-value scans dereference through the
 		// just-mutated parent and find zero rows.
-		await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow);
+		await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
 
 		const args: UpdateArgs = {
 			operation: 'update',
@@ -703,7 +708,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			);
 			await maintainRowTimeStructures(ctx, tableKey,
 				{ op: 'delete', oldRow: result.replacedRow }, backingConnCache);
-			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', result.replacedRow);
+			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', result.replacedRow, undefined, plan.lensRouted);
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...result.replacedRow]);
 			}
@@ -727,7 +732,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			{ op: 'update', oldRow, newRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
-		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, newRow);
+		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
 
 		// Emit auto event for modules without native event support
 		if (needsAutoEvents) {
@@ -798,7 +803,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		// Defense-in-depth RESTRICT enforcement — see comment on the UPDATE
 		// path above.
-		await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow);
+		await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
 
 		const args: UpdateArgs = {
 			operation: 'delete',
@@ -831,7 +836,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			{ op: 'delete', oldRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
-		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', oldRow);
+		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
 
 		// Emit auto event for modules without native event support
 		if (needsAutoEvents) {
