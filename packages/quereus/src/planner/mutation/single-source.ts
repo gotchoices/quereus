@@ -778,6 +778,26 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 	// references must name view columns (a base-only name must not leak through to
 	// the underlying table).
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
+	// View-aware collision guard: two distinct view columns may lower to one base
+	// column (e.g. `select id, b, b+1 as bp` → `set b=5, bp=100`, or a duplicate
+	// rename `b, b as b2` → `set b=1, b2=2`). The base backstop in building/update.ts
+	// would reject these but report the base column twice; detect it here so the
+	// message names both view columns the user actually wrote. Rejected
+	// unconditionally — value-agreement (`set b=5, b2=5`) is not softened.
+	const seenBaseColumns = new Map<string, string>(); // base column (lower) → first view-column spelling
+	const recordBaseColumn = (baseColumn: string, viewColumn: string): void => {
+		const key = baseColumn.toLowerCase();
+		const prior = seenBaseColumns.get(key);
+		if (prior !== undefined) {
+			raiseMutationDiagnostic({
+				reason: 'conflicting-assignment',
+				column: baseColumn,
+				table: view.name,
+				message: `cannot write through view '${view.name}': columns '${prior}' and '${viewColumn}' both target base column '${baseColumn}'; an UPDATE cannot assign one column twice`,
+			});
+		}
+		seenBaseColumns.set(key, viewColumn);
+	};
 	const assignments = stmt.assignments.map(asg => {
 		// Enforce view-column scope on the SET target (an unknown / base-only name is
 		// rejected here; a computed view column is found and surfaces `no-inverse` below).
@@ -796,8 +816,13 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		// base-term substitution). `findViewColumn` above stays the unknown-column guard;
 		// only an opaque `computed` column reaches `requireBaseColumn` (→ `no-inverse`).
 		const site = analysis.writableSites.get(asg.column.toLowerCase());
-		if (site) return { column: site.baseColumn, value: site.inverse ? site.inverse(loweredValue) : loweredValue };
-		return { column: requireBaseColumn(vc), value: loweredValue };
+		if (site) {
+			recordBaseColumn(site.baseColumn, asg.column);
+			return { column: site.baseColumn, value: site.inverse ? site.inverse(loweredValue) : loweredValue };
+		}
+		const baseColumn = requireBaseColumn(vc);
+		recordBaseColumn(baseColumn, asg.column);
+		return { column: baseColumn, value: loweredValue };
 	});
 
 	const userWhere = stmt.where ? transformExpr(stmt.where, substitute, descend) : undefined;

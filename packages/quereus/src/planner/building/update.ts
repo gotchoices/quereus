@@ -121,7 +121,24 @@ export function buildUpdateStmt(
   // IMPORTANT: Build assignments FIRST to ensure parameter indices match SQL text order.
   // SQL: UPDATE t SET col = ?1 WHERE id = ?2
   // The SET clause parameters must be resolved before WHERE clause parameters.
+  // Authoritative backstop against assigning the same base column twice in one
+  // UPDATE. This is the single place that catches all paths — a direct base
+  // UPDATE (`set b=1, b=2`), the single-source lowered statement, and each
+  // multi-source per-member lowered statement — since every lowered view write is
+  // re-planned through here. Keyed on the user SET target name, so it runs before
+  // the appended generated-column assignments (a generated column can't be SET, so
+  // it never collides with a user target). The view spines add a friendlier,
+  // view-aware diagnostic on top of this generic backstop.
+  const seenTargets = new Set<string>();
   const assignments: UpdateAssignment[] = stmt.assignments.map(assign => {
+    const targetKey = assign.column.toLowerCase();
+    if (seenTargets.has(targetKey)) {
+      throw new QuereusError(
+        `duplicate assignment to column '${assign.column}' in UPDATE on '${tableReference.tableSchema.name}'`,
+        StatusCode.ERROR
+      );
+    }
+    seenTargets.add(targetKey);
     // Reject SET on generated columns
     const colIndex = tableReference.tableSchema.columnIndexMap.get(assign.column.toLowerCase());
     if (colIndex !== undefined && tableReference.tableSchema.columns[colIndex].generated) {

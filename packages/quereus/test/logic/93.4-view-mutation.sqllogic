@@ -103,6 +103,51 @@ insert into iv_v (id, bp) values (3, 5);
 -- error: non-invertible
 
 -- ===================================
+-- Conflicting base-column assignments. An UPDATE that lands two SET targets on one
+-- base column is rejected unconditionally (no value-agreement softening), whether
+-- the duplication is direct, via an inverse-vs-base pair (`b`, `b+1 as bp`), or via a
+-- duplicate rename (`b`, `b as b2`). The single-source spine surfaces a view-aware
+-- message naming BOTH colliding view columns; the multi-source (join) spine falls
+-- back to the base builder's generic "duplicate assignment" backstop (which sees only
+-- base names). See docs/view-updateability.md § Diagnostics.
+-- ===================================
+
+create table cfl_t (id integer primary key, b integer null);
+insert into cfl_t values (1, 99), (2, 50);
+
+-- inverse-vs-base: `b` and `b + 1 as bp` both lower to base column b.
+create view cfl_inv as select id, b, b + 1 as bp from cfl_t;
+update cfl_inv set b = 5, bp = 100 where id = 1;
+-- error: both target base column
+
+-- the rejected UPDATE made no change (b stays 99, not last-wins 99 or 5).
+select id, b from cfl_t order by id;
+→ [{"id":1,"b":99},{"id":2,"b":50}]
+
+-- duplicate rename: `b` and `b as b2` both lower to base column b.
+create view cfl_dup as select id, b, b as b2 from cfl_t;
+update cfl_dup set b = 1, b2 = 2 where id = 1;
+-- error: both target base column
+
+-- same-value collision still rejects (documents the no-softening semantics).
+update cfl_dup set b = 5, b2 = 5 where id = 1;
+-- error: both target base column
+
+-- multi-source (join) same-side collision: `note` and `note collate nocase as note2`
+-- both own the child base column note. The join spine routes both to the child's
+-- per-base UPDATE, which the base builder re-plans and rejects via the generic backstop.
+create table cfl_p (pid integer primary key, label text);
+create table cfl_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references cfl_p(pid));
+insert into cfl_p values (1, 'p1');
+insert into cfl_c values (10, 1, 'alpha');
+create view cfl_jv as
+    select c.cid as cid, c.note as note, c.note collate nocase as note2
+    from cfl_c c join cfl_p p on p.pid = c.pref;
+update cfl_jv set note = 'x', note2 = 'y' where cid = 10;
+-- error: duplicate assignment
+
+-- ===================================
 -- Single-source PASSTHROUGH-profile column write-through. `bc = b collate nocase`
 -- and `nc = cast(n as integer)` (a no-op cast, same logical type) are identity-ON-VALUE
 -- projections of pt_t's base columns. The single-source UPDATE path now routes the FULL

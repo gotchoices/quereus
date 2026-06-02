@@ -648,8 +648,28 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 
 	// member relationId → its routed (basisColumn, value) assignments.
 	const perMember = new Map<string, Array<{ column: string; value: AST.Expression }>>();
+	// member relationId → (basis column lower → first view-column spelling). Two
+	// distinct logical columns can route to the same basis column on one member
+	// (e.g. a duplicate rename `b, b as b2`); the per-member UPDATE would then assign
+	// it twice. Reject view-aware so the message names both logical columns. (Cross-
+	// member collisions are impossible — distinct members are distinct tables; a
+	// shared-key target is already rejected in routeAssignment.)
+	const seenPerMember = new Map<string, Map<string, string>>();
 	for (const asg of stmt.assignments) {
 		const routed = routeAssignment(view, shape, asg);
+		let seen = seenPerMember.get(routed.relationId);
+		if (!seen) { seen = new Map<string, string>(); seenPerMember.set(routed.relationId, seen); }
+		const basisKey = routed.basisColumn.toLowerCase();
+		const prior = seen.get(basisKey);
+		if (prior !== undefined) {
+			raiseMutationDiagnostic({
+				reason: 'conflicting-assignment',
+				column: routed.basisColumn,
+				table: view.name,
+				message: `cannot update logical table '${view.name}': columns '${prior}' and '${asg.column}' both target base column '${routed.basisColumn}' on member '${routed.relationId}'; an UPDATE cannot assign one column twice`,
+			});
+		}
+		seen.set(basisKey, asg.column);
 		let list = perMember.get(routed.relationId);
 		if (!list) { list = []; perMember.set(routed.relationId, list); }
 		list.push({ column: routed.basisColumn, value: routed.value });

@@ -845,6 +845,7 @@ interface MutationDiagnostic {
     | 'tag-conflict'                    // target/exclude excludes a side the statement must write
     | 'policy-strict-ambiguity'         // policy=strict rejects an unresolved multi-side delete
     | 'mutual-fk-restrict-delete'       // two-side join DELETE fan-out over a mutual FK whose ON DELETE actions no side order can satisfy under immediate enforcement (no delete_via/target override resolves it)
+    | 'conflicting-assignment'          // two SET targets lower to the same base column (e.g. two view columns over one base column)
     | 'predicate-contradiction';        // statement's predicate is unsatisfiable
   planNodeId: number;
   column?: string;
@@ -852,6 +853,20 @@ interface MutationDiagnostic {
   suggestion?: string;
 }
 ```
+
+An UPDATE that assigns the same base column twice — directly (`update t set b = 1,
+b = 2`), or via two view columns that lower to one base column (`update v set b = 5,
+bp = 100` over `select id, b, b + 1 as bp`) — is rejected **unconditionally**: there
+is no value-agreement softening (`set b = 5, b2 = 5` still rejects), since value
+equality of arbitrary expressions is undecidable. Enforcement is layered. The base
+UPDATE builder is the authoritative backstop: every lowered statement (direct base
+UPDATE, the single-source lowering, and each multi-source per-side / decomposition
+per-member lowering) is re-planned through it, and it rejects a repeated SET target
+with a generic `duplicate assignment to column '<col>'`. On top of that, the
+single-source and decomposition spines detect the collision *during lowering* and
+raise `conflicting-assignment` naming **both** colliding view columns — a friendlier
+message than the base name reported twice. The multi-source join spine relies on the
+base backstop (it sees only base names anyway).
 
 Diagnostics include a suggestion when one applies — for instance, `no-default` includes the `with tags ("quereus.update.default_for.col" = ...)` fragment ready to copy.
 

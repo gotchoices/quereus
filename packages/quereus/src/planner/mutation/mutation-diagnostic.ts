@@ -30,6 +30,7 @@ export type MutationDiagnosticReason =
 	| 'unsupported-source'         // INSERT source shape we cannot thread filter defaults through yet
 	| 'unsupported-multisource-insert' // INSERT into a join view — needs the shared-surrogate context (later phase)
 	| 'cross-source-assignment'    // UPDATE value references a base table other than the column it assigns
+	| 'conflicting-assignment'     // two SET targets lower to the same base column (e.g. two view columns over one base column); an UPDATE cannot assign one column twice
 	| 'unsupported-subquery-correlation' // a view-column ref nested in a predicate/value subquery cannot be proven correlated (unresolvable source / select * / TVF / embedded DML)
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
 	| 'lens-read-only'             // logical table whose PK is not reconstructible at the lens boundary
