@@ -544,26 +544,46 @@ Built-in functions ship with profiles. `cast`-style conversions advertise `inver
 
 User-defined functions declare their profile at registration. A predicate-typed UDF additionally declares which arguments it sees through (passing lineage through, leaving the row's update site untouched) versus which arguments it consumes opaquely. The same surface is reused by the [assertion-derived-premises](optimizer.md#assertion-derived-premises) pipeline.
 
-**Where inverse profiles are consumed (today).** The plan-node backward walk
-(`deriveProjectUpdateLineage` → `traceInvertibleColumn`) already composes the
-inverse chain onto a `base` `UpdateSite` for every projection. **Both** mutation
-spines consume that threaded `inverse` on the UPDATE write path. The **multi-source
-inner-join** path (`mutation/multi-source.ts`, § Inner Join) lowers a `c.cv + 1`
-join column through `w ↦ w - 1`. The **single-source** spine
-(`mutation/single-source.ts`) now does the same: `analyzeView` reads the planned
-body's `updateLineage` (via the shared `resolveBaseSite`) into a per-view-column
-inverse-site map, and `rewriteViewUpdate` routes `set bp = 9` on a `b + 1 as bp`
-column to `set b = 9 - 1` on the base table. An `opaque` (non-invertible) column
-carries no `inverse`, so a write to it still raises `no-inverse` on either spine.
-INSERT remains inverse-blind on both spines — the inverse column stays `computed` in
-the AST `viewColumns` model and the multi-source envelope has no inverse hook — so an
-inverse column is non-insertable even though `is_updatable = 'YES'` (an UPDATE claim).
-The identity-only AST reader (`identityBaseColumn` / `viewColumnsFromUpdateLineage`)
-is deliberately *not* widened: it remains the `deriveViewColumns`-parity surface (and
-backs INSERT routing), while the dynamic UPDATE path reads the richer plan-node
-lineage separately. The static `view_info` / `column_info` surfaces read that same
-plan-node lineage (`baseSiteOf`) and report a `base`-with-`inverse` column writable
-regardless of source arity — now matching the dynamic single-source UPDATE.
+**Where the writable-base set is consumed (today).** The plan-node backward walk
+(`deriveProjectUpdateLineage` → `traceInvertibleColumn`) resolves every projection to a
+`base` `UpdateSite` — `identity` / rename (`b as bc`), `passthrough` (an
+identity-on-value transform — `b collate nocase`, a no-op `cast(b as <same logical
+type>)`; `inverse` *absent*), or `inverse` (a non-identity invertible transform —
+`b + 1`; `inverse` *present*) — else `computed` / `null-extended` (read-only). **Both**
+mutation spines now route the **full writable-base set** (identity + passthrough +
+inverse) on the UPDATE write path, applying a site's `inverse` only when present:
+
+- The **multi-source inner-join** path (`mutation/multi-source.ts`, § Inner Join) gates a
+  column writable on `base`-not-null-extended (`OutColumn.writable`, inverse-agnostic): it
+  lowers an `inverse` column `c.cv + 1` through `w ↦ w - 1`, and a `passthrough` column
+  `c.note collate nocase` through the identity (the raw written value).
+- The **single-source** spine (`mutation/single-source.ts`) does the same: `analyzeView`
+  reads the planned body's `updateLineage` (via the shared `resolveBaseSite`) into a
+  per-view-column **writable-site** map (base column + optional `inverse`), and
+  `rewriteViewUpdate` routes the SET target through it. `set bp = 9` on a `b + 1 as bp`
+  column lowers to `set b = 9 - 1`; `set bc = v` on a `b collate nocase as bc` (or no-op
+  `cast`) passthrough column lowers to `set b = v` (no inverse applied — the stored value
+  is unchanged); an identity / rename column lowers byte-identically to the pre-existing
+  `requireBaseColumn` route.
+
+An `opaque` (non-invertible) or `null-extended` column carries no writable site, so a
+write to it still raises `no-inverse` on either spine. The identity-only AST reader
+(`classifyProjectionExpr` / `identityBaseColumn` / `viewColumnsFromUpdateLineage`) is
+deliberately *not* widened: it remains the `deriveViewColumns`-parity surface (pinned by
+`test/property.spec.ts`) and backs single-source INSERT routing, while the dynamic UPDATE
+path reads the richer plan-node lineage separately. The static `view_info` / `column_info`
+surfaces read that same plan-node lineage (`baseSiteOf`, which treats *any* `base` site —
+identity, passthrough, or inverse — as writable) and report the column writable regardless
+of source arity — now matching the dynamic single-source **and** multi-source UPDATE.
+
+INSERT stays inverse/passthrough-blind on the **single-source** spine — `deriveViewColumns`
+keeps a passthrough / inverse column `computed`, so it is non-insertable even though
+`is_updatable = 'YES'` (an UPDATE claim, not an insertability claim). The **multi-source**
+INSERT path, by contrast, already *admits* a passthrough column (its supplied set is
+`outColumns.filter(c => c.writable && !c.inverse)` — a passthrough is `writable && !inverse`),
+so single-source INSERT (rejects) and multi-source INSERT (admits) diverge for a passthrough
+column; that asymmetry is tracked separately in the backlog ticket
+`view-insert-passthrough-single-multi-divergence` and is out of scope here.
 
 ## Tags: The Override Surface
 

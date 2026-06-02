@@ -83,20 +83,28 @@ interface FilterConstant {
 }
 
 /**
- * A view column whose lineage is a non-identity invertible transform of a single
- * base column (the `inverse` profile — e.g. `b + 1 as bp`). On the UPDATE write
- * path the assigned value is routed to {@link baseColumn} after being run through
- * {@link inverse} (`bp = 9` ⇒ `b = 9 - 1`), mirroring the multi-source spine
- * (`multi-source.ts` `decomposeUpdate`). An identity / rename column carries no
- * entry here (it routes through the ordinary `base` lineage via `columnMap` /
- * `requireBaseColumn`); an `opaque` (non-invertible) column carries none either, so
- * a write to it still raises `no-inverse`. INSERT is unaffected — `viewColumns`
- * keeps an inverse column `computed`, so it stays non-insertable (parity with
- * multi-source, whose envelope has no inverse hook).
+ * A view column whose lineage resolves to a writable single base column — the
+ * full writable-base set the UPDATE write path routes through: `identity` /
+ * rename (`b as bc`), `passthrough` (an identity-on-value transform — `b collate
+ * nocase as bc`, a no-op `cast(b as <same logical type>) as bc`; `inverse`
+ * absent), and `inverse` (a non-identity invertible transform — `b + 1 as bp`;
+ * `inverse` present). On the UPDATE write path the assigned value is routed to
+ * {@link baseColumn}, run through {@link inverse} **only when present** (`bp = 9`
+ * ⇒ `b = 9 - 1`); an identity / passthrough column stores the value verbatim
+ * (there is no inverse — the stored value is unchanged). This mirrors the
+ * multi-source spine, whose `OutColumn.writable` is likewise inverse-agnostic
+ * (`base` site, not null-extended) and applies `inverse` only when present
+ * (`multi-source.ts` `decomposeUpdate`). An `opaque` (non-invertible) /
+ * null-extended column carries no entry here, so a write to it still raises
+ * `no-inverse` via the `requireBaseColumn` fallback. INSERT is unaffected —
+ * `viewColumns` keeps a passthrough / inverse column `computed`, so it stays
+ * non-insertable on the single-source spine (the AST `deriveViewColumns` model is
+ * not widened).
  */
-interface InverseSite {
+interface WritableSite {
 	readonly baseColumn: string;
-	readonly inverse: (written: AST.Expression) => AST.Expression;
+	/** Present only for a non-identity `inverse` profile; absent for identity / passthrough. */
+	readonly inverse?: (written: AST.Expression) => AST.Expression;
 	/** Domain restriction the profile carries (none shipped today — see analyzeView note). */
 	readonly domain?: AST.Expression;
 }
@@ -109,8 +117,8 @@ interface ViewAnalysis {
 	readonly filterConstants: readonly FilterConstant[];
 	/** view-column-name (lowercase) → replacement expression in base terms. */
 	readonly columnMap: ReadonlyMap<string, AST.Expression>;
-	/** view-column-name (lowercase) → inverse-profile write site (UPDATE path only). */
-	readonly inverseSites: ReadonlyMap<string, InverseSite>;
+	/** view-column-name (lowercase) → writable-base write site (UPDATE path only: identity / passthrough / inverse). */
+	readonly writableSites: ReadonlyMap<string, WritableSite>;
 }
 
 function columnExpr(name: string): AST.ColumnExpr {
@@ -458,30 +466,33 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	const filterConstants = extractFilterConstants(sel.where, baseTable);
 	const filterPredicate = sel.where ? normalizeBaseRefs(sel.where, baseAliases) : undefined;
 
-	// Inverse-profile write sites (UPDATE path): read the threaded plan-node
-	// `updateLineage` off the already-planned body and, per view column, capture the
-	// writable base column + its backward `inverse` closure. This is the single-source
-	// dual of what the multi-source spine consumes via `analyzeBodyLineage`
-	// (`backward-body.ts`). The identity-only AST readers (`deriveViewColumns` /
+	// Writable-base write sites (UPDATE path): read the threaded plan-node
+	// `updateLineage` off the already-planned body and, per view column, capture
+	// EVERY writable, non-null-extended base column (identity / passthrough /
+	// inverse) with its optional backward `inverse` closure. This is the
+	// single-source dual of what the multi-source spine consumes (whose
+	// `OutColumn.writable` is likewise the inverse-agnostic `base`-not-null-extended
+	// site). The identity-only AST readers (`deriveViewColumns` /
 	// `classifyProjectionExpr` / `viewColumnsFromUpdateLineage`) are deliberately NOT
 	// widened — their parity is pinned by `test/property.spec.ts` — so the richer
-	// `base`+`inverse` chain is read separately here via the shared `resolveBaseSite`
-	// and applied only to the SET target. An identity / rename column carries no
-	// `inverse` (it routes through `columnMap` / `requireBaseColumn` unchanged), and an
-	// `opaque` column has no `inverse` site, so it still raises `no-inverse`.
+	// `base` chain is read separately here via the shared `resolveBaseSite` and
+	// applied only to the SET target. A passthrough (`collate` / no-op `cast`) or
+	// identity / rename column carries no `inverse` (its value is stored verbatim);
+	// an `inverse` column carries its closure; an `opaque` / null-extended column has
+	// no site, so it still raises `no-inverse` via `requireBaseColumn`.
 	// `viewColumns[i]` ↔ `attrs[i]` holds because `deriveViewColumns` and the planned
 	// projection expand `select *` identically (the parity `viewColumnsFromUpdateLineage`
-	// relies on); a `*` column is pure identity, so it is never picked up here regardless.
+	// relies on); a `*` column is pure identity, stored verbatim like any other.
 	const relBody = bodyPlan as RelationalPlanNode;
 	const attrs = relBody.getAttributes();
 	const lineage = relBody.physical.updateLineage;
-	const inverseSites = new Map<string, InverseSite>();
+	const writableSites = new Map<string, WritableSite>();
 	viewColumns.forEach((vc, i) => {
 		const site = resolveBaseSite(lineage?.get(attrs[i]?.id));
-		if (site.writable && !site.nullExtended && site.inverse && site.baseColumn) {
-			inverseSites.set(vc.name.toLowerCase(), {
+		if (site.writable && !site.nullExtended && site.baseColumn) {
+			writableSites.set(vc.name.toLowerCase(), {
 				baseColumn: site.baseColumn,
-				inverse: site.inverse,
+				...(site.inverse ? { inverse: site.inverse } : {}),
 				// No shipped invertibility profile produces a `domain` (`x ± k` is
 				// unrestricted over integers), so this is always absent today. Threaded
 				// for parity with multi-source (`multi-source.ts` decomposeUpdate), not
@@ -491,7 +502,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		}
 	});
 
-	return { baseTable, viewColumns, filterPredicate, filterConstants, columnMap, inverseSites };
+	return { baseTable, viewColumns, filterPredicate, filterConstants, columnMap, writableSites };
 }
 
 /** Extract `baseColumn = literal` bindings from the view's selection predicate. */
@@ -776,13 +787,16 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		// away (the same encapsulation leak as the `where` / `set`-target guard).
 		guardTopLevelScope(asg.value, analysis, view);
 		const loweredValue = transformExpr(asg.value, substitute, descend);
-		// An inverse-profile column (e.g. `b + 1 as bp`) routes to its base column with
-		// the lowered value run through the site's `inverse` (`set bp = 9` ⇒ `set b = 9 - 1`),
-		// mirroring the multi-source spine. The inverse expects a value already in base
-		// terms, so it wraps the lowered value LAST (after base-term substitution).
-		const inv = analysis.inverseSites.get(asg.column.toLowerCase());
-		if (inv) return { column: inv.baseColumn, value: inv.inverse(loweredValue) };
-		// Identity / rename → its writable base column; opaque computed → `no-inverse`.
+		// Route the SET target through the full writable-base set (identity / passthrough
+		// / inverse), mirroring the multi-source spine. An `inverse`-profile column (e.g.
+		// `b + 1 as bp`) runs the lowered value through the site's `inverse` (`set bp = 9`
+		// ⇒ `set b = 9 - 1`); an identity / passthrough column (`b collate nocase as bc`,
+		// no-op `cast`) has no inverse and stores the value verbatim. The inverse expects
+		// a value already in base terms, so it wraps the lowered value LAST (after
+		// base-term substitution). `findViewColumn` above stays the unknown-column guard;
+		// only an opaque `computed` column reaches `requireBaseColumn` (→ `no-inverse`).
+		const site = analysis.writableSites.get(asg.column.toLowerCase());
+		if (site) return { column: site.baseColumn, value: site.inverse ? site.inverse(loweredValue) : loweredValue };
 		return { column: requireBaseColumn(vc), value: loweredValue };
 	});
 

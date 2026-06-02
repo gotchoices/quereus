@@ -89,6 +89,39 @@ update si_v set bo = 99 where id = 1;
 -- error: read-only
 
 -- ===================================================================
+-- Single-source PASSTHROUGH-profile columns: `bc = b collate nocase` and
+-- `nc = cast(n as integer)` (no-op, same logical type) are identity-ON-VALUE
+-- transforms of one base column — their UpdateSite is `base` WITH NO inverse
+-- (passthrough), which baseSiteOf resolves like any base site → is_updatable='YES'
+-- tracing to the base column. The opaque sibling `bo = b || '!'` (concat has no
+-- inverse profile) stays read-only. The single-source UPDATE path now routes the
+-- FULL writable-base set (identity + passthrough + inverse), so a real write below
+-- stores the value VERBATIM (no inverse to apply) and the view reads it back —
+-- static and dynamic agree. docs § Scalar Invertibility.
+-- ===================================================================
+
+create table pt (id integer primary key, b text null, n integer null);
+create view pt_v as select id, b collate nocase as bc, cast(n as integer) as nc, b || '!' as bo from pt;
+select cid, column_name, is_updatable, base_table, base_column from column_info('pt_v');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"pt","base_column":"id"},{"cid":1,"column_name":"bc","is_updatable":"YES","base_table":"pt","base_column":"b"},{"cid":2,"column_name":"nc","is_updatable":"YES","base_table":"pt","base_column":"n"},{"cid":3,"column_name":"bo","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Dynamic agreement: a passthrough write stores the value VERBATIM (no inverse to
+-- apply), and the view reads it back through the value-preserving forward transform.
+insert into pt values (1, 'hi', 5);
+update pt_v set bc = 'yo' where id = 1;
+select id, b from pt;
+→ [{"id":1,"b":"yo"}]
+update pt_v set nc = 99 where id = 1;
+select id, n from pt;
+→ [{"id":1,"n":99}]
+select id, bc, nc from pt_v;
+→ [{"id":1,"bc":"yo","nc":99}]
+
+-- The opaque sibling stays read-only on the write path too.
+update pt_v set bo = 'X' where id = 1;
+-- error: read-only
+
+-- ===================================================================
 -- Multi-source inner join: each output column traces to its own source base
 -- table; all updatable. (cid/note from ms_child, label from ms_parent.)
 -- ===================================================================

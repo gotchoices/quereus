@@ -103,6 +103,78 @@ insert into iv_v (id, bp) values (3, 5);
 -- error: non-invertible
 
 -- ===================================
+-- Single-source PASSTHROUGH-profile column write-through. `bc = b collate nocase`
+-- and `nc = cast(n as integer)` (a no-op cast, same logical type) are identity-ON-VALUE
+-- projections of pt_t's base columns. The single-source UPDATE path now routes the FULL
+-- writable-base set (identity + passthrough + inverse), so `update v set bc = V` lowers to
+-- `set b = V`, storing the value VERBATIM (no inverse to apply), and the view reads it back
+-- through the value-preserving transform. An `opaque` computed column (`b || '!'` — concat
+-- carries no inverse profile) stays read-only, and a passthrough column is NOT insertable on
+-- the single-source spine (an UPDATE-only claim; the AST deriveViewColumns model keeps it
+-- computed). This matches the static column_info/view_info is_updatable='YES'. See
+-- docs/view-updateability.md § Scalar Invertibility.
+-- ===================================
+
+create table pt_t (id integer primary key, b text null, n integer null);
+insert into pt_t values (1, 'hi', 5), (2, 'world', 20);
+create view pt_v2 as select id, b collate nocase as bc, cast(n as integer) as nc, b || '!' as bo from pt_t;
+
+-- read-through: bc = b, nc = n, bo = b || '!'.
+select id, bc, nc, bo from pt_v2 order by id;
+→ [{"id":1,"bc":"hi","nc":5,"bo":"hi!"},{"id":2,"bc":"world","nc":20,"bo":"world!"}]
+
+-- UPDATE the collate passthrough: `bc = 'yo'` lowers to `b = 'yo'`, stored verbatim.
+update pt_v2 set bc = 'yo' where id = 1;
+select id, b, n from pt_t order by id;
+→ [{"id":1,"b":"yo","n":5},{"id":2,"b":"world","n":20}]
+
+-- UPDATE the no-op-cast passthrough: `nc = 99` lowers to `n = 99`, stored verbatim.
+update pt_v2 set nc = 99 where id = 2;
+select id, b, n from pt_t order by id;
+→ [{"id":1,"b":"yo","n":5},{"id":2,"b":"world","n":99}]
+
+-- the writes read back through the value-preserving forward transform.
+select id, bc, nc from pt_v2 order by id;
+→ [{"id":1,"bc":"yo","nc":5},{"id":2,"bc":"world","nc":99}]
+
+-- the opaque computed column stays read-only (concat has no inverse profile).
+update pt_v2 set bo = 'X' where id = 1;
+-- error: read-only
+
+-- INSERT stays passthrough-blind on the single-source spine: an explicit insert of the
+-- passthrough column is rejected (non-insertable even though is_updatable='YES').
+insert into pt_v2 (id, bc) values (3, 'new');
+-- error: non-invertible
+
+-- ===================================
+-- Single-source ↔ multi-source parity for a PASSTHROUGH (collate) column. The same
+-- `note collate nocase as note` projection of a base column is writable on BOTH mutation
+-- spines: through a single-source view over one table, AND through a two-table inner-join
+-- view. Confirms the two spines agree on an identical passthrough projection — the
+-- single↔multi divergence this ticket closes. docs § Scalar Invertibility, § Inner Join.
+-- ===================================
+
+create table par_p (pid integer primary key, label text);
+create table par_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references par_p(pid));
+insert into par_p values (1, 'p1');
+insert into par_c values (10, 1, 'alpha');
+
+-- single-source view over par_c: the `note collate nocase` passthrough is writable.
+create view par_ss as select cid, note collate nocase as note from par_c;
+update par_ss set note = 'BETA' where cid = 10;
+select cid, note from par_c order by cid;
+→ [{"cid":10,"note":"BETA"}]
+
+-- two-table inner-join view with the SAME passthrough projection: also writable.
+create view par_mj as
+    select c.cid as cid, c.note collate nocase as note, p.label as label
+    from par_c c join par_p p on p.pid = c.pref;
+update par_mj set note = 'gamma' where cid = 10;
+select cid, note from par_c order by cid;
+→ [{"cid":10,"note":"gamma"}]
+
+-- ===================================
 -- Filter pass-through delete
 -- ===================================
 

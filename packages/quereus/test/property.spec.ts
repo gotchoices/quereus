@@ -2588,6 +2588,64 @@ describe('Property-Based Tests', () => {
 			), { numRuns: 50 });
 		});
 
+		// ----- single-source passthrough column write-through (the passthrough analogue) -----
+		// `bc = cast(b as integer)` is an identity-on-value (passthrough) projection of t.b: a
+		// non-identity expression that does not alter the stored value (`inverse === undefined`).
+		// The single-source UPDATE path now routes the FULL writable-base set (identity +
+		// passthrough + inverse), so `update v set bc = NV` stores the BASE value `t.b = NV`
+		// VERBATIM (no inverse to apply) and the view reads back `bc = NV` (PutGet). Statically
+		// the column's UpdateSite is `base` (t.b) with `inverse === undefined`, reported writable.
+		// The identity-only `deriveViewColumns` reader still classifies it `computed` (so INSERT
+		// stays passthrough-blind and the parity test above is untouched) — the write path reads
+		// the richer plan lineage separately via resolveBaseSite. This is the single-source dual
+		// of the multi-source passthrough write, made writable here so static `is_updatable`,
+		// single-source UPDATE, and multi-source UPDATE all agree. docs § Scalar Invertibility.
+		it('PutGet + lineage: a passthrough column (no-op cast) is writable through the single-source view', async () => {
+			await createBase();
+			const body = 'select id, a, cast(b as integer) as bc from t';
+
+			// Static plan-lineage: bc is a base site (t.b) with NO inverse (passthrough), writable.
+			const node = planLogicalBody(body);
+			const attrs = node.getAttributes?.() ?? [];
+			const bcAttr = attrs.find(at => at.name.toLowerCase() === 'bc')!;
+			const site = resolveBaseSite(node.physical.updateLineage?.get(bcAttr.id));
+			expect(site.writable, 'bc resolves to a writable base site').to.equal(true);
+			expect(site.nullExtended, 'bc is not null-extended').to.equal(false);
+			expect((site.baseColumn ?? '').toLowerCase(), 'bc owns base column b').to.equal('b');
+			expect(site.inverse, 'bc carries NO inverse closure (passthrough)').to.equal(undefined);
+			// The identity-only AST reader still reports bc computed (parity preserved).
+			const astBc = deriveViewColumns(
+				new Parser().parse(body) as unknown as AST.SelectStmt,
+				db.schemaManager.getTable('main', 't')!,
+			).find(vc => vc.name.toLowerCase() === 'bc')!;
+			expect(astBc.lineage.kind, 'deriveViewColumns keeps bc computed (identity-only)').to.equal('computed');
+
+			await db.exec('drop view if exists v');
+			await db.exec(`create view v as ${body}`);
+
+			// PutGet: writing bc = NV stores t.b = NV VERBATIM (no inverse) and reads back bc = NV.
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArb, { minLength: 0, maxLength: 10 }),
+				fc.integer({ min: 1, max: 8 }),    // id predicate value K
+				fc.integer({ min: 10, max: 20 }),  // new bc value NV (disjoint from seeds)
+				async (rows, K, NV) => {
+					const kept = await seedBase(rows);
+					await db.exec(`update v set bc = ${NV} where id = ${K}`);
+					// base t.b holds the value NV verbatim for the targeted row (no inverse applied).
+					const expected = kept.map(r => toRecord(r.id === K ? { ...r, b: NV } : r));
+					assertRowsEqual('passthrough PutGet base', await readBase(), expected, ['id', 'a', 'b']);
+
+					// view image: bc reads back as b (cast is value-preserving), so the targeted row surfaces NV.
+					const viewRows: Record<string, SqlValue>[] = [];
+					for await (const row of db.eval('select id, bc from v order by id')) {
+						viewRows.push(row as Record<string, SqlValue>);
+					}
+					const expectedView = expected.map(r => ({ id: r.id, bc: r.b as number }));
+					assertRowsEqual('passthrough PutGet view image', viewRows, expectedView, ['id', 'bc']);
+				},
+			), { numRuns: 50 });
+		});
+
 		// ----- scalar invertibility registry (the widened backward transform chain) -----
 		// The agreement law only constrains KEY columns, and the parity reader collapses
 		// `base`-with-inverse to `computed`; neither actually exercises the new
