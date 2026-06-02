@@ -324,6 +324,24 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 		}
 	});
 
+	it('defers a DELETE filtered on an EAV-served column with the EAV-pivot diagnostic', async () => {
+		// A WHERE on an EAV column (projected by the get body as a correlated subquery, never
+		// a member `columns` entry) defers with the EAV-pivot message — distinct from the
+		// genuine non-anchor-member message, so the misattribution the support fix removed is
+		// not reintroduced through the WHERE gate.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await expectThrows(() => db.exec('delete from x.E where p = 11'), /EAV pivot member/i);
+			// Atomic: every triple intact.
+			expect(await rows(db, 'select eid, attr from main.E_eav order by eid, attr')).to.deep.equal([
+				{ eid: 1, attr: 'p' }, { eid: 1, attr: 'q' }, { eid: 2, attr: 'p' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('insert materializes the anchor row plus one triple per supplied non-null attribute', async () => {
 		const db = new Database();
 		try {
@@ -839,6 +857,77 @@ describe('lens decomposition put: non-identity columnar mappings (computed-mappi
 			expect(await rows(db, 'select id, a, b from main.N_core order by id')).to.deep.equal([
 				{ id: 1, a: 0, b: 20 }, { id: 2, a: 99, b: 20 },
 			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// A subquery defers regardless of which (anchor-resolvable) column it also names — its
+	// multi-member fan-out still needs the snapshot-consistent substrate. The diagnostic is
+	// subquery-specific (`embeds a subquery`), not a misattributed "non-anchor member".
+	it('a DELETE whose WHERE embeds a subquery is deferred with the subquery-specific diagnostic', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			await expectThrows(
+				() => db.exec('delete from x.N where bumped = (select max(a) from main.N_core)'),
+				/embeds a subquery/i,
+			);
+			// Atomic: the seeded row is untouched.
+			expect(await rows(db, 'select id from main.N_core order by id')).to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	/**
+	 * Multi-member columnar split whose ANCHOR carries a computed mapping (`bumped = a+1`)
+	 * alongside a *mandatory non-anchor* member (M_b). Exercises the interaction the
+	 * single-member `nonIdentityAd` fixture cannot: a DELETE filtered on the computed anchor
+	 * column must still fan out to the other member. The substituted predicate (`a + 1 = 11`)
+	 * is anchor-scoped, so each member reads its identifying set from
+	 * `select <anchorKey> from <anchor> where <pred>` — the fan-out is unaffected.
+	 */
+	function multiMemberComputedAnchorAd(): MappingAdvertisement {
+		return {
+			id: 'M_core',
+			logicalTable: 'M',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'M_core',
+				members: [
+					{
+						relationId: 'M_core', relation: { schema: 'main', table: 'M_core' }, presence: 'mandatory',
+						columns: [colMap('id', 'id'), colMap('a', 'a'), { logicalColumn: 'bumped', basisExpr: bin('+', col('a'), lit(1)) }],
+					},
+					{ relationId: 'M_b', relation: { schema: 'main', table: 'M_b' }, presence: 'mandatory', columns: [colMap('b', 'b')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['M_core', ['id']], ['M_b', ['id']]) },
+			},
+		};
+	}
+
+	async function setupMultiMemberComputedAnchor(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [multiMemberComputedAnchorAd()];
+		db.registerModule('mmmod', mod);
+		await db.exec('create table M_core (id integer primary key, a integer) using mmmod');
+		await db.exec('create table M_b (id integer primary key, b integer) using mmmod');
+		await db.exec('declare logical schema x { table M { id integer primary key, a integer, bumped integer, b integer } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.M_core values (1, 10), (2, 50)');
+		await db.exec('insert into main.M_b values (1, 100), (2, 200)');
+	}
+
+	it('a DELETE filtered on a computed anchor column fans out to a non-anchor member (multi-member)', async () => {
+		const db = new Database();
+		try {
+			await setupMultiMemberComputedAnchor(db);
+			// Row id=1 has bumped = a+1 = 11. The computed-anchor predicate substitutes to
+			// `a + 1 = 11` (anchor-scoped), so the delete reaches BOTH members for id=1 only.
+			await db.exec('delete from x.M where bumped = 11');
+			expect(await rows(db, 'select id from main.M_core order by id')).to.deep.equal([{ id: 2 }]);
+			expect(await rows(db, 'select id from main.M_b order by id')).to.deep.equal([{ id: 2 }]);
 		} finally {
 			await db.close();
 		}
