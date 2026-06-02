@@ -28,6 +28,7 @@ import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { Database as DatabaseType } from '../src/core/database.js';
 import type { Schema } from '../src/schema/schema.js';
 import type { MappingAdvertisement, LogicalColumnMapping } from '../src/vtab/mapping-advertisement.js';
+import type * as AST from '../src/parser/ast.js';
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
 	const out: Array<Record<string, unknown>> = [];
@@ -643,6 +644,147 @@ describe('lens decomposition put: INSERT fan-out (edge cases)', () => {
 			// analysis time, before any base op fires.
 			await expectThrows(() => db.exec('insert into x.T (id, a) values (5, 50)'), /NOT NULL with no default|no value reaches it/i);
 			expect(await rows(db, 'select * from main.T_core')).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Non-identity / non-invertible columnar mappings
+ * (`decomposition-non-identity-columnar-mapping-coverage`).
+ *
+ * Every other fixture advertises identity `colMap('a','a')` mappings, so the
+ * lineage-driven `classifyColumn` only ever exercises its identity-`member` branch.
+ * Here a member's `LogicalColumnMapping.basisExpr` is a non-column expression —
+ *   - `bumped` = `a + 1`   → an invertible *transform*: the lineage resolves a
+ *     `base` site WITH an `inverse`, so it fails `classifyColumn`'s identity gate
+ *     (`inverse === undefined`) and routes to `computed-mapping`;
+ *   - `combined` = `a || b` → a non-invertible *composite*: the lineage resolves a
+ *     `computed` site (no single base column), which also routes to `computed-mapping`.
+ * Both are the lineage-driven replacement for the retired
+ * `mapping.basisExpr.type !== 'column'` AST check, and both must be read-only on the
+ * put path while the identity sibling `a` on the same member stays writable. Locks
+ * the writable/read-only boundary the lineage classification now owns.
+ */
+describe('lens decomposition put: non-identity columnar mappings (computed-mapping route)', () => {
+	const col = (name: string): AST.ColumnExpr => ({ type: 'column', name });
+	const lit = (value: number): AST.LiteralExpr => ({ type: 'literal', value });
+	const bin = (operator: string, left: AST.Expression, right: AST.Expression): AST.BinaryExpr =>
+		({ type: 'binary', operator, left, right });
+
+	/**
+	 * Single-member columnar split over main.N_core whose anchor maps two logical
+	 * columns through non-column basis expressions (`bumped` = a+1, `combined` = a||b)
+	 * alongside the identity columns `id` + `a`. Basis column `b` backs only the
+	 * composite (no logical column of its own).
+	 */
+	function nonIdentityAd(): MappingAdvertisement {
+		return {
+			id: 'N_core',
+			logicalTable: 'N',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'N_core',
+				members: [
+					{
+						relationId: 'N_core', relation: { schema: 'main', table: 'N_core' }, presence: 'mandatory',
+						columns: [
+							colMap('id', 'id'),
+							colMap('a', 'a'),                                  // identity sibling — stays writable
+							{ logicalColumn: 'bumped', basisExpr: bin('+', col('a'), lit(1)) },     // invertible transform
+							{ logicalColumn: 'combined', basisExpr: bin('||', col('a'), col('b')) }, // non-invertible composite
+						],
+					},
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['N_core', ['id']]) },
+			},
+		};
+	}
+
+	async function setupNonIdentity(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nonIdentityAd()];
+		db.registerModule('nimod', mod);
+		// `b` nullable: it backs only the composite (no insertable logical column of its
+		// own), so a row inserted through the logical table leaves it null.
+		await db.exec('create table N_core (id integer primary key, a integer, b integer null) using nimod');
+		// `combined` is nullable: `a||b` is nullable because `b` is (concat with null → null).
+		await db.exec('declare logical schema x { table N { id integer primary key, a integer, bumped integer, combined text null } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.N_core values (1, 10, 20)');
+	}
+
+	it('the forward transform reads back through the get body (a+1, a||b)', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			expect(await rows(db, 'select * from x.N order by id')).to.deep.equal([
+				{ id: 1, a: 10, bumped: 11, combined: '1020' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an UPDATE of an invertible-transform column (a+1) is rejected as computed (non-invertible)', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			await expectThrows(() => db.exec('update x.N set bumped = 99 where id = 1'), /computed \(non-invertible\).*read-only/i);
+			// Atomic: the backing base value is untouched.
+			expect(await rows(db, 'select a from main.N_core where id = 1')).to.deep.equal([{ a: 10 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an UPDATE of a non-invertible composite column (a||b) is rejected as computed (non-invertible)', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			await expectThrows(() => db.exec("update x.N set combined = 'x' where id = 1"), /computed \(non-invertible\).*read-only/i);
+			expect(await rows(db, 'select a, b from main.N_core where id = 1')).to.deep.equal([{ a: 10, b: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an INSERT into a non-identity column is rejected (cannot receive an inserted value)', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			await expectThrows(
+				() => db.exec('insert into x.N (id, bumped) values (2, 5)'),
+				/computed \(non-invertible\).*cannot receive an inserted value/i,
+			);
+			await expectThrows(
+				() => db.exec("insert into x.N (id, combined) values (2, 'z')"),
+				/computed \(non-invertible\).*cannot receive an inserted value/i,
+			);
+			// Atomic: no anchor row materialized for the rejected inserts.
+			expect(await rows(db, 'select id from main.N_core order by id')).to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the identity sibling (a) on the same member stays writable — no collateral read-only', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			// UPDATE of the identity column routes to the member and writes through.
+			await db.exec('update x.N set a = 42 where id = 1');
+			expect(await rows(db, 'select a from main.N_core where id = 1')).to.deep.equal([{ a: 42 }]);
+			// And the computed columns recompute off the new base value on read-back.
+			expect(await rows(db, 'select * from x.N order by id')).to.deep.equal([
+				{ id: 1, a: 42, bumped: 43, combined: '4220' },
+			]);
+			// INSERT supplying only identity columns materializes the row.
+			await db.exec('insert into x.N (id, a) values (2, 100)');
+			expect(await rows(db, 'select id, a, b from main.N_core order by id')).to.deep.equal([
+				{ id: 1, a: 42, b: 20 }, { id: 2, a: 100, b: null },
+			]);
 		} finally {
 			await db.close();
 		}
