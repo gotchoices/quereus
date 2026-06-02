@@ -6,15 +6,14 @@ import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
+import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
+import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
 
 /** Reserved tag namespace prefix used for differ-recognized hints. */
 const QUEREUS_TAG_PREFIX = 'quereus.';
-
-/** Recognized tag keys under the `quereus.*` namespace. */
-const KNOWN_QUEREUS_KEYS = new Set(['quereus.id', 'quereus.previous_name']);
 
 export type RenamePolicy = 'allow' | 'require-hint' | 'deny';
 
@@ -141,35 +140,55 @@ export function computeSchemaDiff(
 	const declaredIndexes = new Map<string, AST.DeclaredIndex>();
 	const declaredAssertions = new Map<string, AST.DeclaredAssertion>();
 
+	// Reserved-tag shape/site validation flows through the SAME typed registry
+	// (`validateReservedTags`) as the lens-compile / mutation / advertisement
+	// paths — there is no second differ-local allow-list. Severity is unified:
+	// an unknown / mis-sited / malformed `quereus.*` key is a hard error here too
+	// (Decision 2 of the ticket), so a physical-schema typo fails `apply`/`diff`
+	// loudly instead of silently soft-warning. We accumulate every declared
+	// object's diagnostics across the whole schema, then raise once — BEFORE the
+	// throw-y rename resolution below, so a tag typo surfaces deterministically
+	// rather than being masked by a rename conflict. Sites per Decision 3:
+	// table → physical-table (also the basis-table/advertisement position),
+	// column → physical-column, view / materialized view → view-ddl,
+	// index → physical-index, named constraint → physical-constraint.
+	// Assertions carry no `tags` field (no site). The rename hints
+	// (quereus.id / quereus.previous_name) are first-class specs valid at each of
+	// these physical sites; an MV's hint validates (over-permissive: the differ
+	// supports no MV rename and simply ignores it — harmless, see Decision 1).
+	const tagDiagnostics: TagDiagnostic[] = [];
 	for (const item of declaredSchema.items) {
 		switch (item.type) {
 			case 'declaredTable':
 				declaredTables.set(item.tableStmt.table.name.toLowerCase(), item);
-				warnUnknownQuereusKeys(item.tableStmt.tags, 'table', item.tableStmt.table.name);
+				tagDiagnostics.push(...validateReservedTags(item.tableStmt.tags, 'physical-table'));
 				for (const col of item.tableStmt.columns) {
-					warnUnknownQuereusKeys(col.tags, 'column', `${item.tableStmt.table.name}.${col.name}`);
+					tagDiagnostics.push(...validateReservedTags(col.tags, 'physical-column'));
 				}
 				for (const c of item.tableStmt.constraints ?? []) {
-					if (c.name) warnUnknownQuereusKeys(c.tags, 'constraint', c.name);
+					if (c.name) tagDiagnostics.push(...validateReservedTags(c.tags, 'physical-constraint'));
 				}
 				break;
 			case 'declaredView':
 				declaredViews.set(item.viewStmt.view.name.toLowerCase(), item);
-				warnUnknownQuereusKeys(item.viewStmt.tags, 'view', item.viewStmt.view.name);
+				tagDiagnostics.push(...validateReservedTags(item.viewStmt.tags, 'view-ddl'));
 				break;
 			case 'declaredMaterializedView':
 				declaredMaterializedViews.set(item.viewStmt.view.name.toLowerCase(), item);
-				warnUnknownQuereusKeys(item.viewStmt.tags, 'materialized view', item.viewStmt.view.name);
+				tagDiagnostics.push(...validateReservedTags(item.viewStmt.tags, 'view-ddl'));
 				break;
 			case 'declaredIndex':
 				declaredIndexes.set(item.indexStmt.index.name.toLowerCase(), item);
-				warnUnknownQuereusKeys(item.indexStmt.tags, 'index', item.indexStmt.index.name);
+				tagDiagnostics.push(...validateReservedTags(item.indexStmt.tags, 'physical-index'));
 				break;
 			case 'declaredAssertion':
 				declaredAssertions.set(item.assertionStmt.name.toLowerCase(), item);
 				break;
 		}
 	}
+	raiseReservedTagDiagnostics(tagDiagnostics, {
+		log: (d) => warnLog('reserved tag advisory (%s) on %s: %s', d.reason, d.site, d.message),
+	});
 
 	// Build maps of actual items
 	const actualTables = new Map(actualCatalog.tables.map(t => [t.name.toLowerCase(), t]));
@@ -494,23 +513,6 @@ function readQuereusHint(
 	if (typeof v !== 'string') return undefined;
 	const trimmed = v.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
-}
-
-/**
- * Soft-warn on unrecognized `quereus.*` tag keys so future versions can add
- * keys without breaking older parsers.
- */
-function warnUnknownQuereusKeys(
-	tags: Readonly<Record<string, SqlValue>> | undefined,
-	subject: string,
-	subjectName: string,
-): void {
-	if (!tags) return;
-	for (const key of Object.keys(tags)) {
-		if (!key.startsWith(QUEREUS_TAG_PREFIX)) continue;
-		if (KNOWN_QUEREUS_KEYS.has(key)) continue;
-		warnLog('Unknown reserved tag key %s on %s %s', key, subject, subjectName);
-	}
 }
 
 function enforceRequireHint(kind: string, creates: number, drops: number): void {

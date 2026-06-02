@@ -238,6 +238,67 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
+	describe('rename hints + physical declarative sites (differ path)', () => {
+		const PHYSICAL_SITES: TagSite[] = [
+			'physical-table',
+			'physical-column',
+			'view-ddl',
+			'physical-index',
+			'physical-constraint',
+		];
+
+		it('accepts quereus.id at every physical declarative site (incl. a hyphenated value)', () => {
+			for (const site of PHYSICAL_SITES) {
+				// The hyphenated value guards the `'string'` (NOT csv-of-identifiers)
+				// decision — `'tbl-thing'` is a real id in 50.2-declare-schema-renames.
+				expect(check({ 'quereus.id': 'tbl-thing' }, site), `quereus.id at ${site}`)
+					.to.have.length(0);
+			}
+		});
+
+		it('accepts quereus.previous_name at every physical declarative site', () => {
+			for (const site of PHYSICAL_SITES) {
+				expect(check({ 'quereus.previous_name': 'old_a, old_b' }, site), `previous_name at ${site}`)
+					.to.have.length(0);
+			}
+		});
+
+		it('flags a typo on previous_name as a single unknown-reserved-tag error', () => {
+			const diags = check({ 'quereus.previuos_name': 'old' }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+			expect(diags[0].severity).to.equal('error');
+		});
+
+		it('flags a typo on update.target at a physical site as unknown-reserved-tag', () => {
+			const diags = check({ 'quereus.update.taget': 'Car' }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+			expect(diags[0].severity).to.equal('error');
+		});
+
+		it('rejects update.target on a physical table but accepts it on a view DDL', () => {
+			const onTable = check({ 'quereus.update.target': 'base_a' }, 'physical-table');
+			expect(onTable).to.have.length(1);
+			expect(onTable[0].reason).to.equal('tag-not-allowed-here');
+
+			expect(check({ 'quereus.update.target': 'base_a' }, 'view-ddl')).to.have.length(0);
+		});
+
+		it('keeps quereus.lens.decomp.* valid at physical-table (no regression)', () => {
+			expect(check({ 'quereus.lens.decomp.role.d1': 'primary-storage' }, 'physical-table'))
+				.to.have.length(0);
+		});
+
+		it('rejects a non-column-legal reserved key on a physical column', () => {
+			// quereus.update.policy is view-ddl only; mis-placed on a column it is
+			// now tag-not-allowed-here rather than silently escaping.
+			const diags = check({ 'quereus.update.policy': 'strict' }, 'physical-column');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('tag-not-allowed-here');
+		});
+	});
+
 	describe('RESERVED_TAGS table', () => {
 		it('is deeply frozen (array, each spec, and each spec.sites)', () => {
 			expect(Object.isFrozen(RESERVED_TAGS)).to.equal(true);
@@ -247,11 +308,14 @@ describe('Reserved tag registry', () => {
 			}
 		});
 
-		it('seeds all documented keys (update + lens advisory + escalation policy + lens decomposition families)', () => {
-			// 5 quereus.update.* + 2 quereus.lens.{ack,access} + 2 quereus.lens.policy.*
-			// + 11 quereus.lens.decomp.* = 20.
-			expect(RESERVED_TAGS).to.have.length(20);
+		it('seeds all documented keys (rename hints + update + lens advisory + escalation policy + lens decomposition families)', () => {
+			// 2 rename hints (quereus.id / quereus.previous_name) + 5 quereus.update.*
+			// + 2 quereus.lens.{ack,access} + 2 quereus.lens.policy.*
+			// + 11 quereus.lens.decomp.* = 22.
+			expect(RESERVED_TAGS).to.have.length(22);
 			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
+			expect(keys).to.include('quereus.id');
+			expect(keys).to.include('quereus.previous_name');
 			expect(keys).to.include('quereus.lens.policy.error-on');
 			expect(keys).to.include('quereus.lens.policy.require-ack');
 			expect(keys).to.include('quereus.lens.decomp.role.<id>');

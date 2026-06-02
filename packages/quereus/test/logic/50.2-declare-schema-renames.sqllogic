@@ -281,3 +281,28 @@ insert into child_t values (30, 999);
 
 drop table child_t;
 drop table renamed_t;
+
+-- ===================================
+-- 9. Typo'd reserved tag on a physical declared object → hard error at apply
+-- ===================================
+
+-- The physical declarative differ now validates every declared object's
+-- quereus.* tags through the same typed registry as the lens/mutation paths
+-- (hard-error-on-unknown). A typo that the old soft-warn allow-list silently
+-- swallowed now fails the apply loudly. (`quereus.update.taget` is a typo of
+-- `target`.)
+create table gadget (id integer primary key, name text);
+
+declare schema main {
+	table gadget {
+		id integer primary key,
+		name text
+	} with tags ("quereus.update.taget" = 'gadget')
+}
+
+-- run
+
+apply schema main;
+-- error: unknown reserved tag
+
+drop table gadget;

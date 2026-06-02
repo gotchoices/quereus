@@ -38,14 +38,21 @@ export const RESERVED_TAG_NAMESPACE = 'quereus.';
  * not on a plain view DDL).
  */
 export type TagSite =
-	| 'view-ddl'            // CREATE VIEW / CREATE MATERIALIZED VIEW WITH TAGS
+	| 'view-ddl'            // CREATE VIEW / CREATE MATERIALIZED VIEW WITH TAGS (also a physical declared view in the differ)
 	| 'projection'          // a result-column tag (future; reserved for default_for)
 	| 'join'                // a JOIN-clause tag
 	| 'union-branch'        // a compound-set branch tag
 	| 'dml-stmt'            // INSERT/UPDATE/DELETE ... WITH (...) statement-level tag
 	| 'logical-table'       // tags on a declared logical TableSchema
 	| 'logical-constraint'  // tags on a logical RowConstraint/Unique/ForeignKey schema
-	| 'physical-table';     // tags on a physical (basis) TableSchema — e.g. quereus.lens.decomp.*
+	// `physical-table` covers BOTH the basis-table advertisement position
+	// (quereus.lens.decomp.* read by buildAdvertisementsFromTags) AND the physical
+	// declarative-schema table position (the differ validates a declared table's
+	// tags here, e.g. the quereus.id / quereus.previous_name rename hints).
+	| 'physical-table'      // tags on a physical (basis / declared) TableSchema
+	| 'physical-column'     // tags on a physical declared column (differ)
+	| 'physical-index'      // tags on a physical declared index (differ)
+	| 'physical-constraint';// tags on a physical declared named constraint (differ)
 
 /** Closed value set for `quereus.update.delete_via` (docs/view-updateability.md:277). */
 export const DELETE_VIA_VALUES = ['left_delete', 'right_insert', 'parent'] as const;
@@ -124,6 +131,27 @@ export interface TagDiagnostic {
  * Phase 2) consume this rather than re-declaring the namespace.
  */
 const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
+	// --- rename hints : stable-identity / previous-name for the declarative differ ---
+	// Read by `schema-differ.ts` (`readQuereusHint`) to pair a declared object with
+	// an existing actual across a rename. They are first-class specs (not a
+	// differ-local allow-list) so the differ can validate every declared object's
+	// tags through this registry with hard-error-on-unknown. valueSchema is
+	// `'string'` (NOT csv-of-identifiers): the differ never value-validated these,
+	// and a real id may carry a hyphen (`'tbl-thing'`) or name a quoted identifier
+	// — tightening would falsely reject existing schemas. See docs/schema.md
+	// § Rename Detection. A future ticket may add a dedicated `csv-of-names` schema.
+	{
+		key: 'quereus.id',
+		sites: siteSet('physical-table', 'physical-column', 'view-ddl', 'physical-index', 'physical-constraint'),
+		valueSchema: 'string',
+		description: 'Stable identity of a declared object; the differ pairs it across a rename (preferred over previous_name).',
+	},
+	{
+		key: 'quereus.previous_name',
+		sites: siteSet('physical-table', 'physical-column', 'view-ddl', 'physical-index', 'physical-constraint'),
+		valueSchema: 'string',
+		description: 'Comma-separated former name(s) of a declared object; the differ pairs it across a rename when no id matches.',
+	},
 	// --- quereus.update.* : view-mutation propagation overrides ---
 	{
 		// docs/view-updateability.md:284
@@ -518,7 +546,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key,generator,gencadence}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key,generator,gencadence}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 
@@ -561,6 +589,9 @@ function siteLabel(site: TagSite): string {
 		case 'logical-table': return 'a logical table';
 		case 'logical-constraint': return 'a logical constraint';
 		case 'physical-table': return 'a basis table';
+		case 'physical-column': return 'a physical column';
+		case 'physical-index': return 'a physical index';
+		case 'physical-constraint': return 'a physical constraint';
 	}
 }
 

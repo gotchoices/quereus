@@ -1,7 +1,5 @@
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
-import { QuereusError } from '../../common/errors.js';
-import { StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import {
 	validateReservedTags,
@@ -12,6 +10,7 @@ import {
 	type DeleteViaValue,
 	type UpdatePolicyValue,
 } from '../../schema/reserved-tags.js';
+import { raiseReservedTagDiagnostics } from '../../schema/reserved-tags-policy.js';
 import type { MutableViewLike } from './single-source.js';
 
 const log = createLogger('mutation:tags');
@@ -72,25 +71,19 @@ export function collectMutationTags(view: MutableViewLike, stmt: TaggedStmt): Re
 	return { ...(viewTags ?? {}), ...(stmtTags ?? {}) };
 }
 
-/** Raise the first error diagnostic as a sited error; log any warnings. */
+/**
+ * Raise the first error diagnostic as a sited error; log any warnings. Threads
+ * the statement location + a view-context prefix into the shared caller-policy
+ * helper ({@link raiseReservedTagDiagnostics}).
+ */
 function raiseTagDiagnostics(diagnostics: TagDiagnostic[], view: MutableViewLike, stmt: TaggedStmt, site: TagSite): void {
-	if (diagnostics.length === 0) return;
-	const firstError = diagnostics.find(d => d.severity === 'error');
-	if (firstError) {
-		const where = site === 'view-ddl'
+	raiseReservedTagDiagnostics(diagnostics, {
+		messagePrefix: site === 'view-ddl'
 			? `view '${view.schemaName}.${view.name}' declares an invalid tag — `
-			: '';
-		throw new QuereusError(
-			`${where}${firstError.message}`,
-			StatusCode.ERROR,
-			undefined,
-			stmt.loc?.start.line,
-			stmt.loc?.start.column,
-		);
-	}
-	for (const diag of diagnostics) {
-		log('tag advisory (%s) on %s %s.%s: %s', diag.reason, site, view.schemaName, view.name, diag.message);
-	}
+			: '',
+		loc: { line: stmt.loc?.start.line, column: stmt.loc?.start.column },
+		log: (diag) => log('tag advisory (%s) on %s %s.%s: %s', diag.reason, site, view.schemaName, view.name, diag.message),
+	});
 }
 
 // === typed readers for the consumers (no re-parsing the namespace) ===========

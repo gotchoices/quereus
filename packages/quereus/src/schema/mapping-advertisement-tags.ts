@@ -12,6 +12,7 @@ import type {
 	AttributePivot,
 } from '../vtab/mapping-advertisement.js';
 import { validateReservedTags } from './reserved-tags.js';
+import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 
@@ -59,11 +60,7 @@ export function buildAdvertisementsFromTags(basisSchema: Schema): MappingAdverti
 
 		// Shape/site validation through the existing typed registry — a malformed
 		// decomp tag fails the deploy the same atomic way validateLensTags does.
-		const diagnostics = validateReservedTags(decompTags, 'physical-table');
-		const firstError = diagnostics.find(d => d.severity === 'error');
-		if (firstError) {
-			throw new QuereusError(firstError.message, StatusCode.ERROR);
-		}
+		raiseReservedTagDiagnostics(validateReservedTags(decompTags, 'physical-table'));
 
 		for (const [key, rawValue] of Object.entries(decompTags)) {
 			ingestTag(decomps, table, key, rawValue);

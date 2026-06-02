@@ -11,6 +11,7 @@ import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance,
 	type LensRelationBacking, type LensTableSnapshot, type LensDeploymentSnapshot } from './lens.js';
 import { computeSchemaHash } from './schema-hasher.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
+import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { proveLens, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
 import { applyAckGovernance, resolveEscalationPolicy, type AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
@@ -554,13 +555,9 @@ function validateLensTags(slot: LensSlot): void {
 		if (tags) diagnostics.push(...validateReservedTags(tags, 'logical-constraint'));
 	}
 
-	const firstError = diagnostics.find(d => d.severity === 'error');
-	if (firstError) {
-		throw new QuereusError(firstError.message, StatusCode.ERROR);
-	}
-	for (const diag of diagnostics) {
-		log('lens advisory (%s) on %s.%s: %s', diag.reason, slot.logicalTable.schemaName, slot.logicalTable.name, diag.message);
-	}
+	raiseReservedTagDiagnostics(diagnostics, {
+		log: (diag) => log('lens advisory (%s) on %s.%s: %s', diag.reason, slot.logicalTable.schemaName, slot.logicalTable.name, diag.message),
+	});
 }
 
 /**

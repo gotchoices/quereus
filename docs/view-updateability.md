@@ -474,10 +474,19 @@ registry `packages/quereus/src/schema/reserved-tags.ts`
 (`validateReservedTags(tags, site)`): each reserved key is matched to a frozen
 spec, its position checked against the key's legal `TagSite` set (`view-ddl`,
 `union-branch`, `join`, `dml-stmt`, `projection`, `logical-table`,
-`logical-constraint`), and its value checked against a `TagValueSchema`
-(`csv-of-identifiers`, an enum, an `expression`, …). An unknown or mis-sited key
-is a hard **error**; a malformed value is an error too, except an empty
-`quereus.lens.ack` rationale, which is only a **warning**. The rows below are the
+`logical-constraint`, plus the physical declarative-schema sites
+`physical-table`, `physical-column`, `physical-index`, `physical-constraint`),
+and its value checked against a `TagValueSchema` (`csv-of-identifiers`, an enum,
+an `expression`, …). An unknown or mis-sited key is a hard **error**; a malformed
+value is an error too, except an empty `quereus.lens.ack` rationale, which is
+only a **warning**. This registry is the **single shape/site source of truth for
+every `quereus.*` path** — the lens compiler, the view-mutation override surface,
+the module advertisement builder, and the declarative-schema differ
+(`apply`/`diff schema`) all validate through it, with the *identical*
+hard-error-on-unknown severity (no per-path divergence). The first error
+diagnostic is raised by the shared `raiseReservedTagDiagnostics` caller-policy
+helper (`src/schema/reserved-tags-policy.ts`); the registry itself stays
+policy-free and never throws. The rows below are the
 `quereus.update.*` seeds — the registry validates their shape/site; their **Effect
 (semantics) is realized by the view-mutation override surface** (Phase 3.4 —
 collection + merge in `planner/mutation/mutation-tags.ts`, consumption in
