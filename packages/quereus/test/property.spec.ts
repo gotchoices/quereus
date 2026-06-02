@@ -3459,6 +3459,7 @@ describe('Property-Based Tests', () => {
 			it('PutGet (columnar, missing member): an invisible logical row is untouched; anchor + non-key predicates', async () => {
 				await deployColumnar();
 				let invisibleSeen = 0;
+				let invisibleAnchorTouched = 0;   // an anchor-touching op actually matched an invisible row
 				const opsSeen = new Set<string>();
 				await fc.assert(fc.asyncProperty(
 					fc.array(fc.record({
@@ -3495,6 +3496,11 @@ describe('Property-Based Tests', () => {
 						// regardless of member presence / join visibility).
 						const matched = [...core.keys()].filter(id => pcol === 'id' ? id === pval : core.get(id) === pval);
 						const pred = `${pcol} = ${pval}`;
+						// The headline arm: an anchor-touching op (update-a / update-ab / delete)
+						// landed on a row that is INVISIBLE through the view (its mandatory T_b is
+						// absent). The per-member oracle expects T_core to change here regardless of
+						// visibility — guard that this case is actually generated, not just possible.
+						if (op !== 'update-b' && matched.some(id => !bMap.has(id))) invisibleAnchorTouched++;
 
 						if (op === 'update-a') {
 							await db.exec(`update x.T set a = ${NV} where ${pred}`);
@@ -3527,6 +3533,7 @@ describe('Property-Based Tests', () => {
 				), { numRuns: 80 });
 
 				expect(invisibleSeen, 'missing-member columnar PutGet never produced an invisible logical row').to.be.greaterThan(0);
+				expect(invisibleAnchorTouched, 'an anchor-touching op never matched an invisible row (headline arm unexercised)').to.be.greaterThan(0);
 				expect(opsSeen.size, 'missing-member PutGet did not exercise a spread of ops').to.be.greaterThan(2);
 			});
 
