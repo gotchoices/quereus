@@ -9,7 +9,7 @@ actually shipped:
 |---|---|---|
 | **Phase 1** | Single-source projection-and-filter views: `insert` / `update` / `delete` route to the base table. Constant-FD defaults from equality selection predicates, base-column defaults, identity/rename projection lineage, `OR`-clause conflict resolution, and the `no-inverse` / `predicate-contradiction` / `recursive-cte` / body-shape diagnostics. | **Shipped** |
 | **Phase 1b** | Per-statement mutation-context threading through the view boundary (one captured value stamped across every base row of the statement). Single-base per-row generator cadence rides the base table's column defaults. | **Shipped (single-base)** |
-| **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
+| **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`. Rows are identified by an **up-front base-PK key capture built as plan nodes over the planned join body** (the derived backward walk — `π_{k}(σ_{idPred}(JoinNode))`, materialized once into `__vmupd_keys`), not a re-planned AST body; every side reads it back. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
 | **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. The lenient predicate-honest *multi-side delete fan-out* (an ambiguous two-table inner-join delete with no provable FK / resolving tag deletes from **every** candidate side, via the both-sides UPDATE's eager key materialization) is **shipped**; `policy=strict` still rejects. | **Shipped** |
 | **Phase 2b** | Multi-source **key-preserving inner-join `insert`** write-through, plus the per-row **shared-surrogate mutation-context envelope** it requires. The shared join key is not a view column, so an insert mints a surrogate **once per produced logical row at the envelope, before propagation fans out**, and threads the one captured value into both base inserts (FK-parent before FK-child). The key is either **directly supplied** (a view column maps to a join-key base column) or **minted** (`integer-auto` / `per-row`: `seed + ordinal`, `seed = max(anchor.key)` captured once). Realized by materializing the augmented source once (`ViewMutationNode.envelope` + `EnvelopeScanNode`) so every base op reads the identical rows. | **Shipped (two-table inner join)** |
 | **Phase 3.7** | **RETURNING-through-views.** `insert` / `update` / `delete … returning` returns rows projected through the **view's** column list, evaluated against the post-mutation base state (computed view columns re-evaluated). Single-source: the clause is rewritten into base terms and rides the base op's RETURNING (NEW for insert/update, OLD for delete) — `ViewMutationNode` becomes relational and surfaces it. Multi-source inner-join `delete`: a re-query of the view restricted to the mutation's predicate, captured `pre`. Multi-source inner-join `update`: **per-row identity capture** — each affected view row's base-PK identities `(k0, k1)` are captured `pre`, then the join body is re-queried `post` restricted to those captured identities (robust against an update that rewrites a column its own WHERE filters on). `returning *` expands to the view's columns. | **Shipped (single-source all ops; multi-source update / delete)** |
@@ -45,11 +45,15 @@ for all view mutations: the single-source case decomposes to exactly one base op
 walk — the substrate emitting *more than one* base op — **has landed for the
 key-preserving inner-join `update` / `delete` case** (`planner/mutation/multi-source.ts`):
 a join body routes here, where the planned body's `updateLineage` decides each
-output column's owning base table and a subquery over the join body reconstructs
-the per-side row-identifying predicate (lowered back to AST so the base builders
-are reused untouched). RETURNING through a multi-source `delete` is supported via a
-re-query of the view, and through a multi-source `update` via per-row identity
-capture (see § `returning` Clauses); the per-side base ops carry no RETURNING. What
+output column's owning base table and an up-front base-PK key capture — built as
+plan nodes directly over the planned join body (the derived backward walk, not a
+re-planned AST body) and materialized once into `__vmupd_keys` — reconstructs the
+per-side row-identifying predicate that every base op reads back. Each base op's
+SET/value clause still lowers to AST so the base builders are reused untouched.
+RETURNING through a multi-source `delete` projects the planned body (the `pre` OLD
+image), and through a multi-source `update` re-queries the planned join body `post`
+via per-row identity capture (see § `returning` Clauses); the per-side base ops
+carry no RETURNING. What
 the surface is **not yet** consumed by is the
 multi-source **insert** RETURNING (which needs the shared-surrogate key threaded
 into the projection) and the broader join shapes (outer / set-op / aggregate /
@@ -68,6 +72,22 @@ removed (the single-source rewrite it held now lives in
 > `query_plan()` therefore shows full lineage for single-source projection-filter
 > shapes and on every TableReference; a join's optimized top node shows degraded
 > (`computed`) lineage. The logical operator tree is authoritative.
+>
+> The **multi-source substrate now consumes this plan-node backward walk
+> directly** (`mutation/multi-source.ts`): it plans the join body **once**
+> (`analyzeJoinView`, on the un-optimized logical tree where lineage is intact) and
+> builds the per-row identity capture + RETURNING re-query as plan nodes layered
+> over that planned body (`Project` / `Filter` / a fresh `__vmupd_keys` ref) —
+> reusing the already-planned `JoinNode` and its column scope rather than
+> re-deriving via a re-planned AST body. Because that backward walk reads
+> `updateLineage` (and the logical `JoinNode` it walks), it is precisely the
+> structure-rewriting physical operators above — `HashJoin` / `MergeJoin` /
+> aggregate / set-op / `Sort`/`Limit`/`Distinct` — that degrade the lineage and so
+> keep their view shapes **rejected** (`collectInnerJoinSources` /
+> `analyzeJoinView` accept only the two-table inner equi-join whose logical
+> Project/Filter/Join spine threads lineage end-to-end). The boundary is the same
+> in both directions: a shape the forward walk can't thread, the backward walk
+> can't consume.
 
 **Write-through materialized views** are **delivered** for the passthrough /
 projection-filter shape (`materialized-view-dml-write-through`): DML targeting an MV
@@ -312,24 +332,27 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 ### Inner Join
 
 > **Shipped (Phase 2a) — `update` / `delete` only.** A two-table inner equi-join
-> body decomposes through `planner/mutation/multi-source.ts`. Each output column is
-> routed to its owning base table by the planned body's `updateLineage`; an
-> `update` emits one base `update` per touched side (FK-parent before FK-child),
-> and a `delete` emits one base `delete` on the FK-many (child) side. A **single-side**
-> update (and the delete) identifies rows by a **subquery over the join body** —
-> `<owning>.<pk> in (select <alias>.<pk> from <join> where <predicate>)` — which
-> reconstructs the row-identifying predicate even when the owning side's PK is hidden
-> by the projection. A **both-sides** update instead captures each affected view
-> row's base-PK identities `(k0, k1)` **once up-front** (before any base op mutates)
-> and routes *each* per-side op through that captured set (`<pk> in (select k<side>
-> from __vmupd_keys)`) — a mutation-order-independent identity, so the FK-parent op
-> cannot rewrite a predicate column out from under the FK-child op's identifying
-> re-query (the **eager key materialization** the delete note below anticipates;
-> reuses the per-row identity-capture plumbing the UPDATE RETURNING path ships). The
-> base statement is lowered back to AST so the ordinary base-table builders (and all
-> their constraint / conflict / FK machinery) are reused verbatim. The
-> `quereus.update.*` tag override surface (`target` / `exclude` / `delete_via` /
-> `policy`) is **shipped** (Phase 3.4 — see § Tags). Multi-source **`insert`** is
+> body decomposes through `planner/mutation/multi-source.ts`. The body is planned
+> **once** (`analyzeJoinView`); each output column is routed to its owning base table
+> by that planned body's `updateLineage`; an `update` emits one base `update` per
+> touched side (FK-parent before FK-child), and a `delete` emits one base `delete` on
+> the FK-many (child) side. **Rows are identified by an up-front base-PK key capture
+> built directly over the planned join body** (the derived backward walk — not a
+> re-planned AST body): `π_{k<side>}( σ_{idPred}( JoinNode ) )` is built as plan nodes
+> layered on the already-planned `JoinNode` (its column scope resolving the identifying
+> predicate exactly as the body's own σ did), materialized **once before any base op
+> fires**, and *every* per-side op — single-side and both-sides alike — reads its
+> identifying values back from that set (`<pk> in (select k<side> from __vmupd_keys)`).
+> The capture reconstructs the row-identifying predicate even when a side's PK is
+> hidden by the projection, and being mutation-order-independent it lets a both-sides
+> update's FK-parent op run without rewriting a predicate column out from under the
+> FK-child op (the **eager key materialization** the delete note below relies on; the
+> same plumbing the UPDATE RETURNING path uses). Each base op's SET/value clause is
+> still lowered to AST so the ordinary base-table builders (and all their constraint /
+> conflict / FK machinery) are reused verbatim — only row identification rides the
+> planned tree. The `quereus.update.*` tag override surface (`target` / `exclude` /
+> `delete_via` / `policy`) is **shipped** (Phase 3.4 — see § Tags). Multi-source
+> **`insert`** is
 > **shipped** (Phase 2b — the shared-surrogate envelope, below). **Still rejected:**
 > composite-PK or `> 2`-table joins, self-joins, cross-source `set` values, and
 > `select *` join bodies.
@@ -390,8 +413,11 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 > k<side> from __vmupd_keys)`) rather than a live re-query of the join body — so the
 > first side's delete cannot empty the join out from under the second side's
 > identifying subquery. A **single-side** delete (the `delete_via` / `target` /
-> single-candidate / FK-many cases) has no ordering hazard and keeps the live
-> join-body subquery. Because the fan-out is reached only when no single-direction FK
+> single-candidate / FK-many cases) reads the **same** capture (projecting just its
+> one side's PK): having no ordering hazard, the captured pre-mutation set is exactly
+> what a live re-query would have seen, so the two paths are unified onto one
+> capture built over the planned join body (the live join-body subquery is retired).
+> Because the fan-out is reached only when no single-direction FK
 > is provable, and each base delete is a **predicate-scan** over the live table (not
 > a key-addressed delete that errors on a missing key), an FK cascade — or a
 > mutual-FK edge — that removes a row before its own side's predicate-delete runs is
@@ -636,20 +662,24 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >   `buildMultiSourceReturning`): the view row spans both base tables, so it is not
 >   recoverable from the per-side base ops. Two mechanisms, threaded as
 >   `ViewMutationNode.returning` with a `returningTiming`:
->   - **`delete`** (`pre`): a **re-query of the view** restricted to the mutation's
->     predicate — `select <returning> from <view> [where <user where>]` — captured
->     **before** the base op fires (the rows still match the predicate and are about
->     to disappear).
+>   - **`delete`** (`pre`): the OLD view image restricted to the mutation's
+>     predicate, projected as **plan nodes over the planned body `root`** —
+>     `π_{<returning>}( σ_{<user where>}( root ) )`, resolved against `root`'s
+>     view-output column scope — captured **before** the base op fires (the rows still
+>     match the predicate and are about to disappear). The planned body is reused, not
+>     re-expanded through the view name.
 >   - **`update`** (`post`, with an `identityCapture`): **up-front identity capture**
 >     (`planner/mutation/multi-source.ts` `buildMultiSourceKeyCapture`). Each
 >     affected view row's **base-PK identities** `(k0, k1)` are captured **before** the
->     base ops fire (`select s0.pk0 as k0, s1.pk1 as k1 from <body> where <idPredicate>`,
->     materialized into `rctx.tableContexts` under a shared descriptor — the same
+>     base ops fire — `π_{s0.pk0 as k0, s1.pk1 as k1}( σ_{idPredicate}( JoinNode ) )`
+>     built as plan nodes over the already-planned join body (no AST re-plan),
+>     materialized into `rctx.tableContexts` under a shared descriptor (the same
 >     working-table-in-context plumbing recursive CTEs / the insert envelope reuse).
->     **After** the base ops, the join body is re-queried, projecting the view-spelled
->     base-term RETURNING columns restricted to those captured identities
+>     **After** the base ops, the same planned `JoinNode` is re-queried, projecting the
+>     view-spelled base-term RETURNING columns restricted to those captured identities
 >     (`… where exists (select 1 from __vmupd_keys k where k.k0 = s0.pk0 and k.k1 =
->     s1.pk1)`, via an `InternalRecursiveCTERefNode` over the descriptor). Because the
+>     s1.pk1)`, the EXISTS built over a fresh `InternalRecursiveCTERefNode` for the
+>     descriptor). Because the
 >     match is on captured **identity** (not the now-stale user predicate), this is
 >     robust against an update that **rewrites a column its own WHERE filters on** —
 >     and a row the update pushed *out* of the view's filter is still returned
@@ -939,11 +969,11 @@ goldens.
 - `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed.** A decomposition-backed logical table (a `primary-storage` advertisement, no override) routes to the advertisement-driven fan-out (`decomposition.ts`); a single-table body routes to the single-source spine (`single-source.ts`); a join body routes to the multi-source walk (`multi-source.ts`). Also hosts `classifyViewBody`.
 - `src/planner/mutation/scope-transform.ts` — the **one** scope-aware column-substitution primitive all three backward callers share (§ Selection). **Landed.** Owns the structural expression walker (`transformExpr` with its `descend` hook into `subquery` / `exists` / `in`-subquery operands, plus the deep `cloneExpr` / `cloneQueryExpr` / `mapQueryExprUniform` / `rebuildSelect`), the FROM-source column-name resolution that builds the shadow set (`collectFromColumnNames`), and the scope-aware descent `transformScopedExpr` / `transformScopedQuery` parameterized by a `ScopeContext` value object (`{ makeSubstitute(shadowed, tainted), unresolvableScope, rejectUnresolvableScope?, rejectDmlSubquery }`). The descent owns the shared shadow-accumulation / taint-propagation / `unsupported-subquery-correlation` reject / sibling-leg mechanics; each caller supplies only its `ScopeContext`.
 - `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.** Builds the two `ScopeContext`s that drive the shared `scope-transform.ts` descent: `makeViewScope` (the view-column → base-term descent, behind `makeViewColumnDescend`) and `makeBaseQualifyScope` (the deep base-term correlation-qualifier, behind `makeBaseQualifier`), which rewrite view-column references nested inside a predicate / assigned-value subquery to their base-term lineage and re-bind a substituted term's own correlation refs.
-- `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition. `propagateMultiSource` reads the planned body's `updateLineage` to emit an ordered multi-element `BaseOp[]` for `update` / `delete`, lowered to AST. `analyzeMultiSourceInsert` (Phase 2b) decomposes an `insert`: it routes each supplied view column to its owning side, reads the shared key off the single-equi-join ON predicate, decides directly-supplied-vs-mint, FK-orders the sides, and raises `no-default` / `no-inverse` for an uncoverable side. **Landed.**
+- `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition. `analyzeJoinView` plans the body **once** and exposes its `updateLineage` (column→base routing), the raw `JoinNode`, and the join column scope. `decomposeUpdate` / `decomposeDelete` emit an ordered multi-element `BaseOp[]` whose SET/value clauses lower to AST (re-using the base builders) but whose WHERE addresses rows through the shared `__vmupd_keys` key capture (no AST re-plan of the body for identification). `buildMultiSourceKeyCapture` / `buildMultiSourceUpdateReturning` build the capture / RETURNING re-query as plan nodes directly over the planned `JoinNode` (the derived backward walk). `analyzeMultiSourceInsert` (Phase 2b) decomposes an `insert`: it routes each supplied view column to its owning side, reads the shared key off the single-equi-join ON predicate, decides directly-supplied-vs-mint, FK-orders the sides, and raises `no-default` / `no-inverse` for an uncoverable side. **Landed.**
 - `src/planner/nodes/envelope-scan-node.ts` / `src/runtime/emit/envelope-scan.ts` — the leaf that scans the shared-surrogate envelope rows from `rctx.tableContexts` (set by the `ViewMutation` emitter before fan-out). **Landed.**
 - `src/planner/building/view-mutation-builder.ts` — `buildViewMutation` routes a multi-source inner-join `insert` to `buildMultiSourceInsert`, which builds the envelope source (the user VALUES/SELECT), one base insert per side (each sourcing a projection over an `EnvelopeScanNode`, re-planned through `buildInsertStmt`'s new `preBuiltSource` seam), and the `max(anchor.key)` seed. **Landed.**
 - `src/planner/mutation/decomposition.ts` — the **advertisement-driven** put fan-out for an n-way decomposition lens (`propagateDecomposition` for DELETE/UPDATE; `analyzeDecompositionInsert` for INSERT; `lens-multi-source-put-fanout` + `lens-multi-source-put-insert-fanout`). **Landed:** DELETE across every member (anchor-last, anchor-only predicate); UPDATE routed to the mandatory non-EAV member backing each column; **INSERT** anchor-first one-per-member off the shared-surrogate envelope (`integer-auto` surrogate minted once per row, per-row/per-statement, or a logical-tuple PK threaded straight through; optional members gated per-row; EAV triples per supplied attribute; singleton over the empty key) — built by `buildDecompositionInsert` in `view-mutation-builder.ts` (the AST `BaseOp[]` model cannot carry the envelope). Still deferred onto absent substrate: a non-anchor-member predicate (`unsupported-decomposition-predicate`, snapshot-consistent multi-member execution), an optional/EAV/key UPDATE transition (`unsupported-decomposition-update`, per-row insert-or-delete branching), non-integer surrogate generators (`no-default`), and composite shared keys (`unsupported-decomposition-key`).
-- `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.** The node is **relational** when a `returning` clause is present (`resultRelation()` is the separate multi-source re-query `returning` child, else a relational base op); the builder's `buildMultiSourceReturning` builds the multi-source re-query (with `returningTiming` `pre`/`post`).
+- `src/planner/nodes/view-mutation-node.ts` / `src/planner/building/view-mutation-builder.ts` — the `ViewMutationNode` wrapper and the builder that re-plans each `BaseOp.statement` through the base-table builder. **Landed.** For a multi-source inner-join `update` / `delete`, `buildViewMutation` plans the join body **once** (`analyzeJoinView`) and threads that single analysis through decomposition, the identity capture (built for *every* such mutation now — the live join-body subquery is retired, so every base op reads `__vmupd_keys`), and the RETURNING re-query — so no consumer re-plans the body. The node is **relational** when a `returning` clause is present (`resultRelation()` is the separate multi-source re-query `returning` child, else a relational base op); the builder's `buildMultiSourceReturning` builds the update re-query over the planned `JoinNode` (`post`) and the delete re-query over the planned `root` (`pre`).
 - `src/func/invertibility.ts` — `InvertibilityProfile` type, built-in profile registry, UDF registration hook.
 - `src/runtime/emit/view-mutation.ts` — instruction emitter that issues the emitted base operations in order. For a multi-source insert it first materializes `plan.envelope` once (the shared-surrogate envelope), evaluating the seed and minting `seed + ordinal` per row, then stashes the rows in `rctx.tableContexts` for the base ops' `EnvelopeScanNode`s. **Landed.** For a `returning` mutation it materializes and yields the view-projected rows: a relational base op (single-source) is drained and surfaced, or the separate `returning` re-query is captured before (delete) / after (update) the base ops.
 - `src/schema/view.ts` — `ViewSchema.effectiveTargets`, `ViewSchema.defaultsForColumn`, populated at view-creation time.
@@ -960,6 +990,24 @@ Each surface mirrors a one-to-one correspondence with an existing engine surface
 > Derived Backward Walk above. The law lands first and standalone as
 > `bx-roundtrip-law-harness`; `view-mutation-plan-node-substrate` then threads each
 > operator's backward method as the law-gated derived dual.
+>
+> **Landed (multi-source row identification consumes the planned body, no AST
+> round-trip).** The two-table inner-join `update` / `delete` substrate plans the
+> join body **once** and builds its per-row identity capture and RETURNING re-query
+> as plan nodes over that planned body — it no longer lowers the backward decisions
+> to an AST `select … from <cloned join FROM>` that gets *re-planned* inside every
+> identifying subquery / capture / RETURNING re-query. Concretely
+> (`mutation/multi-source.ts` + `building/view-mutation-builder.ts`): `analyzeJoinView`
+> returns the planned `root` / raw `JoinNode` / join column scope; the identity
+> capture is `π_{k<side>}( σ_{idPred}( JoinNode ) )` built once (every base op —
+> single-side and both-sides alike — reads it back through `__vmupd_keys`, so the
+> live join-body subquery is retired); UPDATE RETURNING re-queries the same
+> `JoinNode` `post` restricted to the captured `(k0, k1)`; DELETE RETURNING projects
+> the planned `root` `pre`. The base writes still lower their SET/value clauses to
+> AST and re-use `buildUpdateStmt` / `buildDeleteStmt` verbatim — only the *backward
+> decisions* (row identification, RETURNING) now ride the planned operator tree, the
+> derived dual the round-trip laws gate. The auto-deriver remains the committed
+> north-star; this is the hand-written derivation shaped to fold into it.
 
 ## Round-Trip Laws and the Derived Backward Walk
 

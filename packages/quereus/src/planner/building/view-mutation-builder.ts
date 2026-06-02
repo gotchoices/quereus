@@ -5,7 +5,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -65,7 +65,26 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// free (`lens-set-level-rowtime-enforcement`, delivered).
 	rejectLensSetLevelConflictResolution(ctx, view, req);
 
-	const baseOps = propagate(ctx, view, withTags(req, tags));
+	// Multi-source inner-join UPDATE / DELETE: plan the join body ONCE here and thread
+	// the single analysis through decomposition, the identity capture, and the
+	// RETURNING re-query — so no consumer re-plans the body via AST (the retired
+	// double-plan; docs/view-updateability.md § Round-Trip Laws and the Derived
+	// Backward Walk). A decomposition-backed logical table (a `primary-storage`
+	// advertisement) is NOT this case — it routes to `propagate`'s advertisement
+	// fan-out (`decomposition.ts`); a single-source body routes to the spine.
+	const msAnalysis: JoinViewAnalysis | undefined =
+		(req.op === 'update' || req.op === 'delete') && isJoinBody(view.selectAst) && !decompositionStorage(ctx, view)
+			? analyzeJoinView(ctx, view)
+			: undefined;
+
+	let baseOps: BaseOp[];
+	if (msAnalysis && req.op === 'update') {
+		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, tags);
+	} else if (msAnalysis && req.op === 'delete') {
+		baseOps = decomposeDelete(ctx, view, msAnalysis, req.stmt, tags);
+	} else {
+		baseOps = propagate(ctx, view, withTags(req, tags));
+	}
 	// Lens row-local enforcement: when the target is a lens-backed logical table,
 	// its prover-classified `enforced-row-local` CHECK obligations (rewritten to
 	// basis terms) ride the basis write's per-row check pipeline, so they fire on
@@ -107,13 +126,13 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// rewrite a predicate column — out from under the second op's identifying
 	// subquery), and the UPDATE RETURNING re-query re-projects by captured identity.
 	// Built once and shared.
-	const keyCapture = buildIdentityCapture(ctx, view, req, baseOps);
-	// Multi-side base ops resolve `select k<side> from __vmupd_keys` against the
-	// context-backed key relation — inject a fresh key ref per op (sharing the one
-	// descriptor) into each op's planning `cteNodes`. A single-side base op (a
-	// single-side update + RETURNING, or any single-side delete) uses the live
-	// join-body subquery, so it needs no injection.
-	const injectKeyRef = !!keyCapture && baseOps.length > 1;
+	const keyCapture = buildIdentityCapture(ctx, view, req, baseOps, msAnalysis);
+	// EVERY multi-source update/delete base op now resolves `select k<side> from
+	// __vmupd_keys` against the context-backed key relation (single-side and both-sides
+	// alike — the live join-body subquery is retired), so inject a fresh key ref per op
+	// (sharing the one capture descriptor) into each op's planning `cteNodes`. Non
+	// multi-source paths build no capture, so this is a no-op there.
+	const injectKeyRef = !!keyCapture;
 	const children = baseOps.map(op =>
 		buildBaseOp(injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx, op, extraConstraints));
 
@@ -124,46 +143,58 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// re-queries the view *before* the base ops fire (its rows are about to vanish);
 	// an update re-queries the join body *after* restricted to the captured identities
 	// (robust against an update that rewrites its own predicate column).
-	const { returning, returningTiming } = buildMultiSourceReturning(ctx, view, req, keyCapture);
+	const { returning, returningTiming } = buildMultiSourceReturning(ctx, view, req, keyCapture, msAnalysis);
 	const identityCapture = keyCapture ? { source: keyCapture.source, descriptor: keyCapture.descriptor } : undefined;
 	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming, identityCapture);
 }
 
 /**
- * Build the shared up-front identity capture for a multi-source mutation when it is
- * needed, through a two-table inner-join view (not decomposition-backed):
- *  - an **UPDATE** that either assigns BOTH base sides (⇒ more than one base op — the
- *    FK-parent/FK-child ordering-hazard case) or carries a RETURNING clause (the
- *    re-query reads the captured identities); or
- *  - a **DELETE** fanned out to BOTH candidate sides (⇒ more than one base op — the
- *    lenient predicate-honest multi-side delete; each base op reads the captured set
- *    so the first side's delete can't empty the join out from under the second's).
- * `undefined` otherwise — a single-side no-RETURNING update, any single-side delete
- * (its RETURNING re-queries the view `pre`, not the capture), inserts,
- * decomposition-backed tables, and single-source spines never capture.
+ * Build the shared up-front identity capture for a multi-source inner-join UPDATE /
+ * DELETE. Now built for **every** such mutation (the single-side live join-body
+ * subquery is retired — single-side and both-sides alike read the captured set), with
+ * `analysis` the SINGLE plan of the join body threaded from {@link buildViewMutation}
+ * so the body is planned once. `undefined` for everything else (inserts, single-source
+ * spines, decomposition-backed tables — none thread an `analysis`).
+ *
+ * The captured sides are the sides whose base ops read the set, EXCEPT an UPDATE with
+ * RETURNING captures BOTH sides' PKs — its post-mutation re-query identifies the full
+ * joined row by `(k0, k1)`, so it needs a single-column PK on each side even when only
+ * one side is assigned (matching the retired path, whose RETURNING capture also
+ * projected both PKs).
  */
 function buildIdentityCapture(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	req: MutationRequest,
 	baseOps: readonly BaseOp[],
+	analysis: JoinViewAnalysis | undefined,
 ): MultiSourceKeyCapture | undefined {
-	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return undefined;
+	if (!analysis) return undefined; // only multi-source update/delete thread an analysis
 	switch (req.op) {
 		case 'update': {
 			const hasReturning = !!req.stmt.returning && req.stmt.returning.length > 0;
-			if (baseOps.length <= 1 && !hasReturning) return undefined;
-			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where);
+			const sides = hasReturning ? [0, 1] : capturedSideIndices(baseOps, analysis);
+			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where, analysis, sides);
 		}
-		case 'delete': {
-			// Only the multi-side fan-out needs the capture; a single-side delete keeps
-			// the live join-body subquery (and its RETURNING re-queries the view `pre`).
-			if (baseOps.length <= 1) return undefined;
-			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where);
-		}
+		case 'delete':
+			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where, analysis, capturedSideIndices(baseOps, analysis));
 		default:
 			return undefined;
 	}
+}
+
+/**
+ * The distinct join-side indices the emitted base ops target (each base op carries the
+ * planned side's `TableReferenceNode`), sorted ascending — the sides whose PKs the
+ * capture must project so each op's `select k<side> from __vmupd_keys` resolves.
+ */
+function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnalysis): number[] {
+	const set = new Set<number>();
+	for (const op of baseOps) {
+		const i = analysis.sides.findIndex(s => s.table.id === op.table.id);
+		if (i >= 0) set.add(i);
+	}
+	return [...set].sort((a, b) => a - b);
 }
 
 /**
@@ -204,36 +235,109 @@ function buildMultiSourceReturning(
 	view: MutableViewLike,
 	req: MutationRequest,
 	keyCapture: MultiSourceKeyCapture | undefined,
+	analysis: JoinViewAnalysis | undefined,
 ): { returning?: RelationalPlanNode; returningTiming?: 'pre' | 'post' } {
 	const returningCols = req.stmt.returning;
 	if (!returningCols || returningCols.length === 0) return {};
 	if (req.op === 'insert') return {}; // single-source insert embeds; multi-source insert is rejected upstream
-	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return {};
+	if (!analysis) return {}; // only multi-source update/delete thread an analysis
 
 	if (req.op === 'update') {
 		// keyCapture is guaranteed present here: buildIdentityCapture builds it
 		// whenever a multi-source update carries RETURNING (same gating conditions).
-		const returning = buildMultiSourceUpdateReturning(ctx, view, req.stmt, keyCapture!);
+		const returning = buildMultiSourceUpdateReturning(ctx, view, req.stmt, keyCapture!, analysis);
 		return { returning, returningTiming: 'post' };
 	}
 
-	// DELETE: re-query the view (predicate-restricted) captured `pre`.
-	const selectAst: AST.SelectStmt = {
-		type: 'select',
-		columns: [...returningCols],
-		from: [{ type: 'table', table: { type: 'identifier', name: view.name, schema: view.schemaName } }],
-		where: req.stmt.where,
-		loc: req.stmt.loc,
-	};
-	const node = buildSelectStmt(ctx, selectAst);
-	if (!isRelationalNode(node)) {
-		raiseMutationDiagnostic({
-			reason: 'returning-through-view',
-			table: view.name,
-			message: `cannot project RETURNING through view '${view.name}': the re-query did not produce a relation`,
-		});
-	}
+	// DELETE: the OLD view image of the rows about to vanish, captured `pre`. Built as
+	// plan nodes over the ALREADY-planned body `root` (the view-projected join) — its
+	// view-column output scope resolves the user WHERE and the RETURNING columns — so
+	// the body is reused, not re-expanded through the view name (no second
+	// `buildSelectStmt` of the body).
+	const node = buildDeleteReturning(ctx, view, req.stmt, returningCols, analysis);
 	return { returning: node, returningTiming: 'pre' };
+}
+
+/**
+ * Build the multi-source DELETE RETURNING relation over the planned body `root`: the
+ * OLD view image restricted to the user predicate (captured `pre`). The user WHERE and
+ * the view-spelled RETURNING columns resolve against a scope registering `root`'s
+ * view-output attributes (by their view spelling, unqualified and view-qualified) — the
+ * same column set `from <view>` would expose — so no AST re-plan of the body.
+ */
+function buildDeleteReturning(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	stmt: AST.DeleteStmt,
+	returningCols: readonly AST.ResultColumn[],
+	analysis: JoinViewAnalysis,
+): RelationalPlanNode {
+	const scope = buildViewOutputScope(ctx, view, analysis);
+	const rctx: PlanningContext = { ...ctx, scope };
+	const filtered: RelationalPlanNode = stmt.where
+		? new FilterNode(scope, analysis.root, buildExpression(rctx, stmt.where))
+		: analysis.root;
+	const projections = buildViewReturningProjections(rctx, analysis, returningCols);
+	// preserveInputColumns=false → output is exactly the view-projected RETURNING columns.
+	return new ProjectNode(scope, filtered, projections, undefined, undefined, false);
+}
+
+/**
+ * A scope registering the planned body `root`'s view-output columns by their view
+ * spelling (unqualified and view-name-qualified), so a multi-source DELETE RETURNING
+ * resolves the user WHERE / RETURNING refs against the view image exactly as a
+ * `from <view>` re-query would — without re-planning the body. The first
+ * `outColumns.length` attributes of `root` are the view's projected columns (the body
+ * is planned with `preserveInputColumns`, so any forwarded base columns follow and are
+ * deliberately NOT registered — preserving the encapsulation guard: a hidden base
+ * column does not resolve).
+ */
+function buildViewOutputScope(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis): RegisteredScope {
+	const scope = new RegisteredScope(ctx.scope);
+	const attrs = analysis.root.getAttributes();
+	const viewName = view.name.toLowerCase();
+	analysis.outColumns.forEach((col, i) => {
+		const attr = attrs[i];
+		if (!attr) return;
+		const name = col.displayName.toLowerCase();
+		scope.registerSymbol(name, (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
+		scope.registerSymbol(`${viewName}.${name}`, (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
+	});
+	return scope;
+}
+
+/**
+ * Lower a multi-source DELETE's RETURNING result columns to `Projection`s over the
+ * planned body `root`: `returning *` expands to every view output column (its view
+ * spelling), a bare/computed column resolves against the view-output scope. Mirrors the
+ * `from <view>` re-query the retired path issued, built directly on `root`.
+ */
+function buildViewReturningProjections(
+	rctx: PlanningContext,
+	analysis: JoinViewAnalysis,
+	returningCols: readonly AST.ResultColumn[],
+): Projection[] {
+	const attrs = analysis.root.getAttributes();
+	const out: Projection[] = [];
+	for (const rc of returningCols) {
+		if (rc.type === 'all') {
+			analysis.outColumns.forEach((col, i) => {
+				const attr = attrs[i];
+				if (!attr) return;
+				out.push({
+					node: new ColumnReferenceNode(rctx.scope, { type: 'column', name: col.displayName }, attr.type, attr.id, i),
+					alias: col.displayName,
+				});
+			});
+		} else {
+			const node = buildExpression(rctx, rc.expr);
+			const alias = rc.alias ?? (rc.expr.type === 'column' ? rc.expr.name : undefined);
+			out.push({ node, alias });
+		}
+	}
+	return out;
 }
 
 /**

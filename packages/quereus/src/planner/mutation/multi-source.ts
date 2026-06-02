@@ -9,6 +9,10 @@ import { PhysicalType } from '../../types/logical-type.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { buildSelectStmt } from '../building/select.js';
+import { buildExpression } from '../building/expression.js';
+import { JoinNode } from '../nodes/join-node.js';
+import { FilterNode } from '../nodes/filter.js';
+import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
@@ -22,26 +26,38 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  * § Per-Operator Semantics — Inner Join, § Multi-Base-Table Mutations).
  *
  * Scope (this phase): a view body that is a two-table **inner equi-join** of base
- * tables, written through with `update` / `delete`. The walk is driven off the
- * **planned** body's `PhysicalProperties.updateLineage` (threaded by
- * `view-mutation-physical-lineage`) to route each output column to its owning
- * base table, then lowers a per-base statement back to AST so the ordinary
- * base-table builders are reused verbatim (the documented lower-risk path — the
- * base builders stay untouched). Each per-base operation is identified by a
- * **subquery over the join body**:
+ * tables, written through with `update` / `delete`. The body is **planned once**
+ * (`analyzeJoinView`); its `PhysicalProperties.updateLineage` (threaded by
+ * `view-mutation-physical-lineage`) routes each output column to its owning base
+ * table. Each per-base SET/value is still lowered to an AST `BaseOp` so the ordinary
+ * base-table builders are reused verbatim (the documented lower-risk path — the base
+ * builders stay untouched), but **row identification no longer round-trips through a
+ * re-planned AST body**: every affected view row's base-PK identities are captured
+ * ONCE up-front, built as plan nodes directly over the already-planned join body
+ * (`Project_{k<side>}(Filter_{idPred}(joinNode))` — the derived backward walk the
+ * docs name, § Round-Trip Laws and the Derived Backward Walk), materialized before
+ * any base op fires, and each base op reads its identifying values back from that
+ * `__vmupd_keys` set:
  *
  * ```sql
  * -- view: select j1.id as id, j1.a as a, j2.c as c
  * --       from tj1 j1 join tj2 j2 on j2.id = j1.t2id
  * update jv set a = 5, c = 9 where id = 3
- *   ->  update tj1 set a = 5 where id in (select j1.id from <join> where j1.id = 3)
- *       update tj2 set c = 9 where id in (select j2.id from <join> where j1.id = 3)
+ *   -- capture (plan nodes over the planned join body, materialized once):
+ *   --   __vmupd_keys = π_{j1.id as k0, j2.id as k1}( σ_{id = 3}( tj1 ⋈ tj2 ) )
+ *   ->  update tj1 set a = 5 where id in (select k0 from __vmupd_keys)
+ *       update tj2 set c = 9 where id in (select k1 from __vmupd_keys)
  * ```
  *
- * The subquery reconstructs the row-identifying predicate (the base PK of the
- * owning side) from the join body, which is exactly the predicate the optimizer
- * already proves a key over — so a side whose own PK is hidden by the projection
- * (`tj2.id` above) is still addressable.
+ * The capture reconstructs the row-identifying predicate (each owning side's base PK)
+ * from the planned join body — exactly the predicate the optimizer already proves a
+ * key over — so a side whose own PK is hidden by the projection (`tj2.id` above) is
+ * still addressable, and a both-sides write is mutation-order-independent (the
+ * FK-parent op cannot rewrite a predicate column out from under the FK-child op).
+ * UPDATE RETURNING re-queries the same planned `joinNode` (post-mutation, restricted
+ * to the captured identities); DELETE RETURNING projects the planned body `root` (the
+ * `pre` OLD image). The body is planned once and reused — no second `buildSelectStmt`
+ * / `cloneFromClause` of it for identification or RETURNING.
  *
  * Multi-source **`insert`** (Phase 2b) is analysed here (`analyzeMultiSourceInsert`)
  * but *built* by `building/view-mutation-builder.ts` (`buildMultiSourceInsert`),
@@ -116,13 +132,35 @@ interface OutColumn {
 	readonly domain?: AST.Expression;
 }
 
-interface JoinViewAnalysis {
+export interface JoinViewAnalysis {
 	readonly sel: AST.SelectStmt;
 	/** The two base-table sides, in AST source order. */
 	readonly sides: readonly [JoinSide, JoinSide];
 	/** View column name (lowercased) -> its base-term replacement expression. */
 	readonly viewColToBaseRef: ReadonlyMap<string, AST.Expression>;
 	readonly outColumns: readonly OutColumn[];
+	/**
+	 * The planned view body (the source of `updateLineage`). Reused by the DELETE
+	 * RETURNING re-query (the OLD view image, projected `pre` over `root`) — so the
+	 * body is planned **once** rather than re-expanded through the view name.
+	 */
+	readonly root: RelationalPlanNode;
+	/**
+	 * The raw `JoinNode` inside {@link root} (the ON-condition join, *before* the
+	 * body's σ/projection). The capture's identifying relation and the UPDATE
+	 * RETURNING re-query are built directly on top of it (Filter + Project plan
+	 * nodes) instead of re-planning a cloned AST body — the derived backward walk
+	 * the docs name (§ Round-Trip Laws and the Derived Backward Walk).
+	 */
+	readonly joinNode: JoinNode;
+	/**
+	 * The join's combined column scope (`ctx.outputScopes.get(joinNode)`), which
+	 * resolves both alias-qualified (`j1.id`) and unqualified base columns — the
+	 * exact scope `buildSelectStmt` used when planning the body. Reused to build the
+	 * identifying predicate / PK projections / RETURNING columns as `ScalarPlanNode`s
+	 * over {@link joinNode}, so resolution is byte-identical to the retired re-plan.
+	 */
+	readonly joinScope: Scope;
 }
 
 // --- entry ----------------------------------------------------------------
@@ -432,7 +470,7 @@ function columnScalarType(col: ColumnSchema): ScalarType {
 
 // --- analysis -------------------------------------------------------------
 
-function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewAnalysis {
+export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewAnalysis {
 	if (view.selectAst.type !== 'select') {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
@@ -474,6 +512,24 @@ function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewA
 	}
 	const root = bodyPlan as RelationalPlanNode;
 	const tableRefsById = collectTableRefs(root);
+
+	// The raw JoinNode + its combined column scope, captured from the SINGLE plan of
+	// the body above. The identity capture and RETURNING re-query build their
+	// identifying / projection plan nodes directly on top of these (no AST re-plan of
+	// the join body for row identification — § Round-Trip Laws and the Derived
+	// Backward Walk). `joinScope` is the exact scope `buildSelectStmt` resolved the
+	// body's own predicate/projections against (set into `ctx.outputScopes` during
+	// `buildJoin`), so reusing it makes base-term resolution byte-identical to the
+	// retired re-plan.
+	const joinNode = findJoinNode(view, root);
+	const joinScope = ctx.outputScopes.get(joinNode);
+	if (!joinScope) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through view '${view.name}': the planned join body did not expose a resolvable column scope`,
+		});
+	}
 
 	// Match each AST source to its planned TableReferenceNode by name (self-joins
 	// are rejected, so the table name is unambiguous among the two sources).
@@ -543,7 +599,32 @@ function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewA
 		}
 	});
 
-	return { sel, sides, viewColToBaseRef, outColumns };
+	return { sel, sides, viewColToBaseRef, outColumns, root, joinNode, joinScope };
+}
+
+/**
+ * The single `JoinNode` inside a planned two-table inner-join body. The body is a
+ * `select <cols> from <a join b on p> [where w]`, so its plan is
+ * `Project(Filter?(Join))` — there is exactly one join. Walks relations from the
+ * root, returning the outermost (only) `JoinNode`. Reused (not re-planned) as the
+ * source the identifying-capture / RETURNING relations build on.
+ */
+function findJoinNode(view: MutableViewLike, root: PlanNode): JoinNode {
+	let found: JoinNode | undefined;
+	const visit = (n: PlanNode): void => {
+		if (found) return;
+		if (n instanceof JoinNode) { found = n; return; }
+		for (const child of n.getRelations()) visit(child);
+	};
+	visit(root);
+	if (!found) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through view '${view.name}': the planned body did not contain a join node`,
+		});
+	}
+	return found;
 }
 
 /**
@@ -641,11 +722,11 @@ function guardTopLevelScope(expr: AST.Expression, analysis: JoinViewAnalysis, vi
 
 // --- UPDATE ---------------------------------------------------------------
 
-function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
+export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
 	// RETURNING through a multi-source update is supported, but the rows are not
 	// recoverable from the per-side base ops (the view row spans both tables), so
 	// the builder (`view-mutation-builder.ts`) supplies them via a re-query of the
-	// view; the base ops themselves carry no RETURNING.
+	// planned join body; the base ops themselves carry no RETURNING.
 
 	// `target` / `exclude` narrow the writable base set (compose AFTER predicate
 	// dispatch — they only restrict, never broaden). For an update the side set is
@@ -659,14 +740,6 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 
 	// Route each assignment to its owning base side.
 	const perSide: Array<{ column: string; value: AST.Expression }[]> = [[], []];
-	// Domains from `inverse`-profile assignments, conjoined into the single-side
-	// identifying predicate below (§ Scalar Invertibility — "substitutes the inverse
-	// and conjoins `domain` into the row-identifying predicate"). No shipped
-	// invertibility profile produces a domain yet (`x ± k` is unrestricted over
-	// integers), so this stays empty in practice; the both-sides captured-key path
-	// (which routes through `__vmupd_keys`, not `idPredicate`) does not yet thread
-	// per-assignment domains — deferred until a domain-bearing profile lands.
-	const assignmentDomains: AST.Expression[] = [];
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
 		if (!out) {
@@ -703,29 +776,24 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 		// inverse wraps that last (it expects a value already in base terms).
 		const written = out.inverse ? out.inverse(baseValue) : baseValue;
 		perSide[out.sideIndex].push({ column: out.baseColumn, value: written });
-		if (out.domain) assignmentDomains.push(qualifyDomainToSide(out.domain, side));
+		// NB: a present `out.domain` (an `inverse`-profile restriction) would conjoin
+		// into the identifying predicate. No shipped invertibility profile produces a
+		// domain (`x ± k` is unrestricted over integers), and the capture path that now
+		// backs EVERY side's identification (`__vmupd_keys`) does not yet thread
+		// per-assignment domains — deferred uniformly until a domain-bearing profile
+		// lands (§ Scalar Invertibility).
 	}
 
-	// Shared identifying predicate: the user WHERE rewritten to base terms,
-	// conjoined with the view body's own WHERE and any `inverse`-profile domains.
-	const idPredicate = assignmentDomains.reduce<AST.Expression | undefined>(
-		(acc, d) => combineAnd(acc, d),
-		buildIdentifyingPredicate(ctx, analysis, stmt.where, view),
-	);
-
-	// When an update assigns BOTH base sides the per-side base ops run sequentially
-	// against live state, so a live-subquery identifier — re-evaluated *after* the
-	// earlier (FK-parent) op already mutated — loses every row whose WHERE filters on
-	// a column that op reassigns (the FK-child side then silently no-ops). Instead
-	// both ops read their identifying values from the up-front identity capture the
-	// builder materializes ONCE before any base op fires (`<pk> in (select k<side>
-	// from __vmupd_keys)`), a mutation-order-independent set, so neither op can lose
-	// rows to the other's writes. A single-side update has no such ordering hazard
-	// (the lone op re-queries before it mutates), so it keeps the live join-body
-	// subquery — preserving all the nested-subquery-descent correctness the e1/e2/
-	// g/h/… cases lock in. The builder pairs this with the matching capture +
-	// `__vmupd_keys` cteNode injection (gated on `baseOps.length > 1`).
-	const bothSidesAssigned = perSide[0].length > 0 && perSide[1].length > 0;
+	// Every affected view row's base-PK identities are captured ONCE up-front (before
+	// any base op fires) and each per-side op reads its identifying values back from
+	// that captured set (`<pk> in (select k<side> from __vmupd_keys)`), a
+	// mutation-order-independent identity built from the ALREADY-planned join body
+	// (the builder materializes the capture; see `buildMultiSourceKeyCapture`). This
+	// unifies the single-side and both-sides paths onto the same identity (no live
+	// re-query of a re-planned AST body): a both-sides update's FK-parent op can no
+	// longer rewrite a predicate column out from under the FK-child op, and a
+	// single-side op — having no ordering hazard — reads the same pre-mutation set it
+	// would have re-queried live.
 
 	// Order parent-before-child where the FK is provable (matches insert ordering
 	// intent and avoids surprising mid-statement FK states); arbitrary otherwise.
@@ -746,9 +814,7 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 		const where: AST.InExpr = {
 			type: 'in',
 			expr: { type: 'column', name: pk },
-			subquery: bothSidesAssigned
-				? buildCapturedKeySubquery(sideIndex)
-				: buildIdentifyingSubquery(analysis, side, pk, idPredicate),
+			subquery: buildCapturedKeySubquery(sideIndex),
 		};
 		const statement: AST.UpdateStmt = {
 			type: 'update',
@@ -837,54 +903,58 @@ export function makeMultiSourceKeyRef(scope: Scope, capture: MultiSourceKeyCaptu
 }
 
 /**
- * Build the up-front identity capture: each affected view row's base-PK identities
- * `(k0, k1)`, by the same identifying predicate the base ops route on (user WHERE →
- * base ∧ body WHERE). `preserveInputColumns=false` ⇒ the output is exactly
- * `[k0, k1]`, positionally aligned to the key columns every reader scans back.
- * Requires a **single-column PK on both** join sides (the captured identity is both
- * sides' PKs); a composite-PK side is rejected with `unsupported-join` by
- * {@link requireSingleColumnPk}.
+ * Build the up-front identity capture: each affected view row's base-PK identities,
+ * by the same identifying predicate the base ops route on (user WHERE → base ∧ body
+ * WHERE). Built as **plan nodes directly over the ALREADY-planned join body**
+ * (`analysis.joinNode` + `analysis.joinScope`) — `Project_{k<side>}(Filter_{idPred}
+ * (joinNode))` — instead of re-planning a cloned AST FROM, so the body is planned
+ * ONCE (§ Round-Trip Laws and the Derived Backward Walk). `preserveInputColumns=false`
+ * ⇒ the materialized rows are exactly the requested key columns, positionally aligned
+ * to the `k<side>` columns every reader scans back (`keyColumns` and the projection
+ * derive from the same `sideIndices` order).
  *
- * Op-agnostic: takes the user `where` directly (an UPDATE's or a DELETE's), since the
- * capture body is identical either way (both sides' single-column PK, the identifying
- * predicate from the statement's WHERE, projected as `k0` / `k1`).
+ * `sideIndices` selects which sides' PKs to capture (each requires a single-column PK
+ * via {@link requireSingleColumnPk}; a composite-PK *requested* side is rejected with
+ * `unsupported-join`). The builder passes exactly the sides whose base ops read the
+ * capture (plus both, for an UPDATE with RETURNING whose EXISTS needs `(k0, k1)`), so
+ * a single-side write never forces a single-column PK on the untouched side.
+ *
+ * Op-agnostic: takes the user `where` directly (an UPDATE's or a DELETE's) — the
+ * identifying predicate is the same either way.
  */
 export function buildMultiSourceKeyCapture(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	where: AST.Expression | undefined,
+	analysis: JoinViewAnalysis,
+	sideIndices: readonly number[],
 ): MultiSourceKeyCapture {
-	const analysis = analyzeJoinView(ctx, view);
-	const [side0, side1] = analysis.sides;
-	const pk0 = requireSingleColumnPk(view, side0);
-	const pk1 = requireSingleColumnPk(view, side1);
-	const pk0Type = columnScalarType(columnByName(side0.schema, pk0));
-	const pk1Type = columnScalarType(columnByName(side1.schema, pk1));
+	// The identifying predicate (user WHERE → base terms ∧ the body's own WHERE), built
+	// as a ScalarPlanNode over the planned join body's own scope — the exact scope
+	// `buildSelectStmt` resolved the body against. The body WHERE is conjoined
+	// explicitly (the source is the raw `joinNode`, before the body's σ), so the
+	// captured set is byte-identical to the retired re-plan over the cloned FROM.
+	const idPredicateAst = buildIdentifyingPredicate(ctx, analysis, where, view);
+	const predicate = idPredicateAst
+		? buildExpression({ ...ctx, scope: analysis.joinScope }, idPredicateAst)
+		: undefined;
+	const filtered: RelationalPlanNode = predicate
+		? new FilterNode(analysis.joinScope, analysis.joinNode, predicate)
+		: analysis.joinNode;
 
-	const idPredicate = buildIdentifyingPredicate(ctx, analysis, where, view);
-	const captureAst: AST.SelectStmt = {
-		type: 'select',
-		columns: [
-			{ type: 'column', expr: { type: 'column', name: pk0, table: side0.alias }, alias: 'k0' },
-			{ type: 'column', expr: { type: 'column', name: pk1, table: side1.alias }, alias: 'k1' },
-		],
-		from: analysis.sel.from!.map(cloneFromClause),
-		where: idPredicate,
-	};
-	const source = buildSelectStmt(ctx, captureAst, new Map(), false);
-	if (!isRelationalNode(source)) {
-		raiseMutationDiagnostic({
-			reason: 'no-base-lineage',
-			table: view.name,
-			message: `cannot write through view '${view.name}': the identity-capture query did not produce a relation`,
-		});
-	}
+	const keyColumns: { name: string; type: ScalarType }[] = [];
+	const projections: Projection[] = sideIndices.map((i): Projection => {
+		const side = analysis.sides[i];
+		const pk = requireSingleColumnPk(view, side);
+		keyColumns.push({ name: MS_UPDATE_KEY_COLUMNS[i], type: columnScalarType(columnByName(side.schema, pk)) });
+		return {
+			node: buildExpression({ ...ctx, scope: analysis.joinScope }, { type: 'column', name: pk, table: side.alias }),
+			alias: MS_UPDATE_KEY_COLUMNS[i],
+		};
+	});
+	const source = new ProjectNode(analysis.joinScope, filtered, projections, undefined, undefined, false);
 
-	return {
-		source,
-		descriptor: {},
-		keyColumns: [{ name: 'k0', type: pk0Type }, { name: 'k1', type: pk1Type }],
-	};
+	return { source, descriptor: {}, keyColumns };
 }
 
 /**
@@ -908,15 +978,21 @@ export function buildMultiSourceUpdateReturning(
 	view: MutableViewLike,
 	stmt: AST.UpdateStmt,
 	capture: MultiSourceKeyCapture,
+	analysis: JoinViewAnalysis,
 ): RelationalPlanNode {
-	const analysis = analyzeJoinView(ctx, view);
 	const returningCols = stmt.returning!;
 	const [side0, side1] = analysis.sides;
 	const pk0 = requireSingleColumnPk(view, side0);
 	const pk1 = requireSingleColumnPk(view, side1);
 
+	// Restrict the POST-mutation join body to the captured identities, built as plan
+	// nodes over the ALREADY-planned `joinNode` (its structural ON-condition only —
+	// the body/user WHERE is intentionally NOT re-applied) — no AST re-plan of the
+	// body. The EXISTS subquery resolves `__vmupd_keys` via `cteNodes` to a fresh key
+	// ref over the shared capture descriptor; `s0.pk0` / `s1.pk1` correlate to the
+	// outer join row through `joinScope`.
 	const keyRef = makeMultiSourceKeyRef(ctx.scope, capture);
-	const existsPredicate: AST.Expression = {
+	const existsPredicateAst: AST.Expression = {
 		type: 'exists',
 		subquery: {
 			type: 'select',
@@ -928,22 +1004,21 @@ export function buildMultiSourceUpdateReturning(
 			),
 		},
 	};
-	const requeryAst: AST.SelectStmt = {
-		type: 'select',
-		columns: buildReturningProjection(ctx, view, analysis, returningCols),
-		from: analysis.sel.from!.map(cloneFromClause),
-		where: existsPredicate,
-	};
-	const returning = buildSelectStmt(ctx, requeryAst, new Map([[MS_UPDATE_KEYS_CTE, keyRef]]), false);
-	if (!isRelationalNode(returning)) {
-		raiseMutationDiagnostic({
-			reason: 'returning-through-view',
-			table: view.name,
-			message: `cannot project RETURNING through view '${view.name}': the post-mutation re-query did not produce a relation`,
-		});
-	}
+	const cteNodes = new Map(ctx.cteNodes ?? []);
+	cteNodes.set(MS_UPDATE_KEYS_CTE, keyRef);
+	const existsNode = buildExpression({ ...ctx, scope: analysis.joinScope, cteNodes }, existsPredicateAst);
+	const filtered = new FilterNode(analysis.joinScope, analysis.joinNode, existsNode);
 
-	return returning;
+	// Project the view-spelled, base-term RETURNING columns over the filtered join.
+	// preserveInputColumns=false ⇒ the output is exactly the RETURNING columns.
+	const projections: Projection[] = buildReturningProjection(ctx, view, analysis, returningCols).map((rc): Projection => {
+		const col = rc as AST.ResultColumnExpr;
+		return {
+			node: buildExpression({ ...ctx, scope: analysis.joinScope }, col.expr),
+			alias: col.alias,
+		};
+	});
+	return new ProjectNode(analysis.joinScope, filtered, projections, undefined, undefined, false);
 }
 
 /**
@@ -992,10 +1067,10 @@ function buildReturningProjection(
 
 // --- DELETE ---------------------------------------------------------------
 
-function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
+export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
 	// RETURNING through a multi-source delete is supported via a re-query of the
-	// view captured *before* the base delete fires (the builder); the base op
-	// itself carries no RETURNING.
+	// planned view body captured *before* the base delete fires (the builder); the
+	// base op itself carries no RETURNING.
 
 	// Scope guard: top-level `where` references must name view columns (parity with
 	// the single-source spine).
@@ -1003,19 +1078,14 @@ function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: 
 
 	const sides = chooseDeleteSides(view, analysis, tags);
 
-	// A multi-side fan-out (the lenient predicate-honest "make this joined row not
-	// exist") runs more than one base delete sequentially against live state, so —
-	// exactly like the both-sides UPDATE — each per-side op reads its identifying
-	// values from the up-front identity capture the builder materializes ONCE before
-	// any base op fires (`<pk> in (select k<side> from __vmupd_keys)`), a
-	// mutation-order-independent set, so the first side's delete cannot empty the join
-	// out from under the second side's identifying subquery. A single-side delete has
-	// no such ordering hazard (the lone op re-queries before it mutates), so it keeps
-	// the live join-body subquery — preserving the (j)/(g)-style nested-subquery-descent
-	// correctness. The builder pairs the fan-out with the matching capture + `__vmupd_keys`
-	// cteNode injection (gated on `baseOps.length > 1`).
-	const fanOut = sides.length > 1;
-	const idPredicate = fanOut ? undefined : buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
+	// Every base delete (single-side and multi-side fan-out alike) reads its
+	// identifying values from the up-front identity capture the builder materializes
+	// ONCE before any base op fires (`<pk> in (select k<side> from __vmupd_keys)`), a
+	// mutation-order-independent set built from the ALREADY-planned join body. So the
+	// first side's delete cannot empty the join out from under the second side's
+	// identifying set (the predicate-honest multi-side fan-out), and a single-side
+	// delete — having no ordering hazard — reads the same pre-mutation set it would
+	// have re-queried live. (No live re-query of a re-planned AST body.)
 
 	// Order parent-before-child where the FK is provable (arbitrary otherwise); a
 	// fan-out is only ever reached when no single FK is provable, so its order is the
@@ -1028,9 +1098,7 @@ function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: 
 		const where: AST.InExpr = {
 			type: 'in',
 			expr: { type: 'column', name: pk },
-			subquery: fanOut
-				? buildCapturedKeySubquery(sideIndex)
-				: buildIdentifyingSubquery(analysis, side, pk, idPredicate),
+			subquery: buildCapturedKeySubquery(sideIndex),
 		};
 		const statement: AST.DeleteStmt = {
 			type: 'delete',
@@ -1204,26 +1272,6 @@ function buildIdentifyingPredicate(
 }
 
 /**
- * `select <alias>.<pk> from <view join body> where <idPredicate>` — the subquery
- * whose result set is the owning side's PK values for every joined row matching
- * the mutation. The FROM is a deep clone of the view body's FROM so the two
- * sides' subqueries never share AST nodes.
- */
-function buildIdentifyingSubquery(
-	analysis: JoinViewAnalysis,
-	side: JoinSide,
-	pk: string,
-	idPredicate: AST.Expression | undefined,
-): AST.SelectStmt {
-	return {
-		type: 'select',
-		columns: [{ type: 'column', expr: { type: 'column', name: pk, table: side.alias } }],
-		from: analysis.sel.from!.map(cloneFromClause),
-		where: idPredicate,
-	};
-}
-
-/**
  * Substitute references to view columns (unqualified, or qualified by the view's
  * own name) with their base-term replacement expression. References already
  * qualified by a base alias are left untouched. A view-column reference nested
@@ -1284,25 +1332,6 @@ function stripSideQualifier(
 	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
 }
 
-/**
- * Qualify a base-column-term `domain` predicate (from an `inverse` profile) to the
- * owning side's alias, so it binds unambiguously against the two-source join body
- * that becomes the identifying subquery's FROM — bare column refs gain the alias;
- * already-qualified refs are left untouched. Threaded into any embedded subquery
- * too (the qualifier rule applies at every nesting depth, like
- * {@link stripSideQualifier}).
- *
- * Currently unreachable — no shipped invertibility profile attaches a `domain`
- * (the `x ± k` registry is unrestricted over integers). Wired so the first
- * domain-bearing profile's restriction survives the lowering into the `<pk> in
- * (select … where <idPredicate>)` subquery in base terms.
- */
-function qualifyDomainToSide(domain: AST.Expression, side: JoinSide): AST.Expression {
-	const qualify = (col: AST.ColumnExpr): AST.Expression | undefined =>
-		col.table ? undefined : { type: 'column', name: col.name, table: side.alias };
-	return transformExpr(domain, qualify, (q) => mapQueryExprUniform(q, qualify));
-}
-
 // --- helpers --------------------------------------------------------------
 
 function tableIdentifier(table: TableSchema): AST.IdentifierExpr {
@@ -1342,24 +1371,6 @@ function orderSides(sides: readonly [JoinSide, JoinSide]): number[] {
 	const child = fkChildIndex(sides);
 	if (child === undefined) return [0, 1];
 	return child === 0 ? [1, 0] : [0, 1];
-}
-
-/** Deep-clone a FROM clause (table sources and inner joins only). */
-function cloneFromClause(fc: AST.FromClause): AST.FromClause {
-	switch (fc.type) {
-		case 'table':
-			return { ...fc };
-		case 'join':
-			return {
-				...fc,
-				left: cloneFromClause(fc.left),
-				right: cloneFromClause(fc.right),
-				condition: fc.condition ? cloneExpr(fc.condition) : undefined,
-			};
-		default:
-			// Unreachable: collectInnerJoinSources rejects non-table/join sources.
-			return { ...fc };
-	}
 }
 
 /**
