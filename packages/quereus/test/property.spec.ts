@@ -2771,6 +2771,66 @@ describe('Property-Based Tests', () => {
 				), { numRuns: 60 });
 			});
 
+			// ----- Family B (B1): an inverse-profile column is writable through the join -----
+			// `cv1 = c.cv + 1` is a non-identity invertible projection of jchild.cv. The
+			// multi-source UPDATE path now consumes the threaded `inverse` (instead of the
+			// identity-only `identityBaseSite` it discarded it to): `update jv2 set cv1 = N`
+			// must store the BASE value `jchild.cv = N - 1` and the view must read back
+			// `cv1 = N` (PutGet). Statically the column's UpdateSite is `base` with an
+			// `inverse` and is reported writable (plan-lineage agreement). This is the B1
+			// acceptance gate (docs § Scalar Invertibility, § Inner Join).
+			it('PutGet + lineage: an inverse-profile column (cv + 1) is writable through the join', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists jv2');
+				await db.exec('drop table if exists jchild');
+				await db.exec('drop table if exists jparent');
+				await db.exec('create table jparent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table jchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references jparent(pp)) using memory');
+				await db.exec('create view jv2 as select c.cc as cc, c.cv + 1 as cv1, p.pv as pv from jchild c join jparent p on p.pp = c.pr');
+
+				// Static plan-lineage: cv1 is a base site (jchild.cv) WITH an inverse, writable.
+				const node = planLogicalBody('select c.cc as cc, c.cv + 1 as cv1, p.pv as pv from jchild c join jparent p on p.pp = c.pr');
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, 'jv2 exposes cc, cv1, pv').to.equal(3);
+				const cv1Site = node.physical.updateLineage?.get(attrs.find(a => a.name.toLowerCase() === 'cv1')!.id);
+				expect(cv1Site?.kind, 'cv1 traces to a base site').to.equal('base');
+				const baseCv1 = cv1Site as Extract<UpdateSite, { kind: 'base' }>;
+				expect(baseCv1.baseColumn.toLowerCase(), 'cv1 owns jchild.cv').to.equal('cv');
+				expect(baseCv1.inverse, 'cv1 carries an inverse closure').to.not.equal(undefined);
+				// Every accepted output column is base-writable (totality + key agreement).
+				assertPlanLineageAgreement('family-B inverse join', attrs, keysOf(node), node.physical.updateLineage);
+				expect(attrs.every(a => node.physical.updateLineage?.get(a.id)?.kind === 'base'),
+					'every output column of the inverse-projecting join traces to a base column').to.equal(true);
+
+				// PutGet: writing cv1 = NV stores jchild.cv = NV - 1 and reads back cv1 = NV.
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					fc.integer({ min: 1, max: 9 }),    // cc predicate value K
+					fc.integer({ min: 10, max: 20 }),  // new cv1 value NV (disjoint from seeds)
+					async (parents, children, K, NV) => {
+						const { parents: P, children: C } = await seedJoin(parents, children);
+						const ppSet = new Set(P.map(p => p.pp));
+						const joined = (c: Child): boolean => ppSet.has(c.pr);
+
+						await db.exec(`update jv2 set cv1 = ${NV} where cc = ${K}`);
+						// base jchild.cv holds the INVERTED value NV - 1 for the targeted joined row.
+						const oChildren = C.map(c => (c.cc === K && joined(c)) ? { ...c, cv: NV - 1 } : c);
+
+						assertRowsEqual('inverse PutGet child', await readRows('select cc, pr, cv from jchild'),
+							oChildren.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), ['cc', 'pr', 'cv']);
+						assertRowsEqual('inverse PutGet parent', await readRows('select pp, pv from jparent'),
+							P.map(p => ({ pp: p.pp, pv: p.pv })), ['pp', 'pv']);
+
+						// view image: cv1 reads back as cv + 1, so the targeted row surfaces NV.
+						const pvAfter = new Map(P.map(p => [p.pp, p.pv]));
+						const expectedView = oChildren.filter(c => ppSet.has(c.pr))
+							.map(c => ({ cc: c.cc, cv1: c.cv + 1, pv: pvAfter.get(c.pr)! }));
+						assertRowsEqual('inverse PutGet view image', await readRows('select cc, cv1, pv from jv2'),
+							expectedView, ['cc', 'cv1', 'pv']);
+					},
+				), { numRuns: 50 });
+			});
+
 			// ----- Multi-source insert: the shared-surrogate envelope (PutGet) -----
 			// jv hides the shared key (jparent.pp = jchild.pr), so an insert mints a
 			// surrogate ONCE per produced row and threads it into BOTH base inserts:

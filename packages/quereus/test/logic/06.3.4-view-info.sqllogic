@@ -161,6 +161,26 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets from vi
 update ms_jv set note = 'x' where cid = 999;
 
 -- ===================================================================
+-- Multi-source inner join exposing an INVERSE-profile column (`nv1 = c.nv + 1`):
+-- still is_updatable='YES' (its `base`-with-`inverse` site is writable, like any
+-- base site), effective_targets both bases. Same per-base shape as ms_jv: the
+-- parent PK is hidden → not deletable at every base, and the child's not-null
+-- `pref` is unrecoverable → not insertable (the inverse column is not insertable
+-- through the multi-source envelope, but `pref` already forces NO here). The
+-- multi-source UPDATE path consumes the inverse — see column_info goldens for the
+-- per-column write. docs § Scalar Invertibility, § Inner Join.
+-- ===================================================================
+
+create table iv_parent (pid integer primary key, label text);
+create table iv_child (cid integer primary key, pref integer, nv integer,
+    foreign key (pref) references iv_parent(pid));
+create view iv_jv as
+    select c.cid as cid, c.nv + 1 as nv1, p.label as label
+    from iv_child c join iv_parent p on p.pid = c.pref;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('iv_jv');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"iv_child\",\"iv_parent\"]"}]
+
+-- ===================================================================
 -- Divergence 1 — view-level `default_for` rescues insertability. `created` is a
 -- not-null, no-declared-default base column projected away by the view; a
 -- view-level default_for tag recovers it → insertable. The `tag-default`

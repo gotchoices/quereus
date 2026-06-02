@@ -338,6 +338,22 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 
 **Updates** route per-column to the side that owns each column. A `set` clause assigning columns from both sides produces two child operations executed atomically. The row-identifying predicate for each child is the projection of the join's row-identifying predicate onto that child's key columns.
 
+> **Shipped (Phase B1) — inverse-profile columns are writable through a join.** The
+> multi-source path consumes the FULL threaded `UpdateSite` (`multi-source.ts`
+> `writableBaseSite`), not just identity sites: a `base` site **with an `inverse`**
+> — a non-identity invertible projection such as `c.cv + 1` — is writable. A write
+> `set cv1 = w` lowers the assigned value through the site's inverse to the base
+> value (`update jchild set cv = w - 1`), and the view reads it back through the
+> forward transform (`cv1 = cv + 1 = w`). A present `domain` is conjoined into the
+> row-identifying predicate (no shipped invertibility profile produces one yet —
+> `x ± k` is unrestricted — so this path is currently unreachable). A `computed` /
+> outer-join `null-extended` site stays read-only (`no-inverse`). **Insert** through
+> an inverse column is still rejected (`no-inverse`): the shared-surrogate envelope
+> writes supplied values verbatim, with no hook to apply the inverse. The static
+> `view_info` / `column_info` surfaces already report a `base`-with-`inverse` site
+> writable (their `baseSiteOf` resolves any base site), so they agree with this
+> dynamic truth.
+
 **Inserts** require values for both sides' `not null`-without-default columns and must satisfy the join predicate. The two child inserts execute FK-parent before FK-child where the dependency is provable; otherwise the order is unspecified. The join predicate, combined with the inserted values, supplies missing join-key columns on either side via EC.
 
 > **Shipped (Phase 2b) — two-table inner join.** A multi-source insert decomposes
@@ -484,6 +500,21 @@ type InvertibilityProfile =
 Built-in functions ship with profiles. `cast`-style conversions advertise `inverse` when lossless and `opaque` when lossy. `coalesce(x, default)` is `passthrough` on `arg = 0` when the default branch is provably unreachable on the update path (via FD-driven `not null` proof). String functions are `opaque` by default; the few invertible cases are declared explicitly.
 
 User-defined functions declare their profile at registration. A predicate-typed UDF additionally declares which arguments it sees through (passing lineage through, leaving the row's update site untouched) versus which arguments it consumes opaquely. The same surface is reused by the [assertion-derived-premises](optimizer.md#assertion-derived-premises) pipeline.
+
+**Where inverse profiles are consumed (today).** The plan-node backward walk
+(`deriveProjectUpdateLineage` → `traceInvertibleColumn`) already composes the
+inverse chain onto a `base` `UpdateSite` for every projection. The **multi-source
+inner-join** update path (`mutation/multi-source.ts`, § Inner Join) consumes that
+threaded `inverse` directly — a `c.cv + 1` join column is writable, the assigned
+value lowered through `w ↦ w - 1`. The **single-source** spine does not yet
+consume inverses: it still classifies projections at the AST level
+(`classifyProjectionExpr`, identity-only), so a single-source `b + 1` column stays
+read-only on a write through the view. The identity-only AST reader
+(`identityBaseColumn` / `viewColumnsFromUpdateLineage`) is therefore the
+single-source authority and is deliberately *not* widened (it is checked against
+`deriveViewColumns` for parity); the static `view_info` / `column_info` surfaces
+read the richer plan-node lineage (`baseSiteOf`) and report a `base`-with-`inverse`
+column writable regardless of source arity.
 
 ## Tags: The Override Surface
 

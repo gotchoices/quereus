@@ -75,6 +75,34 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 → [{"cid":0,"column_name":"cid","is_updatable":"YES","base_table":"ms_child","base_column":"cid"},{"cid":1,"column_name":"note","is_updatable":"YES","base_table":"ms_child","base_column":"note"},{"cid":2,"column_name":"label","is_updatable":"YES","base_table":"ms_parent","base_column":"label"}]
 
 -- ===================================================================
+-- Multi-source inner join with an INVERSE-profile column: `nv1 = c.nv + 1` is a
+-- non-identity invertible projection of iv_child.nv. Its UpdateSite is `base`
+-- (iv_child.nv) WITH an inverse, which baseSiteOf resolves like any base site, so
+-- it reports is_updatable='YES' tracing to the base column — consistent with the
+-- multi-source UPDATE path, which now consumes the threaded inverse (a real write
+-- below stores the inverted base value). docs § Scalar Invertibility, § Inner Join.
+-- ===================================================================
+
+create table iv_parent (pid integer primary key, label text);
+create table iv_child (cid integer primary key, pref integer, nv integer,
+    foreign key (pref) references iv_parent(pid));
+create view iv_jv as
+    select c.cid as cid, c.nv + 1 as nv1, p.label as label
+    from iv_child c join iv_parent p on p.pid = c.pref;
+select cid, column_name, is_updatable, base_table, base_column from column_info('iv_jv');
+→ [{"cid":0,"column_name":"cid","is_updatable":"YES","base_table":"iv_child","base_column":"cid"},{"cid":1,"column_name":"nv1","is_updatable":"YES","base_table":"iv_child","base_column":"nv"},{"cid":2,"column_name":"label","is_updatable":"YES","base_table":"iv_parent","base_column":"label"}]
+
+-- Dynamic agreement: writing the inverse column stores the inverted base value
+-- (nv1 = 9 ⇒ nv = 8), and the view reads it back through the forward transform.
+insert into iv_parent values (1, 'p1');
+insert into iv_child values (10, 1, 5);
+update iv_jv set nv1 = 9 where cid = 10;
+select cid, pref, nv from iv_child;
+→ [{"cid":10,"pref":1,"nv":8}]
+select cid, nv1, label from iv_jv;
+→ [{"cid":10,"nv1":9,"label":"p1"}]
+
+-- ===================================================================
 -- Wholly read-only bodies: every output column is_updatable='NO' with null
 -- trace. Unlike view_info's single conservative row, column_info still emits
 -- one row per output column.

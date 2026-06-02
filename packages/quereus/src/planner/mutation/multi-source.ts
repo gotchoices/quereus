@@ -92,8 +92,28 @@ interface OutColumn {
 	readonly sideIndex?: number;
 	/** Owning base column name (base-writable columns only). */
 	readonly baseColumn?: string;
-	/** True for an identity/rename projection of a base column (writable on update). */
+	/**
+	 * True for a `base` lineage site — an identity/rename projection OR a
+	 * non-identity invertible transform (`inverse` present). Writable on update: an
+	 * `inverse` column lowers its assigned value through {@link inverse} (§ Scalar
+	 * Invertibility). A `computed` / `null-extended` site is read-only (`false`).
+	 */
 	readonly writable: boolean;
+	/**
+	 * Backward inverse closure for a non-identity invertible base site — maps a
+	 * *written* (view-domain) value to the base column's value (e.g. `cv + 1` ⇒
+	 * `w ↦ w - 1`). Absent for an identity/rename column. Insert through such a
+	 * column is NOT supported (the shared-surrogate envelope writes raw values) —
+	 * see {@link analyzeMultiSourceInsert}.
+	 */
+	readonly inverse?: (written: AST.Expression) => AST.Expression;
+	/**
+	 * Domain predicate (base terms) an `inverse` profile restricts to; conjoined
+	 * into the row-identifying predicate on update (§ Scalar Invertibility). No
+	 * shipped profile produces one yet (`x ± k` is unrestricted), so it is
+	 * currently always absent.
+	 */
+	readonly domain?: AST.Expression;
 }
 
 interface JoinViewAnalysis {
@@ -230,21 +250,27 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	const { sides, outColumns } = analysis;
 	const keyColumns = extractJoinKeyColumns(view, analysis.sel, sides);
 
-	// Supplied view columns: the explicit list, or every writable view output column.
+	// Supplied view columns: the explicit list, or every IDENTITY-writable view
+	// output column. An `inverse`-profile column (writable on the UPDATE path) is
+	// NOT insertable here — the shared-surrogate envelope writes supplied values to
+	// base columns verbatim, with no hook to apply the column's inverse, so an
+	// inserted `cv1` would land raw in `cv`. Excluding it from the implicit set lets
+	// it fall to its base default / not-null check (the pre-inverse behavior); an
+	// explicit supply is rejected below.
 	const suppliedNames = stmt.columns && stmt.columns.length > 0
 		? stmt.columns
-		: outColumns.filter(c => c.writable).map(c => c.name);
+		: outColumns.filter(c => c.writable && !c.inverse).map(c => c.name);
 
 	interface Supplied { readonly name: string; readonly sideIndex: number; readonly baseColumn: string; readonly type: ScalarType; readonly isKey: boolean; }
 	const supplied: Supplied[] = suppliedNames.map((rawName): Supplied => {
 		const name = rawName.toLowerCase();
 		const out = outColumns.find(c => c.name === name);
-		if (!out || !out.writable || out.sideIndex === undefined || !out.baseColumn) {
+		if (!out || !out.writable || out.inverse || out.sideIndex === undefined || !out.baseColumn) {
 			raiseMutationDiagnostic({
 				reason: 'no-inverse',
 				column: rawName,
 				table: view.name,
-				message: `cannot insert through view '${view.name}': column '${rawName}' is computed (non-invertible) or not a base column, so it cannot receive an inserted value`,
+				message: `cannot insert through view '${view.name}': column '${rawName}' is computed (non-invertible), a transformed (invertible) column, or not a base column, so it cannot receive an inserted value`,
 			});
 		}
 		const sideIndex = out.sideIndex;
@@ -500,10 +526,18 @@ function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewA
 		viewColToBaseRef.set(outName, (rc as AST.ResultColumnExpr).expr);
 
 		const site = lineage?.get(attr.id);
-		const writableBase = identityBaseSite(site);
+		const writableBase = writableBaseSite(site);
 		if (writableBase) {
 			const sideIndex = sideByTableId.get(writableBase.table);
-			outColumns.push({ name: outName, displayName, sideIndex, baseColumn: writableBase.baseColumn, writable: sideIndex !== undefined });
+			outColumns.push({
+				name: outName,
+				displayName,
+				sideIndex,
+				baseColumn: writableBase.baseColumn,
+				writable: sideIndex !== undefined,
+				...(writableBase.inverse ? { inverse: writableBase.inverse } : {}),
+				...(writableBase.domain ? { domain: writableBase.domain } : {}),
+			});
 		} else {
 			outColumns.push({ name: outName, displayName, writable: false });
 		}
@@ -512,10 +546,18 @@ function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): JoinViewA
 	return { sel, sides, viewColToBaseRef, outColumns };
 }
 
-/** The base column of an identity (bare-column / rename) UpdateSite, else undefined. */
-function identityBaseSite(site: UpdateSite | undefined): { table: number; baseColumn: string } | undefined {
-	if (site && site.kind === 'base' && site.inverse === undefined) {
-		return { table: site.table, baseColumn: site.baseColumn };
+/**
+ * The writable base reference of a `base` UpdateSite — identity (bare column /
+ * rename) OR a non-identity invertible transform, carrying its `inverse` closure
+ * and optional `domain`. A `computed` / `null-extended` site is read-only and
+ * returns `undefined`. This is the full-lineage reader the multi-source path
+ * consumes (it no longer discards an `inverse` site to identity-only). The
+ * identity-only `identityBaseColumn` in `analysis/update-lineage.ts` remains the
+ * *single-source* AST-parity reader — see docs § Scalar Invertibility.
+ */
+function writableBaseSite(site: UpdateSite | undefined): { table: number; baseColumn: string; inverse?: (w: AST.Expression) => AST.Expression; domain?: AST.Expression } | undefined {
+	if (site && site.kind === 'base') {
+		return { table: site.table, baseColumn: site.baseColumn, inverse: site.inverse, domain: site.domain };
 	}
 	return undefined;
 }
@@ -617,6 +659,14 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 
 	// Route each assignment to its owning base side.
 	const perSide: Array<{ column: string; value: AST.Expression }[]> = [[], []];
+	// Domains from `inverse`-profile assignments, conjoined into the single-side
+	// identifying predicate below (§ Scalar Invertibility — "substitutes the inverse
+	// and conjoins `domain` into the row-identifying predicate"). No shipped
+	// invertibility profile produces a domain yet (`x ± k` is unrestricted over
+	// integers), so this stays empty in practice; the both-sides captured-key path
+	// (which routes through `__vmupd_keys`, not `idPredicate`) does not yet thread
+	// per-assignment domains — deferred until a domain-bearing profile lands.
+	const assignmentDomains: AST.Expression[] = [];
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
 		if (!out) {
@@ -646,12 +696,22 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 			substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view),
 			view, side, other,
 		);
-		perSide[out.sideIndex].push({ column: out.baseColumn, value: baseValue });
+		// For an `inverse`-profile column the assigned value is in the VIEW domain;
+		// apply the site's inverse to recover the BASE value (`cv1 = cv + 1` ⇒ the
+		// write `cv1 = w` stores `cv = w - 1`). The base-term substitution + side-
+		// qualifier strip above already produced the written value in base terms; the
+		// inverse wraps that last (it expects a value already in base terms).
+		const written = out.inverse ? out.inverse(baseValue) : baseValue;
+		perSide[out.sideIndex].push({ column: out.baseColumn, value: written });
+		if (out.domain) assignmentDomains.push(qualifyDomainToSide(out.domain, side));
 	}
 
 	// Shared identifying predicate: the user WHERE rewritten to base terms,
-	// conjoined with the view body's own WHERE.
-	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
+	// conjoined with the view body's own WHERE and any `inverse`-profile domains.
+	const idPredicate = assignmentDomains.reduce<AST.Expression | undefined>(
+		(acc, d) => combineAnd(acc, d),
+		buildIdentifyingPredicate(ctx, analysis, stmt.where, view),
+	);
 
 	// When an update assigns BOTH base sides the per-side base ops run sequentially
 	// against live state, so a live-subquery identifier — re-evaluated *after* the
@@ -1222,6 +1282,25 @@ function stripSideQualifier(
 		return undefined;
 	};
 	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
+}
+
+/**
+ * Qualify a base-column-term `domain` predicate (from an `inverse` profile) to the
+ * owning side's alias, so it binds unambiguously against the two-source join body
+ * that becomes the identifying subquery's FROM — bare column refs gain the alias;
+ * already-qualified refs are left untouched. Threaded into any embedded subquery
+ * too (the qualifier rule applies at every nesting depth, like
+ * {@link stripSideQualifier}).
+ *
+ * Currently unreachable — no shipped invertibility profile attaches a `domain`
+ * (the `x ± k` registry is unrestricted over integers). Wired so the first
+ * domain-bearing profile's restriction survives the lowering into the `<pk> in
+ * (select … where <idPredicate>)` subquery in base terms.
+ */
+function qualifyDomainToSide(domain: AST.Expression, side: JoinSide): AST.Expression {
+	const qualify = (col: AST.ColumnExpr): AST.Expression | undefined =>
+		col.table ? undefined : { type: 'column', name: col.name, table: side.alias };
+	return transformExpr(domain, qualify, (q) => mapQueryExprUniform(q, qualify));
 }
 
 // --- helpers --------------------------------------------------------------
