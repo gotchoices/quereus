@@ -171,7 +171,7 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			// Fires only on a successful deploy (an atomic deploy throws before
 			// reaching here on any blocking diagnostic). See docs/lens.md
 			// § Module deployment notification.
-			await notifyLensDeployment(rctx.db, schemaName);
+			await notifyLensDeploymentAll(rctx.db, schemaName);
 			return [];
 		}
 
@@ -423,7 +423,7 @@ async function endSchemaBatchAll(
  * out of `apply schema X` (the lens is already deployed; the failed reconcile is
  * the caller's to handle).
  */
-async function notifyLensDeployment(db: Database, logicalSchemaName: string): Promise<void> {
+async function notifyLensDeploymentAll(db: Database, logicalSchemaName: string): Promise<void> {
 	const snapshot = db.declaredSchemaManager.getDeployedLensSnapshots(logicalSchemaName)?.current;
 	// A successful deploy always rotates a snapshot; guard defensively rather
 	// than notify modules with an undefined deployment.

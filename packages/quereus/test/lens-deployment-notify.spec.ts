@@ -29,9 +29,13 @@ interface NotifyCall {
 class RecordingMemoryModule extends MemoryTableModule {
 	notifyCalls: NotifyCall[] = [];
 	failOnNotify = false;
+	/** Optional label + shared sink, to observe cross-module fan-out order. */
+	label?: string;
+	fireOrder?: string[];
 
 	notifyLensDeployment(_db: DatabaseType, logicalSchemaName: string, snapshot: LensDeploymentSnapshot): void {
 		this.notifyCalls.push({ logicalSchemaName, snapshot });
+		if (this.fireOrder && this.label) this.fireOrder.push(this.label);
 		if (this.failOnNotify) {
 			throw new Error('reconcile-failure');
 		}
@@ -142,5 +146,54 @@ describe('lens deployment notification', () => {
 		const reads: Array<Record<string, unknown>> = [];
 		for await (const r of db.eval('select * from x.Car order by id')) reads.push(r as Record<string, unknown>);
 		expect(reads).to.deep.equal([{ id: 1, vin: 'AAA' }]);
+	});
+
+	it('notifies every registered module that implements the hook, in registration order', async () => {
+		db = new Database();
+		const fireOrder: string[] = [];
+		// Two hook-implementing modules + one plain module (no hook) interleaved,
+		// to prove (a) every implementer is reached and (b) the order is registration
+		// order, not e.g. default-first. The non-implementer is silently skipped.
+		const first = new RecordingMemoryModule();
+		first.label = 'first'; first.fireOrder = fireOrder;
+		const second = new RecordingMemoryModule();
+		second.label = 'second'; second.fireOrder = fireOrder;
+		db.registerModule('first', first);
+		db.registerModule('plain', new MemoryTableModule());
+		db.registerModule('second', second);
+		db.setDefaultVtabName('first');
+
+		await db.exec('declare schema y { table Car { id integer primary key, vin text } }');
+		await db.exec('apply schema y');
+		await db.exec('declare logical schema x { table Car { id integer primary key, vin text } }');
+		await db.exec('apply schema x');
+
+		expect(fireOrder).to.deep.equal(['first', 'second']);
+		// Both implementers saw the same rotated snapshot object.
+		const current = db.declaredSchemaManager.getDeployedLensSnapshots('x')?.current;
+		expect(first.notifyCalls[0].snapshot).to.equal(current);
+		expect(second.notifyCalls[0].snapshot).to.equal(current);
+	});
+
+	it('first throw aborts the apply before later modules are notified', async () => {
+		db = new Database();
+		const fireOrder: string[] = [];
+		const first = new RecordingMemoryModule();
+		first.label = 'first'; first.fireOrder = fireOrder; first.failOnNotify = true;
+		const second = new RecordingMemoryModule();
+		second.label = 'second'; second.fireOrder = fireOrder;
+		db.registerModule('first', first);
+		db.registerModule('second', second);
+		db.setDefaultVtabName('first');
+
+		await db.exec('declare schema y { table Car { id integer primary key } }');
+		await db.exec('apply schema y');
+		await db.exec('declare logical schema x { table Car { id integer primary key } }');
+
+		await expectThrows(() => db.exec('apply schema x'), /reconcile-failure/);
+
+		// `first` fired and threw; `second` was never reached (no aggregation).
+		expect(fireOrder).to.deep.equal(['first']);
+		expect(second.notifyCalls).to.have.lengthOf(0);
 	});
 });
