@@ -9,7 +9,7 @@ import { Parser } from '../src/parser/parser.js';
 import { QuereusError } from '../src/common/errors.js';
 import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
 import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner/util/fd-utils.js';
-import { deriveViewColumns, viewColumnsFromUpdateLineage } from '../src/planner/analysis/update-lineage.js';
+import { deriveViewColumns, viewColumnsFromUpdateLineage, resolveBaseSite } from '../src/planner/analysis/update-lineage.js';
 import { viewComplement } from '../src/planner/analysis/view-complement.js';
 import type * as AST from '../src/parser/ast.js';
 import { type PlanNode, type RelationalPlanNode, type UpdateSite, type AttributeDefault, isRelationalNode } from '../src/planner/nodes/plan-node.js';
@@ -2219,9 +2219,11 @@ describe('Property-Based Tests', () => {
 				}
 			}
 
-			// A computed (non-invertible) column is read-only: a write is rejected
-			// with `no-inverse`, not silently dropped.
-			await db.exec('create view cv as select id, a, b + 1 as bp from t');
+			// An OPAQUE (non-invertible) column is read-only: a write is rejected
+			// with `no-inverse`, not silently dropped. `b * 2` is not in the
+			// invertibility registry (multiplication has no inverse profile) — contrast
+			// the writable `b + 1` inverse column pinned by the dedicated test below.
+			await db.exec('create view cv as select id, a, b * 2 as bp from t');
 			await expectReject('update cv set bp = 100 where id = 1', 'no-inverse');
 			// The base column under it stays writable through the same view.
 			await db.exec('update cv set a = 7 where id = 1');
@@ -2529,6 +2531,61 @@ describe('Property-Based Tests', () => {
 					});
 				}
 			}
+		});
+
+		// ----- single-source inverse-profile column write-through (the B1 analogue) -----
+		// `bp = b + 1` is a non-identity invertible projection of t.b. The single-source
+		// UPDATE path now consumes the threaded `inverse` (mirroring the multi-source join
+		// path's `PutGet + lineage` test): `update v set bp = NV` stores the BASE value
+		// `t.b = NV - 1` and the view reads back `bp = NV` (PutGet). Statically the column's
+		// UpdateSite is `base` (t.b) WITH an `inverse`, reported writable. The identity-only
+		// `deriveViewColumns` reader still classifies it `computed` (so INSERT stays
+		// inverse-blind and the parity test above is untouched) — the write path reads the
+		// richer plan lineage separately via resolveBaseSite. docs § Scalar Invertibility.
+		it('PutGet + lineage: an inverse-profile column (b + 1) is writable through the single-source view', async () => {
+			await createBase();
+			const body = 'select id, a, b + 1 as bp from t';
+
+			// Static plan-lineage: bp is a base site (t.b) WITH an inverse, writable.
+			const node = planLogicalBody(body);
+			const attrs = node.getAttributes?.() ?? [];
+			const bpAttr = attrs.find(at => at.name.toLowerCase() === 'bp')!;
+			const site = resolveBaseSite(node.physical.updateLineage?.get(bpAttr.id));
+			expect(site.writable, 'bp resolves to a writable base site').to.equal(true);
+			expect(site.nullExtended, 'bp is not null-extended').to.equal(false);
+			expect((site.baseColumn ?? '').toLowerCase(), 'bp owns base column b').to.equal('b');
+			expect(site.inverse, 'bp carries an inverse closure').to.not.equal(undefined);
+			// The identity-only AST reader still reports bp computed (parity preserved).
+			const astBp = deriveViewColumns(
+				new Parser().parse(body) as unknown as AST.SelectStmt,
+				db.schemaManager.getTable('main', 't')!,
+			).find(vc => vc.name.toLowerCase() === 'bp')!;
+			expect(astBp.lineage.kind, 'deriveViewColumns keeps bp computed (identity-only)').to.equal('computed');
+
+			await db.exec('drop view if exists v');
+			await db.exec(`create view v as ${body}`);
+
+			// PutGet: writing bp = NV stores t.b = NV - 1 and reads back bp = NV.
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArb, { minLength: 0, maxLength: 10 }),
+				fc.integer({ min: 1, max: 8 }),    // id predicate value K
+				fc.integer({ min: 10, max: 20 }),  // new bp value NV (disjoint from seeds)
+				async (rows, K, NV) => {
+					const kept = await seedBase(rows);
+					await db.exec(`update v set bp = ${NV} where id = ${K}`);
+					// base t.b holds the INVERTED value NV - 1 for the targeted row.
+					const expected = kept.map(r => toRecord(r.id === K ? { ...r, b: NV - 1 } : r));
+					assertRowsEqual('inverse PutGet base', await readBase(), expected, ['id', 'a', 'b']);
+
+					// view image: bp reads back as b + 1, so the targeted row surfaces NV.
+					const viewRows: Record<string, SqlValue>[] = [];
+					for await (const row of db.eval('select id, bp from v order by id')) {
+						viewRows.push(row as Record<string, SqlValue>);
+					}
+					const expectedView = expected.map(r => ({ id: r.id, bp: (r.b as number) + 1 }));
+					assertRowsEqual('inverse PutGet view image', viewRows, expectedView, ['id', 'bp']);
+				},
+			), { numRuns: 50 });
 		});
 
 		// ----- scalar invertibility registry (the widened backward transform chain) -----

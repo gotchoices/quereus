@@ -61,6 +61,34 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 → [{"cid":0,"column_name":"name","is_updatable":"YES","base_table":"t","base_column":"name"},{"cid":1,"column_name":"banner","is_updatable":"NO","base_table":null,"base_column":null}]
 
 -- ===================================================================
+-- Single-source INVERSE-profile column: `bp = b + 1` is a non-identity invertible
+-- projection of si.b. Its UpdateSite is `base` (si.b) WITH an inverse, which
+-- baseSiteOf resolves like any base site → is_updatable='YES' tracing to the base
+-- column. The opaque sibling `bo = b * 2` (multiplication has no inverse profile)
+-- stays read-only. The single-source UPDATE path now consumes the threaded inverse
+-- (a real write below stores the inverted base value), so static and dynamic agree.
+-- docs § Scalar Invertibility.
+-- ===================================================================
+
+create table si (id integer primary key, b integer null);
+create view si_v as select id, b + 1 as bp, b * 2 as bo from si;
+select cid, column_name, is_updatable, base_table, base_column from column_info('si_v');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"si","base_column":"id"},{"cid":1,"column_name":"bp","is_updatable":"YES","base_table":"si","base_column":"b"},{"cid":2,"column_name":"bo","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Dynamic agreement: writing the inverse column stores the inverted base value
+-- (bp = 9 ⇒ b = 8), and the view reads it back through the forward transform.
+insert into si values (1, 5);
+update si_v set bp = 9 where id = 1;
+select id, b from si;
+→ [{"id":1,"b":8}]
+select id, bp, bo from si_v;
+→ [{"id":1,"bp":9,"bo":16}]
+
+-- The opaque sibling stays read-only on the write path too.
+update si_v set bo = 99 where id = 1;
+-- error: read-only
+
+-- ===================================================================
 -- Multi-source inner join: each output column traces to its own source base
 -- table; all updatable. (cid/note from ms_child, label from ms_parent.)
 -- ===================================================================

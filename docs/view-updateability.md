@@ -529,18 +529,24 @@ User-defined functions declare their profile at registration. A predicate-typed 
 
 **Where inverse profiles are consumed (today).** The plan-node backward walk
 (`deriveProjectUpdateLineage` → `traceInvertibleColumn`) already composes the
-inverse chain onto a `base` `UpdateSite` for every projection. The **multi-source
-inner-join** update path (`mutation/multi-source.ts`, § Inner Join) consumes that
-threaded `inverse` directly — a `c.cv + 1` join column is writable, the assigned
-value lowered through `w ↦ w - 1`. The **single-source** spine does not yet
-consume inverses: it still classifies projections at the AST level
-(`classifyProjectionExpr`, identity-only), so a single-source `b + 1` column stays
-read-only on a write through the view. The identity-only AST reader
-(`identityBaseColumn` / `viewColumnsFromUpdateLineage`) is therefore the
-single-source authority and is deliberately *not* widened (it is checked against
-`deriveViewColumns` for parity); the static `view_info` / `column_info` surfaces
-read the richer plan-node lineage (`baseSiteOf`) and report a `base`-with-`inverse`
-column writable regardless of source arity.
+inverse chain onto a `base` `UpdateSite` for every projection. **Both** mutation
+spines consume that threaded `inverse` on the UPDATE write path. The **multi-source
+inner-join** path (`mutation/multi-source.ts`, § Inner Join) lowers a `c.cv + 1`
+join column through `w ↦ w - 1`. The **single-source** spine
+(`mutation/single-source.ts`) now does the same: `analyzeView` reads the planned
+body's `updateLineage` (via the shared `resolveBaseSite`) into a per-view-column
+inverse-site map, and `rewriteViewUpdate` routes `set bp = 9` on a `b + 1 as bp`
+column to `set b = 9 - 1` on the base table. An `opaque` (non-invertible) column
+carries no `inverse`, so a write to it still raises `no-inverse` on either spine.
+INSERT remains inverse-blind on both spines — the inverse column stays `computed` in
+the AST `viewColumns` model and the multi-source envelope has no inverse hook — so an
+inverse column is non-insertable even though `is_updatable = 'YES'` (an UPDATE claim).
+The identity-only AST reader (`identityBaseColumn` / `viewColumnsFromUpdateLineage`)
+is deliberately *not* widened: it remains the `deriveViewColumns`-parity surface (and
+backs INSERT routing), while the dynamic UPDATE path reads the richer plan-node
+lineage separately. The static `view_info` / `column_info` surfaces read that same
+plan-node lineage (`baseSiteOf`) and report a `base`-with-`inverse` column writable
+regardless of source arity — now matching the dynamic single-source UPDATE.
 
 ## Tags: The Override Surface
 

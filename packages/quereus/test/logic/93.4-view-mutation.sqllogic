@@ -60,6 +60,49 @@ select * from RV order by user_id;
 → [{"user_id":1,"full_name":"Bob"}]
 
 -- ===================================
+-- Single-source INVERSE-profile column write-through. `bp = b + 1` is a
+-- non-identity invertible projection of iv_t.b; the single-source UPDATE path now
+-- consumes the threaded `inverse` (parity with the multi-source join path), so
+-- `update v set bp = 9` lowers to `set b = 9 - 1`, storing iv_t.b = 8, and the view
+-- reads back bp = 9. An `opaque` computed column (`substr(s,1,1)` — string functions
+-- carry no inverse profile) stays read-only, and the inverse column is NOT insertable
+-- (an UPDATE-only claim). This matches the static column_info/view_info
+-- is_updatable='YES'. See docs/view-updateability.md § Scalar Invertibility.
+-- ===================================
+
+create table iv_t (id integer primary key, b integer null, s text);
+insert into iv_t values (1, 7, 'hello'), (2, 20, 'world');
+create view iv_v as select id, b + 1 as bp, substr(s, 1, 1) as s1 from iv_t;
+
+-- read-through: bp = b + 1, s1 = first char.
+select id, bp, s1 from iv_v order by id;
+→ [{"id":1,"bp":8,"s1":"h"},{"id":2,"bp":21,"s1":"w"}]
+
+-- UPDATE the inverse column: `bp = 9` lowers to `b = 9 - 1`, storing iv_t.b = 8.
+update iv_v set bp = 9 where id = 1;
+select id, b, s from iv_t order by id;
+→ [{"id":1,"b":8,"s":"hello"},{"id":2,"b":20,"s":"world"}]
+
+-- the write reads back through the forward transform: bp = 8 + 1 = 9.
+select id, bp from iv_v order by id;
+→ [{"id":1,"bp":9},{"id":2,"bp":21}]
+
+-- the inverse is applied AFTER base-term substitution: `bp = id + 100` (id is a view
+-- column) lowers to `b = (id + 100) - 1`, so for id=2 it stores b = 101.
+update iv_v set bp = id + 100 where id = 2;
+select id, b from iv_t order by id;
+→ [{"id":1,"b":8},{"id":2,"b":101}]
+
+-- the opaque computed column stays read-only (a string fn has no inverse profile).
+update iv_v set s1 = 'X' where id = 1;
+-- error: read-only
+
+-- INSERT stays inverse-blind: an explicit insert of the inverse column is rejected
+-- (it is non-insertable even though is_updatable='YES').
+insert into iv_v (id, bp) values (3, 5);
+-- error: non-invertible
+
+-- ===================================
 -- Filter pass-through delete
 -- ===================================
 

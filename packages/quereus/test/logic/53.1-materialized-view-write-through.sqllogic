@@ -143,32 +143,40 @@ delete from rv where id = 1 returning *;
 → [{"id":1,"x":10}]
 
 -- ===================================
--- 7. Deterministic expression column is read-only (inherited per-column lineage):
---    a write to it raises the computed/non-invertible diagnostic, reads are
---    unaffected, and a write to the passthrough columns still propagates (and
---    re-derives the computed column via maintenance).
+-- 7. Per-column lineage on the MV write-through spine (the single-source spine, so
+--    it consumes inverses exactly as a plain view does): an INVERSE-profile column
+--    (`y = x + 1`) is writable and stores the inverted base value, an OPAQUE column
+--    (`z = x * 2`) is read-only (computed/non-invertible diagnostic), reads are
+--    unaffected, and a write to the passthrough column still propagates. Every write
+--    re-derives the computed columns via maintenance (reads-own-writes).
 --    (Needs materialized-view-rowtime-expression-projections so the body is creatable.)
 -- ===================================
 
 create table e (id integer primary key, x integer);
 insert into e values (1, 10), (2, 20);
-create materialized view ev as select id, x, x + 1 as y from e;
-select id, x, y from ev order by id;
-→ [{"id":1,"x":10,"y":11},{"id":2,"x":20,"y":21}]
+create materialized view ev as select id, x, x + 1 as y, x * 2 as z from e;
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":10,"y":11,"z":20},{"id":2,"x":20,"y":21,"z":40}]
 
--- a write to the computed column y is rejected (read-only / non-invertible)
-update ev set y = 99 where id = 1;
+-- a write to the OPAQUE column z is rejected (read-only / non-invertible)
+update ev set z = 99 where id = 1;
 -- error: non-invertible
 
--- a write to the passthrough column still propagates; the computed column re-derives
-update ev set x = 100 where id = 1;
-select id, x, y from ev order by id;
-→ [{"id":1,"x":100,"y":101},{"id":2,"x":20,"y":21}]
+-- a write to the INVERSE-profile column y now propagates: it stores the inverted
+-- base value (y = 99 ⇒ x = 98) and the computed columns re-derive (z = 196).
+update ev set y = 99 where id = 1;
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":98,"y":99,"z":196},{"id":2,"x":20,"y":21,"z":40}]
 
--- insert specifying only the passthrough columns works; y is derived by maintenance
+-- a write to the passthrough column still propagates; the computed columns re-derive
+update ev set x = 100 where id = 1;
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":100,"y":101,"z":200},{"id":2,"x":20,"y":21,"z":40}]
+
+-- insert specifying only the passthrough columns works; y/z are derived by maintenance
 insert into ev (id, x) values (3, 30);
-select id, x, y from ev order by id;
-→ [{"id":1,"x":100,"y":101},{"id":2,"x":20,"y":21},{"id":3,"x":30,"y":31}]
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":100,"y":101,"z":200},{"id":2,"x":20,"y":21,"z":40},{"id":3,"x":30,"y":31,"z":60}]
 
 -- ===================================
 -- 8. Bulk multi-row write-through — an INSERT…SELECT source, a multi-row UPDATE, and a
