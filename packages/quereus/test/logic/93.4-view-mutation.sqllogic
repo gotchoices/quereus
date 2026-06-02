@@ -97,8 +97,9 @@ select id, b from iv_t order by id;
 update iv_v set s1 = 'X' where id = 1;
 -- error: read-only
 
--- INSERT stays inverse-blind: an explicit insert of the inverse column is rejected
--- (it is non-insertable even though is_updatable='YES').
+-- INSERT admits the inverse-ABSENT subset (identity + passthrough) but NOT an inverse
+-- column: an explicit insert of the inverse `bp` is rejected (non-insertable even though
+-- is_updatable='YES' — the envelope would store the value raw, with no hook to invert it).
 insert into iv_v (id, bp) values (3, 5);
 -- error: non-invertible
 
@@ -163,14 +164,14 @@ update cfl_jv set note = 'x', note2 = 'y' where cid = 10;
 -- ===================================
 -- Single-source PASSTHROUGH-profile column write-through. `bc = b collate nocase`
 -- and `nc = cast(n as integer)` (a no-op cast, same logical type) are identity-ON-VALUE
--- projections of pt_t's base columns. The single-source UPDATE path now routes the FULL
+-- projections of pt_t's base columns. The single-source UPDATE path routes the FULL
 -- writable-base set (identity + passthrough + inverse), so `update v set bc = V` lowers to
 -- `set b = V`, storing the value VERBATIM (no inverse to apply), and the view reads it back
--- through the value-preserving transform. An `opaque` computed column (`b || '!'` — concat
--- carries no inverse profile) stays read-only, and a passthrough column is NOT insertable on
--- the single-source spine (an UPDATE-only claim; the AST deriveViewColumns model keeps it
--- computed). This matches the static column_info/view_info is_updatable='YES'. See
--- docs/view-updateability.md § Scalar Invertibility.
+-- through the value-preserving transform. INSERT now consults the same writable-site map and
+-- ALSO admits a passthrough column (stored verbatim) — aligning the single-source spine up to
+-- the multi-source contract. An `opaque` computed column (`b || '!'` — concat carries no
+-- inverse profile) stays read-only AND non-insertable. This matches the static
+-- column_info/view_info is_updatable='YES'. See docs/view-updateability.md § Scalar Invertibility.
 -- ===================================
 
 create table pt_t (id integer primary key, b text null, n integer null);
@@ -199,25 +200,42 @@ select id, bc, nc from pt_v2 order by id;
 update pt_v2 set bo = 'X' where id = 1;
 -- error: read-only
 
--- INSERT stays passthrough-blind on the single-source spine: an explicit insert of the
--- passthrough column is rejected (non-insertable even though is_updatable='YES').
+-- INSERT a passthrough column on the single-source spine: now ADMITTED (this ticket aligns
+-- single-source INSERT up to the multi-source contract). `bc` is a passthrough of base `b`,
+-- so the value is stored VERBATIM; the omitted `nc` base column `n` is nullable and takes null.
+-- At this point pt_t = (1,'yo',5),(2,'world',99).
 insert into pt_v2 (id, bc) values (3, 'new');
--- error: non-invertible
+select id, b, n from pt_t order by id;
+→ [{"id":1,"b":"yo","n":5},{"id":2,"b":"world","n":99},{"id":3,"b":"new","n":null}]
+
+-- read back through the view: bc reads 'new' verbatim; nc is null; bo recomputes b || '!'.
+select id, bc, nc, bo from pt_v2 order by id;
+→ [{"id":1,"bc":"yo","nc":5,"bo":"yo!"},{"id":2,"bc":"world","nc":99,"bo":"world!"},{"id":3,"bc":"new","nc":null,"bo":"new!"}]
+
+-- IMPLICIT insert (no column list): the insertable set is (id, bc, nc) in view order — the
+-- opaque computed column `bo` (no base lineage) is OMITTED rather than erroring, proving the
+-- implicit-set alignment with multi-source. The two passthrough columns store verbatim.
+insert into pt_v2 values (4, 'imp', 7);
+select id, b, n from pt_t order by id;
+→ [{"id":1,"b":"yo","n":5},{"id":2,"b":"world","n":99},{"id":3,"b":"new","n":null},{"id":4,"b":"imp","n":7}]
+select id, bc, nc, bo from pt_v2 order by id;
+→ [{"id":1,"bc":"yo","nc":5,"bo":"yo!"},{"id":2,"bc":"world","nc":99,"bo":"world!"},{"id":3,"bc":"new","nc":null,"bo":"new!"},{"id":4,"bc":"imp","nc":7,"bo":"imp!"}]
 
 -- Filtered view + passthrough: the writable-site SET routing is orthogonal to the
 -- conjoined body WHERE, so the filter still gates a passthrough write exactly as it
--- does a rename write (cf. AliasView). At this point pt_t = (1,'yo',5),(2,'world',99).
+-- does a rename write (cf. AliasView). At this point pt_t =
+-- (1,'yo',5),(2,'world',99),(3,'new',null),(4,'imp',7) (after the inserts above).
 create view pt_vf as select id, b collate nocase as bc from pt_t where n > 10;
 
 -- a visible row (id=2, n=99 > 10): the passthrough write lands in the base column.
 update pt_vf set bc = 'zz' where id = 2;
 select id, b from pt_t order by id;
-→ [{"id":1,"b":"yo"},{"id":2,"b":"zz"}]
+→ [{"id":1,"b":"yo"},{"id":2,"b":"zz"},{"id":3,"b":"new"},{"id":4,"b":"imp"}]
 
 -- a row outside the filter (id=1, n=5): the conjoined predicate matches no base row.
 update pt_vf set bc = 'nope' where id = 1;
 select id, b from pt_t order by id;
-→ [{"id":1,"b":"yo"},{"id":2,"b":"zz"}]
+→ [{"id":1,"b":"yo"},{"id":2,"b":"zz"},{"id":3,"b":"new"},{"id":4,"b":"imp"}]
 
 -- ===================================
 -- Single-source ↔ multi-source parity for a PASSTHROUGH (collate) column. The same
@@ -246,6 +264,38 @@ create view par_mj as
 update par_mj set note = 'gamma' where cid = 10;
 select cid, note from par_c order by cid;
 → [{"cid":10,"note":"gamma"}]
+
+-- ===================================
+-- Single-source ↔ multi-source parity for a PASSTHROUGH (collate) column on INSERT.
+-- The same `note collate nocase` passthrough is INSERTABLE on BOTH spines now — stored
+-- VERBATIM — closing the single↔multi INSERT divergence this ticket targets (previously
+-- single-source rejected the passthrough insert while multi-source admitted it). Fresh
+-- tables keep the inserts free of the par_ss/par_mj seed rows above. An inverse-column
+-- insert still rejects on single-source (the iv_v block, lines ~100), so the alignment is
+-- precisely the inverse-absent subset. docs § Scalar Invertibility, § Inner Join.
+-- ===================================
+
+-- single-source: the passthrough `note` is inserted and stored verbatim in the base column.
+create table pari_t (id integer primary key, note text);
+create view pari_ss as select id, note collate nocase as note from pari_t;
+insert into pari_ss (id, note) values (1, 'Alpha');
+select id, note from pari_t order by id;
+→ [{"id":1,"note":"Alpha"}]
+
+-- two-table inner-join view exposing the SAME passthrough plus a directly-supplied shared
+-- key: the passthrough `note` is likewise inserted verbatim into its owning base side.
+create table pari_a (k integer primary key, note text);
+create table pari_b (k integer primary key, bv text);
+create view pari_mj as
+    select a.k as k, a.note collate nocase as note, b.bv as bv
+    from pari_a a join pari_b b on b.k = a.k;
+insert into pari_mj (k, note, bv) values (1, 'Beta', 'x');
+select k, note from pari_a order by k;
+→ [{"k":1,"note":"Beta"}]
+select k, bv from pari_b order by k;
+→ [{"k":1,"bv":"x"}]
+select k, note, bv from pari_mj order by k;
+→ [{"k":1,"note":"Beta","bv":"x"}]
 
 -- ===================================
 -- Filter pass-through delete

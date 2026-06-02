@@ -2595,11 +2595,13 @@ describe('Property-Based Tests', () => {
 		// passthrough + inverse), so `update v set bc = NV` stores the BASE value `t.b = NV`
 		// VERBATIM (no inverse to apply) and the view reads back `bc = NV` (PutGet). Statically
 		// the column's UpdateSite is `base` (t.b) with `inverse === undefined`, reported writable.
-		// The identity-only `deriveViewColumns` reader still classifies it `computed` (so INSERT
-		// stays passthrough-blind and the parity test above is untouched) — the write path reads
-		// the richer plan lineage separately via resolveBaseSite. This is the single-source dual
-		// of the multi-source passthrough write, made writable here so static `is_updatable`,
-		// single-source UPDATE, and multi-source UPDATE all agree. docs § Scalar Invertibility.
+		// The identity-only `deriveViewColumns` reader still classifies it `computed` (keeping the
+		// parity test above untouched) — but that no longer governs insertability: both the UPDATE
+		// SET path AND INSERT now read the richer plan lineage (the `writableSites` map) via
+		// resolveBaseSite, so a passthrough column is writable AND insertable here. This is the
+		// single-source dual of the multi-source passthrough write/insert, made consistent so static
+		// `is_updatable`, single-source UPDATE/INSERT, and multi-source UPDATE/INSERT all agree.
+		// docs § Scalar Invertibility.
 		it('PutGet + lineage: a passthrough column (no-op cast) is writable through the single-source view', async () => {
 			await createBase();
 			const body = 'select id, a, cast(b as integer) as bc from t';

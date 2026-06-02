@@ -96,10 +96,13 @@ interface FilterConstant {
  * (`base` site, not null-extended) and applies `inverse` only when present
  * (`multi-source.ts` `decomposeUpdate`). An `opaque` (non-invertible) /
  * null-extended column carries no entry here, so a write to it still raises
- * `no-inverse` via the `requireBaseColumn` fallback. INSERT is unaffected —
- * `viewColumns` keeps a passthrough / inverse column `computed`, so it stays
- * non-insertable on the single-source spine (the AST `deriveViewColumns` model is
- * not widened).
+ * `no-inverse` via the `requireBaseColumn` fallback. **INSERT consults this map too**
+ * (`rewriteViewInsert`): a column with a site whose `inverse` is *absent* — identity /
+ * rename and passthrough — is insertable and stores its value verbatim; a site WITH an
+ * `inverse` and a no-site (opaque) column stay non-insertable, matching the multi-source
+ * contract (`outColumns.filter(c => c.writable && !c.inverse)`). The identity-only AST
+ * `deriveViewColumns` model is still not widened — it remains the parity bridge only
+ * (`test/property.spec.ts`); INSERT and UPDATE both read this richer site map instead.
  */
 interface WritableSite {
 	readonly baseColumn: string;
@@ -117,7 +120,7 @@ interface ViewAnalysis {
 	readonly filterConstants: readonly FilterConstant[];
 	/** view-column-name (lowercase) → replacement expression in base terms. */
 	readonly columnMap: ReadonlyMap<string, AST.Expression>;
-	/** view-column-name (lowercase) → writable-base write site (UPDATE path only: identity / passthrough / inverse). */
+	/** view-column-name (lowercase) → writable-base write site (identity / passthrough / inverse). Consumed by the UPDATE SET path and by INSERT (which admits the inverse-absent subset). */
 	readonly writableSites: ReadonlyMap<string, WritableSite>;
 }
 
@@ -466,7 +469,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	const filterConstants = extractFilterConstants(sel.where, baseTable);
 	const filterPredicate = sel.where ? normalizeBaseRefs(sel.where, baseAliases) : undefined;
 
-	// Writable-base write sites (UPDATE path): read the threaded plan-node
+	// Writable-base write sites (UPDATE SET + INSERT): read the threaded plan-node
 	// `updateLineage` off the already-planned body and, per view column, capture
 	// EVERY writable, non-null-extended base column (identity / passthrough /
 	// inverse) with its optional backward `inverse` closure. This is the
@@ -475,11 +478,13 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	// site). The identity-only AST readers (`deriveViewColumns` /
 	// `classifyProjectionExpr` / `viewColumnsFromUpdateLineage`) are deliberately NOT
 	// widened — their parity is pinned by `test/property.spec.ts` — so the richer
-	// `base` chain is read separately here via the shared `resolveBaseSite` and
-	// applied only to the SET target. A passthrough (`collate` / no-op `cast`) or
-	// identity / rename column carries no `inverse` (its value is stored verbatim);
-	// an `inverse` column carries its closure; an `opaque` / null-extended column has
-	// no site, so it still raises `no-inverse` via `requireBaseColumn`.
+	// `base` chain is read separately here via the shared `resolveBaseSite`. The UPDATE
+	// SET path routes any site (applying its `inverse` when present); INSERT
+	// (`rewriteViewInsert`) admits only the inverse-absent subset (identity + passthrough,
+	// stored verbatim). A passthrough (`collate` / no-op `cast`) or identity / rename
+	// column carries no `inverse`; an `inverse` column carries its closure (UPDATE-only —
+	// non-insertable); an `opaque` / null-extended column has no site, so a write to it
+	// still raises `no-inverse` via `requireBaseColumn`.
 	// `viewColumns[i]` ↔ `attrs[i]` holds because `deriveViewColumns` and the planned
 	// projection expand `select *` identically (the parity `viewColumnsFromUpdateLineage`
 	// relies on); a `*` column is pure identity, stored verbatim like any other.
@@ -679,12 +684,33 @@ function remapper(analysis: ViewAnalysis): (col: AST.ColumnExpr) => AST.Expressi
 export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike, tags?: ReservedTagMap): AST.InsertStmt {
 	const analysis = analyzeView(ctx, view);
 
-	// Target view columns: explicit list, or all non-generated view columns.
+	// A view column is INSERTABLE iff it has a writable base site with NO inverse:
+	// `identity` / rename and `passthrough` (`b collate nocase`, no-op `cast`), whose
+	// inserted value is stored verbatim. An `inverse` column (a site WITH an inverse) and
+	// an `opaque` computed column (no site) are NOT insertable — the lowering writes the
+	// value raw, with no hook to apply an inverse. This is exactly the multi-source
+	// contract (`outColumns.filter(c => c.writable && !c.inverse)`), so the single- and
+	// multi-source INSERT spines now admit the identical set. (A bare "has a site" gate
+	// would wrongly admit an inverse column; the `inverse === undefined` check is load-bearing.)
+	const insertableBaseColumn = (name: string): string | undefined => {
+		const site = analysis.writableSites.get(name.toLowerCase());
+		return site && site.inverse === undefined ? site.baseColumn : undefined;
+	};
+
+	// Target view columns: the explicit list, or every non-generated INSERTABLE view
+	// column (display order preserved). An exposed `inverse` / `opaque` computed column is
+	// omitted from the implicit set so it falls to its base default / NOT NULL check
+	// (matching multi-source) rather than erroring.
 	const targetNames = stmt.columns && stmt.columns.length > 0
 		? stmt.columns
-		: analysis.viewColumns.filter(vc => !vc.generated).map(vc => vc.name);
+		: analysis.viewColumns.filter(vc => !vc.generated && insertableBaseColumn(vc.name) !== undefined).map(vc => vc.name);
 
-	const baseColumns = targetNames.map(name => requireBaseColumn(findViewColumn(analysis, name, view)));
+	// Resolve each target to its writable base column: an insertable writable site
+	// (identity + passthrough) routes to its base column; otherwise fall back to
+	// `requireBaseColumn` (the identity base column, or `no-inverse` for an inverse /
+	// opaque column). `findViewColumn` stays the unknown-view-column guard on the fallback.
+	const baseColumns = targetNames.map(name =>
+		insertableBaseColumn(name) ?? requireBaseColumn(findViewColumn(analysis, name, view)));
 
 	// Merge the view's constant-FD defaults: a base column pinned by the
 	// selection predicate is supplied automatically when omitted, and a

@@ -280,17 +280,17 @@ export function deriveJoinUpdateLineage(
  *
  * **Identity-only by design** — this is the AST-parity reader, paired with the
  * identity-only AST classifier (`classifyProjectionExpr`) that
- * `deriveViewColumns` (hence the single-source `viewColumns` model and INSERT
- * routing) consumes; widening it would break that parity
+ * `deriveViewColumns` consumes; widening it would break that parity
  * (`viewColumnsFromUpdateLineage` ⇄ `deriveViewColumns`). It is therefore NOT the
- * authority for an `inverse` site's writability: the n-way {@link resolveBaseSite}
- * (consumed by the multi-source join path, the decomposition fan-out, AND the
- * single-source UPDATE write path) and the static `view_info` / `column_info`
- * surfaces (`func/builtins/schema.ts` `baseSiteOf`) treat a `base` site **with an
- * `inverse`** as writable (docs § Scalar Invertibility, § Inner Join). The
+ * authority for an `inverse` site's writability, nor for INSERT routing: the n-way
+ * {@link resolveBaseSite} (consumed by the multi-source join path, the decomposition
+ * fan-out, AND the single-source UPDATE *and INSERT* paths) and the static `view_info`
+ * / `column_info` surfaces (`func/builtins/schema.ts` `baseSiteOf`) treat a `base` site
+ * **with an `inverse`** as writable (docs § Scalar Invertibility, § Inner Join). The
  * single-source spine now reads that full `base`+`inverse` chain off the planned
- * `updateLineage` (via `resolveBaseSite`) on its UPDATE SET path, while this reader
- * stays identity-only for the `deriveViewColumns` parity bridge.
+ * `updateLineage` (via `resolveBaseSite`) into its `writableSites` map: UPDATE routes
+ * any site, INSERT admits the inverse-absent subset (identity + passthrough). This
+ * reader stays identity-only purely as the `deriveViewColumns` parity bridge.
  */
 export function identityBaseColumn(site: UpdateSite | undefined): string | undefined {
 	return site && site.kind === 'base' && site.inverse === undefined ? site.baseColumn : undefined;

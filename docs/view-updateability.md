@@ -594,14 +594,19 @@ surfaces read that same plan-node lineage (`baseSiteOf`, which treats *any* `bas
 identity, passthrough, or inverse — as writable) and report the column writable regardless
 of source arity — now matching the dynamic single-source **and** multi-source UPDATE.
 
-INSERT stays inverse/passthrough-blind on the **single-source** spine — `deriveViewColumns`
-keeps a passthrough / inverse column `computed`, so it is non-insertable even though
-`is_updatable = 'YES'` (an UPDATE claim, not an insertability claim). The **multi-source**
-INSERT path, by contrast, already *admits* a passthrough column (its supplied set is
-`outColumns.filter(c => c.writable && !c.inverse)` — a passthrough is `writable && !inverse`),
-so single-source INSERT (rejects) and multi-source INSERT (admits) diverge for a passthrough
-column; that asymmetry is tracked separately in the backlog ticket
-`view-insert-passthrough-single-multi-divergence` and is out of scope here.
+**INSERT and the passthrough contract.** A passthrough column is `identity`-on-value (it
+carries no transform to apply on write — `inverse` *absent*), so an inserted value is stored
+verbatim in its single base column, exactly as the UPDATE path now does. INSERT is therefore
+**insertable for the inverse-absent subset on BOTH spines** — `identity` / rename and
+`passthrough` store verbatim — while `inverse` and `opaque` columns stay **non-insertable on
+both** (the lowering writes the value raw, with no hook to apply an inverse). The single-source
+INSERT path (`rewriteViewInsert`) reads the same `writableSites` map the UPDATE SET path does
+and admits exactly `writable && inverse === undefined`; the multi-source path uses the identical
+gate (`outColumns.filter(c => c.writable && !c.inverse)`). The two spines' insertability
+contracts are thus **identical**, and the earlier single↔multi passthrough-INSERT divergence is
+closed. (The identity-only `deriveViewColumns` AST model is unchanged — it keeps a passthrough
+column `computed` purely as the `test/property.spec.ts` parity bridge; INSERT no longer routes
+through it.)
 
 ## Tags: The Override Surface
 
