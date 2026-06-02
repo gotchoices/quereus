@@ -969,7 +969,26 @@ export function buildMultiSourceUpdateReturning(
 	const filtered = new FilterNode(analysis.joinScope, analysis.joinNode, existsNode);
 
 	// Project the view-spelled, base-term RETURNING columns over the filtered join.
-	// preserveInputColumns=false ⇒ the output is exactly the RETURNING columns.
+	return buildMultiSourceReturningProjection(ctx, view, analysis, filtered, returningCols);
+}
+
+/**
+ * Build the multi-source RETURNING projection over a `filtered` join relation: lower
+ * each RETURNING result column to its view-spelled, base-term form
+ * ({@link buildReturningProjection}) and project it as a `ScalarPlanNode` over the
+ * input through `analysis.joinScope`. `preserveInputColumns=false` ⇒ the output is
+ * exactly the RETURNING columns. Shared by the UPDATE re-query (filter = the
+ * post-mutation EXISTS-over-capture join) and the DELETE re-query (filter = the
+ * pre-mutation identifying predicate over the raw join), which differ only in the
+ * `filtered` input relation they pass.
+ */
+function buildMultiSourceReturningProjection(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	analysis: JoinViewAnalysis,
+	filtered: RelationalPlanNode,
+	returningCols: readonly AST.ResultColumn[],
+): RelationalPlanNode {
 	const projections: Projection[] = buildReturningProjection(ctx, view, analysis, returningCols).map((rc): Projection => {
 		const col = rc as AST.ResultColumnExpr;
 		return {
@@ -1025,6 +1044,37 @@ function buildReturningProjection(
 }
 
 // --- DELETE ---------------------------------------------------------------
+
+/**
+ * Build the pre-mutation RETURNING re-query for a multi-source DELETE
+ * (docs/view-updateability.md § `returning`). The OLD view image of the rows about
+ * to vanish: project the view-spelled, base-term RETURNING columns over the raw
+ * `analysis.joinNode` restricted to the identifying predicate (user WHERE → base ∧
+ * body WHERE — the same predicate the key capture and base ops route on). Captured
+ * `pre` (before the base ops fire) so it reads the live base tables through the join.
+ *
+ * Building the projection in **base terms** (rather than referencing the planned
+ * body `root`'s output attribute ids) is what fixes a computed view column: a
+ * computed column has no surviving intermediate attribute id after project-merge, so
+ * a by-id reference dangles — recomputing from base columns has nothing fragile to
+ * reference. Mirrors {@link buildMultiSourceUpdateReturning}; they differ only in the
+ * filter + timing.
+ */
+export function buildMultiSourceDeleteReturning(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	stmt: AST.DeleteStmt,
+	analysis: JoinViewAnalysis,
+): RelationalPlanNode {
+	const idPredicateAst = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
+	const predicate = idPredicateAst
+		? buildExpression({ ...ctx, scope: analysis.joinScope }, idPredicateAst)
+		: undefined;
+	const filtered: RelationalPlanNode = predicate
+		? new FilterNode(analysis.joinScope, analysis.joinNode, predicate)
+		: analysis.joinNode;
+	return buildMultiSourceReturningProjection(ctx, view, analysis, filtered, stmt.returning!);
+}
 
 export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
 	// RETURNING through a multi-source delete is supported via a re-query of the

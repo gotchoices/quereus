@@ -2771,6 +2771,35 @@ describe('Property-Based Tests', () => {
 				), { numRuns: 60 });
 			});
 
+			// ----- Body-computed RETURNING on the delete path -----
+			// A multi-source DELETE RETURNING of a body-computed view column must
+			// recompute it in base terms over the planned join — project-merge eliminates
+			// the computed column's intermediate output attribute id, so referencing it by
+			// id would dangle (`No row context found`). `cvx = c.cv * 2` is that column.
+			it('delete RETURNING recomputes a body-computed view column from base terms', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists jvc');
+				await db.exec('drop table if exists jchild');
+				await db.exec('drop table if exists jparent');
+				await db.exec('create table jparent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table jchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references jparent(pp)) using memory');
+				await db.exec('create view jvc as select c.cc as cc, c.cv as cv, p.pv as pv, c.cv * 2 as cvx from jchild c join jparent p on p.pp = c.pr');
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					fc.integer({ min: 1, max: 9 }),   // cc predicate value K
+					async (parents, children, K) => {
+						const { parents: P, children: C } = await seedJoin(parents, children);
+						const ppSet = new Set(P.map(p => p.pp));
+						// the OLD image of the rows about to vanish (joined ∧ cc = K), with the
+						// computed column recomputed from the pre-delete base value.
+						const expected = C.filter(c => c.cc === K && ppSet.has(c.pr))
+							.map(c => ({ cc: c.cc, cvx: c.cv * 2 }));
+						const returned = await readRows(`delete from jvc where cc = ${K} returning cc, cvx`);
+						assertRowsEqual('delete returning computed', returned, expected, ['cc', 'cvx']);
+					},
+				), { numRuns: 60 });
+			});
+
 			// ----- Family B (B1): an inverse-profile column is writable through the join -----
 			// `cv1 = c.cv + 1` is a non-identity invertible projection of jchild.cv. The
 			// multi-source UPDATE path now consumes the threaded `inverse` (instead of the

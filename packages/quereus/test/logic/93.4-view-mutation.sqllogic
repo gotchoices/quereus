@@ -1201,9 +1201,35 @@ delete from rjoin where cid = 1 returning *;
 select cid, note, label from rjoin order by cid;
 → [{"cid":2,"note":"b","label":"P20x"}]
 
--- A multi-source DELETE RETURNING of a body-COMPUTED view column is NOT yet covered
--- here: the planned-body-`root` projection path cannot surface computed columns —
--- tracked by fix/view-mutation-multisource-delete-returning-computed-column.
+-- A multi-source DELETE RETURNING of a body-COMPUTED view column (`banner`) is
+-- recomputed in base terms over the planned join (NOT referenced by the optimizer-
+-- eliminated intermediate output attribute id), mirroring the UPDATE RETURNING path.
+create table dr_p (pid integer primary key, label text);
+create table dr_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references dr_p(pid));
+insert into dr_p values (10, 'P10'), (20, 'P20');
+insert into dr_c values (1, 10, 'a'), (2, 20, 'b'), (3, 10, 'c');
+create view dr_jv as
+    select c.cid as cid, c.note as note, p.label as label, c.note || '!' as banner
+    from dr_c c join dr_p p on p.pid = c.pref;
+-- run
+
+-- a RETURNING ref to a hidden base column (`pref`, not a dr_jv output) is rejected by
+-- the encapsulation guard — at plan time, before any row is deleted.
+delete from dr_jv where cid = 1 returning pref;
+-- error: is not a column of the view
+
+-- the body-computed column `banner` (= note || '!') is recomputed for the deleted row.
+delete from dr_jv where cid = 1 returning cid, banner;
+→ [{"cid":1,"banner":"a!"}]
+
+-- `returning *` over the join view with a computed column expands and computes it.
+delete from dr_jv where cid = 2 returning *;
+→ [{"cid":2,"note":"b","label":"P20","banner":"b!"}]
+
+-- a computed RETURNING expression over a base-routed column stays green.
+delete from dr_jv where cid = 3 returning note || '+' as notex;
+→ [{"notex":"c+"}]
 
 -- --- (d) multi-source update RETURNING where the predicate filters on a column the
 --         update rewrites — per-row identity capture (the changed rows no longer

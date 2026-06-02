@@ -662,12 +662,18 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >   `buildMultiSourceReturning`): the view row spans both base tables, so it is not
 >   recoverable from the per-side base ops. Two mechanisms, threaded as
 >   `ViewMutationNode.returning` with a `returningTiming`:
->   - **`delete`** (`pre`): the OLD view image restricted to the mutation's
->     predicate, projected as **plan nodes over the planned body `root`** —
->     `π_{<returning>}( σ_{<user where>}( root ) )`, resolved against `root`'s
->     view-output column scope — captured **before** the base op fires (the rows still
->     match the predicate and are about to disappear). The planned body is reused, not
->     re-expanded through the view name.
+>   - **`delete`** (`pre`, `multi-source.ts` `buildMultiSourceDeleteReturning`): the OLD
+>     view image restricted to the mutation's predicate, projected as **plan nodes in
+>     base terms over the already-planned `JoinNode`** —
+>     `π_{<returning, view-spelled, recomputed from base columns>}( σ_{idPredicate}( JoinNode ) )`
+>     — captured **before** the base ops fire (the rows still match the predicate and are
+>     about to disappear). Recomputing each view-spelled column from its base term
+>     (shared with the `update` path via `buildMultiSourceReturningProjection`), rather
+>     than referencing the body `root`'s output attribute id, is what lets a
+>     **body-computed** column (e.g. `c.note || '!' as banner`) survive: project-merge
+>     collapses the computed projection's intermediate attribute id, so a by-id reference
+>     would dangle (`No row context found`). The `idPredicate` is the same user-WHERE →
+>     base ∧ body-WHERE used by the key capture.
 >   - **`update`** (`post`, with an `identityCapture`): **up-front identity capture**
 >     (`planner/mutation/multi-source.ts` `buildMultiSourceKeyCapture`). Each
 >     affected view row's **base-PK identities** `(k0, k1)` are captured **before** the

@@ -5,7 +5,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -249,95 +249,13 @@ function buildMultiSourceReturning(
 		return { returning, returningTiming: 'post' };
 	}
 
-	// DELETE: the OLD view image of the rows about to vanish, captured `pre`. Built as
-	// plan nodes over the ALREADY-planned body `root` (the view-projected join) — its
-	// view-column output scope resolves the user WHERE and the RETURNING columns — so
-	// the body is reused, not re-expanded through the view name (no second
-	// `buildSelectStmt` of the body).
-	const node = buildDeleteReturning(ctx, view, req.stmt, returningCols, analysis);
+	// DELETE: the OLD view image of the rows about to vanish, captured `pre`. Built in
+	// base terms over the planned `joinNode` (recomputing each view-spelled column from
+	// base columns) — robust against a body-computed column whose intermediate output
+	// attribute id the optimizer eliminates (project-merge), which a by-id reference to
+	// the body `root` would dangle on. Mirrors the UPDATE RETURNING path.
+	const node = buildMultiSourceDeleteReturning(ctx, view, req.stmt, analysis);
 	return { returning: node, returningTiming: 'pre' };
-}
-
-/**
- * Build the multi-source DELETE RETURNING relation over the planned body `root`: the
- * OLD view image restricted to the user predicate (captured `pre`). The user WHERE and
- * the view-spelled RETURNING columns resolve against a scope registering `root`'s
- * view-output attributes (by their view spelling, unqualified and view-qualified) — the
- * same column set `from <view>` would expose — so no AST re-plan of the body.
- */
-function buildDeleteReturning(
-	ctx: PlanningContext,
-	view: MutableViewLike,
-	stmt: AST.DeleteStmt,
-	returningCols: readonly AST.ResultColumn[],
-	analysis: JoinViewAnalysis,
-): RelationalPlanNode {
-	const scope = buildViewOutputScope(ctx, view, analysis);
-	const rctx: PlanningContext = { ...ctx, scope };
-	const filtered: RelationalPlanNode = stmt.where
-		? new FilterNode(scope, analysis.root, buildExpression(rctx, stmt.where))
-		: analysis.root;
-	const projections = buildViewReturningProjections(rctx, analysis, returningCols);
-	// preserveInputColumns=false → output is exactly the view-projected RETURNING columns.
-	return new ProjectNode(scope, filtered, projections, undefined, undefined, false);
-}
-
-/**
- * A scope registering the planned body `root`'s view-output columns by their view
- * spelling (unqualified and view-name-qualified), so a multi-source DELETE RETURNING
- * resolves the user WHERE / RETURNING refs against the view image exactly as a
- * `from <view>` re-query would — without re-planning the body. The first
- * `outColumns.length` attributes of `root` are the view's projected columns (the body
- * is planned with `preserveInputColumns`, so any forwarded base columns follow and are
- * deliberately NOT registered — preserving the encapsulation guard: a hidden base
- * column does not resolve).
- */
-function buildViewOutputScope(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis): RegisteredScope {
-	const scope = new RegisteredScope(ctx.scope);
-	const attrs = analysis.root.getAttributes();
-	const viewName = view.name.toLowerCase();
-	analysis.outColumns.forEach((col, i) => {
-		const attr = attrs[i];
-		if (!attr) return;
-		const name = col.displayName.toLowerCase();
-		scope.registerSymbol(name, (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
-		scope.registerSymbol(`${viewName}.${name}`, (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
-	});
-	return scope;
-}
-
-/**
- * Lower a multi-source DELETE's RETURNING result columns to `Projection`s over the
- * planned body `root`: `returning *` expands to every view output column (its view
- * spelling), a bare/computed column resolves against the view-output scope. Mirrors the
- * `from <view>` re-query the retired path issued, built directly on `root`.
- */
-function buildViewReturningProjections(
-	rctx: PlanningContext,
-	analysis: JoinViewAnalysis,
-	returningCols: readonly AST.ResultColumn[],
-): Projection[] {
-	const attrs = analysis.root.getAttributes();
-	const out: Projection[] = [];
-	for (const rc of returningCols) {
-		if (rc.type === 'all') {
-			analysis.outColumns.forEach((col, i) => {
-				const attr = attrs[i];
-				if (!attr) return;
-				out.push({
-					node: new ColumnReferenceNode(rctx.scope, { type: 'column', name: col.displayName }, attr.type, attr.id, i),
-					alias: col.displayName,
-				});
-			});
-		} else {
-			const node = buildExpression(rctx, rc.expr);
-			const alias = rc.alias ?? (rc.expr.type === 'column' ? rc.expr.name : undefined);
-			out.push({ node, alias });
-		}
-	}
-	return out;
 }
 
 /**
