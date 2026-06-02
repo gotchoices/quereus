@@ -1884,6 +1884,62 @@ describe('lens enforcement: parent-side FK CASCADE / SET NULL / SET DEFAULT acti
 			await db.close();
 		}
 	});
+
+	it('composite CASCADE DELETE — a multi-column logical FK cascades over the multi-column WHERE (all components non-null)', async () => {
+		const db = new Database();
+		try {
+			// Composite FK (a, b) -> parent(px, py), every referenced value non-null so the
+			// cascade fires the multi-column WHERE built by the .map(...).join(...) path.
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on delete cascade on update cascade) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'p'), (3, 4, 'q')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2), (11, 1, 2), (12, 3, 4)');
+			await db.exec('delete from x.parent where px = 1 and py = 2');
+			// Only the children matching the full composite key (1,2) are cascade-deleted.
+			expect(await rows(db, 'select id from x.child order by id'), 'only (1,2) children removed').to.deep.equal([{ id: 12 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('composite CASCADE UPDATE — re-keying a composite parent rewrites both child FK columns', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on update cascade) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'p')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2)');
+			// Re-key (1,2) -> (7,8): both child FK columns must follow.
+			await db.exec('update x.parent set px = 7, py = 8 where px = 1 and py = 2');
+			expect(await rows(db, 'select id, a, b from x.child where id = 10'), 'both FK columns rewritten').to.deep.equal([{ id: 10, a: 7, b: 8 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('insert-or-replace on a lens parent cascades the displaced row\'s children (the replacedRow wiring site)', async () => {
+		const db = new Database();
+		try {
+			// REPLACE on the parent PK is a delete-then-insert; the displaced old row fires
+			// the lens cascade via the `replacedRow` delete site in processInsertRow. Standard
+			// SQLite REPLACE semantics: the ON DELETE CASCADE children of the displaced row
+			// are removed even though a new row reoccupies the same PK.
+			await deployCascadeLens(db, { fkTail: 'on delete cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec(`insert or replace into x.parent (id, name) values (1, 'b')`);
+			// The displaced parent's child was cascade-deleted by the replacedRow site...
+			expect(await rows(db, 'select count(*) as n from x.child'), 'displaced row children cascade-deleted').to.deep.equal([{ n: 0 }]);
+			// ...and the new parent row reoccupies the PK.
+			expect(await rows(db, 'select id, name from x.parent where id = 1')).to.deep.equal([{ id: 1, name: 'b' }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens enforcement: parent-side FK cascade — mixed logical/basis cycle', () => {
