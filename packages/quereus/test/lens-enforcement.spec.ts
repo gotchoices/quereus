@@ -1584,6 +1584,33 @@ describe('lens enforcement: parent-side FK basis-redundancy elision', () => {
 		}
 	});
 
+	it('elides under a PARENT rename override when the basis FK references the renamed basis parent column', async () => {
+		const db = new Database();
+		try {
+			// Parent maps logical `id` ← basis `basis_id`; the basis restrict FK references
+			// `basis_id`. The redundancy detector maps the parent referenced column
+			// logical→basis through the parent slot's projection, so the mapped pair-set
+			// equals the basis FK's ⇒ elide. (The child-rename case tests the child half of
+			// `mappedFkBasisPairs`; this exercises the parent half under a non-identity
+			// projection — the path every identity-projection case leaves untested.)
+			await db.exec('declare schema y { table parent (basis_id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(basis_id) on delete restrict on update restrict) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('declare lens for x over y { view parent as select basis_id as id, name from y.parent }');
+			await db.exec('apply schema x');
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE), 'parent-rename elides DELETE').to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE), 'parent-rename elides UPDATE').to.deep.equal([]);
+
+			// Still enforces via the basis FK: deleting a referenced parent ABORTs.
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('elides a composite FK when the basis carries the equivalent composite restrict FK (DELETE + UPDATE)', async () => {
 		const db = new Database();
 		try {
