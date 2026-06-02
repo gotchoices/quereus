@@ -14,7 +14,7 @@ import { hasNativeEventSupport } from '../../util/event-support.js';
 import { sqlValuesEqual } from '../../util/comparison.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
-import { executeForeignKeyActions, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
+import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
 import type { BackingConnectionCache } from '../../core/database-materialized-views.js';
 import type { BackingRowChange } from '../../vtab/memory/layer/manager.js';
 
@@ -498,7 +498,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					);
 					await maintainRowTimeStructures(ctx, tableKey,
 						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow }, backingConnCache);
-					await executeForeignKeyActions(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow);
+					await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow);
 
 					if (needsAutoEvents) {
 						const changedColumns: string[] = [];
@@ -537,7 +537,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			const newKeyValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
 			ctx.db._recordUpdate(tableKey, replacedRow, newRow, pkColumnIndicesInSchema);
 			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow }, backingConnCache);
-			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', replacedRow);
+			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', replacedRow);
 
 			if (needsAutoEvents) {
 				const changedColumns: string[] = [];
@@ -595,7 +595,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			const evictedKeyValues = pkColumnIndicesInSchema.map(idx => evicted[idx]);
 			ctx.db._recordDelete(tableKey, evicted, pkColumnIndicesInSchema);
 			await maintainRowTimeStructures(ctx, tableKey, { op: 'delete', oldRow: evicted }, backingConnCache);
-			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', evicted);
+			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', evicted);
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...evicted]);
 			}
@@ -703,7 +703,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			);
 			await maintainRowTimeStructures(ctx, tableKey,
 				{ op: 'delete', oldRow: result.replacedRow }, backingConnCache);
-			await executeForeignKeyActions(ctx.db, tableSchema, 'delete', result.replacedRow);
+			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', result.replacedRow);
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...result.replacedRow]);
 			}
@@ -727,7 +727,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			{ op: 'update', oldRow, newRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
-		await executeForeignKeyActions(ctx.db, tableSchema, 'update', oldRow, newRow);
+		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, newRow);
 
 		// Emit auto event for modules without native event support
 		if (needsAutoEvents) {
@@ -831,7 +831,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			{ op: 'delete', oldRow }, backingConnCache);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
-		await executeForeignKeyActions(ctx.db, tableSchema, 'delete', oldRow);
+		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', oldRow);
 
 		// Emit auto event for modules without native event support
 		if (needsAutoEvents) {

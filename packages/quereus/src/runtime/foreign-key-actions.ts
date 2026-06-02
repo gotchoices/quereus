@@ -1,12 +1,21 @@
 import type { Database } from '../core/database.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../schema/table.js';
 import { resolveReferencedColumns } from '../schema/table.js';
+import type { ForeignKeyAction } from '../parser/ast.js';
 import type { Row, SqlValue } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { expressionToString, quoteIdentifier } from '../emit/ast-stringify.js';
 import { sqlValuesEqual } from '../util/comparison.js';
+import type { LensSlot } from '../schema/lens.js';
+import { resolveSlotBasisSource } from '../schema/lens-prover.js';
+import {
+	findLogicalParentFkRefs,
+	logicalToBasisColumnMap,
+	basisChildCarriesEquivalentFk,
+	type LogicalParentFkRef,
+} from '../schema/lens-fk-discovery.js';
 
 const log = createLogger('runtime:fk-actions');
 
@@ -78,6 +87,27 @@ export async function executeForeignKeyActions(
 	} finally {
 		visited.delete(parentKey);
 	}
+}
+
+/**
+ * The combined physical + lens FK-action entry point the DML executor fires after
+ * every basis row delete/update. Runs the physical {@link executeForeignKeyActions}
+ * (cascade / set-null / set-default over declared basis `TableSchema.foreignKeys`)
+ * and then the logical dual {@link executeLensForeignKeyActions} (the same actions
+ * over a *logical* FK that lives only on a lens slot's `enforced-fk` obligation). A
+ * single wrapper keeps the two sites from drifting — wherever a basis row write fires
+ * physical FK actions, the logical cascade fires too. The lens half is a cheap early
+ * return when `foreign_keys` is off or no lens slot is backed by `parentTable`.
+ */
+export async function executeForeignKeyActionsAndLens(
+	db: Database,
+	parentTable: TableSchema,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow?: Row,
+): Promise<void> {
+	await executeForeignKeyActions(db, parentTable, operation, oldRow, newRow);
+	await executeLensForeignKeyActions(db, parentTable, operation, oldRow, newRow);
 }
 
 /**
@@ -376,6 +406,204 @@ async function executeSingleFKAction(
 			}).join(', ');
 			const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereClause}`;
 			log('SET DEFAULT: %s with params %o', sql, oldParentValues);
+			await db._execWithinTransaction(sql, oldParentValues);
+			break;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lens cascade walker — the logical dual of executeForeignKeyActions.
+//
+// A logical FK lives only on a child lens slot's `enforced-fk` obligation (on no
+// basis table), so executeForeignKeyActions — which scans declared
+// `TableSchema.foreignKeys` — never sees it. When a lens-backed logical *parent* is
+// deleted / re-keyed, the basis op runs but no logical cascade fires. This walker is
+// fired (via executeForeignKeyActionsAndLens) right after each basis row write: it
+// reverse-maps the basis parent table to the logical parent slot(s) it backs,
+// discovers the referencing logical FKs, and — for the non-RESTRICT actions
+// (cascade / set-null / set-default) — issues the propagating DML against the logical
+// child *view*. Issuing against the view (not the basis child) re-enters the full
+// lens write path, so the child's own constraints + any nested logical cascade fire,
+// exactly as a user-issued `delete from x.child` would. Recursion + termination work
+// identically to executeSingleFKAction's SQL-issuing path: each cascade is a real
+// nested statement and a cycle terminates by data exhaustion.
+// ---------------------------------------------------------------------------
+
+/**
+ * Propagates the non-RESTRICT parent-side actions (cascade / set-null / set-default)
+ * of a *logical* FK through the lens when a lens-backed logical parent is deleted or
+ * updated. The logical dual of {@link executeForeignKeyActions}.
+ *
+ * No-op (early return) when `foreign_keys` is off, or when no lens slot resolves to
+ * `basisParentTable` as its single basis spine — so non-lens DML pays only one cheap
+ * scan over the lens slots (most databases have none). The single-source-spine
+ * boundary is identical to the RESTRICT collector's: a parent slot with no single
+ * basis spine never matches.
+ */
+export async function executeLensForeignKeyActions(
+	db: Database,
+	basisParentTable: TableSchema,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow?: Row,
+): Promise<void> {
+	if (!db.options.getBooleanOption('foreign_keys')) return;
+
+	const sm = db.schemaManager;
+	const basisNameLower = basisParentTable.name.toLowerCase();
+	const basisSchemaLower = basisParentTable.schemaName.toLowerCase();
+
+	// Reverse-map basis → logical parent slots: every lens slot whose single basis
+	// spine is `basisParentTable` (usually 0 or 1). A multi-source / decomposition
+	// parent resolves to no single spine and never matches (documented boundary).
+	for (const schema of sm._getAllSchemas()) {
+		for (const parentSlot of schema.getAllLensSlots()) {
+			const basis = resolveSlotBasisSource(parentSlot, sm);
+			if (!basis) continue;
+			if (basis.name.toLowerCase() !== basisNameLower) continue;
+			if (basis.schemaName.toLowerCase() !== basisSchemaLower) continue;
+			await executeLensFkActionsForParentSlot(db, parentSlot, basisParentTable, operation, oldRow, newRow);
+		}
+	}
+}
+
+/** A non-RESTRICT parent-side action propagated by the lens cascade walker. */
+type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefault'>;
+
+/**
+ * Fires the logical cascade for one logical parent slot backed by `basisParentTable`.
+ * For each referencing logical FK with a non-RESTRICT op-action it: elides when the
+ * basis already propagates over an equivalent basis FK, applies MATCH SIMPLE + the
+ * UPDATE referenced-column-change short-circuit, and issues the logical-child DML.
+ */
+async function executeLensFkActionsForParentSlot(
+	db: Database,
+	parentSlot: LensSlot,
+	basisParentTable: TableSchema,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow: Row | undefined,
+): Promise<void> {
+	const sm = db.schemaManager;
+	const refs = findLogicalParentFkRefs(parentSlot, sm);
+	if (refs.length === 0) return;
+
+	// Maps each logical parent referenced column → its basis column, so the OLD/NEW
+	// referenced values can be read off the basis write row by basis index.
+	const parentMap = logicalToBasisColumnMap(parentSlot);
+
+	for (const ref of refs) {
+		const { fk } = ref;
+		const rawAction = operation === 'delete' ? fk.onDelete : fk.onUpdate;
+		if (rawAction !== 'cascade' && rawAction !== 'setNull' && rawAction !== 'setDefault') continue;
+		const action: LensFkAction = rawAction;
+
+		// Elision (compose with the physical walker): when the basis child carries a
+		// structurally-equivalent FK referencing the basis parent, the physical
+		// executeForeignKeyActions already propagates over the basis (and the logical
+		// view reflects it), so firing the lens cascade on top would be redundant or
+		// double-mutating — the basis governs (divergent-action sub-case is a documented
+		// limitation).
+		if (basisChildCarriesEquivalentFk(ref.childSlot, fk, parentSlot, ref.parentLogicalColumns, basisParentTable, sm)) {
+			log('lens cascade %s on %s: elided — basis child carries an equivalent FK (the physical walker propagates over the basis)',
+				fk.name ?? '<anon>', parentSlot.logicalTable.name);
+			continue;
+		}
+
+		// Read the parent's referenced OLD (and NEW) values off the basis row: logical
+		// referenced column → basis column → basis index. A column with no plain basis
+		// projection disqualifies the cascade (cannot read its basis value).
+		const basisIndices: number[] = [];
+		let mappable = true;
+		for (const logicalCol of ref.parentLogicalColumns) {
+			const basisColName = parentMap.get(logicalCol.toLowerCase());
+			const basisIdx = basisColName !== undefined
+				? basisParentTable.columnIndexMap.get(basisColName.toLowerCase())
+				: undefined;
+			if (basisIdx === undefined) { mappable = false; break; }
+			basisIndices.push(basisIdx);
+		}
+		if (!mappable) continue;
+
+		// MATCH SIMPLE: a NULL referenced value participates in no FK match ⇒ no cascade.
+		const oldParentValues = basisIndices.map(i => oldRow[i]) as SqlValue[];
+		if (oldParentValues.some(v => v === null || v === undefined)) continue;
+
+		// UPDATE short-circuit: skip when no referenced parent column actually changed.
+		let newParentValues: SqlValue[] | undefined;
+		if (operation === 'update' && newRow !== undefined) {
+			let anyChanged = false;
+			for (const i of basisIndices) {
+				if (!sqlValuesEqual(oldRow[i] as SqlValue, newRow[i] as SqlValue)) { anyChanged = true; break; }
+			}
+			if (!anyChanged) continue;
+			newParentValues = basisIndices.map(i => newRow[i]) as SqlValue[];
+		}
+
+		await issueLensFkAction(db, ref, action, operation, oldParentValues, newParentValues);
+	}
+}
+
+/**
+ * Issues the propagating DML against the logical child *view* — the logical dual of
+ * {@link executeSingleFKAction}. Uses the logical child schema / table / column names
+ * and binds the OLD parent values (and NEW for cascade-update) as parameters (never
+ * inlined). The default for SET DEFAULT is the **logical** child column's
+ * `defaultValue` AST (stringified), or NULL when none. Because the target is the
+ * registered logical view, the DML re-enters the lens write path and its own
+ * constraints + nested cascades fire.
+ */
+async function issueLensFkAction(
+	db: Database,
+	ref: LogicalParentFkRef,
+	action: LensFkAction,
+	operation: 'delete' | 'update',
+	oldParentValues: SqlValue[],
+	newParentValues: SqlValue[] | undefined,
+): Promise<void> {
+	const childTable = ref.childSlot.logicalTable;
+	const childLogicalColumns = ref.childLogicalColumns;
+	const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+		? `${quoteIdentifier(childTable.schemaName)}.`
+		: '';
+	const qualifiedChild = `${schemaPrefix}${quoteIdentifier(childTable.name)}`;
+	const whereClause = childLogicalColumns.map(c => `${quoteIdentifier(c)} = ?`).join(' and ');
+
+	switch (action) {
+		case 'cascade': {
+			if (operation === 'delete') {
+				const sql = `delete from ${qualifiedChild} where ${whereClause}`;
+				log('LENS CASCADE DELETE: %s with params %o', sql, oldParentValues);
+				await db._execWithinTransaction(sql, oldParentValues);
+			} else {
+				// CASCADE UPDATE: rewrite the child FK columns to the NEW parent values
+				// (SET) for rows that still reference the OLD values (WHERE).
+				const setClauses = childLogicalColumns.map(c => `${quoteIdentifier(c)} = ?`).join(', ');
+				const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
+				const params = [...(newParentValues ?? []), ...oldParentValues];
+				log('LENS CASCADE UPDATE: %s with params %o', sql, params);
+				await db._execWithinTransaction(sql, params);
+			}
+			break;
+		}
+		case 'setNull': {
+			const setClauses = childLogicalColumns.map(c => `${quoteIdentifier(c)} = null`).join(', ');
+			const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
+			log('LENS SET NULL: %s with params %o', sql, oldParentValues);
+			await db._execWithinTransaction(sql, oldParentValues);
+			break;
+		}
+		case 'setDefault': {
+			const setClauses = childLogicalColumns.map((c, i) => {
+				const defaultVal = childTable.columns[ref.fk.columns[i]]?.defaultValue;
+				if (defaultVal === null || defaultVal === undefined) return `${quoteIdentifier(c)} = null`;
+				// The logical child column's default AST, stringified (parametrizing it is
+				// unnecessary — a default is a constant expression).
+				return `${quoteIdentifier(c)} = (${expressionToString(defaultVal)})`;
+			}).join(', ');
+			const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
+			log('LENS SET DEFAULT: %s with params %o', sql, oldParentValues);
 			await db._execWithinTransaction(sql, oldParentValues);
 			break;
 		}

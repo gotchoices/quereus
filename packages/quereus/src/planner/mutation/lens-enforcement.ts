@@ -1,9 +1,16 @@
 import type * as AST from '../../parser/ast.js';
 import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
 import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema } from '../../schema/table.js';
-import { RowOpFlag, resolveReferencedColumns } from '../../schema/table.js';
+import { RowOpFlag } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import { resolveSlotBasisSource } from '../../schema/lens-prover.js';
+import {
+	logicalToBasisColumnMap,
+	resolveLogicalReferencedColumns,
+	mappedFkBasisPairs,
+	matchingBasisFks,
+	findLogicalParentFkRefs,
+} from '../../schema/lens-fk-discovery.js';
 import { transformExpr } from './scope-transform.js';
 import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
 import { createLogger } from '../../common/logger.js';
@@ -61,28 +68,6 @@ const log = createLogger('planner:lens-enforcement');
 export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
 
 /**
- * Maps each reconstructible logical column (lowercased) to the basis column it
- * projects from, read off the slot's compiled-body projection. Mirrors the
- * prover's `mappedBasisColumn`: a logical column is reconstructible iff its
- * body-output term is a plain `column` reference, in which case a written value
- * maps straight back to that basis column. Hidden columns are skipped (they have
- * no body-output term), keeping the output index aligned with `compiledBody.columns`.
- */
-function logicalToBasisColumnMap(slot: LensSlot): Map<string, string> {
-	const map = new Map<string, string>();
-	let outputIndex = 0;
-	for (const p of slot.columnProvenance) {
-		if (p.source === 'hidden') continue;
-		const rc = slot.compiledBody.columns[outputIndex];
-		outputIndex++;
-		if (rc && rc.type === 'column' && rc.expr.type === 'column') {
-			map.set(p.logicalColumn.toLowerCase(), (rc.expr as AST.ColumnExpr).name);
-		}
-	}
-	return map;
-}
-
-/**
  * Rewrites a logical-column expression into basis-column terms: a column that
  * maps to a basis column is replaced by an unqualified reference to it; any other
  * column reference has its table/schema qualifier stripped so it resolves against
@@ -128,29 +113,6 @@ export function collectLensRowLocalConstraints(slot: LensSlot): RowConstraintSch
 }
 
 /**
- * Resolves a logical FK's referenced (parent) column **names** — the terms the
- * synthesized `EXISTS` subquery filters the parent on. The names resolve against
- * the registered logical parent view, so logical names are correct here. Prefers
- * the FK's stored `referencedColumnNames` (populated for every declared FK); when
- * a bare `references parent` (no column list) leaves them empty, falls back to the
- * parent logical table's primary-key column names (resolved via the parent's lens
- * slot, or a plain table lookup as a backstop).
- */
-function resolveLogicalReferencedColumns(
-	fk: ForeignKeyConstraintSchema,
-	referencedSchema: string,
-	schemaManager: SchemaManager,
-): string[] {
-	if (fk.referencedColumnNames && fk.referencedColumnNames.length > 0) {
-		return [...fk.referencedColumnNames];
-	}
-	const parent = schemaManager.getSchema(referencedSchema)?.getLensSlot(fk.referencedTable)?.logicalTable
-		?? schemaManager.findTable(fk.referencedTable, referencedSchema);
-	if (!parent) return [];
-	return parent.primaryKeyDefinition.map(pk => parent.columns[pk.index]?.name).filter((n): n is string => n !== undefined);
-}
-
-/**
  * Whether the lens body is a faithful, **non-row-reducing** projection of its
  * single basis source — every basis row maps 1:1 to a logical row, so the logical
  * relation's row set equals the basis relation's on any projected column. True iff
@@ -168,95 +130,6 @@ function isNonRowReducingProjection(body: AST.SelectStmt): boolean {
 		&& body.union === undefined
 		&& body.compound === undefined
 		&& body.withClause === undefined;
-}
-
-/** Encodes a `(childCol, parentCol)` basis index pair as an order-independent set key. */
-function pairKey(childCol: number, parentCol: number): string {
-	return `${childCol}:${parentCol}`;
-}
-
-/**
- * The `(basisChildCol → basisParentCol)` index pair-set of the logical FK, mapped
- * through the child and parent slots' reconstructible projections, or `undefined`
- * when any column is not a plain basis-column projection (a name-only fallback, or
- * an unresolved index) — which disqualifies elision. Implements redundancy
- * conditions (1) and the parent half of (2): every logical FK child column maps
- * with no transform to a `basisChild` column, and every logical referenced column
- * maps with no transform to a `basisParent` column.
- */
-function mappedFkBasisPairs(
-	slot: LensSlot,
-	fk: ForeignKeyConstraintSchema,
-	parentSlot: LensSlot,
-	logicalParentColumns: readonly string[],
-	basisChild: TableSchema,
-	basisParent: TableSchema,
-): Set<string> | undefined {
-	const childMap = logicalToBasisColumnMap(slot);
-	const parentMap = logicalToBasisColumnMap(parentSlot);
-	const pairs = new Set<string>();
-	for (let i = 0; i < fk.columns.length; i++) {
-		const childLogical = slot.logicalTable.columns[fk.columns[i]]?.name;
-		if (childLogical === undefined) return undefined;
-		const childBasisName = childMap.get(childLogical.toLowerCase());
-		if (childBasisName === undefined) return undefined; // name-only fallback ⇒ not value-preserving
-		const childBasisCol = basisChild.columnIndexMap.get(childBasisName.toLowerCase());
-		if (childBasisCol === undefined) return undefined;
-
-		const parentBasisName = parentMap.get(logicalParentColumns[i].toLowerCase());
-		if (parentBasisName === undefined) return undefined; // parent col not a plain projection
-		const parentBasisCol = basisParent.columnIndexMap.get(parentBasisName.toLowerCase());
-		if (parentBasisCol === undefined) return undefined;
-
-		pairs.add(pairKey(childBasisCol, parentBasisCol));
-	}
-	return pairs.size > 0 ? pairs : undefined;
-}
-
-/**
- * **All** FKs `basisChild` declares whose unordered `(childCol → parentCol)` index
- * pair-set equals `mappedPairs` and that reference `basisParent` (schema + name) —
- * the full match list, not just the first. Implements redundancy condition (2): the
- * basis write's own FK enforcement (`buildChildSideFKChecks` on the child side,
- * `buildParentSideFKChecks` on the parent side) already enforces such an FK, so a
- * matching one subsumes the lens-level check. The comparison is an unordered *set*
- * of index pairs (mirrors `lookupCoveringFK`'s positional `equiMap` reasoning) — a
- * permuted basis FK (same columns, different pairing) yields a different pair-set and
- * must NOT match; a partial FK fails the arity check.
- *
- * Returning *every* match (not the first) is load-bearing for the **parent-side**
- * caller's action gate: a single non-`restrict` matching basis FK means the basis
- * parent write cascades / nulls rather than rejects, so eliding the lens RESTRICT
- * would be unsound even when a *different* matching basis FK is `restrict`. The
- * action-agnostic child-side caller takes `matches[0]`.
- */
-function matchingBasisFks(
-	basisChild: TableSchema,
-	basisParent: TableSchema,
-	mappedPairs: ReadonlySet<string>,
-): ForeignKeyConstraintSchema[] {
-	const matches: ForeignKeyConstraintSchema[] = [];
-	for (const bfk of basisChild.foreignKeys ?? []) {
-		if (bfk.referencedTable.toLowerCase() !== basisParent.name.toLowerCase()) continue;
-		const bfkParentSchema = (bfk.referencedSchema ?? basisChild.schemaName).toLowerCase();
-		if (bfkParentSchema !== basisParent.schemaName.toLowerCase()) continue;
-		if (bfk.columns.length !== mappedPairs.size) continue;
-		let refCols: readonly number[];
-		try {
-			refCols = resolveReferencedColumns(bfk, basisParent);
-		} catch {
-			continue;
-		}
-		if (refCols.length !== bfk.columns.length) continue;
-		const bfkPairs = new Set<string>();
-		for (let j = 0; j < bfk.columns.length; j++) {
-			bfkPairs.add(pairKey(bfk.columns[j], refCols[j]));
-		}
-		if (bfkPairs.size === mappedPairs.size && [...mappedPairs].every(p => bfkPairs.has(p))) {
-			matches.push(bfk);
-		}
-	}
-	return matches;
 }
 
 /**
@@ -518,8 +391,10 @@ function buildParentSideUpdateGuard(parentBasisColumns: readonly string[], notEx
  * already-shipped child-side).
  *
  * Action gate: only `restrict` (on the op-appropriate `onDelete` / `onUpdate`) emits —
- * **matching `buildParentSideFKChecks` exactly**; CASCADE / SET NULL / SET DEFAULT through
- * the lens are out of scope (backlog). The lens-level check **double-enforces** by default
+ * **matching `buildParentSideFKChecks` exactly**. CASCADE / SET NULL / SET DEFAULT are
+ * **propagated** (not detected here) by the runtime cascade walker
+ * `executeLensForeignKeyActions` (`runtime/foreign-key-actions.ts`), the logical dual of
+ * `executeForeignKeyActions`. The lens-level RESTRICT check **double-enforces** by default
  * (sound: both the lens-level check and any equivalent basis parent-side check reject the
  * same condition), but is now **elided when provably redundant** with the basis parent
  * write's own `buildParentSideFKChecks` (see {@link lensParentSideForeignKeyRedundant}):
@@ -547,70 +422,50 @@ export function collectLensParentSideForeignKeyConstraints(
 	if (!basisParent) return [];
 
 	const parentMap = logicalToBasisColumnMap(parentSlot);
-	const parentLogicalName = parentSlot.logicalTable.name;
-	const parentLogicalSchema = parentSlot.logicalTable.schemaName;
 
 	const constraints: RowConstraintSchema[] = [];
-	for (const schema of schemaManager._getAllSchemas()) {
-		for (const childSlot of schema.getAllLensSlots()) {
-			if (!childSlot.obligations || childSlot.obligations.length === 0) continue;
-			const childLogicalSchema = childSlot.logicalTable.schemaName;
-			for (const obligation of childSlot.obligations) {
-				if (obligation.kind !== 'enforced-fk') continue;
-				if (obligation.constraint.kind !== 'foreignKey') continue;
-				const fk = obligation.constraint.constraint;
-				const referencedSchema = fk.referencedSchema ?? childLogicalSchema;
-				// This FK must reference *this* parent slot's logical table (name + schema).
-				if (fk.referencedTable.toLowerCase() !== parentLogicalName.toLowerCase()) continue;
-				if (referencedSchema.toLowerCase() !== parentLogicalSchema.toLowerCase()) continue;
-				// Action gate — mirror buildParentSideFKChecks exactly: only RESTRICT
-				// synthesizes a parent-side check (cascades handled elsewhere; out of scope here).
-				const action = operation === RowOpFlag.DELETE ? fk.onDelete : fk.onUpdate;
-				if (action !== 'restrict') continue;
-				// Parent referenced columns (logical), rewritten logical→basis through the
-				// parent slot's projection for the OLD/NEW correlation side. Parity with the
-				// child-side count-mismatch guard: skip a malformed / unresolvable FK rather
-				// than synthesize a `NOT EXISTS` with `undefined` parent column names.
-				const parentLogicalColumns = resolveLogicalReferencedColumns(fk, referencedSchema, schemaManager);
-				if (parentLogicalColumns.length !== fk.columns.length) {
-					log('lens parent-side FK %s: parent column count (%d) != child column count (%d); skipping',
-						fk.name ?? '<anon>', parentLogicalColumns.length, fk.columns.length);
-					continue;
-				}
-				// Elide the lens-level parent-side check when the re-planned basis parent
-				// write provably already enforces an equivalent (RESTRICT) parent-side FK
-				// (every uncertain case — including any non-restrict matching basis FK —
-				// still double-enforces).
-				const subsuming = lensParentSideForeignKeyRedundant(
-					childSlot, fk, parentSlot, basisParent, parentLogicalColumns, operation, schemaManager);
-				if (subsuming) {
-					log('lens parent-side FK %s on %s: elided — provably subsumed by basis FK %s referencing %s (action restrict; the re-planned basis parent write enforces it)',
-						fk.name ?? '<anon>', parentSlot.logicalTable.name,
-						subsuming.name ?? '<anon>', subsuming.referencedTable);
-					continue;
-				}
-				const parentBasisColumns = parentLogicalColumns.map(name => parentMap.get(name.toLowerCase()) ?? name);
-				// Child FK columns stay logical — they resolve against the schema-qualified
-				// logical child view named in the NOT EXISTS FROM.
-				const childColumns = fk.columns.map(childIdx => childSlot.logicalTable.columns[childIdx]?.name ?? `#${childIdx}`);
-				const notExists = synthesizeFKNotExistsExpr(
-					childSlot.logicalTable.name,
-					childColumns,
-					parentBasisColumns,
-					'OLD',
-					childLogicalSchema,
-				);
-				const expr = operation === RowOpFlag.DELETE
-					? notExists
-					: buildParentSideUpdateGuard(parentBasisColumns, notExists);
-				constraints.push({
-					name: fk.name ? `lens:fk:parent:${fk.name}` : 'lens:fk:parent',
-					expr,
-					operations: operation,
-					tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
-				});
-			}
+	// Cross-slot discovery (the shared `findLogicalParentFkRefs`): every logical FK on
+	// any slot that references this parent's logical table, with the child / parent
+	// column names + the count-mismatch guard already resolved.
+	for (const { childSlot, fk, childLogicalColumns, parentLogicalColumns } of findLogicalParentFkRefs(parentSlot, schemaManager)) {
+		// Action gate — mirror buildParentSideFKChecks exactly: only RESTRICT
+		// synthesizes a parent-side check (cascades are propagated by the runtime
+		// cascade walker — `executeLensForeignKeyActions` — not here).
+		const action = operation === RowOpFlag.DELETE ? fk.onDelete : fk.onUpdate;
+		if (action !== 'restrict') continue;
+		// Elide the lens-level parent-side check when the re-planned basis parent
+		// write provably already enforces an equivalent (RESTRICT) parent-side FK
+		// (every uncertain case — including any non-restrict matching basis FK —
+		// still double-enforces).
+		const subsuming = lensParentSideForeignKeyRedundant(
+			childSlot, fk, parentSlot, basisParent, parentLogicalColumns, operation, schemaManager);
+		if (subsuming) {
+			log('lens parent-side FK %s on %s: elided — provably subsumed by basis FK %s referencing %s (action restrict; the re-planned basis parent write enforces it)',
+				fk.name ?? '<anon>', parentSlot.logicalTable.name,
+				subsuming.name ?? '<anon>', subsuming.referencedTable);
+			continue;
 		}
+		// Parent referenced columns rewritten logical→basis through the parent slot's
+		// projection for the OLD/NEW correlation side.
+		const parentBasisColumns = parentLogicalColumns.map(name => parentMap.get(name.toLowerCase()) ?? name);
+		// Child FK columns stay logical — they resolve against the schema-qualified
+		// logical child view named in the NOT EXISTS FROM.
+		const notExists = synthesizeFKNotExistsExpr(
+			childSlot.logicalTable.name,
+			childLogicalColumns,
+			parentBasisColumns,
+			'OLD',
+			childSlot.logicalTable.schemaName,
+		);
+		const expr = operation === RowOpFlag.DELETE
+			? notExists
+			: buildParentSideUpdateGuard(parentBasisColumns, notExists);
+		constraints.push({
+			name: fk.name ? `lens:fk:parent:${fk.name}` : 'lens:fk:parent',
+			expr,
+			operations: operation,
+			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
+		});
 	}
 	return constraints;
 }

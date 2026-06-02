@@ -25,6 +25,8 @@ import {
 	LENS_BOUNDARY_ATTACHED_TAG,
 } from '../src/planner/mutation/lens-enforcement.js';
 import { RowOpFlag } from '../src/schema/table.js';
+import { findLogicalParentFkRefs, basisChildCarriesEquivalentFk } from '../src/schema/lens-fk-discovery.js';
+import { resolveSlotBasisSource } from '../src/schema/lens-prover.js';
 import type { LensSlot } from '../src/schema/lens.js';
 
 async function expectThrows(fn: () => Promise<unknown>, matcher?: RegExp): Promise<void> {
@@ -1629,6 +1631,346 @@ describe('lens enforcement: parent-side FK basis-redundancy elision', () => {
 			expect(await rows(db, 'select count(*) as n from x.parent where px = 1 and py = 2')).to.deep.equal([{ n: 1 }]);
 		} finally {
 			await db.close();
+		}
+	});
+});
+
+describe('lens enforcement: parent-side FK CASCADE / SET NULL / SET DEFAULT actions', () => {
+	/**
+	 * Deploys the canonical cascade shape: the basis carries **no** FK, so the
+	 * referential action lives only on the *logical* FK. A delete/update of the
+	 * lens-backed logical parent must propagate the action to the referencing logical
+	 * child via the runtime cascade walker (`executeLensForeignKeyActions`, the logical
+	 * dual of `executeForeignKeyActions`) — issued against the logical child *view*, so
+	 * each cascade re-enters the lens write path. `foreign_keys` defaults on. `fkTail`
+	 * tunes the logical FK's referential actions; `childPid` tunes the child FK column
+	 * declaration (e.g. a default for SET DEFAULT); `childExtra` adds a further logical
+	 * child constraint.
+	 */
+	async function deployCascadeLens(
+		db: Database,
+		opts?: { fkTail?: string; childPid?: string; childExtra?: string },
+	): Promise<void> {
+		const fkTail = opts?.fkTail ?? 'on delete cascade on update cascade';
+		const childPid = opts?.childPid ?? 'pid integer null';
+		const childExtra = opts?.childExtra ? `, ${opts.childExtra}` : '';
+		await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+		await db.exec('apply schema y');
+		await db.exec(`declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, ${childPid}, constraint fk_pid foreign key (pid) references parent(id) ${fkTail}${childExtra}) }`);
+		await db.exec('apply schema x');
+	}
+
+	/** The single logical FK constraint on a child slot (for the unit-style predicate calls). */
+	function childFk(s: LensSlot) {
+		return s.obligations!.flatMap(o =>
+			o.kind === 'enforced-fk' && o.constraint.kind === 'foreignKey' ? [o.constraint.constraint] : [])[0];
+	}
+
+	it('CASCADE DELETE — deleting a referenced logical parent deletes the referencing children (basis has no FK)', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, { fkTail: 'on delete cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			// Deleting parent 1 cascades — both referencing children gone.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children cascade-deleted').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent gone').to.deep.equal([{ n: 0 }]);
+			// The basis reflects the cascade too (the lens cascade re-plans to the basis child write).
+			expect(await rows(db, 'select count(*) as n from y.child')).to.deep.equal([{ n: 0 }]);
+			// An unreferenced parent is untouched.
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 2')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('CASCADE UPDATE — re-keying a referenced logical parent rewrites the child FK column (child row preserved)', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, { fkTail: 'on update cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// Re-key parent 1 → 9 cascades the child's pid 1 → 9; the child row survives.
+			await db.exec('update x.parent set id = 9 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK rewritten').to.deep.equal([{ id: 10, pid: 9 }]);
+			expect(await rows(db, 'select id from x.parent'), 'parent re-keyed').to.deep.equal([{ id: 9 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('SET NULL — on delete set null nulls the child FK column (child row preserved)', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, { fkTail: 'on delete set null' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK nulled, row kept').to.deep.equal([{ id: 10, pid: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('SET NULL (update analogue) — on update set null nulls the child FK column when the parent key changes', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, { fkTail: 'on update set null' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('update x.parent set id = 9 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK nulled on parent re-key').to.deep.equal([{ id: 10, pid: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('SET DEFAULT — on delete set default sets the child FK column to the logical default (which references a valid parent)', async () => {
+		const db = new Database();
+		try {
+			// The child FK column declares `default 0`; seed a parent id=0 so the
+			// re-defaulted child still satisfies its (deferred) child-side FK at commit.
+			await deployCascadeLens(db, { fkTail: 'on delete set default', childPid: 'pid integer default 0' });
+			await db.exec(`insert into x.parent (id, name) values (0, 'def'), (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK set to default 0').to.deep.equal([{ id: 10, pid: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 0'), 'default parent intact').to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('MATCH SIMPLE — a NULL parent referenced value cascades nothing (no children match)', async () => {
+		const db = new Database();
+		try {
+			// A composite FK so the parent referenced key can carry a NULL component.
+			await db.exec('declare schema y { table parent (px integer, py integer null, name text, primary key (px)); table child (id integer primary key, a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer null, name text, primary key (px)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on delete cascade) }');
+			await db.exec('apply schema x');
+			// Parent (1, NULL): its referenced tuple has a NULL component, so MATCH SIMPLE
+			// means no child can reference it — deleting it cascades nothing, and a child
+			// carrying (1, NULL) is NOT deleted.
+			await db.exec(`insert into x.parent (px, py, name) values (1, null, 'a')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, null)');
+			await db.exec('delete from x.parent where px = 1');
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10'), 'NULL-keyed parent cascades nothing').to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE short-circuit — updating a non-referenced parent column cascades nothing (child untouched)', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, { fkTail: 'on update cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// Only `name` changes — the referenced key `id` is unchanged ⇒ no cascade.
+			await db.exec(`update x.parent set name = 'renamed' where id = 1`);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child untouched').to.deep.equal([{ id: 10, pid: 1 }]);
+			expect(await rows(db, 'select name from x.parent where id = 1')).to.deep.equal([{ name: 'renamed' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('transitive — parent → child → grandchild all cascade-delete', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (id integer primary key); table child (id integer primary key, pid integer null); table grandchild (id integer primary key, cid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete cascade); table grandchild (id integer primary key, cid integer null, constraint fk_g foreign key (cid) references child(id) on delete cascade) }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.parent (id) values (1)');
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('insert into x.grandchild (id, cid) values (100, 10)');
+			// Deleting the root cascades all the way down: each cascade re-enters the lens
+			// write path, whose own FK cascade fires the next level.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent')).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.child')).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.grandchild'), 'grandchild cascade-deleted transitively').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('re-enters the lens write path — a cascade-update that violates the logical child row-local check ABORTs', async () => {
+		const db = new Database();
+		try {
+			// The logical child carries a row-local check the basis does NOT — proving the
+			// cascade-update rides the lens write path, not a basis-direct write.
+			await deployCascadeLens(db, { fkTail: 'on update cascade', childExtra: 'constraint nonneg check (pid >= 0)' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// Re-key parent 1 → -5 ⇒ cascade-update child pid → -5 ⇒ violates `pid >= 0` ⇒ ABORT.
+			await expectThrows(() => db.exec('update x.parent set id = -5 where id = 1'), /nonneg|constraint|check/i);
+			// The whole statement rolled back: parent key and child FK both unchanged.
+			expect(await rows(db, 'select id from x.parent'), 'parent re-key rolled back').to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select pid from x.child where id = 10'), 'child unchanged').to.deep.equal([{ pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('elision / no double-cascade — basis also carries the equivalent CASCADE FK ⇒ children removed exactly once, end state correct', async () => {
+		const db = new Database();
+		try {
+			// Basis declares the SAME cascade FK; the physical walker propagates over the
+			// basis and the lens cascade is elided (the basis governs).
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) on delete cascade) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade) }');
+			await db.exec('apply schema x');
+
+			// The lens cascade is elided exactly because the basis child carries the equivalent FK.
+			expect(basisChildCarriesEquivalentFk(
+				slot(db, 'child'),
+				childFk(slot(db, 'child')),
+				slot(db, 'parent'),
+				['id'],
+				resolveSlotBasisSource(slot(db, 'parent'), db.schemaManager)!,
+				db.schemaManager,
+			), 'basis carries equivalent FK ⇒ lens cascade elided').to.be.true;
+
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			// Deleting the parent removes the children exactly once (no error, exact count).
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children removed once').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('pragma gate — foreign_keys = false ⇒ no lens cascade (child orphaned, not deleted)', async () => {
+		const db = new Database();
+		try {
+			await deployCascadeLens(db, { fkTail: 'on delete cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('pragma foreign_keys = false');
+			// No cascade fires — the parent deletes and the child is left orphaned.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child survives (no cascade)').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('multi-source parent — a delete/update of a multi-source logical parent fires no lens cascade and does not throw', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table pa (id integer primary key, a text); table pb (id integer primary key references pa(id), b text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, a text, b text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade on update cascade) }');
+			await db.exec('declare lens for x over y { view parent as select pa.id, pa.a, pb.b from y.pa join y.pb on pa.id = pb.id }');
+			await db.exec('apply schema x');
+
+			await db.exec(`insert into y.pa (id, a) values (1, 'a1'), (2, 'a2')`);
+			await db.exec(`insert into y.pb (id, b) values (1, 'b1'), (2, 'b2')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// The multi-source parent has no single basis spine ⇒ the cascade walker's
+			// reverse-map finds no matching slot ⇒ no cascade, no planner error.
+			await db.exec(`update x.parent set a = 'A1' where id = 1`); // does not throw
+			await db.exec('delete from x.parent where id = 2'); // does not throw
+			// The child of the still-present parent 1 is NOT cascaded (documented no-op).
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens enforcement: parent-side FK cascade — mixed logical/basis cycle', () => {
+	it('terminates by data exhaustion and does not double-delete', async () => {
+		const db = new Database();
+		try {
+			// `a` (basis FK a.bid → b.id ON DELETE CASCADE) and `b` (logical-only FK
+			// b.aid → a.id ON DELETE CASCADE). a[1].bid = 10 → b[10]; b[10].aid = 1 → a[1].
+			await db.exec('declare schema y { table a (id integer primary key, bid integer null, foreign key (bid) references b(id) on delete cascade); table b (id integer primary key, aid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table a (id integer primary key, bid integer null); table b (id integer primary key, aid integer null, constraint fk_b_a foreign key (aid) references a(id) on delete cascade) }');
+			await db.exec('apply schema x');
+
+			// Seed the mutual references inside one transaction (the child-side checks defer to commit).
+			await db.exec('begin');
+			await db.exec('insert into x.b (id, aid) values (10, 1)');
+			await db.exec('insert into x.a (id, bid) values (1, 10)');
+			await db.exec('commit');
+
+			// Deleting a[1]: lens cascade deletes b[10]; b[10]'s basis cascade tries to delete
+			// a rows with bid=10 — a[1] already gone ⇒ data exhausted ⇒ terminates. Each row
+			// is deleted exactly once; no infinite loop, no error.
+			await db.exec('delete from x.a where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.a'), 'a emptied').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.b'), 'b emptied via lens cascade').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens FK discovery: findLogicalParentFkRefs + cascade elision predicate (unit)', () => {
+	it('findLogicalParentFkRefs returns the referencing child ref for a referenced parent slot, and [] for a non-referenced one', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null); table solo (id integer primary key, v integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade); table solo (id integer primary key, v integer) }');
+			await db.exec('apply schema x');
+
+			const parentRefs = findLogicalParentFkRefs(slot(db, 'parent'), db.schemaManager);
+			expect(parentRefs.length, 'one child references parent').to.equal(1);
+			expect(parentRefs[0].childSlot.logicalTable.name).to.equal('child');
+			expect(parentRefs[0].childLogicalColumns).to.deep.equal(['pid']);
+			expect(parentRefs[0].parentLogicalColumns).to.deep.equal(['id']);
+
+			// `solo` is referenced by nothing, and `child` is not a referenced parent.
+			expect(findLogicalParentFkRefs(slot(db, 'solo'), db.schemaManager), 'solo unreferenced').to.deep.equal([]);
+			expect(findLogicalParentFkRefs(slot(db, 'child'), db.schemaManager), 'child is not a parent').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('basisChildCarriesEquivalentFk fires iff the basis child carries an equivalent FK referencing the basis parent', async () => {
+		// With a basis FK on the child referencing the basis parent ⇒ true (elide the lens cascade).
+		const withBasisFk = new Database();
+		try {
+			await withBasisFk.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) on delete cascade) }');
+			await withBasisFk.exec('apply schema y');
+			await withBasisFk.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade) }');
+			await withBasisFk.exec('apply schema x');
+			const cSlot = withBasisFk.schemaManager.getSchema('x')!.getLensSlot('child')!;
+			const pSlot = withBasisFk.schemaManager.getSchema('x')!.getLensSlot('parent')!;
+			const fk = cSlot.obligations!.flatMap(o => o.kind === 'enforced-fk' && o.constraint.kind === 'foreignKey' ? [o.constraint.constraint] : [])[0];
+			expect(basisChildCarriesEquivalentFk(
+				cSlot, fk, pSlot, ['id'], resolveSlotBasisSource(pSlot, withBasisFk.schemaManager)!, withBasisFk.schemaManager,
+			), 'basis FK present ⇒ true').to.be.true;
+		} finally {
+			await withBasisFk.close();
+		}
+
+		// With NO basis FK (the canonical lens shape) ⇒ false (fire the lens cascade).
+		const noBasisFk = new Database();
+		try {
+			await noBasisFk.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+			await noBasisFk.exec('apply schema y');
+			await noBasisFk.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade) }');
+			await noBasisFk.exec('apply schema x');
+			const cSlot = noBasisFk.schemaManager.getSchema('x')!.getLensSlot('child')!;
+			const pSlot = noBasisFk.schemaManager.getSchema('x')!.getLensSlot('parent')!;
+			const fk = cSlot.obligations!.flatMap(o => o.kind === 'enforced-fk' && o.constraint.kind === 'foreignKey' ? [o.constraint.constraint] : [])[0];
+			expect(basisChildCarriesEquivalentFk(
+				cSlot, fk, pSlot, ['id'], resolveSlotBasisSource(pSlot, noBasisFk.schemaManager)!, noBasisFk.schemaManager,
+			), 'no basis FK ⇒ false').to.be.false;
+		} finally {
+			await noBasisFk.close();
 		}
 	});
 });
