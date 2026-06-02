@@ -4,7 +4,7 @@ import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema } fro
 import { RowOpFlag, resolveReferencedColumns } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import { resolveSlotBasisSource } from '../../schema/lens-prover.js';
-import { transformExpr } from './single-source.js';
+import { transformExpr } from './scope-transform.js';
 import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
 import { createLogger } from '../../common/logger.js';
 

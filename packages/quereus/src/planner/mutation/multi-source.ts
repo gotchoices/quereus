@@ -11,7 +11,8 @@ import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref
 import { buildSelectStmt } from '../building/select.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { transformExpr, cloneExpr, combineAnd, makeViewColumnDescend, mapQueryExprUniform, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
+import { combineAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
+import { transformExpr, cloneExpr, mapQueryExprUniform } from './scope-transform.js';
 import { readPolicy, readDeleteVia, readTargetNames, readExcludeNames, type ReservedTagMap } from './mutation-tags.js';
 import type { DeleteViaValue } from '../../schema/reserved-tags.js';
 

@@ -231,9 +231,10 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > **View columns nested inside a predicate / assigned-value subquery.** A
 > view-column reference inside a `subquery` / `exists` / `in`-subquery operand of
 > the user predicate (or a `set` value) is rewritten to its base-term lineage
-> just like a top-level reference — `mutation/single-source.ts`'s `transformExpr`
-> descends into the operand via `transformQueryExpr` (the multi-source spine
-> threads the same descent through `substituteViewColumns`). The descent is
+> just like a top-level reference — `mutation/scope-transform.ts`'s `transformExpr`
+> descends into the operand via the shared scope-aware `transformScopedQuery` (built
+> by `single-source.ts`'s `makeViewColumnDescend`; the multi-source spine threads the
+> same descent through `substituteViewColumns`). The descent is
 > **scope-aware**: a reference is substituted only when it is genuinely correlated
 > to the outer view row — qualified by the view name, or unqualified and *not*
 > shadowed by a column some source local to the subquery introduces. A
@@ -263,9 +264,10 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > whose own correlation `id` lives one level down. If only the top level were
 > qualified, that nested `id` would stay unqualified and, emitted inside a user
 > subquery whose FROM also introduces an `id`, re-bind to the innermost local source
-> — a silent wrong write. So `makeBaseQualifier` builds a `baseQualify` closure that
-> `qualifyCorrelatedBaseRefs` runs over the whole replacement, mirroring the
-> `collectFromColumnNames` / `shadowed` logic of `transformQueryExpr`: at each nested
+> — a silent wrong write. So `makeBaseQualifier` builds a `baseQualify` closure — the
+> base-qualify `ScopeContext` (`makeBaseQualifyScope`) run through the shared
+> `transformScopedExpr` — over the whole replacement, mirroring the
+> `collectFromColumnNames` / `shadowed` logic the view-column descent uses: at each nested
 > `select` the lineage subquery's own FROM column names join a `shadowed` set, and an
 > unqualified ref is qualified **only if** it is a base-table column AND not shadowed.
 > So in `(select x from oth where fk = id)`, `x` / `fk` (shadowed by `oth`) stay
@@ -279,7 +281,7 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > silent wrong write (consistent with the user-subquery-side taint philosophy).
 >
 > The closure threads as `baseQualify` through `makeViewColumnDescend` →
-> `transformQueryExpr` → `makeViewSubstitute`. It is applied **only** on the
+> `transformScopedQuery` → the view `ScopeContext`'s `makeSubstitute`. It is applied **only** on the
 > subquery-descent path: the top-level user WHERE / SET and the RETURNING projection
 > columns resolve against the lowered statement's single source unqualified, and the
 > multi-source spine passes no `baseQualify` because its terms are already
@@ -870,7 +872,8 @@ goldens.
 - `src/planner/analysis/view-complement.ts` — `viewComplement(node)` / `complementOf`, the
   predicate-honest complement derived off the backward walk (for the lens prover).
 - `src/planner/mutation/propagate.ts` — `propagate(ctx, view, req: MutationRequest): BaseOp[]`, the single propagation entry. **Landed.** A decomposition-backed logical table (a `primary-storage` advertisement, no override) routes to the advertisement-driven fan-out (`decomposition.ts`); a single-table body routes to the single-source spine (`single-source.ts`); a join body routes to the multi-source walk (`multi-source.ts`). Also hosts `classifyViewBody`.
-- `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.** Also hosts the shared expression machinery both spines use: `transformExpr` (now with a `descend` hook into `subquery` / `exists` / `in`-subquery operands), the deep `cloneExpr` / `cloneQueryExpr`, and the scope-aware `transformQueryExpr` / `makeViewColumnDescend` that rewrite view-column references nested inside a predicate / assigned-value subquery to their base-term lineage (§ Selection).
+- `src/planner/mutation/scope-transform.ts` — the **one** scope-aware column-substitution primitive all three backward callers share (§ Selection). **Landed.** Owns the structural expression walker (`transformExpr` with its `descend` hook into `subquery` / `exists` / `in`-subquery operands, plus the deep `cloneExpr` / `cloneQueryExpr` / `mapQueryExprUniform` / `rebuildSelect`), the FROM-source column-name resolution that builds the shadow set (`collectFromColumnNames`), and the scope-aware descent `transformScopedExpr` / `transformScopedQuery` parameterized by a `ScopeContext` value object (`{ makeSubstitute(shadowed, tainted), unresolvableScope, rejectUnresolvableScope?, rejectDmlSubquery }`). The descent owns the shared shadow-accumulation / taint-propagation / `unsupported-subquery-correlation` reject / sibling-leg mechanics; each caller supplies only its `ScopeContext`.
+- `src/planner/mutation/single-source.ts` — the relocated single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete` + `analyzeView`), the one-base-op producer `propagate` calls. **Landed.** Builds the two `ScopeContext`s that drive the shared `scope-transform.ts` descent: `makeViewScope` (the view-column → base-term descent, behind `makeViewColumnDescend`) and `makeBaseQualifyScope` (the deep base-term correlation-qualifier, behind `makeBaseQualifier`), which rewrite view-column references nested inside a predicate / assigned-value subquery to their base-term lineage and re-bind a substituted term's own correlation refs.
 - `src/planner/mutation/multi-source.ts` — the two-table key-preserving inner-join decomposition. `propagateMultiSource` reads the planned body's `updateLineage` to emit an ordered multi-element `BaseOp[]` for `update` / `delete`, lowered to AST. `analyzeMultiSourceInsert` (Phase 2b) decomposes an `insert`: it routes each supplied view column to its owning side, reads the shared key off the single-equi-join ON predicate, decides directly-supplied-vs-mint, FK-orders the sides, and raises `no-default` / `no-inverse` for an uncoverable side. **Landed.**
 - `src/planner/nodes/envelope-scan-node.ts` / `src/runtime/emit/envelope-scan.ts` — the leaf that scans the shared-surrogate envelope rows from `rctx.tableContexts` (set by the `ViewMutation` emitter before fan-out). **Landed.**
 - `src/planner/building/view-mutation-builder.ts` — `buildViewMutation` routes a multi-source inner-join `insert` to `buildMultiSourceInsert`, which builds the envelope source (the user VALUES/SELECT), one base insert per side (each sourcing a projection over an `EnvelopeScanNode`, re-planned through `buildInsertStmt`'s new `preBuiltSource` seam), and the `max(anchor.key)` seed. **Landed.**

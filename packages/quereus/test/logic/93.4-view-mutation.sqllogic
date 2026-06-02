@@ -779,7 +779,7 @@ update cn_v set lbl = 'X' where exists (select 1 from cn_src where tag = note);
 -- Blocks (k)/(l)/(m) only ever exercise the base-column GATE: the lineage subquery's
 -- local columns (cv_oth.fk / .x) are excluded from qualification simply because they
 -- are not columns of the base table. The `shadowed`-set accumulation inside
--- qualifyCorrelatedBaseRefsQuery is only the *deciding* factor when a lineage-local
+-- the base-qualify scope-transform descent (makeBaseQualifyScope) is only the *deciding* factor when a lineage-local
 -- column name ALSO collides with a base column name — then the base-column gate alone
 -- would wrongly qualify it, and only the shadow set keeps it local. Here so_oth has
 -- its own `id` (colliding with so_base.id). The lineage `(select x from so_oth where

@@ -9,7 +9,7 @@ import type { ColumnSchema } from '../../schema/column.js';
 import type { SqlValue } from '../../common/types.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { transformExpr, cloneExpr } from './single-source.js';
+import { transformExpr, cloneExpr } from './scope-transform.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
