@@ -30,7 +30,6 @@ export type MutationDiagnosticReason =
 	| 'unsupported-multisource-insert' // INSERT into a join view — needs the shared-surrogate context (later phase)
 	| 'cross-source-assignment'    // UPDATE value references a base table other than the column it assigns
 	| 'unsupported-subquery-correlation' // a view-column ref nested in a predicate/value subquery cannot be proven correlated (unresolvable source / select * / TVF / embedded DML)
-	| 'delete-ambiguous'           // DELETE through a join with no provable FK-child and no delete_via tag
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
 	| 'lens-read-only'             // logical table whose PK is not reconstructible at the lens boundary
 	| 'lens-set-level-conflict-resolution' // or replace / or ignore / upsert against a commit-time set-level lens key (needs a covering structure)

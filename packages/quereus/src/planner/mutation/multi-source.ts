@@ -58,14 +58,16 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
 
 /**
  * The shared identity-capture CTE name + its `(k0, k1)` column names for a
- * multi-source UPDATE. Each affected view row's base-PK identities are
- * materialized ONCE — *before* any base op fires — into `rctx.tableContexts` under
- * a shared descriptor. When an update assigns **both** sides, each per-side base op
- * reads its identifying values back from this set (`<pk> in (select k<side> from
- * __vmupd_keys)`) instead of a live re-query of the join body, so the FK-parent op
- * cannot rewrite a predicate column out from under the FK-child op's identifying
- * subquery (a mutation-order-independent identity). The same capture backs the
- * UPDATE RETURNING re-query (docs/view-updateability.md § Inner Join, § `returning`).
+ * multi-source UPDATE / multi-side DELETE fan-out. Each affected view row's base-PK
+ * identities are materialized ONCE — *before* any base op fires — into
+ * `rctx.tableContexts` under a shared descriptor. When more than one base op runs
+ * against live state (an update assigning **both** sides, or a lenient delete fanned
+ * out to both candidate sides) each per-side base op reads its identifying values
+ * back from this set (`<pk> in (select k<side> from __vmupd_keys)`) instead of a live
+ * re-query of the join body, so the first op cannot empty the join — or rewrite a
+ * predicate column — out from under the second op's identifying subquery (a
+ * mutation-order-independent identity). The same capture backs the UPDATE RETURNING
+ * re-query (docs/view-updateability.md § Inner Join, § `returning`).
  */
 export const MS_UPDATE_KEYS_CTE = '__vmupd_keys';
 export const MS_UPDATE_KEY_COLUMNS = ['k0', 'k1'] as const;
@@ -715,9 +717,10 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 /**
  * `select k<sideIndex> from __vmupd_keys` — read this side's captured base-PK
  * identities back from the up-front materialized key set (the both-sides-assigned
- * UPDATE path; see {@link MS_UPDATE_KEYS_CTE}). The builder injects `__vmupd_keys`
- * into the base op's planning `cteNodes` (resolving to the context-backed key
- * relation), so this is read by descriptor rather than re-querying the join body.
+ * UPDATE path and the multi-side DELETE fan-out; see {@link MS_UPDATE_KEYS_CTE}). The
+ * builder injects `__vmupd_keys` into the base op's planning `cteNodes` (resolving to
+ * the context-backed key relation), so this is read by descriptor rather than
+ * re-querying the join body.
  */
 function buildCapturedKeySubquery(sideIndex: number): AST.SelectStmt {
 	return {
@@ -727,13 +730,13 @@ function buildCapturedKeySubquery(sideIndex: number): AST.SelectStmt {
 	};
 }
 
-// --- UPDATE identity capture (shared by both-sides base ops + RETURNING) ---
+// --- identity capture (shared by both-sides UPDATE / multi-side DELETE base ops + UPDATE RETURNING) ---
 
 /**
  * The up-front base-PK identity capture for a multi-source (two-table inner-join)
- * UPDATE (docs/view-updateability.md § Inner Join, § `returning`). Built ONCE and
- * shared between the both-sides base ops' identifying subqueries and (when present)
- * the RETURNING re-query.
+ * UPDATE or multi-side DELETE fan-out (docs/view-updateability.md § Inner Join,
+ * § `returning`). Built ONCE and shared between the multi-side base ops' identifying
+ * subqueries and (for an UPDATE with RETURNING) the RETURNING re-query.
  *
  *  - `source`: the capture SELECT `select s0.pk0 as k0, s1.pk1 as k1 from <body>
  *    where <idPredicate>` — the emitter materializes it into `rctx.tableContexts`
@@ -742,7 +745,7 @@ function buildCapturedKeySubquery(sideIndex: number): AST.SelectStmt {
  *    and every {@link InternalRecursiveCTERefNode} that reads them back.
  *  - `keyColumns`: the `(k0, k1)` column shape each reader mints a key ref over.
  */
-export interface MultiSourceUpdateKeyCapture {
+export interface MultiSourceKeyCapture {
 	readonly source: RelationalPlanNode;
 	readonly descriptor: TableDescriptor;
 	readonly keyColumns: readonly { readonly name: string; readonly type: ScalarType }[];
@@ -750,12 +753,12 @@ export interface MultiSourceUpdateKeyCapture {
 
 /**
  * Mint a context-backed key relation (`InternalRecursiveCTERefNode`) over a
- * capture's descriptor — what a both-sides base op's identifying `in`-subquery or
+ * capture's descriptor — what a multi-side base op's identifying `in`-subquery or
  * the RETURNING re-query's EXISTS scans `__vmupd_keys` through. Fresh attribute ids
  * per call (each ref lives in its own subtree); the **descriptor** identity is what
  * ties it to the rows the emitter materializes.
  */
-export function makeMultiSourceUpdateKeyRef(scope: Scope, capture: MultiSourceUpdateKeyCapture): InternalRecursiveCTERefNode {
+export function makeMultiSourceKeyRef(scope: Scope, capture: MultiSourceKeyCapture): InternalRecursiveCTERefNode {
 	const keyAttrs: Attribute[] = capture.keyColumns.map(c => ({
 		id: PlanNode.nextAttrId(),
 		name: c.name,
@@ -781,12 +784,16 @@ export function makeMultiSourceUpdateKeyRef(scope: Scope, capture: MultiSourceUp
  * Requires a **single-column PK on both** join sides (the captured identity is both
  * sides' PKs); a composite-PK side is rejected with `unsupported-join` by
  * {@link requireSingleColumnPk}.
+ *
+ * Op-agnostic: takes the user `where` directly (an UPDATE's or a DELETE's), since the
+ * capture body is identical either way (both sides' single-column PK, the identifying
+ * predicate from the statement's WHERE, projected as `k0` / `k1`).
  */
-export function buildMultiSourceUpdateKeyCapture(
+export function buildMultiSourceKeyCapture(
 	ctx: PlanningContext,
 	view: MutableViewLike,
-	stmt: AST.UpdateStmt,
-): MultiSourceUpdateKeyCapture {
+	where: AST.Expression | undefined,
+): MultiSourceKeyCapture {
 	const analysis = analyzeJoinView(ctx, view);
 	const [side0, side1] = analysis.sides;
 	const pk0 = requireSingleColumnPk(view, side0);
@@ -794,7 +801,7 @@ export function buildMultiSourceUpdateKeyCapture(
 	const pk0Type = columnScalarType(columnByName(side0.schema, pk0));
 	const pk1Type = columnScalarType(columnByName(side1.schema, pk1));
 
-	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
+	const idPredicate = buildIdentifyingPredicate(ctx, analysis, where, view);
 	const captureAst: AST.SelectStmt = {
 		type: 'select',
 		columns: [
@@ -832,7 +839,7 @@ export function buildMultiSourceUpdateKeyCapture(
  * rewrote) is still returned (single-source NEW semantics). It keeps only the
  * structural join ON-condition; the body/user WHERE is intentionally NOT re-applied.
  *
- * Reads the shared {@link MultiSourceUpdateKeyCapture} the builder materializes
+ * Reads the shared {@link MultiSourceKeyCapture} the builder materializes
  * before the base ops fire (via its own freshly-minted key ref over the same
  * descriptor).
  */
@@ -840,7 +847,7 @@ export function buildMultiSourceUpdateReturning(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	stmt: AST.UpdateStmt,
-	capture: MultiSourceUpdateKeyCapture,
+	capture: MultiSourceKeyCapture,
 ): RelationalPlanNode {
 	const analysis = analyzeJoinView(ctx, view);
 	const returningCols = stmt.returning!;
@@ -848,7 +855,7 @@ export function buildMultiSourceUpdateReturning(
 	const pk0 = requireSingleColumnPk(view, side0);
 	const pk1 = requireSingleColumnPk(view, side1);
 
-	const keyRef = makeMultiSourceUpdateKeyRef(ctx.scope, capture);
+	const keyRef = makeMultiSourceKeyRef(ctx.scope, capture);
 	const existsPredicate: AST.Expression = {
 		type: 'exists',
 		subquery: {
@@ -934,46 +941,71 @@ function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: 
 	// the single-source spine).
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
 
-	const sideIndex = chooseDeleteSide(view, analysis, tags);
-	const side = analysis.sides[sideIndex];
-	const pk = requireSingleColumnPk(view, side);
-	const idPredicate = buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
-	const where: AST.InExpr = {
-		type: 'in',
-		expr: { type: 'column', name: pk },
-		subquery: buildIdentifyingSubquery(analysis, side, pk, idPredicate),
-	};
-	const statement: AST.DeleteStmt = {
-		type: 'delete',
-		table: tableIdentifier(side.schema),
-		where,
-		contextValues: stmt.contextValues,
-		schemaPath: stmt.schemaPath,
-		loc: stmt.loc,
-	};
-	return [{ table: side.table, op: 'delete', statement }];
+	const sides = chooseDeleteSides(view, analysis, tags);
+
+	// A multi-side fan-out (the lenient predicate-honest "make this joined row not
+	// exist") runs more than one base delete sequentially against live state, so —
+	// exactly like the both-sides UPDATE — each per-side op reads its identifying
+	// values from the up-front identity capture the builder materializes ONCE before
+	// any base op fires (`<pk> in (select k<side> from __vmupd_keys)`), a
+	// mutation-order-independent set, so the first side's delete cannot empty the join
+	// out from under the second side's identifying subquery. A single-side delete has
+	// no such ordering hazard (the lone op re-queries before it mutates), so it keeps
+	// the live join-body subquery — preserving the (j)/(g)-style nested-subquery-descent
+	// correctness. The builder pairs the fan-out with the matching capture + `__vmupd_keys`
+	// cteNode injection (gated on `baseOps.length > 1`).
+	const fanOut = sides.length > 1;
+	const idPredicate = fanOut ? undefined : buildIdentifyingPredicate(ctx, analysis, stmt.where, view);
+
+	// Order parent-before-child where the FK is provable (arbitrary otherwise); a
+	// fan-out is only ever reached when no single FK is provable, so its order is the
+	// as-is [0, 1].
+	const order = orderSides(analysis.sides).filter(i => sides.includes(i));
+	const ops: BaseOp[] = [];
+	for (const sideIndex of order) {
+		const side = analysis.sides[sideIndex];
+		const pk = requireSingleColumnPk(view, side);
+		const where: AST.InExpr = {
+			type: 'in',
+			expr: { type: 'column', name: pk },
+			subquery: fanOut
+				? buildCapturedKeySubquery(sideIndex)
+				: buildIdentifyingSubquery(analysis, side, pk, idPredicate),
+		};
+		const statement: AST.DeleteStmt = {
+			type: 'delete',
+			table: tableIdentifier(side.schema),
+			where,
+			contextValues: stmt.contextValues,
+			schemaPath: stmt.schemaPath,
+			loc: stmt.loc,
+		};
+		ops.push({ table: side.table, op: 'delete', statement });
+	}
+	return ops;
 }
 
 /**
- * Pick the single base side a join delete routes to (§ Inner Join — Deletes).
- * Deleting one side of an inner equi-join removes the joined row from the view,
- * so a delete resolves to exactly one side; the tags decide which.
+ * Pick the base side(s) a join delete routes to (§ Inner Join — Deletes). Deleting
+ * one side of an inner equi-join already removes the joined row from the view, so the
+ * common case resolves to a single side; the maximal-lenient case fans out to every
+ * candidate side ("make this joined row not exist"). Returns 1 or 2 sides.
  *
  * Resolution order (tags compose AFTER predicate dispatch — they only restrict):
  * 1. `target` / `exclude` narrow the candidate sides (`tag-target-not-found` on
  *    an unknown name; `tag-conflict` if they remove every side).
- * 2. An explicit `delete_via` picks a side directly (`parent` → the FK-parent,
+ * 2. An explicit `delete_via` picks a single side directly (`parent` → the FK-parent,
  *    `left_delete` → the left source); it must lie within the candidates.
- * 3. Otherwise the **default**: if `target`/`exclude` already left exactly one
- *    side, that side. Else if a foreign key proves the FK-many (child) side, that
- *    side (deleting the child leaves the parent — the documented FK-style
- *    default). Else the delete is ambiguous: `policy=strict` rejects it with a
- *    `policy-strict-ambiguity` diagnostic; the default `lenient` policy rejects
- *    it as `delete-ambiguous` (the predicate-honest multi-side fan-out is
- *    deferred — it needs snapshot-consistent base-op execution, see the handoff)
- *    — both directing the user to a `delete_via` / `target` override.
+ * 3. Otherwise the **default**: if `target`/`exclude` already left exactly one side,
+ *    that side. Else if a foreign key proves the FK-many (child) side, that single
+ *    side (deleting the child leaves the parent — the documented FK-style default;
+ *    the FK resolves the ambiguity, so it is NOT a fan-out). Else the deletion side is
+ *    ambiguous: `policy=strict` rejects it with a `policy-strict-ambiguity`
+ *    diagnostic; the default `lenient` policy **fans out to every candidate side**
+ *    (the predicate-honest multi-side delete — see {@link decomposeDelete}'s eager
+ *    key capture).
  */
-function chooseDeleteSide(view: MutableViewLike, analysis: JoinViewAnalysis, tags?: ReservedTagMap): number {
+function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis, tags?: ReservedTagMap): number[] {
 	const candidates = applyTargetExclude([0, 1], analysis.sides, tags, view);
 
 	const deleteVia = readDeleteVia(tags);
@@ -986,10 +1018,10 @@ function chooseDeleteSide(view: MutableViewLike, analysis: JoinViewAnalysis, tag
 				message: `cannot delete through view '${view.name}': 'quereus.update.delete_via' picks base table '${analysis.sides[picked].schema.name}', but a 'target'/'exclude' tag excludes it`,
 			});
 		}
-		return picked;
+		return [picked];
 	}
 
-	if (candidates.length === 1) return candidates[0];
+	if (candidates.length === 1) return candidates;
 
 	const policy = readPolicy(tags);
 	if (policy === 'strict') {
@@ -1001,13 +1033,12 @@ function chooseDeleteSide(view: MutableViewLike, analysis: JoinViewAnalysis, tag
 	}
 
 	const childIndex = fkChildIndex(analysis.sides);
-	if (childIndex !== undefined && candidates.includes(childIndex)) return childIndex;
+	if (childIndex !== undefined && candidates.includes(childIndex)) return [childIndex];
 
-	raiseMutationDiagnostic({
-		reason: 'delete-ambiguous',
-		table: view.name,
-		message: `cannot delete through view '${view.name}': no declared foreign key proves which side is the FK-many (child) to delete; pin it with 'quereus.update.delete_via' or 'quereus.update.target'`,
-	});
+	// lenient + 2 residual candidates + no provable single-direction FK + no side tag:
+	// fan out to every candidate side. Reached only when `fkChildIndex` is undefined
+	// (no FK, or a mutual-FK edge), so the candidate list is both sides.
+	return candidates;
 }
 
 /**

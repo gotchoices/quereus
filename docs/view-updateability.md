@@ -10,7 +10,7 @@ actually shipped:
 | **Phase 1** | Single-source projection-and-filter views: `insert` / `update` / `delete` route to the base table. Constant-FD defaults from equality selection predicates, base-column defaults, identity/rename projection lineage, `OR`-clause conflict resolution, and the `no-inverse` / `predicate-contradiction` / `recursive-cte` / body-shape diagnostics. | **Shipped** |
 | **Phase 1b** | Per-statement mutation-context threading through the view boundary (one captured value stamped across every base row of the statement). Single-base per-row generator cadence rides the base table's column defaults. | **Shipped (single-base)** |
 | **Phase 2a** | Multi-source **key-preserving inner-join** bodies: `update` / `delete` write-through. Decomposes to an ordered multi-element `BaseOp[]` (one per owning side, FK-parent before FK-child), routing each output column to its owning base table via the planned body's `updateLineage`, and identifying rows by a subquery over the join body. `delete` routes to the FK-many (child) side by default. | **Shipped (update / delete)** |
-| **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. | **Shipped** (the lenient predicate-honest *multi-side delete fan-out* is deferred — see § Inner Join) |
+| **Phase 3.4** | The `quereus.update.*` **tag override surface**: `target` / `exclude` narrow the multi-source candidate base set; `delete_via` (`parent` / `left_delete`) picks the deletion side; `default_for.<col>` supplies an omitted-insert default; `policy` selects strict-vs-lenient ambiguity handling. Read + site-validated through the typed registry (`schema/reserved-tags.ts`), collected at the view-DDL and DML-statement sites (`WITH TAGS (...)`), merged statement-over-view. The lenient predicate-honest *multi-side delete fan-out* (an ambiguous two-table inner-join delete with no provable FK / resolving tag deletes from **every** candidate side, via the both-sides UPDATE's eager key materialization) is **shipped**; `policy=strict` still rejects. | **Shipped** |
 | **Phase 2b** | Multi-source **key-preserving inner-join `insert`** write-through, plus the per-row **shared-surrogate mutation-context envelope** it requires. The shared join key is not a view column, so an insert mints a surrogate **once per produced logical row at the envelope, before propagation fans out**, and threads the one captured value into both base inserts (FK-parent before FK-child). The key is either **directly supplied** (a view column maps to a join-key base column) or **minted** (`integer-auto` / `per-row`: `seed + ordinal`, `seed = max(anchor.key)` captured once). Realized by materializing the augmented source once (`ViewMutationNode.envelope` + `EnvelopeScanNode`) so every base op reads the identical rows. | **Shipped (two-table inner join)** |
 | **Phase 3.7** | **RETURNING-through-views.** `insert` / `update` / `delete … returning` returns rows projected through the **view's** column list, evaluated against the post-mutation base state (computed view columns re-evaluated). Single-source: the clause is rewritten into base terms and rides the base op's RETURNING (NEW for insert/update, OLD for delete) — `ViewMutationNode` becomes relational and surfaces it. Multi-source inner-join `delete`: a re-query of the view restricted to the mutation's predicate, captured `pre`. Multi-source inner-join `update`: **per-row identity capture** — each affected view row's base-PK identities `(k0, k1)` are captured `pre`, then the join body is re-queried `post` restricted to those captured identities (robust against an update that rewrites a column its own WHERE filters on). `returning *` expands to the view's columns. | **Shipped (single-source all ops; multi-source update / delete)** |
 | Phase 2b+ | Multi-source-**`insert`** RETURNING (needs the minted surrogate threaded into the projection), outer-join / optional-member insert, set-ops, aggregates, nested/recursive CTE bodies, composite-key and `> 2`-table joins, self-joins, cross-source `set` values, `declared-default`-expression and non-integer surrogate generators, multi-source-`insert` `default_for`. | Not shipped — rejected at plan time with a structured diagnostic. |
@@ -351,20 +351,31 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 
 - `quereus.update.target` / `exclude` (CSV of base-table names) first narrow the candidate sides.
 - An explicit `quereus.update.delete_via` then picks a side: `'parent'` selects the FK-parent (requires a declared foreign key), `'left_delete'` the left join source. (`'right_insert'` is an `except`-branch value with no join meaning.)
-- Absent an explicit side tag: if `target`/`exclude` already left exactly one side, that side; else if a declared foreign key proves the FK-many (child) side, that side (the common FK-style default — deletes the child, leaving the parent in place; the inverse is `with tags ("quereus.update.delete_via" = 'parent')`); else the delete is **ambiguous**.
+- Absent an explicit side tag: if `target`/`exclude` already left exactly one side, that side; else if a declared foreign key proves the FK-many (child) side, that single side (the common FK-style default — deletes the child, leaving the parent in place; the inverse is `with tags ("quereus.update.delete_via" = 'parent')`); else, under the default `lenient` policy, **fan out to every candidate side** (the predicate-honest "make this joined row not exist"), while `quereus.update.policy = 'strict'` rejects it.
 
-> **Shipped behavior vs. intent.** An *ambiguous* delete (two candidate sides, no
-> foreign key, no resolving tag) is **rejected** with a structured diagnostic
-> directing the user to a `delete_via` / `target` override. Under
-> `quereus.update.policy = 'strict'` the engine rejects *any* unresolved
-> multi-side delete — it will not even fall back to the FK-many heuristic. The
-> default `lenient` policy keeps the FK-many fallback. The doc's maximal lenient
-> reading — *delete from every side* ("make this row not exist") — is **deferred**:
-> a join's two base deletes each address rows via a subquery over the join, and
-> the view-mutation substrate runs base ops sequentially against live state, so
-> the second delete would re-evaluate the join after the first already removed its
-> matching rows. A correct multi-side fan-out needs snapshot-consistent base-op
-> execution (or eager key materialization), tracked separately.
+> **Shipped (two-table inner join) — the lenient multi-side fan-out.** An
+> *ambiguous* delete (two candidate sides after `target`/`exclude` narrowing, no
+> provable single-direction foreign key, no resolving tag) **fans out: it deletes
+> the joined row's contribution from *every* candidate side** — the maximal-lenient
+> "make this joined row not exist". This reuses the same **eager key
+> materialization** the both-sides UPDATE ships: each affected view row's base-PK
+> identities `(k0, k1)` are captured **once, before any base op fires**, and *each*
+> per-side base delete addresses rows through that captured set (`<pk> in (select
+> k<side> from __vmupd_keys)`) rather than a live re-query of the join body — so the
+> first side's delete cannot empty the join out from under the second side's
+> identifying subquery. A **single-side** delete (the `delete_via` / `target` /
+> single-candidate / FK-many cases) has no ordering hazard and keeps the live
+> join-body subquery. Because the fan-out is reached only when no single-direction FK
+> is provable, and each base delete is a **predicate-scan** over the live table (not
+> a key-addressed delete that errors on a missing key), an FK cascade — or a
+> mutual-FK edge — that removes a row before its own side's predicate-delete runs is
+> a natural **no-op** (the row simply falls out of the scan), never a double-delete
+> error. Under `quereus.update.policy = 'strict'` the engine instead **rejects** any
+> unresolved multi-side delete — it will not even fall back to the FK-many heuristic.
+> A composite-PK side (the captured identity needs a single-column PK on both sides)
+> is rejected with `unsupported-join`. (The general *n*-base, snapshot-consistent
+> multi-side delete fan-out — the separate decomposition path — remains deferred; see
+> § Multi-Base-Table Mutations.)
 
 ### Outer Joins
 
@@ -528,12 +539,16 @@ Order of execution within the statement:
 > **Shipped (two-table inner join).** The substrate runs the per-side base ops
 > sequentially against *live* state, so the pre-statement-snapshot guarantee (3) is
 > realized for **row identification** by **eager key materialization**: a both-sides
-> `update` captures each affected view row's base-PK identities `(k0, k1)` **once,
-> before any base op fires**, and routes both per-side ops through that captured set
-> (§ Inner Join). The FK-parent op therefore cannot rewrite a predicate column out
-> from under the FK-child op's row identification — both ops target the same
-> pre-mutation set regardless of execution order. (The general n-base, snapshot-
-> consistent multi-side *delete* fan-out remains deferred; see § Inner Join — Deletes.)
+> `update` — and a lenient multi-side `delete` fanned out to both candidate sides —
+> captures each affected view row's base-PK identities `(k0, k1)` **once, before any
+> base op fires**, and routes every per-side op through that captured set (§ Inner
+> Join). The first op therefore cannot rewrite a predicate column — or, for the
+> delete, empty the join — out from under the second op's row identification; both
+> ops target the same pre-mutation set regardless of execution order (and an FK
+> cascade that removes a row early is a silent predicate-scan no-op, not a
+> double-delete). (The general n-base, snapshot-consistent multi-side *delete* fan-out
+> — the separate `decomposition.ts` path, rejected with
+> `unsupported-decomposition-predicate` — remains deferred; see § Inner Join — Deletes.)
 
 Constraint enforcement runs at end-of-statement under the prevailing conflict-resolution mode (see [Conflict Resolution](sql.md#conflict-resolution-or-clause)). Deferred CHECKs run at commit per the assertion framework.
 
@@ -585,7 +600,7 @@ Constraint enforcement runs at end-of-statement under the prevailing conflict-re
 >     **before** the base op fires (the rows still match the predicate and are about
 >     to disappear).
 >   - **`update`** (`post`, with an `identityCapture`): **up-front identity capture**
->     (`planner/mutation/multi-source.ts` `buildMultiSourceUpdateKeyCapture`). Each
+>     (`planner/mutation/multi-source.ts` `buildMultiSourceKeyCapture`). Each
 >     affected view row's **base-PK identities** `(k0, k1)` are captured **before** the
 >     base ops fire (`select s0.pk0 as k0, s1.pk1 as k1 from <body> where <idPredicate>`,
 >     materialized into `rctx.tableContexts` under a shared descriptor — the same

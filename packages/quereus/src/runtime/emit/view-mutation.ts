@@ -51,13 +51,14 @@ type Callback = (ctx: RuntimeContext) => OutputValue;
  *     update pushed out of the view filter, or whose predicate column it rewrote, is
  *     still returned).
  *
- * **Up-front identity capture (multi-source update).** When `plan.identityCapture`
- * is present, before any base op runs this materializes each affected view row's
- * base-PK identities into `rctx.tableContexts` under the capture descriptor — read
- * back by descriptor by the both-sides base ops' identifying subqueries (`<pk> in
- * (select k<side> from __vmupd_keys)`) and/or the post-mutation RETURNING re-query.
- * Wrapped across all branches (a both-sides update without RETURNING still needs it)
- * and removed in a `finally`. Mutually exclusive with the insert envelope.
+ * **Up-front identity capture (multi-source update / multi-side delete).** When
+ * `plan.identityCapture` is present, before any base op runs this materializes each
+ * affected view row's base-PK identities into `rctx.tableContexts` under the capture
+ * descriptor — read back by descriptor by the multi-side base ops' identifying
+ * subqueries (`<pk> in (select k<side> from __vmupd_keys)`) and/or the post-mutation
+ * RETURNING re-query. Wrapped across all branches (a both-sides update / multi-side
+ * delete without RETURNING still needs it) and removed in a `finally`. Mutually
+ * exclusive with the insert envelope.
  *
  * Without a `returning` clause every base op is a side-effect statement that
  * yields nothing and this node yields nothing; the block emitter treats it like a
@@ -79,12 +80,13 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	const relationalBaseIdx = plan.baseOps.findIndex(op => isRelationalNode(op));
 	const returningTiming = plan.returningTiming;
 
-	// The up-front identity-capture side input for a multi-source UPDATE: its rows
-	// (each affected view row's base-PK identities) are materialized into context
-	// (under this descriptor) BEFORE the base ops run, and read back by descriptor by
-	// the both-sides base ops' identifying subqueries and/or the post-mutation
-	// RETURNING re-query. Present for a both-sides update (with or without RETURNING)
-	// and a single-side update with RETURNING.
+	// The up-front identity-capture side input for a multi-source UPDATE / multi-side
+	// DELETE fan-out: its rows (each affected view row's base-PK identities) are
+	// materialized into context (under this descriptor) BEFORE the base ops run, and
+	// read back by descriptor by the multi-side base ops' identifying subqueries
+	// and/or the post-mutation RETURNING re-query. Present for a both-sides update
+	// (with or without RETURNING), a single-side update with RETURNING, and a
+	// multi-side delete fan-out (with or without RETURNING).
 	const capture = plan.identityCapture;
 	const captureDescriptor = capture?.descriptor;
 
@@ -152,13 +154,13 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	async function run(rctx: RuntimeContext, ...args: RuntimeValue[]): Promise<OutputValue> {
 		const baseCbs = args.slice(0, baseOpCount);
 
-		// Identity capture (multi-source UPDATE): materialize the affected view rows'
-		// base-PK identities into context BEFORE any base op runs, then run the body.
-		// This wraps ALL branches — both the both-sides base ops (which read
-		// `__vmupd_keys` by descriptor) and the post-mutation RETURNING re-query read
-		// the captured set, and a both-sides update WITHOUT RETURNING still needs it
-		// for the base ops. The context entry is removed in `finally` so it never leaks
-		// past the statement.
+		// Identity capture (multi-source UPDATE / multi-side DELETE fan-out): materialize
+		// the affected view rows' base-PK identities into context BEFORE any base op
+		// runs, then run the body. This wraps ALL branches — the multi-side base ops
+		// (which read `__vmupd_keys` by descriptor) and the post-mutation RETURNING
+		// re-query both read the captured set, and a multi-side mutation WITHOUT
+		// RETURNING still needs it for the base ops. The context entry is removed in
+		// `finally` so it never leaks past the statement.
 		if (captureIdx >= 0 && captureDescriptor) {
 			const captureRows = await collectRows((args[captureIdx] as Callback)(rctx));
 			rctx.tableContexts.set(captureDescriptor, () => arrayIterable(captureRows));
@@ -202,8 +204,9 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		}
 
 		// (3) Void mutation (no RETURNING): drive the base ops, yield nothing. A
-		// both-sides update without RETURNING lands here with its identity capture
-		// already materialized by `run`, so the base ops read `__vmupd_keys`.
+		// both-sides update / multi-side delete fan-out without RETURNING lands here
+		// with its identity capture already materialized by `run`, so the base ops read
+		// `__vmupd_keys`.
 		if (!descriptor) {
 			await drainBaseOps(rctx, baseCbs);
 			return null;

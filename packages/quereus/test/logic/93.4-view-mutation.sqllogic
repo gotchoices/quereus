@@ -321,16 +321,104 @@ create view ax_three as
 update ax_three set pv = 9 where cid = 2;
 -- error: cannot write through
 
--- DELETE through a join with no provable FK and no resolving tag -> ambiguous
--- under the default lenient policy (a delete_via / target override resolves it,
--- exercised in the override-surface section below).
+-- DELETE through a join with no provable FK and no resolving tag -> under the
+-- default lenient policy the predicate-honest multi-side fan-out deletes the joined
+-- row's contribution from EVERY candidate side ("make this joined row not exist").
+-- The two base deletes address rows via the up-front captured key set, so the first
+-- side's delete cannot empty the join out from under the second side's. (A delete_via
+-- / target override pins a single side instead — exercised below.)
 create table ax_x (xid integer primary key, v integer);
 create table ax_y (yid integer primary key, v integer);
 insert into ax_x values (1, 5);
 insert into ax_y values (5, 9);
 create view ax_nofk as select x.xid as xid, y.yid as yid from ax_x x join ax_y y on y.yid = x.v;
 delete from ax_nofk where xid = 1;
--- error: cannot delete through view
+-- the joined row (xid=1 ⋈ yid=5) is gone from both base tables.
+select xid from ax_x order by xid;
+→ []
+select yid from ax_y order by yid;
+→ []
+
+-- ===================================
+-- Lenient multi-side DELETE fan-out (the predicate-honest "make this joined row not
+-- exist"). An ambiguous join delete with two residual candidate sides, no provable
+-- FK, and no resolving tag deletes from BOTH sides. The two base deletes read an
+-- up-front captured key set, so the first side's delete cannot empty the join out
+-- from under the second side's identifying subquery. The inner join hides unmatched
+-- base rows on either side, which the fan-out must leave untouched.
+-- See docs/view-updateability.md § Inner Join — Deletes.
+-- ===================================
+
+-- --- (fo-a) unmatched base rows on either side survive the fan-out ---
+create table fo_x (xid integer primary key, v integer, lx text);
+create table fo_y (yid integer primary key, ly text);
+insert into fo_x values (1, 50, 'x1'), (2, 60, 'x2'), (3, 99, 'x3');  -- xid=3 (v=99) joins nothing
+insert into fo_y values (50, 'a'), (60, 'b'), (70, 'c');             -- yid=70 joins nothing
+create view fo_jv as select x.xid as xid, x.lx as lx, y.ly as ly
+    from fo_x x join fo_y y on y.yid = x.v;
+select xid, lx, ly from fo_jv order by xid;
+→ [{"xid":1,"lx":"x1","ly":"a"},{"xid":2,"lx":"x2","ly":"b"}]
+
+-- fan out: deletes fo_x xid=1 AND fo_y yid=50 (the joined row), leaving every other
+-- base row — including the two unmatched rows the inner join hides — in place.
+delete from fo_jv where xid = 1;
+select xid, v from fo_x order by xid;
+→ [{"xid":2,"v":60},{"xid":3,"v":99}]
+select yid, ly from fo_y order by yid;
+→ [{"yid":60,"ly":"b"},{"yid":70,"ly":"c"}]
+select xid, lx, ly from fo_jv order by xid;
+→ [{"xid":2,"lx":"x2","ly":"b"}]
+
+-- --- (fo-b) fan-out + ON DELETE CASCADE: a cascade-removed row is a silent no-op ---
+-- A MUTUAL FK pair (each side references the other) leaves no single provable FK
+-- direction, so the delete fans out. Both edges are ON DELETE CASCADE: deleting the
+-- first side (cas_a) cascades away the matching row on the second side (cas_b) BEFORE
+-- the fan-out's own second base delete runs. Because each base delete is a
+-- predicate-SCAN over the live table (not a key-addressed delete that errors on a
+-- missing key), the already-removed row simply falls out of the scan — a no-op, not a
+-- double-delete error. Seeded with nullable FK columns + back-fill updates so the
+-- mutual FK can be created under enforcement (foreign_keys defaults on).
+create table cas_a (aid integer primary key, bref integer null,
+    foreign key (bref) references cas_b(bid) on delete cascade);
+create table cas_b (bid integer primary key, aref integer null,
+    foreign key (aref) references cas_a(aid) on delete cascade);
+insert into cas_a (aid, bref) values (1, null), (2, null);
+insert into cas_b (bid, aref) values (10, null), (20, null);
+update cas_a set bref = 10 where aid = 1;
+update cas_a set bref = 20 where aid = 2;
+update cas_b set aref = 1 where bid = 10;
+update cas_b set aref = 2 where bid = 20;
+create view cas_jv as select a.aid as aid, b.bid as bid from cas_a a join cas_b b on b.aref = a.aid;
+select aid, bid from cas_jv order by aid;
+→ [{"aid":1,"bid":10},{"aid":2,"bid":20}]
+
+-- delete the (aid=1 ⋈ bid=10) row: side cas_a deletes aid=1 first, whose ON DELETE
+-- CASCADE removes cas_b bid=10; the fan-out's cas_b delete (bid in {10}) then no-ops.
+delete from cas_jv where aid = 1;
+select aid, bref from cas_a order by aid;
+→ [{"aid":2,"bref":20}]
+select bid, aref from cas_b order by bid;
+→ [{"bid":20,"aref":2}]
+select aid, bid from cas_jv order by aid;
+→ [{"aid":2,"bid":20}]
+
+-- --- (fo-c) fan-out + RETURNING: returns the deleted view rows AND deletes both sides ---
+-- The delete RETURNING re-queries the view captured BEFORE the base ops fire (the
+-- pre-delete image), independent of the captured key set the base ops read.
+create table fr_x (xid integer primary key, v integer, lx text);
+create table fr_y (yid integer primary key, ly text);
+insert into fr_x values (1, 5, 'x1'), (2, 6, 'x2');
+insert into fr_y values (5, 'y5'), (6, 'y6');
+create view fr_jv as select x.xid as xid, x.lx as lx, y.ly as ly
+    from fr_x x join fr_y y on y.yid = x.v;
+delete from fr_jv where xid = 1 returning xid, lx, ly;
+→ [{"xid":1,"lx":"x1","ly":"y5"}]
+select xid, lx from fr_x order by xid;
+→ [{"xid":2,"lx":"x2"}]
+select yid, ly from fr_y order by yid;
+→ [{"yid":6,"ly":"y6"}]
+select xid, lx, ly from fr_jv order by xid;
+→ [{"xid":2,"lx":"x2","ly":"y6"}]
 
 -- ===================================
 -- Phase 3.4: the `quereus.update.*` tag override surface.

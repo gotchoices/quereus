@@ -2883,6 +2883,82 @@ describe('Property-Based Tests', () => {
 				assertRowsEqual('dv view', await readRows('select cc, cv, pv from dvv'), [{ cc: 3, cv: 300, pv: 20 }], ['cc', 'cv', 'pv']);
 			});
 
+			// ----- Family B: a no-FK join delete fans out to BOTH candidate sides -----
+			// With no FK between the two join sides (and no resolving tag), a lenient
+			// delete is the predicate-honest multi-side fan-out: it removes the joined
+			// row's contribution from BOTH bases (the two base deletes read an up-front
+			// captured key set, so the first cannot empty the join out from under the
+			// second). An unmatched base row on either side — hidden by the inner join —
+			// must survive. Mirrors the FK-child PutGet above on a no-FK shape.
+			it('PutGet: a no-FK join delete fans out to both sides, sparing unjoined base rows', async () => {
+				await db.exec('drop view if exists fov');
+				await db.exec('drop table if exists fo_l');
+				await db.exec('drop table if exists fo_r');
+				await db.exec('create table fo_l (lid integer primary key, j integer null, lv integer null) using memory');
+				await db.exec('create table fo_r (rid integer primary key, rv integer null) using memory');
+				// No FK between fo_l and fo_r ⇒ a delete has two candidate sides and fans out.
+				await db.exec('create view fov as select l.lid as lid, l.lv as lv, r.rv as rv from fo_l l join fo_r r on r.rid = l.j');
+
+				const leftArb = fc.array(fc.record({
+					lid: fc.integer({ min: 1, max: 5 }),
+					j: fc.integer({ min: 1, max: 6 }),   // 6 > max rid, so some left rows are unjoined
+					lv: fc.integer({ min: 1, max: 9 }),
+				}), { maxLength: 8 });
+				const rightArb = fc.array(fc.record({
+					rid: fc.integer({ min: 1, max: 5 }),  // some rids unreferenced ⇒ unjoined right rows
+					rv: fc.integer({ min: 1, max: 9 }),
+				}), { maxLength: 6 });
+
+				await fc.assert(fc.asyncProperty(
+					leftArb, rightArb, fc.integer({ min: 1, max: 6 }),  // K = lid to delete (may not exist / join)
+					async (left, right, K) => {
+						await db.exec('delete from fo_l');
+						await db.exec('delete from fo_r');
+						const lSeen = new Set<number>(); const L: { lid: number; j: number; lv: number }[] = [];
+						for (const l of left) {
+							if (lSeen.has(l.lid)) continue;
+							lSeen.add(l.lid);
+							await db.exec(`insert into fo_l values (${l.lid}, ${l.j}, ${l.lv})`);
+							L.push(l);
+						}
+						const rSeen = new Set<number>(); const R: { rid: number; rv: number }[] = [];
+						for (const r of right) {
+							if (rSeen.has(r.rid)) continue;
+							rSeen.add(r.rid);
+							await db.exec(`insert into fo_r values (${r.rid}, ${r.rv})`);
+							R.push(r);
+						}
+
+						const rids = new Set(R.map(r => r.rid));
+						// The joined view row identified by lid=K (if any): a fo_l row lid=K
+						// whose j matches a present rid.
+						const target = L.find(l => l.lid === K && rids.has(l.j));
+						let oL = L.map(l => ({ ...l }));
+						let oR = R.map(r => ({ ...r }));
+						if (target) {
+							oL = oL.filter(l => l.lid !== K);          // captured fo_l row deleted
+							oR = oR.filter(r => r.rid !== target.j);   // captured fo_r row deleted
+						}
+
+						await db.exec(`delete from fov where lid = ${K}`);
+
+						assertRowsEqual('fan-out left base', await readRows('select lid, j, lv from fo_l'),
+							oL.map(l => ({ lid: l.lid, j: l.j, lv: l.lv })), ['lid', 'j', 'lv']);
+						assertRowsEqual('fan-out right base', await readRows('select rid, rv from fo_r'),
+							oR.map(r => ({ rid: r.rid, rv: r.rv })), ['rid', 'rv']);
+
+						// View image: every surviving left row whose j still matches a
+						// surviving right row, paired with that right's rv.
+						const oRids = new Set(oR.map(r => r.rid));
+						const rvByRid = new Map(oR.map(r => [r.rid, r.rv]));
+						const expectedView = oL.filter(l => oRids.has(l.j))
+							.map(l => ({ lid: l.lid, lv: l.lv, rv: rvByRid.get(l.j)! }));
+						assertRowsEqual('fan-out view image', await readRows('select lid, lv, rv from fov'),
+							expectedView, ['lid', 'lv', 'rv']);
+					},
+				), { numRuns: 60 });
+			});
+
 			// ----- Family B: reject-don't-widen + forward/backward lineage agreement -----
 			it('reject-do-not-widen + lineage agreement on the multi-source join shapes', async () => {
 				await db.exec('pragma foreign_keys = false');

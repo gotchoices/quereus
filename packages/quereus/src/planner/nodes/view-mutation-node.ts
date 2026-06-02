@@ -10,24 +10,27 @@ import { StatusCode } from '../../common/types.js';
 export type ReturningTiming = 'pre' | 'post';
 
 /**
- * The up-front base-PK identity capture side input for a multi-source **update**
- * (docs/view-updateability.md § Inner Join, § `returning` Clauses).
+ * The up-front base-PK identity capture side input for a multi-source **update** or
+ * multi-side **delete** fan-out (docs/view-updateability.md § Inner Join, § `returning`
+ * Clauses).
  *
  * `source` selects each affected view row's base-PK identities `(k0, k1)`; the
  * emitter materializes it **before** the base ops run and stashes the rows in
- * `rctx.tableContexts` under {@link descriptor}. Both readers scan it back through
- * an `InternalRecursiveCTERefNode` carrying the same `descriptor`:
- *   - when the update assigns **both** sides, each per-side base op's identifying
- *     `in`-subquery (`<pk> in (select k<side> from __vmupd_keys)`), so the FK-parent
- *     op cannot rewrite a predicate column out from under the FK-child op; and
- *   - when the update carries RETURNING, the post-mutation
+ * `rctx.tableContexts` under {@link descriptor}. The readers scan it back through an
+ * `InternalRecursiveCTERefNode` carrying the same `descriptor`:
+ *   - when more than one base op runs against live state (an update assigning **both**
+ *     sides, or a lenient delete fanned out to **both** candidate sides), each
+ *     per-side base op's identifying `in`-subquery (`<pk> in (select k<side> from
+ *     __vmupd_keys)`), so the first op cannot empty the join — or rewrite a predicate
+ *     column — out from under the second op; and
+ *   - when an update carries RETURNING, the post-mutation
  *     {@link ViewMutationNode.returning} re-query, re-projecting exactly the updated
  *     logical rows by captured identity — even when the update rewrote the column
  *     its own WHERE filtered on.
  *
- * Materialized whenever present (a both-sides update without RETURNING still needs
- * it for the base ops), so it is independent of the RETURNING branch. Parallel to
- * {@link MutationEnvelope} (the insert surrogate).
+ * Materialized whenever present (a both-sides update / multi-side delete without
+ * RETURNING still needs it for the base ops), so it is independent of the RETURNING
+ * branch. Parallel to {@link MutationEnvelope} (the insert surrogate).
  */
 export interface IdentityCapture {
 	readonly source: RelationalPlanNode;
@@ -136,13 +139,14 @@ export class ViewMutationNode extends PlanNode {
 		 */
 		public readonly returningTiming?: ReturningTiming,
 		/**
-		 * The up-front base-PK identity capture for a multi-source **update**: its
-		 * `source` is materialized into context **before** the base ops run, and read
-		 * back by `descriptor` by the both-sides base ops' identifying subqueries
-		 * and/or the post-mutation {@link returning} re-query. Set whenever a
-		 * multi-source update assigns both sides (⇒ more than one base op) or carries
-		 * RETURNING; absent for single-source, multi-source delete (`pre`), and the
-		 * void/insert paths.
+		 * The up-front base-PK identity capture for a multi-source **update** or
+		 * multi-side **delete** fan-out: its `source` is materialized into context
+		 * **before** the base ops run, and read back by `descriptor` by the multi-side
+		 * base ops' identifying subqueries and/or the post-mutation {@link returning}
+		 * re-query. Set whenever a multi-source update assigns both sides (⇒ more than
+		 * one base op) or carries RETURNING, or a lenient delete fans out to both sides
+		 * (⇒ more than one base op); absent for single-source, single-side delete
+		 * (whose RETURNING re-queries the view `pre`), and the void/insert paths.
 		 */
 		public readonly identityCapture?: IdentityCapture,
 	) {
