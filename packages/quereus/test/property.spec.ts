@@ -3049,6 +3049,90 @@ describe('Property-Based Tests', () => {
 				expect(freshSeen, 'fresh-key arm never exercised').to.be.greaterThan(0);
 			});
 
+			// ----- Family B: directly-supplied insert — the partial-write rollback edge -----
+			// The both-collide arm above seeds each key into BOTH bases, so a colliding
+			// supplied key is present in both: the fan-out fails on its FIRST member op and
+			// the second base is never touched — "both unchanged" then holds trivially by
+			// first-op-failure, NOT by rollback of a partial write. The genuinely atomic path
+			// is a key present in EXACTLY ONE base: depending on fan-out order the first
+			// member insert either fails outright (collides-first) or SUCCEEDS and the second
+			// fails (collides-second), forcing the already-written base to be rolled back.
+			// Seed the two bases with overlapping-but-not-identical key sets and model each
+			// base independently (rows present in only one base are invisible through the
+			// inner join, so the oracle must read each base image directly). Assert: a
+			// one-base-collide supplied key is rejected and BOTH bases are byte-for-byte
+			// unchanged from their pre-insert state — independent of which side the fan-out
+			// writes first, so the test does not over-fit member ordering.
+			it('PutGet: a directly-supplied insert key present in exactly one base rolls the partial write back', async () => {
+				await db.exec('drop view if exists dkv');
+				await db.exec('drop table if exists dk_a');
+				await db.exec('drop table if exists dk_b');
+				await db.exec('create table dk_a (k integer primary key, av integer null) using memory');
+				await db.exec('create table dk_b (k integer primary key, bv integer null) using memory');
+				await db.exec('create view dkv as select a.k as k, a.av as av, b.bv as bv from dk_a a join dk_b b on b.k = a.k');
+
+				let oneBaseSeen = 0; let bothCollideSeen = 0; let freshSeen = 0;
+				await fc.assert(fc.asyncProperty(
+					// independent seed sets for the two bases — keys overlap but are not identical
+					fc.array(fc.record({ k: fc.integer({ min: 1, max: 9 }), av: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
+					fc.array(fc.record({ k: fc.integer({ min: 1, max: 9 }), bv: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
+					fc.integer({ min: 1, max: 9 }),  // supplied key — overlaps both seed ranges
+					fc.integer({ min: 1, max: 9 }), fc.integer({ min: 1, max: 9 }),
+					async (aSeed, bSeed, K, av, bv) => {
+						await db.exec('delete from dk_a');
+						await db.exec('delete from dk_b');
+						const aSeen = new Set<number>(); const keptA: { k: number; av: number }[] = [];
+						for (const r of aSeed) {
+							if (aSeen.has(r.k)) continue; aSeen.add(r.k);
+							await db.exec(`insert into dk_a values (${r.k}, ${r.av})`);
+							keptA.push({ k: r.k, av: r.av });
+						}
+						const bSeen = new Set<number>(); const keptB: { k: number; bv: number }[] = [];
+						for (const r of bSeed) {
+							if (bSeen.has(r.k)) continue; bSeen.add(r.k);
+							await db.exec(`insert into dk_b values (${r.k}, ${r.bv})`);
+							keptB.push({ k: r.k, bv: r.bv });
+						}
+						const inA = aSeen.has(K); const inB = bSeen.has(K);
+
+						// pre-insert base images — the oracle for "both unchanged" reads each base
+						// directly because a row in only one base does not surface through the join.
+						const beforeA = keptA.map(r => ({ k: r.k, av: r.av }));
+						const beforeB = keptB.map(r => ({ k: r.k, bv: r.bv }));
+
+						if (inA !== inB) {
+							// present in exactly one base: the fan-out either fails first (no write)
+							// or succeeds-then-fails (partial write that MUST roll back). Either way
+							// the observable outcome is identical: rejection + both bases intact.
+							oneBaseSeen++;
+							let err: unknown;
+							try { await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`); } catch (e) { err = e; }
+							expect(err, `one-base-collide supplied key ${K} must be rejected`).to.not.equal(undefined);
+							assertRowsEqual('partial-write a rolled back', await readRows('select k, av from dk_a'), beforeA, ['k', 'av']);
+							assertRowsEqual('partial-write b rolled back', await readRows('select k, bv from dk_b'), beforeB, ['k', 'bv']);
+						} else if (inA && inB) {
+							// both-collide: first-op-failure path (already covered above; kept as a guard).
+							bothCollideSeen++;
+							let err: unknown;
+							try { await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`); } catch (e) { err = e; }
+							expect(err, `both-collide supplied key ${K} must be rejected`).to.not.equal(undefined);
+							assertRowsEqual('both-collide a unchanged', await readRows('select k, av from dk_a'), beforeA, ['k', 'av']);
+							assertRowsEqual('both-collide b unchanged', await readRows('select k, bv from dk_b'), beforeB, ['k', 'bv']);
+						} else {
+							// fresh key in neither base: both bases gain it.
+							freshSeen++;
+							await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`);
+							assertRowsEqual('fresh a', await readRows('select k, av from dk_a'),
+								[...beforeA, { k: K, av }], ['k', 'av']);
+							assertRowsEqual('fresh b', await readRows('select k, bv from dk_b'),
+								[...beforeB, { k: K, bv }], ['k', 'bv']);
+						}
+					},
+				), { numRuns: 120 });
+				// The whole point of this test is the one-base-collide arm: guard it actually fired.
+				expect(oneBaseSeen, 'one-base-collide (partial-write rollback) arm never exercised').to.be.greaterThan(0);
+			});
+
 			// ----- Family B: delete_via routes a join delete to the FK-parent side -----
 			// Default DELETE routing picks the FK-child (FK-many) side. A `delete_via=parent`
 			// tag overrides that to the FK-parent. FK enforcement is off, so the now-dangling
