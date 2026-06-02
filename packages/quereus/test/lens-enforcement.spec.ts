@@ -2477,7 +2477,7 @@ describe('lens enforcement: parent-side FK RESTRICT over a non-restrict basis (r
 		}
 	});
 
-	it('pragma gate — foreign_keys = false ⇒ no lens RESTRICT pre-check (basis CASCADE runs, child cascade-deleted)', async () => {
+	it('pragma gate — foreign_keys = false ⇒ no lens RESTRICT pre-check (no FK enforcement, child orphaned)', async () => {
 		const db = new Database();
 		try {
 			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete cascade on update cascade' });
@@ -2489,6 +2489,41 @@ describe('lens enforcement: parent-side FK RESTRICT over a non-restrict basis (r
 			await db.exec('delete from x.parent where id = 1');
 			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 0 }]);
 			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child orphaned (no enforcement)').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('transitive — a lens RESTRICT two hops down (through a basis cascade) ABORTs the top-level parent delete', async () => {
+		// parent → mid (basis+logical cascade, agreeing) → leaf (basis cascade, but logical bare ⇒ RESTRICT).
+		// Deleting parent would basis-cascade mid, then basis-cascade leaf. The lens RESTRICT on
+		// leaf→mid must win two hops down: the transitive pre-walk recurses through the mid basis
+		// cascade and re-fires the lens RESTRICT pre-check at the mid level, finding leaf still
+		// referencing mid ⇒ ABORT before any row is mutated. Pins the implementer's claim that
+		// transitivity through basis cascades rides the enclosing transitive walk.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (id integer primary key); table mid (id integer primary key, pid integer null, constraint fk_mp foreign key (pid) references parent(id) on delete cascade on update cascade); table leaf (id integer primary key, mid_id integer null, constraint fk_lm foreign key (mid_id) references mid(id) on delete cascade on update cascade) }');
+			await db.exec('apply schema y');
+			// mid→parent logical cascade AGREES with basis (elided); leaf→mid logical is bare ⇒ RESTRICT.
+			await db.exec('declare logical schema x { table parent (id integer primary key); table mid (id integer primary key, pid integer null, constraint fk_mp foreign key (pid) references parent(id) on delete cascade on update cascade); table leaf (id integer primary key, mid_id integer null, constraint fk_lm foreign key (mid_id) references mid(id)) }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.parent (id) values (1)');
+			await db.exec('insert into x.mid (id, pid) values (10, 1)');
+			await db.exec('insert into x.leaf (id, mid_id) values (100, 10)');
+
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+
+			// Atomic abort: every level still reads its pre-mutation values.
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent survives').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.mid where id = 10'), 'mid survives (not cascade-deleted)').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.leaf where id = 100'), 'leaf survives (the RESTRICT that bit)').to.deep.equal([{ n: 1 }]);
+
+			// Once the blocking leaf is gone, the top-level delete cascades cleanly through mid.
+			await db.exec('delete from x.leaf where id = 100');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent'), 'parent deleted').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.mid'), 'mid cascade-deleted').to.deep.equal([{ n: 0 }]);
 		} finally {
 			await db.close();
 		}
