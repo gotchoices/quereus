@@ -332,8 +332,7 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	identArb,                                  // table name
 	uniqueIdents(3),                            // column names (3 fixed so table constraints have something to reference)
 	fc.boolean(),                               // ifNotExists
-	fc.boolean(),                               // isTemporary
-).chain(([tableName, colNames, ifNotExists, isTemporary]) => {
+).chain(([tableName, colNames, ifNotExists]) => {
 	const columnDefs = colNames.map(name => makeColumnDefArb(name));
 	return fc.tuple(
 		...columnDefs,
@@ -342,7 +341,6 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 		type: 'createTable',
 		table: { type: 'identifier', name: tableName },
 		ifNotExists,
-		isTemporary,
 		columns: [c0, c1, c2],
 		constraints,
 	}));
@@ -531,12 +529,10 @@ const createViewArb: fc.Arbitrary<AST.CreateViewStmt> = fc.tuple(
 	fc.boolean(),
 	fc.option(uniqueIdents(1), { nil: undefined }),
 	queryExprArb,
-	fc.boolean(),
-).map(([name, ifNotExists, columns, body, isTemporary]): AST.CreateViewStmt => ({
+).map(([name, ifNotExists, columns, body]): AST.CreateViewStmt => ({
 	type: 'createView',
 	view: { type: 'identifier', name },
 	ifNotExists,
-	isTemporary,
 	columns: body.type === 'values' ? undefined : columns,
 	select: body,
 }));
@@ -590,9 +586,8 @@ const createAssertionArb: fc.Arbitrary<AST.CreateAssertionStmt> = fc.record({
 
 /**
  * Declared-table inner CreateTableStmt. The declarative grammar forces
- * `ifNotExists`/`isTemporary` to false (no `IF NOT EXISTS` or `TEMP` keyword
- * at the item level), so we pin both to false here to keep generated trees
- * inside the parser's declared-form subset.
+ * `ifNotExists` to false (no `IF NOT EXISTS` at the item level), so we pin it
+ * to false here to keep generated trees inside the parser's declared-form subset.
  */
 const declaredTableInnerArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	identArb,
@@ -606,7 +601,6 @@ const declaredTableInnerArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 		type: 'createTable',
 		table: { type: 'identifier', name: tableName },
 		ifNotExists: false,
-		isTemporary: false,
 		columns: [c0, c1, c2],
 		constraints,
 	}));
@@ -644,7 +638,6 @@ const declaredViewItemArb: fc.Arbitrary<AST.DeclaredView> = fc.record({
 		type: 'createView',
 		view: { type: 'identifier', name },
 		ifNotExists: false,
-		isTemporary: false,
 		columns: cols,
 		select,
 	},

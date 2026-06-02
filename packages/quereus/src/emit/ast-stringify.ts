@@ -770,7 +770,6 @@ export function createIndexToString(stmt: AST.CreateIndexStmt): string {
 
 export function createViewToString(stmt: AST.CreateViewStmt): string {
 	const parts: string[] = ['create'];
-	if (stmt.isTemporary) parts.push('temp');
 	parts.push('view');
 	if (stmt.ifNotExists) parts.push('if not exists');
 
@@ -791,7 +790,6 @@ export function createViewToString(stmt: AST.CreateViewStmt): string {
 
 export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewStmt): string {
 	const parts: string[] = ['create'];
-	if (stmt.isTemporary) parts.push('temp');
 	parts.push('materialized', 'view');
 	if (stmt.ifNotExists) parts.push('if not exists');
 
@@ -1245,7 +1243,6 @@ function contextClauseToString(stmt: AST.CreateTableStmt): string {
 
 export function createTableToString(stmt: AST.CreateTableStmt): string {
 	const parts: string[] = ['create'];
-	if (stmt.isTemporary) parts.push('temp');
 	parts.push('table');
 	if (stmt.ifNotExists) parts.push('if not exists');
 	// Handle schema.table quoting

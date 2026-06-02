@@ -52,8 +52,6 @@ export interface TableSchema {
 	vtabArgs?: Record<string, SqlValue>;
 	/** If virtual, the name the module was registered with */
 	vtabModuleName: string;
-	/** Whether the table is a temporary table */
-	isTemporary?: boolean;
 	/** Whether the table is a view */
 	isView: boolean;
 	/**
@@ -331,7 +329,6 @@ export function createBasicSchema(name: string, columns: { name: string, type: s
 		vtabAuxData: null,
 		vtabArgs: {},
 		vtabModuleName: 'memory',
-		isTemporary: false,
 		isView: false,
 		subqueryAST: undefined,
 		viewDefinition: undefined,

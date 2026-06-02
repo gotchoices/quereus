@@ -38,7 +38,6 @@ export function generateTableDDL(tableSchema: TableSchema, db?: Database): strin
 	const ctx = resolveEmitContext(db);
 
 	const parts: string[] = ['CREATE'];
-	if (tableSchema.isTemporary) parts.push('TEMP');
 	parts.push('TABLE', qualifiedName(tableSchema.schemaName, tableSchema.name, ctx.currentSchemaName));
 
 	const columnDefs: string[] = [];

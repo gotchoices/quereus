@@ -451,7 +451,7 @@ DELETE FROM table WHERE id = 1 WITH CONTEXT (x = 1) WITH SCHEMA main;
 
 ### 2.2 INSERT Statement
 
-The insert statement adds new rows to a table.
+The insert statement adds new rows to a table. The target may also be an updatable view, non-recursive CTE, or subquery in `from` — see [§2.9 Updatable Views](#29-updatable-views).
 
 **Syntax:**
 ```sql
@@ -647,7 +647,7 @@ insert into counters (key, value)
 
 ### 2.3 UPDATE Statement
 
-The update statement modifies existing rows in a table.
+The update statement modifies existing rows in a table. The target may also be an updatable view, non-recursive CTE, or subquery in `from` — see [§2.9 Updatable Views](#29-updatable-views).
 
 **Syntax:**
 ```sql
@@ -729,7 +729,7 @@ with discounted_items as (
 
 ### 2.4 DELETE Statement
 
-The delete statement removes rows from a table.
+The delete statement removes rows from a table. The target may also be an updatable view, non-recursive CTE, or subquery in `from` — see [§2.9 Updatable Views](#29-updatable-views).
 
 **Syntax:**
 ```sql
@@ -875,7 +875,7 @@ The create table statement defines a new table structure.  Note that all tables 
 
 **Syntax:**
 ```sql
-create [temp | temporary] table [if not exists] table_name (
+create table [if not exists] table_name (
   column_definition [, column_definition...]
   [, table_constraint...]
 )
@@ -919,7 +919,6 @@ on conflict { rollback | abort | fail | ignore | replace }
 
 **Options:**
 - If an empty key column list is provided, the table may have 0 or 1 rows.
-- `temp/temporary`: Creates a temporary table
 - `if not exists`: Creates the table only if it doesn't already exist
 - `column_definition`: Defines a column with optional constraints
 - `table_constraint`: Defines a table-level constraint
@@ -1255,6 +1254,142 @@ Changes a single column attribute. Each statement carries exactly one attribute;
 - `SET/DROP DEFAULT` is schema-only; existing rows are not touched.
 
 The declarative schema differ (`diff schema`) detects column-attribute drift and emits the matching `ALTER COLUMN` statements in the order `SET DATA TYPE` → `SET/DROP DEFAULT` → `SET/DROP NOT NULL` so that a newly-declared DEFAULT is in place before any NOT NULL tightening relies on it for backfill.
+
+### 2.8 CREATE VIEW Statement
+
+A view is a named query. Selecting from it re-evaluates the body on every reference (a view is not cached — see [Materialized Views](#210-create-materialized-view-statement) for the stored, kept-consistent variant).
+
+**Syntax:**
+```sql
+create view [if not exists] view_name [(column[, ...])]
+  as query_expr
+[with tags (key = value [, ...])]
+
+drop view [if exists] view_name;
+```
+
+- `query_expr` is any relation-producing expression — a `select`, a `values (...)`, or a `with … select`. A **DML body** (`insert`/`update`/`delete … returning`) is **rejected at create time**: a view re-evaluates per reference, so a write-per-read body is incoherent.
+- An optional column list renames the body's output columns (arity must match).
+- `with tags (...)` attaches metadata; the reserved `quereus.update.*` namespace influences write-through (see [§2.9](#29-updatable-views)).
+
+**Examples:**
+```sql
+create view ActiveUsers as select * from Users where active = 1;
+create view UserNames(uid, label) as select id, name from Users;
+drop view if exists ActiveUsers;
+```
+
+### 2.9 Updatable Views
+
+Views, non-recursive CTEs, and subqueries in `from` are **uniformly mutable**: `insert` / `update` / `delete` against them is rewritten to operate on the underlying base table(s), reusing all constraint / conflict / foreign-key machinery. A relation is updatable iff a deterministic decomposition exists at plan time; otherwise the mutation surfaces a structured diagnostic naming the operator or column that obstructed it. There is **no** `with check option` and **no** `instead of` trigger surface — write-through is predicate-driven, not declared per view.
+
+Reads and writes through a view report the *base* table(s) to `getChangeScope()` and `Database.watch` (see [Usage Guide](usage.md)).
+
+**What is writable (single-source projection-and-filter view):**
+
+- A **passthrough or renamed** column (`c`, `c as alias`) routes the value straight to its base column — writable on both `insert` and `update`.
+- An **invertible-expression** column (`v + 1 as w`) is writable on `update` (the assignment is lowered through the inverse: `set w = 9` ⇒ `set v = 8`). It is **not** insertable.
+- A **computed / non-invertible** column (`lower(name)`, a window or aggregate output) is **read-only**; writing it raises the `no-inverse` diagnostic.
+- A column **omitted** from an `insert` but pinned by an equality predicate is supplied automatically: `create view GreenMen as select * from Men where color = 'green'` lets `insert into GreenMen (name) values ('Bob')` default `color` to `'green'`. Base-column `default`s fill the rest; a `not null` column with no available value is rejected.
+- A top-level reference in `where` / `set` / `returning` must name a **view** column — a base column the view projects away does not silently resolve (`unknown-view-column`).
+
+```sql
+create view GreenMen as select id, name, color from Men where color = 'green';
+insert into GreenMen (id, name) values (7, 'Bob');   -- color defaults to 'green'
+update GreenMen set name = 'Bobby' where id = 7;      -- routes to Men
+delete from GreenMen where id = 7;                    -- routes to Men
+```
+
+**Multi-source (key-preserving inner-join) views** support `update` / `delete` and two-table `insert` write-through: each output column routes to its owning base table, FK-parent before FK-child. Outer joins, set-operations, aggregates, self-joins, `> 2`-table and composite-key joins are rejected with a diagnostic.
+
+**`returning`** through a view projects rows through the *view's* column list, evaluated against post-mutation state (single-source all ops; multi-source `update` / `delete`).
+
+**Override tags (`quereus.update.*`).** When the default routing is ambiguous (e.g. which side of a join a delete removes), attach tags — at the view DDL or per statement via `with tags (...)`:
+
+| Tag | Effect |
+|---|---|
+| `quereus.update.target` / `exclude` | Restrict / exclude the base relations propagation reaches. |
+| `quereus.update.delete_via` | Pick the side a join/`except` delete realizes (`'parent'`, `'left_delete'`, `'right_insert'`). |
+| `quereus.update.default_for.<col>` | Default expression for an omitted `insert` column. |
+| `quereus.update.policy` | `lenient` (default; predicate-honest fan-out) or `strict` (reject ambiguity). |
+
+```sql
+update v with tags ("quereus.update.target" = 'base_a') set col = 1 where ...;
+delete from v with tags ("quereus.update.delete_via" = 'parent') where ...;
+```
+
+See [View Updateability](view-updateability.md) for the full per-operator semantics and the complete diagnostic catalog.
+
+### 2.10 CREATE MATERIALIZED VIEW Statement
+
+A materialized view stores its body in a keyed backing relation kept consistent with its sources **synchronously, inside the writing transaction** (row-time maintenance). It is observably indistinguishable from the plain view it derives from — reads-own-writes hold, a rollback reverts source and backing together — only served from stored rows. There is one maintenance model and **no refresh-policy knob**.
+
+**Syntax:**
+```sql
+create materialized view [if not exists] view_name [(column[, ...])]
+  [using module_name [(module_args...)]]
+  as query_expr
+[with tags (key = value [, ...])]
+
+refresh materialized view view_name;
+drop materialized view [if exists] view_name;
+```
+
+- The body is evaluated and stored at create; create is all-or-nothing.
+- `refresh` is **not required for currency** (row-time maintenance keeps it live); it is an explicit resync verb, useful after a source *schema* change marks the view `stale`.
+- `using module(...)` is parsed for forward compatibility but v1 always backs the view with the in-memory table module.
+- `drop table` / `drop view` reject a materialized-view name and redirect to `drop materialized view` (and vice-versa).
+
+**Eligibility (enforced at create).** Row-time maintenance is only affordable for bodies whose per-write delta is bounded, so the accepted shape is narrow. Eligible bodies:
+
+- a **single source** with a projection (+ optional `where` / `order by`) that includes every PK column as a passthrough — the covering-index shape;
+- a **single-source aggregate** (`group by` over bare source columns);
+- a **single-source lateral table-valued-function** fan-out;
+- a **1:1 row-preserving inner/cross join**.
+
+Any other body (general joins, set-operations, recursion, `distinct`, `limit`/`offset`, non-deterministic projections) is **rejected at create** with a diagnostic that steers you to a plain `view` (live re-evaluation) or `create table … as <body>` (one-off snapshot).
+
+**Write-through.** `insert` / `update` / `delete` against a materialized-view name is rewritten to its source table (via the same [updatable-view](#29-updatable-views) machinery) and the row-time hook syncs the backing within the statement. Per-column writeability is inherited verbatim (passthrough writable, computed read-only).
+
+**Covering structures.** A materialized view that projects a UNIQUE constraint's columns (plus the source PK), ordered by those columns, can *cover* that constraint — its backing table then answers `insert or replace` / `or ignore` / conflict detection at O(log n), row-time. This is the substrate the [lens](#211-logical-schemas-and-lenses) layer's set-level enforcement builds on.
+
+**Declarative schema.** A `materialized view` item is accepted inside `declare schema { … }`; a body change (detected by `bodyHash`) schedules a drop-and-recreate.
+
+```sql
+create materialized view mv as select id, x from t order by x;
+refresh materialized view mv;
+drop materialized view if exists mv;
+```
+
+See [Materialized Views](materialized-views.md) for the maintenance arms, the eligibility detail, and the covering-structure / enforcement model.
+
+### 2.11 Logical Schemas and Lenses
+
+A **logical schema** is an embodiment-free design — tables, types, and logical constraints with no module, indexes, or storage hints. A **lens** maps each logical table onto a **basis** (module-backed) schema as a bidirectional view, built on the updatable-view machinery: `get` is an ordinary `select`, `put` is the predicate-driven propagation. At deploy the lens compiles to an inline view, so the query processor sees an ordinary view over basis.
+
+**Syntax:**
+```sql
+declare logical schema schema_name { table_item* assertion_item* ... }
+
+declare lens for logical_schema over basis_schema {
+  view logical_table as select_expr [hiding (column[, ...])];
+  ...
+}
+
+apply schema logical_schema;   -- compiles + deploys the lens-backed views
+```
+
+- A `logical` schema rejects `using module(...)`, indexes, and physical storage constructs at build time; tags are allowed (engine-facing metadata).
+- A `declare lens` block supplies **sparse overrides** — only the deviations (rename, hide, compute, filter). Columns an override does not cover are gap-filled by the default name-based mapper. `hiding (...)` omits logical columns from the effective body and the registered view's column list.
+- A lens override body must be a single `select` whose `from` sources live in the declared basis (compound set-operations and cross-basis re-anchoring are rejected).
+- The logical spec's constraints are **attached** at the lens boundary and enforced per class — row-local (`not null`, `check`) and foreign keys (child- and parent-side, incl. cascade actions) are live; `unique` / primary keys enforce row-time when a basis covering materialized view answers the key, else commit-time detection.
+
+**Inspect the effective mapping:**
+```sql
+select * from quereus_effective_lens('LogicalSchema', 'TableName');
+```
+
+The lens layer is the most recently landed of these features and is evolving (n-way decomposition, module mapping advertisements, and access-shape routing are partially shipped). See [Lenses and Layered Schemas](lens.md) for the full model, the prover, and the constraint-attachment classes.
 
 ## 3. Clauses and Subclauses
 
@@ -2462,7 +2597,7 @@ Virtual tables are Quereus's primary mechanism for accessing and manipulating da
 
 **Syntax:**
 ```sql
-create [temp | temporary] table [if not exists] table_name [(column_def[, ...])]
+create table [if not exists] table_name [(column_def[, ...])]
 using module_name [(module_arguments...)]
 ```
 
@@ -3466,6 +3601,8 @@ sql_statement      = [ with_clause ] ( select_stmt
                     | create_table_stmt
                     | create_index_stmt
                     | create_view_stmt
+                    | create_materialized_view_stmt
+                    | refresh_materialized_view_stmt
                     | create_assertion_stmt
                     | drop_stmt
                     | alter_table_stmt
@@ -3477,6 +3614,7 @@ sql_statement      = [ with_clause ] ( select_stmt
                     | pragma_stmt
                     | analyze_stmt
                     | declare_schema_stmt
+                    | declare_lens_stmt
                     | diff_schema_stmt
                     | apply_schema_stmt
                     | explain_schema_stmt ) ;
@@ -3581,7 +3719,7 @@ returning_clause   = "returning" [ qualifier "." ] "*" { "," [ qualifier "." ] "
 qualifier          = "old" | "new" ;
 
 /* CREATE TABLE statement */
-create_table_stmt  = "create" [ "temp" | "temporary" ] "table" [ "if" "not" "exists" ]
+create_table_stmt  = "create" "table" [ "if" "not" "exists" ]
                      table_name "(" column_def { "," ( column_def | table_constraint ) } ")"
                      [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ]
                      { context_def_clause | tags_clause } ;
@@ -3639,15 +3777,25 @@ create_index_stmt  = "create" [ "unique" ] "index" [ "if" "not" "exists" ]
 indexed_column     = column_name [ "collate" collation_name ] [ "asc" | "desc" ] ;
 
 /* CREATE VIEW statement */
-create_view_stmt   = "create" [ "temp" | "temporary" ] "view" [ "if" "not" "exists" ]
+create_view_stmt   = "create" "view" [ "if" "not" "exists" ]
                      view_name [ "(" column_name { "," column_name } ")" ] "as" select_stmt
                      [ tags_clause ] ;
+
+/* CREATE / REFRESH MATERIALIZED VIEW statements.
+   The body is any query expression — a select_stmt, values_stmt, or with_clause select_stmt. */
+create_materialized_view_stmt = "create" "materialized" "view"
+                     [ "if" "not" "exists" ] view_name [ "(" column_name { "," column_name } ")" ]
+                     [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ] "as" select_stmt
+                     [ tags_clause ] ;
+
+refresh_materialized_view_stmt = "refresh" "materialized" "view" view_name ;
 
 /* CREATE ASSERTION statement */
 create_assertion_stmt = "create" "assertion" assertion_name "check" "(" expr ")" ;
 
 /* DROP statement */
-drop_stmt          = "drop" ( "table" | "index" | "view" | "assertion" ) [ "if" "exists" ] name ;
+drop_stmt          = "drop" ( "table" | "index" | "view" | "assertion"
+                            | "materialized" "view" ) [ "if" "exists" ] name ;
 
 /* ALTER TABLE statement */
 alter_table_stmt   = "alter" "table" table_name
@@ -3700,10 +3848,14 @@ analyze_stmt       = "analyze" [ ( [ schema_name "." ] table_name ) | ( schema_n
 pragma_value       = signed_number | name | string_literal ;
 
 /* Declarative schema statements */
-declare_schema_stmt = "declare" "schema" schema_name
+declare_schema_stmt = "declare" [ "logical" ] "schema" schema_name
                       [ "version" string_literal ]
                       [ "using" "(" schema_option { "," schema_option } ")" ]
                       "{" { schema_item } "}" ;
+
+declare_lens_stmt  = "declare" "lens" "for" schema_name "over" schema_name
+                     "{" { "view" table_name "as" select_stmt
+                           [ "hiding" "(" column_name { "," column_name } ")" ] [ ";" ] } "}" ;
 
 schema_option      = identifier "=" string_literal ;
 
@@ -3711,6 +3863,9 @@ schema_item        = "table" table_name ( "{" | "(" ) column_def { "," ( column_
                      [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ] ";"
                    | "index" index_name "on" table_name "(" indexed_column { "," indexed_column } ")" ";"
                    | "view" view_name [ "(" column_name { "," column_name } ")" ] "as" select_stmt ";"
+                   | "materialized" "view" view_name [ "(" column_name { "," column_name } ")" ]
+                       [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ] "as" select_stmt ";"
+                   | "assertion" assertion_name "check" "(" expr ")" ";"
                    | seed_item ;
 
 seed_item          = "seed" table_name [ "(" column_name { "," column_name } ")" ]

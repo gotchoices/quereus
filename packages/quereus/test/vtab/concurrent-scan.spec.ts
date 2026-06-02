@@ -37,7 +37,6 @@ function createTableSchema(name: string, module: MemoryTableModule): TableSchema
 		indexes: Object.freeze([]),
 		checkConstraints: Object.freeze([]),
 		vtabModule: module,
-		isTemporary: false,
 		isView: false,
 	};
 }

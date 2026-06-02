@@ -820,6 +820,38 @@ for await (const row of db.eval(`
 3. `PRAGMA schema_path` / `db.setSchemaPath()` - Session default
 4. Default schema (`main`) - Final fallback
 
+## Views, Updatable Views, and Materialized Views
+
+For the SQL syntax and semantics see the [SQL Reference §2.8–2.11](sql.md#28-create-view-statement). This section covers the operational/API-level behavior.
+
+**Plain views** re-evaluate their body on every reference. **Updatable views** let you `insert` / `update` / `delete` through a view (or a non-recursive CTE, or a subquery in `from`) — the engine rewrites the DML to the underlying base table(s):
+
+```typescript
+await db.exec(`create view GreenMen as select id, name, color from Men where color = 'green'`);
+await db.exec(`insert into GreenMen (id, name) values (7, 'Bob')`);   // color defaults to 'green'
+await db.exec(`update GreenMen set name = 'Bobby' where id = 7`);     // routes to Men
+```
+
+Because the write reaches the base table, **change-scope and reactive watches report the base table, not the view** — a `Database.watch` registered against `Men` fires when you write through `GreenMen`. A non-writable column (a computed/aggregate output) is read-only and raises a `no-inverse` diagnostic on write rather than silently dropping the value.
+
+**Materialized views** store the body and keep it consistent with its sources **synchronously, inside the writing transaction**:
+
+```typescript
+await db.exec(`create materialized view mv as select id, x from t order by x`);
+await db.exec(`insert into t values (1, 10)`);
+// reads-own-writes: mv already reflects the insert within the same transaction
+const rows = await db.prepare(`select * from mv`).all();
+```
+
+Operational consequences:
+
+- A materialized view is **transactional** — a maintenance failure or a `rollback` reverts source and backing together; there is no asynchronous drift and `refresh materialized view` is not required for currency.
+- `Database.watch` on a materialized view projects to its **source** tables (the backing table is maintained off the change log, so watching it directly would never fire).
+- Only [narrow body shapes](sql.md#210-create-materialized-view-statement) are eligible; an ineligible body is rejected at `create`.
+- A covering materialized view (projecting a UNIQUE constraint's columns, ordered by them) makes that constraint's enforcement O(log n) and conflict-resolution-capable.
+
+These features run against persistent storage backends too — the `.sqllogic` suites for views, materialized views, and lens write-through are exercised under both the in-memory and LevelDB store backends (`yarn test:store`).
+
 ## Declarative Schema Workflow
 
 Quereus supports an order‑independent declarative schema with a separate apply step. DDL remains primary; declarative is an optional layer that produces canonical DDL. Modules continue to use the DDL interface. For the `DeclaredSchemaManager` API and schema change events, see [Schema Management](schema.md).
@@ -915,6 +947,40 @@ console.log(users);
 - Seed blocks define initial data for tables.
 - Application clears existing data before inserting seeds.
 - Use for test fixtures, reference data, or initial configurations.
+
+### Logical Schemas and Lenses
+
+A **logical schema** describes a design free of any storage commitment; a **lens** maps each logical table onto a module-backed **basis** schema. At `apply` the lens compiles to an inline view, so the rest of the engine sees an ordinary (updatable) view over basis.
+
+```typescript
+// 1) The basis: module-backed storage
+await db.exec(`declare schema basis {
+  table men { id integer primary key, name text not null, color text not null }
+}`);
+await db.exec('apply schema basis');
+
+// 2) The logical design — no module, no indexes
+await db.exec(`declare logical schema app {
+  table Person { id integer primary key, fullName text not null, color text not null }
+}`);
+
+// 3) The lens: sparse overrides over basis (only the deviations)
+await db.exec(`declare lens for app over basis {
+  view Person as select id, name as fullName, color from men;
+}`);
+
+// 4) Deploy — compiles the lens-backed views
+await db.exec('apply schema app');
+
+// 5) Use the logical table like any view; writes propagate to basis
+await db.exec(`insert into app.Person (id, fullName, color) values (1, 'Bob', 'green')`);
+```
+
+- Columns a lens override does not cover are gap-filled by the default name-based mapper; `hiding (...)` omits columns.
+- The logical schema's constraints are enforced at the lens boundary (row-local checks, foreign keys, and uniqueness — see [Lenses](lens.md)).
+- Inspect the composed mapping with `select * from quereus_effective_lens('app', 'Person')`.
+
+The lens layer is the most recently landed feature set and is still evolving; see [Lenses and Layered Schemas](lens.md) for the current boundaries.
 
 
 ## User-Defined Functions

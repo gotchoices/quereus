@@ -2304,24 +2304,22 @@ export class Parser {
 
 	/** @internal */
 	private createStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateTableStmt | AST.CreateIndexStmt | AST.CreateViewStmt | AST.CreateMaterializedViewStmt | AST.CreateAssertionStmt {
-		let isTemporary = false;
+		// TEMP/TEMPORARY is not a Quereus concept — the schema is already transient
+		// and temp placement was never wired. Reject it rather than silently ignore.
 		if (this.peekKeyword('TEMP') || this.peekKeyword('TEMPORARY')) {
-			isTemporary = true;
-			this.advance();
+			throw this.error(this.peek(), "TEMP/TEMPORARY is not supported.");
 		}
 
 		if (this.peekKeyword('TABLE')) {
 			this.consumeKeyword('TABLE', "Expected 'TABLE' after CREATE.");
-			return this.createTableStatement(startToken, isTemporary, withClause);
+			return this.createTableStatement(startToken, withClause);
 		} else if (this.peekKeyword('VIEW')) {
 			this.consumeKeyword('VIEW', "Expected 'VIEW' after CREATE.");
-			return this.createViewStatement(startToken, isTemporary, withClause);
+			return this.createViewStatement(startToken, withClause);
 		} else if (this.peekKeyword('MATERIALIZED')) {
 			this.consumeKeyword('MATERIALIZED', "Expected 'MATERIALIZED' after CREATE.");
 			this.consumeKeyword('VIEW', "Expected 'VIEW' after CREATE MATERIALIZED.");
-			return this.createMaterializedViewStatement(startToken, isTemporary, withClause);
-		} else if (isTemporary) {
-			throw this.error(this.peek(), "Expected TABLE or VIEW after CREATE TEMP/TEMPORARY.");
+			return this.createMaterializedViewStatement(startToken, withClause);
 		} else if (this.peekKeyword('INDEX')) {
 			this.consumeKeyword('INDEX', "Expected 'INDEX' after CREATE.");
 			return this.createIndexStatement(startToken, false, withClause);
@@ -2340,7 +2338,7 @@ export class Parser {
 	 * Parse CREATE TABLE statement
 	 * @returns AST for CREATE TABLE
 	 */
-	private createTableStatement(startToken: Token, isTemporary: boolean, _withClause?: AST.WithClause): AST.CreateTableStmt {
+	private createTableStatement(startToken: Token, _withClause?: AST.WithClause): AST.CreateTableStmt {
 		let ifNotExists = false;
 		if (this.matchKeyword('IF')) {
 			this.consumeKeyword('NOT', "Expected 'NOT' after 'IF'.");
@@ -2443,7 +2441,6 @@ export class Parser {
 			ifNotExists,
 			columns,
 			constraints,
-			isTemporary,
 			moduleName,
 			moduleArgs,
 			contextDefinitions,
@@ -2512,7 +2509,7 @@ export class Parser {
 	 * Parse CREATE VIEW statement
 	 * @returns AST for CREATE VIEW
 	 */
-	private createViewStatement(startToken: Token, isTemporary: boolean, withClause?: AST.WithClause): AST.CreateViewStmt {
+	private createViewStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateViewStmt {
 		let ifNotExists = false;
 		if (this.matchKeyword('IF')) {
 			this.consumeKeyword('NOT', "Expected 'NOT' after 'IF'.");
@@ -2557,7 +2554,6 @@ export class Parser {
 			ifNotExists,
 			columns,
 			select,
-			isTemporary,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
@@ -2570,7 +2566,7 @@ export class Parser {
 	 * The optional `using` clause is parsed before `as` to stay unambiguous with the query body;
 	 * v1 restricts the backing module to `memory` at build time (the AST keeps the slot forward-compatible).
 	 */
-	private createMaterializedViewStatement(startToken: Token, isTemporary: boolean, withClause?: AST.WithClause): AST.CreateMaterializedViewStmt {
+	private createMaterializedViewStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateMaterializedViewStmt {
 		let ifNotExists = false;
 		if (this.matchKeyword('IF')) {
 			this.consumeKeyword('NOT', "Expected 'NOT' after 'IF'.");
@@ -2643,7 +2639,6 @@ export class Parser {
 			select,
 			moduleName,
 			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
-			isTemporary,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
@@ -3197,7 +3192,6 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			constraints,
-			isTemporary: false,
 			moduleName,
 			moduleArgs,
 			contextDefinitions,
@@ -3264,7 +3258,6 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			select,
-			isTemporary: false,
 			tags
 		};
 
@@ -3327,7 +3320,6 @@ export class Parser {
 			select,
 			moduleName,
 			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
-			isTemporary: false,
 			tags
 		};
 

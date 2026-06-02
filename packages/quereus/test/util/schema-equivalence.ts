@@ -54,7 +54,7 @@ import { assertAstEquivalent } from '../emit-roundtrip-comparator.js';
  *   - indexes[*]: columns + directions, unique, partial `where` predicate
  *     (structural), tags
  *   - vtabModuleName + vtabArgs
- *   - isView, isTemporary, isReadOnly
+ *   - isView, isReadOnly
  *   - tags at table level
  *
  * Not compared (deliberately):
@@ -72,7 +72,6 @@ export function assertTableSchemaEqual(direct: TableSchema, applied: TableSchema
 	eq(direct.name.toLowerCase(), applied.name.toLowerCase(), at('name'));
 	eq(direct.schemaName.toLowerCase(), applied.schemaName.toLowerCase(), at('schemaName'));
 	eq(direct.isView, applied.isView, at('isView'));
-	eq(direct.isTemporary ?? false, applied.isTemporary ?? false, at('isTemporary'));
 	eq(direct.isReadOnly ?? false, applied.isReadOnly ?? false, at('isReadOnly'));
 	eq(direct.vtabModuleName, applied.vtabModuleName, at('vtabModuleName'));
 	eqRecord(direct.vtabArgs ?? {}, applied.vtabArgs ?? {}, at('vtabArgs'));

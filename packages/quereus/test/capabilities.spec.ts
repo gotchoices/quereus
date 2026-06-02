@@ -43,7 +43,6 @@ describe('Module Capabilities', () => {
 			indexes: Object.freeze([]),
 			checkConstraints: Object.freeze([]),
 			vtabModule: module,
-			isTemporary: false,
 			isView: false
 		};
 	}

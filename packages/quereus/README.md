@@ -165,7 +165,9 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Usage Guide](../../docs/usage.md) — complete API reference (type mappings, parameter binding, logging, tracing, transactions)
 * [SQL Reference Guide](../../docs/sql.md) — SQL syntax (includes Declarative Schema)
 * [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation
-* [Materialized Views](../../docs/materialized-views.md) — keyed derived relations, manual refresh, declarative-schema round-trip
+* [View Updateability](../../docs/view-updateability.md) — write-through for views, CTEs, and subqueries-in-FROM; per-operator semantics and override tags
+* [Materialized Views](../../docs/materialized-views.md) — keyed derived relations, synchronous row-time maintenance, write-through, covering structures, declarative-schema round-trip
+* [Lenses and Layered Schemas](../../docs/lens.md) — logical/basis separation and bidirectional per-table lenses
 * [Type System](../../docs/types.md) — logical/physical types, temporal types, JSON, custom types
 * [Functions](../../docs/functions.md) — built-in scalar, aggregate, window, and JSON functions
 * [Memory Tables](../../docs/memory-table.md) — built-in MemoryTable module
@@ -208,6 +210,9 @@ Quereus is a feature-complete SQL query processor with a modern planner and inst
 *   **Rich built-in function library** — scalar, aggregate, window, JSON, and date/time functions
 *   **Rule-based optimizer** — constant folding, caching, streaming aggregation, bloom-join selection, and correlated subquery decorrelation. See [Architecture — Optimizer](../../docs/architecture.md#optimizer).
 *   **Change-scope introspection and reactive subscriptions** — `Statement.getChangeScope()` returns a JSON-serializable description of what base-table state and external inputs a prepared statement reads from. The companion `Database.watch(scope, handler)` consumes any `ChangeScope` value (analyzed, deserialized, or hand-built) and fires a post-commit callback whenever matching rows, groups, or tables change. See [Change-scope Documentation](../../docs/change-scope.md).
+*   **Updatable views** — `insert` / `update` / `delete` propagate through views, non-recursive CTEs, and subqueries in `from` to the underlying base tables (no `instead of` triggers; predicate-driven). Single-source projection-and-filter and multi-source key-preserving inner-join bodies are supported, with `returning` and a `quereus.update.*` override-tag surface. See [View Updateability](../../docs/view-updateability.md).
+*   **Materialized views** — `create materialized view` stores a query body as a keyed backing relation kept consistent with its sources **synchronously, inside the writing transaction** (row-time maintenance — no refresh-policy knob, reads-own-writes), with write-through DML and covering-structure constraint enforcement. See [Materialized Views](../../docs/materialized-views.md).
+*   **Logical schemas and lenses** — separate an embodiment-free logical design from a module-backed basis, mapped by per-table bidirectional **lenses** built on view updateability. See [Lenses and Layered Schemas](../../docs/lens.md).
 
 [TODO List](../../docs/todo.md) has remaining priorities.
 

@@ -52,7 +52,6 @@ describe("Memory VTable Module", () => {
 			indexes: Object.freeze([]),
 			checkConstraints: Object.freeze([]),
 			vtabModule: module,
-			isTemporary: false,
 			isView: false
 		};
 	}

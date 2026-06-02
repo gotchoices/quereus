@@ -303,7 +303,6 @@ export interface CreateTableStmt extends AstNode {
 	ifNotExists: boolean;
 	columns: ColumnDef[];
 	constraints: TableConstraint[];
-	isTemporary?: boolean;
 	moduleName?: string;   // Optional module name from USING clause
 	moduleArgs?: Record<string, SqlValue>; // Optional module arguments from USING clause
 	contextDefinitions?: MutationContextVar[]; // Optional mutation context variables
@@ -337,7 +336,6 @@ export interface CreateViewStmt extends AstNode {
 	columns?: string[];
 	/** View body — any relation-producing form. Bare `VALUES (...)` is permitted. */
 	select: QueryExpr;
-	isTemporary?: boolean;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 
@@ -353,7 +351,6 @@ export interface CreateMaterializedViewStmt extends AstNode {
 	moduleName?: string;
 	/** Optional backing-module arguments (forward-compatible; ignored in v1). */
 	moduleArgs?: Record<string, SqlValue>;
-	isTemporary?: boolean;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 

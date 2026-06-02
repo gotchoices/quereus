@@ -178,33 +178,22 @@ describe('Emit: ast-stringify AST round-trip', () => {
 		}
 	});
 
-	describe('CREATE TEMP TABLE / VIEW dispatch', () => {
-		it('preserves isTemporary through `create temp table` round-trip', () => {
-			const sql = 'create temp table T (Id int, primary key (Id))';
-			const original = parse(sql) as CreateTableStmt;
-			expect(original.isTemporary, 'parser sets isTemporary on TEMP table').to.equal(true);
-
-			const emitted = createTableToString(original);
-			const reparsed = parse(emitted) as CreateTableStmt;
-			expect(reparsed.isTemporary, 'isTemporary survives parse → stringify → parse').to.equal(true);
+	describe('TEMP/TEMPORARY is rejected (not a Quereus concept)', () => {
+		it('rejects `create temp table` / `create temporary table`', () => {
+			expect(() => parse('create temp table T (Id int, primary key (Id))')).to.throw(/TEMP\/TEMPORARY is not supported/);
+			expect(() => parse('create temporary table T (Id int, primary key (Id))')).to.throw(/TEMP\/TEMPORARY is not supported/);
 		});
 
-		it('preserves isTemporary through `create temporary table` round-trip', () => {
-			const sql = 'create temporary table T (Id int, primary key (Id))';
-			const original = parse(sql) as CreateTableStmt;
-			expect(original.isTemporary).to.equal(true);
-
-			const reparsed = parse(createTableToString(original)) as CreateTableStmt;
-			expect(reparsed.isTemporary).to.equal(true);
+		it('rejects `create temp view` / `create temporary materialized view`', () => {
+			expect(() => parse('create temp view V as select 1 as N')).to.throw(/TEMP\/TEMPORARY is not supported/);
+			expect(() => parse('create temporary materialized view MV as select 1 as N')).to.throw(/TEMP\/TEMPORARY is not supported/);
 		});
 
-		it('preserves isTemporary through `create temp view` round-trip', () => {
-			const sql = 'create temp view V as select 1 as N';
-			const original = parse(sql) as CreateViewStmt;
-			expect(original.isTemporary, 'parser sets isTemporary on TEMP view').to.equal(true);
-
-			const reparsed = parse(createViewToString(original)) as CreateViewStmt;
-			expect(reparsed.isTemporary).to.equal(true);
+		it('round-trips a plain `create table` / `create view`', () => {
+			const t = parse('create table T (Id int, primary key (Id))') as CreateTableStmt;
+			expect((parse(createTableToString(t)) as CreateTableStmt).type).to.equal('createTable');
+			const v = parse('create view V as select 1 as N') as CreateViewStmt;
+			expect((parse(createViewToString(v)) as CreateViewStmt).type).to.equal('createView');
 		});
 	});
 

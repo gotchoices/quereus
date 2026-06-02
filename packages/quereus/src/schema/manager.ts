@@ -41,7 +41,6 @@ export interface GenericModuleCallOptions extends BaseModuleConfig {
 	moduleArgs?: readonly string[];
 	statementColumns?: readonly AST.ColumnDef[];
 	statementConstraints?: readonly AST.TableConstraint[];
-	isTemporary?: boolean;
 }
 
 /**
@@ -1080,7 +1079,6 @@ export class SchemaManager {
 			checkConstraints: Object.freeze(checkConstraints),
 			foreignKeys: foreignKeys.length > 0 ? Object.freeze(foreignKeys) : undefined,
 			uniqueConstraints: uniqueConstraints.length > 0 ? Object.freeze(uniqueConstraints) : undefined,
-			isTemporary: !!stmt.isTemporary,
 			isView: false,
 			vtabModuleName: moduleName,
 			vtabArgs: effectiveModuleArgs,
@@ -1127,7 +1125,6 @@ export class SchemaManager {
 			checkConstraints: Object.freeze(checkConstraints),
 			foreignKeys: foreignKeys.length > 0 ? Object.freeze(foreignKeys) : undefined,
 			uniqueConstraints: uniqueConstraints.length > 0 ? Object.freeze(uniqueConstraints) : undefined,
-			isTemporary: false,
 			isView: false,
 			isLogical: true,
 			// Logical tables carry no module — they are a design, not storage.

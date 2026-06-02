@@ -81,8 +81,8 @@ const DEFAULT_EQUIVALENCES: Record<string, unknown> = {
  */
 const FALSE_DEFAULT_FIELDS: Record<string, Set<string>> = {
 	select: new Set(['distinct', 'all']),
-	createTable: new Set(['ifNotExists', 'isTemporary']),
-	createView: new Set(['ifNotExists', 'isTemporary']),
+	createTable: new Set(['ifNotExists']),
+	createView: new Set(['ifNotExists']),
 	createIndex: new Set(['ifNotExists', 'isUnique']),
 	drop: new Set(['ifExists']),
 };

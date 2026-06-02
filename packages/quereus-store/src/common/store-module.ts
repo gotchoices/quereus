@@ -247,7 +247,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					columnIndexMap: new Map(),
 					primaryKeyDefinition: [],
 					checkConstraints: Object.freeze([]),
-					isTemporary: false,
 					isView: false,
 					vtabModuleName: 'store',
 					vtabArgs,
