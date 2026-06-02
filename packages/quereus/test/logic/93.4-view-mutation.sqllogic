@@ -805,6 +805,63 @@ select bid, aref from j_b order by bid;
 select aid, bid from j_jv order by aid;
 → [{"aid":2,"bid":20}]
 
+-- --- (fo-k) restrict/restrict mutual FK, join on a NON-FK column -> SUCCESS ---
+-- The plan-time `mutual-fk-restrict-delete` reject is gated on the join provably
+-- correlating a mutual FK edge (the joined rows necessarily cross-reference). Here the
+-- join is on a non-FK column (a.lbl = b.lbl) — it correlates NEITHER edge — and the FK
+-- columns (bref/aref) are left NULL, so the joined rows do not in fact cross-reference.
+-- The schema-only `orderDeleteFanout` still returns undefined (both edges RESTRICT), but
+-- the reject no longer fires; the planner falls back to the fixed [0,1] fan-out and
+-- defers to the runtime RESTRICT pre-check, which (FK columns NULL ⇒ MATCH SIMPLE: no
+-- referencing row) finds nothing and lets the delete succeed. This is the over-rejection
+-- repro from the ticket. See docs/view-updateability.md § Inner Join — Deletes.
+create table k_a (aid integer primary key, lbl text, bref integer null,
+    foreign key (bref) references k_b(bid) on delete restrict);
+create table k_b (bid integer primary key, lbl text, aref integer null,
+    foreign key (aref) references k_a(aid) on delete restrict);
+insert into k_a (aid, lbl, bref) values (1, 'x', null), (2, 'y', null);
+insert into k_b (bid, lbl, aref) values (10, 'x', null), (20, 'z', null);
+create view k_jv as select a.aid as aid, b.bid as bid from k_a a join k_b b on a.lbl = b.lbl;
+select aid, bid from k_jv order by aid;
+→ [{"aid":1,"bid":10}]
+-- fans out [0,1]; both base deletes succeed (FK columns NULL — runtime RESTRICT pre-check
+-- finds no referencing row), removing both base rows of the joined identity (aid=1/bid=10).
+delete from k_jv where aid = 1;
+select aid from k_a order by aid;
+→ [{"aid":2}]
+select bid from k_b order by bid;
+→ [{"bid":20}]
+
+-- --- (fo-l) same non-FK join, but FK columns back-filled -> RAW FK-constraint error ---
+-- The accepted residual tradeoff of (fo-k)'s relaxation: when the join correlates neither
+-- edge, the actionable plan-time `mutual-fk-restrict-delete` diagnostic is no longer
+-- raised — so when the joined rows *do* cross-reference in data (FK columns back-filled
+-- here), the deferred [0,1] fan-out's per-base-op parent-side FK check raises the raw
+-- FK-constraint error instead. A non-correlated join trades the actionable plan-time
+-- diagnostic for the raw FK error when the data happens to reference.
+-- See docs/view-updateability.md § Inner Join — Deletes.
+create table l_a (aid integer primary key, lbl text, bref integer null,
+    foreign key (bref) references l_b(bid) on delete restrict);
+create table l_b (bid integer primary key, lbl text, aref integer null,
+    foreign key (aref) references l_a(aid) on delete restrict);
+insert into l_a (aid, lbl, bref) values (1, 'x', null), (2, 'y', null);
+insert into l_b (bid, lbl, aref) values (10, 'x', null), (20, 'z', null);
+-- back-fill so the joined identity (aid=1/bid=10) cross-references in data
+update l_a set bref = 10 where aid = 1;
+update l_b set aref = 1 where bid = 10;
+create view l_jv as select a.aid as aid, b.bid as bid from l_a a join l_b b on a.lbl = b.lbl;
+select aid, bid from l_jv order by aid;
+→ [{"aid":1,"bid":10}]
+-- deferred [0,1] fan-out: deleting l_a aid=1 first trips l_b's reference to aid=1 (l_b
+-- bid=10 has aref=1) at the per-base-op parent-side FK check.
+delete from l_jv where aid = 1;
+-- error: CHECK constraint failed: _fk_l_b_aref
+-- the rejected delete is a no-op: both base rows survive.
+select aid, bref from l_a order by aid;
+→ [{"aid":1,"bref":10},{"aid":2,"bref":null}]
+select bid, aref from l_b order by bid;
+→ [{"bid":10,"aref":1},{"bid":20,"aref":null}]
+
 -- ===================================
 -- Phase 3.4: the `quereus.update.*` tag override surface.
 -- target / exclude / delete_via / policy / default_for — read + site-validated

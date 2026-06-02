@@ -2,6 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
 import type { TableSchema } from '../../schema/table.js';
+import { resolveReferencedColumns } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
@@ -15,7 +16,7 @@ import { FilterNode } from '../nodes/filter.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { combineAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
+import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
 import { transformExpr, cloneExpr, mapQueryExprUniform } from './scope-transform.js';
 import { readPolicy, readDeleteVia, readTargetNames, readExcludeNames, type ReservedTagMap } from './mutation-tags.js';
 import type { DeleteViaValue } from '../../schema/reserved-tags.js';
@@ -1101,20 +1102,31 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 	// FK) orders by ON DELETE action so the side whose removal clears the other's
 	// reference runs first (`orderDeleteFanout`); a mutual FK whose actions no side
 	// order can satisfy under immediate enforcement raises `mutual-fk-restrict-delete`
-	// at plan time rather than letting the raw transitive-FK error surface at runtime.
-	// A single-side delete has no ordering hazard, so it keeps its trivial order.
+	// at plan time — but ONLY when the join provably correlates a mutual FK edge (the
+	// joined rows necessarily cross-reference, so a RESTRICT necessarily fires). When
+	// the join correlates neither edge (e.g. a join on non-FK columns), the joined
+	// rows are not proven to cross-reference, so the schema-only reject is a data-
+	// independent over-rejection: fall back to the fixed `[0, 1]` fan-out and defer to
+	// the runtime RESTRICT pre-check (`runtime/foreign-key-actions.ts`) on the actual
+	// data. A single-side delete has no ordering hazard, so it keeps its trivial order.
 	let order: readonly number[];
 	if (sides.length === 2) {
 		const fanoutOrder = orderDeleteFanout(analysis.sides);
 		if (fanoutOrder === undefined) {
-			const [a, b] = analysis.sides;
-			raiseMutationDiagnostic({
-				reason: 'mutual-fk-restrict-delete',
-				table: view.name,
-				message: `cannot delete through view '${view.name}': the joined row spans a mutual foreign key ('${a.schema.name}'↔'${b.schema.name}') whose ON DELETE actions cannot be satisfied in either order under immediate FK enforcement (deleting either side trips the other's RESTRICT, directly or transitively through a cascade); break the cycle outside the view — null out the referencing column(s) first, or restructure the offending ON DELETE action — before deleting through the view (a 'deferrable initially deferred' declaration does not help: RESTRICT is enforced immediately regardless)`,
-			});
+			if (joinCorrelatesMutualFk(analysis)) {
+				const [a, b] = analysis.sides;
+				raiseMutationDiagnostic({
+					reason: 'mutual-fk-restrict-delete',
+					table: view.name,
+					message: `cannot delete through view '${view.name}': the joined row spans a mutual foreign key ('${a.schema.name}'↔'${b.schema.name}') whose ON DELETE actions cannot be satisfied in either order under immediate FK enforcement (deleting either side trips the other's RESTRICT, directly or transitively through a cascade); break the cycle outside the view — null out the referencing column(s) first, or restructure the offending ON DELETE action — before deleting through the view (a 'deferrable initially deferred' declaration does not help: RESTRICT is enforced immediately regardless)`,
+				});
+			}
+			// No mutual FK edge is correlated by the join — defer to the runtime
+			// RESTRICT pre-check on the real data via the fixed fan-out order.
+			order = [0, 1];
+		} else {
+			order = fanoutOrder;
 		}
-		order = fanoutOrder;
 	} else {
 		order = sides;
 	}
@@ -1457,6 +1469,113 @@ function orderDeleteFanout(sides: readonly [JoinSide, JoinSide]): readonly numbe
 	if (deletableFirst(inbound0, inbound1)) return [0, 1];
 	if (deletableFirst(inbound1, inbound0)) return [1, 0];
 	return undefined;
+}
+
+/**
+ * Canonical (order-independent) key for a cross-side column equality, so a join
+ * conjunct written either way (`b.aref = a.aid` or `a.aid = b.aref`) hashes the
+ * same and an edge lookup need not know which operand the join named first.
+ */
+function crossEqualityKey(sideA: number, colA: string, sideB: number, colB: string): string {
+	const a = `${sideA}:${colA.toLowerCase()}`;
+	const b = `${sideB}:${colB.toLowerCase()}`;
+	return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+/**
+ * Resolve a join-condition column operand to its owning side index (0 or 1), or
+ * `undefined` when the reference cannot be pinned to exactly one side. An explicit
+ * `.table` qualifier matches a side's `alias` (already lowercased) or
+ * `schema.name`; an unqualified ref resolves by **unique** ownership of `col.name`
+ * across the two sides' columns. An ambiguous / unresolved ref returns `undefined`
+ * (conservative — a term that cannot be placed cannot prove correlation).
+ */
+function resolveColumnSide(col: AST.ColumnExpr, sides: readonly [JoinSide, JoinSide]): number | undefined {
+	const qualifier = col.table?.toLowerCase();
+	if (qualifier !== undefined) {
+		const idx = sides.findIndex(s => s.alias === qualifier || s.schema.name.toLowerCase() === qualifier);
+		return idx < 0 ? undefined : idx;
+	}
+	const colName = col.name.toLowerCase();
+	const owners = sides.flatMap((s, i) => s.schema.columns.some(c => c.name.toLowerCase() === colName) ? [i] : []);
+	return owners.length === 1 ? owners[0] : undefined;
+}
+
+/**
+ * True when the FK on side `childIdx` referencing side `parentIdx` is **correlated**
+ * by the join — i.e. the join's cross-side equalities force the child's FK column(s)
+ * equal to the parent's referenced column(s) for *every* `(childCol, refCol)` pair,
+ * so a joined partner necessarily references the deleted row (a RESTRICT necessarily
+ * fires). Matches the same `referencedTable` / `referencedSchema` predicate as
+ * {@link fkChildIndex}; any one matching FK whose whole column pairing is equated
+ * makes the edge correlated.
+ */
+function edgeCorrelated(
+	childIdx: number,
+	parentIdx: number,
+	crossEqualities: ReadonlySet<string>,
+	sides: readonly [JoinSide, JoinSide],
+): boolean {
+	const child = sides[childIdx];
+	const parent = sides[parentIdx];
+	const parentNameLower = parent.schema.name.toLowerCase();
+	const parentSchemaLower = parent.schema.schemaName.toLowerCase();
+	return (child.schema.foreignKeys ?? []).some(fk => {
+		if (fk.referencedTable.toLowerCase() !== parentNameLower) return false;
+		if ((fk.referencedSchema ?? child.schema.schemaName).toLowerCase() !== parentSchemaLower) return false;
+		const refIndices = resolveReferencedColumns(fk, parent.schema);
+		if (refIndices.length !== fk.columns.length) return false;
+		return fk.columns.every((childColIdx, i) => {
+			const childCol = child.schema.columns[childColIdx].name;
+			const refCol = parent.schema.columns[refIndices[i]].name;
+			return crossEqualities.has(crossEqualityKey(childIdx, childCol, parentIdx, refCol));
+		});
+	});
+}
+
+/**
+ * Whether the view's join **provably correlates at least one mutual FK edge** — the
+ * gate on the plan-time `mutual-fk-restrict-delete` reject (§ Inner Join — Deletes).
+ * Reached only when {@link orderDeleteFanout} found no feasible order (a mutual FK
+ * whose actions no order can satisfy). The two mutual edges mirror the
+ * {@link fkChildIndex} match: edgeA = the FK on side0 referencing side1, edgeB = the
+ * FK on side1 referencing side0. An edge is *correlated* when the join's cross-side
+ * column equalities force that FK's child column(s) equal to the parent's referenced
+ * column(s) — so the joined partner necessarily references the deleted row and a
+ * RESTRICT necessarily fires.
+ *
+ * Cross-side equalities are collected from the join ON condition (`sel.from[0]` is the
+ * single `join`) **and** the body WHERE, flattened on `AND`, keeping each conjunct
+ * that is `column = column` with both operands resolving to *different* sides
+ * ({@link resolveColumnSide}; an unresolved/ambiguous/same-side term is skipped —
+ * conservatively, it cannot prove correlation).
+ *
+ * Returns `true` iff **at least one** edge is correlated. A non-FK join (or a join on
+ * non-FK columns) correlates neither edge ⇒ `false`, and the caller falls back to the
+ * fixed-order fan-out, deferring to the runtime RESTRICT pre-check on the real data.
+ * This is a strict *reduction* of over-rejection, not perfect precision: a join that
+ * correlates one edge whose *other* edge's FK columns happen to be NULL at delete time
+ * is still rejected (indistinguishable at plan time from the (fo-h) data-referencing
+ * shape — accepted residual conservatism).
+ */
+function joinCorrelatesMutualFk(analysis: JoinViewAnalysis): boolean {
+	const conjuncts: AST.Expression[] = [];
+	const join = analysis.sel.from?.[0];
+	if (join && join.type === 'join' && join.condition) conjuncts.push(...flattenAnd(join.condition));
+	if (analysis.sel.where) conjuncts.push(...flattenAnd(analysis.sel.where));
+
+	const crossEqualities = new Set<string>();
+	for (const conj of conjuncts) {
+		if (conj.type !== 'binary' || conj.operator !== '=') continue;
+		if (conj.left.type !== 'column' || conj.right.type !== 'column') continue;
+		const leftSide = resolveColumnSide(conj.left, analysis.sides);
+		const rightSide = resolveColumnSide(conj.right, analysis.sides);
+		if (leftSide === undefined || rightSide === undefined || leftSide === rightSide) continue;
+		crossEqualities.add(crossEqualityKey(leftSide, conj.left.name, rightSide, conj.right.name));
+	}
+
+	return edgeCorrelated(0, 1, crossEqualities, analysis.sides)
+		|| edgeCorrelated(1, 0, crossEqualities, analysis.sides);
 }
 
 /**

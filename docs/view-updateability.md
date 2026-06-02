@@ -432,13 +432,31 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 > any order** under immediate enforcement — `restrict`+`restrict`, `restrict`+`cascade`
 > (the cascade-into-`restrict` is caught by the transitive RESTRICT pre-walk,
 > `runtime/foreign-key-actions.ts`) — is rejected at **plan time** with
-> `mutual-fk-restrict-delete`, rather than letting the raw transitive-FK error surface
-> at runtime; **no `delete_via` / `target` override resolves it** (a single-side delete
-> is equally blocked — one side direct-`restrict`, the other cascade-into-`restrict`),
-> so the resolution is to break the cycle outside the view — null out the referencing
-> column(s) first, or restructure the offending ON DELETE action — before deleting. (A
-> `deferrable initially deferred` declaration does **not** help: the engine enforces
-> RESTRICT immediately regardless of the deferred clause.) This whole analysis depends
+> `mutual-fk-restrict-delete`, **but only when the join provably correlates at least
+> one mutual FK edge** — i.e. the join's cross-side equalities force a child's FK
+> column(s) equal to the parent's referenced column(s), so the joined rows
+> *necessarily* cross-reference and a RESTRICT necessarily fires. A join on **non-FK
+> columns** (or otherwise correlating *neither* edge), where the joined rows are not
+> proven to cross-reference, is **not** rejected at plan time: it falls back to the
+> fixed-order `[0, 1]` fan-out and defers to the **runtime** RESTRICT pre-check on the
+> actual data — so a delete whose FK columns are NULL (MATCH SIMPLE: no FK match)
+> succeeds rather than being rejected up front (the data-independent over-rejection
+> this gate fixes). The reject is gated at the **whole-reject** level (one correlated
+> edge ⇒ keep the reject): when an edge is correlated, at least one delete direction
+> *provably* trips a RESTRICT, and the other direction is data-dependent and
+> structurally indistinguishable from the one-edge-joined-on shapes (fo-g)/(fo-h), so
+> the conservative reject stands. **Accepted residual conservatism:** a join
+> correlating one edge whose *other* edge's FK columns happen to be NULL at delete time
+> is still rejected (indistinguishable at plan time from the data-referencing shape);
+> and, conversely, a non-correlated join trades the actionable plan-time diagnostic for
+> the **raw runtime RESTRICT error** when the data *does* cross-reference. When the
+> reject does fire, **no `delete_via` / `target` override resolves it** (a single-side
+> delete is equally blocked — one side direct-`restrict`, the other
+> cascade-into-`restrict`), so the resolution is to break the cycle outside the view —
+> null out the referencing column(s) first, or restructure the offending ON DELETE
+> action — before deleting. (A `deferrable initially deferred` declaration does **not**
+> help: the engine enforces RESTRICT immediately regardless of the deferred clause.)
+> This whole analysis depends
 > on **immediate** FK enforcement plus that transitive RESTRICT pre-walk. Under `quereus.update.policy = 'strict'` the
 > engine instead **rejects** any unresolved multi-side delete — it will not even fall
 > back to the FK-many heuristic. A composite-PK side (the captured identity needs a

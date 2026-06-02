@@ -130,7 +130,7 @@ function tableIdentifier(table: TableSchema): AST.IdentifierExpr {
 }
 
 /** Flatten a conjunction (`a AND b AND c`) into its conjuncts. */
-function flattenAnd(expr: AST.Expression): AST.Expression[] {
+export function flattenAnd(expr: AST.Expression): AST.Expression[] {
 	if (expr.type === 'binary' && expr.operator === 'AND') {
 		return [...flattenAnd(expr.left), ...flattenAnd(expr.right)];
 	}
