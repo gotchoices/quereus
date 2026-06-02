@@ -6,7 +6,7 @@
 
 import { expect } from 'chai';
 import { Database } from '../../src/index.js';
-import { assertNoRestrictedChildrenForParentMutation, assertTransitiveRestrictsForParentMutation } from '../../src/runtime/foreign-key-actions.js';
+import { assertNoRestrictedChildrenForParentMutation, assertTransitiveRestrictsForParentMutation, assertLensRestrictsForParentMutation } from '../../src/runtime/foreign-key-actions.js';
 
 async function expectThrows(fn: () => Promise<unknown>, messageContains: string): Promise<Error> {
 	let thrown: unknown;
@@ -249,6 +249,36 @@ describe('runtime FK RESTRICT pre-check', () => {
 			() => assertTransitiveRestrictsForParentMutation(db, parentSchema!, 'update', [1], [2]),
 			"violates RESTRICT from 'tc'",
 		);
+	});
+
+	// Direct call against the lens RESTRICT pre-check — the logical dual of
+	// assertNoRestrictedChildrenForParentMutation, keyed off the *logical* FK action.
+	// Mirrors the assertNoRestrictedChildrenForParentMutation direct-call test above, but for
+	// a logical-only RESTRICT FK over a non-restrict basis FK (the lens-RESTRICT-over-cascade
+	// case the deferred plan-time NOT EXISTS cannot enforce). The basis parent table is what
+	// the DML executor hands the function; it reverse-maps it to the logical parent slot.
+	it('lens pre-check throws when a logical child references the OLD parent values; clean for an unreferenced parent', async () => {
+		await db.exec(`
+			declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) on delete cascade on update cascade) }
+		`);
+		await db.exec('apply schema y');
+		await db.exec(`
+			declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }
+		`);
+		await db.exec('apply schema x');
+		await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+		await db.exec('insert into x.child (id, pid) values (10, 1)');
+
+		const basisParent = db.schemaManager.getTable('y', 'parent');
+		void expect(basisParent, 'y.parent schema').to.exist;
+
+		// oldRow = (id=1, name='a'): a logical child references it ⇒ RESTRICT throw.
+		await expectThrows(
+			() => assertLensRestrictsForParentMutation(db, basisParent!, 'delete', [1, 'a']),
+			"violates RESTRICT from 'child'",
+		);
+		// oldRow = (id=2, name='b'): unreferenced ⇒ returns cleanly.
+		await assertLensRestrictsForParentMutation(db, basisParent!, 'delete', [2, 'b']);
 	});
 
 	it('does not fire for CASCADE / SET NULL / SET DEFAULT — those go through the action walker', async () => {

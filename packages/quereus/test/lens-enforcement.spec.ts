@@ -2336,3 +2336,161 @@ describe('lens enforcement: parent-side FK divergent basis action', () => {
 		}
 	});
 });
+
+describe('lens enforcement: parent-side FK RESTRICT over a non-restrict basis (runtime pre-check)', () => {
+	/**
+	 * Deploys a **basis-with-non-restrict-FK + logical-with-RESTRICT-FK** shape: the basis
+	 * child carries the FK with a non-RESTRICT action `B` (cascade / set null / set default),
+	 * and the logical child re-declares the same FK over the same column **bare** ⇒ RESTRICT.
+	 * The lens RESTRICT must win: a delete/update of the logical parent ABORTs (the children
+	 * are neither cascade-deleted nor nulled/defaulted), enforced by the runtime pre-check
+	 * fired BEFORE the basis op so it observes the pre-cascade child state. The deferred
+	 * plan-time `NOT EXISTS` the collector retains for this case races the same-statement
+	 * basis action and is structurally unable to enforce it — the pre-check is what bites.
+	 * `foreign_keys` defaults on. `childPid` tunes both child FK-column declarations.
+	 */
+	async function deployLensRestrictOverBasis(
+		db: Database,
+		opts: { basisFkTail: string; childPid?: string },
+	): Promise<void> {
+		const childPid = opts.childPid ?? 'pid integer null';
+		await db.exec(`declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, ${childPid}, constraint fk foreign key (pid) references parent(id) ${opts.basisFkTail}) }`);
+		await db.exec('apply schema y');
+		// The logical FK is bare ⇒ RESTRICT for both ops (the lens RESTRICT under test).
+		await db.exec(`declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, ${childPid}, constraint fk_pid foreign key (pid) references parent(id)) }`);
+		await db.exec('apply schema x');
+	}
+
+	it('DELETE — lens RESTRICT over basis CASCADE ABORTs; parent and child both survive (the repro)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete cascade on update cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// The basis CASCADE would delete child 10 mid-statement; the lens RESTRICT pre-check
+			// fires first (pre-cascade) and rejects the parent delete.
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent survives').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child survives, not cascade-deleted').to.deep.equal([{ id: 10, pid: 1 }]);
+			expect(await rows(db, 'select count(*) as n from y.child where id = 10'), 'basis child survives too').to.deep.equal([{ n: 1 }]);
+			// An unreferenced parent still deletes cleanly.
+			await db.exec('delete from x.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 2')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — lens RESTRICT over basis SET NULL ABORTs; child retains its FK value (not nulled)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete set null on update set null' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent survives').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK not nulled').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — lens RESTRICT over basis SET DEFAULT ABORTs; child retains its FK value (not defaulted)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete set default on update set default', childPid: 'pid integer default 0' });
+			await db.exec(`insert into x.parent (id, name) values (0, 'def'), (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent survives').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK not set to default').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE of the referenced key — lens RESTRICT over basis CASCADE ABORTs; benign non-key UPDATE succeeds (short-circuit)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete cascade on update cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// Re-keying the referenced parent would basis-CASCADE the child's pid; the lens
+			// RESTRICT pre-check fires first and rejects it.
+			await expectThrows(() => db.exec('update x.parent set id = 9 where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select id from x.parent'), 'key change rolled back').to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child unchanged').to.deep.equal([{ id: 10, pid: 1 }]);
+			// A benign UPDATE that does not touch the referenced key short-circuits ⇒ succeeds.
+			await db.exec(`update x.parent set name = 'renamed' where id = 1`);
+			expect(await rows(db, 'select name from x.parent where id = 1')).to.deep.equal([{ name: 'renamed' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE of the referenced key — lens RESTRICT over basis SET NULL ABORTs (rows unchanged)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete set null on update set null' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('update x.parent set id = 9 where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select id from x.parent'), 'key change rolled back').to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child unchanged').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE of the referenced key — lens RESTRICT over basis SET DEFAULT ABORTs (rows unchanged)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete set default on update set default', childPid: 'pid integer default 0' });
+			await db.exec(`insert into x.parent (id, name) values (0, 'def'), (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('update x.parent set id = 9 where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select id from x.parent order by id'), 'key change rolled back').to.deep.equal([{ id: 0 }, { id: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child unchanged').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('composite key — lens RESTRICT over basis CASCADE ABORTs a delete/update of the referenced composite key', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk foreign key (a, b) references parent(px, py) on delete cascade on update cascade) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'a'), (3, 4, 'b')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2)'); // references (1,2)
+
+			await expectThrows(() => db.exec('delete from x.parent where px = 1 and py = 2'), /constraint|foreign|fk/i);
+			await expectThrows(() => db.exec('update x.parent set px = 9 where px = 1 and py = 2'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select id, a, b from x.child where id = 10'), 'child unchanged').to.deep.equal([{ id: 10, a: 1, b: 2 }]);
+			// An unreferenced composite parent still deletes cleanly.
+			await db.exec('delete from x.parent where px = 3 and py = 4');
+			expect(await rows(db, 'select count(*) as n from x.parent where px = 3')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('pragma gate — foreign_keys = false ⇒ no lens RESTRICT pre-check (basis CASCADE runs, child cascade-deleted)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete cascade on update cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('pragma foreign_keys = false');
+			// With FKs off, neither the lens pre-check nor the basis action fires — the parent
+			// deletes and the child is orphaned (matching the physical parent-side gate).
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child orphaned (no enforcement)').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});

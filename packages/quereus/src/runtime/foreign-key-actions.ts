@@ -163,6 +163,14 @@ export async function assertTransitiveRestrictsForParentMutation(
 		log('TRANSITIVE step1: parent=%s op=%s', parentTable.name, operation);
 		await assertNoRestrictedChildrenForParentMutation(db, parentTable, operation, oldRow, newRow);
 
+		// Step 1b: lens RESTRICT pre-check — the logical dual, keyed off the *logical* FK
+		// action. Fired here (pre-basis-op, riding the same pre-mutation timing) so a logical
+		// RESTRICT over a non-restrict basis FK observes the pre-cascade child state, which a
+		// deferred commit-time `NOT EXISTS` cannot. Direct (non-recursive): transitivity
+		// through basis cascades rides this enclosing walk (a nested basis cascade re-enters
+		// the DML executor and re-fires this walker — and the lens scan — at the next level).
+		await assertLensRestrictsForParentMutation(db, parentTable, operation, oldRow, newRow);
+
 		// Step 2: recurse through cascading children that would propagate a
 		// referenced-column change. For each FK whose action would rewrite or
 		// delete child rows, scan the matching children NOW (pre-mutation, so
@@ -501,6 +509,57 @@ export async function executeLensForeignKeyActions(
 type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefault'>;
 
 /**
+ * Resolves a logical parent FK ref's referenced OLD (and, for UPDATE, NEW) values off the
+ * basis parent write row — the extraction + skip logic shared by the lens cascade walker
+ * ({@link executeLensFkActionsForParentSlot}) and the lens RESTRICT pre-check
+ * ({@link assertLensRestrictsForParentMutation}), factored out so the two paths cannot drift.
+ *
+ * Maps each logical parent referenced column → its basis column (via `parentMap`) → basis
+ * index, and reads the values off `oldRow` / `newRow` by basis index. Returns `undefined`
+ * (⇒ skip this ref) when:
+ *  - a referenced column has no plain basis projection (cannot read its basis value);
+ *  - MATCH SIMPLE: any OLD referenced value is NULL (participates in no FK match); or
+ *  - UPDATE: no referenced parent column actually changed (`sqlValuesEqual` short-circuit).
+ */
+function resolveLensFkParentReferencedValues(
+	ref: LogicalParentFkRef,
+	parentMap: Map<string, string>,
+	basisParentTable: TableSchema,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow: Row | undefined,
+): { oldParentValues: SqlValue[]; newParentValues?: SqlValue[] } | undefined {
+	// Logical referenced column → basis column → basis index. A column with no plain basis
+	// projection disqualifies the ref (cannot read its basis value).
+	const basisIndices: number[] = [];
+	for (const logicalCol of ref.parentLogicalColumns) {
+		const basisColName = parentMap.get(logicalCol.toLowerCase());
+		const basisIdx = basisColName !== undefined
+			? basisParentTable.columnIndexMap.get(basisColName.toLowerCase())
+			: undefined;
+		if (basisIdx === undefined) return undefined;
+		basisIndices.push(basisIdx);
+	}
+
+	// MATCH SIMPLE: a NULL referenced value participates in no FK match.
+	const oldParentValues = basisIndices.map(i => oldRow[i]) as SqlValue[];
+	if (oldParentValues.some(v => v === null || v === undefined)) return undefined;
+
+	// UPDATE short-circuit: skip when no referenced parent column actually changed.
+	let newParentValues: SqlValue[] | undefined;
+	if (operation === 'update' && newRow !== undefined) {
+		let anyChanged = false;
+		for (const i of basisIndices) {
+			if (!sqlValuesEqual(oldRow[i] as SqlValue, newRow[i] as SqlValue)) { anyChanged = true; break; }
+		}
+		if (!anyChanged) return undefined;
+		newParentValues = basisIndices.map(i => newRow[i]) as SqlValue[];
+	}
+
+	return { oldParentValues, newParentValues };
+}
+
+/**
  * Fires the logical cascade for one logical parent slot backed by `basisParentTable`.
  * For each referencing logical FK with a non-RESTRICT op-action it: elides when an
  * equivalent basis FK with an **agreeing** op-action already propagates over the basis
@@ -548,37 +607,13 @@ async function executeLensFkActionsForParentSlot(
 			continue;
 		}
 
-		// Read the parent's referenced OLD (and NEW) values off the basis row: logical
-		// referenced column → basis column → basis index. A column with no plain basis
-		// projection disqualifies the cascade (cannot read its basis value).
-		const basisIndices: number[] = [];
-		let mappable = true;
-		for (const logicalCol of ref.parentLogicalColumns) {
-			const basisColName = parentMap.get(logicalCol.toLowerCase());
-			const basisIdx = basisColName !== undefined
-				? basisParentTable.columnIndexMap.get(basisColName.toLowerCase())
-				: undefined;
-			if (basisIdx === undefined) { mappable = false; break; }
-			basisIndices.push(basisIdx);
-		}
-		if (!mappable) continue;
+		// Read the parent's referenced OLD (and NEW) values off the basis row, applying the
+		// shared MATCH SIMPLE + UPDATE referenced-column-change skip rules. `undefined` ⇒
+		// skip this ref (unmappable column, NULL referenced value, or no key change).
+		const values = resolveLensFkParentReferencedValues(ref, parentMap, basisParentTable, operation, oldRow, newRow);
+		if (!values) continue;
 
-		// MATCH SIMPLE: a NULL referenced value participates in no FK match ⇒ no cascade.
-		const oldParentValues = basisIndices.map(i => oldRow[i]) as SqlValue[];
-		if (oldParentValues.some(v => v === null || v === undefined)) continue;
-
-		// UPDATE short-circuit: skip when no referenced parent column actually changed.
-		let newParentValues: SqlValue[] | undefined;
-		if (operation === 'update' && newRow !== undefined) {
-			let anyChanged = false;
-			for (const i of basisIndices) {
-				if (!sqlValuesEqual(oldRow[i] as SqlValue, newRow[i] as SqlValue)) { anyChanged = true; break; }
-			}
-			if (!anyChanged) continue;
-			newParentValues = basisIndices.map(i => newRow[i]) as SqlValue[];
-		}
-
-		await issueLensFkAction(db, ref, action, operation, oldParentValues, newParentValues);
+		await issueLensFkAction(db, ref, action, operation, values.oldParentValues, values.newParentValues);
 	}
 }
 
@@ -644,5 +679,140 @@ async function issueLensFkAction(
 			await db._execWithinTransaction(sql, oldParentValues);
 			break;
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lens RESTRICT pre-check — the logical dual of assertNoRestrictedChildrenForParentMutation.
+//
+// A *logical* FK with a RESTRICT op-action over a *non-restrict basis* FK (or no basis FK)
+// cannot be enforced by the deferred plan-time `NOT EXISTS` the collector retains: a
+// same-statement basis CASCADE / SET NULL / SET DEFAULT mutates the basis children
+// mid-statement, so the deferred check would observe the *post-cascade* state and pass.
+// Mirroring the physical RESTRICT pre-check, this scan is fired BEFORE the basis op (it
+// rides assertTransitiveRestrictsForParentMutation, which the DML executor invokes before
+// vtab.update), so it observes the *pre-cascade* child state and rejects the mutation.
+//
+// Keyed off the *logical* FK action (the physical pre-check is keyed off the basis action
+// and scans declared TableSchema.foreignKeys, so it never sees a logical-only FK). The scan
+// is direct (non-recursive); transitivity rides the enclosing basis transitive walk.
+// ---------------------------------------------------------------------------
+
+/**
+ * Backend-agnostic RESTRICT pre-check for a *logical* parent-side FK, the logical dual of
+ * {@link assertNoRestrictedChildrenForParentMutation}. Fired by the runtime DML executor
+ * (via {@link assertTransitiveRestrictsForParentMutation}) BEFORE the basis parent DELETE /
+ * UPDATE hits the vtab, so it observes the pre-cascade child state — the timing a deferred
+ * `NOT EXISTS` cannot achieve against a same-statement basis cascade.
+ *
+ * No-op (early return) when `foreign_keys` is off, or when no lens slot resolves to
+ * `basisParentTable` as its single basis spine — so non-lens DML pays only one cheap scan
+ * over the lens slots. The single-source-spine boundary is identical to the cascade walker's
+ * ({@link executeLensForeignKeyActions}).
+ */
+export async function assertLensRestrictsForParentMutation(
+	db: Database,
+	basisParentTable: TableSchema,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow?: Row,
+): Promise<void> {
+	if (!db.options.getBooleanOption('foreign_keys')) return;
+
+	const sm = db.schemaManager;
+	const basisNameLower = basisParentTable.name.toLowerCase();
+	const basisSchemaLower = basisParentTable.schemaName.toLowerCase();
+
+	// Reverse-map basis → logical parent slots: every lens slot whose single basis spine is
+	// `basisParentTable` (usually 0 or 1). A multi-source / decomposition parent resolves to
+	// no single spine and never matches (the documented boundary).
+	for (const schema of sm._getAllSchemas()) {
+		for (const parentSlot of schema.getAllLensSlots()) {
+			const basis = resolveSlotBasisSource(parentSlot, sm);
+			if (!basis) continue;
+			if (basis.name.toLowerCase() !== basisNameLower) continue;
+			if (basis.schemaName.toLowerCase() !== basisSchemaLower) continue;
+			await assertLensRestrictsForParentSlot(db, parentSlot, basisParentTable, operation, oldRow, newRow);
+		}
+	}
+}
+
+/**
+ * Enforces the RESTRICT logical FKs referencing one logical parent slot backed by
+ * `basisParentTable`. For each referencing logical FK with a RESTRICT op-action it reads the
+ * parent's referenced OLD values off the basis write row (shared
+ * {@link resolveLensFkParentReferencedValues} — MATCH SIMPLE + UPDATE short-circuit) and
+ * scans the logical child view for a surviving reference, throwing on a match.
+ */
+async function assertLensRestrictsForParentSlot(
+	db: Database,
+	parentSlot: LensSlot,
+	basisParentTable: TableSchema,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow: Row | undefined,
+): Promise<void> {
+	const sm = db.schemaManager;
+	const refs = findLogicalParentFkRefs(parentSlot, sm);
+	if (refs.length === 0) return;
+
+	// Maps each logical parent referenced column → its basis column, so the OLD referenced
+	// values can be read off the basis write row by basis index.
+	const parentMap = logicalToBasisColumnMap(parentSlot);
+
+	for (const ref of refs) {
+		const { fk } = ref;
+		const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
+		// Only RESTRICT is enforced here — the non-RESTRICT actions are *propagated* by the
+		// cascade walker (executeLensForeignKeyActions), not rejected.
+		if (action !== 'restrict') continue;
+
+		const values = resolveLensFkParentReferencedValues(ref, parentMap, basisParentTable, operation, oldRow, newRow);
+		if (!values) continue;
+
+		await assertNoLensChildReferences(db, ref, parentSlot, operation, values.oldParentValues);
+	}
+}
+
+/**
+ * Scans the logical child *view* (schema-qualified, logical column names — exactly what
+ * {@link issueLensFkAction} reads) for a row still referencing the OLD parent values, and
+ * throws a RESTRICT {@link QuereusError} (message parallel to the physical pre-check's,
+ * matcher-compatible with `/constraint|foreign|fk/i`) when one survives.
+ */
+async function assertNoLensChildReferences(
+	db: Database,
+	ref: LogicalParentFkRef,
+	parentSlot: LensSlot,
+	operation: 'delete' | 'update',
+	oldParentValues: SqlValue[],
+): Promise<void> {
+	const childTable = ref.childSlot.logicalTable;
+	const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+		? `${quoteIdentifier(childTable.schemaName)}.`
+		: '';
+	const qualifiedChild = `${schemaPrefix}${quoteIdentifier(childTable.name)}`;
+	const whereClause = ref.childLogicalColumns.map(c => `${quoteIdentifier(c)} = ?`).join(' and ');
+	const sql = `select 1 from ${qualifiedChild} where ${whereClause} limit 1`;
+
+	log('LENS RESTRICT check (%s): %s with params %o', operation, sql, oldParentValues);
+
+	const stmt = db.prepare(sql);
+	try {
+		stmt.bindAll(oldParentValues);
+		let referenced = false;
+		for await (const _row of stmt._iterateRowsRaw()) {
+			referenced = true;
+			break;
+		}
+		if (referenced) {
+			const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
+			throw new QuereusError(
+				`FOREIGN KEY constraint failed: ${opName} on '${parentSlot.logicalTable.name}' violates RESTRICT from '${childTable.name}'`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	} finally {
+		await stmt.finalize();
 	}
 }
