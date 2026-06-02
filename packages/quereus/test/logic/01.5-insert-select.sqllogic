@@ -226,4 +226,12 @@ insert into dup_cols (a, b, A) values (1, 2, 3);
 select a, b from dup_cols order by a;
 → []
 
+-- false-positive guard: the check keys on exact-name collision, so a legitimate
+-- distinct-column list still works — including columns that merely share a prefix.
+create table prefix_cols (ab integer primary key, abc integer null);
+insert into prefix_cols (ab, abc) values (1, 2);
+select ab, abc from prefix_cols order by ab;
+→ [{"ab":1,"abc":2}]
+drop table prefix_cols;
+
 drop table dup_cols;

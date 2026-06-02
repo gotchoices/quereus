@@ -868,6 +868,20 @@ raise `conflicting-assignment` naming **both** colliding view columns — a frie
 message than the base name reported twice. The multi-source join spine relies on the
 base backstop (it sees only base names anyway).
 
+The INSERT family is guarded by the same reject-unconditionally rule, also layered in
+`building/insert.ts`. An `on conflict do update set b = 1, b = 2` is caught by a
+name-based `seenTargets` set in `buildUpsertClausePlans` (this path never routes through
+the base UPDATE builder, so it carries its own backstop), rejecting with `duplicate
+assignment to column '<col>' in ON CONFLICT DO UPDATE`. An explicit duplicate INSERT
+column list (`insert into t (a, a) …`) is caught up front in `buildInsertStmt` with
+`column '<col>' specified more than once in INSERT into '<table>'`. That same column-list
+guard is the single authoritative backstop for the INSERT analogue of the multi-source
+collision: every view INSERT spine (single-source, multi-source join, decomposition)
+re-plans through `buildInsertStmt` with an explicit base-column list, so two view columns
+that lower to one base column land a duplicate there and are rejected — naming the
+**base** column. Unlike the UPDATE spines, the INSERT spines add no view-aware
+"both target base column" message; they lean on the generic column-list backstop.
+
 Diagnostics include a suggestion when one applies — for instance, `no-default` includes the `with tags ("quereus.update.default_for.col" = ...)` fragment ready to copy.
 
 `query_plan().properties` includes the per-column `updateLineage` summary so the user can inspect propagation behavior without issuing a mutation.

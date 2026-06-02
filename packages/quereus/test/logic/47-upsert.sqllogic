@@ -165,6 +165,18 @@ ON CONFLICT (id) DO UPDATE SET name = 'one', name = 'two';
 SELECT id, name FROM upsert_target;
 → [{"id":1,"name":"Updated"}]
 
+-- The duplicate-target guard is case-insensitive: `name` and `NAME` collide.
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'x@test.com', 'X')
+ON CONFLICT (id) DO UPDATE SET name = 'one', NAME = 'two';
+-- error: duplicate assignment
+
+-- A legitimate DO UPDATE assigning two *distinct* columns still works — the
+-- guard keys on exact-name collision, never on distinct columns.
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'x@test.com', 'X')
+ON CONFLICT (id) DO UPDATE SET email = 'multi@test.com', name = 'Multi';
+SELECT id, email, name FROM upsert_target;
+→ [{"id":1,"email":"multi@test.com","name":"Multi"}]
+
 -- Clean up
 DROP TABLE upsert_test;
 DROP TABLE upsert_target;
