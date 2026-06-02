@@ -274,7 +274,7 @@ function projectionOutputNames(query: AST.QueryExpr): Set<string> | null {
  * callers: the per-column substitution rule and how to treat an unresolvable
  * scope or an embedded data-modifying subquery.
  */
-export interface ScopeContext {
+interface ScopeContextBase {
 	/**
 	 * Build the per-column substitution closure for ONE scope, given the set of
 	 * column names shadowed by this (and enclosing) scopes and whether the scope is
@@ -284,22 +284,28 @@ export interface ScopeContext {
 	 * unqualified, correlation-ambiguous reference).
 	 */
 	makeSubstitute(shadowed: ReadonlySet<string>, tainted: boolean): (col: AST.ColumnExpr) => AST.Expression | undefined;
-	/**
-	 * Policy when a scope's FROM columns are unresolvable (`collectFromColumnNames`
-	 * returns `null`): `'taint'` carries `tainted = true` forward (the substitution
-	 * decides per-reference), `'reject'` raises {@link rejectUnresolvableScope}
-	 * immediately rather than risk a silent mis-bind.
-	 */
-	readonly unresolvableScope: 'taint' | 'reject';
-	/**
-	 * Raise the structured diagnostic for an unresolvable scope. Required (and only
-	 * called) when `unresolvableScope === 'reject'`; a `'taint'` policy never invokes
-	 * it, so it may be omitted there.
-	 */
-	rejectUnresolvableScope?(): never;
 	/** Raise the structured diagnostic for an embedded data-modifying (INSERT/UPDATE/DELETE) subquery. */
 	rejectDmlSubquery(): never;
 }
+
+/**
+ * The caller-specific knobs of a scope-aware substitution. The descent
+ * ({@link transformScopedQuery}) owns the shadow accumulation / taint
+ * propagation / sibling-leg scoping; this object owns only what differs between
+ * callers: the per-column substitution rule and how to treat an unresolvable
+ * scope or an embedded data-modifying subquery.
+ *
+ * The `unresolvableScope` policy — for when a scope's FROM columns are
+ * unresolvable (`collectFromColumnNames` returns `null`) — is a discriminated
+ * union: `'taint'` carries `tainted = true` forward (the substitution decides
+ * per-reference); `'reject'` raises `rejectUnresolvableScope` immediately rather
+ * than risk a silent mis-bind, and the union requires the handler be supplied
+ * exactly with that policy (so the descent never needs a non-null assertion).
+ */
+export type ScopeContext = ScopeContextBase & (
+	| { readonly unresolvableScope: 'taint'; rejectUnresolvableScope?: undefined }
+	| { readonly unresolvableScope: 'reject'; rejectUnresolvableScope(): never }
+);
 
 const NO_SHADOW: ReadonlySet<string> = new Set<string>();
 
@@ -352,7 +358,7 @@ export function transformScopedQuery(
 	let innerShadow: ReadonlySet<string>;
 	let scopeTainted: boolean;
 	if (local === null) {
-		if (scope.unresolvableScope === 'reject') scope.rejectUnresolvableScope!();
+		if (scope.unresolvableScope === 'reject') scope.rejectUnresolvableScope();
 		// Taint: shadowing cannot be proven, so the enclosing shadow set is kept and
 		// the scope (and everything nested in it) is marked tainted.
 		innerShadow = shadowed;
