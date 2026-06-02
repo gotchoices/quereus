@@ -2539,9 +2539,11 @@ describe('Property-Based Tests', () => {
 		// path's `PutGet + lineage` test): `update v set bp = NV` stores the BASE value
 		// `t.b = NV - 1` and the view reads back `bp = NV` (PutGet). Statically the column's
 		// UpdateSite is `base` (t.b) WITH an `inverse`, reported writable. The identity-only
-		// `deriveViewColumns` reader still classifies it `computed` (so INSERT stays
-		// inverse-blind and the parity test above is untouched) — the write path reads the
-		// richer plan lineage separately via resolveBaseSite. docs § Scalar Invertibility.
+		// `deriveViewColumns` reader still classifies it `computed` (keeping the parity test
+		// above untouched) — but that no longer governs insertability: INSERT now reads the
+		// same `writableSites` map and rejects this column because its site carries an
+		// `inverse` (inverse columns stay non-insertable on both spines). The UPDATE write
+		// path likewise reads the richer plan lineage via resolveBaseSite. docs § Scalar Invertibility.
 		it('PutGet + lineage: an inverse-profile column (b + 1) is writable through the single-source view', async () => {
 			await createBase();
 			const body = 'select id, a, b + 1 as bp from t';

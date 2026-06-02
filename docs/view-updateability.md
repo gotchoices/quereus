@@ -588,8 +588,8 @@ An `opaque` (non-invertible) or `null-extended` column carries no writable site,
 write to it still raises `no-inverse` on either spine. The identity-only AST reader
 (`classifyProjectionExpr` / `identityBaseColumn` / `viewColumnsFromUpdateLineage`) is
 deliberately *not* widened: it remains the `deriveViewColumns`-parity surface (pinned by
-`test/property.spec.ts`) and backs single-source INSERT routing, while the dynamic UPDATE
-path reads the richer plan-node lineage separately. The static `view_info` / `column_info`
+`test/property.spec.ts`), while the dynamic UPDATE **and** INSERT paths read the richer
+plan-node lineage separately (see **INSERT and the passthrough contract** below). The static `view_info` / `column_info`
 surfaces read that same plan-node lineage (`baseSiteOf`, which treats *any* `base` site —
 identity, passthrough, or inverse — as writable) and report the column writable regardless
 of source arity — now matching the dynamic single-source **and** multi-source UPDATE.
