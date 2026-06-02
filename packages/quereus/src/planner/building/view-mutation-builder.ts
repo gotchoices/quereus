@@ -226,9 +226,13 @@ function withKeyCapture(ctx: PlanningContext, capture: MultiSourceKeyCapture): P
  *    even though the changed row no longer satisfies the predicate. The capture is
  *    built (and materialized) by {@link buildViewMutation} and shared with the
  *    both-sides base ops, so it is passed in rather than rebuilt here.
- *  - **DELETE** re-queries the view restricted to the user predicate, captured `pre`
- *    (before the base op fires — the rows still match the predicate and are about to
- *    vanish), so the projected columns resolve naturally against the view.
+ *  - **DELETE** re-queries the join body restricted to the identifying predicate,
+ *    captured `pre` (before the base op fires — the rows still match the predicate and
+ *    are about to vanish; `returningTiming: 'pre'`; `buildMultiSourceDeleteReturning`).
+ *    The RETURNING columns are recomputed in **base terms** over the planned `joinNode`
+ *    (shared with the UPDATE path via `buildMultiSourceReturningProjection`), not by
+ *    reference to the body `root`'s output attribute ids — so a body-computed column
+ *    whose intermediate id project-merge eliminates still surfaces.
  */
 function buildMultiSourceReturning(
 	ctx: PlanningContext,
