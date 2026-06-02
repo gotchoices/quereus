@@ -146,6 +146,21 @@ update pt_v2 set bo = 'X' where id = 1;
 insert into pt_v2 (id, bc) values (3, 'new');
 -- error: non-invertible
 
+-- Filtered view + passthrough: the writable-site SET routing is orthogonal to the
+-- conjoined body WHERE, so the filter still gates a passthrough write exactly as it
+-- does a rename write (cf. AliasView). At this point pt_t = (1,'yo',5),(2,'world',99).
+create view pt_vf as select id, b collate nocase as bc from pt_t where n > 10;
+
+-- a visible row (id=2, n=99 > 10): the passthrough write lands in the base column.
+update pt_vf set bc = 'zz' where id = 2;
+select id, b from pt_t order by id;
+→ [{"id":1,"b":"yo"},{"id":2,"b":"zz"}]
+
+-- a row outside the filter (id=1, n=5): the conjoined predicate matches no base row.
+update pt_vf set bc = 'nope' where id = 1;
+select id, b from pt_t order by id;
+→ [{"id":1,"b":"yo"},{"id":2,"b":"zz"}]
+
 -- ===================================
 -- Single-source ↔ multi-source parity for a PASSTHROUGH (collate) column. The same
 -- `note collate nocase as note` projection of a base column is writable on BOTH mutation
