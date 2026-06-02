@@ -301,6 +301,23 @@ create view ax_jv_comp as
 update ax_jv_comp set note = 'q' where c1 = 1;
 -- error: cannot write through
 
+-- ...but a single-side write to the SIMPLE-PK side is allowed even when the OTHER
+-- (untouched) side has a COMPOSITE PK: only the touched side's PK backs the identity
+-- capture, so the composite key on the untouched side is never required. (Parity the
+-- per-side key capture preserves — view-mutation-retire-ast-roundtrip.)
+create table ax_cpk_p (a integer, b integer, lbl text, primary key (a, b));
+create table ax_spk_c (sid integer primary key, pa integer, note text);
+insert into ax_cpk_p values (1, 1, 'L1');
+insert into ax_spk_c values (10, 1, 'n');
+create view ax_jv_simpside as
+    select c.sid as sid, c.note as note, p.lbl as lbl
+    from ax_spk_c c join ax_cpk_p p on p.a = c.pa;
+-- run
+update ax_jv_simpside set note = 'm' where sid = 10;
+-- run
+select sid, note, lbl from ax_jv_simpside order by sid;
+→ [{"sid":10,"note":"m","lbl":"L1"}]
+
 -- Cross-source SET value (assign a column from the other base table) -> rejected.
 create view ax_jv_x as
     select c.cid as cid, c.note as note, p.pv as pv from ax_child c join ax_parent p on p.pid = c.pref;
@@ -1183,6 +1200,10 @@ delete from rjoin where cid = 1 returning *;
 -- the delete removed only the cid=1 child row; cid=2 remains.
 select cid, note, label from rjoin order by cid;
 → [{"cid":2,"note":"b","label":"P20x"}]
+
+-- A multi-source DELETE RETURNING of a body-COMPUTED view column is NOT yet covered
+-- here: the planned-body-`root` projection path cannot surface computed columns —
+-- tracked by fix/view-mutation-multisource-delete-returning-computed-column.
 
 -- --- (d) multi-source update RETURNING where the predicate filters on a column the
 --         update rewrites — per-row identity capture (the changed rows no longer
