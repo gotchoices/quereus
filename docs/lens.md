@@ -183,6 +183,8 @@ Soundness is gated by the obligation **kind** — a false key FD is a *correctne
 
 Only a logical schema's lens slot yields any FD; a plain view / MV has none, so the boundary node is inlined only when ≥1 FD is contributed. The contribution is **read-side only** — the write path (mutation decomposition) walks the compiled body over basis tables, where the boundary node never appears.
 
+The decomposition write path (`planner/mutation/decomposition.ts`) is held to the three backward-direction round-trip laws (PutGet / GetPut / forward-backward lineage agreement) by the **Family C — decomposition fan-out** family of `describe('View Round-Trip Laws')` in `test/property.spec.ts` (columnar split with an optional outer-joined member, an EAV pivot, and a surrogate split; deferred shapes asserted to reject). See [view-updateability §Round-Trip Laws](view-updateability.md#round-trip-laws-and-the-derived-backward-walk).
+
 ## Computed and Generated Columns
 
 A logical column need not map to stored basis data — it can be **computed** by the lens `get`. Such a column has `computed` lineage ([view-updateability §The Update Site Model](view-updateability.md#the-update-site-model)): reads evaluate the expression, writes are rejected. This is how a generated/derived column is expressed — there is no separate `generated as` construct at the logical layer; a column is generated precisely when its lens body computes it and no `put` inverse exists. A computed column with an invertible body remains writable, by the ordinary scalar-invertibility rules; "generated" is just the non-invertible end of that spectrum.

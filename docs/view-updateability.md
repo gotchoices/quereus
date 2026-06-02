@@ -970,20 +970,41 @@ a planned tree that surfaces it. It lands first and standalone as
 engine surface), then `view-mutation-plan-node-substrate` extends the same block to
 the planned multi-source tree as it threads each operator's backward method.
 
-> **Landed (Tier A).** The single-source projection-and-filter Tier A of this block
-> has shipped as `describe('View Round-Trip Laws')` in `test/property.spec.ts` — the
-> backward-direction soundness net, the dual of the forward-direction **Key
-> Soundness** block in the same file. It exercises the view-body zoo (bare `select *`,
-> explicit / rename projection, computed column, equality-filter, alias-qualified
-> body) over random base seeds, with `numRuns: 50` per law and a pure law core +
-> negative self-test mirroring Key Soundness. Lineage agreement is realized as: every
-> forward key (`keysOf` / `isUnique`) is `base`-writable and, traced through
-> `deriveViewColumns` plus the σ filter-constants, reconstructs the base PK, and a
-> fully-surviving base PK is advertised as a forward key. The behavioral laws restrict
-> to the shapes the Phase-1 rewrite admits; `LIMIT`/`OFFSET`/`DISTINCT` bodies are
-> asserted to *reject* (never silently widen). `view-mutation-plan-node-substrate`
-> threads each operator's backward method against this same block as it extends the
-> zoo to the planned multi-source tree.
+> **Landed (Tier A + multi-source + decomposition).** This block has shipped as
+> `describe('View Round-Trip Laws')` in `test/property.spec.ts` — the backward-direction
+> soundness net, the dual of the forward-direction **Key Soundness** block in the same
+> file. Each family is asserted under the same three laws (PutGet / GetPut / forward-
+> backward lineage agreement) with a pure law core + a negative self-test that proves
+> the core reds on an injected violation.
+>
+> - **Tier A — single-source projection-and-filter.** The view-body zoo (bare `select *`,
+>   explicit / rename projection, computed column, equality-filter, alias-qualified
+>   body) over random base seeds, `numRuns: 50` per law. Lineage agreement is realized
+>   as: every forward key (`keysOf` / `isUnique`) is `base`-writable and, traced through
+>   `deriveViewColumns` plus the σ filter-constants, reconstructs the base PK, and a
+>   fully-surviving base PK is advertised as a forward key. `LIMIT`/`OFFSET`/`DISTINCT`
+>   bodies are asserted to *reject* (never silently widen).
+> - **Family B — multi-source key-preserving inner join** (`describe('multi-source inner
+>   join')`). Update touching either side or **both** (the both-sides identity-capture
+>   path), delete (FK-child default + a `delete_via=parent` variant), and insert with the
+>   shared key both **minted** (the `integer-auto` / per-row surrogate envelope) and
+>   **directly supplied**. PutGet cross-checks the post-state view image against the
+>   union of both base images; the static plan-lineage dual checks every join output
+>   column is `base`-writable. Undecomposable shapes (outer-join insert, self-join,
+>   `select *`, composite PK, cross-source `set`) are asserted to *reject* with the
+>   structured diagnostic (`unsupported-join` / `cross-source-assignment`).
+> - **Family C — n-way decomposition fan-out** (`describe('decomposition fan-out')`),
+>   driven by `quereus.lens.decomp.*` tags via `buildAdvertisementsFromTags` (no custom
+>   module). Columnar split with an **optional (outer-joined) member**, an **EAV pivot**
+>   member, and a **surrogate** split; PutGet over INSERT (anchor-first, one-per-member,
+>   per-row optional gate, EAV triples, surrogate minted once and threaded into every
+>   member's key — assert all members agree), UPDATE routed to the backing member, and
+>   anchor-last DELETE, cross-checking the view image against the union of member images.
+>   Lineage agreement checks the advertisement member map reconstructs every forward key.
+>   Deferred shapes (`unsupported-decomposition-predicate`, `unsupported-decomposition-update`,
+>   non-integer surrogate → `no-default`, composite shared key → `unsupported-decomposition-key`)
+>   are asserted to *reject*. `checkedNodes`-style guards keep each family from
+>   degenerating into all-skips or all-rejects.
 
 ### The predicate-honest complement
 

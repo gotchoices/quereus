@@ -2063,6 +2063,20 @@ describe('Property-Based Tests', () => {
 			}));
 		}
 
+		/**
+		 * Reject-don't-widen assertion shared by Families B and C: a deferred shape
+		 * must raise a *structured* mutation diagnostic (`reason`) rather than widen
+		 * into a wrong/empty result. Requires the diagnostic to be present and to
+		 * carry exactly `reason` — a bare error or a silent success both fail here.
+		 */
+		async function expectMutationReject(sql: string, reason: string): Promise<void> {
+			let err: unknown;
+			try { await db.exec(sql); } catch (e) { err = e; }
+			if (err === undefined) throw new Error(`expected '${sql}' to be rejected (${reason}) but it succeeded`);
+			const got = (err as { mutationDiagnostic?: { reason?: string } }).mutationDiagnostic?.reason;
+			expect(got, `expected structured mutationDiagnostic for '${sql}', got: ${(err as Error).message}`).to.equal(reason);
+		}
+
 		/** Stable per-cell signature (mirrors Key Soundness `tupleSig`). */
 		function cellSig(v: SqlValue): string {
 			if (v === null || v === undefined) return 'N';
@@ -2692,10 +2706,11 @@ describe('Property-Based Tests', () => {
 				await createJoinBase();
 				await fc.assert(fc.asyncProperty(
 					parentArb, childArb,
-					fc.constantFrom('update-child', 'update-parent', 'delete'),
+					fc.constantFrom('update-child', 'update-parent', 'update-both', 'delete'),
 					fc.integer({ min: 1, max: 9 }),    // cc predicate value K
 					fc.integer({ min: 10, max: 20 }),  // assignment value NV (disjoint from seeds)
 					async (parents, children, op, K, NV) => {
+						const NV2 = NV + 5; // a second, disjoint value for the parent side
 						const { parents: P, children: C } = await seedJoin(parents, children);
 						const ppSet = new Set(P.map(p => p.pp));
 						const joined = (c: Child): boolean => ppSet.has(c.pr);
@@ -2709,6 +2724,14 @@ describe('Property-Based Tests', () => {
 							await db.exec(`update jv set pv = ${NV} where cc = ${K}`);
 							const target = C.find(c => c.cc === K && joined(c));
 							if (target) oParents = oParents.map(p => p.pp === target.pr ? { ...p, pv: NV } : p);
+						} else if (op === 'update-both') {
+							// per-side base ops in one statement: child cv + parent pv. This is
+							// the both-sides identity-capture path (multi-source.ts Phase 2a) —
+							// a predicate on the child PK pins the rows before either side fires.
+							await db.exec(`update jv set cv = ${NV}, pv = ${NV2} where cc = ${K}`);
+							oChildren = oChildren.map(c => (c.cc === K && joined(c)) ? { ...c, cv: NV } : c);
+							const target = C.find(c => c.cc === K && joined(c));
+							if (target) oParents = oParents.map(p => p.pp === target.pr ? { ...p, pv: NV2 } : p);
 						} else {
 							await db.exec(`delete from jv where cc = ${K}`);
 							oChildren = oChildren.filter(c => !(c.cc === K && joined(c)));
@@ -2792,6 +2815,590 @@ describe('Property-Based Tests', () => {
 							expectedView, ['cc', 'cv', 'pv']);
 					},
 				), { numRuns: 60 });
+			});
+
+			// ----- Family B: insert with the shared key supplied directly (no mint) -----
+			// The dual of the minted-surrogate insert above: when the join body EXPOSES
+			// the shared key, the insert supplies it directly and the envelope mints
+			// nothing — the same key value threads into both bases.
+			it('PutGet: insert with the shared key supplied directly threads it to both bases (no mint)', async () => {
+				await db.exec('drop view if exists dkv');
+				await db.exec('drop table if exists dk_a');
+				await db.exec('drop table if exists dk_b');
+				await db.exec('create table dk_a (k integer primary key, av integer null) using memory');
+				await db.exec('create table dk_b (k integer primary key, bv integer null) using memory');
+				await db.exec('create view dkv as select a.k as k, a.av as av, b.bv as bv from dk_a a join dk_b b on b.k = a.k');
+
+				let inserted = 0;
+				await fc.assert(fc.asyncProperty(
+					fc.array(fc.record({ k: fc.integer({ min: 1, max: 9 }), av: fc.integer({ min: 1, max: 9 }), bv: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
+					fc.integer({ min: 20, max: 40 }),  // fresh shared key (disjoint from the seed range)
+					fc.integer({ min: 1, max: 9 }), fc.integer({ min: 1, max: 9 }),
+					async (seed, K, av, bv) => {
+						await db.exec('delete from dk_a');
+						await db.exec('delete from dk_b');
+						const seen = new Set<number>(); const kept: { k: number; av: number; bv: number }[] = [];
+						for (const r of seed) {
+							if (seen.has(r.k)) continue; seen.add(r.k);
+							await db.exec(`insert into dk_a values (${r.k}, ${r.av})`);
+							await db.exec(`insert into dk_b values (${r.k}, ${r.bv})`);
+							kept.push(r);
+						}
+						await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`);
+						inserted++;
+						// Both bases received the SAME directly-supplied key (no mint).
+						assertRowsEqual('dsk a', await readRows('select k, av from dk_a'),
+							[...kept.map(r => ({ k: r.k, av: r.av })), { k: K, av }], ['k', 'av']);
+						assertRowsEqual('dsk b', await readRows('select k, bv from dk_b'),
+							[...kept.map(r => ({ k: r.k, bv: r.bv })), { k: K, bv }], ['k', 'bv']);
+						assertRowsEqual('dsk view', await readRows('select k, av, bv from dkv'),
+							[...kept.map(r => ({ k: r.k, av: r.av, bv: r.bv })), { k: K, av, bv }], ['k', 'av', 'bv']);
+					},
+				), { numRuns: 40 });
+				expect(inserted, 'directly-supplied insert never exercised').to.be.greaterThan(0);
+			});
+
+			// ----- Family B: delete_via routes a join delete to the FK-parent side -----
+			// Default DELETE routing picks the FK-child (FK-many) side. A `delete_via=parent`
+			// tag overrides that to the FK-parent. FK enforcement is off, so the now-dangling
+			// children survive in the base and the inner join simply hides them.
+			it('PutGet: a delete_via=parent tag routes the join delete to the FK-parent side', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists dvv');
+				await db.exec('drop table if exists dv_child');
+				await db.exec('drop table if exists dv_parent');
+				await db.exec('create table dv_parent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table dv_child (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references dv_parent(pp)) using memory');
+				await db.exec('create view dvv as select c.cc as cc, c.cv as cv, p.pv as pv from dv_child c join dv_parent p on p.pp = c.pr');
+				await db.exec('insert into dv_parent values (1, 10), (2, 20)');
+				await db.exec('insert into dv_child values (1, 1, 100), (2, 1, 200), (3, 2, 300)');
+
+				// cc=1 identifies child 1 (FK-parent pp=1); delete_via=parent removes that parent.
+				await db.exec(`delete from dvv with tags ("quereus.update.delete_via" = 'parent') where cc = 1`);
+
+				assertRowsEqual('dv parent', await readRows('select pp, pv from dv_parent'), [{ pp: 2, pv: 20 }], ['pp', 'pv']);
+				assertRowsEqual('dv child', await readRows('select cc, pr, cv from dv_child'),
+					[{ cc: 1, pr: 1, cv: 100 }, { cc: 2, pr: 1, cv: 200 }, { cc: 3, pr: 2, cv: 300 }], ['cc', 'pr', 'cv']);
+				// view image: only children whose parent still exists (child 3, parent 2).
+				assertRowsEqual('dv view', await readRows('select cc, cv, pv from dvv'), [{ cc: 3, cv: 300, pv: 20 }], ['cc', 'cv', 'pv']);
+			});
+
+			// ----- Family B: reject-don't-widen + forward/backward lineage agreement -----
+			it('reject-do-not-widen + lineage agreement on the multi-source join shapes', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists rj_inner');
+				await db.exec('drop view if exists rj_outer');
+				await db.exec('drop view if exists rj_self');
+				await db.exec('drop view if exists rj_star');
+				await db.exec('drop view if exists rj_comp');
+				await db.exec('drop table if exists rjchild');
+				await db.exec('drop table if exists rjparent');
+				await db.exec('drop table if exists rjck');
+				await db.exec('create table rjparent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table rjchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references rjparent(pp)) using memory');
+				await db.exec('create table rjck (k1 integer, k2 integer, v integer null, primary key (k1, k2)) using memory');
+				await db.exec('insert into rjparent values (1, 10)');
+				await db.exec('insert into rjchild values (1, 1, 100)');
+				await db.exec('create view rj_inner as select c.cc as cc, c.cv as cv, p.pv as pv from rjchild c join rjparent p on p.pp = c.pr');
+				await db.exec('create view rj_outer as select c.cc as cc, c.cv as cv, p.pv as pv from rjchild c left join rjparent p on p.pp = c.pr');
+				await db.exec('create view rj_self as select a.cc as cc, b.cc as cc2 from rjchild a join rjchild b on a.pr = b.cc');
+				await db.exec('create view rj_star as select * from rjchild c join rjparent p on p.pp = c.pr');
+				await db.exec('create view rj_comp as select k.k1 as k1, k.v as v, p.pv as pv from rjck k join rjparent p on p.pp = k.k1');
+
+				// Each undecomposable shape rejects with a structured diagnostic (no silent widen).
+				await expectMutationReject('insert into rj_outer (cc, cv, pv) values (2, 22, 222)', 'unsupported-join'); // outer-join insert
+				await expectMutationReject('update rj_self set cc2 = 9 where cc = 1', 'unsupported-join');               // self-join
+				await expectMutationReject('update rj_star set cv = 9 where cc = 1', 'unsupported-join');                // select *
+				await expectMutationReject('update rj_comp set v = 9 where k1 = 1', 'unsupported-join');                 // composite PK
+				await expectMutationReject('update rj_inner set cv = pv where cc = 1', 'cross-source-assignment');       // cross-source set
+
+				// forward/backward lineage agreement on the ACCEPTED inner-join shape: every
+				// output column's derived backward lineage is base-writable and the forward key
+				// reconstructs through it (the static plan-lineage dual, Family B).
+				const node = planLogicalBody('select c.cc as cc, c.cv as cv, p.pv as pv from rjchild c join rjparent p on p.pp = c.pr');
+				const attrs = node.getAttributes?.() ?? [];
+				assertPlanLineageAgreement('family-B inner join', attrs, keysOf(node), node.physical.updateLineage);
+				expect(attrs.every(a => node.physical.updateLineage?.get(a.id)?.kind === 'base'),
+					'every accepted-join output column traces to a base column').to.equal(true);
+			});
+
+			// ----- Family B: negative self-tests (the law cores red on injected violations) -----
+			it('negative self-test (multi-source): the round-trip cores red on injected join violations', () => {
+				// PutGet: an unjoined child row was perturbed (the write escaped the join).
+				expect(() => assertRowsEqual('ms-inject-escape',
+					[{ cc: 1, pr: 9, cv: 999 }], [{ cc: 1, pr: 9, cv: 100 }], ['cc', 'pr', 'cv'],
+				)).to.throw(/round-trip violation/);
+				// wrong minted-key thread: the child threaded a surrogate the parent never minted.
+				expect(() => assertRowsEqual('ms-inject-thread',
+					[{ cc: 5, pr: 42 }], [{ cc: 5, pr: 41 }], ['cc', 'pr'],
+				)).to.throw(/round-trip violation/);
+				// GetPut: a non-empty parent diff after write-back.
+				expect(() => assertRowsEqual('ms-inject-getput',
+					[{ pp: 1, pv: 77 }], [{ pp: 1, pv: 10 }], ['pp', 'pv'],
+				)).to.throw(/round-trip violation/);
+			});
+		});
+
+		// ----- Family C: n-way decomposition fan-out (advertisement-driven) -----
+		// The derived-put acceptance gate for the decomposition backward method. A
+		// logical table backed by a `primary-storage` decomposition advertisement (built
+		// here from `quereus.lens.decomp.*` tags via `buildAdvertisementsFromTags`, so the
+		// test needs no custom module) is a view whose body is the synthesized
+		// `anchor ⋈ members` join; its writes fan out per `planner/mutation/decomposition.ts`.
+		// PutGet cross-checks the post-state view image against the union of every member's
+		// base image; GetPut checks each member diff is empty; lineage agreement checks the
+		// advertisement member map reconstructs every forward key. Optional (outer-joined)
+		// and EAV-pivot members are covered, plus the surrogate-mint thread-into-every-member
+		// invariant. Reject-don't-widen pins the deferred shapes to structured diagnostics.
+		describe('decomposition fan-out', () => {
+			async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+				const out: Record<string, SqlValue>[] = [];
+				for await (const row of db.eval(sql)) out.push(row as Record<string, SqlValue>);
+				return out;
+			}
+
+			/** Read the resolved advertisement a deployed logical table carries. */
+			function advertisementOf(schema: string, logical: string): any {
+				const slot = (db.schemaManager.getSchema(schema) as any)?.getLensSlot(logical);
+				return slot?.advertisement;
+			}
+
+			// Columnar split: T_core(id,a) anchor + T_b(id,b) mandatory + T_c(id,c) optional,
+			// logical-tuple key `id`. Exercises one-per-member INSERT (anchor first), the
+			// optional per-row presence gate, UPDATE routed to the backing member, and the
+			// anchor-last DELETE.
+			async function deployColumnar(): Promise<void> {
+				await db.exec(`create table T_core (id integer primary key, a integer null) using memory with tags (
+					"quereus.lens.decomp.logical.dT" = 'T',
+					"quereus.lens.decomp.role.dT" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dT" = 'T_core',
+					"quereus.lens.decomp.presence.dT" = 'mandatory',
+					"quereus.lens.decomp.keykind.dT" = 'logical-tuple',
+					"quereus.lens.decomp.key.dT" = 'id',
+					"quereus.lens.decomp.col.dT.id" = 'id',
+					"quereus.lens.decomp.col.dT.a" = 'a'
+				)`);
+				await db.exec(`create table T_b (id integer primary key, b integer null) using memory with tags (
+					"quereus.lens.decomp.logical.dT" = 'T',
+					"quereus.lens.decomp.role.dT" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dT" = 'T_core',
+					"quereus.lens.decomp.presence.dT" = 'mandatory',
+					"quereus.lens.decomp.keykind.dT" = 'logical-tuple',
+					"quereus.lens.decomp.key.dT" = 'id',
+					"quereus.lens.decomp.col.dT.b" = 'b'
+				)`);
+				await db.exec(`create table T_c (id integer primary key, c integer null) using memory with tags (
+					"quereus.lens.decomp.logical.dT" = 'T',
+					"quereus.lens.decomp.role.dT" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dT" = 'T_core',
+					"quereus.lens.decomp.presence.dT" = 'optional',
+					"quereus.lens.decomp.keykind.dT" = 'logical-tuple',
+					"quereus.lens.decomp.key.dT" = 'id',
+					"quereus.lens.decomp.col.dT.c" = 'c'
+				)`);
+				await db.exec('declare logical schema x { table T { id integer primary key, a integer null, b integer null, c integer null } }');
+				await db.exec('apply schema x');
+			}
+
+			// EAV: E_core(id) anchor + E_eav(entity,attr,val) optional pivot, logical E(id,p,q).
+			async function deployEav(): Promise<void> {
+				await db.exec(`create table E_core (id integer primary key) using memory with tags (
+					"quereus.lens.decomp.logical.dE" = 'E',
+					"quereus.lens.decomp.role.dE" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dE" = 'E_core',
+					"quereus.lens.decomp.presence.dE" = 'mandatory',
+					"quereus.lens.decomp.keykind.dE" = 'logical-tuple',
+					"quereus.lens.decomp.key.dE" = 'id',
+					"quereus.lens.decomp.col.dE.id" = 'id'
+				)`);
+				await db.exec(`create table E_eav (entity integer, attr text, val integer null, primary key (entity, attr)) using memory with tags (
+					"quereus.lens.decomp.logical.dE" = 'E',
+					"quereus.lens.decomp.role.dE" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dE" = 'E_core',
+					"quereus.lens.decomp.presence.dE" = 'optional',
+					"quereus.lens.decomp.keykind.dE" = 'logical-tuple',
+					"quereus.lens.decomp.key.dE" = 'entity',
+					"quereus.lens.decomp.pivot.dE.entity" = 'entity',
+					"quereus.lens.decomp.pivot.dE.attribute" = 'attr',
+					"quereus.lens.decomp.pivot.dE.value" = 'val'
+				)`);
+				await db.exec('declare logical schema x { table E { id integer primary key, p integer null, q integer null } }');
+				await db.exec('apply schema x');
+			}
+
+			// Surrogate split: Doc_core(sid,doc_key,title) anchor + Doc_body(doc_sid,body),
+			// integer-auto per-row surrogate. Logical PK is the value column `docKey`.
+			async function deploySurrogate(): Promise<void> {
+				await db.exec(`create table Doc_core (sid integer primary key, doc_key text, title text null) using memory with tags (
+					"quereus.lens.decomp.logical.dD" = 'Doc',
+					"quereus.lens.decomp.role.dD" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dD" = 'Doc_core',
+					"quereus.lens.decomp.presence.dD" = 'mandatory',
+					"quereus.lens.decomp.keykind.dD" = 'surrogate',
+					"quereus.lens.decomp.generator.dD" = 'integer-auto',
+					"quereus.lens.decomp.gencadence.dD" = 'per-row',
+					"quereus.lens.decomp.key.dD" = 'sid',
+					"quereus.lens.decomp.col.dD.docKey" = 'doc_key',
+					"quereus.lens.decomp.col.dD.title" = 'title'
+				)`);
+				await db.exec(`create table Doc_body (doc_sid integer primary key, body text null) using memory with tags (
+					"quereus.lens.decomp.logical.dD" = 'Doc',
+					"quereus.lens.decomp.role.dD" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dD" = 'Doc_core',
+					"quereus.lens.decomp.presence.dD" = 'mandatory',
+					"quereus.lens.decomp.keykind.dD" = 'surrogate',
+					"quereus.lens.decomp.key.dD" = 'doc_sid',
+					"quereus.lens.decomp.col.dD.body" = 'body'
+				)`);
+				await db.exec('declare logical schema x { table Doc { docKey text primary key, title text null, body text null } }');
+				await db.exec('apply schema x');
+			}
+
+			const colRowArb = fc.record({
+				id: fc.integer({ min: 1, max: 6 }),
+				a: fc.integer({ min: 1, max: 9 }),
+				b: fc.integer({ min: 1, max: 9 }),
+				c: fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }),
+			});
+
+			// ----- PutGet (columnar + optional): the mutation reflects across every member -----
+			it('PutGet (columnar+optional): a decomposition mutation reflects across every member, none escapes', async () => {
+				await deployColumnar();
+				let mutated = 0;
+				const opsSeen = new Set<string>();
+
+				await fc.assert(fc.asyncProperty(
+					fc.array(colRowArb, { maxLength: 8 }),
+					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'delete'),
+					fc.integer({ min: 1, max: 6 }),    // id predicate
+					fc.integer({ min: 10, max: 20 }),  // NV  (a)
+					fc.integer({ min: 21, max: 30 }),  // NV2 (b)
+					fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }), // inserted optional c
+					async (seed, op, K, NV, NV2, insC) => {
+						opsSeen.add(op);
+						await db.exec('delete from main.T_core');
+						await db.exec('delete from main.T_b');
+						await db.exec('delete from main.T_c');
+						const core = new Map<number, number>();
+						const bMap = new Map<number, number>();
+						const cMap = new Map<number, number>();
+						const seen = new Set<number>();
+						for (const r of seed) {
+							if (seen.has(r.id)) continue; seen.add(r.id);
+							await db.exec(`insert into main.T_core values (${r.id}, ${r.a})`);
+							await db.exec(`insert into main.T_b values (${r.id}, ${r.b})`);
+							core.set(r.id, r.a); bMap.set(r.id, r.b);
+							if (r.c !== null) { await db.exec(`insert into main.T_c values (${r.id}, ${r.c})`); cMap.set(r.id, r.c); }
+						}
+
+						if (op === 'insert') {
+							const fresh = (seen.size === 0 ? 0 : Math.max(...seen)) + 1;
+							const cols = insC === null ? 'id, a, b' : 'id, a, b, c';
+							const vals = insC === null ? `${fresh}, ${NV}, ${NV2}` : `${fresh}, ${NV}, ${NV2}, ${insC}`;
+							await db.exec(`insert into x.T (${cols}) values (${vals})`);
+							core.set(fresh, NV); bMap.set(fresh, NV2);
+							if (insC !== null) cMap.set(fresh, insC);
+							mutated++;
+						} else if (op === 'update-a') {
+							await db.exec(`update x.T set a = ${NV} where id = ${K}`);
+							if (core.has(K)) { core.set(K, NV); mutated++; }
+						} else if (op === 'update-b') {
+							await db.exec(`update x.T set b = ${NV2} where id = ${K}`);
+							if (bMap.has(K)) { bMap.set(K, NV2); mutated++; }
+						} else if (op === 'update-ab') {
+							await db.exec(`update x.T set a = ${NV}, b = ${NV2} where id = ${K}`);
+							if (core.has(K)) { core.set(K, NV); bMap.set(K, NV2); mutated++; }
+						} else { // delete
+							await db.exec(`delete from x.T where id = ${K}`);
+							if (core.has(K)) { core.delete(K); bMap.delete(K); cMap.delete(K); mutated++; }
+						}
+
+						// Every member's base image matches the oracle.
+						assertRowsEqual('T_core', await readRows('select id, a from main.T_core'),
+							[...core].map(([id, a]) => ({ id, a })), ['id', 'a']);
+						assertRowsEqual('T_b', await readRows('select id, b from main.T_b'),
+							[...bMap].map(([id, b]) => ({ id, b })), ['id', 'b']);
+						assertRowsEqual('T_c', await readRows('select id, c from main.T_c'),
+							[...cMap].map(([id, c]) => ({ id, c })), ['id', 'c']);
+						// The view image is exactly the join of the member images (inner core⋈b, left c).
+						const expView = [...core.keys()].filter(id => bMap.has(id)).map(id => ({
+							id, a: core.get(id)!, b: bMap.get(id)!, c: cMap.has(id) ? cMap.get(id)! : null,
+						}));
+						assertRowsEqual('view image', await readRows('select id, a, b, c from x.T'),
+							expView, ['id', 'a', 'b', 'c']);
+					},
+				), { numRuns: 60 });
+
+				expect(mutated, 'columnar PutGet degenerated into all no-op runs').to.be.greaterThan(0);
+				expect(opsSeen.size, 'columnar PutGet did not exercise a spread of ops').to.be.greaterThan(2);
+			});
+
+			// ----- GetPut (columnar): write read values back, every member unchanged -----
+			it('GetPut (columnar): writing read values back leaves every member unchanged', async () => {
+				await deployColumnar();
+				let checked = 0;
+				await fc.assert(fc.asyncProperty(
+					fc.array(colRowArb, { minLength: 1, maxLength: 8 }),
+					async (seed) => {
+						await db.exec('delete from main.T_core');
+						await db.exec('delete from main.T_b');
+						await db.exec('delete from main.T_c');
+						const seen = new Set<number>();
+						for (const r of seed) {
+							if (seen.has(r.id)) continue; seen.add(r.id);
+							await db.exec(`insert into main.T_core values (${r.id}, ${r.a})`);
+							await db.exec(`insert into main.T_b values (${r.id}, ${r.b})`);
+							if (r.c !== null) await db.exec(`insert into main.T_c values (${r.id}, ${r.c})`);
+						}
+						const view = await readRows('select id, a, b, c from x.T');
+						fc.pre(view.length > 0);
+						const r = view[0];
+						const beforeCore = await readRows('select id, a from main.T_core');
+						const beforeB = await readRows('select id, b from main.T_b');
+						const beforeC = await readRows('select id, c from main.T_c');
+						// Write back the mandatory writable columns (a on the anchor, b on its member).
+						await db.exec(`update x.T set a = ${String(r.a)}, b = ${String(r.b)} where id = ${String(r.id)}`);
+						checked++;
+						assertRowsEqual('GetPut T_core', await readRows('select id, a from main.T_core'), beforeCore, ['id', 'a']);
+						assertRowsEqual('GetPut T_b', await readRows('select id, b from main.T_b'), beforeB, ['id', 'b']);
+						assertRowsEqual('GetPut T_c', await readRows('select id, c from main.T_c'), beforeC, ['id', 'c']);
+					},
+				), { numRuns: 40 });
+				expect(checked, 'columnar GetPut never found a row to write back').to.be.greaterThan(0);
+			});
+
+			// ----- PutGet (EAV pivot): insert/delete fan out to the triple store -----
+			it('PutGet (EAV pivot): insert/delete fan out to the triple store, presence-gated per attribute', async () => {
+				await deployEav();
+				let mutated = 0;
+				const opsSeen = new Set<string>();
+				await fc.assert(fc.asyncProperty(
+					fc.array(fc.record({
+						id: fc.integer({ min: 1, max: 6 }),
+						p: fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }),
+						q: fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }),
+					}), { maxLength: 8 }),
+					fc.constantFrom('insert', 'delete'),
+					fc.integer({ min: 1, max: 6 }),
+					fc.option(fc.integer({ min: 10, max: 20 }), { nil: null }),  // inserted p
+					fc.option(fc.integer({ min: 21, max: 30 }), { nil: null }),  // inserted q
+					async (seed, op, K, insP, insQ) => {
+						opsSeen.add(op);
+						await db.exec('delete from main.E_core');
+						await db.exec('delete from main.E_eav');
+						const core = new Set<number>();
+						const eav = new Map<number, { p: number | null; q: number | null }>();
+						const seen = new Set<number>();
+						for (const r of seed) {
+							if (seen.has(r.id)) continue; seen.add(r.id);
+							await db.exec(`insert into main.E_core values (${r.id})`);
+							core.add(r.id);
+							eav.set(r.id, { p: null, q: null });
+							if (r.p !== null) { await db.exec(`insert into main.E_eav values (${r.id}, 'p', ${r.p})`); eav.get(r.id)!.p = r.p; }
+							if (r.q !== null) { await db.exec(`insert into main.E_eav values (${r.id}, 'q', ${r.q})`); eav.get(r.id)!.q = r.q; }
+						}
+
+						if (op === 'insert') {
+							const fresh = (seen.size === 0 ? 0 : Math.max(...seen)) + 1;
+							const cols = ['id']; const vals = [String(fresh)];
+							if (insP !== null) { cols.push('p'); vals.push(String(insP)); }
+							if (insQ !== null) { cols.push('q'); vals.push(String(insQ)); }
+							await db.exec(`insert into x.E (${cols.join(', ')}) values (${vals.join(', ')})`);
+							core.add(fresh);
+							eav.set(fresh, { p: insP, q: insQ });
+							mutated++;
+						} else {
+							await db.exec(`delete from x.E where id = ${K}`);
+							if (core.has(K)) { core.delete(K); eav.delete(K); mutated++; }
+						}
+
+						assertRowsEqual('E_core', await readRows('select id from main.E_core'),
+							[...core].map(id => ({ id })), ['id']);
+						const expEav: Record<string, SqlValue>[] = [];
+						for (const [id, v] of eav) {
+							if (v.p !== null) expEav.push({ entity: id, attr: 'p', val: v.p });
+							if (v.q !== null) expEav.push({ entity: id, attr: 'q', val: v.q });
+						}
+						assertRowsEqual('E_eav', await readRows('select entity, attr, val from main.E_eav'),
+							expEav, ['entity', 'attr', 'val']);
+						const expView = [...core].map(id => ({ id, p: eav.get(id)?.p ?? null, q: eav.get(id)?.q ?? null }));
+						assertRowsEqual('E view', await readRows('select id, p, q from x.E'), expView, ['id', 'p', 'q']);
+					},
+				), { numRuns: 50 });
+				expect(mutated, 'EAV PutGet degenerated into all no-op runs').to.be.greaterThan(0);
+				expect(opsSeen.size, 'EAV PutGet did not exercise both insert and delete').to.equal(2);
+			});
+
+			// ----- PutGet (surrogate): one minted key threaded into every member -----
+			it('PutGet (surrogate): insert mints one shared key per row, threaded identically into every member', async () => {
+				await deploySurrogate();
+				let inserted = 0;
+				await fc.assert(fc.asyncProperty(
+					fc.array(fc.record({ sid: fc.integer({ min: 1, max: 50 }), dk: fc.integer({ min: 1, max: 50 }), t: fc.integer({ min: 1, max: 9 }), body: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
+					fc.integer({ min: 60, max: 80 }),  // fresh logical key (disjoint from seed dk)
+					fc.integer({ min: 1, max: 9 }), fc.integer({ min: 1, max: 9 }),
+					async (seed, dkNew, tNew, bodyNew) => {
+						await db.exec('delete from main.Doc_core');
+						await db.exec('delete from main.Doc_body');
+						const seenSid = new Set<number>(); const seenDk = new Set<number>();
+						const sids: number[] = [];
+						for (const r of seed) {
+							if (seenSid.has(r.sid) || seenDk.has(r.dk)) continue;
+							seenSid.add(r.sid); seenDk.add(r.dk);
+							await db.exec(`insert into main.Doc_core values (${r.sid}, '${r.dk}', '${r.t}')`);
+							await db.exec(`insert into main.Doc_body values (${r.sid}, '${r.body}')`);
+							sids.push(r.sid);
+						}
+						const mint = (sids.length === 0 ? 0 : Math.max(...sids)) + 1;
+						await db.exec(`insert into x.Doc (docKey, title, body) values ('${dkNew}', '${tNew}', '${bodyNew}')`);
+						inserted++;
+
+						// The anchor minted max(sid)+1 ...
+						const coreRow = await readRows(`select sid, doc_key, title from main.Doc_core where doc_key = '${dkNew}'`);
+						expect(coreRow.length, 'anchor got exactly one new row').to.equal(1);
+						const mintedSid = coreRow[0].sid as number;
+						expect(mintedSid, 'minted surrogate = max(anchor surrogate)+1').to.equal(mint);
+						// ... and the SAME surrogate threaded into the body member's key.
+						const bodyRow = await readRows(`select doc_sid, body from main.Doc_body where doc_sid = ${String(mintedSid)}`);
+						expect(bodyRow.length, 'every member threaded the same minted surrogate').to.equal(1);
+						expect(bodyRow[0].body).to.equal(String(bodyNew));
+						// The new logical row surfaces through the view.
+						const v = await readRows(`select docKey, title, body from x.Doc where docKey = '${dkNew}'`);
+						expect(v).to.deep.equal([{ docKey: String(dkNew), title: String(tNew), body: String(bodyNew) }]);
+					},
+				), { numRuns: 40 });
+				expect(inserted, 'surrogate PutGet never inserted').to.be.greaterThan(0);
+			});
+
+			// ----- forward/backward lineage agreement (the structural crux for C) -----
+			it('forward/backward lineage agreement: the decomposition advertisement reconstructs every forward key', async () => {
+				await deployColumnar();
+				const ad = advertisementOf('x', 'T');
+				expect(ad, 'tag-derived advertisement resolved').to.not.equal(undefined);
+				const storage = ad.storage;
+
+				// (backward) the anchor is among the members.
+				expect(storage.members.some((m: any) => m.relationId === storage.anchorRelationId),
+					'anchor is a member').to.equal(true);
+				// (backward) every non-EAV logical column maps to a base column on its member.
+				const colToBase = new Map<string, string>();
+				for (const m of storage.members) {
+					if (m.attributePivot) continue;
+					for (const c of m.columns) {
+						expect(c.basisExpr.type, `column '${c.logicalColumn}' maps to a base column`).to.equal('column');
+						colToBase.set(c.logicalColumn.toLowerCase(), (c.basisExpr as any).name.toLowerCase());
+					}
+				}
+				// (backward) the anchor carries a shared-key column (the identifying predicate).
+				const anchorKey = storage.sharedKey.keyColumnsByRelation.get(storage.anchorRelationId) as string[] | undefined;
+				expect(anchorKey, 'anchor shared-key present').to.not.equal(undefined);
+
+				// (forward) plan the synthesized body; every forward-key column is base-backed,
+				// and the logical PK is a forward key whose base column is the anchor's shared key.
+				const root = planBody('select * from x.T');
+				const cols = root.getType().columns.map(c => c.name.toLowerCase());
+				const keys = keysOf(root);
+				expect(keys.length, 'the decomposition body advertises a forward key').to.be.greaterThan(0);
+				for (const key of keys) {
+					for (const idx of key) {
+						expect(colToBase.has(cols[idx]), `forward-key column '${cols[idx]}' is base-backed`).to.equal(true);
+					}
+				}
+				const idIdx = cols.indexOf('id');
+				expect(keys.some(k => k.length === 1 && k[0] === idIdx), 'logical PK is a forward key').to.equal(true);
+				expect((anchorKey ?? []).map(s => s.toLowerCase()), 'anchor shared key reconstructs the logical PK')
+					.to.deep.equal([colToBase.get('id')]);
+			});
+
+			// ----- reject-don't-widen: deferred decomposition shapes -----
+			it('reject-do-not-widen: non-anchor predicate / optional / shared-key writes are deferred', async () => {
+				await deployColumnar();
+				await db.exec('insert into main.T_core values (1, 10)');
+				await db.exec('insert into main.T_b values (1, 100)');
+				await db.exec('insert into main.T_c values (1, 1000)');
+				await expectMutationReject('delete from x.T where b = 100', 'unsupported-decomposition-predicate'); // non-anchor predicate
+				await expectMutationReject('update x.T set c = 5 where id = 1', 'unsupported-decomposition-update'); // optional member
+				await expectMutationReject('update x.T set id = 9 where id = 1', 'unsupported-decomposition-update'); // shared key
+			});
+
+			it('reject-do-not-widen: EAV column update is deferred', async () => {
+				await deployEav();
+				await db.exec('insert into main.E_core values (1)');
+				await db.exec("insert into main.E_eav values (1, 'p', 11)");
+				await expectMutationReject('update x.E set p = 99 where id = 1', 'unsupported-decomposition-update'); // EAV pivot member
+				await expectMutationReject('delete from x.E where p = 11', 'unsupported-decomposition-predicate');    // non-anchor predicate
+			});
+
+			it('reject-do-not-widen: non-integer surrogate and composite shared key are deferred', async () => {
+				// non-integer surrogate generator (v1 mints only integer-auto).
+				await db.exec(`create table S_core (sid integer primary key, dk text, t text null) using memory with tags (
+					"quereus.lens.decomp.logical.dS" = 'S',
+					"quereus.lens.decomp.role.dS" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dS" = 'S_core',
+					"quereus.lens.decomp.presence.dS" = 'mandatory',
+					"quereus.lens.decomp.keykind.dS" = 'surrogate',
+					"quereus.lens.decomp.generator.dS" = 'uuid7',
+					"quereus.lens.decomp.key.dS" = 'sid',
+					"quereus.lens.decomp.col.dS.dk" = 'dk',
+					"quereus.lens.decomp.col.dS.t" = 't'
+				)`);
+				await db.exec(`create table S_body (bsid integer primary key, body text null) using memory with tags (
+					"quereus.lens.decomp.logical.dS" = 'S',
+					"quereus.lens.decomp.role.dS" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dS" = 'S_core',
+					"quereus.lens.decomp.presence.dS" = 'mandatory',
+					"quereus.lens.decomp.keykind.dS" = 'surrogate',
+					"quereus.lens.decomp.key.dS" = 'bsid',
+					"quereus.lens.decomp.col.dS.body" = 'body'
+				)`);
+				await db.exec('declare logical schema su { table S { dk text primary key, t text null, body text null } }');
+				await db.exec('apply schema su');
+				await expectMutationReject("insert into su.S (dk, t, body) values ('z1', 't', 'b')", 'no-default');
+
+				// composite shared key (v1 threads a single-column key only).
+				await db.exec(`create table C_core (k1 integer, k2 integer, a integer null, primary key (k1, k2)) using memory with tags (
+					"quereus.lens.decomp.logical.dC" = 'C',
+					"quereus.lens.decomp.role.dC" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dC" = 'C_core',
+					"quereus.lens.decomp.presence.dC" = 'mandatory',
+					"quereus.lens.decomp.keykind.dC" = 'logical-tuple',
+					"quereus.lens.decomp.key.dC" = 'k1,k2',
+					"quereus.lens.decomp.col.dC.k1" = 'k1',
+					"quereus.lens.decomp.col.dC.k2" = 'k2',
+					"quereus.lens.decomp.col.dC.a" = 'a'
+				)`);
+				await db.exec(`create table C_b (k1 integer, k2 integer, b integer null, primary key (k1, k2)) using memory with tags (
+					"quereus.lens.decomp.logical.dC" = 'C',
+					"quereus.lens.decomp.role.dC" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dC" = 'C_core',
+					"quereus.lens.decomp.presence.dC" = 'mandatory',
+					"quereus.lens.decomp.keykind.dC" = 'logical-tuple',
+					"quereus.lens.decomp.key.dC" = 'k1,k2',
+					"quereus.lens.decomp.col.dC.b" = 'b'
+				)`);
+				await db.exec('declare logical schema cz { table C { k1 integer, k2 integer, a integer null, b integer null, primary key (k1, k2) } }');
+				await db.exec('apply schema cz');
+				await db.exec('insert into main.C_core values (1, 2, 10)');
+				await db.exec('insert into main.C_b values (1, 2, 100)');
+				await expectMutationReject('delete from cz.C where k1 = 1 and k2 = 2', 'unsupported-decomposition-key');
+				await expectMutationReject('update cz.C set a = 9 where k1 = 1 and k2 = 2', 'unsupported-decomposition-key');
+				await expectMutationReject('insert into cz.C (k1, k2, a, b) values (3, 4, 30, 300)', 'unsupported-decomposition-key');
+			});
+
+			// ----- negative self-tests (the law cores red on injected member violations) -----
+			it('negative self-test (decomposition): the round-trip cores red on injected member violations', () => {
+				// PutGet: a member row outside the predicate was perturbed (the write escaped).
+				expect(() => assertRowsEqual('decomp-inject-escape',
+					[{ id: 1, b: 100 }, { id: 2, b: 999 }], [{ id: 1, b: 100 }, { id: 2, b: 200 }], ['id', 'b'],
+				)).to.throw(/round-trip violation/);
+				// wrong member key thread: a member threaded a surrogate the anchor never minted.
+				expect(() => assertRowsEqual('decomp-inject-thread',
+					[{ doc_sid: 7 }], [{ doc_sid: 6 }], ['doc_sid'],
+				)).to.throw(/round-trip violation/);
+				// GetPut: a non-empty member diff after write-back.
+				expect(() => assertRowsEqual('decomp-inject-getput',
+					[{ id: 1, a: 77 }], [{ id: 1, a: 10 }], ['id', 'a'],
+				)).to.throw(/round-trip violation/);
 			});
 		});
 	});
