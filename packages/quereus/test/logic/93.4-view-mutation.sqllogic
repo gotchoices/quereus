@@ -628,6 +628,38 @@ select bid, aref from i_b order by bid;
 select aid, bid from i_jv order by aid;
 → [{"aid":2,"bid":20}]
 
+-- --- (fo-j) setNull+restrict mutual FK -> SUCCESS via the MIRRORED [0,1] order ---
+-- The mirror of (fo-i): the SET NULL edge governs deleting side0 (not side1), so the
+-- rescuing order is [0,1] rather than [1,0]. Edge j_a.bref -> j_b ON DELETE RESTRICT
+-- governs deleting side1 (j_b); edge j_b.aref -> j_a ON DELETE SET NULL governs
+-- deleting side0 (j_a). So inbound0 = setNull, inbound1 = restrict — `deletableFirst`
+-- takes its SET NULL clause (not its cascade clause, which (fo-b) already pins), so the
+-- fan-out keeps [0,1]: delete j_a FIRST (its SET NULL clears j_b's aref, tripping no
+-- RESTRICT), then j_b cleanly (no j_a row references it any longer). This pins the
+-- order-selection symmetry — the SET NULL-first rescue works in BOTH directions.
+create table j_a (aid integer primary key, bref integer null,
+    foreign key (bref) references j_b(bid) on delete restrict);
+create table j_b (bid integer primary key, aref integer null,
+    foreign key (aref) references j_a(aid) on delete set null);
+insert into j_a (aid, bref) values (1, null), (2, null);
+insert into j_b (bid, aref) values (10, null), (20, null);
+update j_a set bref = 10 where aid = 1;
+update j_a set bref = 20 where aid = 2;
+update j_b set aref = 1 where bid = 10;
+update j_b set aref = 2 where bid = 20;
+create view j_jv as select a.aid as aid, b.bid as bid from j_a a join j_b b on b.aref = a.aid;
+select aid, bid from j_jv order by aid;
+→ [{"aid":1,"bid":10},{"aid":2,"bid":20}]
+-- reordered fan-out keeps [0,1]: j_a aid=1 deleted first (SET NULL clears j_b bid=10's
+-- aref), then j_b bid=10 deleted cleanly. The aid=2 / bid=20 identity is untouched.
+delete from j_jv where aid = 1;
+select aid, bref from j_a order by aid;
+→ [{"aid":2,"bref":20}]
+select bid, aref from j_b order by bid;
+→ [{"bid":20,"aref":2}]
+select aid, bid from j_jv order by aid;
+→ [{"aid":2,"bid":20}]
+
 -- ===================================
 -- Phase 3.4: the `quereus.update.*` tag override surface.
 -- target / exclude / delete_via / policy / default_for — read + site-validated

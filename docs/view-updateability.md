@@ -435,9 +435,11 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 > `mutual-fk-restrict-delete`, rather than letting the raw transitive-FK error surface
 > at runtime; **no `delete_via` / `target` override resolves it** (a single-side delete
 > is equally blocked — one side direct-`restrict`, the other cascade-into-`restrict`),
-> so the resolution is to break the cycle (clear one side's reference first) or declare
-> the constraint deferred. This whole analysis depends on **immediate** FK enforcement
-> plus that transitive RESTRICT pre-walk. Under `quereus.update.policy = 'strict'` the
+> so the resolution is to break the cycle outside the view — null out the referencing
+> column(s) first, or restructure the offending ON DELETE action — before deleting. (A
+> `deferrable initially deferred` declaration does **not** help: the engine enforces
+> RESTRICT immediately regardless of the deferred clause.) This whole analysis depends
+> on **immediate** FK enforcement plus that transitive RESTRICT pre-walk. Under `quereus.update.policy = 'strict'` the
 > engine instead **rejects** any unresolved multi-side delete — it will not even fall
 > back to the FK-many heuristic. A composite-PK side (the captured identity needs a
 > single-column PK on both sides) is rejected with `unsupported-join`. (The general

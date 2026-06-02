@@ -1111,7 +1111,7 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 			raiseMutationDiagnostic({
 				reason: 'mutual-fk-restrict-delete',
 				table: view.name,
-				message: `cannot delete through view '${view.name}': the joined row spans a mutual foreign key ('${a.schema.name}'↔'${b.schema.name}') whose ON DELETE actions cannot be satisfied in either order under immediate FK enforcement (deleting either side trips the other's RESTRICT, directly or transitively through a cascade); break the cycle (clear one side's reference first, or make the constraint deferred) before deleting through the view`,
+				message: `cannot delete through view '${view.name}': the joined row spans a mutual foreign key ('${a.schema.name}'↔'${b.schema.name}') whose ON DELETE actions cannot be satisfied in either order under immediate FK enforcement (deleting either side trips the other's RESTRICT, directly or transitively through a cascade); break the cycle outside the view — null out the referencing column(s) first, or restructure the offending ON DELETE action — before deleting through the view (a 'deferrable initially deferred' declaration does not help: RESTRICT is enforced immediately regardless)`,
 			});
 		}
 		order = fanoutOrder;
