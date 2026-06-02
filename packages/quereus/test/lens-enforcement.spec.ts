@@ -1277,6 +1277,75 @@ describe('lens enforcement: parent-side FK RESTRICT at the write boundary', () =
 		}
 	});
 
+	/**
+	 * Deploys a lens whose logical FK references a **nullable** unique parent column
+	 * (`parent.email`, not the PK). This is the narrow case the null-safe guard exists
+	 * for: a value→NULL update of the referenced key *does* change it (orphaning a
+	 * child) but plain `OLD.email = NEW.email` evaluates NULL, not false, so without the
+	 * `is null and is null` arm the orphaning update would wrongly short-circuit-pass.
+	 */
+	async function deployNullableRefKeyLens(db: Database): Promise<void> {
+		await db.exec('declare schema y { table parent (id integer primary key, email text null, unique (email)); table child (id integer primary key, pemail text null) }');
+		await db.exec('apply schema y');
+		await db.exec('declare logical schema x { table parent (id integer primary key, email text null, unique (email)); table child (id integer primary key, pemail text null, constraint fk_pe foreign key (pemail) references parent(email)) }');
+		await db.exec('apply schema x');
+	}
+
+	it('value→NULL on a nullable referenced key while a child references the old value ABORTs (null-safe guard parity with physical RESTRICT)', async () => {
+		const db = new Database();
+		try {
+			await deployNullableRefKeyLens(db);
+			await db.exec(`insert into x.parent (id, email) values (1, 'a@x')`);
+			await db.exec(`insert into x.child (id, pemail) values (10, 'a@x')`);
+			// Nulling the referenced key changes it (orphaning child 10) ⇒ the `OLD.email =
+			// NEW.email` arm is NULL and the `is null and is null` arm is false, so the guard
+			// falls through to the NOT EXISTS, which finds the child ⇒ ABORT.
+			await expectThrows(() => db.exec('update x.parent set email = null where id = 1'), /constraint|foreign|fk_/i);
+			expect(await rows(db, 'select email from x.parent where id = 1'), 'orphaning update rolled back').to.deep.equal([{ email: 'a@x' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('NULL→NULL on a referenced row short-circuits true (benign no-op update succeeds)', async () => {
+		const db = new Database();
+		try {
+			await deployNullableRefKeyLens(db);
+			// A parent row whose referenced key is already NULL; a child referencing NULL is
+			// allowed under MATCH SIMPLE (never enforced), but the parent-side guard must still
+			// short-circuit a NULL→NULL no-op via the `is null and is null` arm.
+			await db.exec(`insert into x.parent (id, email) values (2, null)`);
+			await db.exec(`insert into x.child (id, pemail) values (20, null)`);
+			await db.exec(`update x.parent set email = null where id = 2`);
+			expect(await rows(db, 'select email from x.parent where id = 2')).to.deep.equal([{ email: null }]);
+			// And a non-key column update on a value-keyed referenced row still short-circuits
+			// (value→value unchanged) — the existing benign-update behavior is preserved.
+			await db.exec(`insert into x.parent (id, email) values (3, 'b@x')`);
+			await db.exec(`insert into x.child (id, pemail) values (30, 'b@x')`);
+			await db.exec(`update x.parent set id = id where id = 3`); // referenced key unchanged
+			expect(await rows(db, `select count(*) as n from x.parent where email = 'b@x'`)).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('unit: the UPDATE guard is null-safe — `OLD.k = NEW.k or (OLD.k is null and NEW.k is null)`', async () => {
+		const db = new Database();
+		try {
+			await deployNullableRefKeyLens(db);
+			const upd = collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE);
+			expect(upd.length).to.equal(1);
+			const updSql = astToString(upd[0].expr).toLowerCase();
+			expect(updSql, 'plain equality arm retained').to.match(/old\.email\s*=\s*new\.email/);
+			expect(updSql, 'both-null arm added').to.match(/old\.email is null and new\.email is null/);
+			// DELETE form gets no guard, so no NEW reference / both-null arm.
+			const del = collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE);
+			expect(astToString(del[0].expr).toLowerCase(), 'no guard on DELETE').to.not.match(/new\.email/);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a composite FK enforces the parent side — delete/update of the referenced composite key ABORTs; an unreferenced one succeeds', async () => {
 		const db = new Database();
 		try {

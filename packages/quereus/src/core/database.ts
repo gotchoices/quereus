@@ -1724,6 +1724,32 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		await this.watcherManager.runPostCommit();
 	}
 
+	/**
+	 * Fire all active watchers whose scope includes `schema.table`, as if the
+	 * whole table changed, **without** a local commit. For hosts whose tables
+	 * are backed by an external/replicated store (e.g. the optimystic vtab) that
+	 * learns of remote writes out-of-band, so the change never touches this
+	 * `Database`'s commit change-log and the post-commit watcher path would
+	 * otherwise never fire.
+	 *
+	 * Coarse by design: handlers receive a global (whole-table) {@link WatchEvent}
+	 * — `full` watches fire with empty `hits`; `rows`/`rowsByGroup` watches
+	 * surface all their registered literal values as possibly-changed; `groups`
+	 * fire with empty hits. Over-firing only costs the consumer an extra
+	 * re-query; it never misses a change. A no-op when no subscription matches.
+	 * Async to mirror the post-commit watcher path (handlers may be async).
+	 *
+	 * @param tableName  The table whose watchers to fire.
+	 * @param schemaName Defaults to the current schema
+	 *   (`schemaManager.getCurrentSchemaName()`).
+	 */
+	public async notifyExternalChange(tableName: string, schemaName?: string): Promise<void> {
+		this.checkOpen();
+		const schema = schemaName ?? this.schemaManager.getCurrentSchemaName();
+		const fqName = `${schema}.${tableName}`.toLowerCase();
+		await this.watcherManager.notifyExternalTableChange(fqName);
+	}
+
 	/** @internal Compile + register an MV for row-time write-through maintenance.
 	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate). */
 	public registerMaterializedView(mv: MaterializedViewSchema): void {

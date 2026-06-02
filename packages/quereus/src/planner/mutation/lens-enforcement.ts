@@ -338,28 +338,57 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 }
 
 /**
+ * The null-safe per-column "referenced key unchanged" predicate — equivalent to
+ * `OLD.p is not distinct from NEW.p`:
+ *
+ *   ( OLD.p is null and NEW.p is null )
+ *     or ( OLD.p is not null and NEW.p is not null and OLD.p = NEW.p )
+ *
+ * Built from only existing AST node kinds (`=`, `is null`, `is not null`, `and`,
+ * `or`) — Quereus has no general `is not distinct from` operator surface to
+ * synthesize into a constraint AST. Crucially this evaluates to a definite **false**
+ * (never NULL) when exactly one side is NULL: the naive `(OLD = NEW) or (OLD is null
+ * and NEW is null)` instead yields `NULL or false = NULL` there, which the
+ * deferred-constraint check (`value === false || value === 0`) does not treat as a
+ * failure — so it would wrongly admit an orphaning value→NULL update.
+ *
+ * Null-safety matters for a **nullable** referenced parent key: a value→NULL update
+ * *changes* the key (orphaning a child), so the guard must be false ⇒ fall through to
+ * the `NOT EXISTS` ⇒ reject, matching physical RESTRICT. Only a genuine NULL→NULL
+ * no-op (first arm) short-circuits true. For a NOT-NULL referenced key the first arm
+ * and the `is not null` conjuncts are dead and the predicate collapses to the plain
+ * `OLD.p = NEW.p` — exact parity with the physical path.
+ */
+function buildNullSafeEquality(col: string): AST.Expression {
+	const old = { type: 'column', name: col, table: 'OLD' } as AST.ColumnExpr;
+	const neo = { type: 'column', name: col, table: 'NEW' } as AST.ColumnExpr;
+	const isNull = (e: AST.ColumnExpr) => ({ type: 'unary', operator: 'IS NULL', expr: e } as AST.UnaryExpr);
+	const isNotNull = (e: AST.ColumnExpr) => ({ type: 'unary', operator: 'IS NOT NULL', expr: e } as AST.UnaryExpr);
+	const and = (l: AST.Expression, r: AST.Expression) => ({ type: 'binary', operator: 'AND', left: l, right: r } as AST.BinaryExpr);
+	const bothNull = and(isNull(old), isNull(neo));
+	const eq = { type: 'binary', operator: '=', left: old, right: neo } as AST.BinaryExpr;
+	const bothPresentEqual = and(and(isNotNull(old), isNotNull(neo)), eq);
+	return { type: 'binary', operator: 'OR', left: bothNull, right: bothPresentEqual } as AST.BinaryExpr;
+}
+
+/**
  * The parent-side UPDATE short-circuit guard:
  *
- *   ( (OLD.p1 = NEW.p1 and … and OLD.pn = NEW.pn) or <NOT EXISTS over OLD> )
+ *   ( (OLD.p1 ≡ NEW.p1 and … and OLD.pn ≡ NEW.pn) or <NOT EXISTS over OLD> )
  *
- * Reproduces the physical parent-side UPDATE short-circuit (`emit/constraint-check.ts`
- * skips the `NOT EXISTS` when no referenced parent column changed) — a **correctness**
- * requirement, not just perf: a plain `NOT EXISTS` over OLD values would reject a benign
- * update that does not touch the referenced columns but whose key a child still
- * references. Plain `=` (not a null-safe `IS`) is intentional: every NULL case falls
- * through the guard to the `NOT EXISTS`, which itself passes for a NULL OLD key (MATCH
- * SIMPLE). DELETE never gets this guard — there NEW is all-NULL so `OLD = NEW` is NULL
- * and `NULL or <false NOT EXISTS>` evaluates to NULL, which the deferred-constraint
- * check (`value === false || value === 0`) does not treat as a failure, silently
- * dropping a valid RESTRICT rejection (hence op-specific synthesis).
+ * where `≡` is the null-safe {@link buildNullSafeEquality}. Reproduces the physical
+ * parent-side UPDATE short-circuit (`emit/constraint-check.ts` skips the `NOT EXISTS`
+ * when no referenced parent column changed) — a **correctness** requirement, not just
+ * perf: a plain `NOT EXISTS` over OLD values would reject a benign update that does not
+ * touch the referenced columns but whose key a child still references. The per-column
+ * comparison is null-safe so a value→NULL update on a **nullable** referenced key (which
+ * *does* change the key, orphaning the child) falls through to the `NOT EXISTS` and is
+ * rejected, while a NULL→NULL no-op still short-circuits true. DELETE never gets this
+ * guard — there NEW is all-NULL, so on a NULL OLD key `OLD ≡ NEW` would now be true and
+ * wrongly short-circuit; op-specific synthesis keeps DELETE on the plain `NOT EXISTS`.
  */
 function buildParentSideUpdateGuard(parentBasisColumns: readonly string[], notExists: AST.Expression): AST.Expression {
-	const equalities: AST.Expression[] = parentBasisColumns.map(col => ({
-		type: 'binary',
-		operator: '=',
-		left: { type: 'column', name: col, table: 'OLD' } as AST.ColumnExpr,
-		right: { type: 'column', name: col, table: 'NEW' } as AST.ColumnExpr,
-	} as AST.BinaryExpr));
+	const equalities: AST.Expression[] = parentBasisColumns.map(buildNullSafeEquality);
 	const guard = equalities.reduce((acc, eq) => ({
 		type: 'binary',
 		operator: 'AND',
