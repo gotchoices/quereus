@@ -63,19 +63,13 @@ path must still resolve to a two-side fan-out for the repro to reach `orderDelet
 
 ## Options to weigh
 
-- **(a) Accept the conservative reject.** Document it as a deliberate boundary: a
-  declared mutual RESTRICT FK over a two-base view is rejected at plan time irrespective
-  of join shape/data. Simplest; the affected shape is genuinely exotic. (Current state —
-  the completed ticket's docs already scope the analysis to the mutual-pair shape, but do
-  not call out this specific data-independent over-rejection.)
-- **(b) Gate the reject on FK-correlated lineage.** Only raise `mutual-fk-restrict-delete`
+- **(a) Gate the reject on FK-correlated lineage.** Only raise `mutual-fk-restrict-delete`
   when the view's join is proven to correlate the FK columns of the mutual edge (so the
   joined rows necessarily cross-reference). Otherwise fall back to the prior fixed-order
   fan-out and let the runtime RESTRICT pre-check decide on the real data. More precise,
   but needs join-predicate ↔ FK-column correlation analysis in the planner.
-- **(c) Defer the decision to runtime entirely** for the non-FK-correlated case — i.e.
+- **(b) Defer the decision to runtime entirely** for the non-FK-correlated case — i.e.
   keep the plan-time reject only for the FK-correlated common case.
 
-Lean (a) unless a real workload hits the over-rejection; (b) is the principled fix if it
-matters. Either way the resolution should be reflected in
+Lean (a). Either way the resolution should be reflected in
 `docs/view-updateability.md` § Inner Join — Deletes.
