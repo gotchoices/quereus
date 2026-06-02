@@ -1,5 +1,7 @@
 description: The lens parent-side FK UPDATE short-circuit guard uses plain `=`, so updating a *nullable* referenced parent key from a value to NULL while a child still references the old value is wrongly ALLOWED (silently orphans the child), diverging from physical RESTRICT which rejects it. Narrow (nullable referenced columns only; unreachable for NOT-NULL/PK keys) but a genuine soundness gap. Make the guard null-safe (`IS NOT DISTINCT FROM`-equivalent) without requiring a general `IS` operator.
+prereq: lens-parent-side-fk-enforcement
 files: packages/quereus/src/planner/mutation/lens-enforcement.ts, packages/quereus/test/lens-enforcement.spec.ts, docs/lens.md
+effort: low
 ----
 
 ## Problem

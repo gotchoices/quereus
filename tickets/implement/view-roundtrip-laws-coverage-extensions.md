@@ -1,6 +1,7 @@
 description: Tighten the residual dynamic-coverage gaps in the View Round-Trip Law harness (`describe('View Round-Trip Laws')` in `test/property.spec.ts`) flagged at review of `view-roundtrip-laws-multi-source`. The harness is the acceptance gate for the `view-mutation-derived-backward-walk` migration; these extensions close paths the current seeding models in its oracle but never generates, so a put-path regression on them would pass the gate silently. None is a correctness defect in shipped engine code — each is a missing *dynamic* exercise of an already-supported (or already-rejected) path.
 prereq: view-roundtrip-laws-multi-source
 files: packages/quereus/test/property.spec.ts
+effort: medium
 ----
 
 ## Why this exists

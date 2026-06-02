@@ -211,7 +211,7 @@ function buildMultiSourceReturning(
 	if (!isJoinBody(view.selectAst) || decompositionStorage(ctx, view)) return {};
 
 	if (req.op === 'update') {
-		// keyCapture is guaranteed present here: buildUpdateIdentityCapture builds it
+		// keyCapture is guaranteed present here: buildIdentityCapture builds it
 		// whenever a multi-source update carries RETURNING (same gating conditions).
 		const returning = buildMultiSourceUpdateReturning(ctx, view, req.stmt, keyCapture!);
 		return { returning, returningTiming: 'post' };

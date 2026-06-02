@@ -420,6 +420,59 @@ select yid, ly from fr_y order by yid;
 select xid, lx, ly from fr_jv order by xid;
 → [{"xid":2,"lx":"x2","ly":"y6"}]
 
+-- --- (fo-d) fan-out + body WHERE: the capture honors (user WHERE ∧ body WHERE) ---
+-- A view body WHERE further restricts which joined rows exist. The fan-out's
+-- up-front capture identifies rows by (user WHERE ∧ body WHERE) via the shared
+-- buildMultiSourceKeyCapture, so a delete only removes base rows whose joined row is
+-- actually visible through the view; a row excluded by the body predicate is spared
+-- on BOTH sides even when the user WHERE alone would match it.
+create table bw_x (xid integer primary key, v integer, keep integer);
+create table bw_y (yid integer primary key, ly text);
+insert into bw_x values (1, 5, 1), (2, 6, 0);   -- xid=2 has keep=0 -> hidden by body WHERE
+insert into bw_y values (5, 'y5'), (6, 'y6');
+create view bw_dv as select x.xid as xid, y.ly as ly
+    from bw_x x join bw_y y on y.yid = x.v where x.keep = 1;
+-- xid=2 (keep=0) is not in the view, so deleting where xid in (1,2) only removes the
+-- xid=1 joined row from both sides; xid=2 / yid=6 survive.
+delete from bw_dv where xid in (1, 2);
+select xid, v, keep from bw_x order by xid;
+→ [{"xid":2,"v":6,"keep":0}]
+select yid, ly from bw_y order by yid;
+→ [{"yid":6,"ly":"y6"}]
+
+-- --- (fo-e) explicit target naming BOTH tables -> two candidates -> fan out ---
+-- target with a CSV of both base names leaves both candidates, so the no-FK delete
+-- still fans out (same maximal-lenient behavior as no target at all).
+create table te_x (xid integer primary key, v integer);
+create table te_y (yid integer primary key, w integer);
+insert into te_x values (1, 5), (2, 7);
+insert into te_y values (5, 50), (7, 70);
+create view te_jv as select x.xid as xid, y.yid as yid from te_x x join te_y y on y.yid = x.v;
+delete from te_jv with tags ("quereus.update.target" = 'te_x,te_y') where xid = 1;
+select xid from te_x order by xid;
+→ [{"xid":2}]
+select yid from te_y order by yid;
+→ [{"yid":7}]
+
+-- --- (fo-f) no-FK + policy=strict rejects (the strict branch is FK-independent) ---
+-- The strict policy refuses to guess the deletion side BEFORE the FK heuristic, so a
+-- no-FK ambiguous delete is rejected rather than fanned out (parity with the FK
+-- pol_strict case below, on a no-FK shape).
+create table ps_x (xid integer primary key, v integer);
+create table ps_y (yid integer primary key, w integer);
+insert into ps_x values (1, 5);
+insert into ps_y values (5, 50);
+create view ps_jv as select x.xid as xid, y.yid as yid
+    from ps_x x join ps_y y on y.yid = x.v
+    with tags ("quereus.update.policy" = 'strict');
+delete from ps_jv where xid = 1;
+-- error: policy
+-- the rejected delete left both base rows intact.
+select xid from ps_x order by xid;
+→ [{"xid":1}]
+select yid from ps_y order by yid;
+→ [{"yid":5}]
+
 -- ===================================
 -- Phase 3.4: the `quereus.update.*` tag override surface.
 -- target / exclude / delete_via / policy / default_for — read + site-validated
