@@ -971,6 +971,36 @@ delete from dr_v where exists (select 1 from dr_t where dr_t.k = note);
 select id, lbl from dr_t order by id;
 → [{"id":2,"lbl":"B"}]
 
+-- --- (r) RETURNING-subquery same-base-table correlation: SELF_ALIAS is threaded into
+--          rewriteViewReturning, so a correlated subquery INSIDE a RETURNING clause binds
+--          the outer target row the same way a WHERE subquery does. We mutate a NON-
+--          correlation column (g) so the correlation column (note=lbl) is stable across
+--          the write — the asserted count is unambiguous. The view renames base `lbl` to
+--          `note`; the RETURNING subquery FROM is the SAME base table (rt_t). A bare-base-
+--          table qualifier would de-correlate to `rt_t.k = rt_t.lbl` (matches only the one
+--          ('A','A') row -> count 1); the synthesised alias binds the OUTER row's lbl 'A'
+--          -> the correlated `rt_t.k = 'A'` matches BOTH rows -> count 2.
+create table rt_t (id integer primary key, k text, grp text, lbl text);
+insert into rt_t values (1, 'A', 'G', 'A'), (2, 'A', 'G', 'B');
+create view rt_v as select id as id, grp as g, lbl as note from rt_t;
+
+update rt_v set g = 'X' where id = 1 returning (select count(*) from rt_t where rt_t.k = note) as c;
+→ [{"c":2}]
+
+-- --- (s) `in (select ... where <correlation>)` descent form (the (p)/(q) blocks use
+--          `exists`). The correlated `note` lives inside the IN-subquery's WHERE and FROMs
+--          the SAME base table (ir_t). Correlated: for outer lbl 'A' the subquery yields
+--          {'A'} so `'A' in (...)` holds (row 1 changes); for outer lbl 'B' it yields {} so
+--          the row is untouched. De-correlated (`ir_t.k = ir_t.lbl`) would yield {'A'} for
+--          EVERY outer row -> both rows would change (a silent wrong write).
+create table ir_t (id integer primary key, k text, lbl text);
+insert into ir_t values (1, 'A', 'A'), (2, 'Z', 'B');
+create view ir_v as select id as id, lbl as note from ir_t;
+
+update ir_v set note = 'CHANGED' where 'A' in (select ir_t.k from ir_t where ir_t.k = note);
+select id, lbl from ir_t order by id;
+→ [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"B"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so an insert mints a

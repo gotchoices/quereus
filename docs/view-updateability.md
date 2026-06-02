@@ -254,9 +254,11 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > a subquery operand re-binds, by ordinary innermost-scope SQL rules, to a same-named
 > source the subquery's own FROM introduces — not to the outer UPDATE/DELETE target
 > row. So the single-source descent correlation-qualifies the substituted term with
-> the base table name (`p1_t.lbl`), which is exactly the table named by the lowered
-> statement (no synthesised alias), so it correlates to the outer row regardless of
-> what the subquery FROM defines.
+> the lowered target's **correlation name** (`<base>.lbl`) so it correlates to the
+> outer row regardless of what the subquery FROM defines. *Which* name that is — the
+> bare base table name (INSERT / multi-source) or a synthesised collision-proof alias
+> (UPDATE/DELETE) — is the subject of the *same-base-table self-reference* note below;
+> the mechanism here is the same either way.
 >
 > The qualification is **scope-aware and DEEP** — it is not enough to qualify the
 > term's *top-level* refs. A computed column's base-term lineage can itself be (or
