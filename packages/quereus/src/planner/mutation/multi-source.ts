@@ -3,12 +3,12 @@ import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
-import { isRelationalNode, PlanNode, type RelationalPlanNode, type UpdateSite, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
-import { buildSelectStmt } from '../building/select.js';
+import { analyzeBodyLineage } from './backward-body.js';
 import { buildExpression } from '../building/expression.js';
 import { JoinNode } from '../nodes/join-node.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -499,19 +499,24 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 
 	const sources = collectInnerJoinSources(view, sel.from!);
 
-	// Build the planned body and read its backward lineage (threaded by
-	// view-mutation-physical-lineage). The logical tree built here keeps the clean
-	// Project/Join/TableReference operator structure with `updateLineage` intact.
-	const bodyPlan = buildSelectStmt(ctx, sel);
-	if (!isRelationalNode(bodyPlan)) {
+	// Explicit projections only: a `select *` over a join is rejected here (before
+	// the shared backward read) so it surfaces the join-specific diagnostic rather
+	// than the generic projection/attribute arity mismatch (column→base routing
+	// relies on a 1:1 projection list).
+	if (sel.columns.some(c => c.type === 'all')) {
 		raiseMutationDiagnostic({
-			reason: 'no-base-lineage',
+			reason: 'unsupported-join',
 			table: view.name,
-			message: `view '${view.name}' body did not produce a relation`,
+			message: `cannot write through view '${view.name}': list the join's output columns explicitly (a 'select *' join body is not yet decomposable)`,
 		});
 	}
-	const root = bodyPlan as RelationalPlanNode;
-	const tableRefsById = collectTableRefs(root);
+
+	// Plan the body ONCE and read its threaded `updateLineage` through the shared
+	// backward-walk consumer (`analyzeBodyLineage`) — the same n-way reader the
+	// decomposition fan-out consumes (§ Round-Trip Laws and the Derived Backward
+	// Walk). The raw JoinNode + its column scope and the per-side routing layer on
+	// top.
+	const { root, tableRefsById, viewColToBaseRef, columns } = analyzeBodyLineage(ctx, view);
 
 	// The raw JoinNode + its combined column scope, captured from the SINGLE plan of
 	// the body above. The identity capture and RETURNING re-query build their
@@ -549,54 +554,24 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 	const sideByTableId = new Map<number, number>();
 	sides.forEach((s, idx) => sideByTableId.set(Number(s.table.id), idx));
 
-	const attrs = root.getAttributes();
-	const lineage = root.physical.updateLineage;
-
-	// Explicit projections only: `select *` over a join is rejected (column→base
-	// routing relies on a 1:1 projection list).
-	const projections = sel.columns;
-	if (projections.some(c => c.type === 'all')) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-join',
-			table: view.name,
-			message: `cannot write through view '${view.name}': list the join's output columns explicitly (a 'select *' join body is not yet decomposable)`,
-		});
-	}
-	if (projections.length !== attrs.length) {
-		raiseMutationDiagnostic({
-			reason: 'no-base-lineage',
-			table: view.name,
-			message: `cannot write through view '${view.name}': projection/attribute arity mismatch (${projections.length} vs ${attrs.length})`,
-		});
-	}
-
-	const viewColToBaseRef = new Map<string, AST.Expression>();
-	const outColumns: OutColumn[] = [];
-	projections.forEach((rc, i) => {
-		const attr = attrs[i];
-		const displayName = view.columns?.[i] ?? attr.name;
-		const outName = displayName.toLowerCase();
-		// The projection's source expression is already in base terms (it lives in
-		// the body's own FROM scope), so it is the substitution target for user
-		// predicates/assignments written against this view column.
-		viewColToBaseRef.set(outName, (rc as AST.ResultColumnExpr).expr);
-
-		const site = lineage?.get(attr.id);
-		const writableBase = writableBaseSite(site);
-		if (writableBase) {
-			const sideIndex = sideByTableId.get(writableBase.table);
-			outColumns.push({
-				name: outName,
-				displayName,
+	// Route each shared backward column onto its owning join side. An inner-join body
+	// never null-extends, so `nullExtended` is always false for the multi-source
+	// acceptance shape (it is the defensive guard the n-way reader needs for the
+	// decomposition outer-joined optional members).
+	const outColumns: OutColumn[] = columns.map((bc): OutColumn => {
+		if (bc.baseTableId !== undefined && bc.baseColumn !== undefined) {
+			const sideIndex = sideByTableId.get(bc.baseTableId);
+			return {
+				name: bc.name,
+				displayName: bc.displayName,
 				sideIndex,
-				baseColumn: writableBase.baseColumn,
-				writable: sideIndex !== undefined,
-				...(writableBase.inverse ? { inverse: writableBase.inverse } : {}),
-				...(writableBase.domain ? { domain: writableBase.domain } : {}),
-			});
-		} else {
-			outColumns.push({ name: outName, displayName, writable: false });
+				baseColumn: bc.baseColumn,
+				writable: sideIndex !== undefined && !bc.nullExtended,
+				...(bc.inverse ? { inverse: bc.inverse } : {}),
+				...(bc.domain ? { domain: bc.domain } : {}),
+			};
 		}
+		return { name: bc.name, displayName: bc.displayName, writable: false };
 	});
 
 	return { sel, sides, viewColToBaseRef, outColumns, root, joinNode, joinScope };
@@ -625,22 +600,6 @@ function findJoinNode(view: MutableViewLike, root: PlanNode): JoinNode {
 		});
 	}
 	return found;
-}
-
-/**
- * The writable base reference of a `base` UpdateSite — identity (bare column /
- * rename) OR a non-identity invertible transform, carrying its `inverse` closure
- * and optional `domain`. A `computed` / `null-extended` site is read-only and
- * returns `undefined`. This is the full-lineage reader the multi-source path
- * consumes (it no longer discards an `inverse` site to identity-only). The
- * identity-only `identityBaseColumn` in `analysis/update-lineage.ts` remains the
- * *single-source* AST-parity reader — see docs § Scalar Invertibility.
- */
-function writableBaseSite(site: UpdateSite | undefined): { table: number; baseColumn: string; inverse?: (w: AST.Expression) => AST.Expression; domain?: AST.Expression } | undefined {
-	if (site && site.kind === 'base') {
-		return { table: site.table, baseColumn: site.baseColumn, inverse: site.inverse, domain: site.domain };
-	}
-	return undefined;
 }
 
 /**
@@ -1388,18 +1347,4 @@ function rejectReturning(view: MutableViewLike, returning: AST.ResultColumn[] | 
 			message: `RETURNING through a multi-source (join) insert into view '${view.name}' is not yet supported`,
 		});
 	}
-}
-
-/** Collect every `TableReferenceNode` in a planned body, indexed by plan-node id. */
-function collectTableRefs(root: PlanNode): Map<number, TableReferenceNode> {
-	const out = new Map<number, TableReferenceNode>();
-	const visit = (n: PlanNode): void => {
-		if (n instanceof TableReferenceNode) {
-			out.set(Number(n.id), n);
-			return;
-		}
-		for (const child of n.getRelations()) visit(child);
-	};
-	visit(root);
-	return out;
 }

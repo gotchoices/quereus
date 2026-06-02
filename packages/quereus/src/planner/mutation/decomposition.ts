@@ -10,6 +10,7 @@ import type { SqlValue } from '../../common/types.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
+import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
@@ -70,12 +71,97 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
  *   single-column-PK boundary in `multi-source.ts`).
  */
 
-/** Resolved view of one decomposition for the put fan-out. */
+/**
+ * Resolved view of one decomposition for the put fan-out. Its backward decisions
+ * are derived from the **threaded plan-node `updateLineage`** read through the
+ * shared backward-walk consumer (`analyzeBodyLineage`) — the same n-way reader the
+ * multi-source join walk consumes — rather than a parallel AST scan of the
+ * synthesized body's projection list (docs/view-updateability.md § Round-Trip Laws
+ * and the Derived Backward Walk, docs/lens.md § The Default Mapper).
+ */
 interface DecompShape {
 	readonly storage: StorageShape;
 	readonly anchor: DecompositionMember;
-	/** logical-column-name (lowercased) → its backing expression in the get body. */
+	/** logical-column-name (lowercased) → its backing expression in the get body (from the shared consumer). */
 	readonly viewColToBaseRef: ReadonlyMap<string, AST.Expression>;
+	/** Per logical column, its backward lineage off the planned body (shared with multi-source). */
+	readonly columns: readonly BackwardColumn[];
+	/** Planned-body `TableReferenceNode` id → the decomposition member it realizes (join members only). */
+	readonly memberByTableId: ReadonlyMap<number, DecompositionMember>;
+}
+
+/**
+ * Plan the synthesized get body **once** and read its threaded `updateLineage`
+ * into a {@link DecompShape}: the per-column backward lineage (column → owning base
+ * relation) plus a `TableReferenceNode`-id → member map, so the routing / anchor
+ * gate decide off the plan-node backward walk shared with the multi-source path
+ * (not a parallel projection-AST scan). EAV pivot members are correlated subqueries,
+ * not join sources, so they carry no planned `TableReferenceNode` and are absent
+ * from {@link DecompShape.memberByTableId} (resolved off the advertisement instead).
+ */
+function analyzeDecomposition(ctx: PlanningContext, view: MutableViewLike, storage: StorageShape): DecompShape {
+	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
+	if (!anchor) {
+		// Validated at advertisement resolution; defensive.
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through logical table '${view.name}': decomposition anchor '${storage.anchorRelationId}' is not among its members`,
+		});
+	}
+	const lineage = analyzeBodyLineage(ctx, view);
+	const memberByTableId = new Map<number, DecompositionMember>();
+	for (const [id, ref] of lineage.tableRefsById) {
+		const member = storage.members.find(m =>
+			m.relation.table.toLowerCase() === ref.tableSchema.name.toLowerCase()
+			&& m.relation.schema.toLowerCase() === ref.tableSchema.schemaName.toLowerCase());
+		if (member) memberByTableId.set(id, member);
+	}
+	return { storage, anchor, viewColToBaseRef: lineage.viewColToBaseRef, columns: lineage.columns, memberByTableId };
+}
+
+/** How one logical column is backed, decided off the threaded backward lineage (+ advertisement for the deferred shapes). */
+type ColumnRoute =
+	/** An identity base column on a join member — the value-writable / insertable case. */
+	| { readonly kind: 'member'; readonly member: DecompositionMember; readonly baseColumn: string; readonly nullExtended: boolean }
+	/** A `member.columns` mapping the lineage did not resolve to an identity base column (a computed / non-invertible mapping) — read-only. */
+	| { readonly kind: 'computed-mapping'; readonly member: DecompositionMember }
+	/** An EAV pivot member backs it (a correlated-subquery projection — an attribute row, not a join column). */
+	| { readonly kind: 'eav'; readonly member: DecompositionMember }
+	/** Not a logical column of the decomposition / not backed by any member. */
+	| { readonly kind: 'unbacked' };
+
+/**
+ * Classify one logical column against the decomposition. The **primary routing**
+ * (which member backs a writable/insertable column, and its base column) is read
+ * from the threaded `updateLineage` (`shape.columns` + `shape.memberByTableId`);
+ * the advertisement only disambiguates the deferred shapes (a non-identity mapping,
+ * an EAV pivot column), preserving the exact deferral diagnostics. Precedence
+ * mirrors the retired advertisement scan: identity base column → member-mapping →
+ * EAV pivot → unbacked.
+ */
+function classifyColumn(shape: DecompShape, name: string): ColumnRoute {
+	const col = shape.columns.find(c => c.name === name);
+	// An identity base column on a join member, routed by the plan-node lineage.
+	if (col?.baseColumn !== undefined && col.baseTableId !== undefined && col.inverse === undefined) {
+		const member = shape.memberByTableId.get(col.baseTableId);
+		if (member) return { kind: 'member', member, baseColumn: col.baseColumn, nullExtended: col.nullExtended };
+	}
+	// A `member.columns` mapping the lineage did not resolve to an identity base column
+	// is a non-identity (computed / non-invertible) mapping — read-only.
+	for (const member of shape.storage.members) {
+		if (member.columns.some(c => c.logicalColumn.toLowerCase() === name)) {
+			return { kind: 'computed-mapping', member };
+		}
+	}
+	// An EAV pivot backs a logical column the get body projects as a (non-column)
+	// correlated subquery — never a `member.columns` entry, so the loops above miss it.
+	const projected = shape.viewColToBaseRef.get(name);
+	if (projected && projected.type !== 'column') {
+		const eav = shape.storage.members.find(m => m.attributePivot);
+		if (eav) return { kind: 'eav', member: eav };
+	}
+	return { kind: 'unbacked' };
 }
 
 /**
@@ -88,16 +174,7 @@ export function propagateDecomposition(
 	storage: StorageShape,
 	req: MutationRequest,
 ): BaseOp[] {
-	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
-	if (!anchor) {
-		// Validated at advertisement resolution; defensive.
-		raiseMutationDiagnostic({
-			reason: 'no-base-lineage',
-			table: view.name,
-			message: `cannot write through logical table '${view.name}': decomposition anchor '${storage.anchorRelationId}' is not among its members`,
-		});
-	}
-	const shape: DecompShape = { storage, anchor, viewColToBaseRef: buildViewColMap(view) };
+	const shape = analyzeDecomposition(ctx, view, storage);
 
 	switch (req.op) {
 		case 'delete': return decomposeDelete(ctx, view, shape, req.stmt);
@@ -202,24 +279,18 @@ export function analyzeDecompositionInsert(
 ): DecompInsertAnalysis {
 	rejectReturning(view, stmt.returning);
 
-	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
-	if (!anchor) {
-		raiseMutationDiagnostic({
-			reason: 'no-base-lineage',
-			table: view.name,
-			message: `cannot insert into logical table '${view.name}': decomposition anchor '${storage.anchorRelationId}' is not among its members`,
-		});
-	}
-	const shape: DecompShape = { storage, anchor, viewColToBaseRef: buildViewColMap(view) };
+	const shape = analyzeDecomposition(ctx, view, storage);
+	const anchor = shape.anchor;
 
 	// Resolve every member's table once (reused for schema lookups + the seed table).
 	const memberRefs = new Map<string, TableReferenceNode>();
 	for (const m of storage.members) memberRefs.set(m.relationId, resolveMemberTable(ctx, m));
 
-	// Supplied logical columns: the explicit list, or every projected logical column.
+	// Supplied logical columns: the explicit list, or every projected logical column
+	// (in projection order — the order the shared backward consumer enumerates them).
 	const suppliedNames = stmt.columns && stmt.columns.length > 0
 		? stmt.columns
-		: [...shape.viewColToBaseRef.keys()];
+		: shape.columns.map(c => c.name);
 
 	// Declared-case logical column names (the get body's projection aliases) — the
 	// exact attribute literals an EAV write must store (the read does not case-fold).
@@ -249,7 +320,13 @@ export function analyzeDecompositionInsert(
 	};
 }
 
-/** Route one supplied logical column to a columnar member mapping or an EAV pivot. */
+/**
+ * Route one supplied logical column to a columnar member mapping or an EAV pivot,
+ * off the threaded backward lineage ({@link classifyColumn}). A columnar route binds
+ * the value to its member's identity base column; an EAV route writes an attribute
+ * triple gated on the value. Optional members are insertable here (the per-row
+ * presence gate in {@link emitMemberInsert} drops absent components).
+ */
 function routeInsertColumn(
 	view: MutableViewLike,
 	shape: DecompShape,
@@ -259,43 +336,33 @@ function routeInsertColumn(
 	idx: number,
 ): RoutedInsertColumn {
 	const name = rawName.toLowerCase();
-
-	// Columnar: a direct (identity) `member.columns` mapping.
-	for (const member of shape.storage.members) {
-		const mapping = member.columns.find(c => c.logicalColumn.toLowerCase() === name);
-		if (!mapping) continue;
-		if (mapping.basisExpr.type !== 'column') {
-			raiseMutationDiagnostic({
+	const route = classifyColumn(shape, name);
+	switch (route.kind) {
+		case 'member': {
+			const ref = memberRefs.get(route.member.relationId)!;
+			const col = columnByName(view, ref.tableSchema, route.baseColumn);
+			return { name, envelopeIndex: idx, type: columnScalarType(col), columnar: { relationId: route.member.relationId, basisColumn: route.baseColumn } };
+		}
+		case 'eav': {
+			const ref = memberRefs.get(route.member.relationId)!;
+			const valCol = columnByName(view, ref.tableSchema, route.member.attributePivot!.valueColumn);
+			return { name, envelopeIndex: idx, type: columnScalarType(valCol), eav: route.member, eavAttribute: declaredNames.get(name) ?? rawName };
+		}
+		case 'computed-mapping':
+			return raiseMutationDiagnostic({
 				reason: 'no-inverse',
 				column: rawName,
 				table: view.name,
 				message: `cannot insert into logical table '${view.name}': column '${rawName}' is a computed (non-invertible) decomposition mapping and cannot receive an inserted value`,
 			});
-		}
-		const ref = memberRefs.get(member.relationId)!;
-		const basisColumn = (mapping.basisExpr as AST.ColumnExpr).name;
-		const col = columnByName(view, ref.tableSchema, basisColumn);
-		return { name, envelopeIndex: idx, type: columnScalarType(col), columnar: { relationId: member.relationId, basisColumn } };
+		case 'unbacked':
+			return raiseMutationDiagnostic({
+				reason: 'no-inverse',
+				column: rawName,
+				table: view.name,
+				message: `cannot insert into logical table '${view.name}': column '${rawName}' is not backed by any decomposition member`,
+			});
 	}
-
-	// EAV: a logical column the get body projects as a non-column expression (the
-	// correlated triple subquery) + a sole pivot member ⇒ an attribute write.
-	const projected = shape.viewColToBaseRef.get(name);
-	if (projected && projected.type !== 'column') {
-		const eav = shape.storage.members.find(m => m.attributePivot);
-		if (eav) {
-			const ref = memberRefs.get(eav.relationId)!;
-			const valCol = columnByName(view, ref.tableSchema, eav.attributePivot!.valueColumn);
-			return { name, envelopeIndex: idx, type: columnScalarType(valCol), eav, eavAttribute: declaredNames.get(name) ?? rawName };
-		}
-	}
-
-	raiseMutationDiagnostic({
-		reason: 'no-inverse',
-		column: rawName,
-		table: view.name,
-		message: `cannot insert into logical table '${view.name}': column '${rawName}' is not backed by any decomposition member`,
-	});
 }
 
 /** Resolve the shared key envelope index + optional surrogate mint for an insert. */
@@ -608,7 +675,12 @@ interface RoutedAssignment {
 	readonly value: AST.Expression;
 }
 
-/** Resolve one `set <col> = <value>` to its backing member + basis column. */
+/**
+ * Resolve one `set <col> = <value>` to its backing member + basis column off the
+ * threaded backward lineage ({@link classifyColumn}). Only a mandatory, non-EAV,
+ * identity-mapped member is value-writable; an optional / EAV / non-identity / key /
+ * unbacked target is rejected or deferred with its precise diagnostic.
+ */
 function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.UpdateStmt['assignments'][number]): RoutedAssignment {
 	const logical = asg.column.toLowerCase();
 	if (isSharedKeyColumn(shape, logical)) {
@@ -619,50 +691,45 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.Upd
 			message: `cannot update logical table '${view.name}': column '${asg.column}' is part of the decomposition shared key; an identity change is not a value write`,
 		});
 	}
-	for (const member of shape.storage.members) {
-		const mapping = member.columns.find(c => c.logicalColumn.toLowerCase() === logical);
-		if (!mapping) continue;
-		if (member.presence !== 'mandatory' || member.attributePivot) {
-			raiseMutationDiagnostic({
+	const route = classifyColumn(shape, logical);
+	switch (route.kind) {
+		case 'member': {
+			// An optional member is outer-joined (null-extended lineage): writing it is
+			// a per-row insert-or-delete transition the static fan-out cannot express.
+			if (route.member.presence !== 'mandatory' || route.nullExtended) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-decomposition-update',
+					column: asg.column,
+					table: view.name,
+					message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by an optional member ('${route.member.relationId}'); materializing/removing that component row needs the insert/delete fan-out (deferred)`,
+				});
+			}
+			return { relationId: route.member.relationId, basisColumn: route.baseColumn, value: rewriteAssignedValue(view, shape, route.member, asg.value) };
+		}
+		case 'eav':
+			// An EAV pivot member backs its logical columns as attribute *rows*; writing
+			// one is an insert-or-delete of a triple — the deferred component fan-out.
+			return raiseMutationDiagnostic({
 				reason: 'unsupported-decomposition-update',
 				column: asg.column,
 				table: view.name,
-				message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by ${member.attributePivot ? 'an EAV pivot' : 'an optional'} member ('${member.relationId}'); materializing/removing that component row needs the insert/delete fan-out (deferred)`,
+				message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by an EAV pivot member ('${route.member.relationId}'); materializing/removing that component needs the insert/delete fan-out (deferred)`,
 			});
-		}
-		if (mapping.basisExpr.type !== 'column') {
-			raiseMutationDiagnostic({
+		case 'computed-mapping':
+			return raiseMutationDiagnostic({
 				reason: 'no-inverse',
 				column: asg.column,
 				table: view.name,
 				message: `cannot update logical table '${view.name}': column '${asg.column}' is a computed (non-invertible) decomposition mapping and is read-only`,
 			});
-		}
-		return { relationId: member.relationId, basisColumn: mapping.basisExpr.name, value: rewriteAssignedValue(view, shape, member, asg.value) };
+		case 'unbacked':
+			return raiseMutationDiagnostic({
+				reason: 'no-inverse',
+				column: asg.column,
+				table: view.name,
+				message: `cannot update logical table '${view.name}': column '${asg.column}' is not backed by any decomposition member`,
+			});
 	}
-	// An EAV pivot member backs its logical columns as attribute *rows*, not via
-	// `member.columns` (the get body projects them as correlated scalar subqueries,
-	// not join columns), so the loop above never matches them. Detect that here off
-	// the projection map: a logical column the get body projects as a non-column
-	// expression is EAV-served (writing it is an insert-or-delete of a triple — the
-	// deferred component fan-out), whereas a column the body never projects is a
-	// name that is simply not part of the decomposition.
-	const projected = shape.viewColToBaseRef.get(logical);
-	if (projected && projected.type !== 'column') {
-		const eav = shape.storage.members.find(m => m.attributePivot);
-		raiseMutationDiagnostic({
-			reason: 'unsupported-decomposition-update',
-			column: asg.column,
-			table: view.name,
-			message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by ${eav ? `an EAV pivot member ('${eav.relationId}')` : 'a computed projection'}; materializing/removing that component needs the insert/delete fan-out (deferred)`,
-		});
-	}
-	raiseMutationDiagnostic({
-		reason: 'no-inverse',
-		column: asg.column,
-		table: view.name,
-		message: `cannot update logical table '${view.name}': column '${asg.column}' is not backed by any decomposition member`,
-	});
 }
 
 /** `update <member> set <cols> where <memberKey> in (select <anchorKey> from <anchor> where <pred>)`. */
@@ -717,22 +784,42 @@ function rewriteAssignedValue(view: MutableViewLike, shape: DecompShape, owner: 
 
 /**
  * The user WHERE rewritten from logical columns into the get body's base terms,
- * validated to reference **only the anchor** (so each member's identifying set
- * can be read from the anchor alone — see the file header). A predicate touching
- * a non-anchor member is deferred onto the snapshot-consistent substrate.
+ * after the anchor-only gate ({@link assertAnchorScoped}) — so each member's
+ * identifying set can be read from the anchor alone (see the file header). A
+ * predicate touching a non-anchor member is deferred onto the snapshot-consistent
+ * substrate. The substitution into base terms is the AST construction the anchor
+ * subquery rides; the **gate decision** is read off the threaded backward lineage,
+ * not a base-qualifier scan of the substituted expression.
  */
 function anchorPredicate(view: MutableViewLike, shape: DecompShape, where: AST.Expression | undefined): AST.Expression | undefined {
 	if (!where) return undefined;
-	const base = substituteViewColumns(where, shape, view);
-	const refs = collectColumnQualifiers(base);
-	if (refs.hasSubquery || [...refs.tables].some(t => t !== shape.anchor.relationId)) {
+	assertAnchorScoped(view, shape, where);
+	return substituteViewColumns(where, shape, view);
+}
+
+/**
+ * Gate a user WHERE to **anchor-only** references via the threaded backward lineage:
+ * every logical column the predicate names must be backed by the anchor member
+ * ({@link classifyColumn} → `member` whose relation is the anchor), and the predicate
+ * must hold no subquery. A non-anchor member column, an EAV / computed / unbacked
+ * column, or an embedded subquery defers onto the snapshot-consistent multi-member
+ * substrate. (Replaces the retired `collectColumnQualifiers` base-qualifier scan —
+ * the anchor decision now reads `updateLineage`, the same backward walk the
+ * multi-source path consumes.)
+ */
+function assertAnchorScoped(view: MutableViewLike, shape: DecompShape, where: AST.Expression): void {
+	const refs = collectViewColumnRefs(where);
+	const nonAnchor = [...refs.names].some(name => {
+		const route = classifyColumn(shape, name);
+		return !(route.kind === 'member' && route.member.relationId === shape.anchor.relationId);
+	});
+	if (refs.hasSubquery || nonAnchor) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-decomposition-predicate',
 			table: view.name,
 			message: `cannot write through logical table '${view.name}': the WHERE references a non-anchor decomposition member; a predicate-honest multi-member fan-out needs snapshot-consistent base-op execution (deferred — filter only on the anchor / shared key, or pin the rows via the anchor)`,
 		});
 	}
-	return base;
 }
 
 /** `select <anchorKey> from <anchorTable> <anchorAlias> [where <pred>]` — the shared identifying set. */
@@ -766,24 +853,6 @@ function stripAnchorQualifier(expr: AST.Expression, shape: DecompShape): AST.Exp
 }
 
 // --- shape helpers --------------------------------------------------------
-
-/**
- * logical-column → backing get-body expression, read off the synthesized body's
- * projection (`<backingExpr> as <logicalColumn>`). This is the exact inverse of
- * the projection `compileDecompositionBody` emitted, so a user predicate over a
- * logical column maps to the same base term the read uses.
- */
-function buildViewColMap(view: MutableViewLike): Map<string, AST.Expression> {
-	const map = new Map<string, AST.Expression>();
-	const sel = view.selectAst;
-	if (sel.type !== 'select') return map;
-	for (const rc of sel.columns) {
-		if (rc.type !== 'column') continue;
-		const name = (rc.alias ?? (rc.expr.type === 'column' ? rc.expr.name : undefined));
-		if (name) map.set(name.toLowerCase(), rc.expr);
-	}
-	return map;
-}
 
 /** True when `logical` (lowercased) is one of the anchor's shared-key columns. */
 function isSharedKeyColumn(shape: DecompShape, logical: string): boolean {
@@ -821,23 +890,31 @@ function resolveMemberTable(ctx: PlanningContext, member: DecompositionMember): 
 	return buildTableReference(memberIdentifierSource(member), ctx).tableRef;
 }
 
-/** Collect the member aliases (`ColumnExpr.table`) a mapped predicate references, and whether it holds a subquery. */
-function collectColumnQualifiers(expr: AST.Expression): { tables: Set<string>; hasSubquery: boolean } {
-	const tables = new Set<string>();
+/**
+ * Collect the **logical column names** a user predicate references (lowercased,
+ * ignoring any view-name qualifier) and whether it embeds a subquery. The anchor
+ * gate ({@link assertAnchorScoped}) maps each collected name to its owning member
+ * via the threaded backward lineage — so the gate decision is lineage-driven; this
+ * walk only enumerates which columns to check (the user-term analogue of the retired
+ * `collectColumnQualifiers`, which scanned base-table qualifiers on the substituted
+ * expression).
+ */
+function collectViewColumnRefs(expr: AST.Expression): { names: Set<string>; hasSubquery: boolean } {
+	const names = new Set<string>();
 	let hasSubquery = false;
 	const walk = (node: unknown): void => {
 		if (Array.isArray(node)) { node.forEach(walk); return; }
 		if (!node || typeof node !== 'object' || !('type' in (node as object))) return;
 		const n = node as Record<string, unknown> & { type: string };
 		if (n.type === 'column') {
-			if (typeof n.table === 'string') tables.add(n.table);
+			if (typeof n.name === 'string') names.add(n.name.toLowerCase());
 			return;
 		}
 		if (n.type === 'subquery' || n.type === 'select' || n.type === 'exists') { hasSubquery = true; return; }
 		for (const v of Object.values(n)) walk(v);
 	};
 	walk(expr);
-	return { tables, hasSubquery };
+	return { names, hasSubquery };
 }
 
 function rejectReturning(view: MutableViewLike, returning: AST.ResultColumn[] | undefined): void {

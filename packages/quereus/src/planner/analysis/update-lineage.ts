@@ -282,15 +282,63 @@ export function deriveJoinUpdateLineage(
  * the identity-only AST classifier (`classifyProjectionExpr`) the single-source
  * mutation spine still consumes; widening it would break that parity
  * (`viewColumnsFromUpdateLineage` ⇄ `deriveViewColumns`). It is therefore NOT the
- * authority for an `inverse` site's writability: the *multi-source* join path
- * (`mutation/multi-source.ts` `writableBaseSite`) and the static `view_info` /
- * `column_info` surfaces (`func/builtins/schema.ts` `baseSiteOf`) treat a `base`
+ * authority for an `inverse` site's writability: the n-way {@link resolveBaseSite}
+ * (consumed by the multi-source join path and the decomposition fan-out) and the
+ * static `view_info` / `column_info` surfaces (`func/builtins/schema.ts`
+ * `baseSiteOf`) treat a `base`
  * site **with an `inverse`** as writable (docs § Scalar Invertibility, § Inner
  * Join). The single-source dynamic path does not yet consume inverses, so this
  * reader's identity-only divergence is the honest single-source reading.
  */
 export function identityBaseColumn(site: UpdateSite | undefined): string | undefined {
 	return site && site.kind === 'base' && site.inverse === undefined ? site.baseColumn : undefined;
+}
+
+/**
+ * The base-table site an {@link UpdateSite} resolves to, with the outer-join
+ * `null-extended` layer unwrapped so the **owning base relation is always
+ * surfaced** (a null-extended column still names the base table its inner site
+ * targets, just non-writably). This is the *n-way* backward-site reader the put
+ * fan-out consumers share — the generalization of the two single-purpose readers
+ * above it: the former multi-source-local identity-or-inverse reader (which
+ * discarded the table on null-extension) and the single-source identity-only
+ * {@link identityBaseColumn}. One reader, consumed by single-source, the
+ * multi-source join walk, and the decomposition fan-out (docs/view-updateability.md
+ * § Round-Trip Laws and the Derived Backward Walk).
+ *
+ * - `base` → `{ table, baseColumn, writable: true, nullExtended: false, inverse?, domain? }`.
+ * - `null-extended` → the inner base site, but `writable: false`,
+ *   `nullExtended: true` (a write would need materialization of the missing side —
+ *   deferred; the decomposition fan-out reports it as an optional-member write).
+ * - `computed` / absent → `{ writable: false, nullExtended: false }` (read-only).
+ *
+ * `writable` is **identity-or-inverse base** (matching the multi-source reader it
+ * subsumes). A consumer needing *identity-only* writability (the single-source
+ * spine and the decomposition value routing) additionally checks
+ * `inverse === undefined`.
+ */
+export interface ResolvedBaseSite {
+	/** Producing `TableReferenceNode` plan-node id, or `undefined` for a `computed` site. */
+	readonly table?: number;
+	readonly baseColumn?: string;
+	readonly writable: boolean;
+	readonly nullExtended: boolean;
+	readonly inverse?: (written: AST.Expression) => AST.Expression;
+	readonly domain?: AST.Expression;
+}
+
+export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite {
+	if (!site) return { writable: false, nullExtended: false };
+	switch (site.kind) {
+		case 'base':
+			return { table: site.table, baseColumn: site.baseColumn, writable: true, nullExtended: false, inverse: site.inverse, domain: site.domain };
+		case 'null-extended': {
+			const inner = resolveBaseSite(site.inner);
+			return { ...inner, writable: false, nullExtended: true };
+		}
+		case 'computed':
+			return { writable: false, nullExtended: false };
+	}
 }
 
 /**
