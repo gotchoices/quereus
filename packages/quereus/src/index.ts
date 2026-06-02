@@ -204,6 +204,22 @@ export type {
 } from './vtab/mapping-advertisement.js';
 export { buildAdvertisementsFromTags } from './schema/mapping-advertisement-tags.js';
 
+// Lens-deployment surface (logical-schema → basis; docs/lens.md § Deployment).
+// `deployLogicalSchema` is the `apply schema X` compile step for a logical
+// schema; it produces a `LensDeploymentSnapshot` (the deployed basis
+// representation) that the module deployment-notification hook
+// (`VirtualTableModule.notifyLensDeployment`) hands to every registered module,
+// so a host adapter backing the basis can reconcile its storage against the
+// freshly deployed lens. The AST types these reference (`SelectStmt`,
+// `DeclareSchemaStmt`) are available from `@quereus/quereus/parser`.
+export { deployLogicalSchema } from './schema/lens-compiler.js';
+export type {
+	LensDeploymentSnapshot,
+	LensTableSnapshot,
+	LensRelationBacking,
+} from './schema/lens.js';
+export type { LensDeployReport } from './schema/lens-prover.js';
+
 // Re-export plugin manifest types (for plugin authors, but not the loader)
 export type {
 	PluginManifest,

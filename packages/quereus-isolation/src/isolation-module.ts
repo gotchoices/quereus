@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -229,6 +229,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	async endSchemaBatch(db: Database, schemaName: string, error?: unknown): Promise<void> {
 		await this.underlying.endSchemaBatch?.(db, schemaName, error);
+	}
+
+	/**
+	 * Forwards APPLY SCHEMA's lens deployment notification to the underlying module.
+	 *
+	 * A logical `apply schema X` fires `notifyLensDeployment` on the *registered*
+	 * module (this wrapper when a basis is isolated), handing it the freshly
+	 * deployed `LensDeploymentSnapshot` so a basis-backing module can reconcile its
+	 * storage against the new lens. The deployed lens shape is a property of the
+	 * declared logical/basis schemas and is isolation-transparent (the overlay does
+	 * not change it), so a straight delegate is correct — mirroring the
+	 * `getMappingAdvertisements` forward. Without this forward an isolation-wrapped
+	 * basis module would silently never hear the deployment.
+	 */
+	async notifyLensDeployment(db: Database, logicalSchemaName: string, snapshot: LensDeploymentSnapshot): Promise<void> {
+		await this.underlying.notifyLensDeployment?.(db, logicalSchemaName, snapshot);
 	}
 
 	/**

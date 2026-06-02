@@ -8,6 +8,7 @@ import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { ModuleCapabilities } from './capabilities.js';
 import type { MappingAdvertisement } from './mapping-advertisement.js';
 import type { Schema } from '../schema/schema.js';
+import type { LensDeploymentSnapshot } from '../schema/lens.js';
 
 /**
  * Base interface for module-specific configuration passed to create/connect.
@@ -307,6 +308,49 @@ export interface VirtualTableModule<
 	 * end-batch failure is logged and swallowed so the original cause survives.
 	 */
 	endSchemaBatch?(db: Database, schemaName: string, error?: unknown): Promise<void>;
+
+	/**
+	 * Optional. Fired exactly once per successful `apply schema X` of a
+	 * **logical** schema, after the lens layer is fully deployed — every lens
+	 * view + slot is registered and the deployment snapshot has been rotated into
+	 * the `DeclaredSchemaManager`. Hands every registered module the
+	 * {@link LensDeploymentSnapshot} that `deployLogicalSchema` just built for
+	 * `logicalSchemaName` (read back from the manager's rotated `current`, never
+	 * re-derived), so a module backing the basis can realise / reconcile its
+	 * backing relations against the freshly deployed lens (e.g. the Lamina adapter's
+	 * deploy → basis-reconcile path; see `docs/lens.md` § Module deployment
+	 * notification).
+	 *
+	 * Firing contract:
+	 * - **Once per successful apply.** Fires only when `deployLogicalSchema`
+	 *   completed without throwing — the deploy is atomic, so a blocked deploy
+	 *   (prover error, etc.) never reaches here. A **physical** `apply schema`
+	 *   deploys no lens and never fires it.
+	 * - **After deploy, not inside a migration batch.** The logical-apply path runs
+	 *   no `beginSchemaBatch`/`endSchemaBatch` migration-DDL loop (that is the
+	 *   basis / physical path); the notification fires once the lens catalog
+	 *   mutation + snapshot rotation are complete — the logical-apply analogue of
+	 *   "after `endSchemaBatch`".
+	 * - **Snapshot scoped to the affected schema.** `snapshot` is the deployment of
+	 *   `logicalSchemaName` only (its just-rotated `current`). An empty deploy —
+	 *   every logical table removed from the declaration — still fires, carrying an
+	 *   empty-`tables` snapshot, so a consumer can observe the detach.
+	 * - **Every registered module is notified, in registration order.** A module
+	 *   that backs none of the basis relations should no-op (mirrors the
+	 *   `beginSchemaBatch` "owns no tables ⇒ no-op" contract).
+	 * - **Errors propagate.** The lens is already deployed when this fires; a
+	 *   notification that throws aborts `apply schema X` with that error so the
+	 *   caller learns the module's reconcile failed. The deployed lens is **not**
+	 *   rolled back — a subsequent re-apply re-fires the notification.
+	 *
+	 * May be sync or async; the engine awaits the result. Omit ⇒ the module is
+	 * never consulted on deploy (today's behavior).
+	 */
+	notifyLensDeployment?(
+		db: Database,
+		logicalSchemaName: string,
+		snapshot: LensDeploymentSnapshot,
+	): void | Promise<void>;
 }
 
 /**

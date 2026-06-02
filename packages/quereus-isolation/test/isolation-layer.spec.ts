@@ -1241,6 +1241,36 @@ describe('IsolationModule', () => {
 			// reaching here without throwing is the assertion
 		});
 
+		it('forwards notifyLensDeployment to the underlying module', async () => {
+			// A logical APPLY SCHEMA fires `notifyLensDeployment` on the registered
+			// module (the wrapper when a basis is isolated). The deployed snapshot is
+			// isolation-transparent, so it must reach the underlying — a missing
+			// forward silently strands a basis-backing module's reconcile.
+			const calls: { schemaName: string; snapshot: unknown }[] = [];
+			const underlying = {
+				...new MemoryTableModule(),
+				async notifyLensDeployment(_callDb: unknown, schemaName: string, snapshot: unknown) {
+					calls.push({ schemaName, snapshot });
+				},
+			} as any;
+			const isolatedModule = new IsolationModule({ underlying });
+
+			const sentinel = { basisSchemaName: 'y', basisHash: 'h', tables: new Map() } as any;
+			await isolatedModule.notifyLensDeployment(db, 'x', sentinel);
+
+			expect(calls).to.have.lengthOf(1);
+			expect(calls[0].schemaName).to.equal('x');
+			expect(calls[0].snapshot).to.equal(sentinel);
+		});
+
+		it('notifyLensDeployment no-ops when the underlying omits the hook', async () => {
+			const underlying = { ...new MemoryTableModule(), notifyLensDeployment: undefined } as any;
+			const isolatedModule = new IsolationModule({ underlying });
+			const sentinel = { basisSchemaName: 'y', basisHash: 'h', tables: new Map() } as any;
+			await isolatedModule.notifyLensDeployment(db, 'x', sentinel);
+			// reaching here without throwing is the assertion
+		});
+
 		it('reaches the underlying through a real APPLY SCHEMA under isolation', async () => {
 			// End-to-end floor: register the wrapper as a real module, run an actual
 			// `apply schema`, and prove (a) APPLY SCHEMA's registered-module loop

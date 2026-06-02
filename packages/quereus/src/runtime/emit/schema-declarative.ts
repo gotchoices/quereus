@@ -166,6 +166,12 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 				);
 			}
 			deployLogicalSchema(rctx.db, declaredSchema, schemaName);
+			// Hand the freshly-deployed snapshot to every registered module so a
+			// basis-backing module can reconcile its storage against the new lens.
+			// Fires only on a successful deploy (an atomic deploy throws before
+			// reaching here on any blocking diagnostic). See docs/lens.md
+			// § Module deployment notification.
+			await notifyLensDeployment(rctx.db, schemaName);
 			return [];
 		}
 
@@ -401,5 +407,30 @@ async function endSchemaBatchAll(
 	}
 	if (loopError === undefined && firstEndError !== undefined) {
 		throw firstEndError;
+	}
+}
+
+/**
+ * Fires the optional per-module lens deployment notification, once per
+ * successful logical `apply schema X`, after the lens catalog mutation +
+ * snapshot rotation complete (see `VirtualTableModule.notifyLensDeployment`).
+ *
+ * Reads the just-rotated `current` snapshot back from the `DeclaredSchemaManager`
+ * so the notification carries the exact {@link LensDeploymentSnapshot}
+ * `deployLogicalSchema` built — no second derivation. Every module implementing
+ * the hook is notified in registration order; a module that backs none of the
+ * basis relations is expected to no-op. A notification that throws propagates
+ * out of `apply schema X` (the lens is already deployed; the failed reconcile is
+ * the caller's to handle).
+ */
+async function notifyLensDeployment(db: Database, logicalSchemaName: string): Promise<void> {
+	const snapshot = db.declaredSchemaManager.getDeployedLensSnapshots(logicalSchemaName)?.current;
+	// A successful deploy always rotates a snapshot; guard defensively rather
+	// than notify modules with an undefined deployment.
+	if (!snapshot) return;
+	for (const { name, module } of db.schemaManager.allModules()) {
+		if (typeof module.notifyLensDeployment !== 'function') continue;
+		log('notifyLensDeployment → module %s for logical schema %s', name, logicalSchemaName);
+		await module.notifyLensDeployment(db, logicalSchemaName, snapshot);
 	}
 }
