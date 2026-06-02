@@ -476,8 +476,15 @@ export function subscriptionFromChangeScope(
 					break;
 				}
 				case 'groups': {
+					// A `groups` watch carries no literal values to surface, so on a
+					// global re-evaluation (kernel fell back to whole-relation, or an
+					// external/out-of-band change marked the relation global) we fire
+					// with empty hits — "some group changed, re-query" — exactly as the
+					// `full` case does. Without this, a `groups` watch would silently
+					// miss every global change (commit-path fallbacks and the entire
+					// external-change path), violating the never-miss-a-change contract.
 					hits = isGlobal ? [] : (kernelTuples ?? []);
-					observable = hits.length > 0;
+					observable = isGlobal || hits.length > 0;
 					break;
 				}
 				case 'rowsByGroup': {

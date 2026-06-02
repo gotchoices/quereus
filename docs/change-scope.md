@@ -352,10 +352,14 @@ received over a network.
 | `groups`      | The distinct group-key tuples touched in this txn. |
 | `rowsByGroup` | The bound tuples from `values` that intersected the changes in this txn. |
 
-If the kernel falls back to a global re-evaluation (e.g. missing PK or
-the cost-based fallback fired) on a `rows` / `rowsByGroup` watch, the
-watcher surfaces every literal value the watch was registered for —
-"all of your watched keys may have changed."
+If the kernel falls back to a global re-evaluation (e.g. missing PK,
+the cost-based fallback fired, or the whole relation changed opaquely),
+the watcher still fires — coarsely — rather than miss the change:
+
+- `full` and `groups` watches fire with **empty** `hits` ("something
+  changed, re-query"); neither carries a narrower set to report.
+- `rows` / `rowsByGroup` watches surface every literal value the watch
+  was registered for — "all of your watched keys may have changed."
 
 ### Validation
 
@@ -396,6 +400,32 @@ kernel forgets it, and further commits won't fire it. A warning is
 logged with the `Subscription.id`. To continue watching, build a fresh
 `ChangeScope` against the new schema and re-subscribe. This is
 intentional v1 simplicity — auto-rebind is deferred.
+
+### External / out-of-band changes
+
+```ts
+notifyExternalChange(tableName: string, schemaName?: string): Promise<void>;
+```
+
+The post-commit path only fires for changes that flow through *this*
+`Database`'s change log. A table backed by a replicated/external store
+(e.g. an optimystic vtab) can learn of a **remote** write that never
+touched the local change log — its watchers would otherwise never fire.
+`notifyExternalChange` bridges that gap: it fires every active watcher
+whose scope includes `schema.table` as if the whole table changed,
+**without** a local commit. `schemaName` defaults to the current schema;
+matching is case-insensitive on the lowercased `schema.table` key.
+
+It is **coarse by design** — table-granular, no key narrowing. Each
+matching subscription is driven through the same global re-evaluation
+branch the commit-path fallback uses, so the `hits` follow the
+global-fallback rules above (`full`/`groups` → empty `hits`;
+`rows`/`rowsByGroup` → all registered literals). Over-firing only costs
+the consumer an extra re-query; it never misses a change. A no-op when no
+subscription matches; per-handler errors are logged and swallowed, never
+rejecting into the caller (same contract as the post-commit path).
+Handlers fire serially and are awaited. A future optional `changedKeys`
+argument could add a precise key-scoped variant without breaking callers.
 
 ### `Subscription.id` shape
 

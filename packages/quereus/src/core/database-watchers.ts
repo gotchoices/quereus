@@ -194,10 +194,7 @@ export class WatcherManager {
 
 		// Snapshot the matching subscriptions before firing: a handler that
 		// (un)subscribes a peer must not perturb this pass.
-		const matching: ActiveSubscription[] = [];
-		for (const entry of this.active.values()) {
-			if (entry.tables.has(fqName)) matching.push(entry);
-		}
+		const matching = this.subscriptionsForTable(fqName);
 		if (matching.length === 0) return;
 
 		this.currentTxnId = this.mintTxnId();
@@ -250,11 +247,19 @@ export class WatcherManager {
 		entry.captureDisposers.length = 0;
 	}
 
-	private invalidateForTable(fqName: string): void {
-		const toDispose: ActiveSubscription[] = [];
+	/** Snapshot of every active subscription whose scope includes `fqName`
+	 *  (lowercased `schema.table`). Snapshotting decouples the caller's
+	 *  iteration from mutations a handler/disposer may make to `active`. */
+	private subscriptionsForTable(fqName: string): ActiveSubscription[] {
+		const out: ActiveSubscription[] = [];
 		for (const entry of this.active.values()) {
-			if (entry.tables.has(fqName)) toDispose.push(entry);
+			if (entry.tables.has(fqName)) out.push(entry);
 		}
+		return out;
+	}
+
+	private invalidateForTable(fqName: string): void {
+		const toDispose = this.subscriptionsForTable(fqName);
 		for (const entry of toDispose) {
 			warnLog('Invalidating subscription %s due to schema change on %s', entry.id, fqName);
 			this.disposeActive(entry);

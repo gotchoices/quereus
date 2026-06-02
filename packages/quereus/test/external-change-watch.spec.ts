@@ -32,6 +32,32 @@ describe('Database.notifyExternalChange (external/remote change → watch)', () 
 		};
 	}
 
+	/** A hand-built `groups` change-scope watch on a single group column. */
+	function groupsWatch(table: string, groupCol: string): ChangeScope {
+		return {
+			watches: [{
+				table: { schema: 'main', table },
+				columns: new Set([groupCol]),
+				scope: { kind: 'groups', groupBy: [groupCol] },
+			}],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+	}
+
+	/** A hand-built `rowsByGroup` change-scope watch with a literal group value. */
+	function rowsByGroupWatch(table: string, groupCol: string, value: unknown): ChangeScope {
+		return {
+			watches: [{
+				table: { schema: 'main', table },
+				columns: new Set([groupCol]),
+				scope: { kind: 'rowsByGroup', groupBy: [groupCol], values: [[value as never]] },
+			}],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+	}
+
 	it('a `full` watch fires once with empty hits and a set txnId', async () => {
 		await db.exec('create table t (id text primary key, v text) using memory');
 		const scope = db.prepare('select * from t').getChangeScope();
@@ -162,5 +188,33 @@ describe('Database.notifyExternalChange (external/remote change → watch)', () 
 		expect(a).to.have.length(1);
 		expect(b).to.have.length(1);
 		expect(b[0].matched[0].hits).to.deep.equal([['z']]);
+	});
+
+	it('a `groups` watch fires once with empty hits (whole-table → re-query)', async () => {
+		await db.exec('create table t (id text primary key, g text, v text) using memory');
+
+		const events: WatchEvent[] = [];
+		const sub = db.watch(groupsWatch('t', 'g'), e => { events.push(e); });
+
+		await db.notifyExternalChange('t');
+		sub.unsubscribe();
+
+		expect(events).to.have.length(1);
+		expect(events[0].matched).to.have.length(1);
+		// A `groups` watch carries no literals, so a global change surfaces empty hits.
+		expect(events[0].matched[0].hits).to.deep.equal([]);
+	});
+
+	it('a `rowsByGroup` watch surfaces its registered group literal in hits', async () => {
+		await db.exec('create table t (id text primary key, g text, v text) using memory');
+
+		const events: WatchEvent[] = [];
+		const sub = db.watch(rowsByGroupWatch('t', 'g', 'gx'), e => { events.push(e); });
+
+		await db.notifyExternalChange('t');
+		sub.unsubscribe();
+
+		expect(events).to.have.length(1);
+		expect(events[0].matched[0].hits).to.deep.equal([['gx']]);
 	});
 });

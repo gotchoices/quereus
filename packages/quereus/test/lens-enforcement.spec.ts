@@ -1346,6 +1346,31 @@ describe('lens enforcement: parent-side FK RESTRICT at the write boundary', () =
 		}
 	});
 
+	it('value→NULL on ONE component of a composite nullable referenced key ABORTs (per-column null-safe arm under the AND-reduction)', async () => {
+		const db = new Database();
+		try {
+			// Composite nullable referenced key (ka, kb) — the null-safe equality is built
+			// per-column and AND-reduced, so nulling a single component must collapse the
+			// whole guard to false (that component's arm is false, the unchanged component's
+			// arm is true, AND ⇒ false) and fall through to the NOT EXISTS ⇒ ABORT. Guards the
+			// composite path the value→NULL single-column test exercises only for n=1.
+			await db.exec('declare schema y { table parent (id integer primary key, ka integer null, kb integer null, unique (ka, kb)); table child (id integer primary key, ca integer null, cb integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, ka integer null, kb integer null, unique (ka, kb)); table child (id integer primary key, ca integer null, cb integer null, constraint fk_cab foreign key (ca, cb) references parent(ka, kb)) }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.parent (id, ka, kb) values (1, 10, 20)');
+			await db.exec('insert into x.child (id, ca, cb) values (100, 10, 20)'); // references (10, 20)
+			// Nulling only ka changes the key (10,20)→(null,20), orphaning child 100 ⇒ ABORT.
+			await expectThrows(() => db.exec('update x.parent set ka = null where id = 1'), /constraint|foreign|fk_/i);
+			expect(await rows(db, 'select ka, kb from x.parent where id = 1'), 'orphaning composite update rolled back').to.deep.equal([{ ka: 10, kb: 20 }]);
+			// Re-asserting the same composite value (no change) still short-circuits true.
+			await db.exec('update x.parent set ka = 10 where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child where ca = 10 and cb = 20')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a composite FK enforces the parent side — delete/update of the referenced composite key ABORTs; an unreferenced one succeeds', async () => {
 		const db = new Database();
 		try {
