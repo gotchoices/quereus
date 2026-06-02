@@ -1,7 +1,7 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
-import type { TableSchema } from '../../schema/table.js';
+import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
@@ -1390,14 +1390,24 @@ function requireSingleColumnPk(view: MutableViewLike, side: JoinSide): string {
 }
 
 /**
+ * True when `fk` (declared on `child`) targets `parent` — the shared FK-match
+ * predicate: case-insensitive `referencedTable` against the parent's name, with an
+ * absent `referencedSchema` defaulting to the child's own schema. The single source
+ * of truth for "does this declared FK reference that side", reused by
+ * {@link fkChildIndex}, {@link inboundDeleteAction}, and {@link edgeCorrelated}.
+ */
+function fkTargetsSide(fk: ForeignKeyConstraintSchema, child: JoinSide, parent: JoinSide): boolean {
+	return fk.referencedTable.toLowerCase() === parent.schema.name.toLowerCase()
+		&& (fk.referencedSchema ?? child.schema.schemaName).toLowerCase() === parent.schema.schemaName.toLowerCase();
+}
+
+/**
  * Index of the FK-child (many) side: the side declaring a foreign key onto the
  * other. `undefined` when no FK is provable or both sides reference each other.
  */
 function fkChildIndex(sides: readonly [JoinSide, JoinSide]): number | undefined {
 	const refs = (child: JoinSide, parent: JoinSide): boolean =>
-		(child.schema.foreignKeys ?? []).some(fk =>
-			fk.referencedTable.toLowerCase() === parent.schema.name.toLowerCase()
-			&& (fk.referencedSchema ?? child.schema.schemaName).toLowerCase() === parent.schema.schemaName.toLowerCase());
+		(child.schema.foreignKeys ?? []).some(fk => fkTargetsSide(fk, child, parent));
 	const zeroRefsOne = refs(sides[0], sides[1]);
 	const oneRefsZero = refs(sides[1], sides[0]);
 	if (zeroRefsOne && !oneRefsZero) return 0;
@@ -1422,12 +1432,9 @@ function orderSides(sides: readonly [JoinSide, JoinSide]): number[] {
  * `referencedTable` / `referencedSchema` comparison).
  */
 function inboundDeleteAction(child: JoinSide, parent: JoinSide): AST.ForeignKeyAction | undefined {
-	const parentName = parent.schema.name.toLowerCase();
-	const parentSchema = parent.schema.schemaName.toLowerCase();
 	let governing: AST.ForeignKeyAction | undefined;
 	for (const fk of child.schema.foreignKeys ?? []) {
-		if (fk.referencedTable.toLowerCase() !== parentName) continue;
-		if ((fk.referencedSchema ?? child.schema.schemaName).toLowerCase() !== parentSchema) continue;
+		if (!fkTargetsSide(fk, child, parent)) continue;
 		if (fk.onDelete === 'restrict') return 'restrict';        // most-blocking — governs outright
 		if (fk.onDelete === 'cascade') governing = 'cascade';
 		else if (governing !== 'cascade') governing = fk.onDelete;  // setNull / setDefault, unless a cascade already won
@@ -1518,11 +1525,8 @@ function edgeCorrelated(
 ): boolean {
 	const child = sides[childIdx];
 	const parent = sides[parentIdx];
-	const parentNameLower = parent.schema.name.toLowerCase();
-	const parentSchemaLower = parent.schema.schemaName.toLowerCase();
 	return (child.schema.foreignKeys ?? []).some(fk => {
-		if (fk.referencedTable.toLowerCase() !== parentNameLower) return false;
-		if ((fk.referencedSchema ?? child.schema.schemaName).toLowerCase() !== parentSchemaLower) return false;
+		if (!fkTargetsSide(fk, child, parent)) return false;
 		const refIndices = resolveReferencedColumns(fk, parent.schema);
 		if (refIndices.length !== fk.columns.length) return false;
 		return fk.columns.every((childColIdx, i) => {

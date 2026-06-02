@@ -862,6 +862,34 @@ select aid, bref from l_a order by aid;
 select bid, aref from l_b order by bid;
 → [{"bid":10,"aref":1},{"bid":20,"aref":null}]
 
+-- --- (fo-m) correlation expressed in the body WHERE (not the ON) -> REJECT ---
+-- The correlation gate folds the view body's own WHERE conjuncts into the cross-side
+-- equality set, not just the ON condition. Here the join's ON is on a non-FK column
+-- (a.lbl = b.lbl, correlating neither edge), but the body WHERE `b.aref = a.aid`
+-- correlates edge B (m_b.aref -> m_a.aid). So `joinCorrelatesMutualFk` still proves a
+-- mutual FK edge correlated and the plan-time `mutual-fk-restrict-delete` reject fires
+-- — the actionable diagnostic, not the deferred raw FK error. This pins the WHERE-fold
+-- branch of the gate. See docs/view-updateability.md § Inner Join — Deletes.
+create table m_a (aid integer primary key, lbl text, bref integer null,
+    foreign key (bref) references m_b(bid) on delete restrict);
+create table m_b (bid integer primary key, lbl text, aref integer null,
+    foreign key (aref) references m_a(aid) on delete restrict);
+insert into m_a (aid, lbl, bref) values (1, 'x', null), (2, 'y', null);
+insert into m_b (bid, lbl, aref) values (10, 'x', null), (20, 'z', null);
+-- back-fill after both rows exist (avoids the circular insert-time FK chicken-and-egg)
+update m_a set bref = 10 where aid = 1;
+update m_b set aref = 1 where bid = 10;
+create view m_jv as select a.aid as aid, b.bid as bid from m_a a join m_b b on a.lbl = b.lbl where b.aref = a.aid;
+select aid, bid from m_jv order by aid;
+→ [{"aid":1,"bid":10}]
+delete from m_jv where aid = 1;
+-- error: mutual foreign key
+-- both base rows survive the rejected delete.
+select aid, bref from m_a order by aid;
+→ [{"aid":1,"bref":10},{"aid":2,"bref":null}]
+select bid, aref from m_b order by bid;
+→ [{"bid":10,"aref":1},{"bid":20,"aref":null}]
+
 -- ===================================
 -- Phase 3.4: the `quereus.update.*` tag override surface.
 -- target / exclude / delete_via / policy / default_for — read + site-validated
