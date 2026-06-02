@@ -710,6 +710,14 @@ watchers observe). See [change-scope.md](change-scope.md) for the
 full firing semantics, schema-change invalidation policy, and the
 list of v1 limitations.
 
+For tables backed by a replicated/external store (e.g. an optimystic
+vtab) that learns of remote writes out-of-band — changes that never
+touch this `Database`'s commit change-log — call
+`db.notifyExternalChange(tableName, schemaName?)` to fire every watcher
+on that table as if the whole table changed. It is coarse by design
+(table-granular, no key narrowing); see the *External / out-of-band
+changes* section of [change-scope.md](change-scope.md).
+
 ## Virtual Tables
 
 One of Quereus's key features is its support for virtual tables, which allow you to expose any data source as a SQL table.

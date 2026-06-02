@@ -1,4 +1,5 @@
 description: The lenient multi-side DELETE fan-out for two-table inner-join views hardcodes side order [0,1]. Over a mutual FK whose two edges have asymmetric ON DELETE actions (one CASCADE, one RESTRICT), this fixed order can RESTRICT-block where the reverse order would have cascaded and succeeded — and the user only sees a raw "FOREIGN KEY constraint failed … RESTRICT" error with no hint that a side override would fix it.
+prereq: view-mutation-lenient-multiside-delete-fanout
 files: packages/quereus/src/planner/mutation/multi-source.ts, packages/quereus/test/logic/93.4-view-mutation.sqllogic, docs/view-updateability.md
 
 ## Context

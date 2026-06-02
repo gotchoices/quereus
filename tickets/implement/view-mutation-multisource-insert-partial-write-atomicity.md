@@ -1,6 +1,7 @@
 description: The View Round-Trip Law harness gained a "directly-supplied insert key colliding with an existing base key is rejected atomically" test (`describe('multi-source inner join')` in `packages/quereus/test/property.spec.ts`), but as written it cannot falsify a NON-atomic engine. The seed inserts each key into BOTH bases together, so a colliding supplied key is present in both — the per-base fan-out fails on the FIRST member op and the second base is never touched, so "both bases unchanged" is satisfied trivially by first-op-failure, not by rollback of a partial write. The genuinely interesting atomicity path — a supplied key present in EXACTLY ONE base, so the first insert succeeds and the second fails, forcing a rollback of the already-written base — is never constructed. Add coverage that exercises true partial-write rollback.
 prereq:
 files: packages/quereus/test/property.spec.ts
+effort: low
 ----
 
 ## Background

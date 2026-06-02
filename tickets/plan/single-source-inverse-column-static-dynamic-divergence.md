@@ -34,30 +34,41 @@ update v set bp = 9 where id = 1;
 --  rejected: no-inverse  (dynamic says read-only)
 ```
 
-## Expected behavior / decision needed
+## Decision (settled): widen the dynamic single-source path
 
-The two surfaces must agree. There are two directions; this is a **design question**
-for the human:
+The two surfaces must agree, and the resolution is **direction (1) — widen the
+dynamic single-source path to consume the threaded `inverse`**, mirroring what the
+multi-source join path now does (`view-mutation-multisource-threaded-updatesite`).
+`update v set bp = 9` must store `t.b = 8`; the static `is_updatable = 'YES'` becomes
+honest. This is the deliberate continuation of the inverse-writability trajectory —
+the single-source spine should not lag the multi-source one. (Direction (2), narrowing
+the static surface to report `NO`, is explicitly *rejected*: it would under-report a
+column we are choosing to make writable.)
 
-1. **Widen the dynamic single-source path** to consume the threaded `inverse`
-   (mirroring what multi-source now does) — `update v set bp = 9` would store
-   `t.b = 8`. This is the natural continuation of the inverse-writability work and
-   makes the static `YES` honest. It requires the single-source spine to stop
-   relying on the identity-only AST classifier and instead read the plan-node
-   `UpdateSite` (the `identityBaseColumn` / `viewColumnsFromUpdateLineage`
-   reader is deliberately identity-only for `deriveViewColumns` parity, so this
-   would need a separate full-lineage reader on the dynamic path).
+### Design task (plan)
 
-2. **Narrow the static surface** so a single-source `base`-with-`inverse` column
-   reports `is_updatable = 'NO'` until the dynamic path supports it — i.e. make
-   `baseSiteOf` (or its single-source callers) inverse-aware. This keeps the static
-   report conservative and truthful to today's dynamic behavior, at the cost of
-   under-reporting a column that *will* become writable.
+The single-source spine must stop relying on the identity-only AST classifier
+(`classifyProjectionExpr`) and instead read the plan-node `UpdateSite`'s full lineage
+(the `base`+`inverse` chain). Note the existing `identityBaseColumn` /
+`viewColumnsFromUpdateLineage` reader is **deliberately identity-only** for
+`deriveViewColumns` parity, so this needs a *separate* full-lineage reader on the
+dynamic path (do not widen the identity-only reader in place — that would perturb the
+view-column derivation). On an `update set <invcol> = expr`, compose the inverse to
+produce the base setter (`t.b = bp - 1`), reusing `scalar-invertibility.ts`'s
+`traceInvertibleColumn` / inverse-chain machinery (the same surface multi-source
+consumes). A genuinely non-invertible (`opaque`) projection stays `no-inverse`.
 
-Direction (1) is the likely long-term intent (it matches the multi-source
-trajectory), but it is a feature, not a bug-fix, so it is parked here rather than
-in `fix/`. Whichever is chosen, add golden coverage (`06.3.5-column-info` /
-`06.3.4-view-info`) and a single-source PutGet law so the agreement is pinned.
+### Acceptance
+
+- `update v set bp = 9 where id = 1` stores `t.b = 8` (reproduction above now succeeds).
+- A still-`opaque` computed column stays read-only (`no-inverse`) — the widening is
+  inverse-gated, not a blanket allow.
+- Static `column_info` / `view_info` `YES` now matches dynamic behavior.
+- Golden coverage (`06.3.5-column-info` / `06.3.4-view-info`) + a single-source PutGet
+  law pin the static↔dynamic agreement.
+- Update `docs/view-updateability.md` § Scalar Invertibility to drop the "single-source
+  spine does not yet consume inverses" caveat, and the `identityBaseColumn`
+  doc-comment in `analysis/update-lineage.ts`.
 
 ## Notes
 

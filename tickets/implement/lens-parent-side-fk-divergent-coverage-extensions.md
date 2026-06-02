@@ -1,6 +1,7 @@
 description: Extend test coverage for the lens parent-side FK divergent-basis-action mechanism — composite (multi-column) divergent FKs, the full divergent (basis action × logical action) matrix, transitive/multi-level divergence (parent→child→grandchild), and store-backend (rowid-mode / lamina) validation. These are untested floors of `lens-parent-side-fk-divergent-basis-action`, which shipped and was reviewed with the mechanism proven uniform across them by argument — not bugs, just unpinned coverage.
 prereq: lens-parent-side-fk-divergent-basis-action
 files: packages/quereus/test/lens-enforcement.spec.ts, packages/quereus/src/schema/lens-fk-discovery.ts, packages/quereus/src/runtime/foreign-key-actions.ts
+effort: medium
 ----
 
 # Lens parent-side FK divergent basis action — coverage extensions

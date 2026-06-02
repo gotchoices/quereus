@@ -1,6 +1,6 @@
 /**
  * Database.notifyExternalChange — externally-originated (out-of-band) change →
- * watch invalidation (ticket `quereus-external-change-watch-api`).
+ * watch invalidation (ticket `external-change-watch-feature-untracked-provenance`).
  *
  * Watchers normally fire only from the post-commit path, driven by the local
  * transaction's change log. A row written by a remote peer to an
@@ -216,5 +216,32 @@ describe('Database.notifyExternalChange (external/remote change → watch)', () 
 
 		expect(events).to.have.length(1);
 		expect(events[0].matched[0].hits).to.deep.equal([['gx']]);
+	});
+
+	it('fires only the named table within a subscription that watches two tables', async () => {
+		await db.exec('create table t (id text primary key, v text) using memory');
+		await db.exec('create table u (id text primary key, v text) using memory');
+
+		// One subscription, two watches on distinct tables. An external change on
+		// `t` must surface ONLY `t`'s watch in `matched` — the other relation is
+		// untouched and must not over-fire.
+		const scope: ChangeScope = {
+			watches: [
+				{ table: { schema: 'main', table: 't' }, columns: 'all', scope: { kind: 'full' } },
+				{ table: { schema: 'main', table: 'u' }, columns: 'all', scope: { kind: 'full' } },
+			],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+
+		const events: WatchEvent[] = [];
+		const sub = db.watch(scope, e => { events.push(e); });
+
+		await db.notifyExternalChange('t');
+		sub.unsubscribe();
+
+		expect(events).to.have.length(1);
+		expect(events[0].matched).to.have.length(1);
+		expect(events[0].matched[0].watch.table.table).to.equal('t');
 	});
 });

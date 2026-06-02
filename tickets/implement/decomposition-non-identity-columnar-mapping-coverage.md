@@ -1,6 +1,7 @@
 description: Add goldens coverage for non-identity / non-invertible columnar decomposition mappings, which the lineage-driven `classifyColumn` now routes (read-only `computed-mapping`) but which no test exercises. Every existing decomposition advertisement uses identity `colMap('a','a')`, so the new lineage classification of a `member.columns` entry whose basis is a transform (`a+1`) or a composite (`a||b`) is unproven by tests — a regression there would silently flip a column's writability.
 prereq:
 files: packages/quereus/src/planner/mutation/decomposition.ts, packages/quereus/src/planner/mutation/backward-body.ts, packages/quereus/test/lens-put-fanout.spec.ts, packages/quereus/test/lens-advertisement.spec.ts
+effort: medium
 
 ## Background
 
