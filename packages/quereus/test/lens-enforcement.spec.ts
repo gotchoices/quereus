@@ -2335,6 +2335,253 @@ describe('lens enforcement: parent-side FK divergent basis action', () => {
 			await logicalRestrict.close();
 		}
 	});
+
+	// --- Coverage extensions (ticket: lens-parent-side-fk-divergent-coverage-extensions) ---
+	// The mechanism is column-set-based and arity-uniform; these pin the previously-unexercised
+	// composite arity, the remaining divergent (basis × logical) action pairs, the
+	// multi-equivalent-basis-FK residual, and transitive (multi-level) divergence.
+
+	it('composite divergent — logical SET NULL over basis CASCADE nulls both FK columns (not deletes)', async () => {
+		const db = new Database();
+		try {
+			// Two-column FK (a, b) → parent(px, py): basis CASCADE, logical SET NULL. The logical
+			// action wins ⇒ both child FK columns are nulled rather than the rows cascade-deleted.
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk foreign key (a, b) references parent(px, py) on delete cascade on update cascade) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on delete set null on update set null) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'a')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2), (11, 1, 2)');
+			await db.exec('delete from x.parent where px = 1 and py = 2');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children survive (logical set null wins)').to.deep.equal([{ n: 2 }]);
+			expect(await rows(db, 'select id, a, b from x.child order by id'), 'both FK columns nulled').to.deep.equal([{ id: 10, a: null, b: null }, { id: 11, a: null, b: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('composite divergent UPDATE — logical CASCADE over basis SET NULL re-keys both FK columns', async () => {
+		const db = new Database();
+		try {
+			// Re-keying the referenced composite key cascades through the multi-column WHERE/SET
+			// the logical action builds: a → px (1→9), b → py (2, unchanged).
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk foreign key (a, b) references parent(px, py) on delete set null on update set null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on delete cascade on update cascade) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'a')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2)');
+			await db.exec('update x.parent set px = 9 where px = 1 and py = 2');
+			expect(await rows(db, 'select id, a, b from x.child where id = 10'), 'both FK columns cascade re-keyed').to.deep.equal([{ id: 10, a: 9, b: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('unit: a permuted basis composite FK does NOT match ⇒ not suppressed (the pair-set differs)', async () => {
+		const db = new Database();
+		try {
+			// Basis FK pairs (a→py, b→px); logical FK pairs (a→px, b→py). The unordered
+			// (childCol → parentCol) pair-sets differ ⇒ no structural match ⇒ the basis FK is
+			// NOT in the overridden set (a negative case for the order-independent pair-set match).
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_perm foreign key (a, b) references parent(py, px) on delete cascade on update cascade) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on delete set null on update set null) }');
+			await db.exec('apply schema x');
+			const parentSlot = slot(db, 'parent');
+			const basisParent = resolveSlotBasisSource(parentSlot, db.schemaManager)!;
+			const refs = findLogicalParentFkRefs(parentSlot, db.schemaManager);
+			expect(refs.length, 'one logical FK references parent').to.equal(1);
+			expect(matchingBasisFksForLensRef(refs[0], parentSlot, basisParent, db.schemaManager).length, 'permuted basis FK ⇒ no structural match').to.equal(0);
+			expect(basisFksOverriddenByDivergentLensFk(basisParent, 'delete', db.schemaManager).size, 'permuted ⇒ nothing suppressed').to.equal(0);
+			expect(basisFksOverriddenByDivergentLensFk(basisParent, 'update', db.schemaManager).size, 'permuted ⇒ nothing suppressed').to.equal(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — logical CASCADE over basis SET NULL cascade-deletes the children', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete set null on update set null',
+				logicalFkTail: 'on delete cascade on update cascade',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children cascade-deleted (logical wins over basis set null)').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from y.child'), 'basis children deleted too').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — logical SET DEFAULT over basis SET NULL sets the child FK to the logical default', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete set null on update set null',
+				logicalFkTail: 'on delete set default on update set default',
+				childPid: 'pid integer default 0',
+			});
+			await db.exec(`insert into x.parent (id, name) values (0, 'def'), (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK set to the logical default 0').to.deep.equal([{ id: 10, pid: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — logical SET NULL over basis SET DEFAULT nulls the child FK', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete set default on update set default',
+				logicalFkTail: 'on delete set null on update set null',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK nulled (logical wins over basis set default)').to.deep.equal([{ id: 10, pid: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE — logical CASCADE over basis SET NULL re-keys the child FK', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete set null on update set null',
+				logicalFkTail: 'on delete cascade on update cascade',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('update x.parent set id = 9 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK cascade re-keyed to 9').to.deep.equal([{ id: 10, pid: 9 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE — logical SET DEFAULT over basis SET NULL sets the child FK to the logical default', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete set null on update set null',
+				logicalFkTail: 'on delete set default on update set default',
+				childPid: 'pid integer default 0',
+			});
+			await db.exec(`insert into x.parent (id, name) values (0, 'def'), (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('update x.parent set id = 9 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK set to the logical default 0').to.deep.equal([{ id: 10, pid: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE — logical SET NULL over basis SET DEFAULT nulls the child FK', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete set default on update set default',
+				logicalFkTail: 'on delete set null on update set null',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('update x.parent set id = 9 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK nulled').to.deep.equal([{ id: 10, pid: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('unit: pathological multi-match — only the divergent same-column basis FK is suppressed', async () => {
+		const db = new Database();
+		try {
+			// Two basis FKs over the IDENTICAL column with mixed actions: CASCADE (agrees with the
+			// logical CASCADE) and SET NULL (diverges). The walker fires when *any* match diverges
+			// and only the *divergent* matches are suppressed — so the agreeing CASCADE basis FK is
+			// NOT overridden (it co-runs; documented sound-but-non-minimal, never a dropped action).
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete cascade on update cascade, constraint fk_n foreign key (pid) references parent(id) on delete set null on update set null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade on update cascade) }');
+			await db.exec('apply schema x');
+			const parentSlot = slot(db, 'parent');
+			const basisParent = resolveSlotBasisSource(parentSlot, db.schemaManager)!;
+			const basisChild = resolveSlotBasisSource(slot(db, 'child'), db.schemaManager)!;
+			const fkCascade = basisChild.foreignKeys!.find(f => f.onDelete === 'cascade')!;
+			const fkSetNull = basisChild.foreignKeys!.find(f => f.onDelete === 'setNull')!;
+			const overridden = basisFksOverriddenByDivergentLensFk(basisParent, 'delete', db.schemaManager);
+			expect(overridden.has(fkSetNull), 'divergent SET NULL basis FK suppressed').to.be.true;
+			expect(overridden.has(fkCascade), 'agreeing CASCADE basis FK NOT suppressed').to.be.false;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('transitive — step-2 suppression: a suppressed basis cascade is not followed (no spurious grandchild-RESTRICT abort)', async () => {
+		const db = new Database();
+		try {
+			// parent → child diverges (basis CASCADE, logical SET NULL); child → grandchild is a
+			// logical RESTRICT (bare FK, no basis FK). The basis cascade WOULD delete the child and
+			// thereby trip the grandchild RESTRICT; the logical SET NULL does NOT delete the child.
+			// The step-2 suppression in assertTransitiveRestrictsForParentMutation must skip the
+			// suppressed basis cascade so the pre-walk does NOT spuriously abort — the delete
+			// succeeds, the child is nulled, and the grandchild survives.
+			await db.exec('declare schema y { table parent (id integer primary key); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete cascade on update cascade); table grandchild (id integer primary key, cid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete set null on update set null); table grandchild (id integer primary key, cid integer null, constraint fk_g foreign key (cid) references child(id)) }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.parent (id) values (1)');
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('insert into x.grandchild (id, cid) values (100, 10)');
+
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent'), 'parent deleted (not spuriously aborted)').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child survives, FK nulled (logical set null)').to.deep.equal([{ id: 10, pid: null }]);
+			expect(await rows(db, 'select count(*) as n from x.grandchild where id = 100'), 'grandchild survives (its RESTRICT never tripped)').to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('transitive — the logical CASCADE\'s child-view re-entry enforces the grandchild RESTRICT', async () => {
+		const db = new Database();
+		try {
+			// parent → child diverges (basis SET NULL, logical CASCADE); child → grandchild is a
+			// logical RESTRICT. Deleting the parent fires the logical CASCADE, whose child-view
+			// DELETE re-enters the lens write path and re-fires the transitive walk at the child
+			// level — finding the grandchild still referencing the child ⇒ ABORT. Confirms the
+			// logical action's transitivity is enforced at re-entry (the step-2 suppression's
+			// complement: the suppressed basis SET NULL is replaced by the logical cascade, which
+			// itself carries the downstream RESTRICT).
+			await db.exec('declare schema y { table parent (id integer primary key); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete set null on update set null); table grandchild (id integer primary key, cid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key); table child (id integer primary key, pid integer null, constraint fk_c foreign key (pid) references parent(id) on delete cascade on update cascade); table grandchild (id integer primary key, cid integer null, constraint fk_g foreign key (cid) references child(id)) }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.parent (id) values (1)');
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('insert into x.grandchild (id, cid) values (100, 10)');
+
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			// Atomic abort: every level still reads its pre-mutation values.
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent survives').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child survives (cascade rolled back)').to.deep.equal([{ id: 10, pid: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.grandchild where id = 100'), 'grandchild survives (the RESTRICT that bit)').to.deep.equal([{ n: 1 }]);
+
+			// Once the blocking grandchild is gone, the delete cascades cleanly through the child.
+			await db.exec('delete from x.grandchild where id = 100');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent'), 'parent deleted').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.child'), 'child cascade-deleted by the logical action').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens enforcement: parent-side FK RESTRICT over a non-restrict basis (runtime pre-check)', () => {
