@@ -790,3 +790,143 @@ describe('lens decomposition put: non-identity columnar mappings (computed-mappi
 		}
 	});
 });
+
+/**
+ * Lineage-routing robustness (`decomposition-column-classification-robustness`).
+ *
+ * `classifyColumn` routes a logical column off the threaded `updateLineage` plus the
+ * advertisement. Two of its assumptions were unguarded; both classify silently in
+ * states unreachable through shipped shapes, so each is hardened with a defensive
+ * reject + a test that *constructs* the unreachable state (the constructions are the
+ * point — they prove the guard fires before a future change can silently regress it).
+ *
+ * (a) An **identity** mapping whose lineage fully resolves a base column but whose
+ *     base relation is not in `memberByTableId` (a schema/name miss in the build
+ *     loop) must NOT fall through to the name-only `member.columns` match and degrade
+ *     to a read-only `computed-mapping`; it must surface a `no-base-lineage`
+ *     diagnostic. Vehicle: members declared with an EMPTY `relation.schema`.
+ *     `resolveBasisRelation` resolves it (empty → basis 'main'), so the body compiles
+ *     and reads, but `analyzeDecomposition` matches a planned `TableReferenceNode` to a
+ *     member by EXACT `(schema, table)` — '' !== 'main' — so every member misses the
+ *     map while each identity column's plan-level lineage still resolves.
+ *
+ * (b) Two members over the **same** physical base relation (a self-decomposition)
+ *     both claim each body `TableReferenceNode`, so `memberByTableId` resolution is
+ *     ambiguous. The generic multi-source path rejects self-joins upstream, but that
+ *     guard is external; the fan-out must reject locally with a precise diagnostic.
+ */
+describe('lens decomposition put: column-classification robustness', () => {
+	// (a) Empty-schema vehicle: a single-member decomposition whose member declares
+	// `relation.schema: ''`. Reads fine (resolved against 'main'); every identity
+	// column misses `memberByTableId`.
+	function emptySchemaAd(): MappingAdvertisement {
+		return {
+			id: 'G_core',
+			logicalTable: 'G',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'G_core',
+				members: [
+					{ relationId: 'G_core', relation: { schema: '', table: 'G_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['G_core', ['id']]) },
+			},
+		};
+	}
+
+	async function setupEmptySchema(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [emptySchemaAd()];
+		db.registerModule('gmod', mod);
+		await db.exec('create table G_core (id integer primary key, a integer) using gmod');
+		await db.exec('declare logical schema x { table G { id integer primary key, a integer } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.G_core values (1, 10)');
+	}
+
+	it('(a) reads through the body even when the member declares an empty schema', async () => {
+		const db = new Database();
+		try {
+			await setupEmptySchema(db);
+			// The compiled body resolves the empty schema to the basis ('main'), so the
+			// read is unaffected — the miss lives only in the put-side memberByTableId map.
+			expect(await rows(db, 'select * from x.G order by id')).to.deep.equal([{ id: 1, a: 10 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('(a) an identity column whose lineage misses memberByTableId surfaces no-base-lineage, not silent read-only', async () => {
+		const db = new Database();
+		try {
+			await setupEmptySchema(db);
+			// Updating the identity column `a` must NOT be silently rejected as a
+			// "computed (non-invertible) ... read-only" mapping (the pre-hardening
+			// fall-through); it surfaces the lineage-resolution miss instead.
+			let msg = '';
+			try {
+				await db.exec('update x.G set a = 99');
+			} catch (e) {
+				msg = e instanceof Error ? e.message : String(e);
+			}
+			expect(msg, 'expected a lineage-resolution-miss diagnostic').to.match(/lineage-resolution miss/i);
+			expect(msg, 'must not masquerade as a computed/non-invertible mapping').to.not.match(/computed \(non-invertible\)/i);
+			// Atomic: the backing base value is untouched.
+			expect(await rows(db, 'select a from main.G_core where id = 1')).to.deep.equal([{ a: 10 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// (b) Self-decomposition vehicle: two members ('S_a', 'S_b') over the SAME base
+	// table main.S, joined on the shared key — a self-join the read tolerates but the
+	// put fan-out cannot route unambiguously.
+	function selfDecompositionAd(): MappingAdvertisement {
+		return {
+			id: 'S_a',
+			logicalTable: 'S',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'S_a',
+				members: [
+					{ relationId: 'S_a', relation: { schema: 'main', table: 'S' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('x', 'x')] },
+					{ relationId: 'S_b', relation: { schema: 'main', table: 'S' }, presence: 'mandatory', columns: [colMap('y', 'y')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['S_a', ['id']], ['S_b', ['id']]) },
+			},
+		};
+	}
+
+	async function setupSelfDecomposition(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [selfDecompositionAd()];
+		db.registerModule('smod', mod);
+		await db.exec('create table S (id integer primary key, x integer, y integer) using smod');
+		await db.exec('declare logical schema x { table S { id integer primary key, x integer, y integer } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.S values (1, 10, 100)');
+	}
+
+	it('(b) reads through the synthesized self-join', async () => {
+		const db = new Database();
+		try {
+			await setupSelfDecomposition(db);
+			// The self-join over the shared key (id) is 1:1 on the PK, so the read is sound.
+			expect(await rows(db, 'select * from x.S order by id')).to.deep.equal([{ id: 1, x: 10, y: 100 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('(b) a write rejects the ambiguous self-decomposition (two members, one base relation)', async () => {
+		const db = new Database();
+		try {
+			await setupSelfDecomposition(db);
+			await expectThrows(() => db.exec('update x.S set x = 99 where id = 1'), /self-decomposition|both resolve to the same base relation/i);
+			// Atomic: the rejected write left the base table untouched.
+			expect(await rows(db, 'select id, x, y from main.S order by id')).to.deep.equal([{ id: 1, x: 10, y: 100 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});

@@ -112,10 +112,23 @@ function analyzeDecomposition(ctx: PlanningContext, view: MutableViewLike, stora
 	const lineage = analyzeBodyLineage(ctx, view);
 	const memberByTableId = new Map<number, DecompositionMember>();
 	for (const [id, ref] of lineage.tableRefsById) {
-		const member = storage.members.find(m =>
+		const matches = storage.members.filter(m =>
 			m.relation.table.toLowerCase() === ref.tableSchema.name.toLowerCase()
 			&& m.relation.schema.toLowerCase() === ref.tableSchema.schemaName.toLowerCase());
-		if (member) memberByTableId.set(id, member);
+		if (matches.length > 1) {
+			// Two members over the **same** physical base relation (a self-decomposition)
+			// both claim this body `TableReferenceNode`, so routing any column off
+			// `memberByTableId` would be ambiguous (a last-writer would silently win).
+			// The multi-source path rejects self-joins upstream, but that guard sits
+			// outside this code; enforce the single-member-per-base-ref assumption
+			// locally rather than relying on it.
+			raiseMutationDiagnostic({
+				reason: 'unsupported-decomposition-member',
+				table: view.name,
+				message: `cannot write through logical table '${view.name}': decomposition members ${matches.map(m => `'${m.relationId}'`).join(' and ')} both resolve to the same base relation '${ref.tableSchema.schemaName}.${ref.tableSchema.name}' (a self-decomposition); the put fan-out cannot disambiguate which member backs a column`,
+			});
+		}
+		if (matches.length === 1) memberByTableId.set(id, matches[0]);
 	}
 	return { storage, anchor, viewColToBaseRef: lineage.viewColToBaseRef, columns: lineage.columns, memberByTableId };
 }
@@ -140,12 +153,26 @@ type ColumnRoute =
  * mirrors the retired advertisement scan: identity base column → member-mapping →
  * EAV pivot → unbacked.
  */
-function classifyColumn(shape: DecompShape, name: string): ColumnRoute {
+function classifyColumn(view: MutableViewLike, shape: DecompShape, name: string): ColumnRoute {
 	const col = shape.columns.find(c => c.name === name);
 	// An identity base column on a join member, routed by the plan-node lineage.
 	if (col?.baseColumn !== undefined && col.baseTableId !== undefined && col.inverse === undefined) {
 		const member = shape.memberByTableId.get(col.baseTableId);
 		if (member) return { kind: 'member', member, baseColumn: col.baseColumn, nullExtended: col.nullExtended };
+		// The lineage resolved an **identity** base column (a base site, no inverse),
+		// but no decomposition member owns its base `TableReferenceNode`. In a
+		// faithfully-synthesized body every base table-ref IS a member, so this is a
+		// lineage-resolution miss (e.g. a `memberByTableId` schema/name mismatch), NOT a
+		// non-identity mapping. Reject defensively — falling through to the name-only
+		// `member.columns` match below would silently degrade a *writable* column to
+		// `computed-mapping` (read-only), masking the lineage bug as a benign read-only
+		// column.
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			column: col.displayName,
+			table: view.name,
+			message: `cannot write through logical table '${view.name}': column '${col.displayName}' resolves to identity base column '${col.baseColumn}', but no decomposition member backs its base relation (lineage-resolution miss); a writable column must not silently degrade to read-only`,
+		});
 	}
 	// A `member.columns` mapping the lineage did not resolve to an identity base column
 	// is a non-identity (computed / non-invertible) mapping — read-only.
@@ -336,7 +363,7 @@ function routeInsertColumn(
 	idx: number,
 ): RoutedInsertColumn {
 	const name = rawName.toLowerCase();
-	const route = classifyColumn(shape, name);
+	const route = classifyColumn(view, shape, name);
 	switch (route.kind) {
 		case 'member': {
 			const ref = memberRefs.get(route.member.relationId)!;
@@ -711,7 +738,7 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.Upd
 			message: `cannot update logical table '${view.name}': column '${asg.column}' is part of the decomposition shared key; an identity change is not a value write`,
 		});
 	}
-	const route = classifyColumn(shape, logical);
+	const route = classifyColumn(view, shape, logical);
 	switch (route.kind) {
 		case 'member': {
 			// An optional member is outer-joined (null-extended lineage): writing it is
@@ -846,7 +873,7 @@ function assertAnchorScoped(view: MutableViewLike, shape: DecompShape, where: AS
 		}
 	}
 	const nonAnchor = [...refs.names].some(name => {
-		const route = classifyColumn(shape, name);
+		const route = classifyColumn(view, shape, name);
 		return !(route.kind === 'member' && route.member.relationId === shape.anchor.relationId);
 	});
 	if (refs.hasSubquery || nonAnchor) {
