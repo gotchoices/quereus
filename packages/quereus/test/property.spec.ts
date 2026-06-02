@@ -2917,6 +2917,9 @@ describe('Property-Based Tests', () => {
 				// reconstructs through it (the static plan-lineage dual, Family B).
 				const node = planLogicalBody('select c.cc as cc, c.cv as cv, p.pv as pv from rjchild c join rjparent p on p.pp = c.pr');
 				const attrs = node.getAttributes?.() ?? [];
+				// Guard against a vacuous pass: `every`/the totality loop are both no-ops on
+				// an empty attribute list, so pin the column count (cc, cv, pv) first.
+				expect(attrs.length, 'inner-join exposes its three output columns').to.equal(3);
 				assertPlanLineageAgreement('family-B inner join', attrs, keysOf(node), node.physical.updateLineage);
 				expect(attrs.every(a => node.physical.updateLineage?.get(a.id)?.kind === 'base'),
 					'every accepted-join output column traces to a base column').to.equal(true);
