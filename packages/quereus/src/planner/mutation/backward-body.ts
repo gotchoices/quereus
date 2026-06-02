@@ -20,7 +20,7 @@ import type { MutableViewLike } from './single-source.js';
  * anchor-rooted decomposition join (mandatory inner + optional outer members) all
  * funnel through the same read. Multi-source layers its `JoinNode` / side mapping
  * on top of {@link BodyBackwardLineage}; the decomposition fan-out layers its
- * member routing / anchor-only predicate gate on top. Neither re-walks the body's
+ * member routing / anchor-resolvable predicate gate on top. Neither re-walks the body's
  * projection AST for routing.
  */
 

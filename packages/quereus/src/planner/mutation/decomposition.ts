@@ -11,7 +11,7 @@ import { PhysicalType } from '../../types/logical-type.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
-import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
+import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
  * Advertisement-driven **put** fan-out for a logical table backed by an n-way
@@ -56,10 +56,14 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
  * **Deferred (raised here with a precise diagnostic), because each rides a
  * substrate that is not yet present:**
  *
- * - A DELETE/UPDATE **WHERE that references a non-anchor member** — needs the
- *   snapshot-consistent multi-member base-op execution the predicate-honest
- *   multi-side fan-out is deferred onto (see `multi-source.ts` § delete + the
- *   `view-mutation-lenient-multiside-delete-fanout` backlog ticket).
+ * - A DELETE/UPDATE **WHERE that references a non-anchor member** (an EAV pivot, or an
+ *   embedded subquery) — needs the snapshot-consistent multi-member base-op execution
+ *   the predicate-honest multi-side fan-out is deferred onto (see `multi-source.ts`
+ *   § delete + the `view-mutation-lenient-multiside-delete-fanout` backlog ticket). A
+ *   WHERE that is **anchor-resolvable** — an anchor identity column **or** a computed
+ *   mapping whose basis lives on the anchor (`bumped = a + 1`, `combined = a || b`) —
+ *   is *supported*: it substitutes into a predicate over the anchor's own base columns,
+ *   which the anchor subquery already evaluates, so it does not defer.
  * - **UPDATE of an optional-member / EAV / shared-key column** — an optional or
  *   EAV write transition (null→non-null materializes a member row, non-null→all-null
  *   deletes it) needs per-row insert-or-delete branching inside an update group,
@@ -831,12 +835,15 @@ function rewriteAssignedValue(view: MutableViewLike, shape: DecompShape, owner: 
 
 /**
  * The user WHERE rewritten from logical columns into the get body's base terms,
- * after the anchor-only gate ({@link assertAnchorScoped}) — so each member's
- * identifying set can be read from the anchor alone (see the file header). A
- * predicate touching a non-anchor member is deferred onto the snapshot-consistent
- * substrate. The substitution into base terms is the AST construction the anchor
- * subquery rides; the **gate decision** is read off the threaded backward lineage,
- * not a base-qualifier scan of the substituted expression.
+ * after the anchor-resolvable gate ({@link assertAnchorScoped}) — so each member's
+ * identifying set can be read from the anchor alone (see the file header). The gate
+ * admits an anchor identity column **and** a computed mapping whose basis is the
+ * anchor (`bumped = 11` → `a + 1 = 11`): both substitute into a predicate over the
+ * anchor's own base columns. A predicate touching a non-anchor member (or an EAV
+ * pivot / a subquery) is deferred onto the snapshot-consistent substrate. The
+ * substitution into base terms is the AST construction the anchor subquery rides; the
+ * **gate decision** is read off the threaded backward lineage, not a base-qualifier
+ * scan of the substituted expression.
  */
 function anchorPredicate(view: MutableViewLike, shape: DecompShape, where: AST.Expression | undefined): AST.Expression | undefined {
 	if (!where) return undefined;
@@ -845,17 +852,25 @@ function anchorPredicate(view: MutableViewLike, shape: DecompShape, where: AST.E
 }
 
 /**
- * Gate a user WHERE to **anchor-only** references via the threaded backward lineage:
- * every logical column the predicate names must be backed by the anchor member
- * ({@link classifyColumn} → `member` whose relation is the anchor), and the predicate
- * must hold no subquery. A non-anchor member column, an EAV / computed column, or an
- * embedded subquery defers onto the snapshot-consistent multi-member substrate; a name
- * that is not a logical column of the table at all is an encapsulation leak, rejected
- * as `unknown-view-column` (consistent with the single-source / multi-source
- * `assertTopLevelViewColumns` guard — a typo'd / projected-away name is a user error,
- * not a deferred multi-member shape). (Replaces the retired `collectColumnQualifiers`
- * base-qualifier scan — the anchor decision now reads `updateLineage`, the same
- * backward walk the multi-source path consumes.)
+ * Gate a user WHERE to **anchor-resolvable** references via the threaded backward
+ * lineage: every logical column the predicate names must resolve entirely to the
+ * anchor member's own base terms — an identity base column on the anchor
+ * ({@link classifyColumn} → `member` whose relation is the anchor), *or* a computed
+ * mapping whose basis lives on the anchor ({@link classifyColumn} → `computed-mapping`
+ * whose member is the anchor, e.g. `bumped = a + 1` → `a + 1 = 11`). Either substitutes
+ * into a predicate over the anchor's base columns, which the `anchorKeySubquery`
+ * already evaluates, so no new substrate is needed.
+ *
+ * A column backed by a genuine **non-anchor member**, an **EAV pivot**, or an embedded
+ * **subquery** defers onto the snapshot-consistent multi-member substrate — each with
+ * its own accurate message ({@link nonAnchorPredicateDiagnostic}), since an EAV /
+ * unbacked / subquery predicate is not a "non-anchor member" and must not be
+ * misattributed as one. A name that is not a logical column of the table at all is an
+ * encapsulation leak, rejected as `unknown-view-column` (consistent with the
+ * single-source / multi-source `assertTopLevelViewColumns` guard — a typo'd /
+ * projected-away name is a user error, not a deferred multi-member shape). (Replaces
+ * the retired `collectColumnQualifiers` base-qualifier scan — the anchor decision now
+ * reads `updateLineage`, the same backward walk the multi-source path consumes.)
  */
 function assertAnchorScoped(view: MutableViewLike, shape: DecompShape, where: AST.Expression): void {
 	const refs = collectViewColumnRefs(where);
@@ -872,16 +887,57 @@ function assertAnchorScoped(view: MutableViewLike, shape: DecompShape, where: AS
 			});
 		}
 	}
-	const nonAnchor = [...refs.names].some(name => {
-		const route = classifyColumn(view, shape, name);
-		return !(route.kind === 'member' && route.member.relationId === shape.anchor.relationId);
-	});
-	if (refs.hasSubquery || nonAnchor) {
+	// A subquery defers regardless of which columns it names (it may name none) — its
+	// multi-member fan-out needs the snapshot-consistent substrate. Checked first so the
+	// message is subquery-specific rather than a misattributed "non-anchor member".
+	if (refs.hasSubquery) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-decomposition-predicate',
 			table: view.name,
-			message: `cannot write through logical table '${view.name}': the WHERE references a non-anchor decomposition member; a predicate-honest multi-member fan-out needs snapshot-consistent base-op execution (deferred — filter only on the anchor / shared key, or pin the rows via the anchor)`,
+			message: `cannot write through logical table '${view.name}': the WHERE embeds a subquery; a predicate-honest multi-member fan-out needs snapshot-consistent base-op execution (deferred — filter only on anchor base columns)`,
 		});
+	}
+	const anchorId = shape.anchor.relationId;
+	for (const name of refs.names) {
+		const route = classifyColumn(view, shape, name);
+		// Anchor-resolvable — an identity base column on the anchor, OR a computed mapping
+		// whose basis is the anchor. Both `member` and `computed-mapping` carry `member`,
+		// so the union narrows correctly.
+		if ((route.kind === 'member' || route.kind === 'computed-mapping') && route.member.relationId === anchorId) {
+			continue;
+		}
+		raiseMutationDiagnostic(nonAnchorPredicateDiagnostic(view, name, route));
+	}
+}
+
+/**
+ * The deferral diagnostic for a WHERE column that is **not** anchor-resolvable — a
+ * non-anchor member, an EAV pivot, or a name backed by no member. Each keeps the
+ * `unsupported-decomposition-predicate` reason (the structured contract is unchanged)
+ * and differs only in the human message, so the misattribution the support fix removes
+ * does not recur: an EAV / unbacked column is not a "non-anchor member". The
+ * genuine-non-anchor case preserves the `non-anchor decomposition member` substring the
+ * deferral test pins.
+ */
+function nonAnchorPredicateDiagnostic(view: MutableViewLike, name: string, route: ColumnRoute): MutationDiagnostic {
+	const head = `cannot write through logical table '${view.name}': the WHERE references column '${name}',`;
+	const need = `a predicate-honest multi-member fan-out needs snapshot-consistent base-op execution`;
+	switch (route.kind) {
+		case 'eav':
+			return {
+				reason: 'unsupported-decomposition-predicate', column: name, table: view.name,
+				message: `${head} backed by an EAV pivot member; ${need} (deferred — filter only on anchor base columns)`,
+			};
+		case 'unbacked':
+			return {
+				reason: 'unsupported-decomposition-predicate', column: name, table: view.name,
+				message: `${head} which is not backed by any decomposition member; ${need} (deferred — filter only on anchor base columns)`,
+			};
+		default: // 'member' / 'computed-mapping' on a non-anchor member
+			return {
+				reason: 'unsupported-decomposition-predicate', column: name, table: view.name,
+				message: `${head} backed by a non-anchor decomposition member; ${need} (deferred — filter only on the anchor / shared key, or pin the rows via the anchor)`,
+			};
 	}
 }
 

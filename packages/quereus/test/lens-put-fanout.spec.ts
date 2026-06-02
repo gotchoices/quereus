@@ -8,7 +8,8 @@
  * (`planner/mutation/decomposition.ts`) instead of the generic two-table join
  * path. Shipped fan-out:
  *
- * - DELETE across every member (anchor-last, anchor-only predicate).
+ * - DELETE across every member (anchor-last, anchor-resolvable predicate — an anchor
+ *   identity column or a computed mapping whose basis lives on the anchor).
  * - UPDATE routed to the mandatory, non-EAV member backing each column.
  * - INSERT one per member (anchor first) off the shared-surrogate envelope
  *   (`view-mutation-shared-surrogate-insert`): a surrogate minted once per row and
@@ -784,6 +785,59 @@ describe('lens decomposition put: non-identity columnar mappings (computed-mappi
 			await db.exec('insert into x.N (id, a) values (2, 100)');
 			expect(await rows(db, 'select id, a, b from main.N_core order by id')).to.deep.equal([
 				{ id: 1, a: 42, b: 20 }, { id: 2, a: 100, b: null },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// A WHERE on a computed mapping whose basis lives on the ANCHOR is supported, not
+	// deferred: `substituteViewColumns` rewrites it into a predicate over the anchor's own
+	// base columns (`bumped = 11` → `a + 1 = 11`, `combined = '1020'` → `a || b = '1020'`),
+	// which the anchor key subquery already evaluates — no snapshot-consistent multi-member
+	// substrate needed. (Contrast the genuine non-anchor-member deferral on the `split()`
+	// fixture at the top of the file, which filters on a *different* member's column.)
+	it('a DELETE filtered on an invertible-transform anchor column (bumped = a+1) is supported', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			// Non-matching value deletes nothing (the seeded row has bumped = a+1 = 11).
+			await db.exec('delete from x.N where bumped = 999');
+			expect(await rows(db, 'select id from main.N_core order by id')).to.deep.equal([{ id: 1 }]);
+			// The matched value (11) deletes the row, emptying the anchor table.
+			await db.exec('delete from x.N where bumped = 11');
+			expect(await rows(db, 'select id from main.N_core order by id')).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a DELETE filtered on a non-invertible composite anchor column (a||b) is supported', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			// Second row → combined = '9920', which the predicate must NOT match.
+			await db.exec('insert into main.N_core values (2, 99, 20)');
+			await db.exec("delete from x.N where combined = '1020'");
+			// Only the matched row (id=1, combined='1020') is removed.
+			expect(await rows(db, 'select id from main.N_core order by id')).to.deep.equal([{ id: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an UPDATE with a WHERE on a computed anchor column (a||b) targets only the matched row', async () => {
+		const db = new Database();
+		try {
+			await setupNonIdentity(db);
+			// Second row → combined = '9920'.
+			await db.exec('insert into main.N_core values (2, 99, 20)');
+			// The SET target `a` is the writable identity sibling; the point of the case is
+			// the WHERE on the computed anchor column `combined`, which resolves to the
+			// anchor-scoped predicate `a || b = '1020'` and so matches only id=1.
+			await db.exec("update x.N set a = 0 where combined = '1020'");
+			expect(await rows(db, 'select id, a, b from main.N_core order by id')).to.deep.equal([
+				{ id: 1, a: 0, b: 20 }, { id: 2, a: 99, b: 20 },
 			]);
 		} finally {
 			await db.close();
