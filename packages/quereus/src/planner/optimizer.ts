@@ -17,6 +17,7 @@ import { PassManager, PassId } from './framework/pass.js';
 import { ruleMaterializationAdvisory } from './rules/cache/rule-materialization-advisory.js';
 // Phase 1.5 rules
 import { ruleSelectAccessPath } from './rules/access/rule-select-access-path.js';
+import { ruleLensAuxiliaryAccess } from './rules/access/rule-lens-auxiliary-access.js';
 import { ruleMonotonicLimitPushdown } from './rules/access/rule-monotonic-limit-pushdown.js';
 import { ruleMonotonicRangeAccess } from './rules/access/rule-monotonic-range-access.js';
 import { ruleAsofStrategySelect } from './rules/access/rule-asof-strategy-select.js';
@@ -177,6 +178,28 @@ export class Optimizer {
 			// Drops unreferenced inner projections — refuses to drop any whose
 			// scalar expression carries a side effect.
 			sideEffectMode: 'aware',
+		});
+
+		// Lens auxiliary-access routing: route an outer-query predicate over an
+		// inlined lens view through an advertised auxiliary structure (nd-tree /
+		// vector / full-text) — an auxiliary seek ⋈ logical-key semi-join — instead
+		// of a residual filter over the full decomposition scan. Registered BEFORE
+		// predicate-pushdown (priority 20) so the matched predicate is still directly
+		// above the LensAuxiliaryAccess marker when this fires; within the top-down
+		// Structural pass, rules run in registration order, so placing this block
+		// ahead of pushdown is what guarantees first-fire on the Filter. No-ops on
+		// any Filter whose subtree has no marker (every non-lens / non-routable-lens
+		// view), so ordinary queries are untouched.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'lens-auxiliary-access',
+			nodeType: PlanNodeType.Filter,
+			phase: 'rewrite',
+			fn: ruleLensAuxiliaryAccess,
+			priority: 17,
+			// Replaces a Filter over the lens marker with a semi-join against an
+			// auxiliary scan; the logical body (left) survives verbatim and the
+			// auxiliary scan it adds is a fresh read-only table reference.
+			sideEffectMode: 'safe',
 		});
 
 		// Sargable range rewrite: turn `f(col) = c` (for monotone-lossy `f` with

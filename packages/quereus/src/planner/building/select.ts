@@ -25,6 +25,7 @@ import { createLogger } from '../../common/logger.js';
 import { AliasNode } from '../nodes/alias-node.js';
 import { AssertedKeysNode } from '../nodes/asserted-keys-node.js';
 import { computeLensAssertedKeyFds } from '../../schema/lens-prover.js';
+import { buildLensAuxiliaryAccessMarker } from './lens-auxiliary-access.js';
 
 // Import decomposed functionality
 import { buildWithContext } from './select-context.js';
@@ -445,6 +446,18 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					const assertedFds = computeLensAssertedKeyFds(lensSlot, parentContext.db);
 					if (assertedFds.length > 0) {
 						viewSelectNode = new AssertedKeysNode(parentContext.scope, viewSelectNode, assertedFds);
+					}
+
+					// Read-path access-shape marker: carry the lens table's routable
+					// auxiliary-access advertisements (nd-tree spatial / vector knn /
+					// full-text) to `rule-lens-auxiliary-access`, which routes a matching
+					// outer-query predicate through the auxiliary structure (auxiliary
+					// seek ⋈ logical-key) instead of a residual filter over the full
+					// decomposition scan. Only built when ≥1 auxiliary is routable, so a
+					// non-lens / non-routable-lens view is untouched.
+					const auxMarker = buildLensAuxiliaryAccessMarker(parentContext, lensSlot, viewSelectNode);
+					if (auxMarker) {
+						viewSelectNode = auxMarker;
 					}
 				}
 

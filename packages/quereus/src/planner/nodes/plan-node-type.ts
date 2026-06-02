@@ -81,6 +81,7 @@ export enum PlanNodeType {
   // Special relational nodes
   Alias = 'Alias',  // Wraps a relation with an alias for relationName
   AssertedKeys = 'AssertedKeys',  // Pass-through carrying lens-asserted declared-key FDs onto the inlined-view boundary
+  LensAuxiliaryAccess = 'LensAuxiliaryAccess',  // Pass-through carrying routable auxiliary-access advertisements onto the inlined-lens-view boundary (read-path selection)
   Values = 'Values',
 	TableLiteral = "TableLiteral",
   EnvelopeScan = 'EnvelopeScan',  // Scans the shared-surrogate mutation envelope (multi-source view insert)

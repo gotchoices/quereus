@@ -1687,9 +1687,10 @@ function validatePrimaryAdvertisement(
 
 /**
  * Minimal validation for an `auxiliary-access` advertisement: every member
- * relation must resolve. The access-shape planner consumer is deferred (backlog
- * `lens-access-shape-path-selection`), so its predicate forms are stored
- * unvalidated here.
+ * relation must resolve. The advertised predicate forms are not validated here —
+ * the read-path consumer (`rule-lens-auxiliary-access`, `lens-access-shape-path-selection`)
+ * matches them at plan time through its recognizer registry and silently degrades
+ * to scan for any form it cannot serve, so an unknown form is never an error.
  */
 function validateAuxiliaryAdvertisement(
 	ad: MappingAdvertisement,

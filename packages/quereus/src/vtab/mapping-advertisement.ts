@@ -50,8 +50,10 @@ export interface MappingAdvertisement {
 	/** Drives put (and the get join). Required on `primary-storage`. */
 	readonly storage?: StorageShape;
 	/**
-	 * Drives read-path selection. Defined + stored here; its planner consumer is the
-	 * deferred `lens-access-shape-path-selection` (backlog).
+	 * Drives read-path selection. Defined + stored here; consumed by the read-path
+	 * planner consumer (`lens-access-shape-path-selection`,
+	 * `planner/rules/access/rule-lens-auxiliary-access.ts`), which routes a matching
+	 * outer-query predicate through the auxiliary structure.
 	 */
 	readonly access?: AccessShape;
 }

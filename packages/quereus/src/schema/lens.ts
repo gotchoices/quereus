@@ -137,8 +137,11 @@ export interface LensSlot {
 	advertisement?: MappingAdvertisement;
 	/**
 	 * Auxiliary access-path advertisements for this logical table (nd-tree, vector,
-	 * covering structures). Stored here; the planner path-selection consumer is
-	 * deferred (backlog `lens-access-shape-path-selection`).
+	 * covering structures). Stored here; consumed by the read-path planner consumer
+	 * (`lens-access-shape-path-selection`): `planner/building/lens-auxiliary-access.ts`
+	 * wires a `LensAuxiliaryAccessNode` marker carrying the routable subset onto the
+	 * inlined-view boundary, and `planner/rules/access/rule-lens-auxiliary-access.ts`
+	 * routes a matching outer-query predicate through the auxiliary structure.
 	 */
 	auxiliaryAccess?: ReadonlyArray<MappingAdvertisement>;
 	/**
