@@ -1110,6 +1110,25 @@ delete from sv where shown = 'b' returning id;
 select id, shown, secret from t3 order by id;
 → [{"id":1,"shown":"Y","secret":"classified-1"}]
 
+-- (4) SET-value leak: the assigned RHS must also name view columns. A base-only
+-- column on the RHS would otherwise READ a value the view hides (`secret`) into a
+-- visible column — the same encapsulation leak as the where/set-target guard.
+update sv set shown = secret where id = 1;
+-- error: not a column of the view
+update sv set shown = upper(secret) where id = 1;
+-- error: not a column of the view
+
+-- positive: a SET value that references a real view column (here inside a function)
+-- passes the guard and is evaluated normally.
+update sv set shown = 'lo' where id = 1;
+update sv set shown = upper(shown) where id = 1 returning id, shown;
+→ [{"id":1,"shown":"LO"}]
+
+-- INSERT target-column list is guarded the same way (a base-only column is not an
+-- insertable view column).
+insert into sv (id, secret) values (5, 'x');
+-- error: not a column of the view
+
 -- renamed view column: the view spelling `note` is accepted; the base spelling
 -- `label` is rejected (a renamed column's only legal reference is its view name).
 create table pt (id integer primary key, label text);
@@ -1123,6 +1142,9 @@ update pv set note = 'L1x' where note = 'L1' returning id, note;
 update pv set note = 'Z' where label = 'L2';
 -- error: not a column of the view
 update pv set label = 'Z' where id = 2;
+-- error: not a column of the view
+-- the base spelling on the SET value (RHS) is rejected too.
+update pv set note = label where id = 2;
 -- error: not a column of the view
 insert into pv (id, note) values (3, 'L3') returning id, label;
 -- error: not a column of the view
@@ -1155,6 +1177,10 @@ delete from jvscope where plabel = 'P10';
 -- error: not a column of the view
 -- a SET target that is not a view column at all (vs. a computed one) -> same guard.
 update jvscope set plabel = 'Z' where cid = 1;
+-- error: not a column of the view
+-- a SET value referencing a base-only column rejects the same way (previously a
+-- generic "column not found"; now the structured unknown-view-column guard).
+update jvscope set note = plabel where cid = 1;
 -- error: not a column of the view
 
 -- a multi-source UPDATE … RETURNING projecting a base-only column (the re-query

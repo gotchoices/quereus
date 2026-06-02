@@ -629,6 +629,11 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 				message: `cannot write through view '${view.name}': column '${asg.column}' is a computed (non-invertible) expression and is read-only`,
 			});
 		}
+		// The assigned VALUE's top-level references must name view columns too (parity
+		// with the single-source spine). On a single-table side a base-only name would
+		// otherwise re-bind in that table; across sides it would fail to resolve with a
+		// generic error — the structured guard makes the diagnostic uniform either way.
+		guardTopLevelScope(asg.value, analysis, view);
 		const side = analysis.sides[out.sideIndex];
 		const other = analysis.sides[1 - out.sideIndex];
 		// Rewrite the assigned value into base terms, then strip the owning side's

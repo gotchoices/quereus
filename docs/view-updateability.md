@@ -195,8 +195,8 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 - **Deletes** propagate to the child with `parent_predicate ∧ user_predicate`.
 
 > **Top-level view-column scope (the encapsulation guard).** A **top-level**
-> reference in the user `where`, the `set` target columns, or the `returning`
-> clause must name a column the **view** exposes — resolved against the view's
+> reference in the user `where`, the `set` target columns *and* assigned values, or
+> the `returning` clause must name a column the **view** exposes — resolved against the view's
 > output column set, not the base table's. A name that is not a view column raises
 > the structured `unknown-view-column` diagnostic; it does **not** silently resolve
 > against the underlying base table. This closes an encapsulation leak: before the
@@ -208,7 +208,8 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > ```sql
 > create view sv as select id, shown from t3;          -- exposes only (id, shown)
 > update sv set shown = 'X' where secret = 'classified';   -- error: unknown-view-column
-> update sv set secret = 'leaked' where id = 1;            -- error: unknown-view-column
+> update sv set secret = 'leaked' where id = 1;            -- error: unknown-view-column (set target)
+> update sv set shown = secret where id = 1;               -- error: unknown-view-column (set value reads a hidden column)
 > insert into sv (id, shown) values (3, 'g') returning id, secret;  -- error: unknown-view-column
 > ```
 >

@@ -1013,13 +1013,18 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 	const substitute = remapper(analysis);
 	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
 
-	// Scope guard: `set` targets and the top-level `where` references must name view
-	// columns (a base-only name must not leak through to the underlying table).
+	// Scope guard: `set` targets, assigned values, and the top-level `where`
+	// references must name view columns (a base-only name must not leak through to
+	// the underlying table).
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
-	const assignments = stmt.assignments.map(asg => ({
-		column: requireBaseColumn(findViewColumn(analysis, asg.column, view)),
-		value: transformExpr(asg.value, substitute, descend),
-	}));
+	const assignments = stmt.assignments.map(asg => {
+		const column = requireBaseColumn(findViewColumn(analysis, asg.column, view));
+		// The assigned VALUE's top-level references must also name view columns — a
+		// base-only name on the RHS would otherwise read a column the view projects
+		// away (the same encapsulation leak as the `where` / `set`-target guard).
+		guardTopLevelScope(asg.value, analysis, view);
+		return { column, value: transformExpr(asg.value, substitute, descend) };
+	});
 
 	const userWhere = stmt.where ? transformExpr(stmt.where, substitute, descend) : undefined;
 	const where = combineAnd(userWhere, analysis.filterPredicate ? cloneExpr(analysis.filterPredicate) : undefined);
