@@ -3071,7 +3071,14 @@ describe('Property-Based Tests', () => {
 				await db.exec('create table dk_b (k integer primary key, bv integer null) using memory');
 				await db.exec('create view dkv as select a.k as k, a.av as av, b.bv as bv from dk_a a join dk_b b on b.k = a.k');
 
-				let oneBaseSeen = 0; let bothCollideSeen = 0; let freshSeen = 0;
+				// Track the one-base-collide arm split by WHICH side K collides on. The
+				// fan-out writes its sides in a fixed order, so the side written SECOND is
+				// the one whose "K-only-on-this-side" case forces a genuine partial-write
+				// rollback (first side written, second fails). We don't know that order a
+				// priori, but if BOTH aOnly and bOnly fire then whichever side is second was
+				// covered — so requiring both guarantees the rollback sub-path executed,
+				// without over-fitting to the engine's member ordering.
+				let aOnlySeen = 0; let bOnlySeen = 0;
 				await fc.assert(fc.asyncProperty(
 					// independent seed sets for the two bases — keys overlap but are not identical
 					fc.array(fc.record({ k: fc.integer({ min: 1, max: 9 }), av: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
@@ -3104,7 +3111,7 @@ describe('Property-Based Tests', () => {
 							// present in exactly one base: the fan-out either fails first (no write)
 							// or succeeds-then-fails (partial write that MUST roll back). Either way
 							// the observable outcome is identical: rejection + both bases intact.
-							oneBaseSeen++;
+							if (inA) aOnlySeen++; else bOnlySeen++;
 							let err: unknown;
 							try { await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`); } catch (e) { err = e; }
 							expect(err, `one-base-collide supplied key ${K} must be rejected`).to.not.equal(undefined);
@@ -3112,7 +3119,6 @@ describe('Property-Based Tests', () => {
 							assertRowsEqual('partial-write b rolled back', await readRows('select k, bv from dk_b'), beforeB, ['k', 'bv']);
 						} else if (inA && inB) {
 							// both-collide: first-op-failure path (already covered above; kept as a guard).
-							bothCollideSeen++;
 							let err: unknown;
 							try { await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`); } catch (e) { err = e; }
 							expect(err, `both-collide supplied key ${K} must be rejected`).to.not.equal(undefined);
@@ -3120,7 +3126,6 @@ describe('Property-Based Tests', () => {
 							assertRowsEqual('both-collide b unchanged', await readRows('select k, bv from dk_b'), beforeB, ['k', 'bv']);
 						} else {
 							// fresh key in neither base: both bases gain it.
-							freshSeen++;
 							await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`);
 							assertRowsEqual('fresh a', await readRows('select k, av from dk_a'),
 								[...beforeA, { k: K, av }], ['k', 'av']);
@@ -3129,8 +3134,12 @@ describe('Property-Based Tests', () => {
 						}
 					},
 				), { numRuns: 120 });
-				// The whole point of this test is the one-base-collide arm: guard it actually fired.
-				expect(oneBaseSeen, 'one-base-collide (partial-write rollback) arm never exercised').to.be.greaterThan(0);
+				// The whole point of this test is the one-base-collide arm — and specifically
+				// the side that fans out SECOND, whose collision forces a real partial-write
+				// rollback. Guarding that BOTH sides fired guarantees that sub-path executed
+				// regardless of which side the engine writes first.
+				expect(aOnlySeen, 'one-base-collide arm (K in dk_a only) never exercised').to.be.greaterThan(0);
+				expect(bOnlySeen, 'one-base-collide arm (K in dk_b only) never exercised').to.be.greaterThan(0);
 			});
 
 			// ----- Family B: delete_via routes a join delete to the FK-parent side -----
