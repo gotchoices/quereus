@@ -290,14 +290,22 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 > (`lbl`) is never a view column, so a subquery-local source that genuinely defines
 > it keeps binding locally, unchanged.
 >
-> *Known corner (unfixed):* if the subquery FROM names the **same base table**
-> (`update p1_v … where exists (select 1 from p1_t where …)`), the base-table-name
-> qualifier (`p1_t.lbl`) binds to the innermost local `p1_t`, not the outer target —
-> an inherent SQL self-reference scoping ambiguity the single-source lowering (no
-> alias on the target) cannot disambiguate. This is no worse than the pre-fix
-> behaviour and is rare; a future hardening could synthesise an alias on the lowered
-> target. (The deep scope-aware qualification above is orthogonal to this corner —
-> it fixes WHETHER nested refs get qualified, not WHICH name they are qualified with.)
+> *Same-base-table self-reference (fixed):* if the subquery FROM names the **same base
+> table** (`update p1_v … where exists (select 1 from p1_t where …)`), a bare
+> base-table-name qualifier (`p1_t.lbl`) would bind to the innermost local `p1_t`, not
+> the outer target — the EXISTS would silently de-correlate (a wrong write). To close
+> this, the lowered single-source UPDATE/DELETE target carries a synthesised
+> collision-proof correlation alias (`__vm_self`, the same `__`-prefixed internal-name
+> convention as `__vmupd_keys`), and substituted subquery-descent base terms are
+> qualified with **that alias** (`__vm_self.lbl`) instead of the bare base table name.
+> The alias cannot collide with any user-introduced FROM source, so the term always
+> binds the outer target row regardless of what the subquery FROM defines. The base
+> UPDATE/DELETE builder registers the synthesised name as the target's correlation
+> alias (ordinary non-view UPDATE/DELETE never sets it, so behaviour there is
+> byte-identical). The alias is **UPDATE/DELETE-only** — an INSERT base statement has
+> no target-row scan a subquery can correlate to, so it keeps the base-table-name
+> qualifier. This is orthogonal to the deep scope-aware qualification above: that fixes
+> WHETHER nested refs get qualified; this fixes WHICH name they are qualified with.
 
 ### Inner Join
 

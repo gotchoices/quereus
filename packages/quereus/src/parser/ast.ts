@@ -233,6 +233,14 @@ export interface UpdateStmt extends AstNode {
 	type: 'update';
 	withClause?: WithClause;
 	table: IdentifierExpr;
+	/**
+	 * Internal correlation name for the target. Synthesised by the view-mutation
+	 * single-source lowering to give the lowered UPDATE target a collision-proof
+	 * alias, so a substituted subquery-descent base term qualified with it binds the
+	 * outer target row even when the user subquery FROM names the same base table.
+	 * The parser never produces it (there is no `UPDATE t AS x` user syntax in scope).
+	 */
+	alias?: string;
 	assignments: { column: string; value: Expression }[];
 	where?: Expression;
 	returning?: ResultColumn[];
@@ -246,6 +254,14 @@ export interface DeleteStmt extends AstNode {
 	type: 'delete';
 	withClause?: WithClause;
 	table: IdentifierExpr;
+	/**
+	 * Internal correlation name for the target. Synthesised by the view-mutation
+	 * single-source lowering to give the lowered DELETE target a collision-proof
+	 * alias, so a substituted subquery-descent base term qualified with it binds the
+	 * outer target row even when the user subquery FROM names the same base table.
+	 * The parser never produces it (there is no `DELETE FROM t AS x` user syntax in scope).
+	 */
+	alias?: string;
 	where?: Expression;
 	returning?: ResultColumn[];
 	contextValues?: ContextAssignment[]; // Optional mutation context assignments

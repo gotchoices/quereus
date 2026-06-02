@@ -641,6 +641,9 @@ export function updateToString(stmt: AST.UpdateStmt): string {
 	}
 
 	parts.push('update', expressionToString(stmt.table));
+	// Synthesised internal correlation name (view-mutation single-source lowering) —
+	// render it for plan/debug round-trip fidelity.
+	if (stmt.alias) parts.push('as', quoteIdentifier(stmt.alias));
 
 	if (stmt.contextValues && stmt.contextValues.length > 0) {
 		const contextAssignments = stmt.contextValues.map(assign =>
@@ -689,6 +692,9 @@ export function deleteToString(stmt: AST.DeleteStmt): string {
 	}
 
 	parts.push('delete from', expressionToString(stmt.table));
+	// Synthesised internal correlation name (view-mutation single-source lowering) —
+	// render it for plan/debug round-trip fidelity.
+	if (stmt.alias) parts.push('as', quoteIdentifier(stmt.alias));
 
 	if (stmt.contextValues && stmt.contextValues.length > 0) {
 		const contextAssignments = stmt.contextValues.map(assign =>

@@ -62,6 +62,19 @@ export interface MutableViewLike {
 	readonly tags?: Readonly<Record<string, SqlValue>>;
 }
 
+/**
+ * Reserved, collision-proof correlation name synthesised onto the lowered
+ * single-source UPDATE/DELETE target. The `__` internal-name convention (same family
+ * as `__vmupd_keys` / `__shared_key`) guarantees it cannot collide with any
+ * user-introduced FROM source, so a substituted subquery-descent base term qualified
+ * with it (`__vm_self.col`) always binds the outer target row — even when the user
+ * subquery FROM names the view's own base table. Lowered-target nesting cannot occur
+ * (view-over-view / MV-over-MV / view-over-MV are all rejected by `analyzeView`, and a
+ * user subquery is a plain SELECT that never re-lowers), so a single module-level
+ * constant suffices: two `__vm_self`-aliased targets can never be in scope at once.
+ */
+const SELF_ALIAS = '__vm_self';
+
 /** A base column pinned to a constant by the view's selection predicate. */
 interface FilterConstant {
 	readonly baseColumnName: string;
@@ -124,9 +137,12 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
  * INSIDE a subquery operand of a single-source rewrite. An unqualified base term
  * there would re-bind to a same-named source the subquery's own FROM introduces
  * (innermost SQL scoping) instead of correlating to the outer UPDATE/DELETE target
- * row. Qualifying it with the base table name — which is exactly the table named
- * by the lowered statement, with no synthesised alias — makes it correlate to the
- * outer row regardless of what the subquery FROM defines.
+ * row. Qualifying it with `qualifierName` makes it correlate to the outer row
+ * regardless of what the subquery FROM defines. For UPDATE/DELETE the caller passes
+ * the lowered target's synthesised collision-proof alias ({@link SELF_ALIAS}), so the
+ * qualified term binds the outer row even when the subquery FROM names the view's own
+ * base table; INSERT (and the multi-source spine) leaves it at the base table name
+ * (no target-row scan to collide with). Default is the bare base table name.
  *
  * The qualification is **scope-aware and DEEP** (it rides the shared
  * {@link transformScopedExpr} descent over {@link makeBaseQualifyScope}): it
@@ -142,28 +158,31 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
 function makeBaseQualifier(
 	ctx: PlanningContext,
 	baseTable: TableSchema,
+	qualifierName: string = baseTable.name,
 ): (repl: AST.Expression) => AST.Expression {
-	const scope = makeBaseQualifyScope(baseTable);
+	const scope = makeBaseQualifyScope(baseTable, qualifierName);
 	return (repl) => transformScopedExpr(ctx, scope, repl);
 }
 
 /**
  * The {@link ScopeContext} for the base-term correlation-qualifier — the
  * scope-aware DEEP qualify of a substituted base term. Its substitution qualifies
- * an unqualified BASE-table column that is not shadowed with the base table name
- * (the lowered statement's correlation name); an already-qualified ref, a non-base
- * name (a lineage-local column such as the `x` / `fk` a nested subquery's own FROM
- * introduces), or a shadowed name is left untouched. Restricting to base columns
- * changes nothing for a `normalizeBaseRefs`-normalized lineage (whose top-level
- * refs are all base columns) and is the principled gate: only the view's own
- * base-term lineage is correlation-qualified, never a column a nested source owns.
+ * an unqualified BASE-table column that is not shadowed with `qualifierName` — the
+ * lowered statement's correlation name (the synthesised {@link SELF_ALIAS} for
+ * UPDATE/DELETE, the bare base table name for INSERT / multi-source). An
+ * already-qualified ref, a non-base name (a lineage-local column such as the `x` /
+ * `fk` a nested subquery's own FROM introduces), or a shadowed name is left untouched.
+ * Restricting to base columns changes nothing for a `normalizeBaseRefs`-normalized
+ * lineage (whose top-level refs are all base columns) and is the principled gate: only
+ * the view's own base-term lineage is correlation-qualified, never a column a nested
+ * source owns.
  *
  * An unresolvable scope (`select *` / TVF / CTE) is **rejected** rather than
  * tainted-and-deferred: shadowing cannot be proven, so the term could over- or
  * under-qualify into a silent wrong write (`unresolvableScope: 'reject'`).
  */
-function makeBaseQualifyScope(baseTable: TableSchema): ScopeContext {
-	const qualifier = baseTable.name;
+function makeBaseQualifyScope(baseTable: TableSchema, qualifierName: string = baseTable.name): ScopeContext {
+	const qualifier = qualifierName;
 	const baseCols = new Set(baseTable.columns.map(c => c.name.toLowerCase()));
 	return {
 		makeSubstitute: (shadowed) => (col) => {
@@ -684,7 +703,11 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike): AST.UpdateStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
+	// Qualify substituted subquery-descent base terms with the lowered target's
+	// synthesised alias (SELF_ALIAS) so they correlate to the outer target row even
+	// when the user subquery FROM names the view's own base table (the same-base-table
+	// self-reference corner). The lowered statement carries `alias: SELF_ALIAS` below.
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, SELF_ALIAS));
 
 	// Scope guard: `set` targets, assigned values, and the top-level `where`
 	// references must name view columns (a base-only name must not leak through to
@@ -705,10 +728,15 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 	return {
 		type: 'update',
 		table: tableIdentifier(analysis.baseTable),
+		// Synthesised collision-proof correlation name on the lowered target; the base
+		// builder registers it as the target's AliasedScope alias so an `__vm_self.col`
+		// term (emitted by the SELF_ALIAS qualifier above, incl. in RETURNING subqueries)
+		// binds the outer target row regardless of the user subquery FROM.
+		alias: SELF_ALIAS,
 		assignments,
 		where,
 		contextValues: stmt.contextValues,
-		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view),
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view, SELF_ALIAS),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
@@ -719,7 +747,11 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike): AST.DeleteStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
+	// Qualify substituted subquery-descent base terms with the lowered target's
+	// synthesised alias (SELF_ALIAS) so they correlate to the outer target row even
+	// when the user subquery FROM names the view's own base table (the same-base-table
+	// self-reference corner). The lowered statement carries `alias: SELF_ALIAS` below.
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, SELF_ALIAS));
 
 	// Scope guard: top-level `where` references must name view columns.
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
@@ -729,9 +761,12 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
 	return {
 		type: 'delete',
 		table: tableIdentifier(analysis.baseTable),
+		// Synthesised collision-proof correlation name on the lowered target; see
+		// rewriteViewUpdate for the rationale (binds `__vm_self.col` to the outer row).
+		alias: SELF_ALIAS,
 		where,
 		contextValues: stmt.contextValues,
-		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view),
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view, SELF_ALIAS),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
@@ -751,16 +786,22 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
  * OLD/NEW qualifiers on a view-column reference are not honored through a view
  * (the qualifier is dropped, so the base op's default NEW/OLD binding applies);
  * the documented surface is unqualified / view-qualified view columns.
+ *
+ * `correlationName` is the lowered target's correlation name used to qualify
+ * substituted base terms emitted inside a RETURNING subquery (a RETURNING subquery can
+ * correlate to the target row the same way a WHERE subquery can). UPDATE/DELETE pass
+ * the synthesised {@link SELF_ALIAS}; INSERT leaves it at the base table name (default).
  */
 export function rewriteViewReturning(
 	ctx: PlanningContext,
 	returning: AST.ResultColumn[] | undefined,
 	analysis: ViewAnalysis,
 	view: MutableViewLike,
+	correlationName: string = analysis.baseTable.name,
 ): AST.ResultColumn[] | undefined {
 	if (!returning || returning.length === 0) return undefined;
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
+	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, correlationName));
 	const out: AST.ResultColumn[] = [];
 	for (const rc of returning) {
 		if (rc.type === 'all') {

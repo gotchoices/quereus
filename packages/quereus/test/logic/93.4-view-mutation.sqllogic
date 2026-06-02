@@ -945,6 +945,32 @@ update so_v set lbl = 'HIT' where exists (select 1 from so_src where tag = note)
 select id, lbl from so_base order by id;
 → [{"id":1,"lbl":"HIT"},{"id":2,"lbl":"B"}]
 
+-- --- (p) same-base-table self-reference: the user subquery FROM names the view's OWN
+--          base table — the corner the synthesised target alias closes ---
+-- The view renames base `lbl` to view column `note`; the EXISTS subquery FROM is the
+-- SAME base table (sr_t). `note` substitutes to base `lbl` and is correlation-qualified.
+-- A bare-base-table-name qualifier (sr_t.lbl) would bind the INNER sr_t (innermost
+-- scope) -> the predicate degrades to the uncorrelated sr_t.k = sr_t.lbl, true for the
+-- ('A','A') row, so EVERY outer row would pass (a silent wrong write). The synthesised
+-- alias on the lowered target (__vm_self.lbl) binds the OUTER row -> the predicate is
+-- the correlated sr_t.k = <outer>.lbl -> only outer row 1 (lbl 'A', matched by k='A').
+create table sr_t (id integer primary key, k text, lbl text);
+insert into sr_t values (1, 'A', 'A'), (2, 'Z', 'B');
+create view sr_v as select id as id, lbl as note from sr_t;
+
+update sr_v set note = 'CHANGED' where exists (select 1 from sr_t where sr_t.k = note);
+select id, lbl from sr_t order by id;
+→ [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"B"}]
+
+-- --- (q) DELETE variant — the delete path threads the same synthesised alias ---
+create table dr_t (id integer primary key, k text, lbl text);
+insert into dr_t values (1, 'A', 'A'), (2, 'Z', 'B');
+create view dr_v as select id as id, lbl as note from dr_t;
+
+delete from dr_v where exists (select 1 from dr_t where dr_t.k = note);
+select id, lbl from dr_t order by id;
+→ [{"id":2,"lbl":"B"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so an insert mints a

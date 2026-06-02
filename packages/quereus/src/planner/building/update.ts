@@ -99,7 +99,13 @@ export function buildUpdateStmt(
       new ColumnReferenceNode(s, exp as AST.ColumnExpr, c.type, attr.id, i));
   });
   const tableName = tableReference.tableSchema.name.toLowerCase();
-  const tableScope = new AliasedScope(tableColumnScope, tableName, tableName);
+  // The view-mutation single-source lowering may carry a synthesised collision-proof
+  // correlation name on the target (`stmt.alias`), so a substituted subquery-descent
+  // base term qualified with it binds the outer target row even when the user subquery
+  // FROM names the same base table. Ordinary UPDATE never sets `stmt.alias`, so the
+  // correlation name is the table name and the AliasedScope behaves identically.
+  const correlationName = stmt.alias?.toLowerCase() ?? tableName;
+  const tableScope = new AliasedScope(tableColumnScope, tableName, correlationName);
 
   // Create a new planning context with the updated scope for WHERE clause resolution
   const updateCtx = { ...contextWithSchemaPath, scope: tableScope };
