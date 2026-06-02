@@ -801,14 +801,30 @@ function anchorPredicate(view: MutableViewLike, shape: DecompShape, where: AST.E
  * Gate a user WHERE to **anchor-only** references via the threaded backward lineage:
  * every logical column the predicate names must be backed by the anchor member
  * ({@link classifyColumn} → `member` whose relation is the anchor), and the predicate
- * must hold no subquery. A non-anchor member column, an EAV / computed / unbacked
- * column, or an embedded subquery defers onto the snapshot-consistent multi-member
- * substrate. (Replaces the retired `collectColumnQualifiers` base-qualifier scan —
- * the anchor decision now reads `updateLineage`, the same backward walk the
- * multi-source path consumes.)
+ * must hold no subquery. A non-anchor member column, an EAV / computed column, or an
+ * embedded subquery defers onto the snapshot-consistent multi-member substrate; a name
+ * that is not a logical column of the table at all is an encapsulation leak, rejected
+ * as `unknown-view-column` (consistent with the single-source / multi-source
+ * `assertTopLevelViewColumns` guard — a typo'd / projected-away name is a user error,
+ * not a deferred multi-member shape). (Replaces the retired `collectColumnQualifiers`
+ * base-qualifier scan — the anchor decision now reads `updateLineage`, the same
+ * backward walk the multi-source path consumes.)
  */
 function assertAnchorScoped(view: MutableViewLike, shape: DecompShape, where: AST.Expression): void {
 	const refs = collectViewColumnRefs(where);
+	// Encapsulation-leak guard first: a name the logical table does not expose is an
+	// unknown view column (it would otherwise be mislabeled a "non-anchor member" below).
+	for (const name of refs.names) {
+		if (!shape.columns.some(c => c.name === name)) {
+			raiseMutationDiagnostic({
+				reason: 'unknown-view-column',
+				column: name,
+				table: view.name,
+				message: `cannot write through logical table '${view.name}': '${name}' is not a column of the logical table`,
+				suggestion: `logical table '${view.name}' exposes: ${shape.columns.map(c => c.displayName).join(', ')}.`,
+			});
+		}
+	}
 	const nonAnchor = [...refs.names].some(name => {
 		const route = classifyColumn(shape, name);
 		return !(route.kind === 'member' && route.member.relationId === shape.anchor.relationId);

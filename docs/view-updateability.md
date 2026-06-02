@@ -362,8 +362,8 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 **Updates** route per-column to the side that owns each column. A `set` clause assigning columns from both sides produces two child operations executed atomically. The row-identifying predicate for each child is the projection of the join's row-identifying predicate onto that child's key columns.
 
 > **Shipped (Phase B1) — inverse-profile columns are writable through a join.** The
-> multi-source path consumes the FULL threaded `UpdateSite` (`multi-source.ts`
-> `writableBaseSite`), not just identity sites: a `base` site **with an `inverse`**
+> multi-source path consumes the FULL threaded `UpdateSite` (via the shared n-way
+> reader `update-lineage.ts` `resolveBaseSite`), not just identity sites: a `base` site **with an `inverse`**
 > — a non-identity invertible projection such as `c.cv + 1` — is writable. A write
 > `set cv1 = w` lowers the assigned value through the site's inverse to the base
 > value (`update jchild set cv = w - 1`), and the view reads it back through the

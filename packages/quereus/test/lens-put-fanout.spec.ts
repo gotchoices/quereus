@@ -167,6 +167,21 @@ describe('lens decomposition put: DELETE fan-out', () => {
 			await db.close();
 		}
 	});
+
+	it('rejects a WHERE on an unknown column as an encapsulation leak (not a non-anchor member)', async () => {
+		// A name the logical table does not expose is a user error (typo / projected-away
+		// base column), guarded the same way the single-source / multi-source paths guard
+		// it — `unknown-view-column`, NOT the "non-anchor decomposition member" deferral.
+		const db = new Database();
+		try {
+			await setup(db);
+			await expectThrows(() => db.exec('delete from x.T where notacol = 1'), /not a column of the logical table/i);
+			// Atomic: nothing deleted.
+			expect(await rows(db, 'select id from main.T_core order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens decomposition put: UPDATE fan-out', () => {
