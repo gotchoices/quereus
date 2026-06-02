@@ -2964,6 +2964,62 @@ describe('Property-Based Tests', () => {
 				expect(inserted, 'directly-supplied insert never exercised').to.be.greaterThan(0);
 			});
 
+			// ----- Family B: directly-supplied insert — the colliding-key edge -----
+			// The directly-supplied insert above always picks a fresh disjoint key, so the
+			// collision arm (a supplied key already present in a base) is never walked. Fuzz
+			// the key against the seed range: when it collides, the per-base insert must be
+			// REJECTED (the anchor base's PK is violated) and BOTH bases left intact — the
+			// fan-out is atomic, so a partial write (one base gains the row, the other does
+			// not) would be a broken envelope. When it does not collide, both bases gain it.
+			it('PutGet: a directly-supplied insert key colliding with an existing base key is rejected atomically', async () => {
+				await db.exec('drop view if exists dkv');
+				await db.exec('drop table if exists dk_a');
+				await db.exec('drop table if exists dk_b');
+				await db.exec('create table dk_a (k integer primary key, av integer null) using memory');
+				await db.exec('create table dk_b (k integer primary key, bv integer null) using memory');
+				await db.exec('create view dkv as select a.k as k, a.av as av, b.bv as bv from dk_a a join dk_b b on b.k = a.k');
+
+				let collidedSeen = 0; let freshSeen = 0;
+				await fc.assert(fc.asyncProperty(
+					fc.array(fc.record({ k: fc.integer({ min: 1, max: 9 }), av: fc.integer({ min: 1, max: 9 }), bv: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
+					fc.integer({ min: 1, max: 12 }),  // supplied key — overlaps the seed range, so it sometimes collides
+					fc.integer({ min: 1, max: 9 }), fc.integer({ min: 1, max: 9 }),
+					async (seed, K, av, bv) => {
+						await db.exec('delete from dk_a');
+						await db.exec('delete from dk_b');
+						const seen = new Set<number>(); const kept: { k: number; av: number; bv: number }[] = [];
+						for (const r of seed) {
+							if (seen.has(r.k)) continue; seen.add(r.k);
+							await db.exec(`insert into dk_a values (${r.k}, ${r.av})`);
+							await db.exec(`insert into dk_b values (${r.k}, ${r.bv})`);
+							kept.push(r);
+						}
+						const collides = seen.has(K);
+
+						if (collides) {
+							collidedSeen++;
+							let err: unknown;
+							try { await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`); } catch (e) { err = e; }
+							expect(err, `colliding supplied key ${K} must be rejected`).to.not.equal(undefined);
+							// Atomic: neither base gained a row, and the existing rows are intact.
+							assertRowsEqual('collide a unchanged', await readRows('select k, av from dk_a'),
+								kept.map(r => ({ k: r.k, av: r.av })), ['k', 'av']);
+							assertRowsEqual('collide b unchanged', await readRows('select k, bv from dk_b'),
+								kept.map(r => ({ k: r.k, bv: r.bv })), ['k', 'bv']);
+						} else {
+							freshSeen++;
+							await db.exec(`insert into dkv (k, av, bv) values (${K}, ${av}, ${bv})`);
+							assertRowsEqual('fresh a', await readRows('select k, av from dk_a'),
+								[...kept.map(r => ({ k: r.k, av: r.av })), { k: K, av }], ['k', 'av']);
+							assertRowsEqual('fresh b', await readRows('select k, bv from dk_b'),
+								[...kept.map(r => ({ k: r.k, bv: r.bv })), { k: K, bv }], ['k', 'bv']);
+						}
+					},
+				), { numRuns: 60 });
+				expect(collidedSeen, 'collision arm never exercised').to.be.greaterThan(0);
+				expect(freshSeen, 'fresh-key arm never exercised').to.be.greaterThan(0);
+			});
+
 			// ----- Family B: delete_via routes a join delete to the FK-parent side -----
 			// Default DELETE routing picks the FK-child (FK-many) side. A `delete_via=parent`
 			// tag overrides that to the FK-parent. FK enforcement is off, so the now-dangling
@@ -2987,6 +3043,73 @@ describe('Property-Based Tests', () => {
 					[{ cc: 1, pr: 1, cv: 100 }, { cc: 2, pr: 1, cv: 200 }, { cc: 3, pr: 2, cv: 300 }], ['cc', 'pr', 'cv']);
 				// view image: only children whose parent still exists (child 3, parent 2).
 				assertRowsEqual('dv view', await readRows('select cc, cv, pv from dvv'), [{ cc: 3, cv: 300, pv: 20 }], ['cc', 'cv', 'pv']);
+			});
+
+			// ----- Family B: delete_via=parent fuzzed — a parent shared by several children -----
+			// The deterministic case above removes one fixed parent. Property-fuzz it so the
+			// targeted child's FK-parent is SHARED by several children: deleting that one
+			// parent (the routed side) leaves EVERY child in the base (delete_via=parent never
+			// touches the child side), but the inner join now hides each child that referenced
+			// the removed parent — not only the one the predicate named.
+			it('PutGet: delete_via=parent fuzzed — removes the shared parent, all children survive, dependents go invisible', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists dvv');
+				await db.exec('drop table if exists dv_child');
+				await db.exec('drop table if exists dv_parent');
+				await db.exec('create table dv_parent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table dv_child (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references dv_parent(pp)) using memory');
+				await db.exec('create view dvv as select c.cc as cc, c.cv as cv, p.pv as pv from dv_child c join dv_parent p on p.pp = c.pr');
+
+				let routedSeen = 0; let sharedSeen = 0;
+				await fc.assert(fc.asyncProperty(
+					// Few parents, many children ⇒ a parent is frequently shared by several children.
+					fc.array(fc.record({ pp: fc.integer({ min: 1, max: 3 }), pv: fc.integer({ min: 1, max: 9 }) }), { maxLength: 4 }),
+					fc.array(fc.record({ cc: fc.integer({ min: 1, max: 9 }), pr: fc.integer({ min: 1, max: 3 }), cv: fc.integer({ min: 1, max: 9 }) }), { maxLength: 10 }),
+					fc.integer({ min: 1, max: 9 }),  // cc predicate value K (may not exist / join)
+					async (parents, children, K) => {
+						await db.exec('delete from dv_child');
+						await db.exec('delete from dv_parent');
+						const pSeen = new Set<number>(); const P: { pp: number; pv: number }[] = [];
+						for (const p of parents) {
+							if (pSeen.has(p.pp)) continue; pSeen.add(p.pp);
+							await db.exec(`insert into dv_parent values (${p.pp}, ${p.pv})`);
+							P.push(p);
+						}
+						const cSeen = new Set<number>(); const C: { cc: number; pr: number; cv: number }[] = [];
+						for (const c of children) {
+							if (cSeen.has(c.cc)) continue; cSeen.add(c.cc);
+							await db.exec(`insert into dv_child values (${c.cc}, ${c.pr}, ${c.cv})`);
+							C.push(c);
+						}
+						const ppSet = new Set(P.map(p => p.pp));
+
+						// The routed target: the child cc=K, joined (its parent exists). Its FK-parent
+						// is the parent delete_via=parent removes.
+						const target = C.find(c => c.cc === K && ppSet.has(c.pr));
+						let oParents = P.map(p => ({ ...p }));
+						if (target) {
+							routedSeen++;
+							if (C.filter(c => c.pr === target.pr).length > 1) sharedSeen++;
+							oParents = oParents.filter(p => p.pp !== target.pr);
+						}
+
+						await db.exec(`delete from dvv with tags ("quereus.update.delete_via" = 'parent') where cc = ${K}`);
+
+						// Parent base: the routed parent (if any) removed; children base: untouched.
+						assertRowsEqual('dv-fuzz parent', await readRows('select pp, pv from dv_parent'),
+							oParents.map(p => ({ pp: p.pp, pv: p.pv })), ['pp', 'pv']);
+						assertRowsEqual('dv-fuzz child', await readRows('select cc, pr, cv from dv_child'),
+							C.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), ['cc', 'pr', 'cv']);
+						// View image: every child whose parent still exists — the shared parent's
+						// removal makes ALL its dependents invisible, not just the named child.
+						const oppSet = new Set(oParents.map(p => p.pp));
+						const pvAfter = new Map(oParents.map(p => [p.pp, p.pv]));
+						const expView = C.filter(c => oppSet.has(c.pr)).map(c => ({ cc: c.cc, cv: c.cv, pv: pvAfter.get(c.pr)! }));
+						assertRowsEqual('dv-fuzz view', await readRows('select cc, cv, pv from dvv'), expView, ['cc', 'cv', 'pv']);
+					},
+				), { numRuns: 80 });
+				expect(routedSeen, 'delete_via=parent never routed to an existing parent').to.be.greaterThan(0);
+				expect(sharedSeen, 'delete_via=parent never removed a parent shared by multiple children').to.be.greaterThan(0);
 			});
 
 			// ----- Family B: a no-FK join delete fans out to BOTH candidate sides -----
@@ -3318,6 +3441,95 @@ describe('Property-Based Tests', () => {
 				expect(opsSeen.size, 'columnar PutGet did not exercise a spread of ops').to.be.greaterThan(2);
 			});
 
+			// ----- PutGet (columnar, missing mandatory member): the invisible-row arm -----
+			// The columnar PutGet above seeds T_b for EVERY T_core id, so the inner core⋈b
+			// join never hides a row and `expView`'s `.filter(id => bMap.has(id))` is a no-op.
+			// Here some T_core rows have NO T_b row, so the logical row is invisible through
+			// the view, and the put-path arms that only fire on a missing member are walked:
+			//   - a per-member UPDATE to the ABSENT member (`set b`) never materializes it —
+			//     `update T_b where id in (...)` matches nothing, so no row springs into being;
+			//   - the ANCHOR is still routed by the bare anchor predicate (decomposition fans
+			//     out by predicate, not by join visibility), so `set a` lands on T_core even
+			//     for an invisible row — but the row stays invisible (its b is still absent),
+			//     so the view image never widens. The oracle is per-member-independent (each
+			//     member mutates iff its own row is present), which the all-members-present
+			//     seeding could not distinguish from the existing `if (core.has(K))` oracle.
+			// Also exercises an anchor NON-KEY column predicate (`where a = K`), not only the
+			// unique logical PK `id` the existing test pins.
+			it('PutGet (columnar, missing member): an invisible logical row is untouched; anchor + non-key predicates', async () => {
+				await deployColumnar();
+				let invisibleSeen = 0;
+				const opsSeen = new Set<string>();
+				await fc.assert(fc.asyncProperty(
+					fc.array(fc.record({
+						id: fc.integer({ min: 1, max: 6 }),
+						a: fc.integer({ min: 1, max: 4 }),
+						b: fc.integer({ min: 1, max: 9 }),
+						hasB: fc.boolean(),                                       // omit the mandatory T_b member sometimes
+						c: fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }),
+					}), { maxLength: 8 }),
+					fc.constantFrom('update-a', 'update-b', 'update-ab', 'delete'),
+					fc.constantFrom('id', 'a'),        // predicate column: unique logical PK vs anchor non-key
+					fc.integer({ min: 1, max: 6 }),    // predicate value (covers both id and a ranges)
+					fc.integer({ min: 10, max: 20 }),  // NV  (a) — disjoint from id/a/predicate ranges
+					fc.integer({ min: 21, max: 30 }),  // NV2 (b)
+					async (seed, op, pcol, pval, NV, NV2) => {
+						opsSeen.add(op);
+						await db.exec('delete from main.T_core');
+						await db.exec('delete from main.T_b');
+						await db.exec('delete from main.T_c');
+						const core = new Map<number, number>();
+						const bMap = new Map<number, number>();
+						const cMap = new Map<number, number>();
+						const seen = new Set<number>();
+						for (const r of seed) {
+							if (seen.has(r.id)) continue; seen.add(r.id);
+							await db.exec(`insert into main.T_core values (${r.id}, ${r.a})`);
+							core.set(r.id, r.a);
+							if (r.hasB) { await db.exec(`insert into main.T_b values (${r.id}, ${r.b})`); bMap.set(r.id, r.b); }
+							if (r.c !== null) { await db.exec(`insert into main.T_c values (${r.id}, ${r.c})`); cMap.set(r.id, r.c); }
+						}
+						if ([...core.keys()].some(id => !bMap.has(id))) invisibleSeen++;
+
+						// The anchor predicate selects T_core rows (it routes against the anchor,
+						// regardless of member presence / join visibility).
+						const matched = [...core.keys()].filter(id => pcol === 'id' ? id === pval : core.get(id) === pval);
+						const pred = `${pcol} = ${pval}`;
+
+						if (op === 'update-a') {
+							await db.exec(`update x.T set a = ${NV} where ${pred}`);
+							for (const id of matched) core.set(id, NV);                    // anchor: always (row present in T_core)
+						} else if (op === 'update-b') {
+							await db.exec(`update x.T set b = ${NV2} where ${pred}`);
+							for (const id of matched) if (bMap.has(id)) bMap.set(id, NV2); // member: only if present (never materialized)
+						} else if (op === 'update-ab') {
+							await db.exec(`update x.T set a = ${NV}, b = ${NV2} where ${pred}`);
+							for (const id of matched) { core.set(id, NV); if (bMap.has(id)) bMap.set(id, NV2); }
+						} else {
+							await db.exec(`delete from x.T where ${pred}`);
+							for (const id of matched) { core.delete(id); bMap.delete(id); cMap.delete(id); }
+						}
+
+						// Every member's base image matches the per-member-independent oracle.
+						assertRowsEqual('missing-member T_core', await readRows('select id, a from main.T_core'),
+							[...core].map(([id, a]) => ({ id, a })), ['id', 'a']);
+						assertRowsEqual('missing-member T_b', await readRows('select id, b from main.T_b'),
+							[...bMap].map(([id, b]) => ({ id, b })), ['id', 'b']);
+						assertRowsEqual('missing-member T_c', await readRows('select id, c from main.T_c'),
+							[...cMap].map(([id, c]) => ({ id, c })), ['id', 'c']);
+						// The view hides every logical row whose mandatory T_b is absent.
+						const expView = [...core.keys()].filter(id => bMap.has(id)).map(id => ({
+							id, a: core.get(id)!, b: bMap.get(id)!, c: cMap.has(id) ? cMap.get(id)! : null,
+						}));
+						assertRowsEqual('missing-member view image', await readRows('select id, a, b, c from x.T'),
+							expView, ['id', 'a', 'b', 'c']);
+					},
+				), { numRuns: 80 });
+
+				expect(invisibleSeen, 'missing-member columnar PutGet never produced an invisible logical row').to.be.greaterThan(0);
+				expect(opsSeen.size, 'missing-member PutGet did not exercise a spread of ops').to.be.greaterThan(2);
+			});
+
 			// ----- GetPut (columnar): write read values back, every member unchanged -----
 			it('GetPut (columnar): writing read values back leaves every member unchanged', async () => {
 				await deployColumnar();
@@ -3455,11 +3667,87 @@ describe('Property-Based Tests', () => {
 				expect(inserted, 'surrogate PutGet never inserted').to.be.greaterThan(0);
 			});
 
+			// ----- PutGet (surrogate, multi-row): per-row distinct minting through the fan-out -----
+			// The single-row surrogate test above inserts exactly one logical row per run, so
+			// per-row-distinct minting THROUGH the decomposition fan-out (the multi-source-join
+			// insert covers multi-row minting only on its own path) is never exercised. Insert
+			// several logical rows in ONE statement and assert each threads the SAME surrogate
+			// into every member (anchor Doc_core.sid = member Doc_body.doc_sid per row) and that
+			// the per-row surrogates are pairwise distinct (the `per-row` cadence mints afresh
+			// for each produced row, not once for the whole statement).
+			it('PutGet (surrogate, multi-row): one insert statement mints a distinct shared key per row, threaded into every member', async () => {
+				await deploySurrogate();
+				let multiInserted = 0;
+				await fc.assert(fc.asyncProperty(
+					fc.array(fc.record({ sid: fc.integer({ min: 1, max: 50 }), dk: fc.integer({ min: 1, max: 50 }), t: fc.integer({ min: 1, max: 9 }), body: fc.integer({ min: 1, max: 9 }) }), { maxLength: 6 }),
+					// 2..4 logical rows in one statement, with distinct fresh keys disjoint from the seed range.
+					fc.uniqueArray(
+						fc.record({ dk: fc.integer({ min: 60, max: 90 }), t: fc.integer({ min: 1, max: 9 }), body: fc.integer({ min: 1, max: 9 }) }),
+						{ selector: r => r.dk, minLength: 2, maxLength: 4 },
+					),
+					async (seed, news) => {
+						await db.exec('delete from main.Doc_core');
+						await db.exec('delete from main.Doc_body');
+						const seenSid = new Set<number>(); const seenDk = new Set<number>();
+						const sids: number[] = [];
+						for (const r of seed) {
+							if (seenSid.has(r.sid) || seenDk.has(r.dk)) continue;
+							seenSid.add(r.sid); seenDk.add(r.dk);
+							await db.exec(`insert into main.Doc_core values (${r.sid}, '${r.dk}', '${r.t}')`);
+							await db.exec(`insert into main.Doc_body values (${r.sid}, '${r.body}')`);
+							sids.push(r.sid);
+						}
+						const maxSeedSid = sids.length === 0 ? 0 : Math.max(...sids);
+
+						const valuesSql = news.map(r => `('${r.dk}', '${r.t}', '${r.body}')`).join(', ');
+						await db.exec(`insert into x.Doc (docKey, title, body) values ${valuesSql}`);
+						multiInserted++;
+
+						// Each inserted logical row minted exactly one anchor row, with the SAME
+						// surrogate threaded into the body member.
+						const mintedSids: number[] = [];
+						for (const r of news) {
+							const coreRow = await readRows(`select sid, doc_key, title from main.Doc_core where doc_key = '${r.dk}'`);
+							expect(coreRow.length, `anchor got exactly one row for docKey '${r.dk}'`).to.equal(1);
+							const mintedSid = coreRow[0].sid as number;
+							expect(coreRow[0].title).to.equal(String(r.t));
+							const bodyRow = await readRows(`select doc_sid, body from main.Doc_body where doc_sid = ${String(mintedSid)}`);
+							expect(bodyRow.length, `body member threaded the surrogate ${mintedSid}`).to.equal(1);
+							expect(bodyRow[0].body).to.equal(String(r.body));
+							mintedSids.push(mintedSid);
+						}
+						// Pairwise-distinct minting, every minted surrogate beyond the seeded anchors.
+						expect(new Set(mintedSids).size, 'per-row surrogates are pairwise distinct').to.equal(news.length);
+						expect(mintedSids.every(s => s > maxSeedSid), 'every minted surrogate is fresh (> seeded anchors)').to.equal(true);
+						// All inserted logical rows surface through the view.
+						const view = await readRows('select docKey, title, body from x.Doc');
+						for (const r of news) {
+							expect(view.some(v => v.docKey === String(r.dk) && v.title === String(r.t) && v.body === String(r.body)),
+								`logical row '${r.dk}' surfaces through the view`).to.equal(true);
+						}
+					},
+				), { numRuns: 40 });
+				expect(multiInserted, 'surrogate multi-row PutGet never inserted').to.be.greaterThan(0);
+			});
+
 			// ----- forward/backward lineage agreement (the structural crux for C) -----
-			it('forward/backward lineage agreement: the decomposition advertisement reconstructs every forward key', async () => {
-				await deployColumnar();
-				const ad = advertisementOf('x', 'T');
-				expect(ad, 'tag-derived advertisement resolved').to.not.equal(undefined);
+			/**
+			 * The keykind-independent structural member-map reconstruction: the resolved
+			 * advertisement's member map agrees with the forward FD facts of the synthesized
+			 * `anchor ⋈ members` body. Shared by every advertisement shape (columnar / EAV /
+			 * surrogate); the shared-key ⇄ logical-PK reconstruction is keykind-specific and
+			 * left to the caller (a `logical-tuple` key IS the logical PK; a `surrogate` is a
+			 * substrate key distinct from any logical column). Returns the pieces the caller
+			 * needs for that final, keykind-specific assertion.
+			 */
+			function assertAdvertisementLineage(schema: string, logical: string, body: string): {
+				readonly colToBase: Map<string, string>;
+				readonly anchorKey: readonly string[] | undefined;
+				readonly cols: string[];
+				readonly keys: readonly (readonly number[])[];
+			} {
+				const ad = advertisementOf(schema, logical);
+				expect(ad, `tag-derived advertisement for ${schema}.${logical} resolved`).to.not.equal(undefined);
 				const storage = ad.storage;
 
 				// (backward) the anchor is among the members.
@@ -3474,25 +3762,71 @@ describe('Property-Based Tests', () => {
 						colToBase.set(c.logicalColumn.toLowerCase(), (c.basisExpr as any).name.toLowerCase());
 					}
 				}
-				// (backward) the anchor carries a shared-key column (the identifying predicate).
+				// (backward) every member carries a shared-key column (the equi-join stitch),
+				// and the anchor's identifies the predicate target.
+				for (const m of storage.members) {
+					expect((storage.sharedKey.keyColumnsByRelation.get(m.relationId) ?? []).length,
+						`member '${m.relationId}' carries a shared-key column`).to.be.greaterThan(0);
+				}
 				const anchorKey = storage.sharedKey.keyColumnsByRelation.get(storage.anchorRelationId) as string[] | undefined;
 				expect(anchorKey, 'anchor shared-key present').to.not.equal(undefined);
 
-				// (forward) plan the synthesized body; every forward-key column is base-backed,
-				// and the logical PK is a forward key whose base column is the anchor's shared key.
-				const root = planBody('select * from x.T');
+				// (forward) plan the synthesized body; every forward-key column the FD walk
+				// advertises must be base-backed (a forward key may legitimately be absent — a
+				// surrogate is projected away and its logical PK rides a non-unique base column,
+				// so no forward key survives; that is asserted by the caller, not required here).
+				const root = planBody(body);
 				const cols = root.getType().columns.map(c => c.name.toLowerCase());
 				const keys = keysOf(root);
-				expect(keys.length, 'the decomposition body advertises a forward key').to.be.greaterThan(0);
 				for (const key of keys) {
 					for (const idx of key) {
 						expect(colToBase.has(cols[idx]), `forward-key column '${cols[idx]}' is base-backed`).to.equal(true);
 					}
 				}
-				const idIdx = cols.indexOf('id');
-				expect(keys.some(k => k.length === 1 && k[0] === idIdx), 'logical PK is a forward key').to.equal(true);
+				return { colToBase, anchorKey, cols, keys };
+			}
+
+			/** Assert a single-column logical PK survives projection as a forward key. */
+			function expectLogicalPkForwardKey(cols: string[], keys: readonly (readonly number[])[], pkName: string): void {
+				const idx = cols.indexOf(pkName.toLowerCase());
+				expect(idx, `logical PK '${pkName}' is a projected output column`).to.be.greaterThan(-1);
+				expect(keys.some(k => k.length === 1 && k[0] === idx), `logical PK '${pkName}' is a forward key`).to.equal(true);
+			}
+
+			it('forward/backward lineage agreement (columnar): the advertisement reconstructs every forward key', async () => {
+				await deployColumnar();
+				const { colToBase, anchorKey, cols, keys } = assertAdvertisementLineage('x', 'T', 'select * from x.T');
+				// logical-tuple: the anchor shared key IS the logical PK column's base.
+				expectLogicalPkForwardKey(cols, keys, 'id');
 				expect((anchorKey ?? []).map(s => s.toLowerCase()), 'anchor shared key reconstructs the logical PK')
 					.to.deep.equal([colToBase.get('id')]);
+			});
+
+			it('forward/backward lineage agreement (EAV): the pivot advertisement reconstructs the forward key', async () => {
+				await deployEav();
+				const { colToBase, anchorKey, cols, keys } = assertAdvertisementLineage('x', 'E', 'select * from x.E');
+				// logical-tuple, with a pivot member that contributes NO base columns (p/q are
+				// EAV triples, not key columns) — the anchor `id` still reconstructs the PK.
+				expectLogicalPkForwardKey(cols, keys, 'id');
+				expect((anchorKey ?? []).map(s => s.toLowerCase()), 'anchor shared key reconstructs the logical PK')
+					.to.deep.equal([colToBase.get('id')]);
+			});
+
+			it('forward/backward lineage agreement (surrogate): the substrate key threads every member, distinct from the logical PK', async () => {
+				await deploySurrogate();
+				const { colToBase, anchorKey, cols } = assertAdvertisementLineage('x', 'Doc', 'select * from x.Doc');
+				// (backward) the logical PK `docKey` maps to a base column on the anchor, so the
+				// backward identifying predicate is reconstructable from the member map ...
+				expect(cols.includes('dockey'), 'logical PK docKey is a projected output column').to.equal(true);
+				expect(colToBase.has('dockey'), 'logical PK docKey is base-backed (backward reconstruction)').to.equal(true);
+				// ... but the anchor shared key is the SUBSTRATE surrogate (`sid`), distinct from
+				// every logical column's base — so the stitch key is NOT the logical PK. (The
+				// synthesized read body advertises no FORWARD key: the surrogate is projected
+				// away and doc_key carries no base uniqueness — see the caller note above.)
+				const anchorLower = (anchorKey ?? []).map(s => s.toLowerCase());
+				expect(anchorLower.length, 'surrogate anchor key is single-column').to.equal(1);
+				expect([...colToBase.values()].includes(anchorLower[0]),
+					'the surrogate anchor key is a substrate key, not any logical column base').to.equal(false);
 			});
 
 			// ----- reject-don't-widen: deferred decomposition shapes -----
