@@ -6,6 +6,7 @@ import type { ConstraintCheck } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
+import { basisFksOverriddenByDivergentLensFk } from '../../schema/lens-fk-discovery.js';
 import * as AST from '../../parser/ast.js';
 import { createLogger } from '../../common/logger.js';
 
@@ -328,6 +329,15 @@ export function buildParentSideFKChecks(
 
 	const checks: ConstraintCheck[] = [];
 
+	// Basis RESTRICT FKs a divergent non-RESTRICT logical FK overrides — their immediate
+	// plan-time NOT EXISTS is suppressed so the parent write a logical cascade must
+	// complete is not rejected. Cheap-empty when no lens slot is backed by `tableSchema`.
+	const suppressed = basisFksOverriddenByDivergentLensFk(
+		tableSchema,
+		operation === RowOpFlag.DELETE ? 'delete' : 'update',
+		ctx.schemaManager,
+	);
+
 	// Find all tables that have FKs referencing this table
 	for (const schema of ctx.schemaManager._getAllSchemas()) {
 		for (const childTable of schema.getAllTables()) {
@@ -345,6 +355,11 @@ export function buildParentSideFKChecks(
 				// and SET DEFAULT are handled by cascading actions in
 				// runtime/foreign-key-actions.
 				if (action !== 'restrict') continue;
+
+				// Suppressed: a divergent non-RESTRICT logical FK over the same columns
+				// replaces this basis RESTRICT (the logical cascade must complete, not be
+				// rejected by the immediate plan-time NOT EXISTS).
+				if (suppressed.has(fk)) continue;
 
 				const parentColIndices = resolveReferencedColumns(fk, tableSchema);
 				if (parentColIndices.length !== fk.columns.length) continue;

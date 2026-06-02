@@ -13,7 +13,8 @@ import { resolveSlotBasisSource } from '../schema/lens-prover.js';
 import {
 	findLogicalParentFkRefs,
 	logicalToBasisColumnMap,
-	basisChildCarriesEquivalentFk,
+	matchingBasisFksForLensRef,
+	basisFksOverriddenByDivergentLensFk,
 	type LogicalParentFkRef,
 } from '../schema/lens-fk-discovery.js';
 
@@ -50,6 +51,11 @@ export async function executeForeignKeyActions(
 	}
 	visited.add(parentKey);
 
+	// Basis FKs a divergent non-RESTRICT logical FK overrides — their physical action is
+	// suppressed here so the logical action (fired by the lens walker) governs alone.
+	// Cheap-empty when no lens slot is backed by `parentTable` (the common non-lens case).
+	const suppressed = basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager);
+
 	try {
 		// Find all child tables with FKs referencing this parent
 		for (const schema of db.schemaManager._getAllSchemas()) {
@@ -66,6 +72,10 @@ export async function executeForeignKeyActions(
 
 					// RESTRICT is handled by parent-side constraint checks, not actions
 					if (action === 'restrict') continue;
+
+					// Suppressed: a divergent non-RESTRICT logical FK over the same columns
+					// replaces this basis action (the lens walker fires the logical action).
+					if (suppressed.has(fk)) continue;
 
 					const parentColIndices = resolveReferencedColumns(fk, parentTable);
 					if (parentColIndices.length !== fk.columns.length) continue;
@@ -161,6 +171,12 @@ export async function assertTransitiveRestrictsForParentMutation(
 		const parentSchemaLower = parentTable.schemaName.toLowerCase();
 		const parentTableLower = parentTable.name.toLowerCase();
 
+		// Basis cascading FKs a divergent non-RESTRICT logical FK overrides — skip them in
+		// the recursion: the physical cascade they walk will not run (the logical action
+		// replaces it), and the logical action's own transitivity is enforced when its
+		// child-view DML re-enters this walk at the next level.
+		const suppressed = basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager);
+
 		for (const schema of db.schemaManager._getAllSchemas()) {
 			for (const childTable of schema.getAllTables()) {
 				if (!childTable.foreignKeys) continue;
@@ -172,6 +188,10 @@ export async function assertTransitiveRestrictsForParentMutation(
 
 					const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
 					if (action !== 'cascade' && action !== 'setNull' && action !== 'setDefault') continue;
+
+					// Suppressed: the logical action replaces this basis cascade, so the
+					// physical cascade it would walk never runs — do not recurse through it.
+					if (suppressed.has(fk)) continue;
 
 					const parentColIndices = resolveReferencedColumns(fk, parentTable);
 					if (parentColIndices.length !== fk.columns.length) continue;
@@ -284,6 +304,11 @@ export async function assertNoRestrictedChildrenForParentMutation(
 	const parentSchemaLower = parentTable.schemaName.toLowerCase();
 	const parentTableLower = parentTable.name.toLowerCase();
 
+	// Basis RESTRICT FKs a divergent non-RESTRICT logical FK overrides — their RESTRICT
+	// pre-check is suppressed so the parent mutation a logical cascade must complete is
+	// not aborted. Cheap-empty when no lens slot is backed by `parentTable`.
+	const suppressed = basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager);
+
 	for (const schema of db.schemaManager._getAllSchemas()) {
 		for (const childTable of schema.getAllTables()) {
 			if (!childTable.foreignKeys) continue;
@@ -295,6 +320,10 @@ export async function assertNoRestrictedChildrenForParentMutation(
 
 				const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
 				if (action !== 'restrict') continue;
+
+				// Suppressed: a divergent non-RESTRICT logical FK over the same columns
+				// replaces this basis RESTRICT (the logical cascade must run, not abort).
+				if (suppressed.has(fk)) continue;
 
 				const parentColIndices = resolveReferencedColumns(fk, parentTable);
 				if (parentColIndices.length !== fk.columns.length) continue;
@@ -473,9 +502,11 @@ type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefaul
 
 /**
  * Fires the logical cascade for one logical parent slot backed by `basisParentTable`.
- * For each referencing logical FK with a non-RESTRICT op-action it: elides when the
- * basis already propagates over an equivalent basis FK, applies MATCH SIMPLE + the
- * UPDATE referenced-column-change short-circuit, and issues the logical-child DML.
+ * For each referencing logical FK with a non-RESTRICT op-action it: elides when an
+ * equivalent basis FK with an **agreeing** op-action already propagates over the basis
+ * (a divergent basis action is instead suppressed and the logical action wins — see
+ * {@link basisFksOverriddenByDivergentLensFk}), applies MATCH SIMPLE + the UPDATE
+ * referenced-column-change short-circuit, and issues the logical-child DML.
  */
 async function executeLensFkActionsForParentSlot(
 	db: Database,
@@ -499,14 +530,20 @@ async function executeLensFkActionsForParentSlot(
 		if (rawAction !== 'cascade' && rawAction !== 'setNull' && rawAction !== 'setDefault') continue;
 		const action: LensFkAction = rawAction;
 
-		// Elision (compose with the physical walker): when the basis child carries a
-		// structurally-equivalent FK referencing the basis parent, the physical
-		// executeForeignKeyActions already propagates over the basis (and the logical
-		// view reflects it), so firing the lens cascade on top would be redundant or
-		// double-mutating — the basis governs (divergent-action sub-case is a documented
-		// limitation).
-		if (basisChildCarriesEquivalentFk(ref.childSlot, fk, parentSlot, ref.parentLogicalColumns, basisParentTable, sm)) {
-			log('lens cascade %s on %s: elided — basis child carries an equivalent FK (the physical walker propagates over the basis)',
+		// Action-aware elision (compose with the physical walker): elide the lens cascade
+		// only when an equivalent basis FK exists whose op-action AGREES with the logical
+		// action — then the physical executeForeignKeyActions already propagates the same
+		// action over the basis (and the logical view reflects it), so firing on top would
+		// double-mutate. When the matches DIVERGE (e.g. logical set-null over basis cascade,
+		// or logical cascade over basis restrict) the logical action wins: the basis FK is
+		// suppressed at every enforcement site (basisFksOverriddenByDivergentLensFk) and the
+		// lens cascade fires here. With no match the basis enforces nothing ⇒ fire. The two
+		// halves are exact complements in the single-equivalent-basis-FK case (one action).
+		const matches = matchingBasisFksForLensRef(ref, parentSlot, basisParentTable, sm);
+		const agree = matches.length > 0
+			&& matches.every(m => (operation === 'delete' ? m.onDelete : m.onUpdate) === action);
+		if (agree) {
+			log('lens cascade %s on %s: elided — basis child carries an AGREEING equivalent FK (the physical walker propagates over the basis)',
 				fk.name ?? '<anon>', parentSlot.logicalTable.name);
 			continue;
 		}

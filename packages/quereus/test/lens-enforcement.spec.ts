@@ -25,7 +25,12 @@ import {
 	LENS_BOUNDARY_ATTACHED_TAG,
 } from '../src/planner/mutation/lens-enforcement.js';
 import { RowOpFlag } from '../src/schema/table.js';
-import { findLogicalParentFkRefs, basisChildCarriesEquivalentFk } from '../src/schema/lens-fk-discovery.js';
+import {
+	findLogicalParentFkRefs,
+	basisChildCarriesEquivalentFk,
+	matchingBasisFksForLensRef,
+	basisFksOverriddenByDivergentLensFk,
+} from '../src/schema/lens-fk-discovery.js';
 import { resolveSlotBasisSource } from '../src/schema/lens-prover.js';
 import type { LensSlot } from '../src/schema/lens.js';
 
@@ -2121,6 +2126,213 @@ describe('lens FK discovery: findLogicalParentFkRefs + cascade elision predicate
 			), 'no basis FK ⇒ false').to.be.false;
 		} finally {
 			await noBasisFk.close();
+		}
+	});
+});
+
+describe('lens enforcement: parent-side FK divergent basis action', () => {
+	/**
+	 * Deploys a **basis-with-FK + logical-with-divergent-FK** shape: the basis child
+	 * carries the FK with action `B`, and the logical child re-declares the same FK
+	 * over the same column (`pid → parent(id)`) with a divergent action `L ≠ B`. When
+	 * the two actions diverge, the **logical action wins** — the lens walker fires the
+	 * logical action and the basis action / RESTRICT check is suppressed at every
+	 * enforcement site (`basisFksOverriddenByDivergentLensFk`). `foreign_keys` defaults
+	 * on. `childPid` tunes the logical child FK-column declaration (e.g. `default 0`).
+	 */
+	async function deployDivergentFkLens(
+		db: Database,
+		opts: { basisFkTail: string; logicalFkTail: string; childPid?: string },
+	): Promise<void> {
+		const childPid = opts.childPid ?? 'pid integer null';
+		await db.exec(`declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) ${opts.basisFkTail}) }`);
+		await db.exec('apply schema y');
+		await db.exec(`declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, ${childPid}, constraint fk_pid foreign key (pid) references parent(id) ${opts.logicalFkTail}) }`);
+		await db.exec('apply schema x');
+	}
+
+	it('DELETE — logical SET NULL over basis CASCADE nulls the children (not deletes), basis children nulled too', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete set null on update set null',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			// The logical SET NULL wins over the basis CASCADE: deleting the parent nulls
+			// the children's FK rather than cascade-deleting them.
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children survive (not cascade-deleted)').to.deep.equal([{ n: 2 }]);
+			expect(await rows(db, 'select id, pid from x.child order by id'), 'children FK nulled').to.deep.equal([{ id: 10, pid: null }, { id: 11, pid: null }]);
+			// The basis reflects the SET NULL (the lens update re-plans to the basis child), not a delete.
+			expect(await rows(db, 'select count(*) as n from y.child where pid is null'), 'basis children nulled, not deleted').to.deep.equal([{ n: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — logical CASCADE over basis RESTRICT succeeds (not aborted) and cascade-deletes the children', async () => {
+		const db = new Database();
+		try {
+			// The basis RESTRICT would (plan-time immediate + runtime pre-check) abort the
+			// parent delete; the divergent logical CASCADE overrides it ⇒ the delete proceeds
+			// and the children cascade-delete. This is the case the basis RESTRICT previously aborted.
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete restrict on update restrict',
+				logicalFkTail: 'on delete cascade on update cascade',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'parent deleted (not aborted by basis RESTRICT)').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children cascade-deleted').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from y.child'), 'basis children cascade-deleted too').to.deep.equal([{ n: 0 }]);
+			// An unreferenced parent still deletes cleanly.
+			await db.exec('delete from x.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from x.parent')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE — logical SET DEFAULT over basis CASCADE sets the child FK to the logical default (not deletes)', async () => {
+		const db = new Database();
+		try {
+			// The logical child FK column declares `default 0`; seed a parent id=0 so the
+			// re-defaulted child satisfies its (deferred) child-side FK at commit.
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete set default on update set default',
+				childPid: 'pid integer default 0',
+			});
+			await db.exec(`insert into x.parent (id, name) values (0, 'def'), (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK set to default 0, row kept').to.deep.equal([{ id: 10, pid: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 0'), 'default parent intact').to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('UPDATE of the referenced key — logical SET NULL over basis CASCADE nulls (not re-keys); benign non-key UPDATE short-circuits', async () => {
+		const db = new Database();
+		try {
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete set null on update set null',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// Re-keying the referenced parent nulls the child FK (logical SET NULL wins),
+			// it is NOT cascade-re-keyed to 9.
+			await db.exec('update x.parent set id = 9 where id = 1');
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child FK nulled, not re-keyed').to.deep.equal([{ id: 10, pid: null }]);
+			expect(await rows(db, 'select id from x.parent'), 'parent re-keyed').to.deep.equal([{ id: 9 }]);
+
+			// A benign non-key UPDATE (the referenced key unchanged) cascades nothing.
+			await db.exec('insert into x.child (id, pid) values (20, 9)');
+			await db.exec(`update x.parent set name = 'renamed' where id = 9`);
+			expect(await rows(db, 'select id, pid from x.child where id = 20'), 'benign update short-circuits — child untouched').to.deep.equal([{ id: 20, pid: 9 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('agreeing-action control — logical CASCADE over basis CASCADE is unchanged (single cascade, no double-mutation)', async () => {
+		const db = new Database();
+		try {
+			// Same action on both sides ⇒ the walker still elides and the basis governs.
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete cascade on update cascade',
+			});
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children removed exactly once').to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('no-equivalent-basis-FK control — the basis-FK-free cascade lens still fires the logical action', async () => {
+		const db = new Database();
+		try {
+			// The canonical cascade shape: the basis carries NO FK, so there is nothing to
+			// suppress and no match ⇒ the lens walker fires the logical CASCADE. Regression
+			// pin for the action-aware-elision refactor.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade) }');
+			await db.exec('apply schema x');
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+			await db.exec('delete from x.parent where id = 1');
+			expect(await rows(db, 'select count(*) as n from x.child'), 'children cascade-deleted by the logical action').to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('unit: matchingBasisFksForLensRef returns the equivalent basis FK; basisFksOverriddenByDivergentLensFk contains it iff divergent non-RESTRICT', async () => {
+		const db = new Database();
+		try {
+			// basis CASCADE, logical SET NULL ⇒ divergent non-RESTRICT.
+			await deployDivergentFkLens(db, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete set null on update set null',
+			});
+			const parentSlot = slot(db, 'parent');
+			const basisParent = resolveSlotBasisSource(parentSlot, db.schemaManager)!;
+			const refs = findLogicalParentFkRefs(parentSlot, db.schemaManager);
+			expect(refs.length, 'one logical FK references parent').to.equal(1);
+
+			// The match core finds the structurally-equivalent basis FK (action-agnostic).
+			const matches = matchingBasisFksForLensRef(refs[0], parentSlot, basisParent, db.schemaManager);
+			expect(matches.length, 'one equivalent basis FK').to.equal(1);
+			const basisFk = matches[0];
+
+			// Divergent non-RESTRICT ⇒ the basis FK is overridden (suppressed) for both ops,
+			// and by identity (same object the enforcement sites iterate).
+			const delOverridden = basisFksOverriddenByDivergentLensFk(basisParent, 'delete', db.schemaManager);
+			const updOverridden = basisFksOverriddenByDivergentLensFk(basisParent, 'update', db.schemaManager);
+			expect(delOverridden.has(basisFk), 'basis FK overridden on delete').to.be.true;
+			expect(updOverridden.has(basisFk), 'basis FK overridden on update').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('unit: basisFksOverriddenByDivergentLensFk is empty when actions agree or the logical action is RESTRICT', async () => {
+		// Agreeing actions (cascade/cascade) ⇒ nothing overridden (the basis governs).
+		const agree = new Database();
+		try {
+			await deployDivergentFkLens(agree, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete cascade on update cascade',
+			});
+			const basisParent = resolveSlotBasisSource(slot(agree, 'parent'), agree.schemaManager)!;
+			expect(basisFksOverriddenByDivergentLensFk(basisParent, 'delete', agree.schemaManager).size, 'agree ⇒ empty').to.equal(0);
+			expect(basisFksOverriddenByDivergentLensFk(basisParent, 'update', agree.schemaManager).size, 'agree ⇒ empty').to.equal(0);
+		} finally {
+			await agree.close();
+		}
+
+		// Logical RESTRICT over a divergent basis action ⇒ NOT overridden here (a logical
+		// RESTRICT is the prereq's lens-RESTRICT pre-check domain, not this predicate's).
+		const logicalRestrict = new Database();
+		try {
+			await deployDivergentFkLens(logicalRestrict, {
+				basisFkTail: 'on delete cascade on update cascade',
+				logicalFkTail: 'on delete restrict on update restrict',
+			});
+			const basisParent = resolveSlotBasisSource(slot(logicalRestrict, 'parent'), logicalRestrict.schemaManager)!;
+			expect(basisFksOverriddenByDivergentLensFk(basisParent, 'delete', logicalRestrict.schemaManager).size, 'logical RESTRICT ⇒ empty').to.equal(0);
+		} finally {
+			await logicalRestrict.close();
 		}
 	});
 });

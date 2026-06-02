@@ -153,21 +153,44 @@ export function matchingBasisFks(
 }
 
 /**
+ * The basis FKs on `childSlot`'s basis child structurally equivalent to `fk`'s logical
+ * FK over the same mapped `(basisChildCol → basisParentCol)` index-pair set referencing
+ * `basisParent` — the single match core both {@link basisChildCarriesEquivalentFk}
+ * (action-agnostic, `… .length > 0`) and {@link matchingBasisFksForLensRef}
+ * (action-aware) share. Resolves the child's basis source via {@link resolveSlotBasisSource}
+ * and reuses the redundancy detector's structural core ({@link mappedFkBasisPairs} +
+ * {@link matchingBasisFks}), **without** the non-row-reducing projection gate (a
+ * RESTRICT-side conservatism that does not apply when the basis action is what
+ * propagates). Returns `[]` on a multi-source child, a non-plain mapping, or no match.
+ */
+function matchingBasisFksCore(
+	childSlot: LensSlot,
+	fk: ForeignKeyConstraintSchema,
+	parentSlot: LensSlot,
+	parentLogicalColumns: readonly string[],
+	basisParent: TableSchema,
+	schemaManager: SchemaManager,
+): ForeignKeyConstraintSchema[] {
+	const basisChild = resolveSlotBasisSource(childSlot, schemaManager);
+	if (!basisChild) return [];
+	const mappedPairs = mappedFkBasisPairs(childSlot, fk, parentSlot, parentLogicalColumns, basisChild, basisParent);
+	if (!mappedPairs) return [];
+	return matchingBasisFks(basisChild, basisParent, mappedPairs);
+}
+
+/**
  * Whether the basis child carries a structurally-equivalent FK referencing
- * `basisParent` — the cascade walker's elision predicate. When such a basis FK
- * exists, the physical `executeForeignKeyActions` already propagates the parent-side
- * action over the basis (and the logical view reflects it), so firing the lens
- * cascade on top would be redundant (same action) or double-mutating (divergent
- * action) — the basis governs. This is the same structural core
- * ({@link mappedFkBasisPairs} + {@link matchingBasisFks}) the redundancy detector
- * uses, **without** the non-row-reducing projection gate (a RESTRICT-side
- * conservatism that does not apply when the basis action is what propagates).
+ * `basisParent`. When such a basis FK exists, the physical `executeForeignKeyActions`
+ * already propagates the parent-side action over the basis (and the logical view
+ * reflects it). Built on {@link matchingBasisFksCore}.
  *
- * Action-agnostic: any matching basis FK (cascade / set-null / set-default /
- * restrict) elides the lens cascade — the divergent-action sub-case is a documented
- * limitation (`lens-parent-side-fk-divergent-basis-action`). Returns `false` (⇒ fire
- * the lens cascade) on a multi-source child, a non-plain mapping, or no matching
- * basis FK.
+ * **Action-agnostic** — any matching basis FK (cascade / set-null / set-default /
+ * restrict) returns `true`. This is **no longer the lens walker's elision gate**: the
+ * walker now elides only on an *agreeing* basis action (see
+ * {@link matchingBasisFksForLensRef}) and suppresses a *divergent* basis action (see
+ * {@link basisFksOverriddenByDivergentLensFk}). It is kept exported for the
+ * direct-call unit tests, which assert the structural-match predicate independent of
+ * action. Returns `false` on a multi-source child, a non-plain mapping, or no match.
  */
 export function basisChildCarriesEquivalentFk(
 	childSlot: LensSlot,
@@ -177,11 +200,7 @@ export function basisChildCarriesEquivalentFk(
 	basisParent: TableSchema,
 	schemaManager: SchemaManager,
 ): boolean {
-	const basisChild = resolveSlotBasisSource(childSlot, schemaManager);
-	if (!basisChild) return false;
-	const mappedPairs = mappedFkBasisPairs(childSlot, fk, parentSlot, parentLogicalColumns, basisChild, basisParent);
-	if (!mappedPairs) return false;
-	return matchingBasisFks(basisChild, basisParent, mappedPairs).length > 0;
+	return matchingBasisFksCore(childSlot, fk, parentSlot, parentLogicalColumns, basisParent, schemaManager).length > 0;
 }
 
 /**
@@ -245,4 +264,82 @@ export function findLogicalParentFkRefs(
 		}
 	}
 	return refs;
+}
+
+/**
+ * The basis FKs (declared on the logical child's basis table) structurally equivalent
+ * to `ref`'s logical FK over the same mapped `(basisChildCol → basisParentCol)`
+ * index-pair set referencing `basisParent`. The lens walker's per-ref match list — the
+ * action-aware generalization of {@link basisChildCarriesEquivalentFk} (which is now
+ * `… .length > 0`). Resolves the ref's own basis child via `resolveSlotBasisSource`;
+ * returns `[]` on a multi-source child, a non-plain mapping, or no matching basis FK.
+ */
+export function matchingBasisFksForLensRef(
+	ref: LogicalParentFkRef,
+	parentSlot: LensSlot,
+	basisParent: TableSchema,
+	schemaManager: SchemaManager,
+): ForeignKeyConstraintSchema[] {
+	return matchingBasisFksCore(ref.childSlot, ref.fk, parentSlot, ref.parentLogicalColumns, basisParent, schemaManager);
+}
+
+/**
+ * The set of basis FKs on tables referencing `basisParent` that are **overridden** by a
+ * divergent **non-RESTRICT** logical FK over the same equivalent columns for `operation`
+ * — i.e. the basis FKs whose physical action / RESTRICT check must be **suppressed**
+ * because the logical action governs (`lens-parent-side-fk-divergent-basis-action`).
+ * Reverse-maps `basisParent` → parent slot(s) (mirroring `executeLensForeignKeyActions`),
+ * discovers referencing logical FKs ({@link findLogicalParentFkRefs}), and for each
+ * logical ref whose op-action is non-RESTRICT, adds every structurally-equivalent basis
+ * FK ({@link matchingBasisFksForLensRef}) whose op-action **differs**.
+ *
+ * The returned FK objects are the same references the enforcement sites iterate over
+ * (`TableSchema.foreignKeys`), so `overridden.has(fk)` is a direct identity lookup.
+ * Empty (cheap) when no parent slot is backed by `basisParent` — the common non-lens case.
+ *
+ * **Complement invariant** (the load-bearing correctness argument): for one equivalent
+ * basis FK `m` with logical op-action `L` (non-RESTRICT) and basis op-action `B`:
+ *  - `L === B` ⇒ the lens walker elides AND `m ∉ overridden` (basis acts; exactly one
+ *    application of the action).
+ *  - `L !== B` ⇒ the lens walker fires AND `m ∈ overridden` (basis suppressed; exactly
+ *    one application — the logical action).
+ * So in the canonical single-equivalent-basis-FK case the children are mutated by
+ * *exactly one* path: never both (no double-mutation), never neither (no dropped
+ * enforcement).
+ *
+ * **Pathological multi-match residual** (sound, non-minimal): if two basis FKs cover the
+ * identical columns with *mixed* actions, the walker fires when *any* match diverges and
+ * only the *divergent* basis FKs are suppressed — so an agreeing same-action basis FK may
+ * also run, a double application of the *same* (idempotent-ish, e.g. SET NULL twice)
+ * action. This matches the existing "default to enforce / any uncertainty double-acts"
+ * bias; it is never a *dropped* enforcement.
+ */
+export function basisFksOverriddenByDivergentLensFk(
+	basisParent: TableSchema,
+	operation: 'delete' | 'update',
+	schemaManager: SchemaManager,
+): Set<ForeignKeyConstraintSchema> {
+	const overridden = new Set<ForeignKeyConstraintSchema>();
+	const basisNameLower = basisParent.name.toLowerCase();
+	const basisSchemaLower = basisParent.schemaName.toLowerCase();
+	for (const schema of schemaManager._getAllSchemas()) {
+		for (const parentSlot of schema.getAllLensSlots()) {
+			const basis = resolveSlotBasisSource(parentSlot, schemaManager);
+			if (!basis) continue;
+			if (basis.name.toLowerCase() !== basisNameLower) continue;
+			if (basis.schemaName.toLowerCase() !== basisSchemaLower) continue;
+			for (const ref of findLogicalParentFkRefs(parentSlot, schemaManager)) {
+				const logicalAction = operation === 'delete' ? ref.fk.onDelete : ref.fk.onUpdate;
+				// Only a non-RESTRICT logical action overrides a basis action. A logical
+				// RESTRICT is the prereq's domain (`assertLensRestrictsForParentMutation`),
+				// so this predicate never overlaps it.
+				if (logicalAction !== 'cascade' && logicalAction !== 'setNull' && logicalAction !== 'setDefault') continue;
+				for (const m of matchingBasisFksForLensRef(ref, parentSlot, basisParent, schemaManager)) {
+					const basisAction = operation === 'delete' ? m.onDelete : m.onUpdate;
+					if (basisAction !== logicalAction) overridden.add(m);
+				}
+			}
+		}
+	}
+	return overridden;
 }
