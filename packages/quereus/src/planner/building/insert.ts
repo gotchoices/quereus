@@ -326,10 +326,24 @@ function buildUpsertClausePlans(
 
 		const upsertCtx = { ...ctx, scope: upsertScope };
 
-		// Build assignment expressions
+		// Build assignment expressions. Authoritative backstop against assigning the
+		// same base column twice in one DO UPDATE SET — keyed on the user SET target
+		// name, mirroring the `building/update.ts` backstop. This path never routes
+		// through `buildUpdateStmt`, so without it `set b = 1, b = 2` would silently
+		// last-wins on the index-keyed map below. Reject unconditionally (no
+		// value-agreement softening), matching the UPDATE-side decision.
 		const assignments = new Map<number, ScalarPlanNode>();
+		const seenTargets = new Set<string>();
 		if (clause.assignments) {
 			for (const assign of clause.assignments) {
+				const targetKey = assign.column.toLowerCase();
+				if (seenTargets.has(targetKey)) {
+					throw new QuereusError(
+						`duplicate assignment to column '${assign.column}' in ON CONFLICT DO UPDATE on '${tableSchema.name}'`,
+						StatusCode.ERROR
+					);
+				}
+				seenTargets.add(targetKey);
 				const colIndex = tableSchema.columns.findIndex(
 					c => c.name.toLowerCase() === assign.column.toLowerCase()
 				);
@@ -469,6 +483,24 @@ export function buildInsertStmt(
 
 	let targetColumns: ColumnDef[] = [];
 	if (stmt.columns && stmt.columns.length > 0) {
+		// Reject a column named more than once in the INSERT column list
+		// (`insert into t (a, a) ...`). Without this, the positional row-expansion
+		// resolves the duplicate silently (last-wins / a confusing shape) rather than
+		// rejecting. This is also the guard that catches the view INSERT analogue: a
+		// view whose two columns lower to one base column lands a duplicate in the
+		// per-side `targetColumns` re-planned through here. Reject unconditionally,
+		// matching the UPDATE-side decision (no value-agreement softening).
+		const seenColumns = new Set<string>();
+		for (const colName of stmt.columns) {
+			const key = colName.toLowerCase();
+			if (seenColumns.has(key)) {
+				throw new QuereusError(
+					`column '${colName}' specified more than once in INSERT into '${tableReference.tableSchema.name}'`,
+					StatusCode.ERROR
+				);
+			}
+			seenColumns.add(key);
+		}
 		// Explicit columns specified — validate none are generated
 		targetColumns = stmt.columns.map((colName) => {
 			const colIndex = tableReference.tableSchema.columnIndexMap.get(colName.toLowerCase());

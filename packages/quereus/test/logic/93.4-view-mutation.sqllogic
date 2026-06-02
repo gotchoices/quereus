@@ -133,6 +133,19 @@ update cfl_dup set b = 1, b2 = 2 where id = 1;
 update cfl_dup set b = 5, b2 = 5 where id = 1;
 -- error: both target base column
 
+-- INSERT analogue: cfl_dup's `b` and `b2` both lower to base column b, so an
+-- insert supplying both lands a duplicate base column in the single-source
+-- spine's rewritten column list. It re-plans through the base builder and is
+-- rejected by the generic "specified more than once" backstop (which names the
+-- base column) — the INSERT dual of the multi-source UPDATE fallback above. See
+-- ticket insert-family-duplicate-column-targets-silent-last-wins.
+insert into cfl_dup (id, b, b2) values (3, 5, 6);
+-- error: specified more than once
+
+-- the rejected insert made no change (no id=3 row).
+select id, b from cfl_t order by id;
+→ [{"id":1,"b":99},{"id":2,"b":50}]
+
 -- multi-source (join) same-side collision: `note` and `note collate nocase as note2`
 -- both own the child base column note. The join spine routes both to the child's
 -- per-base UPDATE, which the base builder re-plans and rejects via the generic backstop.

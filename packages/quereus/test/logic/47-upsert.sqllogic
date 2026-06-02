@@ -152,6 +152,19 @@ INSERT OR REPLACE INTO upsert_target (id, email, name) VALUES (1, 'test@test.com
 ON CONFLICT DO NOTHING;
 -- error: Cannot use both 'INSERT OR ...' and 'ON CONFLICT' in the same statement
 
+-- ON CONFLICT DO UPDATE assigning the same column twice is rejected (no silent
+-- last-wins). This path never routes through buildUpdateStmt, so it carries its
+-- own backstop mirroring the UPDATE side. See ticket
+-- insert-family-duplicate-column-targets-silent-last-wins.
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'x@test.com', 'X')
+ON CONFLICT (id) DO UPDATE SET name = 'one', name = 'two';
+-- error: duplicate assignment
+
+-- the rejected upsert made no change (name keeps its pre-conflict value, not
+-- last-wins 'two' or 'one').
+SELECT id, name FROM upsert_target;
+→ [{"id":1,"name":"Updated"}]
+
 -- Clean up
 DROP TABLE upsert_test;
 DROP TABLE upsert_target;
