@@ -194,6 +194,39 @@ The selection's predicate is conjoined with the mutation's predicate at every st
 - **Inserts** conjoin the selection's predicate into the existence predicate. If the inserted values contradict the selection (provable at plan time via constant folding and EC), the engine rejects with a diagnostic. If they satisfy the predicate, the row is inserted into the base and is visible through the relation. If satisfiability is unknown at plan time, the insert proceeds; visibility is decided by base data. Constant bindings produced by the selection (e.g., `where color = 'green'` ⇒ FD `∅ → color = 'green'`) are picked up by the projection's insert defaulting rule (§Projection), so omitting the constrained column from the insert is permitted and the value is supplied automatically.
 - **Deletes** propagate to the child with `parent_predicate ∧ user_predicate`.
 
+> **Top-level view-column scope (the encapsulation guard).** A **top-level**
+> reference in the user `where`, the `set` target columns, or the `returning`
+> clause must name a column the **view** exposes — resolved against the view's
+> output column set, not the base table's. A name that is not a view column raises
+> the structured `unknown-view-column` diagnostic; it does **not** silently resolve
+> against the underlying base table. This closes an encapsulation leak: before the
+> guard, a base column the view *projects away* (`secret` below) passed through the
+> view→base remap unmapped and re-bound in the base scope, so it was writable /
+> filterable / returnable through the view despite never being part of the view's
+> image.
+>
+> ```sql
+> create view sv as select id, shown from t3;          -- exposes only (id, shown)
+> update sv set shown = 'X' where secret = 'classified';   -- error: unknown-view-column
+> update sv set secret = 'leaked' where id = 1;            -- error: unknown-view-column
+> insert into sv (id, shown) values (3, 'g') returning id, secret;  -- error: unknown-view-column
+> ```
+>
+> The scope is keyed off the **view's output names**, so a renamed column's only
+> legal reference is its view spelling: for `select label as note …`, `note` is
+> accepted and the base spelling `label` is rejected. A view-qualified miss
+> (`sv.secret`) rejects the same way. A **computed** view column is still a view
+> column — it passes this guard and a write to it surfaces the existing `no-inverse`
+> diagnostic (the column exists; it is just not writable), so the guard never
+> shadows `no-inverse`. The single-source spine (`mutation/single-source.ts`,
+> `assertTopLevelViewColumns`) and the multi-source join path
+> (`mutation/multi-source.ts`) share the guard, so an unknown top-level column is
+> rejected identically through either — the join path naturally also has the leak
+> (its identifying subquery's FROM is the join body of base tables). **Scope is
+> top-level only:** a reference nested inside a `subquery` / `exists` /
+> `in`-subquery operand is *not* validated here — those are rewritten scope-aware by
+> the descent below (and owned by the separate nested-rebind ticket).
+
 > **View columns nested inside a predicate / assigned-value subquery.** A
 > view-column reference inside a `subquery` / `exists` / `in`-subquery operand of
 > the user predicate (or a `set` value) is rewritten to its base-term lineage
@@ -656,6 +689,7 @@ When propagation cannot proceed, the engine raises a `QuereusError` whose `detai
 interface MutationDiagnostic {
   reason:
     | 'no-inverse'                      // scalar function with kind: 'opaque' on update path
+    | 'unknown-view-column'             // a top-level where/set/returning ref names something that is not a column of the view (the encapsulation-scope guard)
     | 'no-default'                      // not-null column with no recoverable value on insert
     | 'recursive-cte'                   // recursive CTE in mutation target
     | 'aggregate-target'                // aggregate-shaped column written

@@ -1074,3 +1074,90 @@ update rjoin3 set quantity = 8 where id = 1 returning id, quantity, dbl, label;
 -- empty match returns an empty set (EXISTS over zero captured identities), not an error.
 update rjoin3 set quantity = 9 where id = 999 returning id, quantity;
 → []
+
+-- ===================================
+-- Top-level view-column scope (the encapsulation guard). A `where` / `set` /
+-- `returning` reference must name a column the VIEW exposes; a base-only column the
+-- view projects away must NOT silently resolve against the underlying base table.
+-- See docs/view-updateability.md § Selection (Top-level view-column scope).
+-- ===================================
+
+create table t3 (id integer primary key, shown text not null, secret text);
+create view sv as select id, shown from t3;          -- view exposes only (id, shown)
+insert into t3 values (1, 'a', 'classified-1'), (2, 'b', 'classified-2');
+
+-- (1) RETURNING leak: `secret` is a base-only column projected away by the view.
+insert into sv (id, shown) values (3, 'g') returning id, secret;
+-- error: not a column of the view
+
+-- (2) WHERE leak: filtering on the projected-away base column.
+update sv set shown = 'X' where secret = 'classified-2';
+-- error: not a column of the view
+
+-- (3) SET leak: assigning the projected-away base column.
+update sv set secret = 'leaked' where id = 1;
+-- error: not a column of the view
+
+-- view-qualified reference to a projected-away base column rejects too.
+update sv set shown = 'X' where sv.secret = 'classified-2';
+-- error: not a column of the view
+
+-- positive: where / set / returning on real view columns still succeed.
+update sv set shown = 'Y' where id = 1 returning id, shown;
+→ [{"id":1,"shown":"Y"}]
+delete from sv where shown = 'b' returning id;
+→ [{"id":2}]
+select id, shown, secret from t3 order by id;
+→ [{"id":1,"shown":"Y","secret":"classified-1"}]
+
+-- renamed view column: the view spelling `note` is accepted; the base spelling
+-- `label` is rejected (a renamed column's only legal reference is its view name).
+create table pt (id integer primary key, label text);
+insert into pt values (1, 'L1'), (2, 'L2');
+create view pv as select id, label as note from pt;
+
+update pv set note = 'L1x' where note = 'L1' returning id, note;
+→ [{"id":1,"note":"L1x"}]
+
+-- the base spelling `label` is not a view column -> rejected on where / set / returning.
+update pv set note = 'Z' where label = 'L2';
+-- error: not a column of the view
+update pv set label = 'Z' where id = 2;
+-- error: not a column of the view
+insert into pv (id, note) values (3, 'L3') returning id, label;
+-- error: not a column of the view
+
+-- computed view column: it IS a view column, so `returning <computed>` reads it,
+-- but `set <computed>` still yields the existing no-inverse diagnostic (NOT the
+-- unknown-view-column guard — the column exists, it is just not writable).
+create table ct (id integer primary key, qty integer);
+insert into ct values (1, 5);
+create view cvv as select id, qty, qty * 2 as dbl from ct;
+
+update cvv set qty = 7 where id = 1 returning id, qty, dbl;
+→ [{"id":1,"qty":7,"dbl":14}]
+update cvv set dbl = 99 where id = 1;
+-- error: read-only
+
+-- parity: a multi-source (join) view rejects an unknown top-level column the SAME
+-- way (the guard reads consistently across the single- and multi-source spines).
+create table jp (pid integer primary key, plabel text);
+create table jc (cid integer primary key, pref integer, note text,
+    foreign key (pref) references jp(pid));
+insert into jp values (10, 'P10');
+insert into jc values (1, 10, 'a');
+create view jvscope as select c.cid as cid, c.note as note from jc c join jp p on p.pid = c.pref;
+
+-- `plabel` is a base column owned by jp but projected away — not a view column.
+update jvscope set note = 'X' where plabel = 'P10';
+-- error: not a column of the view
+delete from jvscope where plabel = 'P10';
+-- error: not a column of the view
+-- a SET target that is not a view column at all (vs. a computed one) -> same guard.
+update jvscope set plabel = 'Z' where cid = 1;
+-- error: not a column of the view
+
+-- a multi-source UPDATE … RETURNING projecting a base-only column (the re-query
+-- projects over the join body) is guarded the same way.
+update jvscope set note = 'Y' where cid = 1 returning cid, plabel;
+-- error: not a column of the view

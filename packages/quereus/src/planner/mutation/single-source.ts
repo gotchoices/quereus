@@ -2,8 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
-import { QuereusError } from '../../common/errors.js';
-import { StatusCode, type SqlValue } from '../../common/types.js';
+import { type SqlValue } from '../../common/types.js';
 import { sqlValuesEqual } from '../../util/comparison.js';
 import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
@@ -769,9 +768,116 @@ function extractFilterConstants(where: AST.Expression | undefined, baseTable: Ta
 function findViewColumn(analysis: ViewAnalysis, name: string, view: MutableViewLike): ViewColumn {
 	const vc = analysis.viewColumns.find(c => c.name.toLowerCase() === name.toLowerCase());
 	if (!vc) {
-		throw new QuereusError(`Column '${name}' not found in view '${view.name}'`, StatusCode.ERROR);
+		// A `set` target / `insert` target column that is not a view column at all —
+		// the same encapsulation-leak guard the top-level `where` / `returning` scan
+		// applies (a base-only column must not be writable through the view). Computed
+		// view columns ARE found here and surface the `no-inverse` diagnostic instead.
+		raiseUnknownViewColumn(name, view, analysis.viewColumns.map(c => c.name));
 	}
 	return vc;
+}
+
+/**
+ * Visit every column reference at the TOP LEVEL of a scalar expression — i.e. NOT
+ * descending into a `subquery` / `exists` / `in`-subquery operand (those nested
+ * references resolve in the lowered base scope and are handled scope-aware by
+ * {@link transformQueryExpr}; the nested-rebind correctness ticket
+ * `view-mutation-single-source-subquery-base-term-local-rebind` owns them). The
+ * structure mirrors {@link transformExpr} exactly, minus the subquery descent.
+ */
+function forEachTopLevelColumn(expr: AST.Expression, visit: (col: AST.ColumnExpr) => void): void {
+	switch (expr.type) {
+		case 'column':
+			visit(expr);
+			return;
+		case 'binary':
+			forEachTopLevelColumn(expr.left, visit);
+			forEachTopLevelColumn(expr.right, visit);
+			return;
+		case 'unary':
+		case 'cast':
+		case 'collate':
+			forEachTopLevelColumn(expr.expr, visit);
+			return;
+		case 'function':
+			expr.args.forEach(a => forEachTopLevelColumn(a, visit));
+			return;
+		case 'between':
+			forEachTopLevelColumn(expr.expr, visit);
+			forEachTopLevelColumn(expr.lower, visit);
+			forEachTopLevelColumn(expr.upper, visit);
+			return;
+		case 'case':
+			if (expr.baseExpr) forEachTopLevelColumn(expr.baseExpr, visit);
+			expr.whenThenClauses.forEach(w => { forEachTopLevelColumn(w.when, visit); forEachTopLevelColumn(w.then, visit); });
+			if (expr.elseExpr) forEachTopLevelColumn(expr.elseExpr, visit);
+			return;
+		case 'in':
+			forEachTopLevelColumn(expr.expr, visit);
+			if (expr.values) expr.values.forEach(v => forEachTopLevelColumn(v, visit));
+			// expr.subquery is a nested scope — intentionally not descended.
+			return;
+		default:
+			// subquery / exists — nested scope, not validated here.
+			// literal / identifier / parameter / windowFunction / functionSource —
+			// no top-level column reference to validate.
+			return;
+	}
+}
+
+/**
+ * Raise the structured `unknown-view-column` diagnostic for a reference that names
+ * something the view does not expose. `displayColumns` is the view's exposed column
+ * list (in display spelling) for the suggestion.
+ */
+export function raiseUnknownViewColumn(spelling: string, view: MutableViewLike, displayColumns: readonly string[]): never {
+	raiseMutationDiagnostic({
+		reason: 'unknown-view-column',
+		column: spelling,
+		table: view.name,
+		message: `cannot write through view '${view.name}': '${spelling}' is not a column of the view`,
+		suggestion: `view '${view.name}' exposes: ${displayColumns.join(', ')}.`,
+	});
+}
+
+/**
+ * Enforce **view-column scope** on the TOP-LEVEL references of a user `where` /
+ * `returning` clause (the `set` targets are guarded separately at their resolution
+ * point). Without this, a name that is not a view column passes through the
+ * view→base remap unmapped and silently re-binds against the underlying base
+ * table(s) — an encapsulation leak letting a column the view projects away be
+ * filtered / returned. A reference must name a column the view exposes, optionally
+ * qualified by the view's own name; a bare base-column name (`secret`), a renamed
+ * column's base spelling (`label` for a `… as note` projection), or a view-qualified
+ * unknown (`sv.secret`) are all rejected. A computed view column passes here (it IS
+ * a view column) so a write to it still surfaces the existing `no-inverse`
+ * diagnostic. Shared by the single-source spine and the multi-source join path so
+ * the two read consistently.
+ */
+/** Single-source convenience: build the scope sets from a {@link ViewAnalysis}. */
+function guardTopLevelScope(expr: AST.Expression, analysis: ViewAnalysis, view: MutableViewLike): void {
+	assertTopLevelViewColumns(
+		expr,
+		new Set(analysis.viewColumns.map(c => c.name.toLowerCase())),
+		analysis.viewColumns.map(c => c.name),
+		view,
+	);
+}
+
+export function assertTopLevelViewColumns(
+	expr: AST.Expression,
+	viewColumnNames: ReadonlySet<string>,
+	displayColumns: readonly string[],
+	view: MutableViewLike,
+): void {
+	const lcView = view.name.toLowerCase();
+	forEachTopLevelColumn(expr, (col) => {
+		const qualifier = col.table?.toLowerCase();
+		const known = viewColumnNames.has(col.name.toLowerCase());
+		if ((qualifier !== undefined && qualifier !== lcView) || !known) {
+			raiseUnknownViewColumn(col.table ? `${col.table}.${col.name}` : col.name, view, displayColumns);
+		}
+	});
 }
 
 /** Resolve a view column to a writable base column, rejecting computed columns. */
@@ -907,6 +1013,9 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 	const substitute = remapper(analysis);
 	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
 
+	// Scope guard: `set` targets and the top-level `where` references must name view
+	// columns (a base-only name must not leak through to the underlying table).
+	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
 	const assignments = stmt.assignments.map(asg => ({
 		column: requireBaseColumn(findViewColumn(analysis, asg.column, view)),
 		value: transformExpr(asg.value, substitute, descend),
@@ -934,6 +1043,8 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
 	const substitute = remapper(analysis);
 	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable));
 
+	// Scope guard: top-level `where` references must name view columns.
+	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
 	const userWhere = stmt.where ? transformExpr(stmt.where, substitute, descend) : undefined;
 	const where = combineAnd(userWhere, analysis.filterPredicate ? cloneExpr(analysis.filterPredicate) : undefined);
 
@@ -983,6 +1094,10 @@ export function rewriteViewReturning(
 			}
 			continue;
 		}
+		// Scope guard: a top-level `returning` reference must name a view column —
+		// the same encapsulation guard as `where` / `set` (a base-only column the
+		// view projects away must not leak through RETURNING).
+		guardTopLevelScope(rc.expr, analysis, view);
 		// Preserve the user's view-term output name BEFORE rewriting to base terms,
 		// so the result column is named as written (the view column / its alias),
 		// not the underlying base column.

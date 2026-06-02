@@ -11,7 +11,7 @@ import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref
 import { buildSelectStmt } from '../building/select.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { transformExpr, cloneExpr, combineAnd, makeViewColumnDescend, mapQueryExprUniform } from './single-source.js';
+import { transformExpr, cloneExpr, combineAnd, makeViewColumnDescend, mapQueryExprUniform, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
 import { readPolicy, readDeleteVia, readTargetNames, readExcludeNames, type ReservedTagMap } from './mutation-tags.js';
 import type { DeleteViaValue } from '../../schema/reserved-tags.js';
 
@@ -576,6 +576,24 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 	return out;
 }
 
+/**
+ * Scope guard for the multi-source path — parity with the single-source spine
+ * (`single-source.ts` § `assertTopLevelViewColumns`). A top-level `where` / `set`
+ * reference that is not a join-view output column would otherwise pass through
+ * `substituteViewColumns` unmapped and re-bind against a base table in the
+ * identifying subquery's join body (the same encapsulation leak). `outColumns`
+ * already enumerates every projected view column (computed ones included, marked
+ * non-writable), so it is the view's exposed column set.
+ */
+function guardTopLevelScope(expr: AST.Expression, analysis: JoinViewAnalysis, view: MutableViewLike): void {
+	assertTopLevelViewColumns(
+		expr,
+		new Set(analysis.outColumns.map(c => c.name)),
+		analysis.outColumns.map(c => c.displayName),
+		view,
+	);
+}
+
 // --- UPDATE ---------------------------------------------------------------
 
 function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
@@ -590,11 +608,20 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: 
 	// assignment to an excluded side is a structured conflict, not a silent drop.
 	const allowedSides = applyTargetExclude([0, 1], analysis.sides, tags, view);
 
+	// Scope guard: top-level `where` references must name view columns (parity with
+	// the single-source spine — a base-only name must not leak through the join body).
+	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
+
 	// Route each assignment to its owning base side.
 	const perSide: Array<{ column: string; value: AST.Expression }[]> = [[], []];
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
-		if (!out || !out.writable || out.sideIndex === undefined || !out.baseColumn) {
+		if (!out) {
+			// Not a view column at all — the same encapsulation-leak guard as the
+			// top-level `where` scan (distinct from a computed view column below).
+			raiseUnknownViewColumn(asg.column, view, analysis.outColumns.map(c => c.displayName));
+		}
+		if (!out.writable || out.sideIndex === undefined || !out.baseColumn) {
 			raiseMutationDiagnostic({
 				reason: 'no-inverse',
 				column: asg.column,
@@ -875,6 +902,11 @@ function buildReturningProjection(
 				out.push({ type: 'column', expr: cloneExpr(baseExpr), alias: col.displayName });
 			}
 		} else {
+			// Scope guard: a top-level RETURNING reference must name a view column —
+			// otherwise it would pass through `substituteViewColumns` unmapped and
+			// re-bind against a base table in the re-query's join body (the same leak
+			// the where/set guard closes). Parity with the single-source RETURNING guard.
+			guardTopLevelScope(rc.expr, analysis, view);
 			const substituted = substituteViewColumns(ctx, rc.expr, analysis.viewColToBaseRef, view);
 			// Preserve the user's view spelling as the output name: an explicit alias
 			// wins; a bare column ref keeps its own name; otherwise leave it unnamed.
@@ -891,6 +923,10 @@ function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: 
 	// RETURNING through a multi-source delete is supported via a re-query of the
 	// view captured *before* the base delete fires (the builder); the base op
 	// itself carries no RETURNING.
+
+	// Scope guard: top-level `where` references must name view columns (parity with
+	// the single-source spine).
+	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
 
 	const sideIndex = chooseDeleteSide(view, analysis, tags);
 	const side = analysis.sides[sideIndex];

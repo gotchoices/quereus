@@ -10,6 +10,7 @@ import { StatusCode } from '../../common/types.js';
 export type MutationDiagnosticReason =
 	// --- doc's structured diagnostics ---
 	| 'no-inverse'                 // non-invertible scalar on an update path (Project)
+	| 'unknown-view-column'        // a top-level where/set/returning ref names something that is not a column of the view (the encapsulation-leak guard)
 	| 'no-default'                 // insert missing a NOT NULL column after the recovery chain
 	| 'predicate-contradiction'    // insert violates the view's selection at plan time (Filter)
 	| 'recursive-cte'              // recursive CTE as mutation target
