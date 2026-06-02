@@ -100,6 +100,34 @@ describe('lens access-shape routing: nd-tree spatial', () => {
 		}
 	});
 
+	it('degrade: a routed-form fragment referencing a second logical column falls back to the scan', async () => {
+		const db = new Database();
+		try {
+			// The aux backs only `coord` (+ key `id`); `other` is a logical column it
+			// does not carry. `nd_contains(coord, other)` matches the form, but routing
+			// it would push `other` below the semi-join onto the aux scan where it does
+			// not exist — so the rule must decline and leave it a residual filter.
+			const mod = new NdTreeModule();
+			mod.ads = [ndTreeAdvertisement()];
+			db.registerModule('ndtree', mod);
+			registerNdTreeFixture(db);
+			await db.exec('create table Spatial (id integer primary key, coord integer, other integer) using ndtree');
+			await db.exec('create table Spatial_nd (id integer primary key, coord integer) using ndtree');
+			await db.exec('insert into Spatial values (1, 100, 100), (2, 200, 999), (3, 100, 7)');
+			await db.exec('insert into Spatial_nd values (1, 100), (2, 200), (3, 100)');
+			await db.exec('declare logical schema x { table Spatial { id integer primary key, coord integer, other integer } }');
+			await db.exec('apply schema x');
+
+			const tables = planTables(db, 'select * from x.Spatial where nd_contains(coord, other)');
+			expect(tables.has('spatial_nd'), 'cross-column fragment ⇒ no routing').to.be.false;
+			// Still correct as a residual filter: nd_contains(coord, other) ≡ coord = other.
+			expect(await rows(db, 'select * from x.Spatial where nd_contains(coord, other) order by id'))
+				.to.deep.equal([{ id: 1, coord: 100, other: 100 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('dual-decomposition discrimination: an equi-lookup on the logical PK does NOT route to the nd-tree', async () => {
 		const db = new Database();
 		try {

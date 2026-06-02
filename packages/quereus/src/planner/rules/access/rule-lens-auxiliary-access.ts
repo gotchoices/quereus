@@ -65,6 +65,25 @@ function replaceMarker(node: RelationalPlanNode, replacement: RelationalPlanNode
 	return node;
 }
 
+/**
+ * Whether every column reference in `fragment` resolves to `accessAttrId`. The
+ * rewrite only re-points the matched access column at the auxiliary's backing
+ * column and pushes the fragment below the semi-join onto the aux scan; any other
+ * logical column it references (e.g. `nd_contains(coord, other)`) would dangle
+ * there — the aux scan does not project it. Such a fragment is **not routable**
+ * (it degrades to scan, the same graceful-degrade contract as an unrecognized
+ * form), so we drop it before choosing a match rather than emit a broken plan.
+ */
+function fragmentConfinedToAccessColumn(fragment: ScalarPlanNode, accessAttrId: number): boolean {
+	const stack: ScalarPlanNode[] = [fragment];
+	while (stack.length) {
+		const n = stack.pop()!;
+		if (n instanceof ColumnReferenceNode && n.attributeId !== accessAttrId) return false;
+		for (const c of n.getChildren()) stack.push(c as ScalarPlanNode);
+	}
+	return true;
+}
+
 /** Replace every ColumnReferenceNode to `fromAttrId` with `replacement` in a scalar subtree. */
 function rewriteAttrRef(node: ScalarPlanNode, fromAttrId: number, replacement: ColumnReferenceNode): ScalarPlanNode {
 	if (node instanceof ColumnReferenceNode) {
@@ -136,7 +155,10 @@ export function ruleLensAuxiliaryAccess(node: PlanNode, _context: OptContext): P
 	const normalized = normalizePredicate(filter.predicate);
 	const conjuncts = splitConjuncts(normalized);
 
-	const matches = matchAccessForms(normalized, marker.routables);
+	const matches = matchAccessForms(normalized, marker.routables)
+		// A routable fragment must reference only its access column; anything else
+		// would dangle when pushed below the semi-join onto the aux scan (degrade).
+		.filter(m => fragmentConfinedToAccessColumn(m.predicateFragment, m.accessColumn.logicalAttrId));
 	const chosen = chooseMatch(matches, conjuncts);
 	if (!chosen) return null;
 
