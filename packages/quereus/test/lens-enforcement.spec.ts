@@ -1430,3 +1430,178 @@ describe('lens enforcement: parent-side FK RESTRICT at the write boundary', () =
 		}
 	});
 });
+
+describe('lens enforcement: parent-side FK basis-redundancy elision', () => {
+	/**
+	 * The inverse of `deployParentFkLens`: the **basis** child *does* carry the FK
+	 * (so the re-planned basis parent write's own `buildParentSideFKChecks` fires),
+	 * and the **logical** child re-declares it. When the basis FK is RESTRICT and the
+	 * lenses are faithful single-source projections, the lens-level parent-side check
+	 * is provably subsumed by the basis parent-side check ⇒ elided. `basisFkTail`
+	 * tunes the basis FK's referential actions to exercise the action-match gate.
+	 */
+	async function deployParentFkBasisEquivLens(
+		db: Database,
+		opts?: { basisFkTail?: string; childOverride?: string },
+	): Promise<void> {
+		const tail = opts?.basisFkTail ?? 'on delete restrict on update restrict';
+		await db.exec(`declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk foreign key (pid) references parent(id) ${tail}) }`);
+		await db.exec('apply schema y');
+		// The logical FK is bare ⇒ RESTRICT for both ops (the lens RESTRICT under test).
+		await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+		if (opts?.childOverride) await db.exec(opts.childOverride);
+		await db.exec('apply schema x');
+	}
+
+	it('elides both ops when the basis carries the equivalent restrict FK over faithful default lenses (no correctness change)', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkBasisEquivLens(db);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE), 'DELETE elided').to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE), 'UPDATE elided').to.deep.equal([]);
+
+			// No correctness change: deleting a referenced parent still ABORTs — now via the
+			// basis parent-side RESTRICT the re-planned basis write enforces — and the child
+			// survives; an unreferenced parent deletes.
+			await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'referenced parent survives').to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, 'select count(*) as n from x.child where id = 10'), 'child not orphaned').to.deep.equal([{ n: 1 }]);
+			await db.exec('delete from x.parent where id = 2');
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 2')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT elide when the basis FK is CASCADE — the lens RESTRICT is retained (the headline caveat)', async () => {
+		const db = new Database();
+		try {
+			// A CASCADE basis FK would cascade-delete / null the children rather than reject,
+			// so `buildParentSideFKChecks` synthesizes no parent-side check for it — eliding
+			// the lens RESTRICT would silently drop enforcement. The collector must keep it.
+			// (The runtime interleaving of a basis cascade vs. the retained lens check is
+			// pre-existing behavior unchanged by this ticket; the load-bearing assertion is
+			// that the collector decision is "retain".)
+			await deployParentFkBasisEquivLens(db, { basisFkTail: 'on delete cascade on update cascade' });
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE).length, 'DELETE retained (basis cascade ≠ restrict)').to.equal(1);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE).length, 'UPDATE retained (basis cascade ≠ restrict)').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('reads the op-appropriate basis action — basis delete-restrict/update-cascade elides DELETE but retains UPDATE', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkBasisEquivLens(db, { basisFkTail: 'on delete restrict on update cascade' });
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE), 'DELETE elided (basis on delete restrict)').to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE).length, 'UPDATE retained (basis on update cascade)').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT elide when the basis FK is SET NULL — only restrict subsumes a lens RESTRICT', async () => {
+		const db = new Database();
+		try {
+			await deployParentFkBasisEquivLens(db, { basisFkTail: 'on delete set null on update set null' });
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE).length, 'DELETE retained (basis set null ≠ restrict)').to.equal(1);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE).length, 'UPDATE retained (basis set null ≠ restrict)').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does not over-elide — no basis FK ⇒ the lens parent-side check is retained', async () => {
+		const db = new Database();
+		try {
+			// The `deployParentFkLens` shape: the basis carries NO FK, so the basis parent
+			// write enforces nothing and the lens-level check must be retained.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('apply schema x');
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE).length, 'no basis FK ⇒ retained').to.equal(1);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE).length, 'no basis FK ⇒ retained').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT elide a permuted basis composite FK (pair-set mismatch)', async () => {
+		const db = new Database();
+		try {
+			// Basis FK pairs (a→py, b→px); the logical FK pairs (a→px, b→py). The pair-sets
+			// differ ⇒ the basis FK is NOT equivalent ⇒ the lens RESTRICT is retained.
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_perm foreign key (a, b) references parent(py, px) on delete restrict on update restrict) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema x');
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE).length, 'permuted basis FK ⇒ retained').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT elide when the logical child body is row-reducing (conservative parity gate)', async () => {
+		const db = new Database();
+		try {
+			// The child lens body filters rows (`where id > 0`); the basis carries the
+			// equivalent restrict FK. Condition (3) (non-row-reducing CHILD projection) fails,
+			// so the collector double-enforces — mirroring the child-side detector exactly.
+			await deployParentFkBasisEquivLens(db, {
+				childOverride: 'declare lens for x over y { view child as select id, pid from y.child where id > 0 }',
+			});
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE).length, 'row-reducing child ⇒ retained').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('elides under a child rename override when the basis FK is over the basis column', async () => {
+		const db = new Database();
+		try {
+			// Child maps logical `pid` ← basis `basis_pid`; the basis restrict FK is on
+			// `basis_pid`. The mapped pair-set equals the basis FK's ⇒ elide. The parent is
+			// the faithful default projection.
+			await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, basis_pid integer null, constraint fk foreign key (basis_pid) references parent(id) on delete restrict on update restrict) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id)) }');
+			await db.exec('declare lens for x over y { view child as select id, basis_pid as pid from y.child }');
+			await db.exec('apply schema x');
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE), 'rename-over-basis-FK elides DELETE').to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE), 'rename-over-basis-FK elides UPDATE').to.deep.equal([]);
+
+			// Still enforces via the basis FK: deleting a referenced parent ABORTs.
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where id = 1')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('elides a composite FK when the basis carries the equivalent composite restrict FK (DELETE + UPDATE)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py) on delete restrict on update restrict) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table parent (px integer, py integer, name text, primary key (px, py)); table child (id integer primary key, a integer null, b integer null, constraint fk_ab foreign key (a, b) references parent(px, py)) }');
+			await db.exec('apply schema x');
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.DELETE), 'composite restrict elides DELETE').to.deep.equal([]);
+			expect(collectLensParentSideForeignKeyConstraints(slot(db, 'parent'), db.schemaManager, RowOpFlag.UPDATE), 'composite restrict elides UPDATE').to.deep.equal([]);
+
+			// Deleting / re-keying a referenced composite key still ABORTs via the basis FK.
+			await db.exec(`insert into x.parent (px, py, name) values (1, 2, 'a')`);
+			await db.exec('insert into x.child (id, a, b) values (10, 1, 2)');
+			await expectThrows(() => db.exec('delete from x.parent where px = 1 and py = 2'), /constraint|foreign|fk/i);
+			await expectThrows(() => db.exec('update x.parent set px = 9 where px = 1 and py = 2'), /constraint|foreign|fk/i);
+			expect(await rows(db, 'select count(*) as n from x.parent where px = 1 and py = 2')).to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});

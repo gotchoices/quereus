@@ -214,20 +214,28 @@ function mappedFkBasisPairs(
 }
 
 /**
- * Whether `basisChild` declares an FK whose unordered `(childCol → parentCol)`
- * index pair-set equals `mappedPairs` and references `basisParent` (schema + name).
- * Implements redundancy condition (2): the basis write's own `buildChildSideFKChecks`
- * already enforces this FK, so a matching one subsumes the lens-level check. The
- * comparison is an unordered *set* of index pairs (mirrors `lookupCoveringFK`'s
- * positional `equiMap` reasoning) — a permuted basis FK (same columns, different
- * pairing) yields a different pair-set and must NOT match; a partial FK fails the
- * arity check.
+ * **All** FKs `basisChild` declares whose unordered `(childCol → parentCol)` index
+ * pair-set equals `mappedPairs` and that reference `basisParent` (schema + name) —
+ * the full match list, not just the first. Implements redundancy condition (2): the
+ * basis write's own FK enforcement (`buildChildSideFKChecks` on the child side,
+ * `buildParentSideFKChecks` on the parent side) already enforces such an FK, so a
+ * matching one subsumes the lens-level check. The comparison is an unordered *set*
+ * of index pairs (mirrors `lookupCoveringFK`'s positional `equiMap` reasoning) — a
+ * permuted basis FK (same columns, different pairing) yields a different pair-set and
+ * must NOT match; a partial FK fails the arity check.
+ *
+ * Returning *every* match (not the first) is load-bearing for the **parent-side**
+ * caller's action gate: a single non-`restrict` matching basis FK means the basis
+ * parent write cascades / nulls rather than rejects, so eliding the lens RESTRICT
+ * would be unsound even when a *different* matching basis FK is `restrict`. The
+ * action-agnostic child-side caller takes `matches[0]`.
  */
-function basisCarriesEquivalentFk(
+function matchingBasisFks(
 	basisChild: TableSchema,
 	basisParent: TableSchema,
 	mappedPairs: ReadonlySet<string>,
-): ForeignKeyConstraintSchema | undefined {
+): ForeignKeyConstraintSchema[] {
+	const matches: ForeignKeyConstraintSchema[] = [];
 	for (const bfk of basisChild.foreignKeys ?? []) {
 		if (bfk.referencedTable.toLowerCase() !== basisParent.name.toLowerCase()) continue;
 		const bfkParentSchema = (bfk.referencedSchema ?? basisChild.schemaName).toLowerCase();
@@ -245,10 +253,45 @@ function basisCarriesEquivalentFk(
 			bfkPairs.add(pairKey(bfk.columns[j], refCols[j]));
 		}
 		if (bfkPairs.size === mappedPairs.size && [...mappedPairs].every(p => bfkPairs.has(p))) {
-			return bfk;
+			matches.push(bfk);
 		}
 	}
-	return undefined;
+	return matches;
+}
+
+/**
+ * The structural core shared by both FK redundancy directions (child-side
+ * {@link lensForeignKeyRedundant} and parent-side {@link lensParentSideForeignKeyRedundant})
+ * — **structural match only, no action reasoning**. Returns every basis FK that
+ * subsumes the lens-level check (`[]` ⇒ none, default to enforce). Three structural
+ * conditions, read from the parent→child direction:
+ *
+ *  1. **Single-source, value-preserving child mapping** + parent half of (2) — every
+ *     logical FK child column maps with no transform to a plain `basisChild` column and
+ *     every logical referenced column to a plain `basisParent` column ({@link mappedFkBasisPairs}).
+ *  2. **Equivalent basis FK** — `basisChild` carries an FK whose unordered index
+ *     pair-set equals the mapped one, referencing `basisParent` ({@link matchingBasisFks}).
+ *  3. **Faithful non-row-reducing projection** of the slot the subsuming check scans —
+ *     `projectionToCheck` selects which: `'parent'` for the child-side check (it scans
+ *     the parent), `'child'` for the parent-side check (it scans the child).
+ *
+ * Any gap returns `[]` ⇒ enforce — a false match silently drops enforcement (a
+ * soundness hole), so the bias is hard-coded toward double-enforce.
+ */
+function basisFksSubsuming(
+	childSlot: LensSlot,
+	fk: ForeignKeyConstraintSchema,
+	parentSlot: LensSlot,
+	logicalParentColumns: readonly string[],
+	basisChild: TableSchema,
+	basisParent: TableSchema,
+	projectionToCheck: 'parent' | 'child',
+): ForeignKeyConstraintSchema[] {
+	const mappedPairs = mappedFkBasisPairs(childSlot, fk, parentSlot, logicalParentColumns, basisChild, basisParent);
+	if (!mappedPairs) return [];
+	const projSlot = projectionToCheck === 'parent' ? parentSlot : childSlot;
+	if (!isNonRowReducingProjection(projSlot.compiledBody)) return [];
+	return matchingBasisFks(basisChild, basisParent, mappedPairs);
 }
 
 /**
@@ -284,23 +327,70 @@ function lensForeignKeyRedundant(
 	const basisChild = resolveSlotBasisSource(slot, schemaManager);
 	if (!basisChild) return undefined;
 
-	// (3) parent lens slot + its single basis source must resolve; defer the
-	// row-set-equivalence clause check until after the cheap structural checks.
+	// (3) parent lens slot + its single basis source must resolve.
 	const parentSlot = schemaManager.getSchema(referencedSchema)?.getLensSlot(fk.referencedTable);
 	if (!parentSlot) return undefined;
 	const basisParent = resolveSlotBasisSource(parentSlot, schemaManager);
 	if (!basisParent) return undefined;
 
-	// (1) + parent half of (2): map every FK column pair to plain basis columns.
-	const mappedPairs = mappedFkBasisPairs(slot, fk, parentSlot, logicalParentColumns, basisChild, basisParent);
-	if (!mappedPairs) return undefined;
+	// Conditions (1)+(2)+(3) via the shared core: the child-side check scans the
+	// *parent*, so the parent projection must be non-row-reducing (`'parent'`).
+	// Child-side FK enforcement is action-agnostic, so the first match suffices.
+	return basisFksSubsuming(slot, fk, parentSlot, logicalParentColumns, basisChild, basisParent, 'parent')[0];
+}
 
-	// (3) the logical parent is a faithful, non-row-reducing projection of the basis
-	// parent (a `where` / join / aggregation makes it a strict subset ⇒ not provable).
-	if (!isNonRowReducingProjection(parentSlot.compiledBody)) return undefined;
-
-	// (2) an equivalent basis FK subsumes the lens-level check.
-	return basisCarriesEquivalentFk(basisChild, basisParent, mappedPairs);
+/**
+ * Whether the lens-level **parent-side** FK check for `fk` (the synthesized `NOT
+ * EXISTS` over the logical child) is **provably** redundant with the equivalent
+ * parent-side check the re-planned basis parent write already enforces via
+ * `buildParentSideFKChecks` — the parent-side dual of {@link lensForeignKeyRedundant},
+ * reusing the same structural core ({@link basisFksSubsuming}). Two things differ from
+ * the child side:
+ *
+ *  - **Projection slot.** The parent-side subquery scans the *child*, so condition (3)
+ *    (non-row-reducing) applies to the **child** projection (`'child'`). This is a
+ *    conservative parity gate: by condition (1) a single-source child already gives
+ *    `L ⊆ B` on the FK columns, so the basis check (scanning the superset `B`) would
+ *    reject a superset of cases even with a filtered child — but keeping the gate
+ *    mirrors the child-side detector exactly and can only *reduce* elision, and
+ *    default-to-double-enforce is always sound.
+ *  - **Action match (parent-side only).** `buildParentSideFKChecks` emits a check
+ *    **only** for a `restrict` basis FK — cascade / set-null / set-default mutate the
+ *    children instead of rejecting, so they synthesize no parent-side check. The basis
+ *    write therefore subsumes the lens RESTRICT only when the matched basis FK's
+ *    op-appropriate action is `restrict`. Because {@link basisFksSubsuming} may return
+ *    *several* matching basis FKs, the gate scans **all** of them: if **any** is
+ *    non-`restrict` for the op, the basis write would cascade / null rather than reject
+ *    ⇒ NOT redundant. (A divergent-action second FK on identical columns referencing
+ *    the same parent is pathological, but "any uncertainty defaults to enforce" demands
+ *    the defensive scan.) `ForeignKeyAction` has no distinct `'no action'` — NO ACTION
+ *    normalizes to the `restrict` default at schema-build time — so "at least as strict
+ *    as the lens RESTRICT" reduces to the exact `=== 'restrict'` test, matching the
+ *    physical gate verbatim.
+ *
+ * Every gap returns `undefined` ⇒ enforce; a false "redundant" verdict silently drops
+ * a RESTRICT rejection (a soundness hole), so the bias is hard-coded toward
+ * double-enforce. Returns the subsuming basis FK (for the elision log) or `undefined`.
+ */
+function lensParentSideForeignKeyRedundant(
+	childSlot: LensSlot,
+	fk: ForeignKeyConstraintSchema,
+	parentSlot: LensSlot,
+	basisParent: TableSchema,
+	logicalParentColumns: readonly string[],
+	operation: RowOpFlag.DELETE | RowOpFlag.UPDATE,
+	schemaManager: SchemaManager,
+): ForeignKeyConstraintSchema | undefined {
+	const basisChild = resolveSlotBasisSource(childSlot, schemaManager);
+	if (!basisChild) return undefined;
+	const matches = basisFksSubsuming(childSlot, fk, parentSlot, logicalParentColumns, basisChild, basisParent, 'child');
+	if (matches.length === 0) return undefined;
+	// Action match: the basis parent-side check fires only for a `restrict` basis FK.
+	// If ANY matching basis FK would cascade / null instead of reject, the basis write
+	// does not subsume the lens RESTRICT — keep enforcing.
+	const actionOf = (m: ForeignKeyConstraintSchema) => operation === RowOpFlag.DELETE ? m.onDelete : m.onUpdate;
+	if (!matches.every(m => actionOf(m) === 'restrict')) return undefined;
+	return matches[0];
 }
 
 /**
@@ -429,9 +519,15 @@ function buildParentSideUpdateGuard(parentBasisColumns: readonly string[], notEx
  *
  * Action gate: only `restrict` (on the op-appropriate `onDelete` / `onUpdate`) emits —
  * **matching `buildParentSideFKChecks` exactly**; CASCADE / SET NULL / SET DEFAULT through
- * the lens are out of scope (backlog). v1 **double-enforces** (sound: both the lens-level
- * check and any equivalent basis parent-side check reject the same condition); parent-side
- * basis-redundancy elision is a backlog follow-up.
+ * the lens are out of scope (backlog). The lens-level check **double-enforces** by default
+ * (sound: both the lens-level check and any equivalent basis parent-side check reject the
+ * same condition), but is now **elided when provably redundant** with the basis parent
+ * write's own `buildParentSideFKChecks` (see {@link lensParentSideForeignKeyRedundant}):
+ * a single-source value-preserving child mapping, an equivalent basis FK referencing the
+ * basis parent, a faithful non-row-reducing logical-child projection, **and** — the
+ * parent-side-only addition the child side does not need — every matching basis FK being
+ * `restrict` for the op (a cascade / null basis FK would not reject, so it never subsumes
+ * a lens RESTRICT). Any uncertainty defaults to double-enforce.
  *
  * Gated by the caller on the `foreign_keys` pragma (mirroring the child-side). Returns
  * `[]` for a multi-source / decomposition parent (its `OLD.*` is not one basis row — a
@@ -446,7 +542,9 @@ export function collectLensParentSideForeignKeyConstraints(
 	// Single-source spine: the parent-side constraint rides the parent's basis base op,
 	// so OLD.* / NEW.* must be exactly one basis row. A multi-source / decomposition
 	// parent (an opaque or multi-table FROM) routes nothing extra (documented boundary).
-	if (!resolveSlotBasisSource(parentSlot, schemaManager)) return [];
+	// `basisParent` is also the table the redundancy detector matches basis FKs against.
+	const basisParent = resolveSlotBasisSource(parentSlot, schemaManager);
+	if (!basisParent) return [];
 
 	const parentMap = logicalToBasisColumnMap(parentSlot);
 	const parentLogicalName = parentSlot.logicalTable.name;
@@ -477,6 +575,18 @@ export function collectLensParentSideForeignKeyConstraints(
 				if (parentLogicalColumns.length !== fk.columns.length) {
 					log('lens parent-side FK %s: parent column count (%d) != child column count (%d); skipping',
 						fk.name ?? '<anon>', parentLogicalColumns.length, fk.columns.length);
+					continue;
+				}
+				// Elide the lens-level parent-side check when the re-planned basis parent
+				// write provably already enforces an equivalent (RESTRICT) parent-side FK
+				// (every uncertain case — including any non-restrict matching basis FK —
+				// still double-enforces).
+				const subsuming = lensParentSideForeignKeyRedundant(
+					childSlot, fk, parentSlot, basisParent, parentLogicalColumns, operation, schemaManager);
+				if (subsuming) {
+					log('lens parent-side FK %s on %s: elided — provably subsumed by basis FK %s referencing %s (action restrict; the re-planned basis parent write enforces it)',
+						fk.name ?? '<anon>', parentSlot.logicalTable.name,
+						subsuming.name ?? '<anon>', subsuming.referencedTable);
 					continue;
 				}
 				const parentBasisColumns = parentLogicalColumns.map(name => parentMap.get(name.toLowerCase()) ?? name);
