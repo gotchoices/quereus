@@ -2831,6 +2831,52 @@ describe('Property-Based Tests', () => {
 				), { numRuns: 50 });
 			});
 
+			// ----- Family B (B1): inverse-column interactions the PutGet law alone doesn't pin -----
+			// The acceptance PutGet above assigns the inverse column ALONE on the single-side
+			// (live-subquery) path. Three adversarial interactions stay uncovered by it and are
+			// locked here: (1) an inverse side + an identity side in one statement routes
+			// through the eager `__vmupd_keys` capture (both-sides path) — the inverse must
+			// still apply per-side; (2) an inverse value that references the OTHER side must be
+			// rejected (`cross-source-assignment`) by the side-qualifier strip BEFORE the
+			// inverse wraps it; (3) RETURNING an inverse column re-queries the forward
+			// projection, so it surfaces the forward image, not the stored base value.
+			it('inverse column: both-sides capture path, cross-source reject, and forward-image RETURNING', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists jv2');
+				await db.exec('drop table if exists jchild');
+				await db.exec('drop table if exists jparent');
+				await db.exec('create table jparent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table jchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references jparent(pp)) using memory');
+				await db.exec('create view jv2 as select c.cc as cc, c.cv + 1 as cv1, p.pv as pv from jchild c join jparent p on p.pp = c.pr');
+				await db.exec('insert into jparent values (1, 10), (2, 20)');
+				await db.exec('insert into jchild values (5, 1, 100), (6, 2, 200)');
+
+				// (1) both-sides + inverse: `set cv1 = 9, pv = 30` routes through the eager
+				// key capture (an inverse side + an identity side). The inverse is applied in
+				// `perSide` independent of the capture path, so the child stores cv = 9 - 1 = 8
+				// and the parent stores pv = 30; the untouched joined row (cc=6) is unperturbed.
+				await db.exec('update jv2 set cv1 = 9, pv = 30 where cc = 5');
+				assertRowsEqual('both-sides+inverse child', await readRows('select cc, pr, cv from jchild'),
+					[{ cc: 5, pr: 1, cv: 8 }, { cc: 6, pr: 2, cv: 200 }], ['cc', 'pr', 'cv']);
+				assertRowsEqual('both-sides+inverse parent', await readRows('select pp, pv from jparent'),
+					[{ pp: 1, pv: 30 }, { pp: 2, pv: 20 }], ['pp', 'pv']);
+				assertRowsEqual('both-sides+inverse view image', await readRows('select cc, cv1, pv from jv2 where cc = 5'),
+					[{ cc: 5, cv1: 9, pv: 30 }], ['cc', 'cv1', 'pv']);
+
+				// (2) an inverse value referencing the OTHER side: `pv` lives on jparent, so the
+				// side-qualifier strip rejects it (`cross-source-assignment`) before the inverse
+				// would wrap it — a cross-source ref never reaches the inverse closure.
+				await expectMutationReject('update jv2 set cv1 = pv + 1 where cc = 6', 'cross-source-assignment');
+
+				// (3) RETURNING through the inverse column surfaces the FORWARD image (cv + 1),
+				// not the stored base value: writing cv1 = 15 stores cv = 14 and returns cv1 = 15.
+				assertRowsEqual('inverse RETURNING forward image',
+					await readRows('update jv2 set cv1 = 15 where cc = 6 returning cv1'),
+					[{ cv1: 15 }], ['cv1']);
+				assertRowsEqual('inverse RETURNING stored base', await readRows('select cv from jchild where cc = 6'),
+					[{ cv: 14 }], ['cv']);
+			});
+
 			// ----- Multi-source insert: the shared-surrogate envelope (PutGet) -----
 			// jv hides the shared key (jparent.pp = jchild.pr), so an insert mints a
 			// surrogate ONCE per produced row and threads it into BOTH base inserts:
