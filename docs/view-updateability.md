@@ -417,17 +417,32 @@ The lineage of an inner-join output column traces unambiguously to one of the tw
 > one side's PK): having no ordering hazard, the captured pre-mutation set is exactly
 > what a live re-query would have seen, so the two paths are unified onto one
 > capture built over the planned join body (the live join-body subquery is retired).
-> Because the fan-out is reached only when no single-direction FK
-> is provable, and each base delete is a **predicate-scan** over the live table (not
-> a key-addressed delete that errors on a missing key), an FK cascade — or a
-> mutual-FK edge — that removes a row before its own side's predicate-delete runs is
-> a natural **no-op** (the row simply falls out of the scan), never a double-delete
-> error. Under `quereus.update.policy = 'strict'` the engine instead **rejects** any
-> unresolved multi-side delete — it will not even fall back to the FK-many heuristic.
-> A composite-PK side (the captured identity needs a single-column PK on both sides)
-> is rejected with `unsupported-join`. (The general *n*-base, snapshot-consistent
-> multi-side delete fan-out — the separate decomposition path — remains deferred; see
-> § Multi-Base-Table Mutations.)
+> Because each base delete is a **predicate-scan** over the live table (not a
+> key-addressed delete that errors on a missing key), a row another side's FK action
+> removed before its own side's predicate-delete runs is a natural **no-op** (the row
+> simply falls out of the scan), never a double-delete error. **Fan-out ordering is
+> ON-DELETE-aware:** the two base deletes are ordered by ON DELETE action so the side
+> whose removal *clears the other's reference* runs first — a `set null` /
+> `set default` inbound action, or a `cascade` that does not recurse into a `restrict`
+> child. A both-`cascade` or no-FK pair keeps the as-is `[0, 1]` order. This rescues
+> the one order-sensitive asymmetric mutual-FK shape (`restrict` + `set null`/`set
+> default`): deleting the `set null`-inbound side first clears the other side's
+> reference, so the `restrict`-inbound side's delete then no-ops, where the fixed
+> `[0, 1]` order would have aborted. A mutual FK whose edges **cannot be satisfied in
+> any order** under immediate enforcement — `restrict`+`restrict`, `restrict`+`cascade`
+> (the cascade-into-`restrict` is caught by the transitive RESTRICT pre-walk,
+> `runtime/foreign-key-actions.ts`) — is rejected at **plan time** with
+> `mutual-fk-restrict-delete`, rather than letting the raw transitive-FK error surface
+> at runtime; **no `delete_via` / `target` override resolves it** (a single-side delete
+> is equally blocked — one side direct-`restrict`, the other cascade-into-`restrict`),
+> so the resolution is to break the cycle (clear one side's reference first) or declare
+> the constraint deferred. This whole analysis depends on **immediate** FK enforcement
+> plus that transitive RESTRICT pre-walk. Under `quereus.update.policy = 'strict'` the
+> engine instead **rejects** any unresolved multi-side delete — it will not even fall
+> back to the FK-many heuristic. A composite-PK side (the captured identity needs a
+> single-column PK on both sides) is rejected with `unsupported-join`. (The general
+> *n*-base, snapshot-consistent multi-side delete fan-out — the separate decomposition
+> path — remains deferred; see § Multi-Base-Table Mutations.)
 
 ### Outer Joins
 
@@ -807,6 +822,7 @@ interface MutationDiagnostic {
     | 'tag-target-not-found'            // target/exclude/default_for/delete_via names an unknown branch/table/column
     | 'tag-conflict'                    // target/exclude excludes a side the statement must write
     | 'policy-strict-ambiguity'         // policy=strict rejects an unresolved multi-side delete
+    | 'mutual-fk-restrict-delete'       // two-side join DELETE fan-out over a mutual FK whose ON DELETE actions no side order can satisfy under immediate enforcement (no delete_via/target override resolves it)
     | 'predicate-contradiction';        // statement's predicate is unsatisfiable
   planNodeId: number;
   column?: string;

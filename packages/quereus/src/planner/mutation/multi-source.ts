@@ -1096,10 +1096,28 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 	// delete — having no ordering hazard — reads the same pre-mutation set it would
 	// have re-queried live. (No live re-query of a re-planned AST body.)
 
-	// Order parent-before-child where the FK is provable (arbitrary otherwise); a
-	// fan-out is only ever reached when no single FK is provable, so its order is the
-	// as-is [0, 1].
-	const order = orderSides(analysis.sides).filter(i => sides.includes(i));
+	// Order the base deletes. The two-side fan-out (reached only when no single-
+	// direction FK is provable — `fkChildIndex` is undefined, i.e. no FK or a mutual
+	// FK) orders by ON DELETE action so the side whose removal clears the other's
+	// reference runs first (`orderDeleteFanout`); a mutual FK whose actions no side
+	// order can satisfy under immediate enforcement raises `mutual-fk-restrict-delete`
+	// at plan time rather than letting the raw transitive-FK error surface at runtime.
+	// A single-side delete has no ordering hazard, so it keeps its trivial order.
+	let order: readonly number[];
+	if (sides.length === 2) {
+		const fanoutOrder = orderDeleteFanout(analysis.sides);
+		if (fanoutOrder === undefined) {
+			const [a, b] = analysis.sides;
+			raiseMutationDiagnostic({
+				reason: 'mutual-fk-restrict-delete',
+				table: view.name,
+				message: `cannot delete through view '${view.name}': the joined row spans a mutual foreign key ('${a.schema.name}'↔'${b.schema.name}') whose ON DELETE actions cannot be satisfied in either order under immediate FK enforcement (deleting either side trips the other's RESTRICT, directly or transitively through a cascade); break the cycle (clear one side's reference first, or make the constraint deferred) before deleting through the view`,
+			});
+		}
+		order = fanoutOrder;
+	} else {
+		order = sides;
+	}
 	const ops: BaseOp[] = [];
 	for (const sideIndex of order) {
 		const side = analysis.sides[sideIndex];
@@ -1380,6 +1398,65 @@ function orderSides(sides: readonly [JoinSide, JoinSide]): number[] {
 	const child = fkChildIndex(sides);
 	if (child === undefined) return [0, 1];
 	return child === 0 ? [1, 0] : [0, 1];
+}
+
+/**
+ * The governing ON DELETE action of FK(s) declared on `child` that reference
+ * `parent` — i.e. the action that fires when a `parent` row is deleted. When more
+ * than one such FK runs between the same ordered pair, the **most-blocking** action
+ * governs (immediate enforcement fires every referencing FK): `restrict` over
+ * `cascade` over `setNull`/`setDefault` over absent (`undefined` — no FK on `child`
+ * references `parent`). Mirrors the FK-match predicate in {@link fkChildIndex} (same
+ * `referencedTable` / `referencedSchema` comparison).
+ */
+function inboundDeleteAction(child: JoinSide, parent: JoinSide): AST.ForeignKeyAction | undefined {
+	const parentName = parent.schema.name.toLowerCase();
+	const parentSchema = parent.schema.schemaName.toLowerCase();
+	let governing: AST.ForeignKeyAction | undefined;
+	for (const fk of child.schema.foreignKeys ?? []) {
+		if (fk.referencedTable.toLowerCase() !== parentName) continue;
+		if ((fk.referencedSchema ?? child.schema.schemaName).toLowerCase() !== parentSchema) continue;
+		if (fk.onDelete === 'restrict') return 'restrict';        // most-blocking — governs outright
+		if (fk.onDelete === 'cascade') governing = 'cascade';
+		else if (governing !== 'cascade') governing = fk.onDelete;  // setNull / setDefault, unless a cascade already won
+	}
+	return governing;
+}
+
+/**
+ * True when deleting side `X` first (then the other side `Y`) does **not** abort
+ * under immediate FK enforcement + the transitive RESTRICT pre-walk
+ * (`runtime/foreign-key-actions.ts` `assertTransitiveRestrictsForParentMutation`).
+ * `inboundX` governs deleting X (the action of the FK referencing X); `inboundY`
+ * governs deleting Y. Deleting X first is feasible iff X carries no inbound
+ * reference, or its inbound action *clears* Y's reference without tripping a RESTRICT:
+ *  - `inboundX` absent — nothing references X, so its delete is unconstrained;
+ *  - `inboundX ∈ {setNull, setDefault}` — Y's reference is cleared (no cascade, no RESTRICT);
+ *  - `inboundX === cascade` **and** `inboundY !== restrict` — the cascade into Y does
+ *    not recurse into a RESTRICT (Y's only inbound child here is X, the root, via `inboundY`).
+ * `inboundX === restrict` ⇒ Y still references X ⇒ NOT deletable-first.
+ */
+function deletableFirst(inboundX: AST.ForeignKeyAction | undefined, inboundY: AST.ForeignKeyAction | undefined): boolean {
+	if (inboundX === undefined) return true;
+	if (inboundX === 'setNull' || inboundX === 'setDefault') return true;
+	return inboundX === 'cascade' && inboundY !== 'restrict';
+}
+
+/**
+ * The feasible base-delete order for the two-side DELETE fan-out, or `undefined`
+ * when a mutual FK's ON DELETE actions cannot be satisfied in *any* order under
+ * immediate enforcement (the caller raises `mutual-fk-restrict-delete`). Reached
+ * only at `fkChildIndex(sides) === undefined` (no FK either way, or a mutual FK): a
+ * no-FK pair has both inbound actions absent ⇒ side0 deletable-first ⇒ `[0, 1]`
+ * (unchanged); a both-cascade mutual FK likewise keeps `[0, 1]`. Prefers `[0, 1]`
+ * when side0 is deletable-first so the no-FK / symmetric paths stay order-stable.
+ */
+function orderDeleteFanout(sides: readonly [JoinSide, JoinSide]): readonly number[] | undefined {
+	const inbound0 = inboundDeleteAction(sides[1], sides[0]); // governs deleting side0
+	const inbound1 = inboundDeleteAction(sides[0], sides[1]); // governs deleting side1
+	if (deletableFirst(inbound0, inbound1)) return [0, 1];
+	if (deletableFirst(inbound1, inbound0)) return [1, 0];
+	return undefined;
 }
 
 /**

@@ -534,6 +534,101 @@ select yid from ps_y order by yid;
 → [{"yid":5}]
 
 -- ===================================
+-- ON-DELETE-aware fan-out ordering over an ASYMMETRIC mutual FK. The two-side
+-- fan-out is reached only when no single-direction FK is provable — a mutual FK
+-- (each side references the other) is one such case. When the two edges' ON DELETE
+-- actions differ, a fixed [0,1] order is no longer order-independent: the fan-out
+-- now orders the base deletes by ON DELETE action (delete the side whose removal
+-- clears the other's reference first), and rejects at plan time the mutual shapes no
+-- order can satisfy under immediate enforcement + the transitive RESTRICT pre-walk
+-- (runtime/foreign-key-actions.ts). Seeded like (fo-b): nullable FK columns +
+-- back-fill updates so the mutual FK can be established under enforcement.
+-- See docs/view-updateability.md § Inner Join — Deletes.
+-- ===================================
+
+-- --- (fo-g) restrict+cascade mutual FK -> structured diagnostic (the headline) ---
+-- Edge g_a.bref -> g_b ON DELETE CASCADE governs deleting side1 (g_b); edge
+-- g_b.aref -> g_a ON DELETE RESTRICT governs deleting side0 (g_a). So inbound0 =
+-- restrict, inbound1 = cascade. Deleting g_a first trips g_b's RESTRICT; deleting
+-- g_b first cascades into g_a, whose deletion then trips g_b's RESTRICT via the
+-- transitive pre-walk. Neither order is satisfiable, so the plan is rejected up front
+-- with `mutual-fk-restrict-delete` instead of the raw transitive-FK runtime error.
+create table g_a (aid integer primary key, bref integer null,
+    foreign key (bref) references g_b(bid) on delete cascade);
+create table g_b (bid integer primary key, aref integer null,
+    foreign key (aref) references g_a(aid) on delete restrict);
+insert into g_a (aid, bref) values (1, null), (2, null);
+insert into g_b (bid, aref) values (10, null), (20, null);
+update g_a set bref = 10 where aid = 1;
+update g_a set bref = 20 where aid = 2;
+update g_b set aref = 1 where bid = 10;
+update g_b set aref = 2 where bid = 20;
+create view g_jv as select a.aid as aid, b.bid as bid from g_a a join g_b b on b.aref = a.aid;
+select aid, bid from g_jv order by aid;
+→ [{"aid":1,"bid":10},{"aid":2,"bid":20}]
+delete from g_jv where aid = 1;
+-- error: mutual foreign key
+-- the rejected delete is a no-op: both base rows survive.
+select aid, bref from g_a order by aid;
+→ [{"aid":1,"bref":10},{"aid":2,"bref":20}]
+select bid, aref from g_b order by bid;
+→ [{"bid":10,"aref":1},{"bid":20,"aref":2}]
+
+-- --- (fo-h) restrict/restrict mutual FK -> same diagnostic ---
+-- Both edges ON DELETE RESTRICT (inbound0 = inbound1 = restrict): deleting either
+-- side trips the other's RESTRICT directly. Unsatisfiable in any order; rejected.
+create table h_a (aid integer primary key, bref integer null,
+    foreign key (bref) references h_b(bid) on delete restrict);
+create table h_b (bid integer primary key, aref integer null,
+    foreign key (aref) references h_a(aid) on delete restrict);
+insert into h_a (aid, bref) values (1, null), (2, null);
+insert into h_b (bid, aref) values (10, null), (20, null);
+update h_a set bref = 10 where aid = 1;
+update h_a set bref = 20 where aid = 2;
+update h_b set aref = 1 where bid = 10;
+update h_b set aref = 2 where bid = 20;
+create view h_jv as select a.aid as aid, b.bid as bid from h_a a join h_b b on b.aref = a.aid;
+delete from h_jv where aid = 1;
+-- error: mutual foreign key
+-- both base rows survive the rejected delete.
+select aid, bref from h_a order by aid;
+→ [{"aid":1,"bref":10},{"aid":2,"bref":20}]
+select bid, aref from h_b order by bid;
+→ [{"bid":10,"aref":1},{"bid":20,"aref":2}]
+
+-- --- (fo-i) restrict+setNull mutual FK -> SUCCESS via reordering (the rescued case) ---
+-- This is the ONLY asymmetric mutual shape a side ordering can satisfy. Edge
+-- i_a.bref -> i_b ON DELETE SET NULL governs deleting side1 (i_b); edge i_b.aref ->
+-- i_a ON DELETE RESTRICT governs deleting side0 (i_a). So inbound0 = restrict,
+-- inbound1 = setNull. The as-is [0,1] order would delete i_a first and trip i_b's
+-- RESTRICT (a latent runtime error before this change); the ON-DELETE-aware order
+-- deletes i_b FIRST — its SET NULL clears i_a.bref, removing no row but no RESTRICT —
+-- then deletes i_a cleanly (no i_b row references it any longer). Both base rows for
+-- the joined identity end up gone.
+create table i_a (aid integer primary key, bref integer null,
+    foreign key (bref) references i_b(bid) on delete set null);
+create table i_b (bid integer primary key, aref integer null,
+    foreign key (aref) references i_a(aid) on delete restrict);
+insert into i_a (aid, bref) values (1, null), (2, null);
+insert into i_b (bid, aref) values (10, null), (20, null);
+update i_a set bref = 10 where aid = 1;
+update i_a set bref = 20 where aid = 2;
+update i_b set aref = 1 where bid = 10;
+update i_b set aref = 2 where bid = 20;
+create view i_jv as select a.aid as aid, b.bid as bid from i_a a join i_b b on b.aref = a.aid;
+select aid, bid from i_jv order by aid;
+→ [{"aid":1,"bid":10},{"aid":2,"bid":20}]
+-- reordered fan-out: i_b bid=10 deleted first (SET NULL clears i_a aid=1's bref),
+-- then i_a aid=1 deleted cleanly. The aid=2 / bid=20 joined identity is untouched.
+delete from i_jv where aid = 1;
+select aid, bref from i_a order by aid;
+→ [{"aid":2,"bref":20}]
+select bid, aref from i_b order by bid;
+→ [{"bid":20,"aref":2}]
+select aid, bid from i_jv order by aid;
+→ [{"aid":2,"bid":20}]
+
+-- ===================================
 -- Phase 3.4: the `quereus.update.*` tag override surface.
 -- target / exclude / delete_via / policy / default_for — read + site-validated
 -- through the typed reserved-tag registry, merged statement-over-view.
