@@ -110,5 +110,37 @@ describe('IN multi-seek inCount honesty (plan=5)', () => {
 		it('full distinct cross-product keeps every tuple', () => {
 			expect(inCountOf('SELECT id FROM c WHERE a IN (1, 2) AND b IN (10, 20)')).to.equal(4);
 		});
+
+		it('keeps only the non-null-bearing tuples and returns their rows', async () => {
+			// a∈{1,null} × b∈{10,20} → drop the NULL-bearing tuples, leaving (1,10),(1,20).
+			expect(inCountOf('SELECT id FROM c WHERE a IN (1, null) AND b IN (10, 20)')).to.equal(2);
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('SELECT id FROM c WHERE a IN (1, null) AND b IN (10, 20) ORDER BY id')) {
+				rows.push(r as Record<string, unknown>);
+			}
+			expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		});
+
+		it('an entirely NULL-bearing cross-product becomes an empty result (no degraded full scan)', async () => {
+			const sql = 'SELECT id FROM c WHERE a IN (null, null) AND b IN (10, 20)';
+			const root = db.getPlan(sql);
+			expect(collectNodes(root, isIndexSeek), 'no IndexSeek should remain').to.have.lengthOf(0);
+			expect(collectNodes(root, isEmptyResult), 'should be an EmptyResult').to.have.lengthOf(1);
+
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+			expect(rows).to.deep.equal([]);
+		});
+
+		it('a single-equality NULL component empties the cross-product (composite NULL-equality is correct)', async () => {
+			// `b = null` makes every tuple NULL-bearing ⇒ no row can match. Unlike the
+			// single-column plan=2 equality path (tracked in fix/in-null-equality-returns-all-rows),
+			// the composite multi-seek builder reduces to an EmptyResult here.
+			const sql = 'SELECT id FROM c WHERE a IN (1, 2) AND b = null';
+			expect(collectNodes(db.getPlan(sql), isEmptyResult), 'should be an EmptyResult').to.have.lengthOf(1);
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+			expect(rows).to.deep.equal([]);
+		});
 	});
 });
