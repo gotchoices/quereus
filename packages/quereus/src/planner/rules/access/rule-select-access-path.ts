@@ -474,6 +474,15 @@ function selectPhysicalNodeFromPlan(
 			);
 		}
 
+		// A literal NULL in any seek column makes the (row-value) equality UNKNOWN ⇒
+		// no row can match. Emit an empty result rather than a doomed point-seek so
+		// EXPLAIN stays honest (EmptyResult, not a degraded IndexSeek/SeqScan). A
+		// dynamic `valueExpr` is left to the scan-layer runtime guard (Part A).
+		if ([...eqBySeekCol.values()].some(isLiteralNullEquality)) {
+			log('Equality seek on %s has a literal NULL key — using empty result', physicalIndexName);
+			return createEmptyResultNode(tableRef);
+		}
+
 		// Standard equality seek on all seek columns
 		const seekKeys: ScalarPlanNode[] = seekCols.map(colIdx => {
 			const c = eqBySeekCol.get(colIdx)!;
@@ -526,6 +535,22 @@ function selectPhysicalNodeFromPlan(
 		}
 
 		if (prefixEqCols.length > 0 && trailingRangeCol !== undefined) {
+			// A literal NULL in any prefix-equality column makes every row-value
+			// comparison UNKNOWN ⇒ no match. Emit an empty result rather than relying
+			// on the runtime prefix walk breaking on the first row. Part A does not
+			// cover this path (it walks via `equalityPrefix`, not `equalityKey`), so
+			// the plan-time check is the robustness guarantee here.
+			const prefixHasLiteralNull = prefixEqCols.some(colIdx => {
+				const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
+					(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
+					handledByCol.has(c.columnIndex));
+				return c !== undefined && isLiteralNullEquality(c);
+			});
+			if (prefixHasLiteralNull) {
+				log('Prefix-range seek on %s has a literal NULL prefix key — using empty result', physicalIndexName);
+				return createEmptyResultNode(tableRef);
+			}
+
 			const seekKeys: ScalarPlanNode[] = [];
 			const allConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 			let argv = 1;
@@ -725,7 +750,7 @@ function selectPhysicalNodeLegacy(
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
 	providesOrdering: { column: number; desc: boolean }[] | undefined
-): SeqScanNode | IndexScanNode | IndexSeekNode {
+): SeqScanNode | IndexScanNode | IndexSeekNode | EmptyResultNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	// Analyze the access plan to determine node type
 	const handledByCol = new Set<number>();
@@ -744,6 +769,17 @@ function selectPhysicalNodeLegacy(
 	const treatAsHandledPk = coversPk && pkCols.every(pk => handledByCol.has(pk.index) || eqByCol.has(pk.index));
 
 	if ((hasEqualityConstraints && coversPk || treatAsHandledPk) && maybeRows <= 10) {
+		// A literal NULL in any PK column makes the point-seek UNKNOWN ⇒ no row can
+		// match. Emit an empty result instead of a doomed seek (mirrors the
+		// index-aware path; the scan-layer runtime guard covers the dynamic case).
+		if (pkCols.some(pk => {
+			const c = eqByCol.get(pk.index);
+			return c !== undefined && isLiteralNullEquality(c);
+		})) {
+			log('PK equality seek has a literal NULL key — using empty result (legacy)');
+			return createEmptyResultNode(tableRef);
+		}
+
 		const seekKeys: ScalarPlanNode[] = pkCols.map(pk => {
 			const c = eqByCol.get(pk.index)!;
 			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
@@ -944,6 +980,29 @@ function createEmptyResultNode(tableRef: TableReferenceNode): EmptyResultNode {
 		}
 	};
 	return new EmptyResultNode(tableRef.scope, tableRef, emptyFilterInfo, 0);
+}
+
+/**
+ * True when an equality constraint resolves to a *literal* SQL NULL — `col = null`
+ * or single-value `col IN (null)` carrying no dynamic value expression. SQL NULL
+ * equality is UNKNOWN under three-valued logic, so such a point-seek matches no
+ * row; the planner emits an {@link createEmptyResultNode} instead of a doomed
+ * point-seek (mirrors the all-NULL IN-list reduction in {@link reduceLiteralSeekValues}).
+ *
+ * A dynamic single `valueExpr` (parameter/correlated binding) is deliberately NOT
+ * treated as literal: its NULL-ness is unknown at plan time and is handled by the
+ * scan-layer runtime guard (`seekKeyHasNull`) instead. This mirrors the
+ * literal-vs-dynamic discrimination used where `seekKeys` are materialized
+ * (`c.valueExpr && !Array.isArray(c.valueExpr)` ⇒ dynamic). A dynamic single-value
+ * `IN (?)` carries an *array* `valueExpr` and an `undefined` placeholder value, so
+ * the effective-value check below also rejects it.
+ */
+function isLiteralNullEquality(c: PlannerPredicateConstraint): boolean {
+	if (c.valueExpr && !Array.isArray(c.valueExpr)) return false;
+	const val = c.op === 'IN' && Array.isArray(c.value)
+		? (c.value as unknown as SqlValue[])[0]
+		: (c.value as SqlValue);
+	return val === null;
 }
 
 /**

@@ -92,6 +92,46 @@ describe('IN multi-seek inCount honesty (plan=5)', () => {
 			}
 			expect(rows).to.deep.equal([]);
 		});
+
+		// Single-value plan=2 NULL equality: `col = null` / single-element `col IN (null)`
+		// on a unique-or-PK column. Previously a NULL equality key compiled to a
+		// point-seek that fell through to a full-index walk and returned every row
+		// (fix/in-null-equality-returns-all-rows). Part B emits an EmptyResult for the
+		// *literal* case; Part A's scan-layer guard covers the dynamic-param case below.
+		for (const { label, sql } of [
+			{ label: 'unique secondary index, `= null`', sql: 'SELECT id FROM u WHERE v = null' },
+			{ label: 'unique secondary index, `IN (null)`', sql: 'SELECT id FROM u WHERE v IN (null)' },
+			{ label: 'primary key, `= null`', sql: 'SELECT id FROM u WHERE id = null' },
+			{ label: 'primary key, `IN (null)`', sql: 'SELECT id FROM u WHERE id IN (null)' },
+		]) {
+			it(`literal NULL equality becomes an empty result (${label})`, async () => {
+				const root = db.getPlan(sql);
+				expect(collectNodes(root, isIndexSeek), `no IndexSeek should remain: ${sql}`).to.have.lengthOf(0);
+				expect(collectNodes(root, isEmptyResult), `should be an EmptyResult: ${sql}`).to.have.lengthOf(1);
+
+				const rows: Array<Record<string, unknown>> = [];
+				for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+				expect(rows).to.deep.equal([]);
+			});
+		}
+
+		// Dynamic parameter bound to NULL: the value is unknown at plan time, so Part B
+		// cannot emit an EmptyResult — the plan keeps a real point-seek and the
+		// scan-layer runtime guard (Part A) short-circuits the NULL key to zero rows.
+		// sqllogic can't bind params, so this lives here.
+		for (const { label, sql } of [
+			{ label: 'unique secondary index', sql: 'SELECT id FROM u WHERE v = ?' },
+			{ label: 'primary key', sql: 'SELECT id FROM u WHERE id = ?' },
+		]) {
+			it(`dynamic param bound to NULL returns no rows (${label})`, async () => {
+				// Still a genuine point-seek at plan time (NULL-ness unknown).
+				expect(collectNodes(db.getPlan(sql), isIndexSeek), `point-seek expected: ${sql}`).to.have.lengthOf(1);
+
+				const rows: Array<Record<string, unknown>> = [];
+				for await (const r of db.eval(sql, [null])) rows.push(r as Record<string, unknown>);
+				expect(rows).to.deep.equal([]);
+			});
+		}
 	});
 
 	describe('composite IN (cross-product)', () => {
@@ -133,9 +173,9 @@ describe('IN multi-seek inCount honesty (plan=5)', () => {
 		});
 
 		it('a single-equality NULL component empties the cross-product (composite NULL-equality is correct)', async () => {
-			// `b = null` makes every tuple NULL-bearing ⇒ no row can match. Unlike the
-			// single-column plan=2 equality path (tracked in fix/in-null-equality-returns-all-rows),
-			// the composite multi-seek builder reduces to an EmptyResult here.
+			// `b = null` makes every tuple NULL-bearing ⇒ no row can match. The
+			// single-column plan=2 equality path now reduces to an EmptyResult too
+			// (fix/in-null-equality-returns-all-rows), matching this composite builder.
 			const sql = 'SELECT id FROM c WHERE a IN (1, 2) AND b = null';
 			expect(collectNodes(db.getPlan(sql), isEmptyResult), 'should be an EmptyResult').to.have.lengthOf(1);
 			const rows: Array<Record<string, unknown>> = [];

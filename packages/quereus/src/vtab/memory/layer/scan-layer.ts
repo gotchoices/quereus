@@ -78,7 +78,12 @@ export async function* scanLayer(
 		const tree = layer.getModificationTree('primary');
 		if (!tree) return;
 
-		if (plan.equalityKey != null) {
+		if (plan.equalityKey !== undefined) {
+			// A NULL (or NULL-containing) equality key is UNKNOWN under SQL three-valued
+			// logic ⇒ no row matches. Short-circuit before `tree.get`: a literal `null`
+			// could otherwise match a stored NULL index entry for a composite key. Only
+			// `undefined` (no equality key) falls through to the full/range walk below.
+			if (seekKeyHasNull(plan.equalityKey)) return;
 			const value = tree.get(plan.equalityKey as BTreeKeyForPrimary);
 			if (value) {
 				yield value as Row;
@@ -165,7 +170,10 @@ export async function* scanLayer(
 
 		const primaryTree = layer.getModificationTree('primary');
 
-		if (plan.equalityKey != null) {
+		if (plan.equalityKey !== undefined) {
+			// NULL equality is UNKNOWN ⇒ no rows (see the primary branch above). Only
+			// `undefined` falls through to the ordered walk.
+			if (seekKeyHasNull(plan.equalityKey)) return;
 			const indexEntry = indexTree.get(plan.equalityKey as BTreeKeyForIndex);
 			if (indexEntry && primaryTree) {
 				for (const pk of indexEntry.primaryKeys) {

@@ -20,6 +20,25 @@ insert into t values (1, 5), (2, 7);
 select k, v from t where v in (5);
 → [{"k":1,"v":5}]
 
+-- ===== Single-value NULL equality (plan=2 point-seek) returns zero rows =====
+-- `col = null` is UNKNOWN ⇒ no rows. Regression for the point-seek branch of
+-- scanLayer, where a NULL equality key fell through to the full-index walk and
+-- returned every row (fix/in-null-equality-returns-all-rows). Covers the unique
+-- secondary index (v) and the primary key (k) on the memory module, plus the
+-- residual-filter path on the store module.
+
+select k, v from t where v in (null);
+→ []
+
+select k, v from t where v = null;
+→ []
+
+select k, v from t where k = null;
+→ []
+
+select k, v from t where k in (null);
+→ []
+
 -- ===== (a) Duplicate literal must not multiply the matching row =====
 
 select k, v from t where v in (5, 5);
