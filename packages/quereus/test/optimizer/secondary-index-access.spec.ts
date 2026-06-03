@@ -250,6 +250,52 @@ describe('Secondary index access path selection', () => {
 			for await (const r of db.eval(q)) results.push(r);
 			expect(results.map(r => r.id)).to.deep.equal([1, 3]);
 		});
+
+		it('NOCASE UNIQUE: two case-variant literals hit one entry, yield the row once', async () => {
+			// The justification for deduping by PK (physical row identity) rather than
+			// by seek key: 'A' and 'a' are distinct literals but collation-equal under
+			// the NOCASE index, so both seeks return the same single stored row. A naive
+			// key-compare dedup would see two different keys and double-yield.
+			await db.exec("CREATE TABLE u (k INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE UNIQUE) USING memory");
+			await db.exec("INSERT INTO u VALUES (1, 'A'), (2, 'B')");
+			const q = "SELECT k, v FROM u WHERE v IN ('A', 'a') ORDER BY k";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results).to.deep.equal([{ k: 1, v: 'A' }]);
+		});
+
+		it('NOCASE non-unique index: overlapping seeks keep both distinct matching rows', async () => {
+			// 'a' and 'A' are two DISTINCT rows that are NOCASE-equal. Each of the two
+			// overlapping seeks ('A','a') matches the same index entry (both PKs), so PK
+			// dedup must collapse the per-seek duplication while preserving both rows.
+			await db.exec("CREATE TABLE n (k INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE) USING memory");
+			await db.exec("CREATE INDEX idx_nv ON n(v)");
+			await db.exec("INSERT INTO n VALUES (1, 'a'), (2, 'A'), (3, 'b')");
+			const q = "SELECT k FROM n WHERE v IN ('A', 'a') ORDER BY k";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results.map(r => r.k)).to.deep.equal([1, 2]);
+		});
+
+		it('transaction overlay: dedup spans the merged MVCC view within an open txn', async () => {
+			// The dedup `seen` BTree lives for a single scanLayer call on the merged
+			// (overlay-over-base) view, so an IN dup/NULL must collapse correctly against
+			// rows pending in the transaction layer, then revert on rollback.
+			await db.exec("CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER UNIQUE) USING memory");
+			await db.exec("INSERT INTO t VALUES (1, 5), (2, 7)");
+			await db.exec("BEGIN");
+			await db.exec("INSERT INTO t VALUES (3, 9)");
+			await db.exec("UPDATE t SET v = 50 WHERE k = 1");
+			const inTxn: ResultRow[] = [];
+			for await (const r of db.eval("SELECT k, v FROM t WHERE v IN (50, 50, 9, null) ORDER BY k")) inTxn.push(r);
+			expect(inTxn).to.deep.equal([{ k: 1, v: 50 }, { k: 3, v: 9 }]);
+			await db.exec("ROLLBACK");
+			const afterRollback: ResultRow[] = [];
+			for await (const r of db.eval("SELECT k, v FROM t WHERE v IN (5, 5, 9) ORDER BY k")) afterRollback.push(r);
+			expect(afterRollback).to.deep.equal([{ k: 1, v: 5 }]);
+		});
 	});
 
 	it('still uses PK seek when filtering on primary key', async () => {
