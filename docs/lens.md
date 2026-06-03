@@ -2,24 +2,88 @@
 
 ## Overview
 
-Quereus separates a database into three relational layers, in the Codd / ANSI-SPARC tradition but expressed entirely in Quereus's own primitives (all relations virtual, key-addressed, no rowids):
+A database has two faces that rarely match. There is the design you want to *think* in — clean tables with the columns, types, and rules your application cares about — and the storage you actually *run on*, which may split one designed table across several physical tables, fold it into key-value triples, or spread it across more than one storage module. A **lens** is the two-way mapping between them: it lets you read and write your designed tables normally while the engine translates, in both directions, to and from however the data is really stored.
+
+Concretely. Suppose you want to work with a `Car` table:
+
+```sql
+-- The design — how you want to think about it. No storage decisions here.
+declare logical schema App {
+  table Car (
+    id       int primary key,
+    make     text,
+    topSpeed int
+  );
+}
+```
+
+…but your storage keeps each car's identity and its performance numbers in separate physical tables:
+
+```sql
+-- The storage — ordinary module-backed tables. Quereus calls this the "basis".
+declare schema Store {
+  table CarCore  (id int primary key, make text)    using mem();
+  table CarSpeed (id int primary key, topSpeed int) using mem();
+}
+```
+
+A lens binds the design to the storage. This one is a single line — it tells the engine how the two storage tables join. Because the column names already line up, nothing else needs saying; each `Car` column maps itself:
+
+```sql
+declare lens for App over Store {
+  view Car as
+    select id, make, topSpeed
+    from CarCore join CarSpeed using (id);
+}
+apply schema App;
+```
+
+Now `App.Car` behaves like an ordinary table **in both directions**:
+
+```sql
+select id, make, topSpeed from App.Car where id = 7;
+--   → reads CarCore joined to CarSpeed, transparently
+
+insert into App.Car (id, make, topSpeed) values (7, 'Civic', 180);
+--   → writes (id, make) to CarCore and (id, topSpeed) to CarSpeed, in one statement
+
+update App.Car set topSpeed = 200 where id = 7;
+--   → updates only CarSpeed
+```
+
+That is the whole idea. You design `Car` once; the storage underneath can be a single table, a column split like this, a key-value layout, or several modules at once — and `App.Car` reads and writes the same way regardless. Swapping storage strategies becomes a change to the lens, never to the design or the application. This is the decisive property: **the design carries no commitment to how it is stored.**
+
+The rest of this document is the precise machinery behind that picture — how the mapping is generated when you don't write it, how writes reach the right storage tables, how the rules you declared on the design are still enforced, and how the engine *proves* the mapping is faithful before it deploys.
+
+### Key terms
+
+A few terms recur throughout; no background in database research is assumed.
+
+- **Logical** — the design layer: the tables, columns, types, and rules (primary key, `unique`, `check`, foreign key, `not null`) you reason about. No storage.
+- **Basis** — the storage layer seen *as relations*: ordinary `using module(...)` tables, possibly several per logical table, possibly across several modules.
+- **Lens** — the mapping between one logical table and the basis, in two directions. **`get`** is the *read* — an ordinary `select` that produces the logical table from basis. **`put`** is the *write* — how an `insert` / `update` / `delete` on the logical table is pushed back down to basis. "Bidirectional" just means a lens has both.
+- **Decomposition** — a logical table whose data is split across more than one basis table (the `Car` example splits across two). When the engine generates such a mapping itself, one basis table acts as the **anchor** — the one that decides whether a row exists — and the others attach their columns to it.
+- **Surrogate key** — an internal join key (often auto-generated) that basis tables share, distinct from the logical primary key.
+- **Functional dependency (FD)** — shorthand for "these columns determine those" (a primary key determines the rest of its row). Quereus tracks FDs all through the query plan; the lens layer reuses that tracking to decide what is writable and to prove keys hold. You will see the names **GetPut** and **PutGet** later — they are the two correctness laws a lens must satisfy, defined where they are used.
+
+### The three layers
+
+Stated precisely, a database separates into three layers of relations (Quereus expresses all three with its own virtual, key-addressed tables — there are no row-ids):
 
 - **Logical** — the relations a developer designs and reasons about, free of any storage commitment. A logical schema declares tables with columns, types, and *logical* constraints (primary key, unique, check, foreign key, not null) and nothing physical: no module association, no indexes, no storage hints. It is a pure design.
 - **Basis** — the relations that modules actually back. Basis tables are ordinary `using module(...)` tables and may be spread across many modules (a single logical table can map to a columnar decomposition over several basis tables). Basis is still *relational* — it is the lowest layer a developer reasons about as relations. Covering structures (secondary indexes, unique-enforcement structures) live here as materialized views.
-- **Mapping (the lens)** — for each logical table, a bidirectional relational expression that realizes it over basis relations. `get` is the query that produces the logical relation; `put` is the update propagation that pushes logical mutations down to basis. The lens is *not* a schema; it is a per-logical-table **slot**, populated either by explicit `declare lens` syntax or generated internally when absent.
+- **Mapping (the lens)** — for each logical table, the bidirectional `get` / `put` pair that realizes it over basis relations. The lens is *not* a schema; it is a per-logical-table **slot**, populated either by an explicit `declare lens` block or generated for you when absent.
 
 Below basis sits the **physical** layer — module storage layout and the on-disk/in-memory realization of covering structures. The lens never sees physical concerns; it composes over basis relations, and modules handle storage beneath.
 
-The decisive property is **decoupling**: a logical design carries no embodiment, so one logical schema can be paired with different basis schemas (a row-store, a columnar split, an exotic module) at different deployments. The lens is where a design meets a storage.
-
 ## What a Lens Is
 
-A lens is the bidirectional-transformation (`get` / `put`) pair that Quereus's [view updateability](view-updateability.md) already provides: `get` is an ordinary `select`, and `put` is the predicate-driven propagation pass. The lens layer adds no new algebra. **There is exactly one operator set — relational algebra — used in both directions.** This is a deliberate design constraint:
+A lens reuses machinery Quereus already has, rather than inventing a new sublanguage. The **`get`** direction is an ordinary `select`. The **`put`** direction is the engine's existing ability to push a change through a view down to its base tables (see [view updateability](view-updateability.md)) — an `insert` / `update` / `delete` on the view becomes the equivalent writes on the tables underneath. So **the only operator set, in both directions, is ordinary relational algebra** (the operations behind `select`). Two consequences follow:
 
-- **`get` is relationally complete.** Any mapping expressible as a view is expressible as a lens, because a lens body *is* a view body.
-- **`put` is the invertible fragment plus explicit disambiguation.** Not every relational expression has a sound, total inverse. Where propagation can infer the inverse it does; where it cannot, the gap is filled by explicit hints (`default_for`-style tags) or the mutation surfaces a structured diagnostic. Invertibility is made explicit rather than restricting the language.
+- **Any view can serve as the read mapping.** If you can write it as a `select`, you can use it as a `get` — a lens body *is* a view body.
+- **A write goes through only when the mapping can be run in reverse.** Not every expression has a sound inverse — `lower(name)` cannot be undone, for instance. Where the engine can infer the inverse it does; where it cannot, you either supply an explicit hint (a `default_for`-style tag) or the write is refused with a clear diagnostic naming the column. Invertibility is made explicit rather than silently narrowing what you can write.
 
-To the query processor, a logical table is simply a view that is "out there, ready to go." Selecting from `Logical.T` resolves to the lens-compiled body over basis; mutating it propagates through that body via the standard view-update machinery. All lens-specific work happens at compile time: **validate, generate, and attach semantics**.
+To the query processor, then, a logical table is simply a view that is "out there, ready to go." Selecting from `Logical.T` resolves to the lens-compiled body over basis; mutating it propagates through that body via the standard view-update machinery. All lens-specific work happens at compile time: **validate, generate, and attach semantics** — there is no lens-specific code at query runtime.
 
 ## Schema Kinds
 
@@ -45,6 +109,8 @@ The slot is populated by one of two paths:
 At any deployment a logical table has exactly **one** active lens (its inlined body). Portability across embodiments is a *source-level* property — the same logical schema can be written against different lens+basis pairs for different targets — not a simultaneous-catalog property.
 
 ## The Default Mapper
+
+**The gist:** when you don't write a lens, the engine writes one — it matches each logical column to a basis column by name (plus any hints a storage module advertises) and assembles the join, exactly as in the `Car` example above. The rest of this section is what keeps that generated mapping correct when the match is *not* a clean one-to-one: split tables, optional columns, generated keys, and storage that doesn't expose your column names at all.
 
 When a lens body is not authored, it is generated. The generator is **module-specific and customizable**: the strategy of a standard row-store is the default, but modules can advertise their own logical→basis mapping so that exotic storage strategies (columnar decomposition, EAV, column-family) are accommodated without the developer authoring the join.
 
@@ -190,6 +256,8 @@ The composed effective mapping is inspectable on demand (not editable text — s
 | `effective_sql` | the composed effective body SQL (repeated on every row) |
 
 ## Constraint Attachment
+
+**The gist:** the rules you declared on the logical table — `not null`, `check`, `unique`, foreign keys — are real, and the lens is what enforces them when you write through it. A plain view can't do this: its `where` filters what you *read* but constrains nothing on write. So the lens carries each declared rule down to the storage write and enforces it there. Each rule is classified at deploy into *how* it is enforced (cheaply per-row, or by a lookup, or at commit), detailed below.
 
 A view predicate is a read-time filter, not a write-time invariant ([view-updateability § Interaction with Constraints](view-updateability.md#interaction-with-constraints)). The lens layer is therefore where the logical spec's constraints become **real constraints on the compiled view**, attached explicitly from the logical declaration rather than inferred from the body.
 
