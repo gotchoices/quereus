@@ -530,7 +530,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key,generator,gencadence}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 

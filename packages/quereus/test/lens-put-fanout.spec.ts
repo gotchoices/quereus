@@ -429,7 +429,7 @@ describe('lens decomposition put: INSERT fan-out (logical-tuple)', () => {
 		}
 	});
 
-	it('omitting the logical-tuple shared key is rejected (no generator)', async () => {
+	it('omitting the logical-tuple shared key is rejected (it threads the supplied value)', async () => {
 		const db = new Database();
 		try {
 			await setup(db);

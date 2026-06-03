@@ -3924,8 +3924,9 @@ describe('Property-Based Tests', () => {
 			// insert covers multi-row minting only on its own path) is never exercised. Insert
 			// several logical rows in ONE statement and assert each threads the SAME surrogate
 			// into every member (anchor Doc_core.sid = member Doc_body.doc_sid per row) and that
-			// the per-row surrogates are pairwise distinct (the `per-row` cadence mints afresh
-			// for each produced row, not once for the whole statement).
+			// the per-row surrogates are pairwise distinct (the anchor key default is
+			// evaluated afresh for each produced row via `mutation_ordinal()`, not once
+			// for the whole statement).
 			it('PutGet (surrogate, multi-row): one insert statement mints a distinct shared key per row, threaded into every member', async () => {
 				await deploySurrogate();
 				let multiInserted = 0;
