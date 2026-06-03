@@ -23,6 +23,7 @@ import type { ColumnMeta, BestAccessPlanRequest, BestAccessPlanResult } from '..
 import { FilterInfo } from '../../../vtab/filter-info.js';
 import type { IndexConstraint, IndexConstraintUsage } from '../../../vtab/index-info.js';
 import type { SqlValue } from '../../../common/types.js';
+import { compareSqlValues } from '../../../util/comparison.js';
 import type { Scope } from '../../scopes/scope.js';
 import { TableReferenceNode } from '../../nodes/reference.js';
 import { FilterNode } from '../../nodes/filter.js';
@@ -221,27 +222,7 @@ function selectPhysicalNode(
 	// Empty result optimization (e.g., IS NULL on NOT NULL column)
 	if (accessPlan.rows === 0 && accessPlan.handledFilters.every(h => h)) {
 		log('Using empty result (impossible predicate detected)');
-		const emptyFilterInfo: FilterInfo = {
-			idxNum: 0,
-			idxStr: 'empty',
-			constraints: [],
-			args: [],
-			indexInfoOutput: {
-				nConstraint: 0,
-				aConstraint: [],
-				nOrderBy: 0,
-				aOrderBy: [],
-				aConstraintUsage: [] as IndexConstraintUsage[],
-				idxNum: 0,
-				idxStr: 'empty',
-				orderByConsumed: false,
-				estimatedCost: 0,
-				estimatedRows: 0n,
-				idxFlags: 0,
-				colUsed: 0n,
-			}
-		};
-		return new EmptyResultNode(tableRef.scope, tableRef, emptyFilterInfo, 0);
+		return createEmptyResultNode(tableRef);
 	}
 
 	// Create a default FilterInfo for the physical nodes
@@ -291,7 +272,7 @@ function selectPhysicalNodeFromPlan(
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
 	providesOrdering: { column: number; desc: boolean }[] | undefined
-): SeqScanNode | IndexScanNode | IndexSeekNode {
+): SeqScanNode | IndexScanNode | IndexSeekNode | EmptyResultNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	const seekCols = accessPlan.seekColumnIndexes!;
 	// Map accessPlan.indexName to physical node indexName ('_primary_' → 'primary')
@@ -339,25 +320,39 @@ function selectPhysicalNodeFromPlan(
 			// Multi-seek: IN on single-column index
 			const colIdx = seekCols[0];
 			const inConstraint = eqBySeekCol.get(colIdx)!;
-			const inValues = inConstraint.value as unknown as SqlValue[];
+			const rawValues = inConstraint.value as unknown as SqlValue[];
 
-			// Use valueExpr nodes when available (mixed-binding IN from OR collapse),
-			// otherwise construct literal nodes from values
-			const seekKeys: ScalarPlanNode[] = Array.isArray(inConstraint.valueExpr)
-				? inConstraint.valueExpr
-				: inValues.map(v => literalFromValue(tableRef.scope, v));
+			let seekKeys: ScalarPlanNode[];
+			if (Array.isArray(inConstraint.valueExpr)) {
+				// Mixed-binding IN (from OR collapse): some values are dynamic, so the
+				// runtime scan-layer dedup/NULL-skip stays authoritative — keep the raw
+				// list and let it perform set-membership at execution time.
+				seekKeys = inConstraint.valueExpr;
+			} else {
+				// Pure-literal IN: collapse duplicate literals and drop NULLs so the
+				// advertised inCount reflects the effective distinct non-null seek count.
+				const effectiveValues = reduceLiteralSeekValues(rawValues);
+				if (effectiveValues.length === 0) {
+					// Every seek key is NULL ⇒ no row can match. Emit an empty result
+					// rather than a zero-key multi-seek (inCount=0 would parse back to no
+					// equalityKeys and degrade to an unbounded full-index walk).
+					log('IN-list is entirely NULL literals on %s — using empty result', physicalIndexName);
+					return createEmptyResultNode(tableRef);
+				}
+				seekKeys = effectiveValues.map(v => literalFromValue(tableRef.scope, v));
+			}
 
-			const inConstraints: { constraint: IndexConstraint; argvIndex: number }[] = inValues.map((_v, i) => ({
+			const inConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekKeys.map((_sk, i) => ({
 				constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
 				argvIndex: i + 1,
 			}));
 			const fi: FilterInfo = {
 				...filterInfo,
 				constraints: inConstraints,
-				idxStr: `idx=${idxStrName}(0);plan=5;inCount=${inValues.length}`,
+				idxStr: `idx=${idxStrName}(0);plan=5;inCount=${seekKeys.length}`,
 			};
 
-			log('Using index multi-seek on %s (IN with %d values)', physicalIndexName, inValues.length);
+			log('Using index multi-seek on %s (IN with %d values)', physicalIndexName, seekKeys.length);
 			return new IndexSeekNode(
 				tableRef.scope,
 				tableRef,
@@ -389,11 +384,58 @@ function selectPhysicalNodeFromPlan(
 				}
 			}
 
-			// Compute cross-product of value indices
+			const seekWidth = seekCols.length;
+
+			// A column is pure-literal iff its constraint carries no value expression
+			// (a `valueExpr` is present only for dynamic/parameter or mixed bindings).
+			// When every component is literal we can reduce the cross-product at plan
+			// time; otherwise the runtime scan-layer dedup/NULL-skip is authoritative.
+			const allLiteral = seekCols.every(colIdx => eqBySeekCol.get(colIdx)!.valueExpr === undefined);
+
+			if (allLiteral) {
+				// Build the cross-product of actual literal tuples, then drop any tuple
+				// with a NULL component and collapse duplicates so inCount reflects the
+				// effective distinct non-null seek count.
+				const valueTuples = cartesianProduct(columnValues.map(cv => cv.values));
+				const effectiveTuples = reduceLiteralSeekTuples(valueTuples);
+				if (effectiveTuples.length === 0) {
+					// Every cross-product tuple is NULL-bearing ⇒ no row can match.
+					log('Composite IN cross-product on %s is entirely NULL-bearing — using empty result', physicalIndexName);
+					return createEmptyResultNode(tableRef);
+				}
+
+				const seekKeys: ScalarPlanNode[] = effectiveTuples.flatMap(tuple =>
+					tuple.map(v => literalFromValue(tableRef.scope, v))
+				);
+				const seekConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekKeys.map((_sk, i) => ({
+					constraint: { iColumn: seekCols[i % seekWidth], op: IndexConstraintOp.EQ, usable: true },
+					argvIndex: i + 1,
+				}));
+				const fi: FilterInfo = {
+					...filterInfo,
+					constraints: seekConstraints,
+					idxStr: `idx=${idxStrName}(0);plan=5;inCount=${effectiveTuples.length};seekWidth=${seekWidth}`,
+				};
+
+				log('Using composite index multi-seek on %s (cross-product of %d distinct non-null seeks, width %d)', physicalIndexName, effectiveTuples.length, seekWidth);
+				return new IndexSeekNode(
+					tableRef.scope,
+					tableRef,
+					fi,
+					physicalIndexName,
+					seekKeys,
+					false,
+					providesOrdering,
+					accessPlan.cost,
+					advertisement,
+				);
+			}
+
+			// Dynamic/mixed composite: keep the raw cross-product over value indices and
+			// let the runtime perform set-membership at execution time.
 			const crossProduct = cartesianProduct(columnValues.map(cv =>
 				cv.values.map((_v, i) => i)
 			));
-			const seekWidth = seekCols.length;
 
 			// Build seekKeys — one ScalarPlanNode per value in flattened cross-product
 			const seekKeys: ScalarPlanNode[] = crossProduct.flatMap(combo =>
@@ -872,4 +914,77 @@ function opToIndexOp(op: RangeOp): IndexConstraintOp {
 function literalFromValue(scope: Scope, value: SqlValue): LiteralNode {
 	const lit: AST.LiteralExpr = { type: 'literal', value };
 	return new LiteralNode(scope, lit);
+}
+
+/**
+ * Build the canonical empty-relation leaf used when a predicate is provably
+ * unsatisfiable (e.g. an IN-list whose literals are all NULL — every seek key
+ * is skipped at runtime). Shared by the impossible-predicate optimization and
+ * the literal-IN reduction below.
+ */
+function createEmptyResultNode(tableRef: TableReferenceNode): EmptyResultNode {
+	const emptyFilterInfo: FilterInfo = {
+		idxNum: 0,
+		idxStr: 'empty',
+		constraints: [],
+		args: [],
+		indexInfoOutput: {
+			nConstraint: 0,
+			aConstraint: [],
+			nOrderBy: 0,
+			aOrderBy: [],
+			aConstraintUsage: [] as IndexConstraintUsage[],
+			idxNum: 0,
+			idxStr: 'empty',
+			orderByConsumed: false,
+			estimatedCost: 0,
+			estimatedRows: 0n,
+			idxFlags: 0,
+			colUsed: 0n,
+		}
+	};
+	return new EmptyResultNode(tableRef.scope, tableRef, emptyFilterInfo, 0);
+}
+
+/**
+ * Reduce a list of *literal* IN seek values to the effective distinct, non-null
+ * set, so the multi-seek's advertised `inCount` matches the number of seeks the
+ * runtime actually performs. Mirrors the runtime set-membership semantics in
+ * `scan-layer.ts`: a NULL seek key contributes no match (skipped), and duplicate
+ * seek keys collapse.
+ *
+ * This is a strict *subset* of the runtime dedup — it only collapses values that
+ * are equal under the default binary comparator, since the column's collation is
+ * unknown at plan time. The runtime remains the authority and may collapse
+ * further (e.g. NOCASE case-variants that hit the same index entry). Literal-only:
+ * dynamic/parameter seek values are never reduced here.
+ */
+function reduceLiteralSeekValues(values: readonly SqlValue[]): SqlValue[] {
+	const result: SqlValue[] = [];
+	for (const v of values) {
+		if (v === null) continue;
+		if (result.some(kept => compareSqlValues(kept, v) === 0)) continue;
+		result.push(v);
+	}
+	return result;
+}
+
+/**
+ * Composite analogue of {@link reduceLiteralSeekValues}: drop any cross-product
+ * tuple with a NULL component (mirrors `scan-layer.ts`'s `seekKeyHasNull` for
+ * row-value seeks — a NULL component makes the comparison NULL ⇒ no match) and
+ * collapse duplicate tuples. Tuples are compared componentwise under the default
+ * binary comparator; literal-only, same subset rationale as the scalar case.
+ */
+function reduceLiteralSeekTuples(tuples: readonly SqlValue[][]): SqlValue[][] {
+	const result: SqlValue[][] = [];
+	for (const tuple of tuples) {
+		if (tuple.some(v => v === null)) continue;
+		const isDup = result.some(kept =>
+			kept.length === tuple.length && kept.every((kv, i) => compareSqlValues(kv, tuple[i]) === 0)
+		);
+		if (isDup) continue;
+		result.push(tuple);
+	}
+	return result;
 }
