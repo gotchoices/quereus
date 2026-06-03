@@ -135,6 +135,33 @@ The eventual mechanism addresses coverage by **stable attribute ID** on the plan
 
 **`hiding (col, ...)`** lists logical columns to omit from the effective body *and* from the registered view's column list, so `select * from X.T` does not surface them and `X.T.<hidden>` resolves to unknown-column. The logical spec still *declares* a hidden column — the prover decides what an attached constraint over a hidden column means. Each name is validated against the logical table's columns at deploy time; a name matching no logical column (a typo) is an error, not a silent no-op.
 
+#### What "covered" means (and what `hiding` is for)
+
+An override projection is a **sparse patch, not an exhaustive column list.** Writing `select id, who` does not say "the view has only these two columns" — it says "`id` and `who` are *covered* by this override; every other logical column is gap-filled." **Omission is not exclusion:** an unmentioned logical column reappears via gap-fill, and the only way to drop one is `hiding`. Coverage is decided **entirely by a projection term's output name**, never by what the term computes:
+
+```sql
+declare logical schema X {
+  table Audit (id int primary key, who text, raw_blob blob, preview text);
+}
+
+declare lens for X over Y {
+  view Audit as
+    select
+      id,                                  -- covers `id`      (identity  → writable)
+      who,                                 -- covers `who`     (identity  → writable)
+      substr(raw_blob, 1, 100) as preview  -- covers `preview` (computed  → read-only)
+    from Y.AuditLog
+    hiding (raw_blob);                     -- drop `raw_blob` from the lens surface
+}
+```
+
+- **The alias is the coverage key — the expression's shape is invisible.** `substr(raw_blob, 1, 100) as preview` covers logical column `preview` exactly as a bare `preview` would; the merger never looks inside the term to decide coverage, however deeply nested it is. (A computed term therefore *must* be aliased — an unaliased `substr(raw_blob, 1, 100)` maps to no logical column and is rejected; see [Body-shape restrictions](#body-shape-restrictions).)
+- **Without `hiding`, `raw_blob` would gap-fill back in.** It is a logical column the projection does not cover, so the default mapper name-matches it to `Y.AuditLog.raw_blob` and re-adds it. `hiding (raw_blob)` is what actually drops it — from the effective body *and* the registered view's column list. (Conversely, `preview` can *only* be authored: gap-fill name-matches or follows a module advertisement, but never synthesizes the `substr(...)` expression — so a computed mapping is always "signal" you write explicitly, never something the mapper generates.)
+- **`hiding` operates on the logical surface, not the basis.** Hiding `raw_blob` removes it as a *logical/view* column (`X.Audit.raw_blob` → unknown-column), but the basis column `Y.AuditLog.raw_blob` stays in scope — which is precisely why the `preview` expression can still read it. "Hide the blob, expose a redaction of it" is the normal idiom, not a conflict.
+- **Writability of a covered column follows scalar-invertibility, composed over the nest.** An all-invertible chain (`(speed + 1) * 2 as adjusted`) stays writable — a write lowers through the composed inverse — while any opaque step (`substr`, `lower`, a hash) makes the column read-only and a write raises `no-inverse` (see [Computed and Generated Columns](#computed-and-generated-columns)).
+
+`quereus_effective_lens('x', 'Audit')` reports the resolved disposition of every logical column — `override` / `default` / `hidden` — so the covered-vs-gap-filled-vs-dropped split is inspectable without guessing.
+
 #### Body-shape restrictions
 
 The merger composes one effective body by replacing **only the top SELECT's projection** with the composed logical-column list (covered ⊕ gap-fill ⊖ hidden). Body shapes that this single-projection rewrite cannot soundly compose are rejected at deploy/parse time rather than silently mis-mapped:
@@ -175,7 +202,7 @@ Enforcement splits by class, with each constraint classified at deploy into an e
 - **Row-local (`not null`, `check`)** — evaluable on the projected row being written, so a non-materialized lens enforces them for free at the write boundary. A logical `check` is rewritten from logical→basis column terms and merged into the basis write's per-row constraint check, so it fires on every insert/update through the lens even when the basis carries no such check. This is the common case; most mappings need nothing extra.
 
 - **Set-level (`unique`, primary key)** — enforced by an existence lookup: "does a row with this key already exist?" Two regimes:
-  - **Row-time** when a basis covering structure (a materialized index) answers the key: the lookup is O(log n), consistent at the moment of write, and conflict-resolution-capable (`insert or replace` / `or ignore`). This is *not* a new lens code path. The prover classifies the key row-time **only when** a matching basis `UNIQUE` plus a non-stale covering materialized view exists; the single-source re-plan reaches that basis UC in basis terms, and the basis UC's [physical enforcement-through-covering-MV path](materialized-views.md#enforcement-through-a-covering-mv-delivered) does the lookup and honors the conflict action — statement-level `OR` first, else the basis UC's own declared action, else `ABORT`.
+  - **Row-time** when a basis covering structure (a materialized index) answers the key: the lookup is O(log n), consistent at the moment of write, and conflict-resolution-capable (`insert or replace` / `or ignore`). This is *not* a new lens code path. The prover classifies the key row-time **only when** a matching basis `UNIQUE` plus a non-stale covering materialized view exists; the single-source re-plan reaches that basis UC in basis terms, and the basis UC's [physical enforcement-through-covering-MV path](materialized-views.md#enforcement-through-a-covering-mv) does the lookup and honors the conflict action — statement-level `OR` first, else the basis UC's own declared action, else `ABORT`.
   - **Commit-time, detection-only** when no covering structure answers the key: the lens routes a deferred `(select count(*) from <logicalView> as _u where _u.lk = NEW.bk …) <= 1` CHECK. The contained scalar subquery auto-defers it to commit, where the logical view reflects the post-mutation basis, so the new row sees count `1` (unique) or `≥ 2` (duplicate ⇒ ABORT). NULL-distinct falls out for free — `_u.lk = NEW.bk` is `NULL`, never counted, when either side is NULL. Because a commit-time scan can only ABORT, `insert or replace` / `or ignore` / upsert against a commit-time key is rejected up front with a clear diagnostic rather than silently ABORTing at commit.
 
   A logical key's own constraint-level conflict action is honored on **neither** set-level path — the row-time path resolves the action from the *basis* UC, and the commit-time scan can only ABORT. So a key declaring `on conflict replace` / `ignore` that its backing structure cannot itself honor is rejected at `apply schema` with `lens.unenforceable-conflict-action`, steering the developer to either declare the matching action on the basis UNIQUE/PK (upgrading to row-time honoring) or drop the conflict action. (`on conflict abort` / `fail` / `rollback`, and no declared action, are always fine — they ABORT.)
@@ -245,7 +272,7 @@ These proof obligations are the lens laws restated in Quereus's own terms. **Put
 
 ### Coverage checklist
 
-`proveLens` runs in the lens compiler's compile-first loop, per logical table. Every diagnostic is **coded** (the `lens.*` codes below, a stable vocabulary) and **sited** (`{ table, constraint?, column? }`). Errors aggregate across all tables and throw atomically (before any catalog mutation, preserving the atomic-deploy contract); warnings attach to the deploy report. The prover derives no new inference — it applies the shipped inference surface (`proveEffectiveKeyUnique` / `keysOf` / `isUnique` / the FD framework) per logical aspect, and degrades to the safe verdict (no spurious error) when a fact cannot be established.
+`proveLens` runs in the lens compiler's compile-first loop, per logical table. Every diagnostic is **coded** (the `lens.*` codes below, a stable vocabulary) and **sited** (`{ table, constraint?, column? }`). Errors aggregate across all tables and throw atomically (before any catalog mutation, preserving the atomic-deploy contract); warnings attach to the deploy report. The prover derives no new inference — it applies the existing inference surface (`proveEffectiveKeyUnique` / `keysOf` / `isUnique` / the FD framework) per logical aspect, and degrades to the safe verdict (no spurious error) when a fact cannot be established.
 
 Each check has a severity: an **error** blocks the compile (the mapping is unsound or incomplete); a **warning** is advisory (the mapping is correct but suboptimal). One nuance: **key reconstructibility is reported as a warning** — a non-reconstructible PK does not block the deploy (reads still work); it makes the table read-only and any *mutation* errors at the lens boundary.
 
@@ -396,7 +423,7 @@ Indexes are a basis-layer concern, expressed as **materialized views**: a materi
 
 Unique enforcement is a key existence lookup against that covering materialized view when present (row-time, conflict-resolution-capable), falling back to a commit-time scan when absent. The unified covering-structure surface this layer consumes — the `CoveringStructure` discriminated union (`memory-index` | `materialized-view`), the eager constraint↔structure linking, and the coverage prover that recognizes a covering `order by` MV — is described in [Materialized Views § Covering structures](materialized-views.md#covering-structures).
 
-The write-through prerequisite is satisfied for the covering-index shape: a materialized view keeps its backing table consistent synchronously with each source row-write, within the transaction (the single row-time materialization model — [Materialized Views § Maintenance](materialized-views.md#maintenance-row-time-per-statement)), so a covering MV is *kept current at write time*, which is what a row-time existence lookup requires. Routing `unique` enforcement through that backing table for conflict resolution is described in [Materialized Views § Enforcement through a covering MV](materialized-views.md#enforcement-through-a-covering-mv-delivered). In the logical-schema world — where the auto-index is retired and an explicit covering MV becomes the *sole* enforcement structure — that path is load-bearing. Where no covering structure answers a constraint, the commit-time scan governs the gap (the `lens.no-answering-structure` advisory).
+The write-through prerequisite is satisfied for the covering-index shape: a materialized view keeps its backing table consistent synchronously with each source row-write, within the transaction (the single row-time materialization model — [Materialized Views § Maintenance](materialized-views.md#maintenance-row-time-per-statement)), so a covering MV is *kept current at write time*, which is what a row-time existence lookup requires. Routing `unique` enforcement through that backing table for conflict resolution is described in [Materialized Views § Enforcement through a covering MV](materialized-views.md#enforcement-through-a-covering-mv). In the logical-schema world — where the auto-index is retired and an explicit covering MV becomes the *sole* enforcement structure — that path is load-bearing. Where no covering structure answers a constraint, the commit-time scan governs the gap (the `lens.no-answering-structure` advisory).
 
 ## Syntax
 
@@ -425,7 +452,8 @@ declare lens for X over Y {
     from Y.CarCore join Y.CarPerf using (id);  -- other Car columns gap-filled
   view Audit as
     select id, who from Y.AuditLog
-    hiding (raw_blob);                          -- omit raw_blob from the lens
+    hiding (raw_blob);                          -- drop raw_blob; omitting it from the
+                                                -- projection alone would gap-fill it back in
   -- tables of X not mentioned here are auto-mapped against Y entirely
 }
 ```
