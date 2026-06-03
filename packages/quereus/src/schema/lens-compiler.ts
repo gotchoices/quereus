@@ -1608,12 +1608,24 @@ function validatePrimaryAdvertisement(
 		}
 	}
 
-	// Shared key: surrogate ⇒ generator present; logical-tuple ⇒ generator absent
-	// AND each member's key columns match the logical PK arity.
+	// Shared key: surrogate ⇒ the anchor's shared-key column declares a DEFAULT (the
+	// engine evaluates it once per row and threads it via the EC — it chooses no ID
+	// policy of its own); logical-tuple ⇒ the supplied logical PK, with each member's
+	// key columns matching the logical PK arity.
 	const sharedKey = storage.sharedKey;
 	if (sharedKey.kind === 'surrogate') {
-		if (!sharedKey.generator) {
-			errors.push(`shared key is 'surrogate' but no generator is declared`);
+		// The surrogate's value must come from the anchor key column's declared
+		// `default` (replacing the retired engine-invented `integer-auto` mint): an
+		// INSERT evaluates it once per row, and the EC threads the captured value to
+		// every member. A single-column anchor key whose column has no default is a
+		// deploy-time error — there is nowhere for the surrogate to come from.
+		const anchorKeys = sharedKey.keyColumnsByRelation.get(storage.anchorRelationId) ?? [];
+		const anchorTable = memberTables.get(storage.anchorRelationId);
+		if (anchorTable && anchorKeys.length === 1) {
+			const keyCol = anchorTable.columns.find(c => c.name.toLowerCase() === anchorKeys[0].toLowerCase());
+			if (keyCol && keyCol.defaultValue === null) {
+				errors.push(`shared key is 'surrogate' but anchor '${storage.anchorRelationId}' key column '${anchorKeys[0]}' declares no DEFAULT; a surrogate's value comes from that column's default (e.g. \`default (coalesce((select max(${anchorKeys[0]}) from ${anchorTable.name}), 0) + mutation_ordinal())\`) — the engine no longer auto-generates one`);
+			}
 		}
 		// A surrogate is not tied to the logical PK arity, but the equi-join pairs
 		// each member's key columns positionally with the anchor's, so they must all
@@ -1631,9 +1643,6 @@ function validatePrimaryAdvertisement(
 		}
 	}
 	if (sharedKey.kind === 'logical-tuple') {
-		if (sharedKey.generator) {
-			errors.push(`shared key is 'logical-tuple' but a generator is declared (a logical-tuple key collapses surrogate generation)`);
-		}
 		const pkArity = logicalTable.primaryKeyDefinition.length;
 		for (const member of storage.members) {
 			const keyCols = sharedKey.keyColumnsByRelation.get(member.relationId);

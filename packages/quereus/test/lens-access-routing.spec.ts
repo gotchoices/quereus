@@ -174,7 +174,6 @@ describe('lens access-shape routing: nd-tree spatial', () => {
 					sharedKey: {
 						kind: 'surrogate',
 						keyColumnsByRelation: new Map([['Spatial_surr', ['sid']]]),
-						generator: { strategy: 'integer-auto', cadence: 'per-row' },
 					},
 				},
 				access: { served: [{ columns: ['coord'], forms: ['contains'] }] },

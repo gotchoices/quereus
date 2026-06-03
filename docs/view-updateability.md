@@ -329,20 +329,35 @@ Bindings have two cadences:
 - **Per-statement** — a captured `now`, a bound parameter. Evaluated once; stable across every row and every base operation the statement emits (transaction-time semantics).
 - **Per-row** — a sequence, a surrogate allocator. Evaluated once *per top-level row produced*, so a multi-row insert mints a distinct value per row. The captured context records the per-row values, preserving replay.
 
-A multi-source `insert` resolves a shared key once per produced logical row **at the envelope, before propagation fans out**, and threads the single captured value into every base insert. The envelope is realized as a **materialized augmented source**: it holds the per-row supplied view columns, drains them once into an array, appends the minted key per row, and stashes the rows in the runtime context; each base op reads them back through an envelope-scan leaf (the recursive-CTE working-table pattern), so every branch observes the identical row — there is no "which branch generates first" question. The built-in generator is `integer-auto`: `seed + ordinal`, where `seed = max(anchor.key)` is evaluated **once** before fan-out (so it observes the pre-mutation state) and the 1-based ordinal makes each row's key distinct; the anchor is the FK-parent (else the left source). The same envelope is the surface the [lens decomposition insert fan-out](lens.md) rides: a `surrogate` shared key mints `integer-auto` here (`per-row` ⇒ `seed + ordinal`; `per-statement` ⇒ `seed + 1` bound once for the statement); a `logical-tuple` key threads the supplied logical PK with no generation; optional / EAV members read the same envelope behind a per-row presence filter. Multi-source `update` / `delete` do not need this — they address existing rows by a subquery over the join, not by minting a shared key. A genuinely non-deterministic per-row generator (a `declared-default` expression, a real allocator) would ride the same envelope unchanged; only the `integer-auto` strategy is currently built (non-integer / `declared-default` surrogates require the key to be directly supplied).
+### Shared keys are ordinary defaults — the engine chooses no ID policy
 
-**Worked example.** A logical `User(name, email)` is decomposed over two base relations that share a surrogate `rid`. The surrogate has nowhere to come from in the logical row, so it is a **generated default** on the anchor; the second relation inherits it through the join-key equivalence class:
+A multi-source `insert` (and an n-way lens decomposition insert) needs a shared key that lives in neither the logical row nor any single base table. **The engine does not invent it.** The basis author declares whatever generator they want as the **declared `default` on the anchor's key column**; the engine evaluates that default **once per produced logical row at the envelope** and threads the single value into every member's key column via the **equivalence class** the synthesized (or authored) join establishes (`on k.rid = c.rid` puts the members' key columns in one EC, and the insert-defaulting EC propagation — § [Projection](#projection) step 4 — carries the captured value to every branch). There is one policy: *source the value from the anchor key column's default, then EC-thread it.* A `surrogate` key (distinct from any logical column) is sourced this way; a `logical-tuple` key (the key IS a supplied logical column) threads the supplied value with no default; and a `not null` key with neither a default nor a supplied value raises the ordinary `no-default` diagnostic.
+
+The envelope is realized as a **materialized augmented source**: it holds the per-row supplied view columns, drains them once into an array, appends the **default-evaluated** key per row, and stashes the rows in the runtime context; each base op reads them back through an envelope-scan leaf (the recursive-CTE working-table pattern), so every branch observes the identical row — there is no "which branch generates first" question. Because the materialization happens **before any base write**, a `max()` subquery inside the default observes the **pre-mutation** state for every row; the per-row ordinal (below) is what distinguishes the rows of a multi-row insert. Multi-source `update` / `delete` do not need the envelope — they address existing rows by a subquery over the join, not by sourcing a shared key.
+
+**The `mutation_ordinal()` context primitive.** `mutation_ordinal()` is a nullary, **deterministic** builtin returning the 1-based ordinal of the row being produced within the current statement. It is the column-`default`-position analogue of `row_number()` (§ [Sequential ID Generation](architecture.md#sequential-id-generation)), reaching where a window function cannot — inside a column default. It is valid only during INSERT-default / mutation-context evaluation and errors elsewhere. Being deterministic, a default that uses only it plus deterministic state passes the schema-determinism gate with no `nondeterministic_schema` opt-out. The envelope sets it per row before evaluating the anchor default; it is equally reachable from an ordinary single-source insert's column default.
+
+Bindings have two cadences (a general mutation-context property, independent of the shared-key mechanism):
+
+- **Per-statement** — a captured `now`, a bound parameter. Evaluated once; stable across every row and every base operation the statement emits (transaction-time semantics).
+- **Per-row** — the anchor-default shared key, a per-row allocator. Evaluated once *per top-level row produced*, so a multi-row insert produces a distinct value per row.
+
+> **Intentional behavior change.** A surrogate decomposition previously worked with **zero configuration** — the engine fabricated integer keys (`seed + ordinal`, `seed = max(anchor.key)`). It no longer does: the basis author **must declare a `default`** on the anchor's surrogate key column (or expose the key as a supplied logical column). This is the point — the engine stops choosing an ID policy it has no business choosing. The **migration recipe** that reconstructs the old monotonic-integer behavior as ordinary SQL is `default (coalesce((select max(<key>) from <anchor>), 0) + mutation_ordinal())`.
+
+**Worked example.** A logical `User(name, email)` is decomposed over two base relations that share a surrogate `rid`. The surrogate has nowhere to come from in the logical row, so the **anchor declares its default**; the second relation inherits the value through the join-key equivalence class:
 
 ```sql
--- basis: two relations sharing a surrogate `rid`; the anchor generates it per row
-create table u_core    (rid int primary key default next_rid(), name text) using mem();
+-- basis: two relations sharing a surrogate `rid`; the anchor declares its allocator
+create table u_core    (rid int primary key
+                          default (coalesce((select max(rid) from u_core), 0) + mutation_ordinal()),
+                        name text) using mem();
 create table u_contact (rid int primary key, email text) using mem();
 
 -- the lens get
 create view User as
   select c.name, k.email
   from u_core c
-  left join u_contact k on k.rid = c.rid;
+  join u_contact k on k.rid = c.rid;
 ```
 
 Now a two-row insert through the lens:
@@ -354,11 +369,11 @@ insert into User (name, email)
 
 Propagation, per top-level row:
 
-1. `next_rid()` is a **per-row** generator, so the envelope resolves it once for each produced row — say `rid = 1001` for Ada, `rid = 1002` for Lin — and records both in the captured context.
-2. The join predicate `k.rid = c.rid` puts `u_core.rid` and `u_contact.rid` in one equivalence class, so the captured `rid` is the value used for *both* base inserts of that row. No second `next_rid()` call fires.
-3. The emitted base operations are therefore `u_core(rid=1001, name='Ada')` + `u_contact(rid=1001, email='ada@x.io')`, then the `1002` pair for Lin.
+1. The envelope evaluates `u_core`'s `default` once per produced row, *before* any base write. `max(rid)` observes the pre-mutation state (0 for an empty table), and `mutation_ordinal()` is `1` for Ada, `2` for Lin — so `rid = 1`, then `2`.
+2. The join predicate `k.rid = c.rid` puts `u_core.rid` and `u_contact.rid` in one equivalence class, so the captured `rid` is the value used for *both* base inserts of that row. The default fires once per row, not once per member.
+3. The emitted base operations are therefore `u_core(rid=1, name='Ada')` + `u_contact(rid=1, email='ada@x.io')`, then the `2` pair for Lin.
 
-Contrast the cadences: had the example also carried `created int default now_ms()`, that **per-statement** binding would resolve *once* and stamp the same value onto both rows, whereas `rid` differs per row. And because `(1001, 1002)` live in the recorded context, replaying the statement re-emits byte-identical base rows — the insert is deterministic-given-context even though `next_rid()` is not deterministic in isolation. Per-column `default_for` tags may reference context bindings; bindings evaluate per their cadence and are reused across every per-base operation that consumes them.
+A non-deterministic allocator (`uuid7()`, a clock read) works identically under `pragma nondeterministic_schema`: the default is evaluated **once per row at the envelope** and the single captured value threads to every member, so the members never disagree on the key — the load-bearing evaluate-once-and-thread guarantee, the same way captured timestamps replay. Had the example also carried `created int default now_ms()` with a per-statement binding, that value would stamp the same on both rows, whereas `rid` differs per row. Per-column `default_for` tags may reference context bindings; bindings evaluate per their cadence and are reused across every per-base operation that consumes them.
 
 ## Diagnostics
 
@@ -496,6 +511,7 @@ No new subsystem is introduced — view updateability is the existing FD / EC / 
 | Two-table inner-join decomposition (`analyzeJoinView`, `decomposeUpdate`/`decomposeDelete`, `buildMultiSourceKeyCapture`, `analyzeMultiSourceInsert`) | `src/planner/mutation/multi-source.ts` |
 | n-way decomposition put fan-out (DELETE/UPDATE/INSERT) | `src/planner/mutation/decomposition.ts` |
 | Shared-surrogate envelope scan leaf | `src/planner/nodes/envelope-scan-node.ts`, `src/runtime/emit/envelope-scan.ts` |
+| `mutation_ordinal()` per-row context primitive (the surrogate-default building block) | `src/func/builtins/mutation.ts` (read off `RuntimeContext.mutationOrdinal`, set by the insert executor + envelope) |
 | `ViewMutationNode` wrapper + builder (`buildViewMutation`, `buildMultiSourceInsert`, `buildMultiSourceReturning`) | `src/planner/nodes/view-mutation-node.ts`, `src/planner/building/view-mutation-builder.ts` |
 | Base-op issue order + envelope materialization + RETURNING surfacing | `src/runtime/emit/view-mutation.ts` |
 | `InvertibilityProfile` type, built-in registry, UDF hook | `src/func/invertibility.ts` |
@@ -531,8 +547,8 @@ The following shapes are rejected at plan time with a structured diagnostic; the
 
 - **Outer-join / optional-member write-through** — the model is specified under [Outer Joins](#outer-joins), but the multi-source substrate accepts only two-table inner equi-joins today, so an outer-join body is rejected wholesale (both sides).
 - **Composite-key or `> 2`-table joins, self-joins, cross-source `set` values** — the key capture requires a single-column PK on each side, and the decomposition is two-table.
-- **Multi-source (join) `insert` RETURNING** — needs the minted shared surrogate threaded into the RETURNING projection; rejected with `returning-through-view`. RETURNING through a decomposition-backed logical table is likewise rejected.
+- **Multi-source (join) `insert` RETURNING** — needs the shared key threaded into the RETURNING projection; rejected with `returning-through-view`. RETURNING through a decomposition-backed logical table is likewise rejected.
 - **Aggregate / window write propagation** — read-only at the column level; reserved for the extension that consumes the [incremental-maintenance](incremental-maintenance.md) framework.
 - **Recursive CTE bodies** — read-only (`recursive-cte`).
-- **Non-integer / `declared-default`-expression surrogate generators** — only the `integer-auto` strategy is built; other generators require the shared key to be directly supplied.
+- **Composite shared keys** — the shared-key envelope threads a single-column key; a multi-column surrogate / shared key is deferred (`unsupported-decomposition-key`). (The surrogate's *value source* is now an ordinary column `default`, so non-integer / non-deterministic allocators — `uuid7()`, a custom UDF — are fully supported; only the multi-column shape remains deferred.)
 - **Mechanical `put`-from-`get` auto-derivation** — the committed north-star, deferred until the operator set stabilizes; each backward method is hand-written today but shaped to fold into it behind the round-trip laws.

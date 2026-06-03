@@ -7,7 +7,6 @@ import type {
 	DecompositionMember,
 	LogicalColumnMapping,
 	SharedKey,
-	SharedKeyGenerator,
 	StorageShape,
 	AttributePivot,
 } from '../vtab/mapping-advertisement.js';
@@ -36,8 +35,8 @@ import { StatusCode } from '../common/types.js';
  *   `quereus.lens.decomp.role.<id>`        = primary-storage | auxiliary-access
  *   `quereus.lens.decomp.anchor.<id>`      = the anchor member relationId
  *   `quereus.lens.decomp.keykind.<id>`     = surrogate | logical-tuple
- *   `quereus.lens.decomp.generator.<id>`   = integer-auto | uuid7 | callback
- *   `quereus.lens.decomp.gencadence.<id>`  = per-row | per-statement
+ *     (a surrogate's value comes from the anchor key column's declared `default`;
+ *      no generator tag — the engine chooses no ID policy)
  * - member-scoped (declared on the member table they describe):
  *   `quereus.lens.decomp.member.<id>`      = this table's member relationId (default: table name)
  *   `quereus.lens.decomp.presence.<id>`    = mandatory | optional (default: mandatory)
@@ -93,8 +92,6 @@ interface DecompAccumulator {
 	role?: string;
 	anchor?: string;
 	keykind?: string;
-	generatorStrategy?: string;
-	cadence?: string;
 	/** Keyed by member relationId. */
 	members: Map<string, MemberAccumulator>;
 }
@@ -129,8 +126,6 @@ function ingestTag(
 		case 'role': setScoped(decomps, rest, 'role', value, key); return;
 		case 'anchor': setScoped(decomps, rest, 'anchor', value, key); return;
 		case 'keykind': setScoped(decomps, rest, 'keykind', value, key); return;
-		case 'generator': setScoped(decomps, rest, 'generatorStrategy', value, key); return;
-		case 'gencadence': setScoped(decomps, rest, 'cadence', value, key); return;
 	}
 
 	// Member-scoped facets. `member`/`presence`/`key` carry `<id>`; `col`/`pivot`
@@ -171,7 +166,7 @@ function ingestTag(
 function setScoped(
 	decomps: Map<string, DecompAccumulator>,
 	id: string,
-	field: 'logicalTable' | 'role' | 'anchor' | 'keykind' | 'generatorStrategy' | 'cadence',
+	field: 'logicalTable' | 'role' | 'anchor' | 'keykind',
 	value: string,
 	key: string,
 ): void {
@@ -243,14 +238,7 @@ function assembleAdvertisement(
 		return a.relationId < b.relationId ? -1 : a.relationId > b.relationId ? 1 : 0;
 	});
 
-	const generator: SharedKeyGenerator | undefined = acc.generatorStrategy
-		? {
-			strategy: acc.generatorStrategy as SharedKeyGenerator['strategy'],
-			cadence: (acc.cadence ?? 'per-row') as SharedKeyGenerator['cadence'],
-		}
-		: undefined;
-
-	const sharedKey: SharedKey = { kind: keykind, keyColumnsByRelation, generator };
+	const sharedKey: SharedKey = { kind: keykind, keyColumnsByRelation };
 	const storage: StorageShape = { anchorRelationId, members, sharedKey };
 
 	// The advertisement id IS the existence anchor's relationId (the IND contract,

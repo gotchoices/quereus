@@ -3,7 +3,7 @@ import type { PlanningContext } from '../planning-context.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
-import { ViewMutationNode, type MutationEnvelope } from '../nodes/view-mutation-node.js';
+import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
 import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
@@ -24,6 +24,7 @@ import { isRelationalNode } from '../nodes/plan-node.js';
 import { parseExpressionString } from '../../parser/index.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
+import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 
 /**
  * Build the view-mutation substrate for a view-/materialized-view-mediated DML.
@@ -377,22 +378,23 @@ function withTags(req: MutationRequest, tags: MutationRequest['tags']): Mutation
  * plus the envelope shape. We build:
  *   - the **envelope source** — the user's VALUES/SELECT, whose columns are the
  *     supplied view columns. The `ViewMutation` emitter materializes it once,
- *     appends the minted shared key (if any) per row, and stashes the rows in
- *     context;
+ *     appends the default-sourced shared key (if any) per row, and stashes the rows
+ *     in context;
  *   - one **base insert per side**, each sourcing from a projection over an
  *     `EnvelopeScanNode` that reads those shared rows back (key first, then the
  *     view columns that side owns). Re-planned through the ordinary base-table
  *     builder, so every constraint / conflict / FK / default rule is reused; and
- *   - the **surrogate seed** (`max(anchor.key)`), evaluated once before fan-out.
+ *   - the **key default** (the anchor key column's declared `default`), evaluated
+ *     once per produced row at the envelope.
  *
  * The sides are already FK-parent-before-FK-child ordered; the emitter drives them
- * in that order. Every side reads the same materialized envelope, so a generated
- * shared key is minted exactly once per produced row and threaded identically.
+ * in that order. Every side reads the same materialized envelope, so the shared key
+ * is evaluated exactly once per produced row and threaded identically.
  */
 function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
 	const plan = analyzeMultiSourceInsert(ctx, view, stmt);
 
-	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.mint);
+	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.keyDefault);
 
 	const baseOps = plan.orderedSides.map(side => {
 		const scan = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
@@ -430,9 +432,9 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 	});
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-	const mint = buildSeedMint(ctx, plan.mint);
+	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault);
 
-	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
+	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, keyDefault });
 }
 
 /**
@@ -446,23 +448,24 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
  * shape. We build the **envelope source** (the user's VALUES/SELECT, columns = the
  * supplied logical columns), one **base insert per op** (each sourcing from a
  * projection — over a presence `FilterNode` for an optional/EAV op — of the shared
- * `EnvelopeScanNode`), and the **surrogate seed** when the shared key is minted.
- * Every member reads the same materialized envelope, so a generated key is minted
- * once per produced row and threaded identically across the fan-out.
+ * `EnvelopeScanNode`), and the **key default** (the anchor key column's declared
+ * `default`) when the shared key is a surrogate. Every member reads the same
+ * materialized envelope, so the default is evaluated once per produced row and the
+ * value threads identically across the fan-out.
  */
 function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
 	const storage = decompositionStorage(ctx, view)!; // guaranteed by the caller's gate
 	const plan = analyzeDecompositionInsert(ctx, view, storage, stmt);
 
-	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.mint);
+	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.keyDefault);
 
 	const baseOps = plan.ops.map(op =>
 		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op));
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-	const mint = buildSeedMint(ctx, plan.mint);
+	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault);
 
-	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, mint });
+	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, keyDefault });
 }
 
 /**
@@ -502,21 +505,26 @@ function buildEnvelopeShape(
 }
 
 /**
- * Build the `MutationEnvelope.mint` from an analysis' surrogate descriptor (or
- * `undefined` when the shared key is supplied, not minted). The seed is
- * `coalesce(max(<anchor.key>), 0)` evaluated once before fan-out — it observes the
- * pre-mutation state. The optional cadence (`per-row` / `per-statement`) is
- * threaded through; the multi-source insert leaves it absent (⇒ `per-row`).
+ * Compile the `MutationEnvelope.keyDefault` from the anchor key column's declared
+ * `default` AST (or `undefined` when the shared key is directly supplied). The
+ * emitter evaluates it once per produced row — with `mutation_ordinal()` resolving
+ * to the row's ordinal and any `max()` subquery observing the pre-mutation state
+ * (no base write has fired yet). Determinism is validated exactly as a base-column
+ * default is on the single-source insert path (skipped under
+ * `nondeterministic_schema`), so a `uuid7()`-style default rides the same
+ * capture-once-and-thread guarantee.
  */
-function buildSeedMint(
+function buildKeyDefault(
 	ctx: PlanningContext,
-	mintSpec: { readonly seedTable: { tableSchema: { schemaName: string; name: string } }; readonly seedColumn: string; readonly cadence?: 'per-row' | 'per-statement' } | undefined,
-): MutationEnvelope['mint'] | undefined {
-	if (!mintSpec) return undefined;
-	const seedExpr = parseExpressionString(
-		`coalesce((select max(${quoteIdent(mintSpec.seedColumn)}) from ${qualifiedTable(mintSpec.seedTable.tableSchema.schemaName, mintSpec.seedTable.tableSchema.name)}), 0)`,
-	);
-	return { seed: buildExpression(ctx, seedExpr) as ScalarPlanNode, cadence: mintSpec.cadence };
+	view: MutableViewLike,
+	keyDefault: AST.Expression | undefined,
+): ScalarPlanNode | undefined {
+	if (!keyDefault) return undefined;
+	const node = buildExpression(ctx, keyDefault) as ScalarPlanNode;
+	if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+		validateDeterministicDefault(node, '<shared key>', view.name);
+	}
+	return node;
 }
 
 /**
@@ -638,10 +646,6 @@ function assertSourceArity(view: MutableViewLike, got: number, expected: number)
 
 function quoteIdent(name: string): string {
 	return `"${name.replace(/"/g, '""')}"`;
-}
-
-function qualifiedTable(schema: string, table: string): string {
-	return `${quoteIdent(schema)}.${quoteIdent(table)}`;
 }
 
 /**

@@ -169,6 +169,17 @@ from (select customer_id, sum(price) as total from cart_items group by customer_
 
 The `WITH CONTEXT` boundary captures `epoch_ms('now')` as a literal, and `row_number() over (order by ...)` assigns a deterministic ordinal over a declared ordering. The entire statement is replayable. For richer formats (ULIDs, UUIDv7), register a deterministic scalar UDF that encodes `(seed, counter)` into the desired format — or use a lateral join to a deterministic TVF when multiple columns are needed per generated row.
 
+**`mutation_ordinal()` — the per-row ordinal in column-`default` position.** `row_number()` is a window function, so it reaches only query (`SELECT`) position. The same per-row ordinal is needed in a **column `default`**, where no window function can reach — most importantly for the [shared-key-via-default](view-updateability.md#mutation-context) surrogate case, where the engine evaluates the anchor key column's `default` once per produced row and threads the value across a multi-table write. `mutation_ordinal()` is a first-class, **deterministic** nullary builtin returning the 1-based ordinal of the row being produced within the current statement; it is valid during INSERT-default / mutation-context evaluation and errors elsewhere. It composes the same ID story into the default position:
+
+```sql
+-- the surrogate-key allocator the engine used to fabricate, now authored as SQL:
+create table orders (id integer primary key
+                       default (coalesce((select max(id) from orders), 0) + mutation_ordinal()),
+                     customer_id integer, total integer);
+```
+
+Being deterministic, it needs no `nondeterministic_schema` opt-out (a `max()` subquery + ordinal is a pure function of pre-mutation state). NB: in a **plain** single-source insert the rows are written incrementally, so a `max()`-based default already sees prior rows of the same statement — compose the ordinal with deterministic state directly there; the shared-key **envelope** instead freezes a pre-mutation snapshot, so `max() + mutation_ordinal()` is the correct monotonic allocator there.
+
 ## Optimizer
 
 Quereus features a sophisticated rule-based query optimizer that transforms logical plans into efficient physical execution plans. The optimizer uses a single plan node hierarchy with logical-to-physical transformation, generic tree rewriting infrastructure, and comprehensive optimization rules including constant folding, intelligent caching, streaming aggregation, bloom (hash) join selection for equi-joins, and correlated subquery decorrelation (EXISTS/IN → semi/anti joins).

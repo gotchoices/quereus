@@ -20,6 +20,7 @@ import { jsonValidFunc, jsonSchemaFunc, jsonTypeFunc, jsonExtractFunc, jsonQuote
 	jsonArrayLengthFunc, jsonPatchFunc,
 	jsonGroupArrayFunc, jsonGroupObjectFunc } from './json.js';
 import { generateSeriesFunc } from './generation.js';
+import { mutationOrdinalFunc } from './mutation.js';
 import { queryPlanFunc, schedulerProgramFunc, stackTraceFunc, executionTraceFunc, rowTraceFunc, explainAssertionFunc, effectiveLensFunc, basisBackfillFunc, lensAdvisoriesFunc } from './explain.js';
 import { schemaFunc, tableInfoFunc, functionInfoFunc, foreignKeyInfoFunc,
 	indexInfoFunc, checkConstraintInfoFunc, uniqueConstraintInfoFunc, assertionInfoFunc,
@@ -141,6 +142,8 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	jsonGroupObjectFunc,
 	// Generation functions
 	generateSeriesFunc,
+	// Mutation-context functions
+	mutationOrdinalFunc,
 	// Explain functions
 	queryPlanFunc,
 	schedulerProgramFunc,

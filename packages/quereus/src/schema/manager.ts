@@ -1152,6 +1152,16 @@ export class SchemaManager {
 		}
 	): void {
 		let offendingType: 'parameter' | 'column' | undefined;
+		// A column reference nested inside a subquery is scoped to that subquery's own
+		// FROM, not the row being inserted, so it is not an illegal sibling-row
+		// reference — only top-level (depth-0) columns are. This is what lets a DEFAULT
+		// author a self-referencing allocator like
+		// `coalesce((select max(rid) from t), 0) + mutation_ordinal()` (the
+		// shared-key-via-default surrogate recipe — docs/view-updateability.md
+		// § Mutation Context). Parameters stay rejected at any depth.
+		let subqueryDepth = 0;
+		const isQueryBoundary = (node: AST.AstNode): boolean =>
+			node.type === 'select' || node.type === 'subquery' || node.type === 'exists';
 		traverseAst(expr, {
 			enterNode: (node: AST.AstNode) => {
 				if (offendingType) return false;
@@ -1159,10 +1169,14 @@ export class SchemaManager {
 					offendingType = 'parameter';
 					return false;
 				}
-				if (options.rejectColumns && node.type === 'column') {
+				if (options.rejectColumns && node.type === 'column' && subqueryDepth === 0) {
 					offendingType = 'column';
 					return false;
 				}
+				if (isQueryBoundary(node)) subqueryDepth += 1;
+			},
+			exitNode: (node: AST.AstNode) => {
+				if (isQueryBoundary(node)) subqueryDepth -= 1;
 			},
 		});
 		if (offendingType === 'parameter') {
@@ -1187,6 +1201,20 @@ export class SchemaManager {
 	 * context variable, and the build attempt is permitted to fail —
 	 * scope resolution is deferred to row-time).
 	 */
+	/** True when a DEFAULT expression embeds a subquery (scalar subquery / EXISTS / SELECT). */
+	private defaultEmbedsSubquery(expr: AST.AstNode): boolean {
+		let found = false;
+		traverseAst(expr, {
+			enterNode: (node: AST.AstNode) => {
+				if (node.type === 'select' || node.type === 'subquery' || node.type === 'exists') {
+					found = true;
+					return false;
+				}
+			},
+		});
+		return found;
+	}
+
 	private validateDefaultDeterminism(
 		columns: ReadonlyArray<ColumnSchema>,
 		tableName: string,
@@ -1221,16 +1249,25 @@ export class SchemaManager {
 			});
 
 			let defaultExpr: ScalarPlanNode | undefined;
+			// A DEFAULT that embeds a subquery may forward-reference the table being
+			// created (a self-referencing allocator — `select max(rid) from t` on `t`):
+			// the table is not yet registered here, so the build legitimately fails.
+			// Determinism is re-checked at INSERT time (both the single-source insert
+			// expansion and the shared-key envelope re-validate the compiled default),
+			// so defer rather than reject. Non-subquery build failures (a typo'd
+			// function / column) stay strict.
+			const defaultEmbedsSubquery = this.defaultEmbedsSubquery(col.defaultValue as AST.AstNode);
 			try {
 				defaultExpr = buildExpression(planningCtx, col.defaultValue as AST.Expression) as ScalarPlanNode;
 			} catch (e) {
-				if (hasMutationContext) {
+				if (hasMutationContext || defaultEmbedsSubquery) {
 					// Column-style identifiers in DEFAULT may resolve to mutation
-					// context variables at INSERT time; the row scope isn't
+					// context variables at INSERT time; a subquery may forward-reference
+					// the table being created. Either way the row/table scope isn't
 					// available here, so a build failure isn't necessarily a bug.
 					// Determinism is re-checked at INSERT time.
-					log('Skipping determinism validation for default on column %s.%s at CREATE TABLE time (deferred to INSERT, mutation context present): %s',
-						tableName, col.name, (e as Error).message);
+					log('Skipping determinism validation for default on column %s.%s at CREATE TABLE time (deferred to INSERT%s): %s',
+						tableName, col.name, hasMutationContext ? ', mutation context present' : ', embeds subquery', (e as Error).message);
 				} else {
 					const message = e instanceof Error ? e.message : String(e);
 					const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;

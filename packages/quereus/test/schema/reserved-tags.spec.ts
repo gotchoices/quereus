@@ -311,8 +311,10 @@ describe('Reserved tag registry', () => {
 		it('seeds all documented keys (rename hints + update + lens advisory + escalation policy + lens decomposition families)', () => {
 			// 2 rename hints (quereus.id / quereus.previous_name) + 5 quereus.update.*
 			// + 2 quereus.lens.{ack,access} + 2 quereus.lens.policy.*
-			// + 11 quereus.lens.decomp.* = 22.
-			expect(RESERVED_TAGS).to.have.length(22);
+			// + 9 quereus.lens.decomp.* = 20. (The decomp generator/gencadence tags were
+			// retired — a surrogate's value now comes from the anchor key column's
+			// declared DEFAULT, not an engine-chosen generator strategy.)
+			expect(RESERVED_TAGS).to.have.length(20);
 			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
 			expect(keys).to.include('quereus.id');
 			expect(keys).to.include('quereus.previous_name');

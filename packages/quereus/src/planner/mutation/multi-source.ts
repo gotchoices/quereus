@@ -6,7 +6,6 @@ import { resolveReferencedColumns } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
-import { PhysicalType } from '../../types/logical-type.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { analyzeBodyLineage } from './backward-body.js';
@@ -63,8 +62,9 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  * Multi-source **`insert`** (Phase 2b) is analysed here (`analyzeMultiSourceInsert`)
  * but *built* by `building/view-mutation-builder.ts` (`buildMultiSourceInsert`),
  * because it needs the plan-level shared-surrogate envelope rather than an AST
- * `BaseOp`: the shared join key is not a view column, so it is minted once per row
- * at the envelope and threaded into both base inserts (§ Mutation Context).
+ * `BaseOp`: the shared join key is not a view column, so it is sourced from the
+ * anchor key column's declared `default` once per row at the envelope and threaded
+ * into both base inserts via the equivalence class (§ Mutation Context).
  *
  * **Deferred, rejected here with a structured diagnostic (later phases):**
  * - outer / cross / set-op / aggregate / window bodies — `unsupported-*`.
@@ -264,17 +264,23 @@ export interface MsInsertSide {
  * The plan-agnostic decomposition of a multi-source inner-join INSERT, consumed
  * by `buildMultiSourceInsert`. The **envelope** is the per-row augmented source:
  * its leading columns are the supplied view columns (`suppliedColumns`, in
- * user-source order), optionally followed by a minted surrogate shared key
- * (`mint`). Each side reads its values back out of that one materialized
- * envelope, so a generated key is minted exactly once per row and threaded
- * across both base inserts (docs/view-updateability.md § Mutation Context).
+ * user-source order), optionally followed by a surrogate shared key sourced from
+ * the anchor key column's declared `default` (`keyDefault`). Each side reads its
+ * values back out of that one materialized envelope, so the default is evaluated
+ * exactly once per row and the value threads across both base inserts via the
+ * equivalence class (docs/view-updateability.md § Mutation Context).
  */
 export interface MsInsertAnalysis {
 	readonly suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[];
 	/** Sides ordered FK-parent before FK-child (the FK-safe insert order). */
 	readonly orderedSides: readonly MsInsertSide[];
-	/** Set when the shared key is not directly supplied — mint `seed + ordinal`. */
-	readonly mint?: { readonly seedTable: TableReferenceNode; readonly seedColumn: string };
+	/**
+	 * The anchor key column's declared `default`, evaluated once per produced row at
+	 * the envelope (with `mutation_ordinal()` in scope) and threaded into every side's
+	 * key column via the equivalence class. Set only when the shared key is **not**
+	 * directly supplied; absent ⇒ a supplied view column threads the key.
+	 */
+	readonly keyDefault?: AST.Expression;
 }
 
 /**
@@ -333,18 +339,20 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	}
 
 	// The shared key is either directly supplied (a supplied view column maps to a
-	// join-key base column) or minted once per row at the envelope.
+	// join-key base column) or sourced from the anchor key column's declared `default`,
+	// evaluated once per row at the envelope and EC-threaded into both sides. The engine
+	// mints nothing of its own — the basis author declares the policy
+	// (docs/view-updateability.md § Mutation Context).
 	const suppliedKeyIndex = supplied.findIndex(s => s.isKey);
-	let mint: MsInsertAnalysis['mint'] | undefined;
+	let keyDefault: AST.Expression | undefined;
 	let keyEnvelopeIndex: number;
 	if (suppliedKeyIndex >= 0) {
 		keyEnvelopeIndex = suppliedKeyIndex;
 	} else {
-		keyEnvelopeIndex = supplied.length; // the minted column is appended last
+		keyEnvelopeIndex = supplied.length; // the default-sourced column is appended last
 		const anchorIndex = anchorSideIndex(sides);
 		const anchorKeyCol = columnByName(sides[anchorIndex].schema, keyColumns[anchorIndex]);
-		requireIntegerSurrogate(view, sides[anchorIndex].schema, anchorKeyCol);
-		mint = { seedTable: sides[anchorIndex].table, seedColumn: keyColumns[anchorIndex] };
+		keyDefault = requireKeyDefault(view, sides[anchorIndex].schema, anchorKeyCol);
 	}
 
 	// Per-side: the shared key (every side) plus the supplied view columns it owns.
@@ -364,7 +372,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	return {
 		suppliedColumns: supplied.map(s => ({ name: s.name, type: s.type })),
 		orderedSides: order.map(i => sideSpecs[i]),
-		mint,
+		keyDefault,
 	};
 }
 
@@ -445,16 +453,24 @@ function assertNoMissingNotNull(view: MutableViewLike, schema: TableSchema, targ
 	}
 }
 
-/** The surrogate generator (`integer-auto`) mints integers — reject a non-integer key. */
-function requireIntegerSurrogate(view: MutableViewLike, schema: TableSchema, keyCol: ColumnSchema): void {
-	if (keyCol.logicalType.physicalType !== PhysicalType.INTEGER) {
+/**
+ * The anchor key column's declared `default` — the surrogate's per-row source —
+ * evaluated once per produced row at the envelope (with `mutation_ordinal()` in
+ * scope) and threaded into both sides via the equivalence class. The engine no
+ * longer invents a surrogate: a key that is neither supplied nor defaulted raises
+ * `no-default` with the migration recipe.
+ */
+function requireKeyDefault(view: MutableViewLike, schema: TableSchema, keyCol: ColumnSchema): AST.Expression {
+	if (keyCol.defaultValue === null) {
 		raiseMutationDiagnostic({
 			reason: 'no-default',
 			column: keyCol.name,
 			table: view.name,
-			message: `cannot insert through view '${view.name}': the shared key '${schema.name}.${keyCol.name}' is not supplied and is not an integer surrogate the engine can auto-generate; supply the key as a view column`,
+			message: `cannot insert through view '${view.name}': the shared key '${schema.name}.${keyCol.name}' is neither supplied nor declares a DEFAULT; declare a default (e.g. \`default (coalesce((select max(${keyCol.name}) from ${schema.name}), 0) + mutation_ordinal())\`) or supply the key through a view column`,
+			suggestion: `declare a DEFAULT on '${schema.name}.${keyCol.name}', or expose the key as a supplied view column`,
 		});
 	}
+	return keyCol.defaultValue;
 }
 
 function columnByName(schema: TableSchema, name: string): ColumnSchema {

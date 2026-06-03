@@ -2783,7 +2783,10 @@ describe('Property-Based Tests', () => {
 				await db.exec('drop view if exists jv');
 				await db.exec('drop table if exists jchild');
 				await db.exec('drop table if exists jparent');
-				await db.exec('create table jparent (pp integer primary key, pv integer null) using memory');
+				// The FK-parent anchor declares a high-water-mark allocator default (the
+				// surrogate's per-row source for the multi-source insert; the engine mints
+				// nothing of its own). An explicit pp in seedJoin overrides it.
+				await db.exec('create table jparent (pp integer primary key default (coalesce((select max(pp) from jparent), 0) + mutation_ordinal()), pv integer null) using memory');
 				await db.exec('create table jchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references jparent(pp)) using memory');
 				await db.exec('create view jv as select c.cc as cc, c.cv as cv, p.pv as pv from jchild c join jparent p on p.pp = c.pr');
 			}
@@ -3575,17 +3578,17 @@ describe('Property-Based Tests', () => {
 				await db.exec('apply schema x');
 			}
 
-			// Surrogate split: Doc_core(sid,doc_key,title) anchor + Doc_body(doc_sid,body),
-			// integer-auto per-row surrogate. Logical PK is the value column `docKey`.
+			// Surrogate split: Doc_core(sid,doc_key,title) anchor + Doc_body(doc_sid,body).
+			// The surrogate's value is sourced from the anchor's declared `default`
+			// (max(sid)+mutation_ordinal()); the engine mints nothing of its own. Logical
+			// PK is the value column `docKey`.
 			async function deploySurrogate(): Promise<void> {
-				await db.exec(`create table Doc_core (sid integer primary key, doc_key text, title text null) using memory with tags (
+				await db.exec(`create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text null) using memory with tags (
 					"quereus.lens.decomp.logical.dD" = 'Doc',
 					"quereus.lens.decomp.role.dD" = 'primary-storage',
 					"quereus.lens.decomp.anchor.dD" = 'Doc_core',
 					"quereus.lens.decomp.presence.dD" = 'mandatory',
 					"quereus.lens.decomp.keykind.dD" = 'surrogate',
-					"quereus.lens.decomp.generator.dD" = 'integer-auto',
-					"quereus.lens.decomp.gencadence.dD" = 'per-row',
 					"quereus.lens.decomp.key.dD" = 'sid',
 					"quereus.lens.decomp.col.dD.docKey" = 'doc_key',
 					"quereus.lens.decomp.col.dD.title" = 'title'
@@ -4096,15 +4099,16 @@ describe('Property-Based Tests', () => {
 				await expectMutationReject('delete from x.E where p = 11', 'unsupported-decomposition-predicate');    // non-anchor predicate
 			});
 
-			it('reject-do-not-widen: non-integer surrogate and composite shared key are deferred', async () => {
-				// non-integer surrogate generator (v1 mints only integer-auto).
+			it('reject-do-not-widen: a surrogate with no anchor default, and a composite shared key, are deferred', async () => {
+				// A surrogate whose anchor key column declares no DEFAULT is rejected at
+				// DEPLOY time — the engine no longer invents a key; the basis author must
+				// declare the policy (a `default` on the anchor key column).
 				await db.exec(`create table S_core (sid integer primary key, dk text, t text null) using memory with tags (
 					"quereus.lens.decomp.logical.dS" = 'S',
 					"quereus.lens.decomp.role.dS" = 'primary-storage',
 					"quereus.lens.decomp.anchor.dS" = 'S_core',
 					"quereus.lens.decomp.presence.dS" = 'mandatory',
 					"quereus.lens.decomp.keykind.dS" = 'surrogate',
-					"quereus.lens.decomp.generator.dS" = 'uuid7',
 					"quereus.lens.decomp.key.dS" = 'sid',
 					"quereus.lens.decomp.col.dS.dk" = 'dk',
 					"quereus.lens.decomp.col.dS.t" = 't'
@@ -4119,8 +4123,10 @@ describe('Property-Based Tests', () => {
 					"quereus.lens.decomp.col.dS.body" = 'body'
 				)`);
 				await db.exec('declare logical schema su { table S { dk text primary key, t text null, body text null } }');
-				await db.exec('apply schema su');
-				await expectMutationReject("insert into su.S (dk, t, body) values ('z1', 't', 'b')", 'no-default');
+				let deployErr: unknown;
+				try { await db.exec('apply schema su'); } catch (e) { deployErr = e; }
+				expect(deployErr, 'expected apply schema to reject a surrogate whose anchor key declares no DEFAULT').to.not.equal(undefined);
+				expect((deployErr as Error).message).to.match(/declares no DEFAULT/i);
 
 				// composite shared key (v1 threads a single-column key only).
 				await db.exec(`create table C_core (k1 integer, k2 integer, a integer null, primary key (k1, k2)) using memory with tags (

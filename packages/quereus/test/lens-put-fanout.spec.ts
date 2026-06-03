@@ -12,15 +12,15 @@
  *   identity column or a computed mapping whose basis lives on the anchor).
  * - UPDATE routed to the mandatory, non-EAV member backing each column.
  * - INSERT one per member (anchor first) off the shared-surrogate envelope
- *   (`view-mutation-shared-surrogate-insert`): a surrogate minted once per row and
- *   threaded (`integer-auto`, per-row / per-statement), or a logical-tuple PK
- *   threaded straight through; optional members gated per-row on a supplied value;
- *   EAV pivots emit one triple per supplied attribute; singleton over the empty key.
+ *   (`view-mutation-shared-surrogate-insert`): a surrogate sourced from the anchor key
+ *   column's declared `default` (evaluated once per row, with `mutation_ordinal()` in
+ *   scope) and threaded via the EC, or a logical-tuple PK threaded straight through;
+ *   optional members gated per-row on a supplied value; EAV pivots emit one triple per
+ *   supplied attribute; singleton over the empty key.
  *
  * Still deferred onto absent substrate (asserted to raise a precise diagnostic): a
- * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution),
- * an optional/EAV/key UPDATE transition (per-row insert-or-delete branching), and
- * non-integer surrogate generators.
+ * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution) and
+ * an optional/EAV/key UPDATE transition (per-row insert-or-delete branching).
  */
 
 import { expect } from 'chai';
@@ -454,10 +454,11 @@ describe('lens decomposition put: INSERT fan-out (logical-tuple)', () => {
 
 /**
  * Surrogate decomposition: anchor Doc_core(sid pk, doc_key, title) + Doc_body
- * (doc_sid pk, body), joined on a surrogate spelled `sid`/`doc_sid`, generated
- * `integer-auto`. The logical key `docKey` is an ordinary value column.
+ * (doc_sid pk, body), joined on a surrogate spelled `sid`/`doc_sid`. The surrogate's
+ * value is sourced from the anchor (Doc_core.sid) declared `default` — the engine
+ * mints nothing of its own. The logical key `docKey` is an ordinary value column.
  */
-function surrogateAd(cadence: 'per-row' | 'per-statement'): MappingAdvertisement {
+function surrogateAd(): MappingAdvertisement {
 	return {
 		id: 'Doc_core',
 		logicalTable: 'Doc',
@@ -471,35 +472,42 @@ function surrogateAd(cadence: 'per-row' | 'per-statement'): MappingAdvertisement
 			sharedKey: {
 				kind: 'surrogate',
 				keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']]),
-				generator: { strategy: 'integer-auto', cadence },
 			},
 		},
 	};
 }
 
-async function setupSurrogate(db: Database, cadence: 'per-row' | 'per-statement'): Promise<void> {
+/**
+ * @param anchorDefault when true, Doc_core.sid declares a high-water-mark allocator
+ *   default (the surrogate's value source); when false, it declares no default (the
+ *   deploy-time rejection case — the engine no longer invents one).
+ */
+async function setupSurrogate(db: Database, anchorDefault = true): Promise<void> {
 	const mod = new AdvertisingModule();
-	mod.ads = [surrogateAd(cadence)];
+	mod.ads = [surrogateAd()];
 	db.registerModule('docmod', mod);
-	await db.exec('create table Doc_core (sid integer primary key, doc_key text, title text) using docmod');
+	const sidDef = anchorDefault
+		? 'sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal())'
+		: 'sid integer primary key';
+	await db.exec(`create table Doc_core (${sidDef}, doc_key text, title text) using docmod`);
 	await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docmod');
 	await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
 	await db.exec('apply schema x');
-	await db.exec("insert into main.Doc_core values (100, 'k1', 'First'), (101, 'k2', 'Second')");
+	await db.exec("insert into main.Doc_core (sid, doc_key, title) values (100, 'k1', 'First'), (101, 'k2', 'Second')");
 	await db.exec("insert into main.Doc_body values (100, 'b1'), (101, 'b2')");
 }
 
 describe('lens decomposition put: INSERT fan-out (surrogate)', () => {
-	it('per-row: mints one surrogate per row, threaded across members, distinct per row', async () => {
+	it('sources the surrogate from the anchor default once per row, threaded across members, distinct per row', async () => {
 		const db = new Database();
 		try {
-			await setupSurrogate(db, 'per-row');
+			await setupSurrogate(db);
 			await db.exec("insert into x.Doc (docKey, title, body) values ('k3', 'T3', 'B3'), ('k4', 'T4', 'B4')");
-			// seed = max(sid) = 101 → minted 102, 103 (per-row, distinct).
+			// anchor default = coalesce(max(sid),0)+mutation_ordinal() → 102, 103 (distinct per row).
 			expect(await rows(db, 'select sid, doc_key from main.Doc_core order by sid')).to.deep.equal([
 				{ sid: 100, doc_key: 'k1' }, { sid: 101, doc_key: 'k2' }, { sid: 102, doc_key: 'k3' }, { sid: 103, doc_key: 'k4' },
 			]);
-			// Each minted sid is identical on the Doc_body side (one generation, threaded).
+			// Each evaluated sid is identical on the Doc_body side (one evaluation, threaded via the EC).
 			expect(await rows(db, 'select doc_sid, body from main.Doc_body order by doc_sid')).to.deep.equal([
 				{ doc_sid: 100, body: 'b1' }, { doc_sid: 101, body: 'b2' }, { doc_sid: 102, body: 'B3' }, { doc_sid: 103, body: 'B4' },
 			]);
@@ -512,10 +520,10 @@ describe('lens decomposition put: INSERT fan-out (surrogate)', () => {
 		}
 	});
 
-	it('per-statement: a single row mints one surrogate (seed + 1), threaded across members', async () => {
+	it('a single-row insert sources one key from the anchor default, threaded across members', async () => {
 		const db = new Database();
 		try {
-			await setupSurrogate(db, 'per-statement');
+			await setupSurrogate(db);
 			await db.exec("insert into x.Doc (docKey, title, body) values ('k3', 'T3', 'B3')");
 			expect(await rows(db, 'select sid, doc_key from main.Doc_core where sid >= 102')).to.deep.equal([{ sid: 102, doc_key: 'k3' }]);
 			expect(await rows(db, 'select doc_sid, body from main.Doc_body where doc_sid >= 102')).to.deep.equal([{ doc_sid: 102, body: 'B3' }]);
@@ -525,14 +533,10 @@ describe('lens decomposition put: INSERT fan-out (surrogate)', () => {
 		}
 	});
 
-	it('per-statement: a multi-row insert binds one key for the whole statement → collides atomically', async () => {
+	it('a surrogate whose anchor key column declares no DEFAULT is rejected at deploy time', async () => {
 		const db = new Database();
 		try {
-			await setupSurrogate(db, 'per-statement');
-			// Both rows mint the same surrogate (seed + 1 = 102); the second member insert
-			// collides on the PK, the statement aborts, and nothing persists.
-			await expectThrows(() => db.exec("insert into x.Doc (docKey, title, body) values ('k3', 'T3', 'B3'), ('k4', 'T4', 'B4')"), /constraint|unique|primary/i);
-			expect(await rows(db, 'select sid from main.Doc_core order by sid')).to.deep.equal([{ sid: 100 }, { sid: 101 }]);
+			await expectThrows(() => setupSurrogate(db, false), /declares no DEFAULT|surrogate/i);
 		} finally {
 			await db.close();
 		}

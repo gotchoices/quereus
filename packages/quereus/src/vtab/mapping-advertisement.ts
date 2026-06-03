@@ -119,15 +119,19 @@ export interface LogicalColumnMapping {
  */
 export interface SharedKey {
 	/**
-	 * Accommodation #3 — first-class, surfaces to the compiler so it knows whether
-	 * to drive surrogate generation:
-	 * - `surrogate`: a substrate-managed key distinct from any logical column.
-	 *   Engages the per-row default evaluator before fan-out
-	 *   (evaluate-once-and-thread, `docs/view-updateability.md` § Mutation Context).
-	 *   Requires {@link generator}.
-	 * - `logical-tuple`: the shared key IS the logical PK, arriving mapped from the
-	 *   logical layer. Generation collapses entirely; {@link generator} must be
-	 *   absent.
+	 * Accommodation #3 — a **coverage fact**, derived from whether the shared-key
+	 * column is also a logical column. It is not a generation policy: the engine no
+	 * longer invents a key. Both kinds source the threaded value from ordinary
+	 * column-default / supplied-value machinery and propagate it across the fan-out
+	 * via the equivalence class (`docs/view-updateability.md` § Mutation Context):
+	 * - `surrogate`: a substrate-managed key distinct from any logical column. The
+	 *   value comes from the **anchor's shared-key column `default`**, evaluated once
+	 *   per produced row at the envelope (evaluate-once-and-thread). A basis author
+	 *   composes a per-row allocator with `mutation_ordinal()`; the engine chooses no
+	 *   ID policy of its own. The anchor's key column must therefore declare a
+	 *   `default` (validated at deploy time).
+	 * - `logical-tuple`: the shared key IS the logical PK, arriving mapped (supplied)
+	 *   from the logical layer; it threads with no generation.
 	 */
 	readonly kind: 'surrogate' | 'logical-tuple';
 	/**
@@ -135,20 +139,6 @@ export interface SharedKey {
 	 * differently across relations). Keyed by member `relationId`.
 	 */
 	readonly keyColumnsByRelation: ReadonlyMap<string, readonly string[]>;
-	readonly generator?: SharedKeyGenerator;
-}
-
-/** How a surrogate shared key is minted at insert. */
-export interface SharedKeyGenerator {
-	readonly strategy: 'integer-auto' | 'uuid7' | 'callback';
-	/**
-	 * `per-row` mints a distinct value per produced logical row; `per-statement`
-	 * binds once for the statement (`docs/view-updateability.md` § Mutation Context
-	 * cadences).
-	 */
-	readonly cadence: 'per-row' | 'per-statement';
-	/** `callback`: the basis-level default expression/function evaluated at insert. */
-	readonly expr?: AST.Expression;
 }
 
 /**

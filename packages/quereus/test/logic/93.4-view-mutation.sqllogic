@@ -1470,16 +1470,21 @@ select id, lbl from ir_t order by id;
 
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
--- envelope). The shared join key is not a view column, so an insert mints a
--- surrogate ONCE per produced logical row at the envelope and threads the one
--- captured value into both base inserts (so the branches agree on identity).
--- Sides are written FK-parent-before-FK-child. See docs/view-updateability.md
--- § Inner Join (Inserts), § Mutation Context (the worked example + cadences).
+-- envelope). The shared join key is not a view column, so its value is sourced
+-- from the ANCHOR key column's declared `default`, evaluated ONCE per produced
+-- logical row at the envelope (with `mutation_ordinal()` resolving to the row's
+-- 1-based ordinal) and threaded into both base inserts via the equivalence class
+-- (so the branches agree on identity). The engine itself mints nothing — the
+-- basis author declares the policy. Sides are written FK-parent-before-FK-child.
+-- See docs/view-updateability.md § Inner Join (Inserts), § Mutation Context.
 -- ===================================
 
 -- --- (a) the worked example: two base tables sharing a surrogate `rid` the view
---         hides; one minted `rid` per row, shared across both base inserts ---
-create table u_core (rid integer primary key, name text);
+--         hides. The anchor (u_core) declares a high-water-mark allocator default
+--         `coalesce(max(rid),0) + mutation_ordinal()` — the user-authored
+--         reconstruction of the retired zero-config `integer-auto` mint. One value
+--         per row, shared across both base inserts ---
+create table u_core (rid integer primary key default (coalesce((select max(rid) from u_core), 0) + mutation_ordinal()), name text);
 create table u_contact (rid integer primary key, email text);
 create view appuser as
     select c.name as name, k.email as email
@@ -1487,7 +1492,7 @@ create view appuser as
 
 insert into appuser (name, email) values ('Ada', 'ada@x.io'), ('Lin', 'lin@x.io');
 
--- Exactly one generation per row (rid 1 then 2), shared across both base inserts
+-- Exactly one evaluation per row (rid 1 then 2), shared across both base inserts
 -- of that row, distinct across rows.
 select rid, name from u_core order by rid;
 → [{"rid":1,"name":"Ada"},{"rid":2,"name":"Lin"}]
@@ -1498,19 +1503,28 @@ select rid, email from u_contact order by rid;
 select name, email from appuser order by name;
 → [{"name":"Ada","email":"ada@x.io"},{"name":"Lin","email":"lin@x.io"}]
 
--- --- (b) the surrogate mints above existing keys; FK-parent inserted before the
---         FK-child, so the child's shared key references a parent that exists ---
-create table msi_parent (pp integer primary key, pv integer null);
+-- A second insert allocates ABOVE the existing keys (max(rid)=2 observed before any
+-- base write), and the ordinal distinguishes rows of the multi-row insert.
+insert into appuser (name, email) values ('Bo', 'bo@x.io'), ('Cy', 'cy@x.io');
+select rid, name from u_core order by rid;
+→ [{"rid":1,"name":"Ada"},{"rid":2,"name":"Lin"},{"rid":3,"name":"Bo"},{"rid":4,"name":"Cy"}]
+select rid, email from u_contact order by rid;
+→ [{"rid":1,"email":"ada@x.io"},{"rid":2,"email":"lin@x.io"},{"rid":3,"email":"bo@x.io"},{"rid":4,"email":"cy@x.io"}]
+
+-- --- (b) the allocator default sits on the FK-PARENT anchor; FK-parent inserted
+--         before the FK-child, so the child's shared key references a parent that
+--         exists. The default allocates above a pre-existing parent row ---
+create table msi_parent (pp integer primary key default (coalesce((select max(pp) from msi_parent), 0) + mutation_ordinal()), pv integer null);
 create table msi_child (cc integer primary key, pr integer null, cv integer null,
     foreign key (pr) references msi_parent(pp));
 create view msi_jv as
     select c.cc as cc, c.cv as cv, p.pv as pv
     from msi_child c join msi_parent p on p.pp = c.pr;
--- a pre-existing parent so the minted surrogate must clear it.
+-- a pre-existing parent (explicit pp overrides the default) so the allocator must clear it.
 insert into msi_parent values (40, 400);
 
 insert into msi_jv (cc, cv, pv) values (1, 11, 111);
--- minted pp = max(40)+1 = 41, shared as msi_child.pr.
+-- allocated pp = max(40)+1 = 41, shared as msi_child.pr.
 select pp, pv from msi_parent order by pp;
 → [{"pp":40,"pv":400},{"pp":41,"pv":111}]
 select cc, pr, cv from msi_child order by cc;
@@ -1518,15 +1532,35 @@ select cc, pr, cv from msi_child order by cc;
 select cc, cv, pv from msi_jv order by cc;
 → [{"cc":1,"cv":11,"pv":111}]
 
--- a multi-row insert mints a DISTINCT surrogate per row, each shared across both sides.
+-- a multi-row insert allocates a DISTINCT key per row, each shared across both sides.
 insert into msi_jv (cc, cv, pv) values (2, 22, 222), (3, 33, 333);
 select pp, pv from msi_parent order by pp;
 → [{"pp":40,"pv":400},{"pp":41,"pv":111},{"pp":42,"pv":222},{"pp":43,"pv":333}]
 select cc, pr, cv from msi_child order by cc;
 → [{"cc":1,"pr":41,"cv":11},{"cc":2,"pr":42,"cv":22},{"cc":3,"pr":43,"cv":33}]
 
--- --- (c) directly-supplied shared key: the view exposes the join key, so no
---         surrogate is minted — the supplied value threads to both sides ---
+-- --- (c) a NON-DETERMINISTIC anchor default (a clock read) under
+--         `nondeterministic_schema`: the value is captured ONCE per row at the
+--         envelope and threaded to BOTH members, so they always agree on the key
+--         (the load-bearing evaluate-once-and-thread guarantee). The ordinal makes
+--         each row distinct even within one clock tick ---
+pragma nondeterministic_schema = true;
+create table ndc_core (rid integer primary key default (epoch_ms('now') * 1000 + mutation_ordinal()), name text);
+create table ndc_contact (rid integer primary key, email text);
+create view ndc_v as select c.name as name, k.email as email
+    from ndc_core c join ndc_contact k on k.rid = c.rid;
+insert into ndc_v (name, email) values ('Ada', 'a@x'), ('Lin', 'l@x');
+-- The surrogate was evaluated once per row and threaded to both members, so every
+-- core row joins exactly one contact row on the identical key, and the two rows are
+-- distinct. (Exact rid values are non-deterministic, so we assert the invariants.)
+select (select count(*) from ndc_core) as core_rows,
+       (select count(*) from ndc_core c join ndc_contact k on k.rid = c.rid) as joined_rows,
+       (select count(distinct rid) from ndc_core) as distinct_rids;
+→ [{"core_rows":2,"joined_rows":2,"distinct_rids":2}]
+pragma nondeterministic_schema = false;
+
+-- --- (d) directly-supplied shared key: the view exposes the join key, so no
+--         default is evaluated — the supplied value threads to both sides ---
 create table dk_a (k integer primary key, av text);
 create table dk_b (k integer primary key, bv text);
 create view dk_v as select m.k as k, m.av as av, s.bv as bv
@@ -1540,14 +1574,24 @@ select k, bv from dk_b order by k;
 select k, av, bv from dk_v order by k;
 → [{"k":7,"av":"a7","bv":"b7"},{"k":9,"av":"a9","bv":"b9"}]
 
--- --- (d) a NOT NULL base column with no default and no supplied value -> rejected ---
-create table nd_main (k integer primary key, must_have text not null);
+-- --- (e) a NOT NULL NON-KEY base column with no default and no supplied value ->
+--         rejected (the anchor key has a default, so this isolates the must_have check) ---
+create table nd_main (k integer primary key default (coalesce((select max(k) from nd_main), 0) + mutation_ordinal()), must_have text not null);
 create table nd_side (k integer primary key, sv text);
 create view nd_v as select m.k as k, s.sv as sv from nd_main m join nd_side s on s.k = m.k;
 insert into nd_v (sv) values ('x');
 -- error: no default
 
--- --- (e) a computed (non-invertible) target column is not insertable ---
+-- --- (f) a surrogate shared key whose anchor column declares NO default and is not
+--         supplied -> rejected (the engine no longer invents one) ---
+create table skn_core (rid integer primary key, name text);
+create table skn_contact (rid integer primary key, email text);
+create view skn_v as select c.name as name, k.email as email
+    from skn_core c join skn_contact k on k.rid = c.rid;
+insert into skn_v (name, email) values ('x', 'y');
+-- error: neither supplied nor declares a default
+
+-- --- (g) a computed (non-invertible) target column is not insertable ---
 create table cm_a (k integer primary key, av integer);
 create table cm_b (k integer primary key, bv integer);
 create view cm_v as select a.k as k, a.av + 1 as bumped, b.bv as bv
@@ -1555,7 +1599,7 @@ create view cm_v as select a.k as k, a.av + 1 as bumped, b.bv as bv
 insert into cm_v (bumped, bv) values (5, 6);
 -- error: non-invertible
 
--- --- (f) the shared key exposed by more than one view column (both sides of the
+-- --- (h) the shared key exposed by more than one view column (both sides of the
 --         equi-join key) is over-specified: an insert cannot honor divergent
 --         supplied values, so it is rejected rather than silently dropping one ---
 create table bk_a (k integer primary key, av text);
@@ -1564,6 +1608,19 @@ create view bk_v as select a.k as ka, b.k as kb, a.av as av, b.bv as bv
     from bk_a a join bk_b b on b.k = a.k;
 insert into bk_v (ka, kb, av, bv) values (5, 7, 'a', 'b');
 -- error: shared join key is exposed by more than one view column
+
+-- --- (i) `mutation_ordinal()` is a general mutation-context primitive — it reaches
+--         an ordinary single-source multi-row INSERT column default (not just the
+--         decomposition envelope) and resolves to each row's 1-based ordinal, where a
+--         window function cannot reach (the column-default position). NB: unlike the
+--         envelope (which freezes a pre-mutation snapshot), a plain insert writes
+--         incrementally, so compose the ordinal with deterministic state directly
+--         rather than `max()` (which would already include prior rows of the same
+--         statement) ---
+create table mo_seq (id integer primary key, ord integer default (mutation_ordinal()), label text);
+insert into mo_seq (id, label) values (10, 'a'), (20, 'b'), (30, 'c');
+select id, ord, label from mo_seq order by id;
+→ [{"id":10,"ord":1,"label":"a"},{"id":20,"ord":2,"label":"b"},{"id":30,"ord":3,"label":"c"}]
 
 -- ===================================
 -- RETURNING through a view (single- and multi-source).

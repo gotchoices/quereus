@@ -7,7 +7,6 @@ import type { ScalarType } from '../../common/datatype.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import type { SqlValue } from '../../common/types.js';
-import { PhysicalType } from '../../types/logical-type.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
@@ -42,10 +41,12 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * - **INSERT** fans out to one insert per member, **anchor first** (FK-order root).
  *   It rides the shared-surrogate mutation envelope `view-mutation-shared-surrogate-insert`
  *   ships (`ViewMutationNode.envelope` + `EnvelopeScanNode`): the user source is
- *   materialized once, a surrogate is minted once per row (`integer-auto`,
- *   per-row/per-statement) and threaded into every member's key column(s), and each
- *   member reads the identical rows back. `logical-tuple` keys thread the supplied
- *   logical PK; no generation. Optional members are inserted only for rows that
+ *   materialized once, the surrogate value is sourced from the **anchor key column's
+ *   declared `default`** — evaluated once per row at the envelope (with
+ *   `mutation_ordinal()` in scope), so the basis author chooses the ID policy and the
+ *   engine invents nothing — and threaded into every member's key column(s) via the
+ *   equivalence class, with each member reading the identical rows back.
+ *   `logical-tuple` keys thread the supplied logical PK; no default. Optional members are inserted only for rows that
  *   supply ≥1 of their columns (a per-row presence filter — the outer-join
  *   semantics the read preserves); EAV pivot members emit one triple insert per
  *   supplied attribute, gated on a non-null value. The plan-agnostic decomposition
@@ -69,8 +70,6 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   deletes it) needs per-row insert-or-delete branching inside an update group,
  *   which the static base-op fan-out cannot yet express; a key write is an identity
  *   change.
- * - **non-integer / declared-default surrogate generators** (`uuid7`, `callback`)
- *   — v1 mints `integer-auto` only (mirrors the multi-source surrogate boundary).
  * - **composite shared keys** — v1 threads a single-column key (mirrors the
  *   single-column-PK boundary in `multi-source.ts`).
  */
@@ -260,21 +259,24 @@ export interface DecompInsertOp {
  * The plan-agnostic decomposition of a decomposition INSERT, consumed by
  * `buildDecompositionInsert` (`building/view-mutation-builder.ts`). The **envelope**
  * leading columns are the supplied logical columns (in user-source order),
- * optionally followed by a minted surrogate shared key (`mint`). Each member op
- * reads its values back out of that one materialized envelope, so a generated key
- * is minted once per produced row and threaded across every member insert
- * (docs/view-updateability.md § Mutation Context, docs/lens.md § The Default Mapper).
+ * optionally followed by a surrogate shared key sourced from the anchor key
+ * column's declared `default` (`keyDefault`). Each member op reads its values back
+ * out of that one materialized envelope, so the default is evaluated once per
+ * produced row and the value threads across every member insert via the
+ * equivalence class (docs/view-updateability.md § Mutation Context, docs/lens.md § The Default Mapper).
  */
 export interface DecompInsertAnalysis {
 	readonly suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[];
 	/** Member base inserts, anchor first (then advertisement order). */
 	readonly ops: readonly DecompInsertOp[];
-	/** Set when the shared key is a surrogate minted at the envelope (`integer-auto`). */
-	readonly mint?: {
-		readonly seedTable: TableReferenceNode;
-		readonly seedColumn: string;
-		readonly cadence: 'per-row' | 'per-statement';
-	};
+	/**
+	 * The anchor key column's declared `default` — the surrogate's per-row source.
+	 * Set only for a surrogate shared key (the engine evaluates it once per produced
+	 * row at the envelope, with `mutation_ordinal()` in scope, and threads the value
+	 * into every member's key column via the equivalence class). Absent for a
+	 * logical-tuple (supplied) key.
+	 */
+	readonly keyDefault?: AST.Expression;
 }
 
 /** One supplied logical column routed to its backing member. */
@@ -330,11 +332,12 @@ export function analyzeDecompositionInsert(
 	const routed = suppliedNames.map((raw, idx): RoutedInsertColumn =>
 		routeInsertColumn(view, shape, memberRefs, declaredNames, raw, idx));
 
-	// Shared key: a surrogate is minted at the envelope; a logical-tuple threads the
-	// supplied logical PK. `keyEnvelopeIndex` is the envelope column every member's
-	// key column reads (the minted column for a surrogate, the supplied PK column for
-	// a logical-tuple, or undefined for the singleton empty key).
-	const { keyEnvelopeIndex, mint } = resolveInsertSharedKey(view, shape, memberRefs, routed);
+	// Shared key: a surrogate's value comes from the anchor key column's declared
+	// `default`, evaluated once per row at the envelope; a logical-tuple threads the
+	// supplied logical PK. `keyEnvelopeIndex` is the envelope column every member's key
+	// column reads (the default-sourced column for a surrogate, the supplied PK column
+	// for a logical-tuple, or undefined for the singleton empty key).
+	const { keyEnvelopeIndex, keyDefault } = resolveInsertSharedKey(view, shape, memberRefs, routed);
 
 	// Member ops, anchor first (FK-order root: members may FK-reference the anchor).
 	const ops: DecompInsertOp[] = [];
@@ -347,7 +350,7 @@ export function analyzeDecompositionInsert(
 	return {
 		suppliedColumns: routed.map(r => ({ name: r.name, type: r.type })),
 		ops,
-		mint,
+		keyDefault,
 	};
 }
 
@@ -396,45 +399,40 @@ function routeInsertColumn(
 	}
 }
 
-/** Resolve the shared key envelope index + optional surrogate mint for an insert. */
+/** Resolve the shared key envelope index + optional anchor-default source for an insert. */
 function resolveInsertSharedKey(
 	view: MutableViewLike,
 	shape: DecompShape,
 	memberRefs: ReadonlyMap<string, TableReferenceNode>,
 	routed: readonly RoutedInsertColumn[],
-): { keyEnvelopeIndex: number | undefined; mint: DecompInsertAnalysis['mint'] } {
+): { keyEnvelopeIndex: number | undefined; keyDefault: DecompInsertAnalysis['keyDefault'] } {
 	const sharedKey = shape.storage.sharedKey;
 	const anchor = shape.anchor;
 
 	if (sharedKey.kind === 'surrogate') {
-		const generator = sharedKey.generator; // resolver guarantees presence
-		if (!generator || generator.strategy !== 'integer-auto') {
-			raiseMutationDiagnostic({
-				reason: 'no-default',
-				table: view.name,
-				message: `cannot insert into logical table '${view.name}': the decomposition shares a '${generator?.strategy ?? 'missing'}' surrogate generator; v1 mints only an 'integer-auto' surrogate (non-integer / declared-default generators are deferred — supply the key as a logical column instead)`,
-			});
-		}
 		const anchorKeys = memberKeyColumns(view, shape, anchor);
 		if (anchorKeys.length !== 1) {
 			raiseMutationDiagnostic({
 				reason: 'unsupported-decomposition-key',
 				table: view.name,
-				message: `cannot insert into logical table '${view.name}': a surrogate decomposition needs a single-column key on the anchor '${anchor.relationId}' (v1 mints a single-column surrogate)`,
+				message: `cannot insert into logical table '${view.name}': a surrogate decomposition needs a single-column key on the anchor '${anchor.relationId}' (v1 threads a single-column surrogate)`,
 			});
 		}
 		const anchorRef = memberRefs.get(anchor.relationId)!;
-		requireIntegerSurrogate(view, anchorRef.tableSchema, columnByName(view, anchorRef.tableSchema, anchorKeys[0]));
+		// The surrogate's value comes from the anchor key column's declared `default`
+		// (the engine no longer auto-generates one): evaluated once per row at the
+		// envelope and EC-threaded into every member's key column.
+		const keyDefault = requireKeyDefault(view, anchorRef.tableSchema, columnByName(view, anchorRef.tableSchema, anchorKeys[0]));
 		return {
-			keyEnvelopeIndex: routed.length, // the minted column is appended last
-			mint: { seedTable: anchorRef, seedColumn: anchorKeys[0], cadence: generator.cadence },
+			keyEnvelopeIndex: routed.length, // the default-sourced column is appended last
+			keyDefault,
 		};
 	}
 
 	// logical-tuple: the supplied logical PK threads to every member's key column.
 	const anchorKeys = memberKeyColumns(view, shape, anchor);
 	if (anchorKeys.length === 0) {
-		return { keyEnvelopeIndex: undefined, mint: undefined }; // singleton — no key to thread
+		return { keyEnvelopeIndex: undefined, keyDefault: undefined }; // singleton — no key to thread
 	}
 	const anchorKeyCol = anchorKeys[0].toLowerCase();
 	const keyRouted = routed.find(r => r.columnar
@@ -444,10 +442,30 @@ function resolveInsertSharedKey(
 		raiseMutationDiagnostic({
 			reason: 'no-default',
 			table: view.name,
-			message: `cannot insert into logical table '${view.name}': the logical-tuple shared key (anchor '${anchor.relationId}' column '${anchorKeys[0]}') is not supplied through the logical table; a logical-tuple key has no generator, so it must be provided`,
+			message: `cannot insert into logical table '${view.name}': the logical-tuple shared key (anchor '${anchor.relationId}' column '${anchorKeys[0]}') is not supplied through the logical table; a logical-tuple key threads the supplied value, so it must be provided`,
 		});
 	}
-	return { keyEnvelopeIndex: keyRouted.envelopeIndex, mint: undefined };
+	return { keyEnvelopeIndex: keyRouted.envelopeIndex, keyDefault: undefined };
+}
+
+/**
+ * The anchor key column's declared `default` — the surrogate's per-row source —
+ * evaluated once per produced row at the envelope (with `mutation_ordinal()` in
+ * scope) and EC-threaded into every member's key column. The engine no longer
+ * invents a surrogate: a surrogate key whose anchor column declares no default
+ * raises `no-default` with the migration recipe.
+ */
+function requireKeyDefault(view: MutableViewLike, schema: TableSchema, keyCol: ColumnSchema): AST.Expression {
+	if (keyCol.defaultValue === null) {
+		raiseMutationDiagnostic({
+			reason: 'no-default',
+			column: keyCol.name,
+			table: view.name,
+			message: `cannot insert into logical table '${view.name}': the surrogate shared key '${schema.name}.${keyCol.name}' declares no DEFAULT; a surrogate's value comes from the anchor key column's default (e.g. \`default (coalesce((select max(${keyCol.name}) from ${schema.name}), 0) + mutation_ordinal())\`) — the engine no longer auto-generates one`,
+			suggestion: `declare a DEFAULT on '${schema.name}.${keyCol.name}', or expose the key as a supplied logical column`,
+		});
+	}
+	return keyCol.defaultValue;
 }
 
 /** Emit the base insert op(s) for one member (one columnar op, or one triple per supplied EAV attribute). */
@@ -540,18 +558,6 @@ function assertNoMissingNotNull(view: MutableViewLike, schema: TableSchema, colu
 			column: col.name,
 			table: view.name,
 			message: `cannot insert into logical table '${view.name}': basis relation '${schema.name}' column '${col.name}' is NOT NULL with no default and no value reaches it through the decomposition`,
-		});
-	}
-}
-
-/** The surrogate generator (`integer-auto`) mints integers — reject a non-integer key. */
-function requireIntegerSurrogate(view: MutableViewLike, schema: TableSchema, keyCol: ColumnSchema): void {
-	if (keyCol.logicalType.physicalType !== PhysicalType.INTEGER) {
-		raiseMutationDiagnostic({
-			reason: 'no-default',
-			column: keyCol.name,
-			table: view.name,
-			message: `cannot insert into logical table '${view.name}': the surrogate shared key '${schema.name}.${keyCol.name}' is not an integer the engine can auto-generate (non-integer surrogates are deferred)`,
 		});
 	}
 }

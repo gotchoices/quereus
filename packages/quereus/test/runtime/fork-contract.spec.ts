@@ -40,6 +40,9 @@ const EXPECTED_FORK_POLICY = {
 	tracer: 'shared-sink',
 	activeConnection: 'shared-cooperative',
 	enableMetrics: 'shared-frozen',
+	// Per-row INSERT/envelope ordinal: set+restored synchronously by the sequential
+	// insert path, never mutated inside a parallel fork — each child snapshots it.
+	mutationOrdinal: 'shared-frozen',
 	contextTracker: 'shared-sink',
 	planStack: 'shared-sink',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
@@ -117,6 +120,8 @@ function makeRuntimeContext(): RuntimeContext {
 		context: createStrictRowContextMap(),
 		tableContexts: wrapTableContextsStrict(new Map()),
 		enableMetrics: false,
+		// Non-undefined sentinel so the 'shared-frozen' aliasing assertion is meaningful.
+		mutationOrdinal: 0,
 	};
 }
 

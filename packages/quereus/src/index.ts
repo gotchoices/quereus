@@ -197,7 +197,6 @@ export type {
 	DecompositionMember,
 	LogicalColumnMapping,
 	SharedKey,
-	SharedKeyGenerator,
 	AccessForm,
 	AccessShape,
 	AttributePivot,

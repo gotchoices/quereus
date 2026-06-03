@@ -226,29 +226,14 @@ describe('lens advertisement: validation errors (atomic, before catalog mutation
 		}
 	});
 
-	it('surrogate shared key with no generator', async () => {
+	it('surrogate shared key whose anchor key column declares no DEFAULT', async () => {
+		// The basis T_core.id declares no DEFAULT, so a surrogate decomposition has
+		// nowhere to source its per-row key — rejected at deploy (the engine no longer
+		// invents one).
 		const ad = columnarSplit();
 		await expectBadAdvertisement(
 			{ ...ad, storage: { ...ad.storage!, sharedKey: { kind: 'surrogate', keyColumnsByRelation: ad.storage!.sharedKey.keyColumnsByRelation } } },
-			/surrogate.*no generator/i,
-		);
-	});
-
-	it('logical-tuple shared key carrying a generator', async () => {
-		const ad = columnarSplit();
-		await expectBadAdvertisement(
-			{
-				...ad,
-				storage: {
-					...ad.storage!,
-					sharedKey: {
-						kind: 'logical-tuple',
-						keyColumnsByRelation: ad.storage!.sharedKey.keyColumnsByRelation,
-						generator: { strategy: 'integer-auto', cadence: 'per-row' },
-					},
-				},
-			},
-			/logical-tuple.*generator/i,
+			/declares no DEFAULT/i,
 		);
 	});
 
@@ -264,7 +249,6 @@ describe('lens advertisement: validation errors (atomic, before catalog mutation
 						// Anchor T_core has 1 key column; T_b declares 2 — the positional
 						// equi-join would pair by Math.min and silently under-join.
 						keyColumnsByRelation: keyMap(['T_core', ['id']], ['T_b', ['id', 'b']], ['T_c', ['id']]),
-						generator: { strategy: 'integer-auto', cadence: 'per-row' },
 					},
 				},
 			},
@@ -662,14 +646,14 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 					sharedKey: {
 						kind: 'surrogate',
 						keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']]),
-						generator: { strategy: 'integer-auto', cadence: 'per-row' },
 					},
 				},
 			}];
 			db.registerModule('admod', mod);
 			// The surrogate is spelled differently per relation (sid vs doc_sid); the
 			// logical key (docKey) is carried as an ordinary value column on Doc_core.
-			await db.exec('create table Doc_core (sid integer primary key, doc_key text, title text) using admod');
+			// The anchor (Doc_core.sid) declares the surrogate's per-row source default.
+			await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text) using admod');
 			await db.exec('create table Doc_body (doc_sid integer primary key, body text) using admod');
 			await db.exec("insert into Doc_core values (100, 'k1', 'First'), (101, 'k2', 'Second')");
 			await db.exec("insert into Doc_body values (100, 'body one'), (101, 'body two')");
@@ -993,12 +977,11 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 					sharedKey: {
 						kind: 'surrogate',
 						keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']]),
-						generator: { strategy: 'integer-auto', cadence: 'per-row' },
 					},
 				},
 			}];
 			db.registerModule('admod', mod);
-			await db.exec('create table Doc_core (sid integer primary key, doc_key text, title text) using admod');
+			await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text) using admod');
 			await db.exec('create table Doc_body (doc_sid integer primary key, body text) using admod');
 			await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
 			await db.exec('apply schema x');
@@ -1076,13 +1059,12 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 					sharedKey: {
 						kind: 'surrogate',
 						keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['body_sid']]),
-						generator: { strategy: 'integer-auto', cadence: 'per-row' },
 					},
 				},
 			}];
 			db.registerModule('admod', mod);
 			// Anchor surrogate `sid` at ordinal 2 (not 0); member surrogate `body_sid` at ordinal 0.
-			await db.exec('create table Doc_core (doc_key text, title text, sid integer primary key) using admod');
+			await db.exec('create table Doc_core (doc_key text, title text, sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal())) using admod');
 			await db.exec('create table Doc_body (body_sid integer primary key, body text) using admod');
 			await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text } }');
 			await db.exec('apply schema x');

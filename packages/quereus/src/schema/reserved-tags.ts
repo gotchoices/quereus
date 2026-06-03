@@ -68,10 +68,6 @@ export const DECOMP_ROLE_VALUES = ['primary-storage', 'auxiliary-access'] as con
 export const DECOMP_PRESENCE_VALUES = ['mandatory', 'optional'] as const;
 /** Closed value set for `quereus.lens.decomp.keykind.<id>`. */
 export const DECOMP_KEYKIND_VALUES = ['surrogate', 'logical-tuple'] as const;
-/** Closed value set for `quereus.lens.decomp.generator.<id>` (a surrogate generator strategy). */
-export const DECOMP_GENERATOR_VALUES = ['integer-auto', 'uuid7', 'callback'] as const;
-/** Closed value set for `quereus.lens.decomp.gencadence.<id>`. */
-export const DECOMP_CADENCE_VALUES = ['per-row', 'per-statement'] as const;
 
 /**
  * The shape a reserved tag's value must satisfy. Validation here is purely
@@ -268,25 +264,13 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		key: { template: 'quereus.lens.decomp.keykind.<id>' },
 		sites: siteSet('physical-table'),
 		valueSchema: { enum: DECOMP_KEYKIND_VALUES },
-		description: 'Shared-key kind of decomposition <id>: surrogate (requires a generator) or logical-tuple.',
+		description: 'Shared-key kind of decomposition <id>: surrogate (its value comes from the anchor key column\'s declared DEFAULT) or logical-tuple (the supplied logical PK).',
 	},
 	{
 		key: { template: 'quereus.lens.decomp.key.<id>' },
 		sites: siteSet('physical-table'),
 		valueSchema: 'csv-of-identifiers',
 		description: 'This member\'s shared-key column(s) within decomposition <id> (the equi-join columns).',
-	},
-	{
-		key: { template: 'quereus.lens.decomp.generator.<id>' },
-		sites: siteSet('physical-table'),
-		valueSchema: { enum: DECOMP_GENERATOR_VALUES },
-		description: 'Surrogate generator strategy for decomposition <id> (required when keykind is surrogate).',
-	},
-	{
-		key: { template: 'quereus.lens.decomp.gencadence.<id>' },
-		sites: siteSet('physical-table'),
-		valueSchema: { enum: DECOMP_CADENCE_VALUES },
-		description: 'Surrogate generator cadence for decomposition <id>: per-row or per-statement.',
 	},
 	{
 		// Remainder captured whole as `<id>.<logicalColumn>`; the builder sub-parses it.

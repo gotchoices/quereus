@@ -45,28 +45,25 @@ export interface IdentityCapture {
  * reads it back through an `EnvelopeScanNode` carrying the same {@link descriptor},
  * so the fan-out shares one set of rows.
  *
- * When `mint` is present the emitter appends a generated shared key as the last
- * envelope column. `seed` is evaluated exactly once (pre-fan-out — it observes the
- * pre-mutation state). The minted value depends on the {@link mint.cadence}:
- * `per-row` (default) makes each row distinct (`seed + 1-based ordinal`);
- * `per-statement` binds once for the whole statement (`seed + 1` for every row —
- * `docs/view-updateability.md` § Mutation Context cadences). The single captured
- * value is threaded into every base insert of that row, so the branches cannot
- * diverge.
+ * When `keyDefault` is present the emitter appends a shared key as the last envelope
+ * column. It is the anchor key column's declared `default`, evaluated **once per
+ * produced row** at the envelope (with `mutation_ordinal()` resolving to the row's
+ * 1-based ordinal, and any `max()` subquery observing pre-mutation state since no base
+ * write has fired yet). The single evaluated value is threaded into every base insert
+ * of that row via the equivalence class, so the branches cannot diverge. The engine
+ * itself mints nothing — the basis author declares the policy in the column default
+ * (`docs/view-updateability.md` § Mutation Context). Absent ⇒ the shared key is
+ * directly supplied (no appended column).
  */
 export interface MutationEnvelope {
 	readonly source: RelationalPlanNode;
 	readonly descriptor: TableDescriptor;
-	readonly mint?: {
-		/** Surrogate base, evaluated once before fan-out. */
-		readonly seed: ScalarPlanNode;
-		/**
-		 * `per-row` (default) ⇒ minted value = `seed + 1-based ordinal` (distinct per
-		 * row); `per-statement` ⇒ `seed + 1` bound once for the statement (stable
-		 * across rows). Absent ⇒ `per-row` (the multi-source insert's only cadence).
-		 */
-		readonly cadence?: 'per-row' | 'per-statement';
-	};
+	/**
+	 * The anchor key column's compiled `default`, evaluated once per produced row at
+	 * the envelope to fill the appended `__shared_key` column. Absent ⇒ the shared
+	 * key is directly supplied.
+	 */
+	readonly keyDefault?: ScalarPlanNode;
 }
 
 /**
@@ -188,11 +185,11 @@ export class ViewMutationNode extends PlanNode {
 		return this.resultRelation()?.getAttributes() ?? [];
 	}
 
-	/** Extra (non-base-op) plan children: the envelope source + optional surrogate seed. */
+	/** Extra (non-base-op) plan children: the envelope source + optional key-default expr. */
 	private envelopeChildren(): PlanNode[] {
 		if (!this.envelope) return [];
-		return this.envelope.mint
-			? [this.envelope.source, this.envelope.mint.seed]
+		return this.envelope.keyDefault
+			? [this.envelope.source, this.envelope.keyDefault]
 			: [this.envelope.source];
 	}
 
@@ -246,11 +243,11 @@ export class ViewMutationNode extends PlanNode {
 		if (this.envelope) {
 			const newSource = newChildren[cursor] as RelationalPlanNode;
 			cursor += 1;
-			const newSeed = this.envelope.mint ? newChildren[cursor] as ScalarPlanNode : undefined;
+			const newKeyDefault = this.envelope.keyDefault ? newChildren[cursor] as ScalarPlanNode : undefined;
 			newEnvelope = {
 				source: newSource,
 				descriptor: this.envelope.descriptor,
-				mint: this.envelope.mint ? { seed: newSeed!, cadence: this.envelope.mint.cadence } : undefined,
+				keyDefault: newKeyDefault,
 			};
 		}
 
@@ -259,7 +256,7 @@ export class ViewMutationNode extends PlanNode {
 			&& newReturning === this.returning
 			&& (!this.identityCapture || newCapture!.source === this.identityCapture.source)
 			&& (!this.envelope || (newEnvelope!.source === this.envelope.source
-				&& newEnvelope!.mint?.seed === this.envelope.mint?.seed));
+				&& newEnvelope!.keyDefault === this.envelope.keyDefault));
 		if (unchanged) {
 			return this;
 		}
@@ -279,7 +276,7 @@ export class ViewMutationNode extends PlanNode {
 	}
 
 	override toString(): string {
-		const env = this.envelope ? ` +envelope${this.envelope.mint ? '(mint)' : ''}` : '';
+		const env = this.envelope ? ` +envelope${this.envelope.keyDefault ? '(default)' : ''}` : '';
 		const cap = this.identityCapture ? ' +capture' : '';
 		const ret = this.resultRelation() ? ` returning${this.returning ? `(${this.returningTiming})` : ''}` : '';
 		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env}${cap}${ret})`;
@@ -288,7 +285,7 @@ export class ViewMutationNode extends PlanNode {
 	override getLogicalAttributes(): Record<string, unknown> {
 		return {
 			baseOps: this.baseOps.length,
-			envelope: this.envelope ? (this.envelope.mint ? 'mint' : 'shared') : undefined,
+			envelope: this.envelope ? (this.envelope.keyDefault ? 'default' : 'shared') : undefined,
 			identityCapture: this.identityCapture ? 'identity' : undefined,
 			returning: this.resultRelation() ? (this.returning ? `requery(${this.returningTiming})` : 'base-op') : undefined,
 		};

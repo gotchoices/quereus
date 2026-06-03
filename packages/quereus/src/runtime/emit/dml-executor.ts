@@ -432,11 +432,43 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const backingConnCache: BackingConnectionCache = new Map();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
-		yield* runWithStatementSavepoints(ctx, vtab, rows, isFailMode, (flatRow) =>
+		// Stamp the per-row mutation ordinal so a column `default` referencing
+		// `mutation_ordinal()` (a per-row surrogate allocator) resolves to the 1-based
+		// position of the row being produced. The defaults are evaluated upstream as
+		// each row is *pulled*, so the ordinal is set BEFORE pulling — see
+		// `stampMutationOrdinal`.
+		yield* runWithStatementSavepoints(ctx, vtab, stampMutationOrdinal(ctx, rows), isFailMode, (flatRow) =>
 			processInsertRow(
 				ctx, vtab, needsAutoEvents, flatRow, contextRow, runtimeUpsertClauses, upsertEvaluators, backingConnCache,
 			),
 		);
+	}
+
+	/**
+	 * Wrap the INSERT source so `rctx.mutationOrdinal` holds the 1-based ordinal of the
+	 * row about to be produced. The column-default projection runs upstream when each
+	 * row is *pulled*, so the ordinal is set immediately before `it.next()` — that pull
+	 * drives the default evaluation for exactly that row, and `mutation_ordinal()` reads
+	 * the just-set value. Saved/restored so a nested mutation (an FK cascade, a
+	 * row-time backing write) does not see a stale ordinal, and cleared in `finally` so
+	 * it never leaks past the statement.
+	 */
+	async function* stampMutationOrdinal(rctx: RuntimeContext, rows: AsyncIterable<Row>): AsyncIterable<Row> {
+		const saved = rctx.mutationOrdinal;
+		const it = rows[Symbol.asyncIterator]();
+		let ordinal = 0;
+		try {
+			while (true) {
+				rctx.mutationOrdinal = ordinal + 1;
+				const next = await it.next();
+				if (next.done) break;
+				ordinal += 1;
+				yield next.value;
+			}
+		} finally {
+			rctx.mutationOrdinal = saved;
+			if (it.return) await it.return();
+		}
 	}
 
 	/**

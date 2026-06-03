@@ -29,9 +29,11 @@ type Callback = (ctx: RuntimeContext) => OutputValue;
  * present, before any base op runs this:
  *   1. materializes the augmented source once into an array (every supplied view
  *      column, in projection order);
- *   2. if `mint` is set, evaluates the surrogate `seed` once and appends
- *      `seed + ordinal` (1-based) as the last column of each row — the
- *      generate-once-per-row, thread-everywhere shared key; and
+ *   2. if `keyDefault` is set, evaluates the anchor key column's `default` **once per
+ *      produced row** — with `rctx.mutationOrdinal` set to the row's 1-based ordinal so
+ *      `mutation_ordinal()` resolves, and any `max()` subquery observing pre-mutation
+ *      state — and appends the value as the last column of each row (the
+ *      evaluate-once-per-row, thread-everywhere shared key); and
  *   3. stashes the rows in `rctx.tableContexts` under the envelope descriptor.
  * The base ops (run with this same `rctx`) each read those rows back through an
  * `EnvelopeScanNode`, so the shared key is identical across the fan-out. The
@@ -70,10 +72,9 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 
 	const envelope = plan.envelope;
 	const descriptor = envelope?.descriptor;
-	const doMint = !!envelope?.mint;
-	// `per-statement` binds one surrogate for the whole statement (stable across
-	// rows); `per-row` (default) makes each row distinct (`seed + ordinal`).
-	const perStatementMint = envelope?.mint?.cadence === 'per-statement';
+	// When set, the anchor key column's `default` is evaluated once per produced row at
+	// the envelope (with `mutation_ordinal()` in scope) and appended as the shared key.
+	const hasKeyDefault = !!envelope?.keyDefault;
 
 	// The relational base op carrying a single-source RETURNING (the rewritten,
 	// view-projected clause), or -1. Mutually exclusive with `plan.returning`.
@@ -102,8 +103,8 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	if (capture) { captureIdx = cursor++; params.push(emitCallFromPlan(capture.source, ctx)); }
 	let envSourceIdx = -1;
 	if (envelope) { envSourceIdx = cursor++; params.push(emitCallFromPlan(envelope.source, ctx)); }
-	let seedIdx = -1;
-	if (envelope?.mint) { seedIdx = cursor++; params.push(emitCallFromPlan(envelope.mint.seed, ctx)); }
+	let keyDefaultIdx = -1;
+	if (envelope?.keyDefault) { keyDefaultIdx = cursor++; params.push(emitCallFromPlan(envelope.keyDefault, ctx)); }
 
 	async function drainBaseOps(rctx: RuntimeContext, baseCbs: RuntimeValue[]): Promise<void> {
 		for (const cb of baseCbs) {
@@ -127,25 +128,32 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		return rows;
 	}
 
-	async function materializeEnvelope(rctx: RuntimeContext, sourceCb: Callback, seedCb: Callback | undefined): Promise<Row[]> {
-		// Evaluate the surrogate base BEFORE draining the source so it observes the
-		// pre-mutation state (e.g. `max(anchor.key)`), captured once for every row.
-		let seedValue = 0;
-		if (seedCb) {
-			const raw = await seedCb(rctx);
-			seedValue = raw === null || raw === undefined ? 0 : Number(raw as SqlValue);
-		}
+	async function materializeEnvelope(rctx: RuntimeContext, sourceCb: Callback, keyDefaultCb: Callback | undefined): Promise<Row[]> {
 		const rows: Row[] = [];
 		const sourceResult = sourceCb(rctx);
 		const resolved = sourceResult instanceof Promise ? await sourceResult : sourceResult;
 		if (isAsyncIterable(resolved)) {
+			// Save/restore the ambient ordinal so a nested mutation never sees a stale
+			// value and it does not leak past the envelope.
+			const savedOrdinal = rctx.mutationOrdinal;
 			let ordinal = 0;
-			for await (const row of resolved as AsyncIterable<Row>) {
-				ordinal += 1;
-				// per-statement: one surrogate bound for the statement (`seed + 1` for
-				// every row); per-row: `seed + ordinal` (distinct per produced row).
-				const minted = (perStatementMint ? seedValue + 1 : seedValue + ordinal) as SqlValue;
-				rows.push(doMint ? ([...row, minted] as Row) : (row as Row));
+			try {
+				for await (const row of resolved as AsyncIterable<Row>) {
+					ordinal += 1;
+					if (keyDefaultCb) {
+						// Evaluate the anchor key column's `default` once for THIS row, with
+						// `mutation_ordinal()` resolving to its 1-based ordinal and any `max()`
+						// subquery observing pre-mutation state (no base write has fired). The
+						// single value threads into every member's key column via the EC.
+						rctx.mutationOrdinal = ordinal;
+						const minted = await keyDefaultCb(rctx);
+						rows.push([...row, minted as SqlValue] as Row);
+					} else {
+						rows.push(row as Row);
+					}
+				}
+			} finally {
+				rctx.mutationOrdinal = savedOrdinal;
 			}
 		}
 		return rows;
@@ -213,8 +221,8 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		}
 
 		const sourceCb = args[envSourceIdx] as Callback;
-		const seedCb = doMint ? (args[seedIdx] as Callback) : undefined;
-		const rows = await materializeEnvelope(rctx, sourceCb, seedCb);
+		const keyDefaultCb = hasKeyDefault ? (args[keyDefaultIdx] as Callback) : undefined;
+		const rows = await materializeEnvelope(rctx, sourceCb, keyDefaultCb);
 		rctx.tableContexts.set(descriptor, () => arrayIterable(rows));
 		try {
 			await drainBaseOps(rctx, baseCbs);

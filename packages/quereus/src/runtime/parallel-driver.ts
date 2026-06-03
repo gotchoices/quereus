@@ -53,7 +53,10 @@ export class ParallelDriver {
 	 * - an **independent** `tableContexts` map seeded with a shallow snapshot of the
 	 *   parent's entries — set/delete in one fork do not leak to siblings or parent;
 	 * - **shared** references to read-mostly state: `db`, `stmt`, `params`,
-	 *   `enableMetrics`, `tracer`, `activeConnection`, `contextTracker`, `planStack`.
+	 *   `enableMetrics`, `mutationOrdinal`, `tracer`, `activeConnection`,
+	 *   `contextTracker`, `planStack`. (`mutationOrdinal` is a per-row INSERT/envelope
+	 *   scalar set+restored synchronously by the sequential insert path, never mutated
+	 *   inside a parallel fork, so each child snapshots the parent value.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -82,6 +85,7 @@ export class ParallelDriver {
 				tracer: rctx.tracer,
 				activeConnection: rctx.activeConnection,
 				enableMetrics: rctx.enableMetrics,
+				mutationOrdinal: rctx.mutationOrdinal,
 				contextTracker: rctx.contextTracker,
 				planStack: rctx.planStack,
 			};
