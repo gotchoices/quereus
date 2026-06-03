@@ -182,5 +182,31 @@ describe('IN multi-seek inCount honesty (plan=5)', () => {
 			for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
 			expect(rows).to.deep.equal([]);
 		});
+
+		it('multi-column pure-equality with a NULL component empties (standard-equality seek path)', async () => {
+			// `a = 1 AND b = null` (both equality, >1 seek column) routes through the
+			// plan=2 standard-equality builder — a distinct code path from the plan=5
+			// cross-product above. The literal NULL in `b` makes the row-value equality
+			// UNKNOWN ⇒ no row can match, so it too must reduce to an EmptyResult.
+			const sql = 'SELECT id FROM c WHERE a = 1 AND b = null';
+			expect(collectNodes(db.getPlan(sql), isIndexSeek), `no IndexSeek should remain: ${sql}`).to.have.lengthOf(0);
+			expect(collectNodes(db.getPlan(sql), isEmptyResult), `should be an EmptyResult: ${sql}`).to.have.lengthOf(1);
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+			expect(rows).to.deep.equal([]);
+		});
+
+		it('literal NULL in a prefix-equality column empties (prefix-range seek path)', async () => {
+			// `a = null AND b > 5` builds a prefix-equality (`a`) + trailing-range (`b`)
+			// seek. The literal NULL prefix key makes every comparison UNKNOWN ⇒ no row
+			// can match. This path is NOT covered by the scan-layer runtime guard (Part A
+			// walks via `equalityPrefix`, not `equalityKey`), so the plan-time EmptyResult
+			// is the sole correctness guarantee — guard it explicitly.
+			const sql = 'SELECT id FROM c WHERE a = null AND b > 5';
+			expect(collectNodes(db.getPlan(sql), isEmptyResult), `should be an EmptyResult: ${sql}`).to.have.lengthOf(1);
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+			expect(rows).to.deep.equal([]);
+		});
 	});
 });
