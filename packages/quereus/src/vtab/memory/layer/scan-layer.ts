@@ -1,12 +1,23 @@
+import { BTree } from 'inheritree';
 import type { ScanPlan } from './scan-plan.js';
 import type { Layer } from './interface.js';
-import type { BTreeKeyForPrimary, BTreeKeyForIndex } from '../types.js';
+import type { BTreeKey, BTreeKeyForPrimary, BTreeKeyForIndex } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { compareSqlValues } from '../../../util/comparison.js';
 import { StatusCode, type Row } from '../../../common/types.js';
 import { safeIterate } from './safe-iterate.js';
 import { QuereusError } from '../../../common/errors.js';
 import { planAppliesToKey } from './plan-filter.js';
+
+/**
+ * True if a multi-seek key is SQL NULL (scalar) or contains any NULL component
+ * (composite tuple). Such a key contributes no match: `x IN (…, NULL)` is TRUE on
+ * a non-null equal element else NULL, so the WHERE excludes the row; for a tuple
+ * seek, a NULL in any component makes the row-value comparison NULL ⇒ no match.
+ */
+function seekKeyHasNull(key: BTreeKey): boolean {
+	return Array.isArray(key) ? key.some(v => v === null) : key === null;
+}
 
 /**
  * Scans a layer (base or transaction) according to a ScanPlan, yielding matching rows.
@@ -16,11 +27,32 @@ export async function* scanLayer(
 	layer: Layer,
 	plan: ScanPlan
 ): AsyncIterable<Row> {
-	// Multi-seek: iterate over multiple equality keys
+	// Multi-seek: iterate over multiple equality keys (e.g. `col IN (v1, v2, …)`).
+	// This is set-membership, not a bag, so two faults must be avoided:
+	//  - A duplicate seek key (`IN (5, 5)`, or two case-variant literals that hit the
+	//    same NOCASE index entry) must not re-yield its row. We dedup the *yielded
+	//    rows by primary key* — keying on physical row identity is collation-agnostic.
+	//  - A NULL (or NULL-containing) seek key contributes no match and must be skipped;
+	//    leaving it in would also fall through to the unbounded full-index walk below
+	//    (the point-seek branches gate on `equalityKey != null`).
 	if (plan.equalityKeys && plan.equalityKeys.length > 0) {
+		const seekSchema = layer.getSchema();
+		const { primaryKeyExtractorFromRow, primaryKeyComparator } =
+			layer.getPkExtractorsAndComparators(seekSchema);
+		const seen = new BTree<BTreeKeyForPrimary, BTreeKeyForPrimary>(
+			(k: BTreeKeyForPrimary) => k,
+			primaryKeyComparator,
+		);
 		for (const key of plan.equalityKeys) {
+			if (seekKeyHasNull(key)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
-			yield* scanLayer(layer, singlePlan);
+			for await (const row of scanLayer(layer, singlePlan)) {
+				const pk = primaryKeyExtractorFromRow(row);
+				// insert returns a path whose `.on` is true only for a newly added key;
+				// a false `.on` means this row was already yielded by an earlier seek.
+				if (!seen.insert(pk).on) continue;
+				yield row;
+			}
 		}
 		return;
 	}

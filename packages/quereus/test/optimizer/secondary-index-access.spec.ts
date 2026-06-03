@@ -184,6 +184,74 @@ describe('Secondary index access path selection', () => {
 		});
 	});
 
+	// Regression: the multi-seek (plan=5) must behave as set membership, not a bag.
+	// A duplicate literal previously re-yielded its row, and a NULL element fell
+	// through to a full-index walk yielding spurious rows. Each test asserts the
+	// IndexSeek (multi-seek) path is actually chosen so we exercise the fixed code.
+	describe('IN multi-seek set membership (dup/NULL regression)', () => {
+		async function expectIndexSeek(q: string): Promise<void> {
+			const planRows: ResultRow[] = [];
+			for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
+				planRows.push(r);
+			}
+			expect(planRows).to.have.lengthOf(1);
+			expect(planRows[0].ops as string).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+		}
+
+		it('UNIQUE column: duplicate literal yields the row once', async () => {
+			await setup();
+			await db.exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER UNIQUE)");
+			await db.exec("INSERT INTO u VALUES (1, 5), (2, 7)");
+			const q = "SELECT id, v FROM u WHERE v IN (5, 5)";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results).to.deep.equal([{ id: 1, v: 5 }]);
+		});
+
+		it('UNIQUE column: NULL element contributes no match (no full scan)', async () => {
+			await setup();
+			await db.exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER UNIQUE)");
+			await db.exec("INSERT INTO u VALUES (1, 5), (2, 7)");
+			const q = "SELECT id, v FROM u WHERE v IN (5, null) ORDER BY id";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results).to.deep.equal([{ id: 1, v: 5 }]);
+		});
+
+		it('secondary index: duplicate + NULL with two distinct matches', async () => {
+			// idx_age is non-unique: age=25 maps to two PKs (Bob, Diana). Dedup must
+			// not collapse those distinct rows, but must collapse the duplicate seek.
+			await setup();
+			const q = "SELECT name FROM items WHERE age IN (25, 25, null) ORDER BY name";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results.map(r => r.name)).to.deep.equal(['Bob', 'Diana']);
+		});
+
+		it('PRIMARY KEY column: duplicate + NULL yields each row once', async () => {
+			await setup();
+			const q = "SELECT id FROM items WHERE id IN (1, 1, 3, null) ORDER BY id";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results.map(r => r.id)).to.deep.equal([1, 3]);
+		});
+
+		it('composite index: cross-product with duplicate and NULL', async () => {
+			await db.exec("CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) USING memory");
+			await db.exec("CREATE INDEX idx_ab ON c(a, b)");
+			await db.exec("INSERT INTO c VALUES (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20)");
+			const q = "SELECT id FROM c WHERE a IN (1, 1, 2) AND b IN (10, null) ORDER BY id";
+			await expectIndexSeek(q);
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results.map(r => r.id)).to.deep.equal([1, 3]);
+		});
+	});
+
 	it('still uses PK seek when filtering on primary key', async () => {
 		await setup();
 		const q = "SELECT name FROM items WHERE id = 3";
