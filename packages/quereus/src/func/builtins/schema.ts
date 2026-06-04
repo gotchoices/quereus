@@ -649,21 +649,18 @@ function yesNo(value: boolean): string {
 
 /**
  * Resolve an UpdateSite to its underlying base reference: the producing
- * `TableReferenceNode` id + base column for a `base` site, else `undefined`
- * (a `computed` / leaf-less site).
- *
- * The `null-extended` unwrap is now defensive only: `deriveViewInfo`
- * short-circuits any body carrying a `null-extended` site to the conservative
- * row (`hasNullExtendedLineage`) *before* this is reached, so on a cleared body
- * this only ever sees plain `base` sites and the unwrap is a no-op. It is
- * retained for the future per-side relaxation — when outer-join write
- * materialization lands and the gate softens to per-side writability, this will
- * again resolve the preserved side's base for `effective_targets` membership.
+ * `TableReferenceNode` id + base column for a `base` site (plain or `null-extended`),
+ * else `undefined` (a `computed` / leaf-less site). `nullExtended` is true when an
+ * outer-join `null-extended` layer was unwrapped to reach the base — the column names a
+ * base table/column (so it is insertable through the both-sides envelope and counts as
+ * an effective target) but is read-only on UPDATE (the deferred per-row materialization),
+ * so the per-column / `is_updatable` surfaces report it non-updatable.
  */
-function baseSiteOf(site: UpdateSite | undefined): { readonly table: number; readonly baseColumn: string } | undefined {
+function baseSiteOf(site: UpdateSite | undefined): { readonly table: number; readonly baseColumn: string; readonly nullExtended: boolean } | undefined {
 	let s = site;
-	while (s && s.kind === 'null-extended') s = s.inner;
-	return s && s.kind === 'base' ? { table: s.table, baseColumn: s.baseColumn } : undefined;
+	let nullExtended = false;
+	while (s && s.kind === 'null-extended') { nullExtended = true; s = s.inner; }
+	return s && s.kind === 'base' ? { table: s.table, baseColumn: s.baseColumn, nullExtended } : undefined;
 }
 
 /** Every relational node in the planned body (deduped), root-first. */
@@ -694,25 +691,6 @@ function buildTableRefsById(nodes: RelationalPlanNode[]): Map<number, TableRefer
 	return tableRefsById;
 }
 
-/**
- * True when any collected body node carries a `null-extended` lineage site —
- * the signature of a LEFT/RIGHT/FULL outer-join body (`deriveJoinUpdateLineage`
- * wraps the non-preserved side `null-extended`). `propagateMultiSource` rejects
- * the *entire* outer join today (`collectInnerJoinSources` accepts only inner
- * equi-joins, on either side), so such a body supports no mutation at all;
- * `deriveViewInfo` short-circuits it to the conservative row to agree with
- * `propagate()`. Walks the whole spine — not just the root — because an outer
- * join whose non-preserved columns are all projected away still carries the
- * `null-extended` sites on the `JoinNode`'s own lineage.
- */
-function hasNullExtendedLineage(nodes: RelationalPlanNode[]): boolean {
-	for (const n of nodes) {
-		const l = n.physical?.updateLineage;
-		if (l) for (const site of l.values()) if (site.kind === 'null-extended') return true;
-	}
-	return false;
-}
-
 /** Record `baseColumn` (lowercased) as defaultable for base table `table`. */
 function addDefaultable(map: Map<number, Set<string>>, table: number, baseColumn: string): void {
 	const set = map.get(table) ?? new Set<string>();
@@ -740,26 +718,16 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 
 	const nodes = collectBodyNodes(root);
 
-	// Outer-join gate (Divergence 2): a body carrying any `null-extended` site is
-	// a LEFT/RIGHT/FULL outer join, which `propagate()` rejects wholesale today
-	// (both sides). Short-circuit to the conservative row before the target walk
-	// so `view_info()` agrees with the dynamic truth, regardless of which columns
-	// the projection keeps. Inner-join bodies never null-extend, so the
-	// multi-source positive case (`ms_jv`) is untouched.
-	if (hasNullExtendedLineage(nodes)) return CONSERVATIVE_VIEW_INFO;
-
-	// Non-inner-join shape gate (Divergence 3): cross / comma (implicit) / subquery- or
-	// function-source join bodies never null-extend (only LEFT/RIGHT/FULL do — see
-	// `deriveJoinUpdateLineage`), so they carry strict-`base` lineage and slip past the
-	// outer-join gate above. `propagate()` decomposes an n-way (≥2) inner equi-join —
-	// composite-PK sides and self-joins included (`isDecomposableJoinBody`, the boolean
-	// shadow of `collectInnerJoinSources`) — and rejects every other join shape, so
-	// without this gate the target walk below resolves their bases and over-reports
-	// `is_updatable = 'YES'` (and possibly insertable/deletable). Mirrors the same gate
-	// in `deriveColumnInfo`: this reads the AST shape, `hasNullExtendedLineage` reads
-	// lineage — kept parallel as defense-in-depth. The accepted inner-join positive cases
-	// (`ms_jv`, n-way, composite-PK, self-join) are not a match (`isDecomposableJoinBody`
-	// accepts them) and stay writable.
+	// Non-decomposable join shape gate: cross / comma (implicit) / subquery- or
+	// function-source join bodies are not write-through-able, so they must report the
+	// conservative all-`NO` row. `propagate()` decomposes an n-way (≥2) equi-join —
+	// `inner`/`left`/`right`/`full`, composite-PK sides and self-joins included
+	// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and rejects
+	// every other join shape, so without this gate the target walk below would resolve
+	// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable
+	// now (partially writable), so they flow through to the per-column walk, which reports
+	// a non-preserved (`null-extended`) column non-updatable via `baseSiteOf().nullExtended`
+	// — agreeing with the dynamic `propagate()` truth (a non-preserved update rejects).
 	if (isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst)) {
 		return CONSERVATIVE_VIEW_INFO;
 	}
@@ -767,17 +735,23 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	const tableRefsById = buildTableRefsById(nodes);
 
 	// Output-column lineage: effective targets, the per-table set of base columns
-	// exposed by the projection, and the is_updatable flag (≥1 output column with
-	// base lineage — docs: "at least one output column has base lineage").
+	// exposed by the projection, and the is_updatable flag (≥1 output column with a
+	// PRESERVED base site — a non-preserved `null-extended` column is read-only on
+	// update, so it does not make the view updatable). `preservedTargets` are the base
+	// tables a column reaches non-null-extended — the only ones a DELETE routes to
+	// (§ Outer Joins — Deletes), so they alone gate deletability below.
 	const rootLineage = root.physical?.updateLineage;
 	const targetIds = new Set<number>();
+	const preservedTargets = new Set<number>();
 	const exposed = new Map<number, Set<string>>();
 	let anyBase = false;
 	for (const attr of root.getAttributes()) {
 		const bs = baseSiteOf(rootLineage?.get(attr.id));
 		if (!bs) continue;
-		anyBase = true;
+		if (!bs.nullExtended) { anyBase = true; preservedTargets.add(bs.table); }
 		targetIds.add(bs.table);
+		// A null-extended column still exposes its base column for INSERT coverage (the
+		// both-sides envelope supplies it) — add it regardless of preservation.
 		const set = exposed.get(bs.table) ?? new Set<string>();
 		set.add(bs.baseColumn.toLowerCase());
 		exposed.set(bs.table, set);
@@ -786,6 +760,13 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// No base lineage at the root ⇒ wholly read-only (VALUES / aggregate / set-op /
 	// computed-only / recursive-CTE body). The conservative row falls straight out.
 	if (targetIds.size === 0) return CONSERVATIVE_VIEW_INFO;
+
+	// No PRESERVED base column ⇒ a FULL outer join (every side null-extended), or a
+	// LEFT/RIGHT body that projects away its whole preserved side. v1 defers write-through
+	// there (a full-outer write is per-row — § Outer Joins), so report the conservative
+	// row, agreeing with the dynamic rejects (`unsupported-outer-join-update` on update,
+	// `unsupported-join` on delete/insert through a side-less preserved set).
+	if (preservedTargets.size === 0) return CONSERVATIVE_VIEW_INFO;
 
 	// Defaultable base columns: every (node, attribute) carrying an insert default
 	// (`constant-fd` selection pin, declared `base-default`, `tag-default`),
@@ -848,8 +829,16 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		const exp = exposed.get(id) ?? new Set<string>();
 		const def = defaultable.get(id) ?? new Set<string>();
 
-		// Deletable iff every PK column of this base is exposed through base lineage
-		// (so `pk = <view value>` is constructible). A keyless base is undeletable.
+		// Deletability + insertability are decided over the PRESERVED targets only — a
+		// non-preserved (outer-join) target is never the delete route (deleting it merely
+		// null-extends the row — § Outer Joins — Deletes) and is an *optional* member of
+		// the insert fan-out (the preserved-only insert omits it). So a non-preserved
+		// target's unexposed PK / uncovered not-null column does not block either flag; a
+		// real both-sides insert that DOES supply it is gated at runtime instead.
+		if (!preservedTargets.has(id)) continue;
+
+		// Deletable iff every preserved target's PK is exposed through base lineage (so
+		// `pk = <view value>` is constructible). A keyless preserved base is undeletable.
 		const pkCols = tbl.primaryKeyDefinition.map(pk => tbl.columns[pk.index].name.toLowerCase());
 		if (pkCols.length === 0 || !pkCols.every(c => exp.has(c))) isDeletable = false;
 
@@ -1029,28 +1018,15 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 
 		const nodes = collectBodyNodes(root);
 
-		// Outer-join gate (mirrors `deriveViewInfo`'s Divergence 2): a body carrying
-		// any `null-extended` site is a LEFT/RIGHT/FULL outer join, which
-		// `propagate()` rejects wholesale today (both sides — `collectInnerJoinSources`
-		// accepts only inner equi-joins), so *every* column is non-updatable. Without
-		// this gate `baseSiteOf` would unwrap `null-extended` to the inner base and
-		// over-report a preserved-side column as `'YES'` even though no write through
-		// the view is accepted — disagreeing with both `view_info()` (which short-
-		// circuits the same body to all-`NO`) and the dynamic truth. When per-side
-		// write materialization lands and the gate softens, both surfaces relax
-		// together (see `baseSiteOf`'s forward-looking note).
-		const outerJoin = hasNullExtendedLineage(nodes);
-
-		// Non-inner-join shape gate (Divergence 3): cross / comma / subquery-source join
-		// bodies never null-extend (only LEFT/RIGHT/FULL do), so they carry strict-
-		// `base` lineage and slip past `outerJoin`. `propagate()` decomposes an n-way
-		// (≥2) inner equi-join — composite-PK sides and self-joins included
-		// (`isDecomposableJoinBody`, the boolean shadow of `collectInnerJoinSources`) —
-		// and rejects every other join shape, so without this gate `baseSiteOf` resolves
-		// their bases and over-reports `is_updatable = 'YES'`. The shape check subsumes
-		// the `outerJoin` gate for join bodies (it also rejects `joinType !== 'inner'`);
-		// both are kept as parallel, defense-in-depth gates mirroring `deriveViewInfo`'s
-		// structure — `outerJoin` reads lineage, this reads the AST shape.
+		// Non-decomposable join shape gate: cross / comma / subquery-source join bodies
+		// are not write-through-able. `propagate()` decomposes an n-way (≥2) equi-join —
+		// `inner`/`left`/`right`/`full`, composite-PK sides and self-joins included
+		// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and
+		// rejects every other join shape, so without this gate `baseSiteOf` would resolve
+		// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable
+		// now; their non-preserved columns are reported non-updatable per-column below via
+		// `baseSiteOf().nullExtended` (matching the dynamic deferral), rather than
+		// short-circuiting the whole view to all-`NO`.
 		const unsupportedJoinShape = isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst);
 
 		const tableRefsById = buildTableRefsById(nodes);
@@ -1060,12 +1036,15 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		const rows: ColumnInfoRow[] = [];
 		for (let i = 0; i < attrs.length; i++) {
 			const attr = attrs[i];
-			const bs = (outerJoin || unsupportedJoinShape) ? undefined : baseSiteOf(rootLineage?.get(attr.id));
+			const bs = unsupportedJoinShape ? undefined : baseSiteOf(rootLineage?.get(attr.id));
 			const ref = bs ? tableRefsById.get(bs.table) : undefined;
-			// Updatable iff a base site resolves to a producing TableReferenceNode.
-			// A base id without a resolved ref should not happen (root lineage ids
-			// come from the collected nodes); fail conservative if it does.
-			const updatable = !!(bs && ref);
+			// Updatable iff a PRESERVED base site resolves to a producing
+			// TableReferenceNode. A non-preserved (`null-extended`) column names a base
+			// table/column but is read-only on UPDATE (the deferred materialization), so it
+			// reports `'NO'` with no trace — agreeing with the dynamic
+			// `unsupported-outer-join-update` reject. A base id without a resolved ref
+			// should not happen; fail conservative if it does.
+			const updatable = !!(bs && ref && !bs.nullExtended);
 			rows.push({
 				schema: schemaName,
 				objectName: view.name,

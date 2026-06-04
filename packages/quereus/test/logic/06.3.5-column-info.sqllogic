@@ -178,25 +178,27 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 → [{"cid":0,"column_name":"n","is_updatable":"NO","base_table":null,"base_column":null}]
 
 -- ===================================================================
--- Outer-join body: every column reports is_updatable='NO' with null trace,
--- mirroring view_info's Divergence 2 gate. An outer join wraps the non-preserved
--- side `null-extended`; collectInnerJoinSources rejects the WHOLE join (both
--- sides), so propagate() accepts no write through the view. column_info must NOT
--- unwrap `null-extended` and over-report a preserved-side column as 'YES' — it
--- short-circuits the same body deriveViewInfo does. Both the preserved-side
--- columns (aid, av) and the null-extended column (bv) read 'NO'.
+-- Outer-join body: PER-SIDE updatability. A LEFT outer join is partially writable
+-- — the preserved side's columns (aid, av) report is_updatable='YES' with their base
+-- trace, while the non-preserved (`null-extended`) side's column (bv) reports 'NO'
+-- with null trace (its UPDATE is deferred — `unsupported-outer-join-update`).
+-- column_info reads the same per-column `null-extended` lineage `view_info` does, so
+-- the two surfaces agree with the dynamic truth.
 -- ===================================================================
 
 create table oj_a (aid integer primary key, av text);
 create table oj_b (bid integer primary key, bv text);
+insert into oj_a values (1, 'a1');
 create view oj_left as
     select a.aid as aid, a.av as av, b.bv as bv
     from oj_a a left join oj_b b on b.bid = a.aid;
 select cid, column_name, is_updatable, base_table, base_column from column_info('oj_left');
-→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"av","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"oj_a","base_column":"aid"},{"cid":1,"column_name":"av","is_updatable":"YES","base_table":"oj_a","base_column":"av"},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
 
--- Surface agrees with propagate(): a mutation through the outer-join view is rejected.
+-- Surface agrees with propagate(): a preserved-side update is accepted; the
+-- non-preserved-side update is deferred.
 update oj_left set av = 'z' where aid = 1;
+update oj_left set bv = 'z' where aid = 1;
 -- error: cannot write through view
 
 -- ===================================================================

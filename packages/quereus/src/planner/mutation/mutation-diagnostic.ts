@@ -30,6 +30,8 @@ export type MutationDiagnosticReason =
 	| 'unsupported-source'         // INSERT source shape we cannot thread filter defaults through yet
 	| 'unsupported-multisource-insert' // INSERT into a join view — needs the shared-surrogate context (later phase)
 	| 'cross-source-assignment'    // UPDATE value references a base table other than the column it assigns
+	| 'unsupported-outer-join-update' // UPDATE assigns a non-preserved (outer-join null-extended) column — the matched→update / null-extended→insert per-row branch needs runtime materialization (deferred to view-write-optional-member-transitions)
+	| 'null-extended-create-conflict' // INSERT supplies only non-preserved-side columns through an outer join with no preserved-side row to attach to (the envelope mints/threads the shared key from the preserved anchor — v1 rejects the non-preserved-only insert)
 	| 'conflicting-assignment'     // two SET targets lower to the same base column (e.g. two view columns over one base column); an UPDATE cannot assign one column twice
 	| 'unsupported-subquery-correlation' // a view-column ref nested in a predicate/value subquery cannot be proven correlated (unresolvable source / select * / TVF / embedded DML)
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6

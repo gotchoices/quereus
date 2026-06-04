@@ -410,6 +410,13 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 
 	const baseOps = plan.orderedSides.map(side => {
 		const scan = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
+		// A non-preserved (outer-join optional) side inserts only for rows that supply ≥1
+		// of its columns — gate the envelope through the same presence FilterNode the
+		// decomposition fan-out uses (`buildDecompositionMemberInsert`). Empty ⇒
+		// unconditional (a preserved / inner side).
+		const gated: RelationalPlanNode = side.presenceGateIndices.length > 0
+			? new FilterNode(ctx.scope, scan, buildPresenceGate(ctx, envelopeAttrs, side.presenceGateIndices))
+			: scan;
 		const projections: Projection[] = side.targetColumns.map((baseColumn, k) => {
 			const envIdx = side.envelopeIndices[k];
 			const attr = envelopeAttrs[envIdx];
@@ -424,7 +431,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 		});
 		// preserveInputColumns=false → output is exactly the picked columns, fresh
 		// attribute ids, positionally aligned to the base op's target columns.
-		const source = new ProjectNode(ctx.scope, scan, projections, undefined, undefined, false);
+		const source = new ProjectNode(ctx.scope, gated, projections, undefined, undefined, false);
 
 		const sideInsert: AST.InsertStmt = {
 			type: 'insert',

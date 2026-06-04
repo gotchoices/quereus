@@ -36,8 +36,10 @@ create view vj as select t.id as tid from t join t2 on t.id = t2.id;
 insert into vj (tid) values (9);
 -- error: no default
 
--- Outer (left) join body: a non-preserved-side write needs row materialization,
--- which is a later phase — still rejected.
+-- Outer (left) join body: the PRESERVED side is now write-through-able (see
+-- 93.4-view-mutation.sqllogic § Outer joins), but a NON-preserved-side update needs the
+-- per-row matched-update / null-extended-insert materialization — still deferred
+-- (`unsupported-outer-join-update`). `n2` = t2.name is the non-preserved (right) side.
 create view voj as select t.id as tid, t2.name as n2 from t left join t2 on t.id = t2.id;
 
 update voj set n2 = 'q' where tid = 1;

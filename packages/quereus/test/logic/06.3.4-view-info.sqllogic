@@ -216,41 +216,55 @@ select is_insertable_into from view_info('dfi_v_typo');
 → [{"is_insertable_into":"NO"}]
 
 -- ===================================================================
--- Divergence 2 — outer-join bodies report conservative and agree with
--- propagate(). An outer join wraps the non-preserved side `null-extended`;
--- collectInnerJoinSources rejects the WHOLE join (both sides), so every mutation
--- through the view is rejected. deriveViewInfo short-circuits any body carrying
--- a `null-extended` site to all-`NO`/`[]`. Covers LEFT, RIGHT, and FULL.
+-- Divergence 2 — outer-join bodies report PER-SIDE and agree with propagate().
+-- A LEFT/RIGHT outer join is partially writable: the preserved side's columns are
+-- base-updatable, the view is insertable (preserved-only / both-side routing) and
+-- deletable (delete-to-preserved). The non-preserved (`null-extended`) side's columns
+-- are reported non-updatable — agreeing with the dynamic `unsupported-outer-join-update`
+-- deferral. A FULL outer join has no preserved side (every side null-extended per row),
+-- so it stays conservative all-`NO` and the dynamic write is deferred.
 -- ===================================================================
 
 create table oj_a (aid integer primary key, av text);
 create table oj_b (bid integer primary key, bv text);
 insert into oj_a values (1, 'a1');
 
+-- LEFT: oj_a preserved, oj_b non-preserved. aid/av updatable; the view is
+-- insertable (preserved-only insert always works — oj_a's PK is projected) and
+-- deletable (delete routes to oj_a, whose PK is exposed). Both bases are effective
+-- targets (a both-side insert reaches oj_b).
 create view oj_left as
     select a.aid as aid, a.av as av, b.bv as bv
     from oj_a a left join oj_b b on b.bid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_left');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
 
--- Surface agrees with propagate(): a mutation through the outer-join view is rejected.
+-- Surface agrees with propagate(): a preserved-side update is accepted, a
+-- non-preserved-side update is deferred (unsupported-outer-join-update).
 update oj_left set av = 'z' where aid = 1;
+update oj_left set bv = 'z' where aid = 1;
 -- error: cannot write through view
 
+-- RIGHT: oj_b preserved, oj_a non-preserved. bid/bv updatable; av (non-preserved) NO.
 create view oj_right as
     select a.av as av, b.bid as bid, b.bv as bv
     from oj_a a right join oj_b b on b.bid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_right');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
 
+-- FULL: every side null-extended ⇒ no preserved anchor ⇒ conservative all-`NO`.
 create view oj_full as
     select a.aid as aid, a.av as av, b.bid as bid, b.bv as bv
     from oj_a a full join oj_b b on b.bid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_full');
 → [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the full-outer view is deferred.
+update oj_full set av = 'z' where aid = 1;
+-- error: cannot write through view
 
 -- ===================================================================
 -- Divergence 3 — non-inner join bodies report conservative and agree with

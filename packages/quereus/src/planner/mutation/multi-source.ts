@@ -21,13 +21,19 @@ import { readPolicy, readDeleteVia, readTargetNames, readExcludeNames, type Rese
 import type { DeleteViaValue } from '../../schema/reserved-tags.js';
 
 /**
- * Multi-source view-mediated DML decomposition — the **key-preserving inner
- * join** acceptance case of the view-mutation substrate (docs/view-updateability.md
- * § Per-Operator Semantics — Inner Join, § Multi-Base-Table Mutations).
+ * Multi-source view-mediated DML decomposition — the **key-preserving join**
+ * acceptance case of the view-mutation substrate (docs/view-updateability.md
+ * § Per-Operator Semantics — Inner Join, § Outer Joins, § Multi-Base-Table Mutations).
  *
- * Scope (this phase): a view body that is an **n-way (≥2) inner equi-join** of base
- * tables — including composite-PK sides and **self-joins** (one base table under two
- * or more distinct aliases) — written through with `update` / `delete`. The body is
+ * Scope: a view body that is an **n-way (≥2) equi-join** of base tables — `inner`,
+ * `left`, `right`, or `full` — including composite-PK sides and **self-joins** (one base
+ * table under two or more distinct aliases) — written through with `update` / `delete` /
+ * `insert`. Outer joins are admitted for the **statically-expressible** cases:
+ * preserved-side update passthrough, delete-to-the-preserved-side, and insert routing
+ * (both-side / preserved-only / presence-gated non-preserved member). The one
+ * outer-join case that needs new runtime — an UPDATE of a **non-preserved** column (a
+ * per-row matched-update / null-extended-insert branch) — defers with
+ * `unsupported-outer-join-update` (`view-write-optional-member-transitions`). The body is
  * **planned once**
  * (`analyzeJoinView`); its `PhysicalProperties.updateLineage` (threaded by
  * `view-mutation-physical-lineage`) routes each output column to its owning base
@@ -61,15 +67,19 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  * `pre` OLD image). The body is planned once and reused — no second `buildSelectStmt`
  * / `cloneFromClause` of it for identification or RETURNING.
  *
- * Multi-source **`insert`** (Phase 2b) is analysed here (`analyzeMultiSourceInsert`)
- * but *built* by `building/view-mutation-builder.ts` (`buildMultiSourceInsert`),
- * because it needs the plan-level shared-surrogate envelope rather than an AST
- * `BaseOp`: the shared join key is not a view column, so it is sourced from the
- * anchor key column's declared `default` once per row at the envelope and threaded
- * into both base inserts via the equivalence class (§ Mutation Context).
+ * Multi-source **`insert`** is analysed here (`analyzeMultiSourceInsert`) but *built* by
+ * `building/view-mutation-builder.ts` (`buildMultiSourceInsert`), because it needs the
+ * plan-level shared-surrogate envelope rather than an AST `BaseOp`: the shared join key is
+ * not a view column, so it is sourced from the anchor key column's declared `default` once
+ * per row at the envelope and threaded into the active base inserts via the equivalence
+ * class (§ Mutation Context). For an outer join the **non-preserved** side is an *optional*
+ * member of the fan-out — dropped when its columns are absent (the preserved-only insert),
+ * presence-gated per row when supplied (the both-side insert).
  *
- * **Deferred, rejected here with a structured diagnostic (later phases):**
- * - outer / cross / set-op / aggregate / window bodies — `unsupported-*`.
+ * **Deferred, rejected here with a structured diagnostic:**
+ * - UPDATE of a non-preserved outer-join column — `unsupported-outer-join-update`.
+ * - INSERT of only non-preserved columns with no preserved anchor — `null-extended-create-conflict`.
+ * - cross / set-op / aggregate / window bodies — `unsupported-*`.
  * - comma (implicit) joins, `select *` join bodies, and cross-side `set` value
  *   references — each a precise diagnostic.
  * - composite **shared-key insert** (the surrogate envelope threads a single-column
@@ -113,6 +123,24 @@ interface JoinSide {
 	readonly schema: TableSchema;
 	/** AST alias (lowercased) the body uses for this source, or the table name. */
 	readonly alias: string;
+	/**
+	 * True when this side is **preserved** by the join shape — an inner-join side, or
+	 * the preserved side of a LEFT/RIGHT outer join (the left of `left`, the right of
+	 * `right`). A **non-preserved** side (`preserved: false`) is potentially
+	 * null-extended: the right of a `left`, the left of a `right`, and *both* sides of
+	 * a `full` outer join (§ Outer Joins). The per-op routing keys off this: an UPDATE
+	 * defers a non-preserved-column write, a DELETE routes to preserved side(s), an
+	 * INSERT treats a non-preserved side as an optional (presence-gated) member.
+	 */
+	readonly preserved: boolean;
+	/**
+	 * The enclosing outer join's ON predicate — the *guard* under which this
+	 * non-preserved side's columns are real (the row is null-extended when the guard
+	 * fails). Absent for a preserved side, and for an outer join expressed with USING
+	 * (no AST `Expression` guard). Surfaced from the planned join shape for future
+	 * per-row materialization; v1 routing does not consume it.
+	 */
+	readonly guard?: AST.Expression;
 }
 
 /** One output column of the join view body, by backward lineage. */
@@ -132,6 +160,15 @@ interface OutColumn {
 	 * Invertibility). A `computed` / `null-extended` site is read-only (`false`).
 	 */
 	readonly writable: boolean;
+	/**
+	 * True when the owning site is an outer-join **non-preserved** (null-extended)
+	 * base column. Distinguishes a deferred outer-join column (base lineage present,
+	 * but the write needs per-row materialization — `unsupported-outer-join-update`)
+	 * from a genuinely computed column (no base lineage — `no-inverse`). A
+	 * null-extended base column is still **insertable** (the both-sides envelope
+	 * supplies it), so it carries {@link sideIndex} / {@link baseColumn}.
+	 */
+	readonly nullExtended: boolean;
 	/**
 	 * Backward inverse closure for a non-identity invertible base site — maps a
 	 * *written* (view-domain) value to the base column's value (e.g. `cv + 1` ⇒
@@ -192,22 +229,24 @@ export function isJoinBody(selectAst: AST.QueryExpr): boolean {
 }
 
 /**
- * Non-throwing AST shape check — the boolean shadow of {@link collectInnerJoinSources}'s
- * acceptance: `true` iff the body is a single explicit **n-way (≥2) INNER join** with
- * an ON (or USING) predicate over plain base tables (the exact multi-source shape
- * `propagate()` decomposes), including **composite-PK sides** and **self-joins** (one
- * base table under two or more distinct aliases). Every other multi-table body — cross
- * / outer / comma (implicit) / subquery- or function-source — returns `false`.
+ * Non-throwing AST shape check — the boolean shadow of {@link collectJoinSources}'s
+ * acceptance: `true` iff the body is a single explicit **n-way (≥2) equi-join** — `inner`,
+ * `left`, `right`, or `full` — with an ON (or USING) predicate over plain base tables (the
+ * exact multi-source shape `propagate()` decomposes), including **composite-PK sides** and
+ * **self-joins** (one base table under two or more distinct aliases). Every other
+ * multi-table body — cross / comma (implicit) / subquery- or function-source — returns
+ * `false`.
  *
  * Shared with the static updateability surfaces (`deriveViewInfo` /
  * `deriveColumnInfo` in `func/builtins/schema.ts`): they gate on this so they
- * agree with what a real mutation through the view accepts, rather than reading
- * `updateLineage` (which carries strict-`base` sites for cross bodies — only
- * LEFT/RIGHT/FULL outer joins null-extend — and would otherwise over-report
- * `is_updatable = 'YES'`). The throwing `collectInnerJoinSources` stays the
- * substrate's source of truth; this mirrors only its AST-level shape gate (it does
- * not re-check DISTINCT/LIMIT/`select *`, which are deeper semantic rejects handled
- * downstream — PK shape is no longer a reject now that composite keys are admitted).
+ * agree with what a real mutation through the view accepts. An outer join is now
+ * **partially** writable (preserved-side update, delete-to-preserved, insert), so it is
+ * decomposable here; those surfaces read per-column `null-extended` lineage to report a
+ * non-preserved column non-updatable (the matching deferral). The throwing
+ * {@link collectJoinSources} stays the substrate's source of truth; this mirrors only its
+ * AST-level shape gate (it does not re-check DISTINCT/LIMIT/`select *`, which are deeper
+ * semantic rejects handled downstream — PK shape is no longer a reject now that composite
+ * keys are admitted).
  */
 export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.from) return false;
@@ -220,10 +259,12 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 			case 'table':
 				tableCount += 1;
 				return true;
-			case 'join':
-				// INNER join with an explicit ON predicate or a USING column list.
-				if (fc.joinType !== 'inner' || (!fc.condition && !(fc.columns && fc.columns.length > 0))) return false;
+			case 'join': {
+				// INNER/LEFT/RIGHT/FULL join with an explicit ON predicate or a USING column list.
+				const accepted = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'right' || fc.joinType === 'full';
+				if (!accepted || (!fc.condition && !(fc.columns && fc.columns.length > 0))) return false;
 				return visit(fc.left) && visit(fc.right);
+			}
 			default:
 				return false; // subquery / function source — not a plain base table
 		}
@@ -237,14 +278,15 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 }
 
 /**
- * Decompose a multi-source (n-way inner-join) view mutation into an ordered
- * `BaseOp[]`. Throws a structured diagnostic for any unsupported shape.
+ * Decompose a multi-source (n-way `inner`/`left`/`right`/`full` join) view mutation into
+ * an ordered `BaseOp[]`. Throws a structured diagnostic for any unsupported shape.
  */
 export function propagateMultiSource(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): BaseOp[] {
-	// Validate the join shape first (this rejects outer/cross/comma joins, > 2
-	// tables, non-table sources, etc. with a `cannot write through view`
-	// diagnostic), so every unsupported join — including an `insert` through one —
-	// surfaces the precise shape reason before the op-specific handling.
+	// Validate the join shape first (this rejects cross/comma joins, non-table sources,
+	// etc. with a `cannot write through view` diagnostic), so every unsupported join —
+	// including an `insert` through one — surfaces the precise shape reason before the
+	// op-specific handling. Outer joins are admitted: an UPDATE of a non-preserved column
+	// defers (`unsupported-outer-join-update`), DELETE routes to the preserved side(s).
 	const analysis = analyzeJoinView(ctx, view);
 	switch (req.op) {
 		case 'update': return decomposeUpdate(ctx, view, analysis, req.stmt, req.tags);
@@ -275,6 +317,14 @@ export interface MsInsertSide {
 	readonly schema: TableSchema;
 	readonly targetColumns: readonly string[];
 	readonly envelopeIndices: readonly number[];
+	/**
+	 * Envelope indices whose non-null presence gates this side's insert per row — a
+	 * non-preserved (outer-join optional) member inserts only for rows that supply ≥1
+	 * of its columns (§ Outer Joins — Inserts). Empty ⇒ unconditional (a preserved /
+	 * inner side, always inserted). Reuses the decomposition fan-out's presence gate
+	 * (`buildDecompositionMemberInsert`).
+	 */
+	readonly presenceGateIndices: readonly number[];
 }
 
 /**
@@ -301,12 +351,20 @@ export interface MsInsertAnalysis {
 }
 
 /**
- * Decompose an n-way key-preserving inner-join INSERT into the per-side base inserts
- * plus the shared-surrogate envelope they fan out from. Throws a structured diagnostic
- * for any unsupported shape (computed target column, a not-null base column with no
- * value, a non-equi-join key, …). The shared key remains **single-column**: a side
- * contributing a composite shared key to the join's equivalence class is rejected with
+ * Decompose an n-way key-preserving INSERT into the per-side base inserts plus the
+ * shared-surrogate envelope they fan out from. Throws a structured diagnostic for any
+ * unsupported shape (computed target column, a not-null base column with no value, a
+ * non-equi-join key, …). The shared key remains **single-column**: a side contributing a
+ * composite shared key to the join's equivalence class is rejected with
  * `unsupported-decomposition-key` (the envelope threads one key value per row).
+ *
+ * **Outer joins** (§ Outer Joins — Inserts): a **non-preserved** side is an *optional*
+ * member of the fan-out. A side whose columns are all absent emits no insert (it is
+ * dropped); a non-preserved side that IS supplied is presence-gated per row (it inserts
+ * only for rows supplying ≥1 of its columns). The shared key is minted/threaded only when
+ * ≥2 sides are active (the preserved-only case is a single preserved insert — the row
+ * reads back null-extended); an insert supplying *only* non-preserved columns, with no
+ * preserved anchor row to attach to, is rejected `null-extended-create-conflict` (v1).
  */
 export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): MsInsertAnalysis {
 	rejectReturning(view, stmt.returning);
@@ -314,22 +372,27 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	const { sides, outColumns } = analysis;
 	const keyColumns = extractJoinKeyColumns(view, analysis.sel, sides);
 
-	// Supplied view columns: the explicit list, or every IDENTITY-writable view
-	// output column. An `inverse`-profile column (writable on the UPDATE path) is
-	// NOT insertable here — the shared-surrogate envelope writes supplied values to
-	// base columns verbatim, with no hook to apply the column's inverse, so an
-	// inserted `cv1` would land raw in `cv`. Excluding it from the implicit set lets
-	// it fall to its base default / not-null check (the pre-inverse behavior); an
-	// explicit supply is rejected below.
+	// Supplied view columns: the explicit list, or every base-routed (identity, rename,
+	// or outer-join null-extended) view output column. An `inverse`-profile column
+	// (writable on the UPDATE path) is NOT insertable — the shared-surrogate envelope
+	// writes supplied values to base columns verbatim, with no hook to apply the column's
+	// inverse, so an inserted `cv1` would land raw in `cv`. Excluding it from the implicit
+	// set lets it fall to its base default / not-null check; an explicit supply is
+	// rejected below. A non-preserved (null-extended) base column IS insertable here (the
+	// both-sides envelope supplies it), so it is included even though it is read-only on
+	// the UPDATE path.
 	const suppliedNames = stmt.columns && stmt.columns.length > 0
 		? stmt.columns
-		: outColumns.filter(c => c.writable && !c.inverse).map(c => c.name);
+		: outColumns.filter(c => c.sideIndex !== undefined && c.baseColumn !== undefined && !c.inverse).map(c => c.name);
 
 	interface Supplied { readonly name: string; readonly sideIndex: number; readonly baseColumn: string; readonly type: ScalarType; readonly isKey: boolean; }
 	const supplied: Supplied[] = suppliedNames.map((rawName): Supplied => {
 		const name = rawName.toLowerCase();
 		const out = outColumns.find(c => c.name === name);
-		if (!out || !out.writable || out.inverse || out.sideIndex === undefined || !out.baseColumn) {
+		// A base-routed column (identity/rename or outer-join null-extended) carries
+		// `sideIndex` + `baseColumn`; a computed column does not, and an `inverse` column
+		// cannot store a raw value. Either of the latter is non-insertable.
+		if (!out || out.inverse || out.sideIndex === undefined || !out.baseColumn) {
 			raiseMutationDiagnostic({
 				reason: 'no-inverse',
 				column: rawName,
@@ -343,11 +406,49 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		return { name, sideIndex, baseColumn: out.baseColumn, type: columnScalarType(baseCol), isKey };
 	});
 
-	// The shared key is a single value threaded into both sides. If the view exposes
-	// it more than once (both sides of the equi-join key, or the same side's key
-	// twice), an insert cannot honor divergent supplied values without either
-	// breaking the join invariant or silently dropping one — reject, directing the
-	// user to supply the shared key through a single view column.
+	// A FULL outer join has no preserved anchor side to mint/thread the shared key from
+	// (every side is null-extended per row), so a statically-routed insert is not
+	// expressible — defer it (the static `view_info` surface short-circuits the same body
+	// to all-`NO`).
+	const hasPreservedSide = sides.some(s => s.preserved);
+	if (!hasPreservedSide) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': a FULL outer join has no preserved anchor side to mint/thread the shared key from; inserting through a full-outer view is deferred`,
+		});
+	}
+
+	// Active sides: a preserved (or inner) side is always inserted (the anchor row); a
+	// non-preserved (outer) side is active only when ≥1 of its columns is supplied — an
+	// absent non-preserved side emits no insert (the per-row null-extension semantics).
+	const suppliedSides = new Set(supplied.map(s => s.sideIndex));
+	const isActive = (i: number): boolean => sides[i].preserved || suppliedSides.has(i);
+	const activeIndices = sides.map((_, i) => i).filter(isActive);
+
+	// Non-preserved-only reject (§ Outer Joins — Inserts): supplying only a non-preserved
+	// side's columns, with no preserved anchor row to mint/thread the shared key from, is
+	// not yet expressible (the envelope sources the key from the preserved anchor).
+	const anyNonPreservedActive = sides.some((s, i) => !s.preserved && suppliedSides.has(i));
+	const anyPreservedSupplied = supplied.some(s => sides[s.sideIndex].preserved);
+	if (anyNonPreservedActive && !anyPreservedSupplied) {
+		raiseMutationDiagnostic({
+			reason: 'null-extended-create-conflict',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': only non-preserved-side columns were supplied through the outer join, with no preserved-side row to attach to; supply the preserved side's columns too (the shared key is minted/threaded from the preserved anchor)`,
+		});
+	}
+
+	// The shared key relates two or more active sides; with only one active side (the
+	// preserved-only insert) no key is needed — the single side inserts and the row reads
+	// back null-extended.
+	const needsSharedKey = activeIndices.length >= 2;
+
+	// The shared key is either directly supplied (a supplied view column maps to a
+	// join-key base column) or sourced from the anchor key column's declared `default`,
+	// evaluated once per row at the envelope and EC-threaded into the active sides. The
+	// engine mints nothing of its own — the basis author declares the policy
+	// (docs/view-updateability.md § Mutation Context).
 	const suppliedKeys = supplied.filter(s => s.isKey);
 	if (suppliedKeys.length > 1) {
 		raiseMutationDiagnostic({
@@ -356,41 +457,60 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 			message: `cannot insert through view '${view.name}': the shared join key is exposed by more than one view column (${suppliedKeys.map(s => `'${s.name}'`).join(', ')}); supply it through a single view column`,
 		});
 	}
-
-	// The shared key is either directly supplied (a supplied view column maps to a
-	// join-key base column) or sourced from the anchor key column's declared `default`,
-	// evaluated once per row at the envelope and EC-threaded into both sides. The engine
-	// mints nothing of its own — the basis author declares the policy
-	// (docs/view-updateability.md § Mutation Context).
 	const suppliedKeyIndex = supplied.findIndex(s => s.isKey);
 	let keyDefault: AST.Expression | undefined;
-	let keyEnvelopeIndex: number;
-	if (suppliedKeyIndex >= 0) {
-		keyEnvelopeIndex = suppliedKeyIndex;
-	} else {
-		keyEnvelopeIndex = supplied.length; // the default-sourced column is appended last
-		const anchorIndex = anchorSideIndex(sides);
-		const anchorKeyCol = columnByName(sides[anchorIndex].schema, keyColumns[anchorIndex]);
-		keyDefault = requireKeyDefault(view, sides[anchorIndex].schema, anchorKeyCol);
+	let keyEnvelopeIndex = -1;
+	if (needsSharedKey) {
+		if (suppliedKeyIndex >= 0) {
+			keyEnvelopeIndex = suppliedKeyIndex;
+		} else {
+			keyEnvelopeIndex = supplied.length; // the default-sourced column is appended last
+			// The anchor is the FK-root among the **active** sides (so a dropped optional
+			// member never seeds the surrogate); its key column's declared default sources
+			// the minted value.
+			const anchorIndex = orderSides(sides).find(isActive)!;
+			const anchorKeyCol = columnByName(sides[anchorIndex].schema, keyColumns[anchorIndex]);
+			keyDefault = requireKeyDefault(view, sides[anchorIndex].schema, anchorKeyCol);
+		}
 	}
 
-	// Per-side: the shared key (every side) plus the supplied view columns it owns.
-	const sideSpecs: MsInsertSide[] = sides.map((side, sideIndex): MsInsertSide => {
-		const targetColumns: string[] = [keyColumns[sideIndex]];
-		const envelopeIndices: number[] = [keyEnvelopeIndex];
+	// Per active side: the shared key (when needed) plus the supplied view columns it
+	// owns. A non-preserved active side carries a presence gate over its supplied columns.
+	//
+	// v1 caveat: when a non-preserved side IS active but a *given row's* supplied values are
+	// all null (its presence gate fails for that row), that row's non-preserved insert is
+	// dropped while the preserved side still threads the minted key into its join column —
+	// so a preserved row whose optional partner is absent for that row points its FK column
+	// at a key with no partner row (it reads back correctly null-extended, but with FK
+	// enforcement on this is a dangling reference). The tested path is single-row inserts
+	// with FK off; the per-row conditional key thread (`pr = case when <present> then key
+	// else null`) is deferred. The *statically* absent case (a non-preserved side with NO
+	// supplied columns) is handled cleanly above: it is inactive ⇒ no key is threaded.
+	const specByIndex = new Map<number, MsInsertSide>();
+	for (const sideIndex of activeIndices) {
+		const side = sides[sideIndex];
+		const targetColumns: string[] = [];
+		const envelopeIndices: number[] = [];
+		if (needsSharedKey) {
+			targetColumns.push(keyColumns[sideIndex]);
+			envelopeIndices.push(keyEnvelopeIndex);
+		}
+		const presenceGateIndices: number[] = [];
 		supplied.forEach((s, idx) => {
-			if (s.sideIndex !== sideIndex || s.isKey) return; // the key is already threaded above
+			if (s.sideIndex !== sideIndex) return;
+			if (needsSharedKey && s.isKey) return; // the key is threaded above
 			targetColumns.push(s.baseColumn);
 			envelopeIndices.push(idx);
+			if (!side.preserved) presenceGateIndices.push(idx);
 		});
 		assertNoMissingNotNull(view, side.schema, targetColumns);
-		return { table: side.table, schema: side.schema, targetColumns, envelopeIndices };
-	});
+		specByIndex.set(sideIndex, { table: side.table, schema: side.schema, targetColumns, envelopeIndices, presenceGateIndices });
+	}
 
-	const order = orderSides(sides);
+	const order = orderSides(sides).filter(i => specByIndex.has(i));
 	return {
 		suppliedColumns: supplied.map(s => ({ name: s.name, type: s.type })),
-		orderedSides: order.map(i => sideSpecs[i]),
+		orderedSides: order.map(i => specByIndex.get(i)!),
 		keyDefault,
 	};
 }
@@ -524,11 +644,6 @@ function extractJoinKeyColumns(view: MutableViewLike, sel: AST.SelectStmt, sides
 	return keyCols;
 }
 
-/** The side whose key seeds a minted surrogate: the FK-root (topo head), else the left source. */
-function anchorSideIndex(sides: readonly JoinSide[]): number {
-	return orderSides(sides)[0];
-}
-
 /** Reject a not-null base column with no declared default that no envelope value covers. */
 function assertNoMissingNotNull(view: MutableViewLike, schema: TableSchema, targetColumns: readonly string[]): void {
 	const covered = new Set(targetColumns.map(c => c.toLowerCase()));
@@ -605,7 +720,7 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 		});
 	}
 
-	const sources = collectInnerJoinSources(view, sel.from!);
+	const sources = collectJoinSources(view, sel.from!);
 
 	// Explicit projections only: a `select *` over a join is rejected here (before
 	// the shared backward read) so it surfaces the join-specific diagnostic rather
@@ -660,26 +775,27 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 	for (const ref of tableRefsById.values()) schemaByTableName.set(ref.tableSchema.name.toLowerCase(), ref.tableSchema);
 
 	const sides: JoinSide[] = sources.map((src): JoinSide => {
-		const alias = (src.alias ?? src.table.name).toLowerCase();
-		const schema = schemaByTableName.get(src.table.name.toLowerCase());
+		const alias = (src.source.alias ?? src.source.table.name).toLowerCase();
+		const schema = schemaByTableName.get(src.source.table.name.toLowerCase());
 		if (!schema) {
 			raiseMutationDiagnostic({
 				reason: 'no-base-lineage',
 				table: view.name,
-				message: `cannot write through view '${view.name}': base table '${src.table.name}' did not resolve in the planned body`,
+				message: `cannot write through view '${view.name}': base table '${src.source.table.name}' did not resolve in the planned body`,
 			});
 		}
 		const ref = resolveSourceTableRef(ctx, joinScope, schema, alias, attrToTableRef, view);
-		return { table: ref, schema: ref.tableSchema, alias };
+		return { table: ref, schema: ref.tableSchema, alias, preserved: src.preserved, ...(src.guard ? { guard: src.guard } : {}) };
 	});
 
 	const sideByTableId = new Map<number, number>();
 	sides.forEach((s, idx) => sideByTableId.set(Number(s.table.id), idx));
 
 	// Route each shared backward column onto its owning join side. An inner-join body
-	// never null-extends, so `nullExtended` is always false for the multi-source
-	// acceptance shape (it is the defensive guard the n-way reader needs for the
-	// decomposition outer-joined optional members).
+	// never null-extends (`nullExtended` always false); an outer-join body marks the
+	// non-preserved side's columns `nullExtended: true` (the join-predicate-guarded
+	// site `deriveJoinUpdateLineage` wraps) — still base-routed, but read-only on
+	// update (the deferred materialization) and insertable as an optional member.
 	const outColumns: OutColumn[] = columns.map((bc): OutColumn => {
 		if (bc.baseTableId !== undefined && bc.baseColumn !== undefined) {
 			const sideIndex = sideByTableId.get(bc.baseTableId);
@@ -689,11 +805,12 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 				sideIndex,
 				baseColumn: bc.baseColumn,
 				writable: sideIndex !== undefined && !bc.nullExtended,
+				nullExtended: bc.nullExtended,
 				...(bc.inverse ? { inverse: bc.inverse } : {}),
 				...(bc.domain ? { domain: bc.domain } : {}),
 			};
 		}
-		return { name: bc.name, displayName: bc.displayName, writable: false };
+		return { name: bc.name, displayName: bc.displayName, writable: false, nullExtended: false };
 	});
 
 	return { sel, sides, viewColToBaseRef, outColumns, root, joinNode, joinScope };
@@ -769,15 +886,31 @@ function findJoinNode(view: MutableViewLike, root: PlanNode): JoinNode {
 	return found;
 }
 
+/** One base-table source of the join body, with its preserved/guard classification. */
+interface JoinSourceInfo {
+	readonly source: AST.TableSource;
+	/** False when an enclosing outer join potentially null-extends this source. */
+	readonly preserved: boolean;
+	/** The conjoined ON predicate(s) of the enclosing outer join(s) that null-extend it. */
+	readonly guard?: AST.Expression;
+}
+
 /**
- * Collect the join's base-table sources (in AST declaration order), validating the
- * body is an **n-way (≥2) inner equi-join** over plain base tables (no outer / cross /
- * comma joins, no subquery or function sources). A **self-join** — the same base table
- * under distinct aliases — is accepted (routing is alias-keyed downstream); USING joins
- * are accepted alongside ON joins. The declaration order is the alias-declaration order
- * the substrate serializes per-side ops in (§ Cycles, Self-Joins).
+ * Collect the join's base-table sources (in AST declaration order), validating the body
+ * is an **n-way (≥2) equi-join** over plain base tables — `inner`, `left`, `right`, or
+ * `full` (no comma/implicit cross join, no subquery or function sources). A **self-join**
+ * — the same base table under distinct aliases — is accepted (routing is alias-keyed
+ * downstream); USING joins are accepted alongside ON joins. The declaration order is the
+ * alias-declaration order the substrate serializes per-side ops in (§ Cycles, Self-Joins).
+ *
+ * Each source is tagged **preserved** / **non-preserved** by walking the join tree and
+ * tracking which branch each table sits on: the right of a `left`, the left of a `right`,
+ * and both sides of a `full` are non-preserved (potentially null-extended), carrying the
+ * enclosing outer join's ON predicate as their guard (§ Outer Joins). An inner join
+ * propagates its parents' classification unchanged. This is the AST-shape dual of the
+ * planned body's `null-extended` lineage (which `analyzeJoinView` cross-checks per column).
  */
-function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromClause[]): AST.TableSource[] {
+function collectJoinSources(view: MutableViewLike, from: readonly AST.FromClause[]): JoinSourceInfo[] {
 	if (from.length !== 1 || from[0].type !== 'join') {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-join',
@@ -786,23 +919,49 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 		});
 	}
 
-	const out: AST.TableSource[] = [];
-	const visit = (fc: AST.FromClause): void => {
+	const out: JoinSourceInfo[] = [];
+	// `nonPreserved` is true when an enclosing outer join can null-extend the subtree;
+	// `guards` are those outer joins' ON predicates (conjoined onto each leaf's guard).
+	const visit = (fc: AST.FromClause, nonPreserved: boolean, guards: readonly AST.Expression[]): void => {
 		switch (fc.type) {
 			case 'table':
-				out.push(fc);
+				out.push({
+					source: fc,
+					preserved: !nonPreserved,
+					guard: guards.reduce<AST.Expression | undefined>((acc, g) => combineAnd(acc, g), undefined),
+				});
 				return;
 			case 'join': {
 				const hasPredicate = !!fc.condition || (!!fc.columns && fc.columns.length > 0);
-				if (fc.joinType !== 'inner' || !hasPredicate) {
+				const acceptedType = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'right' || fc.joinType === 'full';
+				if (!acceptedType || !hasPredicate) {
 					raiseMutationDiagnostic({
 						reason: 'unsupported-join',
 						table: view.name,
-						message: `cannot write through view '${view.name}': only INNER joins with an ON/USING predicate are decomposable (got '${fc.joinType}'${hasPredicate ? '' : ' without ON/USING'})`,
+						message: `cannot write through view '${view.name}': only INNER/LEFT/RIGHT/FULL joins with an ON/USING predicate are decomposable (got '${fc.joinType}'${hasPredicate ? '' : ' without ON/USING'})`,
 					});
 				}
-				visit(fc.left);
-				visit(fc.right);
+				// USING joins carry no AST `Expression` guard — only an explicit ON predicate
+				// is surfaced as the null-extension guard (v1 routing does not consume it).
+				const guardsWith = fc.condition ? [...guards, fc.condition] : guards;
+				switch (fc.joinType) {
+					case 'inner':
+						visit(fc.left, nonPreserved, guards);
+						visit(fc.right, nonPreserved, guards);
+						break;
+					case 'left':
+						visit(fc.left, nonPreserved, guards);
+						visit(fc.right, true, guardsWith);
+						break;
+					case 'right':
+						visit(fc.left, true, guardsWith);
+						visit(fc.right, nonPreserved, guards);
+						break;
+					case 'full':
+						visit(fc.left, true, guardsWith);
+						visit(fc.right, true, guardsWith);
+						break;
+				}
 				return;
 			}
 			default:
@@ -813,7 +972,7 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 				});
 		}
 	};
-	visit(from[0]);
+	visit(from[0], false, []);
 
 	if (out.length < 2) {
 		raiseMutationDiagnostic({
@@ -904,6 +1063,20 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// Not a view column at all — the same encapsulation-leak guard as the
 			// top-level `where` scan (distinct from a computed view column below).
 			raiseUnknownViewColumn(asg.column, view, analysis.outColumns.map(c => c.displayName));
+		}
+		// A non-preserved (outer-join null-extended) base column: the row is either matched
+		// (→ a normal base update) or null-extended (→ an insert on the missing side), a
+		// per-row branch not statically decidable here (§ Outer Joins — Updates on a
+		// non-preserved-side column). Defer to `view-write-optional-member-transitions` with
+		// a precise diagnostic — distinct from the genuinely-computed `no-inverse` below
+		// (the column DOES have base lineage; it just needs the materialization fan-out).
+		if (out.nullExtended && out.sideIndex !== undefined && out.baseColumn) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-outer-join-update',
+				column: asg.column,
+				table: view.name,
+				message: `cannot write through view '${view.name}': column '${asg.column}' is backed by the non-preserved side of an outer join (base table '${analysis.sides[out.sideIndex].schema.name}'); updating it needs the per-row matched-update / null-extended-insert materialization (deferred to the optional-member transitions fan-out)`,
+			});
 		}
 		if (!out.writable || out.sideIndex === undefined || !out.baseColumn) {
 			raiseMutationDiagnostic({
@@ -1005,6 +1178,18 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 /** All side indices `0..n-1` — the default candidate set for `target`/`exclude`. */
 function allSideIndices(sides: readonly JoinSide[]): number[] {
 	return sides.map((_, i) => i);
+}
+
+/**
+ * The **preserved** side indices — the default DELETE candidate set (§ Outer Joins —
+ * Deletes: "deleting from the preserved side is the only way for the joined row to
+ * disappear from the view"). For an inner join every side is preserved, so this is
+ * `allSideIndices` (unchanged routing). For a LEFT/RIGHT outer join it is the single
+ * preserved side. A `full` outer join has *no* preserved side; the caller falls back to
+ * the full candidate set there (every side is both preserved and non-preserved).
+ */
+function preservedSideIndices(sides: readonly JoinSide[]): number[] {
+	return sides.flatMap((s, i) => s.preserved ? [i] : []);
 }
 
 /**
@@ -1425,7 +1610,20 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
  *    key capture).
  */
 function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis, tags?: ReservedTagMap): number[] {
-	const candidates = applyTargetExclude(allSideIndices(analysis.sides), analysis.sides, tags, view);
+	// The candidate set defaults to the **preserved** side(s) — deleting the preserved
+	// side is the only way the joined row leaves the view (§ Outer Joins — Deletes).
+	// Inner joins are all-preserved (⇒ the full set, unchanged). A `full` outer join has
+	// no preserved side (each side is both preserved and non-preserved per row), so a
+	// statically-routed delete is not expressible — defer it.
+	const preserved = preservedSideIndices(analysis.sides);
+	if (preserved.length === 0) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot delete through view '${view.name}': a FULL outer join has no preserved side to route the delete to (each side is both preserved and non-preserved per row); deleting through a full-outer view is deferred`,
+		});
+	}
+	const candidates = applyTargetExclude(preserved, analysis.sides, tags, view);
 
 	const deleteVia = readDeleteVia(tags);
 	if (deleteVia) {

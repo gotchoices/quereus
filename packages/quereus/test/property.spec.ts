@@ -3607,7 +3607,10 @@ describe('Property-Based Tests', () => {
 				await db.exec('drop table if exists rjchild');
 				await db.exec('drop table if exists rjparent');
 				await db.exec('drop table if exists rjck');
-				await db.exec('create table rjparent (pp integer primary key, pv integer null) using memory');
+				// rjparent's PK declares the high-water-mark allocator default — the surrogate
+				// source the both-sides OUTER-join insert mints the shared key from (the engine
+				// mints nothing of its own); an explicit pp overrides it.
+				await db.exec('create table rjparent (pp integer primary key default (coalesce((select max(pp) from rjparent), 0) + mutation_ordinal()), pv integer null) using memory');
 				await db.exec('create table rjchild (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references rjparent(pp)) using memory');
 				await db.exec('create table rjck (k1 integer, k2 integer, v integer null, primary key (k1, k2)) using memory');
 				await db.exec('insert into rjparent values (1, 10)');
@@ -3639,10 +3642,23 @@ describe('Property-Based Tests', () => {
 				expect(xsRows.length, 'cross-source smoke needs a joined row').to.be.greaterThan(0);
 				for (const r of xsRows) expect(r.cv, 'cross-source set copied the joined pv into cv').to.equal(r.pv);
 
+				// Outer (LEFT) join bodies are now PARTIALLY writable — preserved-side update,
+				// delete-to-preserved, and insert routing. Smoke that they no longer reject
+				// wholesale; full PutGet/GetPut round-trips are pinned in the dedicated
+				// outer-join test below.
+				await db.exec('insert into rj_outer (cc, cv, pv) values (2, 22, 222)');   // both-sides outer insert: accepted (parent presence-gated)
+				await db.exec('insert into rj_outer (cc, cv) values (3, 33)');            // preserved-only insert: accepted (reads back null-extended)
+				await db.exec('update rj_outer set cv = 99 where cc = 1');                // preserved-side update: accepted
+				await db.exec('delete from rj_outer where cc = 2');                       // delete routes to the preserved (child) side
+				const ojSmoke = await readRows('select cc, cv, pv from rj_outer where cc = 3');
+				expect(ojSmoke.length, 'preserved-only insert is visible').to.equal(1);
+				expect(ojSmoke[0].pv, 'preserved-only row reads back null-extended').to.equal(null);
+
 				// Shapes still deferred reject with their precise diagnostic (no silent widen).
-				await expectMutationReject('insert into rj_outer (cc, cv, pv) values (2, 22, 222)', 'unsupported-join'); // outer-join insert
+				await expectMutationReject('update rj_outer set pv = 9 where cc = 1', 'unsupported-outer-join-update'); // non-preserved-side update: deferred to the transitions ticket
+				await expectMutationReject('insert into rj_outer (pv) values (9)', 'null-extended-create-conflict');    // non-preserved-only insert: no preserved anchor
 				await expectMutationReject('update rj_star set cv = 9 where cc = 1', 'unsupported-join');                // select *
-				await expectMutationReject('update rj_outer set cv = pv where cc = 1', 'unsupported-join');              // cross-source set through an OUTER join: still deferred
+				await expectMutationReject('update rj_outer set cv = pv where cc = 1', 'no-inverse');                    // cross-source set reading a non-preserved (null-extended) partner column
 				await expectMutationReject('update rj_pc set cv = pvc where cc = 1', 'no-inverse');                      // cross-source read of a COMPUTED partner column
 
 				// forward/backward lineage agreement on the ACCEPTED inner-join shape: every
@@ -3851,6 +3867,115 @@ describe('Property-Based Tests', () => {
 						assertRowsEqual('sj view', await readRows('select aid, ax, bx from sjv'), expView, ['aid', 'ax', 'bx']);
 					},
 				), { numRuns: 60 });
+			});
+
+			// ----- Outer (LEFT) join: preserved write-through + presence-gated optional member -----
+			// `ojv` = oj_child LEFT JOIN oj_parent on parent.pp = child.pr. oj_child (left) is
+			// PRESERVED; oj_parent (right) is the non-preserved optional member (null-extended
+			// when the child has no matching parent). Preserved-side update, delete-to-preserved,
+			// and both-side / preserved-only insert all round-trip; a non-preserved-side update
+			// defers (`unsupported-outer-join-update`) and a non-preserved-only insert rejects
+			// (`null-extended-create-conflict`). Static `view_info`/`column_info` agree per-side.
+			it('outer (left) join: preserved write-through + presence-gated optional member round-trips', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists ojv');
+				await db.exec('drop table if exists oj_child');
+				await db.exec('drop table if exists oj_parent');
+				// The preserved anchor's partner (parent) declares the high-water-mark allocator
+				// default — the source the both-side insert mints the shared key from.
+				await db.exec('create table oj_parent (pp integer primary key default (coalesce((select max(pp) from oj_parent), 0) + mutation_ordinal()), pv integer null) using memory');
+				await db.exec('create table oj_child (cc integer primary key, pr integer null references oj_parent(pp), cv integer null) using memory');
+				await db.exec('create view ojv as select c.cc as cc, c.cv as cv, p.pv as pv from oj_child c left join oj_parent p on p.pp = c.pr');
+
+				// Static plan-lineage: cc/cv are preserved base sites; pv is non-preserved null-extended.
+				const node = planLogicalBody('select c.cc as cc, c.cv as cv, p.pv as pv from oj_child c left join oj_parent p on p.pp = c.pr');
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, 'ojv exposes cc,cv,pv').to.equal(3);
+				const kindByName = new Map(attrs.map(a => [a.name.toLowerCase(), node.physical.updateLineage?.get(a.id)?.kind]));
+				expect(kindByName.get('cc'), 'cc preserved base').to.equal('base');
+				expect(kindByName.get('cv'), 'cv preserved base').to.equal('base');
+				expect(kindByName.get('pv'), 'pv non-preserved null-extended').to.equal('null-extended');
+
+				// Static surfaces agree with the dynamic per-side truth.
+				const vinfo = await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('ojv')");
+				expect(vinfo[0], 'ojv view_info per-side').to.deep.equal({ is_insertable_into: 'YES', is_updatable: 'YES', is_deletable: 'YES' });
+				const cinfo = await readRows("select column_name, is_updatable from column_info('ojv')");
+				const updByCol = new Map(cinfo.map(r => [String(r.column_name).toLowerCase(), r.is_updatable]));
+				expect(updByCol.get('cc'), 'cc updatable').to.equal('YES');
+				expect(updByCol.get('cv'), 'cv updatable').to.equal('YES');
+				expect(updByCol.get('pv'), 'pv (non-preserved) update deferred').to.equal('NO');
+
+				// Negatives: a non-preserved-side update / non-preserved-only insert defer.
+				await db.exec('insert into oj_parent values (1, 10)');
+				await db.exec('insert into oj_child values (1, 1, 100)');     // joined row
+				await db.exec('insert into oj_child values (2, null, 200)');  // null-extended row
+				await expectMutationReject('update ojv set pv = 999 where cc = 1', 'unsupported-outer-join-update');
+				await expectMutationReject('insert into ojv (pv) values (999)', 'null-extended-create-conflict');
+
+				// Delete-to-preserved: deleting the null-extended row removes it from the view
+				// but leaves every parent untouched (the delete routes to the preserved child).
+				await db.exec('delete from ojv where cc = 2');
+				assertRowsEqual('oj delete null-extended view', await readRows('select cc, cv, pv from ojv'),
+					[{ cc: 1, cv: 100, pv: 10 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('oj delete leaves parent', await readRows('select pp, pv from oj_parent'),
+					[{ pp: 1, pv: 10 }], ['pp', 'pv']);
+
+				// Property: both-side / preserved-only insert, preserved-side update (incl
+				// null-extended rows), delete-to-preserved (incl null-extended rows) round-trip.
+				const rowsArb = fc.array(fc.record({
+					cc: fc.integer({ min: 1, max: 6 }),
+					joined: fc.boolean(),                    // joined → both-side insert; else preserved-only
+					cv: fc.integer({ min: 1, max: 9 }),
+					pv: fc.integer({ min: 10, max: 19 }),
+				}), { maxLength: 6 });
+
+				await fc.assert(fc.asyncProperty(
+					rowsArb,
+					fc.integer({ min: 1, max: 6 }),    // target cc for update + delete
+					fc.integer({ min: 20, max: 29 }),  // new cv (disjoint from seeds)
+					async (rows, K, NCV) => {
+						await db.exec('delete from oj_child');
+						await db.exec('delete from oj_parent');
+						const byCc = new Map<number, { cc: number; joined: boolean; cv: number; pv: number }>();
+						for (const r of rows) {
+							if (byCc.has(r.cc)) continue;
+							byCc.set(r.cc, r);
+							if (r.joined) {
+								await db.exec(`insert into ojv (cc, cv, pv) values (${r.cc}, ${r.cv}, ${r.pv})`);  // both-side
+							} else {
+								await db.exec(`insert into ojv (cc, cv) values (${r.cc}, ${r.cv})`);                // preserved-only
+							}
+						}
+						const kept = [...byCc.values()];
+						const imageWith = (cv: (r: typeof kept[number]) => number) =>
+							kept.map(r => ({ cc: r.cc, cv: cv(r), pv: r.joined ? r.pv : null }));
+
+						// PutGet (insert): each child reads back, pv present iff joined.
+						assertRowsEqual('oj insert view', await readRows('select cc, cv, pv from ojv'),
+							imageWith(r => r.cv), ['cc', 'cv', 'pv']);
+
+						// GetPut (update): writing a row's own cv back leaves the image unchanged.
+						const hitRow = byCc.get(K);
+						if (hitRow) {
+							await db.exec(`update ojv set cv = ${hitRow.cv} where cc = ${K}`);
+							assertRowsEqual('oj GetPut update', await readRows('select cc, cv, pv from ojv'),
+								imageWith(r => r.cv), ['cc', 'cv', 'pv']);
+						}
+
+						// PutGet (preserved update): set cv on the target — works for joined AND
+						// null-extended rows; a null-extended row stays null-extended.
+						await db.exec(`update ojv set cv = ${NCV} where cc = ${K}`);
+						assertRowsEqual('oj update view', await readRows('select cc, cv, pv from ojv'),
+							imageWith(r => r.cc === K ? NCV : r.cv), ['cc', 'cv', 'pv']);
+
+						// PutGet (delete-to-preserved): deleting the target removes the joined row.
+						await db.exec(`delete from ojv where cc = ${K}`);
+						assertRowsEqual('oj delete view', await readRows('select cc, cv, pv from ojv'),
+							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc, cv: r.cv, pv: r.joined ? r.pv : null })), ['cc', 'cv', 'pv']);
+						assertRowsEqual('oj delete child base', await readRows('select cc from oj_child'),
+							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc })), ['cc']);
+					},
+				), { numRuns: 50 });
 			});
 		});
 

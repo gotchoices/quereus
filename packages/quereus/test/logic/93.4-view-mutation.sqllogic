@@ -1970,3 +1970,60 @@ update jvscope set note = plabel where cid = 1;
 -- projects over the join body) is guarded the same way.
 update jvscope set note = 'Y' where cid = 1 returning cid, plabel;
 -- error: not a column of the view
+
+-- ===================================
+-- Outer joins (§ Outer Joins). A LEFT outer join is partially write-through-able:
+-- the PRESERVED side (left) updates / deletes / inserts normally; the NON-preserved
+-- (right) side is a presence-gated optional member of the insert fan-out and is
+-- read-only on UPDATE (deferred — `unsupported-outer-join-update`). The preserved
+-- anchor's partner declares the high-water-mark default the both-side insert mints
+-- the shared key from. FK off so an unmatched (null-extended) child can exist.
+-- ===================================
+pragma foreign_keys = false;
+create table ojp (pp integer primary key default (coalesce((select max(pp) from ojp), 0) + mutation_ordinal()), pv integer null);
+create table ojc (cc integer primary key, pr integer null references ojp(pp), cv integer null);
+create view ojv as select c.cc as cc, c.cv as cv, p.pv as pv from ojc c left join ojp p on p.pp = c.pr;
+
+insert into ojp values (1, 10);
+insert into ojc values (1, 1, 100);     -- joined row
+insert into ojc values (2, null, 200);  -- null-extended row (no parent)
+
+-- The view null-extends the unmatched child.
+select cc, cv, pv from ojv order by cc;
+→ [{"cc":1,"cv":100,"pv":10},{"cc":2,"cv":200,"pv":null}]
+
+-- Preserved-side update propagates to the child — including the null-extended row,
+-- which stays null-extended (the parent side is untouched).
+update ojv set cv = 111 where cc = 1;
+update ojv set cv = 222 where cc = 2;
+select cc, cv, pv from ojv order by cc;
+→ [{"cc":1,"cv":111,"pv":10},{"cc":2,"cv":222,"pv":null}]
+
+-- A non-preserved-side update is deferred (the per-row matched-update / null-extended-
+-- insert branch — handed to the optional-member transitions fan-out).
+update ojv set pv = 99 where cc = 1;
+-- error: cannot write through view
+
+-- Both-side insert: child + (presence-gated) parent under the minted shared key.
+insert into ojv (cc, cv, pv) values (3, 33, 333);
+select cc, cv, pv from ojv where cc = 3;
+→ [{"cc":3,"cv":33,"pv":333}]
+
+-- Preserved-only insert: a single child insert; the row reads back null-extended.
+insert into ojv (cc, cv) values (4, 44);
+select cc, cv, pv from ojv where cc = 4;
+→ [{"cc":4,"cv":44,"pv":null}]
+
+-- A non-preserved-only insert has no preserved anchor row to attach to — rejected.
+insert into ojv (pv) values (999);
+-- error: only non-preserved-side columns
+
+-- Delete routes to the preserved (child) side: the joined row disappears and the
+-- parent survives; a null-extended row is deletable too.
+delete from ojv where cc = 1;
+delete from ojv where cc = 2;
+select cc, cv, pv from ojv order by cc;
+→ [{"cc":3,"cv":33,"pv":333},{"cc":4,"cv":44,"pv":null}]
+-- the parent of the deleted joined row survives (the delete hit only the child side).
+select pv from ojp order by pv;
+→ [{"pv":10},{"pv":333}]
