@@ -1545,8 +1545,9 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 	// RESTRICT pre-check (`runtime/foreign-key-actions.ts`) on the actual data.
 	//
 	// This plan-time mutual-FK analysis is **deliberately NOT generalized past two
-	// sides** (§ Out of scope): an n-way (>2) delete uses the FK topological order over
-	// the chosen sides and defers any mutual-FK cycle wholesale to the runtime RESTRICT
+	// sides** (§ Out of scope): an n-way (>2) delete uses the **reverse** FK-topological
+	// order (FK-child before FK-parent) over the chosen sides — the FK-safe delete
+	// direction — and defers any mutual-FK cycle wholesale to the runtime RESTRICT
 	// pre-check. A single-side delete has no ordering hazard, so it keeps its trivial
 	// order.
 	let order: readonly number[];
@@ -1568,9 +1569,18 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 			order = fanoutOrder;
 		}
 	} else {
-		// Single side, or an n-way (>2) fan-out: FK topological order (parent before
-		// child) restricted to the chosen sides; mutual-FK cycles defer to runtime.
-		order = orderSides(analysis.sides).filter(i => sides.includes(i));
+		// Single side, or an n-way (>2) fan-out. Delete in **reverse** FK-topological
+		// order — FK-CHILD before FK-parent — so a child's referencing row is gone before
+		// its parent row is deleted (the canonical columnar-split shape: each member's PK
+		// references the anchor's). The forward (parent-first) order trips the parent's
+		// inbound RESTRICT/NO-ACTION under immediate FK enforcement and aborts the whole
+		// statement. Child-first is unconditionally FK-safe (deleting a referencing row
+		// never trips a constraint on the referenced row, for any ON DELETE action), so it
+		// is the right default for both RESTRICT and CASCADE; a mutual-FK cycle still
+		// defers wholesale to the runtime RESTRICT pre-check. A single-side delete reverses
+		// a one-element order (a no-op). The eager up-front key capture makes the order
+		// purely an FK-enforcement concern — identity is fixed before any op fires.
+		order = orderSides(analysis.sides).filter(i => sides.includes(i)).reverse();
 	}
 	const ops: BaseOp[] = [];
 	for (const sideIndex of order) {

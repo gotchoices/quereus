@@ -608,6 +608,48 @@ update ax_three set bv = 9 where cid = 2;
 select bid, v from ax_b order by bid;
 → [{"bid":2,"v":9},{"bid":7,"v":60}]
 
+-- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
+-- order the base deletes FK-child before FK-parent. The canonical columnar split has each
+-- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first
+-- would trip the children's inbound RESTRICT/NO-ACTION and abort. The reverse FK-topo
+-- order deletes the children first, so the joined row clears from every member cleanly.
+create table axd_a (k integer primary key, av integer);
+create table axd_b (k integer primary key references axd_a(k), bv integer);
+create table axd_c (k integer primary key references axd_a(k), cv integer);
+insert into axd_a values (1, 10), (2, 20);
+insert into axd_b values (1, 11), (2, 21);
+insert into axd_c values (1, 12), (2, 22);
+create view axd_v as
+    select a.k as k, a.av as av, b.bv as bv, c.cv as cv
+    from axd_a a join axd_b b on b.k = a.k join axd_c c on c.k = a.k;
+delete from axd_v where k = 1;
+select k from axd_a order by k;
+→ [{"k":2}]
+select k from axd_b order by k;
+→ [{"k":2}]
+select k from axd_c order by k;
+→ [{"k":2}]
+
+-- n-way (3-table star) INSERT under FK enforcement -> the shared key is minted once from
+-- the anchor's declared default (axi_a), FK-parent first, then threaded into the two
+-- children's key columns via the equivalence class. One insert through the view produces
+-- one row per member, all sharing the minted key.
+create table axi_a (k integer primary key default (coalesce((select max(k) from axi_a), 0) + 1), av integer);
+create table axi_b (k integer primary key references axi_a(k), bv integer);
+create table axi_c (k integer primary key references axi_a(k), cv integer);
+create view axi_v as
+    select a.k as k, a.av as av, b.bv as bv, c.cv as cv
+    from axi_a a join axi_b b on b.k = a.k join axi_c c on c.k = a.k;
+insert into axi_v (av, bv, cv) values (100, 200, 300);
+select k, av from axi_a order by k;
+→ [{"k":1,"av":100}]
+select k, bv from axi_b order by k;
+→ [{"k":1,"bv":200}]
+select k, cv from axi_c order by k;
+→ [{"k":1,"cv":300}]
+select k, av, bv, cv from axi_v order by k;
+→ [{"k":1,"av":100,"bv":200,"cv":300}]
+
 -- DELETE through a join with no provable FK and no resolving tag -> under the
 -- default lenient policy the predicate-honest multi-side fan-out deletes the joined
 -- row's contribution from EVERY candidate side ("make this joined row not exist").

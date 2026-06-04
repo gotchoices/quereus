@@ -259,7 +259,7 @@ CREATE TABLE relaxed_default_colref (
     a INTEGER,
     b INTEGER DEFAULT (a)
 );
--- error: may not reference columns
+-- error: may not reference a bare column
 
 CREATE TABLE relaxed_check_bindparam (
     id INTEGER PRIMARY KEY,

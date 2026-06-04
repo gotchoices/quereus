@@ -1212,8 +1212,14 @@ export class SchemaManager {
 					return false;
 				}
 				if (options.rejectColumns && node.type === 'column' && subqueryDepth === 0) {
-					offendingType = 'column';
-					return false;
+					// `new.<column>` is an explicit, legal read of a value the INSERT
+					// supplies for a sibling column (resolved against the row scope at
+					// INSERT time); only a bare (unqualified) column is the illegal
+					// sibling reference rejected here.
+					if ((node as AST.ColumnExpr).table?.toLowerCase() !== 'new') {
+						offendingType = 'column';
+						return false;
+					}
 				}
 				if (isQueryBoundary(node)) subqueryDepth += 1;
 			},
@@ -1257,6 +1263,21 @@ export class SchemaManager {
 		return found;
 	}
 
+	/** True when a DEFAULT expression reads the row being written via `new.<column>`. */
+	private defaultReferencesNewRow(expr: AST.AstNode): boolean {
+		let found = false;
+		traverseAst(expr, {
+			enterNode: (node: AST.AstNode) => {
+				if (found) return false;
+				if (node.type === 'column' && (node as AST.ColumnExpr).table?.toLowerCase() === 'new') {
+					found = true;
+					return false;
+				}
+			},
+		});
+		return found;
+	}
+
 	private validateDefaultDeterminism(
 		columns: ReadonlyArray<ColumnSchema>,
 		tableName: string,
@@ -1287,29 +1308,35 @@ export class SchemaManager {
 				formatParamError: () =>
 					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference bind parameters.`,
 				formatColumnError: () =>
-					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference columns; use a generated column instead.`,
+					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference a bare column; use 'new.<column>' to read a value supplied by the INSERT, or a generated column instead.`,
 			});
 
 			let defaultExpr: ScalarPlanNode | undefined;
 			// A DEFAULT that embeds a subquery may forward-reference the table being
 			// created (a self-referencing allocator — `select max(rid) from t` on `t`):
 			// the table is not yet registered here, so the build legitimately fails.
-			// Determinism is re-checked at INSERT time (both the single-source insert
+			// A DEFAULT that reads `new.<column>` resolves only against the row scope
+			// established at INSERT time, so it likewise cannot build here. Either way
+			// determinism is re-checked at INSERT time (both the single-source insert
 			// expansion and the shared-key envelope re-validate the compiled default),
-			// so defer rather than reject. Non-subquery build failures (a typo'd
-			// function / column) stay strict.
+			// so defer rather than reject. Other build failures (a typo'd function /
+			// bare column) stay strict.
 			const defaultEmbedsSubquery = this.defaultEmbedsSubquery(col.defaultValue as AST.AstNode);
+			const defaultReferencesNewRow = this.defaultReferencesNewRow(col.defaultValue as AST.AstNode);
 			try {
 				defaultExpr = buildExpression(planningCtx, col.defaultValue as AST.Expression) as ScalarPlanNode;
 			} catch (e) {
-				if (hasMutationContext || defaultEmbedsSubquery) {
+				if (hasMutationContext || defaultEmbedsSubquery || defaultReferencesNewRow) {
 					// Column-style identifiers in DEFAULT may resolve to mutation
 					// context variables at INSERT time; a subquery may forward-reference
-					// the table being created. Either way the row/table scope isn't
-					// available here, so a build failure isn't necessarily a bug.
-					// Determinism is re-checked at INSERT time.
+					// the table being created; `new.<column>` resolves against the INSERT
+					// row scope. The row/table scope isn't available here, so a build
+					// failure isn't necessarily a bug. Determinism is re-checked at
+					// INSERT time.
 					log('Skipping determinism validation for default on column %s.%s at CREATE TABLE time (deferred to INSERT%s): %s',
-						tableName, col.name, hasMutationContext ? ', mutation context present' : ', embeds subquery', (e as Error).message);
+						tableName, col.name,
+						hasMutationContext ? ', mutation context present' : defaultEmbedsSubquery ? ', embeds subquery' : ', references new row',
+						(e as Error).message);
 				} else {
 					const message = e instanceof Error ? e.message : String(e);
 					const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;

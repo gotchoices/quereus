@@ -31,3 +31,35 @@ SELECT * FROM t_defaults ORDER BY id;
 → [{"id":1,"name":"test1","created_timestamp":9999,"computed":"custom"},{"id":2,"name":"test2","created_timestamp":1500,"computed":"prefix_suffix"},{"id":3,"name":"unnamed","created_timestamp":2000,"computed":"prefix_suffix"},{"id":4,"name":"unnamed","created_timestamp":1500,"computed":"prefix_suffix"}]
 
 DROP TABLE t_defaults;
+
+-- ===================================
+-- DEFAULT deriving from a populated sibling via new.<column>
+-- A default may read a value the INSERT actually supplies; only INSERT-supplied
+-- columns are visible, so a default never depends on another column's default
+-- (which would impose an evaluation-order race).
+-- ===================================
+
+CREATE TABLE t_newref (
+  id INTEGER PRIMARY KEY,
+  base INTEGER,
+  title TEXT,
+  doubled INTEGER DEFAULT (new.base * 2),
+  slug TEXT DEFAULT (lower(new.title))
+);
+
+-- Siblings populated → the defaults derive from them
+INSERT INTO t_newref (id, base, title) VALUES (1, 10, 'Hello');
+SELECT id, base, title, doubled, slug FROM t_newref WHERE id = 1;
+→ [{"id":1,"base":10,"title":"Hello","doubled":20,"slug":"hello"}]
+
+-- An explicitly supplied value overrides the default (new.* unused)
+INSERT INTO t_newref (id, base, title, doubled) VALUES (2, 10, 'X', 999);
+SELECT doubled FROM t_newref WHERE id = 2;
+→ [{"doubled":999}]
+
+-- Referencing a column the INSERT did not supply → clear resolution error
+-- (here `title` is omitted, so `new.title` in slug's default has no value).
+INSERT INTO t_newref (id, base) VALUES (3, 7);
+-- error: isn't a column
+
+DROP TABLE t_newref;

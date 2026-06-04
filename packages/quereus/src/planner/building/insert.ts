@@ -14,6 +14,7 @@ import { checkColumnsAssignable, columnSchemaToDef } from '../type-utils.js';
 import type { ColumnDef } from '../../common/datatype.js';
 import type { CTEScopeNode } from '../nodes/cte-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
+import type { ReferenceCallback } from '../scopes/scope.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
@@ -62,19 +63,31 @@ function createRowExpansionProjection(
 	const projections: Projection[] = [];
 	const sourceAttributes = sourceNode.getAttributes();
 
-	// If we have a context scope, we need to also register source columns in it
-	// so that defaults can reference them (e.g., DEFAULT base_price + markup)
-	if (contextScope) {
-		targetColumns.forEach((targetCol, index) => {
-			if (index < sourceAttributes.length) {
-				const sourceAttr = sourceAttributes[index];
-				const colNameLower = targetCol.name.toLowerCase();
-				contextScope.registerSymbol(colNameLower, (exp, s) =>
-					new ColumnReferenceNode(s, exp as AST.ColumnExpr, sourceAttr.type, sourceAttr.id, index)
-				);
-			}
-		});
-	}
+	// Expose the source-provided ("populated") columns to default expressions so a
+	// default can derive from a sibling the INSERT actually supplied, e.g.
+	// `slug text default (lower(new.title))`. The `new.`-qualified form is always
+	// available; the bare form resolves too, unless a same-named mutation-context
+	// variable shadows it (preserving the WITH CONTEXT precedence). Columns the
+	// INSERT omitted are intentionally NOT registered: they are themselves being
+	// defaulted in this same projection and have no value yet, so a default cannot
+	// depend on another column's default (which would impose an evaluation-order
+	// race). Parented on contextScope so mutation-context variables stay resolvable.
+	const contextVarNames = new Set(
+		(tableReference.tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
+	);
+	const defaultScope = new RegisteredScope(contextScope ?? ctx.scope);
+	targetColumns.forEach((targetCol, index) => {
+		if (index >= sourceAttributes.length) return;
+		const sourceAttr = sourceAttributes[index];
+		const colNameLower = targetCol.name.toLowerCase();
+		const makeRef: ReferenceCallback = (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, sourceAttr.type, sourceAttr.id, index);
+		defaultScope.registerSymbol(`new.${colNameLower}`, makeRef);
+		if (!contextVarNames.has(colNameLower)) {
+			defaultScope.registerSymbol(colNameLower, makeRef);
+		}
+	});
+	const defaultCtx: PlanningContext = { ...ctx, scope: defaultScope };
 
 	tableSchema.columns.forEach((tableColumn) => {
 		// Find if this table column is in the target columns
@@ -118,10 +131,9 @@ function createRowExpansionProjection(
 				);
 			}
 		} else {
-			// This column is omitted - use default value or NULL
+			// This column is omitted - use its default expression (evaluated against
+			// defaultScope, so it can read populated siblings via `new.`) or NULL.
 			let defaultNode: ScalarPlanNode;
-			// Use context scope for default evaluation if available
-			const defaultCtx = contextScope ? { ...ctx, scope: contextScope } : ctx;
 			if (tableColumn.defaultValue !== undefined) {
 				// Use default value
 				if (typeof tableColumn.defaultValue === 'object' && tableColumn.defaultValue !== null && 'type' in tableColumn.defaultValue) {
