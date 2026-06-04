@@ -1,5 +1,5 @@
 description: Remove the redundant quereus.update.* routing tags (target / exclude / delete_via, and evaluate policy) once the existence/membership presence columns subsume them. Keep default_for (value supply, no column equivalent). Shrinks the override surface to one mechanism: explicit per-row presence columns.
-prereq: outer-join-existence-column, set-operator-membership-columns
+prereq: outer-join-existence-column, set-op-membership-write
 files: packages/quereus/src/schema/reserved-tags.ts, packages/quereus/src/schema/reserved-tags-policy.ts, packages/quereus/src/planner/mutation/mutation-tags.ts, packages/quereus/src/planner/mutation/propagate.ts, packages/quereus/src/planner/mutation/multi-source.ts, packages/quereus/src/planner/mutation/decomposition.ts, docs/view-updateability.md, docs/sql.md, docs/lens.md
 ----
 
