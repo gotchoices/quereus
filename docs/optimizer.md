@@ -477,6 +477,7 @@ Rules are organized by optimization family in `src/planner/rules/`:
 - `ruleCteOptimization`: Adds caching to frequently-accessed CTEs
 - `ruleInSubqueryCache`: Wraps uncorrelated, deterministic IN-subquery sources in CacheNode
 - `ruleMaterializationAdvisory`: Global analysis for cache injection
+- `ruleMaterializedViewRewrite`: Automatic materialized-view query rewrite (read side). Rewrites an *arbitrary* scan-projection-filter query that never names an MV to scan the MV's backing table when a covering MV answers it. See § [Materialized-view query rewrite (read side)](#materialized-view-query-rewrite-read-side).
 - `ruleMutatingSubqueryCache`: Ensures mutating subqueries execute once
 - `ruleScalarCSE`: Scalar common subexpression elimination. Detects duplicate deterministic scalar expressions across a ProjectNode and its child chain (Filter, Sort), injects a lower ProjectNode that computes each deduplicated expression once, and replaces duplicates with column references. Skips bare column references, literals, and non-deterministic expressions. Runs in the Structural pass at priority 22.
 
@@ -508,6 +509,25 @@ Rules are organized by optimization family in `src/planner/rules/`:
 
 **Constant Folding** (pass)
 - Constant folding pass: Evaluates constant expressions at plan time
+
+### Materialized-view query rewrite (read side)
+
+`ruleMaterializedViewRewrite` (`rules/cache/rule-materialized-view-rewrite.ts`) is the read-side dual of the [coverage prover](materialized-views.md#explicit-covering-structures-the-coverage-prover): it recognizes when an *arbitrary* scan-projection-filter query — one that **never names** a materialized view — is *answered from* a covering MV, and rewrites it to scan the MV's backing table (`_mv_<name>`) with a residual projection/filter instead of recomputing the body against the base tables. Because the replacement is an ordinary `TableReference`, `query_plan()` shows the backing scan for free.
+
+**Matcher** (`planner/analysis/query-rewrite-matcher.ts`, sibling to `coverage-prover.ts`). The question is **output-relation subsumption**: do the MV's stored rows contain a superset (re-coverable via a bounded residual) of the rows the fragment produces, keyed so the residual recovers exactly the fragment's output? It shares the coverage prover's entailment vocabulary (`recognizeConjunctiveClauses` / `guardClausesEntail`), so NULL semantics are identical. Soundness mirrors the prover exactly — **a false NotMatch only forgoes a speedup; a false Match returns wrong rows** — so every check forgoes the rewrite on doubt, and the rule only ever replaces the correct recompute-over-base plan with a provably row-equivalent backing scan (non-regressing).
+
+- **Shape.** The fragment must be a single-source `Project(Filter?(scan(TableReference)))` over base `T`; the MV body (read from `mv.selectAst`) the same projection-and-filter over the same `T`. Aggregation / DISTINCT / set-op / join / LIMIT on either side ⇒ NotMatch (`shape`). Aggregate-rollup and join-subsumption are deferred phases that extend this matcher.
+- **Predicate entailment (containment).** The fragment's row set must be a subset of the MV's: the MV's WHERE `P_mv` must be entailed by the fragment's WHERE `P_q`. The residual is the conjunction of `P_q` conjuncts not already entailed by `P_mv`, applied as a `Filter` on the backing scan (`predicate-not-entailed` otherwise). An MV with no WHERE subsumes any fragment WHERE (residual = full `P_q`); a fragment with no WHERE requires `P_mv` empty too.
+- **Projection coverage.** Every fragment output column (a bare passthrough of a `T` column) must be a column the MV projects; the residual's columns likewise (`missing-column` otherwise). A computed fragment output is not re-derived in v1.
+- **Gates.** A **stale** MV (its backing is an unmaintained snapshot), a **non-deterministic body** (reuses the function-registry determinism metadata — a registered MV is already deterministic by construction), or a **source-schema mismatch** are all rejected before shape matching.
+
+**Pass placement.** Registered FIRST in the Structural `rewrite` pass (pass rules fire in *registration* order, not by `priority`), so it sees the pristine `Project(Filter?(Retrieve(TableReference)))` and reads the fragment's WHERE off the live plan — *before* `grow-retrieve` / `predicate-pushdown` reposition the Filter and before the Physical pass absorbs a predicate into a range scan (where the matcher could no longer see it and would falsely treat the fragment as unfiltered). Logical→logical, so the substituted backing `TableReference` flows through the normal Physical-pass access-path selection. `sideEffectMode: 'safe'`: the matcher admits only a read-only fragment (recognized predicates, no subqueries), so the dropped base-scan subtree is pure, and the replacement re-emits the fragment's identical output attribute ids so the parent splice stays valid.
+
+**Cost gate.** Compares the recompute-over-base cost (`seqScanCost(baseRows) + filter + project`) to the MV-backed cost (`seqScanCost(backingRows) + residual + project`); chooses the MV only when strictly cheaper, picking the cheapest match with a stable lowercased-name tiebreak. Backing cardinality prefers a real stat that reflects the materialized subset and otherwise applies a selectivity discount when the MV carries a WHERE, so a covering MV that pre-filters wins even when the stats provider reports no row counts (memory tables). A no-win case — an MV with no WHERE answering a no-WHERE query (backing == base size, no filter saved) — is equal-cost and declines.
+
+**Self-maintenance suppression.** The rule is disabled (`SchemaManager.withSuppressedMaterializedViewRewrite`) while planning an MV's own body to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating.
+
+The soundness backstop is the equivalence property harness (`test/query-rewrite-equivalence.spec.ts`): over random base data it asserts `rewritten(query) == unrewritten(query)` row-for-row (including NULLs and empty results) for a corpus of covering and near-miss queries, run with the rule enabled vs disabled.
 
 ### Virtual Table Integration
 

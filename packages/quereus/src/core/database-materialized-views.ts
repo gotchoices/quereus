@@ -751,8 +751,13 @@ export class MaterializedViewManager {
 	 */
 	private buildMaintenancePlan(mv: MaterializedViewSchema): MaintenancePlan {
 		const db = this.ctx as unknown as Database;
-		const { plan } = this.ctx._buildPlan([mv.selectAst as AST.Statement]);
-		const analyzed = this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
+		// Analyze the MV's own body to compile maintenance; suppress the read-side
+		// rewrite so the body stays over its SOURCE table, not re-pointed at this
+		// MV's backing (which the maintenance plan is what keeps consistent).
+		const analyzed = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
+			const { plan } = this.ctx._buildPlan([mv.selectAst as AST.Statement]);
+			return this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
+		});
 
 		const reject = (detail: string): never => {
 			throw new QuereusError(
@@ -1303,7 +1308,11 @@ export class MaterializedViewManager {
 		if (rewritten === analyzed) {
 			reject('its body could not be parameterized for residual maintenance (the source reference was not found)');
 		}
-		const optimized = this.ctx.optimizer.optimize(rewritten, db) as BlockNode;
+		// Suppress the read-side rewrite: the residual is the MV's own body (+ a key
+		// filter) compiled to maintain its backing, so it must stay over the source.
+		const optimized = db.schemaManager.withSuppressedMaterializedViewRewrite(
+			() => this.ctx.optimizer.optimize(rewritten, db) as BlockNode,
+		);
 		const instruction = emitPlanNode(optimized, new EmissionContext(db));
 		return new Scheduler(instruction);
 	}

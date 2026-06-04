@@ -135,7 +135,20 @@ async function readMultiset(db: Database, sql: string): Promise<string[]> {
 /** Assert `read(MV) == evaluate(body)` as multisets. */
 async function assertEquivalent(db: Database, body: string, phase: string): Promise<void> {
 	const fromMv = await readMultiset(db, 'select * from mv');
-	const fromBody = await readMultiset(db, body);
+	// The oracle must recompute `body` LIVE from the source. The body is, by
+	// construction, the MV's own defining SELECT, so the read-side query-rewrite rule
+	// (`rule-materialized-view-rewrite`) would otherwise redirect it to the very
+	// backing this oracle exists to check — making the comparison vacuous. Disable it
+	// for the oracle read only (the `select * from mv` above resolves to the backing
+	// directly, independent of the rule).
+	const prev = db.optimizer.tuning;
+	db.optimizer.updateTuning({ ...prev, disabledRules: new Set([...(prev.disabledRules ?? []), 'materialized-view-rewrite']) });
+	let fromBody: string[];
+	try {
+		fromBody = await readMultiset(db, body);
+	} finally {
+		db.optimizer.updateTuning(prev);
+	}
 	expect(fromMv, `${phase}: MV backing diverged from live body`).to.deep.equal(fromBody);
 }
 

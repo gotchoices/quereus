@@ -15,6 +15,7 @@ import type { OptimizerDiagnostics } from './framework/context.js';
 import { PassManager, PassId } from './framework/pass.js';
 // Phase 2 rules
 import { ruleMaterializationAdvisory } from './rules/cache/rule-materialization-advisory.js';
+import { ruleMaterializedViewRewrite } from './rules/cache/rule-materialized-view-rewrite.js';
 // Phase 1.5 rules
 import { ruleSelectAccessPath } from './rules/access/rule-select-access-path.js';
 import { ruleLensAuxiliaryAccess } from './rules/access/rule-lens-auxiliary-access.js';
@@ -105,6 +106,28 @@ export class Optimizer {
 	 * Register rules with their appropriate passes
 	 */
 	private registerRulesToPasses(): void {
+		// Materialized-view query rewrite (read side). Registered FIRST in the
+		// Structural pass so it fires on the pristine `Project(Filter?(Retrieve(
+		// TableReference)))` — before grow-retrieve / predicate-pushdown reposition
+		// the Filter and before the Physical pass absorbs a predicate into a range
+		// scan — where the matcher can read the fragment's WHERE off the live plan.
+		// Pass rules fire in REGISTRATION order (not by `priority`), so placement here
+		// is what guarantees first-fire. Logical→logical: the substituted backing
+		// TableReference then flows through normal physical access selection, so
+		// `query_plan()` shows an ordinary `_mv_<name>` scan for free.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'materialized-view-rewrite',
+			nodeType: PlanNodeType.Project,
+			phase: 'rewrite',
+			fn: ruleMaterializedViewRewrite,
+			priority: 6,
+			// Replaces a read-only scan-project-filter fragment with a provably
+			// row-equivalent backing scan; the dropped base-scan subtree is pure (the
+			// matcher admits only recognized predicates, no subqueries) and the
+			// replacement re-emits the fragment's identical output attribute ids.
+			sideEffectMode: 'safe',
+		});
+
 		// Structural pass rules (top-down) - for operations that need parent context
 		// Register grow-retrieve for ALL relational node types
 		// The rule itself will determine if growth is possible

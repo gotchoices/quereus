@@ -61,6 +61,18 @@ export function deriveBackingShape(
 	bodySql: string,
 	explicitColumns: ReadonlyArray<string> | undefined,
 ): BackingShape {
+	// Suppress the read-side rewrite: we are computing the MV body to derive/populate
+	// its OWN backing, so it must not be rewritten to read that backing.
+	return db.schemaManager.withSuppressedMaterializedViewRewrite(
+		() => deriveBackingShapeUnguarded(db, bodySql, explicitColumns),
+	);
+}
+
+function deriveBackingShapeUnguarded(
+	db: Database,
+	bodySql: string,
+	explicitColumns: ReadonlyArray<string> | undefined,
+): BackingShape {
 	const plan = db.getPlan(bodySql);
 	const root = plan.getRelations()[0];
 	if (!root) {
@@ -189,16 +201,21 @@ export function buildBackingTableSchema(
 /** Runs the body to completion and returns its rows (raw `Row` arrays). Uses the
  *  no-transaction-management primitive — the caller is already inside DDL execution. */
 export async function collectBodyRows(db: Database, bodySql: string): Promise<Row[]> {
-	const stmt = db.prepare(bodySql);
-	try {
-		const rows: Row[] = [];
-		for await (const row of stmt._iterateRowsRaw()) {
-			rows.push(row as Row);
+	// Suppress the read-side rewrite for the whole prepare+iterate: this body is run
+	// to (re)compute the MV's OWN backing (create fill / refresh rebuild), so it must
+	// recompute from the source, never read the backing it is populating.
+	return db.schemaManager.withSuppressedMaterializedViewRewriteAsync(async () => {
+		const stmt = db.prepare(bodySql);
+		try {
+			const rows: Row[] = [];
+			for await (const row of stmt._iterateRowsRaw()) {
+				rows.push(row as Row);
+			}
+			return rows;
+		} finally {
+			await stmt.finalize();
 		}
-		return rows;
-	} finally {
-		await stmt.finalize();
-	}
+	});
 }
 
 /**
@@ -255,7 +272,11 @@ export function getBackingManager(backingSchema: TableSchema): MemoryTableManage
  * simply records nothing.
  */
 export function linkCoveredUniqueConstraints(db: Database, mv: MaterializedViewSchema, bodySql: string): void {
-	const root = db.getPlan(bodySql).getRelations()[0];
+	// The coverage prover reasons over the body's SOURCE table; suppress the
+	// read-side rewrite so the body is not re-pointed at this MV's own backing.
+	const root = db.schemaManager.withSuppressedMaterializedViewRewrite(
+		() => db.getPlan(bodySql).getRelations()[0],
+	);
 	if (!root) return;
 	const sm = db.schemaManager;
 	for (const qualified of mv.sourceTables) {
@@ -298,7 +319,11 @@ export function unlinkCoveredUniqueConstraints(db: Database, mv: MaterializedVie
 export function revalidateBody(db: Database, mvName: string, bodySql: string): RelationalPlanNode {
 	let root: RelationalPlanNode | undefined;
 	try {
-		root = db.getPlan(bodySql).getRelations()[0];
+		// Re-validate the body against the SOURCE schemas; suppress the read-side
+		// rewrite so it is not re-pointed at this MV's own backing.
+		root = db.schemaManager.withSuppressedMaterializedViewRewrite(
+			() => db.getPlan(bodySql).getRelations()[0],
+		);
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
 		throw new QuereusError(

@@ -128,6 +128,23 @@ Recursion and set operations are out of the row-time model entirely (no bounded 
 
 A reference to `mv` in a query resolves to a `TableReferenceNode` against the **backing table**, not to a body expansion. Reads therefore go straight to the stored rows and cost like a table scan, not like re-running the body. (An unqualified MV reference resolves against the current schema; a materialized view in a non-current schema must be qualified.)
 
+### Automatic query rewrite (read side)
+
+The above is the *named* read path. There is also an **automatic** path: the optimizer recognizes when an *arbitrary* scan-projection-filter query — one that **never names** the MV — is *answered from* a covering MV, and rewrites it to scan the MV's backing table with a residual projection/filter instead of recomputing the body against the base tables. This is the read-side dual of the [coverage prover](#explicit-covering-structures-the-coverage-prover) (which proves a base-table `UNIQUE` constraint is covered, on the write/enforcement side).
+
+```sql
+create materialized view recent as
+  select id, customer_id, amt from sales where amt > 0;
+
+-- never names `recent`, but the optimizer answers from it:
+select customer_id, amt from sales where amt > 0 and customer_id = 7;
+--   → scan _mv_recent, residual filter (customer_id = 7), residual project (customer_id, amt)
+```
+
+The matcher (`planner/analysis/query-rewrite-matcher.ts`) asks **output-relation subsumption**: does the MV's stored rows contain a superset of the rows the fragment produces, keyed so a bounded residual recovers exactly the fragment's output? It reuses the coverage prover's entailment vocabulary (`recognizeConjunctiveClauses` / `guardClausesEntail`), so NULL semantics are identical. Soundness mirrors the prover exactly — **a false NotMatch only forgoes a speedup; a false Match would return wrong rows** — so every check forgoes the rewrite on doubt. The rule (`planner/rules/cache/rule-materialized-view-rewrite.ts`) only ever *replaces* the correct recompute-over-base plan with a provably row-equivalent backing scan, so it is non-regressing (a no-op when nothing matches or the cost gate declines, byte-identical rows when it fires). See [docs/optimizer.md](optimizer.md#materialized-view-query-rewrite-read-side) for the matcher shape rules, the gates (stale / deterministic / source-schema), the cost gate, and pass placement.
+
+This phase handles the **projection + filter subsumption** shape; aggregate rollup and join subsumption are pure additions to the same matcher (`mv-query-rewrite-aggregate-rollup`, `mv-query-rewrite-join-subsumption`). The rewrite is **suppressed while planning an MV's own body** to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating (`SchemaManager.withSuppressedMaterializedViewRewrite`).
+
 ## Write boundary (write-through)
 
 `INSERT` / `UPDATE` / `DELETE` targeting an MV *name* is **rewritten to target the MV's source table `T`** and re-planned through the ordinary base-table builder — the identical AST-level rewrite plain-view mutation performs, reached via the same `getView(…) ?? getMaterializedView(…)` dispatch wired into all three DML builders. Every MV is (post row-time consolidation) a single-source projection-and-filter — a strict subset of the [view-updateability](view-updateability.md) projection-and-filter shape — so write-through is pure routing, with no MV-specific propagation code. The rewritten write hits `T`, which fires the row-time maintenance hook, so the backing is brought into sync **inside the same statement / transaction**: a subsequent `select … from mv` sees the write (reads-own-writes) and a rollback reverts source + backing in lockstep. A write-through to an MV is observably **indistinguishable from writing the source and reading the MV**.

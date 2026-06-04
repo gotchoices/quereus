@@ -26,7 +26,13 @@ async function freshDb(ddl: string[]): Promise<Database> {
 }
 
 function bodyRoot(db: Database, bodySql: string): RelationalPlanNode {
-	const root = db.getPlan(bodySql).getRelations()[0];
+	// The coverage prover analyzes the MV body over its SOURCE table. Suppress the
+	// read-side query-rewrite rule (as the production caller
+	// `linkCoveredUniqueConstraints` does) so a body matching a registered MV is not
+	// re-pointed at that MV's backing before the prover sees it.
+	const root = db.schemaManager.withSuppressedMaterializedViewRewrite(
+		() => db.getPlan(bodySql).getRelations()[0],
+	);
 	expect(root, 'body produced a relation').to.not.be.undefined;
 	return root as RelationalPlanNode;
 }

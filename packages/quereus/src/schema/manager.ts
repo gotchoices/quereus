@@ -64,6 +64,16 @@ export class SchemaManager {
 	 * See `assertion-hoist-cache.ts` and `core/database-assertions.ts`.
 	 */
 	private assertionHoistSuppressed: number = 0;
+	/**
+	 * Re-entrancy guard: when truthy, the read-side materialized-view query-rewrite
+	 * rule (`rule-materialized-view-rewrite.ts`) is suppressed. Set while planning a
+	 * materialized view's own body for the purpose of (re)computing or maintaining
+	 * its backing table (create / refresh / row-time-maintenance compile). Without
+	 * it, the rewrite rule would recognize the MV's body as "answered from" the MV
+	 * itself and rewrite it to scan the backing table being populated — reading a
+	 * stale/empty snapshot instead of recomputing from the source.
+	 */
+	private mvRewriteSuppressed: number = 0;
 
 	/**
 	 * Creates a new schema manager
@@ -328,6 +338,39 @@ export class SchemaManager {
 			return fn();
 		} finally {
 			this.assertionHoistSuppressed--;
+		}
+	}
+
+	/**
+	 * True when the read-side materialized-view query-rewrite rule must be
+	 * suppressed (the caller is currently planning an MV's own body to recompute or
+	 * maintain its backing). Read by `rule-materialized-view-rewrite.ts`.
+	 */
+	isMaterializedViewRewriteSuppressed(): boolean {
+		return this.mvRewriteSuppressed > 0;
+	}
+
+	/**
+	 * Run a synchronous `fn` with the materialized-view query-rewrite rule
+	 * suppressed. Re-entrant via a depth counter; always restores state, even on
+	 * throw. Wrap every place that plans an MV body to (re)compute its backing.
+	 */
+	withSuppressedMaterializedViewRewrite<T>(fn: () => T): T {
+		this.mvRewriteSuppressed++;
+		try {
+			return fn();
+		} finally {
+			this.mvRewriteSuppressed--;
+		}
+	}
+
+	/** Async counterpart of {@link withSuppressedMaterializedViewRewrite}. */
+	async withSuppressedMaterializedViewRewriteAsync<T>(fn: () => Promise<T>): Promise<T> {
+		this.mvRewriteSuppressed++;
+		try {
+			return await fn();
+		} finally {
+			this.mvRewriteSuppressed--;
 		}
 	}
 
