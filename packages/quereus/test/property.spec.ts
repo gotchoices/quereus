@@ -11,6 +11,7 @@ import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equ
 import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner/util/fd-utils.js';
 import { deriveViewColumns, viewColumnsFromUpdateLineage, resolveBaseSite } from '../src/planner/analysis/update-lineage.js';
 import { viewComplement } from '../src/planner/analysis/view-complement.js';
+import { computeRoundTrip, getPutComposesToIdentity } from '../src/schema/lens-prover.js';
 import type * as AST from '../src/parser/ast.js';
 import { type PlanNode, type RelationalPlanNode, type UpdateSite, type AttributeDefault, isRelationalNode } from '../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../src/planner/nodes/plan-node-type.js';
@@ -2762,6 +2763,87 @@ describe('Property-Based Tests', () => {
 			const full = viewComplement(planLogicalBody('select * from t'));
 			expect(full.hiddenColumns.length).to.equal(0);
 			expect(full.residualPredicate).to.equal(undefined);
+		});
+
+		// ----- Computed deploy-time round-trip predicate (the lens prover's seam) -----
+		// The lens prover's `proveRoundTrip` (schema/lens-prover.ts) computes the
+		// GetPut/PutGet verdict per column off `viewComplement`. The PRIMARY correctness
+		// gate is that its per-column verdict AGREES with the operational law: a column
+		// the operational law accepts a write to is writable-and-faithful under the
+		// computed predicate, and a column whose write the operational law reds
+		// (`no-inverse`) is classified non-writable. This makes the static deploy-time
+		// check and the dynamic mutation harness the same oracle over the supported
+		// fragment (ticket `2-lens-roundtrip-deploy-time-proving`).
+		it('computeRoundTrip per-column verdict agrees with the operational write/no-inverse law across the zoo', async () => {
+			await createBase();
+			await db.exec('insert into t values (1, 1, 1)');
+
+			// The single-source zoo (× optional filter), PLUS an opaque (non-invertible)
+			// computed column so the NON-writable branch is exercised — every zoo column is
+			// writable (identity / rename / `b + 1` inverse), so `b * 2` (no inverse profile)
+			// is the only way to reach a `no-inverse` operational verdict here.
+			const bodies: string[] = [];
+			for (const s of SHAPES) for (const k of [undefined, 2] as const) bodies.push(buildBody(s, k));
+			bodies.push('select id, a, b * 2 as bp from t');
+
+			for (const body of bodies) {
+				const verdicts = computeRoundTrip(planLogicalBody(body));
+				expect(verdicts, `single-source body is in the fragment: ${body}`).to.not.equal(undefined);
+
+				await db.exec('drop view if exists rtv');
+				await db.exec(`create view rtv as ${body}`);
+
+				for (const v of verdicts!) {
+					const computedWritable = v.writable && v.faithful;
+					// Operational truth: does a write to this column propagate, or red `no-inverse`?
+					// Acceptance is a plan-time decision (independent of matching rows).
+					let operationalWritable = true;
+					try {
+						await db.exec(`update rtv set ${v.name} = 1`);
+					} catch (e) {
+						const reason = (e as { mutationDiagnostic?: { reason?: string } }).mutationDiagnostic?.reason;
+						if (reason === 'no-inverse') operationalWritable = false;
+					}
+					expect(computedWritable, `round-trip verdict for column '${v.name}' in "${body}"`)
+						.to.equal(operationalWritable);
+				}
+			}
+		});
+
+		// negative self-test: the round-trip law core reds on an injected unfaithful inverse
+		// (a forward/inverse pair that is not `get ∘ put = id`), mirroring the
+		// `injected-widening` / `injected-getput` self-tests above. The shipped registry is
+		// faithful, so this error path is reachable only via this injection.
+		it('the round-trip law core (getPutComposesToIdentity) reds on an injected unfaithful inverse', () => {
+			// forward `get`: b + 1.
+			const forward: AST.Expression = {
+				type: 'binary', operator: '+',
+				left: { type: 'column', name: 'b' }, right: { type: 'literal', value: 1 },
+			};
+			// honest `put`: w ↦ w - 1, so get(put(w)) = (w - 1) + 1 = w.
+			const honest = (w: AST.Expression): AST.Expression => ({ type: 'binary', operator: '-', left: w, right: { type: 'literal', value: 1 } });
+			// injected unfaithful `put`: w ↦ w - 2, so get(put(w)) = w - 1 ≠ w.
+			const unfaithful = (w: AST.Expression): AST.Expression => ({ type: 'binary', operator: '-', left: w, right: { type: 'literal', value: 2 } });
+
+			expect(getPutComposesToIdentity(forward, honest), 'honest inverse round-trips').to.equal(true);
+			expect(getPutComposesToIdentity(forward, unfaithful), 'injected unfaithful inverse reds').to.equal(false);
+			// identity forward + identity put also round-trips (the passthrough/identity case).
+			expect(getPutComposesToIdentity({ type: 'column', name: 'b' }, (w) => w), 'identity round-trips').to.equal(true);
+		});
+
+		// degrade-to-safe: a body the complement cannot characterize yields `undefined`
+		// (the safe verdict — the mutation-time nets still govern), never a spurious red.
+		it('computeRoundTrip degrades to the safe verdict outside the single-source fragment', async () => {
+			await createBase();
+			// LIMIT / OFFSET / DISTINCT are tolerated by the shape walk but the complement
+			// does not characterize them — out of fragment.
+			expect(computeRoundTrip(planLogicalBody('select id, a, b from t limit 2'))).to.equal(undefined);
+			expect(computeRoundTrip(planLogicalBody('select distinct a, b from t'))).to.equal(undefined);
+			// A non-negation-free residual (`a <> 1`) signals the complement is not honestly
+			// determined.
+			expect(computeRoundTrip(planLogicalBody('select id, a, b from t where a <> 1'))).to.equal(undefined);
+			// A genuine single-source projection-and-filter body IS characterized.
+			expect(computeRoundTrip(planLogicalBody('select id, a, b from t where a = 2'))).to.not.equal(undefined);
 		});
 
 		// ----- Multi-source (key-preserving inner join): dynamic PutGet / GetPut -----

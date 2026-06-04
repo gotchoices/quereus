@@ -606,3 +606,108 @@ describe('lens prover: proveLens unit (direct slot proof)', () => {
 		}
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Round-trip (lens laws) — the computed deploy-time GetPut/PutGet predicate over
+// the predicate-honest complement (ticket `2-lens-roundtrip-deploy-time-proving`).
+//
+// `lens.non-invertible` is an ERROR, so a deploy that emits it THROWS atomically
+// (no report). "No over-block" therefore asserts `apply schema` does NOT throw and
+// a report exists; "faithful write" asserts the deploy succeeds and the value
+// round-trips. The shipped invertibility registry is faithful by construction, so
+// the error is reachable only via the property-test injection — these deploy-time
+// scenarios exercise the admit (no over-block) and faithful-write paths.
+// ---------------------------------------------------------------------------
+
+/** The single column_info row's `is_updatable` for `x.<table>.<column>`. */
+async function isUpdatable(db: Database, table: string, column: string): Promise<string | undefined> {
+	for await (const r of db.eval(`select is_updatable from column_info('${table}') where column_name = '${column}'`)) {
+		return (r as Record<string, unknown>).is_updatable as string;
+	}
+	return undefined;
+}
+
+describe('lens prover: round-trip (computed deploy-time predicate)', () => {
+	it('deploys writable for an all-invertible chain column and the write round-trips', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, speed integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.src values (1, 10)');
+			// `adjusted = (speed + 1) - 2` is an invertible ±k CHAIN (the registry inverts
+			// `±k`; it does NOT invert `*`, so the doc's `(speed + 1) * 2` would be read-only
+			// — see handoff). Declared writable, it must PASS the deploy-time round-trip check
+			// (the inverse-chain composition path is admitted, not over-blocked).
+			await db.exec('declare logical schema x { table m (id integer primary key, speed integer null, adjusted integer null) }');
+			await db.exec('declare lens for x over y { view m as select id, speed, (speed + 1) - 2 as adjusted from y.src }');
+			await db.exec('apply schema x'); // no throw — admitted, not over-blocked
+
+			const s = slot(db, 'm');
+			expect(s.readOnly ?? false, 'lens is writable').to.equal(false);
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+			expect(await isUpdatable(db, 'm', 'adjusted'), 'adjusted is writable').to.equal('YES');
+
+			// Write round-trips: set adjusted = 5 stores speed = 6 (inverse), reads back 5.
+			await db.exec('update x.m set adjusted = 5 where id = 1');
+			const out: Record<string, unknown>[] = [];
+			for await (const r of db.eval('select speed, adjusted from x.m where id = 1')) out.push(r as Record<string, unknown>);
+			expect(out[0].adjusted, 'adjusted reads back the written value').to.equal(5);
+			expect(out[0].speed, 'base speed holds the inverted value (adjusted + 1)').to.equal(6);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does not over-block: a single-source body with a non-negation-free residual (where speed <> 1) degrades to safe', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, speed integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table m (id integer primary key, speed integer null) }');
+			// `<>` ⇒ the residual is not negation-free ⇒ the complement is not honestly
+			// determined ⇒ the round-trip check degrades to the safe verdict (no spurious error).
+			await db.exec('declare lens for x over y { view m as select id, speed from y.src where speed <> 1 }');
+			await db.exec('apply schema x'); // must NOT throw a lens.non-invertible
+			expect(report(db), 'deploy succeeded').to.not.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does not over-block: a two-table inner-join body is out of the single-source fragment (safe verdict)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table a (id integer primary key, av integer null); table b (id integer primary key, bv integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table m (id integer primary key, av integer null, bv integer null) }');
+			await db.exec('declare lens for x over y { view m as select a.id, a.av, b.bv from y.a join y.b on b.id = a.id }');
+			await db.exec('apply schema x'); // join body is out of fragment ⇒ no spurious lens.non-invertible
+			expect(report(db), 'deploy succeeded').to.not.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does not over-block: a documented computed (opaque) derived column deploys read-only, no lens.non-invertible', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, who text null) }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.src values (1, 'ada')");
+			// `upper(who) as label` is the documented sound derived-column pattern
+			// (docs/lens.md § Computed and Generated Columns). It is OUTSIDE the writable
+			// fragment, so the laws impose no obligation and it emits NO deploy error — it is
+			// faithfully read-only (a write reds `no-inverse` at mutation time, as today).
+			await db.exec('declare logical schema x { table m (id integer primary key, who text null, label text null) }');
+			await db.exec('declare lens for x over y { view m as select id, who, upper(who) as label from y.src }');
+			await db.exec('apply schema x'); // computed column is not a deploy error
+			expect(report(db), 'deploy succeeded').to.not.be.undefined;
+
+			expect(await isUpdatable(db, 'm', 'label'), 'label is read-only').to.equal('NO');
+			// The write path still reds at mutation time — the deploy did not over-block it.
+			await expectThrows(() => db.exec("update x.m set label = 'X' where id = 1"), /no-inverse|read-only|cannot write/i);
+		} finally {
+			await db.close();
+		}
+	});
+});

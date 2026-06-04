@@ -4,10 +4,15 @@ import type { TableSchema, UniqueConstraintSchema } from './table.js';
 import { resolvePkDefaultConflict } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type * as AST from '../parser/ast.js';
-import type { FunctionalDependency, GuardClause, GuardPredicate, RelationalPlanNode } from '../planner/nodes/plan-node.js';
+import type { FunctionalDependency, GuardClause, GuardPredicate, PlanNode, RelationalPlanNode } from '../planner/nodes/plan-node.js';
 import { addFd, superkeyToFd } from '../planner/util/fd-utils.js';
 import { proveEffectiveKeyUnique } from '../planner/analysis/coverage-prover.js';
-import { astToString } from '../emit/ast-stringify.js';
+import { resolveBaseSite, type ResolvedBaseSite } from '../planner/analysis/update-lineage.js';
+import { viewComplement } from '../planner/analysis/view-complement.js';
+import { classifyViewBody } from '../planner/mutation/propagate.js';
+import { ProjectNode } from '../planner/nodes/project-node.js';
+import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
+import { astToString, expressionToString } from '../emit/ast-stringify.js';
 import { PhysicalType } from '../types/logical-type.js';
 import { getReservedTagByTemplate } from './reserved-tags.js';
 import type { AcknowledgedAdvisory } from './lens-ack.js';
@@ -475,23 +480,344 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
 }
 
 // ---------------------------------------------------------------------------
-// Error: round-trip / lens laws (lens.non-invertible) — v1 enumerated form
+// Error: round-trip / lens laws (lens.non-invertible) — computed deploy-time form
 // ---------------------------------------------------------------------------
 
 /**
- * Round-trip (GetPut / PutGet) over the writable fragment, behind a single
- * swappable function. **v1 is the enumerated failure-shape form**: the predicate-
- * honest *complement* of a lens body that would make GetPut/PutGet *computed*
- * predicates lands with `bx-operator-model-and-roundtrip-laws` +
- * `view-mutation-plan-node-substrate`; until then non-invertibility is already
- * detected where it bites — at mutation time, by view-updateability's own
- * diagnostics (`docs/view-updateability.md` § Diagnostics) — and a non-
- * reconstructible key is caught by {@link checkKeyReconstructibility}. So the v1
- * enumerated check adds no *new* deploy-time error and returns none; it exists as
- * the single seam to tighten to the computed form. See `docs/lens.md` § Round-trip.
+ * Round-trip (GetPut / PutGet) over the writable fragment, **computed at deploy**
+ * from the predicate-honest complement ({@link viewComplement}). Because Quereus
+ * resolves the Bancilhon–Spyratos ambiguity by predicate-honest fan-out, the
+ * complement is *determined, not chosen*, which makes the two laws decidable over
+ * the single-source projection-and-filter fragment with no theorem prover:
+ *
+ *  - **GetPut** ("read a row, write the same values back ⇒ base unchanged") holds
+ *    iff `put` leaves the complement **fixed**: no writable column's backward
+ *    write path targets a base column the complement lists as *hidden*.
+ *  - **PutGet** ("write a value through the view, read it back ⇒ get the written
+ *    value") holds iff, for every column the lens presents as **writable**, the
+ *    composed `get ∘ put` is the identity on the writable value, and any `domain`
+ *    restriction the column's inverse carries is **entailed** by the residual
+ *    predicate.
+ *
+ * The firing rule: `lens.non-invertible` (error) fires **only** for a column the
+ * lens presents as writable (a `base` {@link ResolvedBaseSite}) whose round-trip
+ * the analysis cannot prove faithful. A `computed`/opaque output column is *not* a
+ * deploy error — it is an intentional read-only/derived column (its write reds
+ * `no-inverse` at mutation time, as today), per the prover's soundness-over-
+ * completeness principle and the no-over-block requirement (`docs/lens.md`
+ * § Computed and Generated Columns).
+ *
+ * Degrade-to-safe: returns `[]` (today's behaviour — the mutation-time and
+ * key-reconstructibility nets still govern) whenever the complement cannot
+ * characterize the body (out of the single-source projection-and-filter fragment,
+ * lineage not threaded, or a non-negation-free residual). The body is planned
+ * **logically** ({@link planLogicalBody}, not `ctx.root`) so the
+ * Project/Filter/TableReference operator tree threading `updateLineage` survives.
+ * See `docs/lens.md` § Round-trip and `docs/view-updateability.md`
+ * § The predicate-honest complement.
  */
-function proveRoundTrip(_ctx: ProveContext): LensDiagnostic[] {
-	return [];
+function proveRoundTrip(ctx: ProveContext): LensDiagnostic[] {
+	const root = planLogicalBody(ctx);
+	if (!root) return []; // body failed to plan logically → safe verdict
+	const verdicts = computeRoundTrip(root);
+	if (!verdicts) return []; // out of fragment / indeterminate complement → safe verdict
+
+	const errors: LensDiagnostic[] = [];
+	verdicts.forEach((v, i) => {
+		if (!v.writable || v.faithful) return;
+		// Site at the *logical* column (the contract spelling), positionally aligned
+		// with the body output — the same space `column_info` derives writability in.
+		const column = ctx.outputColumns[i] ?? v.name;
+		errors.push({
+			code: 'lens.non-invertible',
+			severity: 'error',
+			site: { table: ctx.table.name, column },
+			message: `lens: writable column '${ctx.table.name}.${column}' is not faithfully invertible at the lens boundary (${v.obstruction}); its GetPut/PutGet round-trip cannot be proved, so the declared write path is unsound`,
+		});
+	});
+	return errors;
+}
+
+/**
+ * Plan the lens body **logically** (the `view_info`/`column_info` and mutation
+ * substrate path via `_buildPlan`, *not* the optimized `ctx.root`), so the clean
+ * Project/Filter/TableReference operator tree — and the `updateLineage` it threads
+ * — survives (the optimizer degrades a structure-rewriting node's lineage to
+ * `computed`; `docs/view-updateability.md` § surface authority). Guarded with the
+ * same graceful-degradation `try/catch` as {@link planBody}.
+ */
+function planLogicalBody(ctx: ProveContext): RelationalPlanNode | undefined {
+	try {
+		const { plan } = ctx.db._buildPlan([ctx.slot.compiledBody as AST.Statement]);
+		return plan.getRelations()[0];
+	} catch (e) {
+		log('lens-prover: round-trip body failed to plan logically, degrading to safe: %O', e);
+		return undefined;
+	}
+}
+
+/** The per-output-column round-trip verdict over a planned single-source body. */
+export interface ColumnRoundTrip {
+	readonly attrId: number;
+	/** Body-output column name (the lens spells these as the logical columns). */
+	readonly name: string;
+	/** The lens presents this column as writable (a `base` {@link ResolvedBaseSite}). */
+	readonly writable: boolean;
+	/** A *writable* column whose GetPut/PutGet round-trip is proved faithful. */
+	readonly faithful: boolean;
+	/** Names the obstruction for a writable-but-unfaithful column (else undefined). */
+	readonly obstruction?: string;
+}
+
+/**
+ * The computed per-column GetPut/PutGet verdict over a planned **logical** body —
+ * the deploy-time predicate `proveRoundTrip` consumes, exported so the operational
+ * round-trip harness (`test/property.spec.ts` § View Round-Trip Laws) can assert
+ * it agrees with the operational law per column.
+ *
+ * Returns `undefined` (the degrade-to-safe signal) for any body the complement
+ * does not characterize: not single-source projection-and-filter (multi-source /
+ * join / aggregate / set-op / VALUES / recursive-CTE / LIMIT / OFFSET / DISTINCT),
+ * `updateLineage` not threaded, or a residual predicate that is not negation-free.
+ * Otherwise one verdict per output column, in attribute order.
+ *
+ * Each writable site is read through {@link resolveBaseSite} — the same n-way
+ * reader the single-source, join, and decomposition put paths share — so the
+ * GetPut hidden-column and PutGet inverse-domain checks already generalize past
+ * single-source when the complement is later defined on the join/decomposition
+ * fragment (`view-write-through-shape-gaps`); only the fragment gate here is
+ * single-source-only.
+ */
+export function computeRoundTrip(root: RelationalPlanNode): ColumnRoundTrip[] | undefined {
+	if (!isSingleSourceProjectionFilter(root)) return undefined;
+	const lineage = root.physical.updateLineage;
+	if (!lineage) return undefined; // lineage not threaded ⇒ complement cannot be characterized
+
+	const complement = viewComplement(root);
+	if (complement.residualPredicate && !isNegationFree(complement.residualPredicate)) {
+		return undefined; // a non-negation-free residual signals the complement is not honestly determined
+	}
+
+	const hidden = new Set(complement.hiddenColumns.map(h => h.column.toLowerCase()));
+	const forwardByAttr = collectForwardExprs(root);
+
+	return root.getAttributes().map((attr): ColumnRoundTrip => {
+		const site = resolveBaseSite(lineage.get(attr.id));
+		if (!site.writable) {
+			return { attrId: attr.id, name: attr.name, writable: false, faithful: false };
+		}
+		const obstruction = roundTripObstruction(site, hidden, forwardByAttr.get(attr.id), complement.residualPredicate);
+		return { attrId: attr.id, name: attr.name, writable: true, faithful: obstruction === undefined, obstruction };
+	});
+}
+
+/**
+ * The GetPut / PutGet obstruction for a writable column, or `undefined` when its
+ * round-trip is proved faithful:
+ *  - **GetPut** — `put` leaves the complement fixed: the writable base column is
+ *    not one the complement lists as hidden (holds structurally over the single-
+ *    source fragment — a guard that reds the day a shape violates it).
+ *  - **PutGet** — `get ∘ put` reproduces the written value ({@link getPutComposesToIdentity},
+ *    over the closed registry vocabulary), and any inverse `domain` is entailed by
+ *    the residual. The shipped registry is faithful with unrestricted domains, so
+ *    this returns `undefined` for it — the seam stays correct as the registry
+ *    grows a domain-restricted or composed profile.
+ */
+function roundTripObstruction(
+	site: ResolvedBaseSite,
+	hidden: ReadonlySet<string>,
+	forward: AST.Expression | undefined,
+	residual: AST.Expression | undefined,
+): string | undefined {
+	if (site.baseColumn !== undefined && hidden.has(site.baseColumn.toLowerCase())) {
+		return `GetPut: the write-back targets base column '${site.baseColumn}', which the view-complement holds fixed`;
+	}
+	// `get ∘ put = id` is verifiable only with the forward `get` expression; if it is
+	// unavailable (no Project node found) degrade to safe — the shipped registry is
+	// faithful by construction, so a missing forward never masks a real violation.
+	if (site.inverse !== undefined && forward !== undefined && !getPutComposesToIdentity(forward, site.inverse)) {
+		return `PutGet: the 'put' inverse does not reproduce the written value back through 'get'`;
+	}
+	if (site.domain !== undefined && !domainEntailedBy(site.domain, residual)) {
+		return `PutGet: the inverse's domain restriction is not entailed by the view predicate`;
+	}
+	return undefined;
+}
+
+/**
+ * The single-source projection-and-filter fragment gate. Reuses {@link classifyViewBody}
+ * (the substrate's shape classifier) to reject multi-source / join / aggregate /
+ * set-op / VALUES / recursive-CTE bodies, then additionally rejects LIMIT / OFFSET /
+ * DISTINCT — which that classifier tolerates as pass-through (so its walk can reach
+ * the base table) but the complement does not characterize.
+ */
+function isSingleSourceProjectionFilter(root: RelationalPlanNode): boolean {
+	if (classifyViewBody(root).kind !== 'single-source') return false;
+	let windowed = false;
+	const visit = (n: PlanNode): void => {
+		if (n.nodeType === PlanNodeType.LimitOffset || n.nodeType === PlanNodeType.Distinct) windowed = true;
+		for (const child of n.getRelations()) visit(child);
+	};
+	visit(root);
+	return !windowed;
+}
+
+/**
+ * The forward `get` expression per output attribute, read off the topmost
+ * {@link ProjectNode}'s projection list (which the planner aligns 1:1 with output
+ * attributes, expanding `select *`). The `get` half of the round-trip; the `put`
+ * half is the site's `inverse`.
+ */
+function collectForwardExprs(root: RelationalPlanNode): Map<number, AST.Expression> {
+	const map = new Map<number, AST.Expression>();
+	const project = findProjectNode(root);
+	if (project) {
+		for (const p of project.getProjections()) map.set(p.attributeId, p.node.expression);
+	}
+	return map;
+}
+
+/** The topmost {@link ProjectNode} in a planned body's relational spine, or undefined. */
+function findProjectNode(node: PlanNode): ProjectNode | undefined {
+	if (node instanceof ProjectNode) return node;
+	for (const child of node.getRelations()) {
+		const found = findProjectNode(child);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+/** Numeric probes for the `get ∘ put = id` check — distinct points pin any affine map. */
+const ROUND_TRIP_PROBES: readonly number[] = [7, 13, -5];
+
+/**
+ * PutGet identity probe: is the composed `get ∘ put` the identity on the writable
+ * value? For each probe `w`, lowers it through the `put` inverse to a base value
+ * and re-applies the forward `get`, requiring `get(put(w)) === w`. Sound because a
+ * writable column's `get` and the inverse's `put` are built **only** from the
+ * law-gated invertibility registry's closed vocabulary (column ref, `± k`, no-op
+ * cast, collate), which {@link evalClosed} evaluates exactly; an expression outside
+ * it yields `undefined` and reds (the analysis cannot prove faithfulness).
+ *
+ * Exported as the pure core the operational harness's injected-violation self-test
+ * drives (an unfaithful forward/inverse pair must red), mirroring the harness's
+ * `injected-widening` / `injected-getput` cores.
+ */
+export function getPutComposesToIdentity(
+	forward: AST.Expression,
+	inverse: (written: AST.Expression) => AST.Expression,
+): boolean {
+	for (const w of ROUND_TRIP_PROBES) {
+		const baseVal = evalClosed(inverse({ type: 'literal', value: w }), undefined); // put: written → base
+		if (baseVal === undefined) return false;
+		const got = evalClosed(forward, baseVal); // get: base → written
+		if (got === undefined || got !== w) return false;
+	}
+	return true;
+}
+
+/**
+ * Synchronous evaluator over the **closed** invertibility-registry vocabulary —
+ * literal (int/real), the bound column (`columnValue`), `+`/`-`/`*` binary, unary
+ * `±`, and the value-preserving `cast`/`collate` wrappers. Returns `undefined` for
+ * anything outside that set (the signal that the expression is not a registry
+ * round-trip term). Total and side-effect-free — NOT a general expression
+ * interpreter; the writable fragment never contains anything else.
+ */
+function evalClosed(expr: AST.Expression, columnValue: number | undefined): number | undefined {
+	switch (expr.type) {
+		case 'literal': {
+			const v = (expr as AST.LiteralExpr).value;
+			if (typeof v === 'number') return v;
+			if (typeof v === 'bigint') return Number(v);
+			return undefined;
+		}
+		case 'column':
+			return columnValue;
+		case 'cast':
+			return evalClosed((expr as AST.CastExpr).expr, columnValue);
+		case 'collate':
+			return evalClosed((expr as AST.CollateExpr).expr, columnValue);
+		case 'unary': {
+			const u = expr as AST.UnaryExpr;
+			const o = evalClosed(u.expr, columnValue);
+			if (o === undefined) return undefined;
+			if (u.operator === '-') return -o;
+			if (u.operator === '+') return o;
+			return undefined;
+		}
+		case 'binary': {
+			const b = expr as AST.BinaryExpr;
+			const l = evalClosed(b.left, columnValue);
+			const r = evalClosed(b.right, columnValue);
+			if (l === undefined || r === undefined) return undefined;
+			switch (b.operator) {
+				case '+': return l + r;
+				case '-': return l - r;
+				case '*': return l * r;
+				default: return undefined;
+			}
+		}
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Whether a residual predicate is negation-free — `viewComplement` carries the σ
+ * conjuncts verbatim, so the presence of `not` / `is not null` / `!=` (`<>`) /
+ * `not between` means the complement is **not** honestly determined and the
+ * round-trip check must degrade to the safe verdict. A reflective walk mirroring
+ * {@link collectColumnRefNames}.
+ */
+function isNegationFree(expr: AST.Expression): boolean {
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.type === 'unary') {
+			const op = (node as AST.UnaryExpr).operator;
+			if (op === 'NOT' || op === 'IS NOT NULL') return false;
+		}
+		if (node.type === 'binary' && ((node as AST.BinaryExpr).operator === '!=' || (node as AST.BinaryExpr).operator === '<>')) {
+			return false;
+		}
+		if (node.type === 'between' && (node as AST.BetweenExpr).not === true) return false;
+		for (const key of Object.keys(node)) {
+			const value = (node as unknown as Record<string, unknown>)[key];
+			if (!value) continue;
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					if (item && typeof item === 'object' && 'type' in item) stack.push(item as AST.AstNode);
+				}
+			} else if (typeof value === 'object' && 'type' in (value as object)) {
+				stack.push(value as AST.AstNode);
+			}
+		}
+	}
+	return true;
+}
+
+/**
+ * Best-effort structural entailment of an inverse's `domain` by the residual
+ * predicate — the residual's AND-conjuncts include the domain verbatim. Unreachable
+ * today (the shipped registry's profiles carry no `domain`); the conservative seam
+ * for a future domain-restricted profile (an un-entailed domain ⇒ a value the view
+ * admits could be stored that `get` cannot reproduce ⇒ red).
+ */
+function domainEntailedBy(domain: AST.Expression, residual: AST.Expression | undefined): boolean {
+	if (residual === undefined) return false;
+	const conjuncts: AST.Expression[] = [];
+	const split = (e: AST.Expression): void => {
+		if (e.type === 'binary' && (e as AST.BinaryExpr).operator === 'AND') {
+			split((e as AST.BinaryExpr).left);
+			split((e as AST.BinaryExpr).right);
+		} else {
+			conjuncts.push(e);
+		}
+	};
+	split(residual);
+	const target = expressionToString(domain);
+	return conjuncts.some(c => expressionToString(c) === target);
 }
 
 // ---------------------------------------------------------------------------
