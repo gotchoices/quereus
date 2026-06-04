@@ -748,17 +748,18 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// multi-source positive case (`ms_jv`) is untouched.
 	if (hasNullExtendedLineage(nodes)) return CONSERVATIVE_VIEW_INFO;
 
-	// Non-inner-join shape gate (Divergence 3): cross / comma (implicit) / `> 2`-table
-	// / self-join bodies never null-extend (only LEFT/RIGHT/FULL do — see
+	// Non-inner-join shape gate (Divergence 3): cross / comma (implicit) / subquery- or
+	// function-source join bodies never null-extend (only LEFT/RIGHT/FULL do — see
 	// `deriveJoinUpdateLineage`), so they carry strict-`base` lineage and slip past the
-	// outer-join gate above. `propagate()` rejects every join shape but a single
-	// two-table inner equi-join (`isDecomposableJoinBody`, the boolean shadow of
-	// `collectInnerJoinSources`), so without this gate the target walk below resolves
-	// their bases and over-reports `is_updatable = 'YES'` (and possibly
-	// insertable/deletable). Mirrors the same gate in `deriveColumnInfo`: this reads
-	// the AST shape, `hasNullExtendedLineage` reads lineage — kept parallel as
-	// defense-in-depth. The two-table inner equi-join positive case (`ms_jv`) is not a
-	// match (`isDecomposableJoinBody` accepts it) and stays writable.
+	// outer-join gate above. `propagate()` decomposes an n-way (≥2) inner equi-join —
+	// composite-PK sides and self-joins included (`isDecomposableJoinBody`, the boolean
+	// shadow of `collectInnerJoinSources`) — and rejects every other join shape, so
+	// without this gate the target walk below resolves their bases and over-reports
+	// `is_updatable = 'YES'` (and possibly insertable/deletable). Mirrors the same gate
+	// in `deriveColumnInfo`: this reads the AST shape, `hasNullExtendedLineage` reads
+	// lineage — kept parallel as defense-in-depth. The accepted inner-join positive cases
+	// (`ms_jv`, n-way, composite-PK, self-join) are not a match (`isDecomposableJoinBody`
+	// accepts them) and stay writable.
 	if (isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst)) {
 		return CONSERVATIVE_VIEW_INFO;
 	}
@@ -1040,16 +1041,16 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		// together (see `baseSiteOf`'s forward-looking note).
 		const outerJoin = hasNullExtendedLineage(nodes);
 
-		// Non-inner-join shape gate (Divergence 3): cross / `> 2`-table / self-join
+		// Non-inner-join shape gate (Divergence 3): cross / comma / subquery-source join
 		// bodies never null-extend (only LEFT/RIGHT/FULL do), so they carry strict-
-		// `base` lineage and slip past `outerJoin`. `propagate()` rejects every join
-		// shape but a single two-table inner equi-join (`isDecomposableJoinBody`, the
-		// boolean shadow of `collectInnerJoinSources`), so without this gate
-		// `baseSiteOf` resolves their bases and over-reports `is_updatable = 'YES'`.
-		// The shape check subsumes the `outerJoin` gate for join bodies (it also
-		// rejects `joinType !== 'inner'`); both are kept as parallel, defense-in-depth
-		// gates mirroring `deriveViewInfo`'s structure — `outerJoin` reads lineage,
-		// this reads the AST shape.
+		// `base` lineage and slip past `outerJoin`. `propagate()` decomposes an n-way
+		// (≥2) inner equi-join — composite-PK sides and self-joins included
+		// (`isDecomposableJoinBody`, the boolean shadow of `collectInnerJoinSources`) —
+		// and rejects every other join shape, so without this gate `baseSiteOf` resolves
+		// their bases and over-reports `is_updatable = 'YES'`. The shape check subsumes
+		// the `outerJoin` gate for join bodies (it also rejects `joinType !== 'inner'`);
+		// both are kept as parallel, defense-in-depth gates mirroring `deriveViewInfo`'s
+		// structure — `outerJoin` reads lineage, this reads the AST shape.
 		const unsupportedJoinShape = isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst);
 
 		const tableRefsById = buildTableRefsById(nodes);

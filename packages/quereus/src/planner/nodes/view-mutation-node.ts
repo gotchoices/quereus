@@ -14,15 +14,16 @@ export type ReturningTiming = 'pre' | 'post';
  * multi-side **delete** fan-out (docs/view-updateability.md § Inner Join, § `returning`
  * Clauses).
  *
- * `source` selects each affected view row's base-PK identities `(k0, k1)`; the
- * emitter materializes it **before** the base ops run and stashes the rows in
- * `rctx.tableContexts` under {@link descriptor}. The readers scan it back through an
- * `InternalRecursiveCTERefNode` carrying the same `descriptor`:
+ * `source` selects each affected view row's base-PK identities (one capture column per
+ * side per PK column, named `k<side>_<j>`); the emitter materializes it **before** the
+ * base ops run and stashes the rows in `rctx.tableContexts` under {@link descriptor}.
+ * The readers scan it back through an `InternalRecursiveCTERefNode` carrying the same
+ * `descriptor`:
  *   - when more than one base op runs against live state (an update assigning **both**
- *     sides, or a lenient delete fanned out to **both** candidate sides), each
- *     per-side base op's identifying `in`-subquery (`<pk> in (select k<side> from
- *     __vmupd_keys)`), so the first op cannot empty the join — or rewrite a predicate
- *     column — out from under the second op; and
+ *     sides, an n-way fan-out, or a lenient delete fanned out to multiple candidate
+ *     sides), each per-side base op's identifying correlated EXISTS over `__vmupd_keys`
+ *     (matching that side's PK columns), so the first op cannot empty the join — or
+ *     rewrite a predicate column — out from under a later op; and
  *   - when an update carries RETURNING, the post-mutation
  *     {@link ViewMutationNode.returning} re-query, re-projecting exactly the updated
  *     logical rows by captured identity — even when the update rewrote the column

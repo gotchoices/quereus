@@ -253,16 +253,19 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets
 → [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
 
 -- ===================================================================
--- Divergence 3 — non-inner / multi-table join bodies report conservative and
--- agree with propagate(). Cross joins and > 2-table inner joins never null-extend
--- (only LEFT/RIGHT/FULL do — deriveJoinUpdateLineage), so they carry strict-`base`
--- lineage and slip past the Divergence-2 outer-join gate above. Without the AST
+-- Divergence 3 — non-inner join bodies report conservative and agree with
+-- propagate(). A cross join (and a comma/implicit join) never null-extends (only
+-- LEFT/RIGHT/FULL do — deriveJoinUpdateLineage), so it carries strict-`base`
+-- lineage and slips past the Divergence-2 outer-join gate above. Without the AST
 -- shape gate (isJoinBody && !isDecomposableJoinBody) deriveViewInfo would resolve
--- their bases and over-report is_updatable='YES' (with both tables in
--- effective_targets). propagate() rejects every join shape but a single two-table
--- inner equi-join (collectInnerJoinSources), so the surface must report the
--- conservative all-`NO`/`[]` row — cross-checked below against a real (rejected)
--- mutation through each view.
+-- its bases and over-report is_updatable='YES'. propagate() rejects a cross join
+-- (collectInnerJoinSources requires an ON/USING predicate), so the surface must
+-- report the conservative all-`NO`/`[]` row — cross-checked below against a real
+-- (rejected) mutation.
+--
+-- n-way (≥2) inner equi-joins — composite-PK sides and self-joins included — are
+-- now DECOMPOSABLE (isDecomposableJoinBody accepts them), so they report writable
+-- and agree with propagate() accepting the write (covered after the cross join).
 --
 -- Comma / implicit join bodies are NOT tested here: a multi-source comma FROM
 -- never produces a buildable view — with aliases (from a x, b y) it is a parse
@@ -289,35 +292,35 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets
 update xj_cross set av = 'z' where aid = 1;
 -- error: cannot write through view
 
--- Three-table inner join (> 2 base tables): also strict-`base` lineage, unwritable.
+-- Three-table inner join (> 2 base tables): now decomposable ⇒ updatable, with all
+-- three bases in effective_targets. Not deletable (xj_b/xj_c PKs are not projected,
+-- so a per-base row identity is not constructible from the view image) and not
+-- insertable (their not-null PKs are unrecoverable). Agrees with propagate().
 create view xj_three as
     select a.aid as aid, a.av as av, b.bv as bv, c.cv as cv
     from xj_a a join xj_b b on b.bid = a.aid join xj_c c on c.cid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('xj_three');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"xj_a\",\"xj_b\",\"xj_c\"]"}]
 
--- Surface agrees with propagate(): a write through the 3-table-join view is rejected.
+-- Surface agrees with propagate(): a write through the 3-table-join view is accepted
+-- (no row matches the empty bases, so it is a clean no-op rather than an error).
 update xj_three set av = 'z' where aid = 1;
--- error: cannot write through view
 
--- Self-join (two alias-bound sites on one table): a single explicit INNER join
--- with ON, but the two sides resolve to the *same* base table, which
--- isDecomposableJoinBody rejects (distinct-table-name check) — mirroring
--- collectInnerJoinSources, which rejects a self-join wholesale. This is the only
--- buildable case that exercises that branch (cross / > 2-table fail earlier
--- checks), so it pins the surface to conservative for a shape that is otherwise
--- a structurally valid two-table inner join.
+-- Self-join (two alias-bound sites on one table): now decomposable ⇒ updatable. Both
+-- aliases resolve to xj_a, so effective_targets collapses to the single base name.
+-- Not deletable (alias b's PK `aid` is not exposed — only b.av is projected) and not
+-- insertable (b's not-null PK is unrecoverable). Agrees with propagate() accepting.
 create view xj_self as
     select a.aid as aid, a.av as av, b.av as av2
     from xj_a a join xj_a b on b.aid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('xj_self');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"xj_a\"]"}]
 
--- Surface agrees with propagate(): a write through the self-join view is rejected.
+-- Surface agrees with propagate(): a write through the self-join view is accepted
+-- (empty base ⇒ clean no-op).
 update xj_self set av = 'z' where aid = 1;
--- error: cannot write through view
 
 -- ===================================================================
 -- Name filter vs. full enumeration.

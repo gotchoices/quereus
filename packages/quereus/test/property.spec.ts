@@ -3454,11 +3454,17 @@ describe('Property-Based Tests', () => {
 				await db.exec('create view rj_star as select * from rjchild c join rjparent p on p.pp = c.pr');
 				await db.exec('create view rj_comp as select k.k1 as k1, k.v as v, p.pv as pv from rjck k join rjparent p on p.pp = k.k1');
 
-				// Each undecomposable shape rejects with a structured diagnostic (no silent widen).
+				// Composite-PK and self-join inner joins are now DECOMPOSABLE by the n-way
+				// substrate, so they ACCEPT rather than reject (flipped negatives); full
+				// PutGet/GetPut round-trips are pinned in the dedicated tests below. Smoke
+				// here that they no longer raise.
+				await db.exec('insert into rjck values (1, 2, 100)');
+				await db.exec('update rj_comp set v = 9 where k1 = 1');               // composite-PK side: accepted
+				await db.exec('update rj_self set cc2 = 9 where cc = 1');             // self-join: accepted
+
+				// Shapes still deferred reject with their precise diagnostic (no silent widen).
 				await expectMutationReject('insert into rj_outer (cc, cv, pv) values (2, 22, 222)', 'unsupported-join'); // outer-join insert
-				await expectMutationReject('update rj_self set cc2 = 9 where cc = 1', 'unsupported-join');               // self-join
 				await expectMutationReject('update rj_star set cv = 9 where cc = 1', 'unsupported-join');                // select *
-				await expectMutationReject('update rj_comp set v = 9 where k1 = 1', 'unsupported-join');                 // composite PK
 				await expectMutationReject('update rj_inner set cv = pv where cc = 1', 'cross-source-assignment');       // cross-source set
 
 				// forward/backward lineage agreement on the ACCEPTED inner-join shape: every
@@ -3488,6 +3494,185 @@ describe('Property-Based Tests', () => {
 				expect(() => assertRowsEqual('ms-inject-getput',
 					[{ pp: 1, pv: 77 }], [{ pp: 1, pv: 10 }], ['pp', 'pv'],
 				)).to.throw(/round-trip violation/);
+			});
+
+			// ===== n-way generalization: composite-PK, ≥3-table, self-join =====
+
+			// ----- Composite-PK inner join (flipped `rj_comp` negative) -----
+			// Two tables each with a 2-column PK joined on the shared composite key. An
+			// update keyed on the composite PK must bind the correct base rows on BOTH
+			// sides (the capture projects k<side>_0/k<side>_1 and the base op's EXISTS
+			// correlates both). PutGet + GetPut + plan-lineage agreement.
+			it('composite-PK inner join: an update keyed on the composite PK round-trips', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists cpv');
+				await db.exec('drop table if exists cpa');
+				await db.exec('drop table if exists cpb');
+				await db.exec('create table cpa (k1 integer, k2 integer, av integer null, primary key (k1, k2)) using memory');
+				await db.exec('create table cpb (k1 integer, k2 integer, bv integer null, primary key (k1, k2)) using memory');
+				await db.exec('create view cpv as select a.k1 as k1, a.k2 as k2, a.av as av, b.bv as bv from cpa a join cpb b on b.k1 = a.k1 and b.k2 = a.k2');
+
+				// Static plan-lineage: every output column is base-writable and the forward
+				// composite key reconstructs through the backward identifying predicate.
+				const node = planLogicalBody('select a.k1 as k1, a.k2 as k2, a.av as av, b.bv as bv from cpa a join cpb b on b.k1 = a.k1 and b.k2 = a.k2');
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, 'cpv exposes k1,k2,av,bv').to.equal(4);
+				assertPlanLineageAgreement('composite-PK join', attrs, keysOf(node), node.physical.updateLineage);
+
+				const rowsArb = fc.array(fc.record({
+					k1: fc.integer({ min: 1, max: 3 }), k2: fc.integer({ min: 1, max: 3 }),
+					av: fc.integer({ min: 1, max: 9 }), bv: fc.integer({ min: 1, max: 9 }),
+				}), { maxLength: 6 });
+
+				await fc.assert(fc.asyncProperty(
+					rowsArb,
+					fc.integer({ min: 1, max: 3 }), fc.integer({ min: 1, max: 3 }),  // target (K1, K2)
+					fc.integer({ min: 10, max: 19 }), fc.integer({ min: 20, max: 29 }),  // new av, bv (disjoint)
+					async (rows, K1, K2, NAV, NBV) => {
+						await db.exec('delete from cpa');
+						await db.exec('delete from cpb');
+						const seen = new Set<string>(); const kept: { k1: number; k2: number; av: number; bv: number }[] = [];
+						for (const r of rows) {
+							const sig = `${r.k1}:${r.k2}`;
+							if (seen.has(sig)) continue; seen.add(sig);
+							await db.exec(`insert into cpa values (${r.k1}, ${r.k2}, ${r.av})`);
+							await db.exec(`insert into cpb values (${r.k1}, ${r.k2}, ${r.bv})`);
+							kept.push(r);
+						}
+						// GetPut: writing a read row's values back leaves both bases unchanged.
+						const beforeA = await readRows('select k1, k2, av from cpa');
+						const beforeB = await readRows('select k1, k2, bv from cpb');
+						const view = await readRows('select k1, k2, av, bv from cpv');
+						if (view.length > 0) {
+							const r = view[0];
+							await db.exec(`update cpv set av = ${String(r.av)}, bv = ${String(r.bv)} where k1 = ${String(r.k1)} and k2 = ${String(r.k2)}`);
+							assertRowsEqual('cp GetPut a', await readRows('select k1, k2, av from cpa'), beforeA, ['k1', 'k2', 'av']);
+							assertRowsEqual('cp GetPut b', await readRows('select k1, k2, bv from cpb'), beforeB, ['k1', 'k2', 'bv']);
+						}
+
+						// PutGet: both-sides update keyed on the composite PK.
+						const hit = (r: { k1: number; k2: number }): boolean => r.k1 === K1 && r.k2 === K2;
+						await db.exec(`update cpv set av = ${NAV}, bv = ${NBV} where k1 = ${K1} and k2 = ${K2}`);
+						assertRowsEqual('cp PutGet a', await readRows('select k1, k2, av from cpa'),
+							kept.map(r => ({ k1: r.k1, k2: r.k2, av: hit(r) ? NAV : r.av })), ['k1', 'k2', 'av']);
+						assertRowsEqual('cp PutGet b', await readRows('select k1, k2, bv from cpb'),
+							kept.map(r => ({ k1: r.k1, k2: r.k2, bv: hit(r) ? NBV : r.bv })), ['k1', 'k2', 'bv']);
+						assertRowsEqual('cp PutGet view', await readRows('select k1, k2, av, bv from cpv'),
+							kept.map(r => ({ k1: r.k1, k2: r.k2, av: hit(r) ? NAV : r.av, bv: hit(r) ? NBV : r.bv })), ['k1', 'k2', 'av', 'bv']);
+					},
+				), { numRuns: 50 });
+			});
+
+			// ----- n-way (≥3) inner join -----
+			// A 3-table columnar split (anchor + two FK-children, all sharing one key)
+			// written through one update touching each member: three base ops, FK-parent
+			// first (the n-way topological order). PutGet + plan-lineage agreement.
+			it('n-way (3-table) inner join: one update touches each member, FK-ordered', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists n3v');
+				await db.exec('drop table if exists n3b');
+				await db.exec('drop table if exists n3c');
+				await db.exec('drop table if exists n3a');
+				await db.exec('create table n3a (k integer primary key, av integer null) using memory');
+				await db.exec('create table n3b (k integer primary key references n3a(k), bv integer null) using memory');
+				await db.exec('create table n3c (k integer primary key references n3a(k), cv integer null) using memory');
+				await db.exec('create view n3v as select a.k as k, a.av as av, b.bv as bv, c.cv as cv from n3a a join n3b b on b.k = a.k join n3c c on c.k = a.k');
+
+				const node = planLogicalBody('select a.k as k, a.av as av, b.bv as bv, c.cv as cv from n3a a join n3b b on b.k = a.k join n3c c on c.k = a.k');
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, 'n3v exposes k,av,bv,cv').to.equal(4);
+				assertPlanLineageAgreement('n-way join', attrs, keysOf(node), node.physical.updateLineage);
+
+				const rowsArb = fc.array(fc.record({
+					k: fc.integer({ min: 1, max: 5 }),
+					av: fc.integer({ min: 1, max: 9 }), bv: fc.integer({ min: 1, max: 9 }), cv: fc.integer({ min: 1, max: 9 }),
+				}), { maxLength: 6 });
+
+				await fc.assert(fc.asyncProperty(
+					rowsArb,
+					fc.integer({ min: 1, max: 5 }),  // target K
+					fc.integer({ min: 10, max: 19 }), fc.integer({ min: 20, max: 29 }), fc.integer({ min: 30, max: 39 }),
+					async (rows, K, NA, NB, NC) => {
+						await db.exec('delete from n3b');
+						await db.exec('delete from n3c');
+						await db.exec('delete from n3a');
+						const seen = new Set<number>(); const kept: { k: number; av: number; bv: number; cv: number }[] = [];
+						for (const r of rows) {
+							if (seen.has(r.k)) continue; seen.add(r.k);
+							await db.exec(`insert into n3a values (${r.k}, ${r.av})`);
+							await db.exec(`insert into n3b values (${r.k}, ${r.bv})`);
+							await db.exec(`insert into n3c values (${r.k}, ${r.cv})`);
+							kept.push(r);
+						}
+						await db.exec(`update n3v set av = ${NA}, bv = ${NB}, cv = ${NC} where k = ${K}`);
+						const hit = (k: number): boolean => k === K;
+						assertRowsEqual('n3 a', await readRows('select k, av from n3a'),
+							kept.map(r => ({ k: r.k, av: hit(r.k) ? NA : r.av })), ['k', 'av']);
+						assertRowsEqual('n3 b', await readRows('select k, bv from n3b'),
+							kept.map(r => ({ k: r.k, bv: hit(r.k) ? NB : r.bv })), ['k', 'bv']);
+						assertRowsEqual('n3 c', await readRows('select k, cv from n3c'),
+							kept.map(r => ({ k: r.k, cv: hit(r.k) ? NC : r.cv })), ['k', 'cv']);
+						assertRowsEqual('n3 view', await readRows('select k, av, bv, cv from n3v'),
+							kept.map(r => ({ k: r.k, av: hit(r.k) ? NA : r.av, bv: hit(r.k) ? NB : r.bv, cv: hit(r.k) ? NC : r.cv })), ['k', 'av', 'bv', 'cv']);
+					},
+				), { numRuns: 50 });
+			});
+
+			// ----- Self-join (flipped `rj_self` negative) -----
+			// `sj` aliased twice (a, b) joined on `b.id = a.fk` — one base table under two
+			// distinct aliases. An update routes per alias and serializes in alias-
+			// declaration order (a before b), each observing the prior (when a and b are
+			// the same physical row, b's write wins). PutGet + plan-lineage agreement.
+			it('self-join: per-alias routing serialized in alias-declaration order round-trips', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists sjv');
+				await db.exec('drop table if exists sj');
+				await db.exec('create table sj (id integer primary key, fk integer null references sj(id), x integer null) using memory');
+				await db.exec('create view sjv as select a.id as aid, a.x as ax, b.x as bx from sj a join sj b on b.id = a.fk');
+
+				const node = planLogicalBody('select a.id as aid, a.x as ax, b.x as bx from sj a join sj b on b.id = a.fk');
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, 'sjv exposes aid,ax,bx').to.equal(3);
+				assertPlanLineageAgreement('self-join', attrs, keysOf(node), node.physical.updateLineage);
+
+				const rowsArb = fc.array(fc.record({
+					id: fc.integer({ min: 1, max: 5 }),
+					fk: fc.integer({ min: 1, max: 6 }),   // 6 > max id ⇒ some rows have no parent (unjoined)
+					x: fc.integer({ min: 1, max: 9 }),
+				}), { maxLength: 8 });
+
+				await fc.assert(fc.asyncProperty(
+					rowsArb,
+					fc.integer({ min: 1, max: 5 }),  // target aid = K
+					fc.integer({ min: 10, max: 19 }), fc.integer({ min: 20, max: 29 }),  // new ax, bx (disjoint)
+					async (rows, K, NA, NB) => {
+						await db.exec('delete from sj');
+						const byId = new Map<number, { id: number; fk: number; x: number }>();
+						for (const r of rows) {
+							if (byId.has(r.id)) continue;
+							byId.set(r.id, { ...r });
+							await db.exec(`insert into sj values (${r.id}, ${r.fk}, ${r.x})`);
+						}
+						// Oracle: the view row aid=K joins iff sj row K exists and its parent
+						// (sj row K.fk) exists. The capture pins both identities BEFORE the writes;
+						// op a (alias-order first) sets row K.x=NA, then op b sets row (K.fk).x=NB —
+						// observing the prior, so a self-referencing row (K === K.fk) ends at NB.
+						const a = byId.get(K);
+						if (a && a.fk !== null && byId.has(a.fk)) {
+							byId.get(K)!.x = NA;        // op a
+							byId.get(a.fk)!.x = NB;     // op b (observes prior)
+						}
+						await db.exec(`update sjv set ax = ${NA}, bx = ${NB} where aid = ${K}`);
+
+						const expBase = [...byId.values()].map(r => ({ id: r.id, fk: r.fk, x: r.x }));
+						assertRowsEqual('sj base', await readRows('select id, fk, x from sj'), expBase, ['id', 'fk', 'x']);
+						// View image: each sj row whose fk points to an existing row, paired with
+						// that parent's (post-state) x.
+						const expView = [...byId.values()].filter(r => r.fk !== null && byId.has(r.fk))
+							.map(r => ({ aid: r.id, ax: r.x, bx: byId.get(r.fk)!.x }));
+						assertRowsEqual('sj view', await readRows('select aid, ax, bx from sjv'), expView, ['aid', 'ax', 'bx']);
+					},
+				), { numRuns: 60 });
 			});
 		});
 

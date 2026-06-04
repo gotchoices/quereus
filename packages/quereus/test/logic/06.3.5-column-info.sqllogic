@@ -200,19 +200,22 @@ update oj_left set av = 'z' where aid = 1;
 -- error: cannot write through view
 
 -- ===================================================================
--- Non-inner / multi-table join bodies (Divergence 3): cross join and a
--- > 2-table inner join. These shapes never null-extend (only LEFT/RIGHT/FULL
--- do — deriveJoinUpdateLineage), so they carry strict-`base` lineage and slip
--- past the outer-join gate. But propagate() rejects every join shape but a
--- single two-table inner equi-join (collectInnerJoinSources), so column_info
--- must report every output column is_updatable='NO' with null trace, agreeing
--- with view_info()'s conservative row and with what a real mutation accepts.
+-- Non-inner join bodies (Divergence 3): a cross join never null-extends (only
+-- LEFT/RIGHT/FULL do — deriveJoinUpdateLineage), so it carries strict-`base`
+-- lineage and slips past the outer-join gate. propagate() rejects a cross join
+-- (collectInnerJoinSources requires an ON/USING predicate), so column_info must
+-- report every output column is_updatable='NO' with null trace, agreeing with
+-- view_info()'s conservative row.
+--
+-- n-way (≥2) inner equi-joins — composite-PK sides and self-joins included — are
+-- now DECOMPOSABLE (isDecomposableJoinBody accepts them), so column_info reports
+-- each base column updatable with its trace, agreeing with propagate() accepting
+-- the write (covered after the cross join).
 --
 -- Comma / implicit joins are NOT tested here: the SELECT builder rejects ANY
 -- multiple-FROM-source body ("SELECT with multiple FROM sources (joins) not
 -- supported"), so a comma-join view can never be created to reach column_info —
--- there is no buildable case. Self-joins, by contrast, ARE buildable (one table
--- under two alias-bound sites) and are covered below.
+-- there is no buildable case.
 -- ===================================================================
 
 create table ra (aid integer primary key, av text);
@@ -229,27 +232,27 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 update cross_v set av = 'z' where aid = 1;
 -- error: cannot write through view
 
--- 3-table inner join (> 2 base tables): also strict-`base` lineage. All 'NO' / null.
+-- 3-table inner join (> 2 base tables): now decomposable ⇒ each column traces to
+-- its owning base, updatable.
 create view three_v as select a.aid as aid, a.av as av, b.bv as bv, c.cv as cv
     from ra a join rb b on b.bid = a.aid join rc c on c.cid = a.aid;
 select cid, column_name, is_updatable, base_table, base_column from column_info('three_v');
-→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"av","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"column_name":"cv","is_updatable":"NO","base_table":null,"base_column":null}]
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"ra","base_column":"aid"},{"cid":1,"column_name":"av","is_updatable":"YES","base_table":"ra","base_column":"av"},{"cid":2,"column_name":"bv","is_updatable":"YES","base_table":"rb","base_column":"bv"},{"cid":3,"column_name":"cv","is_updatable":"YES","base_table":"rc","base_column":"cv"}]
 
--- Surface agrees with propagate(): a mutation through the 3-table-join view is rejected.
+-- Surface agrees with propagate(): a write through the 3-table-join view is accepted
+-- (empty bases ⇒ clean no-op).
 update three_v set av = 'z' where aid = 1;
--- error: cannot write through view
 
--- Self-join (one table under two alias-bound sites): isDecomposableJoinBody
--- rejects it (collectInnerJoinSources cannot resolve which side a column owns
--- when both sides are the same table), so every column reads 'NO' / null.
+-- Self-join (one table under two alias-bound sites): now decomposable ⇒ each column
+-- traces to its owning alias's scan; both base_table values collapse to `ra`.
 create view self_v as select a.aid as aid, b.av as bv
     from ra a join ra b on b.aid = a.aid;
 select cid, column_name, is_updatable, base_table, base_column from column_info('self_v');
-→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"ra","base_column":"aid"},{"cid":1,"column_name":"bv","is_updatable":"YES","base_table":"ra","base_column":"av"}]
 
--- Surface agrees with propagate(): a mutation through the self-join view is rejected.
+-- Surface agrees with propagate(): a write through the self-join view is accepted
+-- (empty base ⇒ clean no-op).
 update self_v set bv = 'z' where aid = 1;
--- error: cannot write through view
 
 -- ===================================================================
 -- Unknown name throws (mirrors table_info's required-target posture).

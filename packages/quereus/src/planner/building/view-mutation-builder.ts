@@ -165,10 +165,10 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
  * spines, decomposition-backed tables — none thread an `analysis`).
  *
  * The captured sides are the sides whose base ops read the set, EXCEPT an UPDATE with
- * RETURNING captures BOTH sides' PKs — its post-mutation re-query identifies the full
- * joined row by `(k0, k1)`, so it needs a single-column PK on each side even when only
- * one side is assigned (matching the retired path, whose RETURNING capture also
- * projected both PKs).
+ * RETURNING captures EVERY side's PK — its post-mutation re-query identifies the full
+ * joined row by all sides' keys, so it needs a key on each side even when only one side
+ * is assigned (matching the retired path, whose RETURNING capture also projected both
+ * sides' PKs). Composite-PK sides contribute one capture column per PK column.
  */
 function buildIdentityCapture(
 	ctx: PlanningContext,
@@ -181,7 +181,7 @@ function buildIdentityCapture(
 	switch (req.op) {
 		case 'update': {
 			const hasReturning = !!req.stmt.returning && req.stmt.returning.length > 0;
-			const sides = hasReturning ? [0, 1] : capturedSideIndices(baseOps, analysis);
+			const sides = hasReturning ? analysis.sides.map((_, i) => i) : capturedSideIndices(baseOps, analysis);
 			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where, analysis, sides);
 		}
 		case 'delete':

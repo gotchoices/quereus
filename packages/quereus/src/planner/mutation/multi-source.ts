@@ -6,7 +6,7 @@ import { resolveReferencedColumns } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
-import { TableReferenceNode } from '../nodes/reference.js';
+import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { analyzeBodyLineage } from './backward-body.js';
 import { buildExpression } from '../building/expression.js';
@@ -25,8 +25,10 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  * join** acceptance case of the view-mutation substrate (docs/view-updateability.md
  * § Per-Operator Semantics — Inner Join, § Multi-Base-Table Mutations).
  *
- * Scope (this phase): a view body that is a two-table **inner equi-join** of base
- * tables, written through with `update` / `delete`. The body is **planned once**
+ * Scope (this phase): a view body that is an **n-way (≥2) inner equi-join** of base
+ * tables — including composite-PK sides and **self-joins** (one base table under two
+ * or more distinct aliases) — written through with `update` / `delete`. The body is
+ * **planned once**
  * (`analyzeJoinView`); its `PhysicalProperties.updateLineage` (threaded by
  * `view-mutation-physical-lineage`) routes each output column to its owning base
  * table. Each per-base SET/value is still lowered to an AST `BaseOp` so the ordinary
@@ -68,26 +70,40 @@ import type { DeleteViaValue } from '../../schema/reserved-tags.js';
  *
  * **Deferred, rejected here with a structured diagnostic (later phases):**
  * - outer / cross / set-op / aggregate / window bodies — `unsupported-*`.
- * - `> 2` base tables, self-joins, composite-PK sides, comma (implicit) joins,
- *   `select *` join bodies, and cross-side `set` value references — each a
- *   precise diagnostic.
+ * - comma (implicit) joins, `select *` join bodies, and cross-side `set` value
+ *   references — each a precise diagnostic.
+ * - composite **shared-key insert** (the surrogate envelope threads a single-column
+ *   key) — `unsupported-decomposition-key`. (Composite-PK *identification* on the
+ *   update/delete capture path IS supported here; only the insert envelope's shared
+ *   key stays single-column.)
  */
 
 /**
- * The shared identity-capture CTE name + its `(k0, k1)` column names for a
- * multi-source UPDATE / multi-side DELETE fan-out. Each affected view row's base-PK
- * identities are materialized ONCE — *before* any base op fires — into
- * `rctx.tableContexts` under a shared descriptor. When more than one base op runs
- * against live state (an update assigning **both** sides, or a lenient delete fanned
- * out to both candidate sides) each per-side base op reads its identifying values
- * back from this set (`<pk> in (select k<side> from __vmupd_keys)`) instead of a live
- * re-query of the join body, so the first op cannot empty the join — or rewrite a
- * predicate column — out from under the second op's identifying subquery (a
- * mutation-order-independent identity). The same capture backs the UPDATE RETURNING
- * re-query (docs/view-updateability.md § Inner Join, § `returning`).
+ * The shared identity-capture CTE name for a multi-source (n-way inner-join) UPDATE /
+ * multi-side DELETE fan-out. Each affected view row's base-PK identities are
+ * materialized ONCE — *before* any base op fires — into `rctx.tableContexts` under a
+ * shared descriptor. *Every* per-side base op reads its identifying values back from
+ * this set via a correlated EXISTS (`exists (select 1 from __vmupd_keys k where
+ * k.k<side>_<j> = <side>.<pk<j>> …)`) instead of a live re-query of the join body, so
+ * the first op cannot empty the join — or rewrite a predicate column — out from under
+ * a later op's identifying subquery (a mutation-order-independent identity). The same
+ * capture backs the UPDATE RETURNING re-query (docs/view-updateability.md § Inner Join,
+ * § `returning`).
+ *
+ * The capture relation carries one column **per side per PK column**, named
+ * `k<sideIndex>_<pkColumnOrdinal>` ({@link keyColumnName}) — so a composite-PK side
+ * contributes `k<side>_0, k<side>_1, …`. This flattened per-side-per-column shape is
+ * what generalizes the substrate past the retired single-column `(k0, k1)` tuple.
  */
 export const MS_UPDATE_KEYS_CTE = '__vmupd_keys';
-export const MS_UPDATE_KEY_COLUMNS = ['k0', 'k1'] as const;
+
+/**
+ * The capture column name for side `sideIndex`'s `j`-th PK column. A single-column-PK
+ * side yields just `k<side>_0`; a composite-PK side yields `k<side>_0, k<side>_1, …`.
+ */
+export function keyColumnName(sideIndex: number, j: number): string {
+	return `k${sideIndex}_${j}`;
+}
 
 // --- shape model ----------------------------------------------------------
 
@@ -135,8 +151,8 @@ interface OutColumn {
 
 export interface JoinViewAnalysis {
 	readonly sel: AST.SelectStmt;
-	/** The two base-table sides, in AST source order. */
-	readonly sides: readonly [JoinSide, JoinSide];
+	/** The base-table sides (≥2), in AST source order; routing is keyed by index 0..n-1. */
+	readonly sides: readonly JoinSide[];
 	/** View column name (lowercased) -> its base-term replacement expression. */
 	readonly viewColToBaseRef: ReadonlyMap<string, AST.Expression>;
 	readonly outColumns: readonly OutColumn[];
@@ -177,35 +193,36 @@ export function isJoinBody(selectAst: AST.QueryExpr): boolean {
 
 /**
  * Non-throwing AST shape check — the boolean shadow of {@link collectInnerJoinSources}'s
- * acceptance: `true` iff the body is a single explicit two-table INNER join with
- * an ON predicate over two **distinct plain base tables** (the exact multi-source
- * shape `propagate()` decomposes). Every other multi-table body — cross / outer /
- * comma (implicit) / `> 2`-table / subquery- or function-source / self-join —
- * returns `false`.
+ * acceptance: `true` iff the body is a single explicit **n-way (≥2) INNER join** with
+ * an ON (or USING) predicate over plain base tables (the exact multi-source shape
+ * `propagate()` decomposes), including **composite-PK sides** and **self-joins** (one
+ * base table under two or more distinct aliases). Every other multi-table body — cross
+ * / outer / comma (implicit) / subquery- or function-source — returns `false`.
  *
  * Shared with the static updateability surfaces (`deriveViewInfo` /
  * `deriveColumnInfo` in `func/builtins/schema.ts`): they gate on this so they
  * agree with what a real mutation through the view accepts, rather than reading
- * `updateLineage` (which carries strict-`base` sites for cross / `> 2`-table
- * bodies — only LEFT/RIGHT/FULL outer joins null-extend — and would otherwise
- * over-report `is_updatable = 'YES'`). The throwing `collectInnerJoinSources`
- * stays the substrate's source of truth; this mirrors only its AST-level shape
- * gate (it does not re-check DISTINCT/LIMIT/`select *`/PK, which are deeper
- * semantic rejects handled downstream).
+ * `updateLineage` (which carries strict-`base` sites for cross bodies — only
+ * LEFT/RIGHT/FULL outer joins null-extend — and would otherwise over-report
+ * `is_updatable = 'YES'`). The throwing `collectInnerJoinSources` stays the
+ * substrate's source of truth; this mirrors only its AST-level shape gate (it does
+ * not re-check DISTINCT/LIMIT/`select *`, which are deeper semantic rejects handled
+ * downstream — PK shape is no longer a reject now that composite keys are admitted).
  */
 export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.from) return false;
 	const from = selectAst.from;
 	if (from.length !== 1 || from[0].type !== 'join') return false;
 
-	const tables: AST.TableSource[] = [];
+	let tableCount = 0;
 	const visit = (fc: AST.FromClause): boolean => {
 		switch (fc.type) {
 			case 'table':
-				tables.push(fc);
+				tableCount += 1;
 				return true;
 			case 'join':
-				if (fc.joinType !== 'inner' || !fc.condition) return false;
+				// INNER join with an explicit ON predicate or a USING column list.
+				if (fc.joinType !== 'inner' || (!fc.condition && !(fc.columns && fc.columns.length > 0))) return false;
 				return visit(fc.left) && visit(fc.right);
 			default:
 				return false; // subquery / function source — not a plain base table
@@ -213,14 +230,14 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 	};
 	if (!visit(from[0])) return false;
 
-	// Exactly two distinct base tables (a self-join references one table under two
-	// alias-bound sites, which the substrate also rejects).
-	if (tables.length !== 2) return false;
-	return tables[0].table.name.toLowerCase() !== tables[1].table.name.toLowerCase();
+	// ≥2 plain base tables. A self-join (the same base table under distinct aliases) is
+	// now accepted; routing is alias-keyed downstream, so the table names need not be
+	// distinct here.
+	return tableCount >= 2;
 }
 
 /**
- * Decompose a multi-source (two-table inner-join) view mutation into an ordered
+ * Decompose a multi-source (n-way inner-join) view mutation into an ordered
  * `BaseOp[]`. Throws a structured diagnostic for any unsupported shape.
  */
 export function propagateMultiSource(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): BaseOp[] {
@@ -284,10 +301,12 @@ export interface MsInsertAnalysis {
 }
 
 /**
- * Decompose a two-table key-preserving inner-join INSERT into the per-side base
- * inserts plus the shared-surrogate envelope they fan out from. Throws a
- * structured diagnostic for any unsupported shape (computed target column, a
- * not-null base column with no value, a non-equi-join key, …).
+ * Decompose an n-way key-preserving inner-join INSERT into the per-side base inserts
+ * plus the shared-surrogate envelope they fan out from. Throws a structured diagnostic
+ * for any unsupported shape (computed target column, a not-null base column with no
+ * value, a non-equi-join key, …). The shared key remains **single-column**: a side
+ * contributing a composite shared key to the join's equivalence class is rejected with
+ * `unsupported-decomposition-key` (the envelope threads one key value per row).
  */
 export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): MsInsertAnalysis {
 	rejectReturning(view, stmt.returning);
@@ -376,66 +395,138 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	};
 }
 
+/** One cross-side `column = column` equality recovered from a join ON / USING clause. */
+interface CrossSideEquality { readonly sideA: number; readonly colA: string; readonly sideB: number; readonly colB: string; }
+
 /**
- * The per-side shared-key base columns of a two-table inner equi-join, aligned to
- * `sides` by index. Requires a single `a.col = b.col` ON predicate naming one
- * column on each side (the surrogate the decomposition stitches on).
+ * Walk every nested `JoinClause`'s ON predicate (flattened on AND) and USING column
+ * list across the n-way join tree, collecting cross-side `column = column` equalities
+ * (each operand resolving to a *different* side via {@link resolveColumnSide}). The
+ * shared backward read the insert envelope's shared-key extraction relies on — it must
+ * see ALL conjunctions (not just the outermost join's ON), since for `a join b on …
+ * join c on …` only the last ON is on `from[0]`.
  */
-function extractJoinKeyColumns(view: MutableViewLike, sel: AST.SelectStmt, sides: readonly [JoinSide, JoinSide]): [string, string] {
-	const join = sel.from?.[0];
-	if (!join || join.type !== 'join' || !join.condition) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-join',
-			table: view.name,
-			message: `cannot insert through view '${view.name}': the join must carry an explicit ON predicate naming the shared key`,
-		});
-	}
-	const cond = join.condition;
-	if (cond.type !== 'binary' || cond.operator !== '=' || cond.left.type !== 'column' || cond.right.type !== 'column') {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-join',
-			table: view.name,
-			message: `cannot insert through view '${view.name}': only a single equi-join 'a.col = b.col' identifies the shared key for an insert (composite / expression join keys are a later phase)`,
-		});
-	}
-	const sideOf = (col: AST.ColumnExpr): number => {
-		const qualifier = col.table?.toLowerCase();
-		if (qualifier === undefined) {
-			raiseMutationDiagnostic({
-				reason: 'unsupported-join',
-				table: view.name,
-				message: `cannot insert through view '${view.name}': the join key column '${col.name}' must be qualified by its base table/alias`,
-			});
+function collectCrossSideEqualities(from: readonly AST.FromClause[], sides: readonly JoinSide[]): CrossSideEquality[] {
+	const out: CrossSideEquality[] = [];
+	const sidesUnder = (fc: AST.FromClause): number[] => {
+		switch (fc.type) {
+			case 'table': {
+				const alias = (fc.alias ?? fc.table.name).toLowerCase();
+				const idx = sides.findIndex(s => s.alias === alias);
+				return idx >= 0 ? [idx] : [];
+			}
+			case 'join':
+				return [...sidesUnder(fc.left), ...sidesUnder(fc.right)];
+			default:
+				return [];
 		}
-		const idx = sides.findIndex(s => s.alias === qualifier || s.schema.name.toLowerCase() === qualifier);
-		if (idx < 0) {
-			raiseMutationDiagnostic({
-				reason: 'unsupported-join',
-				table: view.name,
-				message: `cannot insert through view '${view.name}': the join key references '${qualifier}', which is not a base table of the join`,
-			});
-		}
-		return idx;
 	};
-	const leftSide = sideOf(cond.left);
-	const rightSide = sideOf(cond.right);
-	if (leftSide === rightSide) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-join',
-			table: view.name,
-			message: `cannot insert through view '${view.name}': the join key must relate the two distinct base tables`,
-		});
-	}
-	const keys: [string, string] = ['', ''];
-	keys[leftSide] = cond.left.name;
-	keys[rightSide] = cond.right.name;
-	return keys;
+	const visit = (fc: AST.FromClause): void => {
+		if (fc.type !== 'join') return;
+		visit(fc.left);
+		visit(fc.right);
+		if (fc.condition) {
+			for (const conj of flattenAnd(fc.condition)) {
+				if (conj.type !== 'binary' || conj.operator !== '=') continue;
+				if (conj.left.type !== 'column' || conj.right.type !== 'column') continue;
+				const sa = resolveColumnSide(conj.left, sides);
+				const sb = resolveColumnSide(conj.right, sides);
+				if (sa === undefined || sb === undefined || sa === sb) continue;
+				out.push({ sideA: sa, colA: conj.left.name, sideB: sb, colB: conj.right.name });
+			}
+		}
+		// USING (c, …): each named column equates the same-named column on the left and
+		// right operands. The operands may be nested joins, so locate the unique owning
+		// side under each (a column present on exactly one side of each operand subtree).
+		if (fc.columns) {
+			const ownerUnder = (operand: AST.FromClause, col: string): number | undefined => {
+				const owners = sidesUnder(operand).filter(i => sides[i].schema.columns.some(c => c.name.toLowerCase() === col.toLowerCase()));
+				return owners.length === 1 ? owners[0] : undefined;
+			};
+			for (const colName of fc.columns) {
+				const sa = ownerUnder(fc.left, colName);
+				const sb = ownerUnder(fc.right, colName);
+				if (sa === undefined || sb === undefined || sa === sb) continue;
+				out.push({ sideA: sa, colA: colName, sideB: sb, colB: colName });
+			}
+		}
+	};
+	visit(from[0]);
+	return out;
 }
 
-/** The side whose key seeds a minted surrogate: the FK-parent, else the left source. */
-function anchorSideIndex(sides: readonly [JoinSide, JoinSide]): number {
-	const child = fkChildIndex(sides);
-	return child === undefined ? 0 : 1 - child;
+/**
+ * The per-side shared-key base columns of an n-way inner equi-join, aligned to `sides`
+ * by index. Walks every ON conjunction / USING column ({@link collectCrossSideEqualities})
+ * and requires they connect all sides into a **single** shared-key equivalence class
+ * with exactly one key column per side (the surrogate the decomposition threads through
+ * the envelope's equivalence class). A side contributing more than one column to the EC
+ * is the deferred multi-column-surrogate shape — rejected `unsupported-decomposition-key`;
+ * a join that does not relate every side through one shared value (a chained / multi-key
+ * join) is rejected `unsupported-join`.
+ */
+function extractJoinKeyColumns(view: MutableViewLike, sel: AST.SelectStmt, sides: readonly JoinSide[]): string[] {
+	const equalities = collectCrossSideEqualities(sel.from!, sides);
+	if (equalities.length === 0) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-join',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': the join must carry an explicit equi-join ON/USING predicate naming the shared key`,
+		});
+	}
+
+	// Per side: the distinct columns it contributes to a cross-side equality.
+	const perSideCols: Array<Set<string>> = sides.map(() => new Set<string>());
+	// Union-find over `<side>:<col>` keys — proves a single shared-key equivalence class.
+	const parent = new Map<string, string>();
+	const ensure = (k: string): void => { if (!parent.has(k)) parent.set(k, k); };
+	const find = (k: string): string => { ensure(k); let r = k; while (parent.get(r) !== r) r = parent.get(r)!; parent.set(k, r); return r; };
+	const union = (a: string, b: string): void => { parent.set(find(a), find(b)); };
+	const nodeKey = (side: number, col: string): string => `${side}:${col.toLowerCase()}`;
+	for (const eq of equalities) {
+		perSideCols[eq.sideA].add(eq.colA);
+		perSideCols[eq.sideB].add(eq.colB);
+		union(nodeKey(eq.sideA, eq.colA), nodeKey(eq.sideB, eq.colB));
+	}
+
+	const keyCols = sides.map((side, i): string => {
+		const cols = [...perSideCols[i]];
+		if (cols.length === 0) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-join',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': base table '${side.schema.name}' is not related to the shared join key by any equi-join predicate`,
+			});
+		}
+		if (cols.length > 1) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-decomposition-key',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': base table '${side.schema.name}' contributes a composite shared key (${cols.join(', ')}); a multi-column shared-key insert envelope is not yet supported`,
+			});
+		}
+		return cols[0];
+	});
+
+	// All sides' key columns must belong to ONE equivalence class — a single shared value
+	// threaded into every side via the EC. A chain (`a.x=b.y join … b.z=c.w`) yields
+	// disjoint key classes that no single surrogate can thread.
+	const root0 = find(nodeKey(0, keyCols[0]));
+	for (let i = 1; i < sides.length; i++) {
+		if (find(nodeKey(i, keyCols[i])) !== root0) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-join',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': the join does not relate all base tables through a single shared key (a chained / multi-key join insert is not yet supported)`,
+			});
+		}
+	}
+	return keyCols;
+}
+
+/** The side whose key seeds a minted surrogate: the FK-root (topo head), else the left source. */
+function anchorSideIndex(sides: readonly JoinSide[]): number {
+	return orderSides(sides)[0];
 }
 
 /** Reject a not-null base column with no declared default that no envelope value covers. */
@@ -553,20 +644,34 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 		});
 	}
 
-	// Match each AST source to its planned TableReferenceNode by name (self-joins
-	// are rejected, so the table name is unambiguous among the two sources).
-	const sides = sources.map((src): JoinSide => {
-		const name = src.table.name.toLowerCase();
-		const ref = [...tableRefsById.values()].find(r => r.tableSchema.name.toLowerCase() === name);
-		if (!ref) {
+	// Map each AST source's **alias** to its planned `TableReferenceNode` by resolving
+	// the alias-qualified PK column through the join's combined scope (the same scope the
+	// body's own projections resolved against) to the producing attribute → its owning
+	// `TableReferenceNode`. A by-table-NAME match is ambiguous for a self-join (two
+	// sources share one table name); the alias is the discriminator, and each alias is a
+	// distinct scan node post-plan, so resolving through the scope pins the right ref.
+	// `attrToTableRef` inverts every base ref's attribute ids (which the inner join
+	// preserves up to its output) so a resolved column reference identifies its source.
+	const attrToTableRef = new Map<number, TableReferenceNode>();
+	for (const ref of tableRefsById.values()) {
+		for (const attr of ref.getAttributes()) attrToTableRef.set(attr.id, ref);
+	}
+	const schemaByTableName = new Map<string, TableSchema>();
+	for (const ref of tableRefsById.values()) schemaByTableName.set(ref.tableSchema.name.toLowerCase(), ref.tableSchema);
+
+	const sides: JoinSide[] = sources.map((src): JoinSide => {
+		const alias = (src.alias ?? src.table.name).toLowerCase();
+		const schema = schemaByTableName.get(src.table.name.toLowerCase());
+		if (!schema) {
 			raiseMutationDiagnostic({
 				reason: 'no-base-lineage',
 				table: view.name,
 				message: `cannot write through view '${view.name}': base table '${src.table.name}' did not resolve in the planned body`,
 			});
 		}
-		return { table: ref, schema: ref.tableSchema, alias: (src.alias ?? src.table.name).toLowerCase() };
-	}) as [JoinSide, JoinSide];
+		const ref = resolveSourceTableRef(ctx, joinScope, schema, alias, attrToTableRef, view);
+		return { table: ref, schema: ref.tableSchema, alias };
+	});
 
 	const sideByTableId = new Map<number, number>();
 	sides.forEach((s, idx) => sideByTableId.set(Number(s.table.id), idx));
@@ -595,11 +700,56 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 }
 
 /**
- * The single `JoinNode` inside a planned two-table inner-join body. The body is a
- * `select <cols> from <a join b on p> [where w]`, so its plan is
- * `Project(Filter?(Join))` — there is exactly one join. Walks relations from the
- * root, returning the outermost (only) `JoinNode`. Reused (not re-planned) as the
- * source the identifying-capture / RETURNING relations build on.
+ * Resolve one AST join source (by its `alias`) to its planned `TableReferenceNode`.
+ * Probes with the source's first PK column (or first column if keyless) qualified by
+ * the alias, resolved through the join's combined `joinScope` — the inner join
+ * preserves the producing base scan's attribute id up to its output, so the resolved
+ * `ColumnReferenceNode`'s attribute id pins the alias's owning `TableReferenceNode`
+ * via `attrToTableRef`. This is what disambiguates a **self-join** (two sources sharing
+ * one table name but distinct aliases → distinct scan nodes).
+ */
+function resolveSourceTableRef(
+	ctx: PlanningContext,
+	joinScope: Scope,
+	schema: TableSchema,
+	alias: string,
+	attrToTableRef: ReadonlyMap<number, TableReferenceNode>,
+	view: MutableViewLike,
+): TableReferenceNode {
+	const pk = schema.primaryKeyDefinition;
+	const probeColName = (pk.length > 0 ? schema.columns[pk[0].index] : schema.columns[0])?.name;
+	if (!probeColName) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through view '${view.name}': base table '${schema.name}' (alias '${alias}') has no columns to resolve its join side`,
+		});
+	}
+	const probe = buildExpression({ ...ctx, scope: joinScope }, { type: 'column', name: probeColName, table: alias } as AST.ColumnExpr);
+	if (!(probe instanceof ColumnReferenceNode)) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through view '${view.name}': join source alias '${alias}' did not resolve to a base column reference in the planned body`,
+		});
+	}
+	const ref = attrToTableRef.get(probe.attributeId);
+	if (!ref) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through view '${view.name}': join source alias '${alias}' did not resolve to a base table in the planned body`,
+		});
+	}
+	return ref;
+}
+
+/**
+ * The single `JoinNode` inside a planned n-way inner-join body — the outermost
+ * `JoinNode` reached from the root (the body's plan is `Project(Filter?(Join…))`; for
+ * an n-way join the outermost JoinNode transitively contains the nested ones). Reused
+ * (not re-planned) as the source the identifying-capture / RETURNING relations build
+ * on; the nested joins ride inside it via its own `getRelations()`.
  */
 function findJoinNode(view: MutableViewLike, root: PlanNode): JoinNode {
 	let found: JoinNode | undefined;
@@ -620,16 +770,19 @@ function findJoinNode(view: MutableViewLike, root: PlanNode): JoinNode {
 }
 
 /**
- * Collect the join's base-table sources, validating the body is a two-table
- * inner equi-join over plain base tables (no outer/cross/comma joins, subquery
- * or function sources, self-joins, or > 2 tables).
+ * Collect the join's base-table sources (in AST declaration order), validating the
+ * body is an **n-way (≥2) inner equi-join** over plain base tables (no outer / cross /
+ * comma joins, no subquery or function sources). A **self-join** — the same base table
+ * under distinct aliases — is accepted (routing is alias-keyed downstream); USING joins
+ * are accepted alongside ON joins. The declaration order is the alias-declaration order
+ * the substrate serializes per-side ops in (§ Cycles, Self-Joins).
  */
 function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromClause[]): AST.TableSource[] {
 	if (from.length !== 1 || from[0].type !== 'join') {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-join',
 			table: view.name,
-			message: `cannot write through view '${view.name}': only an explicit two-table 'JOIN ... ON' body is decomposable (a comma/implicit cross join is not)`,
+			message: `cannot write through view '${view.name}': only an explicit 'JOIN ... ON/USING' body is decomposable (a comma/implicit cross join is not)`,
 		});
 	}
 
@@ -640,11 +793,12 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 				out.push(fc);
 				return;
 			case 'join': {
-				if (fc.joinType !== 'inner' || !fc.condition) {
+				const hasPredicate = !!fc.condition || (!!fc.columns && fc.columns.length > 0);
+				if (fc.joinType !== 'inner' || !hasPredicate) {
 					raiseMutationDiagnostic({
 						reason: 'unsupported-join',
 						table: view.name,
-						message: `cannot write through view '${view.name}': only INNER joins with an ON predicate are decomposable (got '${fc.joinType}'${fc.condition ? '' : ' without ON'})`,
+						message: `cannot write through view '${view.name}': only INNER joins with an ON/USING predicate are decomposable (got '${fc.joinType}'${hasPredicate ? '' : ' without ON/USING'})`,
 					});
 				}
 				visit(fc.left);
@@ -661,18 +815,11 @@ function collectInnerJoinSources(view: MutableViewLike, from: readonly AST.FromC
 	};
 	visit(from[0]);
 
-	if (out.length !== 2) {
+	if (out.length < 2) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-join',
 			table: view.name,
-			message: `cannot write through view '${view.name}': only a two-table join is decomposable (found ${out.length} base tables)`,
-		});
-	}
-	if (out[0].table.name.toLowerCase() === out[1].table.name.toLowerCase()) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-join',
-			table: view.name,
-			message: `cannot write through view '${view.name}': a self-join is not yet decomposable (its lineage references one table under two alias-bound sites)`,
+			message: `cannot write through view '${view.name}': a decomposable join needs at least two base tables (found ${out.length})`,
 		});
 	}
 	return out;
@@ -708,14 +855,14 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// dispatch — they only restrict, never broaden). For an update the side set is
 	// already pinned per-assignment by lineage, so the tag acts as a guard: an
 	// assignment to an excluded side is a structured conflict, not a silent drop.
-	const allowedSides = applyTargetExclude([0, 1], analysis.sides, tags, view);
+	const allowedSides = applyTargetExclude(allSideIndices(analysis.sides), analysis.sides, tags, view);
 
 	// Scope guard: top-level `where` references must name view columns (parity with
 	// the single-source spine — a base-only name must not leak through the join body).
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
 
-	// Route each assignment to its owning base side.
-	const perSide: Array<{ column: string; value: AST.Expression }[]> = [[], []];
+	// Route each assignment to its owning base side (one entry per side, index 0..n-1).
+	const perSide: Array<{ column: string; value: AST.Expression }[]> = analysis.sides.map(() => []);
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
 		if (!out) {
@@ -737,13 +884,13 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// generic error — the structured guard makes the diagnostic uniform either way.
 		guardTopLevelScope(asg.value, analysis, view);
 		const side = analysis.sides[out.sideIndex];
-		const other = analysis.sides[1 - out.sideIndex];
+		const others = analysis.sides.filter((_, i) => i !== out.sideIndex);
 		// Rewrite the assigned value into base terms, then strip the owning side's
 		// qualifier (the base UPDATE targets that table directly). A reference to
-		// the other side cannot be expressed as a single-table SET — reject.
+		// any OTHER side cannot be expressed as a single-table SET — reject.
 		const baseValue = stripSideQualifier(
 			substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view),
-			view, side, other,
+			view, side, others,
 		);
 		// For an `inverse`-profile column the assigned value is in the VIEW domain;
 		// apply the site's inverse to recover the BASE value (`cv1 = cv + 1` ⇒ the
@@ -762,17 +909,19 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 
 	// Every affected view row's base-PK identities are captured ONCE up-front (before
 	// any base op fires) and each per-side op reads its identifying values back from
-	// that captured set (`<pk> in (select k<side> from __vmupd_keys)`), a
-	// mutation-order-independent identity built from the ALREADY-planned join body
-	// (the builder materializes the capture; see `buildMultiSourceKeyCapture`). This
-	// unifies the single-side and both-sides paths onto the same identity (no live
-	// re-query of a re-planned AST body): a both-sides update's FK-parent op can no
-	// longer rewrite a predicate column out from under the FK-child op, and a
-	// single-side op — having no ordering hazard — reads the same pre-mutation set it
-	// would have re-queried live.
+	// that captured set via a correlated EXISTS over `__vmupd_keys` (matching all of the
+	// side's PK columns — composite keys included), a mutation-order-independent identity
+	// built from the ALREADY-planned join body (the builder materializes the capture; see
+	// `buildMultiSourceKeyCapture`). This unifies the single-side and both-sides paths
+	// onto the same identity (no live re-query of a re-planned AST body): a both-sides
+	// update's FK-parent op can no longer rewrite a predicate column out from under the
+	// FK-child op, and a single-side op — having no ordering hazard — reads the same
+	// pre-mutation set it would have re-queried live.
 
-	// Order parent-before-child where the FK is provable (matches insert ordering
-	// intent and avoids surprising mid-statement FK states); arbitrary otherwise.
+	// Order FK-parent before FK-child by the n-way FK topological sort (matches insert
+	// ordering intent and avoids surprising mid-statement FK states); source order within
+	// an FK-equivalence class (and for self-joins, whose mutual edges fall back to
+	// alias-declaration order — § Cycles, Self-Joins).
 	const order = orderSides(analysis.sides);
 	const ops: BaseOp[] = [];
 	for (const sideIndex of order) {
@@ -786,12 +935,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			});
 		}
 		const side = analysis.sides[sideIndex];
-		const pk = requireSingleColumnPk(view, side);
-		const where: AST.InExpr = {
-			type: 'in',
-			expr: { type: 'column', name: pk },
-			subquery: buildCapturedKeySubquery(sideIndex),
-		};
+		const where = buildCapturedKeyPredicate(view, side, sideIndex);
 		const statement: AST.UpdateStmt = {
 			type: 'update',
 			table: tableIdentifier(side.schema),
@@ -816,36 +960,58 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	return ops;
 }
 
+/** All side indices `0..n-1` — the default candidate set for `target`/`exclude`. */
+function allSideIndices(sides: readonly JoinSide[]): number[] {
+	return sides.map((_, i) => i);
+}
+
 /**
- * `select k<sideIndex> from __vmupd_keys` — read this side's captured base-PK
- * identities back from the up-front materialized key set (the both-sides-assigned
- * UPDATE path and the multi-side DELETE fan-out; see {@link MS_UPDATE_KEYS_CTE}). The
- * builder injects `__vmupd_keys` into the base op's planning `cteNodes` (resolving to
- * the context-backed key relation), so this is read by descriptor rather than
- * re-querying the join body.
+ * The correlated EXISTS identifying predicate a per-side base op routes on:
+ * `exists (select 1 from __vmupd_keys k where k.k<side>_0 = <pk0> [and k.k<side>_1 =
+ * <pk1> …])` — matching ALL of the side's PK columns (composite keys included) against
+ * the up-front materialized key set (the both-sides-assigned UPDATE path, every
+ * single-side update/delete, and the multi-side DELETE fan-out; see
+ * {@link MS_UPDATE_KEYS_CTE}). The right-hand `<pk_j>` are unqualified, so they bind to
+ * the base op's own target table; `k.k<side>_<j>` reads the captured column. The builder
+ * injects `__vmupd_keys` into the base op's planning `cteNodes` (resolving to the
+ * context-backed key relation), so this is read by descriptor rather than re-querying
+ * the join body. (EXISTS — not a row-value `IN` — to reuse the UPDATE RETURNING
+ * re-query's correlation shape; one pattern.)
  */
-function buildCapturedKeySubquery(sideIndex: number): AST.SelectStmt {
+function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIndex: number): AST.Expression {
+	const keyCols = requireKeyColumns(view, side);
+	const conds = keyCols.map((pkCol, j): AST.Expression => ({
+		type: 'binary',
+		operator: '=',
+		left: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
+		right: { type: 'column', name: pkCol },
+	}));
 	return {
-		type: 'select',
-		columns: [{ type: 'column', expr: { type: 'column', name: MS_UPDATE_KEY_COLUMNS[sideIndex] } }],
-		from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE } }],
+		type: 'exists',
+		subquery: {
+			type: 'select',
+			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
+			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
+		},
 	};
 }
 
 // --- identity capture (shared by both-sides UPDATE / multi-side DELETE base ops + UPDATE RETURNING) ---
 
 /**
- * The up-front base-PK identity capture for a multi-source (two-table inner-join)
- * UPDATE or multi-side DELETE fan-out (docs/view-updateability.md § Inner Join,
- * § `returning`). Built ONCE and shared between the multi-side base ops' identifying
- * subqueries and (for an UPDATE with RETURNING) the RETURNING re-query.
+ * The up-front base-PK identity capture for a multi-source (n-way inner-join) UPDATE or
+ * multi-side DELETE fan-out (docs/view-updateability.md § Inner Join, § `returning`).
+ * Built ONCE and shared between the per-side base ops' identifying subqueries and (for
+ * an UPDATE with RETURNING) the RETURNING re-query.
  *
- *  - `source`: the capture SELECT `select s0.pk0 as k0, s1.pk1 as k1 from <body>
- *    where <idPredicate>` — the emitter materializes it into `rctx.tableContexts`
- *    under {@link descriptor} **before** any base op runs.
+ *  - `source`: the capture SELECT `select s0.pk0 as k0_0[, s0.pk1 as k0_1], s1.pk0 as
+ *    k1_0, … from <body> where <idPredicate>` — the emitter materializes it into
+ *    `rctx.tableContexts` under {@link descriptor} **before** any base op runs.
  *  - `descriptor`: the identity stitch shared between the materialized capture rows
  *    and every {@link InternalRecursiveCTERefNode} that reads them back.
- *  - `keyColumns`: the `(k0, k1)` column shape each reader mints a key ref over.
+ *  - `keyColumns`: the flattened `k<side>_<j>` column shape (one entry per requested
+ *    side per PK column) each reader mints a key ref over.
  */
 export interface MultiSourceKeyCapture {
 	readonly source: RelationalPlanNode;
@@ -882,18 +1048,19 @@ export function makeMultiSourceKeyRef(scope: Scope, capture: MultiSourceKeyCaptu
  * Build the up-front identity capture: each affected view row's base-PK identities,
  * by the same identifying predicate the base ops route on (user WHERE → base ∧ body
  * WHERE). Built as **plan nodes directly over the ALREADY-planned join body**
- * (`analysis.joinNode` + `analysis.joinScope`) — `Project_{k<side>}(Filter_{idPred}
+ * (`analysis.joinNode` + `analysis.joinScope`) — `Project_{k<side>_<j>}(Filter_{idPred}
  * (joinNode))` — instead of re-planning a cloned AST FROM, so the body is planned
  * ONCE (§ Round-Trip Laws and the Derived Backward Walk). `preserveInputColumns=false`
  * ⇒ the materialized rows are exactly the requested key columns, positionally aligned
- * to the `k<side>` columns every reader scans back (`keyColumns` and the projection
- * derive from the same `sideIndices` order).
+ * to the `k<side>_<j>` columns every reader scans back (`keyColumns` and the projection
+ * derive from the same `sideIndices` order; a composite-PK side contributes one column
+ * per PK column).
  *
- * `sideIndices` selects which sides' PKs to capture (each requires a single-column PK
- * via {@link requireSingleColumnPk}; a composite-PK *requested* side is rejected with
- * `unsupported-join`). The builder passes exactly the sides whose base ops read the
- * capture (plus both, for an UPDATE with RETURNING whose EXISTS needs `(k0, k1)`), so
- * a single-side write never forces a single-column PK on the untouched side.
+ * `sideIndices` selects which sides' PKs to capture (each requires ≥1 PK column via
+ * {@link requireKeyColumns}; a keyless side is rejected with `unsupported-join`). The
+ * builder passes exactly the sides whose base ops read the capture (plus all sides, for
+ * an UPDATE with RETURNING whose EXISTS correlates the full joined row), so a single-
+ * side write never forces a PK on an untouched side.
  *
  * Op-agnostic: takes the user `where` directly (an UPDATE's or a DELETE's) — the
  * identifying predicate is the same either way.
@@ -918,16 +1085,22 @@ export function buildMultiSourceKeyCapture(
 		? new FilterNode(analysis.joinScope, analysis.joinNode, predicate)
 		: analysis.joinNode;
 
+	// One capture column per requested side per PK column: `k<side>_<j>`. A composite-PK
+	// side projects all its PK columns; the readers' EXISTS correlate on the same set.
 	const keyColumns: { name: string; type: ScalarType }[] = [];
-	const projections: Projection[] = sideIndices.map((i): Projection => {
+	const projections: Projection[] = [];
+	for (const i of sideIndices) {
 		const side = analysis.sides[i];
-		const pk = requireSingleColumnPk(view, side);
-		keyColumns.push({ name: MS_UPDATE_KEY_COLUMNS[i], type: columnScalarType(columnByName(side.schema, pk)) });
-		return {
-			node: buildExpression({ ...ctx, scope: analysis.joinScope }, { type: 'column', name: pk, table: side.alias }),
-			alias: MS_UPDATE_KEY_COLUMNS[i],
-		};
-	});
+		const pkCols = requireKeyColumns(view, side);
+		pkCols.forEach((pk, j) => {
+			const name = keyColumnName(i, j);
+			keyColumns.push({ name, type: columnScalarType(columnByName(side.schema, pk)) });
+			projections.push({
+				node: buildExpression({ ...ctx, scope: analysis.joinScope }, { type: 'column', name: pk, table: side.alias }),
+				alias: name,
+			});
+		});
+	}
 	const source = new ProjectNode(analysis.joinScope, filtered, projections, undefined, undefined, false);
 
 	return { source, descriptor: {}, keyColumns };
@@ -940,14 +1113,16 @@ export function buildMultiSourceKeyCapture(
  * rewrote (the changed row no longer matches), so this matches by the captured
  * **identity** instead: project the view-spelled, base-term RETURNING columns over
  * the post-mutation join body, restricted to the captured identities by `exists
- * (select 1 from __vmupd_keys k where k.k0 = s0.pk0 and k.k1 = s1.pk1)` — so a row
- * the update pushed *out* of the view's filter (or whose predicate column it
- * rewrote) is still returned (single-source NEW semantics). It keeps only the
- * structural join ON-condition; the body/user WHERE is intentionally NOT re-applied.
+ * (select 1 from __vmupd_keys k where k.k0_0 = s0.pk0 [and k.k0_1 = s0.pk1] and k.k1_0
+ * = s1.pk0 …)` (every side × PK column) — so a row the update pushed *out* of the
+ * view's filter (or whose predicate column it rewrote) is still returned (single-source
+ * NEW semantics). It keeps only the structural join ON-condition; the body/user WHERE is
+ * intentionally NOT re-applied.
  *
  * Reads the shared {@link MultiSourceKeyCapture} the builder materializes
  * before the base ops fire (via its own freshly-minted key ref over the same
- * descriptor).
+ * descriptor). The capture covers ALL sides for an UPDATE with RETURNING, so this
+ * correlates the full joined row's identity.
  */
 export function buildMultiSourceUpdateReturning(
 	ctx: PlanningContext,
@@ -957,16 +1132,24 @@ export function buildMultiSourceUpdateReturning(
 	analysis: JoinViewAnalysis,
 ): RelationalPlanNode {
 	const returningCols = stmt.returning!;
-	const [side0, side1] = analysis.sides;
-	const pk0 = requireSingleColumnPk(view, side0);
-	const pk1 = requireSingleColumnPk(view, side1);
 
 	// Restrict the POST-mutation join body to the captured identities, built as plan
 	// nodes over the ALREADY-planned `joinNode` (its structural ON-condition only —
 	// the body/user WHERE is intentionally NOT re-applied) — no AST re-plan of the
 	// body. The EXISTS subquery resolves `__vmupd_keys` via `cteNodes` to a fresh key
-	// ref over the shared capture descriptor; `s0.pk0` / `s1.pk1` correlate to the
-	// outer join row through `joinScope`.
+	// ref over the shared capture descriptor; `s<side>.pk<j>` correlate to the outer
+	// join row through `joinScope`. Conjoin one equality per side per PK column.
+	const conds: AST.Expression[] = [];
+	analysis.sides.forEach((side, sideIndex) => {
+		requireKeyColumns(view, side).forEach((pk, j) => {
+			conds.push({
+				type: 'binary',
+				operator: '=',
+				left: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
+				right: { type: 'column', name: pk, table: side.alias },
+			});
+		});
+	});
 	const keyRef = makeMultiSourceKeyRef(ctx.scope, capture);
 	const existsPredicateAst: AST.Expression = {
 		type: 'exists',
@@ -974,10 +1157,7 @@ export function buildMultiSourceUpdateReturning(
 			type: 'select',
 			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
 			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
-			where: combineAnd(
-				{ type: 'binary', operator: '=', left: { type: 'column', name: 'k0', table: 'k' }, right: { type: 'column', name: pk0, table: side0.alias } },
-				{ type: 'binary', operator: '=', left: { type: 'column', name: 'k1', table: 'k' }, right: { type: 'column', name: pk1, table: side1.alias } },
-			),
+			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
 		},
 	};
 	const cteNodes = new Map(ctx.cteNodes ?? []);
@@ -1106,27 +1286,31 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 
 	// Every base delete (single-side and multi-side fan-out alike) reads its
 	// identifying values from the up-front identity capture the builder materializes
-	// ONCE before any base op fires (`<pk> in (select k<side> from __vmupd_keys)`), a
-	// mutation-order-independent set built from the ALREADY-planned join body. So the
-	// first side's delete cannot empty the join out from under the second side's
-	// identifying set (the predicate-honest multi-side fan-out), and a single-side
-	// delete — having no ordering hazard — reads the same pre-mutation set it would
-	// have re-queried live. (No live re-query of a re-planned AST body.)
+	// ONCE before any base op fires (a correlated EXISTS over `__vmupd_keys` matching
+	// the side's PK columns), a mutation-order-independent set built from the
+	// ALREADY-planned join body. So the first side's delete cannot empty the join out
+	// from under a later side's identifying set (the predicate-honest multi-side
+	// fan-out), and a single-side delete — having no ordering hazard — reads the same
+	// pre-mutation set it would have re-queried live. (No live re-query of a re-planned
+	// AST body.)
 
-	// Order the base deletes. The two-side fan-out (reached only when no single-
-	// direction FK is provable — `fkChildIndex` is undefined, i.e. no FK or a mutual
-	// FK) orders by ON DELETE action so the side whose removal clears the other's
-	// reference runs first (`orderDeleteFanout`); a mutual FK whose actions no side
-	// order can satisfy under immediate enforcement raises `mutual-fk-restrict-delete`
-	// at plan time — but ONLY when the join provably correlates a mutual FK edge (the
-	// joined rows necessarily cross-reference, so a RESTRICT necessarily fires). When
-	// the join correlates neither edge (e.g. a join on non-FK columns), the joined
-	// rows are not proven to cross-reference, so the schema-only reject is a data-
-	// independent over-rejection: fall back to the fixed `[0, 1]` fan-out and defer to
-	// the runtime RESTRICT pre-check (`runtime/foreign-key-actions.ts`) on the actual
-	// data. A single-side delete has no ordering hazard, so it keeps its trivial order.
+	// Order the base deletes. The **two-side fan-out over a 2-table join** orders by ON
+	// DELETE action so the side whose removal clears the other's reference runs first
+	// (`orderDeleteFanout`); a mutual FK whose actions no side order can satisfy under
+	// immediate enforcement raises `mutual-fk-restrict-delete` at plan time — but ONLY
+	// when the join provably correlates a mutual FK edge (the joined rows necessarily
+	// cross-reference, so a RESTRICT necessarily fires). When the join correlates neither
+	// edge (e.g. a join on non-FK columns), the schema-only reject is a data-independent
+	// over-rejection: fall back to the fixed `[0, 1]` fan-out and defer to the runtime
+	// RESTRICT pre-check (`runtime/foreign-key-actions.ts`) on the actual data.
+	//
+	// This plan-time mutual-FK analysis is **deliberately NOT generalized past two
+	// sides** (§ Out of scope): an n-way (>2) delete uses the FK topological order over
+	// the chosen sides and defers any mutual-FK cycle wholesale to the runtime RESTRICT
+	// pre-check. A single-side delete has no ordering hazard, so it keeps its trivial
+	// order.
 	let order: readonly number[];
-	if (sides.length === 2) {
+	if (analysis.sides.length === 2 && sides.length === 2) {
 		const fanoutOrder = orderDeleteFanout(analysis.sides);
 		if (fanoutOrder === undefined) {
 			if (joinCorrelatesMutualFk(analysis)) {
@@ -1144,17 +1328,14 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 			order = fanoutOrder;
 		}
 	} else {
-		order = sides;
+		// Single side, or an n-way (>2) fan-out: FK topological order (parent before
+		// child) restricted to the chosen sides; mutual-FK cycles defer to runtime.
+		order = orderSides(analysis.sides).filter(i => sides.includes(i));
 	}
 	const ops: BaseOp[] = [];
 	for (const sideIndex of order) {
 		const side = analysis.sides[sideIndex];
-		const pk = requireSingleColumnPk(view, side);
-		const where: AST.InExpr = {
-			type: 'in',
-			expr: { type: 'column', name: pk },
-			subquery: buildCapturedKeySubquery(sideIndex),
-		};
+		const where = buildCapturedKeyPredicate(view, side, sideIndex);
 		const statement: AST.DeleteStmt = {
 			type: 'delete',
 			table: tableIdentifier(side.schema),
@@ -1172,7 +1353,7 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
  * Pick the base side(s) a join delete routes to (§ Inner Join — Deletes). Deleting
  * one side of an inner equi-join already removes the joined row from the view, so the
  * common case resolves to a single side; the maximal-lenient case fans out to every
- * candidate side ("make this joined row not exist"). Returns 1 or 2 sides.
+ * candidate side ("make this joined row not exist"). Returns 1 or more sides.
  *
  * Resolution order (tags compose AFTER predicate dispatch — they only restrict):
  * 1. `target` / `exclude` narrow the candidate sides (`tag-target-not-found` on
@@ -1189,7 +1370,7 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
  *    key capture).
  */
 function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis, tags?: ReservedTagMap): number[] {
-	const candidates = applyTargetExclude([0, 1], analysis.sides, tags, view);
+	const candidates = applyTargetExclude(allSideIndices(analysis.sides), analysis.sides, tags, view);
 
 	const deleteVia = readDeleteVia(tags);
 	if (deleteVia) {
@@ -1218,9 +1399,10 @@ function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis, ta
 	const childIndex = fkChildIndex(analysis.sides);
 	if (childIndex !== undefined && candidates.includes(childIndex)) return [childIndex];
 
-	// lenient + 2 residual candidates + no provable single-direction FK + no side tag:
-	// fan out to every candidate side. Reached only when `fkChildIndex` is undefined
-	// (no FK, or a mutual-FK edge), so the candidate list is both sides.
+	// lenient + ≥2 residual candidates + no provable single-direction FK-child default +
+	// no side tag: fan out to every candidate side (the predicate-honest multi-side
+	// delete). `fkChildIndex` is binary, so for an n-way (>2) join it is undefined and
+	// the fan-out is the whole candidate set.
 	return candidates;
 }
 
@@ -1230,7 +1412,7 @@ function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis, ta
  * selects the left join source. `'right_insert'` is an `except`-branch value
  * with no join meaning — rejected with a pointer to the join-valid forms.
  */
-function resolveDeleteViaSide(deleteVia: DeleteViaValue, sides: readonly [JoinSide, JoinSide], view: MutableViewLike): number {
+function resolveDeleteViaSide(deleteVia: DeleteViaValue, sides: readonly JoinSide[], view: MutableViewLike): number {
 	switch (deleteVia) {
 		case 'parent': {
 			const child = fkChildIndex(sides);
@@ -1262,7 +1444,7 @@ function resolveDeleteViaSide(deleteVia: DeleteViaValue, sides: readonly [JoinSi
  */
 function applyTargetExclude(
 	candidates: number[],
-	sides: readonly [JoinSide, JoinSide],
+	sides: readonly JoinSide[],
 	tags: ReservedTagMap | undefined,
 	view: MutableViewLike,
 ): number[] {
@@ -1355,24 +1537,34 @@ function substituteViewColumns(
 
 /**
  * Strip the owning side's alias qualifier from a base-term assignment value (so
- * it targets the single-table UPDATE directly), rejecting any reference to the
- * other side (which a single-table SET cannot express). The strip is threaded
+ * it targets the single-table UPDATE directly), rejecting any reference to **any
+ * other side** (which a single-table SET cannot express). The strip is threaded
  * into any subquery embedded in the value (the qualifier rule is purely about a
  * column's own table qualifier, so it applies uniformly at every nesting depth);
  * a nested owning-side reference is correlated to the target row of the lowered
  * UPDATE just like a top-level one.
+ *
+ * The owning-side qualifier set is checked **first**, so a self-join (where an
+ * `other` side shares the owning side's table name) still strips an owning-alias
+ * reference; only a reference qualified by a *different alias* is the cross-source
+ * reject.
  */
 function stripSideQualifier(
 	expr: AST.Expression,
 	view: MutableViewLike,
 	owning: JoinSide,
-	other: JoinSide,
+	others: readonly JoinSide[],
 ): AST.Expression {
 	const owningQuals = new Set([owning.alias, owning.schema.name.toLowerCase()]);
-	const otherQuals = new Set([other.alias, other.schema.name.toLowerCase()]);
+	const otherQuals = new Set<string>();
+	for (const o of others) {
+		otherQuals.add(o.alias);
+		otherQuals.add(o.schema.name.toLowerCase());
+	}
 	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
 		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
+		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		if (otherQuals.has(t)) {
 			raiseMutationDiagnostic({
 				reason: 'cross-source-assignment',
@@ -1381,7 +1573,6 @@ function stripSideQualifier(
 				message: `cannot write through view '${view.name}': an update value references column '${col.name}' on a different base table than the column it assigns; cross-source assignment is not supported`,
 			});
 		}
-		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		return undefined;
 	};
 	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
@@ -1393,16 +1584,22 @@ function tableIdentifier(table: TableSchema): AST.IdentifierExpr {
 	return { type: 'identifier', name: table.name, schema: table.schemaName };
 }
 
-function requireSingleColumnPk(view: MutableViewLike, side: JoinSide): string {
+/**
+ * The side's primary-key column names (≥1), in declaration order — the per-side
+ * identifying key the capture projects and the base ops' EXISTS correlates on.
+ * Composite keys are admitted (each PK column contributes a `k<side>_<j>` capture
+ * column); a keyless table is the only reject (`unsupported-join`).
+ */
+function requireKeyColumns(view: MutableViewLike, side: JoinSide): string[] {
 	const pk = side.schema.primaryKeyDefinition;
-	if (pk.length !== 1) {
+	if (pk.length === 0) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-join',
 			table: view.name,
-			message: `cannot write through view '${view.name}': base table '${side.schema.name}' has a ${pk.length === 0 ? 'missing' : 'composite'} primary key; multi-source identifying predicates need a single-column key`,
+			message: `cannot write through view '${view.name}': base table '${side.schema.name}' has no primary key; multi-source identifying predicates need a key`,
 		});
 	}
-	return side.schema.columns[pk[0].index].name;
+	return pk.map(def => side.schema.columns[def.index].name);
 }
 
 /**
@@ -1417,25 +1614,65 @@ function fkTargetsSide(fk: ForeignKeyConstraintSchema, child: JoinSide, parent: 
 		&& (fk.referencedSchema ?? child.schema.schemaName).toLowerCase() === parent.schema.schemaName.toLowerCase();
 }
 
+/** True when `child` declares any foreign key onto `parent`. */
+function sideDeclaresFkOnto(child: JoinSide, parent: JoinSide): boolean {
+	return (child.schema.foreignKeys ?? []).some(fk => fkTargetsSide(fk, child, parent));
+}
+
 /**
- * Index of the FK-child (many) side: the side declaring a foreign key onto the
- * other. `undefined` when no FK is provable or both sides reference each other.
+ * Index of the FK-child (many) side of a **two-side** join: the side declaring a
+ * foreign key onto the other. `undefined` when no FK is provable, both sides reference
+ * each other (mutual), or the join is not two-sided (the binary FK-child concept does
+ * not generalize past two sides — the n-way delete fan-out / `orderSides` topo sort
+ * handle >2). Used by the two-side delete routing (`chooseDeleteSides`,
+ * `resolveDeleteViaSide`).
  */
-function fkChildIndex(sides: readonly [JoinSide, JoinSide]): number | undefined {
-	const refs = (child: JoinSide, parent: JoinSide): boolean =>
-		(child.schema.foreignKeys ?? []).some(fk => fkTargetsSide(fk, child, parent));
-	const zeroRefsOne = refs(sides[0], sides[1]);
-	const oneRefsZero = refs(sides[1], sides[0]);
+function fkChildIndex(sides: readonly JoinSide[]): number | undefined {
+	if (sides.length !== 2) return undefined;
+	const zeroRefsOne = sideDeclaresFkOnto(sides[0], sides[1]);
+	const oneRefsZero = sideDeclaresFkOnto(sides[1], sides[0]);
 	if (zeroRefsOne && !oneRefsZero) return 0;
 	if (oneRefsZero && !zeroRefsOne) return 1;
 	return undefined;
 }
 
-/** Side execution order: FK-parent before FK-child where provable, else as-is. */
-function orderSides(sides: readonly [JoinSide, JoinSide]): number[] {
-	const child = fkChildIndex(sides);
-	if (child === undefined) return [0, 1];
-	return child === 0 ? [1, 0] : [0, 1];
+/**
+ * Side execution order: an FK **topological sort** over the n sides — every FK-parent
+ * precedes its FK-child — stable by source order within an FK-equivalence class. A
+ * mutual FK (each side referencing the other, e.g. a self-join's two aliases of one
+ * self-referencing table) forms a cycle with no zero-in-degree head; it is broken by
+ * lowest source index, i.e. it falls back to **alias-declaration order** (§ Cycles,
+ * Self-Joins). The two-side binary order (`[parent, child]` / `[0, 1]`) is the n=2
+ * specialization of this.
+ */
+function orderSides(sides: readonly JoinSide[]): number[] {
+	const n = sides.length;
+	// parents[child] = set of side indices the child must follow (its declared FK parents).
+	const parents: Array<Set<number>> = sides.map(() => new Set<number>());
+	for (let child = 0; child < n; child++) {
+		for (let parent = 0; parent < n; parent++) {
+			if (child !== parent && sideDeclaresFkOnto(sides[child], sides[parent])) parents[child].add(parent);
+		}
+	}
+	const placed = new Set<number>();
+	const order: number[] = [];
+	while (order.length < n) {
+		// Lowest-index unplaced side all of whose (non-self, unplaced-cycle-aside) parents
+		// are already placed.
+		let pick = -1;
+		for (let i = 0; i < n; i++) {
+			if (placed.has(i)) continue;
+			if ([...parents[i]].every(p => placed.has(p))) { pick = i; break; }
+		}
+		// A cycle (mutual FK) leaves no ready node — break it by lowest unplaced index
+		// (source / alias-declaration order).
+		if (pick === -1) {
+			for (let i = 0; i < n; i++) if (!placed.has(i)) { pick = i; break; }
+		}
+		order.push(pick);
+		placed.add(pick);
+	}
+	return order;
 }
 
 /**
@@ -1486,7 +1723,7 @@ function deletableFirst(inboundX: AST.ForeignKeyAction | undefined, inboundY: AS
  * (unchanged); a both-cascade mutual FK likewise keeps `[0, 1]`. Prefers `[0, 1]`
  * when side0 is deletable-first so the no-FK / symmetric paths stay order-stable.
  */
-function orderDeleteFanout(sides: readonly [JoinSide, JoinSide]): readonly number[] | undefined {
+function orderDeleteFanout(sides: readonly JoinSide[]): readonly number[] | undefined {
 	const inbound0 = inboundDeleteAction(sides[1], sides[0]); // governs deleting side0
 	const inbound1 = inboundDeleteAction(sides[0], sides[1]); // governs deleting side1
 	if (deletableFirst(inbound0, inbound1)) return [0, 1];
@@ -1506,14 +1743,15 @@ function crossEqualityKey(sideA: number, colA: string, sideB: number, colB: stri
 }
 
 /**
- * Resolve a join-condition column operand to its owning side index (0 or 1), or
+ * Resolve a join-condition column operand to its owning side index (`0..n-1`), or
  * `undefined` when the reference cannot be pinned to exactly one side. An explicit
- * `.table` qualifier matches a side's `alias` (already lowercased) or
- * `schema.name`; an unqualified ref resolves by **unique** ownership of `col.name`
- * across the two sides' columns. An ambiguous / unresolved ref returns `undefined`
- * (conservative — a term that cannot be placed cannot prove correlation).
+ * `.table` qualifier matches a side's `alias` (already lowercased) or `schema.name`
+ * (alias preferred, so a self-join's distinct aliases resolve unambiguously even
+ * though the table names collide); an unqualified ref resolves by **unique** ownership
+ * of `col.name` across the sides' columns. An ambiguous / unresolved ref returns
+ * `undefined` (conservative — a term that cannot be placed cannot prove correlation).
  */
-function resolveColumnSide(col: AST.ColumnExpr, sides: readonly [JoinSide, JoinSide]): number | undefined {
+function resolveColumnSide(col: AST.ColumnExpr, sides: readonly JoinSide[]): number | undefined {
 	const qualifier = col.table?.toLowerCase();
 	if (qualifier !== undefined) {
 		const idx = sides.findIndex(s => s.alias === qualifier || s.schema.name.toLowerCase() === qualifier);
@@ -1537,7 +1775,7 @@ function edgeCorrelated(
 	childIdx: number,
 	parentIdx: number,
 	crossEqualities: ReadonlySet<string>,
-	sides: readonly [JoinSide, JoinSide],
+	sides: readonly JoinSide[],
 ): boolean {
 	const child = sides[childIdx];
 	const parent = sides[parentIdx];

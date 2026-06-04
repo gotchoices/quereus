@@ -531,13 +531,17 @@ update ax_named set n = 'g' where k = 7;
 select cid, note from ax_child order by cid;
 → [{"cid":2,"note":"F"},{"cid":7,"note":"g"}]
 
--- Composite-PK side -> rejected (identifying predicate needs a single-column key).
+-- Composite-PK side -> accepted: the identity capture projects one column per PK
+-- column (k0_0=x.c1, k0_1=x.c2) and the base op's EXISTS correlates on both, so a
+-- predicate on part of the key (c1 = 1) binds every composite-keyed row it matches.
 create table ax_comp (c1 integer, c2 integer, pref integer, note text,
     primary key (c1, c2), foreign key (pref) references ax_parent(pid));
+insert into ax_comp values (1, 1, 10, 'a'), (1, 2, 20, 'b'), (2, 1, 10, 'c');
 create view ax_jv_comp as
     select x.c1 as c1, x.note as note, p.pv as pv from ax_comp x join ax_parent p on p.pid = x.pref;
 update ax_jv_comp set note = 'q' where c1 = 1;
--- error: cannot write through
+select c1, c2, note from ax_comp order by c1, c2;
+→ [{"c1":1,"c2":1,"note":"q"},{"c1":1,"c2":2,"note":"q"},{"c1":2,"c2":1,"note":"c"}]
 
 -- ...but a single-side write to the SIMPLE-PK side is allowed even when the OTHER
 -- (untouched) side has a COMPOSITE PK: only the touched side's PK backs the identity
@@ -562,19 +566,28 @@ create view ax_jv_x as
 update ax_jv_x set note = pv where cid = 2;
 -- error: cannot write through
 
--- Self-join body -> rejected.
+-- Self-join body -> accepted: `e` and `m` are distinct aliases of one base table,
+-- routed by alias (the column's producing scan), not table name. `mv = m.v` routes to
+-- alias `m`'s side; `where id = 1` identifies via alias `e` (id = e.id). For id=1
+-- (mgr=2) the joined `m` is the row id=2, so its `v` is set to 9.
 create table ax_emp (id integer primary key, mgr integer, v integer);
+insert into ax_emp values (1, 2, 10), (2, 9, 20), (9, 9, 30);
 create view ax_self as select e.id as id, m.v as mv from ax_emp e join ax_emp m on m.id = e.mgr;
 update ax_self set mv = 9 where id = 1;
--- error: cannot write through
+select id, mgr, v from ax_emp order by id;
+→ [{"id":1,"mgr":2,"v":10},{"id":2,"mgr":9,"v":9},{"id":9,"mgr":9,"v":30}]
 
--- Three-table join -> rejected.
+-- Three-table inner join -> accepted: the n-way fan-out routes each assignment to its
+-- owning base. `bv = b.v` routes to the third side (ax_b); `where cid = 2` identifies
+-- through the join (b.bid = c.cid = 2).
 create table ax_b (bid integer primary key, v integer);
+insert into ax_b values (2, 50), (7, 60);
 create view ax_three as
     select c.cid as cid, p.pv as pv, b.v as bv
     from ax_child c join ax_parent p on p.pid = c.pref join ax_b b on b.bid = c.cid;
-update ax_three set pv = 9 where cid = 2;
--- error: cannot write through
+update ax_three set bv = 9 where cid = 2;
+select bid, v from ax_b order by bid;
+→ [{"bid":2,"v":9},{"bid":7,"v":60}]
 
 -- DELETE through a join with no provable FK and no resolving tag -> under the
 -- default lenient policy the predicate-honest multi-side fan-out deletes the joined
