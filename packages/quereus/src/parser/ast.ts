@@ -715,7 +715,7 @@ export interface ExplainSchemaStmt extends AstNode {
 }
 
 /**
- * `declare lens for X over Y { view T as <select> [hiding (...)] ... }` — the
+ * `declare lens for X over Y { view T as <select> ... }` — the
  * lens authoring surface (sibling of `declare schema`, NOT a variant of it).
  *
  * Binds a logical schema (`for X`) to a basis schema (`over Y`) and supplies
@@ -735,15 +735,12 @@ export interface DeclareLensStmt extends AstNode {
 }
 
 /**
- * One `view T as <select> [hiding (...)]` entry inside a {@link DeclareLensStmt}.
- * `select` is the authored override body; `hiding` lists logical columns to omit
- * from the effective body and the registered view's column list.
+ * One `view T as <select>` entry inside a {@link DeclareLensStmt}.
+ * `select` is the authored override body.
  */
 export interface LensOverride {
 	/** The logical table this override targets. */
 	table: string;
 	/** The authored override body (a relation-producing SELECT). */
 	select: SelectStmt;
-	/** Logical columns to hide (omit from effective body + view column list). */
-	hiding?: readonly string[];
 }

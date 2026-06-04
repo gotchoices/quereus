@@ -303,6 +303,16 @@ export const KEYWORDS: Record<string, TokenType> = {
 };
 
 /**
+ * Reserved words that the lexer tokenizes specially but which SQL still permits as
+ * identifiers in most contexts (table/column/alias names, function names, etc.).
+ * Shared by the parser (the many `consumeIdentifier(CONTEXTUAL_KEYWORDS, …)` sites)
+ * and the emitter (which must know that, e.g., `like(…)` re-parses bare so it should
+ * not be quoted). Lives next to KEYWORDS so the two classifications stay together;
+ * callers needing extras spread it, e.g. `[...CONTEXTUAL_KEYWORDS, 'replace']`.
+ */
+export const CONTEXTUAL_KEYWORDS = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'] as const;
+
+/**
  * Lexer class for tokenizing SQL statements
  */
 export class Lexer {

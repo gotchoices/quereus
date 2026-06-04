@@ -380,6 +380,10 @@ describe('Emit: statement round-trips', () => {
 		it('ROLLBACK TO', () => {
 			roundTripStmt('rollback to sp1');
 		});
+
+		// Reserved-word savepoint names (the `release to` regression class) are now
+		// covered exhaustively — every keyword, every savepoint form — by the
+		// position-by-position suite in `emit-roundtrip-positions.spec.ts`.
 	});
 
 	describe('PRAGMA', () => {

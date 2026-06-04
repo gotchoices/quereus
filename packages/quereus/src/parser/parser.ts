@@ -1,5 +1,5 @@
 import { createLogger } from '../common/logger.js'; // Import logger
-import { Lexer, type Token, TokenType } from './lexer.js';
+import { Lexer, type Token, TokenType, CONTEXTUAL_KEYWORDS } from './lexer.js';
 import * as AST from './ast.js';
 import { ConflictResolution } from '../common/constants.js';
 import type { RowOp, SqlValue } from '../common/types.js';
@@ -35,14 +35,6 @@ function _createLoc(startToken: Token, endToken: Token): AST.AstNode['loc'] {
 		},
 	};
 }
-
-/**
- * Reserved words that the lexer tokenizes specially but which SQL still permits as
- * identifiers in most contexts (table/column/alias names, etc.). Shared across the many
- * parser methods that accept identifiers; methods needing extras spread this constant,
- * e.g. `[...CONTEXTUAL_KEYWORDS, 'replace']`.
- */
-const CONTEXTUAL_KEYWORDS = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'] as const;
 
 /**
  * IMPORTANT: Any changes to parsed syntax must also be reflected in the corresponding emitters:
@@ -987,15 +979,10 @@ export class Parser {
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
 		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.LPAREN) &&
 			!this.checkNext(1, TokenType.DOT) &&
 			!this.checkNext(1, TokenType.COMMA) &&
 			!this.isJoinToken() &&
 			!this.isEndOfClause()) {
-			// A bare identifier immediately followed by '(' is never a base-table
-			// alias (standardTableSource parses no alias column-list) — guarding on
-			// LPAREN lets a contextual trailing clause like `hiding (...)` survive
-			// the FROM parse instead of being swallowed as an alias.
 			const aliasToken = this.advance();
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
@@ -1507,7 +1494,9 @@ export class Parser {
 
 		if (this.matchKeyword('COLLATE')) {
 			const collationToken = this.consume(TokenType.IDENTIFIER, "Expected collation name after COLLATE.");
-			return { type: 'collate', expr, collation: collationToken.lexeme, loc: _createLoc(startToken, collationToken) };
+			// getIdentifierValue strips the quotes from a quoted collation name (e.g.
+			// `collate "select"`); using the raw lexeme would embed them in the value.
+			return { type: 'collate', expr, collation: this.getIdentifierValue(collationToken), loc: _createLoc(startToken, collationToken) };
 		}
 
 		return expr;
@@ -3051,10 +3040,10 @@ export class Parser {
 	}
 
 	/**
-	 * Parses `declare lens for <X> over <Y> { ( view <T> as <select> [hiding (<cols>)] ;? )* }`.
-	 * The DECLARE token is already consumed by {@link statement}. `lens`, `for`,
-	 * and `hiding` are contextual keywords (matched via peekKeyword's IDENTIFIER
-	 * fallback); `over` is the existing window-function keyword.
+	 * Parses `declare lens for <X> over <Y> { ( view <T> as <select> ;? )* }`.
+	 * The DECLARE token is already consumed by {@link statement}. `lens` and `for`
+	 * are contextual keywords (matched via peekKeyword's IDENTIFIER fallback);
+	 * `over` is the existing window-function keyword.
 	 */
 	private declareLensStatement(startToken: Token): AST.DeclareLensStmt {
 		this.consumeKeyword('LENS', "Expected 'LENS' after DECLARE.");
@@ -3081,17 +3070,7 @@ export class Parser {
 				throw this.error(this.previous(), `A lens override body must be a single SELECT; compound set-operations (union/intersect/except) are not supported in v1 lens overrides.`);
 			}
 
-			// Optional: hiding (col1, col2, ...) — omits columns from the effective
-			// body + the registered view's column list. The LPAREN-guard in
-			// standardTableSource keeps `hiding` from being swallowed as a table alias.
-			let hiding: string[] | undefined;
-			if (this.matchKeyword('HIDING')) {
-				this.consume(TokenType.LPAREN, "Expected '(' after 'hiding'.");
-				hiding = this.identifierList();
-				this.consume(TokenType.RPAREN, "Expected ')' after the hiding column list.");
-			}
-
-			overrides.push({ table, select: body, ...(hiding ? { hiding } : {}) });
+			overrides.push({ table, select: body });
 			this.match(TokenType.SEMICOLON);
 		}
 		this.consume(TokenType.RBRACE, "Expected '}' to close the lens declaration block.");

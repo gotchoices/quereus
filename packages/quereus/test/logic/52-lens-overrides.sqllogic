@@ -1,7 +1,7 @@
 -- Lens explicit overrides + per-attribute merge (docs/lens.md).
--- `declare lens for X over Y { view T as <select> [hiding (...)] }` composes an
--- effective read body: covered columns (override) ⊕ default-mapper gap-fill ⊖
--- hidden. Read-correct only — write enforcement is the prover ticket's concern.
+-- `declare lens for X over Y { view T as <select> }` composes an effective read
+-- body: covered columns (override) ⊕ default-mapper gap-fill. Read-correct only —
+-- write enforcement is the prover ticket's concern.
 
 -- ===================================
 -- 1. Rename override + sparse gap-fill
@@ -53,7 +53,8 @@ select color from carapp.Car where id = 2;
 → [{"color": "blue"}]
 
 -- ===================================
--- 2. Hide via `hiding (...)` — omitted from select * and from resolution
+-- 2. A logical column with no basis mapping is a coverage error
+--    (every logical column must map to basis — stored or computed)
 -- ===================================
 
 declare schema ph {
@@ -69,10 +70,6 @@ apply schema ph;
 
 -- run
 
-insert into ph.PersonCore values (1, 'Ada');
-
--- run
-
 declare logical schema papp {
 	table Person {
 		id integer primary key,
@@ -83,20 +80,14 @@ declare logical schema papp {
 
 -- run
 
+-- `secret` has no basis column to map to → the lens compile rejects it.
 declare lens for papp over ph {
-	view Person as select id, name from ph.PersonCore hiding (secret)
+	view Person as select id, name from ph.PersonCore
 }
 
 -- run
 
 apply schema papp;
-
--- run
-
-select * from papp.Person;
-→ [{"id": 1, "name": "Ada"}]
-
-select secret from papp.Person;
 -- error: secret
 
 -- ===================================

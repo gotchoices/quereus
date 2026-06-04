@@ -155,29 +155,6 @@ describe('lens FD contribution: the soundness gate (computeLensAssertedKeyFds)',
 		}
 	});
 
-	it('hidden key column — a composite PK with a hidden member is read-only, contributes no FD, and reads do not crash', async () => {
-		const db = new Database();
-		try {
-			await db.exec('declare schema y { table t (a integer, b integer, c text null, primary key (a, b)) }');
-			await db.exec('apply schema y');
-			await db.exec('declare logical schema x { table t (a integer, b integer, c text null, primary key (a, b)) }');
-			// Hide PK member `b` → the key is not reconstructible (read-only); the PK
-			// obligation has no full output mapping, so no FD is expressible.
-			await db.exec('declare lens for x over y { view t as select a, c from y.t hiding (b) }');
-			await db.exec('apply schema x');
-
-			expect(fds(db, 't'), 'a key with a hidden member contributes no FD').to.deep.equal([]);
-
-			// Reads still resolve through the lens without crashing on the missing column.
-			await db.exec(`insert into y.t values (1, 2, 'three')`);
-			const out: unknown[] = [];
-			for await (const r of db.eval('select a, c from x.t')) out.push(r);
-			expect(out).to.deep.equal([{ a: 1, c: 'three' }]);
-		} finally {
-			await db.close();
-		}
-	});
-
 	it('plain (non-lens) view contributes no node — computeLensAssertedKeyFds only sees lens slots', async () => {
 		const db = new Database();
 		try {

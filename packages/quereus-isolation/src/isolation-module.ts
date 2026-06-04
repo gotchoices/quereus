@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -11,6 +11,39 @@ let overlayIdCounter = 0;
  */
 export function generateOverlayId(): number {
 	return ++overlayIdCounter;
+}
+
+/**
+ * Concurrency-mode strength ranking: weakest → strongest.
+ * `'serial'` (0) tolerates the least; `'fully-reentrant'` (2) the most.
+ * Used by {@link weakerMode} / {@link clampToReentrantReads} to compute the
+ * mode `IsolationModule` forwards (see `IsolationModule.concurrencyMode`).
+ */
+const MODE_RANK: Record<VtabConcurrencyMode, number> = {
+	serial: 0,
+	'reentrant-reads': 1,
+	'fully-reentrant': 2,
+};
+
+/**
+ * Returns the weaker (lower-rank) of two concurrency modes. A merged read
+ * through `IsolationModule` touches BOTH the underlying and the overlay table,
+ * so it is only as concurrency-safe as the weaker of the two.
+ */
+export function weakerMode(a: VtabConcurrencyMode, b: VtabConcurrencyMode): VtabConcurrencyMode {
+	return MODE_RANK[a] <= MODE_RANK[b] ? a : b;
+}
+
+/**
+ * Caps a mode at `'reentrant-reads'`. `IsolationModule`'s own write path
+ * (`IsolatedTable.update` → `ensureOverlay`, `setHasChanges`, the multi-step
+ * merged-conflict checks, the savepoint sets) mutates shared per-connection
+ * state non-atomically, so the wrapper is never `'fully-reentrant'` no matter
+ * how reentrant the underlying/overlay are. This is the single place that
+ * invariant is enforced.
+ */
+export function clampToReentrantReads(mode: VtabConcurrencyMode): VtabConcurrencyMode {
+	return MODE_RANK[mode] > MODE_RANK['reentrant-reads'] ? 'reentrant-reads' : mode;
 }
 
 /**
@@ -71,10 +104,80 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	private readonly preOverlaySavepoints = new Map<string, Set<number>>();
 
+	/**
+	 * In-flight covering-connection builds, keyed identically to
+	 * {@link connectionOverlays} (`<dbId>:<schema>.<table>` via
+	 * {@link makeConnectionOverlayKey}). Connection registration is a
+	 * per-connection (per-db+table) invariant, not a per-wrapper one, so the memo
+	 * lives here — at the layer that spans every `IsolatedTable` wrapper for one
+	 * (db, table) — rather than on the wrapper instance.
+	 *
+	 * `IsolatedTable.ensureConnection()` `await`s the overlay `createConnection()`
+	 * / the database `registerConnection()` between its covering-reuse lookup and
+	 * the `registeredConnection` set. This module forwards `'reentrant-reads'` (see
+	 * {@link concurrencyMode}), so the runtime may drive two concurrent
+	 * merged-overlay scans of one table — and it connects a FRESH `IsolatedTable`
+	 * per scan (see {@link connect}), so the two scans land on DISTINCT wrapper
+	 * instances. A per-wrapper memo cannot coalesce them: both see
+	 * `registeredConnection === null`, both miss the existing-covering lookup, both
+	 * `registerConnection` — double-registering, which makes
+	 * `DeferredConstraintQueue.findConnection()` throw on multiple covering
+	 * candidates. Keying the memo per (db, table) coalesces across wrappers: the
+	 * first scan to enter creates the build promise; concurrent peers `await` it
+	 * and resolve to the SAME covering connection. Typed in
+	 * `VirtualTableConnection` terms (not `IsolatedConnection`) to keep this module
+	 * free of an `isolated-connection` import; the resolved value is an
+	 * `IsolatedConnection`. Mirrors `LaminaTable.connectionInFlight`.
+	 */
+	private readonly connectionInFlight = new Map<string, Promise<VirtualTableConnection>>();
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
 		this.tombstoneColumn = config.tombstoneColumn ?? '_tombstone';
+	}
+
+	/**
+	 * Forwards a concurrency-mode hint so a host that wraps a reentrant module
+	 * in `IsolationModule` keeps the plan-level `concurrencySafe` it would get
+	 * registering the underlying directly (read by
+	 * `TableReferenceNode.computePhysical` via `getModuleConcurrencyMode`).
+	 *
+	 * Merged reads touch BOTH the underlying table and the overlay table (a
+	 * `MemoryTable` by default, or a host-injected `config.overlay`), so the
+	 * forwarded mode is the {@link weakerMode weaker} of the two — a serial
+	 * underlying OR a serial custom overlay degrades the whole wrapper to
+	 * `'serial'`. The result is then {@link clampToReentrantReads capped} at
+	 * `'reentrant-reads'`: `IsolationModule`'s write path is never reentrant.
+	 *
+	 * A live getter (not a construction-time snapshot): the underlying's mode is
+	 * a static module property today, but mirroring `expectedLatencyMs` — whose
+	 * value is learned lazily at connect time — keeps both forwards reading live
+	 * each plan. Always returns a concrete value (never `undefined`), satisfying
+	 * the optional `concurrencyMode?` under `exactOptionalPropertyTypes`.
+	 */
+	get concurrencyMode(): VtabConcurrencyMode {
+		const underlying = this.underlying.concurrencyMode ?? 'serial';
+		const overlay = this.overlayModule.concurrencyMode ?? 'serial';
+		return clampToReentrantReads(weakerMode(underlying, overlay));
+	}
+
+	/**
+	 * Forwards the underlying module's first-row-latency planner hint so a cold
+	 * `NodeFsProvider` / OPFS install's scan node carries the latency estimate
+	 * through the wrapper (read by `TableReferenceNode.computePhysical`, which
+	 * only lifts the value when `> 0`). The overlay is an in-memory staging table
+	 * with no meaningful latency, so only the underlying contributes.
+	 *
+	 * Returns `0` (never `undefined`) when the underlying declares none — `0` is
+	 * observably identical to omitting the hint, and a concrete value satisfies
+	 * the optional `expectedLatencyMs?` under `exactOptionalPropertyTypes`. A
+	 * getter, not a stored field: `LaminaModule.expectedLatencyMs` is itself a
+	 * getter whose value is learned lazily at connect time, so a construction-time
+	 * snapshot would capture a stale `0`.
+	 */
+	get expectedLatencyMs(): number {
+		return this.underlying.expectedLatencyMs ?? 0;
 	}
 
 	/**
@@ -145,6 +248,43 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	clearPreOverlaySavepoints(db: Database, schemaName: string, tableName: string): void {
 		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		this.preOverlaySavepoints.delete(key);
+	}
+
+	/**
+	 * Coalesces concurrent covering-connection builds for one (db, table) onto a
+	 * single in-flight promise, keyed identically to {@link connectionOverlays}
+	 * (see {@link connectionInFlight}).
+	 *
+	 * On a cache hit, returns the existing in-flight build so a concurrent peer
+	 * resolves to the SAME covering connection. On a miss, calls `build()` and
+	 * stores the returned promise with **no `await` between the `get` and the
+	 * `set`** — `build()` runs its synchronous prefix (including the
+	 * covering-reuse lookup) and returns at its first `await`, so a second caller
+	 * cannot interleave into the synchronous get→set region and always observes
+	 * the populated memo. This holds regardless of where the build's internal
+	 * `await`s fall or how microtasks order.
+	 *
+	 * The memo is cleared on settle (fulfil AND reject), identity-guarded so a
+	 * later rebuild's promise is never clobbered by an earlier build's clear — a
+	 * failed build must let the next read retry.
+	 */
+	coalesceConnectionBuild(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		build: () => Promise<VirtualTableConnection>,
+	): Promise<VirtualTableConnection> {
+		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		const existing = this.connectionInFlight.get(key);
+		if (existing) return existing;
+
+		const inFlight = build();
+		this.connectionInFlight.set(key, inFlight);
+		const clear = (): void => {
+			if (this.connectionInFlight.get(key) === inFlight) this.connectionInFlight.delete(key);
+		};
+		inFlight.then(clear, clear);
+		return inFlight;
 	}
 
 	/**

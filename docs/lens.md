@@ -186,11 +186,11 @@ An override authored as ordinary SQL is consumed as a **sparse patch keyed by at
 
 1. The override `select` (if any) is parsed to a relational expression.
 2. Its output **coverage** is read — which logical columns it covers, and from which basis expressions.
-3. For every logical column the override does not cover (and does not `hiding`), the default mapper generates the mapping and composes it in.
+3. For every logical column the override does not cover, the default mapper generates the mapping and composes it in.
 
-So renaming a column and later adding a column compose cleanly: the rename override is untouched, and the new column appears as an uncovered attribute the mapper fills. The result is one effective `select` whose projection is exactly the logical columns, in declaration order, minus the hidden ones.
+So renaming a column and later adding a column compose cleanly: the rename override is untouched, and the new column appears as an uncovered attribute the mapper fills. The result is one effective `select` whose projection is exactly the logical columns, in declaration order.
 
-Most overrides cap the generated body at the boundary (rename = projection-with-alias, hide = projection-away, compute = extend, filter = restrict) and never touch the join interior. A change that *must* reach inside the join (a column now originating from a different basis table) is genuinely structural, cannot reduce to a boundary cap, and therefore correctly costs more authoring and surfaces as signal.
+Most overrides cap the generated body at the boundary (rename = projection-with-alias, compute = extend, filter = restrict) and never touch the join interior. A change that *must* reach inside the join (a column now originating from a different basis table) is genuinely structural, cannot reduce to a boundary cap, and therefore correctly costs more authoring and surfaces as signal.
 
 #### Coverage is name-based and re-read from source
 
@@ -199,38 +199,39 @@ The eventual mechanism addresses coverage by **stable attribute ID** on the plan
 - **Coverage is read by name.** A logical column is *covered* when the override's output column name (the `as` alias, e.g. `speed as maxSpeed`, or a bare column name, or a `*`-expansion of a FROM source) matches the logical column name (case-insensitive). Everything else is gap-filled.
 - **Survival across baseline regeneration comes from re-reading the override AST from source on every deploy.** The stored override is never rewritten, so the *rename-then-add* example composes: the rename override is untouched and the freshly-added logical column is simply uncovered → gap-filled. This re-read-from-source is the load-bearing assumption of the merger; it stands in for the attribute-ID property.
 
-**`hiding (col, ...)`** lists logical columns to omit from the effective body *and* from the registered view's column list, so `select * from X.T` does not surface them and `X.T.<hidden>` resolves to unknown-column. The logical spec still *declares* a hidden column — the prover decides what an attached constraint over a hidden column means. Each name is validated against the logical table's columns at deploy time; a name matching no logical column (a typo) is an error, not a silent no-op.
+#### What "covered" means
 
-#### What "covered" means (and what `hiding` is for)
-
-An override projection is a **sparse patch, not an exhaustive column list.** Writing `select id, who` does not say "the view has only these two columns" — it says "`id` and `who` are *covered* by this override; every other logical column is gap-filled." **Omission is not exclusion:** an unmentioned logical column reappears via gap-fill, and the only way to drop one is `hiding`. Coverage is decided **entirely by a projection term's output name**, never by what the term computes:
+An override projection is a **sparse patch, not an exhaustive column list.** Writing `select id, who` does not say "the view has only these two columns" — it says "`id` and `who` are *covered* by this override; every other logical column is gap-filled." **Omission is not exclusion:** an unmentioned logical column is gap-filled, not dropped — and if the basis cannot back it, that is a coverage error (every logical column must map to basis). Coverage is decided **entirely by a projection term's output name**, never by what the term computes:
 
 ```sql
+-- The design. `label` is derived; `id`, `who`, `ip` are ordinary columns.
 declare logical schema X {
-  table Audit (id int primary key, who text, raw_blob blob, preview text);
+  table Audit (id int primary key, who text, ip text, label text);
 }
 
-declare lens for X over Y {
+declare lens for X over Y {           -- basis Y.AuditLog has columns id, who, ip
   view Audit as
     select
-      id,                                  -- covers `id`      (identity  → writable)
-      who,                                 -- covers `who`     (identity  → writable)
-      substr(raw_blob, 1, 100) as preview  -- covers `preview` (computed  → read-only)
-    from Y.AuditLog
-    hiding (raw_blob);                     -- drop `raw_blob` from the lens surface
+      id,                   -- covered, identity  → writable
+      who,                  -- covered, identity  → writable
+      upper(who) as label   -- covered, computed  → read-only
+    from Y.AuditLog;
+  -- `ip` is unmentioned → gap-filled from Y.AuditLog.ip by name (it is NOT dropped)
 }
 ```
 
-- **The alias is the coverage key — the expression's shape is invisible.** `substr(raw_blob, 1, 100) as preview` covers logical column `preview` exactly as a bare `preview` would; the merger never looks inside the term to decide coverage, however deeply nested it is. (A computed term therefore *must* be aliased — an unaliased `substr(raw_blob, 1, 100)` maps to no logical column and is rejected; see [Body-shape restrictions](#body-shape-restrictions).)
-- **Without `hiding`, `raw_blob` would gap-fill back in.** It is a logical column the projection does not cover, so the default mapper name-matches it to `Y.AuditLog.raw_blob` and re-adds it. `hiding (raw_blob)` is what actually drops it — from the effective body *and* the registered view's column list. (Conversely, `preview` can *only* be authored: gap-fill name-matches or follows a module advertisement, but never synthesizes the `substr(...)` expression — so a computed mapping is always "signal" you write explicitly, never something the mapper generates.)
-- **`hiding` operates on the logical surface, not the basis.** Hiding `raw_blob` removes it as a *logical/view* column (`X.Audit.raw_blob` → unknown-column), but the basis column `Y.AuditLog.raw_blob` stays in scope — which is precisely why the `preview` expression can still read it. "Hide the blob, expose a redaction of it" is the normal idiom, not a conflict.
-- **Writability of a covered column follows scalar-invertibility, composed over the nest.** An all-invertible chain (`(speed + 1) * 2 as adjusted`) stays writable — a write lowers through the composed inverse — while any opaque step (`substr`, `lower`, a hash) makes the column read-only and a write raises `no-inverse` (see [Computed and Generated Columns](#computed-and-generated-columns)).
+Here every logical column is either *covered* (`id`, `who`, `label`) or *gap-filled* (`ip`). The points:
 
-`quereus_effective_lens('x', 'Audit')` reports the resolved disposition of every logical column — `override` / `default` / `hidden` — so the covered-vs-gap-filled-vs-dropped split is inspectable without guessing.
+- **The alias is the coverage key — the expression's shape is invisible.** `upper(who) as label` covers logical column `label` exactly as a bare `label` would; the merger never looks inside the term to decide coverage, however deeply nested it is. (A computed term therefore *must* be aliased — an unaliased `upper(who)` maps to no logical column and is rejected; see [Body-shape restrictions](#body-shape-restrictions).)
+- **Omission is not exclusion — this is the one that surprises.** Leaving `ip` out of the `select` does *not* drop it. `ip` is a logical column the projection does not cover, so the default mapper name-matches it to `Y.AuditLog.ip` and gap-fills it straight back in. Every logical column must end up mapped: if the basis cannot back an omitted column, the compile fails with a coverage error rather than silently dropping it (see [Gap-fill fidelity boundary](#gap-fill-fidelity-boundary)).
+- **A computed mapping is always authored, never gap-filled.** Gap-fill only name-matches (or follows a module advertisement); it never synthesizes an expression. So `label`'s `upper(who)` mapping has to be written out — the mapper cannot guess it — which is why a computed column is "signal" rather than something generated. (A *derived* column like `label` is still a legitimate part of the design: consumers read it, it simply isn't stored.)
+- **Writability of a covered column follows scalar-invertibility, composed over the nest.** A bare/renamed column, or an invertible expression (`(speed + 1) * 2 as adjusted`), stays writable — a write runs the inverse — while any opaque step (`upper`, `substr`, a hash) makes the column read-only and a write raises `no-inverse` (see [Computed and Generated Columns](#computed-and-generated-columns)). So `label` is read-only.
+
+`quereus_effective_lens('x', 'Audit')` reports the resolved disposition of every logical column — `override` or `default` — so the covered-vs-gap-filled split is inspectable without guessing.
 
 #### Body-shape restrictions
 
-The merger composes one effective body by replacing **only the top SELECT's projection** with the composed logical-column list (covered ⊕ gap-fill ⊖ hidden). Body shapes that this single-projection rewrite cannot soundly compose are rejected at deploy/parse time rather than silently mis-mapped:
+The merger composes one effective body by replacing **only the top SELECT's projection** with the composed logical-column list (covered ⊕ gap-fill). Body shapes that this single-projection rewrite cannot soundly compose are rejected at deploy/parse time rather than silently mis-mapped:
 
 - **The body must be a single `SELECT`.** Compound set-operations (`union` / `union all` / `intersect` / `except`) and `values (...)` bodies are rejected at parse time — the merger would compose only the top leg and keep the rest verbatim.
 - **A computed projection term must be aliased.** An unaliased non-column term (e.g. `select id, speed * 2 from …`) maps to no logical column; it is rejected (naming the term) rather than dropped and gap-filled.
@@ -240,7 +241,7 @@ The merger composes one effective body by replacing **only the top SELECT's proj
 
 Gap-fill resolves an uncovered logical column against the basis tables in the override's `FROM`. When it cannot, it errors rather than guess:
 
-- **Single-source override, basis lacks the column** — the *hide-via-gap-fill trap*: the compile errors naming the column (the author meant to hide it, or to cover it, and did neither).
+- **Single-source override, basis lacks the column** — the compile errors naming the column. Every logical column must map to basis, so an uncovered column the basis cannot back is a hard error: cover it explicitly, or it should not be a logical column of this design.
 - **Partial cross-basis join, the gap needs another source** — a full-coverage cross-basis join is fine (gap-fill is a no-op and the body is used verbatim), but a join that covers only *some* columns where an uncovered column is *not reachable from the override's `FROM`* errors rather than emit an unsound body. Reaching a column that lives in a different basis source the single-source mapper cannot join in is genuinely structural — it is the decomposition's concern.
 
 ### `quereus_effective_lens(schema, table)`
@@ -250,7 +251,7 @@ The composed effective mapping is inspectable on demand (not editable text — s
 | column | meaning |
 |---|---|
 | `logical_column` | logical column name |
-| `source` | `'override'` (covered by the override) · `'default'` (gap-filled by the default mapper) · `'hidden'` (`hiding (...)`) |
+| `source` | `'override'` (covered by the override) · `'default'` (gap-filled by the default mapper) |
 | `advertised_member` | when a resolved primary-storage advertisement backs this column, the member `relationId` that backs it (the existence anchor for an EAV pivot); `NULL` for name-match / override-only provenance |
 | `advertisement_anchor` | the resolved decomposition's existence-anchor `relationId` (= advertisement id), or `NULL` when no advertisement backs this logical table |
 | `effective_sql` | the composed effective body SQL (repeated on every row) |
@@ -411,7 +412,7 @@ The authored source stays sparse (signal only). The *compiled* effective mapping
 
 ### The deployed basis representation
 
-Migrations require a stable record of *what is deployed*, so augmentations can be generated against it and basis invariants verified to be intact. The deployed basis is therefore persisted and **hash-coded** (reusing the schema hasher). A deploy compares the freshly generated basis against the deployed hash, computes the additive diff, and — for data-effecting changes (column adds with backfill, decomposition changes) — emits DDL the application can run with custom backfills, exactly as the declarative-schema pipeline already supports. Schema-only changes (rename, hide) are metadata; data-effecting changes (split / merge / pivot) carry a backfill obligation.
+Migrations require a stable record of *what is deployed*, so augmentations can be generated against it and basis invariants verified to be intact. The deployed basis is therefore persisted and **hash-coded** (reusing the schema hasher). A deploy compares the freshly generated basis against the deployed hash, computes the additive diff, and — for data-effecting changes (column adds with backfill, decomposition changes) — emits DDL the application can run with custom backfills, exactly as the declarative-schema pipeline already supports. Schema-only changes (rename) are metadata; data-effecting changes (split / merge / pivot) carry a backfill obligation.
 
 A useful subset of that backfill obligation is **engine-expressible rather than fully delegated**. When the new basis can be populated by running the new lens `get` over the prior basis — a pure re-decomposition such as a split or merge that introduces no information the prior basis lacks — the differ can emit the backfill as generated DDL, the same shape as a one-shot derivation. Only backfills that need data the prior basis does not contain remain the application's to supply. The obligation thus splits cleanly: re-decompositions the engine generates from the lens itself, genuinely new information the application provides.
 
@@ -420,7 +421,7 @@ A useful subset of that backfill obligation is **engine-expressible rather than 
 The deployed representation is persisted per logical schema as a **lens deployment snapshot** (`LensDeploymentSnapshot`), captured on each successful `apply schema X` and **rotated** (`previous ← current`), so the prior deploy survives exactly one re-apply. The snapshot is the **source of truth** the backfill differ diffs — robust to the lens already pointing at the new basis, because it records the *prior* compiled `get` rather than re-deriving from live catalog timing. Per logical table it holds:
 
 - `getBody` — the compiled `get` body deployed for the table (`prior_lens.get(prior_basis)`), wrapped as the backfill's `from (<prior get>)` subquery;
-- `logicalColumns` — the non-hidden logical columns (declaration order), used to test reconstructibility;
+- `logicalColumns` — the logical columns (declaration order), used to test reconstructibility;
 - `relationBacking` — per basis relation, the `(basisColumn → logicalColumn)` pairs it backs, derived from the body's projection **plus shared join-key threading** (a columnar split joins its members on a shared key but projects it once; the other members carry the key column and must be backfilled with it);
 - `basisHash` — the schema hash of the basis declared schema at deploy time. This is the migration-safety record: a later deploy or introspection confirms the basis still matches the one last deployed against, and a mismatch is surfaced (not silently proceeded past) as a basis-drifted-out-of-band warning.
 
@@ -519,15 +520,14 @@ declare lens for X over Y {
     select id, speed as maxSpeed              -- rename override
     from Y.CarCore join Y.CarPerf using (id);  -- other Car columns gap-filled
   view Audit as
-    select id, who from Y.AuditLog
-    hiding (raw_blob);                          -- drop raw_blob; omitting it from the
-                                                -- projection alone would gap-fill it back in
+    select id, who, upper(who) as label         -- compute override; other Audit columns gap-filled
+    from Y.AuditLog;
   -- tables of X not mentioned here are auto-mapped against Y entirely
 }
 ```
 
 - `declare logical schema X { ... }` — `kind: 'logical'`, declarative end-state, diffed by the schema differ.
-- `declare lens for X over Y { ... }` — names the logical schema (`for X`) and the **explicit basis** (`over Y`), and populates lens slots. It is a **sibling statement of `declare schema`, not a variant** of it. Unmentioned tables are auto-mapped; columns unmentioned within a mentioned table are gap-filled; columns in `hiding (...)` are omitted entirely. The basis binding lives on the lens, never on the logical schema — that is what keeps the logical schema embodiment-free and lets one logical schema target multiple bases across deployments. Re-declaring a lens for X replaces the prior block; two `view T as` for the same logical table within one block is an error. The lens must be declared **before** `apply schema X` (it is re-read from source on every apply).
+- `declare lens for X over Y { ... }` — names the logical schema (`for X`) and the **explicit basis** (`over Y`), and populates lens slots. It is a **sibling statement of `declare schema`, not a variant** of it. Unmentioned tables are auto-mapped; columns unmentioned within a mentioned table are gap-filled. The basis binding lives on the lens, never on the logical schema — that is what keeps the logical schema embodiment-free and lets one logical schema target multiple bases across deployments. Re-declaring a lens for X replaces the prior block; two `view T as` for the same logical table within one block is an error. The lens must be declared **before** `apply schema X` (it is re-read from source on every apply).
 
 ## Background
 

@@ -174,35 +174,70 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * IsolatedConnection, causing DeferredConstraintQueue.findConnection() to find multiple
 	 * covering candidates and throw. We therefore reuse the first covering connection
 	 * already registered for this table.
+	 *
+	 * Concurrent first-reads coalesce through the module-level in-flight memo
+	 * (`IsolationModule.coalesceConnectionBuild`, keyed per db+table) rather than a
+	 * per-instance one: the runtime connects a FRESH `IsolatedTable` per scan, so
+	 * two concurrent scans of one table land on distinct instances and only a memo
+	 * that spans all wrappers for the (db, table) can collapse them onto one
+	 * registered covering connection. The resolved connection is cached in
+	 * `registeredConnection` so subsequent reads on THIS instance fast-path — this
+	 * is the only place that field is set when the build was coalesced onto another
+	 * instance's in-flight promise (that instance's `buildConnection` ran, ours did
+	 * not).
 	 */
 	private async ensureConnection(): Promise<IsolatedConnection> {
-		if (!this.registeredConnection) {
-			// Reuse an existing covering (IsolatedConnection) if one is already registered
-			// for this table — avoids accumulating one IsolatedConnection per statement.
-			const qualifiedName = `${this.schemaName}.${this.tableName}`;
-			const existing = (this.db as DatabaseInternal).getConnectionsForTable(qualifiedName);
-			const existingCovering = existing.find((c: VirtualTableConnection) => c.isCovering) as IsolatedConnection | undefined;
-			if (existingCovering) {
-				this.registeredConnection = existingCovering;
-				return this.registeredConnection;
-			}
+		if (this.registeredConnection) return this.registeredConnection;
+		const conn = await this.isolationModule.coalesceConnectionBuild(
+			this.db,
+			this.schemaName,
+			this.tableName,
+			() => this.buildConnection(),
+		) as IsolatedConnection;
+		this.registeredConnection = conn;
+		return conn;
+	}
 
-			// Create connection - overlay connection created lazily if needed
-			const overlayConn = this.overlayTable
-				? await Promise.resolve(this.overlayTable.createConnection?.())
-				: undefined;
-
-			this.registeredConnection = new IsolatedConnection(
-				`${this.schemaName}.${this.tableName}`,
-				undefined,
-				overlayConn,
-				this
-			);
-
-			// Register connection with the database for transaction management
-			await (this.db as DatabaseInternal).registerConnection(this.registeredConnection);
+	/**
+	 * Builds (or reuses) the registered connection for this table. Always called
+	 * through `IsolationModule.coalesceConnectionBuild` so concurrent callers —
+	 * across all `IsolatedTable` instances for this (db, table) — share one build.
+	 *
+	 * The covering-reuse check stays INSIDE this coalesced body so a connection
+	 * registered by another instance between calls (e.g. after the memo cleared on
+	 * settle) is still picked up by the next read.
+	 * `registeredConnection` is assigned only on the success paths (covering reuse
+	 * or a completed `registerConnection`); a thrown `registerConnection` /
+	 * overlay `createConnection` leaves it null and rejects the in-flight promise,
+	 * which `coalesceConnectionBuild` clears so a later read rebuilds.
+	 */
+	private async buildConnection(): Promise<IsolatedConnection> {
+		// Reuse an existing covering (IsolatedConnection) if one is already registered
+		// for this table — avoids accumulating one IsolatedConnection per statement.
+		const qualifiedName = `${this.schemaName}.${this.tableName}`;
+		const existing = (this.db as DatabaseInternal).getConnectionsForTable(qualifiedName);
+		const existingCovering = existing.find((c: VirtualTableConnection) => c.isCovering) as IsolatedConnection | undefined;
+		if (existingCovering) {
+			this.registeredConnection = existingCovering;
+			return existingCovering;
 		}
-		return this.registeredConnection;
+
+		// Create connection - overlay connection created lazily if needed
+		const overlayConn = this.overlayTable
+			? await Promise.resolve(this.overlayTable.createConnection?.())
+			: undefined;
+
+		const connection = new IsolatedConnection(
+			`${this.schemaName}.${this.tableName}`,
+			undefined,
+			overlayConn,
+			this
+		);
+
+		// Register connection with the database for transaction management
+		await (this.db as DatabaseInternal).registerConnection(connection);
+		this.registeredConnection = connection;
+		return connection;
 	}
 
 	// ==================== Connection Management ====================

@@ -22,14 +22,13 @@ const log = createLogger('schema:lens-fk-discovery');
  * projects from, read off the slot's compiled-body projection. Mirrors the
  * prover's `mappedBasisColumn`: a logical column is reconstructible iff its
  * body-output term is a plain `column` reference, in which case a written value
- * maps straight back to that basis column. Hidden columns are skipped (they have
- * no body-output term), keeping the output index aligned with `compiledBody.columns`.
+ * maps straight back to that basis column. The output index stays aligned with
+ * `compiledBody.columns`.
  */
 export function logicalToBasisColumnMap(slot: LensSlot): Map<string, string> {
 	const map = new Map<string, string>();
 	let outputIndex = 0;
 	for (const p of slot.columnProvenance) {
-		if (p.source === 'hidden') continue;
 		const rc = slot.compiledBody.columns[outputIndex];
 		outputIndex++;
 		if (rc && rc.type === 'column' && rc.expr.type === 'column') {

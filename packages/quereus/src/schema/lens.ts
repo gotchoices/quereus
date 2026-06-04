@@ -52,12 +52,10 @@ export type LogicalConstraint =
  *
  * - `override` — the column is covered by the `declare lens` override body.
  * - `default`  — gap-filled by the default name-based mapper.
- * - `hidden`   — listed in `hiding (...)`; absent from the effective body and
- *   the registered view's column list.
  */
 export interface LensColumnProvenance {
 	logicalColumn: string;
-	source: 'override' | 'default' | 'hidden';
+	source: 'override' | 'default';
 	/**
 	 * When a resolved primary-storage advertisement backs this logical column, the
 	 * member `relationId` that backs it (the existence anchor for an EAV pivot).
@@ -84,20 +82,14 @@ export interface LensSlot {
 	 * The authored override body from `declare lens for X over Y { view T as ... }`,
 	 * when one covers this logical table. `undefined` for a purely default-mapped
 	 * table. The effective {@link compiledBody} is composed from this override
-	 * (covered columns) ⊕ default-mapper gap-fill (uncovered columns) ⊖ {@link hiding}.
+	 * (covered columns) ⊕ default-mapper gap-fill (uncovered columns).
 	 */
 	override?: AST.SelectStmt;
-	/**
-	 * Logical columns hidden via `hiding (...)` (lowercased). Omitted from the
-	 * effective body and the registered view's column list. Empty/absent when the
-	 * override declares no `hiding` clause.
-	 */
-	hiding?: ReadonlySet<string>;
-	/** The effective body — default mapper, or override ⊕ gap-fill ⊖ hidden. */
+	/** The effective body — default mapper, or override ⊕ gap-fill. */
 	compiledBody: AST.SelectStmt;
 	/**
-	 * Per-logical-column provenance, in declaration order (covers hidden columns
-	 * too). Surfaced by the `quereus_effective_lens` introspection TVF.
+	 * Per-logical-column provenance, in declaration order. Surfaced by the
+	 * `quereus_effective_lens` introspection TVF.
 	 */
 	columnProvenance: ReadonlyArray<LensColumnProvenance>;
 	/**
@@ -218,7 +210,7 @@ export interface LensTableSnapshot {
 	 * mutated after deploy.
 	 */
 	getBody: AST.SelectStmt;
-	/** Non-hidden logical columns, declaration order (original case). */
+	/** Logical columns, declaration order (original case). */
 	logicalColumns: readonly string[];
 	/** basis-relation key (`schema.table`, lowercased) → how it backs the table. */
 	relationBacking: ReadonlyMap<string, LensRelationBacking>;

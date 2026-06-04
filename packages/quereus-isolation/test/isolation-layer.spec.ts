@@ -1,7 +1,8 @@
-import { describe, it, beforeEach } from 'mocha';
+import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray } from '@quereus/quereus';
-import { IsolationModule } from '../src/index.js';
+import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTable, VirtualTableConnection } from '@quereus/quereus';
+import { IsolationModule, IsolatedTable } from '../src/index.js';
 
 describe('IsolationModule', () => {
 	let db: Database;
@@ -1337,6 +1338,392 @@ describe('IsolationModule', () => {
 			expect(caps.supportsPushDown).to.be.true; // underlying capability preserved
 			expect(caps.isolation).to.be.true; // isolation guarantee layered on
 			expect(caps.savepoints).to.be.true;
+		});
+	});
+});
+
+// ===========================================================================
+// concurrencyMode / expectedLatencyMs forwarding + ensureConnection reentrancy
+//
+// IsolationModule forwards the underlying module's plan-level hints so a host
+// wrapping a reentrant module (e.g. Lamina over a Memory overlay) keeps the
+// `concurrencySafe` / `expectedLatencyMs` it would get registering the
+// underlying directly. The forward is safe because the one lazy-init race in
+// the merged-overlay read path (`IsolatedTable.ensureConnection`) is hardened
+// with an in-flight memo.
+// ===========================================================================
+describe('IsolationModule concurrency + latency forwarding', () => {
+	/**
+	 * Minimal module stub exposing only the two forwarded hints. The forwarding
+	 * getters read just `concurrencyMode` / `expectedLatencyMs`; no create/connect
+	 * is exercised for the getter-level assertions.
+	 */
+	function modeStub(concurrencyMode?: VtabConcurrencyMode, expectedLatencyMs?: number): VirtualTableModule<any, any> {
+		const m: Record<string, unknown> = {};
+		if (concurrencyMode !== undefined) m.concurrencyMode = concurrencyMode;
+		if (expectedLatencyMs !== undefined) m.expectedLatencyMs = expectedLatencyMs;
+		return m as unknown as VirtualTableModule<any, any>;
+	}
+
+	/** Functional memory module declaring a non-zero latency hint
+	 *  (reentrant-reads inherited from MemoryTableModule). */
+	class HighLatencyMemoryModule extends MemoryTableModule {
+		readonly expectedLatencyMs = 25;
+	}
+
+	describe('forwarding (getter-level)', () => {
+		it('serial underlying degrades the wrapper to serial', () => {
+			const iso = new IsolationModule({ underlying: modeStub('serial'), overlay: modeStub('reentrant-reads') });
+			expect(getModuleConcurrencyMode(iso)).to.equal('serial');
+			expect(iso.concurrencyMode).to.equal('serial');
+		});
+
+		it('reentrant underlying + default Memory overlay → reentrant-reads', () => {
+			// overlay omitted → defaults to MemoryTableModule (reentrant-reads).
+			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads') });
+			expect(getModuleConcurrencyMode(iso)).to.equal('reentrant-reads');
+		});
+
+		it('reentrant underlying + serial custom overlay → serial (weakest-of)', () => {
+			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads'), overlay: modeStub('serial') });
+			expect(getModuleConcurrencyMode(iso)).to.equal('serial');
+		});
+
+		it('fully-reentrant underlying + fully-reentrant overlay clamps to reentrant-reads', () => {
+			const iso = new IsolationModule({ underlying: modeStub('fully-reentrant'), overlay: modeStub('fully-reentrant') });
+			// IsolationModule's own write path is never reentrant → cap applies.
+			expect(iso.concurrencyMode).to.equal('reentrant-reads');
+		});
+
+		it('absent concurrencyMode on both sides → serial', () => {
+			const iso = new IsolationModule({ underlying: modeStub(undefined), overlay: modeStub(undefined) });
+			expect(getModuleConcurrencyMode(iso)).to.equal('serial');
+		});
+
+		it('expectedLatencyMs absent on underlying → 0 (no hint)', () => {
+			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads') });
+			expect(iso.expectedLatencyMs).to.equal(0);
+		});
+
+		it('expectedLatencyMs forwarded from underlying (25)', () => {
+			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads', 25) });
+			expect(iso.expectedLatencyMs).to.equal(25);
+		});
+
+		it('expectedLatencyMs comes from the underlying, never the overlay', () => {
+			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads', 25), overlay: modeStub('reentrant-reads', 999) });
+			expect(iso.expectedLatencyMs).to.equal(25);
+		});
+	});
+
+	describe('plan-level forwarding (physical properties)', () => {
+		// PlanNode / PlanNodeType are not part of the published @quereus/quereus
+		// surface, so we walk the optimized tree structurally and match the leaf
+		// table reference by its node-type string ('TableReference').
+		function findByType(root: any, nodeType: string): any[] {
+			const out: any[] = [];
+			const seen = new Set<string>();
+			const stack: any[] = [root];
+			while (stack.length > 0) {
+				const n = stack.pop();
+				if (!n || seen.has(n.id)) continue;
+				seen.add(n.id);
+				if (n.nodeType === nodeType) out.push(n);
+				for (const c of n.getChildren()) stack.push(c);
+			}
+			return out;
+		}
+
+		it('reentrant + latency underlying surfaces concurrencySafe=true and the latency hint through the wrapper', async () => {
+			const db = new Database();
+			const iso = new IsolationModule({ underlying: new HighLatencyMemoryModule() });
+			db.registerModule('isolated', iso);
+			await db.exec('create table t (id integer primary key, v text) using isolated');
+
+			const plan = db.getPlan('select * from t');
+			const refs = findByType(plan, 'TableReference');
+			expect(refs.length, 'expected a TableReference node in the plan').to.be.greaterThan(0);
+			const phys = refs[0].physical;
+			expect(phys.concurrencySafe).to.equal(true);
+			expect(phys.expectedLatencyMs).to.equal(25);
+			await db.close();
+		});
+
+		it('serial wrapper (serial overlay) yields concurrencySafe=false and no latency hint', async () => {
+			const db = new Database();
+			// Reentrant underlying, serial custom overlay → weakest-of → serial.
+			// The overlay module is never instantiated during a read-only plan.
+			const iso = new IsolationModule({ underlying: new MemoryTableModule(), overlay: modeStub('serial') });
+			db.registerModule('isolated', iso);
+			await db.exec('create table t (id integer primary key, v text) using isolated');
+
+			const plan = db.getPlan('select * from t');
+			const refs = findByType(plan, 'TableReference');
+			expect(refs.length, 'expected a TableReference node in the plan').to.be.greaterThan(0);
+			const phys = refs[0].physical;
+			expect(phys.concurrencySafe).to.equal(false);
+			expect(phys.expectedLatencyMs).to.equal(undefined);
+			await db.close();
+		});
+	});
+
+	describe('ensureConnection reentrancy + merged-read correctness', () => {
+		let db: Database;
+
+		beforeEach(() => {
+			db = new Database();
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		/** A full-scan FilterInfo. `idxStr === null` → primary-key scan; a
+		 *  `idx=<name>(0);plan=2` string → a full ascending scan over that
+		 *  secondary index. Mirrors `IsolatedTable.createFullScanFilterInfo`. */
+		function fullScanFilter(idxStr: string | null): FilterInfo {
+			return {
+				idxNum: 0,
+				idxStr,
+				constraints: [],
+				args: [],
+				indexInfoOutput: {
+					nConstraint: 0,
+					aConstraint: [],
+					nOrderBy: 0,
+					aOrderBy: [],
+					colUsed: 0n,
+					aConstraintUsage: [],
+					idxNum: 0,
+					idxStr,
+					orderByConsumed: false,
+					estimatedCost: 1000000,
+					estimatedRows: 1000000n,
+					idxFlags: 0,
+				},
+			};
+		}
+
+		/** The merged ground truth for the staged overlay below, as [id, v]. */
+		const EXPECTED: SqlValue[][] = [[1, 'a'], [3, 'C'], [4, 'd']];
+
+		/** Normalises a merged result to sorted [id, v] tuples for multiset compare. */
+		function sortRows(rows: readonly Row[]): SqlValue[][] {
+			return rows.map(r => [r[0], r[1]] as SqlValue[]).sort((x, y) => Number(x[0]) - Number(y[0]));
+		}
+
+		const QUALIFIED = 'main.t';
+		function dbi(): DatabaseInternal { return db as unknown as DatabaseInternal; }
+		function conns(): VirtualTableConnection[] { return dbi().getConnectionsForTable(QUALIFIED); }
+		function clearConns(): void { for (const c of conns()) dbi().unregisterConnection(c.connectionId); }
+
+		async function connectReader(iso: IsolationModule, readCommitted = false): Promise<IsolatedTable> {
+			const opts = (readCommitted ? { _readCommitted: true } : {}) as unknown as BaseModuleConfig;
+			return await iso.connect(db, undefined, 'isolated', 'main', 't', opts) as IsolatedTable;
+		}
+
+		/**
+		 * Creates `t (id, v)` over an isolation-wrapped memory module, seeds three
+		 * committed rows, then injects an overlay holding a staged insert (id=4), a
+		 * staged tombstone (id=2) and a staged update (id=3 → 'C') directly — no
+		 * transaction. The merged view is {@link EXPECTED}.
+		 *
+		 * Direct overlay injection (rather than BEGIN + DML) keeps the registered-
+		 * connection count deterministic: there is no open transaction to defer
+		 * `unregisterConnection`, so the concurrent-read seam is exercised from a
+		 * known-clean connection state.
+		 */
+		async function setupStagedOverlay(withSecondaryIndex: boolean): Promise<IsolationModule> {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', iso);
+			await db.exec('create table t (id integer primary key, v text) using isolated');
+			if (withSecondaryIndex) await db.exec('create index t_by_v on t(v)');
+			await db.exec("insert into t values (1,'a'),(2,'b'),(3,'c')");
+
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
+			// Overlay rows carry a trailing tombstone column (0 = live, 1 = tombstone).
+			await overlay.update({ operation: 'insert', values: [4, 'd', 0] }); // staged insert
+			await overlay.update({ operation: 'insert', values: [2, null, 1] }); // staged tombstone (id=2)
+			await overlay.update({ operation: 'insert', values: [3, 'C', 0] }); // staged update (id=3)
+			iso.setConnectionOverlay(db, 'main', 't', { overlayTable: overlay, hasChanges: true });
+			return iso;
+		}
+
+		/** Builds the `idx=<name>(0);plan=2` string for the index over column `v`. */
+		function secondaryIdxStr(iso: IsolationModule): string {
+			const schema = iso.getUnderlyingState('main', 't')!.underlyingTable.tableSchema!;
+			const vIdx = schema.columnIndexMap.get('v')!;
+			const idx = schema.indexes!.find(i => i.columns.some(c => c.index === vIdx))!;
+			return `idx=${idx.name}(0);plan=2`;
+		}
+
+		it('primary scan: concurrent first-reads on one instance register exactly one connection and match the serial baseline', async () => {
+			const iso = await setupStagedOverlay(false);
+			const filter = () => fullScanFilter(null);
+
+			// Serial baseline through its own fresh instance.
+			const baseline = await asyncIterableToArray((await connectReader(iso)).query(filter()));
+			expect(sortRows(baseline)).to.deep.equal(EXPECTED);
+
+			// Drop any covering connection so the concurrent pair hits the
+			// no-existing-covering seam in ensureConnection.
+			clearConns();
+			expect(conns().length).to.equal(0);
+
+			const inst = await connectReader(iso);
+			const [a, b] = await Promise.all([
+				asyncIterableToArray(inst.query(filter())),
+				asyncIterableToArray(inst.query(filter())),
+			]);
+
+			expect(conns().length, 'memo must coalesce concurrent first-reads to one registration').to.equal(1);
+			expect(sortRows(a)).to.deep.equal(EXPECTED);
+			expect(sortRows(b)).to.deep.equal(EXPECTED);
+		});
+
+		it('secondary-index scan: concurrent first-reads register exactly one connection and match the serial baseline', async () => {
+			const iso = await setupStagedOverlay(true);
+			const idxStr = secondaryIdxStr(iso);
+			const filter = () => fullScanFilter(idxStr);
+
+			const baseline = await asyncIterableToArray((await connectReader(iso)).query(filter()));
+			expect(sortRows(baseline)).to.deep.equal(EXPECTED);
+
+			clearConns();
+			expect(conns().length).to.equal(0);
+
+			const inst = await connectReader(iso);
+			const [a, b] = await Promise.all([
+				asyncIterableToArray(inst.query(filter())),
+				asyncIterableToArray(inst.query(filter())),
+			]);
+
+			expect(conns().length, 'memo must coalesce concurrent first-reads to one registration').to.equal(1);
+			expect(sortRows(a)).to.deep.equal(EXPECTED);
+			expect(sortRows(b)).to.deep.equal(EXPECTED);
+		});
+
+		// --- Cross-instance coalescing -----------------------------------------
+		// The runtime connects a FRESH IsolatedTable per scan, so two concurrent
+		// merged-overlay scans of one table land on DISTINCT wrapper instances —
+		// the path the same-instance tests above never exercise. A per-instance
+		// memo cannot coalesce these; only the module-level memo
+		// (IsolationModule.coalesceConnectionBuild, keyed per db+table) can. Without
+		// it both instances register their own covering IsolatedConnection
+		// (covering.length === 2), tripping DeferredConstraintQueue.findConnection's
+		// "found multiple candidate connections" throw downstream.
+
+		it('primary scan: concurrent first-reads across SEPARATE instances coalesce onto one covering connection', async () => {
+			const iso = await setupStagedOverlay(false);
+			const filter = () => fullScanFilter(null);
+
+			// Start from a clean connection set so both fresh instances hit the
+			// no-existing-covering seam in ensureConnection simultaneously.
+			clearConns();
+			expect(conns().length).to.equal(0);
+
+			const instA = await connectReader(iso);
+			const instB = await connectReader(iso);
+			const [a, b] = await Promise.all([
+				asyncIterableToArray(instA.query(filter())),
+				asyncIterableToArray(instB.query(filter())),
+			]);
+
+			expect(conns().filter(c => c.isCovering).length,
+				'module-level memo must coalesce cross-instance first-reads to one covering connection').to.equal(1);
+			expect(sortRows(a)).to.deep.equal(EXPECTED);
+			expect(sortRows(b)).to.deep.equal(EXPECTED);
+		});
+
+		it('secondary-index scan: concurrent first-reads across SEPARATE instances coalesce onto one covering connection', async () => {
+			const iso = await setupStagedOverlay(true);
+			const idxStr = secondaryIdxStr(iso);
+			const filter = () => fullScanFilter(idxStr);
+
+			clearConns();
+			expect(conns().length).to.equal(0);
+
+			const instA = await connectReader(iso);
+			const instB = await connectReader(iso);
+			const [a, b] = await Promise.all([
+				asyncIterableToArray(instA.query(filter())),
+				asyncIterableToArray(instB.query(filter())),
+			]);
+
+			expect(conns().filter(c => c.isCovering).length,
+				'module-level memo must coalesce cross-instance first-reads to one covering connection').to.equal(1);
+			expect(sortRows(a)).to.deep.equal(EXPECTED);
+			expect(sortRows(b)).to.deep.equal(EXPECTED);
+		});
+
+		it('reuses an existing covering connection under concurrency (no extra registration)', async () => {
+			const iso = await setupStagedOverlay(false);
+			// Register a covering connection via a serial first read.
+			await asyncIterableToArray((await connectReader(iso)).query(fullScanFilter(null)));
+			const before = conns().length;
+			expect(before).to.be.greaterThan(0);
+
+			const inst = await connectReader(iso);
+			const [a, b] = await Promise.all([
+				asyncIterableToArray(inst.query(fullScanFilter(null))),
+				asyncIterableToArray(inst.query(fullScanFilter(null))),
+			]);
+
+			// The covering-reuse check inside the memoized body still fires — no growth.
+			expect(conns().length).to.equal(before);
+			expect(sortRows(a)).to.deep.equal(EXPECTED);
+			expect(sortRows(b)).to.deep.equal(EXPECTED);
+		});
+
+		it('a failed connection build clears the in-flight memo so a later read retries', async () => {
+			const iso = await setupStagedOverlay(false);
+			clearConns();
+			const inst = await connectReader(iso);
+
+			const realRegister = dbi().registerConnection.bind(dbi());
+			let calls = 0;
+			(db as any).registerConnection = async (c: VirtualTableConnection) => {
+				calls++;
+				if (calls === 1) throw new Error('boom: simulated registration failure');
+				return realRegister(c);
+			};
+			try {
+				let threw = false;
+				try {
+					await asyncIterableToArray(inst.query(fullScanFilter(null)));
+				} catch {
+					threw = true;
+				}
+				expect(threw, 'first read must surface the build failure').to.equal(true);
+
+				// Memo cleared on reject → the retry rebuilds and registers exactly once.
+				const rows = await asyncIterableToArray(inst.query(fullScanFilter(null)));
+				expect(sortRows(rows)).to.deep.equal(EXPECTED);
+				expect(conns().length).to.equal(1);
+			} finally {
+				delete (db as any).registerConnection;
+			}
+		});
+
+		it('read-committed scan over a reentrant underlying stays concurrency-safe and bypasses the overlay', async () => {
+			const iso = await setupStagedOverlay(false);
+			expect(getModuleConcurrencyMode(iso)).to.equal('reentrant-reads');
+			clearConns();
+
+			// readCommitted → fast path delegates straight to the underlying (no
+			// overlay merge, no connection registration).
+			const inst = await connectReader(iso, true);
+			const [a, b] = await Promise.all([
+				asyncIterableToArray(inst.query(fullScanFilter(null))),
+				asyncIterableToArray(inst.query(fullScanFilter(null))),
+			]);
+
+			// Committed underlying only: staged insert/tombstone/update are invisible.
+			const committed: SqlValue[][] = [[1, 'a'], [2, 'b'], [3, 'c']];
+			expect(sortRows(a)).to.deep.equal(committed);
+			expect(sortRows(b)).to.deep.equal(committed);
+			expect(conns().length, 'read-committed fast path registers no connection').to.equal(0);
 		});
 	});
 });

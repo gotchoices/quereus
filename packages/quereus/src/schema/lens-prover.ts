@@ -237,7 +237,7 @@ interface ProveContext {
 	readonly table: TableSchema;
 	/** Lowercased logical column name → its index in `logicalTable.columns`. */
 	readonly logicalColIndex: ReadonlyMap<string, number>;
-	/** Non-hidden logical column names, in body-output order. */
+	/** Logical column names, in body-output order. */
 	readonly outputColumns: readonly string[];
 	/** Logical column name (lower) → body-output column index. */
 	readonly outputIndex: ReadonlyMap<string, number>;
@@ -273,19 +273,17 @@ function buildProveContext(slot: LensSlot, db: Database): ProveContext {
 }
 
 /**
- * The non-hidden output-index map for a lens slot: logical column name (lower) →
+ * The output-index map for a lens slot: logical column name (lower) →
  * body-output column index, plus the columns in declaration order. The single
  * source of truth for the body's output-column-index space — shared by
  * {@link buildProveContext} and {@link computeLensAssertedKeyFds} so the two can
  * never drift (the FD-contribution columns must land in exactly the space the
- * prover proved its keys in). Hidden columns are skipped — they are absent from
- * the registered view and the inlined ProjectNode alike.
+ * prover proved its keys in).
  */
 function buildOutputIndex(slot: LensSlot): { outputIndex: Map<string, number>; outputColumns: string[] } {
 	const outputColumns: string[] = [];
 	const outputIndex = new Map<string, number>();
 	for (const p of slot.columnProvenance) {
-		if (p.source === 'hidden') continue;
 		outputIndex.set(p.logicalColumn.toLowerCase(), outputColumns.length);
 		outputColumns.push(p.logicalColumn);
 	}
@@ -334,10 +332,10 @@ export function resolveSlotBasisSource(slot: LensSlot, schemaManager: SchemaMana
 // ---------------------------------------------------------------------------
 
 /**
- * Every non-hidden logical column resolves to a basis expression. The compiler's
- * gap-fill path already errors on an uncovered column before the prover runs, so
- * this is the formal restatement / backstop: a provenance entry must exist for
- * every column and a non-hidden one must be `override` or `default`.
+ * Every logical column resolves to a basis expression. The compiler's gap-fill
+ * path already errors on an uncovered column before the prover runs, so this is
+ * the formal restatement / backstop: a provenance entry must exist for every
+ * column and must be `override` or `default`.
  */
 function checkColumnCoverage(ctx: ProveContext, errors: LensDiagnostic[]): void {
 	const provByName = new Map(ctx.slot.columnProvenance.map(p => [p.logicalColumn.toLowerCase(), p]));
@@ -396,7 +394,7 @@ function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[]): v
 	const outCols = ctx.root.getType().columns;
 	for (const col of ctx.table.columns) {
 		const oi = ctx.outputIndex.get(col.name.toLowerCase());
-		if (oi === undefined) continue; // hidden column — not in the body output
+		if (oi === undefined) continue; // defensive: column absent from the body output
 		const outCol = outCols[oi];
 		if (!outCol) continue;
 		const outType = outCol.type;
@@ -434,7 +432,7 @@ function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[]): v
 /**
  * For a writable logical table the logical PK must be reconstructible at the lens
  * boundary — each PK column maps to a plain (invertible) basis column projection.
- * When it is not (a computed / hidden / aggregated PK column), the table is
+ * When it is not (a computed / aggregated PK column), the table is
  * **read-only**: reads still work, but any mutation errors at the lens
  * (`planner/mutation/single-source.ts` `analyzeView` raises). This is not a deploy-blocking error — the table
  * deploys read-only — so it surfaces as a warning, and `readOnly` is set on the
@@ -465,13 +463,13 @@ function checkKeyReconstructibility(ctx: ProveContext, warnings: LensDiagnostic[
 }
 
 /**
- * A logical column is reconstructible iff it is non-hidden and its body-output
- * projection term is a plain column reference (so a written value maps straight
- * back to a basis column). A computed (non-column) projection has no write path.
+ * A logical column is reconstructible iff its body-output projection term is a
+ * plain column reference (so a written value maps straight back to a basis
+ * column). A computed (non-column) projection has no write path.
  */
 function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean {
 	const oi = ctx.outputIndex.get(columnName.toLowerCase());
-	if (oi === undefined) return false; // hidden — not writable through the lens
+	if (oi === undefined) return false; // not in the body output — not writable through the lens
 	const rc = ctx.slot.compiledBody.columns[oi];
 	return rc?.type === 'column' && rc.expr.type === 'column';
 }
@@ -504,7 +502,7 @@ function proveRoundTrip(_ctx: ProveContext): LensDiagnostic[] {
  * Classifies every attached logical constraint into a {@link ConstraintObligation}
  * and, in the process, performs the *constraint realizability* error check
  * (`lens.unrealizable-constraint`): a constraint referencing a column with no
- * write path (computed lineage / hidden) is neither provable nor attachable.
+ * write path (computed lineage) is neither provable nor attachable.
  * Set-level constraints with no covering structure emit `lens.no-backing-index`.
  */
 function classifyObligations(ctx: ProveContext, readOnly: boolean, errors: LensDiagnostic[], warnings: LensDiagnostic[]): ConstraintObligation[] {
@@ -583,7 +581,7 @@ function conflictActionName(action: ConflictResolution | undefined): string {
  * Classifies a key constraint (primary key / unique). Empty key ⇒ vacuous
  * (singleton).
  *
- * A column with no write path (computed / hidden lineage) is handled by class:
+ * A column with no write path (computed lineage) is handled by class:
  *  - a **unique** over such a column is `lens.unrealizable-constraint` (you
  *    declared uniqueness on a value with no write path — it can be neither proved
  *    nor enforced);
@@ -622,7 +620,7 @@ function classifyKeyConstraint(
 				code: 'lens.unrealizable-constraint',
 				severity: 'error',
 				site: { table: ctx.table.name, constraint: label, column: name },
-				message: `lens: ${label} on '${ctx.table.name}' references column '${name ?? `#${li}`}', which has no write path at the lens boundary (computed or hidden lineage); the constraint can be neither proved nor enforced`,
+				message: `lens: ${label} on '${ctx.table.name}' references column '${name ?? `#${li}`}', which has no write path at the lens boundary (computed lineage); the constraint can be neither proved nor enforced`,
 			});
 			return { constraint, kind: 'enforced-set-level', mode: 'commit-time' };
 		}
@@ -731,7 +729,7 @@ function rejectRowTimeConflictAction(
 
 /**
  * Classifies a `check` constraint. A check referencing a column with no write
- * path (computed / hidden) is unrealizable (error). Otherwise it is row-local —
+ * path (computed lineage) is unrealizable (error). Otherwise it is row-local —
  * evaluable on the projected row at the write boundary. (Vacuous-by-body-predicate
  * detection is deferred; a row-local check is always sound, just possibly redundant.)
  */
@@ -749,7 +747,7 @@ function classifyCheckConstraint(
 				code: 'lens.unrealizable-constraint',
 				severity: 'error',
 				site: { table: ctx.table.name, constraint: label, column: ref },
-				message: `lens: ${label} on '${ctx.table.name}' references column '${ref}', which has computed or hidden lineage (no write path); a check over it cannot be enforced at the lens boundary`,
+				message: `lens: ${label} on '${ctx.table.name}' references column '${ref}', which has computed lineage (no write path); a check over it cannot be enforced at the lens boundary`,
 			});
 			return { constraint, kind: 'enforced-row-local' };
 		}
@@ -915,8 +913,8 @@ function logicalKeyColumns(c: Extract<LogicalConstraint, { kind: 'primaryKey' | 
 
 /**
  * Encode `key → others` over the body's output columns. Maps each logical key
- * column → its non-hidden output index; a key column with no output index
- * (hidden / not emitted) makes the key inexpressible (⇒ undefined). The
+ * column → its output index; a key column with no output index
+ * (not emitted) makes the key inexpressible (⇒ undefined). The
  * all-columns key has no non-trivial FD encoding (`superkeyToFd` ⇒ undefined) and
  * is skipped (v1). When `guard` is supplied the FD activates only under a
  * surrounding predicate that entails it (the nullable / partial-UNIQUE case).
@@ -932,7 +930,7 @@ function encodeKeyFd(
 	for (const li of logicalColumns) {
 		const name = table.columns[li]?.name;
 		const oi = name !== undefined ? outputIndex.get(name.toLowerCase()) : undefined;
-		if (oi === undefined) return undefined; // hidden / not emitted ⇒ not in the readable relation
+		if (oi === undefined) return undefined; // not emitted ⇒ not in the readable relation
 		outCols.push(oi);
 	}
 	const fd = superkeyToFd(outCols, outColCount);

@@ -10,9 +10,18 @@
  * documented parser default (see below); each such omission is mirrored by an
  * entry in `test/emit-roundtrip-comparator.ts` so the drop stays intentional.
  *
+ * Identifier quoting is conditional (`quoteIdentifier`): a name is quoted only
+ * when it is a reserved word or not a bare-valid identifier, otherwise it is
+ * emitted bare. Every identifier *position* (table/column/alias/schema/index/
+ * view/savepoint/CTE/collation/pragma/function/…) must route through that gate
+ * or a reserved-word name fails to re-parse — this is verified position-by-
+ * position, driven off the lexer `KEYWORDS` table, in
+ * `test/emit-roundtrip-positions.spec.ts` (the property test deliberately avoids
+ * reserved words, so it cannot cover this class).
+ *
  * Formatting Notes:
  * - Emits lowercase SQL keywords.
- * - Quotes identifiers (table/column names) using double quotes.
+ * - Quotes identifiers (table/column names) using double quotes when necessary.
  * - String literals are escaped.
  * - Omits clauses that represent the default SQLite behavior:
  *   - `ON CONFLICT ABORT`
@@ -21,7 +30,7 @@
  */
 import type * as AST from '../parser/ast.js';
 import { ConflictResolution } from '../common/constants.js';
-import { KEYWORDS } from '../parser/lexer.js';
+import { KEYWORDS, CONTEXTUAL_KEYWORDS } from '../parser/lexer.js';
 import { uint8ArrayToHex } from '../util/serialization.js';
 import type { SqlValue } from '../common/types.js';
 
@@ -43,6 +52,25 @@ export function quoteIdentifier(name: string): string {
 		return `"${name.replace(/"/g, '""')}"`; // Escape internal quotes
 	}
 	return name;
+}
+
+/**
+ * Keyword function names the parser still accepts *bare* in a call position
+ * (`consumeIdentifier([...CONTEXTUAL_KEYWORDS, 'replace'])` in parser.ts). For
+ * these, emitting bare both round-trips and keeps the auto-derived result-column
+ * name readable (`like('a%', x)`, not `"like"('a%', x)`).
+ */
+const BARE_CALLABLE_FUNCTION_NAMES = new Set<string>([...CONTEXTUAL_KEYWORDS, 'replace']);
+
+/**
+ * Quote a function name only when a bare emit would not re-parse as a call.
+ * Ordinary names and bare-callable keyword names stay bare (lowercased, matching
+ * the historical style); only a keyword the parser would reject bare (e.g.
+ * `select`) is quoted so an exotic `"select"(x)` call still round-trips.
+ */
+function quoteFunctionName(name: string): string {
+	const lower = name.toLowerCase();
+	return BARE_CALLABLE_FUNCTION_NAMES.has(lower) ? lower : quoteIdentifier(lower);
 }
 
 
@@ -113,10 +141,10 @@ export function astToString(node: AST.AstNode): string {
 		case 'declareLens':
 			return declareLensToString(node as unknown as AST.DeclareLensStmt);
 		case 'diffSchema':
-			return `diff schema ${(node as unknown as AST.DiffSchemaStmt).schemaName || 'main'}`;
+			return `diff schema ${quoteIdentifier((node as unknown as AST.DiffSchemaStmt).schemaName || 'main')}`;
 		case 'applySchema': {
 			const n = node as unknown as AST.ApplySchemaStmt;
-			let s = `apply schema ${n.schemaName || 'main'}`;
+			let s = `apply schema ${quoteIdentifier(n.schemaName || 'main')}`;
 			if (n.toVersion) s += ` to version '${n.toVersion}'`;
 			if (n.withSeed) s += ' with seed';
 			if (n.options) {
@@ -131,7 +159,7 @@ export function astToString(node: AST.AstNode): string {
 			return s;
 		}
 		case 'explainSchema':
-			return `explain schema ${(node as unknown as AST.ExplainSchemaStmt).schemaName || 'main'}`;
+			return `explain schema ${quoteIdentifier((node as unknown as AST.ExplainSchemaStmt).schemaName || 'main')}`;
 
 		default:
 			return `[${node.type}]`; // Fallback for unknown node types
@@ -210,7 +238,7 @@ export function expressionToString(expr: AST.Expression): string {
 			}
 			const argsStr = expr.args.map(arg => expressionToString(arg)).join(', ');
 			const distinctStr = expr.distinct ? 'distinct ' : '';
-			return `${expr.name.toLowerCase()}(${distinctStr}${argsStr})`;
+			return `${quoteFunctionName(expr.name)}(${distinctStr}${argsStr})`;
 		}
 
 		case 'cast':
@@ -254,7 +282,7 @@ export function expressionToString(expr: AST.Expression): string {
 		}
 
 		case 'collate':
-			return `${expressionToString(expr.expr)} collate ${expr.collation.toLowerCase()}`;
+			return `${expressionToString(expr.expr)} collate ${quoteIdentifier(expr.collation.toLowerCase())}`;
 
 		case 'case': {
 			// TODO: preserve and emit with original case
@@ -516,7 +544,7 @@ function fromClauseToString(from: AST.FromClause): string {
 			// Check if from.name is a function expression or identifier expression
 			let funcName: string;
 			if (from.name.type === 'identifier') {
-				funcName = from.name.name.toLowerCase();
+				funcName = quoteIdentifier(from.name.name.toLowerCase());
 			} else if (from.name.type === 'function') {
 				funcName = expressionToString(from.name);
 			} else {
@@ -739,7 +767,7 @@ function indexedColumnsToString(cols: readonly AST.IndexedColumn[]): string {
 	return cols.map(col => {
 		if (col.name) {
 			let colStr = quoteIdentifier(col.name);
-			if (col.collation) colStr += ` collate ${col.collation.toLowerCase()}`;
+			if (col.collation) colStr += ` collate ${quoteIdentifier(col.collation.toLowerCase())}`;
 			if (col.direction === 'desc') colStr += ' desc';
 			return colStr;
 		} else if (col.expr) {
@@ -897,19 +925,19 @@ function beginToString(_stmt: AST.BeginStmt): string {
 function rollbackToString(stmt: AST.RollbackStmt): string {
 	let result = 'rollback';
 	if (stmt.savepoint) {
-		result += ` to ${stmt.savepoint}`;
+		result += ` to ${quoteIdentifier(stmt.savepoint)}`;
 	}
 	return result;
 }
 
 function savepointToString(stmt: AST.SavepointStmt): string {
-	return `savepoint ${stmt.name}`;
+	return `savepoint ${quoteIdentifier(stmt.name)}`;
 }
 
 function releaseToString(stmt: AST.ReleaseStmt): string {
 	let result = 'release';
 	if (stmt.savepoint) {
-		result += ` ${stmt.savepoint}`;
+		result += ` ${quoteIdentifier(stmt.savepoint)}`;
 	}
 	return result;
 }
@@ -943,9 +971,6 @@ function declareLensToString(stmt: AST.DeclareLensStmt): string {
 	let s = `declare lens for ${quoteIdentifier(stmt.logicalSchema)} over ${quoteIdentifier(stmt.basisSchema)} {`;
 	for (const ov of stmt.overrides) {
 		s += ` view ${quoteIdentifier(ov.table)} as ${selectToString(ov.select)}`;
-		if (ov.hiding && ov.hiding.length > 0) {
-			s += ` hiding (${ov.hiding.map(quoteIdentifier).join(', ')})`;
-		}
 		s += ';';
 	}
 	s += ' }';
@@ -1105,7 +1130,7 @@ function columnConstraintsToString(constraints: AST.ColumnConstraint[]): string 
 				s += `default ${expressionToString(c.expr!)}`;
 				break;
 			case 'collate':
-				s += `collate ${c.collation!.toLowerCase()}`;
+				s += `collate ${quoteIdentifier(c.collation!.toLowerCase())}`;
 				break;
 			case 'foreignKey':
 				if (c.foreignKey) {

@@ -440,7 +440,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				// Dependency Tracking). Only a logical schema's lens slot yields any —
 				// a plain view / MV has none, so this never affects ordinary views. The
 				// node wraps the view's ProjectNode (whose output indices == the lens
-				// prover's non-hidden output-index space), inside the optional AliasNode.
+				// prover's output-index space), inside the optional AliasNode.
 				const lensSlot = parentContext.db.schemaManager.getSchema(viewSchema.schemaName)?.getLensSlot(viewSchema.name);
 				if (lensSlot) {
 					const assertedFds = computeLensAssertedKeyFds(lensSlot, parentContext.db);

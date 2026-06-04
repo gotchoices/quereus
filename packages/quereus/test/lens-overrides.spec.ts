@@ -3,9 +3,9 @@
  * `lens-explicit-overrides-and-attribute-merge`).
  *
  * Covers the authoring half on top of the foundation: the
- * `declare lens for X over Y { view T as <select> [hiding (...)] }` surface, the
+ * `declare lens for X over Y { view T as <select> }` surface, the
  * explicit-basis binding, the per-attribute sparse-override merger (covered ⊕
- * default-mapper gap-fill ⊖ hidden), the `quereus_effective_lens` introspection
+ * default-mapper gap-fill), the `quereus_effective_lens` introspection
  * TVF, and DDL round-trip. Read-correct only — write enforcement of attached
  * logical constraints is the prover ticket's concern.
  */
@@ -105,27 +105,8 @@ describe('lens overrides: sparse rename + gap-fill', () => {
 	});
 });
 
-describe('lens overrides: hiding', () => {
-	it('hide-via-`hiding` omits the column from select * and resolution', async () => {
-		const db = new Database();
-		try {
-			await db.exec('declare schema y { table CarCore { id integer primary key, name text } }');
-			await db.exec('apply schema y');
-			await db.exec("insert into y.CarCore values (1, 'ka')");
-
-			await db.exec('declare logical schema x { table Car { id integer primary key, name text, maxSpeed integer } }');
-			await db.exec('declare lens for x over y { view Car as select id, name from y.CarCore hiding (maxSpeed) }');
-			await db.exec('apply schema x');
-
-			expect(db.schemaManager.getView('x', 'Car')!.columns).to.deep.equal(['id', 'name']);
-			expect(await rows(db, 'select * from x.Car')).to.deep.equal([{ id: 1, name: 'ka' }]);
-			await expectThrows(() => db.exec('select maxSpeed from x.Car'), /maxSpeed|column/i);
-		} finally {
-			await db.close();
-		}
-	});
-
-	it('hide-via-gap-fill trap: an uncovered column the basis cannot back errors, naming it', async () => {
+describe('lens overrides: coverage', () => {
+	it('an uncovered logical column the basis cannot back errors, naming it', async () => {
 		const db = new Database();
 		try {
 			await db.exec('declare schema y { table CarCore { id integer primary key } }');
@@ -268,20 +249,6 @@ describe('lens overrides: body-shape validation', () => {
 			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
 			await db.exec('declare lens for x over y { view Car as select id, speed * 2 from y.CarCore }');
 			await expectThrows(() => db.exec('apply schema x'), /computed projection term|no output name|add an alias/i);
-		} finally {
-			await db.close();
-		}
-	});
-
-	// Defect 4: a `hiding (...)` name matching no logical column is a silent no-op.
-	it('errors on a hiding name that matches no logical column, naming it', async () => {
-		const db = new Database();
-		try {
-			await db.exec('declare schema y { table CarCore { id integer primary key, color text } }');
-			await db.exec('apply schema y');
-			await db.exec('declare logical schema x { table Car { id integer primary key, color text } }');
-			await db.exec('declare lens for x over y { view Car as select id, color from y.CarCore hiding (colour) }');
-			await expectThrows(() => db.exec('apply schema x'), /hides unknown column 'colour'|unknown column.*colour/i);
 		} finally {
 			await db.close();
 		}
@@ -474,8 +441,8 @@ describe('lens overrides: quereus_effective_lens', () => {
 			await db.exec('apply schema y');
 			await db.exec("insert into y.CarCore values (1, 120, 'red')");
 
-			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer, color text, note text } }');
-			await db.exec('declare lens for x over y { view Car as select id, speed as maxSpeed from y.CarCore hiding (note) }');
+			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer, color text } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed as maxSpeed from y.CarCore }');
 			await db.exec('apply schema x');
 
 			const provenance = await rows(db, "select logical_column, source from quereus_effective_lens('x', 'Car') order by logical_column");
@@ -483,7 +450,6 @@ describe('lens overrides: quereus_effective_lens', () => {
 				{ logical_column: 'color', source: 'default' },   // gap-filled
 				{ logical_column: 'id', source: 'override' },      // covered
 				{ logical_column: 'maxSpeed', source: 'override' },// covered (renamed)
-				{ logical_column: 'note', source: 'hidden' },      // hiding(note)
 			]);
 
 			const sqlRows = await rows(db, "select distinct effective_sql from quereus_effective_lens('x', 'Car')");
@@ -507,17 +473,15 @@ describe('lens overrides: quereus_effective_lens', () => {
 
 describe('lens overrides: DDL round-trip', () => {
 	it('round-trips `declare lens` through stringify + reparse (equal AST + hash)', () => {
-		const sql = "declare lens for x over y { view Car as select id, speed as maxSpeed from y.CarCore hiding (note); view U as select * from y.U where active = 1 }";
+		const sql = "declare lens for x over y { view Car as select id, speed as maxSpeed from y.CarCore; view U as select * from y.U where active = 1 }";
 		const ast1 = new Parser().parseAll(sql)[0] as AST.DeclareLensStmt;
 		expect(ast1.type).to.equal('declareLens');
 		expect(ast1.logicalSchema).to.equal('x');
 		expect(ast1.basisSchema).to.equal('y');
 		expect(ast1.overrides.length).to.equal(2);
-		expect(ast1.overrides[0].hiding).to.deep.equal(['note']);
 
 		const emitted = astToString(ast1);
 		expect(emitted.toLowerCase()).to.match(/declare\s+lens\s+for\s+x\s+over\s+y/);
-		expect(emitted.toLowerCase()).to.contain('hiding (note)');
 
 		const ast2 = new Parser().parseAll(emitted)[0] as AST.DeclareLensStmt;
 		expect(ast2.overrides.length).to.equal(2);

@@ -976,7 +976,7 @@ await db.exec('apply schema app');
 await db.exec(`insert into app.Person (id, fullName, color) values (1, 'Bob', 'green')`);
 ```
 
-- Columns a lens override does not cover are gap-filled by the default name-based mapper; `hiding (...)` omits columns.
+- Columns a lens override does not cover are gap-filled by the default name-based mapper; every logical column must end up mapped to basis (an uncovered column the basis cannot back is a compile error).
 - The logical schema's constraints are enforced at the lens boundary (row-local checks, foreign keys, and uniqueness — see [Lenses](lens.md)).
 - Inspect the composed mapping with `select * from quereus_effective_lens('app', 'Person')`.
 

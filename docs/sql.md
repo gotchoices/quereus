@@ -1372,7 +1372,7 @@ A **logical schema** is an embodiment-free design — tables, types, and logical
 declare logical schema schema_name { table_item* assertion_item* ... }
 
 declare lens for logical_schema over basis_schema {
-  view logical_table as select_expr [hiding (column[, ...])];
+  view logical_table as select_expr;
   ...
 }
 
@@ -1380,7 +1380,7 @@ apply schema logical_schema;   -- compiles + deploys the lens-backed views
 ```
 
 - A `logical` schema rejects `using module(...)`, indexes, and physical storage constructs at build time; tags are allowed (engine-facing metadata).
-- A `declare lens` block supplies **sparse overrides** — only the deviations (rename, hide, compute, filter). Columns an override does not cover are gap-filled by the default name-based mapper. `hiding (...)` omits logical columns from the effective body and the registered view's column list.
+- A `declare lens` block supplies **sparse overrides** — only the deviations (rename, compute, filter). Columns an override does not cover are gap-filled by the default name-based mapper; every logical column must end up mapped to basis (an uncovered column the basis cannot back is a compile error).
 - A lens override body must be a single `select` whose `from` sources live in the declared basis (compound set-operations and cross-basis re-anchoring are rejected).
 - The logical spec's constraints are **attached** at the lens boundary and enforced per class — row-local (`not null`, `check`) and foreign keys (child- and parent-side, incl. cascade actions) are live; `unique` / primary keys enforce row-time when a basis covering materialized view answers the key, else commit-time detection.
 
@@ -3854,8 +3854,7 @@ declare_schema_stmt = "declare" [ "logical" ] "schema" schema_name
                       "{" { schema_item } "}" ;
 
 declare_lens_stmt  = "declare" "lens" "for" schema_name "over" schema_name
-                     "{" { "view" table_name "as" select_stmt
-                           [ "hiding" "(" column_name { "," column_name } ")" ] [ ";" ] } "}" ;
+                     "{" { "view" table_name "as" select_stmt [ ";" ] } "}" ;
 
 schema_option      = identifier "=" string_literal ;
 

@@ -118,7 +118,6 @@ export function deployLogicalSchema(
 
 		let compiledBody: AST.SelectStmt;
 		let provenance: LensColumnProvenance[];
-		let hiding: ReadonlySet<string> | undefined;
 		let effectiveColumns: string[];
 		// Whether the body came from `compileDecompositionBody` (the synthesized
 		// n-way decomposition). Only that body actually carries the advertised
@@ -129,7 +128,6 @@ export function deployLogicalSchema(
 			const merged = compileOverrideBody(logicalTable, logicalSchemaName, basis.schemaName, schemaManager, override, advertisement);
 			compiledBody = merged.body;
 			provenance = merged.provenance;
-			hiding = merged.hiding.size > 0 ? merged.hiding : undefined;
 			effectiveColumns = merged.effectiveColumns;
 			// Override ⊕ advertisement composition (docs/lens.md § Override-vs-advertisement):
 			// a *sparse* override (one that relies on gap-fill) must not re-anchor or
@@ -180,7 +178,6 @@ export function deployLogicalSchema(
 			logicalTable,
 			defaultBasis: { schemaName: basis.schemaName },
 			override: override?.select,
-			hiding,
 			compiledBody,
 			columnProvenance: provenance,
 			attachedConstraints: buildLogicalConstraints(logicalTable),
@@ -222,7 +219,7 @@ export function deployLogicalSchema(
 			sql: astToString(compiledBody),
 			selectAst: compiledBody,
 			// Pin the consumer-facing column names to the *logical* declaration
-			// (the contract, minus hidden columns), independent of the basis
+			// (the contract), independent of the basis
 			// column casing. Equivalent to `create view T(<logical cols>) as
 			// <body>`: `select * from X.T` then surfaces the logical names, not
 			// whatever the basis happens to spell them. Write-through is
@@ -285,7 +282,7 @@ function formatProveErrors(logicalSchemaName: string, errors: ReadonlyArray<Lens
 
 /**
  * Builds the {@link LensDeploymentSnapshot} for a just-completed deploy: per
- * logical table, the compiled get-body, its non-hidden logical columns, and the
+ * logical table, the compiled get-body, its logical columns, and the
  * per-column basis backing (relation + column) derived from the effective body.
  * Also records `basisHash = computeSchemaHash(basis declared schema)` — the
  * migration-safety record. An empty deploy (every logical table removed, no
@@ -309,7 +306,7 @@ function buildDeploymentSnapshot(
 	if (basis) {
 		for (const { slot } of compiled) {
 			const relationBacking = deriveRelationBacking(slot.compiledBody, slot.columnProvenance, basis, db.schemaManager);
-			const logicalColumns = slot.columnProvenance.filter(p => p.source !== 'hidden').map(p => p.logicalColumn);
+			const logicalColumns = slot.columnProvenance.map(p => p.logicalColumn);
 			const surrogateMemberKeys = deriveSurrogateMemberKeys(slot, basis);
 			tables.set(slot.logicalTable.name.toLowerCase(), {
 				logicalTable: slot.logicalTable.name,
@@ -348,7 +345,7 @@ function requiredBasisColumnsOf(table: TableSchema): string[] {
  * for one compiled effective body — the record a later re-decomposition diffs and
  * backfills (docs/lens.md § The deployed basis representation). Two contributions:
  *
- * 1. **Projection.** The body's projection is exactly the non-hidden logical
+ * 1. **Projection.** The body's projection is exactly the logical
  *    columns, in declaration order (see `compileDefaultBody` / `compileOverrideBody`);
  *    each plain column reference resolves to its FROM source. A computed
  *    (non-column) projection has no single basis backing and is omitted.
@@ -390,8 +387,7 @@ function deriveRelationBacking(
 
 	// 1. Projection.
 	const projected: Array<{ logical: string; src: OverrideSource; basisColumn: string }> = [];
-	const nonHidden = provenance.filter(p => p.source !== 'hidden');
-	for (let i = 0; i < nonHidden.length && i < body.columns.length; i++) {
+	for (let i = 0; i < provenance.length && i < body.columns.length; i++) {
 		const rc = body.columns[i];
 		if (rc.type !== 'column') continue;
 		const expr = rc.expr;
@@ -399,8 +395,8 @@ function deriveRelationBacking(
 		const colExpr = expr as AST.ColumnExpr;
 		const src = colExpr.table ? byRef.get(colExpr.table.toLowerCase()) : single;
 		if (!src) continue; // unqualified ref over a multi-source FROM, or an opaque source
-		projected.push({ logical: nonHidden[i].logicalColumn, src, basisColumn: colExpr.name });
-		add(src, colExpr.name, nonHidden[i].logicalColumn);
+		projected.push({ logical: provenance[i].logicalColumn, src, basisColumn: colExpr.name });
+		add(src, colExpr.name, provenance[i].logicalColumn);
 	}
 
 	// 2. Shared join keys — thread each equated key column to a projected logical column.
@@ -1174,14 +1170,14 @@ interface OverrideSource {
  * Composes one effective **read** body for a logical table that has a
  * `declare lens` override, per docs/lens.md § D2:
  *
- *   covered columns (override projection) ⊕ default-mapper gap-fill ⊖ hidden.
+ *   covered columns (override projection) ⊕ default-mapper gap-fill.
  *
  * Coverage is read **by name** from the override's output column names (alias or
- * bare name, and `*`-expansion of FROM-source columns). Each uncovered,
- * non-hidden logical column is gap-filled from a same-named basis column of the
- * override's FROM. When a gap is not reachable from the FROM (the hide-via-
- * gap-fill trap, or a partial cross-basis join), the compile errors rather than
- * emit an unsound body. The composition is recomputed on every deploy.
+ * bare name, and `*`-expansion of FROM-source columns). Each uncovered logical
+ * column is gap-filled from a same-named basis column of the override's FROM.
+ * When a gap is not reachable from the FROM (basis lacks the column, or a partial
+ * cross-basis join), the compile errors rather than emit an unsound body — every
+ * logical column must map to basis. The composition is recomputed on every deploy.
  */
 function compileOverrideBody(
 	logicalTable: TableSchema,
@@ -1190,7 +1186,7 @@ function compileOverrideBody(
 	schemaManager: SchemaManager,
 	override: AST.LensOverride,
 	advertisement?: MappingAdvertisement,
-): { body: AST.SelectStmt; provenance: LensColumnProvenance[]; hiding: ReadonlySet<string>; effectiveColumns: string[] } {
+): { body: AST.SelectStmt; provenance: LensColumnProvenance[]; effectiveColumns: string[] } {
 	const select = override.select;
 	const logicalName = logicalTable.name;
 
@@ -1198,20 +1194,6 @@ function compileOverrideBody(
 	// override referencing a *different* existing schema (e.g. `Z.Foo` while the
 	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
 	validateOverrideBasisSources(select, basisSchemaName, logicalSchemaName, logicalName);
-
-	const hidden = new Set((override.hiding ?? []).map(h => h.toLowerCase()));
-	// `hiding (...)` names that match no logical column are silently a no-op (a
-	// typo hides nothing). Validate against the logical columns, preserving the
-	// author's spelling in the message.
-	const logicalColumnNames = new Set(logicalTable.columns.map(c => c.name.toLowerCase()));
-	for (const h of override.hiding ?? []) {
-		if (!logicalColumnNames.has(h.toLowerCase())) {
-			throw new QuereusError(
-				`lens: override for logical table '${logicalSchemaName}.${logicalName}' hides unknown column '${h}'; it matches no column of the logical table`,
-				StatusCode.ERROR,
-			);
-		}
-	}
 
 	// Resolve FROM-source basis tables once — used for both `*` expansion and
 	// gap-fill. Opaque sources (subquery / function / unresolvable table) are
@@ -1273,10 +1255,6 @@ function compileOverrideBody(
 	const effectiveColumns: string[] = [];
 	for (const col of logicalTable.columns) {
 		const key = col.name.toLowerCase();
-		if (hidden.has(key)) {
-			provenance.push({ logicalColumn: col.name, source: 'hidden' });
-			continue;
-		}
 		const coveredExpr = coverage.get(key);
 		if (coveredExpr !== undefined) {
 			composed.push({ type: 'column', expr: coveredExpr, alias: col.name });
@@ -1324,7 +1302,7 @@ function compileOverrideBody(
 	// order/limit/distinct/with — the filter shape, etc.); replace only the
 	// projection with the composed logical-column list.
 	const body: AST.SelectStmt = { ...select, columns: composed };
-	return { body, provenance, hiding: hidden, effectiveColumns };
+	return { body, provenance, effectiveColumns };
 }
 
 /** Walks an override's FROM tree, collecting introspectable basis-table sources. */
@@ -1439,7 +1417,7 @@ function gapFillRef(colName: string, sources: ReadonlyArray<OverrideSource>, qua
 	return undefined;
 }
 
-/** Diagnostic for an uncovered, non-hidden logical column the FROM can't gap-fill. */
+/** Diagnostic for an uncovered logical column the FROM can't gap-fill. */
 function gapFillError(
 	logicalSchemaName: string,
 	logicalName: string,
@@ -1452,10 +1430,10 @@ function gapFillError(
 		: `basis source(s) ${sources.map(s => s.table.name).join(', ')} have no column '${colName}'`;
 	if (sources.length > 1 || hasOpaqueSource) {
 		// Cross-basis / partial-coverage fidelity boundary (docs/lens.md § D2).
-		return `lens: override for logical table '${logicalSchemaName}.${logicalName}' covers only some columns; uncovered column '${colName}' is not reachable from the override's FROM (${sourceDesc}) — it would need a basis source the v1 single-source mapper cannot join in. Cover it explicitly or list it in hiding(...)`;
+		return `lens: override for logical table '${logicalSchemaName}.${logicalName}' covers only some columns; uncovered column '${colName}' is not reachable from the override's FROM (${sourceDesc}) — it would need a basis source the single-source mapper cannot join in. Cover it explicitly.`;
 	}
-	// Single-source hide-via-gap-fill trap (docs/lens.md § D3).
-	return `lens: override for logical table '${logicalSchemaName}.${logicalName}' leaves column '${colName}' uncovered and ${sourceDesc} to gap-fill from (the hide-via-gap-fill trap) — add it to the override projection or list it in hiding(...)`;
+	// Every logical column must map to basis (docs/lens.md § Gap-fill fidelity boundary).
+	return `lens: override for logical table '${logicalSchemaName}.${logicalName}' leaves column '${colName}' uncovered and ${sourceDesc} to gap-fill it from — cover it explicitly in the override projection (every logical column must map to basis).`;
 }
 
 // ===========================================================================
@@ -1757,7 +1735,6 @@ function annotateProvenanceWithAdvertisement(
 	const eavMembers = storage.members.filter(m => m.attributePivot);
 	const soleEav = eavMembers.length === 1 ? eavMembers[0].relationId : undefined;
 	for (const p of provenance) {
-		if (p.source === 'hidden') continue;
 		const explicit = backedBy.get(p.logicalColumn.toLowerCase());
 		if (explicit && explicit !== 'ambiguous') {
 			p.advertisedBy = explicit;
