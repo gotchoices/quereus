@@ -5,7 +5,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -78,9 +78,14 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 			? analyzeJoinView(ctx, view)
 			: undefined;
 
+	// Cross-source SET values (`update v set a.x = b.y`) the multi-source UPDATE lowers
+	// to a correlated read of the captured partner column accumulate here, then thread
+	// into the identity capture so the same `__vmupd_keys` set carries them (§ Inner
+	// Join). Empty for delete / single-source / decomposition.
+	const sourceValues: CrossSourceValue[] = [];
 	let baseOps: BaseOp[];
 	if (msAnalysis && req.op === 'update') {
-		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, tags);
+		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, tags, sourceValues);
 	} else if (msAnalysis && req.op === 'delete') {
 		baseOps = decomposeDelete(ctx, view, msAnalysis, req.stmt, tags);
 	} else {
@@ -127,7 +132,7 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// rewrite a predicate column — out from under the second op's identifying
 	// subquery), and the UPDATE RETURNING re-query re-projects by captured identity.
 	// Built once and shared.
-	const keyCapture = buildIdentityCapture(ctx, view, req, baseOps, msAnalysis);
+	const keyCapture = buildIdentityCapture(ctx, view, req, baseOps, msAnalysis, sourceValues);
 	// EVERY multi-source update/delete base op now resolves `select k<side> from
 	// __vmupd_keys` against the context-backed key relation (single-side and both-sides
 	// alike — the live join-body subquery is retired), so inject a fresh key ref per op
@@ -169,6 +174,12 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
  * joined row by all sides' keys, so it needs a key on each side even when only one side
  * is assigned (matching the retired path, whose RETURNING capture also projected both
  * sides' PKs). Composite-PK sides contribute one capture column per PK column.
+ *
+ * `sourceValues` carries any cross-source SET reads `decomposeUpdate` lowered (the
+ * partner base columns a `set a.x = b.y` reads); they ride the SAME capture as extra
+ * `srcN` projections (so a single-side cross-source update — which previously needed no
+ * capture distinct from the unified one — still materializes it once with the read
+ * column). Empty for delete.
  */
 function buildIdentityCapture(
 	ctx: PlanningContext,
@@ -176,13 +187,14 @@ function buildIdentityCapture(
 	req: MutationRequest,
 	baseOps: readonly BaseOp[],
 	analysis: JoinViewAnalysis | undefined,
+	sourceValues: readonly CrossSourceValue[],
 ): MultiSourceKeyCapture | undefined {
 	if (!analysis) return undefined; // only multi-source update/delete thread an analysis
 	switch (req.op) {
 		case 'update': {
 			const hasReturning = !!req.stmt.returning && req.stmt.returning.length > 0;
 			const sides = hasReturning ? analysis.sides.map((_, i) => i) : capturedSideIndices(baseOps, analysis);
-			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where, analysis, sides);
+			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where, analysis, sides, sourceValues);
 		}
 		case 'delete':
 			return buildMultiSourceKeyCapture(ctx, view, req.stmt.where, analysis, capturedSideIndices(baseOps, analysis));

@@ -845,7 +845,22 @@ function guardTopLevelScope(expr: AST.Expression, analysis: JoinViewAnalysis, vi
 
 // --- UPDATE ---------------------------------------------------------------
 
-export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap): BaseOp[] {
+/**
+ * A partner-side base column a cross-source SET value reads (`update v set a.x = b.y`),
+ * captured into `__vmupd_keys` so the lowered single-table UPDATE can read it back. The
+ * `expr` is the read column in base terms (alias-qualified — `b.y`), projected into the
+ * capture over the join body's scope under the stable `alias` (`src0`, `src1`, …); the
+ * rewritten value (`select <alias> from __vmupd_keys k where <ownerPk = capture>`) reads
+ * it correlated by the owning side's PK. Because the capture materializes **before** any
+ * base op fires, the read-back value is the **pre-mutation** partner value — robust to a
+ * both-sides update that also rewrites it (docs/view-updateability.md § Inner Join).
+ */
+export interface CrossSourceValue {
+	readonly alias: string;
+	readonly expr: AST.Expression;
+}
+
+export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap, sourceValues?: CrossSourceValue[]): BaseOp[] {
 	// RETURNING through a multi-source update is supported, but the rows are not
 	// recoverable from the per-side base ops (the view row spans both tables), so
 	// the builder (`view-mutation-builder.ts`) supplies them via a re-query of the
@@ -860,6 +875,26 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// Scope guard: top-level `where` references must name view columns (parity with
 	// the single-source spine — a base-only name must not leak through the join body).
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
+
+	// Cross-source SET values (`set a.x = b.y`) ride the same `__vmupd_keys` capture:
+	// each partner-side base column the SET reads is projected into the capture under a
+	// stable `srcN` alias, and the reference is rewritten to a correlated scalar read of
+	// it (keyed by the owning side's PK). The carrier is the `sourceValues` out-param the
+	// builder threads into `buildMultiSourceKeyCapture`; absent it (the legacy
+	// `propagateMultiSource` path, unreachable from build) cross-source values stay
+	// rejected by `stripSideQualifier`'s throw.
+	const srcDedup = new Map<string, string>();
+	const registerCrossSource = sourceValues
+		? (col: AST.ColumnExpr): string => {
+			const key = `${(col.table ?? '').toLowerCase()}.${col.name.toLowerCase()}`;
+			const existing = srcDedup.get(key);
+			if (existing) return existing;
+			const alias = `src${sourceValues.length}`;
+			srcDedup.set(key, alias);
+			sourceValues.push({ alias, expr: { type: 'column', name: col.name, table: col.table } });
+			return alias;
+		}
+		: undefined;
 
 	// Route each assignment to its owning base side (one entry per side, index 0..n-1).
 	const perSide: Array<{ column: string; value: AST.Expression }[]> = analysis.sides.map(() => []);
@@ -883,14 +918,21 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// otherwise re-bind in that table; across sides it would fail to resolve with a
 		// generic error — the structured guard makes the diagnostic uniform either way.
 		guardTopLevelScope(asg.value, analysis, view);
+		// Gate cross-source reads: a value that reads a partner-side view column is
+		// admitted only when that column has `base` lineage (its value is recoverable
+		// from a captured base column). A computed (non-base) partner column stays
+		// rejected (`no-inverse`); a same-side read keeps the qualifier-strip path. Run
+		// only when a capture carrier is threaded — the legacy path rejects wholesale.
+		if (registerCrossSource) gateCrossSourceReads(asg.value, out.sideIndex, analysis, view);
 		const side = analysis.sides[out.sideIndex];
 		const others = analysis.sides.filter((_, i) => i !== out.sideIndex);
 		// Rewrite the assigned value into base terms, then strip the owning side's
-		// qualifier (the base UPDATE targets that table directly). A reference to
-		// any OTHER side cannot be expressed as a single-table SET — reject.
+		// qualifier (the base UPDATE targets that table directly). A reference to a
+		// partner side is rewritten to a correlated read of its captured pre-mutation
+		// value (`registerCrossSource`); absent the carrier it is rejected.
 		const baseValue = stripSideQualifier(
 			substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view),
-			view, side, others,
+			view, side, out.sideIndex, others, registerCrossSource,
 		);
 		// For an `inverse`-profile column the assigned value is in the VIEW domain;
 		// apply the site's inverse to recover the BASE value (`cv1 = cv + 1` ⇒ the
@@ -1071,6 +1113,7 @@ export function buildMultiSourceKeyCapture(
 	where: AST.Expression | undefined,
 	analysis: JoinViewAnalysis,
 	sideIndices: readonly number[],
+	sourceValues?: readonly CrossSourceValue[],
 ): MultiSourceKeyCapture {
 	// The identifying predicate (user WHERE → base terms ∧ the body's own WHERE), built
 	// as a ScalarPlanNode over the planned join body's own scope — the exact scope
@@ -1101,6 +1144,18 @@ export function buildMultiSourceKeyCapture(
 			});
 		});
 	}
+
+	// Cross-source SET read values: project each partner base column the SET reads under
+	// its stable `srcN` alias (over the same join-body scope), so every per-side base op's
+	// correlated `select srcN from __vmupd_keys k where …` reads the captured pre-mutation
+	// value. Appended AFTER the per-side PK columns, positionally aligned with the readers'
+	// `keyColumns` (which are pushed in the same order).
+	for (const sv of sourceValues ?? []) {
+		const node = buildExpression({ ...ctx, scope: analysis.joinScope }, sv.expr);
+		keyColumns.push({ name: sv.alias, type: node.getType() });
+		projections.push({ node, alias: sv.alias });
+	}
+
 	const source = new ProjectNode(analysis.joinScope, filtered, projections, undefined, undefined, false);
 
 	return { source, descriptor: {}, keyColumns };
@@ -1536,24 +1591,34 @@ function substituteViewColumns(
 }
 
 /**
- * Strip the owning side's alias qualifier from a base-term assignment value (so
- * it targets the single-table UPDATE directly), rejecting any reference to **any
- * other side** (which a single-table SET cannot express). The strip is threaded
- * into any subquery embedded in the value (the qualifier rule is purely about a
- * column's own table qualifier, so it applies uniformly at every nesting depth);
- * a nested owning-side reference is correlated to the target row of the lowered
- * UPDATE just like a top-level one.
+ * Strip the owning side's alias qualifier from a base-term assignment value (so it
+ * targets the single-table UPDATE directly). A reference to **any other side** cannot
+ * be expressed as a single-table SET, so it is either captured-and-rewritten (when a
+ * `registerCrossSource` carrier is supplied — § Inner Join, cross-source `set`) or
+ * rejected (`cross-source-assignment`, the legacy path). The strip is threaded into any
+ * subquery embedded in the value (the qualifier rule is purely about a column's own
+ * table qualifier, so it applies uniformly at every nesting depth); a nested owning-side
+ * reference is correlated to the target row of the lowered UPDATE just like a top-level
+ * one.
  *
- * The owning-side qualifier set is checked **first**, so a self-join (where an
- * `other` side shares the owning side's table name) still strips an owning-alias
- * reference; only a reference qualified by a *different alias* is the cross-source
- * reject.
+ * The owning-side qualifier set is checked **first**, so a self-join (where an `other`
+ * side shares the owning side's table name) still strips an owning-alias reference; only
+ * a reference qualified by a *different alias* is the cross-source case.
+ *
+ * A cross-source read is rewritten to `(select <srcN> from __vmupd_keys k where
+ * k.k<owningSide>_0 = <pk0> [and …])`: `registerCrossSource` projects the partner column
+ * into the capture under `srcN` and returns the alias; the unqualified `<pk_j>` bind to
+ * the lowered UPDATE's own target row, so each row reads the captured pre-mutation
+ * partner value of its joined row. The cross-source gate (`gateCrossSourceReads`) has
+ * already proved every reached partner column has `base` lineage.
  */
 function stripSideQualifier(
 	expr: AST.Expression,
 	view: MutableViewLike,
 	owning: JoinSide,
+	owningSideIndex: number,
 	others: readonly JoinSide[],
+	registerCrossSource: ((col: AST.ColumnExpr) => string) | undefined,
 ): AST.Expression {
 	const owningQuals = new Set([owning.alias, owning.schema.name.toLowerCase()]);
 	const otherQuals = new Set<string>();
@@ -1561,21 +1626,112 @@ function stripSideQualifier(
 		otherQuals.add(o.alias);
 		otherQuals.add(o.schema.name.toLowerCase());
 	}
+	// The owning side's PK — the correlation a captured cross-source read binds on.
+	// Resolved lazily (only a cross-source rewrite needs it).
+	let owningPk: readonly string[] | undefined;
 	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
 		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
 		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		if (otherQuals.has(t)) {
-			raiseMutationDiagnostic({
-				reason: 'cross-source-assignment',
-				column: col.name,
-				table: view.name,
-				message: `cannot write through view '${view.name}': an update value references column '${col.name}' on a different base table than the column it assigns; cross-source assignment is not supported`,
-			});
+			if (!registerCrossSource) {
+				raiseMutationDiagnostic({
+					reason: 'cross-source-assignment',
+					column: col.name,
+					table: view.name,
+					message: `cannot write through view '${view.name}': an update value references column '${col.name}' on a different base table than the column it assigns; cross-source assignment is not supported`,
+				});
+			}
+			const srcAlias = registerCrossSource(col);
+			owningPk ??= requireKeyColumns(view, owning);
+			return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
 		}
 		return undefined;
 	};
 	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
+}
+
+/**
+ * The correlated scalar read a cross-source SET value lowers to:
+ * `(select <srcAlias> from __vmupd_keys k where k.k<owningSide>_0 = <pk0> [and …])`
+ * — `<srcAlias>` is the capture projection of the partner base column; the unqualified
+ * `<pk_j>` bind to the lowered UPDATE's own target row (the owning side), matching the
+ * per-side identifying EXISTS so each target row reads the captured pre-mutation partner
+ * value of its joined row. Composite owning keys conjoin one equality per PK column.
+ */
+function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[]): AST.Expression {
+	const conds = owningPk.map((pk, j): AST.Expression => ({
+		type: 'binary',
+		operator: '=',
+		left: { type: 'column', name: keyColumnName(owningSideIndex, j), table: 'k' },
+		right: { type: 'column', name: pk },
+	}));
+	return {
+		type: 'subquery',
+		query: {
+			type: 'select',
+			columns: [{ type: 'column', expr: { type: 'column', name: srcAlias, table: 'k' } }],
+			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
+		},
+	};
+}
+
+/**
+ * Reject a cross-source value read whose partner-side view column is **not** `base`
+ * (computed / non-invertible) — its value is not recoverable from a captured base
+ * column, so the cross-source rewrite cannot carry it (`no-inverse`; an outer-join
+ * `null-extended` partner is already rejected wholesale upstream). A same-side read (the
+ * column reads only the assigned side) is left to the qualifier strip; a `base` partner
+ * column is admitted and captured. Walks only the value's top-level column references
+ * (the scope `guardTopLevelScope` already proved are view columns); a reference nested in
+ * a value subquery is left to the qualifier strip's per-leaf handling.
+ */
+function gateCrossSourceReads(value: AST.Expression, owningSideIndex: number, analysis: JoinViewAnalysis, view: MutableViewLike): void {
+	forEachTopLevelColumnRef(value, (col) => {
+		const vco = analysis.outColumns.find(c => c.name === col.name.toLowerCase());
+		if (!vco) return; // guardTopLevelScope already proved top-level refs are view columns
+		const readSides = viewColumnReadSides(vco, analysis);
+		const crossSource = [...readSides].some(s => s !== owningSideIndex);
+		if (crossSource && !vco.writable) {
+			raiseMutationDiagnostic({
+				reason: 'no-inverse',
+				column: vco.displayName,
+				table: view.name,
+				message: `cannot write through view '${view.name}': the update value reads computed column '${vco.displayName}' on a different base table than the column it assigns; a cross-source read requires the partner column to have base lineage`,
+			});
+		}
+	});
+}
+
+/**
+ * The set of join-side indices a view column's value reads. A `base` site reads only
+ * its owning side; a computed site reads every side its base-term expression's column
+ * leaves resolve to (so a same-side computed read stays admissible while a cross-source
+ * computed read is rejected).
+ */
+function viewColumnReadSides(vco: OutColumn, analysis: JoinViewAnalysis): Set<number> {
+	if (vco.writable && vco.sideIndex !== undefined) return new Set([vco.sideIndex]);
+	const sides = new Set<number>();
+	const expr = analysis.viewColToBaseRef.get(vco.name);
+	if (expr) {
+		forEachColumnRefDeep(expr, (col) => {
+			const s = resolveColumnSide(col, analysis.sides);
+			if (s !== undefined) sides.add(s);
+		});
+	}
+	return sides;
+}
+
+/** Observe every TOP-LEVEL column reference in an expression (no subquery descent). */
+function forEachTopLevelColumnRef(expr: AST.Expression, fn: (col: AST.ColumnExpr) => void): void {
+	transformExpr(expr, (col) => { fn(col); return undefined; });
+}
+
+/** Observe every column reference in an expression, descending into subqueries. */
+function forEachColumnRefDeep(expr: AST.Expression, fn: (col: AST.ColumnExpr) => void): void {
+	const observe = (col: AST.ColumnExpr): AST.Expression | undefined => { fn(col); return undefined; };
+	transformExpr(expr, observe, (q) => mapQueryExprUniform(q, observe));
 }
 
 // --- helpers --------------------------------------------------------------

@@ -560,10 +560,29 @@ update ax_jv_simpside set note = 'm' where sid = 10;
 select sid, note, lbl from ax_jv_simpside order by sid;
 → [{"sid":10,"note":"m","lbl":"L1"}]
 
--- Cross-source SET value (assign a column from the other base table) -> rejected.
+-- Cross-source SET value (assign from the OTHER base table) -> now ACCEPTED when the
+-- read column has `base` lineage: the partner value (p.pv) is projected into the
+-- __vmupd_keys capture under a `srcN` alias and read back correlated by the owning
+-- side's PK (the child's cid). For cid=2 (joined parent pid=20, pv=200) the child's
+-- cval becomes 200; cid=1 is untouched, and the parent base is unchanged.
+create table ax_xs_p (pid integer primary key, pv integer);
+create table ax_xs_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references ax_xs_p(pid));
+insert into ax_xs_p values (10, 100), (20, 200);
+insert into ax_xs_c values (1, 10, 1), (2, 20, 2);
 create view ax_jv_x as
-    select c.cid as cid, c.note as note, p.pv as pv from ax_child c join ax_parent p on p.pid = c.pref;
-update ax_jv_x set note = pv where cid = 2;
+    select c.cid as cid, c.cval as cval, p.pv as pv from ax_xs_c c join ax_xs_p p on p.pid = c.pref;
+update ax_jv_x set cval = pv where cid = 2;
+select cid, cval from ax_xs_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":200}]
+select pid, pv from ax_xs_p order by pid;
+→ [{"pid":10,"pv":100},{"pid":20,"pv":200}]
+
+-- ...but a cross-source value reading a COMPUTED (non-base) partner column stays
+-- rejected: its value is not recoverable from a captured base column.
+create view ax_jv_xc as
+    select c.cid as cid, c.cval as cval, (p.pv * 2) as pvc from ax_xs_c c join ax_xs_p p on p.pid = c.pref;
+update ax_jv_xc set cval = pvc where cid = 1;
 -- error: cannot write through
 
 -- Self-join body -> accepted: `e` and `m` are distinct aliases of one base table,

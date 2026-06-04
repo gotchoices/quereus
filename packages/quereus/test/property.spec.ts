@@ -3069,11 +3069,11 @@ describe('Property-Based Tests', () => {
 			// (live-subquery) path. Three adversarial interactions stay uncovered by it and are
 			// locked here: (1) an inverse side + an identity side in one statement routes
 			// through the eager `__vmupd_keys` capture (both-sides path) — the inverse must
-			// still apply per-side; (2) an inverse value that references the OTHER side must be
-			// rejected (`cross-source-assignment`) by the side-qualifier strip BEFORE the
-			// inverse wraps it; (3) RETURNING an inverse column re-queries the forward
-			// projection, so it surfaces the forward image, not the stored base value.
-			it('inverse column: both-sides capture path, cross-source reject, and forward-image RETURNING', async () => {
+			// still apply per-side; (2) an inverse value that references the OTHER side is now
+			// ADMITTED (cross-source) — the captured partner value rides `__vmupd_keys` and the
+			// inverse wraps the captured read; (3) RETURNING an inverse column re-queries the
+			// forward projection, so it surfaces the forward image, not the stored base value.
+			it('inverse column: both-sides capture path, inverse-wrapped cross-source read, and forward-image RETURNING', async () => {
 				await db.exec('pragma foreign_keys = false');
 				await db.exec('drop view if exists jv2');
 				await db.exec('drop table if exists jchild');
@@ -3096,10 +3096,16 @@ describe('Property-Based Tests', () => {
 				assertRowsEqual('both-sides+inverse view image', await readRows('select cc, cv1, pv from jv2 where cc = 5'),
 					[{ cc: 5, cv1: 9, pv: 30 }], ['cc', 'cv1', 'pv']);
 
-				// (2) an inverse value referencing the OTHER side: `pv` lives on jparent, so the
-				// side-qualifier strip rejects it (`cross-source-assignment`) before the inverse
-				// would wrap it — a cross-source ref never reaches the inverse closure.
-				await expectMutationReject('update jv2 set cv1 = pv + 1 where cc = 6', 'cross-source-assignment');
+				// (2) an inverse value referencing the OTHER side is now ADMITTED: `pv` (jparent,
+				// base lineage) rides the __vmupd_keys capture and the site's inverse wraps the
+				// captured read — `set cv1 = pv + 1` lowers to `cv = ((select src…) + 1) - 1`, so
+				// for cc=6 (joined parent pp=2, pv=20) the child stores cv = 20 and reads back
+				// cv1 = cv + 1 = 21. (Pre-cross-source this rejected `cross-source-assignment`.)
+				await db.exec('update jv2 set cv1 = pv + 1 where cc = 6');
+				assertRowsEqual('inverse+cross-source child', await readRows('select cc, cv from jchild where cc = 6'),
+					[{ cc: 6, cv: 20 }], ['cc', 'cv']);
+				assertRowsEqual('inverse+cross-source view image', await readRows('select cc, cv1, pv from jv2 where cc = 6'),
+					[{ cc: 6, cv1: 21, pv: 20 }], ['cc', 'cv1', 'pv']);
 
 				// (3) RETURNING through the inverse column surfaces the FORWARD image (cv + 1),
 				// not the stored base value: writing cv1 = 15 stores cv = 14 and returns cv1 = 15.
@@ -3108,6 +3114,81 @@ describe('Property-Based Tests', () => {
 					[{ cv1: 15 }], ['cv1']);
 				assertRowsEqual('inverse RETURNING stored base', await readRows('select cv from jchild where cc = 6'),
 					[{ cv: 14 }], ['cv']);
+			});
+
+			// ----- Family B (B2): cross-source `set` rides the key capture (PutGet + GetPut) -----
+			// `set cv = pv` reads the joined PARENT's pv into the CHILD's cv — a per-row value
+			// from the partner row a single-table UPDATE cannot express. The partner column
+			// (base lineage) is projected into `__vmupd_keys` under a `srcN` alias and read
+			// back correlated by the child's PK. PutGet: each matched joined child's cv becomes
+			// its parent's pv; unjoined/dangling and non-matched children, and the parent base,
+			// are untouched. GetPut: cv already equals pv, so re-running is a no-op on both bases.
+			it('PutGet/GetPut: cross-source set (cv = pv) copies the joined partner value', async () => {
+				await createJoinBase();
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					fc.integer({ min: 1, max: 9 }),   // cc predicate value K
+					async (parents, children, K) => {
+						const { parents: P, children: C } = await seedJoin(parents, children);
+						const ppSet = new Set(P.map(p => p.pp));
+						const pvByPp = new Map(P.map(p => [p.pp, p.pv]));
+						const joined = (c: Child): boolean => ppSet.has(c.pr);
+
+						await db.exec(`update jv set cv = pv where cc = ${K}`);
+
+						// The matched joined child's cv := its joined parent's pv; everything else
+						// (other children, dangling children, the parent base) untouched.
+						const expectedChild = C.map(c =>
+							(c.cc === K && joined(c)) ? { ...c, cv: pvByPp.get(c.pr)! } : c);
+						assertRowsEqual('cross-source child', await readRows('select cc, pr, cv from jchild'),
+							expectedChild.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), ['cc', 'pr', 'cv']);
+						assertRowsEqual('cross-source parent (untouched)', await readRows('select pp, pv from jparent'),
+							P.map(p => ({ pp: p.pp, pv: p.pv })), ['pp', 'pv']);
+
+						// GetPut: cv already equals pv for the matched row, so re-running the same
+						// cross-source set writes the read-back value and changes nothing.
+						const beforeC = await readRows('select cc, pr, cv from jchild');
+						const beforeP = await readRows('select pp, pv from jparent');
+						await db.exec(`update jv set cv = pv where cc = ${K}`);
+						assertRowsEqual('cross-source GetPut child', await readRows('select cc, pr, cv from jchild'), beforeC, ['cc', 'pr', 'cv']);
+						assertRowsEqual('cross-source GetPut parent', await readRows('select pp, pv from jparent'), beforeP, ['pp', 'pv']);
+					},
+				), { numRuns: 60 });
+			});
+
+			// ----- Family B (B2): both-sides + cross-source — the captured value is PRE-mutation -----
+			// `set cv = pv, pv = NV` in ONE statement: the child reads the joined parent's pv
+			// (cross-source) WHILE the parent's pv is rewritten to NV. The capture materializes
+			// the partner value BEFORE any base op fires (eager key materialization), so cv
+			// takes the PRE-mutation pv — NOT NV — even though the FK-parent (pv := NV) op runs
+			// first. Proves the cross-source value rides the same up-front capture as the keys.
+			it('both-sides + cross-source: cv := the PRE-mutation pv even as pv is rewritten', async () => {
+				await createJoinBase();
+				await fc.assert(fc.asyncProperty(
+					parentArb, childArb,
+					fc.integer({ min: 1, max: 9 }),    // cc predicate value K
+					fc.integer({ min: 30, max: 40 }),  // new pv value NV (disjoint from seeds 1..9)
+					async (parents, children, K, NV) => {
+						const { parents: P, children: C } = await seedJoin(parents, children);
+						const ppSet = new Set(P.map(p => p.pp));
+						const pvByPp = new Map(P.map(p => [p.pp, p.pv]));
+						const joined = (c: Child): boolean => ppSet.has(c.pr);
+						const target = C.find(c => c.cc === K && joined(c));
+
+						await db.exec(`update jv set cv = pv, pv = ${NV} where cc = ${K}`);
+
+						// child cv = the PRE-mutation parent pv (1..9), NOT NV (30..40).
+						const expectedChild = C.map(c =>
+							(c.cc === K && joined(c)) ? { ...c, cv: pvByPp.get(c.pr)! } : c);
+						assertRowsEqual('precedence child', await readRows('select cc, pr, cv from jchild'),
+							expectedChild.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), ['cc', 'pr', 'cv']);
+						// parent pv := NV for the matched row's parent; others untouched.
+						const expectedParent = P.map(p =>
+							(target && p.pp === target.pr) ? { ...p, pv: NV } : p);
+						assertRowsEqual('precedence parent', await readRows('select pp, pv from jparent'),
+							expectedParent.map(p => ({ pp: p.pp, pv: p.pv })), ['pp', 'pv']);
+					},
+				), { numRuns: 60 });
 			});
 
 			// ----- Multi-source insert: the shared-surrogate envelope (PutGet) -----
@@ -3522,6 +3603,7 @@ describe('Property-Based Tests', () => {
 				await db.exec('drop view if exists rj_self');
 				await db.exec('drop view if exists rj_star');
 				await db.exec('drop view if exists rj_comp');
+				await db.exec('drop view if exists rj_pc');
 				await db.exec('drop table if exists rjchild');
 				await db.exec('drop table if exists rjparent');
 				await db.exec('drop table if exists rjck');
@@ -3535,6 +3617,9 @@ describe('Property-Based Tests', () => {
 				await db.exec('create view rj_self as select a.cc as cc, b.cc as cc2 from rjchild a join rjchild b on a.pr = b.cc');
 				await db.exec('create view rj_star as select * from rjchild c join rjparent p on p.pp = c.pr');
 				await db.exec('create view rj_comp as select k.k1 as k1, k.v as v, p.pv as pv from rjck k join rjparent p on p.pp = k.k1');
+				// rj_pc exposes a COMPUTED partner column (p.pv * 2) — read-only lineage, so a
+				// cross-source value reading it cannot be carried by the capture (no base column).
+				await db.exec('create view rj_pc as select c.cc as cc, c.cv as cv, (p.pv * 2) as pvc from rjchild c join rjparent p on p.pp = c.pr');
 
 				// Composite-PK and self-join inner joins are now DECOMPOSABLE by the n-way
 				// substrate, so they ACCEPT rather than reject (flipped negatives); full
@@ -3544,10 +3629,21 @@ describe('Property-Based Tests', () => {
 				await db.exec('update rj_comp set v = 9 where k1 = 1');               // composite-PK side: accepted
 				await db.exec('update rj_self set cc2 = 9 where cc = 1');             // self-join: accepted
 
+				// Cross-source `set` (a value reading a partner-side BASE column) is now
+				// ADMITTED: the partner value rides the __vmupd_keys capture (flipped from a
+				// `cross-source-assignment` reject). Full PutGet/GetPut round-trip is pinned in
+				// the dedicated test below; smoke here that it no longer raises and copies the
+				// joined partner's pv onto the child's cv.
+				await db.exec('update rj_inner set cv = pv');
+				const xsRows = await readRows('select cc, cv, pv from rj_inner');
+				expect(xsRows.length, 'cross-source smoke needs a joined row').to.be.greaterThan(0);
+				for (const r of xsRows) expect(r.cv, 'cross-source set copied the joined pv into cv').to.equal(r.pv);
+
 				// Shapes still deferred reject with their precise diagnostic (no silent widen).
 				await expectMutationReject('insert into rj_outer (cc, cv, pv) values (2, 22, 222)', 'unsupported-join'); // outer-join insert
 				await expectMutationReject('update rj_star set cv = 9 where cc = 1', 'unsupported-join');                // select *
-				await expectMutationReject('update rj_inner set cv = pv where cc = 1', 'cross-source-assignment');       // cross-source set
+				await expectMutationReject('update rj_outer set cv = pv where cc = 1', 'unsupported-join');              // cross-source set through an OUTER join: still deferred
+				await expectMutationReject('update rj_pc set cv = pvc where cc = 1', 'no-inverse');                      // cross-source read of a COMPUTED partner column
 
 				// forward/backward lineage agreement on the ACCEPTED inner-join shape: every
 				// output column's derived backward lineage is base-writable and the forward key

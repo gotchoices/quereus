@@ -673,34 +673,39 @@ export class SchemaManager {
 		// is non-NULL.
 		await this.assertNoReferencingChildrenForDrop(schemaName, tableName);
 
-		// Remove any active connections for this table before destroying the module.
-		// Connections become stale once the table is dropped and must not be reused
-		// if the table is later recreated with the same name.
-		this.db.removeConnectionsForTable(schemaName, tableName);
-
-		let destroyPromise: Promise<void> | null = null;
-
-		// Call destroy on the module, providing table details
+		// Call destroy on the module FIRST, awaiting it and PROPAGATING any rejection,
+		// BEFORE any engine-side teardown. A module may veto the drop (e.g. a
+		// schema-level inbound-FK guard that an emptied child cannot satisfy); by
+		// awaiting destroy before mutating connection/schema state we make the veto
+		// abort the statement atomically — on rejection the table stays in our schema
+		// map AND in the module's own catalogue, since neither has been touched yet.
+		// Awaiting here (rather than after removeTable, as before) also preserves the
+		// original "subsequent DDL/DML sees a clean slate" intent: destroy still
+		// completes before dropTable returns, just without swallowing its error.
 		if (tableSchema.vtabModuleName) { // tableSchema is guaranteed to be defined here
 			const moduleRegistration = this.getModule(tableSchema.vtabModuleName);
 			if (moduleRegistration && moduleRegistration.module && moduleRegistration.module.destroy) {
 				log(`Calling destroy for VTab %s.%s via module %s`, schemaName, tableName, tableSchema.vtabModuleName);
-				destroyPromise = moduleRegistration.module.destroy(
+				await moduleRegistration.module.destroy(
 					this.db,
 					moduleRegistration.auxData,
 					tableSchema.vtabModuleName,
 					schemaName,
 					tableName
-				).catch(err => {
-					errorLog(`Error during VTab module destroy for %s.%s: %O`, schemaName, tableName, err);
-					// Potentially re-throw or handle as a critical error if destroy failure is problematic
-				});
+				);
+				log(`destroy completed for VTab %s.%s`, schemaName, tableName);
 			} else {
 				warnLog(`VTab module %s (for table %s.%s) or its destroy method not found during dropTable.`, tableSchema.vtabModuleName, schemaName, tableName);
 			}
 		}
 
-		// Remove from schema map immediately
+		// destroy succeeded (or the module had none) — now tear down engine-side state.
+		// Remove any active connections for this table before removing it from the
+		// schema map. Connections become stale once the table is dropped and must not
+		// be reused if the table is later recreated with the same name.
+		this.db.removeConnectionsForTable(schemaName, tableName);
+
+		// Remove from schema map
 		const removed = schema.removeTable(tableName);
 		if (!removed && !ifExists) {
 			// This should ideally not be reached if tableSchema was found above.
@@ -727,12 +732,6 @@ export class SchemaManager {
 					objectName: tableName,
 				});
 			}
-		}
-
-		// Await destruction so subsequent DDL/DML sees a clean slate
-		if (destroyPromise) {
-			await destroyPromise;
-			log(`destroy completed for VTab %s.%s`, schemaName, tableName);
 		}
 
 		return removed; // True if removed from schema, false if not found and ifExists was true.
