@@ -841,7 +841,7 @@ export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewS
 /** `using <module>(args)` clause for a materialized view, or '' when absent. */
 function mvModuleClauseToString(stmt: AST.CreateMaterializedViewStmt): string {
 	if (!stmt.moduleName) return '';
-	let s = `using ${stmt.moduleName}`;
+	let s = `using ${quoteIdentifier(stmt.moduleName)}`;
 	if (stmt.moduleArgs && Object.keys(stmt.moduleArgs).length > 0) {
 		const args = Object.entries(stmt.moduleArgs).map(([k, v]) =>
 			`${quoteIdentifier(k)} = ${JSON.stringify(v)}`
@@ -1245,7 +1245,7 @@ function tableBodyDefsToString(stmt: AST.CreateTableStmt): string {
 
 function moduleClauseToString(stmt: AST.CreateTableStmt): string {
 	if (!stmt.moduleName) return '';
-	let s = `using ${stmt.moduleName}`;
+	let s = `using ${quoteIdentifier(stmt.moduleName)}`;
 	if (stmt.moduleArgs && Object.keys(stmt.moduleArgs).length > 0) {
 		const args = Object.entries(stmt.moduleArgs).map(([key, value]) =>
 			`${quoteIdentifier(key)} = ${JSON.stringify(value)}`

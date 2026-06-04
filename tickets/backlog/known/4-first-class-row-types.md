@@ -122,6 +122,23 @@ The **gaps** are all on the type/plan side:
 - **`values` consumes rows:** `values` is a list of row constructors (the SQL-standard model), so bare `(a, b, c)` *is* the positional row constructor and a bare row-valued expression is consumed implicitly — `values :r` spreads `:r`'s fields as columns, `values (:r)` nests `:r` in a single column. Parens-presence is the sole disambiguator (no type-magic), and `values` context means the `row` keyword is never needed there. Payoff spelling: `insert into InviteResult values :result`.
 - **Comparison:** `(a, b) = (c, d)` and `(a, b) in (...)`, element-wise with the SQL-standard NULL rule.
 
+## Binding mode: name vs ordinal alignment
+
+SQL hardcodes a binding mode per combining operator: `insert ... values` and set operations align **by ordinal**; `natural join` / `using` align **by name**. The standard's one escape hatch is `corresponding [by (...)]`, which flips set operations to name-matching (SQL-92, rarely implemented); modern engines bolt on more — DuckDB `union [all] by name` and `insert into t by name`, Snowflake `by name`, Spark `unionByName` — and dataframe libraries (pandas `concat`, dplyr `bind_rows`) default to name alignment outright. Every one of these is a per-operator patch for the same missing capability.
+
+A first-class tuple carries **both** a heading (names) and an order (ordinals), so *both* alignments are always well-defined. That collapses the patches into **one uniform modifier** — `by name` / `by position` — usable wherever two tuples/relations combine: `insert`, set operations, the `values`-consumes-rows path, even join (where it subsumes `using` / `corresponding`). **Ordinal stays the default** for SQL compatibility; `by name` is the explicit opt-in, placed at the source↔target junction — `insert into t by name values :row`, `a union by name b` — the slot the optional `(column list)` already occupies (matching DuckDB / Snowflake). (The `natural join` footgun is the lesson: the hazard is never name *or* ordinal — it is the choice being *implicit and invisible*. A visible modifier is the cure.)
+
+**Not every tuple carries a significant order.** A positional constructor `(1, 'a')` or a relation's row is **ordered** (and may also be named); a tuple built by name — the canonical case being a **host object parameter** like `{ b: 2, a: 1 }`, where key order is incidental, not intent — is **name-keyed**, with no ordinal worth binding against. So the tuple *type* must track whether its ordering is significant (an `ordered` / name-keyed facet), and the rule becomes precise and symmetric:
+
+> The modifier is **mandatory exactly when the source tuple cannot satisfy the operator's default alignment**, and omittable (the default applies) when it can.
+
+- `insert ... values :t` (ordinal default): an **ordered** `:t` binds positionally, no keyword; a **name-keyed** `:t` has no ordinal → **`by name` required, else a compile-time error** — never a silent positional guess off incidental key order.
+- `insert ... by name values :t`: requires `:t` to carry names; a purely positional source (names absent) errors under `by name`.
+
+This buys ergonomics (no keyword when the source already matches the default mode) *and* safety (error, not guess, when it does not). It ties straight back to *Parameters as a contextual row*: an object binding is name-keyed, an array binding is ordinal, and a relation's row is both — so the parameter boundary is exactly where the distinction first bites.
+
+**Open:** whether a host object is *strictly* name-keyed (order never significant — the safe lean) or honors JS insertion order as a fallback ordinal (ergonomic but refactor-fragile); whether the uniform modifier *subsumes* `using` / `corresponding` / `natural` or merely coexists; and whether `ordered` vs name-keyed is a first-class type facet or inferred per construction site.
+
 ## Prior art to draw on
 
 | Source | Type spelling | Construct | Access | Worth stealing |
@@ -142,6 +159,7 @@ References: [TTM implementers' reflections (D4 row types)](https://www.dcs.warwi
 3. **Constructor syntax:** `row(expr as name, ...)`.
 4. **Row vs JSON:** distinct structural type that **coerces to/from `json`**.
 5. **Dot disambiguation:** open — the PostgreSQL parens form was rejected.
+6. **Binding mode:** an explicit, uniform `by name` / `by position` modifier across combining sites, with **ordinal the SQL-compatible default**. The modifier is mandatory exactly when the source can't satisfy the default alignment — a name-only tuple under the ordinal default needs `by name` or errors. Finer rules open — see *Binding mode*.
 
 ## Open questions (resolve before planning)
 
@@ -152,11 +170,12 @@ References: [TTM implementers' reflections (D4 row types)](https://www.dcs.warwi
 - **Single-element row vs grouping.** In *expression* position, `(x)` reads as grouping and `(x, y, …)` as a row; `row(x)` forces a one-field row (the SQL-standard `ROW(x)` vs `(x)` rule). Inside `values`, `(x)` stays a one-column row as today. Pinning this is also the gate on the larger "bare parens = row constructor in every expression position" step that row comparison `(a, b) = (c, d)` (Phase 4) needs.
 - **Coercion rules** between `row(...)` and `json` (assignability both directions; what a round-trip preserves — field order, types).
 - **Parameter row vs `with context`.** Whether the host-supplied parameter tuple and the SQL-declared `with context` bag unify or stay siblings (see *Parameters as a contextual row*). Defensible default: siblings.
+- **Binding-mode defaults.** Host object strictly name-keyed vs insertion-order fallback; whether the uniform `by name` / `by position` modifier subsumes `using` / `corresponding` / `natural`; whether *ordered* vs *name-keyed* is a tracked type facet (see *Binding mode*).
 
 ## Phasing sketch (staging, not a task list)
 
 1. **Typed row params + field access** — infer shape from the bound object; type `:p.field`; validate shape at bind. Highest value, smallest surface (no new runtime value kind). Touches `type-inference.ts`, `core/param.ts`, `planner/scopes/param.ts`, a row field-access node + emitter.
-2. **Spread & row-as-relation** — a row value coerces to a one-row relation; `values` is the multi-row form. `(:p).*` (hook `buildStarProjections` in `building/select-projections.ts`); `from :row`; and implicit `values` consumption — extend the per-row item parser in `valuesStatement` (`parser/parser.ts`) to accept a bare row-valued expression alongside the existing `(scalars...)` list, with parens-presence selecting spread (`values :r`) vs nest (`values (:r)`). Builders: `buildValuesStmt` (`building/select.ts`), `nodes/values-node.ts`, `building/insert.ts`. Localized — does **not** require bare-parens-as-row-constructor in every expression position (that pairs with Phase 4). Where `insert into T values :result` lands.
+2. **Spread & row-as-relation** — a row value coerces to a one-row relation; `values` is the multi-row form. `(:p).*` (hook `buildStarProjections` in `building/select-projections.ts`); `from :row`; and implicit `values` consumption — extend the per-row item parser in `valuesStatement` (`parser/parser.ts`) to accept a bare row-valued expression alongside the existing `(scalars...)` list, with parens-presence selecting spread (`values :r`) vs nest (`values (:r)`). Builders: `buildValuesStmt` (`building/select.ts`), `nodes/values-node.ts`, `building/insert.ts`. Localized — does **not** require bare-parens-as-row-constructor in every expression position (that pairs with Phase 4). Where `insert into T values :result` lands; the spread's name/ordinal alignment follows *Binding mode* (a name-keyed `:result` needs `by name`, else errors).
 3. **Row literals/constructors** — `row(expr as name, ...)`, nesting, rows in projections, UDFs that accept/return rows.
 4. **Row comparison & multi-column `in`** — expose `compareRows` as a scalar `=`/ordering with the SQL-standard NULL rule; this is where bare `(a, b)` becomes a row constructor in *expression* position (see the single-element open question).
 5. *(optional, TTM-complete)* rows as **column types** (nested/composite storage, RVA/TVA), row-typed CTEs, full tuple generator; this is where the `RelationType = {RowType}` refactor pays off most.

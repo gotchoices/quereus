@@ -144,6 +144,10 @@ const POSITIONS: Position[] = [
 	// --- pragma ---
 	{ label: 'pragma name', template: 'pragma {ID} = 1' },
 
+	// --- using <module> ---
+	{ label: 'create table using module', template: 'create table t (a integer) using {ID}' },
+	{ label: 'create materialized view using module', template: 'create materialized view v using {ID} as select 1' },
+
 	// --- function ---
 	{ label: 'scalar function name', template: 'select {ID}(x) from t' },
 	{ label: 'table-valued function name', template: 'select * from {ID}(1)' },
