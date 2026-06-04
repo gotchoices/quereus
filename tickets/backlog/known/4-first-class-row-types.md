@@ -7,7 +7,31 @@ files: packages/quereus/src/common/datatype.ts, packages/quereus/src/common/type
 
 ## Motivation
 
-SQL forces callers to flatten naturally-structured data into a wide list of scalar bind parameters, hand-destructuring host objects field by field even when the structure is already present. A representative host-side `db.exec` insert:
+A relation is a set of tuples. That is the whole of the relational model — Codd's relation is a set of tuples over a *heading* (a set of attribute `name: type` pairs), and every operator of the algebra is defined in those terms. The tuple is the atom; the relation is the collection of atoms.
+
+Yet mainstream SQL never made the tuple a first-class *value* (the standard's `row` type is the under-realized exception — see Prior art). It exposes the top and bottom of the ladder and skips the rung between:
+
+- a **scalar** — one value you can name, bind, pass to a function, and return;
+- a **relation** — a table, derived table, or subquery that flows through `from`;
+- a **tuple** — *one row, the very element a relation is made of* — which you can do none of those things with.
+
+The missing rung is felt everywhere. Because a row's worth of data is not a value, structured data gets shredded into N separate scalars at every boundary and reassembled by position at the destination — even when both sides already hold it as one thing. Restoring the rung makes `scalar → tuple → relation` a continuous ladder, each level built from the one below.
+
+**Named *and* positional is the tuple's dual nature, not a compromise** — a relational language needs both, because they answer different questions:
+
+- **Names** are what make a relation *relational*. A heading is a set of *named* attributes; projection, natural join / `using`, and rename all operate by name; `{id, name}` and `{name, id}` are the same heading. Names carry meaning and make access order-independent and robust to schema change.
+- **Positions** are what make a tuple *constructible*. You write `(1, 'a')` and read it left-to-right; `values` lists rows positionally; `(a, b) = (c, d)` compares positionally; `insert` aligns by position. Position gives literal syntax, ordering, and concision — you needn't name every field to build or compare one.
+
+Drop the names and tuples decay into positional blobs with identity by offset; drop the positions and you lose literal construction, ordering, and the bridge to the algebra's positional operators. A first-class tuple carries *both*: built concisely by position, read meaningfully by name. The duality is already latent here — a `Row` is a positional `SqlValue[]` whose heading lives out-of-band in `Attribute` / `RowDescriptor` (the name↔ordinal map). The engine reconciles the two on every row already; a tuple type just makes that reconciliation a property of the *value* instead of something carried beside it.
+
+With the middle rung present, the conversions turn trivial and symmetric — which is the real prize, because it is what lets tuples *compose*:
+
+- scalar ⟷ tuple — a one-attribute tuple; field access projects back to a scalar.
+- tuple ⟷ relation — a tuple *is* a one-row relation; `from :t` / `values :t` lift it, a row subquery extracts it back.
+
+So subqueries can return tuples (not only scalars or relations), functions can accept and return tuples, and `values` becomes exactly what the standard already says it is: a relation built from tuples.
+
+Made concrete, the everyday clumsiness falls away. A host object *is* a tuple, yet today it must be destructured at the boundary and re-tupled by position in SQL:
 
 ```sql
 insert into InviteResult (SlotCid, IsAccepted, InviteSignature, InvokedId)
@@ -15,15 +39,10 @@ values (:slotCid, :isAccepted, :inviteSignature, :invokedId)
 ```
 
 ```ts
-db.exec(sql, {
-  slotCid,
-  isAccepted: invite.isAccepted,
-  inviteSignature: invite.inviteSignature,
-  invokedId,
-});
+db.exec(sql, { slotCid, isAccepted: invite.isAccepted, inviteSignature: invite.inviteSignature, invokedId });
 ```
 
-A first-class row type lets a structured value pass as a single parameter, with its fields referenced inline:
+With a tuple value the structure survives the boundary — pass it whole, name fields where needed, spread it where shapes align:
 
 ```sql
 insert into InviteResult (SlotCid, IsAccepted, InviteSignature, InvokedId)
@@ -34,7 +53,7 @@ values (:slotCid, :invite.isAccepted, :invite.inviteSignature, :invokedId)
 db.exec(sql, { slotCid, invite, invokedId });
 ```
 
-And where a row's shape matches the target, the whole row spreads into columns — `insert into InviteResult select (:result).*`.
+Quereus already builds on Third Manifesto principles (bags vs sets, relational orthogonality, default NOT NULL), and TTM is emphatic that `TUPLE` is a peer type generator to `RELATION`. The relation half shipped; a first-class, named-and-positional tuple is its missing peer.
 
 Use cases this unlocks:
 
@@ -45,6 +64,18 @@ Use cases this unlocks:
 - **Row comparison** — `(a, b) = (c, d)` and multi-column `(a, b) in (select ...)` (the latter is a currently-missing capability).
 - **Canonical serialization** — an *ordered* row type yields a deterministic field serialization (e.g. for hashing/digests), which an unordered JSON object does not guarantee — relevant to the determinism/replay invariants.
 - **Table composition** — declaring a relation as "a set/bag of RowType `R`" lets a row type's attributes (and, per the open question below, its keys/constraints) be reused across many relations.
+
+## Parameters as a contextual row (an alternative framing)
+
+A second way to introduce the feature may motivate it even more directly: **the parameter set was always a single contextual tuple — expose it as one.**
+
+A statement's parameters arrive from the host as either an object — `db.exec(sql, { slotCid, invite, invokedId })` — or an array — `db.exec(sql, [v1, v2])`. The object *is* a named tuple; the array *is* a positional tuple. The two binding styles are precisely the **named and positional faces of one value** — the duality argued for above, already shipped and in daily use. The runtime even stores it that way: a single `ctx.params` on `RuntimeContext`, into which each `:name` / `?` reference does a by-name / by-ordinal lookup.
+
+So the existing `:name` and `?` are not two kinds of parameter but **by-name and by-ordinal access into one implicit contextual row.** A *row-valued* parameter then stops being a special case: `:invite` is a field of that contextual row whose type is itself a tuple, and `:invite.isAccepted` is nested access. "Row parameters" reduces to "the contextual row is a tuple, recursively." (Whether the whole row is also nameable in SQL — for splat or pass-through — is a minor surface question; the conceptual content is that it was a tuple all along.) The host's binding object and the engine's contextual row become *the same value crossing the boundary intact* — the structure-survives-the-boundary point, instantiated at the one boundary every statement already has.
+
+This also pins **shape inference** (open question 2): the contextual row's heading is just the keys/positions of the supplied binding — inferred at prepare time exactly as scalar parameter types are inferred today, or declared explicitly (e.g. a `with params (...)` preamble) for prepare-once/bind-many.
+
+Quereus already carries a *second* contextual row: `with context k = v, ...` (the mutation-seed / validation-flag bag — `IsSigningValid = true` in the example above). That too is a named contextual tuple, handled today by separate machinery. **Open:** whether the host-supplied parameter row and the SQL-declared `with context` row unify into one contextual-row concept or remain siblings — likely siblings, since one is external input and the other SQL-declared and often constant (a line the change-scope / determinism layer already draws), but they share the tuple *shape* concept.
 
 ## Core idea: row type as the foundational structural type
 
@@ -120,6 +151,7 @@ References: [TTM implementers' reflections (D4 row types)](https://www.dcs.warwi
 - **Dot-access disambiguation** rule (replacement for `(r).field`).
 - **Single-element row vs grouping.** In *expression* position, `(x)` reads as grouping and `(x, y, …)` as a row; `row(x)` forces a one-field row (the SQL-standard `ROW(x)` vs `(x)` rule). Inside `values`, `(x)` stays a one-column row as today. Pinning this is also the gate on the larger "bare parens = row constructor in every expression position" step that row comparison `(a, b) = (c, d)` (Phase 4) needs.
 - **Coercion rules** between `row(...)` and `json` (assignability both directions; what a round-trip preserves — field order, types).
+- **Parameter row vs `with context`.** Whether the host-supplied parameter tuple and the SQL-declared `with context` bag unify or stay siblings (see *Parameters as a contextual row*). Defensible default: siblings.
 
 ## Phasing sketch (staging, not a task list)
 
