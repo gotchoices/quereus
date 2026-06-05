@@ -597,19 +597,27 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		specByIndex.set(sideIndex, { table: side.table, schema: side.schema, targetColumns, envelopeIndices, presenceGateIndices });
 	}
 
-	// Per-row conditional key thread (the FK-dangling-key fix). With the key minted/threaded,
-	// any active side `S` that declares a foreign key onto a presence-gated active partner
-	// `P` must NOT point its key (FK) column at the shared key for a row where `P` is
+	// Per-row conditional key thread (the FK-dangling-key fix). With the key MINTED and
+	// threaded, any active side `S` that declares a foreign key onto a presence-gated active
+	// partner `P` must NOT point its key (FK) column at the shared key for a row where `P` is
 	// per-row absent (its presence gate fails, dropping its insert) — otherwise `S`'s row
-	// references a key with no partner row. Gate `S`'s key column on the AND, over each
-	// such partner, of that partner's presence predicate (the OR of its supplied columns
-	// being non-null — its own `presenceGateIndices`), nulling the key when all such
+	// references a freshly minted key with no partner row. Gate `S`'s key column on the AND,
+	// over each such partner, of that partner's presence predicate (the OR of its supplied
+	// columns being non-null — its own `presenceGateIndices`), nulling the key when all such
 	// partners are absent. A parent/anchor side (whose key is its own referenced PK)
 	// declares no FK onto the partner ⇒ no gate ⇒ its key threads unconditionally (nulling
 	// a NOT NULL PK would be wrong); a key shared only among always-active sides likewise
 	// stays unconditional. The key sits at target index 0 (pushed first under
 	// `needsSharedKey`).
-	if (needsSharedKey) {
+	//
+	// A *supplied* shared key (a view column carries it, `suppliedKeyIndex >= 0`) is NEVER
+	// gated: the value is the user's explicit reference, which may point at a PRE-EXISTING
+	// parent the insert does not touch (`pv` left null because the parent already exists), so
+	// nulling it would silently discard the user's key and orphan the child. The both-side-
+	// create "no partner ⇒ no key" reasoning holds only for the engine-minted key, whose
+	// referent exists iff this insert creates it; for a supplied key, FK enforcement is the
+	// correct validator of a dangling reference (an honest error beats a silent null).
+	if (needsSharedKey && suppliedKeyIndex < 0) {
 		for (const sideIndex of activeIndices) {
 			const groups: number[][] = [];
 			for (const partnerIndex of activeIndices) {

@@ -2167,4 +2167,23 @@ select cc, case when pr is null then 'null' else 'fk' end as pr_kind from ojc2 w
 -- exactly one parent row materialized (for cc=7); its pv is the supplied 777.
 select pv from ojp2 order by pv;
 → [{"pv":777}]
+
+-- ===================================
+-- SUPPLIED shared key (the join key is a writable view column, not minted): the per-row
+-- key gate must NOT fire. The user's explicit key may reference a PRE-EXISTING parent the
+-- insert never touches (pv left null because the parent already exists); nulling it would
+-- silently discard the supplied key and orphan the child. FK enforcement validates a bad
+-- reference instead. (Regression: the minted-key gate wrongly nulled the supplied key.)
+-- ===================================
+create table skp (pp integer primary key, pv integer null);
+create table skc (cc integer primary key, pr integer null references skp(pp), cv integer null);
+create view skv as select c.cc as cc, c.pr as k, c.cv as cv, p.pv as pv from skc c left join skp p on p.pp = c.pr;
+-- A parent that already exists; the child points at it via the supplied key with pv null.
+insert into skp (pp, pv) values (42, 4242);
+insert into skv (cc, k, cv, pv) values (7, 42, 99, null);
+-- The supplied key is preserved (pr = 42), so the child joins the pre-existing parent.
+select cc, k, cv, pv from skv where cc = 7;
+→ [{"cc":7,"k":42,"cv":99,"pv":4242}]
+select pr from skc where cc = 7;
+→ [{"pr":42}]
 pragma foreign_keys = false;
