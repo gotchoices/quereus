@@ -257,6 +257,25 @@ describe('query-rewrite — end-to-end rows + plan shape', () => {
 		}
 	});
 
+	it('an aliased/qualified-column query rewrites and stays row-identical', async () => {
+		const db = await freshDb([...SALES, 'create materialized view recent as select id, customer_id, amt from sales where amt > 0']);
+		try {
+			// Qualified source (`from sales s`) + qualified columns (`s.amt`): entailment
+			// resolves by bare name and the residual/outputs remap by columnIndex.
+			const q = 'select s.customer_id, s.amt from sales s where s.amt > 0 and s.customer_id = 7 order by s.amt';
+			expect(serializePlanTree(db.getPlan(q)), 'rewrote to backing').to.contain('_mv_recent');
+
+			const enabled = await readRows(db, q);
+			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite']) });
+			const disabled = await readRows(db, q);
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			expect(enabled).to.equal(disabled);
+			expect(enabled).to.equal('[7,10]|[7,20]');
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a near-miss (non-entailed predicate) keeps the base recompute', async () => {
 		const db = await freshDb([...SALES, 'create materialized view recent as select id, customer_id, amt from sales where amt > 0']);
 		try {
