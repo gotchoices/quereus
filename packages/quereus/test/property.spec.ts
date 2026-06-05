@@ -1633,6 +1633,9 @@ describe('Property-Based Tests', () => {
 			'select b, c from ta except select e, e from tb',                    // EXCEPT (set)
 			'select ta.a as ja, tb.d as jd, ta.b as jb from ta join tb on ta.b = tb.d', // inner join
 			'select ta.a as la, tb.d as ld from ta left join tb on ta.b = tb.d', // left join
+			// Outer-join existence column: the appended `fex` flag must leave the
+			// preserved key [la] intact and never appear inside a claimed key.
+			'select ta.a as la2, tb.d as ld2, fex from ta left join tb on ta.b = tb.d exists right as fex',
 			'select ta.a as xa, tb.d as xd, ta.c as xc from ta cross join tb',   // cross join
 			'select x, y from (select distinct b as x, c as y from ta)',         // projection over inner DISTINCT
 			'select distinct x, y from (select distinct b as x, c as y from ta)',// nested DISTINCT
@@ -1952,6 +1955,166 @@ describe('Property-Based Tests', () => {
 				expect(declaredEmptyKeyOf(target!), `${type} of \`${sql}\` declared-empty-key channel`).to.equal(key);
 				expect(hasSingletonFd(target!.physical?.fds, colCount), `${type} of \`${sql}\` singleton-FD channel`).to.equal(fd);
 			}
+		});
+	});
+
+	// --- Outer-join existence column (read half) ---
+	// The read-only front half of the Dataphor `include rowexists` feature: the
+	// `exists [<side>] as <name>` join clause manifests an outer join's match
+	// existence as a first-class clean `{true,false}` NOT NULL column derived AT THE
+	// COMBINATOR (not a null-extended constant, not a predicate re-evaluation).
+	describe('Outer-join existence column (read half)', () => {
+		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
+			return out;
+		}
+
+		/** First JoinNode in a logically-planned body. */
+		function findJoin(sql: string): RelationalPlanNode {
+			const ast = new Parser().parse(sql) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			const root = (plan as unknown as { getRelations(): readonly RelationalPlanNode[] }).getRelations()[0];
+			let found: RelationalPlanNode | undefined;
+			const visit = (n: PlanNode): void => {
+				if (found) return;
+				if (n.nodeType === PlanNodeType.Join) { found = n as RelationalPlanNode; return; }
+				for (const c of n.getChildren()) visit(c);
+			};
+			visit(root);
+			if (!found) throw new Error('no JoinNode in planned body');
+			return found;
+		}
+
+		async function seed(): Promise<void> {
+			await db.exec('create table exc (cc integer primary key, pr integer null, cv integer null) using memory');
+			await db.exec('create table exp (pp integer primary key, pv integer null) using memory');
+			await db.exec('insert into exp values (1, 10), (2, 20)');
+			// cc=1→pr=1 matches; cc=2→pr=9 no match; cc=3→pr=2 matches; cc=4→pr=null no match
+			await db.exec('insert into exc values (1, 1, 100), (2, 9, 200), (3, 2, 300), (4, null, 400)');
+			await db.exec('create view ex_v as select c.cc as cc, c.cv as cv, p.pv as pv, hasP from exc c left join exp p on p.pp = c.pr exists right as hasP');
+		}
+
+		it('read agreement: hasP is true exactly on matched (non-null-extended) rows', async () => {
+			await seed();
+			const rows = await readRows('select cc, hasP, pv from ex_v order by cc');
+			expect(rows).to.deep.equal([
+				{ cc: 1, hasP: true, pv: 10 },
+				{ cc: 2, hasP: false, pv: null },
+				{ cc: 3, hasP: true, pv: 20 },
+				{ cc: 4, hasP: false, pv: null },
+			]);
+			// hasP agrees row-by-row with the non-preserved column's presence.
+			for (const r of rows) expect(r.hasP, `cc=${r.cc}`).to.equal(r.pv !== null);
+		});
+
+		it('clean boolean: hasP is never NULL and is always in {true,false}', async () => {
+			await seed();
+			const rows = await readRows('select cc, hasP from ex_v');
+			expect(rows.length).to.be.greaterThan(0);
+			for (const r of rows) {
+				expect(r.hasP, `cc=${r.cc} not null`).to.not.equal(null);
+				expect([true, false], `cc=${r.cc} clean boolean`).to.include(r.hasP);
+			}
+		});
+
+		it('soundness: the flag tracks ACTUAL match, not predicate re-evaluation', async () => {
+			// `... on p.pp = c.pr or p.pp is null` is satisfiable on a null-extended row
+			// (where p.pp reads NULL), so re-evaluating the predicate over the joined row
+			// would wrongly report a match. The flag must be the actual combinator bit.
+			await db.exec('create table sc (cc integer primary key, pr integer null) using memory');
+			await db.exec('create table sp (pp integer primary key, pv integer null) using memory');
+			await db.exec('insert into sp values (1, 10)');
+			await db.exec('insert into sc values (1, 1), (2, 9)');
+			await db.exec('create view sv as select c.cc as cc, hasP, p.pv as pv from sc c left join sp p on p.pp = c.pr or p.pp is null exists right as hasP');
+			const rows = await readRows('select cc, hasP, pv from sv order by cc');
+			// cc=2 (pr=9) matches no real sp row → null-extended → hasP false even though
+			// the ON predicate is true on the null-padded row.
+			expect(rows).to.deep.equal([
+				{ cc: 1, hasP: true, pv: 10 },
+				{ cc: 2, hasP: false, pv: null },
+			]);
+		});
+
+		it('FDs: key → flag holds, flag never appears inside a claimed key (Invariants 1–2)', async () => {
+			await seed();
+			const withFlag = findJoin('select c.cc, c.cv, p.pv, hasP from exc c left join exp p on p.pp = c.pr exists right as hasP');
+			const noFlag = findJoin('select c.cc, c.cv, p.pv from exc c left join exp p on p.pp = c.pr');
+
+			// Adding the flag column leaves the join's claimed keys / isSet unchanged.
+			const keysWith = keysOf(withFlag).map(k => k.slice()).sort();
+			const keysNo = keysOf(noFlag).map(k => k.slice()).sort();
+			expect(keysWith).to.deep.equal(keysNo);
+			expect(withFlag.getType().isSet).to.equal(noFlag.getType().isSet);
+
+			// The flag is the last output column (exc:3 + exp:2 = index 5).
+			const flagIdx = withFlag.getType().columns.length - 1;
+			expect(withFlag.getType().columns[flagIdx].name).to.equal('hasP');
+
+			// Invariant 1: flag never inside a claimed key.
+			for (const key of keysOf(withFlag)) {
+				expect(key, 'flag must not be in a claimed key').to.not.include(flagIdx);
+			}
+
+			// Invariant 1: key → flag is present (the join output is keyed on the
+			// preserved child PK, so the flag is functionally determined by it).
+			const fds = withFlag.physical?.fds ?? [];
+			const keyDeterminesFlag = fds.some(fd => fd.dependents.includes(flagIdx) && fd.determinants.length > 0);
+			expect(keyDeterminesFlag, 'expected a key → flag FD over the keyed join output').to.equal(true);
+
+			// The flag carries a {true,false} domain constraint and is NOT NULL.
+			expect(withFlag.getType().columns[flagIdx].type.nullable, 'flag is NOT NULL').to.equal(false);
+			const domains = withFlag.physical?.domainConstraints ?? [];
+			const flagDomain = domains.find(d => d.column === flagIdx && d.kind === 'enum');
+			expect(flagDomain, 'expected a {true,false} enum domain on the flag').to.not.equal(undefined);
+		});
+
+		it('lineage: the flag carries an `existence` UpdateSite, non-writable (read half)', async () => {
+			await seed();
+			const join = findJoin('select c.cc, c.cv, p.pv, hasP from exc c left join exp p on p.pp = c.pr exists right as hasP');
+			const attrs = join.getAttributes();
+			const flagAttr = attrs[attrs.length - 1];
+			expect(flagAttr.name).to.equal('hasP');
+			const site = join.physical?.updateLineage?.get(flagAttr.id);
+			expect(site?.kind, 'flag lineage is an existence site').to.equal('existence');
+			expect(resolveBaseSite(site).writable, 'existence is read-only in the read half').to.equal(false);
+		});
+
+		it('write still rejects: update/insert of the flag is a clear deferral, not a silent no-op', async () => {
+			await seed();
+			// Writing the existence column resolves to a non-writable site — rejected.
+			let updErr: any;
+			try { await db.exec('update ex_v set hasP = true where cc = 1'); } catch (e) { updErr = e; }
+			expect(updErr, 'update of hasP must reject').to.not.equal(undefined);
+			expect(updErr.mutationDiagnostic?.reason, 'structured deferral diagnostic').to.equal('no-inverse');
+
+			let insErr: any;
+			try { await db.exec('insert into ex_v (cc, cv, hasP) values (5, 55, true)'); } catch (e) { insErr = e; }
+			expect(insErr, 'insert supplying hasP must reject').to.not.equal(undefined);
+
+			// The base tables are untouched by the rejected writes.
+			const child = await readRows('select cc from exc order by cc');
+			expect(child.map(r => r.cc)).to.deep.equal([1, 2, 3, 4]);
+		});
+
+		it('column_info: the existence column reports is_updatable=NO with null base (read half)', async () => {
+			await seed();
+			const rows = await readRows("select column_name, is_updatable, base_table, base_column from column_info('ex_v')");
+			const flag = rows.find(r => r.column_name === 'hasP');
+			expect(flag, 'column_info exposes the existence column').to.not.equal(undefined);
+			expect(flag!.is_updatable, 'existence column is not updatable in the read half').to.equal('NO');
+			expect(flag!.base_table, 'existence column has no base table').to.equal(null);
+			expect(flag!.base_column, 'existence column has no base column').to.equal(null);
+			// The prereq's per-side relaxation still reports the base columns updatable.
+			const pv = rows.find(r => r.column_name === 'pv');
+			expect(pv!.is_updatable, 'non-preserved base column stays per-side updatable').to.equal('YES');
+		});
+
+		it('grammar: exists existence rejects on inner/cross and full-without-side', () => {
+			const parser = new Parser();
+			expect(() => parser.parse('select c.cc from exc c join exp p on p.pp = c.pr exists right as h')).to.throw();
+			expect(() => parser.parse('select c.cc from exc c cross join exp p exists left as h')).to.throw();
+			expect(() => parser.parse('select c.cc from exc c full join exp p on p.pp = c.pr exists as h')).to.throw();
 		});
 	});
 

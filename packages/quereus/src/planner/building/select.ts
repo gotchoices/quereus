@@ -17,7 +17,8 @@ import { buildTableFunctionCall } from './table-function.js';
 import { CTEReferenceNode } from '../nodes/cte-reference-node.js';
 import { InternalRecursiveCTERefNode as _InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import type { CTEScopeNode, CTEPlanNode } from '../nodes/cte-node.js';
-import { JoinNode } from '../nodes/join-node.js';
+import { JoinNode, type ExistenceColumnSpec } from '../nodes/join-node.js';
+import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { ValuesNode } from '../nodes/values-node.js';
@@ -661,18 +662,40 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 		// TODO: This could be improved by synthesizing the equality conditions here
 	}
 
+	// Existence (`exists … as`) flags: mint a stable attribute id per clause (once,
+	// here — so it survives `withChildren` rebuilds) and expose each by its `as`
+	// name through a scope layered over the combined join scope. The flag's output
+	// column index is after both sides (leftCols + rightCols + i), matching where
+	// `buildJoinAttributes`/`buildJoinRelationType` append it.
+	let existence: ExistenceColumnSpec[] | undefined;
+	let columnScope: Scope = combinedScope;
+	if (joinClause.existence && joinClause.existence.length > 0) {
+		existence = joinClause.existence.map(e => ({ attrId: PlanNode.nextAttrId(), name: e.name, side: e.side }));
+		const leftCols = leftNode.getType().columns.length;
+		const rightCols = rightNode.getType().columns.length;
+		const flagScope = new RegisteredScope(combinedScope);
+		existence.forEach((spec, i) => {
+			const columnIndex = leftCols + rightCols + i;
+			flagScope.registerSymbol(spec.name.toLowerCase(), (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, EXISTENCE_FLAG_TYPE, spec.attrId, columnIndex));
+		});
+		columnScope = flagScope;
+	}
+
 	const joinNode = new JoinNode(
 		parentContext.scope,
 		leftNode,
 		rightNode,
 		joinClause.joinType,
 		condition,
-		usingColumns
+		usingColumns,
+		existence,
 	);
 
-	// Use the combined scope as the column scope for the join
-	// This allows both qualified and unqualified column references to resolve properly
-	parentContext.outputScopes.set(joinNode, combinedScope);
+	// Use the combined scope (plus any existence-flag names) as the column scope for
+	// the join. This allows both qualified and unqualified column references to
+	// resolve properly.
+	parentContext.outputScopes.set(joinNode, columnScope);
 
 	return joinNode;
 }

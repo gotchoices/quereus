@@ -42,6 +42,7 @@ Every relational `PlanNode` carries an `updateLineage` field mapping each output
 - **`base`** — the column traces to a base-table column through a chain of invertible transformations. The chain is recorded so the engine can compose a setter expression on the base column.
 - **`computed`** — the column is the output of a non-invertible expression over inputs; it is read-only. Reads pass through; writes against this column are rejected with a diagnostic naming the originating expression.
 - **`null-extended`** — the column is potentially null-extended by an outer join; updates require materialization of the missing side (see [Outer Joins](#outer-joins)).
+- **`existence`** — an outer-join `exists … as` match flag (a clean `{true,false}` boolean derived at the combinator). Read-only in the read half; it has no base column and is writable through an *effect*, not a base mapping (see [Existence columns](#existence-columns-on-outer-joins-read-half)).
 
 Lineage is computed in a single pass that mirrors the optimizer's physical-property pass, reusing the functional-dependency framework (see [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking)) to thread per-column provenance through every operator. Equivalence classes propagate writeability: if `a.x` and `b.y` belong to the same EC, a write to either reaches both bases. Constant FDs (`∅ → c = v`) supply default values without authorial intervention.
 
@@ -187,6 +188,42 @@ Outer joins introduce **null-extended** lineage on the non-preserved side(s). Fo
 > **RIGHT / FULL — not yet, gated by the runtime:** the Quereus runtime cannot execute a `right join` or `full join` at all (`runtime/emit/join.ts` throws `RIGHT/FULL JOIN is not supported yet`, pinned by `test/logic/90.5-unsupported-join-types.sqllogic`), so such a view is neither readable nor *writable*. RIGHT is therefore **excluded from write-through recognition** and the static surfaces report it conservative all-`NO` (the preserved/non-preserved classification is the mirror of LEFT and would otherwise advertise it `is_updatable`). FULL self-conservatizes (no preserved anchor — a non-preserved update there rejects `unsupported-outer-join-update`, since no preserved side can key the materialization). Re-admit RIGHT — and, once the runtime supports it, FULL — when `runtime/emit/join.ts` gains those join types.
 >
 > **Still deferred (LEFT):** a non-preserved-**only** insert (no preserved row to attach to) rejects `null-extended-create-conflict`. (The **decomposition optional-member / EAV UPDATE** dual — null→non-null materializes a component, non-null→all-null deletes it — is the decomposition analogue and is now **shipped** as anchor-keyed base ops in `decomposition.ts`; see [Decomposition fan-out](lens.md#the-default-mapper) § UPDATE. Only a non-constant optional/EAV value and a shared-key identity write stay rejected with `unsupported-decomposition-update`.)
+
+#### Existence columns on outer joins (read half)
+
+The `exists [<side>] as <name>` join clause (Dataphor `include rowexists`) manifests
+an outer join's match-existence as a first-class boolean column — reading it tells
+you whether the non-preserved `side` matched the current row. See
+[`sql.md` § Existence columns](sql.md#existence-columns-on-outer-joins) for the
+grammar. Two properties make the flag sound:
+
+- **Derived at the combinator, not stored.** The flag is the join operator's own
+  per-row null-extension bit (`runtime/emit/join.ts`), *not* a constant column
+  inside the operand (a null-extended `true` would read back as `{true,NULL}`,
+  re-introducing the very `IS NOT NULL` test the column replaces) and *not* a
+  re-evaluation of the `ON` predicate over the joined row (unsound for predicates
+  satisfiable on a null-extended row, e.g. `p.pp = c.pr or p.pp is null`). The
+  result is a clean `{true,false}` **NOT NULL** column.
+- **FD ramifications (Invariants 1–2).** When the join output is keyed (a 1:1
+  outer join's preserved PK), the forward FD walk emits `key → flag` (so DISTINCT /
+  ORDER-BY / join-elimination still reason about the flag), and the flag is **never**
+  claimed as part of a key.
+
+The flag is modelled as an extra output **attribute of the `JoinNode`** (not a
+`ProjectNode` expression — that could only see join *outputs* and would have to
+re-derive the match from nullability, the unsound path), carrying a new
+`existence` `UpdateSite` (kind `existence`, with a `RelationalComponentRef`
+component + the join-predicate guard). The flag-bearing `JoinNode` stays the
+nested-loop join (the join-physical-selection / merge / fanout / elimination rules
+bail on it) so the appended flag column is never dropped by a physical rewrite —
+a documented read-half limitation (existence joins forgo hash/merge selection).
+
+**Read half only.** The existence column is **read-only here**: a write resolves to
+a non-writable site and rejects (`no-inverse`); `column_info` reports it
+`is_updatable = 'NO'` with `base_table` / `base_column` = `null` (it has no base
+column even once writable — it is writable through an *effect*, not a base
+mapping). The write half (existence-flip ⇒ insert/delete of the component) is
+`outer-join-existence-column`.
 
 ### Union All
 

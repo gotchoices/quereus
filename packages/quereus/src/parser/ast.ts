@@ -436,6 +436,19 @@ export interface SubquerySource extends AstNode {
 	columns?: string[]; // Optional column list: AS alias(col1, col2, ...)
 }
 
+/**
+ * One `exists [<side>] as <name>` existence-column clause on a join (Dataphor
+ * `include rowexists`). The flag reifies whether the non-preserved `side`
+ * matched the current row — a clean `{true,false}` boolean derived at the
+ * combinator (NOT a null-extended constant). `side` is the resolved
+ * non-preserved side (the parser resolves the elided form against the join
+ * type), so it is always explicit in the AST and round-trips unambiguously.
+ */
+export interface JoinExistenceColumn {
+	side: 'left' | 'right';
+	name: string;
+}
+
 // JOIN clause in FROM
 export interface JoinClause extends AstNode {
 	type: 'join';
@@ -446,6 +459,8 @@ export interface JoinClause extends AstNode {
 	columns?: string[];     // For USING clause
 	/** Right side is a LATERAL (correlated) subquery — the left's columns are visible inside. */
 	isLateral?: boolean;
+	/** `exists [<side>] as <name>` existence columns derived at the combinator (read-only here). */
+	existence?: ReadonlyArray<JoinExistenceColumn>;
 }
 
 // ORDER BY clause

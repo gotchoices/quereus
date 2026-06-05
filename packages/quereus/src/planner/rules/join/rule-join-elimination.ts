@@ -67,6 +67,11 @@ export function ruleJoinElimination(node: PlanNode, _context: OptContext): PlanN
 	if (!walk) return null;
 
 	const { join, chain } = walk;
+	// An `exists … as` flag depends on whether the non-preserved side matched, but
+	// its attribute id is not a column of that side — so the `usesRight`/`usesLeft`
+	// demand scan cannot see the dependency and the join could be wrongly eliminated
+	// out from under a live flag. Keep the flag-bearing join intact (read half).
+	if (join.hasExistenceColumns) return null;
 	if (join.joinType !== 'left' && join.joinType !== 'right' && join.joinType !== 'inner') return null;
 	if (!join.condition) return null;
 

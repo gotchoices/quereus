@@ -1,5 +1,5 @@
 import { isRelationalNode, PlanNode } from './plan-node.js';
-import type { RelationalPlanNode, Attribute, BinaryRelationalNode, ScalarPlanNode } from './plan-node.js';
+import type { RelationalPlanNode, Attribute, BinaryRelationalNode, ScalarPlanNode, DomainConstraint } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
@@ -13,9 +13,22 @@ import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
 import { ColumnReferenceNode } from './reference.js';
 import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
-import { deriveJoinUpdateLineage } from '../analysis/update-lineage.js';
+import { deriveJoinUpdateLineage, type JoinExistenceSite } from '../analysis/update-lineage.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
+
+/**
+ * One `exists [<side>] as <name>` existence match-flag column the JoinNode
+ * appends after both sides. The `attrId` is minted once at build time (so it is
+ * stable across `withChildren` rebuilds, like the per-side attribute ids the
+ * join preserves); `side` is the resolved non-preserved side whose match the
+ * flag reifies.
+ */
+export interface ExistenceColumnSpec {
+	readonly attrId: number;
+	readonly name: string;
+	readonly side: 'left' | 'right';
+}
 
 /**
  * Extract equi-join column index pairs from a join condition (AND-of-equalities).
@@ -78,7 +91,8 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		public readonly right: RelationalPlanNode,
 		public readonly joinType: JoinType,
 		public readonly condition?: ScalarPlanNode,
-		public readonly usingColumns?: readonly string[]
+		public readonly usingColumns?: readonly string[],
+		public readonly existence?: readonly ExistenceColumnSpec[],
 	) {
 		// Cost estimate: base cost is sum of children plus join cost
 		const leftCost = left.getTotalCost();
@@ -129,29 +143,68 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		// the forward pass computed (output attribute ids are preserved per side,
 		// so the maps merge directly). Outer joins wrap the non-preserved side's
 		// sites `null-extended` under the join predicate — annotation only; write
-		// materialization is a later phase.
+		// materialization is a later phase. Each existence flag registers an
+		// `existence` site (read-only here) under the same join predicate.
 		const { updateLineage, attributeDefaults } = deriveJoinUpdateLineage(
 			this.joinType,
 			leftPhys?.updateLineage, rightPhys?.updateLineage,
 			leftPhys?.attributeDefaults, rightPhys?.attributeDefaults,
 			this.condition?.expression,
+			this.existenceSites(),
 		);
 
 		return {
 			estimatedRows: result.estimatedRows,
 			monotonicOn: propagateJoinMonotonicOn(this.joinType, leftPhys, rightPhys, attrIdPairs),
+			// `fdResult.fds` already covers `key → flag` for each preserved key: the
+			// forward walk's `withKeyFds` builds `key → all_other_cols` over the FULL
+			// output column count (which includes the appended flags), so a flag is a
+			// dependent of every preserved key and never a determinant — Invariant 1.
 			fds: fdResult.fds,
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
-			domainConstraints: fdResult.domainConstraints,
+			// Each flag carries a `{true,false}` enum domain (the clean-boolean point).
+			domainConstraints: this.withFlagDomains(fdResult.domainConstraints),
 			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftType.columns.length),
 			updateLineage,
 			attributeDefaults,
 		};
 	}
 
+	/** Output column index of the i-th existence flag (appended after both sides). */
+	private flagColumnIndex(i: number): number {
+		return this.left.getType().columns.length + this.right.getType().columns.length + i;
+	}
+
+	/** Existence sites for the backward lineage walk (empty when no flags). */
+	private existenceSites(): ReadonlyArray<JoinExistenceSite> | undefined {
+		if (!this.existence || this.existence.length === 0) return undefined;
+		return this.existence.map(spec => ({
+			attrId: spec.attrId,
+			side: spec.side,
+			componentTable: Number(spec.side === 'left' ? this.left.id : this.right.id),
+		}));
+	}
+
+	/** Append a `{true,false}` enum domain constraint per existence flag. */
+	private withFlagDomains(
+		domains: ReadonlyArray<DomainConstraint> | undefined,
+	): ReadonlyArray<DomainConstraint> | undefined {
+		if (!this.existence || this.existence.length === 0) return domains;
+		const out = [...(domains ?? [])];
+		this.existence.forEach((_spec, i) => {
+			out.push({ kind: 'enum', column: this.flagColumnIndex(i), values: [true, false] });
+		});
+		return out;
+	}
+
+	/** True when this join exposes one or more `exists … as` match flags. */
+	get hasExistenceColumns(): boolean {
+		return !!this.existence && this.existence.length > 0;
+	}
+
 	private buildAttributes(): Attribute[] {
-		return buildJoinAttributes(this.left.getAttributes(), this.right.getAttributes(), this.joinType);
+		return buildJoinAttributes(this.left.getAttributes(), this.right.getAttributes(), this.joinType, undefined, this.existence);
 	}
 
 	getAttributes(): Attribute[] {
@@ -167,7 +220,7 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			this.condition, this.left.getAttributes(), this.right.getAttributes(),
 		);
 		const keys = combineJoinKeys(leftType.keys, rightType.keys, this.joinType, leftType.columns.length, pairs);
-		return buildJoinRelationType(leftType, rightType, this.joinType, keys);
+		return buildJoinRelationType(leftType, rightType, this.joinType, keys, this.existence);
 	}
 
 	getChildren(): readonly PlanNode[] {
@@ -206,14 +259,17 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			return this;
 		}
 
-		// Create new instance - JoinNode creates new attributes by combining left and right
+		// Create new instance - JoinNode creates new attributes by combining left and
+		// right. The existence specs carry pre-minted stable attribute ids, so they
+		// are threaded verbatim (the appended flag columns survive the rebuild).
 		return new JoinNode(
 			this.scope,
 			newLeft as RelationalPlanNode,
 			newRight as RelationalPlanNode,
 			this.joinType,
 			newCondition as ScalarPlanNode | undefined,
-			this.usingColumns
+			this.usingColumns,
+			this.existence,
 		);
 	}
 
@@ -237,6 +293,7 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			joinType: this.joinType,
 			hasCondition: !!this.condition,
 			usingColumns: this.usingColumns,
+			existence: this.existence?.map(e => `exists ${e.side} as ${e.name}`),
 			leftRows: this.left.estimatedRows,
 			rightRows: this.right.estimatedRows
 		};

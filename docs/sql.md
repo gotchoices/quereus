@@ -1436,6 +1436,38 @@ This allows for powerful compositions where the results of data modifications ca
 - `on condition`: Join condition
 - `using (column[,...])`: Join on equal named columns
 
+#### Existence columns on outer joins
+
+After a complete `on` / `using` predicate, an outer join may expose **existence
+columns** — a clean `{true,false}` NOT NULL flag per non-preserved side telling you
+whether that side matched the current row (Dataphor's `include rowexists`):
+
+```sql
+-- non-preserved (right) side of a LEFT join; `exists as` resolves the side
+select c.id, hasOrder
+from customers c left join orders o on o.cust = c.id exists as hasOrder;
+
+-- explicit side; required for FULL (both sides null-extendable), comma-separated
+select a.id, aOnly, bOnly
+from a full join b on b.k = a.k exists left as aOnly, exists right as bOnly;
+```
+
+- The clause appears **only after a finished `on` / `using` predicate**, and
+  `exists` here is always followed by `as` or a side token — never `(` — so it never
+  collides with the `exists (<subquery>)` predicate (one-token lookahead
+  distinguishes them). The comma form is recognised only when the next token is
+  another `exists`, so a genuine new FROM-source comma is unaffected. This is
+  additive grammar — it occupies previously-unused space and breaks nothing.
+- `exists as <name>` resolves to the unique non-preserved side of a `left` / `right`
+  join. A side is **required** for `full outer` (both sides null-extend); `inner` /
+  `cross` and the preserved side of a `left` / `right` join are **rejected** (no
+  null-extension ⇒ the flag would be a meaningless constant `true`).
+- The flag is derived **at the join** from the actual match, never stored in the
+  operand and never a re-evaluation of the predicate (which would be unsound on a
+  null-extended row). It is **read-only** today (writing it is rejected); the write
+  side — an existence-flip turning into an insert/delete of that component — is a
+  later phase. See [view-updateability.md § Existence columns](view-updateability.md#existence-columns-on-outer-joins-read-half).
+
 **Examples:**
 ```sql
 -- Multiple tables

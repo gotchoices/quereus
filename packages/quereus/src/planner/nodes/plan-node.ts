@@ -251,7 +251,36 @@ export type UpdateSite =
 			readonly domain?: Expression;
 		}
 	| { readonly kind: 'computed'; readonly expr: Expression }
-	| { readonly kind: 'null-extended'; readonly guard: Expression; readonly inner: UpdateSite };
+	| { readonly kind: 'null-extended'; readonly guard: Expression; readonly inner: UpdateSite }
+	| {
+			/**
+			 * An outer-join existence (`exists … as`) match flag — a clean `{true,false}`
+			 * boolean reifying whether the referenced relational `component` matched the
+			 * current row. Read-only in the read half (a write resolves to a non-writable
+			 * site); the write half (`outer-join-existence-column`) turns an
+			 * existence-flip into an insert/delete of that component. It has no base
+			 * column — it is writable through an *effect*, not a base mapping.
+			 */
+			readonly kind: 'existence';
+			/** The relational component whose match the flag reifies. */
+			readonly component: RelationalComponentRef;
+			/** The join-predicate guard (AST) the flag is the truth-value of. */
+			readonly guard: Expression;
+		};
+
+/**
+ * Generalized handle on a relational component an {@link UpdateSite} of kind
+ * `existence` reifies the membership of — a join side now; a set-operation
+ * branch is added by `set-operator-membership-columns`, so this stays a
+ * discriminated union rather than a hard-coded join side.
+ */
+export type RelationalComponentRef =
+	| {
+			readonly kind: 'join-side';
+			/** The non-preserved side's relational plan-node id (numeric; best-effort handle the write half refines to a `TableReferenceNode`). */
+			readonly table: number;
+			readonly side: 'left' | 'right';
+		};
 
 /**
  * Per-attribute insert-default provenance — the value used when an `insert`

@@ -568,6 +568,14 @@ function fromClauseToString(from: AST.FromClause): string {
 			} else if (from.columns) {
 				joinStr += ` using (${from.columns.map(quoteIdentifier).join(', ')})`;
 			}
+			// `exists <side> as <name>` existence columns after the ON/USING predicate.
+			// The side is always emitted (the parser resolves the elided form) so the
+			// clause round-trips structurally.
+			if (from.existence && from.existence.length > 0) {
+				joinStr += ' ' + from.existence
+					.map(e => `exists ${e.side} as ${quoteIdentifier(e.name)}`)
+					.join(', ');
+			}
 			return joinStr;
 		}
 

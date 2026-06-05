@@ -41,6 +41,10 @@ const log = createLogger('optimizer:rule:monotonic-merge-join');
 export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): PlanNode | null {
 	if (!(node instanceof JoinNode)) return null;
 
+	// Existence-flag joins must stay the nested-loop JoinNode (see
+	// rule-join-physical-selection): the MergeJoin variant would drop the flag.
+	if (node.hasExistenceColumns) return null;
+
 	const joinType = node.joinType;
 	if (joinType !== 'inner' && joinType !== 'left' && joinType !== 'semi' && joinType !== 'anti') return null;
 

@@ -139,6 +139,11 @@ function composeUpdateSite(
 			return child;
 		case 'null-extended':
 			return { kind: 'null-extended', guard: child.guard, inner: composeUpdateSite(child.inner, outerInverse, outerDomain) };
+		case 'existence':
+			// Read-only at the combinator; an outer scalar transform on the flag does
+			// not make it base-writable. A bare projection (identity, no outer inverse)
+			// passes it through unchanged; the resolver still reports it non-writable.
+			return child;
 	}
 }
 
@@ -218,6 +223,19 @@ export function deriveFilterAttributeDefaults(
  * is a later phase — this only annotates the lineage). `guard` is the join
  * predicate AST; absent for `cross` (which never null-extends).
  */
+/**
+ * One existence (`exists … as`) flag the JoinNode appends after both sides, for
+ * {@link deriveJoinUpdateLineage} to register an `existence` `UpdateSite` against.
+ */
+export interface JoinExistenceSite {
+	/** Output attribute id of the appended flag column. */
+	readonly attrId: number;
+	/** The non-preserved side the flag reifies the match of. */
+	readonly side: 'left' | 'right';
+	/** That side's relational plan-node id (the component handle). */
+	readonly componentTable: number;
+}
+
 export function deriveJoinUpdateLineage(
 	joinType: string,
 	leftLineage: ReadonlyMap<number, UpdateSite> | undefined,
@@ -225,6 +243,7 @@ export function deriveJoinUpdateLineage(
 	leftDefaults: ReadonlyMap<number, AttributeDefault> | undefined,
 	rightDefaults: ReadonlyMap<number, AttributeDefault> | undefined,
 	guard: AST.Expression | undefined,
+	existence?: ReadonlyArray<JoinExistenceSite>,
 ): BackwardLineage {
 	const lineage = new Map<number, UpdateSite>();
 	const defaults = new Map<number, AttributeDefault>();
@@ -264,6 +283,21 @@ export function deriveJoinUpdateLineage(
 			addSide(leftLineage, leftDefaults, false);
 			break;
 	}
+
+	// Register an `existence` site per appended flag (read-only here; the write
+	// half flips its routing on). The guard is the join predicate the flag is the
+	// truth-value of — absent for `cross` (which never null-extends, so the parser
+	// rejects existence clauses there; defensively skip if guard is missing).
+	if (existence && guard !== undefined) {
+		for (const ex of existence) {
+			lineage.set(ex.attrId, {
+				kind: 'existence',
+				component: { kind: 'join-side', table: ex.componentTable, side: ex.side },
+				guard,
+			});
+		}
+	}
+
 	return {
 		updateLineage: lineage.size > 0 ? lineage : undefined,
 		attributeDefaults: defaults.size > 0 ? defaults : undefined,
@@ -339,6 +373,9 @@ export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite 
 			return { ...inner, writable: false, nullExtended: true };
 		}
 		case 'computed':
+		case 'existence':
+			// The existence flag has no base column (read-only in this half; writable
+			// through an effect, not a base mapping, once the write half lands).
 			return { writable: false, nullExtended: false };
 	}
 }

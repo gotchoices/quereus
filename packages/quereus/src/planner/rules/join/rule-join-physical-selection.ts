@@ -66,6 +66,12 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 	// Guard: only apply to logical JoinNode, not already-physical nodes
 	if (!(node instanceof JoinNode)) return null;
 
+	// A join exposing `exists … as` match flags stays the nested-loop JoinNode (the
+	// only emitter that derives the flag bit); the physical Bloom/Merge variants do
+	// not carry or emit the appended flag column, so converting would drop it. Read
+	// half: existence joins forgo hash/merge selection — documented limitation.
+	if (node.hasExistenceColumns) return null;
+
 	const joinType = node.joinType;
 
 	// Support INNER, LEFT, SEMI, and ANTI joins

@@ -1122,6 +1122,14 @@ export class Parser {
 			throw this.error(this.peek(), "Expected 'ON' or 'USING' after JOIN.");
 		}
 
+		// Optional `exists [left|right] as <name>` existence column clause(s), after a
+		// complete ON/USING predicate. One-token lookahead after `exists` (an `as` or
+		// side token, never `(`) distinguishes this from the `exists (<subquery>)`
+		// predicate; the comma form is recognised only when followed by another
+		// `exists`, so a genuine new FROM source comma is left for `tableSourceList`.
+		const existence = this.joinExistenceClauses(joinType);
+		if (existence) endToken = this.previous();
+
 		return {
 			type: 'join',
 			joinType,
@@ -1130,8 +1138,77 @@ export class Parser {
 			condition,
 			columns,
 			isLateral: isLateral || undefined,
+			existence,
 			loc: _createLoc(joinStartToken, endToken),
 		};
+	}
+
+	/**
+	 * Parse the optional comma-separated `exists [left|right] as <name>` clauses
+	 * trailing a join. Returns `undefined` when none are present. Resolves and
+	 * validates the side against the join type (default = the unique non-preserved
+	 * side; explicit side required for `full`; `inner`/`cross` rejected — no
+	 * null-extension means the flag would be a meaningless constant `true`).
+	 */
+	private joinExistenceClauses(
+		joinType: 'inner' | 'left' | 'right' | 'full' | 'cross',
+	): ReadonlyArray<AST.JoinExistenceColumn> | undefined {
+		// `exists` here must be followed by `as` or a side token, never `(` (which
+		// would be the `exists (<subquery>)` predicate). Bail before consuming if the
+		// lookahead does not match the clause shape.
+		const atExistenceClause = (): boolean =>
+			this.check(TokenType.EXISTS) &&
+			(this.checkNext(1, TokenType.AS) || this.checkNext(1, TokenType.LEFT) || this.checkNext(1, TokenType.RIGHT));
+
+		if (!atExistenceClause()) return undefined;
+
+		const result: AST.JoinExistenceColumn[] = [];
+		do {
+			this.consume(TokenType.EXISTS, "Expected 'exists'.");
+			let explicitSide: 'left' | 'right' | undefined;
+			if (this.match(TokenType.LEFT)) explicitSide = 'left';
+			else if (this.match(TokenType.RIGHT)) explicitSide = 'right';
+			this.consume(TokenType.AS, "Expected 'as' after 'exists' join existence clause.");
+			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected name after 'exists ... as'.");
+			result.push({ side: this.resolveExistenceSide(joinType, explicitSide), name });
+
+			// Continue only on `, exists ...`; a plain comma starts a new FROM source.
+		} while (this.check(TokenType.COMMA) && this.checkNext(1, TokenType.EXISTS) && this.advance());
+
+		return result;
+	}
+
+	/**
+	 * Resolve and validate the side of an `exists [<side>] as` join existence
+	 * clause. The flag must reference a null-extendable (non-preserved) side.
+	 */
+	private resolveExistenceSide(
+		joinType: 'inner' | 'left' | 'right' | 'full' | 'cross',
+		explicitSide: 'left' | 'right' | undefined,
+	): 'left' | 'right' {
+		// Non-preserved (null-extendable) sides per join type.
+		const nonPreserved: ('left' | 'right')[] =
+			joinType === 'left' ? ['right']
+			: joinType === 'right' ? ['left']
+			: joinType === 'full' ? ['left', 'right']
+			: []; // inner / cross: neither side null-extends
+
+		if (nonPreserved.length === 0) {
+			throw this.error(this.previous(),
+				`'exists ... as' is not valid on an ${joinType.toUpperCase()} join (no side is null-extended, so the flag would be a constant true)`);
+		}
+		if (explicitSide) {
+			if (!nonPreserved.includes(explicitSide)) {
+				throw this.error(this.previous(),
+					`'exists ${explicitSide} as' references the preserved side of a ${joinType.toUpperCase()} join; only the non-preserved side (${nonPreserved.join('/')}) has a meaningful match flag`);
+			}
+			return explicitSide;
+		}
+		if (nonPreserved.length > 1) {
+			throw this.error(this.previous(),
+				`'exists as' is ambiguous on a ${joinType.toUpperCase()} join — specify 'exists left as' or 'exists right as'`);
+		}
+		return nonPreserved[0];
 	}
 
 	/**

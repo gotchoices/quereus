@@ -1,6 +1,7 @@
 import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, InclusionDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
-import type { JoinType } from './join-node.js';
-import type { RelationType, ColRef } from '../../common/datatype.js';
+import type { JoinType, ExistenceColumnSpec } from './join-node.js';
+import type { RelationType, ColRef, ColumnDef, ScalarType } from '../../common/datatype.js';
+import { BOOLEAN_TYPE } from '../../types/builtin-types.js';
 import {
 	addEquivalence, addFd,
 	closeConstantBindingsOverEcs,
@@ -31,11 +32,24 @@ export interface EquiJoinPair {
  * logical JoinNode) the preserved set is returned directly.  Otherwise the
  * attributes are computed from the left/right inputs and the join type.
  */
+/**
+ * The scalar type of an existence (`exists … as`) match flag: a clean
+ * `{true,false}` boolean, genuinely NOT NULL (the null-extension test the column
+ * replaces), and read-only (derived at the combinator).
+ */
+export const EXISTENCE_FLAG_TYPE: ScalarType = {
+	typeClass: 'scalar',
+	logicalType: BOOLEAN_TYPE,
+	nullable: false,
+	isReadOnly: true,
+};
+
 export function buildJoinAttributes(
 	leftAttrs: readonly Attribute[],
 	rightAttrs: readonly Attribute[],
 	joinType: JoinType,
 	preserveAttributeIds?: readonly Attribute[],
+	existence?: readonly ExistenceColumnSpec[],
 ): Attribute[] {
 	if (preserveAttributeIds) return preserveAttributeIds.slice() as Attribute[];
 	if (joinType === 'semi' || joinType === 'anti') return leftAttrs.slice() as Attribute[];
@@ -48,6 +62,13 @@ export function buildJoinAttributes(
 	for (const attr of rightAttrs) {
 		const isNullable = joinType === 'left' || joinType === 'full';
 		attributes.push(isNullable ? { ...attr, type: { ...attr.type, nullable: true } } : attr);
+	}
+	// Existence flags are appended AFTER both sides — boolean NOT NULL, never
+	// marked nullable (the clean-boolean point), with their pre-minted stable ids.
+	if (existence) {
+		for (const spec of existence) {
+			attributes.push({ id: spec.attrId, name: spec.name, type: EXISTENCE_FLAG_TYPE });
+		}
 	}
 	return attributes;
 }
@@ -63,6 +84,7 @@ export function buildJoinRelationType(
 	rightType: RelationType,
 	joinType: JoinType,
 	keys?: ReadonlyArray<ReadonlyArray<ColRef>>,
+	existence?: readonly ExistenceColumnSpec[],
 ): RelationType {
 	if (joinType === 'semi' || joinType === 'anti') {
 		return {
@@ -75,6 +97,11 @@ export function buildJoinRelationType(
 		};
 	}
 
+	const existenceColumns: ColumnDef[] = (existence ?? []).map(spec => ({
+		name: spec.name,
+		type: EXISTENCE_FLAG_TYPE,
+	}));
+
 	const combinedColumns = [
 		...leftType.columns.map(col => {
 			const isNullable = joinType === 'right' || joinType === 'full';
@@ -84,6 +111,8 @@ export function buildJoinRelationType(
 			const isNullable = joinType === 'left' || joinType === 'full';
 			return isNullable ? { ...col, type: { ...col.type, nullable: true } } : col;
 		}),
+		// Existence flags appended after both sides; never part of any join key.
+		...existenceColumns,
 	];
 
 	const isSet = (joinType === 'inner' || joinType === 'cross') &&

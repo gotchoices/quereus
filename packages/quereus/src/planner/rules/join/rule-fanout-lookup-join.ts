@@ -519,6 +519,9 @@ function recognizeBranch(
 	outerAttrs: readonly Attribute[],
 ): RecognizedBranch | null {
 	if (join.joinType !== 'left' && join.joinType !== 'inner' && join.joinType !== 'cross') return null;
+	// A join carrying `exists … as` match flags is not folded into a fan-out lookup
+	// shape (which would not carry the appended flag column); keep it nested-loop.
+	if (join.hasExistenceColumns) return null;
 	if (!join.condition) return null;
 
 	const leftAttrs = join.left.getAttributes();

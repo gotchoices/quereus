@@ -36,6 +36,16 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 		return { leftIndex, rightIndex, collationFunc };
 	});
 
+	// Existence (`exists … as`) flags appended after both sides. The flag is the
+	// ACTUAL match bit the outer-join null-extension already computes (NOT a
+	// re-evaluation of the ON predicate, which would be unsound on a null-extended
+	// row): a matched row has every side present (all flags true); a null-extended
+	// row's non-preserved side is absent (its flag false; the preserved side stays
+	// true). Pre-compute the two flag rows once at emit time.
+	const existence = plan.existence;
+	const matchedFlags: Row | undefined = existence ? existence.map(() => true) as Row : undefined;
+	const unmatchedFlags: Row | undefined = existence ? existence.map(spec => spec.side === 'left') as Row : undefined;
+
 	// NOTE: rightSource must be re-startable (optimizer facilitates through cache node)
 	async function* run(rctx: RuntimeContext, leftSource: AsyncIterable<Row>, rightCallback: (ctx: RuntimeContext) => AsyncIterable<Row>, conditionCallback?: (ctx: RuntimeContext) => OutputValue): AsyncIterable<Row> {
 		const joinType = plan.joinType;
@@ -90,12 +100,12 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 							// Anti: just record the match, don't emit yet
 							break;
 						}
-						yield [...leftRow, ...rightRow] as Row;
+						yield (matchedFlags ? [...leftRow, ...rightRow, ...matchedFlags] : [...leftRow, ...rightRow]) as Row;
 					}
 				}
 
 				const postRow = joinOutputRow(joinType, leftMatched, isSemiOrAnti, leftRow, rightAttributes.length, rightSlot);
-				if (postRow) yield postRow;
+				if (postRow) yield (unmatchedFlags ? [...postRow, ...unmatchedFlags] : postRow) as Row;
 			}
 
 		} finally {

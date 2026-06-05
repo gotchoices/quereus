@@ -86,6 +86,35 @@ describe('Emit: statement round-trips', () => {
 			roundTripStmt('select a.x from a cross join b');
 		});
 
+		it('LEFT JOIN with exists existence column (side resolved)', () => {
+			// `exists as f` resolves to the non-preserved (right) side; stringify emits
+			// the explicit side, so the round-trip is stable from the second parse on.
+			expect(roundTripStmt('select a.x, f from a left join b on a.id = b.id exists as f'))
+				.to.equal('select a.x, f from a left join b on a.id = b.id exists right as f');
+		});
+
+		it('LEFT JOIN with explicit exists right', () => {
+			roundTripStmt('select a.x, f from a left join b on a.id = b.id exists right as f');
+		});
+
+		it('FULL JOIN with both-side exists existence columns', () => {
+			roundTripStmt('select a.x, fa, fb from a full join b on a.id = b.id exists left as fa, exists right as fb');
+		});
+
+		it('rejects exists existence on inner/cross/full-without-side', () => {
+			expect(() => parse('select a.x from a inner join b on a.id = b.id exists right as f')).to.throw();
+			expect(() => parse('select a.x from a join b on a.id = b.id exists left as f')).to.throw();
+			expect(() => parse('select a.x from a full join b on a.id = b.id exists as f')).to.throw();
+			// `exists left` on a LEFT join names the preserved side — rejected.
+			expect(() => parse('select a.x from a left join b on a.id = b.id exists left as f')).to.throw();
+		});
+
+		it('does not absorb a trailing exists-predicate subquery as an existence clause', () => {
+			// `exists (` is the predicate form, never the existence clause — a WHERE
+			// `exists (...)` after the join must still parse as a predicate.
+			roundTripStmt('select a.x from a left join b on a.id = b.id where exists (select 1 from b)');
+		});
+
 		it('WITH CTE', () => {
 			roundTripStmt('with cte as (select 1 as x) select x from cte');
 		});
