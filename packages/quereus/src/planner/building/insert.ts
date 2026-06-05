@@ -14,6 +14,7 @@ import { checkColumnsAssignable, columnSchemaToDef } from '../type-utils.js';
 import type { ColumnDef } from '../../common/datatype.js';
 import type { CTEScopeNode } from '../nodes/cte-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
+import type { Scope } from '../scopes/scope.js';
 import { buildRowDefaultScope } from './default-scope.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
@@ -44,7 +45,17 @@ function createRowExpansionProjection(
 	sourceNode: RelationalPlanNode,
 	targetColumns: ColumnDef[],
 	tableReference: TableReferenceNode,
-	contextScope?: RegisteredScope
+	contextScope?: RegisteredScope,
+	/**
+	 * The produced-row NEW context a synthetic decomposition / multi-source member
+	 * insert threads (see {@link buildInsertStmt}'s param). When set, an omitted
+	 * column's expression default resolves `new.<col>` against the **produced logical
+	 * row's** supplied columns (the envelope), not only this member's own supplied
+	 * columns — so a member default correlating on a sibling logical column the
+	 * member's base table does not carry still resolves. `undefined` for an ordinary
+	 * insert (single-source `new.<col>` is unchanged).
+	 */
+	defaultRowContextScope?: Scope,
 ): RelationalPlanNode {
 	const tableSchema = tableReference.tableSchema;
 	const hasGeneratedColumns = tableSchema.columns.some(col => col.generated);
@@ -83,7 +94,7 @@ function createRowExpansionProjection(
 			(tableReference.tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
 		);
 		const defaultScope = buildRowDefaultScope(
-			contextScope ?? ctx.scope,
+			contextScope ?? defaultRowContextScope ?? ctx.scope,
 			targetColumns,
 			sourceAttributes,
 			contextVarNames,
@@ -421,6 +432,20 @@ export function buildInsertStmt(
 	 * `lensRouted` field. Default `false` for ordinary base-table inserts.
 	 */
 	lensRouted = false,
+	/**
+	 * The produced-row NEW context a synthetic decomposition / multi-source member
+	 * insert threads so this member's column defaults can correlate on the **produced
+	 * logical row's** other supplied columns via `new.<col>` — even ones this member's
+	 * base table does not carry (e.g. an anchor key-column default
+	 * `default (select … where parent.key = new.<fk>)`, where `<fk>` lives on a
+	 * sibling member). It registers each supplied logical column as `new.<col>` over
+	 * the shared envelope attributes, which stay resolvable through the member insert's
+	 * pipeline (the narrowing envelope projection keeps them bound). Parented beneath
+	 * the member's own supplied columns + mutation context, so a name a member carries
+	 * itself still wins. `undefined` for an ordinary insert — single-source `new.<col>`
+	 * resolution (table columns only) is unchanged.
+	 */
+	defaultRowContextScope?: Scope,
 ): PlanNode {
 	// Apply schema path from statement if present
 	const contextWithSchemaPath = stmt.schemaPath
@@ -472,8 +497,11 @@ export function buildInsertStmt(
 			});
 		});
 
-		// Create a new scope for mutation context
-		contextScope = new RegisteredScope(contextWithSchemaPath.scope);
+		// Create a new scope for mutation context. When a synthetic member insert
+		// threads a produced-row NEW context, parent on it so context variables still
+		// shadow the envelope's `new.<col>` (WITH CONTEXT precedence), while an envelope
+		// column the member does not carry stays resolvable below.
+		contextScope = new RegisteredScope(defaultRowContextScope ?? contextWithSchemaPath.scope);
 
 		// Register mutation context variables in the scope (before evaluating expressions)
 		contextAttributes.forEach((attr, index) => {
@@ -599,7 +627,7 @@ export function buildInsertStmt(
 	}
 
 	// ORTHOGONAL ROW EXPANSION: Apply uniform row expansion to map any source to table structure with defaults
-	const expandedSourceNode = createRowExpansionProjection(contextWithSchemaPath, sourceNode, targetColumns, tableReference, contextScope);
+	const expandedSourceNode = createRowExpansionProjection(contextWithSchemaPath, sourceNode, targetColumns, tableReference, contextScope, defaultRowContextScope);
 
 	// Update targetColumns to reflect all table columns since we've expanded the source
 	const finalTargetColumns = tableReference.tableSchema.columns.map(col => columnSchemaToDef(col.name, col));
@@ -663,7 +691,7 @@ export function buildInsertStmt(
 	// Pre-build DEFAULT evaluators for NOT NULL columns. Used by REPLACE to
 	// substitute the default when the user supplied NULL.
 	const notNullDefaults = buildNotNullDefaults(
-		ctx, tableReference.tableSchema, newAttributes, contextAttributes
+		ctx, tableReference.tableSchema, newAttributes, contextAttributes, defaultRowContextScope
 	);
 
 	const insertNode = new InsertNode(

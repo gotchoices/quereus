@@ -444,6 +444,11 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 
 	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.keyDefault);
 
+	// Produced-row NEW context shared by every side's default scope (the dual of the
+	// decomposition fan-out's): a side's column default can correlate on a sibling
+	// supplied column its own base table does not carry, via `new.<col>`.
+	const sideNewRowScope = buildMemberDefaultRowScope(ctx, plan.suppliedColumns, envelopeAttrs);
+
 	const baseOps = plan.orderedSides.map(side => {
 		const scan = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
 		// A non-preserved (outer-join optional) side inserts only for rows that supply ≥1
@@ -483,7 +488,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 		// single basis spine, so the runtime parent-side cascade reverse-map never matches
 		// it — the marker would have no effect. The single-source spine (`buildBaseOp`) is
 		// the only place it is load-bearing. Do not "fix" this omission.
-		return buildInsertStmt(ctx, sideInsert, [], source);
+		return buildInsertStmt(ctx, sideInsert, [], source, false, sideNewRowScope);
 	});
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
@@ -519,8 +524,18 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 
 	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.keyDefault);
 
+	// The produced logical row's NEW context, shared by every member insert's default
+	// scope: each supplied logical column registered as `new.<col>` over the shared
+	// envelope attributes (the same surface the single-source insert path exposes). A
+	// member's key-column / NOT NULL default can thereby correlate on a sibling logical
+	// column its own base table does not carry (e.g. an anchor surrogate default
+	// `default (select … where parent.key = new.<fk>)`). The envelope attributes stay
+	// resolvable through the member insert's pipeline — the narrowing envelope
+	// projection keeps them bound while downstream rows are produced.
+	const memberNewRowScope = buildMemberDefaultRowScope(ctx, plan.suppliedColumns, envelopeAttrs);
+
 	const baseOps = plan.ops.map(op =>
-		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op));
+		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op, memberNewRowScope));
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
 	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.suppliedColumns);
@@ -632,6 +647,9 @@ function buildDecompositionMemberInsert(
 	envelopeAttrs: Attribute[],
 	envelopeType: RelationType,
 	op: DecompInsertOp,
+	/** The produced-row NEW context (`new.<col>` over the supplied envelope columns)
+	 *  threaded into this member's default-build scope (see {@link buildDecompositionInsert}). */
+	memberNewRowScope: RegisteredScope,
 ): PlanNode {
 	let source: RelationalPlanNode = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
 
@@ -670,7 +688,28 @@ function buildDecompositionMemberInsert(
 	// Leaves `lensRouted = false` (default) for the same reason as the multi-source
 	// path: a decomposition parent has no single basis spine for the runtime parent-side
 	// cascade reverse-map to match, so the marker is moot here. Do not "fix" this.
-	return buildInsertStmt(ctx, memberInsert, [], projectedSource);
+	// `memberNewRowScope` threads the produced row's `new.<col>` context so this
+	// member's defaults resolve against the supplied logical row (not only this
+	// member's own columns).
+	return buildInsertStmt(ctx, memberInsert, [], projectedSource, false, memberNewRowScope);
+}
+
+/**
+ * Build the produced-row NEW context every member insert of a fan-out shares: each
+ * supplied logical column registered as `new.<col>` (and the bare form, unless a
+ * member shadows it) over the shared envelope attributes — the same `new.<col>`
+ * surface the single-source insert path exposes, lifted to the produced *logical*
+ * row. A member insert's default-build scope parents on this, so a default can
+ * correlate on a sibling supplied column the member's own base table does not carry.
+ * The envelope attributes it references stay resolvable through each member insert's
+ * pipeline because the narrowing envelope projection keeps its source row bound.
+ */
+function buildMemberDefaultRowScope(
+	ctx: PlanningContext,
+	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
+	envelopeAttrs: Attribute[],
+): RegisteredScope {
+	return buildRowDefaultScope(ctx.scope, suppliedColumns, envelopeAttrs);
 }
 
 /**

@@ -300,3 +300,81 @@ alter table ac_multi add column s integer default (new.a + new.b);
 select id, s from ac_multi order by id;
 → [{"id":1,"s":5},{"id":2,"s":11}]
 DROP TABLE ac_multi;
+
+-- ===================================
+-- Identity-resolving default through a DECOMPOSITION fan-out. The anchor key
+-- column's surrogate `default` correlates on a SIBLING supplied logical column
+-- (`new.value`) the anchor's own base table does NOT carry — it lives on another
+-- member. The produced row's NEW context now threads into every member insert, so
+-- the engine's own fan-out resolves the parent surrogate per produced row and
+-- EC-threads it across the members (the multi-member dual of the single-source
+-- identity-resolving default above). Before this, the fan-out's buildNotNullDefaults
+-- raised `new.value isn't a column` from buildDecompositionMemberInsert.
+-- ===================================
+
+create table hd_parent (pid integer primary key, value integer);
+
+-- run
+
+insert into hd_parent (pid, value) values (10, 100), (20, 200), (30, 300);
+
+-- run
+
+-- Per-column decomposition of logical T(value): anchor hd_anchor holds ONLY the
+-- surrogate key rowId, whose default resolves the parent's pid from the inserted
+-- value (`new.value`); member hd_value carries the value column. The resolved rowId
+-- threads from the anchor default into hd_value via the shared key.
+create table hd_anchor (
+	rowId integer primary key default (select pid from hd_parent p where p.value = new.value)
+) with tags (
+	"quereus.lens.decomp.logical.dT" = 'T',
+	"quereus.lens.decomp.role.dT" = 'primary-storage',
+	"quereus.lens.decomp.anchor.dT" = 'hd_anchor',
+	"quereus.lens.decomp.presence.dT" = 'mandatory',
+	"quereus.lens.decomp.keykind.dT" = 'surrogate',
+	"quereus.lens.decomp.key.dT" = 'rowId'
+);
+
+create table hd_value (rowId integer primary key, value integer) with tags (
+	"quereus.lens.decomp.logical.dT" = 'T',
+	"quereus.lens.decomp.role.dT" = 'primary-storage',
+	"quereus.lens.decomp.anchor.dT" = 'hd_anchor',
+	"quereus.lens.decomp.presence.dT" = 'mandatory',
+	"quereus.lens.decomp.keykind.dT" = 'surrogate',
+	"quereus.lens.decomp.key.dT" = 'rowId',
+	"quereus.lens.decomp.col.dT.value" = 'value'
+);
+
+-- run
+
+declare logical schema xd { table T { value integer } }
+
+-- run
+
+apply schema xd;
+
+-- run
+
+-- value=200 resolves the parent pid=20 via the anchor default and threads that
+-- surrogate into the value member (no longer throws `new.value isn't a column`).
+insert into xd.T (value) values (200);
+select rowId, value from hd_value;
+→ [{"rowId":20,"value":200}]
+
+-- the identical surrogate landed on the anchor member.
+select rowId from hd_anchor;
+→ [{"rowId":20}]
+
+-- Multi-row in ONE statement: each produced row resolves its OWN parent from its
+-- supplied value (the NEW context is per produced row, not once per statement).
+insert into xd.T (value) values (100), (300);
+select rowId, value from hd_value order by rowId;
+→ [{"rowId":10,"value":100},{"rowId":20,"value":200},{"rowId":30,"value":300}]
+
+-- the view reads back the full logical image (anchor ⋈ value on the shared key).
+select value from xd.T order by value;
+→ [{"value":100},{"value":200},{"value":300}]
+
+DROP TABLE hd_value;
+DROP TABLE hd_anchor;
+DROP TABLE hd_parent;

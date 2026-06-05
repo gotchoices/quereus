@@ -4968,6 +4968,38 @@ describe('Property-Based Tests', () => {
 				await db.exec('apply schema x');
 			}
 
+			// Parent-resolving surrogate split: the anchor key's `default` resolves an
+			// EXISTING parent row's surrogate from an inserted FK value via a correlated
+			// subquery over a sibling base table — the lens parent-fk shared-rowId identity
+			// pattern. Crucially the `new.<col>` it correlates on (`new.fk`) is a logical
+			// column carried by ANOTHER member (Pr_data), NOT the anchor's own base table,
+			// so the default resolves only because the produced row's NEW context threads
+			// into every member insert's default scope. anchor Pr_anchor(rowId) +
+			// mandatory Pr_data(rowId, fk, payload); logical P(fk, payload).
+			async function deployParentSurrogate(): Promise<void> {
+				await db.exec('create table Pr_users (uid integer primary key, ukey integer) using memory');
+				await db.exec(`create table Pr_anchor (rowId integer primary key default (select uid from Pr_users u where u.ukey = new.fk)) using memory with tags (
+					"quereus.lens.decomp.logical.dP" = 'P',
+					"quereus.lens.decomp.role.dP" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dP" = 'Pr_anchor',
+					"quereus.lens.decomp.presence.dP" = 'mandatory',
+					"quereus.lens.decomp.keykind.dP" = 'surrogate',
+					"quereus.lens.decomp.key.dP" = 'rowId'
+				)`);
+				await db.exec(`create table Pr_data (rowId integer primary key, fk integer not null, payload integer not null) using memory with tags (
+					"quereus.lens.decomp.logical.dP" = 'P',
+					"quereus.lens.decomp.role.dP" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dP" = 'Pr_anchor',
+					"quereus.lens.decomp.presence.dP" = 'mandatory',
+					"quereus.lens.decomp.keykind.dP" = 'surrogate',
+					"quereus.lens.decomp.key.dP" = 'rowId',
+					"quereus.lens.decomp.col.dP.fk" = 'fk',
+					"quereus.lens.decomp.col.dP.payload" = 'payload'
+				)`);
+				await db.exec('declare logical schema xp { table P { fk integer, payload integer } }');
+				await db.exec('apply schema xp');
+			}
+
 			const colRowArb = fc.record({
 				id: fc.integer({ min: 1, max: 6 }),
 				a: fc.integer({ min: 1, max: 9 }),
@@ -5363,6 +5395,62 @@ describe('Property-Based Tests', () => {
 					},
 				), { numRuns: 40 });
 				expect(multiInserted, 'surrogate multi-row PutGet never inserted').to.be.greaterThan(0);
+			});
+
+			// ----- PutGet (surrogate, parent-resolving default): new.<col> reaches the fan-out -----
+			// The anchor key's surrogate `default` resolves an existing PARENT row's surrogate
+			// from an inserted FK value, correlating on `new.fk` — a logical column carried by
+			// a SIBLING member (Pr_data), not the anchor's own base table. Before the produced-
+			// row NEW context threaded into each member insert, this threw `new.fk isn't a
+			// column` from the fan-out's own buildDecompositionMemberInsert → buildNotNullDefaults.
+			// Now each produced row resolves its OWN parent surrogate (new.fk per row) and threads
+			// it identically into every member — the multi-member dual of the single-source
+			// identity-resolving default, and the lone gate for Lamina's parent-fk shared-rowId
+			// identity through the lens.
+			it('PutGet (surrogate, parent-resolving default): the anchor default resolves a parent surrogate from a sibling-member column (new.fk), threaded into every member', async () => {
+				await deployParentSurrogate();
+				let inserted = 0;
+				await fc.assert(fc.asyncProperty(
+					// Distinct parents: uid is the surrogate the FK resolves TO (and the member PK),
+					// ukey the single-valued lookup key the FK matches. Each inserted logical row
+					// resolves to a distinct parent ⇒ a distinct shared rowId (the 1:1
+					// child-shares-parent-identity shape).
+					fc.uniqueArray(
+						fc.record({ uid: fc.integer({ min: 1, max: 40 }), ukey: fc.integer({ min: 1, max: 40 }), payload: fc.integer({ min: 1, max: 9 }) }),
+						{ selector: r => r.uid, minLength: 1, maxLength: 6 },
+					),
+					async (parents) => {
+						// ukey must also be unique so the correlated subquery is single-valued.
+						const seenKey = new Set<number>();
+						const ps = parents.filter(p => { if (seenKey.has(p.ukey)) return false; seenKey.add(p.ukey); return true; });
+						fc.pre(ps.length > 0);
+						await db.exec('delete from main.Pr_anchor');
+						await db.exec('delete from main.Pr_data');
+						await db.exec('delete from main.Pr_users');
+						for (const p of ps) await db.exec(`insert into main.Pr_users values (${p.uid}, ${p.ukey})`);
+
+						// One logical insert per parent (fk → that parent's ukey), all in ONE statement:
+						// the anchor default resolves each row's surrogate = the parent's uid, per produced row.
+						const valuesSql = ps.map(p => `(${p.ukey}, ${p.payload})`).join(', ');
+						await db.exec(`insert into xp.P (fk, payload) values ${valuesSql}`);
+						inserted++;
+
+						for (const p of ps) {
+							// The anchor minted the RESOLVED parent surrogate (not a fresh key) ...
+							const anchorRow = await readRows(`select rowId from main.Pr_anchor where rowId = ${String(p.uid)}`);
+							expect(anchorRow.length, `anchor carries the resolved parent surrogate ${p.uid}`).to.equal(1);
+							// ... and the SAME surrogate threaded into the data member, alongside the supplied values.
+							const dataRow = await readRows(`select rowId, fk, payload from main.Pr_data where rowId = ${String(p.uid)}`);
+							expect(dataRow.length, `data member threaded the same surrogate ${p.uid}`).to.equal(1);
+							expect(dataRow[0].fk, 'supplied fk landed on the data member').to.equal(p.ukey);
+							expect(dataRow[0].payload, 'supplied payload landed on the data member').to.equal(p.payload);
+						}
+						// The view reads back exactly one logical row per insert (anchor ⋈ data on rowId).
+						const view = await readRows('select fk, payload from xp.P');
+						expect(view.length, 'view image has one row per insert').to.equal(ps.length);
+					},
+				), { numRuns: 50 });
+				expect(inserted, 'parent-resolving surrogate PutGet never inserted').to.be.greaterThan(0);
 			});
 
 			// ----- forward/backward lineage agreement (the structural crux for C) -----

@@ -4,6 +4,7 @@ import { RowOpFlag } from '../../schema/table.js';
 import type { Attribute, RowDescriptor } from '../nodes/plan-node.js';
 import type { ConstraintCheck, NotNullDefaultPlan } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
+import type { Scope } from '../scopes/scope.js';
 import { buildExpression } from './expression.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
@@ -204,6 +205,16 @@ export function buildNotNullDefaults(
   tableSchema: TableSchema,
   newAttributes: Attribute[],
   contextAttributes: Attribute[] = [],
+  /**
+   * Parent scope for `new.<col>` resolution, threaded by a synthetic decomposition /
+   * multi-source member insert (see {@link buildInsertStmt}'s `defaultRowContextScope`).
+   * It exposes the **produced logical row's** supplied columns as `new.<col>`, so a NOT
+   * NULL column's default can correlate on a sibling logical column the member's own base
+   * table does not carry (e.g. an anchor key-column default
+   * `default (select … where parent.key = new.<fk>)`). The member's own NEW columns are
+   * registered below and shadow it. `undefined` (⇒ `ctx.scope`) for an ordinary insert.
+   */
+  defaultRowContextScope?: Scope,
 ): NotNullDefaultPlan[] {
   const result: NotNullDefaultPlan[] = [];
 
@@ -213,7 +224,7 @@ export function buildNotNullDefaults(
     const defaultExpr = column.defaultValue;
     if (!defaultExpr || typeof defaultExpr !== 'object' || !('type' in defaultExpr)) continue;
 
-    const scope = new RegisteredScope(ctx.scope);
+    const scope = new RegisteredScope(defaultRowContextScope ?? ctx.scope);
     const reservedKeys = new Set<string>();
 
     // Mutation context variables first so they shadow column names if conflicts exist
