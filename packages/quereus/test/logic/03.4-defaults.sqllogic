@@ -129,3 +129,35 @@ INSERT INTO t_gen_ref (id, x) VALUES (1, 5);
 -- error: isn't a column
 
 DROP TABLE t_gen_ref;
+
+-- ===================================
+-- Identity-resolving default: new.<column> inside a correlated subquery over
+-- ANOTHER base table resolves an existing parent row's key from a supplied
+-- value (the PK-is-FK extension-table / lens basis pattern). The default reads
+-- new.value and looks the matching parent rowId up, rather than minting a fresh
+-- surrogate.
+-- ===================================
+
+CREATE TABLE h0_users_id (
+  rowId INTEGER PRIMARY KEY,
+  value INTEGER
+);
+INSERT INTO h0_users_id (rowId, value) VALUES (10, 100), (20, 200);
+
+CREATE TABLE h2_uprof (
+  rowId INTEGER PRIMARY KEY DEFAULT (SELECT rowId FROM h0_users_id h0 WHERE h0.value = new.value),
+  value INTEGER
+);
+
+-- value=200 resolves the parent's rowId=20 through the correlated subquery
+INSERT INTO h2_uprof (value) VALUES (200);
+SELECT rowId, value FROM h2_uprof WHERE value = 200;
+→ [{"rowId":20,"value":200}]
+
+-- a second resolution against a different supplied value
+INSERT INTO h2_uprof (value) VALUES (100);
+SELECT rowId, value FROM h2_uprof ORDER BY rowId;
+→ [{"rowId":10,"value":100},{"rowId":20,"value":200}]
+
+DROP TABLE h2_uprof;
+DROP TABLE h0_users_id;

@@ -511,6 +511,31 @@ Propagation, per top-level row:
 
 A non-deterministic allocator (`uuid7()`, a clock read) works identically under `pragma nondeterministic_schema`: the default is evaluated **once per row at the envelope** and the single captured value threads to every member, so the members never disagree on the key — the load-bearing evaluate-once-and-thread guarantee, the same way captured timestamps replay. Had the example also carried `created int default now_ms()` with a per-statement binding, that value would stamp the same on both rows, whereas `rid` differs per row. Per-column `default_for` tags may reference context bindings; bindings evaluate per their cadence and are reused across every per-base operation that consumes them.
 
+### A default may read the in-flight row via `new.<col>` — minting vs. resolving a key
+
+A column `default` can read the **other supplied values of the same row** through `new.<col>`. Only INSERT-supplied (or already-defaulted) siblings are visible — an omitted column raises a resolution error rather than reading a not-yet-evaluated default, so there is no evaluation-order race. The `new.`-qualified form is always available; the bare form resolves too unless a same-named mutation-context variable shadows it. This is the same row scope `mutation_ordinal()` participates in, surfaced as ordinary column references at plan-build time (no runtime-context plumbing).
+
+The two flavours of generated key follow directly:
+
+- **Minting** a fresh surrogate — the `max() + mutation_ordinal()` recipe above; the default ignores the row's values.
+- **Resolving** an existing key — the default reads `new.<col>` to look an existing parent row up. This is the natural shape for a **PK-is-FK extension table** (or lens basis relation) whose surrogate *adopts the parent's* rather than minting its own:
+
+```sql
+-- parent identity table
+create table h0_users_id (rowId int primary key, value int) using mem();
+
+-- extension relation: its rowId resolves the parent's via the supplied `value`
+create table h2_uprof (
+  rowId int primary key
+          default (select rowId from h0_users_id h0 where h0.value = new.value),
+  value int
+) using mem();
+
+insert into h2_uprof (value) values (200);   -- rowId is resolved to the matching parent row
+```
+
+The default's correlated subquery reads `new.value` (the row's supplied value), so `h2_uprof.rowId` adopts the parent `h0_users_id.rowId` whose `value` matches. Such a default is deterministic *given install state* — it resolves an existing row and introduces no nondeterminism beyond the basis read it already performs, so it needs no `nondeterministic_schema` opt-out.
+
 ## Diagnostics
 
 When propagation cannot proceed, the engine raises a `QuereusError` whose `details.mutationDiagnostic` is a structured record:
