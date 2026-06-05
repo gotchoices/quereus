@@ -2143,9 +2143,10 @@ describe('Property-Based Tests', () => {
 	// `<setop> exists <branch> as <name>` clause reifies which immediate operand of a
 	// binary set operation a result tuple is a member of. The flag is a clean
 	// `{true,false}` NOT NULL boolean derived AT THE COMBINATOR by a per-branch semijoin
-	// probe (`inA ≡ tuple ∈ A`), never a stored operand column. These read-half tests pin
-	// the derived flag; *writing* it (membership-flip ⇒ branch insert/delete) is the write
-	// half (`set-op-membership-write`) and still rejects here.
+	// probe (`inA ≡ tuple ∈ A`), never a stored operand column. These tests pin the derived
+	// flag and its now-writable lineage / static surfaces; *writing* it (membership-flip ⇒
+	// branch insert/delete, data/delete fan-out, insert-through) is exercised by the
+	// `Set-operation membership writes` family below (`set-op-membership-write`).
 	describe('Set-operation membership columns', () => {
 		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
 			const out: Record<string, SqlValue>[] = [];
@@ -2320,7 +2321,7 @@ describe('Property-Based Tests', () => {
 			expect(claimsKeyToFlag, 'union all makes no key → flag claim').to.equal(false);
 		});
 
-		it('lineage: each flag carries a read-only `set-op-branch` existence UpdateSite', async () => {
+		it('lineage: each flag carries a writable-through-effect `set-op-branch` existence UpdateSite', async () => {
 			await createSchemas();
 			const setOp = findSetOp('select id, x from A union exists left as inA, exists right as inB select id, x from B');
 			const attrs = setOp.getAttributes();
@@ -2330,10 +2331,11 @@ describe('Property-Based Tests', () => {
 				const site = setOp.physical?.updateLineage?.get(attr.id);
 				expect(site?.kind, `${name} lineage is an existence site`).to.equal('existence');
 				const resolved = resolveBaseSite(site);
-				// Read-only in this half: not writable, no base column, no write effect yet.
-				expect(resolved.writable, `${name} is read-only in the read half`).to.equal(false);
+				// Write half: writable through an effect (the membership flip drives a branch
+				// insert/delete), no base column, carrying the set-op-branch component ref.
+				expect(resolved.writable, `${name} is writable through an effect`).to.equal(true);
 				expect(resolved.baseColumn, `${name} has no base column`).to.equal(undefined);
-				expect(resolved.existenceComponent, `${name} carries no write component yet`).to.equal(undefined);
+				expect(resolved.existenceComponent?.kind, `${name} carries its set-op-branch component`).to.equal('set-op-branch');
 				if (site?.kind === 'existence') {
 					expect(site.component.kind, `${name} is a set-op-branch component`).to.equal('set-op-branch');
 					if (site.component.kind === 'set-op-branch') {
@@ -2343,26 +2345,24 @@ describe('Property-Based Tests', () => {
 			}
 		});
 
-		it('column_info: a membership column reports is_updatable=NO with null base (read half)', async () => {
+		it('column_info: a membership column reports is_updatable=YES with null base (writable through effect)', async () => {
 			await seed();
 			const rows = await readRows("select column_name, is_updatable, base_table, base_column from column_info('U')");
 			for (const name of ['inA', 'inB']) {
 				const flag = rows.find(r => r.column_name === name);
 				expect(flag, `column_info exposes ${name}`).to.not.equal(undefined);
-				expect(flag!.is_updatable, `${name} is read-only in the read half`).to.equal('NO');
+				expect(flag!.is_updatable, `${name} is writable through an effect`).to.equal('YES');
 				expect(flag!.base_table, `${name} has no base table`).to.equal(null);
 				expect(flag!.base_column, `${name} has no base column`).to.equal(null);
 			}
 		});
 
-		it('write still rejects: membership/set-op view writes are read-only here', async () => {
+		it('view_info: a set-op membership view is insertable/updatable/deletable through its branches', async () => {
 			await seed();
-			let threw = false;
-			try { await db.exec('update U set inB = true where id = 1'); } catch { threw = true; }
-			expect(threw, 'update of a membership column rejects (write half not wired)').to.equal(true);
-			threw = false;
-			try { await db.exec('insert into U (id, x, inA, inB) values (9, 90, true, false)'); } catch { threw = true; }
-			expect(threw, 'insert through a set-op membership view rejects').to.equal(true);
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('U')"))[0];
+			expect(info.is_insertable_into).to.equal('YES');
+			expect(info.is_updatable).to.equal('YES');
+			expect(info.is_deletable).to.equal('YES');
 		});
 
 		it('grammar: the membership clause is captured in the AST and rejects on DIFF', () => {
@@ -2374,6 +2374,179 @@ describe('Property-Based Tests', () => {
 			]);
 			// Rejected on DIFF (symmetric difference desugars to two EXCEPTs — ambiguous).
 			expect(() => parser.parse('select id from A diff exists left as inA select id from B')).to.throw();
+		});
+	});
+
+	// --- Set-operation membership WRITES (set-op-membership-write) ---
+	// The first set-op view writability in the engine. A membership column IS the branch
+	// presence: writing it drives the branch's existence (`set inB = true` ⇒ insert into B,
+	// `= false` ⇒ delete from B). Data-column writes and deletes fan out to the member
+	// branches via the runtime membership probe; insert-through routes by the supplied
+	// flags. Every write is decomposed into per-branch base ops over an up-front,
+	// Halloween-safe capture of the affected rows + their probe flags
+	// (planner/mutation/set-op.ts).
+	describe('Set-operation membership writes', () => {
+		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
+			return out;
+		}
+		async function ids(sql: string): Promise<SqlValue[]> {
+			return (await readRows(sql)).map(r => Object.values(r)[0]);
+		}
+		async function seed(): Promise<void> {
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			// (1,10) in A only; (2,20),(3,30) in both; (4,40) in B only.
+			await db.exec('insert into A values (1, 10), (2, 20), (3, 30)');
+			await db.exec('insert into B values (2, 20), (3, 30), (4, 40)');
+			await db.exec('create view U as select id, x from A union exists left as inA, exists right as inB select id, x from B');
+		}
+
+		it('inB false→true: a membership flip inserts the row into branch B', async () => {
+			await seed();
+			await db.exec('update U set inB = true where id = 1'); // (1,10) in A only
+			expect(await ids('select id from B order by id')).to.deep.equal([1, 2, 3, 4]);
+			expect((await readRows('select x from B where id = 1'))[0].x).to.equal(10);
+			// PutGet: inB now reads true for id=1.
+			expect((await readRows('select inB from U where id = 1'))[0].inB).to.equal(true);
+		});
+
+		it('inB false→true on a row already in B is a clean no-op (idempotent)', async () => {
+			await seed();
+			const before = await readRows('select id, x from B order by id');
+			await db.exec('update U set inB = true where id = 2'); // already in B
+			expect(await readRows('select id, x from B order by id')).to.deep.equal(before);
+		});
+
+		it('inB false→true with an undefaulted NOT NULL branch column rejects (no-default)', async () => {
+			await db.exec('create table A3 (id integer primary key, x integer) using memory');
+			await db.exec('create table B3 (id integer primary key, x integer, req integer not null) using memory');
+			await db.exec('insert into A3 values (1, 10)');
+			await db.exec('create view U3 as select id, x from A3 union exists left as inA, exists right as inB select id, x from B3');
+			let threw = false;
+			try { await db.exec('update U3 set inB = true where id = 1'); } catch { threw = true; }
+			expect(threw, 'a NOT NULL branch column with no value blocks the materialization').to.equal(true);
+		});
+
+		it('inB true→false: a membership flip deletes the matching B row; A is untouched', async () => {
+			await seed();
+			await db.exec('update U set inB = false where id = 2'); // (2,20) in both
+			expect(await ids('select id from B order by id')).to.deep.equal([3, 4]);
+			expect(await ids('select id from A order by id')).to.deep.equal([1, 2, 3]); // untouched
+			// Still visible (still inA), now inB=false.
+			expect((await readRows('select inA, inB from U where id = 2'))[0]).to.deep.equal({ inA: true, inB: false });
+		});
+
+		it('both false: the row leaves the view entirely', async () => {
+			await seed();
+			await db.exec('update U set inA = false, inB = false where id = 2'); // in both
+			expect(await ids('select id from A order by id')).to.deep.equal([1, 3]);
+			expect(await ids('select id from B order by id')).to.deep.equal([3, 4]);
+			expect(await readRows('select id from U where id = 2')).to.deep.equal([]);
+		});
+
+		it('except: set inR=true inserts into B and the row vanishes from the view', async () => {
+			await seed();
+			await db.exec('create view Ux as select id, x from A except exists left as inL, exists right as inR select id, x from B');
+			// Ux = A except B = {(1,10)}. Pushing it into B removes it from Ux.
+			expect(await ids('select id from Ux')).to.deep.equal([1]);
+			await db.exec('update Ux set inR = true where id = 1');
+			expect(await ids('select id from B where id = 1')).to.deep.equal([1]);
+			expect(await readRows('select id from Ux where id = 1')).to.deep.equal([]);
+		});
+
+		it('except: set inL=false deletes from A (the row leaves the view)', async () => {
+			await seed();
+			await db.exec('create view Ux as select id, x from A except exists left as inL, exists right as inR select id, x from B');
+			await db.exec('update Ux set inL = false where id = 1');
+			expect(await ids('select id from A where id = 1')).to.deep.equal([]);
+			expect(await readRows('select id from Ux where id = 1')).to.deep.equal([]);
+		});
+
+		it('intersect: set inR=false deletes from B and drops the row from the view', async () => {
+			await seed();
+			await db.exec('create view Ui as select id, x from A intersect exists left as inL, exists right as inR select id, x from B');
+			expect(await ids('select id from Ui order by id')).to.deep.equal([2, 3]);
+			await db.exec('update Ui set inR = false where id = 2');
+			expect(await ids('select id from B where id = 2')).to.deep.equal([]);
+			expect(await readRows('select id from Ui where id = 2')).to.deep.equal([]);
+		});
+
+		it('composition: set x and flip true inserts B with the new value; A is also aligned', async () => {
+			await seed();
+			await db.exec('update U set x = 5, inB = true where id = 1'); // A-only
+			expect((await readRows('select x from B where id = 1'))[0].x).to.equal(5);
+			expect((await readRows('select x from A where id = 1'))[0].x).to.equal(5);
+		});
+
+		it('composition: set x and flip false rejects (contradiction)', async () => {
+			await seed();
+			let threw = false;
+			try { await db.exec('update U set x = 5, inB = false where id = 2'); } catch { threw = true; }
+			expect(threw, 'cannot both delete a branch and write its column').to.equal(true);
+		});
+
+		it('data fan-out: update fans to every member branch (A-only, B-only, both)', async () => {
+			await seed();
+			await db.exec('update U set x = 71 where id = 1'); // A only
+			await db.exec('update U set x = 74 where id = 4'); // B only
+			await db.exec('update U set x = 72 where id = 2'); // both
+			expect((await readRows('select x from A where id = 1'))[0].x).to.equal(71);
+			expect(await readRows('select x from B where id = 1')).to.deep.equal([]); // not a member
+			expect((await readRows('select x from B where id = 4'))[0].x).to.equal(74);
+			expect(await readRows('select x from A where id = 4')).to.deep.equal([]); // not a member
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(72);
+			expect((await readRows('select x from B where id = 2'))[0].x).to.equal(72);
+		});
+
+		it('delete fan-out: delete removes the row from every member branch (A-only, B-only, both)', async () => {
+			await seed();
+			await db.exec('delete from U where id in (1, 2, 4)');
+			expect(await ids('select id from A order by id')).to.deep.equal([3]);
+			expect(await ids('select id from B order by id')).to.deep.equal([3]);
+			expect(await readRows('select id from U where id in (1, 2, 4)')).to.deep.equal([]);
+		});
+
+		it('insert-through: flags route the row to the true-flagged branches', async () => {
+			await seed();
+			await db.exec('insert into U (id, x, inA, inB) values (9, 90, true, false)'); // A only
+			await db.exec('insert into U (id, x, inA, inB) values (8, 80, true, true)');  // both
+			expect(await ids('select id from A where id in (8, 9) order by id')).to.deep.equal([8, 9]);
+			expect(await ids('select id from B where id in (8, 9) order by id')).to.deep.equal([8]);
+			expect((await readRows('select inA, inB from U where id = 9'))[0]).to.deep.equal({ inA: true, inB: false });
+			expect((await readRows('select inA, inB from U where id = 8'))[0]).to.deep.equal({ inA: true, inB: true });
+		});
+
+		it('insert-through: a flag-less ambiguous insert rejects', async () => {
+			await seed();
+			let threw = false;
+			try { await db.exec('insert into U (id, x) values (9, 90)'); } catch { threw = true; }
+			expect(threw, 'a flag-less multi-branch insert is ambiguous').to.equal(true);
+		});
+
+		it('GetPut: writing the read-back membership value is a base no-op (true→true, false→false)', async () => {
+			await seed();
+			const beforeA = await readRows('select id, x from A order by id');
+			const beforeB = await readRows('select id, x from B order by id');
+			// id=2 reads inA=true,inB=true; id=1 reads inA=true,inB=false.
+			await db.exec('update U set inA = true where id = 2');  // true→true
+			await db.exec('update U set inB = true where id = 2');  // true→true
+			await db.exec('update U set inB = false where id = 1'); // false→false
+			await db.exec('update U set inA = true where id = 1');  // true→true
+			expect(await readRows('select id, x from A order by id')).to.deep.equal(beforeA);
+			expect(await readRows('select id, x from B order by id')).to.deep.equal(beforeB);
+		});
+
+		it('static surface agrees with the dynamic write: column_info and the actual writes match', async () => {
+			await seed();
+			const cols = await readRows("select column_name, is_updatable from column_info('U')");
+			// Every column reports updatable; verify each is actually writable through the view.
+			for (const c of cols) expect(c.is_updatable, `${c.column_name} is_updatable`).to.equal('YES');
+			await db.exec('update U set x = 100 where id = 2');   // data column writable
+			await db.exec('update U set inB = false where id = 3'); // membership column writable
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(100);
+			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
 		});
 	});
 

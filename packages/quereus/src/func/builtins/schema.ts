@@ -20,6 +20,7 @@ import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-no
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { readDefaultFor } from "../../planner/mutation/mutation-tags.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
+import { isSetOpMembershipBody } from "../../planner/mutation/set-op.js";
 import type { ViewSchema } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -718,6 +719,17 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 
 	const nodes = collectBodyNodes(root);
 
+	// Set-operation membership body: the per-branch fan-out makes the view
+	// insertable-into (flag-routed insert-through), updatable (membership flip + data
+	// fan-out), and deletable (delete fan-out), agreeing with the dynamic `propagate()`
+	// truth (`set-op-membership-write`). The effective targets are the branch base
+	// tables. A plain (flag-less) set-op body is NOT this case — it falls through to the
+	// `targetIds.size === 0` conservative row below (no membership column to address a branch).
+	if (isSetOpMembershipBody(view.selectAst)) {
+		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
+		return { isInsertableInto: true, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
+	}
+
 	// Non-decomposable join shape gate: cross / comma (implicit) / subquery- or
 	// function-source join bodies are not write-through-able, so they must report the
 	// conservative all-`NO` row. `propagate()` decomposes an n-way (≥2) equi-join —
@@ -1019,6 +1031,23 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		if (!root) return [];
 
 		const nodes = collectBodyNodes(root);
+
+		// Set-operation membership body: every column is writable through an *effect*, not a
+		// base mapping — a membership flag flips its branch's presence (insert/delete), a data
+		// column fans out to its member branches (`set-op-membership-write`). So each reports
+		// `is_updatable = 'YES'` with `base_table` / `base_column` = null (no single base
+		// column), the same writable-through-effect shape a join-side existence flag reports.
+		if (isSetOpMembershipBody(view.selectAst)) {
+			return root.getAttributes().map((attr, i): ColumnInfoRow => ({
+				schema: schemaName,
+				objectName: view.name,
+				cid: i,
+				columnName: attr.name,
+				isUpdatable: true,
+				baseTable: null,
+				baseColumn: null,
+			}));
+		}
 
 		// Non-decomposable join shape gate: cross / comma / subquery-source join bodies
 		// are not write-through-able. `propagate()` decomposes an n-way (≥2) equi-join —

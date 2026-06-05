@@ -341,10 +341,17 @@ from a union exists left as inA, exists right as inB select id, x from b;
   false`; `intersect` reads all flags `true`.
 - The binary combinator always names its **own** two operands; the n-way case is covered by
   **nesting** (no global positional "middle branch" naming).
-- **Read-only today.** Reading a membership column is fully supported; *writing* it
-  (membership-flip ⇒ branch insert/delete) is the deferred write half, so a write to the
-  column — or any write through a set-operation view — still rejects. `column_info` reports
-  the column `is_updatable = 'NO'` with null base.
+- **Writable (binary, non-nested).** A membership column **is** the branch presence, so
+  *writing* it drives the branch's existence — `set inB = true` over a row absent from B
+  inserts it into B; `set inB = false` over a row in B deletes the matching B row; **both
+  false** removes the row from the view. For `except` (`A except B`), `set inRight = true`
+  inserts into B (pushing the row out of the view) and `set inLeft = false` deletes from A;
+  for `intersect`, `set inB = false` deletes from B (dropping the row). A membership value
+  must be a boolean literal. Data-column writes and `delete from`s **fan out** to every
+  branch the row is a member of (via the runtime membership probe); `insert into` routes by
+  the supplied flags (a true flag inserts into that branch). `column_info` reports each
+  column `is_updatable = 'YES'` with null base (writable through an *effect*, not a base
+  mapping). Nested / n-way set-op writes and non-literal membership values are deferred.
 
 **Examples:**
 ```sql

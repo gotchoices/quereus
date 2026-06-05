@@ -387,18 +387,15 @@ export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite 
 		case 'computed':
 			return { writable: false, nullExtended: false };
 		case 'existence':
-			// A `set-op-branch` existence flag is READ-ONLY in the read half
-			// (`set-op-membership-read`): no base column, and no write effect wired yet
-			// (the write half, `set-op-membership-write`, flips this routing on). It must
-			// resolve non-writable so a write to it rejects rather than silently no-op.
-			if (site.component.kind === 'set-op-branch') {
-				return { writable: false, nullExtended: false };
-			}
-			// A join-side existence flag is writable through an *effect*, not a base
-			// mapping: it has no base column (`table` / `baseColumn` undefined), but a
-			// written flag drives an insert/delete of `component`. The multi-source write
-			// path consumes the `existenceComponent` discriminator; base-column readers
-			// gate on `baseColumn`.
+			// An existence flag — a join side OR a set-op branch — is writable through an
+			// *effect*, not a base mapping: it has no base column (`table` / `baseColumn`
+			// undefined), but a written flag drives an insert/delete of `component`. The
+			// join-side variant materializes/removes the non-preserved side (the
+			// multi-source write path); the `set-op-branch` variant inserts/deletes the
+			// named operand (the set-op write path, `set-op-membership-write` — it routes
+			// the per-branch fan-out off the runtime membership probe rather than the join
+			// match). Both surface the `existenceComponent` discriminator; base-column
+			// readers gate on `baseColumn`, so they are unaffected.
 			return { writable: true, nullExtended: false, existenceComponent: site.component, existenceGuard: site.guard };
 	}
 }

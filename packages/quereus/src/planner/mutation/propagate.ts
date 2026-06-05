@@ -4,7 +4,7 @@ import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { isRelationalNode, type PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { buildTableReference } from '../building/table.js';
-import type { MutationDiagnosticReason } from './mutation-diagnostic.js';
+import { raiseMutationDiagnostic, type MutationDiagnosticReason } from './mutation-diagnostic.js';
 import { rewriteViewInsert, rewriteViewUpdate, rewriteViewDelete, type MutableViewLike } from './single-source.js';
 import { isJoinBody, propagateMultiSource } from './multi-source.js';
 import { propagateDecomposition } from './decomposition.js';
@@ -227,6 +227,28 @@ export function propagate(ctx: PlanningContext, view: MutableViewLike, req: Muta
 	const storage = decompositionStorage(ctx, view);
 	if (storage) {
 		return propagateDecomposition(ctx, view, storage, req);
+	}
+
+	// A binary set-operation body carrying membership flags is written through the
+	// per-branch fan-out, which needs a plan-level capture (the affected rows + their
+	// runtime membership probe) the AST `BaseOp[]` model cannot carry — so it is built
+	// directly by `building/view-mutation-builder.ts` (`buildSetOpMutation`), which
+	// intercepts before `propagate` runs. Reaching here means a direct/recursive
+	// `propagate` call on such a body (e.g. a nested set-op branch — `set-op-membership-nested`);
+	// guard it explicitly rather than mis-routing it into the single-source rewrite (which
+	// would reject `unsupported-set-op` with a misleading message). A plain (flag-less)
+	// set-op body is NOT intercepted — it falls through to the single-source spine below
+	// and rejects `unsupported-set-op` as before (no membership column to address a branch).
+	// The AST peek is inlined (not imported from `set-op.ts`) to keep the dependency
+	// one-directional — `set-op.ts` imports `propagate`, never the reverse.
+	const so = view.selectAst;
+	if (so.type === 'select' && so.compound && so.compound.op !== 'diff'
+		&& so.compound.existence && so.compound.existence.length > 0) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op',
+			table: view.name,
+			message: `cannot write through view '${view.name}': a nested / recursively-reached set-operation membership body is not yet decomposable (binary, non-nested set-op writes are built via buildSetOpMutation; nested subtree writes are set-op-membership-nested)`,
+		});
 	}
 
 	// A join body decomposes through the multi-source planned-body walk; a

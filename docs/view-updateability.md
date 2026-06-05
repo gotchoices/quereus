@@ -267,7 +267,7 @@ hard-coded join side) so the set-operation membership-column work
 >   row also reads back null-extended. The flag controls component existence, not a
 >   per-preserved-row link.
 
-### Set-operation membership columns (read half)
+### Set-operation membership columns
 
 The vertical (row) analogue of the outer-join existence column: the
 `<setop> exists <branch> as <name>` clause manifests a set operation's **branch
@@ -299,18 +299,105 @@ for the grammar. The same two soundness properties as the join existence column 
 
 The flag is modelled as an extra output **attribute of the `SetOperationNode`** (not a
 `ProjectNode` expression — that could only see set-op *outputs*, never the per-branch
-data relations the probe needs), carrying a read-only `existence` `UpdateSite` whose
+data relations the probe needs), carrying an `existence` `UpdateSite` whose
 `RelationalComponentRef` is a `set-op-branch` (the owning node + the immediate operand).
-**Read-only in this half** (`resolveBaseSite` resolves a `set-op-branch` component
-non-writable, `column_info` reports `is_updatable = 'NO'` / null base, and a write to the
-column rejects). The routing is **component-generic** (the same `existence` site the join
-existence column uses), so the write half (membership-flip ⇒ branch insert/delete) extends
-it without forking. An **unused** flag is a semijoin probe and is *in principle*
-dead-column-eliminable — it ought not force a branch to be retained or probed when no
-other column needs it. No such pruning pass exists yet: the membership runner is selected
-whenever the node carries any flag, so an unused flag on a `union all` currently forces the
-buffering runner instead of the streaming one (correctness is unaffected; a sibling prune
-to `prune-unused-existence-flag` is deferred).
+**Writable through an effect** (`resolveBaseSite` resolves a `set-op-branch` component
+`writable: true` with no base column, `column_info` reports `is_updatable = 'YES'` / null
+base, and a write drives a per-branch insert/delete — see § Set-operation membership
+writes). The routing is **component-generic** (the same `existence` site the join
+existence column uses), so the write half extends it without forking. An **unused** flag
+is a semijoin probe and is *in principle* dead-column-eliminable — it ought not force a
+branch to be retained or probed when no other column needs it. No such pruning pass exists
+yet: the membership runner is selected whenever the node carries any flag, so an unused
+flag on a `union all` currently forces the buffering runner instead of the streaming one
+(correctness is unaffected; a sibling prune to `prune-unused-existence-flag` is deferred).
+
+### Set-operation membership writes
+
+The first set-op view writability in the engine (`planner/mutation/set-op.ts`). A
+membership column **is** the branch presence, so *writing* it drives the branch's
+existence — the explicit, per-row control surface that replaces the never-built
+`quereus.update.*` routing-tag dispatch for set-ops (`union-branch` / `delete_via`, dead
+today; their removal is `remove-update-routing-tag-surface`). Scope is the **binary
+(non-nested)** case: `union` / `union all` / `except` / `intersect`. Nested / subtree
+flags and product-coordinate addressing are `set-op-membership-nested`.
+
+A set-op view body is **not** routed through the single-source/join spines — `propagate`
+rejects a `SetOperationNode` body. Instead `building/view-mutation-builder.ts` intercepts a
+membership body (`buildSetOpMutation`) and decomposes it into per-branch base ops over an
+**up-front, Halloween-safe capture**: the affected view rows — their data columns **and**
+their membership-probe flags — are materialized **once** (`Project(Filter_{userWhere}
+(SetOperationNode))`) into the same context-backed `__vmupd_keys` relation the multi-source
+path uses, *before* any branch op fires. Each branch op then reads that immutable capture,
+so a branch insert/delete can never perturb the affected set out from under a sibling op
+(the DML executor drains its source lazily, so referencing the view directly would be
+Halloween-unsafe). The capture rides the existing `ViewMutationNode.identityCapture` side
+input + void/drain runtime path — no new runtime substrate.
+
+**A branch is itself a view body.** Each operand (`select … from B`) is a single-source
+(or, in principle, join) view body, so each per-branch op is lowered to an AST `BaseOp`
+against a **synthetic branch view-like** and run back through `propagate` — reusing the
+spines verbatim (the branch's own σ predicate, column renames, and base routing are honored
+by its own spine; `no-default` / computed-column rejections fall out of the recursion). A
+branch that bottoms out in a base table emits one base op; a branch that is itself a
+`SetOperationNode` would recurse again (the nested subtree write — `set-op-membership-nested`).
+
+**Per-operator membership-write semantics** (uniform across operators because the probe
+flags already encode each operator's branch truth):
+
+- **`union` / `union all`** — `inA` / `inB` independent. `set inA = true` ⇒ insert into A,
+  `= false` ⇒ delete from A; symmetrically for B. **Both false** ⇒ the row leaves the view
+  (deleted from every branch it was in).
+- **`except`** (`A except B`) — a visible row is `inLeft = true, inRight = false`.
+  `set inRight = true` ⇒ insert into B, pushing the row **out** of the view (the explicit
+  form of the dead `delete_via = 'right_insert'`); `set inLeft = false` ⇒ delete from A
+  (the row leaves the view).
+- **`intersect`** — reads are trivially all-true, so membership columns are **write-useful
+  only**: `set inB = false` ⇒ delete from B, dropping the row from the intersect.
+
+**The probe makes a redundant flip a clean no-op.** A `set <flag> = true` inserts only the
+captured rows **absent** from that branch (`where not k.<flag>`), so writing `true` over a
+row already present is a no-op — and the per-operator semantics fold in for free (`except`'s
+always-false right flag inserts every visible row; `intersect`'s always-true flags insert
+none). A `set <flag> = false` deletes the matching branch row only for captured rows
+present there (a NULL-safe full-data-tuple `exists` correlation against `__vmupd_keys`; set
+operations treat `NULL = NULL` as equal, and the engine has no `IS NOT DISTINCT FROM`).
+
+**Data-column writes & deletes fan out via the probe.** `update U set <dataCol> = v where
+…` fans an update to **every branch the row is a member of** (the full-tuple `exists`
+correlation restricts each branch update to its resident rows — a non-member branch matches
+none, so no explicit flag gate is needed, and a branch need not even declare a flag for
+fan-out). `delete from U where …` fans a delete to every member branch the same way.
+
+**Composition & rejection.** A same-statement data assignment folds into a `true` flip's
+inserted projection (`set x = 5, inB = true` over an A-only row inserts B with `x = 5` and
+aligns A). `set x = 5, inB = false` is **rejected** (`conflicting-assignment`) — a write
+cannot both delete a branch and write a column that fans out to it. A membership value must
+be a **boolean literal** (`true`/`false`, or the `1`/`0` spellings); a non-literal per-row
+branch is deferred. **Insert-through** (`insert into U (id, x, inA, inB) values (…, true,
+false)`) routes by the supplied flags — a true flag activates its branch, a false flag omits
+it — over a VALUES source (the flags are a uniform per-statement routing directive). A
+flag-less ambiguous multi-branch insert is rejected. RETURNING through a set-op membership
+write is not yet recoverable (rejected).
+
+**v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
+view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of
+that tuple (the count variant is deferred). A data-fan-out value that *references* a data
+column requires the operand legs to use matching column names (a leg rename of a
+referenced column is not yet remapped); literal values are unaffected. A branch leg must
+be a plain (optionally renamed) base-column projection — a `select *` or computed leg
+column in a writable branch is rejected.
+
+> **Implemented surface vs. the design below.** Binary set-op write-through is realized
+> through the **membership columns** above (`set-op-membership-write`): the explicit
+> per-row branch control surface. The predicate-honest fan-out + `quereus.update.*`
+> routing-tag dispatch described in the four subsections that follow (`delete_via`,
+> `target`, `right_insert`, branch-consistency inference) is the **original aspirational
+> design** — it was never built (no parser syntax, no consumer), and the routing-tag
+> surface itself is being retired (`remove-update-routing-tag-surface`). The runtime
+> membership probe is the branch oracle in its place; for set-ops without membership
+> columns, write-through still rejects (`unsupported-set-op`). The subsections are kept for
+> the per-operator semantic intent, which the membership-write rules above realize.
 
 ### Union All
 

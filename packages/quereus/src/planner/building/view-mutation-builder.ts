@@ -7,6 +7,7 @@ import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
 import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
+import { isSetOpMembershipBody, buildSetOpWrite } from '../mutation/set-op.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { collectMutationTags } from '../mutation/mutation-tags.js';
@@ -55,6 +56,16 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// the AST-level `BaseOp[]` model cannot express — build it directly.
 	if (req.op === 'insert' && isJoinBody(view.selectAst)) {
 		return buildMultiSourceInsert(ctx, view, req.stmt);
+	}
+
+	// Set-operation membership write (binary, non-nested): the per-branch fan-out keyed
+	// on the runtime membership probe needs a plan-level capture (the affected rows +
+	// their probe flags, materialized once before any branch op fires — Halloween-safe),
+	// which the AST `BaseOp[]` model cannot express. Build it directly (the dual of the
+	// multi-source insert), for insert / update / delete alike. A plain (flag-less)
+	// set-op body is NOT this case — it keeps rejecting `unsupported-set-op` downstream.
+	if (isSetOpMembershipBody(view.selectAst)) {
+		return buildSetOpMutation(ctx, view, req);
 	}
 
 	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
@@ -380,6 +391,30 @@ function withTags(req: MutationRequest, tags: MutationRequest['tags']): Mutation
 		case 'update': return { op: 'update', stmt: req.stmt, tags };
 		case 'delete': return { op: 'delete', stmt: req.stmt, tags };
 	}
+}
+
+/**
+ * Build the set-operation membership-write substrate (docs/view-updateability.md
+ * § Set Operations) — the first set-op view writability in the engine.
+ *
+ * `buildSetOpWrite` (planner/mutation/set-op.ts) decomposes the write into the ordered
+ * per-branch base ops (each lowered through `propagate` against a synthetic branch
+ * view-like, so the branch's own spine handles its base routing) plus the up-front
+ * affected-row capture they read. We wire the capture through the SAME `identityCapture`
+ * side input + context-backed `__vmupd_keys` relation the multi-source path uses (so the
+ * branch ops' `exists (… from __vmupd_keys …)` resolves), and sequence the base ops in a
+ * void `ViewMutationNode` (no RETURNING through a set-op write in v1). Insert-through
+ * carries no capture (its values are self-contained), so no key ref is injected there.
+ */
+function buildSetOpMutation(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): PlanNode {
+	const { baseOps, capture } = buildSetOpWrite(ctx, view, req);
+	// Each probe-driven branch op reads the capture back through `__vmupd_keys`; inject a
+	// fresh context-backed key ref (sharing the one capture descriptor) per op, exactly as
+	// the multi-source update/delete path does. Insert-through has no capture ⇒ no injection.
+	const opCtx = capture ? withKeyCapture(ctx, capture) : ctx;
+	const children = baseOps.map(op => buildBaseOp(opCtx, op, [], false));
+	const identityCapture = capture ? { source: capture.source, descriptor: capture.descriptor } : undefined;
+	return new ViewMutationNode(ctx.scope, children, undefined, undefined, undefined, identityCapture);
 }
 
 /**
