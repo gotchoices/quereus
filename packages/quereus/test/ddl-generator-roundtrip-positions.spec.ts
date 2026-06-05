@@ -1,0 +1,289 @@
+/**
+ * Deterministic reserved-word round-trip for the canonical DDL generator
+ * (`src/schema/ddl-generator.ts` + `src/schema/catalog.ts`) — the second,
+ * persistence-oriented DDL emitter, distinct from the AST stringifier.
+ *
+ * The AST round-trip suites (`emit-roundtrip-positions.spec.ts`,
+ * `emit-roundtrip-property.spec.ts`) go `parse → astToString → parse` and
+ * structurally cannot reach this generator, so a reserved-word name in a
+ * generator-only identifier position was uncovered. This suite closes that gap
+ * by building schemas that carry reserved-word names, generating DDL, and
+ * re-parsing it — mirroring the spirit of `emit-roundtrip-positions.spec.ts`.
+ *
+ * Coverage (the four bare-emit sites the ticket routes through `quoteIdentifier`):
+ *   - COLLATE name        — generateIndexDDL  → parse  (collation survives)
+ *   - USING module name   — generateTableDDL  → parse  (module name survives)
+ *   - vtab-arg key        — generateTableDDL  → parse  (arg key survives)
+ *   - CREATE ASSERTION name — collectSchemaCatalog over a real keyword-named
+ *     assertion → assert the emitted catalog `ddl` quotes the name.
+ *
+ * The keyword set is driven straight off the lexer `KEYWORDS` table (as in the
+ * AST suite) so it can never drift from the lexer.
+ *
+ * Deferred: a *full* re-parse of the assertion catalog `ddl` is intentionally
+ * not attempted — `assertionSchemaToCatalog` embeds `violationSql` (a
+ * `select 1 where not (…)` query) in the CHECK slot, which is not itself a
+ * CHECK-*expression* and so never round-trips through `parse()` regardless of
+ * the name. The name-quoting — the property this ticket fixes — is what the
+ * assertion site asserts here.
+ */
+
+import { expect } from 'chai';
+import { parse } from '../src/parser/index.js';
+import { KEYWORDS } from '../src/parser/lexer.js';
+import { generateTableDDL, generateIndexDDL } from '../src/schema/ddl-generator.js';
+import { collectSchemaCatalog } from '../src/schema/catalog.js';
+import { Database } from '../src/core/database.js';
+import { INTEGER_TYPE } from '../src/types/builtin-types.js';
+import type { Statement, IndexedColumn } from '../src/parser/ast.js';
+import type { TableSchema, IndexSchema } from '../src/schema/table.js';
+import type { ColumnSchema } from '../src/schema/column.js';
+
+/** Every reserved word, taken straight from the lexer so the suite can't drift. */
+const RESERVED_WORDS = Object.keys(KEYWORDS);
+
+function errText(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * The collation a re-parsed index column carries. The parser folds
+ * `c COLLATE x` into a `collate` expression on `.expr` (its `.collation` field
+ * stays unset for that form), so look in both places.
+ */
+function collationOf(col: IndexedColumn): string | undefined {
+	if (col.collation) return col.collation;
+	if (col.expr?.type === 'collate') return col.expr.collation;
+	return undefined;
+}
+
+/** Build a minimal ColumnSchema (mirrors the store ddl-generator spec helper). */
+function makeColumn(name: string, opts?: Partial<ColumnSchema>): ColumnSchema {
+	return {
+		name,
+		logicalType: INTEGER_TYPE,
+		notNull: true,
+		primaryKey: false,
+		pkOrder: 0,
+		defaultValue: null,
+		collation: '',
+		generated: false,
+		...opts,
+	};
+}
+
+/** Build a minimal TableSchema (mirrors the store ddl-generator spec helper). */
+function makeTableSchema(overrides: Partial<TableSchema> & { name: string; columns: ColumnSchema[] }): TableSchema {
+	const columns = overrides.columns;
+	const columnIndexMap = new Map(columns.map((c, i) => [c.name.toLowerCase(), i]));
+	return {
+		schemaName: 'main',
+		primaryKeyDefinition: [],
+		checkConstraints: [],
+		vtabModuleName: '',
+		isView: false,
+		columnIndexMap,
+		...overrides,
+	} as TableSchema;
+}
+
+describe('Generator: reserved word survives every generator-only identifier position', function () {
+	// Whole-KEYWORDS sweep per position; a generous timeout keeps it safe under
+	// the slower store harness.
+	this.timeout(30000);
+
+	it('COLLATE name (generateIndexDDL → parse)', () => {
+		const failures: string[] = [];
+		const table = makeTableSchema({ name: 't', columns: [makeColumn('c')] });
+
+		for (const kw of RESERVED_WORDS) {
+			const idx: IndexSchema = { name: 'i', columns: [{ index: 0, collation: kw }] };
+			const ddl = generateIndexDDL(idx, table);
+
+			let stmt: Statement;
+			try {
+				stmt = parse(ddl);
+			} catch (e) {
+				failures.push(`[${kw}] re-parse failed (forgot to quote?): ${errText(e)}\n      ddl: ${ddl}`);
+				continue;
+			}
+			if (stmt.type !== 'createIndex') {
+				failures.push(`[${kw}] expected createIndex, got ${stmt.type}\n      ddl: ${ddl}`);
+				continue;
+			}
+			const got = stmt.columns[0] ? collationOf(stmt.columns[0])?.toLowerCase() : undefined;
+			if (got !== kw) {
+				failures.push(`[${kw}] collation did not survive: got ${String(got)}\n      ddl: ${ddl}`);
+			}
+		}
+
+		expect(failures, `\n${failures.join('\n')}\n`).to.have.length(0);
+	});
+
+	it('USING module name (generateTableDDL → parse)', () => {
+		const failures: string[] = [];
+
+		for (const kw of RESERVED_WORDS) {
+			// No db context → USING is emitted unconditionally.
+			const table = makeTableSchema({ name: 't', columns: [makeColumn('c')], vtabModuleName: kw });
+			const ddl = generateTableDDL(table);
+
+			let stmt: Statement;
+			try {
+				stmt = parse(ddl);
+			} catch (e) {
+				failures.push(`[${kw}] re-parse failed (forgot to quote?): ${errText(e)}\n      ddl: ${ddl}`);
+				continue;
+			}
+			if (stmt.type !== 'createTable') {
+				failures.push(`[${kw}] expected createTable, got ${stmt.type}\n      ddl: ${ddl}`);
+				continue;
+			}
+			if (stmt.moduleName?.toLowerCase() !== kw) {
+				failures.push(`[${kw}] module name did not survive: got ${String(stmt.moduleName)}\n      ddl: ${ddl}`);
+			}
+		}
+
+		expect(failures, `\n${failures.join('\n')}\n`).to.have.length(0);
+	});
+
+	it('vtab-arg key (generateTableDDL → parse)', () => {
+		const failures: string[] = [];
+
+		for (const kw of RESERVED_WORDS) {
+			const table = makeTableSchema({
+				name: 't',
+				columns: [makeColumn('c')],
+				vtabModuleName: 'store',
+				vtabArgs: { [kw]: 'v' },
+			});
+			const ddl = generateTableDDL(table);
+
+			let stmt: Statement;
+			try {
+				stmt = parse(ddl);
+			} catch (e) {
+				failures.push(`[${kw}] re-parse failed (forgot to quote?): ${errText(e)}\n      ddl: ${ddl}`);
+				continue;
+			}
+			if (stmt.type !== 'createTable') {
+				failures.push(`[${kw}] expected createTable, got ${stmt.type}\n      ddl: ${ddl}`);
+				continue;
+			}
+			const keys = Object.keys(stmt.moduleArgs ?? {}).map(k => k.toLowerCase());
+			if (!keys.includes(kw)) {
+				failures.push(`[${kw}] arg key did not survive: got [${keys.join(', ')}]\n      ddl: ${ddl}`);
+			}
+		}
+
+		expect(failures, `\n${failures.join('\n')}\n`).to.have.length(0);
+	});
+
+	// `formatUsingClause` has two emit paths: the no-db branch (above) and the
+	// db-context branch (reached when a db is passed and the module differs from
+	// the session default `default_vtab_module`, which defaults to 'memory').
+	// A fresh Database has that default, and no reserved word equals 'memory',
+	// so passing `db` exercises the db-context branch for every keyword.
+	describe('USING module name — db-context branch', () => {
+		let db: Database;
+
+		beforeEach(() => {
+			db = new Database();
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		it('generateTableDDL(table, db) → parse', () => {
+			const failures: string[] = [];
+
+			for (const kw of RESERVED_WORDS) {
+				const table = makeTableSchema({ name: 't', columns: [makeColumn('c')], vtabModuleName: kw });
+				const ddl = generateTableDDL(table, db);
+
+				let stmt: Statement;
+				try {
+					stmt = parse(ddl);
+				} catch (e) {
+					failures.push(`[${kw}] re-parse failed (forgot to quote?): ${errText(e)}\n      ddl: ${ddl}`);
+					continue;
+				}
+				if (stmt.type !== 'createTable') {
+					failures.push(`[${kw}] expected createTable, got ${stmt.type}\n      ddl: ${ddl}`);
+					continue;
+				}
+				if (stmt.moduleName?.toLowerCase() !== kw) {
+					failures.push(`[${kw}] module name did not survive: got ${String(stmt.moduleName)}\n      ddl: ${ddl}`);
+				}
+			}
+
+			expect(failures, `\n${failures.join('\n')}\n`).to.have.length(0);
+		});
+	});
+});
+
+describe('Generator: ordinary identifiers are never over-quoted', () => {
+	// Pins `quoteIdentifier`'s "quote only when necessary" policy at the
+	// generator's bare-emit sites, guarding against an always-quote regression
+	// (which would also break the store ddl-generator spec's bare-emit asserts).
+	it('COLLATE name stays bare', () => {
+		const table = makeTableSchema({ name: 't', columns: [makeColumn('c')] });
+		const ddl = generateIndexDDL({ name: 'i', columns: [{ index: 0, collation: 'mycoll' }] }, table);
+		expect(ddl).to.include('COLLATE mycoll');
+		expect(ddl).to.not.include('COLLATE "mycoll"');
+	});
+
+	it('USING module name stays bare', () => {
+		const table = makeTableSchema({ name: 't', columns: [makeColumn('c')], vtabModuleName: 'mymod' });
+		const ddl = generateTableDDL(table);
+		expect(ddl).to.include('USING mymod');
+		expect(ddl).to.not.include('USING "mymod"');
+	});
+
+	it('vtab-arg key stays bare', () => {
+		const table = makeTableSchema({
+			name: 't',
+			columns: [makeColumn('c')],
+			vtabModuleName: 'store',
+			vtabArgs: { cache_size: 100 },
+		});
+		const ddl = generateTableDDL(table);
+		expect(ddl).to.include('cache_size = 100');
+		expect(ddl).to.not.include('"cache_size"');
+	});
+});
+
+describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
+	// The assertion DDL is emitted inside the private `assertionSchemaToCatalog`;
+	// `collectSchemaCatalog` is the public driver that reaches it. We create a
+	// real assertion (CHECK with no table dependency, as in 95-assertions.sqllogic)
+	// and inspect the emitted catalog `ddl`. See the file header re: why a full
+	// re-parse of the assertion `ddl` is not asserted.
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('quotes a reserved-word assertion name', async () => {
+		await db.exec('create assertion "select" check (1 = 1)');
+		const catalog = collectSchemaCatalog(db, 'main');
+		const a = catalog.assertions.find(x => x.name.toLowerCase() === 'select');
+		expect(a, 'keyword-named assertion present in catalog').to.exist;
+		expect(a!.ddl).to.include('CREATE ASSERTION "select" CHECK');
+	});
+
+	it('does not over-quote an ordinary assertion name', async () => {
+		await db.exec('create assertion my_assert check (1 = 1)');
+		const catalog = collectSchemaCatalog(db, 'main');
+		const a = catalog.assertions.find(x => x.name.toLowerCase() === 'my_assert');
+		expect(a, 'ordinary-named assertion present in catalog').to.exist;
+		expect(a!.ddl).to.include('CREATE ASSERTION my_assert CHECK');
+		expect(a!.ddl).to.not.include('"my_assert"');
+	});
+});

@@ -2,7 +2,7 @@ import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema } from './table.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { generateTableDDL, generateIndexDDL } from './ddl-generator.js';
@@ -302,7 +302,7 @@ function indexSchemaToCatalog(
 function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): CatalogAssertion {
 	return {
 		name: assertionSchema.name,
-		ddl: `CREATE ASSERTION ${assertionSchema.name} CHECK (${assertionSchema.violationSql})`
+		ddl: `CREATE ASSERTION ${quoteIdentifier(assertionSchema.name)} CHECK (${assertionSchema.violationSql})`
 	};
 }
 

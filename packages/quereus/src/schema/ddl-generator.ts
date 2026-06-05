@@ -85,7 +85,7 @@ export function generateIndexDDL(
 
 	const cols = indexSchema.columns.map(col => {
 		let colStr = quoteName(tableSchema.columns[col.index].name);
-		if (col.collation) colStr += ` COLLATE ${col.collation}`;
+		if (col.collation) colStr += ` COLLATE ${quoteIdentifier(col.collation)}`;
 		if (col.desc) colStr += ' DESC';
 		return colStr;
 	});
@@ -185,7 +185,7 @@ function formatUsingClause(tableSchema: TableSchema, ctx: EmitContext): string |
 
 	// If no db context, always emit both module and args.
 	if (ctx.defaultVtabModule === undefined) {
-		let clause = `USING ${moduleName}`;
+		let clause = `USING ${quoteIdentifier(moduleName)}`;
 		if (hasArgs) clause += ` (${formatVtabArgs(args)})`;
 		return clause;
 	}
@@ -196,14 +196,14 @@ function formatUsingClause(tableSchema: TableSchema, ctx: EmitContext): string |
 
 	if (moduleMatches && argsMatch) return null;
 
-	let clause = `USING ${moduleName}`;
+	let clause = `USING ${quoteIdentifier(moduleName)}`;
 	if (hasArgs) clause += ` (${formatVtabArgs(args)})`;
 	return clause;
 }
 
 function formatVtabArgs(args: Record<string, SqlValue>): string {
 	return Object.entries(args)
-		.map(([key, value]) => `${key} = ${formatSqlLiteral(value)}`)
+		.map(([key, value]) => `${quoteIdentifier(key)} = ${formatSqlLiteral(value)}`)
 		.join(', ');
 }
 

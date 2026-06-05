@@ -39,8 +39,8 @@ function _createLoc(startToken: Token, endToken: Token): AST.AstNode['loc'] {
 /**
  * IMPORTANT: Any changes to parsed syntax must also be reflected in the corresponding emitters:
  *   - packages/quereus/src/emit/ast-stringify.ts          (AST-to-SQL string conversion)
- *   - packages/quereus/src/schema/catalog.ts              (DDL generation for catalog/hashing)
- *   - packages/quereus-store/src/common/ddl-generator.ts  (DDL generation for persistence)
+ *   - packages/quereus/src/schema/catalog.ts              (CREATE ASSERTION DDL for catalog/hashing)
+ *   - packages/quereus/src/schema/ddl-generator.ts        (canonical DDL generation for persistence)
  * If only the parser is updated, SQL round-trips and persisted schemas will silently lose the new syntax.
  */
 export class Parser {
