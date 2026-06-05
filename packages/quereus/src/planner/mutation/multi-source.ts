@@ -1122,6 +1122,23 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 					message: `cannot write through view '${view.name}': column '${asg.column}' is backed by the non-preserved side of an outer join (base table '${analysis.sides[out.sideIndex].schema.name}'); the per-row matched-update / null-extended-insert materialization needs the capture carrier`,
 				});
 			}
+			// RETURNING is not recoverable through a non-preserved-side update: the
+			// post-mutation re-query (`buildMultiSourceUpdateReturning`) identifies rows by
+			// EVERY side's CAPTURED PK, but a null-extended row's non-preserved PK was
+			// captured NULL while the materialized row now carries a real one — the `NULL = pk`
+			// identity match never holds, so the row is silently dropped from the RETURNING
+			// image (the matched rows would still surface, but the result would be a silent
+			// partial set). Reject at plan time (data-independent — we cannot know which rows
+			// null-extend) until the re-query keys off the stable preserved-side identity
+			// (`view-write-outer-join-nonpreserved-returning`).
+			if (stmt.returning && stmt.returning.length > 0) {
+				raiseMutationDiagnostic({
+					reason: 'returning-through-view',
+					column: asg.column,
+					table: view.name,
+					message: `cannot write through view '${view.name}': RETURNING is not supported on an update of non-preserved (outer-join null-extended) column '${asg.column}' — a materialized null-extended row is not recoverable by the captured-identity re-query`,
+				});
+			}
 			// The assigned value's top-level references must name view columns (parity with
 			// the preserved path); the value is then lowered to base terms over the join body
 			// and captured pre-mutation, so a same- or cross-side read resolves uniformly.
@@ -1322,6 +1339,17 @@ function buildNullExtendedInsert(
  * materialized row joins back to the preserved row. A non-preserved side related to no
  * preserved side by an equi-join key cannot be materialized with a joinable key — rejected
  * `unsupported-outer-join-update`.
+ *
+ * Only a **single-column** join key is materializable: the insert threads exactly one
+ * non-preserved join column, so a composite key (the non-preserved side equated on more
+ * than one distinct column) would leave the extra predicate(s) unsatisfied — the freshly
+ * inserted row would NOT join back to the preserved row (a silent non-join leaving a stray
+ * unreachable row), so it is rejected `unsupported-outer-join-update`. Mirrors the
+ * inner-join insert envelope's single-column shared-key restriction
+ * ({@link extractJoinKeyColumns}); the matched-update branch (keyed on the full np PK) is
+ * unaffected, but the whole non-preserved update rejects at plan time since the create
+ * branch cannot be expressed (the conservative, data-independent precedent of
+ * {@link assertNullExtendedInsertCovered}).
  */
 function outerJoinInsertKey(
 	view: MutableViewLike,
@@ -1329,17 +1357,30 @@ function outerJoinInsertKey(
 	npSideIndex: number,
 ): { npJoinColumn: string; preservedExpr: AST.Expression } {
 	const eqs = collectCrossSideEqualities(analysis.sel.from!, analysis.sides);
-	for (const eq of eqs) {
-		let npCol: string | undefined;
-		let partnerSide: number | undefined;
-		let partnerCol: string | undefined;
-		if (eq.sideA === npSideIndex) { npCol = eq.colA; partnerSide = eq.sideB; partnerCol = eq.colB; }
-		else if (eq.sideB === npSideIndex) { npCol = eq.colB; partnerSide = eq.sideA; partnerCol = eq.colA; }
-		else continue;
-		if (!analysis.sides[partnerSide].preserved) continue;
+	// Every cross-side equality the non-preserved side participates in (its own column +
+	// the partner side/column it is equated to).
+	const npEqs = eqs.flatMap(eq => {
+		if (eq.sideA === npSideIndex) return [{ npCol: eq.colA, partnerSide: eq.sideB, partnerCol: eq.colB }];
+		if (eq.sideB === npSideIndex) return [{ npCol: eq.colB, partnerSide: eq.sideA, partnerCol: eq.colA }];
+		return [];
+	});
+	// Reject a composite join key (the np side equated on >1 distinct column): the
+	// single-column materialization insert cannot satisfy the extra predicate(s), so the
+	// new row would not join back (a silent non-join). Distinct by np column name — the
+	// same np column equated to several partners (a 3-way shared key) still threads once.
+	const distinctNpCols = new Set(npEqs.map(e => e.npCol.toLowerCase()));
+	if (distinctNpCols.size > 1) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-outer-join-update',
+			table: view.name,
+			message: `cannot write through view '${view.name}': the non-preserved side (base table '${analysis.sides[npSideIndex].schema.name}') is related to the join by a composite key (${[...distinctNpCols].join(', ')}); a null-extended row can only be materialized through a single-column join key`,
+		});
+	}
+	const match = npEqs.find(e => analysis.sides[e.partnerSide].preserved);
+	if (match) {
 		return {
-			npJoinColumn: npCol,
-			preservedExpr: { type: 'column', name: partnerCol, table: analysis.sides[partnerSide].alias },
+			npJoinColumn: match.npCol,
+			preservedExpr: { type: 'column', name: match.partnerCol, table: analysis.sides[match.partnerSide].alias },
 		};
 	}
 	return raiseMutationDiagnostic({

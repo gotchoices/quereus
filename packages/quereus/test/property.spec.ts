@@ -4047,6 +4047,24 @@ describe('Property-Based Tests', () => {
 				await db.exec('create table np2_child (cc integer primary key, pr integer null, cv integer null) using memory');
 				await db.exec('create view npv2 as select c.cc as cc, c.cv as cv, p.pv as pv from np2_child c left join np2_parent p on p.pp = c.pr');
 				await expectMutationReject('update npv2 set pv = 9 where cc = 1', 'null-extended-create-conflict');
+
+				// Composite join key: the materialization insert threads a single join column,
+				// so a non-preserved side equated on >1 column cannot be re-joined — reject at
+				// plan time rather than silently mint a stray non-joining row.
+				await db.exec('drop view if exists npvk');
+				await db.exec('drop table if exists npk_child');
+				await db.exec('drop table if exists npk_parent');
+				await db.exec('create table npk_parent (pp integer primary key, k2 integer null, pv integer null) using memory');
+				await db.exec('create table npk_child (cc integer primary key, x integer null, y integer null) using memory');
+				await db.exec('create view npvk as select c.cc as cc, p.pv as pv from npk_child c left join npk_parent p on p.pp = c.x and p.k2 = c.y');
+				await db.exec('insert into npk_child values (1, 99, 7)'); // null-extended, dangling composite key
+				await expectMutationReject('update npvk set pv = 5 where cc = 1', 'unsupported-outer-join-update');
+
+				// RETURNING through a non-preserved-side update is not recoverable: the
+				// post-mutation re-query identifies by the captured non-preserved PK, which a
+				// materialized null-extended row no longer matches (captured NULL vs the real
+				// minted key). Reject at plan time rather than return a silent partial set.
+				await expectMutationReject('update npv set pv = 7 where cc = 1 returning cc, pv', 'returning-through-view');
 			});
 		});
 
