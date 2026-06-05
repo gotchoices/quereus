@@ -2548,6 +2548,22 @@ describe('Property-Based Tests', () => {
 			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(100);
 			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
 		});
+
+		it('bound parameters resolve in the WHERE of every membership-write form', async () => {
+			await seed();
+			// The capture filter resolves the user WHERE against the set-op view-column scope;
+			// it must chain to the statement scope so a bound `?` / `:name` parameter (the
+			// dominant DML form) resolves rather than throwing `? isn't a parameter`.
+			await db.exec('update U set inB = true where id = ?', [1]);   // anonymous, A-only ⇒ insert B
+			await db.exec('update U set inA = false where id = :p', { p: 4 }); // named, B-only ⇒ no A row
+			await db.exec('delete from U where id = ?', [2]);            // fan-out delete by param
+			expect(await ids('select id from A order by id')).to.deep.equal([1, 3]);
+			expect(await ids('select id from B order by id')).to.deep.equal([1, 3, 4]);
+			// A base-only / unknown name in the WHERE still rejects (encapsulation preserved).
+			let threw = false;
+			try { await db.exec('update U set inB = true where nonexistent = 1'); } catch { threw = true; }
+			expect(threw, 'an unknown column in the WHERE still rejects').to.equal(true);
+		});
 	});
 
 	// --- 16. View Round-Trip Laws ---

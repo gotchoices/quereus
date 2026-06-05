@@ -209,7 +209,11 @@ function analyzeSetOpView(ctx: PlanningContext, view: MutableViewLike): SetOpAna
 	// A scope resolving each view output column name to its producing attribute over the
 	// planned root — the same shape `createSetOperationScope` builds for the body itself,
 	// reused here so the user predicate / capture projections resolve byte-identically.
-	const viewColScope = new RegisteredScope();
+	// Parented to `ctx.scope` so a user WHERE's parameters (`where id = ?`), CTE refs, and
+	// other ambient symbols still resolve — a view output column shadows them (checked
+	// first), and a base-only name still fails to resolve (the statement scope exposes no
+	// base columns), so the encapsulation guard is unchanged.
+	const viewColScope = new RegisteredScope(ctx.scope);
 	attrs.forEach((attr, i) => {
 		viewColScope.registerSymbol(attr.name.toLowerCase(), (exp, s) =>
 			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
