@@ -220,8 +220,9 @@ select is_insertable_into from view_info('dfi_v_typo');
 -- A LEFT outer join is partially writable: the preserved side's columns are
 -- base-updatable, the view is insertable (preserved-only / both-side routing) and
 -- deletable (delete-to-preserved). The non-preserved (`null-extended`) side's columns
--- are reported non-updatable — agreeing with the dynamic `unsupported-outer-join-update`
--- deferral. RIGHT and FULL stay conservative all-`NO`: the runtime cannot execute a
+-- are now ALSO updatable (the matched-update / null-extended-insert materialization keyed
+-- off the preserved anchor — `view-write-optional-member-transitions`), so the view-level
+-- is_updatable stays YES. RIGHT and FULL stay conservative all-`NO`: the runtime cannot execute a
 -- RIGHT or FULL join at all (runtime/emit/join.ts, pinned by 90.5-unsupported-join-types),
 -- so a RIGHT-join view is neither readable nor writable and must NOT advertise as such;
 -- FULL additionally has no preserved side. (Re-admit RIGHT once the runtime supports it.)
@@ -242,11 +243,14 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_left');
 → [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
 
--- Surface agrees with propagate(): a preserved-side update is accepted, a
--- non-preserved-side update is deferred (unsupported-outer-join-update).
+-- Surface agrees with propagate(): a preserved-side update is accepted, and a
+-- non-preserved-side update is now accepted too — aid=1 has no oj_b match, so this
+-- materializes oj_b(bid=1, bv='z') via the EC join key (bid = aid) and the row reads
+-- back joined.
 update oj_left set av = 'z' where aid = 1;
 update oj_left set bv = 'z' where aid = 1;
--- error: cannot write through view
+select aid, av, bv from oj_left where aid = 1;
+→ [{"aid":1,"av":"z","bv":"z"}]
 
 -- RIGHT: not runtime-executable (runtime/emit/join.ts throws `RIGHT JOIN is not
 -- supported yet`), so the view is neither readable nor writable — report conservative

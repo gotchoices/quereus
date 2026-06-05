@@ -1027,27 +1027,38 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and
 		// rejects every other join shape, so without this gate `baseSiteOf` would resolve
 		// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable
-		// now; their non-preserved columns are reported non-updatable per-column below via
-		// `baseSiteOf().nullExtended` (matching the dynamic deferral), rather than
-		// short-circuiting the whole view to all-`NO`.
+		// now; their non-preserved columns are reported updatable per-column below when a
+		// preserved anchor exists (matching the dynamic matched-update / null-extended-insert
+		// materialization), rather than short-circuiting the whole view to all-`NO`.
 		const unsupportedJoinShape = isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst);
 
 		const tableRefsById = buildTableRefsById(nodes);
 		const rootLineage = root.physical?.updateLineage;
 
 		const attrs = root.getAttributes();
+		// Whether the body exposes a PRESERVED base column — a preserved anchor that pins
+		// each view row's identity. A LEFT join has one (the preserved side); a FULL outer
+		// join (every column null-extended) does not, so a non-preserved update there stays
+		// deferred. A non-preserved (`null-extended`) column is now updatable WHEN such an
+		// anchor exists: the matched-update / null-extended-insert materialization keys off
+		// it (`view-write-optional-member-transitions`), matching the dynamic accept.
+		const hasPreservedBase = !unsupportedJoinShape && attrs.some(a => {
+			const s = baseSiteOf(rootLineage?.get(a.id));
+			return s !== undefined && !s.nullExtended;
+		});
+
 		const rows: ColumnInfoRow[] = [];
 		for (let i = 0; i < attrs.length; i++) {
 			const attr = attrs[i];
 			const bs = unsupportedJoinShape ? undefined : baseSiteOf(rootLineage?.get(attr.id));
 			const ref = bs ? tableRefsById.get(bs.table) : undefined;
-			// Updatable iff a PRESERVED base site resolves to a producing
-			// TableReferenceNode. A non-preserved (`null-extended`) column names a base
-			// table/column but is read-only on UPDATE (the deferred materialization), so it
-			// reports `'NO'` with no trace — agreeing with the dynamic
-			// `unsupported-outer-join-update` reject. A base id without a resolved ref
-			// should not happen; fail conservative if it does.
-			const updatable = !!(bs && ref && !bs.nullExtended);
+			// Updatable iff a base site resolves to a producing TableReferenceNode. A
+			// PRESERVED base column is always updatable; a non-preserved (`null-extended`)
+			// column is updatable when the body has a preserved anchor (the matched-update /
+			// null-extended-insert materialization pins identity off it), and read-only only
+			// when no anchor exists (a FULL outer — write-through stays deferred there). A
+			// base id without a resolved ref should not happen; fail conservative if it does.
+			const updatable = !!(bs && ref && (!bs.nullExtended || hasPreservedBase));
 			rows.push({
 				schema: schemaName,
 				objectName: view.name,

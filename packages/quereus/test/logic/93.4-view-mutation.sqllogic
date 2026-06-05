@@ -2083,10 +2083,12 @@ update ojv set cv = 222 where cc = 2;
 select cc, cv, pv from ojv order by cc;
 → [{"cc":1,"cv":111,"pv":10},{"cc":2,"cv":222,"pv":null}]
 
--- A non-preserved-side update is deferred (the per-row matched-update / null-extended-
--- insert branch — handed to the optional-member transitions fan-out).
+-- A non-preserved-side update now propagates per row (the matched-update / null-extended-
+-- insert materialization). cc=1 is matched (parent pp=1), so this updates the parent in
+-- place; the null-extended materialization branch is exercised in property.spec.ts.
 update ojv set pv = 99 where cc = 1;
--- error: cannot write through view
+select cc, pv from ojv where cc = 1;
+→ [{"cc":1,"pv":99}]
 
 -- Both-side insert: child + (presence-gated) parent under the minted shared key.
 insert into ojv (cc, cv, pv) values (3, 33, 333);
@@ -2108,6 +2110,7 @@ delete from ojv where cc = 1;
 delete from ojv where cc = 2;
 select cc, cv, pv from ojv order by cc;
 → [{"cc":3,"cv":33,"pv":333},{"cc":4,"cv":44,"pv":null}]
--- the parent of the deleted joined row survives (the delete hit only the child side).
+-- the parent of the deleted joined row survives (the delete hit only the child side),
+-- carrying the pv=99 written through the matched non-preserved-side update above.
 select pv from ojp order by pv;
-→ [{"pv":10},{"pv":333}]
+→ [{"pv":99},{"pv":333}]

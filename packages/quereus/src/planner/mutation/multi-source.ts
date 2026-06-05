@@ -1061,6 +1061,22 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// `propagateMultiSource` path, unreachable from build) cross-source values stay
 	// rejected by `stripSideQualifier`'s throw.
 	const srcDedup = new Map<string, string>();
+	// Project an arbitrary base-term expression into the up-front `__vmupd_keys` capture
+	// under a stable `srcN` alias (deduped by `key`), returning that alias. The carrier is
+	// the `sourceValues` out-param the builder threads into the capture, so each projection
+	// is materialized pre-mutation over the join body. Backs both the cross-source SET reads
+	// and the outer-join non-preserved materialization (the captured assigned value + the EC
+	// join key). Absent ⇒ the legacy non-build path, which keeps deferring those shapes.
+	const registerCapturedExpr = sourceValues
+		? (key: string, expr: AST.Expression): string => {
+			const existing = srcDedup.get(key);
+			if (existing) return existing;
+			const alias = `src${sourceValues.length}`;
+			srcDedup.set(key, alias);
+			sourceValues.push({ alias, expr });
+			return alias;
+		}
+		: undefined;
 	const registerCrossSource = sourceValues
 		? (col: AST.ColumnExpr): string => {
 			const key = `${(col.table ?? '').toLowerCase()}.${col.name.toLowerCase()}`;
@@ -1075,6 +1091,11 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 
 	// Route each assignment to its owning base side (one entry per side, index 0..n-1).
 	const perSide: Array<{ column: string; value: AST.Expression }[]> = analysis.sides.map(() => []);
+	// Non-preserved (outer-join null-extended) assignments, keyed by their owning side: each
+	// rides a matched-UPDATE (pushed into `perSide`, its captured PK non-null) plus a single
+	// null-extended-INSERT op (built after the per-side loop, one per non-preserved side,
+	// carrying every column assigned on that side). § Outer Joins — Updates.
+	const nullExtendedBySide = new Map<number, Array<{ baseColumn: string; valAlias: string }>>();
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
 		if (!out) {
@@ -1082,19 +1103,42 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// top-level `where` scan (distinct from a computed view column below).
 			raiseUnknownViewColumn(asg.column, view, analysis.outColumns.map(c => c.displayName));
 		}
-		// A non-preserved (outer-join null-extended) base column: the row is either matched
-		// (→ a normal base update) or null-extended (→ an insert on the missing side), a
-		// per-row branch not statically decidable here (§ Outer Joins — Updates on a
-		// non-preserved-side column). Defer to `view-write-optional-member-transitions` with
-		// a precise diagnostic — distinct from the genuinely-computed `no-inverse` below
-		// (the column DOES have base lineage; it just needs the materialization fan-out).
+		// A non-preserved (outer-join null-extended) base column splits per row (§ Outer
+		// Joins — Updates on a non-preserved-side column): where the non-preserved side
+		// matched it is an ordinary base update; where the row is null-extended (no match) it
+		// is rewritten as an insert on that side. Both ride the up-front `__vmupd_keys`
+		// capture, materialized pre-mutation over the join body: the matched op reads its
+		// captured PK (non-null for a matched row); the null-extended op fires for the rows
+		// whose captured PK is null. The assigned value is captured ONCE (so both branches
+		// read the identical pre-mutation value), and the matched op reads it back keyed on
+		// the non-preserved PK. Needs the capture carrier; the legacy `propagateMultiSource`
+		// path (no carrier) keeps deferring with `unsupported-outer-join-update`.
 		if (out.nullExtended && out.sideIndex !== undefined && out.baseColumn) {
-			raiseMutationDiagnostic({
-				reason: 'unsupported-outer-join-update',
-				column: asg.column,
-				table: view.name,
-				message: `cannot write through view '${view.name}': column '${asg.column}' is backed by the non-preserved side of an outer join (base table '${analysis.sides[out.sideIndex].schema.name}'); updating it needs the per-row matched-update / null-extended-insert materialization (deferred to the optional-member transitions fan-out)`,
-			});
+			if (!registerCapturedExpr) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-outer-join-update',
+					column: asg.column,
+					table: view.name,
+					message: `cannot write through view '${view.name}': column '${asg.column}' is backed by the non-preserved side of an outer join (base table '${analysis.sides[out.sideIndex].schema.name}'); the per-row matched-update / null-extended-insert materialization needs the capture carrier`,
+				});
+			}
+			// The assigned value's top-level references must name view columns (parity with
+			// the preserved path); the value is then lowered to base terms over the join body
+			// and captured pre-mutation, so a same- or cross-side read resolves uniformly.
+			guardTopLevelScope(asg.value, analysis, view);
+			const npSide = analysis.sides[out.sideIndex];
+			const baseValue = substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view);
+			const valAlias = registerCapturedExpr(`neval:${out.sideIndex}:${out.baseColumn.toLowerCase()}`, baseValue);
+			// Matched rows: a per-side UPDATE reading the captured value back, correlated by
+			// the non-preserved side's PK (`buildCapturedKeyPredicate` already filters to
+			// matched rows — a null captured PK never equals a real one).
+			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide)) });
+			// Null-extended rows: accumulate the (column, captured value) for this side's
+			// single materialization insert, built after the loop.
+			let list = nullExtendedBySide.get(out.sideIndex);
+			if (!list) { list = []; nullExtendedBySide.set(out.sideIndex, list); }
+			list.push({ baseColumn: out.baseColumn, valAlias });
+			continue;
 		}
 		if (!out.writable || out.sideIndex === undefined || !out.baseColumn) {
 			raiseMutationDiagnostic({
@@ -1181,6 +1225,14 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		ops.push({ table: side.table, op: 'update', statement });
 	}
 
+	// Materialize the null-extended rows: one insert per non-preserved side over the
+	// captured partition (the affected rows whose non-preserved PK was captured null). The
+	// matched UPDATE for the same side was already emitted by the per-side loop above (its
+	// tag-allowance enforced there), so this only adds the create branch. § Outer Joins.
+	for (const [sideIndex, cols] of nullExtendedBySide) {
+		ops.push(buildNullExtendedInsert(ctx, view, analysis, sideIndex, cols, registerCapturedExpr!, stmt));
+	}
+
 	if (ops.length === 0) {
 		// No assignment routed (e.g. only computed columns) — caught above as
 		// no-inverse, so this is unreachable; guard for safety.
@@ -1191,6 +1243,131 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		});
 	}
 	return ops;
+}
+
+/**
+ * Build the null-extended materialization INSERT for a non-preserved outer-join side:
+ * `insert into <np> (<joinKey>, <set cols…>) select k.<jk>, k.<val…> from __vmupd_keys k
+ * where <every np PK k col> is null and k.<jk> is not null` (§ Outer Joins — Updates). It
+ * fires only for the affected rows the join null-extended (the non-preserved PK captured
+ * null) whose preserved-side join key is non-null (a null key cannot seed a joinable row).
+ * The new row carries the EC join key (so the preserved row joins it), the assigned
+ * value(s) read from the same pre-mutation `__vmupd_keys` capture the matched UPDATE reads,
+ * and base defaults for everything else; a NOT NULL base column without a default that no
+ * value covers raises `null-extended-create-conflict`.
+ *
+ * Built as a pure AST `BaseOp` (an insert-from-select over `__vmupd_keys`, resolved by the
+ * builder's `cteNodes` injection) — no new plan-node substrate: the existing
+ * capture-materialize-then-drain machinery already supplies the pre-mutation partition.
+ */
+function buildNullExtendedInsert(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	analysis: JoinViewAnalysis,
+	npSideIndex: number,
+	cols: ReadonlyArray<{ baseColumn: string; valAlias: string }>,
+	registerCapturedExpr: (key: string, expr: AST.Expression) => string,
+	stmt: AST.UpdateStmt,
+): BaseOp {
+	const npSide = analysis.sides[npSideIndex];
+	const { npJoinColumn, preservedExpr } = outerJoinInsertKey(view, analysis, npSideIndex);
+	const jkAlias = registerCapturedExpr(`nejk:${npSideIndex}`, preservedExpr);
+
+	// Insert columns: the non-preserved join column (= the captured preserved-side join
+	// value, so the preserved row joins the freshly materialized row) followed by each
+	// assigned base column (= its captured value). The join column is threaded once.
+	const targetColumns: string[] = [npJoinColumn];
+	const projections: AST.ResultColumn[] = [
+		{ type: 'column', expr: { type: 'column', name: jkAlias, table: 'k' }, alias: npJoinColumn },
+	];
+	const joinColLower = npJoinColumn.toLowerCase();
+	for (const c of cols) {
+		if (c.baseColumn.toLowerCase() === joinColLower) continue; // join column already threaded
+		targetColumns.push(c.baseColumn);
+		projections.push({ type: 'column', expr: { type: 'column', name: c.valAlias, table: 'k' }, alias: c.baseColumn });
+	}
+	assertNullExtendedInsertCovered(view, npSide.schema, targetColumns);
+
+	// Restrict to the null-extended partition: every captured PK column of the non-preserved
+	// side is null (no join match), and the preserved join key is non-null (a null key has
+	// no joinable row to create).
+	const conds: AST.Expression[] = requireKeyColumns(view, npSide).map((_pk, j): AST.Expression =>
+		({ type: 'unary', operator: 'IS NULL', expr: { type: 'column', name: keyColumnName(npSideIndex, j), table: 'k' } } as AST.UnaryExpr));
+	conds.push({ type: 'unary', operator: 'IS NOT NULL', expr: { type: 'column', name: jkAlias, table: 'k' } } as AST.UnaryExpr);
+	const where = conds.reduce((acc, c) => combineAnd(acc, c)!);
+
+	const select: AST.SelectStmt = {
+		type: 'select',
+		columns: projections,
+		from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+		where,
+	};
+	const statement: AST.InsertStmt = {
+		type: 'insert',
+		table: tableIdentifier(npSide.schema),
+		columns: targetColumns,
+		source: select,
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	return { table: npSide.table, op: 'insert', statement };
+}
+
+/**
+ * The non-preserved side's join column + the preserved partner's join value for the
+ * null-extended materialization insert. Walks the join's cross-side equalities
+ * ({@link collectCrossSideEqualities}) for one connecting the non-preserved side to a
+ * PRESERVED side: the non-preserved column is set to the preserved value, so the
+ * materialized row joins back to the preserved row. A non-preserved side related to no
+ * preserved side by an equi-join key cannot be materialized with a joinable key — rejected
+ * `unsupported-outer-join-update`.
+ */
+function outerJoinInsertKey(
+	view: MutableViewLike,
+	analysis: JoinViewAnalysis,
+	npSideIndex: number,
+): { npJoinColumn: string; preservedExpr: AST.Expression } {
+	const eqs = collectCrossSideEqualities(analysis.sel.from!, analysis.sides);
+	for (const eq of eqs) {
+		let npCol: string | undefined;
+		let partnerSide: number | undefined;
+		let partnerCol: string | undefined;
+		if (eq.sideA === npSideIndex) { npCol = eq.colA; partnerSide = eq.sideB; partnerCol = eq.colB; }
+		else if (eq.sideB === npSideIndex) { npCol = eq.colB; partnerSide = eq.sideA; partnerCol = eq.colA; }
+		else continue;
+		if (!analysis.sides[partnerSide].preserved) continue;
+		return {
+			npJoinColumn: npCol,
+			preservedExpr: { type: 'column', name: partnerCol, table: analysis.sides[partnerSide].alias },
+		};
+	}
+	return raiseMutationDiagnostic({
+		reason: 'unsupported-outer-join-update',
+		table: view.name,
+		message: `cannot write through view '${view.name}': the non-preserved side (base table '${analysis.sides[npSideIndex].schema.name}') is not related to a preserved side by an equi-join key, so a null-extended row cannot be materialized with a joinable key`,
+	});
+}
+
+/**
+ * Reject a NOT NULL base column on the non-preserved side that the null-extended
+ * materialization insert leaves unset (no default, no covering value) — the row cannot be
+ * created. Mirrors {@link assertNoMissingNotNull} but raises `null-extended-create-conflict`
+ * (the outer-join create-side diagnostic), distinguishing a missing materialization value
+ * from an ordinary insert's missing column.
+ */
+function assertNullExtendedInsertCovered(view: MutableViewLike, schema: TableSchema, covered: readonly string[]): void {
+	const set = new Set(covered.map(c => c.toLowerCase()));
+	for (const col of schema.columns) {
+		if (col.generated || !col.notNull || col.defaultValue !== null) continue;
+		if (set.has(col.name.toLowerCase())) continue;
+		raiseMutationDiagnostic({
+			reason: 'null-extended-create-conflict',
+			column: col.name,
+			table: view.name,
+			message: `cannot update through view '${view.name}': materializing a null-extended row on base table '${schema.name}' would leave NOT NULL column '${col.name}' (no default) unset, so the non-preserved-side row cannot be created`,
+		});
+	}
 }
 
 /** All side indices `0..n-1` — the default candidate set for `target`/`exclude`. */

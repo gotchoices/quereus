@@ -3654,8 +3654,14 @@ describe('Property-Based Tests', () => {
 				expect(ojSmoke.length, 'preserved-only insert is visible').to.equal(1);
 				expect(ojSmoke[0].pv, 'preserved-only row reads back null-extended').to.equal(null);
 
+				// Non-preserved-side update is now SUPPORTED (the matched-update / null-extended-
+				// insert materialization). Smoke that it no longer rejects wholesale; the full
+				// matched + null-extended round-trip is pinned in the dedicated test below. (The
+				// shared rjchild rows were perturbed by the self-join update above, so this only
+				// asserts the statement is accepted, not a specific post-image.)
+				await db.exec('update rj_outer set pv = 9 where cc = 1');
+
 				// Shapes still deferred reject with their precise diagnostic (no silent widen).
-				await expectMutationReject('update rj_outer set pv = 9 where cc = 1', 'unsupported-outer-join-update'); // non-preserved-side update: deferred to the transitions ticket
 				await expectMutationReject('insert into rj_outer (pv) values (9)', 'null-extended-create-conflict');    // non-preserved-only insert: no preserved anchor
 				await expectMutationReject('update rj_star set cv = 9 where cc = 1', 'unsupported-join');                // select *
 				await expectMutationReject('update rj_outer set cv = pv where cc = 1', 'no-inverse');                    // cross-source set reading a non-preserved (null-extended) partner column
@@ -3903,13 +3909,17 @@ describe('Property-Based Tests', () => {
 				const updByCol = new Map(cinfo.map(r => [String(r.column_name).toLowerCase(), r.is_updatable]));
 				expect(updByCol.get('cc'), 'cc updatable').to.equal('YES');
 				expect(updByCol.get('cv'), 'cv updatable').to.equal('YES');
-				expect(updByCol.get('pv'), 'pv (non-preserved) update deferred').to.equal('NO');
+				// pv (non-preserved) is now updatable through the matched-update / null-extended-
+				// insert materialization (a preserved anchor pins identity); the round-trip is
+				// pinned in the dedicated non-preserved-update test below.
+				expect(updByCol.get('pv'), 'pv (non-preserved) now updatable via materialization').to.equal('YES');
 
-				// Negatives: a non-preserved-side update / non-preserved-only insert defer.
+				// A non-preserved-only insert still defers (no preserved anchor to attach to);
+				// the non-preserved-side UPDATE is now supported (the dedicated test below pins
+				// it), so only the insert rejects here.
 				await db.exec('insert into oj_parent values (1, 10)');
 				await db.exec('insert into oj_child values (1, 1, 100)');     // joined row
 				await db.exec('insert into oj_child values (2, null, 200)');  // null-extended row
-				await expectMutationReject('update ojv set pv = 999 where cc = 1', 'unsupported-outer-join-update');
 				await expectMutationReject('insert into ojv (pv) values (999)', 'null-extended-create-conflict');
 
 				// Delete-to-preserved: deleting the null-extended row removes it from the view
@@ -3976,6 +3986,67 @@ describe('Property-Based Tests', () => {
 							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc })), ['cc']);
 					},
 				), { numRuns: 50 });
+			});
+
+			// ----- Outer (LEFT) join: non-preserved-side UPDATE (matched + null-extended) -----
+			// `npv` = np_child LEFT JOIN np_parent on parent.pp = child.pr. Updating the
+			// non-preserved column `pv` splits per row: a MATCHED row updates the joined parent
+			// in place; a NULL-EXTENDED row with a dangling join key materializes a parent
+			// carrying the EC join key + pv (so the child joins it); a null-extended row with a
+			// NULL join key is a no-op (no key to seed a joinable row — the documented boundary).
+			// A NOT NULL non-preserved column with no default the create branch cannot supply
+			// rejects with `null-extended-create-conflict`.
+			it('outer (left) join: non-preserved-side update materializes matched + null-extended rows', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists npv');
+				await db.exec('drop table if exists np_child');
+				await db.exec('drop table if exists np_parent');
+				await db.exec('create table np_parent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table np_child (cc integer primary key, pr integer null, cv integer null) using memory');
+				await db.exec('create view npv as select c.cc as cc, c.cv as cv, p.pv as pv from np_child c left join np_parent p on p.pp = c.pr');
+
+				await db.exec('insert into np_parent values (10, 100)');
+				await db.exec('insert into np_child values (1, 10, 1000)');   // joined
+				await db.exec('insert into np_child values (2, 99, 2000)');   // null-extended, dangling key
+				await db.exec('insert into np_child values (3, null, 3000)'); // null-extended, NULL key
+
+				// Matched: updates the joined parent in place — no new parent row.
+				await db.exec('update npv set pv = 111 where cc = 1');
+				assertRowsEqual('np matched update view', await readRows('select cc, pv from npv where cc = 1'),
+					[{ cc: 1, pv: 111 }], ['cc', 'pv']);
+				assertRowsEqual('np matched update parent base', await readRows('select pp, pv from np_parent order by pp'),
+					[{ pp: 10, pv: 111 }], ['pp', 'pv']);
+
+				// Null-extended with a dangling key: materializes a parent carrying the EC join
+				// key (pp = the child's pr = 99) + pv, so the child now joins it. PutGet green.
+				await db.exec('update npv set pv = 222 where cc = 2');
+				assertRowsEqual('np null-extended materialization view', await readRows('select cc, cv, pv from npv where cc = 2'),
+					[{ cc: 2, cv: 2000, pv: 222 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('np null-extended materialization parent base', await readRows('select pp, pv from np_parent where pp = 99'),
+					[{ pp: 99, pv: 222 }], ['pp', 'pv']);
+
+				// Null-extended with a NULL key: no joinable key to seed, so the update is a
+				// no-op (the documented boundary — pv stays null, no stray parent minted).
+				await db.exec('update npv set pv = 333 where cc = 3');
+				assertRowsEqual('np null-key update is a no-op', await readRows('select cc, pv from npv where cc = 3'),
+					[{ cc: 3, pv: null }], ['cc', 'pv']);
+				expect((await readRows('select pp from np_parent where pp = 333')).length,
+					'no stray parent minted for the null-key row').to.equal(0);
+
+				// GetPut: writing each row's own pv back leaves the whole image unchanged.
+				await db.exec('update npv set pv = 111 where cc = 1');
+				assertRowsEqual('np GetPut idempotent', await readRows('select cc, cv, pv from npv order by cc'),
+					[{ cc: 1, cv: 1000, pv: 111 }, { cc: 2, cv: 2000, pv: 222 }, { cc: 3, cv: 3000, pv: null }], ['cc', 'cv', 'pv']);
+
+				// null-extended-create-conflict: a NOT NULL non-preserved column with no default
+				// the materialization create branch cannot supply rejects (a plan-time guard).
+				await db.exec('drop view if exists npv2');
+				await db.exec('drop table if exists np2_child');
+				await db.exec('drop table if exists np2_parent');
+				await db.exec('create table np2_parent (pp integer primary key, pv integer null, req integer not null) using memory');
+				await db.exec('create table np2_child (cc integer primary key, pr integer null, cv integer null) using memory');
+				await db.exec('create view npv2 as select c.cc as cc, c.cv as cv, p.pv as pv from np2_child c left join np2_parent p on p.pp = c.pr');
+				await expectMutationReject('update npv2 set pv = 9 where cc = 1', 'null-extended-create-conflict');
 			});
 		});
 

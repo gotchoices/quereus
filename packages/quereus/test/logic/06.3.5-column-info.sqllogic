@@ -178,10 +178,12 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 → [{"cid":0,"column_name":"n","is_updatable":"NO","base_table":null,"base_column":null}]
 
 -- ===================================================================
--- Outer-join body: PER-SIDE updatability. A LEFT outer join is partially writable
--- — the preserved side's columns (aid, av) report is_updatable='YES' with their base
--- trace, while the non-preserved (`null-extended`) side's column (bv) reports 'NO'
--- with null trace (its UPDATE is deferred — `unsupported-outer-join-update`).
+-- Outer-join body: PER-SIDE updatability. A LEFT outer join is writable on every base
+-- column — the preserved side's columns (aid, av) report is_updatable='YES' with their
+-- base trace, and the non-preserved (`null-extended`) side's column (bv) ALSO reports
+-- 'YES' tracing to oj_b.bv: its UPDATE materializes per row (a matched row updates the
+-- non-preserved base row, a null-extended row inserts one keyed by the EC join key —
+-- `view-write-optional-member-transitions`), since the body has a preserved anchor.
 -- column_info reads the same per-column `null-extended` lineage `view_info` does, so
 -- the two surfaces agree with the dynamic truth.
 -- ===================================================================
@@ -193,13 +195,15 @@ create view oj_left as
     select a.aid as aid, a.av as av, b.bv as bv
     from oj_a a left join oj_b b on b.bid = a.aid;
 select cid, column_name, is_updatable, base_table, base_column from column_info('oj_left');
-→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"oj_a","base_column":"aid"},{"cid":1,"column_name":"av","is_updatable":"YES","base_table":"oj_a","base_column":"av"},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"oj_a","base_column":"aid"},{"cid":1,"column_name":"av","is_updatable":"YES","base_table":"oj_a","base_column":"av"},{"cid":2,"column_name":"bv","is_updatable":"YES","base_table":"oj_b","base_column":"bv"}]
 
--- Surface agrees with propagate(): a preserved-side update is accepted; the
--- non-preserved-side update is deferred.
+-- Surface agrees with propagate(): both a preserved-side and a non-preserved-side
+-- update are accepted — aid=1 has no oj_b match, so the bv update materializes
+-- oj_b(bid=1, bv='z') via the EC join key (bid = aid) and the row reads back joined.
 update oj_left set av = 'z' where aid = 1;
 update oj_left set bv = 'z' where aid = 1;
--- error: cannot write through view
+select cid, column_name, is_updatable from column_info('oj_left');
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES"},{"cid":1,"column_name":"av","is_updatable":"YES"},{"cid":2,"column_name":"bv","is_updatable":"YES"}]
 
 -- ===================================================================
 -- Non-inner join bodies (Divergence 3): a cross join never null-extends (only
