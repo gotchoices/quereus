@@ -578,6 +578,48 @@ select cid, cval from ax_xs_c order by cid;
 select pid, pv from ax_xs_p order by pid;
 → [{"pid":10,"pv":100},{"pid":20,"pv":200}]
 
+-- TWO distinct cross-source leaves in one statement -> each partner column mints its own
+-- `srcN` projection, but all reads of `__vmupd_keys` within a base op resolve to ONE
+-- injected key-ref instance (a shared DAG). Both shapes must lower correctly: a two-leaf
+-- expression (`cw = pv + pw`) and two single-leaf assignments (`cv = pv, cw = pw`). For
+-- cid=2 (joined parent pid=20: pv=200, pw=2000) the expression case sets cw=2200; the
+-- two-assignment case sets cv=200, cw=2000.
+create table ax_xs2_p (pid integer primary key, pv integer, pw integer);
+create table ax_xs2_c (cid integer primary key, pref integer, cv integer, cw integer,
+    foreign key (pref) references ax_xs2_p(pid));
+insert into ax_xs2_p values (10, 100, 1000), (20, 200, 2000);
+insert into ax_xs2_c values (1, 10, 0, 0), (2, 20, 0, 0);
+create view ax_jv_x2 as
+    select c.cid as cid, c.cv as cv, c.cw as cw, p.pv as pv, p.pw as pw
+    from ax_xs2_c c join ax_xs2_p p on p.pid = c.pref;
+update ax_jv_x2 set cw = pv + pw where cid = 1;
+update ax_jv_x2 set cv = pv, cw = pw where cid = 2;
+select cid, cv, cw from ax_xs2_c order by cid;
+→ [{"cid":1,"cv":0,"cw":1100},{"cid":2,"cv":200,"cw":2000}]
+
+-- Cross-source `set` on a COMPOSITE-PK owning side: the correlated read-back conjoins one
+-- equality per owning PK column (k.k0_0 = k1 and k.k0_1 = k2), so only the identified row
+-- (k1=1, k2=2 — joined parent pp=20, pv=200) takes the partner value; (1,1) is untouched.
+create table ax_xscpk_k (k1 integer, k2 integer, v integer, ref integer, primary key (k1, k2));
+create table ax_xscpk_p (pp integer primary key, pv integer);
+insert into ax_xscpk_p values (10, 100), (20, 200);
+insert into ax_xscpk_k values (1, 1, 0, 10), (1, 2, 0, 20);
+create view ax_xscpk_v as
+    select k.k1 as k1, k.k2 as k2, k.v as v, p.pv as pv from ax_xscpk_k k join ax_xscpk_p p on p.pp = k.ref;
+update ax_xscpk_v set v = pv where k1 = 1 and k2 = 2;
+select k1, k2, v from ax_xscpk_k order by k1, k2;
+→ [{"k1":1,"k2":1,"v":0},{"k1":1,"k2":2,"v":200}]
+
+-- Cross-source `set` on a SELF-JOIN owning side: the owning side is alias-keyed, so the
+-- read-back correlates on the assigned alias's PK. `set sal = msal where id = 1` copies the
+-- manager (alias `m`, id=2) salary onto employee id=1; id=2 is untouched.
+create table ax_xs_emp (id integer primary key, mgr integer, sal integer);
+insert into ax_xs_emp values (1, 2, 50), (2, 2, 90);
+create view ax_xs_self as select e.id as id, e.sal as sal, m.sal as msal from ax_xs_emp e join ax_xs_emp m on e.mgr = m.id;
+update ax_xs_self set sal = msal where id = 1;
+select id, sal from ax_xs_emp order by id;
+→ [{"id":1,"sal":90},{"id":2,"sal":90}]
+
 -- ...but a cross-source value reading a COMPUTED (non-base) partner column stays
 -- rejected: its value is not recoverable from a captured base column.
 create view ax_jv_xc as
