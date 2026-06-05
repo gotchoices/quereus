@@ -31,7 +31,7 @@ A mutation against a relation is a predicate over base-table state. The engine f
 - **Update** = "for rows matching this predicate, change these columns to these values"
 - **Delete** = "make these rows not exist in the relation"
 
-For n-ary operators (union, intersect, except, join), the default policy is **fan out to every branch whose own predicate is consistent with the mutation's row-identifying predicate**. The user controls fan-out by adding predicates (narrowing the rows to a single branch) or by attaching tags (overriding the default routing). The engine never silently drops one of several consistent branches.
+For n-ary operators (union, intersect, except, join), the default policy is **fan out to every branch whose own predicate is consistent with the mutation's row-identifying predicate**. The user controls fan-out by adding predicates (narrowing the rows to a single branch) or by writing a per-row **presence/membership column** (the outer-join existence column, the set-op membership columns) that states the routing explicitly. The engine never silently drops one of several consistent branches.
 
 The classical view-update ambiguity (Bancilhon–Spyratos) only arises when one chooses to suppress effects on some branches. Quereus does not suppress: a mutation routed to *every* satisfying branch is unambiguous by construction. The cost is that mutations can produce more base-table operations than a one-branch policy would, but this is the honest reading of the predicate.
 
@@ -150,15 +150,17 @@ A `set` **value** may read a column owned by a *different* side than the column 
 
 **Inserts** require values for both sides' `not null`-without-default columns and must satisfy the join predicate. Each supplied view column routes to its owning side by `updateLineage`; the shared join key (read from the single `a.col = b.col` ON predicate) is **directly supplied** when a view column maps to it, otherwise **minted** at the envelope (§ [Mutation Context](#mutation-context)). The two child inserts execute FK-parent before FK-child where the dependency is provable. A `not null` base column with neither a supplied value nor a declared default raises `no-default`; a computed target column raises `no-inverse`. The shared key must be exposed by **at most one** view column — a body projecting both sides of the equi-join key is over-specified for an insert (it could not honor divergent supplied values) and raises `unsupported-join`. Insert through an *invertible* column is rejected (`no-inverse`): the envelope writes supplied values verbatim, with no hook to apply the inverse.
 
-**Deletes** are inherently ambiguous — removing the joined row requires deleting from at least one side. Tags compose *after* the predicate dispatch — they only restrict the candidate sides, never broaden them:
+**Deletes** are inherently ambiguous — removing the joined row requires deleting from at least one side. Routing is **predicate / FK truth only** (the routing tags were removed; routing is expressed per-row by a writable presence column where a non-default side is wanted):
 
-- `quereus.update.target` / `exclude` (CSV of base-table names) first narrow the candidate sides.
-- An explicit `quereus.update.delete_via` then picks a side: `'parent'` selects the FK-parent (requires a declared foreign key), `'left_delete'` the left join source.
-- Absent an explicit side tag: if `target`/`exclude` already left exactly one side, that side; else if a declared foreign key proves the FK-many (child) side, that single side (the common FK-style default — deletes the child, leaving the parent in place); else, under the default `lenient` policy, **fan out to every candidate side** (the predicate-honest "make this joined row not exist"), while `quereus.update.policy = 'strict'` rejects it.
+- The candidate sides are the **preserved** side(s) (an inner join is all-preserved).
+- If a declared foreign key proves the FK-many (child) side, that single side is chosen — the common FK-style default: it deletes the child, leaving the parent in place. The FK resolves the ambiguity, so this is *not* a fan-out.
+- Otherwise the deletion side is ambiguous and the **lenient default fans out to every candidate side** (the predicate-honest "make this joined row not exist").
+
+To realize a *non-default* deletion side explicitly — e.g. delete the FK-**parent** instead of the child — expose the side as a per-row **existence column** on an outer join (`… left join parent … exists right as hasP`) and write the routing directly: `update v set hasP = false where …` deletes the matched parent for the targeted rows (§ [Existence columns](#existence-columns)).
 
 The lenient multi-side fan-out deletes the joined row's contribution from *every* candidate side, reusing the same eager key materialization as the both-sides update: each affected view row's base-PK identities are captured once, before any base op fires, and *each* per-side delete addresses rows through that captured set — so the first side's delete cannot empty the join out from under the second side's identifying subquery. A single-side delete reads the same capture (projecting just its one side's PK). Because each base delete is a **predicate-scan** over the live table (not a key-addressed delete that errors on a missing key), a row another side's FK action removed first is a natural **no-op**, never a double-delete error.
 
-**Fan-out ordering is ON-DELETE-aware:** the two base deletes are ordered by ON DELETE action so the side whose removal *clears the other's reference* runs first — a `set null` / `set default` inbound action, or a `cascade` that does not recurse into a `restrict` child. This rescues the order-sensitive asymmetric mutual-FK shape (`restrict` + `set null`): deleting the `set null`-inbound side first clears the other side's reference, so the `restrict`-inbound side's delete then no-ops. A mutual FK whose edges **cannot be satisfied in any order** under immediate enforcement — `restrict`+`restrict`, or `restrict`+`cascade` where the cascade recurses into the `restrict` — is rejected at **plan time** with `mutual-fk-restrict-delete`, **but only when the join provably correlates at least one mutual FK edge** (its cross-side equalities force a child's FK column(s) equal to the parent's referenced column(s), so the joined rows *necessarily* cross-reference and a RESTRICT necessarily fires). A join on **non-FK columns**, where the rows are not proven to cross-reference, is not rejected up front: it falls back to the fixed `[0, 1]` order and defers to the **runtime** RESTRICT pre-check on the actual data — so a delete whose FK columns are NULL (MATCH SIMPLE: no FK match) succeeds rather than being over-rejected. When the reject fires, no `delete_via` / `target` override resolves it; the resolution is to break the cycle outside the view (null out the referencing column first, or restructure the offending ON DELETE action). A `deferrable initially deferred` declaration does not help — RESTRICT is enforced immediately regardless. This analysis depends on **immediate** FK enforcement plus the transitive RESTRICT pre-walk (`runtime/foreign-key-actions.ts`).
+**Fan-out ordering is ON-DELETE-aware:** the two base deletes are ordered by ON DELETE action so the side whose removal *clears the other's reference* runs first — a `set null` / `set default` inbound action, or a `cascade` that does not recurse into a `restrict` child. This rescues the order-sensitive asymmetric mutual-FK shape (`restrict` + `set null`): deleting the `set null`-inbound side first clears the other side's reference, so the `restrict`-inbound side's delete then no-ops. A mutual FK whose edges **cannot be satisfied in any order** under immediate enforcement — `restrict`+`restrict`, or `restrict`+`cascade` where the cascade recurses into the `restrict` — is rejected at **plan time** with `mutual-fk-restrict-delete`, **but only when the join provably correlates at least one mutual FK edge** (its cross-side equalities force a child's FK column(s) equal to the parent's referenced column(s), so the joined rows *necessarily* cross-reference and a RESTRICT necessarily fires). A join on **non-FK columns**, where the rows are not proven to cross-reference, is not rejected up front: it falls back to the fixed `[0, 1]` order and defers to the **runtime** RESTRICT pre-check on the actual data — so a delete whose FK columns are NULL (MATCH SIMPLE: no FK match) succeeds rather than being over-rejected. When the reject fires, the resolution is to break the cycle outside the view (null out the referencing column first, or restructure the offending ON DELETE action). A `deferrable initially deferred` declaration does not help — RESTRICT is enforced immediately regardless. This analysis depends on **immediate** FK enforcement plus the transitive RESTRICT pre-walk (`runtime/foreign-key-actions.ts`).
 
 > This plan-time ON-DELETE / mutual-FK analysis is **two-side only**. An n-way (>2) delete fan-out orders its chosen sides by the **reverse** FK topological sort (FK-child before FK-parent — the FK-safe delete direction, so a referencing row is removed before the row it references rather than tripping the parent's inbound RESTRICT) and defers any mutual-FK cycle wholesale to the **runtime** RESTRICT pre-check on the actual data — the plan-time `mutual-fk-restrict-delete` reject is not generalized past two sides (a deliberate scope boundary; see the inner-join substrate).
 
@@ -317,8 +319,8 @@ flag on a `union all` currently forces the buffering runner instead of the strea
 The first set-op view writability in the engine (`planner/mutation/set-op.ts`). A
 membership column **is** the branch presence, so *writing* it drives the branch's
 existence — the explicit, per-row control surface that replaces the never-built
-`quereus.update.*` routing-tag dispatch for set-ops (`union-branch` / `delete_via`, dead
-today; their removal is `remove-update-routing-tag-surface`). Scope is the **binary
+`quereus.update.*` routing-tag dispatch for set-ops (`union-branch` / `delete_via`,
+removed by `remove-update-routing-tag-surface`). Scope is the **binary
 (non-nested)** case: `union` / `union all` / `except` / `intersect`. Nested / subtree
 flags and product-coordinate addressing are `set-op-membership-nested`.
 
@@ -350,7 +352,7 @@ flags already encode each operator's branch truth):
   (deleted from every branch it was in).
 - **`except`** (`A except B`) — a visible row is `inLeft = true, inRight = false`.
   `set inRight = true` ⇒ insert into B, pushing the row **out** of the view (the explicit
-  form of the dead `delete_via = 'right_insert'`); `set inLeft = false` ⇒ delete from A
+  form of the removed `delete_via = 'right_insert'`); `set inLeft = false` ⇒ delete from A
   (the row leaves the view).
 - **`intersect`** — reads are trivially all-true, so membership columns are **write-useful
   only**: `set inB = false` ⇒ delete from B, dropping the row from the intersect.
@@ -391,13 +393,14 @@ column in a writable branch is rejected.
 > **Implemented surface vs. the design below.** Binary set-op write-through is realized
 > through the **membership columns** above (`set-op-membership-write`): the explicit
 > per-row branch control surface. The predicate-honest fan-out + `quereus.update.*`
-> routing-tag dispatch described in the four subsections that follow (`delete_via`,
-> `target`, `right_insert`, branch-consistency inference) is the **original aspirational
+> routing-tag dispatch once described in the four subsections that follow (`delete_via`,
+> `target`, `right_insert`, branch-consistency inference) was the **original aspirational
 > design** — it was never built (no parser syntax, no consumer), and the routing-tag
-> surface itself is being retired (`remove-update-routing-tag-surface`). The runtime
+> surface has been **removed** (`remove-update-routing-tag-surface`). The runtime
 > membership probe is the branch oracle in its place; for set-ops without membership
 > columns, write-through still rejects (`unsupported-set-op`). The subsections are kept for
-> the per-operator semantic intent, which the membership-write rules above realize.
+> the per-operator semantic intent, which the membership-write rules above realize — read
+> any `delete_via` / `target` mention there as its membership-column equivalent.
 
 ### Union All
 
@@ -425,7 +428,7 @@ A view row exists iff present in every branch. By predicate honesty:
 
 - **Inserts** fan out to every branch (otherwise the row does not appear in the view).
 - **Updates** fan out to every branch (the row exists on each side and must be kept aligned).
-- **Deletes** fan out to every branch by default — the predicate-honest reading of "this fact is no longer true" is "remove from every relation that asserts it". The `delete_via` tag narrows.
+- **Deletes** fan out to every branch by default — the predicate-honest reading of "this fact is no longer true" is "remove from every relation that asserts it". A membership column narrows it to one branch (`set inB = false` drops the row from B only).
 
 ### Except
 
@@ -433,7 +436,7 @@ A view row exists iff present in the left and absent from the right.
 
 - **Inserts** insert into the left; if the row is also present in the right (provable via the existence predicate against right's relation), delete from the right.
 - **Updates** propagate to the left only.
-- **Deletes** delete from the left by default. The tag `"quereus.update.delete_via" = 'right_insert'` switches to inserting into the right, achieving the same view-level effect through the opposite base-level change.
+- **Deletes** delete from the left by default. A membership write `set inRight = true` switches to inserting into the right, achieving the same view-level effect through the opposite base-level change (the explicit replacement for the removed `delete_via = 'right_insert'`).
 
 ### Distinct
 
@@ -476,28 +479,26 @@ Built-in functions ship with profiles. `cast`-style conversions advertise `inver
 
 ## Tags: The Override Surface
 
-Default propagation is deterministic and predicate-honest. When a user wants different behavior, they attach tags via the existing `with tags (...)` syntax (see [SQL Reference § Tags](sql.md#tags)). The reserved `quereus.update.*` namespace controls propagation.
+Default propagation is deterministic and predicate-honest, and there is exactly **one** override mechanism left in the `quereus.update.*` namespace: `default_for.<column>`, which supplies a *value* for an omitted insert column. **Write routing is no longer a tag.** It is expressed three ways, in order of precedence:
 
-Shape and site validation for the whole `quereus.*` namespace is centralized in the typed registry `packages/quereus/src/schema/reserved-tags.ts` (`validateReservedTags(tags, site)`): each reserved key is matched to a frozen spec, its position checked against the key's legal `TagSite` set, and its value checked against a `TagValueSchema` (`csv-of-identifiers`, an enum, an `expression`, …). An unknown or mis-sited key is a hard **error**; a malformed value is an error too, except an empty `quereus.lens.ack` rationale, which is only a **warning**. This registry is the **single shape/site source of truth for every `quereus.*` path** — the lens compiler, the view-mutation override surface, the module advertisement builder, and the declarative-schema differ all validate through it with the identical hard-error-on-unknown severity. The registry itself stays policy-free; the throw-first-error / log-warnings caller policy lives in the shared `raiseReservedTagDiagnostics` helper. The registry validates a tag's shape/site; the `quereus.update.*` **semantics** are realized by the view-mutation override surface (collection + merge in `planner/mutation/mutation-tags.ts`, consumption in the single-source / multi-source spines).
+1. **Predicates** rule — narrowing the row-identifying predicate to a single branch/side routes there.
+2. **Per-row presence/membership columns** state routing explicitly and writably — the outer-join existence column (`exists … as hasP`, write `false` to delete the matched non-preserved side, `true` to materialize it) and the set-op membership columns (`set inB = false` to drop a branch). These are real, writable view columns, so the routing lives in the data shape and is self-documenting.
+3. **Default fan-out** otherwise — every consistent branch/side (the FK-child default resolves a join delete to one side when a foreign key proves it).
+
+The blanket "this view only ever writes relation X" restriction the removed `target` / `exclude` tags expressed is now achieved by **lens shape**: a view that does not project a relation's columns (and does not expose its presence/membership column) has no path to write that relation through the view. There is no replacement tag.
+
+Shape and site validation for the whole `quereus.*` namespace is centralized in the typed registry `packages/quereus/src/schema/reserved-tags.ts` (`validateReservedTags(tags, site)`): each reserved key is matched to a frozen spec, its position checked against the key's legal `TagSite` set, and its value checked against a `TagValueSchema` (`csv-of-identifiers`, an enum, an `expression`, …). An unknown or mis-sited key is a hard **error** — so a stray `quereus.update.target` / `exclude` / `delete_via` / `policy` (the removed routing keys) is now an `unknown-reserved-tag` error at any site — except an empty `quereus.lens.ack` rationale, which is only a **warning**. This registry is the **single shape/site source of truth for every `quereus.*` path** — the lens compiler, the view-mutation override surface, the module advertisement builder, and the declarative-schema differ all validate through it with the identical hard-error-on-unknown severity. The registry itself stays policy-free; the throw-first-error / log-warnings caller policy lives in the shared `raiseReservedTagDiagnostics` helper. The registry validates a tag's shape/site; the `default_for` **semantics** are realized by the view-mutation override surface (collection + merge in `planner/mutation/mutation-tags.ts`, consumption in the single-source / multi-source spines).
 
 Tags are collected at two sites: the view DDL (`ViewSchema.tags`, validated `view-ddl`) and the DML statement (`WITH TAGS (...)` → `stmt.tags`, validated `dml-stmt`); a sited diagnostic is raised before any base op is built.
 
 | Tag | Where | Effect |
 |---|---|---|
-| `"quereus.update.target"` | view DDL, branch of `union`/`intersect`/`except`, join side, dml statement | Restrict propagation to the listed relation(s). Value is a comma-separated list of base table names or branch identifiers. |
-| `"quereus.update.exclude"` | same | Exclude the listed branches; the inverse of `target`. |
 | `"quereus.update.default_for.<column>"` | view DDL, projection, dml statement | Default expression for `insert` through the view when the column is omitted. The expression may reference any surviving column. A statement-level binding overrides the view-level default for that statement. |
-| `"quereus.update.delete_via"` | `except`, join, dml statement | For `except`: `'left_delete'` (default) or `'right_insert'`. For joins: pick the side whose deletion realizes the view-level delete. A statement-level binding overrides the branch/join default. |
-| `"quereus.update.policy"` | view DDL | `strict` (reject any ambiguity) or `lenient` (default; predicate-honest fan-out). |
 
-Tags compose with the predicate-driven dispatch: predicates always run first, narrowing the candidate set; tags then further restrict, or — for `default_for` — supply missing values. Tags can never broaden the candidate set beyond what predicates allow.
-
-Statement-level tags appear in a `with tags (...)` clause on the statement, where a `with context (...)` clause would sit (before `set` / the `values` source / `where`, or trailing):
+`default_for` is the **only** retained `quereus.update.*` key. A statement-level binding appears in a `with tags (...)` clause on the statement, where a `with context (...)` clause would sit (before `set` / the `values` source / `where`, or trailing):
 
 ```sql
-update v with tags ("quereus.update.target" = 'base_a') set col = 1 where ...;
 insert into v with tags ("quereus.update.default_for.created" = 'epoch_ms(''now'')') values (...);
-delete from v with tags ("quereus.update.delete_via" = 'left_delete') where ...;
 ```
 
 A `default_for` value is a TEXT **expression** (parsed as SQL), so a non-literal must be SQL-quoted as shown. Statement-level tags override view-level tags for the duration of the statement.
@@ -637,9 +638,7 @@ interface MutationDiagnostic {
     | 'aggregate-target'                // aggregate-shaped column written
     | 'null-extended-create-conflict'   // outer-join insert supplies only non-preserved columns (no preserved anchor), OR a non-preserved-side update's null-extended materialization insert leaves a not-null-without-default base column unset
     | 'unsupported-outer-join-update'    // update of a non-preserved outer-join column with no preserved anchor to key the materialization (a FULL outer join, or a non-preserved side related to no preserved side by an equi-join key) — the LEFT-anchored case is shipped
-    | 'tag-target-not-found'            // target/exclude/default_for/delete_via names an unknown branch/table/column
-    | 'tag-conflict'                    // target/exclude excludes a side the statement must write
-    | 'policy-strict-ambiguity'         // policy=strict rejects an unresolved multi-side delete
+    | 'tag-target-not-found'            // a quereus.update.default_for.<col> names a column that is neither a view nor a base column (the routing tags were removed; this remains for the retained default_for key)
     | 'mutual-fk-restrict-delete'       // two-side join DELETE fan-out over a mutual FK whose ON DELETE actions no side order can satisfy under immediate enforcement
     | 'conflicting-assignment'          // two SET targets lower to the same base column
     | 'predicate-contradiction';        // statement's predicate is unsatisfiable
@@ -736,7 +735,7 @@ A per-operator round-trip property block (`test/property.spec.ts` § View Round-
 The law is the **acceptance gate** for the derived backward walk: a new operator's backward method is not "done" until PutGet / GetPut / lineage-agreement are green over a planned tree that surfaces it. The harness covers three families, each with a pure law core plus a negative self-test that proves the core reds on an injected violation:
 
 - **Single-source projection-and-filter** — the view-body zoo (bare `select *`, explicit / rename projection, computed column, equality-filter, alias-qualified body). `LIMIT`/`OFFSET`/`DISTINCT` bodies are asserted to *reject* (never silently widen).
-- **Multi-source key-preserving inner join** — update touching either side or **both** (the both-sides identity-capture path), a **cross-source `set`** (a value reading a partner-side `base` column, captured into `__vmupd_keys` under a `srcN` alias — including the both-sides-precedence case where the read value is the pre-mutation partner value), delete (FK-child default + a `delete_via=parent` variant), and insert with the shared key both **minted** and **directly supplied**; plus the n-way generalization — **composite-PK** inner joins, **≥3-table** inner joins, and **self-joins** (alias-keyed routing, serialized in alias-declaration order) all round-trip. Still-undecomposable shapes (outer-join body, `select *`, composite shared-key insert, a cross-source `set` reading a *computed* partner column or through an *outer* join) are asserted to *reject*.
+- **Multi-source key-preserving inner join** — update touching either side or **both** (the both-sides identity-capture path), a **cross-source `set`** (a value reading a partner-side `base` column, captured into `__vmupd_keys` under a `srcN` alias — including the both-sides-precedence case where the read value is the pre-mutation partner value), delete (FK-child default + an explicit parent-side route via an outer-join existence column, `set hasP = false`), and insert with the shared key both **minted** and **directly supplied**; plus the n-way generalization — **composite-PK** inner joins, **≥3-table** inner joins, and **self-joins** (alias-keyed routing, serialized in alias-declaration order) all round-trip. Still-undecomposable shapes (outer-join body, `select *`, composite shared-key insert, a cross-source `set` reading a *computed* partner column or through an *outer* join) are asserted to *reject*.
 - **n-way decomposition fan-out** — driven by `quereus.lens.decomp.*` tags: a columnar split with an optional (outer-joined) member, an EAV pivot member, and a surrogate split; INSERT (anchor-first, per-row optional gate, EAV triples, surrogate minted once and threaded into every member), UPDATE routed to the backing member — including the **optional-member / EAV value-write materialization** (matched UPDATE / `on conflict do nothing` materialize INSERT / all-null DELETE), anchor-last DELETE. Deferred shapes (shared-key identity write, non-constant optional/EAV value, non-anchor predicate, composite key) are asserted to *reject*.
 
 ### The predicate-honest complement

@@ -3469,9 +3469,9 @@ describe('Property-Based Tests', () => {
 			type Child = { cc: number; pr: number; cv: number };
 
 			async function createJoinBase(): Promise<void> {
-				// FK declared (so the delete_via walk proves the child side) but
-				// enforcement off, so a dangling child (an unjoined row the inner join
-				// hides) can exist — that is the row PutGet must never touch.
+				// FK declared (so the FK-child default routes the join delete to the child
+				// side) but enforcement off, so a dangling child (an unjoined row the inner
+				// join hides) can exist — that is the row PutGet must never touch.
 				await db.exec('pragma foreign_keys = false');
 				await db.exec('drop view if exists jv');
 				await db.exec('drop table if exists jchild');
@@ -4038,45 +4038,51 @@ describe('Property-Based Tests', () => {
 				expect(bOnlySeen, 'one-base-collide arm (K in dk_b only) never exercised').to.be.greaterThan(0);
 			});
 
-			// ----- Family B: delete_via routes a join delete to the FK-parent side -----
-			// Default DELETE routing picks the FK-child (FK-many) side. A `delete_via=parent`
-			// tag overrides that to the FK-parent. FK enforcement is off, so the now-dangling
-			// children survive in the base and the inner join simply hides them.
-			it('PutGet: a delete_via=parent tag routes the join delete to the FK-parent side', async () => {
+			// ----- Family B: an existence-column write routes a join delete to the FK-parent side -----
+			// Default DELETE routing picks the FK-child (FK-many) side. To delete the FK-PARENT
+			// instead — the non-default side — expose the parent's match as a per-row existence
+			// column on a LEFT join (`exists right as hasP`) and write `hasP = false` (the explicit,
+			// strictly-more-precise replacement for the removed `delete_via=parent` tag). FK
+			// enforcement is off, so the now-dangling children survive in the base and the LEFT
+			// join reads them null-extended.
+			it('PutGet: an existence-column write (hasP=false) routes the join delete to the FK-parent side', async () => {
 				await db.exec('pragma foreign_keys = false');
 				await db.exec('drop view if exists dvv');
 				await db.exec('drop table if exists dv_child');
 				await db.exec('drop table if exists dv_parent');
 				await db.exec('create table dv_parent (pp integer primary key, pv integer null) using memory');
 				await db.exec('create table dv_child (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references dv_parent(pp)) using memory');
-				await db.exec('create view dvv as select c.cc as cc, c.cv as cv, p.pv as pv from dv_child c join dv_parent p on p.pp = c.pr');
+				await db.exec('create view dvv as select c.cc as cc, c.cv as cv, p.pv as pv, hasP from dv_child c left join dv_parent p on p.pp = c.pr exists right as hasP');
 				await db.exec('insert into dv_parent values (1, 10), (2, 20)');
 				await db.exec('insert into dv_child values (1, 1, 100), (2, 1, 200), (3, 2, 300)');
 
-				// cc=1 identifies child 1 (FK-parent pp=1); delete_via=parent removes that parent.
-				await db.exec(`delete from dvv with tags ("quereus.update.delete_via" = 'parent') where cc = 1`);
+				// cc=1 identifies child 1 (FK-parent pp=1); hasP=false deletes that matched parent.
+				await db.exec(`update dvv set hasP = false where cc = 1`);
 
 				assertRowsEqual('dv parent', await readRows('select pp, pv from dv_parent'), [{ pp: 2, pv: 20 }], ['pp', 'pv']);
 				assertRowsEqual('dv child', await readRows('select cc, pr, cv from dv_child'),
 					[{ cc: 1, pr: 1, cv: 100 }, { cc: 2, pr: 1, cv: 200 }, { cc: 3, pr: 2, cv: 300 }], ['cc', 'pr', 'cv']);
-				// view image: only children whose parent still exists (child 3, parent 2).
-				assertRowsEqual('dv view', await readRows('select cc, cv, pv from dvv'), [{ cc: 3, cv: 300, pv: 20 }], ['cc', 'cv', 'pv']);
+				// view image (LEFT join): the shared parent pp=1 is gone, so children 1 AND 2 read
+				// back null-extended (hasP false); child 3 still joins parent 2.
+				assertRowsEqual('dv view', await readRows('select cc, cv, pv, hasP from dvv'),
+					[{ cc: 1, cv: 100, pv: null, hasP: false }, { cc: 2, cv: 200, pv: null, hasP: false }, { cc: 3, cv: 300, pv: 20, hasP: true }],
+					['cc', 'cv', 'pv', 'hasP']);
 			});
 
-			// ----- Family B: delete_via=parent fuzzed — a parent shared by several children -----
-			// The deterministic case above removes one fixed parent. Property-fuzz it so the
-			// targeted child's FK-parent is SHARED by several children: deleting that one
-			// parent (the routed side) leaves EVERY child in the base (delete_via=parent never
-			// touches the child side), but the inner join now hides each child that referenced
-			// the removed parent — not only the one the predicate named.
-			it('PutGet: delete_via=parent fuzzed — removes the shared parent, all children survive, dependents go invisible', async () => {
+			// ----- Family B: existence-column parent-delete fuzzed — a parent shared by several children -----
+			// The deterministic case above removes one fixed parent via hasP=false. Property-fuzz it
+			// so the targeted child's FK-parent is SHARED by several children: deleting that one
+			// parent (the routed side) leaves EVERY child in the base (the parent delete never
+			// touches the child side), but the LEFT join now reads each child that referenced the
+			// removed parent as null-extended — not only the one the predicate named.
+			it('PutGet: existence-column parent-delete fuzzed — removes the shared parent, all children survive, dependents go null-extended', async () => {
 				await db.exec('pragma foreign_keys = false');
 				await db.exec('drop view if exists dvv');
 				await db.exec('drop table if exists dv_child');
 				await db.exec('drop table if exists dv_parent');
 				await db.exec('create table dv_parent (pp integer primary key, pv integer null) using memory');
 				await db.exec('create table dv_child (cc integer primary key, pr integer null, cv integer null, foreign key (pr) references dv_parent(pp)) using memory');
-				await db.exec('create view dvv as select c.cc as cc, c.cv as cv, p.pv as pv from dv_child c join dv_parent p on p.pp = c.pr');
+				await db.exec('create view dvv as select c.cc as cc, c.cv as cv, p.pv as pv, hasP from dv_child c left join dv_parent p on p.pp = c.pr exists right as hasP');
 
 				let routedSeen = 0; let sharedSeen = 0;
 				await fc.assert(fc.asyncProperty(
@@ -4102,7 +4108,7 @@ describe('Property-Based Tests', () => {
 						const ppSet = new Set(P.map(p => p.pp));
 
 						// The routed target: the child cc=K, joined (its parent exists). Its FK-parent
-						// is the parent delete_via=parent removes.
+						// is the parent the hasP=false existence write removes.
 						const target = C.find(c => c.cc === K && ppSet.has(c.pr));
 						let oParents = P.map(p => ({ ...p }));
 						if (target) {
@@ -4111,23 +4117,27 @@ describe('Property-Based Tests', () => {
 							oParents = oParents.filter(p => p.pp !== target.pr);
 						}
 
-						await db.exec(`delete from dvv with tags ("quereus.update.delete_via" = 'parent') where cc = ${K}`);
+						await db.exec(`update dvv set hasP = false where cc = ${K}`);
 
 						// Parent base: the routed parent (if any) removed; children base: untouched.
 						assertRowsEqual('dv-fuzz parent', await readRows('select pp, pv from dv_parent'),
 							oParents.map(p => ({ pp: p.pp, pv: p.pv })), ['pp', 'pv']);
 						assertRowsEqual('dv-fuzz child', await readRows('select cc, pr, cv from dv_child'),
 							C.map(c => ({ cc: c.cc, pr: c.pr, cv: c.cv })), ['cc', 'pr', 'cv']);
-						// View image: every child whose parent still exists — the shared parent's
-						// removal makes ALL its dependents invisible, not just the named child.
+						// View image (LEFT join): EVERY child appears; one whose parent still exists
+						// reads its parent's pv (hasP true), one whose parent was removed reads
+						// null-extended (hasP false) — the shared parent's removal null-extends ALL
+						// its dependents, not just the named child.
 						const oppSet = new Set(oParents.map(p => p.pp));
 						const pvAfter = new Map(oParents.map(p => [p.pp, p.pv]));
-						const expView = C.filter(c => oppSet.has(c.pr)).map(c => ({ cc: c.cc, cv: c.cv, pv: pvAfter.get(c.pr)! }));
-						assertRowsEqual('dv-fuzz view', await readRows('select cc, cv, pv from dvv'), expView, ['cc', 'cv', 'pv']);
+						const expView = C.map(c => oppSet.has(c.pr)
+							? { cc: c.cc, cv: c.cv, pv: pvAfter.get(c.pr)!, hasP: true }
+							: { cc: c.cc, cv: c.cv, pv: null, hasP: false });
+						assertRowsEqual('dv-fuzz view', await readRows('select cc, cv, pv, hasP from dvv'), expView, ['cc', 'cv', 'pv', 'hasP']);
 					},
 				), { numRuns: 80 });
-				expect(routedSeen, 'delete_via=parent never routed to an existing parent').to.be.greaterThan(0);
-				expect(sharedSeen, 'delete_via=parent never removed a parent shared by multiple children').to.be.greaterThan(0);
+				expect(routedSeen, 'existence write never routed to an existing parent').to.be.greaterThan(0);
+				expect(sharedSeen, 'existence write never removed a parent shared by multiple children').to.be.greaterThan(0);
 			});
 
 			// ----- Family B: a no-FK join delete fans out to BOTH candidate sides -----

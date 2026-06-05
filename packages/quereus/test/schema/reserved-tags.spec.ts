@@ -22,7 +22,7 @@ describe('Reserved tag registry', () => {
 
 		it('ignores user tags even alongside reserved ones', () => {
 			const diags = check(
-				{ display_name: 'X', 'quereus.update.policy': 'strict' },
+				{ display_name: 'X', 'quereus.update.default_for.created': '1' },
 				'view-ddl',
 			);
 			expect(diags).to.have.length(0);
@@ -61,9 +61,36 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
+	describe('removed routing keys (target / exclude / delete_via / policy) are unknown everywhere', () => {
+		// These four `quereus.update.*` routing keys were removed — routing is now
+		// expressed per-row by writable presence/membership columns, not a tag. A stray
+		// occurrence is the standard hard `unknown-reserved-tag` error at any site
+		// (the registry is the single source of truth; no other call site special-cases
+		// them). See ticket `remove-update-routing-tag-surface`.
+		const REMOVED = [
+			['quereus.update.target', 'base_a'],
+			['quereus.update.exclude', 'base_b'],
+			['quereus.update.delete_via', 'left_delete'],
+			['quereus.update.policy', 'strict'],
+		] as const;
+		const SITES: TagSite[] = ['view-ddl', 'dml-stmt', 'physical-table'];
+
+		for (const [key, value] of REMOVED) {
+			for (const site of SITES) {
+				it(`${key} @ ${site} → unknown-reserved-tag`, () => {
+					const diags = check({ [key]: value }, site);
+					expect(diags).to.have.length(1);
+					expect(diags[0].reason).to.equal('unknown-reserved-tag');
+					expect(diags[0].severity).to.equal('error');
+				});
+			}
+		}
+	});
+
 	describe('tag-not-allowed-here', () => {
-		it('rejects delete_via on a view DDL site', () => {
-			const diags = check({ 'quereus.update.delete_via': 'left_delete' }, 'view-ddl');
+		it('rejects default_for on a logical-table site', () => {
+			// default_for is legal only at view-ddl / projection / dml-stmt.
+			const diags = check({ 'quereus.update.default_for.created': '1' }, 'logical-table');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('tag-not-allowed-here');
 			expect(diags[0].severity).to.equal('error');
@@ -76,50 +103,57 @@ describe('Reserved tag registry', () => {
 			expect(diags[0].reason).to.equal('tag-not-allowed-here');
 		});
 
-		it('rejects policy on a DML statement site', () => {
-			const diags = check({ 'quereus.update.policy': 'strict' }, 'dml-stmt');
+		it('accepts default_for at a DML statement site (the override-surface statement site)', () => {
+			expect(check({ 'quereus.update.default_for.created': '1' }, 'dml-stmt')).to.have.length(0);
+		});
+
+		it('rejects lens.access on a DML statement site', () => {
+			const diags = check({ 'quereus.lens.access.vin': 'lookup' }, 'dml-stmt');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('tag-not-allowed-here');
 		});
 	});
 
 	describe('invalid-tag-value: enum', () => {
-		it('rejects an out-of-set policy (error)', () => {
-			const diags = check({ 'quereus.update.policy': 'looose' }, 'view-ddl');
+		it('rejects an out-of-set lens.decomp.role (error)', () => {
+			const diags = check({ 'quereus.lens.decomp.role.d1': 'bogus' }, 'physical-table');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('invalid-tag-value');
 			expect(diags[0].severity).to.equal('error');
 			expect(diags[0].message.toLowerCase()).to.include('invalid value');
 		});
 
-		it('rejects an out-of-set delete_via (error)', () => {
-			const diags = check({ 'quereus.update.delete_via': 'sideways' }, 'join');
+		it('rejects an out-of-set lens.decomp.presence (error)', () => {
+			const diags = check({ 'quereus.lens.decomp.presence.d1': 'sometimes' }, 'physical-table');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('invalid-tag-value');
 			expect(diags[0].severity).to.equal('error');
 		});
 
 		it('accepts every enum member', () => {
-			expect(check({ 'quereus.update.policy': 'lenient' }, 'view-ddl')).to.have.length(0);
-			expect(check({ 'quereus.update.delete_via': 'right_insert' }, 'union-branch')).to.have.length(0);
-			expect(check({ 'quereus.update.delete_via': 'parent' }, 'join')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.role.d1': 'primary-storage' }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.role.d1': 'auxiliary-access' }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.presence.d1': 'mandatory' }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.presence.d1': 'optional' }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.keykind.d1': 'surrogate' }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.keykind.d1': 'logical-tuple' }, 'physical-table')).to.have.length(0);
 		});
 	});
 
 	describe('invalid-tag-value: csv-of-identifiers', () => {
 		it('accepts a comma-separated identifier list', () => {
-			expect(check({ 'quereus.update.target': 'base_a, base_b' }, 'view-ddl')).to.have.length(0);
+			expect(check({ 'quereus.lens.decomp.key.d1': 'col_a, col_b' }, 'physical-table')).to.have.length(0);
 		});
 
 		it('rejects an empty value (error)', () => {
-			const diags = check({ 'quereus.update.exclude': '' }, 'view-ddl');
+			const diags = check({ 'quereus.lens.decomp.key.d1': '' }, 'physical-table');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('invalid-tag-value');
 			expect(diags[0].severity).to.equal('error');
 		});
 
 		it('rejects an empty segment (error)', () => {
-			const diags = check({ 'quereus.update.target': 'a, , b' }, 'view-ddl');
+			const diags = check({ 'quereus.lens.decomp.key.d1': 'a, , b' }, 'physical-table');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('invalid-tag-value');
 		});
@@ -166,18 +200,17 @@ describe('Reserved tag registry', () => {
 	});
 
 	describe('getReservedTag (typed, exact key)', () => {
-		it('reads an enum value as its union', () => {
-			const tags = { 'quereus.update.policy': 'strict' };
-			const policy = getReservedTag(tags, 'quereus.update.policy');
-			expect(policy).to.equal('strict');
+		it('reads a string value verbatim', () => {
+			const tags = { 'quereus.lens.policy.error-on': 'lens.no-backing-index' };
+			expect(getReservedTag(tags, 'quereus.lens.policy.error-on')).to.equal('lens.no-backing-index');
 		});
 
 		it('returns undefined for an absent key', () => {
-			expect(getReservedTag({}, 'quereus.update.policy')).to.be.undefined;
+			expect(getReservedTag({}, 'quereus.lens.policy.error-on')).to.be.undefined;
 		});
 
 		it('returns undefined for a null value', () => {
-			expect(getReservedTag({ 'quereus.update.policy': null }, 'quereus.update.policy')).to.be.undefined;
+			expect(getReservedTag({ 'quereus.id': null }, 'quereus.id')).to.be.undefined;
 		});
 	});
 
@@ -206,35 +239,30 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
-	describe('quereus.update.* statement-site coverage (override surface)', () => {
-		// docs/view-updateability.md § Tags shows statement-level examples:
-		//   update v with ("quereus.update.target" = 'base_a') ...
+	describe('quereus.update.default_for statement-site coverage (the sole override surface key)', () => {
+		// docs/view-updateability.md § Tags shows the one retained statement-level example:
 		//   insert into v with ("quereus.update.default_for.created" = epoch_ms('now')) ...
-		//   delete from v with ("quereus.update.delete_via" = 'right_insert') ...
-		// target / exclude / default_for / delete_via are legal at the dml-stmt site so a
-		// statement can override the view-level routing; policy stays view-DDL only.
-		it('accepts target at a DML statement site', () => {
-			expect(check({ 'quereus.update.target': 'base_a' }, 'dml-stmt')).to.have.length(0);
-		});
-
-		it('accepts exclude at a DML statement site', () => {
-			expect(check({ 'quereus.update.exclude': 'base_b' }, 'dml-stmt')).to.have.length(0);
-		});
-
+		// Routing is no longer a tag — target / exclude / delete_via / policy were removed
+		// (a per-row presence/membership column states routing explicitly).
 		it('accepts default_for at a DML statement site (matches the doc insert example)', () => {
 			expect(check({ 'quereus.update.default_for.created': "epoch_ms('now')" }, 'dml-stmt')).to.have.length(0);
 		});
 
-		it('accepts delete_via at a DML statement site (matches the doc delete example)', () => {
-			expect(check({ 'quereus.update.delete_via': 'right_insert' }, 'dml-stmt')).to.have.length(0);
+		it('accepts default_for at a view-ddl site', () => {
+			expect(check({ 'quereus.update.default_for.created': "epoch_ms('now')" }, 'view-ddl')).to.have.length(0);
 		});
 
-		it('keeps default_for / delete_via out of unrelated (lens-only) sites', () => {
-			// physical-table is a lens-only site; the update overrides never apply there.
-			expect(check({ 'quereus.update.default_for.created': "epoch_ms('now')" }, 'physical-table'))
-				.to.have.length(1);
-			expect(check({ 'quereus.update.delete_via': 'left_delete' }, 'physical-table'))
-				.to.have.length(1);
+		it('the removed routing keys are unknown at a DML statement site', () => {
+			expect(check({ 'quereus.update.target': 'base_a' }, 'dml-stmt')[0].reason).to.equal('unknown-reserved-tag');
+			expect(check({ 'quereus.update.exclude': 'base_b' }, 'dml-stmt')[0].reason).to.equal('unknown-reserved-tag');
+			expect(check({ 'quereus.update.delete_via': 'left_delete' }, 'dml-stmt')[0].reason).to.equal('unknown-reserved-tag');
+		});
+
+		it('keeps default_for out of unrelated (lens-only) sites', () => {
+			// physical-table is a lens-only site; the default_for override never applies there.
+			const diags = check({ 'quereus.update.default_for.created': "epoch_ms('now')" }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('tag-not-allowed-here');
 		});
 	});
 
@@ -277,12 +305,12 @@ describe('Reserved tag registry', () => {
 			expect(diags[0].severity).to.equal('error');
 		});
 
-		it('rejects update.target on a physical table but accepts it on a view DDL', () => {
-			const onTable = check({ 'quereus.update.target': 'base_a' }, 'physical-table');
+		it('rejects default_for on a physical table but accepts it on a view DDL', () => {
+			const onTable = check({ 'quereus.update.default_for.created': '1' }, 'physical-table');
 			expect(onTable).to.have.length(1);
 			expect(onTable[0].reason).to.equal('tag-not-allowed-here');
 
-			expect(check({ 'quereus.update.target': 'base_a' }, 'view-ddl')).to.have.length(0);
+			expect(check({ 'quereus.update.default_for.created': '1' }, 'view-ddl')).to.have.length(0);
 		});
 
 		it('keeps quereus.lens.decomp.* valid at physical-table (no regression)', () => {
@@ -291,9 +319,9 @@ describe('Reserved tag registry', () => {
 		});
 
 		it('rejects a non-column-legal reserved key on a physical column', () => {
-			// quereus.update.policy is view-ddl only; mis-placed on a column it is
-			// now tag-not-allowed-here rather than silently escaping.
-			const diags = check({ 'quereus.update.policy': 'strict' }, 'physical-column');
+			// quereus.update.default_for is view-ddl / projection / dml-stmt only; mis-placed
+			// on a column it is tag-not-allowed-here rather than silently escaping.
+			const diags = check({ 'quereus.update.default_for.x': '1' }, 'physical-column');
 			expect(diags).to.have.length(1);
 			expect(diags[0].reason).to.equal('tag-not-allowed-here');
 		});
@@ -308,20 +336,25 @@ describe('Reserved tag registry', () => {
 			}
 		});
 
-		it('seeds all documented keys (rename hints + update + lens advisory + escalation policy + lens decomposition families)', () => {
-			// 2 rename hints (quereus.id / quereus.previous_name) + 5 quereus.update.*
+		it('seeds all documented keys (rename hints + the one update override + lens advisory + escalation policy + lens decomposition families)', () => {
+			// 2 rename hints (quereus.id / quereus.previous_name) + 1 quereus.update.*
+			// (default_for — the routing keys target/exclude/delete_via/policy were removed)
 			// + 2 quereus.lens.{ack,access} + 2 quereus.lens.policy.*
-			// + 9 quereus.lens.decomp.* = 20. (The decomp generator/gencadence tags were
-			// retired — a surrogate's value now comes from the anchor key column's
-			// declared DEFAULT, not an engine-chosen generator strategy.)
-			expect(RESERVED_TAGS).to.have.length(20);
+			// + 9 quereus.lens.decomp.* = 16.
+			expect(RESERVED_TAGS).to.have.length(16);
 			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
 			expect(keys).to.include('quereus.id');
 			expect(keys).to.include('quereus.previous_name');
+			expect(keys).to.include('quereus.update.default_for.<column>');
 			expect(keys).to.include('quereus.lens.policy.error-on');
 			expect(keys).to.include('quereus.lens.policy.require-ack');
 			expect(keys).to.include('quereus.lens.decomp.role.<id>');
 			expect(keys).to.include('quereus.lens.decomp.col.<id_dot_column>');
+			// The removed routing keys are gone.
+			expect(keys).to.not.include('quereus.update.target');
+			expect(keys).to.not.include('quereus.update.exclude');
+			expect(keys).to.not.include('quereus.update.delete_via');
+			expect(keys).to.not.include('quereus.update.policy');
 		});
 	});
 });

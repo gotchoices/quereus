@@ -692,12 +692,12 @@ select k, cv from axi_c order by k;
 select k, av, bv, cv from axi_v order by k;
 → [{"k":1,"av":100,"bv":200,"cv":300}]
 
--- DELETE through a join with no provable FK and no resolving tag -> under the
--- default lenient policy the predicate-honest multi-side fan-out deletes the joined
--- row's contribution from EVERY candidate side ("make this joined row not exist").
--- The two base deletes address rows via the up-front captured key set, so the first
--- side's delete cannot empty the join out from under the second side's. (A delete_via
--- / target override pins a single side instead — exercised below.)
+-- DELETE through a join with no provable FK -> the hardwired-lenient predicate-honest
+-- multi-side fan-out deletes the joined row's contribution from EVERY candidate side
+-- ("make this joined row not exist"). The two base deletes address rows via the
+-- up-front captured key set, so the first side's delete cannot empty the join out from
+-- under the second side's. (To pin a single non-default side, expose it as a per-row
+-- presence/existence column and write it — routing is no longer a tag.)
 create table ax_x (xid integer primary key, v integer);
 create table ax_y (yid integer primary key, v integer);
 insert into ax_x values (1, 5);
@@ -811,38 +811,36 @@ select xid, v, keep from bw_x order by xid;
 select yid, ly from bw_y order by yid;
 → [{"yid":6,"ly":"y6"}]
 
--- --- (fo-e) explicit target naming BOTH tables -> two candidates -> fan out ---
--- target with a CSV of both base names leaves both candidates, so the no-FK delete
--- still fans out (same maximal-lenient behavior as no target at all).
+-- --- (fo-e) a second no-FK two-candidate join still fans out (no tag needed) ---
+-- With two candidate sides and no provable FK, the hardwired-lenient delete fans out
+-- to both — the same maximal-lenient behavior the routing tags used to leave in place.
 create table te_x (xid integer primary key, v integer);
 create table te_y (yid integer primary key, w integer);
 insert into te_x values (1, 5), (2, 7);
 insert into te_y values (5, 50), (7, 70);
 create view te_jv as select x.xid as xid, y.yid as yid from te_x x join te_y y on y.yid = x.v;
-delete from te_jv with tags ("quereus.update.target" = 'te_x,te_y') where xid = 1;
+delete from te_jv where xid = 1;
 select xid from te_x order by xid;
 → [{"xid":2}]
 select yid from te_y order by yid;
 → [{"yid":7}]
 
--- --- (fo-f) no-FK + policy=strict rejects (the strict branch is FK-independent) ---
--- The strict policy refuses to guess the deletion side BEFORE the FK heuristic, so a
--- no-FK ambiguous delete is rejected rather than fanned out (parity with the FK
--- pol_strict case below, on a no-FK shape).
+-- --- (fo-f) no-FK ambiguous delete fans out (lenient is now unconditional) ---
+-- The removed `quereus.update.policy='strict'` knob could once reject an ambiguous
+-- multi-side delete; lenient fan-out is now the only behavior, so the same no-FK shape
+-- deletes from BOTH sides rather than rejecting. To forbid a side, do not expose it.
 create table ps_x (xid integer primary key, v integer);
 create table ps_y (yid integer primary key, w integer);
 insert into ps_x values (1, 5);
 insert into ps_y values (5, 50);
 create view ps_jv as select x.xid as xid, y.yid as yid
-    from ps_x x join ps_y y on y.yid = x.v
-    with tags ("quereus.update.policy" = 'strict');
+    from ps_x x join ps_y y on y.yid = x.v;
 delete from ps_jv where xid = 1;
--- error: policy
--- the rejected delete left both base rows intact.
+-- the joined row is gone from both base tables (lenient fan-out).
 select xid from ps_x order by xid;
-→ [{"xid":1}]
+→ []
 select yid from ps_y order by yid;
-→ [{"yid":5}]
+→ []
 
 -- ===================================
 -- ON-DELETE-aware fan-out ordering over an ASYMMETRIC mutual FK. The two-side
@@ -1057,10 +1055,13 @@ select bid, aref from m_b order by bid;
 → [{"bid":10,"aref":1},{"bid":20,"aref":null}]
 
 -- ===================================
--- Phase 3.4: the `quereus.update.*` tag override surface.
--- target / exclude / delete_via / policy / default_for — read + site-validated
--- through the typed reserved-tag registry, merged statement-over-view.
--- See docs/view-updateability.md § Tags: The Override Surface.
+-- Phase 3.4: the `quereus.update.*` override surface + per-row routing.
+-- The sole retained override tag is `default_for` (supply a value for an omitted
+-- insert column), read + site-validated through the typed reserved-tag registry and
+-- merged statement-over-view. Write *routing* is no longer a tag — predicates rule,
+-- and a per-row writable presence/existence column states a non-default side
+-- explicitly. The removed routing keys (target / exclude / delete_via / policy) are now
+-- `unknown-reserved-tag` errors. See docs/view-updateability.md § Tags: The Override Surface.
 -- ===================================
 
 -- --- default_for: statement-level omitted-insert default (single-source) ---
@@ -1091,117 +1092,80 @@ select * from df2 order by id;
 insert into df2_v with tags ("quereus.update.default_for.nope" = '0') values (3);
 -- error: not a column
 
--- --- target / exclude: narrow a multi-source delete to one side ---
+-- --- predicate/FK default: an FK join delete auto-routes to the FK-child side ---
+-- A declared foreign key proves the child (FK-many) side, so the join delete routes
+-- there unconditionally (deleting the child leaves the parent) — the predicate/FK
+-- truth, no tag involved.
+create table pol_parent (pid integer primary key, lbl text);
+create table pol_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references pol_parent(pid));
+insert into pol_parent values (10, 'P10'), (20, 'P20');
+insert into pol_child values (1, 10, 'a'), (2, 20, 'b');
+create view pol_fk as
+    select c.cid as cid, c.note as note, p.lbl as lbl
+    from pol_child c join pol_parent p on p.pid = c.pref;
+delete from pol_fk where cid = 1;
+select cid from pol_child order by cid;
+→ [{"cid":2}]
+select pid from pol_parent order by pid;
+→ [{"pid":10},{"pid":20}]
+
+-- --- explicit non-default side via a per-row existence column ---
+-- The removed `delete_via='parent'` / `target` routing is now expressed per-row: a LEFT
+-- join exposes the parent's match as `exists right as hasP`, and writing `hasP = false`
+-- deletes the matched parent for the targeted rows (ON DELETE CASCADE clears the
+-- now-orphaned child). This is the strictly-more-precise replacement — the side is named
+-- in the data shape, per row, not by a statement-level tag.
+create table er_parent (pid integer primary key, lbl text);
+create table er_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references er_parent(pid) on delete cascade);
+insert into er_parent values (10, 'P10'), (20, 'P20');
+insert into er_child values (1, 10, 'a'), (2, 20, 'b');
+create view er_jv as
+    select c.cid as cid, c.note as note, p.lbl as lbl, hasP
+    from er_child c left join er_parent p on p.pid = c.pref exists right as hasP;
+update er_jv set hasP = false where cid = 1;
+select pid from er_parent order by pid;
+→ [{"pid":20}]
+select cid from er_child order by cid;
+→ [{"cid":2}]
+
+-- --- the removed routing keys are now unknown-reserved-tag errors ---
+-- target / exclude / delete_via / policy on a DML statement -> unknown reserved tag.
 create table tg_x (xid integer primary key, v integer, lx text);
 create table tg_y (yid integer primary key, ly text);
 insert into tg_x values (1, 5, 'x1'), (2, 6, 'x2');
 insert into tg_y values (5, 'y5'), (6, 'y6');
 create view tg_jv as
     select x.xid as xid, x.lx as lx, y.ly as ly from tg_x x join tg_y y on y.yid = x.v;
-select * from tg_jv order by xid;
-→ [{"xid":1,"lx":"x1","ly":"y5"},{"xid":2,"lx":"x2","ly":"y6"}]
 
--- target narrows the (no-FK ambiguous) delete to tg_x: only tg_x loses the row.
 delete from tg_jv with tags ("quereus.update.target" = 'tg_x') where xid = 1;
+-- error: unknown reserved tag
+
+delete from tg_jv with tags ("quereus.update.delete_via" = 'left_delete') where xid = 1;
+-- error: unknown reserved tag
+
+-- the rejected deletes left every base row intact.
 select xid from tg_x order by xid;
-→ [{"xid":2}]
+→ [{"xid":1},{"xid":2}]
 select yid from tg_y order by yid;
 → [{"yid":5},{"yid":6}]
 
--- exclude tg_x routes the same shape to the OTHER side (tg_y); xid=2 joins y.yid=6.
-delete from tg_jv with tags ("quereus.update.exclude" = 'tg_x') where xid = 2;
-select yid from tg_y order by yid;
-→ [{"yid":5}]
-select xid from tg_x order by xid;
-→ [{"xid":2}]
-
--- target naming a table not in the join -> sited tag-target-not-found.
-delete from tg_jv with tags ("quereus.update.target" = 'nope') where xid = 2;
--- error: not a base table of the join
-
--- target/exclude excluding a side an UPDATE assigns -> structured conflict.
-update tg_jv with tags ("quereus.update.exclude" = 'tg_x') set lx = 'z' where xid = 2;
--- error: excludes that table
-
--- --- delete_via: pick the deletion side explicitly ---
-create table dv_l (lid integer primary key, v integer);
-create table dv_r (rid integer primary key, w integer);
-insert into dv_l values (1, 5), (2, 6);
-insert into dv_r values (5, 50), (6, 60);
-create view dv_jv as select l.lid as lid, r.rid as rid from dv_l l join dv_r r on r.rid = l.v;
-
--- delete_via='left_delete' picks the left join source (dv_l); dv_r is untouched.
-delete from dv_jv with tags ("quereus.update.delete_via" = 'left_delete') where lid = 1;
-select lid from dv_l order by lid;
-→ [{"lid":2}]
-select rid from dv_r order by rid;
-→ [{"rid":5},{"rid":6}]
-
--- delete_via='parent' picks the FK-parent side; ON DELETE CASCADE removes the child.
-create table dvp_parent (pid integer primary key, lbl text);
-create table dvp_child (cid integer primary key, pref integer, note text,
-    foreign key (pref) references dvp_parent(pid) on delete cascade);
-insert into dvp_parent values (10, 'P10'), (20, 'P20');
-insert into dvp_child values (1, 10, 'a'), (2, 20, 'b');
-create view dvp_jv as
-    select c.cid as cid, c.note as note, p.lbl as lbl
-    from dvp_child c join dvp_parent p on p.pid = c.pref;
-delete from dvp_jv with tags ("quereus.update.delete_via" = 'parent') where cid = 1;
-select pid from dvp_parent order by pid;
-→ [{"pid":20}]
-select cid from dvp_child order by cid;
-→ [{"cid":2}]
-
--- --- policy: strict refuses to guess; lenient auto-routes (FK-child default) ---
-create table pol_parent (pid integer primary key, lbl text);
-create table pol_child (cid integer primary key, pref integer, note text,
-    foreign key (pref) references pol_parent(pid));
-insert into pol_parent values (10, 'P10'), (20, 'P20');
-insert into pol_child values (1, 10, 'a'), (2, 20, 'b');
-
--- lenient (default): the FK join delete auto-routes to the FK-child side.
-create view pol_lenient as
-    select c.cid as cid, c.note as note, p.lbl as lbl
-    from pol_child c join pol_parent p on p.pid = c.pref;
-delete from pol_lenient where cid = 1;
-select cid from pol_child order by cid;
-→ [{"cid":2}]
-select pid from pol_parent order by pid;
-→ [{"pid":10},{"pid":20}]
-
--- strict (view-level policy tag): the same delete is rejected — strict will not
--- guess the deletion side even when an FK proves one.
-create view pol_strict as
-    select c.cid as cid, c.note as note, p.lbl as lbl
-    from pol_child c join pol_parent p on p.pid = c.pref
-    with tags ("quereus.update.policy" = 'strict');
-delete from pol_strict where cid = 2;
--- error: policy
-
--- an explicit target (narrowing to one side) resolves the strict ambiguity.
-delete from pol_strict with tags ("quereus.update.target" = 'pol_child') where cid = 2;
-select cid from pol_child order by cid;
-→ []
-
 -- --- sited diagnostics for malformed reserved tags ---
 
--- unknown reserved key on a DML statement -> sited error.
+-- unknown reserved key (a typo) on a DML statement -> sited error.
 update tg_jv with tags ("quereus.update.taget" = 'tg_x') set lx = 'z' where xid = 2;
 -- error: unknown reserved tag
 
--- mis-sited reserved key on a DML statement (policy is view-DDL-only) -> error.
-delete from tg_jv with tags ("quereus.update.policy" = 'strict') where xid = 2;
--- error: not allowed
-
--- unknown reserved key declared on the VIEW DDL -> surfaces (sited) at mutation.
+-- a removed routing key declared on the VIEW DDL -> surfaces (sited) at mutation.
 create table bvu (id integer primary key, x integer);
-create view bvu_v as select id from bvu with tags ("quereus.update.taget" = 'bvu');
+create view bvu_v as select id from bvu with tags ("quereus.update.policy" = 'strict');
 insert into bvu_v values (1);
 -- error: unknown reserved tag
 
 -- ===================================
--- Phase 3.4: adversarial edges (review pass) — precedence, conflicting tags,
--- the except-only delete_via value on a join, and the single-source no-op.
+-- Phase 3.4: adversarial edges (review pass) — default_for precedence and a
+-- single-source view carrying a removed routing tag.
 -- ===================================
 
 -- --- default_for precedence: an explicit supply of the column wins ---
@@ -1215,24 +1179,17 @@ insert into dfp_v (id) values (2);
 select * from dfp order by id;
 → [{"id":1,"created":999},{"id":2,"created":111}]
 
--- --- delete_via='right_insert' is an except-only value -> rejected for a join ---
-delete from dv_jv with tags ("quereus.update.delete_via" = 'right_insert') where lid = 2;
--- error: except
-
--- --- target + delete_via that disagree -> structured tag-conflict ---
--- target pins dv_r, but delete_via='left_delete' picks dv_l (excluded) -> conflict.
-delete from dv_jv with tags ("quereus.update.target" = 'dv_r', "quereus.update.delete_via" = 'left_delete') where lid = 2;
--- error: excludes it
-
--- --- single-source view carrying a routing tag: a documented no-op ---
--- target/exclude only narrow a multi-source base set; on a single-source view the
--- tag is inert and an unknown name is NOT existence-checked (per the contract).
+-- --- single-source view carrying a removed routing tag -> error at mutation ---
+-- target/exclude/delete_via/policy were removed; a stray one declared on a view (single-
+-- or multi-source) is no longer an inert no-op — it is an unknown-reserved-tag error
+-- surfaced when the view is mutated, so nothing is written.
 create table sst (id integer primary key, note text);
 create view sst_v as select id, note from sst
     with tags ("quereus.update.target" = 'not_a_real_table');
 insert into sst_v values (1, 'a');
+-- error: unknown reserved tag
 select * from sst order by id;
-→ [{"id":1,"note":"a"}]
+→ []
 
 -- ===================================
 -- View-column references nested inside subquery / exists / in-subquery operands

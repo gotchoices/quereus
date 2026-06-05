@@ -7,9 +7,13 @@ import type { SqlValue } from '../common/types.js';
  * only keys under the `quereus.` prefix are governed here. The namespace is a
  * precise mini-language designed across the docs:
  *
- * - `quereus.update.{target, exclude, default_for.<column>, delete_via, policy}`
- *   — view-mutation propagation overrides (`docs/view-updateability.md`
- *   § Tags: The Override Surface).
+ * - `quereus.update.default_for.<column>`
+ *   — the sole view-mutation override: an insert-value supply for an omitted
+ *   column (`docs/view-updateability.md` § Tags: The Override Surface). Write
+ *   *routing* is no longer a tag — it is expressed per-row by writable
+ *   presence/membership columns (outer-join existence column, set-op membership
+ *   columns), so the routing tags (`target`/`exclude`/`delete_via`/`policy`) were
+ *   removed.
  * - `quereus.lens.ack.<code>[:<target>]`, `quereus.lens.access.<col>`
  *   — lens advisory acknowledgments / access-pattern hints (`docs/lens.md`
  *   § Acknowledging advisories).
@@ -34,14 +38,12 @@ export const RESERVED_TAG_NAMESPACE = 'quereus.';
 /**
  * The declaration / statement site a tag was found at. Validation is
  * site-sensitive: a key valid in one position can be illegal in another (e.g.
- * `quereus.update.delete_via` is meaningful on an `except` branch or a join, but
- * not on a plain view DDL).
+ * `quereus.update.default_for.<column>` is meaningful on a view DDL / projection /
+ * DML statement, but not on a logical-table site).
  */
 export type TagSite =
 	| 'view-ddl'            // CREATE VIEW / CREATE MATERIALIZED VIEW WITH TAGS (also a physical declared view in the differ)
-	| 'projection'          // a result-column tag (future; reserved for default_for)
-	| 'join'                // a JOIN-clause tag
-	| 'union-branch'        // a compound-set branch tag
+	| 'projection'          // a result-column tag (reserved for default_for)
 	| 'dml-stmt'            // INSERT/UPDATE/DELETE ... WITH (...) statement-level tag
 	| 'logical-table'       // tags on a declared logical TableSchema
 	| 'logical-constraint'  // tags on a logical RowConstraint/Unique/ForeignKey schema
@@ -53,14 +55,6 @@ export type TagSite =
 	| 'physical-column'     // tags on a physical declared column (differ)
 	| 'physical-index'      // tags on a physical declared index (differ)
 	| 'physical-constraint';// tags on a physical declared named constraint (differ)
-
-/** Closed value set for `quereus.update.delete_via` (docs/view-updateability.md:277). */
-export const DELETE_VIA_VALUES = ['left_delete', 'right_insert', 'parent'] as const;
-export type DeleteViaValue = typeof DELETE_VIA_VALUES[number];
-
-/** Closed value set for `quereus.update.policy` (docs/view-updateability.md:278). */
-export const UPDATE_POLICY_VALUES = ['strict', 'lenient'] as const;
-export type UpdatePolicyValue = typeof UPDATE_POLICY_VALUES[number];
 
 /** Closed value set for `quereus.lens.decomp.role.<id>` (docs/lens.md § The Default Mapper). */
 export const DECOMP_ROLE_VALUES = ['primary-storage', 'auxiliary-access'] as const;
@@ -76,8 +70,8 @@ export const DECOMP_KEYKIND_VALUES = ['surrogate', 'logical-tuple'] as const;
  */
 export type TagValueSchema =
 	| 'string'
-	| 'csv-of-identifiers'                 // comma-separated base-table/branch names
-	| { readonly enum: readonly string[] } // closed value set, e.g. policy/delete_via
+	| 'csv-of-identifiers'                 // comma-separated identifier names (e.g. decomp shared-key columns)
+	| { readonly enum: readonly string[] } // closed value set, e.g. a lens decomp role/presence/keykind
 	| 'required-nonempty-rationale'        // non-empty TEXT; empty => warning
 	| 'expression';                        // a SQL expression string (default_for.<col>)
 
@@ -148,46 +142,18 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		valueSchema: 'string',
 		description: 'Comma-separated former name(s) of a declared object; the differ pairs it across a rename when no id matches.',
 	},
-	// --- quereus.update.* : view-mutation propagation overrides ---
+	// --- quereus.update.* : the sole retained view-mutation override ---
 	{
-		// docs/view-updateability.md:284
-		key: 'quereus.update.target',
-		sites: siteSet('view-ddl', 'union-branch', 'join', 'dml-stmt'),
-		valueSchema: 'csv-of-identifiers',
-		description: 'Restrict propagation to the listed base relation(s)/branch(es).',
-	},
-	{
-		// docs/view-updateability.md:285
-		key: 'quereus.update.exclude',
-		sites: siteSet('view-ddl', 'union-branch', 'join', 'dml-stmt'),
-		valueSchema: 'csv-of-identifiers',
-		description: 'Exclude the listed branches (the inverse of target).',
-	},
-	{
-		// docs/view-updateability.md:286 (view DDL / projection) + :318
-		// (statement-level `insert into v with ("quereus.update.default_for.created" = …)`).
-		// The statement site supplies a per-statement omitted-insert default that
-		// overrides the view-level default for that statement's duration.
+		// docs/view-updateability.md § Tags (view DDL / projection) + the statement-level
+		// `insert into v with ("quereus.update.default_for.created" = …)`. The statement
+		// site supplies a per-statement omitted-insert default that overrides the
+		// view-level default for that statement's duration. Routing is no longer a tag —
+		// per-row presence/membership columns express it (target/exclude/delete_via/policy
+		// were removed).
 		key: { template: 'quereus.update.default_for.<column>' },
 		sites: siteSet('view-ddl', 'projection', 'dml-stmt'),
 		valueSchema: 'expression',
 		description: 'Default expression for insert through the view when the column is omitted (view DDL, projection, or per-statement).',
-	},
-	{
-		// docs/view-updateability.md:287, 165, 220 (except branch / join) + :319
-		// (statement-level `delete from v with ("quereus.update.delete_via" = …)`),
-		// which overrides the branch/join default for that statement's duration.
-		key: 'quereus.update.delete_via',
-		sites: siteSet('union-branch', 'join', 'dml-stmt'),
-		valueSchema: { enum: DELETE_VIA_VALUES },
-		description: 'For except: left_delete (default) or right_insert; for joins: the side whose deletion realizes the view-level delete. May also be pinned per-statement.',
-	},
-	{
-		// docs/view-updateability.md:288
-		key: 'quereus.update.policy',
-		sites: siteSet('view-ddl'),
-		valueSchema: { enum: UPDATE_POLICY_VALUES },
-		description: 'strict (reject any ambiguity) or lenient (default; predicate-honest fan-out).',
 	},
 	// --- quereus.lens.* : lens advisory acknowledgments / access hints ---
 	{
@@ -293,15 +259,12 @@ export const RESERVED_TAGS: readonly ReservedTagSpec[] = Object.freeze(
 );
 
 /**
- * The value type a reserved key resolves to, keyed off the literal key. Enum
- * specs surface their closed union; every other reserved value is TEXT (a CSV,
- * an expression, a rationale, an access hint), so the default is `string`. Lets
- * a consumer read `delete_via` as its union, never a re-parsed bare `SqlValue`.
+ * The value type a reserved key resolves to, keyed off the literal key. Every
+ * retained reserved value is TEXT (a CSV, an expression, a rationale, an access
+ * hint), so the result is always `string`. (Kept as a mapped type so a future
+ * enum key can reintroduce a closed union without touching call sites.)
  */
-export type TypedValueFor<K extends string> =
-	K extends 'quereus.update.delete_via' ? DeleteViaValue :
-	K extends 'quereus.update.policy' ? UpdatePolicyValue :
-	string;
+export type TypedValueFor<K extends string> = K extends string ? string : string;
 
 /**
  * Validates every `quereus.*` key in `tags` against the registry for the given
@@ -530,7 +493,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.update.{target, exclude, default_for.<column>, delete_via, policy}, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.update.default_for.<column>, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 
@@ -567,8 +530,6 @@ function siteLabel(site: TagSite): string {
 	switch (site) {
 		case 'view-ddl': return 'a view declaration';
 		case 'projection': return 'a result column';
-		case 'join': return 'a join clause';
-		case 'union-branch': return 'a compound-set branch';
 		case 'dml-stmt': return 'a DML statement';
 		case 'logical-table': return 'a logical table';
 		case 'logical-constraint': return 'a logical constraint';

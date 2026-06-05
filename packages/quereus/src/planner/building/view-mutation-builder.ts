@@ -96,9 +96,9 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	const sourceValues: CrossSourceValue[] = [];
 	let baseOps: BaseOp[];
 	if (msAnalysis && req.op === 'update') {
-		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, tags, sourceValues);
+		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, sourceValues);
 	} else if (msAnalysis && req.op === 'delete') {
-		baseOps = decomposeDelete(ctx, view, msAnalysis, req.stmt, tags);
+		baseOps = decomposeDelete(ctx, view, msAnalysis, req.stmt);
 	} else {
 		baseOps = propagate(ctx, view, withTags(req, tags));
 	}

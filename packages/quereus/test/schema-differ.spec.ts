@@ -264,11 +264,22 @@ describe('Schema Differ', () => {
 			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
 		});
 
-		it('accepts quereus.update.policy on a declared view (legal at view-ddl)', () => {
+		it('accepts quereus.update.default_for on a declared view (legal at view-ddl)', () => {
+			// default_for is the sole retained quereus.update.* override and is legal at view-ddl.
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key, x integer } view v as select id from t with tags ("quereus.update.default_for.x" = '0') }`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+		});
+
+		it('throws on the removed quereus.update.policy routing tag on a declared view', () => {
+			// policy (with target / exclude / delete_via) was removed — routing is now a
+			// per-row presence/membership column, not a tag — so it is unknown at any site.
 			const declared = parseDeclaredSchema(
 				`declare schema main { table t { id integer primary key, x integer } view v as select id from t with tags ("quereus.update.policy" = 'strict') }`
 			);
-			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /unknown reserved tag/i);
 		});
 
 		it('throws on a typo in an UNNAMED table-constraint tag (table-level WITH TAGS is consumed even unnamed)', () => {

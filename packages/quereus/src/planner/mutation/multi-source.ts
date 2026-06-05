@@ -18,8 +18,6 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
 import { transformExpr, cloneExpr, mapQueryExprUniform } from './scope-transform.js';
-import { readPolicy, readDeleteVia, readTargetNames, readExcludeNames, type ReservedTagMap } from './mutation-tags.js';
-import type { DeleteViaValue } from '../../schema/reserved-tags.js';
 
 /**
  * Multi-source view-mediated DML decomposition — the **key-preserving join**
@@ -313,8 +311,8 @@ export function propagateMultiSource(ctx: PlanningContext, view: MutableViewLike
 	// defers (`unsupported-outer-join-update`), DELETE routes to the preserved side(s).
 	const analysis = analyzeJoinView(ctx, view);
 	switch (req.op) {
-		case 'update': return decomposeUpdate(ctx, view, analysis, req.stmt, req.tags);
-		case 'delete': return decomposeDelete(ctx, view, analysis, req.stmt, req.tags);
+		case 'update': return decomposeUpdate(ctx, view, analysis, req.stmt);
+		case 'delete': return decomposeDelete(ctx, view, analysis, req.stmt);
 		case 'insert':
 			// Insert needs the plan-level shared-surrogate envelope, so it is built
 			// directly by `building/view-mutation-builder.ts` (`buildMultiSourceInsert`,
@@ -1213,17 +1211,15 @@ export interface CrossSourceValue {
 	readonly expr: AST.Expression;
 }
 
-export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, tags?: ReservedTagMap, sourceValues?: CrossSourceValue[]): BaseOp[] {
+export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, sourceValues?: CrossSourceValue[]): BaseOp[] {
 	// RETURNING through a multi-source update is supported, but the rows are not
 	// recoverable from the per-side base ops (the view row spans both tables), so
 	// the builder (`view-mutation-builder.ts`) supplies them via a re-query of the
 	// planned join body; the base ops themselves carry no RETURNING.
 
-	// `target` / `exclude` narrow the writable base set (compose AFTER predicate
-	// dispatch — they only restrict, never broaden). For an update the side set is
-	// already pinned per-assignment by lineage, so the tag acts as a guard: an
-	// assignment to an excluded side is a structured conflict, not a silent drop.
-	const allowedSides = applyTargetExclude(allSideIndices(analysis.sides), analysis.sides, tags, view);
+	// Each assignment routes to its owning base side by lineage, unconditionally —
+	// there is no statement-level base-set override (the routing tags were removed;
+	// a per-row presence/membership column expresses any non-default routing).
 
 	// Scope guard: top-level `where` references must name view columns (parity with
 	// the single-source spine — a base-only name must not leak through the join body).
@@ -1309,13 +1305,6 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 				});
 			}
 			const npSideIndex = out.existenceSide;
-			if (!allowedSides.includes(npSideIndex)) {
-				raiseMutationDiagnostic({
-					reason: 'tag-conflict',
-					table: view.name,
-					message: `cannot write through view '${view.name}': the existence column '${asg.column}' drives base table '${analysis.sides[npSideIndex].schema.name}', but a 'quereus.update.target'/'exclude' tag excludes that table`,
-				});
-			}
 			// RETURNING is not recoverable through an existence-flip (the post-mutation
 			// re-query identifies by the captured non-preserved PK — null for a freshly
 			// materialized row, deleted for a removed one), so reject it (parity with the
@@ -1482,13 +1471,6 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	for (const sideIndex of order) {
 		const assignments = perSide[sideIndex];
 		if (assignments.length === 0) continue;
-		if (!allowedSides.includes(sideIndex)) {
-			raiseMutationDiagnostic({
-				reason: 'tag-conflict',
-				table: view.name,
-				message: `cannot write through view '${view.name}': the update assigns a column owned by base table '${analysis.sides[sideIndex].schema.name}', but a 'quereus.update.target'/'exclude' tag excludes that table`,
-			});
-		}
 		const side = analysis.sides[sideIndex];
 		const where = buildCapturedKeyPredicate(view, side, sideIndex);
 		const statement: AST.UpdateStmt = {
@@ -1690,16 +1672,11 @@ function assertNullExtendedInsertCovered(view: MutableViewLike, schema: TableSch
 	}
 }
 
-/** All side indices `0..n-1` — the default candidate set for `target`/`exclude`. */
-function allSideIndices(sides: readonly JoinSide[]): number[] {
-	return sides.map((_, i) => i);
-}
-
 /**
- * The **preserved** side indices — the default DELETE candidate set (§ Outer Joins —
+ * The **preserved** side indices — the DELETE candidate set (§ Outer Joins —
  * Deletes: "deleting from the preserved side is the only way for the joined row to
- * disappear from the view"). For an inner join every side is preserved, so this is
- * `allSideIndices` (unchanged routing). For a LEFT/RIGHT outer join it is the single
+ * disappear from the view"). For an inner join every side is preserved, so this is the
+ * full set `0..n-1`. For a LEFT/RIGHT outer join it is the single
  * preserved side. A `full` outer join has *no* preserved side; the caller falls back to
  * the full candidate set there (every side is both preserved and non-preserved).
  */
@@ -2028,7 +2005,7 @@ export function buildMultiSourceDeleteReturning(
 	return buildMultiSourceReturningProjection(ctx, view, analysis, filtered, stmt.returning!);
 }
 
-export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, tags?: ReservedTagMap): BaseOp[] {
+export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt): BaseOp[] {
 	// RETURNING through a multi-source delete is supported via a re-query of the
 	// planned view body captured *before* the base delete fires (the builder); the
 	// base op itself carries no RETURNING.
@@ -2037,7 +2014,7 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
 	// the single-source spine).
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
 
-	const sides = chooseDeleteSides(view, analysis, tags);
+	const sides = chooseDeleteSides(view, analysis);
 
 	// Every base delete (single-side and multi-side fan-out alike) reads its
 	// identifying values from the up-front identity capture the builder materializes
@@ -2120,152 +2097,45 @@ export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, ana
  * common case resolves to a single side; the maximal-lenient case fans out to every
  * candidate side ("make this joined row not exist"). Returns 1 or more sides.
  *
- * Resolution order (tags compose AFTER predicate dispatch — they only restrict):
- * 1. `target` / `exclude` narrow the candidate sides (`tag-target-not-found` on
- *    an unknown name; `tag-conflict` if they remove every side).
- * 2. An explicit `delete_via` picks a single side directly (`parent` → the FK-parent,
- *    `left_delete` → the left source); it must lie within the candidates.
- * 3. Otherwise the **default**: if `target`/`exclude` already left exactly one side,
- *    that side. Else if a foreign key proves the FK-many (child) side, that single
- *    side (deleting the child leaves the parent — the documented FK-style default;
- *    the FK resolves the ambiguity, so it is NOT a fan-out). Else the deletion side is
- *    ambiguous: `policy=strict` rejects it with a `policy-strict-ambiguity`
- *    diagnostic; the default `lenient` policy **fans out to every candidate side**
- *    (the predicate-honest multi-side delete — see {@link decomposeDelete}'s eager
- *    key capture).
+ * The routing is **predicate/FK truth only** — there is no tag override (the routing
+ * tags were removed; a per-row presence/membership column, e.g. the outer-join
+ * existence column, expresses any non-default side explicitly):
+ * 1. The candidate set is the **preserved** side(s) — deleting a preserved side is the
+ *    only way the joined row leaves the view (§ Outer Joins — Deletes). An inner join
+ *    is all-preserved; a `full` outer join has no preserved side, so its delete defers.
+ * 2. If a foreign key proves the FK-many (child) side, that single side (deleting the
+ *    child leaves the parent — the documented FK-style default; the FK resolves the
+ *    ambiguity, so it is NOT a fan-out).
+ * 3. Otherwise the deletion side is ambiguous and the (hardwired) lenient default
+ *    **fans out to every candidate side** — the predicate-honest multi-side delete
+ *    (see {@link decomposeDelete}'s eager key capture).
  */
-function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis, tags?: ReservedTagMap): number[] {
-	// The candidate set defaults to the **preserved** side(s) — deleting the preserved
-	// side is the only way the joined row leaves the view (§ Outer Joins — Deletes).
-	// Inner joins are all-preserved (⇒ the full set, unchanged). A `full` outer join has
-	// no preserved side (each side is both preserved and non-preserved per row), so a
+function chooseDeleteSides(view: MutableViewLike, analysis: JoinViewAnalysis): number[] {
+	// The candidate set is the **preserved** side(s) — deleting the preserved side is
+	// the only way the joined row leaves the view (§ Outer Joins — Deletes). Inner
+	// joins are all-preserved (⇒ the full set). A `full` outer join has no preserved
+	// side (each side is both preserved and non-preserved per row), so a
 	// statically-routed delete is not expressible — defer it.
-	const preserved = preservedSideIndices(analysis.sides);
-	if (preserved.length === 0) {
+	const candidates = preservedSideIndices(analysis.sides);
+	if (candidates.length === 0) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-join',
 			table: view.name,
 			message: `cannot delete through view '${view.name}': a FULL outer join has no preserved side to route the delete to (each side is both preserved and non-preserved per row); deleting through a full-outer view is deferred`,
 		});
 	}
-	const candidates = applyTargetExclude(preserved, analysis.sides, tags, view);
-
-	const deleteVia = readDeleteVia(tags);
-	if (deleteVia) {
-		const picked = resolveDeleteViaSide(deleteVia, analysis.sides, view);
-		if (!candidates.includes(picked)) {
-			raiseMutationDiagnostic({
-				reason: 'tag-conflict',
-				table: view.name,
-				message: `cannot delete through view '${view.name}': 'quereus.update.delete_via' picks base table '${analysis.sides[picked].schema.name}', but a 'target'/'exclude' tag excludes it`,
-			});
-		}
-		return [picked];
-	}
 
 	if (candidates.length === 1) return candidates;
 
-	const policy = readPolicy(tags);
-	if (policy === 'strict') {
-		raiseMutationDiagnostic({
-			reason: 'policy-strict-ambiguity',
-			table: view.name,
-			message: `cannot delete through view '${view.name}': the deletion side is ambiguous and 'quereus.update.policy' = 'strict' forbids guessing; pin it with 'quereus.update.delete_via' or 'quereus.update.target'`,
-		});
-	}
-
+	// A provable FK-child side resolves the ambiguity to that single side (deleting the
+	// child leaves the parent). `fkChildIndex` is binary, so for an n-way (>2) join it
+	// is undefined and the delete fans out.
 	const childIndex = fkChildIndex(analysis.sides);
 	if (childIndex !== undefined && candidates.includes(childIndex)) return [childIndex];
 
-	// lenient + ≥2 residual candidates + no provable single-direction FK-child default +
-	// no side tag: fan out to every candidate side (the predicate-honest multi-side
-	// delete). `fkChildIndex` is binary, so for an n-way (>2) join it is undefined and
-	// the fan-out is the whole candidate set.
+	// ≥2 residual candidates + no provable single-direction FK-child default: fan out to
+	// every candidate side (the hardwired lenient, predicate-honest multi-side delete).
 	return candidates;
-}
-
-/**
- * The single base side an explicit `delete_via` names for a join. `'parent'`
- * selects the FK-parent (requires a provable foreign key); `'left_delete'`
- * selects the left join source. `'right_insert'` is an `except`-branch value
- * with no join meaning — rejected with a pointer to the join-valid forms.
- */
-function resolveDeleteViaSide(deleteVia: DeleteViaValue, sides: readonly JoinSide[], view: MutableViewLike): number {
-	switch (deleteVia) {
-		case 'parent': {
-			const child = fkChildIndex(sides);
-			if (child === undefined) {
-				raiseMutationDiagnostic({
-					reason: 'tag-target-not-found',
-					table: view.name,
-					message: `cannot delete through view '${view.name}': 'quereus.update.delete_via' = 'parent' needs a declared foreign key to identify the parent side, but none is provable; name the side with 'quereus.update.target' instead`,
-				});
-			}
-			return 1 - child;
-		}
-		case 'left_delete':
-			return 0;
-		case 'right_insert':
-			raiseMutationDiagnostic({
-				reason: 'tag-target-not-found',
-				table: view.name,
-				message: `cannot delete through view '${view.name}': 'quereus.update.delete_via' = 'right_insert' applies to an 'except' branch, not a join; use 'left_delete', 'parent', or 'quereus.update.target'`,
-			});
-	}
-}
-
-/**
- * Indices of `sides` permitted by `target` / `exclude` (each a CSV of base-table
- * names or aliases). An unknown name is a hard `tag-target-not-found`; removing
- * every side is a `tag-conflict`. With neither tag present the candidate list is
- * returned unchanged.
- */
-function applyTargetExclude(
-	candidates: number[],
-	sides: readonly JoinSide[],
-	tags: ReservedTagMap | undefined,
-	view: MutableViewLike,
-): number[] {
-	const target = readTargetNames(tags);
-	const exclude = readExcludeNames(tags);
-	if (!target && !exclude) return candidates;
-
-	const nameToIndex = new Map<string, number>();
-	sides.forEach((s, i) => {
-		nameToIndex.set(s.schema.name.toLowerCase(), i);
-		nameToIndex.set(s.alias, i); // alias is already lowercased
-	});
-	const requireKnown = (names: readonly string[], tagName: string): void => {
-		for (const name of names) {
-			if (!nameToIndex.has(name)) {
-				raiseMutationDiagnostic({
-					reason: 'tag-target-not-found',
-					table: view.name,
-					message: `cannot write through view '${view.name}': 'quereus.update.${tagName}' names '${name}', which is not a base table of the join`,
-				});
-			}
-		}
-	};
-
-	let result = candidates;
-	if (target) {
-		requireKnown(target, 'target');
-		const allowed = new Set(target.map(n => nameToIndex.get(n)!));
-		result = result.filter(i => allowed.has(i));
-	}
-	if (exclude) {
-		requireKnown(exclude, 'exclude');
-		const excluded = new Set(exclude.map(n => nameToIndex.get(n)!));
-		result = result.filter(i => !excluded.has(i));
-	}
-	if (result.length === 0) {
-		raiseMutationDiagnostic({
-			reason: 'tag-conflict',
-			table: view.name,
-			message: `cannot write through view '${view.name}': 'quereus.update.target'/'exclude' tags exclude every base table of the join`,
-		});
-	}
-	return result;
 }
 
 // --- predicate / subquery construction ------------------------------------
@@ -2518,8 +2388,7 @@ function sideDeclaresFkOnto(child: JoinSide, parent: JoinSide): boolean {
  * foreign key onto the other. `undefined` when no FK is provable, both sides reference
  * each other (mutual), or the join is not two-sided (the binary FK-child concept does
  * not generalize past two sides — the n-way delete fan-out / `orderSides` topo sort
- * handle >2). Used by the two-side delete routing (`chooseDeleteSides`,
- * `resolveDeleteViaSide`).
+ * handle >2). Used by the two-side delete routing ({@link chooseDeleteSides}).
  */
 function fkChildIndex(sides: readonly JoinSide[]): number | undefined {
 	if (sides.length !== 2) return undefined;

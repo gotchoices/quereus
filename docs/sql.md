@@ -1354,21 +1354,17 @@ delete from GreenMen where id = 7;                    -- routes to Men
 
 **`returning`** through a view projects rows through the *view's* column list, evaluated against post-mutation state (single-source all ops; multi-source `update` / `delete`).
 
-**Override tags (`quereus.update.*`).** When the default routing is ambiguous (e.g. which side of a join a delete removes), attach tags — at the view DDL or per statement via `with tags (...)`:
+**Override tag (`quereus.update.*`).** Write *routing* is not a tag — it is expressed by predicates and per-row writable **presence/membership columns** (the outer-join existence column, the set-op membership columns). The sole retained `quereus.update.*` tag supplies a *value*:
 
 | Tag | Effect |
 |---|---|
-| `quereus.update.target` / `exclude` | Restrict / exclude the base relations propagation reaches. |
-| `quereus.update.delete_via` | Pick the side a join/`except` delete realizes (`'parent'`, `'left_delete'`, `'right_insert'`). |
 | `quereus.update.default_for.<col>` | Default expression for an omitted `insert` column. |
-| `quereus.update.policy` | `lenient` (default; predicate-honest fan-out) or `strict` (reject ambiguity). |
 
 ```sql
-update v with tags ("quereus.update.target" = 'base_a') set col = 1 where ...;
-delete from v with tags ("quereus.update.delete_via" = 'parent') where ...;
+insert into v with tags ("quereus.update.default_for.created" = 'epoch_ms(''now'')') values (...);
 ```
 
-See [View Updateability](view-updateability.md) for the full per-operator semantics and the complete diagnostic catalog.
+To realize a non-default deletion side (e.g. delete the FK-parent), expose the side as an outer-join existence column and write it: `update v set hasP = false where ...`. The removed routing tags (`target` / `exclude` / `delete_via` / `policy`) are now an `unknown-reserved-tag` error. See [View Updateability](view-updateability.md) for the full per-operator semantics and the complete diagnostic catalog.
 
 ### 2.10 CREATE MATERIALIZED VIEW Statement
 

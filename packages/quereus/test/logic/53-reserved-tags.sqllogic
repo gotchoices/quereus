@@ -42,14 +42,15 @@ apply schema bad_unknown;
 
 -- ===================================
 -- 2. Mis-sited reserved key on a logical table → error at apply
---    (`quereus.update.policy` is legal only on a view declaration)
+--    (`quereus.update.default_for.<col>` is legal only at a view DDL /
+--    projection / DML statement, never on a logical table)
 -- ===================================
 
 declare logical schema bad_site {
 	table Car {
 		id integer primary key,
 		vin text
-	} with tags ("quereus.update.policy" = 'strict')
+	} with tags ("quereus.update.default_for.vin" = '0')
 }
 
 -- run
