@@ -19,13 +19,29 @@ export interface AddColumnBackfill {
 }
 
 /**
+ * Per-row CHECK enforcement for an ADD COLUMN whose DEFAULT does not fold to a literal
+ * (e.g. `new.<col>`). Each predicate is compiled against a row scope covering the
+ * existing columns plus the new column; `rowDescriptor` maps those attribute ids to
+ * positions (existing columns at their index, the new column at `existingColumns.length`).
+ * The emitter feeds each backfilled row's `[...existingRow, newValue]` into the scope and
+ * throws on a violation, so a CHECK-violating backfilled row aborts the ALTER before any
+ * tree/batch swap (mirrors the NOT NULL per-row path). `exprText` / `name` are for the
+ * error message. A literal/folded default carries no `checks`; the post-backfill scan
+ * (`validateBackfillAgainstChecks`) covers that path instead.
+ */
+export interface AddColumnCheck {
+	readonly predicates: ReadonlyArray<{ readonly node: ScalarPlanNode; readonly name?: string; readonly exprText: string }>;
+	readonly rowDescriptor: RowDescriptor;
+}
+
+/**
  * Discriminated union of ALTER TABLE actions handled by AlterTableNode.
  * addConstraint is handled separately by AddConstraintNode.
  */
 export type AlterTableAction =
 	| { type: 'renameTable'; newName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string }
-	| { type: 'addColumn'; column: AST.ColumnDef; backfill?: AddColumnBackfill }
+	| { type: 'addColumn'; column: AST.ColumnDef; backfill?: AddColumnBackfill; checks?: AddColumnCheck }
 	| { type: 'dropColumn'; name: string }
 	| {
 		/**

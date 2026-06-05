@@ -1,7 +1,7 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { AddConstraintNode } from '../nodes/add-constraint-node.js';
-import { AlterTableNode, type AddColumnBackfill } from '../nodes/alter-table-node.js';
+import { AlterTableNode, type AddColumnBackfill, type AddColumnCheck } from '../nodes/alter-table-node.js';
 import { buildTableReference } from './table.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -11,6 +11,8 @@ import { buildExpression } from './expression.js';
 import { buildRowDefaultScope } from './default-scope.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
+import { inferType } from '../../types/registry.js';
+import { expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
 import { raiseReservedTagDiagnostics } from '../../schema/reserved-tags-policy.js';
 
@@ -67,22 +69,18 @@ export function buildAlterTableStmt(
         );
       }
       const backfill = buildAddColumnBackfill(ctx, tableReference, column);
-      // A per-row (non-foldable) default that is backfilled is not yet enforced
-      // against a CHECK on the new column: the post-backfill validation scan reads a
-      // pre-backfill snapshot for the evaluator path (the literal-default path is
-      // unaffected and still validated). Reject the combination at plan-build time
-      // rather than silently admitting CHECK-violating rows. Tracked by fix ticket
-      // `alter-add-column-backfill-check-enforcement`.
-      if (backfill && column.constraints?.some(c => c.type === 'check')) {
-        throw new QuereusError(
-          `ALTER TABLE ADD COLUMN '${column.name}' with both a non-foldable DEFAULT (e.g. new.<column>) and a CHECK constraint is not yet supported — the per-row backfill is not validated against the CHECK. Add the column first, then add the CHECK separately, or use a literal DEFAULT.`,
-          StatusCode.UNSUPPORTED,
-        );
-      }
+      // For the per-row (evaluator) default path, enforce any CHECK on the new column
+      // against each backfilled row by compiling the predicates here and evaluating them
+      // inside the per-row backfill hook (mirrors the NOT NULL per-row path) — a violating
+      // row aborts the ALTER before any tree/batch swap. The literal-default path is left to
+      // the post-backfill scan (`validateBackfillAgainstChecks`), so checks are only
+      // compiled when a backfill is present.
+      const checks = backfill ? buildAddColumnChecks(ctx, tableReference, column) : undefined;
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'addColumn',
         column,
         backfill,
+        checks,
       });
 		}
 
@@ -196,4 +194,64 @@ function buildAddColumnBackfill(
   const rowDescriptor: RowDescriptor = [];
   rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
   return { node, rowDescriptor };
+}
+
+/**
+ * Compile the column-level CHECK predicates of an ADD COLUMN whose DEFAULT does not fold
+ * to a literal, so they can be enforced per backfilled row inside the backfill hook. Each
+ * predicate is built against a row scope covering the table's *existing* columns plus the
+ * *new* column, so a CHECK referencing the new column (bare `<col>` or `new.<col>`) and any
+ * existing sibling resolves. The new column sits at position `existingColumns.length` in the
+ * row descriptor; the emitter sets that slot to `[...existingRow, backfilledValue]` per row.
+ * Returns `undefined` when the column carries no CHECK (the common case allocates nothing).
+ */
+function buildAddColumnChecks(
+  ctx: PlanningContext,
+  tableReference: TableReferenceNode,
+  columnDef: AST.ColumnDef,
+): AddColumnCheck | undefined {
+  const checkConstraints = (columnDef.constraints ?? []).filter(c => c.type === 'check' && c.expr);
+  if (checkConstraints.length === 0) return undefined;
+
+  const tableSchema = tableReference.tableSchema;
+  // Fresh attributes for the existing columns followed by the new column. The new column's
+  // logical type / nullability come from the column def (same inference the schema builder
+  // uses); refs in the CHECK resolve through the row slot the emitter installs per row.
+  const existingAttrs: Attribute[] = tableSchema.columns.map(column => ({
+    id: PlanNode.nextAttrId(),
+    name: column.name,
+    type: {
+      typeClass: 'scalar' as const,
+      logicalType: column.logicalType,
+      nullable: !column.notNull,
+      isReadOnly: false,
+      collationName: column.collation,
+    },
+    sourceRelation: 'add-column-check',
+  }));
+  const newColNotNull = (columnDef.constraints ?? []).some(c => c.type === 'notNull');
+  const newColAttr: Attribute = {
+    id: PlanNode.nextAttrId(),
+    name: columnDef.name,
+    type: {
+      typeClass: 'scalar' as const,
+      logicalType: inferType(columnDef.dataType),
+      nullable: !newColNotNull,
+      isReadOnly: false,
+    },
+    sourceRelation: 'add-column-check',
+  };
+  const rowAttrs = [...existingAttrs, newColAttr];
+  const targetColumns = [...tableSchema.columns, { name: columnDef.name }];
+  const rowScope = buildRowDefaultScope(ctx.scope, targetColumns, rowAttrs);
+
+  const predicates = checkConstraints.map(con => ({
+    node: buildExpression({ ...ctx, scope: rowScope }, con.expr!) as ScalarPlanNode,
+    name: con.name,
+    exprText: expressionToString(con.expr!),
+  }));
+
+  const rowDescriptor: RowDescriptor = [];
+  rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
+  return { predicates, rowDescriptor };
 }

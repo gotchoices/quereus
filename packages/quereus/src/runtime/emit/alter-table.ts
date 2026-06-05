@@ -1,4 +1,4 @@
-import type { AlterTableNode, AddColumnBackfill } from '../../planner/nodes/alter-table-node.js';
+import type { AlterTableNode, AddColumnBackfill, AddColumnCheck } from '../../planner/nodes/alter-table-node.js';
 import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
@@ -33,9 +33,16 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 
 	// An ADD COLUMN with a non-foldable DEFAULT carries a backfill scalar; emit it as a
 	// scheduled sub-program so the scheduler resolves it into a callback the run() body
-	// evaluates per existing row (via a row slot over the default's row descriptor).
+	// evaluates per existing row (via a row slot over the default's row descriptor). When the
+	// new column also carries a CHECK, its predicates ride alongside as further callbacks,
+	// evaluated per backfilled row against `[...existingRow, backfilledValue]`. Slot order is
+	// fixed: backfill first (present whenever checks are), then the checks in order.
 	const backfill: AddColumnBackfill | undefined = action.type === 'addColumn' ? action.backfill : undefined;
-	const params: Instruction[] = backfill ? [emitCallFromPlan(backfill.node, ctx)] : [];
+	const checks: AddColumnCheck | undefined = action.type === 'addColumn' ? action.checks : undefined;
+	const params: Instruction[] = [
+		...(backfill ? [emitCallFromPlan(backfill.node, ctx)] : []),
+		...(checks?.predicates ?? []).map(p => emitCallFromPlan(p.node, ctx)),
+	];
 
 	async function run(rctx: RuntimeContext, ...args: unknown[]): Promise<SqlValue> {
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
@@ -49,8 +56,12 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runRenameTable(rctx, tableSchema, schema, action.newName);
 			case 'renameColumn':
 				return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName);
-			case 'addColumn':
-				return runAddColumn(rctx, tableSchema, schema, action.column, backfill, args[0] as Callback | undefined);
+			case 'addColumn': {
+				// Slot order set in `params`: backfill callback first (if any), then check callbacks.
+				const backfillCb = backfill ? (args[0] as Callback) : undefined;
+				const checkCbs = (args.slice(backfill ? 1 : 0) as Callback[]);
+				return runAddColumn(rctx, tableSchema, schema, action.column, backfill, backfillCb, checks, checkCbs);
+			}
 			case 'dropColumn':
 				return runDropColumn(rctx, tableSchema, schema, action.name);
 			case 'dropConstraint':
@@ -222,6 +233,8 @@ async function runAddColumn(
 	columnDef: ColumnDef,
 	backfill?: AddColumnBackfill,
 	backfillCb?: Callback,
+	checks?: AddColumnCheck,
+	checkCbs?: ReadonlyArray<Callback>,
 ): Promise<SqlValue> {
 	// Validate column doesn't already exist
 	if (tableSchema.columnIndexMap.has(columnDef.name.toLowerCase())) {
@@ -278,16 +291,41 @@ async function runAddColumn(
 	// slot over the default's row descriptor; the evaluator the module calls per existing
 	// row sets the slot to that row, so the default's `new.<col>` refs resolve to it.
 	const rowSlot = backfill ? createRowSlot(rctx, backfill.rowDescriptor) : undefined;
+	// When the new column carries a CHECK, install a second slot over the existing columns
+	// plus the new column; we evaluate each predicate against `[...existingRow, value]` after
+	// computing the backfilled value and throw on a violation, so a CHECK-violating row aborts
+	// the ALTER inside the per-row hook — before any tree/batch swap — and the catalog is never
+	// mutated (mirrors the NOT NULL per-row path). This supersedes the post-backfill scan,
+	// which reads a stale pre-backfill snapshot for the evaluator path.
+	const checkSlot = backfill && checks ? createRowSlot(rctx, checks.rowDescriptor) : undefined;
+	const checkPredicates = checks?.predicates ?? [];
 	const backfillEvaluator = backfill && backfillCb && rowSlot
 		? async (row: Row): Promise<SqlValue> => {
 			rowSlot.set(row);
-			const value = backfillCb(rctx);
-			return (value instanceof Promise ? await value : value) as SqlValue;
+			const valueRaw = backfillCb(rctx);
+			const value = (valueRaw instanceof Promise ? await valueRaw : valueRaw) as SqlValue;
+			if (checkSlot && checkPredicates.length > 0 && checkCbs) {
+				checkSlot.set([...row, value]);
+				for (let i = 0; i < checkPredicates.length; i++) {
+					const resultRaw = checkCbs[i](rctx);
+					const result = (resultRaw instanceof Promise ? await resultRaw : resultRaw) as SqlValue;
+					// CHECK passes on truthy / NULL; fails on false / 0 (matches write-time semantics).
+					if (result === false || result === 0) {
+						const pred = checkPredicates[i];
+						const hint = pred.exprText ? ` (${pred.exprText})` : '';
+						throw new QuereusError(
+							`CHECK constraint failed: ${pred.name ?? `_check_${columnDef.name}`}${hint}`,
+							StatusCode.CONSTRAINT,
+						);
+					}
+				}
+			}
+			return value;
 		}
 		: undefined;
 
-	// The slot is only needed while the module is appending the column (it calls the
-	// evaluator per existing row); close it as soon as that returns — before the CHECK
+	// The slots are only needed while the module is appending the column (it calls the
+	// evaluator per existing row); close them as soon as that returns — before the CHECK
 	// scan below re-reads the table — so the backfill's context does not shadow the
 	// scan's own row context.
 	let updatedTableSchema: TableSchema;
@@ -299,6 +337,7 @@ async function runAddColumn(
 		});
 	} finally {
 		rowSlot?.close();
+		checkSlot?.close();
 	}
 
 	// Resolve the new child column index in the freshly returned schema for any FK constraints.
@@ -309,6 +348,10 @@ async function runAddColumn(
 
 	// Merge new column-level CHECK / FK into the table-level constraint sets so the
 	// existing constraint-builder picks them up for INSERT/UPDATE enforcement.
+	// FOLLOW-UP: column-level FK is merged for future INSERT/UPDATE only — existing
+	// backfilled rows are NOT validated against it for any default kind. The per-row
+	// backfill hook used here for CHECK could be reused to validate FKs against
+	// backfilled rows; not implemented (see ticket out-of-scope note).
 	const mergedChecks = newCheckConstraints.length > 0
 		? Object.freeze([...updatedTableSchema.checkConstraints, ...newCheckConstraints])
 		: updatedTableSchema.checkConstraints;
@@ -336,7 +379,12 @@ async function runAddColumn(
 	// (drop the column + restore the original catalog entry) on a violation. NOT NULL of
 	// a per-row default is enforced by the module during backfill (it has the values
 	// in-hand and throws before the column is committed), so it needs no post-scan here.
-	if (newCheckConstraints.length > 0) {
+	//
+	// The per-row (evaluator) default path already enforced each CHECK inside the backfill
+	// hook above (against the freshly-computed value, not a stale snapshot), so skip the
+	// post-scan there — it is only correct for the literal-default path (`!backfill`), whose
+	// values were bulk-written by the module without a per-row hook.
+	if (!backfill && newCheckConstraints.length > 0) {
 		try {
 			await validateBackfillAgainstChecks(rctx, enhancedTableSchema, newCheckConstraints);
 		} catch (err) {
