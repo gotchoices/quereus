@@ -893,6 +893,10 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 			return `alter table ${table} drop column ${quoteIdentifier(stmt.action.name)}`;
 		case 'addConstraint':
 			return `alter table ${table} add ${tableConstraintsToString([stmt.action.constraint])}`;
+		case 'dropConstraint':
+			return `alter table ${table} drop constraint ${quoteIdentifier(stmt.action.name)}`;
+		case 'renameConstraint':
+			return `alter table ${table} rename constraint ${quoteIdentifier(stmt.action.oldName)} to ${quoteIdentifier(stmt.action.newName)}`;
 		case 'alterPrimaryKey': {
 			const cols = stmt.action.columns
 				.map(c => {
@@ -1193,7 +1197,7 @@ function columnConstraintsToString(constraints: AST.ColumnConstraint[]): string 
 }
 
 // Helper to stringify table constraints
-function tableConstraintsToString(constraints: AST.TableConstraint[]): string {
+export function tableConstraintsToString(constraints: AST.TableConstraint[]): string {
 	return constraints.map(c => {
 		let s = '';
 		if (c.name) s += `constraint ${quoteIdentifier(c.name)} `;

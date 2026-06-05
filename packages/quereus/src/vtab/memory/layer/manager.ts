@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass } from '../../../schema/table.js';
 import { type BTreeKeyForPrimary } from '../types.js';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer } from './base.js';
@@ -1859,6 +1859,161 @@ export class MemoryTableManager {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			logger.error('Drop Index', this._tableName, e);
+			throw e;
+		} finally {
+			release();
+		}
+	}
+
+	/**
+	 * Drops a named table-level constraint (CHECK / UNIQUE / FOREIGN KEY). Schema-
+	 * only — constraints don't change row shape — except that dropping a UNIQUE
+	 * also tears down the implicit covering index (the auto-built secondary BTree
+	 * named `uc.name ?? '_uc_<cols>'`) so introspection / the declarative differ
+	 * don't observe an orphaned index. The class is resolved here (NOTFOUND /
+	 * ambiguous), so the engine can route through `module.alterTable` uniformly.
+	 */
+	async dropConstraint(constraintName: string): Promise<void> {
+		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
+		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
+		const release = await Latches.acquire(lockKey);
+		const originalManagerSchema = this.tableSchema;
+		try {
+			await this.ensureSchemaChangeSafety();
+			const cls = resolveNamedConstraintClass(this.tableSchema, constraintName);
+			const lower = constraintName.toLowerCase();
+			let newSchema: TableSchema;
+			let droppedIndexName: string | undefined;
+
+			if (cls === 'check') {
+				newSchema = Object.freeze({
+					...this.tableSchema,
+					checkConstraints: Object.freeze(
+						this.tableSchema.checkConstraints.filter(c => c.name?.toLowerCase() !== lower),
+					),
+				});
+			} else if (cls === 'foreignKey') {
+				const remaining = (this.tableSchema.foreignKeys ?? []).filter(c => c.name?.toLowerCase() !== lower);
+				newSchema = Object.freeze({
+					...this.tableSchema,
+					foreignKeys: remaining.length > 0 ? Object.freeze(remaining) : undefined,
+				});
+			} else {
+				// UNIQUE — drop the constraint and its implicit covering index.
+				const uc = this.tableSchema.uniqueConstraints!.find(c => c.name?.toLowerCase() === lower)!;
+				const idxName = uc.name ?? this.implicitIndexNameFor(uc);
+				const idxLower = idxName.toLowerCase();
+				const existingIndexes = this.tableSchema.indexes ?? [];
+				const keptIndexes = existingIndexes.filter(i => i.name.toLowerCase() !== idxLower);
+				if (keptIndexes.length !== existingIndexes.length) droppedIndexName = idxName;
+				const remainingUcs = this.tableSchema.uniqueConstraints!.filter(c => c.name?.toLowerCase() !== lower);
+				newSchema = Object.freeze({
+					...this.tableSchema,
+					uniqueConstraints: remainingUcs.length > 0 ? Object.freeze(remainingUcs) : undefined,
+					indexes: Object.freeze(keptIndexes),
+				});
+				this.implicitCoveringStructures.delete(uc.name ?? idxName);
+			}
+
+			this.baseLayer.updateSchema(newSchema);
+			if (droppedIndexName) await this.baseLayer.dropIndexFromBase(droppedIndexName);
+			this.tableSchema = newSchema;
+			this.initializePrimaryKeyFunctions();
+
+			this.eventEmitter?.emitSchemaChange?.({
+				type: 'alter',
+				objectType: 'table',
+				schemaName: this.schemaName,
+				objectName: this._tableName,
+			});
+
+			logger.operation('Drop Constraint', this._tableName, { constraintName });
+		} catch (e: unknown) {
+			this.baseLayer.updateSchema(originalManagerSchema);
+			this.tableSchema = originalManagerSchema;
+			this.initializePrimaryKeyFunctions();
+			logger.error('Drop Constraint', this._tableName, e);
+			throw e;
+		} finally {
+			release();
+		}
+	}
+
+	/**
+	 * Renames a named table-level constraint. Schema-only, with one caveat: a
+	 * UNIQUE whose implicit covering index is named after the constraint has that
+	 * index renamed in lock-step (so the index stays recognized as the
+	 * constraint's covering structure rather than surfacing as an orphan).
+	 */
+	async renameConstraint(oldName: string, newName: string): Promise<void> {
+		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
+		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
+		const release = await Latches.acquire(lockKey);
+		const originalManagerSchema = this.tableSchema;
+		try {
+			await this.ensureSchemaChangeSafety();
+			const cls = resolveNamedConstraintClass(this.tableSchema, oldName);
+			const oldLower = oldName.toLowerCase();
+			let newSchema: TableSchema;
+			let renamedIndex = false;
+
+			if (cls === 'check') {
+				newSchema = Object.freeze({
+					...this.tableSchema,
+					checkConstraints: Object.freeze(
+						this.tableSchema.checkConstraints.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: newName } : c)),
+					),
+				});
+			} else if (cls === 'foreignKey') {
+				newSchema = Object.freeze({
+					...this.tableSchema,
+					foreignKeys: Object.freeze(
+						this.tableSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: newName } : c)),
+					),
+				});
+			} else {
+				// UNIQUE — rename the constraint and, when present, its implicit covering index.
+				const uc = this.tableSchema.uniqueConstraints!.find(c => c.name?.toLowerCase() === oldLower)!;
+				const oldIdxName = uc.name ?? this.implicitIndexNameFor(uc);
+				const oldIdxLower = oldIdxName.toLowerCase();
+				const newUcs = this.tableSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: newName } : c));
+				let indexes = this.tableSchema.indexes ?? [];
+				if (indexes.some(i => i.name.toLowerCase() === oldIdxLower)) {
+					indexes = indexes.map(i => (i.name.toLowerCase() === oldIdxLower ? { ...i, name: newName } : i));
+					renamedIndex = true;
+				}
+				newSchema = Object.freeze({
+					...this.tableSchema,
+					uniqueConstraints: Object.freeze(newUcs),
+					indexes: Object.freeze(indexes),
+				});
+				const rec = this.implicitCoveringStructures.get(uc.name ?? oldIdxName);
+				if (rec) {
+					this.implicitCoveringStructures.delete(uc.name ?? oldIdxName);
+					this.implicitCoveringStructures.set(newName, { ...rec, indexName: renamedIndex ? newName : rec.indexName });
+				}
+			}
+
+			this.baseLayer.updateSchema(newSchema);
+			// A renamed covering index lives under a new key — rebuild secondary indexes
+			// from the post-rename schema so the base layer's index map matches.
+			if (renamedIndex) this.baseLayer.rebuildAllSecondaryIndexes();
+			this.tableSchema = newSchema;
+			this.initializePrimaryKeyFunctions();
+
+			this.eventEmitter?.emitSchemaChange?.({
+				type: 'alter',
+				objectType: 'table',
+				schemaName: this.schemaName,
+				objectName: this._tableName,
+			});
+
+			logger.operation('Rename Constraint', this._tableName, { oldName, newName });
+		} catch (e: unknown) {
+			this.baseLayer.updateSchema(originalManagerSchema);
+			this.tableSchema = originalManagerSchema;
+			this.initializePrimaryKeyFunctions();
+			logger.error('Rename Constraint', this._tableName, e);
 			throw e;
 		} finally {
 			release();

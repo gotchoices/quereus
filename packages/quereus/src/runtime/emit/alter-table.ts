@@ -7,7 +7,7 @@ import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
-import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule } from '../../schema/table.js';
+import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass } from '../../schema/table.js';
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -53,6 +53,10 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runAddColumn(rctx, tableSchema, schema, action.column, backfill, args[0] as Callback | undefined);
 			case 'dropColumn':
 				return runDropColumn(rctx, tableSchema, schema, action.name);
+			case 'dropConstraint':
+				return runDropConstraint(rctx, tableSchema, schema, action.name);
+			case 'renameConstraint':
+				return runRenameConstraint(rctx, tableSchema, schema, action.oldName, action.newName);
 			case 'alterPrimaryKey':
 				return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns);
 			case 'alterColumn':
@@ -72,6 +76,8 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 			case 'renameColumn': return `renameColumn(${tableSchema.name}.${action.oldName} -> ${action.newName})`;
 			case 'addColumn': return `addColumn(${tableSchema.name}.${action.column.name})`;
 			case 'dropColumn': return `dropColumn(${tableSchema.name}.${action.name})`;
+			case 'dropConstraint': return `dropConstraint(${tableSchema.name}.${action.name})`;
+			case 'renameConstraint': return `renameConstraint(${tableSchema.name}.${action.oldName} -> ${action.newName})`;
 			case 'alterPrimaryKey': return `alterPrimaryKey(${tableSchema.name} -> [${action.columns.map(c => c.name).join(', ')}])`;
 			case 'alterColumn': return `alterColumn(${tableSchema.name}.${action.columnName})`;
 			case 'setTags': {
@@ -530,6 +536,136 @@ async function runDropColumn(
 
 	log('Dropped column %s from table %s.%s', columnName, tableSchema.schemaName, tableSchema.name);
 	return null;
+}
+
+/**
+ * DROP CONSTRAINT <name> — removes a named table-level constraint (CHECK / UNIQUE
+ * / FOREIGN KEY). Resolves the class up front (NOTFOUND / ambiguous surfaced here
+ * with a clear error before any module call), rejects dropping a UNIQUE constraint
+ * that is the synthesized side of an explicit `CREATE UNIQUE INDEX` (the index is
+ * the user's — `DROP INDEX` is the correct primitive), then routes the rewrite
+ * through `module.alterTable` so persistent modules re-persist their DDL. The
+ * module owns the actual array rewrite and, for a UNIQUE, tearing down the
+ * implicit covering index that backs it.
+ */
+async function runDropConstraint(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+	constraintName: string,
+): Promise<SqlValue> {
+	const constraintClass = resolveNamedConstraintClass(tableSchema, constraintName);
+	if (constraintClass === 'unique') {
+		rejectDerivedFromIndex(tableSchema, constraintName, 'DROP');
+	}
+
+	const module = requireVtabModule(tableSchema);
+	if (!module.alterTable) {
+		throw new QuereusError(
+			`Module for table '${tableSchema.name}' does not support ALTER TABLE DROP CONSTRAINT`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+
+	const updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+		type: 'dropConstraint',
+		constraintName,
+	});
+
+	schema.addTable(updatedTableSchema);
+
+	rctx.db.schemaManager.getChangeNotifier().notifyChange({
+		type: 'table_modified',
+		schemaName: tableSchema.schemaName,
+		objectName: tableSchema.name,
+		oldObject: tableSchema,
+		newObject: updatedTableSchema,
+	});
+
+	log('Dropped constraint %s from table %s.%s', constraintName, tableSchema.schemaName, tableSchema.name);
+	return null;
+}
+
+/**
+ * RENAME CONSTRAINT <old> TO <new> — name-level rename of a named table-level
+ * constraint. Resolves the class up front, rejects a no-op / collision (the new
+ * name must not already address a constraint), and rejects renaming a UNIQUE
+ * derived from an explicit index. Routed through `module.alterTable`.
+ */
+async function runRenameConstraint(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+	oldName: string,
+	newName: string,
+): Promise<SqlValue> {
+	const constraintClass = resolveNamedConstraintClass(tableSchema, oldName);
+	if (constraintClass === 'unique') {
+		rejectDerivedFromIndex(tableSchema, oldName, 'RENAME');
+	}
+
+	// Collision: the new name must not already address an existing named constraint
+	// (unless it's a case-only change of the same constraint).
+	const oldLower = oldName.toLowerCase();
+	const newLower = newName.toLowerCase();
+	if (oldLower !== newLower && namedConstraintExists(tableSchema, newName)) {
+		throw new QuereusError(
+			`Cannot rename constraint to '${newName}': a constraint with that name already exists in table '${tableSchema.name}'`,
+			StatusCode.CONSTRAINT,
+		);
+	}
+
+	const module = requireVtabModule(tableSchema);
+	if (!module.alterTable) {
+		throw new QuereusError(
+			`Module for table '${tableSchema.name}' does not support ALTER TABLE RENAME CONSTRAINT`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+
+	const updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+		type: 'renameConstraint',
+		oldName,
+		newName,
+	});
+
+	schema.addTable(updatedTableSchema);
+
+	rctx.db.schemaManager.getChangeNotifier().notifyChange({
+		type: 'table_modified',
+		schemaName: tableSchema.schemaName,
+		objectName: tableSchema.name,
+		oldObject: tableSchema,
+		newObject: updatedTableSchema,
+	});
+
+	log('Renamed constraint %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
+	return null;
+}
+
+/** True when `name` addresses any named CHECK / UNIQUE / FOREIGN KEY constraint. */
+function namedConstraintExists(tableSchema: TableSchema, name: string): boolean {
+	const lower = name.toLowerCase();
+	return (tableSchema.checkConstraints ?? []).some(c => c.name?.toLowerCase() === lower)
+		|| (tableSchema.uniqueConstraints ?? []).some(c => c.name?.toLowerCase() === lower)
+		|| (tableSchema.foreignKeys ?? []).some(c => c.name?.toLowerCase() === lower);
+}
+
+/**
+ * Rejects DROP/RENAME of a UNIQUE constraint that was synthesized from an explicit
+ * `CREATE UNIQUE INDEX` (`derivedFromIndex` set). That constraint is the index's
+ * shadow — dropping/renaming it alone would strand the index, so the user must
+ * operate on the index (`DROP INDEX`) instead.
+ */
+function rejectDerivedFromIndex(tableSchema: TableSchema, constraintName: string, op: 'DROP' | 'RENAME'): void {
+	const lower = constraintName.toLowerCase();
+	const uc = (tableSchema.uniqueConstraints ?? []).find(c => c.name?.toLowerCase() === lower);
+	if (uc?.derivedFromIndex) {
+		throw new QuereusError(
+			`Cannot ${op} CONSTRAINT '${constraintName}' on '${tableSchema.name}': it is backed by index '${uc.derivedFromIndex}' (created via CREATE UNIQUE INDEX). Use DROP INDEX '${uc.derivedFromIndex}' instead.`,
+			StatusCode.CONSTRAINT,
+		);
+	}
 }
 
 async function runAlterColumn(

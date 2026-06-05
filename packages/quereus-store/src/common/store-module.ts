@@ -29,7 +29,7 @@ import type {
 	Schema,
 	MappingAdvertisement,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -776,6 +776,81 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					`Store table does not support ADD CONSTRAINT ${change.constraint.type}`,
 					StatusCode.UNSUPPORTED,
 				);
+			}
+
+			case 'dropConstraint': {
+				// Schema-only catalog rewrite: store-backed UNIQUE enforcement is a
+				// full-scan over `uniqueConstraints` (no separate index store for an
+				// inline UNIQUE), so dropping the constraint stops enforcement with no
+				// physical teardown. A UNIQUE derived from a CREATE UNIQUE INDEX is
+				// rejected upstream (drop the index instead), so we never strand a store.
+				const constraintClass = resolveNamedConstraintClass(oldSchema, change.constraintName);
+				const lower = change.constraintName.toLowerCase();
+				let updatedSchema: TableSchema;
+				if (constraintClass === 'check') {
+					updatedSchema = {
+						...oldSchema,
+						checkConstraints: Object.freeze(oldSchema.checkConstraints.filter(c => c.name?.toLowerCase() !== lower)),
+					};
+				} else if (constraintClass === 'foreignKey') {
+					const remaining = (oldSchema.foreignKeys ?? []).filter(c => c.name?.toLowerCase() !== lower);
+					updatedSchema = { ...oldSchema, foreignKeys: remaining.length > 0 ? Object.freeze(remaining) : undefined };
+				} else {
+					const remaining = (oldSchema.uniqueConstraints ?? []).filter(c => c.name?.toLowerCase() !== lower);
+					updatedSchema = { ...oldSchema, uniqueConstraints: remaining.length > 0 ? Object.freeze(remaining) : undefined };
+				}
+
+				table.updateSchema(updatedSchema);
+				await this.saveTableDDL(updatedSchema);
+
+				this.eventEmitter?.emitSchemaChange({
+					type: 'alter',
+					objectType: 'table',
+					schemaName,
+					objectName: tableName,
+				});
+
+				return updatedSchema;
+			}
+
+			case 'renameConstraint': {
+				const constraintClass = resolveNamedConstraintClass(oldSchema, change.oldName);
+				const oldLower = change.oldName.toLowerCase();
+				let updatedSchema: TableSchema;
+				if (constraintClass === 'check') {
+					updatedSchema = {
+						...oldSchema,
+						checkConstraints: Object.freeze(
+							oldSchema.checkConstraints.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
+						),
+					};
+				} else if (constraintClass === 'foreignKey') {
+					updatedSchema = {
+						...oldSchema,
+						foreignKeys: Object.freeze(
+							oldSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
+						),
+					};
+				} else {
+					updatedSchema = {
+						...oldSchema,
+						uniqueConstraints: Object.freeze(
+							oldSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
+						),
+					};
+				}
+
+				table.updateSchema(updatedSchema);
+				await this.saveTableDDL(updatedSchema);
+
+				this.eventEmitter?.emitSchemaChange({
+					type: 'alter',
+					objectType: 'table',
+					schemaName,
+					objectName: tableName,
+				});
+
+				return updatedSchema;
 			}
 
 			case 'alterColumn': {

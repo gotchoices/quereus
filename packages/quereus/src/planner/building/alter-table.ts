@@ -92,6 +92,19 @@ export function buildAlterTableStmt(
         name: stmt.action.name,
       });
 
+    case 'dropConstraint':
+      return new AlterTableNode(ctx.scope, tableReference, {
+        type: 'dropConstraint',
+        name: stmt.action.name,
+      });
+
+    case 'renameConstraint':
+      return new AlterTableNode(ctx.scope, tableReference, {
+        type: 'renameConstraint',
+        oldName: stmt.action.oldName,
+        newName: stmt.action.newName,
+      });
+
     case 'alterPrimaryKey':
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'alterPrimaryKey',

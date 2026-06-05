@@ -133,8 +133,8 @@ export { quoteIdentifier } from './emit/ast-stringify.js';
 
 // Schema management
 export { SchemaManager } from './schema/manager.js';
-export { buildColumnIndexMap, columnDefToSchema } from './schema/table.js';
-export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema } from './schema/table.js';
+export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass } from './schema/table.js';
+export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';
 export { generateTableDDL, generateIndexDDL } from './schema/ddl-generator.js';

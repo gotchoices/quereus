@@ -708,6 +708,14 @@ const alterTableArb: fc.Arbitrary<AST.AlterTableStmt> = fc.tuple(
 		})),
 		// DROP COLUMN
 		identArb.map(name => ({ type: 'dropColumn', name })),
+		// DROP CONSTRAINT <name>
+		identArb.map(name => ({ type: 'dropConstraint' as const, name })),
+		// RENAME CONSTRAINT <old> TO <new>
+		fc.tuple(identArb, identArb).map(([oldName, newName]) => ({
+			type: 'renameConstraint' as const,
+			oldName,
+			newName,
+		})),
 		// ADD CONSTRAINT — generate a NAMED constraint so the parser's `ADD CONSTRAINT`
 		// path is exercised (the unnamed table-constraint path requires the constraint
 		// keyword to be present anyway, so we always set a name).

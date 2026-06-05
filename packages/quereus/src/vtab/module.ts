@@ -377,6 +377,27 @@ export type SchemaChangeInfo =
 	| { type: 'addConstraint'; constraint: TableConstraint }
 	| {
 		/**
+		 * DROP CONSTRAINT — remove a named table-level constraint by name. The module
+		 * resolves the class (CHECK / UNIQUE / FOREIGN KEY), rewrites its schema, and
+		 * returns the updated TableSchema. No row migration is needed (constraints
+		 * don't change row shape), though dropping a UNIQUE may also tear down the
+		 * secondary index backing it.
+		 */
+		type: 'dropConstraint';
+		constraintName: string;
+	}
+	| {
+		/**
+		 * RENAME CONSTRAINT — change a named table-level constraint's name. The module
+		 * resolves the class and rewrites its schema (and, for a UNIQUE backed by an
+		 * implicit covering index named after the constraint, renames that index too).
+		 */
+		type: 'renameConstraint';
+		oldName: string;
+		newName: string;
+	}
+	| {
+		/**
 		 * ALTER COLUMN with exactly one attribute change.
 		 *
 		 * Module contract:

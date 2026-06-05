@@ -298,7 +298,7 @@ Errors include source location (`line`, `column`) when available from the AST no
 The `declare schema` / `diff schema` / `apply schema` workflow provides order-independent, end-state schema declarations. The engine computes diffs against the current catalog (`computeSchemaDiff`) and generates migration DDL (`generateMigrationDDL`). Key diff types:
 
 - `SchemaDiff` — tables/views/indexes/assertions to create, drop, alter, or rename
-- `TableAlterDiff` — columns to rename, add, alter, or drop within an existing table; named-constraint renames
+- `TableAlterDiff` — columns to rename, add, alter, or drop within an existing table; named-constraint rename / drop / add (`constraintsToRename` / `constraintsToDrop` / `constraintsToAdd`)
 
 Destructive changes (drops) require explicit acknowledgement. See the [SQL Reference](sql.md#20-declarative-schema-optional-order-independent) for full syntax and examples.
 
@@ -349,9 +349,9 @@ The deploy summary tallies `acknowledged: N` (`LensDeployReport.acknowledged.len
 1. **Renames first** — `ALTER TABLE ... RENAME TO` for objects with a stable identity hint (`quereus.id` / `quereus.previous_name`). This frees the old name before any create reuses it and lets the engine's rename rewriter propagate references through dependents.
 2. **Drops second** — `DROP TABLE`, `DROP VIEW`, `DROP INDEX` for objects neither declared nor consumed by a rename.
 3. **Creates third** — `CREATE TABLE`, `CREATE VIEW`, `CREATE INDEX` for new objects.
-4. **Alters last** — within each `TableAlterDiff`: `RENAME COLUMN` first (so subsequent phases see post-rename names), then `ADD COLUMN`, `ALTER COLUMN`, `ALTER PRIMARY KEY`, `DROP COLUMN`.
+4. **Alters last** — within each `TableAlterDiff`: `RENAME COLUMN` first (so subsequent phases see post-rename names), then `ADD COLUMN`, `ALTER COLUMN`, then the **constraint lifecycle** — `RENAME CONSTRAINT` then `DROP CONSTRAINT` (free / remove a name before any re-add, and drop a UNIQUE before the PK change so it can't strand a PK dependency) — then `ALTER PRIMARY KEY`, then `ADD CONSTRAINT` (after the PK change and the column adds it may reference), then `DROP COLUMN` last, then the tag-drift `SET TAGS` phase.
 
-This ordering ensures that dropped tables free their names before creates run, and that forward references between tables (e.g. foreign keys to later-declared tables) work because declarations are order-independent.
+This ordering ensures that dropped tables free their names before creates run, and that forward references between tables (e.g. foreign keys to later-declared tables) work because declarations are order-independent. A constraint `ADD` lands after all `CREATE TABLE`s, so a declared FK constraint added to an existing table can reference a freshly-declared parent.
 
 ### Rename Detection
 
@@ -363,7 +363,9 @@ This ordering ensures that dropped tables free their names before creates run, a
 
 Conflicts (declared name and hint resolving to two distinct existing objects) always throw, independent of policy beyond `'deny'`.
 
-The same resolution runs at column granularity inside `computeTableAlterDiff` and at named-constraint granularity. Column renames emit `ALTER TABLE ... RENAME COLUMN`. View, index, and named-constraint renames have no engine-level rename primitive and currently fall back to drop+recreate via the standard buckets.
+The same resolution runs at column granularity inside `computeTableAlterDiff` and at named-constraint granularity. Column renames emit `ALTER TABLE ... RENAME COLUMN`; named-constraint renames now emit the `ALTER TABLE ... RENAME CONSTRAINT` primitive (CHECK / UNIQUE / FOREIGN KEY). View and index renames have no engine-level rename primitive and still fall back to drop+recreate via the standard buckets.
+
+Alongside renames, `computeTableAlterDiff` resolves the full **named-constraint lifecycle** by name: a user-named constraint in the catalog but absent from the declaration (and not consumed by a rename) → `TableAlterDiff.constraintsToDrop` → `DROP CONSTRAINT`; a declared user-named constraint absent from the catalog (and not a rename target) → `TableAlterDiff.constraintsToAdd` → `ADD <fragment>`. Declared constraints are gathered from **both** the table-level `constraints` list and column-level constraints carrying an explicit name (`qty int constraint chk_qty check (qty > 0)`), matching what the catalog's `namedConstraints` surfaces. Only **user-named** constraints participate: engine-synthesized auto-names (`_check_*` / `_fk_*` / `_uc_*`), PRIMARY KEY constraints (handled by `primaryKeyChange`), and UNIQUE constraints derived from a `CREATE UNIQUE INDEX` (`derivedFromIndex`, managed through their index) are excluded — keeping the diff stable/idempotent for unnamed and index-derived constraints. Under `require-hint`, a constraint add **and** drop on the same table with no rename hint is rejected, mirroring the table/column guard. **Note:** `ADD CONSTRAINT` applies a CHECK in place but a UNIQUE / FOREIGN KEY add depends on module `addConstraint` support, which the built-in memory / store modules do not yet provide (it raises `UNSUPPORTED`); so a declarative add of a non-CHECK constraint to an existing table is not yet end-to-end (declare it at `CREATE TABLE` time). DROP and RENAME work for all three classes.
 
 #### Tag-drift detection
 

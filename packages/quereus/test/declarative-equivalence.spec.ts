@@ -28,7 +28,7 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { StatusCode } from '../src/common/types.js';
 import { computeSchemaHash } from '../src/schema/schema-hasher.js';
-import { computeSchemaDiff } from '../src/schema/schema-differ.js';
+import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
 import {
 	assertTableSchemaEqual,
@@ -1252,6 +1252,223 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 		} finally {
 			await a.close();
 			await b.close();
+		}
+	});
+});
+
+// ============================================================================
+// Named-constraint lifecycle — declarative add / drop / rename by name
+// ============================================================================
+
+describe('declarative-equivalence: named-constraint lifecycle', () => {
+	function diffOf(db: Database) {
+		return computeSchemaDiff(
+			db.declaredSchemaManager.getDeclaredSchema('main')!,
+			collectSchemaCatalog(db, 'main'),
+		);
+	}
+
+	it('a declared named-CHECK add converges via ADD CONSTRAINT and is idempotent', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER }
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare adding a named CHECK.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER,
+					constraint chk_qty check (qty > 0)
+				}
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the added constraint').to.equal(1);
+			expect(diff.tablesToAlter[0].constraintsToAdd?.length, 'one add').to.equal(1);
+			expect(diff.tablesToAlter[0].constraintsToDrop ?? [], 'no drop').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The CHECK now enforces.
+			const cc = db.schemaManager.getTable('main', 't')!.checkConstraints.find(c => c.name === 'chk_qty');
+			expect(cc, 'chk_qty present after apply').to.not.be.undefined;
+			let rejected = false;
+			try { await db.exec('insert into t values (1, -1)'); } catch { rejected = true; }
+			expect(rejected, 'negative qty rejected by added CHECK').to.be.true;
+			await db.exec('insert into t values (2, 5)');
+
+			// Idempotent: re-diff produces no constraint churn.
+			const diff2 = diffOf(db);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a declared named-CHECK drop converges via DROP CONSTRAINT and is idempotent', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER,
+					constraint chk_qty check (qty > 0)
+				}
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare WITHOUT the named CHECK → drop.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER }
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the dropped constraint').to.equal(1);
+			expect(diff.tablesToAlter[0].constraintsToDrop, 'drops chk_qty').to.deep.equal(['chk_qty']);
+			expect(diff.tablesToAlter[0].constraintsToAdd ?? [], 'no add').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// Enforcement gone.
+			const cc = db.schemaManager.getTable('main', 't')!.checkConstraints.find(c => c.name === 'chk_qty');
+			expect(cc, 'chk_qty gone after apply').to.be.undefined;
+			await db.exec('insert into t values (1, -1)'); // would have violated
+
+			const diff2 = diffOf(db);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a hinted named-constraint rename emits RENAME CONSTRAINT and converges (was a silent no-op)', async function () {
+		// Before this ticket, computeTableAlterDiff populated `constraintsToRename`
+		// but generateMigrationDDL never read it — a declared constraint rename was
+		// silently dropped on the floor. Guard the wiring end-to-end.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER,
+					constraint chk_old check (qty > 0)
+				}
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare with the constraint renamed via a previous_name hint.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER,
+					constraint chk_new check (qty > 0) with tags ("quereus.previous_name" = 'chk_old')
+				}
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the rename').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.constraintsToRename, 'rename op detected').to.deep.equal([{ oldName: 'chk_old', newName: 'chk_new' }]);
+			// A rename is neither an add nor a drop.
+			expect(alter.constraintsToAdd ?? [], 'rename is not an add').to.deep.equal([]);
+			expect(alter.constraintsToDrop ?? [], 'rename is not a drop').to.deep.equal([]);
+
+			// The dead-code bug: the RENAME CONSTRAINT statement must actually be emitted.
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(
+				ddl.some(s => /RENAME CONSTRAINT .*chk_old.* TO .*chk_new/i.test(s)),
+				`expected a RENAME CONSTRAINT statement, got:\n${ddl.join('\n')}`,
+			).to.be.true;
+
+			await db.exec('apply schema main');
+
+			// The constraint is renamed in the live catalog and still enforces.
+			const checks = db.schemaManager.getTable('main', 't')!.checkConstraints;
+			expect(checks.some(c => c.name === 'chk_old'), 'old name gone').to.be.false;
+			expect(checks.some(c => c.name === 'chk_new'), 'new name present').to.be.true;
+			let rejected = false;
+			try { await db.exec('insert into t values (1, -1)'); } catch { rejected = true; }
+			expect(rejected, 'renamed CHECK still enforces').to.be.true;
+
+			// Idempotent: the previous_name hint must not re-trigger after the rename.
+			const diff2 = diffOf(db);
+			expect(diff2.renames, 'no further rename').to.deep.equal([]);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a column-level named CHECK is gathered for lifecycle (add detected and converges)', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER }
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare adding a COLUMN-LEVEL named CHECK.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER constraint chk_qty check (qty > 0)
+				}
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter[0]?.constraintsToAdd?.length, 'column-level named CHECK detected as an add').to.equal(1);
+
+			await db.exec('apply schema main');
+			expect(
+				db.schemaManager.getTable('main', 't')!.checkConstraints.some(c => c.name === 'chk_qty'),
+				'chk_qty present after apply',
+			).to.be.true;
+
+			// Idempotent — the column-level constraint matches by name on re-diff.
+			expect(diffOf(db).tablesToAlter, 'idempotent').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('IDEMPOTENCY: an UNNAMED column CHECK does not churn add/drop (auto-name excluded)', async function () {
+		// The extractor auto-names an unnamed column CHECK `_check_<col>`; that name
+		// is engine-synthesized and must NOT participate in lifecycle diffing, or a
+		// declaration that only carries explicit names would spuriously drop it.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER check (qty > 0)
+				}
+			}`);
+			await db.exec('apply schema main');
+
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter, 'unnamed column CHECK must not churn a drop/add').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('IDEMPOTENCY: a CREATE UNIQUE INDEX-derived constraint does not churn a DROP CONSTRAINT', async function () {
+		// A UNIQUE constraint synthesized from a unique index is excluded from the
+		// catalog's user-addressable named constraints (it is managed via the index),
+		// so re-applying a schema that declares the index must not drop the constraint.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, email TEXT }
+				unique index uq_email on t (email)
+			}`);
+			await db.exec('apply schema main');
+
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter, 'index-derived UNIQUE must not churn a constraint drop').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'index itself stable').to.deep.equal([]);
+			expect(diff.indexesToCreate, 'index itself stable').to.deep.equal([]);
+		} finally {
+			await db.close();
 		}
 	});
 });

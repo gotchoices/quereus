@@ -259,7 +259,7 @@ apply schema main to version '1.0.0' options (
 
 A rename detected via `quereus.id` is authoritative: when both `id` and `previous_name` would resolve, `id` wins. A *conflict* — declared name and the hint resolving to two distinct existing actuals — is always an error regardless of policy.
 
-Renames apply to tables, views, indexes, named constraints (table-level `CONSTRAINT <name> ...`), and columns. Tables and columns rename via the `ALTER TABLE ... RENAME` primitives, which propagate references through dependent CHECK expressions, FK targets, and view bodies. View, index, and named-constraint renames currently fall back to drop+recreate when no rename primitive exists.
+Renames apply to tables, views, indexes, named constraints (CHECK / UNIQUE / FOREIGN KEY, either table-level `CONSTRAINT <name> ...` or a column-level constraint carrying a name), and columns. Tables and columns rename via the `ALTER TABLE ... RENAME` / `RENAME COLUMN` primitives, which propagate references through dependent CHECK expressions, FK targets, and view bodies. Named constraints rename via the `ALTER TABLE ... RENAME CONSTRAINT` primitive. The differ also detects constraint **drops** (a named constraint present in the catalog but absent from the declaration → `DROP CONSTRAINT`) and **adds** (a declared named constraint absent from the catalog → `ADD CONSTRAINT`; CHECK applies in place, UNIQUE / FK adds depend on module support — see §2.7). Only **user-named** constraints participate — engine-synthesized names (the `_check_*` / `_fk_*` / `_uc_*` auto-names for unnamed constraints) and UNIQUE constraints derived from a `CREATE UNIQUE INDEX` are excluded (the latter are managed through their index). View and index renames still fall back to drop+recreate when no rename primitive exists.
 
 **Notes:**
 - Keywords `schema`, `version`, and `seed` are contextual and don't conflict with column names or function calls like `schema()`.
@@ -1280,6 +1280,22 @@ Removes a column from the table and all its data. Restrictions:
 
 - Cannot drop a PRIMARY KEY column.
 - Cannot drop the last remaining column.
+
+**ADD / DROP / RENAME CONSTRAINT**
+
+```sql
+ALTER TABLE table_name ADD CONSTRAINT con_name <constraint-body>;  -- CHECK (...) / UNIQUE (...) / FOREIGN KEY (...)
+ALTER TABLE table_name DROP CONSTRAINT con_name;
+ALTER TABLE table_name RENAME CONSTRAINT old_con TO new_con;
+```
+
+Manages a **named** table-level constraint (CHECK / UNIQUE / FOREIGN KEY) over its lifetime. All three resolve a name across the constraint classes in the fixed order CHECK → UNIQUE → FOREIGN KEY; a name present in more than one class is rejected as **ambiguous**, and an unknown name raises `NOTFOUND`. Constraint names are local to their table — there are no cross-object references to rewrite on rename.
+
+- **ADD CONSTRAINT** adds a new named constraint. A CHECK is added in place and begins enforcing on the next INSERT/UPDATE. A UNIQUE / FOREIGN KEY add routes through the table's module and is **not yet implemented by the built-in memory / store modules** (raises `UNSUPPORTED`) — declare those at `CREATE TABLE` time for now.
+- **DROP CONSTRAINT** removes the named constraint. Dropping a UNIQUE also tears down the auto-built secondary index that backs it. A UNIQUE constraint synthesized from a `CREATE UNIQUE INDEX` cannot be dropped this way (the index is the user's object) — use `DROP INDEX`, which removes both.
+- **RENAME CONSTRAINT** changes a named constraint's name; the new name must not already address a constraint. For a UNIQUE backed by an implicit covering index named after the constraint, the index is renamed in lock-step. (A UNIQUE derived from a `CREATE UNIQUE INDEX` is likewise managed via its index, not renamed here.)
+
+These are schema-catalog operations that round-trip through the module's `alterTable`, so store-backed tables re-persist their DDL across reconnect.
 
 **ALTER PRIMARY KEY**
 

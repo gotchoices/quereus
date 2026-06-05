@@ -9,7 +9,7 @@ import { StatusCode, type SqlValue } from '../common/types.js';
 import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js';
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
-import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule } from './table.js';
+import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass } from './table.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import { backingTableNameFor } from './view.js';
 import { isHiddenImplicitIndex } from './catalog.js';
@@ -701,26 +701,15 @@ export class SchemaManager {
 			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
 		const lower = constraintName.toLowerCase();
-		const inChecks = (tableSchema.checkConstraints ?? []).some(c => c.name?.toLowerCase() === lower);
-		const inUnique = (tableSchema.uniqueConstraints ?? []).some(c => c.name?.toLowerCase() === lower);
-		const inFks = (tableSchema.foreignKeys ?? []).some(c => c.name?.toLowerCase() === lower);
-		const matchCount = [inChecks, inUnique, inFks].filter(Boolean).length;
-		if (matchCount === 0) {
-			throw new QuereusError(`Named constraint '${constraintName}' not found in table '${tableName}'`, StatusCode.NOTFOUND);
-		}
-		if (matchCount > 1) {
-			throw new QuereusError(
-				`Constraint name '${constraintName}' is ambiguous in table '${tableName}' (present in more than one of CHECK / UNIQUE / FOREIGN KEY)`,
-				StatusCode.ERROR,
-			);
-		}
+		// Resolve to exactly one class (check → unique → fk), or throw NOTFOUND/ambiguous.
+		const constraintClass = resolveNamedConstraintClass(tableSchema, constraintName);
 		const frozen = this.freezeTags(tags);
 		const updatedSchema: TableSchema = { ...tableSchema };
-		if (inChecks) {
+		if (constraintClass === 'check') {
 			updatedSchema.checkConstraints = Object.freeze(
 				tableSchema.checkConstraints.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
 			);
-		} else if (inUnique) {
+		} else if (constraintClass === 'unique') {
 			updatedSchema.uniqueConstraints = Object.freeze(
 				tableSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
 			);

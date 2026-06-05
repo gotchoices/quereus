@@ -27,6 +27,25 @@ export type AlterTableAction =
 	| { type: 'renameColumn'; oldName: string; newName: string }
 	| { type: 'addColumn'; column: AST.ColumnDef; backfill?: AddColumnBackfill }
 	| { type: 'dropColumn'; name: string }
+	| {
+		/**
+		 * DROP CONSTRAINT — remove a named table-level constraint (CHECK / UNIQUE /
+		 * FOREIGN KEY). Schema-catalog operation routed through `module.alterTable`
+		 * so persistent modules re-persist the DDL. Dropping a UNIQUE may also tear
+		 * down its implicit covering index (see runtime emitter).
+		 */
+		type: 'dropConstraint';
+		name: string;
+	}
+	| {
+		/**
+		 * RENAME CONSTRAINT — name-level rename of a named table-level constraint.
+		 * Schema-catalog operation routed through `module.alterTable`.
+		 */
+		type: 'renameConstraint';
+		oldName: string;
+		newName: string;
+	}
 	| { type: 'alterPrimaryKey'; columns: Array<{ name: string; direction?: 'asc' | 'desc' }> }
 	| {
 		type: 'alterColumn';
@@ -78,6 +97,10 @@ export class AlterTableNode extends VoidNode {
 				return `ALTER TABLE ADD COLUMN ${this.action.column.name}`;
 			case 'dropColumn':
 				return `ALTER TABLE DROP COLUMN ${this.action.name}`;
+			case 'dropConstraint':
+				return `ALTER TABLE DROP CONSTRAINT ${this.action.name}`;
+			case 'renameConstraint':
+				return `ALTER TABLE RENAME CONSTRAINT ${this.action.oldName} TO ${this.action.newName}`;
 			case 'alterPrimaryKey':
 				return `ALTER TABLE ALTER PRIMARY KEY (${this.action.columns.map(c => c.name).join(', ')})`;
 			case 'alterColumn':

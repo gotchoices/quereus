@@ -2921,6 +2921,13 @@ export class Parser {
 				this.consumeKeyword('TO', "Expected 'TO' after old column name.");
 				const newName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected new column name after TO.");
 				action = { type: 'renameColumn', oldName, newName };
+			} else if (this.matchKeyword('CONSTRAINT')) {
+				// RENAME CONSTRAINT <old> TO <new> — name-level rename of a named
+				// table-level constraint (CHECK / UNIQUE / FOREIGN KEY).
+				const oldName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected old constraint name after RENAME CONSTRAINT.");
+				this.consumeKeyword('TO', "Expected 'TO' after old constraint name.");
+				const newName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected new constraint name after TO.");
+				action = { type: 'renameConstraint', oldName, newName };
 			} else {
 				this.consumeKeyword('TO', "Expected 'TO' after RENAME.");
 				const newName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected new table name after RENAME TO.");
@@ -2940,9 +2947,16 @@ export class Parser {
 			}
 		} else if (this.peekKeyword('DROP')) {
 			this.consumeKeyword('DROP', "Expected DROP.");
-			this.matchKeyword('COLUMN');
-			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name after DROP COLUMN.");
-			action = { type: 'dropColumn', name };
+			if (this.matchKeyword('CONSTRAINT')) {
+				// DROP CONSTRAINT <name> — drop a named table-level constraint
+				// (CHECK / UNIQUE / FOREIGN KEY).
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected constraint name after DROP CONSTRAINT.");
+				action = { type: 'dropConstraint', name };
+			} else {
+				this.matchKeyword('COLUMN');
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name after DROP COLUMN.");
+				action = { type: 'dropColumn', name };
+			}
 		} else if (this.peekKeyword('SET')) {
 			// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
 			this.consumeKeyword('SET', "Expected SET.");

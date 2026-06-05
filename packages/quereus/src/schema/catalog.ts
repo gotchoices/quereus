@@ -66,6 +66,20 @@ export interface CatalogAssertion {
 }
 
 /**
+ * True when a constraint name is engine-synthesized rather than user-supplied.
+ * The schema extractors auto-name unnamed column/table constraints with a
+ * reserved `_`-leading prefix (`_check_<col>`, `_fk_<table>_<cols>`,
+ * `_uc_<cols>`); such names are deterministic from structure but are NOT stable
+ * identity a declarative schema can reference, so they are excluded from the
+ * catalog's user-addressable `namedConstraints` (which drives differ
+ * add/drop/rename lifecycle). A user who explicitly names a constraint `_x`
+ * forfeits declarative lifecycle management of it — an acceptable corner.
+ */
+function isAutoConstraintName(name: string): boolean {
+	return name.startsWith('_');
+}
+
+/**
  * Collects current schema state from the database into a catalog representation
  */
 export function collectSchemaCatalog(db: Database, schemaName: string = 'main'): SchemaCatalog {
@@ -176,17 +190,26 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		referencedTables.push(refName);
 	}
 
-	// Surface named constraints with their tags so the differ can detect renames
-	// of named CHECK / UNIQUE / FOREIGN KEY constraints.
+	// Surface *user-addressable* named constraints with their tags so the differ
+	// can detect renames / drops / adds of named CHECK / UNIQUE / FOREIGN KEY
+	// constraints. Excluded:
+	//   - engine-synthesized names (the `_check_*` / `_fk_*` / `_uc_*` auto-names
+	//     the extractors assign to unnamed column/table constraints) — these are
+	//     not stable identity a user can reference declaratively, and surfacing
+	//     them would churn add/drop on every diff against a declaration that only
+	//     carries explicit names (see `isAutoConstraintName`);
+	//   - UNIQUE constraints synthesized from a `CREATE UNIQUE INDEX`
+	//     (`derivedFromIndex`) — those are managed as indexes (the differ's
+	//     index buckets), not as table constraints.
 	const namedConstraints: CatalogTable['namedConstraints'] = [];
 	for (const c of tableSchema.checkConstraints ?? []) {
-		if (c.name) namedConstraints.push({ name: c.name, tags: c.tags });
+		if (c.name && !isAutoConstraintName(c.name)) namedConstraints.push({ name: c.name, tags: c.tags });
 	}
 	for (const c of tableSchema.uniqueConstraints ?? []) {
-		if (c.name) namedConstraints.push({ name: c.name, tags: c.tags });
+		if (c.name && !isAutoConstraintName(c.name) && !c.derivedFromIndex) namedConstraints.push({ name: c.name, tags: c.tags });
 	}
 	for (const c of tableSchema.foreignKeys ?? []) {
-		if (c.name) namedConstraints.push({ name: c.name, tags: c.tags });
+		if (c.name && !isAutoConstraintName(c.name)) namedConstraints.push({ name: c.name, tags: c.tags });
 	}
 
 	return {

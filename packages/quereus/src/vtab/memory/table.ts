@@ -342,6 +342,12 @@ export class MemoryTable extends VirtualTable {
 						`MemoryTable does not support ADD CONSTRAINT ${changeInfo.constraint.type}`,
 						StatusCode.UNSUPPORTED,
 					);
+				case 'dropConstraint':
+					await this.manager.dropConstraint(changeInfo.constraintName);
+					break;
+				case 'renameConstraint':
+					await this.manager.renameConstraint(changeInfo.oldName, changeInfo.newName);
+					break;
 				case 'alterColumn':
 					await this.manager.alterColumn({
 						columnName: changeInfo.columnName,

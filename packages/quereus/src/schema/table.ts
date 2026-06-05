@@ -115,6 +115,39 @@ export function requireVtabModule(table: TableSchema): AnyVirtualTableModule {
 }
 
 /**
+ * The class of a named table-level constraint, as stored in the three distinct
+ * constraint arrays on {@link TableSchema}.
+ */
+export type NamedConstraintClass = 'check' | 'unique' | 'foreignKey';
+
+/**
+ * Resolves a named table-level constraint to its class, searching in the fixed
+ * order check → unique → foreign key. Used by `ALTER TABLE … DROP/RENAME
+ * CONSTRAINT` and `… ALTER CONSTRAINT … SET TAGS` so a single name maps to
+ * exactly one constraint.
+ *
+ * @throws QuereusError(NOTFOUND) if no named constraint matches.
+ * @throws QuereusError(ERROR) if the name exists in more than one class (ambiguous).
+ */
+export function resolveNamedConstraintClass(tableSchema: TableSchema, constraintName: string): NamedConstraintClass {
+	const lower = constraintName.toLowerCase();
+	const inCheck = (tableSchema.checkConstraints ?? []).some(c => c.name?.toLowerCase() === lower);
+	const inUnique = (tableSchema.uniqueConstraints ?? []).some(c => c.name?.toLowerCase() === lower);
+	const inFk = (tableSchema.foreignKeys ?? []).some(c => c.name?.toLowerCase() === lower);
+	const matchCount = [inCheck, inUnique, inFk].filter(Boolean).length;
+	if (matchCount === 0) {
+		throw new QuereusError(`Named constraint '${constraintName}' not found in table '${tableSchema.name}'`, StatusCode.NOTFOUND);
+	}
+	if (matchCount > 1) {
+		throw new QuereusError(
+			`Constraint name '${constraintName}' is ambiguous in table '${tableSchema.name}' (present in more than one of CHECK / UNIQUE / FOREIGN KEY)`,
+			StatusCode.ERROR,
+		);
+	}
+	return inCheck ? 'check' : inUnique ? 'unique' : 'foreignKey';
+}
+
+/**
  * Builds a map from column names to their indices in the columns array
  *
  * @param columns Array of column schemas

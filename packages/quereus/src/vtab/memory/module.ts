@@ -861,6 +861,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 					`MemoryTable does not support ADD CONSTRAINT ${change.constraint.type}`,
 					StatusCode.UNSUPPORTED,
 				);
+			case 'dropConstraint':
+				await manager.dropConstraint(change.constraintName);
+				break;
+			case 'renameConstraint':
+				await manager.renameConstraint(change.oldName, change.newName);
+				break;
 			case 'alterColumn':
 				await manager.alterColumn({
 					columnName: change.columnName,

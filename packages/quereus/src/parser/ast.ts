@@ -591,6 +591,8 @@ export type AlterTableAction =
 	| { type: 'addColumn', column: ColumnDef }
 	| { type: 'dropColumn', name: string }
 	| { type: 'addConstraint', constraint: TableConstraint }
+	| { type: 'dropConstraint', name: string }
+	| { type: 'renameConstraint', oldName: string, newName: string }
 	| { type: 'alterPrimaryKey', columns: Array<{ name: string; direction?: 'asc' | 'desc' }> }
 	| {
 		/**

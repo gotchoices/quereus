@@ -1,7 +1,7 @@
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString } from '../emit/ast-stringify.js';
 import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
@@ -104,8 +104,22 @@ export interface TableAlterDiff {
 	columnsToAlter: ColumnAttributeChange[];
 	/** Column renames discovered via `quereus.id` / `quereus.previous_name` on declared columns. */
 	columnsToRename: ColumnRenameOp[];
-	/** Constraint renames discovered via tag hints (table-level named constraints only). */
+	/** Constraint renames discovered via tag hints (user-named CHECK / UNIQUE / FK). */
 	constraintsToRename?: ColumnRenameOp[];
+	/**
+	 * User-named constraints present in the actual catalog but absent from the
+	 * declaration (and not consumed by a rename) → `DROP CONSTRAINT <name>`.
+	 */
+	constraintsToDrop?: string[];
+	/**
+	 * Declared user-named constraints absent from the actual catalog (and not a
+	 * rename target) → `ADD <constraint-fragment>`. Each entry is the constraint
+	 * DDL fragment (`constraint <name> check (...)` etc.) the `ALTER TABLE … ADD`
+	 * primitive consumes. NOTE: the engine's `ADD CONSTRAINT` only implements CHECK
+	 * in-place today; an emitted UNIQUE / FOREIGN KEY add will fail at apply with
+	 * UNSUPPORTED (a pre-existing `ADD CONSTRAINT` limitation, not introduced here).
+	 */
+	constraintsToAdd?: string[];
 	primaryKeyChange?: {
 		oldPkColumns: string[];
 		newPkColumns: Array<{ name: string; direction?: 'asc' | 'desc' }>;
@@ -293,6 +307,8 @@ export function computeSchemaDiff(
 				|| alterDiff.columnsToAlter.length > 0
 				|| alterDiff.columnsToRename.length > 0
 				|| (alterDiff.constraintsToRename?.length ?? 0) > 0
+				|| (alterDiff.constraintsToDrop?.length ?? 0) > 0
+				|| (alterDiff.constraintsToAdd?.length ?? 0) > 0
 				|| alterDiff.primaryKeyChange
 				|| alterDiff.tableTagsChange !== undefined
 				|| (alterDiff.constraintTagsChanges?.length ?? 0) > 0
@@ -662,6 +678,70 @@ function applyIndexDefaults(
 	return result;
 }
 
+/**
+ * A declared user-named table constraint, normalized for lifecycle detection.
+ * `ddl` is the constraint fragment (`constraint <name> check (...)` etc.) consumed
+ * by `ALTER TABLE … ADD <fragment>`.
+ */
+interface DeclaredNamedConstraint {
+	name: string;
+	tags?: Readonly<Record<string, SqlValue>>;
+	ddl: string;
+}
+
+/**
+ * Converts a column-level constraint carrying a name into the equivalent
+ * table-level {@link AST.TableConstraint}, so it can be stringified into an
+ * `ADD CONSTRAINT` fragment and diffed by name alongside table-level constraints.
+ * Returns undefined for constraint kinds that are not lifecycle-managed named
+ * constraints (NOT NULL / NULL / DEFAULT / COLLATE / GENERATED / PRIMARY KEY).
+ */
+function columnConstraintToTableConstraint(columnName: string, cc: AST.ColumnConstraint): AST.TableConstraint | undefined {
+	switch (cc.type) {
+		case 'check':
+			if (!cc.expr) return undefined;
+			return { type: 'check', name: cc.name, expr: cc.expr, operations: cc.operations, onConflict: cc.onConflict, tags: cc.tags };
+		case 'unique':
+			return { type: 'unique', name: cc.name, columns: [{ name: columnName }], onConflict: cc.onConflict, tags: cc.tags };
+		case 'foreignKey':
+			if (!cc.foreignKey) return undefined;
+			return { type: 'foreignKey', name: cc.name, columns: [{ name: columnName }], foreignKey: cc.foreignKey, tags: cc.tags };
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Gathers declared *user-named* CHECK / UNIQUE / FOREIGN KEY constraints from a
+ * declared table — both table-level and column-level (carrying an explicit name)
+ * — keyed by lowercased name. PRIMARY KEY is excluded (handled by
+ * `primaryKeyChange`); engine-synthesized `_`-prefixed names are excluded to stay
+ * symmetric with the catalog's `namedConstraints`. On a name collision the first
+ * wins (a duplicate user constraint name is a separate validation concern).
+ */
+function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable): Map<string, DeclaredNamedConstraint> {
+	const out = new Map<string, DeclaredNamedConstraint>();
+	const add = (name: string | undefined, tags: Readonly<Record<string, SqlValue>> | undefined, tc: AST.TableConstraint): void => {
+		if (!name) return;
+		const lower = name.toLowerCase();
+		if (lower.startsWith('_')) return;
+		if (out.has(lower)) return;
+		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]) });
+	};
+	for (const c of declaredTable.tableStmt.constraints ?? []) {
+		if (c.type === 'primaryKey') continue;
+		add(c.name, c.tags, c);
+	}
+	for (const col of declaredTable.tableStmt.columns) {
+		for (const cc of col.constraints ?? []) {
+			if (!cc.name) continue;
+			const tc = columnConstraintToTableConstraint(col.name, cc);
+			if (tc) add(cc.name, cc.tags, tc);
+		}
+	}
+	return out;
+}
+
 function computeTableAlterDiff(
 	declaredTable: AST.DeclaredTable,
 	actualTable: CatalogTable,
@@ -732,23 +812,24 @@ function computeTableAlterDiff(
 		enforceRequireHint(`column (${actualTable.name})`, diff.columnsToAdd.length, diff.columnsToDrop.length);
 	}
 
-	// Detect named-constraint renames (table-level only). We do not surface
-	// drops/creates of constraints here — the engine has no ALTER for those
-	// today; the caller would have to manage that out-of-band. For renames,
-	// when a primitive doesn't exist this becomes drop+recreate at DDL emit time.
-	const declaredNamedConstraints = new Map<string, AST.TableConstraint>();
-	for (const c of declaredTable.tableStmt.constraints ?? []) {
-		if (c.name) declaredNamedConstraints.set(c.name.toLowerCase(), c);
-	}
+	// Constraint lifecycle (CHECK / UNIQUE / FOREIGN KEY) by name: rename / drop /
+	// add. We gather declared *user-named* constraints from BOTH the table-level
+	// `constraints` list AND column-level constraints carrying an explicit name
+	// (e.g. `qty int constraint chk_qty check (qty > 0)`) — the actual catalog's
+	// `namedConstraints` already merges both. PRIMARY KEY constraints are excluded
+	// (PK changes flow through `primaryKeyChange`); auto-prefixed (`_`) names are
+	// excluded to stay symmetric with the catalog (see catalog.ts) so an unnamed
+	// declared constraint never churns add/drop against its synthesized actual name.
+	const declaredNamedConstraints = collectDeclaredNamedConstraints(declaredTable);
 	const actualNamedConstraints = new Map<string, CatalogTable['namedConstraints'][number]>();
 	for (const c of actualTable.namedConstraints ?? []) {
 		actualNamedConstraints.set(c.name.toLowerCase(), c);
 	}
-	const constraintRenames = resolveRenames<AST.TableConstraint, CatalogTable['namedConstraints'][number]>({
+	const constraintRenames = resolveRenames<DeclaredNamedConstraint, CatalogTable['namedConstraints'][number]>({
 		kind: 'constraint',
 		declared: declaredNamedConstraints,
 		actual: actualNamedConstraints,
-		getDeclaredName: d => d.name!,
+		getDeclaredName: d => d.name,
 		getActualName: a => a.name,
 		getDeclaredTags: d => d.tags,
 		getActualTags: a => a.tags,
@@ -756,6 +837,29 @@ function computeTableAlterDiff(
 	});
 	if (constraintRenames.renames.length > 0) {
 		diff.constraintsToRename = constraintRenames.renames.map(r => ({ oldName: r.oldName, newName: r.newName }));
+	}
+
+	// Adds: declared constraint not matched (by name or rename) to any actual →
+	// emit its DDL fragment as an `ALTER TABLE … ADD`.
+	const constraintsToAdd: string[] = [];
+	for (const [lower, d] of declaredNamedConstraints) {
+		if (constraintRenames.pairs.has(lower)) continue; // exists (name- or rename-matched)
+		constraintsToAdd.push(d.ddl);
+	}
+	if (constraintsToAdd.length > 0) diff.constraintsToAdd = constraintsToAdd;
+
+	// Drops: actual constraint neither declared nor consumed by a rename → DROP.
+	const constraintsToDrop: string[] = [];
+	for (const [lower, a] of actualNamedConstraints) {
+		if (constraintRenames.consumedActuals.has(lower)) continue;
+		if (!declaredNamedConstraints.has(lower)) constraintsToDrop.push(a.name);
+	}
+	if (constraintsToDrop.length > 0) diff.constraintsToDrop = constraintsToDrop;
+
+	// Apply require-hint to constraints within this table (an add + a drop with no
+	// rename hint is the ambiguous case the policy guards).
+	if (policy === 'require-hint') {
+		enforceRequireHint(`constraint (${actualTable.name})`, constraintsToAdd.length, constraintsToDrop.length);
 	}
 
 	// Detect named-constraint tag drift (name-matched constraints only — a
@@ -767,7 +871,7 @@ function computeTableAlterDiff(
 		if (!actualConstraint) continue; // a rename/create — not a same-name tag change
 		if (tagsDrifted(declaredConstraint.tags, actualConstraint.tags)) {
 			constraintTagsChanges.push({
-				constraintName: declaredConstraint.name!,
+				constraintName: declaredConstraint.name,
 				tags: desiredTagSet(declaredConstraint.tags),
 			});
 		}
@@ -1064,7 +1168,10 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	//   → ADD COLUMN
 	//   → ALTER COLUMN (type, then default, then nullability — so SET NOT NULL
 	//     can rely on an already-populated DEFAULT for backfill)
+	//   → RENAME CONSTRAINT, then DROP CONSTRAINT (free / remove a name before any
+	//     re-add; a UNIQUE drop precedes the PK change so it can't strand a PK dep)
 	//   → ALTER PRIMARY KEY
+	//   → ADD CONSTRAINT (after the PK change and the column adds it may reference)
 	//   → DROP COLUMN (last, so NOT NULL relaxation never blocks subsequent drops)
 	for (const alter of diff.tablesToAlter) {
 		const quotedTable = `${schemaPrefix}${quoteIdentifier(alter.tableName)}`;
@@ -1092,6 +1199,15 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 					: `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP NOT NULL`);
 			}
 		}
+		// Constraint lifecycle: RENAME (free a name) then DROP (remove a stale /
+		// conflicting constraint), both BEFORE re-adds and before the PK change so a
+		// dropped UNIQUE can't strand a PK dependency.
+		for (const r of alter.constraintsToRename ?? []) {
+			statements.push(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
+		}
+		for (const name of alter.constraintsToDrop ?? []) {
+			statements.push(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`);
+		}
 		if (alter.primaryKeyChange) {
 			const pkCols = alter.primaryKeyChange.newPkColumns
 				.map(c => {
@@ -1101,6 +1217,12 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 				})
 				.join(', ');
 			statements.push(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`);
+		}
+		// ADD CONSTRAINT after the PK change (a new UNIQUE / FK may align with the new
+		// key) and after the column adds it may reference. CHECK adds apply in-place;
+		// UNIQUE / FK adds depend on module ADD CONSTRAINT support (see constraintsToAdd).
+		for (const frag of alter.constraintsToAdd ?? []) {
+			statements.push(`ALTER TABLE ${quotedTable} ADD ${frag}`);
 		}
 		for (const colName of alter.columnsToDrop) {
 			statements.push(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`);
