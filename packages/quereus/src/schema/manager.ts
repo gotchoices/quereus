@@ -724,8 +724,11 @@ export class SchemaManager {
 	/**
 	 * Sets metadata tags on an existing view, replacing any existing tags (empty
 	 * record clears). Catalog-only: swaps the in-memory {@link ViewSchema} and
-	 * re-registers it. Mirrors the no-event create path (`emitCreateView`) — a plain
-	 * view carries no schema-change event, so none is fired here either.
+	 * re-registers it. Fires `view_modified` so a cached write-through plan that
+	 * recorded a `view` dependency (every view-/MV-mediated write does — see
+	 * `buildViewMutation`) is invalidated when the view's behavioral
+	 * `quereus.update.*` tags change. This event is distinct from the (non-existent)
+	 * plain-view create event, so it triggers no maintenance re-registration.
 	 *
 	 * @throws QuereusError(NOTFOUND) if the view does not exist.
 	 */
@@ -738,6 +741,13 @@ export class SchemaManager {
 		}
 		const updated: ViewSchema = { ...view, tags: this.freezeTags(tags) };
 		schema.addView(updated);
+		this.changeNotifier.notifyChange({
+			type: 'view_modified',
+			schemaName: targetSchemaName,
+			objectName: viewName,
+			oldObject: view,
+			newObject: updated,
+		});
 	}
 
 	/**
@@ -745,9 +755,12 @@ export class SchemaManager {
 	 * tags (empty record clears). Catalog-only: swaps the in-memory
 	 * {@link MaterializedViewSchema} and re-registers it. The backing table and the
 	 * row-time maintenance plan are untouched (tags do not affect maintenance), so
-	 * this never re-materializes. No change event is fired — `materialized_view_added`
-	 * (what create emits) would mislead listeners into re-registering maintenance,
-	 * and there is no `_modified` event.
+	 * this never re-materializes. Fires `materialized_view_modified` so a cached
+	 * write-through plan that recorded a `view` dependency is invalidated when the
+	 * MV's behavioral `quereus.update.*` tags change. This event is deliberately
+	 * distinct from `materialized_view_added` (what create emits) — the MV
+	 * maintenance manager re-registers on `_added` but ignores `_modified`, so a tag
+	 * change does not re-register maintenance or rebuild the backing.
 	 *
 	 * @throws QuereusError(NOTFOUND) if the materialized view does not exist.
 	 */
@@ -760,6 +773,13 @@ export class SchemaManager {
 		}
 		const updated: MaterializedViewSchema = { ...mv, tags: this.freezeTags(tags) };
 		schema.addMaterializedView(updated);
+		this.changeNotifier.notifyChange({
+			type: 'materialized_view_modified',
+			schemaName: targetSchemaName,
+			objectName: name,
+			oldObject: mv,
+			newObject: updated,
+		});
 	}
 
 	/**

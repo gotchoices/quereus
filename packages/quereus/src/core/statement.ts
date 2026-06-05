@@ -157,7 +157,9 @@ export class Statement {
 				this.schemaChangeUnsubscriber = this.db.schemaManager.getChangeNotifier().addListener(event => {
 					// Map event type to dependency type
 					let dependencyType: string;
-					if (event.type.startsWith('table_')) {
+					if (event.type === 'view_modified' || event.type === 'materialized_view_modified') {
+						dependencyType = 'view';
+					} else if (event.type.startsWith('table_')) {
 						dependencyType = 'table';
 					} else if (event.type.startsWith('function_')) {
 						dependencyType = 'function';

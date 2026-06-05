@@ -1,7 +1,7 @@
 import type { TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
-import type { MaterializedViewSchema } from './view.js';
+import type { MaterializedViewSchema, ViewSchema } from './view.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:change-events');
@@ -48,10 +48,31 @@ export type AssertionAddedEvent = SchemaObjectAdded<'assertion_added', Integrity
 export type AssertionRemovedEvent = SchemaObjectRemoved<'assertion_removed', IntegrityAssertionSchema>;
 export type AssertionModifiedEvent = SchemaObjectModified<'assertion_modified', IntegrityAssertionSchema>;
 
+// ── View events ────────────────────────────────────────────────────
+
+/**
+ * Emitted after an in-place change to an existing (non-materialized) view —
+ * currently only `ALTER VIEW … SET TAGS`. Distinct from `view_added` (there is
+ * none; plain-view create fires no event) so a cached write-through plan that
+ * recorded a `view` dependency invalidates when the view's behavioral
+ * `quereus.update.*` tags change.
+ */
+export type ViewModifiedEvent = SchemaObjectModified<'view_modified', ViewSchema>;
+
 // ── Materialized view events ───────────────────────────────────────
 
 export type MaterializedViewAddedEvent = SchemaObjectAdded<'materialized_view_added', MaterializedViewSchema>;
 export type MaterializedViewRemovedEvent = SchemaObjectRemoved<'materialized_view_removed', MaterializedViewSchema>;
+
+/**
+ * Emitted after an in-place change to an existing materialized view — currently
+ * only `ALTER MATERIALIZED VIEW … SET TAGS`. Deliberately **distinct** from
+ * `materialized_view_added` (which the MV maintenance manager treats as a
+ * re-registration trigger): a tag change must invalidate dependent cached
+ * write-through plans WITHOUT re-registering maintenance or rebuilding the
+ * backing. No maintenance listener subscribes to this event.
+ */
+export type MaterializedViewModifiedEvent = SchemaObjectModified<'materialized_view_modified', MaterializedViewSchema>;
 
 /** Emitted after a successful `REFRESH MATERIALIZED VIEW`. Carries the current schema. */
 export interface MaterializedViewRefreshedEvent {
@@ -86,8 +107,10 @@ export type SchemaChangeEvent =
 	| AssertionAddedEvent
 	| AssertionRemovedEvent
 	| AssertionModifiedEvent
+	| ViewModifiedEvent
 	| MaterializedViewAddedEvent
 	| MaterializedViewRemovedEvent
+	| MaterializedViewModifiedEvent
 	| MaterializedViewRefreshedEvent
 	| ModuleAddedEvent
 	| ModuleRemovedEvent

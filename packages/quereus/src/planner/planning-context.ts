@@ -26,7 +26,7 @@ export interface DebugOptions {
  * Used for plan invalidation when schema changes.
  */
 export interface SchemaDependency {
-	readonly type: 'table' | 'function' | 'vtab_module' | 'collation';
+	readonly type: 'table' | 'view' | 'function' | 'vtab_module' | 'collation';
 	readonly schemaName?: string; // undefined for functions, collations, and vtab modules
 	readonly objectName: string;
 	readonly objectVersion?: number; // For future versioning support
