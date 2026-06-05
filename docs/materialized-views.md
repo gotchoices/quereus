@@ -143,7 +143,36 @@ select customer_id, amt from sales where amt > 0 and customer_id = 7;
 
 The matcher (`planner/analysis/query-rewrite-matcher.ts`) asks **output-relation subsumption**: does the MV's stored rows contain a superset of the rows the fragment produces, keyed so a bounded residual recovers exactly the fragment's output? It reuses the coverage prover's entailment vocabulary (`recognizeConjunctiveClauses` / `guardClausesEntail`), so NULL semantics are identical. Soundness mirrors the prover exactly — **a false NotMatch only forgoes a speedup; a false Match would return wrong rows** — so every check forgoes the rewrite on doubt. The rule (`planner/rules/cache/rule-materialized-view-rewrite.ts`) only ever *replaces* the correct recompute-over-base plan with a provably row-equivalent backing scan, so it is non-regressing (a no-op when nothing matches or the cost gate declines, byte-identical rows when it fires). See [docs/optimizer.md](optimizer.md#materialized-view-query-rewrite-read-side) for the matcher shape rules, the gates (stale / deterministic / source-schema), the cost gate, and pass placement.
 
-This phase handles the **projection + filter subsumption** shape; aggregate rollup and join subsumption are pure additions to the same matcher (`mv-query-rewrite-aggregate-rollup`, `mv-query-rewrite-join-subsumption`). The rewrite is **suppressed while planning an MV's own body** to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating (`SchemaManager.withSuppressedMaterializedViewRewrite`).
+The matcher handles two shapes: **projection + filter subsumption** (above) and **aggregate rollup** (below); join subsumption is a pure addition to the same matcher (`mv-query-rewrite-join-subsumption`). The rewrite is **suppressed while planning an MV's own body** to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating (`SchemaManager.withSuppressedMaterializedViewRewrite`).
+
+#### Aggregate rollup (indexed-view matching)
+
+The headline case: a `group by g₁,…,gₖ agg(…)` query answered from a **grouped** MV. The matcher (`matchAggregateFragmentToMv`) fires when the fragment root is a logical `Aggregate(Filter?(scan(T)))` and the MV body is `select g…, agg(…) … group by g…` over the same single source `T`. The query GROUP BY and MV GROUP BY are mapped to **bare source-column** sets (a computed group key on either side ⇒ forgo); the query key must be a **subset** of the MV key (⊄ ⇒ NotMatch). Two sub-cases:
+
+```sql
+create materialized view daily as
+  select d, sum(amt) as total, count(*) as cnt from sales group by d;
+
+select d, sum(amt) from sales group by d;   -- exact-key  → scan _mv_daily, residual project (no re-aggregation)
+select sum(amt) from sales;                  -- rollup     → scan _mv_daily, re-aggregate sum(total) into one group
+```
+
+- **Exact-key** — query key == MV key. The backing rows *are* the answer: scan the backing directly with an optional residual `Filter` on the group-key columns (a range `where g ≥ …`) and a residual `Project`. No re-aggregation, so any query aggregate that is *exactly* a stored MV aggregate (same function, argument, and `distinct`) is admitted as a passthrough — including `count(distinct)` / `group_concat`. `avg` under exact-key requires a stored `avg`.
+- **Superset-key (rollup)** — query key ⊊ MV key (incl. the empty global key, the degenerate "re-aggregate every backing row into one group" case). The backing partials are **re-aggregated** down to the query's coarser key. Sound **only for the decomposable-aggregate allowlist** (default-deny — any aggregate without a recipe ⇒ forgo):
+
+  | query aggregate | recombine from the MV's stored partials |
+  |---|---|
+  | `sum(x)` | `sum(mv.sum_x)` |
+  | `count(*)` / `count(x)` | `coalesce(sum(mv.cnt), 0)` — the coalesce restores `count`-over-zero-rows = 0 (a bare `sum` would surface NULL for the empty global group) |
+  | `min(x)` / `max(x)` | `min` / `max` of the partials |
+  | `avg(x)` | `sum(mv.sum_x) / sum(mv.cnt)` — requires the MV to store both `sum(x)` **and** a count. The count must exclude the same NULLs `avg` does: a stored `count(x)` always qualifies; a stored `count(*)` only when `x` is declared `not null`. (Quereus `/` is real division, so this matches the native `avg`; over zero rows ⇒ NULL/NULL = NULL.) |
+  | `count(distinct …)`, `group_concat`, any `distinct`, anything else | **forgo** — the classic rollup correctness trap (a partial `count(distinct)` cannot be re-summed). |
+
+**Soundness witnesses.** The backing's primary key must equal the MV's group key (`backingPkIsGroupKey`) — the schema-level form of the coverage prover's `proveEffectiveKeyUnique`, certifying the backing is one row per MV group, so the exact-key scan returns one row per query group and the rollup re-aggregates a *set*, not a bag. A residual `Filter` may reference only MV group-key columns (it partitions whole groups, commuting with the rollup); a `where` on a non-group column ⇒ NotMatch (the MV already aggregated those rows away).
+
+**Two forgo guards** (both forgo on doubt, mirroring the soundness contract):
+- *Group-key reorder* — when a query `where` constant-pins (`g = 1`, `g is null`) or equates (`g₁ = g₂`) a group key **and** there are ≥2 group keys, the base's `rule-groupby-fd-simplification` drops the functionally-determined group column and re-emits it as a picker `min` at a *shifted* output position, changing the result's column order. The rewrite preserves the pristine order, so it forgoes to stay a faithful drop-in (range / `in` residuals create no determining FD and stay eligible).
+- *Rollup-residual* — a rollup that needs a residual filter is currently forgone, working around a **pre-existing** base-engine bug where `WHERE pk_col = const` is mis-dropped under `GROUP BY` on a composite-PK relation (reproduces with no MV; see `tickets/.pre-existing-error.md`). Exact-key (no re-aggregation) answers residual queries unaffected.
 
 ## Write boundary (write-through)
 

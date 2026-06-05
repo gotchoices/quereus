@@ -121,3 +121,101 @@ describe('Materialized-view query rewrite — equivalence (rewritten == unrewrit
 		}
 	});
 });
+
+/* ── Aggregate-rollup equivalence ────────────────────────────────────────────
+ * Extends the harness with the aggregate arm: a grouped MV over (k, j) answering
+ * exact-key, rollup-to-k, and global-scalar aggregate queries. The aggregated
+ * column `x` is nullable, and the row count starts at 0, so every run exercises the
+ * load-bearing NULL/empty cases the rollup recombine must preserve exactly:
+ *   - sum over zero rows / all-NULL groups ⇒ NULL (not 0)
+ *   - count over zero rows ⇒ 0 (not NULL — the coalesce in the count recombine)
+ *   - avg over zero rows / all-NULL ⇒ NULL; otherwise sum/count real division
+ * The group key (k, j) is NOT NULL so the backing PK is well-formed; the interesting
+ * NULL semantics live in `x`. */
+
+interface AggRow { id: number; k: number; j: number; x: number | null }
+
+const aggValArb = fc.option(fc.integer({ min: -3, max: 6 }), { nil: null });
+const aggRowArb = fc.record({
+	id: fc.integer({ min: 1, max: 8 }),
+	k: fc.integer({ min: -1, max: 2 }),
+	j: fc.integer({ min: 0, max: 2 }),
+	x: aggValArb,
+});
+
+/** Aggregate queries answerable from `amv_kj`: exact-key, rollup-to-k, and global. */
+const AGG_QUERIES: readonly string[] = [
+	// Exact-key (query key == MV key == {k, j}).
+	'select k, j, sum(x) from t group by k, j',
+	'select k, j, count(*), count(x) from t group by k, j',
+	'select k, j, min(x), max(x), avg(x) from t group by k, j',
+	// Exact-key with a range residual on a group-key column (safe: no re-aggregation).
+	'select k, j, sum(x) from t where k >= 0 group by k, j',
+	// Rollup to the coarser key {k}.
+	'select k, sum(x) from t group by k',
+	'select k, count(*), count(x) from t group by k',
+	'select k, avg(x), min(x), max(x) from t group by k',
+	// Global-scalar rollup (the empty/zero-row cases live here).
+	'select sum(x) from t',
+	'select count(*) from t',
+	'select count(x) from t',
+	'select avg(x) from t',
+	'select min(x), max(x) from t',
+];
+
+/** Aggregate queries that must actually rewrite (non-vacuous harness). */
+const AGG_MUST_REWRITE: readonly string[] = [
+	'select k, j, sum(x) from t group by k, j',
+	'select k, sum(x) from t group by k',
+	'select sum(x) from t',
+	'select count(*) from t',
+	'select avg(x) from t',
+];
+
+async function loadAggRows(db: Database, rows: readonly AggRow[]): Promise<void> {
+	await db.exec('delete from t');
+	const byId = new Map<number, AggRow>();
+	for (const r of rows) byId.set(r.id, r);
+	for (const r of byId.values()) {
+		await db.exec(`insert into t (id, k, j, x) values (${r.id}, ${r.k}, ${r.j}, ${lit(r.x)})`);
+	}
+}
+
+describe('Materialized-view query rewrite — aggregate-rollup equivalence (rewritten == unrewritten)', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec(`
+			create table t (id integer primary key, k integer not null, j integer not null, x integer null);
+			create materialized view amv_kj as
+				select k, j, sum(x) as sx, count(*) as c, count(x) as cx, min(x) as mn, max(x) as mx, avg(x) as av
+				from t group by k, j;
+		`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('every exact-key / rollup / global query returns identical rows with the rewrite on vs off', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(aggRowArb, { minLength: 0, maxLength: 8 }),
+			async (rows) => {
+				await loadAggRows(db, rows);
+				for (const q of AGG_QUERIES) {
+					db.optimizer.updateTuning(DEFAULT_TUNING);
+					const on = await readMultiset(db, q);
+					db.optimizer.updateTuning(REWRITE_OFF);
+					const off = await readMultiset(db, q);
+					db.optimizer.updateTuning(DEFAULT_TUNING);
+					expect(on, `rewrite changed rows for: ${q}`).to.deep.equal(off);
+				}
+			},
+		), { numRuns: 40 });
+	});
+
+	it('the harness is non-vacuous: the rewritable aggregate queries actually rewrite', () => {
+		for (const q of AGG_MUST_REWRITE) {
+			const plan = serializePlanTree(db.getPlan(q));
+			expect(plan, `expected a backing rewrite for: ${q}`).to.match(/_mv_/);
+		}
+	});
+});

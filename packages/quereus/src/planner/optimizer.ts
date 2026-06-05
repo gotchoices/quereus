@@ -127,6 +127,23 @@ export class Optimizer {
 			// replacement re-emits the fragment's identical output attribute ids.
 			sideEffectMode: 'safe',
 		});
+		// Aggregate arm of the same rewrite (`mv-query-rewrite-aggregate-rollup`):
+		// recognizes a logical `Aggregate(Filter?(scan))` answered from a grouped MV
+		// (exact-key direct scan or superset-key rollup re-aggregation). Registered as
+		// a SECOND handle because pass rules fire only on their `nodeType` and are
+		// deduped by id — so the aggregate arm needs the `Aggregate` node type and a
+		// distinct id. It honors the canonical `materialized-view-rewrite` disable
+		// switch internally (see the rule), so existing rule-disable controls turn off
+		// both arms. Registered immediately after the Project arm so it likewise fires
+		// on the pristine fragment, before grow-retrieve / predicate-pushdown.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'materialized-view-rewrite-aggregate',
+			nodeType: PlanNodeType.Aggregate,
+			phase: 'rewrite',
+			fn: ruleMaterializedViewRewrite,
+			priority: 6,
+			sideEffectMode: 'safe',
+		});
 
 		// Structural pass rules (top-down) - for operations that need parent context
 		// Register grow-retrieve for ALL relational node types

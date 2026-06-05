@@ -94,3 +94,54 @@ describe('Materialized-view query rewrite — golden plans', () => {
 		expect(DEFAULT_TUNING.disabledRules?.has?.('materialized-view-rewrite') ?? false).to.equal(false);
 	});
 });
+
+describe('Materialized-view query rewrite — aggregate rollup golden plans', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec(`
+			create table sales (id integer primary key, d integer not null, amt integer null);
+			insert into sales values (1,1,10),(2,1,20),(3,2,5),(4,2,7),(5,3,1);
+			create materialized view daily as select d, sum(amt) as total, count(*) as cnt from sales group by d;
+		`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('exact-key aggregate (query key == MV key) → direct backing scan, no re-aggregation', () => {
+		const plan = serializePlanTree(db.getPlan('select d, sum(amt) from sales group by d'));
+		expect(plan, 'rewrote to backing').to.contain('_mv_daily');
+		expect(plan, 'base no longer recomputed').to.not.contain('"main.sales"');
+		// Exact-key answers from a direct scan + Project — no StreamAggregate/HashAggregate.
+		expect(plan).to.not.match(/StreamAggregate|HashAggregate/);
+	});
+
+	it('global-scalar rollup → backing scan + a re-aggregate node', () => {
+		const plan = serializePlanTree(db.getPlan('select sum(amt) from sales'));
+		expect(plan, 'rewrote to backing').to.contain('_mv_daily');
+		// Rollup re-aggregates the backing rows into one group.
+		expect(plan).to.match(/StreamAggregate|HashAggregate/);
+	});
+
+	it('a near-miss (query key ⊄ MV key) keeps the base recompute', () => {
+		// `group by amt` is not a subset of the MV's {d} group key, so no rewrite.
+		const plan = serializePlanTree(db.getPlan('select amt, sum(d) from sales group by amt'));
+		expect(plan).to.not.contain('_mv_daily');
+		expect(plan).to.contain('sales');
+	});
+
+	it('rollup with a residual filter is forgone (pre-existing composite-PK filter-drop bug)', async () => {
+		const db2 = new Database();
+		try {
+			await db2.exec(`
+				create table regsales (id integer primary key, d integer not null, r integer not null, amt integer null);
+				create materialized view byregion as select d, r, sum(amt) as total from regsales group by d, r;
+			`);
+			// rollup to {d} with a residual on r (a non-query-group backing PK column) → forgo.
+			const plan = serializePlanTree(db2.getPlan('select d, sum(amt) from regsales where r = 1 group by d'));
+			expect(plan).to.not.contain('_mv_byregion');
+			expect(plan).to.contain('regsales');
+		} finally {
+			await db2.close();
+		}
+	});
+});

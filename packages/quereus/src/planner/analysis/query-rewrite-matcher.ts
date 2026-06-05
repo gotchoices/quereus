@@ -49,7 +49,7 @@
  * what the plan computes, so it cannot produce a false Match.
  */
 
-import type { RelationalPlanNode, ScalarPlanNode, GuardClause } from '../nodes/plan-node.js';
+import type { RelationalPlanNode, ScalarPlanNode, GuardClause, Attribute } from '../nodes/plan-node.js';
 import { ProjectNode } from '../nodes/project-node.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
@@ -57,6 +57,8 @@ import { AliasNode } from '../nodes/alias-node.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { SeqScanNode, IndexScanNode } from '../nodes/table-access-nodes.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
+import { AggregateNode } from '../nodes/aggregate-node.js';
+import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import type { MaterializedViewSchema } from '../../schema/view.js';
 import type { TableSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
@@ -69,6 +71,11 @@ export type RewriteFailureReason =
 	| 'source-mismatch'        // MV reads different base table(s) than the fragment
 	| 'predicate-not-entailed' // fragment WHERE not entailed by MV WHERE (would read rows the MV dropped)
 	| 'missing-column'         // fragment needs an output/residual column the MV does not project
+	| 'aggregate-shape'        // fragment isn't a recognizable bare-key aggregate, or MV isn't a grouped MV
+	| 'group-key-mismatch'     // fragment GROUP BY key is not a subset of the MV's group key
+	| 'group-key-pinned'       // a query WHERE pins/equates a group key (the base reorders output cols; forgo)
+	| 'rollup-residual'        // a rollup would need a residual filter over the backing (pre-existing engine bug; forgo)
+	| 'aggregate-not-decomposable' // a fragment aggregate has no sound recombine recipe from the MV
 	| 'cost-declined';         // matched, but the MV scan is not cheaper (set by the rule, not the matcher)
 
 export interface RewriteMatch {
@@ -100,6 +107,57 @@ export interface RewriteMatch {
 	 * references onto the backing scan.
 	 */
 	readonly backingColOfBaseCol: ReadonlyMap<number, number>;
+	/**
+	 * Present iff this match answers an **aggregate** fragment from a grouped MV
+	 * (the {@link matchAggregateFragmentToMv} arm). Absent ⇒ a plain
+	 * projection-filter match (the foundation arm).
+	 *
+	 *  - `exact === true` (query group key == MV group key) — the backing rows *are*
+	 *    the answer: {@link outputColumnMap} + {@link residualConjuncts} fully
+	 *    describe a direct scan, so the rule reuses the foundation's `buildReplacement`
+	 *    (scan → optional residual Filter on group-key columns → residual Project). No
+	 *    re-aggregation. The other `rollup` fields are unused.
+	 *  - `exact === false` (query group key ⊊ MV group key, incl. the empty global key)
+	 *    — the rule re-aggregates the backing rows down to {@link groupKeyBackingCols}
+	 *    using the per-aggregate {@link aggregates} recipes. {@link outputColumnMap}
+	 *    is unused in this case.
+	 */
+	readonly rollup?: AggregateRollup;
+}
+
+/**
+ * How to reconstruct one fragment aggregate from the MV's stored backing columns
+ * during a rollup re-aggregation. The recombine is sound only for the
+ * decomposable-aggregate allowlist (see {@link matchAggregateFragmentToMv}).
+ */
+export interface AggregateRecipe {
+	/** The fragment aggregate's output attribute (preserved through the rewrite). */
+	readonly outAttr: Attribute;
+	/**
+	 * The recombine operator over the backing column(s):
+	 *  - `'sum'` — re-aggregate `sum(backingCol)` (reconstructs `sum(x)`).
+	 *  - `'count'` — re-aggregate `coalesce(sum(backingCol), 0)` (reconstructs
+	 *    `count(*)` / `count(x)`; the coalesce restores the count-over-zero-rows = 0
+	 *    semantics a bare `sum` would surface as NULL for the empty global group).
+	 *  - `'min'` / `'max'` — re-aggregate `min`/`max` of the partials.
+	 *  - `'avg'` — `sum(sumBackingCol) / sum(countBackingCol)` (Quereus `/` is real
+	 *    division, matching the native `avg`; NULL/0 over zero rows ⇒ NULL).
+	 */
+	readonly kind: 'sum' | 'count' | 'min' | 'max' | 'avg';
+	/** Backing column(s): `[col]` for sum/count/min/max; `[sumCol, countCol]` for avg. */
+	readonly backingCols: readonly number[];
+}
+
+/** The aggregate-rollup descriptor on a {@link RewriteMatch}. */
+export interface AggregateRollup {
+	/** True ⇒ exact-key direct scan (no re-aggregation); false ⇒ rollup re-aggregate. */
+	readonly exact: boolean;
+	/** Query group key in backing-column indices (in fragment group order; `[]` for the global scalar). */
+	readonly groupKeyBackingCols: readonly number[];
+	/** Fragment group-key output attributes (in order) — preserved by the re-aggregate's group columns. */
+	readonly groupOutAttrs: readonly Attribute[];
+	/** One recipe per fragment aggregate, in fragment aggregate order. */
+	readonly aggregates: readonly AggregateRecipe[];
 }
 
 export type RewriteResult =
@@ -145,8 +203,36 @@ export function analyzeQueryFragment(root: RelationalPlanNode): FragmentResult {
 	if (!(root instanceof ProjectNode)) return { ok: false, reason: 'shape' };
 
 	// Descend the source chain, collecting WHERE conjuncts, down to the base table.
+	const walk = walkScanFilterChain(root.source);
+	if (!walk) return { ok: false, reason: 'shape' };
+	const { tableRef, conjuncts } = walk;
+
+	// Each output column must be a bare column reference into the base table; a
+	// computed output is unrecoverable from the backing in v1 (missing-column).
+	const outputs = root.projections.map((proj, i) => ({
+		attrId: root.getAttributes()[i].id,
+		baseCol: proj.node instanceof ColumnReferenceNode ? proj.node.columnIndex : undefined,
+	}));
+
+	return {
+		ok: true,
+		shape: { project: root, tableRef, baseTable: tableRef.tableSchema, outputs, conjuncts },
+	};
+}
+
+/**
+ * Walk a single-source scan-project-filter source chain `Filter? → {Retrieve|Alias|
+ * full SeqScan/IndexScan}* → TableReference`, collecting top-level AND-split WHERE
+ * conjuncts (plan-node level). Returns the leaf `TableReferenceNode` and conjuncts,
+ * or `undefined` for any other node (a row-reducing seek / range-bounded scan,
+ * Sort/Limit/Distinct/Aggregate/Join/SetOp). Shared by the projection-filter and
+ * aggregate arms so the recognized source shape is identical.
+ */
+function walkScanFilterChain(
+	start: RelationalPlanNode | undefined,
+): { tableRef: TableReferenceNode; conjuncts: ScalarPlanNode[] } | undefined {
 	const conjuncts: ScalarPlanNode[] = [];
-	let node: RelationalPlanNode | undefined = root.source;
+	let node: RelationalPlanNode | undefined = start;
 	let tableRef: TableReferenceNode | undefined;
 	while (node) {
 		if (node instanceof TableReferenceNode) {
@@ -160,32 +246,21 @@ export function analyzeQueryFragment(root: RelationalPlanNode): FragmentResult {
 		}
 		if (node instanceof RetrieveNode || node instanceof AliasNode) {
 			node = singleRelation(node);
-			if (!node) return { ok: false, reason: 'shape' };
+			if (!node) return undefined;
 			continue;
 		}
 		// A full (non-range-bounded) physical scan is a row-preserving pass-through;
 		// a range-bounded scan has absorbed a predicate we can no longer see (sound
 		// only because the rule fires before access selection — this is defensive).
 		if (node instanceof SeqScanNode || node instanceof IndexScanNode) {
-			if (node.rangeBoundedOn) return { ok: false, reason: 'shape' };
+			if (node.rangeBoundedOn) return undefined;
 			node = node.source;
 			continue;
 		}
-		return { ok: false, reason: 'shape' };
+		return undefined;
 	}
-	if (!tableRef) return { ok: false, reason: 'shape' };
-
-	// Each output column must be a bare column reference into the base table; a
-	// computed output is unrecoverable from the backing in v1 (missing-column).
-	const outputs = root.projections.map((proj, i) => ({
-		attrId: root.getAttributes()[i].id,
-		baseCol: proj.node instanceof ColumnReferenceNode ? proj.node.columnIndex : undefined,
-	}));
-
-	return {
-		ok: true,
-		shape: { project: root, tableRef, baseTable: tableRef.tableSchema, outputs, conjuncts },
-	};
+	if (!tableRef) return undefined;
+	return { tableRef, conjuncts };
 }
 
 /**
@@ -313,6 +388,472 @@ export function matchMaterializedViewRewrite(
 	return matchFragmentToMv(frag.shape, mv, backing, isDeterministic);
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * Aggregate-rollup arm — the canonical "indexed-view-matching" case: an
+ * aggregate query answered from a grouped MV (`mv-query-rewrite-aggregate-rollup`).
+ *
+ * Two sub-cases, both gated by the same soundness contract as the foundation:
+ *  - **Exact-key** — query GROUP BY key == MV group key (as a set of base columns)
+ *    and every query aggregate is *exactly* a stored MV aggregate. The backing rows
+ *    are the answer: a direct scan + optional residual Filter on group-key columns
+ *    + residual Project. Reuses the foundation's `buildReplacement`.
+ *  - **Superset-key (rollup)** — query GROUP BY ⊊ MV group key (incl. the empty
+ *    global key). Re-aggregate the backing down to the query key. Sound only for the
+ *    decomposable-aggregate allowlist: `sum`→`sum`, `count`→`sum`(+coalesce),
+ *    `min`/`max`→`min`/`max`, `avg`→`sum(sum)/sum(count)`. `count(distinct)` /
+ *    `group_concat` / any DISTINCT / any other aggregate ⇒ forgo (default-deny).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** A fragment aggregate recognized as `f([col])` / `count(*)` over the base table. */
+export interface FragmentAggregate {
+	/** Lowercased aggregate function name. */
+	readonly funcName: string;
+	/** Base-table column index of a bare-column argument; `undefined` ⇒ no argument (`count(*)`). */
+	readonly argBaseCol: number | undefined;
+	readonly isDistinct: boolean;
+	/** The fragment output attribute this aggregate produces. */
+	readonly outAttr: Attribute;
+}
+
+/**
+ * The recognized shape of an aggregate query fragment: its single base table, the
+ * bare-column GROUP BY key, the aggregates, and the pre-aggregation WHERE conjuncts.
+ */
+export interface AggregateFragmentShape {
+	readonly aggregateNode: AggregateNode;
+	readonly tableRef: TableReferenceNode;
+	readonly baseTable: TableSchema;
+	/** Query GROUP BY key as base-table column indices, in group order (`[]` for the global scalar). */
+	readonly groupBaseCols: readonly number[];
+	/** Query GROUP BY output attributes, in order. */
+	readonly groupOutAttrs: readonly Attribute[];
+	readonly aggregates: readonly FragmentAggregate[];
+	/** Top-level AND-split conjuncts of the pre-aggregation WHERE (empty ⇒ no filter). */
+	readonly conjuncts: readonly ScalarPlanNode[];
+}
+
+export type AggregateFragmentResult =
+	| { ok: true; shape: AggregateFragmentShape }
+	| { ok: false; reason: RewriteFailureReason };
+
+/**
+ * Recognize a query fragment rooted at a logical {@link AggregateNode} (the shape
+ * the optimizer presents in the Structural pass, before physical aggregate
+ * selection) as a single-source aggregate over a scan-filter chain. Requires
+ * **bare-column** GROUP BY expressions and aggregate arguments — a computed group
+ * key or aggregate argument (`group by d+1`, `sum(amt*2)`, `group_concat(x, ',')`)
+ * is unrecoverable from a stored MV column in v1 ⇒ `aggregate-shape`. Mirrors the
+ * row-time aggregate eligibility gate, which likewise requires bare group columns.
+ */
+export function analyzeAggregateFragment(root: RelationalPlanNode): AggregateFragmentResult {
+	if (!(root instanceof AggregateNode)) return { ok: false, reason: 'aggregate-shape' };
+
+	const walk = walkScanFilterChain(root.source);
+	if (!walk) return { ok: false, reason: 'aggregate-shape' };
+	const { tableRef, conjuncts } = walk;
+
+	const attrs = root.getAttributes();
+	const groupCount = root.groupBy.length;
+
+	// GROUP BY key: every expression must be a bare column reference into the base table.
+	const groupBaseCols: number[] = [];
+	for (const gb of root.groupBy) {
+		if (!(gb instanceof ColumnReferenceNode)) return { ok: false, reason: 'aggregate-shape' };
+		groupBaseCols.push(gb.columnIndex);
+	}
+
+	// Aggregates: each must be an aggregate function over `count(*)` (no arg) or a
+	// single bare base column.
+	const aggregates: FragmentAggregate[] = [];
+	for (let i = 0; i < root.aggregates.length; i++) {
+		const expr = root.aggregates[i].expression;
+		if (!(expr instanceof AggregateFunctionCallNode)) return { ok: false, reason: 'aggregate-shape' };
+		let argBaseCol: number | undefined;
+		if (expr.args.length === 0) {
+			argBaseCol = undefined; // count(*)
+		} else if (expr.args.length === 1 && expr.args[0] instanceof ColumnReferenceNode) {
+			argBaseCol = (expr.args[0] as ColumnReferenceNode).columnIndex;
+		} else {
+			return { ok: false, reason: 'aggregate-shape' }; // computed / multi-arg argument
+		}
+		aggregates.push({
+			funcName: expr.functionName.toLowerCase(),
+			argBaseCol,
+			isDistinct: expr.isDistinct,
+			outAttr: attrs[groupCount + i],
+		});
+	}
+
+	return {
+		ok: true,
+		shape: {
+			aggregateNode: root,
+			tableRef,
+			baseTable: tableRef.tableSchema,
+			groupBaseCols,
+			groupOutAttrs: attrs.slice(0, groupCount),
+			aggregates,
+			conjuncts,
+		},
+	};
+}
+
+/** A function column stored in an MV body (`sum(amt) as total`, `count(*) as cnt`). */
+interface StoredAggregate {
+	readonly funcName: string;
+	readonly argBaseCol: number | undefined;
+	readonly isDistinct: boolean;
+	readonly backingCol: number;
+}
+
+/** The parsed select list of a grouped MV body. */
+interface MvStoredColumns {
+	/** Base column index → backing column index, for bare-column (group-key) select items. */
+	readonly groupBackingOfBaseCol: ReadonlyMap<number, number>;
+	/** Stored aggregate columns, in backing-column order. */
+	readonly storedAggs: readonly StoredAggregate[];
+}
+
+/**
+ * Decide whether the grouped MV `mv` (backed by `backing`) answers the aggregate
+ * fragment `shape`. See the arm doc above for the two sub-cases and the soundness
+ * contract; every check forgoes on doubt (a false NotMatch only forgoes a speedup).
+ */
+export function matchAggregateFragmentToMv(
+	shape: AggregateFragmentShape,
+	mv: MaterializedViewSchema,
+	backing: TableSchema | undefined,
+	isDeterministic: DeterminismProbe,
+): RewriteResult {
+	const baseTable = shape.baseTable;
+
+	// ---- Candidate gates (a false-positive here only forgoes a speedup). ----
+	if (mv.stale === true) return fail('no-candidate');
+	if (!backing) return fail('no-candidate');
+	if (mvBodyHasNonDeterminism(mv.selectAst, isDeterministic)) return fail('no-candidate');
+
+	const qualified = `${baseTable.schemaName}.${baseTable.name}`.toLowerCase();
+	if (mv.sourceTables.length !== 1 || mv.sourceTables[0] !== qualified) {
+		return fail('source-mismatch');
+	}
+
+	// ---- MV body shape: a single-source grouped aggregate, no HAVING/DISTINCT/cap. ----
+	if (mv.selectAst.type !== 'select') return fail('aggregate-shape');
+	const sel = mv.selectAst;
+	if (!sel.groupBy || sel.groupBy.length === 0) return fail('aggregate-shape'); // not a grouped MV
+	if (sel.having || sel.distinct || sel.limit !== undefined || sel.offset !== undefined
+		|| sel.union || sel.compound) {
+		return fail('aggregate-shape');
+	}
+	if (!sel.from || sel.from.length !== 1 || sel.from[0].type !== 'table') return fail('aggregate-shape');
+
+	// ---- MV group key (base columns) — every GROUP BY expr must be a bare column. ----
+	const mvGroupBaseCols: number[] = [];
+	for (const gb of sel.groupBy) {
+		const col = baseColumnOfExpr(gb, baseTable);
+		if (col === undefined) return fail('aggregate-shape'); // computed MV group key
+		mvGroupBaseCols.push(col);
+	}
+	const mvGroupSet = new Set(mvGroupBaseCols);
+
+	// ---- MV stored columns: group-key passthroughs + stored aggregates. ----
+	const stored = analyzeMvStoredColumns(sel.columns, baseTable);
+	if (!stored) return fail('aggregate-shape');
+
+	// Every MV group-key column must be stored as a backing column (so the backing is
+	// addressable by the group key — needed for re-grouping and residual filtering).
+	for (const gc of mvGroupBaseCols) {
+		if (!stored.groupBackingOfBaseCol.has(gc)) return fail('missing-column');
+	}
+
+	// ---- One-row-per-MV-group witness: the backing's primary key must be exactly the
+	//      MV group key (as backing columns). This is the schema-level form of
+	//      `coverage-prover.ts`'s `proveEffectiveKeyUnique` — it certifies the backing
+	//      is a *set* keyed by the group columns, so the exact-key direct scan returns
+	//      one row per query group and the rollup re-aggregates a set (not a bag). The
+	//      backing of a grouped MV is maintained keyed on its group columns, so this
+	//      holds by construction; the check forgoes if a future shape ever diverges. ----
+	if (!backingPkIsGroupKey(backing, mvGroupBaseCols, stored.groupBackingOfBaseCol)) {
+		return fail('aggregate-shape');
+	}
+
+	// ---- Group-key alignment: query key must be a subset of the MV key. ----
+	const queryGroupSet = new Set(shape.groupBaseCols);
+	for (const gc of queryGroupSet) {
+		if (!mvGroupSet.has(gc)) return fail('group-key-mismatch');
+	}
+	const exact = queryGroupSet.size === mvGroupSet.size;
+
+	// Query group-key columns must be stored (to re-group / output them).
+	const groupKeyBackingCols: number[] = [];
+	for (const gc of shape.groupBaseCols) {
+		const bc = stored.groupBackingOfBaseCol.get(gc);
+		if (bc === undefined) return fail('missing-column');
+		groupKeyBackingCols.push(bc);
+	}
+
+	// `backingColOfBaseCol` exposes only the stored group-key columns. The residual
+	// coverage check (below) then forgoes any residual conjunct on a non-group column
+	// — exactly the columns the MV has already aggregated away.
+	const backingColOfBaseCol = new Map<number, number>(stored.groupBackingOfBaseCol);
+
+	// ---- Aggregate decomposition: a recipe per fragment aggregate. ----
+	const recipes: AggregateRecipe[] = [];
+	const outputColumnMap: { attrId: number; backingCol: number }[] = [];
+	for (const qa of shape.aggregates) {
+		const recipe = exact
+			? recipeForExact(qa, stored.storedAggs)
+			: recipeForRollup(qa, stored.storedAggs, baseTable);
+		if (!recipe) return fail('aggregate-not-decomposable');
+		recipes.push(recipe);
+		if (exact) outputColumnMap.push({ attrId: qa.outAttr.id, backingCol: recipe.backingCols[0] });
+	}
+
+	// ---- Predicate alignment (identical containment logic to the foundation), with
+	//      the aggregate-specific gate that every residual conjunct references only
+	//      MV group-key columns (so it partitions whole MV groups and commutes with
+	//      the rollup). A residual on a non-group column resolves to a base column
+	//      absent from `backingColOfBaseCol` ⇒ `missing-column`. ----
+	const mvClauses = sel.where ? recognizeConjunctiveClauses(sel.where, baseTable) : [];
+	if (mvClauses === undefined) return fail('predicate-not-entailed');
+
+	const queryClauses: GuardClause[] = [];
+	const residualConjuncts: ScalarPlanNode[] = [];
+	const residualClauses: GuardClause[] = [];
+	for (const conjunct of shape.conjuncts) {
+		const expr = conjunctExpression(conjunct);
+		const clauses = expr ? recognizeConjunctiveClauses(expr, baseTable) : undefined;
+		if (!clauses) return fail('predicate-not-entailed');
+		queryClauses.push(...clauses);
+		if (!guardClausesEntail(mvClauses, clauses)) {
+			residualConjuncts.push(conjunct);
+			residualClauses.push(...clauses);
+		}
+	}
+	if (!guardClausesEntail(queryClauses, mvClauses)) return fail('predicate-not-entailed');
+
+	for (const clause of residualClauses) {
+		for (const col of clauseColumns(clause)) {
+			if (!backingColOfBaseCol.has(col)) return fail('missing-column');
+		}
+	}
+
+	// Group-key reorder guard. When the query WHERE constant-pins (`g = 1`, `g is
+	// null`) or equates (`g1 = g2`) a group-key column AND there are ≥2 group keys,
+	// the base's `rule-groupby-fd-simplification` drops the functionally-determined
+	// group column and re-emits it as a picker `min` at a *shifted* output position,
+	// changing the result's column ORDER. The rewrite preserves the pristine column
+	// order, so the two would diverge — forgo to remain a faithful drop-in. (A single
+	// group key is never dropped — the rule keeps ≥1 — and range/IN residuals create
+	// no determining FD, so both stay eligible. Checks the full query WHERE, not just
+	// the residual: a pin entailed by the MV still drives the base's simplification.)
+	if (queryGroupSet.size >= 2 && queryClauses.some(c => clausePinsOrEquatesGroupCol(c, queryGroupSet))) {
+		return fail('group-key-pinned');
+	}
+
+	// PRE-EXISTING ENGINE BUG WORKAROUND. A rollup re-aggregates over the backing,
+	// whose primary key is the (often composite) MV group key. A query of the form
+	// `<group-by-aggregate> WHERE pk_col = const` over a composite-PK relation
+	// currently mis-drops the WHERE when the filtered column is part of the PK but
+	// not in the GROUP BY (reproduces on a plain `create table … primary key (a, b)`
+	// — see tickets/.pre-existing-error.md). The rollup re-aggregate hits exactly
+	// that shape, so until the base bug is fixed, forgo a rollup that needs a
+	// residual filter. Exact-key answers residual queries via a direct scan (no
+	// GROUP BY), so it is unaffected.
+	if (!exact && residualConjuncts.length > 0) return fail('rollup-residual');
+
+	// ---- Exact-key: assemble the output column map for the group-key passthroughs so
+	//      the foundation's `buildReplacement` can re-emit the whole row directly. ----
+	if (exact) {
+		const groupOut: { attrId: number; backingCol: number }[] = [];
+		shape.groupBaseCols.forEach((gc, i) => {
+			groupOut.push({ attrId: shape.groupOutAttrs[i].id, backingCol: groupKeyBackingCols[i] });
+		});
+		// outputColumnMap currently holds the aggregate outputs; prepend the group outputs
+		// so the order matches the fragment's [group…, aggregate…] output order.
+		outputColumnMap.unshift(...groupOut);
+	}
+
+	const rollup: AggregateRollup = {
+		exact,
+		groupKeyBackingCols,
+		groupOutAttrs: shape.groupOutAttrs,
+		aggregates: recipes,
+	};
+
+	return {
+		match: {
+			mv,
+			backing,
+			residualClauses,
+			residualConjuncts,
+			outputColumnMap,
+			backingColOfBaseCol,
+			rollup,
+		},
+	};
+}
+
+/**
+ * Convenience entry point (used by the unit tests): analyze `root` as an aggregate
+ * fragment and, on success, match it against `mv`.
+ */
+export function matchAggregateMaterializedViewRewrite(
+	root: RelationalPlanNode,
+	mv: MaterializedViewSchema,
+	backing: TableSchema | undefined,
+	isDeterministic: DeterminismProbe,
+): RewriteResult {
+	const frag = analyzeAggregateFragment(root);
+	if (!frag.ok) return fail(frag.reason);
+	return matchAggregateFragmentToMv(frag.shape, mv, backing, isDeterministic);
+}
+
+/** Decomposable rollup aggregates that re-aggregate as plain `sum`/`min`/`max`. */
+const ROLLUP_SUM_LIKE: ReadonlyMap<string, AggregateRecipe['kind']> = new Map([
+	['sum', 'sum'], ['min', 'min'], ['max', 'max'],
+]);
+
+/**
+ * Exact-key recipe: the query aggregate must be *exactly* a stored MV aggregate
+ * (same function, same argument column, same DISTINCT flag). The stored value is
+ * the answer, so this admits any aggregate — including `count(distinct)` /
+ * `group_concat` — as a passthrough. Returns a `sum`-kind passthrough recipe whose
+ * `backingCols[0]` is the stored column (the kind is unused for exact-key, which the
+ * rule answers via `outputColumnMap`).
+ */
+function recipeForExact(qa: FragmentAggregate, stored: readonly StoredAggregate[]): AggregateRecipe | undefined {
+	const match = stored.find(sa =>
+		sa.funcName === qa.funcName && sa.argBaseCol === qa.argBaseCol && sa.isDistinct === qa.isDistinct);
+	if (!match) return undefined;
+	return { outAttr: qa.outAttr, kind: 'sum', backingCols: [match.backingCol] };
+}
+
+/**
+ * Rollup recipe: reconstruct `qa` by re-aggregating the MV's stored partials. Only
+ * the decomposable allowlist is admitted; a DISTINCT aggregate never composes.
+ */
+function recipeForRollup(
+	qa: FragmentAggregate,
+	stored: readonly StoredAggregate[],
+	baseTable: TableSchema,
+): AggregateRecipe | undefined {
+	if (qa.isDistinct) return undefined; // count(distinct …) and friends never compose under rollup.
+
+	const sumLike = ROLLUP_SUM_LIKE.get(qa.funcName);
+	if (sumLike) {
+		// sum(x) ← sum(stored sum(x)); min/max(x) ← min/max(stored min/max(x)).
+		const col = findStored(stored, qa.funcName, qa.argBaseCol);
+		return col === undefined ? undefined : { outAttr: qa.outAttr, kind: sumLike, backingCols: [col] };
+	}
+
+	if (qa.funcName === 'count') {
+		// count(*) ← sum(stored count(*)); count(x) ← sum(stored count(x)). The 'count'
+		// kind adds the coalesce-to-0 the rule emits (count over zero rows is 0, not NULL).
+		const col = findStored(stored, 'count', qa.argBaseCol);
+		return col === undefined ? undefined : { outAttr: qa.outAttr, kind: 'count', backingCols: [col] };
+	}
+
+	if (qa.funcName === 'avg') {
+		// avg(x) ← sum(stored sum(x)) / sum(stored count). Requires both partials; the
+		// count must exclude the same NULLs `avg` does — a stored `count(x)` always
+		// qualifies, and a stored `count(*)` only when `x` is declared NOT NULL.
+		const sumCol = findStored(stored, 'sum', qa.argBaseCol);
+		if (sumCol === undefined) return undefined;
+		let countCol = findStored(stored, 'count', qa.argBaseCol);
+		if (countCol === undefined && qa.argBaseCol !== undefined && baseTable.columns[qa.argBaseCol]?.notNull === true) {
+			countCol = findStored(stored, 'count', undefined); // count(*) is sound when x is NOT NULL.
+		}
+		if (countCol === undefined) return undefined;
+		return { outAttr: qa.outAttr, kind: 'avg', backingCols: [sumCol, countCol] };
+	}
+
+	return undefined; // total / group_concat / unknown ⇒ not decomposable.
+}
+
+/** The backing column of a stored, non-distinct aggregate `f(argBaseCol)`, or undefined. */
+function findStored(stored: readonly StoredAggregate[], funcName: string, argBaseCol: number | undefined): number | undefined {
+	const match = stored.find(sa => sa.funcName === funcName && sa.argBaseCol === argBaseCol && !sa.isDistinct);
+	return match?.backingCol;
+}
+
+/**
+ * Parse a grouped MV's select list into its group-key passthrough columns and its
+ * stored aggregate columns, by backing-column position. A bare column is a group
+ * key; an aggregate function call (`count(*)`, or `f(col)`) is a stored aggregate;
+ * a `*` or any other computed item is ignored (it answers no group key or aggregate).
+ * Returns undefined only for a `table.*` naming a non-base table (defensive).
+ */
+function analyzeMvStoredColumns(
+	columns: readonly AST.ResultColumn[],
+	baseTable: TableSchema,
+): MvStoredColumns | undefined {
+	const groupBackingOfBaseCol = new Map<number, number>();
+	const storedAggs: StoredAggregate[] = [];
+	for (let backingCol = 0; backingCol < columns.length; backingCol++) {
+		const col = columns[backingCol];
+		if (col.type === 'all') {
+			if (col.table && col.table.toLowerCase() !== baseTable.name.toLowerCase()) return undefined;
+			// A `*` in a grouped body would be an error at create time; ignore defensively.
+			continue;
+		}
+		const expr = col.expr;
+		if (expr.type === 'function') {
+			const fn = expr as AST.FunctionExpr;
+			const argBaseCol = mvAggregateArgBaseCol(fn, baseTable);
+			if (argBaseCol === 'unrecognized') continue; // computed/multi-arg ⇒ unusable
+			storedAggs.push({
+				funcName: fn.name.toLowerCase(),
+				argBaseCol,
+				isDistinct: fn.distinct === true,
+				backingCol,
+			});
+			continue;
+		}
+		const baseCol = baseColumnOfExpr(expr, baseTable);
+		if (baseCol !== undefined && !groupBackingOfBaseCol.has(baseCol)) {
+			groupBackingOfBaseCol.set(baseCol, backingCol);
+		}
+		// A computed non-aggregate select item is left unmapped (unusable).
+	}
+	return { groupBackingOfBaseCol, storedAggs };
+}
+
+/**
+ * The base-table column index of an MV aggregate's argument: `undefined` for
+ * `count(*)` (no argument), a base column index for a single bare-column argument,
+ * or `'unrecognized'` for a computed / multi-argument call (which no fragment
+ * aggregate — itself required to be bare — can match).
+ */
+function mvAggregateArgBaseCol(fn: AST.FunctionExpr, baseTable: TableSchema): number | undefined | 'unrecognized' {
+	if (fn.args.length === 0) return undefined;
+	if (fn.args.length === 1) {
+		const col = baseColumnOfExpr(fn.args[0], baseTable);
+		return col === undefined ? 'unrecognized' : col;
+	}
+	return 'unrecognized';
+}
+
+/**
+ * True iff the backing table's primary key is exactly the MV's group key (mapped to
+ * backing columns). The witness that the backing is one row per MV group.
+ */
+function backingPkIsGroupKey(
+	backing: TableSchema,
+	mvGroupBaseCols: readonly number[],
+	groupBackingOfBaseCol: ReadonlyMap<number, number>,
+): boolean {
+	const pk = backing.primaryKeyDefinition;
+	if (pk.length !== mvGroupBaseCols.length) return false;
+	const pkSet = new Set(pk.map(c => c.index));
+	if (pkSet.size !== pk.length) return false;
+	for (const gc of mvGroupBaseCols) {
+		const bc = groupBackingOfBaseCol.get(gc);
+		if (bc === undefined || !pkSet.has(bc)) return false;
+	}
+	return true;
+}
+
 /** The sole relational child of a single-source pass-through, or undefined. */
 function singleRelation(node: RelationalPlanNode): RelationalPlanNode | undefined {
 	const rels = node.getRelations();
@@ -372,6 +913,21 @@ function baseColumnOfExpr(expr: AST.Expression, baseTable: TableSchema): number 
 		return baseTable.columnIndexMap.get(id.name.toLowerCase());
 	}
 	return undefined;
+}
+
+/**
+ * True when `clause` constant-pins (`g = literal`, `g is null`) or equates
+ * (`g1 = g2`) a column in `groupSet` — the predicate shapes that give a group-key
+ * column a determining FD and so drive `rule-groupby-fd-simplification` to drop and
+ * reposition it. Range / IN (`or-of`) clauses create no such FD and return false.
+ */
+function clausePinsOrEquatesGroupCol(clause: GuardClause, groupSet: ReadonlySet<number>): boolean {
+	switch (clause.kind) {
+		case 'eq-literal': return groupSet.has(clause.column);
+		case 'is-null': return groupSet.has(clause.column);
+		case 'eq-column': return groupSet.has(clause.left) || groupSet.has(clause.right);
+		default: return false; // range / or-of: no constant-determining FD
+	}
 }
 
 /** The base-table column indices a recognized guard clause references. */
