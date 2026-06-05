@@ -4355,6 +4355,60 @@ describe('Property-Based Tests', () => {
 				await db.exec('insert into ex2_child values (1, 5, 50)');   // null-extended dangling
 				await expectMutationReject('update rj_ex2 set hasP = true where cc = 1', 'null-extended-create-conflict');
 			});
+
+			// Existence-write COMPOSITIONS and edges the primary rj_ex test only smoke-covers:
+			// same-side / cross-side column folds, multi-row insert directives, and the
+			// silent-no-op boundary when the join key is null (no joinable row can be minted).
+			it('outer (left) join: existence-column write compositions and null-key boundary', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists rjc_ex');
+				await db.exec('drop table if exists exc_child');
+				await db.exec('drop table if exists exc_parent');
+				await db.exec('create table exc_parent (pp integer primary key default (coalesce((select max(pp) from exc_parent), 0) + mutation_ordinal()), pv integer null) using memory');
+				await db.exec('create table exc_child (cc integer primary key, pr integer null references exc_parent(pp), cv integer null) using memory');
+				await db.exec('create view rjc_ex as select c.cc as cc, c.cv as cv, p.pv as pv, hasP from exc_child c left join exc_parent p on p.pp = c.pr exists right as hasP');
+				await db.exec('insert into exc_parent values (10, 100)');
+				await db.exec('insert into exc_child values (1, 10, 1000)');   // matched
+				await db.exec('insert into exc_child values (2, 9, 2000)');    // null-extended (dangling key 9)
+				await db.exec('insert into exc_child values (3, null, 3000)'); // null-extended (NULL key)
+
+				// Composition `set pv = …, hasP = true` over a MATCHED row: the matched UPDATE
+				// fires (pv changes) and the null-extended materialization INSERT is a no-op (the
+				// matched row's captured parent PK is non-null, so the create branch excludes it).
+				await db.exec('update rjc_ex set pv = 555, hasP = true where cc = 1');
+				expect((await readRows('select cc, cv, pv, hasP from rjc_ex where cc = 1'))[0], 'matched: pv updated, no second parent')
+					.to.deep.equal({ cc: 1, cv: 1000, pv: 555, hasP: true });
+				expect((await readRows('select pp, pv from exc_parent order by pp')), 'exactly one parent (no spurious insert)')
+					.to.deep.equal([{ pp: 10, pv: 555 }]);
+
+				// Cross-side composition `set <preservedCol> = …, hasP = false`: different sides,
+				// no contradiction — the preserved column updates AND the matched parent is deleted,
+				// so the row reads back null-extended with the new preserved value.
+				await db.exec('update rjc_ex set cv = 999, hasP = false where cc = 1');
+				expect((await readRows('select cc, cv, pv, hasP from rjc_ex where cc = 1'))[0], 'preserved write + parent delete compose')
+					.to.deep.equal({ cc: 1, cv: 999, pv: null, hasP: false });
+				expect((await readRows('select pp from exc_parent where pp = 10')).length, 'matched parent deleted by the cross-side compose').to.equal(0);
+
+				// Silent-no-op boundary: `hasP = true` over a NULL-join-key null-extended row
+				// cannot mint a joinable parent (a null key never matches), so it is a no-op — the
+				// flag reads back false. Pinned as the documented boundary (a write asking for an
+				// unmaterializable existence is dropped, NOT rejected — inherited from the
+				// null-extended-INSERT `<join key> is not null` guard).
+				await db.exec('update rjc_ex set hasP = true where cc = 3');
+				expect((await readRows('select cc, pv, hasP from rjc_ex where cc = 3'))[0], 'null-key hasP=true is a silent no-op')
+					.to.deep.equal({ cc: 3, pv: null, hasP: false });
+
+				// Insert directive — multi-row UNIFORM false (preserved-only across every row).
+				await db.exec('insert into rjc_ex (cc, cv, hasP) values (20, 200, false), (21, 210, false)');
+				expect((await readRows('select cc, cv, pv, hasP from rjc_ex where cc in (20, 21) order by cc')), 'uniform-false multi-row insert is preserved-only')
+					.to.deep.equal([{ cc: 20, cv: 200, pv: null, hasP: false }, { cc: 21, cv: 210, pv: null, hasP: false }]);
+
+				// Insert directive — per-row MIX (true, false) is not a single plan-time directive: reject.
+				await expectMutationReject("insert into rjc_ex (cc, cv, pv, hasP) values (30, 300, 3000, true), (31, 310, null, false)", 'unsupported-outer-join-update');
+
+				// `hasP = true` with NO preserved anchor column supplied — non-preserved-only create.
+				await expectMutationReject('insert into rjc_ex (hasP) values (true)', 'null-extended-create-conflict');
+			});
 		});
 
 		// ----- Family C: n-way decomposition fan-out (advertisement-driven) -----

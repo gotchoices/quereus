@@ -243,14 +243,29 @@ Joins — Updates), specialized to insert-or-delete:
   null-extended insert). A `false` directive contradicting a supplied non-preserved
   column rejects `conflicting-assignment`.
 
-Only a **boolean literal** (`true`/`false`) is admitted — a per-row branch on a
-non-literal value is deferred (`unsupported-outer-join-update`). RETURNING through an
-existence write rejects `returning-through-view` (the captured-identity re-query cannot
-recover a materialized/deleted non-preserved row — the non-preserved-column UPDATE's
-boundary). The static surfaces report the flag `is_updatable = 'YES'` with `base_table` /
-`base_column` = `null` (writable through an *effect*, mapping to no base column). The
-routing stays **component-generic** (no hard-coded join side) so the set-operation
-membership-column work (`set-operator-membership-columns`) extends the same site.
+Only a **boolean literal** (`true`/`false` — or the numeric `1`/`0` spelling) is admitted
+— a per-row branch on a non-literal value is deferred (`unsupported-outer-join-update`),
+and on an INSERT the directive must be **uniform** across every VALUES row (a per-row mix
+defers). RETURNING through an existence write rejects `returning-through-view` (the
+captured-identity re-query cannot recover a materialized/deleted non-preserved row — the
+non-preserved-column UPDATE's boundary). The static surfaces report the flag
+`is_updatable = 'YES'` with `base_table` / `base_column` = `null` (writable through an
+*effect*, mapping to no base column). The routing stays **component-generic** (no
+hard-coded join side) so the set-operation membership-column work
+(`set-operator-membership-columns`) extends the same site.
+
+> [!NOTE]
+> **Two boundaries inherited from the materialization substrate.** Because the flag drives
+> the *component* (not a private per-row row), the write is an effect on shared base state:
+> - **Null join key ⇒ `hasB = true` is a silent no-op.** A null-extended row whose
+>   preserved-side join key is itself `null` has no key to seed a joinable row from, so the
+>   materialization INSERT (`<join key> is not null` guarded) drops it — the flag reads back
+>   `false` after a write of `true`. The write is *dropped, not rejected* (matching the
+>   non-preserved-column UPDATE's create branch).
+> - **A shared non-preserved row is shared.** `hasB = false` over one preserved row deletes
+>   the matched non-preserved row outright; every *other* preserved row that joined the same
+>   row also reads back null-extended. The flag controls component existence, not a
+>   per-preserved-row link.
 
 ### Union All
 
