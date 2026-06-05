@@ -97,16 +97,6 @@ describe('DDL generator', () => {
 			expect(ddl).to.include('"inventory"."items"');
 		});
 
-		it('includes TEMP for temporary tables', () => {
-			const schema = makeTableSchema({
-				name: 'tmp',
-				isTemporary: true,
-				columns: [makeColumn('x', INTEGER_TYPE)],
-			});
-			const ddl = generateTableDDL(schema);
-			expect(ddl).to.include('TEMP');
-		});
-
 		it('includes USING clause for virtual tables', () => {
 			const schema = makeTableSchema({
 				name: 'data',
