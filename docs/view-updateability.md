@@ -42,7 +42,7 @@ Every relational `PlanNode` carries an `updateLineage` field mapping each output
 - **`base`** — the column traces to a base-table column through a chain of invertible transformations. The chain is recorded so the engine can compose a setter expression on the base column.
 - **`computed`** — the column is the output of a non-invertible expression over inputs; it is read-only. Reads pass through; writes against this column are rejected with a diagnostic naming the originating expression.
 - **`null-extended`** — the column is potentially null-extended by an outer join; updates require materialization of the missing side (see [Outer Joins](#outer-joins)).
-- **`existence`** — an outer-join `exists … as` match flag (a clean `{true,false}` boolean derived at the combinator). Read-only in the read half; it has no base column and is writable through an *effect*, not a base mapping (see [Existence columns](#existence-columns-on-outer-joins-read-half)).
+- **`existence`** — an outer-join `exists … as` match flag (a clean `{true,false}` boolean derived at the combinator). It has no base column and is **writable through an *effect*, not a base mapping**: a flag-flip inserts/deletes the named relational component (see [Existence columns](#existence-columns-on-outer-joins)).
 
 Lineage is computed in a single pass that mirrors the optimizer's physical-property pass, reusing the functional-dependency framework (see [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking)) to thread per-column provenance through every operator. Equivalence classes propagate writeability: if `a.x` and `b.y` belong to the same EC, a write to either reaches both bases. Constant FDs (`∅ → c = v`) supply default values without authorial intervention.
 
@@ -189,7 +189,7 @@ Outer joins introduce **null-extended** lineage on the non-preserved side(s). Fo
 >
 > **Still deferred (LEFT):** a non-preserved-**only** insert (no preserved row to attach to) rejects `null-extended-create-conflict`. (The **decomposition optional-member / EAV UPDATE** dual — null→non-null materializes a component, non-null→all-null deletes it — is the decomposition analogue and is now **shipped** as anchor-keyed base ops in `decomposition.ts`; see [Decomposition fan-out](lens.md#the-default-mapper) § UPDATE. Only a non-constant optional/EAV value and a shared-key identity write stay rejected with `unsupported-decomposition-update`.)
 
-#### Existence columns on outer joins (read half)
+#### Existence columns on outer joins
 
 The `exists [<side>] as <name>` join clause (Dataphor `include rowexists`) manifests
 an outer join's match-existence as a first-class boolean column — reading it tells
@@ -218,12 +218,39 @@ nested-loop join (the join-physical-selection / merge / fanout / elimination rul
 bail on it) so the appended flag column is never dropped by a physical rewrite —
 a documented read-half limitation (existence joins forgo hash/merge selection).
 
-**Read half only.** The existence column is **read-only here**: a write resolves to
-a non-writable site and rejects (`no-inverse`); `column_info` reports it
-`is_updatable = 'NO'` with `base_table` / `base_column` = `null` (it has no base
-column even once writable — it is writable through an *effect*, not a base
-mapping). The write half (existence-flip ⇒ insert/delete of the component) is
-`outer-join-existence-column`.
+**Writing the flag (the write half).** The existence column is the explicit, per-row
+control surface for the non-preserved side's existence — *writing* the flag **is** the
+guard. It reuses the non-preserved-side UPDATE substrate (the up-front `__vmupd_keys`
+capture, the null-extended materialization INSERT, the captured-key DELETE — § Outer
+Joins — Updates), specialized to insert-or-delete:
+
+- **`update v set hasB = true`** — over a **null-extended** row, materialize the side:
+  the null-extended-INSERT branch (no assigned columns ⇒ the EC join key + base
+  defaults). Over a **matched** row it is a no-op. An undefaulted `not null` column the
+  create branch cannot supply rejects `null-extended-create-conflict`.
+- **`update v set hasB = false`** — over a **matched** row, delete the side: a base
+  DELETE keyed on the captured non-preserved PK (a null-extended row's captured PK is
+  null, so the same captured-key EXISTS naturally excludes it ⇒ a no-op there). The
+  preserved side is untouched, so the row reads back null-extended.
+- **Composition.** `set y = 5, hasB = true` over a null-extended row inserts the side
+  with `y = 5` (the same-side `set` folds into the materialization INSERT — the explicit
+  `hasB` trigger for the same insert the non-preserved-column UPDATE infers). `set y = 5,
+  hasB = false` is a **contradiction** (delete the side *and* write its column) and
+  rejects `conflicting-assignment`.
+- **Insert-through.** `hasB` participates in INSERT routing as a directive (never
+  stored): `insert into v (…, hasB) values (…, true)` activates the non-preserved side
+  (both-side insert / B-with-defaults), `… , false` forces preserved-only (the
+  null-extended insert). A `false` directive contradicting a supplied non-preserved
+  column rejects `conflicting-assignment`.
+
+Only a **boolean literal** (`true`/`false`) is admitted — a per-row branch on a
+non-literal value is deferred (`unsupported-outer-join-update`). RETURNING through an
+existence write rejects `returning-through-view` (the captured-identity re-query cannot
+recover a materialized/deleted non-preserved row — the non-preserved-column UPDATE's
+boundary). The static surfaces report the flag `is_updatable = 'YES'` with `base_table` /
+`base_column` = `null` (writable through an *effect*, mapping to no base column). The
+routing stays **component-generic** (no hard-coded join side) so the set-operation
+membership-column work (`set-operator-membership-columns`) extends the same site.
 
 ### Union All
 

@@ -1958,12 +1958,14 @@ describe('Property-Based Tests', () => {
 		});
 	});
 
-	// --- Outer-join existence column (read half) ---
-	// The read-only front half of the Dataphor `include rowexists` feature: the
-	// `exists [<side>] as <name>` join clause manifests an outer join's match
-	// existence as a first-class clean `{true,false}` NOT NULL column derived AT THE
-	// COMBINATOR (not a null-extended constant, not a predicate re-evaluation).
-	describe('Outer-join existence column (read half)', () => {
+	// --- Outer-join existence column ---
+	// The Dataphor `include rowexists` feature: the `exists [<side>] as <name>` join
+	// clause manifests an outer join's match existence as a first-class clean
+	// `{true,false}` NOT NULL column derived AT THE COMBINATOR (not a null-extended
+	// constant, not a predicate re-evaluation). These read-half tests pin the derived
+	// flag; *writing* it drives the non-preserved side's insert/delete (write half — the
+	// comprehensive round-trips live in View Round-Trip Laws § the outer-join family).
+	describe('Outer-join existence column', () => {
 		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
 			const out: Record<string, SqlValue>[] = [];
 			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
@@ -2069,7 +2071,7 @@ describe('Property-Based Tests', () => {
 			expect(flagDomain, 'expected a {true,false} enum domain on the flag').to.not.equal(undefined);
 		});
 
-		it('lineage: the flag carries an `existence` UpdateSite, non-writable (read half)', async () => {
+		it('lineage: the flag carries an `existence` UpdateSite, writable through an effect', async () => {
 			await seed();
 			const join = findJoin('select c.cc, c.cv, p.pv, hasP from exc c left join exp p on p.pp = c.pr exists right as hasP');
 			const attrs = join.getAttributes();
@@ -2077,32 +2079,46 @@ describe('Property-Based Tests', () => {
 			expect(flagAttr.name).to.equal('hasP');
 			const site = join.physical?.updateLineage?.get(flagAttr.id);
 			expect(site?.kind, 'flag lineage is an existence site').to.equal('existence');
-			expect(resolveBaseSite(site).writable, 'existence is read-only in the read half').to.equal(false);
+			// The write half makes the flag writable-through-effect: NO base column, but a
+			// component ref + guard that drives the insert/delete on write.
+			const resolved = resolveBaseSite(site);
+			expect(resolved.writable, 'existence is writable-through-effect in the write half').to.equal(true);
+			expect(resolved.baseColumn, 'existence has no base column').to.equal(undefined);
+			expect(resolved.existenceComponent, 'existence carries its component ref').to.not.equal(undefined);
 		});
 
-		it('write still rejects: update/insert of the flag is a clear deferral, not a silent no-op', async () => {
+		it('write drives insert/delete: the flag-flip materializes / removes the non-preserved side', async () => {
 			await seed();
-			// Writing the existence column resolves to a non-writable site — rejected.
-			let updErr: any;
-			try { await db.exec('update ex_v set hasP = true where cc = 1'); } catch (e) { updErr = e; }
-			expect(updErr, 'update of hasP must reject').to.not.equal(undefined);
-			expect(updErr.mutationDiagnostic?.reason, 'structured deferral diagnostic').to.equal('no-inverse');
+			// `hasP = false` on a MATCHED row deletes the joined parent → the child reads back
+			// null-extended (hasP false, pv null); the child base is untouched.
+			await db.exec('update ex_v set hasP = false where cc = 1');
+			expect((await readRows('select cc, hasP, pv from ex_v where cc = 1'))[0])
+				.to.deep.equal({ cc: 1, hasP: false, pv: null });
+			expect((await readRows('select pp from exp where pp = 1')).length, 'matched parent deleted').to.equal(0);
 
-			let insErr: any;
-			try { await db.exec('insert into ex_v (cc, cv, hasP) values (5, 55, true)'); } catch (e) { insErr = e; }
-			expect(insErr, 'insert supplying hasP must reject').to.not.equal(undefined);
+			// `hasP = true` on a NULL-EXTENDED row (cc=2, pr=9, no parent) materializes a parent
+			// carrying the EC join key (pp = 9) → the child now joins it (hasP true, pv null).
+			await db.exec('update ex_v set hasP = true where cc = 2');
+			expect((await readRows('select cc, hasP, pv from ex_v where cc = 2'))[0])
+				.to.deep.equal({ cc: 2, hasP: true, pv: null });
+			expect((await readRows('select pp from exp where pp = 9')).length, 'null-extended parent materialized').to.equal(1);
 
-			// The base tables are untouched by the rejected writes.
-			const child = await readRows('select cc from exc order by cc');
-			expect(child.map(r => r.cc)).to.deep.equal([1, 2, 3, 4]);
+			// Preserved-only insert via hasP=false (no parent columns supplied) reads back null-extended.
+			await db.exec('insert into ex_v (cc, cv, hasP) values (5, 55, false)');
+			expect((await readRows('select cc, cv, hasP, pv from ex_v where cc = 5'))[0])
+				.to.deep.equal({ cc: 5, cv: 55, hasP: false, pv: null });
+
+			// Every child row is still present — none escaped the existence writes.
+			expect((await readRows('select cc from exc order by cc')).map(r => r.cc)).to.deep.equal([1, 2, 3, 4, 5]);
 		});
 
-		it('column_info: the existence column reports is_updatable=NO with null base (read half)', async () => {
+		it('column_info: the existence column reports is_updatable=YES with null base (write half)', async () => {
 			await seed();
 			const rows = await readRows("select column_name, is_updatable, base_table, base_column from column_info('ex_v')");
 			const flag = rows.find(r => r.column_name === 'hasP');
 			expect(flag, 'column_info exposes the existence column').to.not.equal(undefined);
-			expect(flag!.is_updatable, 'existence column is not updatable in the read half').to.equal('NO');
+			// Writable through an effect, but maps to no base column.
+			expect(flag!.is_updatable, 'existence column is updatable in the write half').to.equal('YES');
 			expect(flag!.base_table, 'existence column has no base table').to.equal(null);
 			expect(flag!.base_column, 'existence column has no base column').to.equal(null);
 			// The prereq's per-side relaxation still reports the base columns updatable.
@@ -4228,6 +4244,116 @@ describe('Property-Based Tests', () => {
 				// materialized null-extended row no longer matches (captured NULL vs the real
 				// minted key). Reject at plan time rather than return a silent partial set.
 				await expectMutationReject('update npv set pv = 7 where cc = 1 returning cc, pv', 'returning-through-view');
+			});
+
+			// ----- Outer (LEFT) join: existence-column WRITE (flag-flip ⇒ insert/delete) -----
+			// `rj_ex` = ex_child LEFT JOIN ex_parent on parent.pp = child.pr, with the match
+			// existence reified as `exists right as hasP`. WRITING hasP drives the non-preserved
+			// (parent) side: `set hasP = true` materializes a parent for a null-extended row
+			// (no-op when matched); `set hasP = false` deletes the matched parent (no-op when
+			// already null-extended). It composes with a same-side column write and with
+			// insert-through; the flag is consumed as a routing directive, never stored. This is
+			// the write-half payoff over the `outer-join-existence-read` flag.
+			it('outer (left) join: existence-column write drives the non-preserved side insert/delete', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists rj_ex');
+				await db.exec('drop table if exists ex_child');
+				await db.exec('drop table if exists ex_parent');
+				// The parent PK declares the high-water-mark allocator default — the surrogate the
+				// both-side existence insert mints the shared key from when no pp is supplied.
+				await db.exec('create table ex_parent (pp integer primary key default (coalesce((select max(pp) from ex_parent), 0) + mutation_ordinal()), pv integer null) using memory');
+				// The FK marks ex_parent the mint anchor for the both-side insert (and the FK-root
+				// ordering); `foreign_keys = false` keeps the parent-delete (hasP=false over a still-
+				// referenced child) from tripping RESTRICT — the documented existence-write FK caveat.
+				await db.exec('create table ex_child (cc integer primary key, pr integer null references ex_parent(pp), cv integer null) using memory');
+				await db.exec('create view rj_ex as select c.cc as cc, c.cv as cv, p.pv as pv, hasP from ex_child c left join ex_parent p on p.pp = c.pr exists right as hasP');
+
+				// Static surface: hasP is updatable through an effect, with null base trace.
+				const cinfo = await readRows("select column_name, is_updatable, base_table, base_column from column_info('rj_ex')");
+				const hp = cinfo.find(r => String(r.column_name).toLowerCase() === 'hasp')!;
+				expect(hp.is_updatable, 'hasP updatable via effect').to.equal('YES');
+				expect([hp.base_table, hp.base_column], 'hasP maps to no base column').to.deep.equal([null, null]);
+
+				// Seed: cc=1 matched (pr=10 → parent 10); cc=2 null-extended dangling (pr=9, no
+				// parent); cc=3 null-extended NULL key (pr=null).
+				await db.exec('insert into ex_parent values (10, 100)');
+				await db.exec('insert into ex_child values (1, 10, 1000)');
+				await db.exec('insert into ex_child values (2, 9, 2000)');
+				await db.exec('insert into ex_child values (3, null, 3000)');
+
+				// hasP false→true over a null-extended row: a parent appears (pp = the EC join key
+				// = 9), pv defaulted null; PutGet shows hasP now reads true.
+				await db.exec('update rj_ex set hasP = true where cc = 2');
+				expect((await readRows('select cc, cv, pv, hasP from rj_ex where cc = 2'))[0])
+					.to.deep.equal({ cc: 2, cv: 2000, pv: null, hasP: true });
+				expect((await readRows('select pp, pv from ex_parent where pp = 9'))[0], 'parent materialized via EC key')
+					.to.deep.equal({ pp: 9, pv: null });
+
+				// hasP false→true is a no-op on a matched row: the parent base is unchanged.
+				const matchedBefore = await readRows('select pp, pv from ex_parent order by pp');
+				await db.exec('update rj_ex set hasP = true where cc = 1');
+				assertRowsEqual('hasP true no-op on matched', await readRows('select pp, pv from ex_parent order by pp'), matchedBefore, ['pp', 'pv']);
+
+				// hasP true→false over a matched row: the joined parent disappears, child untouched.
+				await db.exec('update rj_ex set hasP = false where cc = 1');
+				expect((await readRows('select cc, cv, pv, hasP from rj_ex where cc = 1'))[0])
+					.to.deep.equal({ cc: 1, cv: 1000, pv: null, hasP: false });
+				expect((await readRows('select pp from ex_parent where pp = 10')).length, 'matched parent deleted').to.equal(0);
+				expect((await readRows('select cc, pr, cv from ex_child where cc = 1'))[0], 'child untouched by the parent delete')
+					.to.deep.equal({ cc: 1, pr: 10, cv: 1000 });
+
+				// hasP true→false over an already null-extended row (cc=3, NULL key): a no-op.
+				await db.exec('update rj_ex set hasP = false where cc = 3');
+				expect((await readRows('select cc, pv, hasP from rj_ex where cc = 3'))[0]).to.deep.equal({ cc: 3, pv: null, hasP: false });
+
+				// GetPut: writing each row's read-back hasP value back is a no-op on both bases.
+				const snapshot = async () => ({
+					parent: await readRows('select pp, pv from ex_parent order by pp'),
+					child: await readRows('select cc, pr, cv from ex_child order by cc'),
+				});
+				const before = await snapshot();
+				for (const row of await readRows('select cc, hasP from rj_ex order by cc')) {
+					await db.exec(`update rj_ex set hasP = ${row.hasP ? 'true' : 'false'} where cc = ${row.cc}`);
+				}
+				const after = await snapshot();
+				assertRowsEqual('existence GetPut parent', after.parent, before.parent, ['pp', 'pv']);
+				assertRowsEqual('existence GetPut child', after.child, before.child, ['cc', 'pr', 'cv']);
+
+				// Composition: `set pv = 5, hasP = true` over a null-extended row inserts a parent
+				// carrying pv = 5 (the same-side `set` folds into the materialization insert).
+				await db.exec('insert into ex_child values (4, 77, 4000)');   // null-extended (no parent 77)
+				await db.exec('update rj_ex set pv = 5, hasP = true where cc = 4');
+				expect((await readRows('select cc, cv, pv, hasP from rj_ex where cc = 4'))[0])
+					.to.deep.equal({ cc: 4, cv: 4000, pv: 5, hasP: true });
+				expect((await readRows('select pp, pv from ex_parent where pp = 77'))[0]).to.deep.equal({ pp: 77, pv: 5 });
+
+				// Composition contradiction: delete the side AND write its column — rejected.
+				await expectMutationReject('update rj_ex set pv = 5, hasP = false where cc = 4', 'conflicting-assignment');
+
+				// Insert-through: both-side (pv supplied + hasP=true) and preserved-only (hasP=false).
+				await db.exec('insert into rj_ex (cc, cv, pv, hasP) values (9, 90, 900, true)');
+				expect((await readRows('select cc, cv, pv, hasP from rj_ex where cc = 9'))[0], 'both-side existence insert')
+					.to.deep.equal({ cc: 9, cv: 90, pv: 900, hasP: true });
+				await db.exec('insert into rj_ex (cc, cv, hasP) values (11, 110, false)');
+				expect((await readRows('select cc, cv, pv, hasP from rj_ex where cc = 11'))[0], 'preserved-only existence insert reads back null-extended')
+					.to.deep.equal({ cc: 11, cv: 110, pv: null, hasP: false });
+
+				// RETURNING through an existence write is not recoverable — reject (no silent partial).
+				await expectMutationReject('update rj_ex set hasP = false where cc = 9 returning cc, hasP', 'returning-through-view');
+
+				// A non-literal existence value (a per-row branch) is deferred.
+				await expectMutationReject('update rj_ex set hasP = (cv > 0) where cc = 9', 'unsupported-outer-join-update');
+
+				// no-default: a hasP=true materialization of a parent with an undefaulted NOT NULL
+				// column the create branch cannot supply rejects (not a silent drop).
+				await db.exec('drop view if exists rj_ex2');
+				await db.exec('drop table if exists ex2_child');
+				await db.exec('drop table if exists ex2_parent');
+				await db.exec('create table ex2_parent (pp integer primary key, pv integer null, req integer not null) using memory');
+				await db.exec('create table ex2_child (cc integer primary key, pr integer null, cv integer null) using memory');
+				await db.exec('create view rj_ex2 as select c.cc as cc, c.cv as cv, p.pv as pv, hasP from ex2_child c left join ex2_parent p on p.pp = c.pr exists right as hasP');
+				await db.exec('insert into ex2_child values (1, 5, 50)');   // null-extended dangling
+				await expectMutationReject('update rj_ex2 set hasP = true where cc = 1', 'null-extended-create-conflict');
 			});
 		});
 

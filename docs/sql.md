@@ -1464,9 +1464,13 @@ from a full join b on b.k = a.k exists left as aOnly, exists right as bOnly;
   null-extension ⇒ the flag would be a meaningless constant `true`).
 - The flag is derived **at the join** from the actual match, never stored in the
   operand and never a re-evaluation of the predicate (which would be unsound on a
-  null-extended row). It is **read-only** today (writing it is rejected); the write
-  side — an existence-flip turning into an insert/delete of that component — is a
-  later phase. See [view-updateability.md § Existence columns](view-updateability.md#existence-columns-on-outer-joins-read-half).
+  null-extended row). **Writing it drives the non-preserved side's existence** through
+  an updatable view: `set hasOrder = true` over a null-extended row inserts the matching
+  side (join key via the equi-join equivalence class, other columns defaulted), `= false`
+  over a matched row deletes it, and it is consumed as a routing directive on insert
+  (`insert into v (…, hasOrder) values (…, false)` ⇒ preserved-only) — never stored to a
+  base column. Only a **boolean literal** (`true`/`false`) is supported; a per-row branch
+  on a non-literal value is deferred. See [view-updateability.md § Existence columns](view-updateability.md#existence-columns-on-outer-joins).
 
 **Examples:**
 ```sql

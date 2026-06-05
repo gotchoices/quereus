@@ -2,7 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { TableSchema } from '../../schema/table.js';
 import { classifyProjectionExpr, traceInvertibleColumn, composeDomain } from './scalar-invertibility.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
-import type { Attribute, AttributeDefault, ConstantBinding, ConstantValue, ScalarPlanNode, UpdateSite } from '../nodes/plan-node.js';
+import type { Attribute, AttributeDefault, ConstantBinding, ConstantValue, RelationalComponentRef, ScalarPlanNode, UpdateSite } from '../nodes/plan-node.js';
 
 /**
  * Update-lineage model — per-output-column provenance back onto base columns,
@@ -361,6 +361,18 @@ export interface ResolvedBaseSite {
 	readonly nullExtended: boolean;
 	readonly inverse?: (written: AST.Expression) => AST.Expression;
 	readonly domain?: AST.Expression;
+	/**
+	 * Set on an outer-join `existence` (`exists … as`) flag — the **writable-through-
+	 * effect** descriptor: there is no base column (`table` / `baseColumn` stay
+	 * `undefined`), but `writable: true` because *writing* the flag drives an
+	 * insert/delete of the named {@link RelationalComponentRef}. The multi-source write
+	 * path reads this discriminator to route the existence-flip to the conditional
+	 * materialization (`true` ⇒ insert the component, `false` ⇒ delete it); a `base`-
+	 * column consumer keeps gating on `baseColumn !== undefined`, so it is unaffected.
+	 */
+	readonly existenceComponent?: RelationalComponentRef;
+	/** The join-predicate guard the existence flag is the truth-value of (present iff {@link existenceComponent}). */
+	readonly existenceGuard?: AST.Expression;
 }
 
 export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite {
@@ -373,10 +385,13 @@ export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite 
 			return { ...inner, writable: false, nullExtended: true };
 		}
 		case 'computed':
-		case 'existence':
-			// The existence flag has no base column (read-only in this half; writable
-			// through an effect, not a base mapping, once the write half lands).
 			return { writable: false, nullExtended: false };
+		case 'existence':
+			// Writable through an *effect*, not a base mapping: it has no base column
+			// (`table` / `baseColumn` undefined), but a written flag drives an
+			// insert/delete of `component`. The multi-source write path consumes the
+			// `existenceComponent` discriminator; base-column readers gate on `baseColumn`.
+			return { writable: true, nullExtended: false, existenceComponent: site.component, existenceGuard: site.guard };
 	}
 }
 

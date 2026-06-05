@@ -4,13 +4,14 @@ import type { Scope } from '../scopes/scope.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
-import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor, type RelationalComponentRef } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { analyzeBodyLineage } from './backward-body.js';
 import { buildExpression } from '../building/expression.js';
 import { JoinNode } from '../nodes/join-node.js';
+import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { FilterNode } from '../nodes/filter.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
@@ -188,6 +189,17 @@ interface OutColumn {
 	 * currently always absent.
 	 */
 	readonly domain?: AST.Expression;
+	/**
+	 * Set for an outer-join `existence` (`exists … as`) flag column. It maps to **no
+	 * base column** ({@link sideIndex} / {@link baseColumn} stay undefined), so it is
+	 * not a base-write target; instead a write to it is a per-row insert/delete of the
+	 * named component (§ Existence columns). `existenceSide` is the resolved
+	 * non-preserved side it reifies the match of — the side the flag-flip materializes
+	 * (`true`) or removes (`false`). The write router keys off this presence.
+	 */
+	readonly existenceComponent?: RelationalComponentRef;
+	/** The non-preserved side index the existence flag drives (present iff {@link existenceComponent}). */
+	readonly existenceSide?: number;
 }
 
 export interface JoinViewAnalysis {
@@ -397,10 +409,39 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		? stmt.columns
 		: outColumns.filter(c => c.sideIndex !== undefined && c.baseColumn !== undefined && !c.inverse).map(c => c.name);
 
-	interface Supplied { readonly name: string; readonly sideIndex: number; readonly baseColumn: string; readonly type: ScalarType; readonly isKey: boolean; }
-	const supplied: Supplied[] = suppliedNames.map((rawName): Supplied => {
+	// One supplied envelope column. A base-routed column carries `sideIndex`/`baseColumn`;
+	// an **existence** (`exists … as`) flag carries neither — it is a per-row *routing
+	// directive* (`existenceFlag`) on its non-preserved `existenceSide`, never stored to a
+	// base, but kept as an (unused) envelope column so the materialized source's arity still
+	// matches the user's VALUES (§ Existence columns — Inserts).
+	interface Supplied {
+		readonly name: string;
+		readonly type: ScalarType;
+		readonly sideIndex?: number;
+		readonly baseColumn?: string;
+		readonly isKey: boolean;
+		readonly existenceSide?: number;
+		readonly existenceFlag?: boolean;
+	}
+	const supplied: Supplied[] = suppliedNames.map((rawName, columnIndex): Supplied => {
 		const name = rawName.toLowerCase();
 		const out = outColumns.find(c => c.name === name);
+		// An existence flag is consumed as a routing directive, not stored. Pull its uniform
+		// boolean literal out of the VALUES source (`true` ⇒ insert the non-preserved side;
+		// `false` ⇒ omit it / preserved-only). It stays an envelope column for arity but is
+		// never a base target (no `sideIndex`/`baseColumn`).
+		if (out?.existenceComponent) {
+			if (out.existenceSide === undefined) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-outer-join-update',
+					column: rawName,
+					table: view.name,
+					message: `cannot insert through view '${view.name}': the existence column '${rawName}' does not resolve to a single non-preserved side (an ambiguous / full-outer existence shape is deferred)`,
+				});
+			}
+			const existenceFlag = existenceInsertFlag(view, stmt, columnIndex, rawName);
+			return { name, type: EXISTENCE_FLAG_TYPE, isKey: false, existenceSide: out.existenceSide, existenceFlag };
+		}
 		// A base-routed column (identity/rename or outer-join null-extended) carries
 		// `sideIndex` + `baseColumn`; a computed column does not, and an `inverse` column
 		// cannot store a raw value. Either of the latter is non-insertable.
@@ -431,18 +472,43 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		});
 	}
 
+	// Existence directives (§ Existence columns — Inserts): an `exists … as` flag forces its
+	// non-preserved side active (`true`) or inactive (`false`), overriding the columns-
+	// supplied inference. A `false` directive on a side whose columns ARE supplied, or a
+	// `true`+`false` collision, contradicts — reject rather than silently pick one.
+	const forcedActive = new Set<number>();
+	const forcedInactive = new Set<number>();
+	for (const s of supplied) {
+		if (s.existenceSide === undefined) continue;
+		(s.existenceFlag ? forcedActive : forcedInactive).add(s.existenceSide);
+	}
+	const baseSupplied = supplied.filter((s): s is Supplied & { sideIndex: number; baseColumn: string } => s.sideIndex !== undefined);
+	const suppliedSides = new Set(baseSupplied.map(s => s.sideIndex));
+	for (const i of forcedInactive) {
+		if (forcedActive.has(i) || suppliedSides.has(i)) {
+			raiseMutationDiagnostic({
+				reason: 'conflicting-assignment',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': an existence flag is false (omit base table '${sides[i].schema.name}') but the same insert ${forcedActive.has(i) ? 'also sets that flag true' : 'supplies one of its columns'} — the two contradict`,
+			});
+		}
+	}
+
 	// Active sides: a preserved (or inner) side is always inserted (the anchor row); a
-	// non-preserved (outer) side is active only when ≥1 of its columns is supplied — an
-	// absent non-preserved side emits no insert (the per-row null-extension semantics).
-	const suppliedSides = new Set(supplied.map(s => s.sideIndex));
-	const isActive = (i: number): boolean => sides[i].preserved || suppliedSides.has(i);
+	// non-preserved (outer) side is active when ≥1 of its columns is supplied OR an
+	// existence flag forces it (`true`). A `false` directive forces it inactive even if a
+	// stray column slipped through (already rejected above). An absent non-preserved side
+	// emits no insert (the per-row null-extension semantics).
+	const isActive = (i: number): boolean =>
+		forcedInactive.has(i) ? false : (forcedActive.has(i) || sides[i].preserved || suppliedSides.has(i));
 	const activeIndices = sides.map((_, i) => i).filter(isActive);
 
-	// Non-preserved-only reject (§ Outer Joins — Inserts): supplying only a non-preserved
-	// side's columns, with no preserved anchor row to mint/thread the shared key from, is
-	// not yet expressible (the envelope sources the key from the preserved anchor).
-	const anyNonPreservedActive = sides.some((s, i) => !s.preserved && suppliedSides.has(i));
-	const anyPreservedSupplied = supplied.some(s => sides[s.sideIndex].preserved);
+	// Non-preserved-only reject (§ Outer Joins — Inserts): activating only a non-preserved
+	// side (columns supplied or `hasB = true`), with no preserved anchor row to mint/thread
+	// the shared key from, is not yet expressible (the envelope sources the key from the
+	// preserved anchor).
+	const anyNonPreservedActive = sides.some((s, i) => !s.preserved && isActive(i));
+	const anyPreservedSupplied = baseSupplied.some(s => sides[s.sideIndex].preserved);
 	if (anyNonPreservedActive && !anyPreservedSupplied) {
 		raiseMutationDiagnostic({
 			reason: 'null-extended-create-conflict',
@@ -509,7 +575,9 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		}
 		const presenceGateIndices: number[] = [];
 		supplied.forEach((s, idx) => {
-			if (s.sideIndex !== sideIndex) return;
+			// An existence directive (no `baseColumn`/`sideIndex`) is never stored — it is an
+			// unused envelope column. Base columns route to their owning side as before.
+			if (s.sideIndex !== sideIndex || s.baseColumn === undefined) return;
 			if (needsSharedKey && s.isKey) return; // the key is threaded above
 			targetColumns.push(s.baseColumn);
 			envelopeIndices.push(idx);
@@ -525,6 +593,51 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		orderedSides: order.map(i => specByIndex.get(i)!),
 		keyDefault,
 	};
+}
+
+/**
+ * The uniform boolean directive an `exists … as` existence column supplies on a
+ * multi-source INSERT — `true` ⇒ insert the non-preserved side, `false` ⇒ omit it
+ * (preserved-only). The flag is a *routing directive*, decided at plan time, so it must
+ * be a boolean literal that is the **same** across every inserted VALUES row (a per-row
+ * branch on the written value, or a SELECT/DML source whose value is not statically
+ * known, is deferred — `unsupported-outer-join-update` / `unsupported-source`).
+ * `columnIndex` is the flag's position in the explicit column list, hence its position in
+ * each VALUES tuple.
+ */
+function existenceInsertFlag(view: MutableViewLike, stmt: AST.InsertStmt, columnIndex: number, columnName: string): boolean {
+	if (stmt.source.type !== 'values') {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-source',
+			column: columnName,
+			table: view.name,
+			message: `cannot insert through view '${view.name}': the existence column '${columnName}' is a routing directive that must be a literal in a VALUES source (a SELECT/DML source's per-row value is deferred)`,
+		});
+	}
+	let flag: boolean | undefined;
+	for (const row of stmt.source.values) {
+		const cell = row[columnIndex];
+		const b = cell ? asBooleanLiteral(cell) : undefined;
+		if (b === undefined) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-outer-join-update',
+				column: columnName,
+				table: view.name,
+				message: `cannot insert through view '${view.name}': the existence column '${columnName}' must be a boolean literal (true/false); a non-literal per-row directive is deferred`,
+			});
+		}
+		if (flag === undefined) flag = b;
+		else if (flag !== b) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-outer-join-update',
+				column: columnName,
+				table: view.name,
+				message: `cannot insert through view '${view.name}': the existence column '${columnName}' must be uniform across the inserted rows (a per-row mix of true/false is deferred)`,
+			});
+		}
+	}
+	// An empty VALUES list cannot reach here (the parser requires ≥1 row); default false.
+	return flag ?? false;
 }
 
 /** One cross-side `column = column` equality recovered from a join ON / USING clause. */
@@ -803,6 +916,13 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 	const sideByTableId = new Map<number, number>();
 	sides.forEach((s, idx) => sideByTableId.set(Number(s.table.id), idx));
 
+	// The existence flag's `RelationalComponentRef` carries the JoinNode CHILD's
+	// plan-node id (best-effort — an *aliased* source wraps the scan in an `AliasNode`,
+	// so the child id is the wrapper's, not the scan's). Map every body node id to the
+	// SOLE `TableReferenceNode` beneath it so a flag's component id resolves through the
+	// wrapper to its scan node, then to its side index (§ Existence columns).
+	const nodeToSoleTableRef = buildNodeToSoleTableRef(root);
+
 	// Route each shared backward column onto its owning join side. An inner-join body
 	// never null-extends (`nullExtended` always false); an outer-join body marks the
 	// non-preserved side's columns `nullExtended: true` (the join-predicate-guarded
@@ -820,6 +940,19 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 				nullExtended: bc.nullExtended,
 				...(bc.inverse ? { inverse: bc.inverse } : {}),
 				...(bc.domain ? { domain: bc.domain } : {}),
+			};
+		}
+		if (bc.existenceComponent) {
+			const existenceSide = resolveExistenceSide(bc.existenceComponent, nodeToSoleTableRef, sideByTableId, sides);
+			return {
+				name: bc.name,
+				displayName: bc.displayName,
+				// Not a base-column write — its write is an insert/delete effect on the
+				// component side, routed by `decomposeUpdate` off `existenceComponent`.
+				writable: false,
+				nullExtended: false,
+				existenceComponent: bc.existenceComponent,
+				...(existenceSide !== undefined ? { existenceSide } : {}),
 			};
 		}
 		return { name: bc.name, displayName: bc.displayName, writable: false, nullExtended: false };
@@ -896,6 +1029,49 @@ function findJoinNode(view: MutableViewLike, root: PlanNode): JoinNode {
 		});
 	}
 	return found;
+}
+
+/**
+ * Map every node in a planned body to the SOLE `TableReferenceNode` reachable beneath
+ * it. Resolves an existence flag's `RelationalComponentRef` — which names the JoinNode
+ * child's plan-node id, an `AliasNode` wrapper for an *aliased* source — back to its
+ * scan node. A node spanning two or more base tables is left unmapped (size ≠ 1).
+ */
+function buildNodeToSoleTableRef(root: PlanNode): Map<number, TableReferenceNode> {
+	const out = new Map<number, TableReferenceNode>();
+	const visit = (n: PlanNode): TableReferenceNode[] => {
+		if (n instanceof TableReferenceNode) { out.set(Number(n.id), n); return [n]; }
+		const refs: TableReferenceNode[] = [];
+		for (const child of n.getRelations()) refs.push(...visit(child));
+		const uniqueIds = new Set(refs.map(r => Number(r.id)));
+		if (uniqueIds.size === 1) out.set(Number(n.id), refs[0]);
+		return refs;
+	};
+	visit(root);
+	return out;
+}
+
+/**
+ * Resolve an existence flag's component to the non-preserved join side it drives. The
+ * component names the JoinNode child's plan-node id; resolve it through any wrapper to
+ * its scan node ({@link buildNodeToSoleTableRef}) → side index. Falls back to the unique
+ * non-preserved side when the id does not resolve (v1: a single LEFT join has exactly
+ * one such side). Returns `undefined` only when the side is genuinely ambiguous (≠1
+ * non-preserved side — e.g. a parser-rejected FULL); the write router then defers.
+ */
+function resolveExistenceSide(
+	component: RelationalComponentRef,
+	nodeToSoleTableRef: ReadonlyMap<number, TableReferenceNode>,
+	sideByTableId: ReadonlyMap<number, number>,
+	sides: readonly JoinSide[],
+): number | undefined {
+	if (component.kind === 'join-side') {
+		const ref = nodeToSoleTableRef.get(component.table);
+		const direct = ref ? sideByTableId.get(Number(ref.id)) : undefined;
+		if (direct !== undefined) return direct;
+	}
+	const nonPreserved = sides.flatMap((s, i) => s.preserved ? [] : [i]);
+	return nonPreserved.length === 1 ? nonPreserved[0] : undefined;
 }
 
 /** One base-table source of the join body, with its preserved/guard classification. */
@@ -1096,12 +1272,82 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// null-extended-INSERT op (built after the per-side loop, one per non-preserved side,
 	// carrying every column assigned on that side). § Outer Joins — Updates.
 	const nullExtendedBySide = new Map<number, Array<{ baseColumn: string; valAlias: string }>>();
+	// Existence-flag writes (§ Existence columns): writing an `exists … as` flag drives the
+	// non-preserved side's existence. `set hasB = true` materializes the side for the
+	// null-extended partition (the matched-update path's null-extended INSERT with no
+	// assigned columns — the EC join key + base defaults); `set hasB = false` deletes the
+	// matched partition. Tracked by the non-preserved side they drive.
+	const existenceInsertSides = new Set<number>();
+	const existenceDeleteSides = new Set<number>();
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
 		if (!out) {
 			// Not a view column at all — the same encapsulation-leak guard as the
 			// top-level `where` scan (distinct from a computed view column below).
 			raiseUnknownViewColumn(asg.column, view, analysis.outColumns.map(c => c.displayName));
+		}
+		// An `exists … as` existence flag (no base column): writing it is the explicit
+		// insert/delete-of-the-component effect. `true` ⇒ insert the non-preserved side for
+		// the null-extended partition; `false` ⇒ delete the matched partition. Reuses the
+		// non-preserved-column update substrate (capture + null-extended INSERT / captured-key
+		// DELETE), so the runtime is reused, not extended (§ Existence columns).
+		if (out.existenceComponent) {
+			if (!registerCapturedExpr) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-outer-join-update',
+					column: asg.column,
+					table: view.name,
+					message: `cannot write through view '${view.name}': the existence column '${asg.column}' drives a per-row insert/delete of the non-preserved side, which needs the capture carrier`,
+				});
+			}
+			if (out.existenceSide === undefined) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-outer-join-update',
+					column: asg.column,
+					table: view.name,
+					message: `cannot write through view '${view.name}': the existence column '${asg.column}' does not resolve to a single non-preserved side (an ambiguous / full-outer existence shape is deferred)`,
+				});
+			}
+			const npSideIndex = out.existenceSide;
+			if (!allowedSides.includes(npSideIndex)) {
+				raiseMutationDiagnostic({
+					reason: 'tag-conflict',
+					table: view.name,
+					message: `cannot write through view '${view.name}': the existence column '${asg.column}' drives base table '${analysis.sides[npSideIndex].schema.name}', but a 'quereus.update.target'/'exclude' tag excludes that table`,
+				});
+			}
+			// RETURNING is not recoverable through an existence-flip (the post-mutation
+			// re-query identifies by the captured non-preserved PK — null for a freshly
+			// materialized row, deleted for a removed one), so reject it (parity with the
+			// non-preserved-column update).
+			if (stmt.returning && stmt.returning.length > 0) {
+				raiseMutationDiagnostic({
+					reason: 'returning-through-view',
+					column: asg.column,
+					table: view.name,
+					message: `cannot write through view '${view.name}': RETURNING is not supported on an existence-flag write '${asg.column}' — the materialized/deleted non-preserved row is not recoverable by the captured-identity re-query`,
+				});
+			}
+			const flag = asBooleanLiteral(asg.value);
+			if (flag === undefined) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-outer-join-update',
+					column: asg.column,
+					table: view.name,
+					message: `cannot write through view '${view.name}': the existence column '${asg.column}' must be assigned a boolean literal (true/false); a per-row branch on a non-literal value is deferred`,
+				});
+			}
+			if (flag) {
+				// `true`: materialize the non-preserved side for the null-extended partition.
+				// Ensure a (possibly empty) `nullExtendedBySide` entry so the post-loop emits
+				// the materialization INSERT; a same-side `set` folds its columns into it.
+				existenceInsertSides.add(npSideIndex);
+				if (!nullExtendedBySide.has(npSideIndex)) nullExtendedBySide.set(npSideIndex, []);
+			} else {
+				// `false`: delete the matched partition (captured non-preserved PK non-null).
+				existenceDeleteSides.add(npSideIndex);
+			}
+			continue;
 		}
 		// A non-preserved (outer-join null-extended) base column splits per row (§ Outer
 		// Joins — Updates on a non-preserved-side column): where the non-preserved side
@@ -1201,6 +1447,21 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// lands (§ Scalar Invertibility).
 	}
 
+	// Existence-flip contradiction (§ Existence columns): `set <npCol> = …, hasB = false`
+	// cannot both delete the non-preserved side and write one of its columns; an np-column
+	// write always emits a matched per-side UPDATE, so a non-empty `perSide[side]` on a
+	// delete side is the contradiction. `hasB = true, hasB = false` (insert+delete the same
+	// side) is the same conflict. Reject rather than silently picking one effect.
+	for (const side of existenceDeleteSides) {
+		if (perSide[side].length > 0 || existenceInsertSides.has(side)) {
+			raiseMutationDiagnostic({
+				reason: 'conflicting-assignment',
+				table: view.name,
+				message: `cannot write through view '${view.name}': an existence-flag write deletes base table '${analysis.sides[side].schema.name}' (the non-preserved side) while the same statement also writes one of its columns — the two effects contradict`,
+			});
+		}
+	}
+
 	// Every affected view row's base-PK identities are captured ONCE up-front (before
 	// any base op fires) and each per-side op reads its identifying values back from
 	// that captured set via a correlated EXISTS over `__vmupd_keys` (matching all of the
@@ -1248,6 +1509,24 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// tag-allowance enforced there), so this only adds the create branch. § Outer Joins.
 	for (const [sideIndex, cols] of nullExtendedBySide) {
 		ops.push(buildNullExtendedInsert(ctx, view, analysis, sideIndex, cols, registerCapturedExpr!, stmt));
+	}
+
+	// Existence-flip deletes (§ Existence columns): `set hasB = false` removes the matched
+	// non-preserved rows (their captured PK is non-null; a null-extended row's captured PK
+	// is null, so the same captured-key EXISTS naturally excludes it). The preserved side is
+	// untouched, so a deleted row reads back null-extended (`hasB` now false).
+	for (const sideIndex of existenceDeleteSides) {
+		const side = analysis.sides[sideIndex];
+		const where = buildCapturedKeyPredicate(view, side, sideIndex);
+		const statement: AST.DeleteStmt = {
+			type: 'delete',
+			table: tableIdentifier(side.schema),
+			where,
+			contextValues: stmt.contextValues,
+			schemaPath: stmt.schemaPath,
+			loc: stmt.loc,
+		};
+		ops.push({ table: side.table, op: 'delete', statement });
 	}
 
 	if (ops.length === 0) {
@@ -2182,6 +2461,21 @@ function forEachColumnRefDeep(expr: AST.Expression, fn: (col: AST.ColumnExpr) =>
 
 function tableIdentifier(table: TableSchema): AST.IdentifierExpr {
 	return { type: 'identifier', name: table.name, schema: table.schemaName };
+}
+
+/**
+ * The boolean value of a literal existence-flag assignment (`set hasB = true|false`), or
+ * `undefined` for any non-literal / non-boolean value — a per-row branch on the *written*
+ * value is deferred (§ Existence columns, v1). Accepts the boolean literals `true`/`false`
+ * and the numeric `1`/`0` spellings (integers lower to `bigint` here).
+ */
+function asBooleanLiteral(expr: AST.Expression): boolean | undefined {
+	if (expr.type !== 'literal') return undefined;
+	const v = expr.value;
+	if (v === true || v === false) return v;
+	if (v === 1 || v === 1n) return true;
+	if (v === 0 || v === 0n) return false;
+	return undefined;
 }
 
 /**

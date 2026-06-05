@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
-import { isRelationalNode, type PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalComponentRef, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { buildSelectStmt } from '../building/select.js';
 import { resolveBaseSite } from '../analysis/update-lineage.js';
@@ -50,6 +50,15 @@ export interface BackwardColumn {
 	readonly inverse?: (written: AST.Expression) => AST.Expression;
 	/** Domain restriction an `inverse` profile carries (conjoined into the identifying predicate). */
 	readonly domain?: AST.Expression;
+	/**
+	 * Set for an outer-join `existence` (`exists … as`) flag — the relational component
+	 * whose membership the flag reifies. It has no `baseTableId` / `baseColumn` (it maps
+	 * to no base column), but is **writable through an effect**: the multi-source write
+	 * path routes a flag-flip to an insert/delete of this component (§ Existence columns).
+	 */
+	readonly existenceComponent?: RelationalComponentRef;
+	/** The join-predicate guard the existence flag is the truth-value of (present iff {@link existenceComponent}). */
+	readonly existenceGuard?: AST.Expression;
 	/** The projection's source expression (already in base terms) — the substitution target for a user predicate / assigned value over this column. */
 	readonly baseTermExpr: AST.Expression;
 }
@@ -151,6 +160,8 @@ export function analyzeBodyLineage(ctx: PlanningContext, view: MutableViewLike):
 			nullExtended: resolved.nullExtended,
 			...(resolved.inverse ? { inverse: resolved.inverse } : {}),
 			...(resolved.domain ? { domain: resolved.domain } : {}),
+			...(resolved.existenceComponent ? { existenceComponent: resolved.existenceComponent } : {}),
+			...(resolved.existenceGuard ? { existenceGuard: resolved.existenceGuard } : {}),
 			baseTermExpr,
 		});
 	});
