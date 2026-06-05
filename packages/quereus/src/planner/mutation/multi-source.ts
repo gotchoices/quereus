@@ -1539,7 +1539,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
  * capture-materialize-then-drain machinery already supplies the pre-mutation partition.
  */
 function buildNullExtendedInsert(
-	ctx: PlanningContext,
+	_ctx: PlanningContext,
 	view: MutableViewLike,
 	analysis: JoinViewAnalysis,
 	npSideIndex: number,
@@ -2005,7 +2005,7 @@ export function buildMultiSourceDeleteReturning(
 	return buildMultiSourceReturningProjection(ctx, view, analysis, filtered, stmt.returning!);
 }
 
-export function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt): BaseOp[] {
+export function decomposeDelete(_ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt): BaseOp[] {
 	// RETURNING through a multi-source delete is supported via a re-query of the
 	// planned view body captured *before* the base delete fires (the builder); the
 	// base op itself carries no RETURNING.
