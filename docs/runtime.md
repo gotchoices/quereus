@@ -1114,8 +1114,14 @@ to `module.alterTable`, so `new.<column>` resolves to the existing row's sibling
 The memory module applies the evaluator while it appends the column (building the
 new tree locally and swapping it in only once every row migrates), enforcing the
 column's NOT NULL on the produced value before commit. New CHECK constraints are
-validated against the backfilled rows afterward, reverting the column add on a
-violation. `ADD CONSTRAINT` likewise validates at first INSERT/UPDATE.
+validated against the backfilled rows afterward (a post-`alterTable` scan),
+reverting the column add on a violation — but **only for the literal-default
+path**: the post-scan reads a pre-backfill snapshot for the per-row evaluator
+path, so ADD COLUMN with both a non-foldable default and a CHECK on the new
+column is currently rejected at plan-build time (`StatusCode.UNSUPPORTED`) rather
+than admitting unvalidated rows (fix ticket
+`alter-add-column-backfill-check-enforcement`). `ADD CONSTRAINT` likewise
+validates at first INSERT/UPDATE.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion

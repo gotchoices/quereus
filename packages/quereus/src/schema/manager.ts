@@ -1429,7 +1429,8 @@ export class SchemaManager {
 	 * (absent a mutation context) bare columns are rejected, non-determinism is rejected
 	 * unless `nondeterministic_schema` is set, and a `new.<column>` default is accepted
 	 * with its build deferred — it reads the existing row's sibling during backfill and
-	 * the INSERT-supplied sibling for future inserts. Called from the ALTER TABLE emitter.
+	 * the INSERT-supplied sibling for future inserts. Called from the ALTER TABLE
+	 * statement builder (`buildAlterTableStmt`) at plan-build time.
 	 */
 	validateAddColumnDefault(
 		defaultExpr: AST.Expression,

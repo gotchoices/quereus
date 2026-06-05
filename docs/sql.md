@@ -1268,6 +1268,7 @@ Adds a new column to the table. Existing rows are backfilled with the column's D
 
 - Cannot add a PRIMARY KEY column.
 - Cannot add a NOT NULL column without a DEFAULT if the table has existing rows — unless the table's module advertises the `delegatesNotNullBackfill` capability, in which case the engine skips this pre-check and the module's `alterTable` owns the decision (intended for structurally-total modules that carry pre-existing rows forward and enforce NOT NULL at write time going forward). Native modules (memory, store) leave the capability off, so this restriction applies to them. A NOT NULL column *with* a per-row default whose backfill yields NULL for some existing row is likewise rejected (after backfill), and the column add is reverted.
+- Cannot add a column with **both** a non-foldable (per-row) DEFAULT and a CHECK constraint on the new column — this combination is not yet supported, because the per-row backfill is not validated against the CHECK (the literal-default + CHECK path *is* validated and reverts on violation). Add the column first, then add the CHECK separately, or use a literal DEFAULT.
 
 **DROP COLUMN**
 

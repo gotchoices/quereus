@@ -64,10 +64,23 @@ export function buildAlterTableStmt(
           defaultConstraint.expr, column.name, tableReference.tableSchema.name, hasMutationContext,
         );
       }
+      const backfill = buildAddColumnBackfill(ctx, tableReference, column);
+      // A per-row (non-foldable) default that is backfilled is not yet enforced
+      // against a CHECK on the new column: the post-backfill validation scan reads a
+      // pre-backfill snapshot for the evaluator path (the literal-default path is
+      // unaffected and still validated). Reject the combination at plan-build time
+      // rather than silently admitting CHECK-violating rows. Tracked by fix ticket
+      // `alter-add-column-backfill-check-enforcement`.
+      if (backfill && column.constraints?.some(c => c.type === 'check')) {
+        throw new QuereusError(
+          `ALTER TABLE ADD COLUMN '${column.name}' with both a non-foldable DEFAULT (e.g. new.<column>) and a CHECK constraint is not yet supported — the per-row backfill is not validated against the CHECK. Add the column first, then add the CHECK separately, or use a literal DEFAULT.`,
+          StatusCode.UNSUPPORTED,
+        );
+      }
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'addColumn',
         column,
-        backfill: buildAddColumnBackfill(ctx, tableReference, column),
+        backfill,
       });
 		}
 
