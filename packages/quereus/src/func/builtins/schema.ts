@@ -721,7 +721,8 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// Non-decomposable join shape gate: cross / comma (implicit) / subquery- or
 	// function-source join bodies are not write-through-able, so they must report the
 	// conservative all-`NO` row. `propagate()` decomposes an n-way (≥2) equi-join —
-	// `inner`/`left`/`right`/`full`, composite-PK sides and self-joins included
+	// `inner`/`left`/`full` (RIGHT excluded — runtime can't execute it), composite-PK
+	// sides and self-joins included
 	// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and rejects
 	// every other join shape, so without this gate the target walk below would resolve
 	// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable
@@ -762,7 +763,8 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	if (targetIds.size === 0) return CONSERVATIVE_VIEW_INFO;
 
 	// No PRESERVED base column ⇒ a FULL outer join (every side null-extended), or a
-	// LEFT/RIGHT body that projects away its whole preserved side. v1 defers write-through
+	// LEFT body that projects away its whole preserved side (RIGHT never reaches here —
+	// it is gated conservative by the shape check above). v1 defers write-through
 	// there (a full-outer write is per-row — § Outer Joins), so report the conservative
 	// row, agreeing with the dynamic rejects (`unsupported-outer-join-update` on update,
 	// `unsupported-join` on delete/insert through a side-less preserved set).
@@ -1020,7 +1022,8 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 
 		// Non-decomposable join shape gate: cross / comma / subquery-source join bodies
 		// are not write-through-able. `propagate()` decomposes an n-way (≥2) equi-join —
-		// `inner`/`left`/`right`/`full`, composite-PK sides and self-joins included
+		// `inner`/`left`/`full` (RIGHT excluded — runtime can't execute it), composite-PK
+	// sides and self-joins included
 		// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and
 		// rejects every other join shape, so without this gate `baseSiteOf` would resolve
 		// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable

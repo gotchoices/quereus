@@ -217,12 +217,14 @@ select is_insertable_into from view_info('dfi_v_typo');
 
 -- ===================================================================
 -- Divergence 2 — outer-join bodies report PER-SIDE and agree with propagate().
--- A LEFT/RIGHT outer join is partially writable: the preserved side's columns are
+-- A LEFT outer join is partially writable: the preserved side's columns are
 -- base-updatable, the view is insertable (preserved-only / both-side routing) and
 -- deletable (delete-to-preserved). The non-preserved (`null-extended`) side's columns
 -- are reported non-updatable — agreeing with the dynamic `unsupported-outer-join-update`
--- deferral. A FULL outer join has no preserved side (every side null-extended per row),
--- so it stays conservative all-`NO` and the dynamic write is deferred.
+-- deferral. RIGHT and FULL stay conservative all-`NO`: the runtime cannot execute a
+-- RIGHT or FULL join at all (runtime/emit/join.ts, pinned by 90.5-unsupported-join-types),
+-- so a RIGHT-join view is neither readable nor writable and must NOT advertise as such;
+-- FULL additionally has no preserved side. (Re-admit RIGHT once the runtime supports it.)
 -- ===================================================================
 
 create table oj_a (aid integer primary key, av text);
@@ -246,13 +248,21 @@ update oj_left set av = 'z' where aid = 1;
 update oj_left set bv = 'z' where aid = 1;
 -- error: cannot write through view
 
--- RIGHT: oj_b preserved, oj_a non-preserved. bid/bv updatable; av (non-preserved) NO.
+-- RIGHT: not runtime-executable (runtime/emit/join.ts throws `RIGHT JOIN is not
+-- supported yet`), so the view is neither readable nor writable — report conservative
+-- all-`NO`. The write-through recognition excludes RIGHT for the same reason; re-admit
+-- it (and flip this row to the per-side LEFT shape) when the runtime gains RIGHT joins.
 create view oj_right as
     select a.av as av, b.bid as bid, b.bv as bv
     from oj_a a right join oj_b b on b.bid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_right');
-→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the RIGHT-join view rejects at plan
+-- time (recognition excludes RIGHT — the runtime cannot execute it).
+update oj_right set bv = 'z' where bid = 1;
+-- error: cannot write through view
 
 -- FULL: every side null-extended ⇒ no preserved anchor ⇒ conservative all-`NO`.
 create view oj_full as

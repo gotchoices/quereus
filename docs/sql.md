@@ -978,6 +978,14 @@ Generated columns are computed from an expression over other columns in the same
 - Cannot INSERT into or UPDATE a generated column directly.
 - `ALTER TABLE ... DROP COLUMN` of a column referenced by another generated column's expression is rejected; drop the referencing generated column first.
 
+**Default Values:**
+
+A column `DEFAULT` supplies the value when an INSERT omits the column; an explicitly supplied value always wins. The expression must be deterministic and may not reference bind parameters.
+
+- A default may read a sibling **the INSERT supplies** via `new.<column>` — e.g. `slug text default (lower(new.title))` or `total integer default (new.subtotal + tax)`. Only INSERT-supplied columns are visible, so a default never depends on another column's default (which would impose an evaluation-order race); referencing an omitted column raises a resolution error.
+- A **bare** (unqualified) column reference is rejected at `CREATE TABLE` — use `new.<column>` to read a supplied value, or `GENERATED ALWAYS AS` to compute from any sibling. (With a `with context (...)` clause an unqualified identifier may instead resolve to a mutation-context variable.)
+- `mutation_ordinal()` (the 1-based per-row ordinal) and mutation-context variables are also available in default position. See [View Updateability § Mutation context](view-updateability.md#mutation-context).
+
 ### 2.6.1 CREATE/DROP ASSERTION (Global Integrity Constraints)
 
 Quereus supports database-wide integrity assertions evaluated at COMMIT time.

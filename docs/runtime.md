@@ -1083,8 +1083,12 @@ determinism checks).
 
 **CREATE TABLE:**
 - DEFAULT expressions are rejected if they reference bind parameters
-  (`?`, `:name`) or table columns; both are detected via an AST pre-walk
-  before expression building.
+  (`?`, `:name`) or a **bare** table column; both are detected via an AST
+  pre-walk before expression building. A `new.<column>` reference is the
+  exception — it explicitly reads a sibling value the INSERT supplies, so it
+  passes the pre-walk and its build/determinism check is deferred to INSERT
+  time (the row scope isn't available at CREATE TABLE), alongside the existing
+  deferrals for mutation-context identifiers and self-referencing subqueries.
 - DEFAULT expressions are then built and rejected if their physical
   `deterministic` property is false (e.g. `random()`).
 - CHECK constraints are walked at DDL time: any function call is looked up

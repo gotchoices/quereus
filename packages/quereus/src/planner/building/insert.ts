@@ -63,31 +63,40 @@ function createRowExpansionProjection(
 	const projections: Projection[] = [];
 	const sourceAttributes = sourceNode.getAttributes();
 
-	// Expose the source-provided ("populated") columns to default expressions so a
-	// default can derive from a sibling the INSERT actually supplied, e.g.
-	// `slug text default (lower(new.title))`. The `new.`-qualified form is always
-	// available; the bare form resolves too, unless a same-named mutation-context
-	// variable shadows it (preserving the WITH CONTEXT precedence). Columns the
-	// INSERT omitted are intentionally NOT registered: they are themselves being
-	// defaulted in this same projection and have no value yet, so a default cannot
-	// depend on another column's default (which would impose an evaluation-order
-	// race). Parented on contextScope so mutation-context variables stay resolvable.
-	const contextVarNames = new Set(
-		(tableReference.tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
-	);
-	const defaultScope = new RegisteredScope(contextScope ?? ctx.scope);
-	targetColumns.forEach((targetCol, index) => {
-		if (index >= sourceAttributes.length) return;
-		const sourceAttr = sourceAttributes[index];
-		const colNameLower = targetCol.name.toLowerCase();
-		const makeRef: ReferenceCallback = (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, sourceAttr.type, sourceAttr.id, index);
-		defaultScope.registerSymbol(`new.${colNameLower}`, makeRef);
-		if (!contextVarNames.has(colNameLower)) {
-			defaultScope.registerSymbol(colNameLower, makeRef);
-		}
-	});
-	const defaultCtx: PlanningContext = { ...ctx, scope: defaultScope };
+	// Expose the source-provided ("populated") columns to default expressions, built
+	// lazily. A default can derive from a sibling the INSERT actually supplied, e.g.
+	// `slug text default (lower(new.title))`; the `new.`-qualified form is always
+	// available, and the bare form resolves too unless a same-named mutation-context
+	// variable shadows it (preserving the WITH CONTEXT precedence). Columns the INSERT
+	// omitted are intentionally NOT registered: they have no value yet in this same
+	// projection, so a default cannot depend on another column's default (which would
+	// impose an evaluation-order race). The scope is parented on contextScope so
+	// mutation-context variables stay resolvable.
+	//
+	// INSERT is a hot path, so this is constructed only on demand — the first time an
+	// omitted column carries an *expression* default. The common insert (every column
+	// supplied, or only literal/NULL defaults) allocates nothing here.
+	let rowScopedDefaultCtx: PlanningContext | undefined;
+	const defaultCtxFor = (): PlanningContext => {
+		if (rowScopedDefaultCtx) return rowScopedDefaultCtx;
+		const contextVarNames = new Set(
+			(tableReference.tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
+		);
+		const defaultScope = new RegisteredScope(contextScope ?? ctx.scope);
+		targetColumns.forEach((targetCol, index) => {
+			if (index >= sourceAttributes.length) return;
+			const sourceAttr = sourceAttributes[index];
+			const colNameLower = targetCol.name.toLowerCase();
+			const makeRef: ReferenceCallback = (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, sourceAttr.type, sourceAttr.id, index);
+			defaultScope.registerSymbol(`new.${colNameLower}`, makeRef);
+			if (!contextVarNames.has(colNameLower)) {
+				defaultScope.registerSymbol(colNameLower, makeRef);
+			}
+		});
+		rowScopedDefaultCtx = { ...ctx, scope: defaultScope };
+		return rowScopedDefaultCtx;
+	};
 
 	tableSchema.columns.forEach((tableColumn) => {
 		// Find if this table column is in the target columns
@@ -131,14 +140,15 @@ function createRowExpansionProjection(
 				);
 			}
 		} else {
-			// This column is omitted - use its default expression (evaluated against
-			// defaultScope, so it can read populated siblings via `new.`) or NULL.
+			// This column is omitted - use its default expression (which may read a
+			// populated sibling via `new.`) or NULL.
 			let defaultNode: ScalarPlanNode;
 			if (tableColumn.defaultValue !== undefined) {
 				// Use default value
 				if (typeof tableColumn.defaultValue === 'object' && tableColumn.defaultValue !== null && 'type' in tableColumn.defaultValue) {
-					// It's an AST.Expression - build it into a plan node with context scope
-					defaultNode = buildExpression(defaultCtx, tableColumn.defaultValue as AST.Expression) as ScalarPlanNode;
+					// AST expression default — resolve against the row-scoped context that
+					// exposes populated siblings as `new.<column>` (built lazily, on first use).
+					defaultNode = buildExpression(defaultCtxFor(), tableColumn.defaultValue as AST.Expression) as ScalarPlanNode;
 
 					// Validate that the default expression is deterministic — skip when the
 					// `nondeterministic_schema` option permits non-deterministic defaults.
@@ -146,12 +156,12 @@ function createRowExpansionProjection(
 						validateDeterministicDefault(defaultNode, tableColumn.name, tableSchema.name);
 					}
 				} else {
-					// Literal default value
-					defaultNode = buildExpression(defaultCtx, { type: 'literal', value: tableColumn.defaultValue }) as ScalarPlanNode;
+					// Literal default value — no row scope needed.
+					defaultNode = buildExpression(ctx, { type: 'literal', value: tableColumn.defaultValue }) as ScalarPlanNode;
 				}
 			} else {
-				// No default value - use NULL
-				defaultNode = buildExpression(defaultCtx, { type: 'literal', value: null }) as ScalarPlanNode;
+				// No default value - use NULL (no row scope needed).
+				defaultNode = buildExpression(ctx, { type: 'literal', value: null }) as ScalarPlanNode;
 			}
 			projections.push({
 				node: defaultNode,
