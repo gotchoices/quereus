@@ -575,6 +575,21 @@ export type AlterTableAction =
 		setNotNull?: boolean,          // true = SET NOT NULL, false = DROP NOT NULL
 		setDataType?: string,
 		setDefault?: Expression | null // null = DROP DEFAULT, Expression = SET DEFAULT
+	}
+	| {
+		/**
+		 * ALTER TABLE … SET TAGS — whole-set replacement of the metadata tags on the
+		 * table itself, one of its columns, or one of its named table-level constraints.
+		 * `tags` is the complete desired tag set; an empty record clears all tags.
+		 * Tags are catalog-only metadata (no stored-row / physical effect), so this
+		 * never round-trips through `module.alterTable`.
+		 */
+		type: 'setTags',
+		target:
+			| { kind: 'table' }
+			| { kind: 'column'; columnName: string }
+			| { kind: 'constraint'; constraintName: string },
+		tags: Record<string, SqlValue> // empty record = clear all tags
 	};
 
 // Add PragmaStmt interface

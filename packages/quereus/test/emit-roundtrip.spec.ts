@@ -408,6 +408,26 @@ describe('Emit: statement round-trips', () => {
 		it('DROP COLUMN', () => {
 			roundTripStmt('alter table t drop column c');
 		});
+
+		it('SET TAGS (table)', () => {
+			roundTripStmt("alter table t set tags (display_name = 'T', audit = true)");
+		});
+
+		it('SET TAGS () clear (table)', () => {
+			roundTripStmt('alter table t set tags ()');
+		});
+
+		it('ALTER COLUMN SET TAGS', () => {
+			roundTripStmt("alter table t alter column c set tags (searchable = true)");
+		});
+
+		it('ALTER COLUMN SET TAGS () clear', () => {
+			roundTripStmt('alter table t alter column c set tags ()');
+		});
+
+		it('ALTER CONSTRAINT SET TAGS', () => {
+			roundTripStmt("alter table t alter constraint uq set tags (msg = 'dup')");
+		});
 	});
 
 	describe('Transaction', () => {

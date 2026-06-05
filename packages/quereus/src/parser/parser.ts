@@ -2885,13 +2885,28 @@ export class Parser {
 			this.matchKeyword('COLUMN');
 			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name after DROP COLUMN.");
 			action = { type: 'dropColumn', name };
+		} else if (this.peekKeyword('SET')) {
+			// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
+			this.consumeKeyword('SET', "Expected SET.");
+			this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
+			const tags = this.parseTags();
+			action = { type: 'setTags', target: { kind: 'table' }, tags };
 		} else if (this.peekKeyword('ALTER')) {
 			this.consumeKeyword('ALTER', "Expected ALTER.");
 			if (this.peekKeyword('COLUMN')) {
 				this.consumeKeyword('COLUMN', "Expected COLUMN.");
 				action = this.alterColumnAction();
+			} else if (this.peekKeyword('CONSTRAINT')) {
+				// ALTER CONSTRAINT <name> SET TAGS (...) — whole-set tag replacement on
+				// a named table-level constraint (only named constraints are addressable).
+				this.consumeKeyword('CONSTRAINT', "Expected CONSTRAINT.");
+				const constraintName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected constraint name after ALTER CONSTRAINT.");
+				this.consumeKeyword('SET', "Expected 'SET' after constraint name.");
+				this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
+				const tags = this.parseTags();
+				action = { type: 'setTags', target: { kind: 'constraint', constraintName }, tags };
 			} else {
-				this.consumeKeyword('PRIMARY', "Expected 'PRIMARY' or 'COLUMN' after ALTER.");
+				this.consumeKeyword('PRIMARY', "Expected 'PRIMARY', 'COLUMN', or 'CONSTRAINT' after ALTER.");
 				this.consumeKeyword('KEY', "Expected 'KEY' after PRIMARY.");
 				this.consume(TokenType.LPAREN, "Expected '(' after PRIMARY KEY.");
 				const columns: Array<{ name: string; direction?: 'asc' | 'desc' }> = [];
@@ -2947,7 +2962,12 @@ export class Parser {
 				const expr = this.expression();
 				return { type: 'alterColumn', columnName, setDefault: expr };
 			}
-			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, or DEFAULT after SET.");
+			if (this.matchKeyword('TAGS')) {
+				// ALTER COLUMN <name> SET TAGS (...) — whole-set tag replacement on the column.
+				const tags = this.parseTags();
+				return { type: 'setTags', target: { kind: 'column', columnName }, tags };
+			}
+			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, DEFAULT, or TAGS after SET.");
 		}
 
 		if (this.matchKeyword('DROP')) {

@@ -11,6 +11,8 @@ import { buildExpression } from './expression.js';
 import { buildRowDefaultScope } from './default-scope.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
+import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
+import { raiseReservedTagDiagnostics } from '../../schema/reserved-tags-policy.js';
 
 export function buildAlterTableStmt(
   ctx: PlanningContext,
@@ -104,6 +106,26 @@ export function buildAlterTableStmt(
         setDataType: stmt.action.setDataType,
         setDefault: stmt.action.setDefault,
       });
+
+    case 'setTags': {
+      // Validate any reserved `quereus.*` tags at the matching site so a typo
+      // (e.g. `quereus.update.taget`) fails loudly here rather than being stored.
+      // The CREATE / declarative paths route tags through the same registry.
+      const target = stmt.action.target;
+      const site: TagSite =
+        target.kind === 'column' ? 'physical-column'
+        : target.kind === 'constraint' ? 'physical-constraint'
+        : 'physical-table';
+      raiseReservedTagDiagnostics(
+        validateReservedTags(stmt.action.tags, site),
+        { log: () => { /* warnings (e.g. empty ack rationale) never block */ } },
+      );
+      return new AlterTableNode(ctx.scope, tableReference, {
+        type: 'setTags',
+        target,
+        tags: stmt.action.tags,
+      });
+    }
 
     default:
       throw new QuereusError(

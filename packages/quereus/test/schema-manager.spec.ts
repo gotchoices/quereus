@@ -193,6 +193,66 @@ describe('Schema Manager', () => {
 			expect(view).to.exist;
 			expect(view!.tags).to.deep.equal({ cacheable: true });
 		});
+
+		// ── setColumnTags ──
+		it('should set column tags via setColumnTags', async () => {
+			await db.exec('create table t1 (id integer primary key, name text)');
+			db.schemaManager.setColumnTags('t1', 'name', { searchable: true, display_name: 'Name' });
+			const table = db.schemaManager.findTable('t1');
+			expect(table!.columns[1].tags).to.deep.equal({ searchable: true, display_name: 'Name' });
+		});
+
+		it('should clear column tags when setting empty object', async () => {
+			await db.exec("create table t1 (id integer primary key, name text with tags (x = 1))");
+			db.schemaManager.setColumnTags('t1', 'name', {});
+			const table = db.schemaManager.findTable('t1');
+			expect(table!.columns[1].tags).to.be.undefined;
+		});
+
+		it('should not disturb other column attributes when setting column tags', async () => {
+			await db.exec("create table t1 (id integer primary key, name text not null default 'x')");
+			db.schemaManager.setColumnTags('t1', 'name', { a: 1 });
+			const col = db.schemaManager.findTable('t1')!.columns[1];
+			expect(col.notNull, 'NOT NULL preserved').to.be.true;
+			expect(col.defaultValue, 'DEFAULT preserved').to.not.be.null;
+			expect(col.tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should throw NOTFOUND when setting column tags on an unknown column', async () => {
+			await db.exec('create table t1 (id integer primary key)');
+			expect(() => db.schemaManager.setColumnTags('t1', 'nope', { a: 1 })).to.throw(/not found/i);
+		});
+
+		it('should throw when setting column tags on an unknown table', () => {
+			expect(() => db.schemaManager.setColumnTags('nope', 'c', { a: 1 })).to.throw();
+		});
+
+		// ── setConstraintTags ──
+		it('should set tags on a named UNIQUE constraint', async () => {
+			await db.exec('create table t1 (id integer primary key, email text, constraint uq_e unique (email))');
+			db.schemaManager.setConstraintTags('t1', 'uq_e', { msg: 'unique' });
+			const uc = db.schemaManager.findTable('t1')!.uniqueConstraints!.find(c => c.name === 'uq_e');
+			expect(uc!.tags).to.deep.equal({ msg: 'unique' });
+		});
+
+		it('should set tags on a named CHECK constraint', async () => {
+			await db.exec('create table t1 (id integer primary key, qty integer, constraint chk_q check (qty > 0))');
+			db.schemaManager.setConstraintTags('t1', 'chk_q', { msg: 'positive' });
+			const cc = db.schemaManager.findTable('t1')!.checkConstraints.find(c => c.name === 'chk_q');
+			expect(cc!.tags).to.deep.equal({ msg: 'positive' });
+		});
+
+		it('should clear constraint tags when setting empty object', async () => {
+			await db.exec("create table t1 (id integer primary key, email text, constraint uq_e unique (email) with tags (x = 1))");
+			db.schemaManager.setConstraintTags('t1', 'uq_e', {});
+			const uc = db.schemaManager.findTable('t1')!.uniqueConstraints!.find(c => c.name === 'uq_e');
+			expect(uc!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND when setting tags on an unknown constraint', async () => {
+			await db.exec('create table t1 (id integer primary key)');
+			expect(() => db.schemaManager.setConstraintTags('t1', 'nope', { a: 1 })).to.throw(/not found/i);
+		});
 	});
 
 	// ────────────────── Schema hashing: tags excluded ──────────────────
@@ -213,6 +273,20 @@ describe('Schema Manager', () => {
 			const schema1 = parse('declare schema test { table t1 (id integer primary key); }') as DeclareSchemaStmt;
 			const schema2 = parse('declare schema test { table t1 (id integer primary key, name text); }') as DeclareSchemaStmt;
 			expect(computeSchemaHash(schema1)).to.not.equal(computeSchemaHash(schema2));
+		});
+
+		it('should produce the same hash regardless of tag VALUE (tag-only change is hash-neutral)', () => {
+			// A tag-only mutation (the declarative analogue of `alter table set tags`)
+			// must not perturb the structural schema hash — tags are excluded entirely.
+			const v1 = parse("declare schema test { table t1 (id integer primary key) with tags (label = 'a'); }") as DeclareSchemaStmt;
+			const v2 = parse("declare schema test { table t1 (id integer primary key) with tags (label = 'b'); }") as DeclareSchemaStmt;
+			expect(computeSchemaHash(v1)).to.equal(computeSchemaHash(v2));
+		});
+
+		it('should produce the same hash regardless of constraint tag VALUE', () => {
+			const v1 = parse("declare schema test { table t1 (id integer primary key, email text, constraint uq unique (email) with tags (m = '1')); }") as DeclareSchemaStmt;
+			const v2 = parse("declare schema test { table t1 (id integer primary key, email text, constraint uq unique (email) with tags (m = '2')); }") as DeclareSchemaStmt;
+			expect(computeSchemaHash(v1)).to.equal(computeSchemaHash(v2));
 		});
 	});
 

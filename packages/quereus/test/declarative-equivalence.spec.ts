@@ -775,6 +775,117 @@ describe('declarative-equivalence: decorations (tags)', () => {
 			],
 		});
 	});
+
+	it('apply schema converges drifted table/column/constraint tags, and re-apply is idempotent', async function () {
+		const db = new Database();
+		try {
+			// Apply an initial schema with one set of tags at each site.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					name TEXT NOT NULL with tags (searchable = true),
+					constraint uq_name unique (name) with tags (msg = 'orig')
+				} with tags (owner = 'team-a')
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare with changed tags at all three sites (structure unchanged).
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					name TEXT NOT NULL with tags (searchable = false, indexed = true),
+					constraint uq_name unique (name) with tags (msg = 'updated')
+				} with tags (owner = 'team-b', layer = 'core')
+			}`);
+
+			// The diff detects tag drift at all three sites (and nothing structural).
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, collectSchemaCatalog(db, 'main'));
+			expect(diff.tablesToAlter.length, 'tag drift should produce exactly one alter').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToAdd, 'no structural column adds').to.deep.equal([]);
+			expect(alter.columnsToDrop, 'no structural column drops').to.deep.equal([]);
+			expect(alter.primaryKeyChange, 'no PK change').to.be.undefined;
+			expect(alter.tableTagsChange).to.deep.equal({ owner: 'team-b', layer: 'core' });
+			const colChange = alter.columnsToAlter.find(c => c.columnName.toLowerCase() === 'name');
+			expect(colChange?.tags).to.deep.equal({ searchable: false, indexed: true });
+			expect(colChange?.dataType, 'no type drift').to.be.undefined;
+			expect(colChange?.notNull, 'no nullability drift').to.be.undefined;
+			expect(alter.constraintTagsChanges).to.deep.equal([{ constraintName: 'uq_name', tags: { msg: 'updated' } }]);
+
+			await db.exec('apply schema main');
+
+			// The live catalog converged at all three sites.
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.tags).to.deep.equal({ owner: 'team-b', layer: 'core' });
+			const nameCol = t.columns.find(c => c.name.toLowerCase() === 'name')!;
+			expect(nameCol.tags).to.deep.equal({ searchable: false, indexed: true });
+			const uq = t.uniqueConstraints!.find(c => c.name === 'uq_name')!;
+			expect(uq.tags).to.deep.equal({ msg: 'updated' });
+
+			// Re-applying the same declaration is a no-op — no tag drift remains.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a tag-only declaration change does not perturb the structural schema hash', async function () {
+		const a = new Database();
+		const b = new Database();
+		try {
+			await a.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT NOT NULL } with tags (owner = 'team-a')
+			}`);
+			await b.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT NOT NULL } with tags (owner = 'team-b')
+			}`);
+			const ha = computeSchemaHash(a.declaredSchemaManager.getDeclaredSchema('main')!);
+			const hb = computeSchemaHash(b.declaredSchemaManager.getDeclaredSchema('main')!);
+			expect(ha, 'tag value must not change the schema hash').to.equal(hb);
+		} finally {
+			await a.close();
+			await b.close();
+		}
+	});
+
+	it('a SET TAGS carrying only a rename hint does not churn after the rename completes', async function () {
+		const db = new Database();
+		try {
+			// Apply a table; then re-declare it renamed via a previous_name hint plus a
+			// real tag. After the rename lands, re-declaring with the SAME hint must not
+			// produce a tag drift (hints are excluded from the drift comparison).
+			await db.exec(`declare schema main {
+				table orders { id INTEGER PRIMARY KEY } with tags (owner = 'team-a')
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table sales_orders { id INTEGER PRIMARY KEY } with tags (owner = 'team-a', "quereus.previous_name" = 'orders')
+			}`);
+			await db.exec('apply schema main');
+
+			// The table is renamed and carries the real tag.
+			expect(db.schemaManager.getTable('main', 'orders'), 'old name gone').to.be.undefined;
+			const renamed = db.schemaManager.getTable('main', 'sales_orders')!;
+			expect(renamed.tags?.owner).to.equal('team-a');
+
+			// Re-diff with the same declaration: the previous_name hint must not register
+			// as a tag drift now that the rename has completed.
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.renames, 'no further rename').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'hint-only difference must not churn a SET TAGS').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================

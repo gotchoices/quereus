@@ -915,6 +915,17 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 			}
 			return `alter table ${table} alter column ${colName}`;
 		}
+		case 'setTags': {
+			const a = stmt.action;
+			const body = tagsBodyToString(a.tags);
+			if (a.target.kind === 'column') {
+				return `alter table ${table} alter column ${quoteIdentifier(a.target.columnName)} set tags ${body}`;
+			}
+			if (a.target.kind === 'constraint') {
+				return `alter table ${table} alter constraint ${quoteIdentifier(a.target.constraintName)} set tags ${body}`;
+			}
+			return `alter table ${table} set tags ${body}`;
+		}
 	}
 }
 
@@ -1234,12 +1245,21 @@ function tagValueToString(value: SqlValue): string {
 }
 
 /** Formats a tags record as a WITH TAGS (...) clause */
-function tagsClauseToString(tags: Record<string, SqlValue> | undefined): string {
-	if (!tags || Object.keys(tags).length === 0) return '';
-	const entries = Object.entries(tags)
+/**
+ * Renders the inner `(k = v, …)` body of a tag list. Shared by the `WITH TAGS`
+ * clause and the `ALTER TABLE … SET TAGS` forms. An empty list renders `()`
+ * (the explicit clear-all form for SET TAGS).
+ */
+export function tagsBodyToString(tags: Record<string, SqlValue> | undefined): string {
+	const entries = Object.entries(tags ?? {})
 		.map(([key, value]) => `${quoteIdentifier(key)} = ${tagValueToString(value)}`)
 		.join(', ');
-	return ` with tags (${entries})`;
+	return `(${entries})`;
+}
+
+function tagsClauseToString(tags: Record<string, SqlValue> | undefined): string {
+	if (!tags || Object.keys(tags).length === 0) return '';
+	return ` with tags ${tagsBodyToString(tags)}`;
 }
 
 export function columnDefToString(col: AST.ColumnDef): string {

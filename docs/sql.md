@@ -1211,7 +1211,7 @@ create index idx_name on Products (name) with tags (purpose = 'search optimizati
 
 Tag values can be strings, numbers, booleans (`true`/`false`), or `null`. Tag keys are identifiers. `TAGS` is a contextual keyword and can still be used as a regular identifier. `WITH TAGS` can appear alongside `WITH CONTEXT` in any order.
 
-Tags are available on the schema interfaces (`TableSchema.tags`, `ColumnSchema.tags`, etc.) and via the programmatic API (`SchemaManager.getTableTags()`, `SchemaManager.setTableTags()`).
+Tags are available on the schema interfaces (`TableSchema.tags`, `ColumnSchema.tags`, etc.) and via the programmatic API (`SchemaManager.getTableTags()`, `SchemaManager.setTableTags()`, `SchemaManager.setColumnTags()`, `SchemaManager.setConstraintTags()`). Tags set at `CREATE` time can be changed later from SQL with `ALTER TABLE … SET TAGS` (whole-set replacement; see [§2.7](#27-alter-table-statement)).
 
 **Reserved namespace `quereus.*`:** keys whose name starts with `quereus.` are reserved for the engine. Tag keys with dots must use the quoted-identifier form (`"quereus.id"`). Currently recognized keys:
 
@@ -1307,6 +1307,26 @@ Changes a single column attribute. Each statement carries exactly one attribute;
 - `SET/DROP DEFAULT` is schema-only; existing rows are not touched.
 
 The declarative schema differ (`diff schema`) detects column-attribute drift and emits the matching `ALTER COLUMN` statements in the order `SET DATA TYPE` → `SET/DROP DEFAULT` → `SET/DROP NOT NULL` so that a newly-declared DEFAULT is in place before any NOT NULL tightening relies on it for backfill.
+
+**SET TAGS**
+
+```sql
+ALTER TABLE table_name SET TAGS (key = value [, ...]);                       -- table tags
+ALTER TABLE table_name SET TAGS ();                                          -- clear all table tags
+ALTER TABLE table_name ALTER COLUMN col_name SET TAGS (key = value [, ...]); -- column tags
+ALTER TABLE table_name ALTER CONSTRAINT con_name SET TAGS (key = value [, ...]); -- named-constraint tags
+```
+
+Replaces the metadata tags on the table itself, one of its columns, or one of its **named** table-level constraints (CHECK / UNIQUE / FOREIGN KEY). Semantics and restrictions:
+
+- **Whole-set replacement.** `SET TAGS` always replaces the *entire* tag set at the target with the listed tags — there is no per-key merge or per-key delete primitive (those are a planned ergonomic follow-up). An empty list `SET TAGS ()` clears all tags, after which the introspection TVFs (`schema()`, `table_info()`, `check_constraint_info()`, …) report `tags IS NULL`.
+- **Catalog-only.** Tags are pure informational metadata: they touch no stored row and no physical layout, so `SET TAGS` never round-trips through the module's `alterTable` and succeeds even on modules that don't implement it. (Caveat: store-backed modules re-persist DDL only through `alterTable`, so a tag-only change on a store table is not yet re-persisted across reconnect — see the schema docs.)
+- **Reserved-tag validation.** A `quereus.*` key is validated against the reserved-tag registry at the matching site (table / column / constraint) exactly as on `CREATE TABLE` / `declare schema`, so a misspelled or mis-sited reserved key (e.g. `"quereus.update.taget"`) fails loudly rather than being stored.
+- **Schema hash unaffected.** Tags are excluded from the schema hash, so `explain schema` reports the same hash after a tag-only `ALTER`.
+- **Only named constraints are addressable.** `ALTER CONSTRAINT` targets a constraint by name; an unnamed constraint (e.g. an inline `CHECK` whose trailing `WITH TAGS` attaches to its column) has no addressable name and its tags are immutable post-create. A name that does not match any named constraint raises `NOTFOUND`; a name present in more than one constraint class (lookup order CHECK → UNIQUE → FOREIGN KEY) is rejected as ambiguous.
+- **Attribute-preserving.** `SET TAGS` on a column changes only its `tags`; nullability, type, default, generated-ness, and PK membership are untouched.
+
+The declarative schema differ detects tag drift at all three sites and emits the matching `SET TAGS` statements **after** the structural ALTER phases (rename/add/alter/pk/drop), so a tag set lands on the post-rename column / constraint name. The rename-hint keys `"quereus.id"` and `"quereus.previous_name"` are excluded from the tag-drift comparison (they drive rename detection, not data state, so a declaration carrying only a hint does not churn out a `SET TAGS` after the rename completes); behavioral reserved tags (`quereus.update.*`, `quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared.
 
 ### 2.8 CREATE VIEW Statement
 
@@ -3890,7 +3910,9 @@ alter_table_stmt   = "alter" "table" table_name
                      | drop_column_stmt
                      | add_constraint_stmt
                      | alter_pk_stmt
-                     | alter_column_stmt ) ;
+                     | alter_column_stmt
+                     | set_table_tags_stmt
+                     | alter_constraint_tags_stmt ) ;
 
 rename_table_stmt  = "rename" "to" new_table_name ;
 
@@ -3909,7 +3931,15 @@ alter_column_stmt  = "alter" "column" column_name
                      | "drop" "not" "null"
                      | "set" "data" "type" type_name
                      | "set" "default" expression
-                     | "drop" "default" ) ;
+                     | "drop" "default"
+                     | "set" "tags" tags_body ) ;
+
+set_table_tags_stmt = "set" "tags" tags_body ;
+
+alter_constraint_tags_stmt = "alter" "constraint" constraint_name "set" "tags" tags_body ;
+
+/* Like tags_clause's body but without the "with tags" prefix; empty "()" clears all tags. */
+tags_body          = "(" [ tag_entry { "," tag_entry } ] ")" ;
 
 pk_col             = column_name [ "asc" | "desc" ] ;
 

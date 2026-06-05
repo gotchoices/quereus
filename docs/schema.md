@@ -79,7 +79,9 @@ These links are informational in the current release (enforcement still routes t
 | `getView(schemaName, viewName)` | Retrieves a view definition |
 | `getSchemaItem(schemaName, itemName)` | Returns a table or view by name (views take priority on name conflict) |
 | `getTableTags(tableName, schemaName?)` | Returns metadata tags for a table, or `undefined` |
-| `setTableTags(tableName, tags, schemaName?)` | Sets metadata tags on a table (pass `{}` to clear) |
+| `setTableTags(tableName, tags, schemaName?)` | Replaces a table's metadata tags (pass `{}` to clear); fires `table_modified` |
+| `setColumnTags(tableName, columnName, tags, schemaName?)` | Replaces a column's metadata tags (pass `{}` to clear). Catalog-only — column nullability / type / default / PK membership are untouched. Throws `NOTFOUND` for an unknown table or column |
+| `setConstraintTags(tableName, constraintName, tags, schemaName?)` | Replaces a **named** table-level constraint's metadata tags (pass `{}` to clear). Lookup order CHECK → UNIQUE → FOREIGN KEY; throws `NOTFOUND` for no match and `ERROR` for a name ambiguous across classes |
 | `findSchemasContainingTable(tableName)` | Returns all schema names containing the table — useful for error messages |
 | `findFunction(funcName, nArg)` | Finds a function by name and argument count |
 
@@ -360,9 +362,15 @@ Conflicts (declared name and hint resolving to two distinct existing objects) al
 
 The same resolution runs at column granularity inside `computeTableAlterDiff` and at named-constraint granularity. Column renames emit `ALTER TABLE ... RENAME COLUMN`. View, index, and named-constraint renames have no engine-level rename primitive and currently fall back to drop+recreate via the standard buckets.
 
+#### Tag-drift detection
+
+`computeTableAlterDiff` also detects **metadata-tag drift** at three sites — the table (`TableAlterDiff.tableTagsChange`), each surviving column (`ColumnAttributeChange.tags`, computed in `computeColumnAttributeChange`), and each name-matched named constraint (`TableAlterDiff.constraintTagsChanges`). The schema hash deliberately excludes tags, so drift is detected **structurally** (an order-independent `stableStringify` compare) rather than via the hash. The rename-hint keys `quereus.id` and `quereus.previous_name` are excluded from the comparison (they drive rename detection, not data state, so a declaration carrying only a hint does not churn out a `SET TAGS` after the rename completes); behavioral reserved tags (`quereus.update.*`, `quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared. `generateMigrationDDL` emits the drift as `ALTER TABLE … SET TAGS (…)` / `ALTER TABLE … ALTER COLUMN … SET TAGS (…)` / `ALTER TABLE … ALTER CONSTRAINT … SET TAGS (…)` **after** the structural ALTER phases, so a tag set lands on the post-rename column / constraint name. These `SET TAGS` mutations are **catalog-only**: the runtime swaps the in-memory schema and fires `table_modified` without calling `module.alterTable`. Store-backed modules re-persist DDL only from their `alterTable` hook, so a tag-only change on a store table is not yet re-persisted across reconnect — tracked by backlog ticket `tag-mutation-store-persistence`.
+
 #### Reserved-tag validation on the declarative path
 
 `quereus.id` and `quereus.previous_name` are first-class entries in the typed reserved-tag registry (`src/schema/reserved-tags.ts`), not a differ-local allow-list. Before any rename resolution, `computeSchemaDiff` routes every declared object's tags through `validateReservedTags(tags, site)` at the physical declarative sites — `physical-table` (table), `physical-column` (column), `view-ddl` (view / materialized view), `physical-index` (index), `physical-constraint` (table constraint, named or not — a table-level `WITH TAGS` clause is consumed even when the constraint is unnamed, so its tags are validated too; rename detection still keys off named constraints only) — and raises the first error via the shared `raiseReservedTagDiagnostics` policy helper. This is the **same registry and the same hard-error-on-unknown severity** as the lens-compile, view-mutation, and advertisement paths: a misspelled or mis-sited `quereus.*` key (e.g. `quereus.update.taget`, or `quereus.update.default_for.x` on a table rather than a view / projection / DML statement) now fails `apply schema` / `diff schema` loudly instead of being silently swallowed. The two rename hints carry value-schema `'string'` (a `quereus.id` may legitimately contain a hyphen, e.g. `'tbl-thing'`), so the existing rename flow is unchanged. An MV's `quereus.id` validates but is ignored (the differ supports no materialized-view rename).
+
+The imperative `ALTER TABLE … SET TAGS` path routes through the **same** registry at the matching site (`physical-table` / `physical-column` / `physical-constraint`) during plan-build, so a misspelled or mis-sited reserved key fails the statement loudly rather than being stored.
 
 ### Module Batch Hooks
 

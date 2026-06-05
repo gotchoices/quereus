@@ -3,6 +3,7 @@ import { VoidNode, type PhysicalProperties, type ScalarPlanNode, type RowDescrip
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type * as AST from '../../parser/ast.js';
+import type { SqlValue } from '../../common/types.js';
 
 /**
  * The per-row backfill of an ADD COLUMN whose DEFAULT does not fold to a literal
@@ -33,6 +34,19 @@ export type AlterTableAction =
 		setNotNull?: boolean;
 		setDataType?: string;
 		setDefault?: AST.Expression | null;
+	}
+	| {
+		/**
+		 * SET TAGS — catalog-only whole-set replacement of metadata tags on the
+		 * table, a column, or a named table-level constraint. `tags` is the complete
+		 * desired set (empty = clear). No module round-trip (see runtime emitter).
+		 */
+		type: 'setTags';
+		target:
+			| { kind: 'table' }
+			| { kind: 'column'; columnName: string }
+			| { kind: 'constraint'; constraintName: string };
+		tags: Record<string, SqlValue>;
 	};
 
 /**
@@ -68,6 +82,12 @@ export class AlterTableNode extends VoidNode {
 				return `ALTER TABLE ALTER PRIMARY KEY (${this.action.columns.map(c => c.name).join(', ')})`;
 			case 'alterColumn':
 				return `ALTER TABLE ALTER COLUMN ${this.action.columnName}`;
+			case 'setTags': {
+				const target = this.action.target;
+				if (target.kind === 'column') return `ALTER TABLE ALTER COLUMN ${target.columnName} SET TAGS`;
+				if (target.kind === 'constraint') return `ALTER TABLE ALTER CONSTRAINT ${target.constraintName} SET TAGS`;
+				return `ALTER TABLE SET TAGS`;
+			}
 		}
 	}
 

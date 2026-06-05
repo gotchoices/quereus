@@ -1,7 +1,7 @@
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString } from '../emit/ast-stringify.js';
 import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
@@ -77,6 +77,13 @@ export interface ColumnAttributeChange {
 	 *   Expression = set to given expression
 	 */
 	defaultValue?: AST.Expression | null;
+	/**
+	 * Desired metadata tag set (whole-set replacement) when the declared column
+	 * tags differ from actual. Omitted = no change; `{}` = clear all tags. Rename
+	 * hints (`quereus.id` / `quereus.previous_name`) are excluded from the drift
+	 * comparison but kept verbatim in the emitted set.
+	 */
+	tags?: Record<string, SqlValue>;
 }
 
 export interface TableAlterDiff {
@@ -92,6 +99,16 @@ export interface TableAlterDiff {
 		oldPkColumns: string[];
 		newPkColumns: Array<{ name: string; direction?: 'asc' | 'desc' }>;
 	};
+	/**
+	 * Desired table-level metadata tag set (whole-set replacement) when the declared
+	 * table tags differ from actual. Omitted = no change; `{}` = clear all tags.
+	 */
+	tableTagsChange?: Record<string, SqlValue>;
+	/**
+	 * Per named table-level constraint whose declared tags drifted from actual.
+	 * Whole-set replacement; `tags: {}` clears. Name-matched constraints only.
+	 */
+	constraintTagsChanges?: Array<{ constraintName: string; tags: Record<string, SqlValue> }>;
 }
 
 /**
@@ -263,6 +280,8 @@ export function computeSchemaDiff(
 				|| alterDiff.columnsToRename.length > 0
 				|| (alterDiff.constraintsToRename?.length ?? 0) > 0
 				|| alterDiff.primaryKeyChange
+				|| alterDiff.tableTagsChange !== undefined
+				|| (alterDiff.constraintTagsChanges?.length ?? 0) > 0
 			) {
 				diff.tablesToAlter.push(alterDiff);
 			}
@@ -710,6 +729,29 @@ function computeTableAlterDiff(
 		diff.constraintsToRename = constraintRenames.renames.map(r => ({ oldName: r.oldName, newName: r.newName }));
 	}
 
+	// Detect named-constraint tag drift (name-matched constraints only — a
+	// renamed constraint is not addressable by ALTER CONSTRAINT, see the runtime
+	// emitter). Whole-set replacement; rename hints excluded from the compare.
+	const constraintTagsChanges: Array<{ constraintName: string; tags: Record<string, SqlValue> }> = [];
+	for (const [name, declaredConstraint] of declaredNamedConstraints) {
+		const actualConstraint = actualNamedConstraints.get(name);
+		if (!actualConstraint) continue; // a rename/create — not a same-name tag change
+		if (tagsDrifted(declaredConstraint.tags, actualConstraint.tags)) {
+			constraintTagsChanges.push({
+				constraintName: declaredConstraint.name!,
+				tags: desiredTagSet(declaredConstraint.tags),
+			});
+		}
+	}
+	if (constraintTagsChanges.length > 0) {
+		diff.constraintTagsChanges = constraintTagsChanges;
+	}
+
+	// Detect table-level tag drift (whole-set replacement; rename hints excluded).
+	if (tagsDrifted(declaredTable.tableStmt.tags, actualTable.tags)) {
+		diff.tableTagsChange = desiredTagSet(declaredTable.tableStmt.tags);
+	}
+
 	// Detect PK changes
 	const declaredPk = extractDeclaredPK(declaredTable);
 	const actualPk = actualTable.primaryKey;
@@ -764,6 +806,43 @@ function stableStringify(v: unknown): string {
 	return `{${keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',')}}`;
 }
 
+/**
+ * Rename-hint keys excluded from tag-drift comparison: they drive rename
+ * detection ({@link resolveRenames}), not data state, so a tag set carrying only
+ * a hint must not churn out a `SET TAGS` after the rename completes. Behavioral
+ * reserved tags (`quereus.update.*`, `quereus.lens.*`,
+ * `quereus.expose_implicit_index`, …) are real schema state and ARE compared.
+ */
+const RENAME_HINT_KEYS = new Set([QUEREUS_TAG_PREFIX + 'id', QUEREUS_TAG_PREFIX + 'previous_name']);
+
+/** A tag record with the rename-hint keys stripped, for drift comparison. */
+function tagsForDriftCompare(tags: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> {
+	const out: Record<string, SqlValue> = {};
+	if (tags) {
+		for (const [k, v] of Object.entries(tags)) {
+			if (!RENAME_HINT_KEYS.has(k.toLowerCase())) out[k] = v;
+		}
+	}
+	return out;
+}
+
+/**
+ * True when the declared and actual tag sets differ (order-independent, rename
+ * hints ignored). On drift the differ emits a `SET TAGS` carrying the full
+ * declared set (hints included — they are stored verbatim).
+ */
+function tagsDrifted(
+	declared: Readonly<Record<string, SqlValue>> | undefined,
+	actual: Readonly<Record<string, SqlValue>> | undefined,
+): boolean {
+	return stableStringify(tagsForDriftCompare(declared)) !== stableStringify(tagsForDriftCompare(actual));
+}
+
+/** The whole-set replacement value to emit for a drifted tag site (declared, or `{}`). */
+function desiredTagSet(declared: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> {
+	return declared ? { ...declared } : {};
+}
+
 function computeColumnAttributeChange(
 	declared: AST.ColumnDef,
 	actual: CatalogTable['columns'][number],
@@ -795,6 +874,12 @@ function computeColumnAttributeChange(
 		}
 	} else if (actualDefault !== null) {
 		change.defaultValue = null;
+		any = true;
+	}
+
+	// Tag drift — whole-set replacement (rename hints excluded from the compare).
+	if (tagsDrifted(declared.tags, actual.tags)) {
+		change.tags = desiredTagSet(declared.tags);
 		any = true;
 	}
 
@@ -990,6 +1075,19 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		}
 		for (const colName of alter.columnsToDrop) {
 			statements.push(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`);
+		}
+		// Tags phase — last, so a SET TAGS lands on the post-structural column /
+		// constraint set (a tag set emitted alongside a RENAME COLUMN targets the
+		// post-rename name). Whole-set replacement; an empty set clears.
+		if (alter.tableTagsChange !== undefined) {
+			statements.push(`ALTER TABLE ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`);
+		}
+		for (const colAlter of alter.columnsToAlter) {
+			if (colAlter.tags === undefined) continue;
+			statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)} SET TAGS ${tagsBodyToString(colAlter.tags)}`);
+		}
+		for (const ctc of alter.constraintTagsChanges ?? []) {
+			statements.push(`ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)} SET TAGS ${tagsBodyToString(ctc.tags)}`);
 		}
 	}
 

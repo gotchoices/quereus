@@ -612,6 +612,32 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Freezes a whole-set tag replacement: an empty record stores `undefined`
+	 * (so `tags IS NULL` and the differ's "no tags" both hold), a non-empty one a
+	 * frozen copy. Shared by the three catalog-only tag setters.
+	 */
+	private freezeTags(tags: Record<string, SqlValue>): Readonly<Record<string, SqlValue>> | undefined {
+		return Object.keys(tags).length > 0 ? Object.freeze({ ...tags }) : undefined;
+	}
+
+	/**
+	 * Re-registers a tag-only schema swap and fires `table_modified` so optimizer
+	 * caches invalidate. Tags are excluded from the schema hash, so a tag-only swap
+	 * is a structural no-op except for the metadata itself.
+	 */
+	private commitTagUpdate(targetSchemaName: string, oldSchema: TableSchema, newSchema: TableSchema): void {
+		const schema = this.getSchemaOrFail(targetSchemaName);
+		schema.addTable(newSchema);
+		this.changeNotifier.notifyChange({
+			type: 'table_modified',
+			schemaName: targetSchemaName,
+			objectName: newSchema.name,
+			oldObject: oldSchema,
+			newObject: newSchema,
+		});
+	}
+
+	/**
 	 * Sets metadata tags on an existing table, replacing any existing tags.
 	 *
 	 * @param tableName The table name
@@ -624,13 +650,85 @@ export class SchemaManager {
 		if (!tableSchema) {
 			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
-		const hasTags = Object.keys(tags).length > 0;
 		const updatedSchema: TableSchema = {
 			...tableSchema,
-			tags: hasTags ? Object.freeze({ ...tags }) : undefined,
+			tags: this.freezeTags(tags),
 		};
-		const schema = this.getSchemaOrFail(targetSchemaName);
-		schema.addTable(updatedSchema);
+		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
+	}
+
+	/**
+	 * Sets metadata tags on a column of an existing table, replacing any existing
+	 * tags on that column (empty record clears). Catalog-only — only the column's
+	 * `tags` field changes; nullability / type / default / PK membership are
+	 * untouched.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the table or column does not exist.
+	 */
+	setColumnTags(tableName: string, columnName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const tableSchema = this.getTable(targetSchemaName, tableName);
+		if (!tableSchema) {
+			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+		}
+		const colIndex = tableSchema.columnIndexMap.get(columnName.toLowerCase());
+		if (colIndex === undefined) {
+			throw new QuereusError(`Column '${columnName}' not found in table '${tableName}'`, StatusCode.NOTFOUND);
+		}
+		const frozen = this.freezeTags(tags);
+		const newColumns = tableSchema.columns.map((c, i) => (i === colIndex ? { ...c, tags: frozen } : c));
+		const updatedSchema: TableSchema = {
+			...tableSchema,
+			columns: Object.freeze(newColumns),
+		};
+		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
+	}
+
+	/**
+	 * Sets metadata tags on a NAMED table-level constraint (CHECK / UNIQUE /
+	 * FOREIGN KEY), replacing any existing tags (empty record clears). Lookup order
+	 * is checks → unique → foreign keys; a name present in more than one class is
+	 * rejected as ambiguous. Unnamed constraints are not addressable.
+	 *
+	 * @throws QuereusError(NOTFOUND) if no named constraint matches.
+	 * @throws QuereusError(ERROR) if the name is ambiguous across constraint classes.
+	 */
+	setConstraintTags(tableName: string, constraintName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const tableSchema = this.getTable(targetSchemaName, tableName);
+		if (!tableSchema) {
+			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+		}
+		const lower = constraintName.toLowerCase();
+		const inChecks = (tableSchema.checkConstraints ?? []).some(c => c.name?.toLowerCase() === lower);
+		const inUnique = (tableSchema.uniqueConstraints ?? []).some(c => c.name?.toLowerCase() === lower);
+		const inFks = (tableSchema.foreignKeys ?? []).some(c => c.name?.toLowerCase() === lower);
+		const matchCount = [inChecks, inUnique, inFks].filter(Boolean).length;
+		if (matchCount === 0) {
+			throw new QuereusError(`Named constraint '${constraintName}' not found in table '${tableName}'`, StatusCode.NOTFOUND);
+		}
+		if (matchCount > 1) {
+			throw new QuereusError(
+				`Constraint name '${constraintName}' is ambiguous in table '${tableName}' (present in more than one of CHECK / UNIQUE / FOREIGN KEY)`,
+				StatusCode.ERROR,
+			);
+		}
+		const frozen = this.freezeTags(tags);
+		const updatedSchema: TableSchema = { ...tableSchema };
+		if (inChecks) {
+			updatedSchema.checkConstraints = Object.freeze(
+				tableSchema.checkConstraints.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
+			);
+		} else if (inUnique) {
+			updatedSchema.uniqueConstraints = Object.freeze(
+				tableSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
+			);
+		} else {
+			updatedSchema.foreignKeys = Object.freeze(
+				tableSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
+			);
+		}
+		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
 	}
 
 	/**

@@ -57,6 +57,12 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns);
 			case 'alterColumn':
 				return runAlterColumn(rctx, tableSchema, schema, action);
+			case 'setTags': {
+				const target = action.target;
+				if (target.kind === 'column') return runSetColumnTags(rctx, tableSchema, target.columnName, action.tags);
+				if (target.kind === 'constraint') return runSetConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
+				return runSetTableTags(rctx, tableSchema, action.tags);
+			}
 		}
 	}
 
@@ -68,6 +74,13 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 			case 'dropColumn': return `dropColumn(${tableSchema.name}.${action.name})`;
 			case 'alterPrimaryKey': return `alterPrimaryKey(${tableSchema.name} -> [${action.columns.map(c => c.name).join(', ')}])`;
 			case 'alterColumn': return `alterColumn(${tableSchema.name}.${action.columnName})`;
+			case 'setTags': {
+				const t = action.target;
+				const where = t.kind === 'column' ? `${tableSchema.name}.${t.columnName}`
+					: t.kind === 'constraint' ? `${tableSchema.name}.constraint ${t.constraintName}`
+					: tableSchema.name;
+				return `setTags(${where})`;
+			}
 		}
 	})();
 
@@ -588,6 +601,50 @@ async function runAlterColumn(
 	});
 
 	log('Altered column %s.%s.%s', tableSchema.schemaName, tableSchema.name, action.columnName);
+	return null;
+}
+
+/**
+ * Catalog-only metadata-tag mutations. Tags touch no stored row and no physical
+ * layout, so these never call `module.alterTable` — they delegate to the
+ * SchemaManager setters, which swap the in-memory schema and fire `table_modified`
+ * (so optimizer caches invalidate). This makes SET TAGS succeed even on modules
+ * without an `alterTable` hook.
+ *
+ * NOTE: store-backed modules persist DDL from their own `alterTable`, which this
+ * path deliberately bypasses, so a tag-only change does not re-persist for a
+ * store table across reconnect (the same gap the programmatic `setTableTags`
+ * already has). Tracked by backlog ticket `tag-mutation-store-persistence`.
+ */
+function runSetTableTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	tags: Record<string, SqlValue>,
+): SqlValue {
+	rctx.db.schemaManager.setTableTags(tableSchema.name, tags, tableSchema.schemaName);
+	log('Set tags on table %s.%s', tableSchema.schemaName, tableSchema.name);
+	return null;
+}
+
+function runSetColumnTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	columnName: string,
+	tags: Record<string, SqlValue>,
+): SqlValue {
+	rctx.db.schemaManager.setColumnTags(tableSchema.name, columnName, tags, tableSchema.schemaName);
+	log('Set tags on column %s.%s.%s', tableSchema.schemaName, tableSchema.name, columnName);
+	return null;
+}
+
+function runSetConstraintTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	constraintName: string,
+	tags: Record<string, SqlValue>,
+): SqlValue {
+	rctx.db.schemaManager.setConstraintTags(tableSchema.name, constraintName, tags, tableSchema.schemaName);
+	log('Set tags on constraint %s.%s.%s', tableSchema.schemaName, tableSchema.name, constraintName);
 	return null;
 }
 

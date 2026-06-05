@@ -191,3 +191,100 @@ CREATE TABLE SpecialTags (
 INSERT INTO SpecialTags VALUES (1);
 SELECT * FROM SpecialTags;
 → [{"id":1}]
+
+-- ===================================================================
+-- Phase 11: ALTER TABLE ... SET TAGS (table-level, whole-set replace + clear)
+-- ===================================================================
+
+CREATE TABLE Alterable (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+-- No tags yet → tags IS NULL
+SELECT tags FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"tags":null}]
+
+-- Set table tags
+ALTER TABLE Alterable SET TAGS (display_name = 'Alterable Table', audit = true);
+SELECT json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"dn":"Alterable Table","audit":true}]
+
+-- Whole-set replace: the previous keys are gone, only the new one remains
+ALTER TABLE Alterable SET TAGS (display_name = 'Renamed');
+SELECT json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"dn":"Renamed","audit":null}]
+
+-- Clear all tags → tags IS NULL
+ALTER TABLE Alterable SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"tags":null}]
+
+-- The table still works after tag mutations
+INSERT INTO Alterable VALUES (1, 'row');
+SELECT * FROM Alterable;
+→ [{"id":1,"name":"row"}]
+
+-- ===================================================================
+-- Phase 12: ALTER TABLE ... ALTER COLUMN ... SET TAGS
+-- ===================================================================
+
+ALTER TABLE Alterable ALTER COLUMN name SET TAGS (searchable = true, display_name = 'Name');
+SELECT name, json_extract(tags, '$.searchable') AS searchable, json_extract(tags, '$.display_name') AS dn
+    FROM table_info('Alterable') WHERE name = 'name';
+→ [{"name":"name","searchable":true,"dn":"Name"}]
+
+-- Column attributes (NOT NULL, type) are untouched by SET TAGS
+SELECT name, type, notnull FROM table_info('Alterable') WHERE name = 'name';
+→ [{"name":"name","type":"TEXT","notnull":1}]
+
+-- Clear column tags
+ALTER TABLE Alterable ALTER COLUMN name SET TAGS ();
+SELECT tags FROM table_info('Alterable') WHERE name = 'name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 13: ALTER TABLE ... ALTER CONSTRAINT ... SET TAGS (named constraint)
+-- ===================================================================
+
+CREATE TABLE Staff (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    CONSTRAINT uq_staff_email UNIQUE (email)
+);
+
+ALTER TABLE Staff ALTER CONSTRAINT uq_staff_email SET TAGS (error_message = 'Email must be unique');
+SELECT name, json_extract(tags, '$.error_message') AS msg
+    FROM unique_constraint_info('Staff') WHERE name = 'uq_staff_email';
+→ [{"name":"uq_staff_email","msg":"Email must be unique"}]
+
+-- The UNIQUE constraint still enforces after the tag mutation
+INSERT INTO Staff VALUES (1, 'a@x'), (2, 'b@x');
+SELECT count(*) AS n FROM Staff;
+→ [{"n":2}]
+
+INSERT INTO Staff VALUES (3, 'a@x');
+-- error: constraint
+
+-- ===================================================================
+-- Phase 14: reserved-tag typo rejection on the ALTER path
+-- ===================================================================
+
+-- A misspelled reserved key is rejected loudly (not silently stored)
+ALTER TABLE Alterable SET TAGS ("quereus.update.taget" = 1);
+-- error: reserved tag
+
+ALTER TABLE Alterable ALTER COLUMN name SET TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- ===================================================================
+-- Phase 15: NOTFOUND for unknown column / constraint
+-- ===================================================================
+
+ALTER TABLE Alterable ALTER COLUMN nope SET TAGS (a = 1);
+-- error: not found
+
+ALTER TABLE Alterable ALTER CONSTRAINT nope SET TAGS (a = 1);
+-- error: not found
