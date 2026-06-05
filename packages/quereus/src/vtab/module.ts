@@ -9,6 +9,7 @@ import type { ModuleCapabilities } from './capabilities.js';
 import type { MappingAdvertisement } from './mapping-advertisement.js';
 import type { Schema } from '../schema/schema.js';
 import type { LensDeploymentSnapshot } from '../schema/lens.js';
+import type { Row, SqlValue } from '../common/types.js';
 
 /**
  * Base interface for module-specific configuration passed to create/connect.
@@ -357,7 +358,19 @@ export interface VirtualTableModule<
  * Defines the structure for schema change information passed to xAlterSchema
  */
 export type SchemaChangeInfo =
-	| { type: 'addColumn'; columnDef: ColumnDef }
+	| {
+		type: 'addColumn';
+		columnDef: ColumnDef;
+		/**
+		 * Per-row backfill for a non-foldable DEFAULT (e.g. `new.<col>`): given an
+		 * existing row, returns that row's value for the new column. Absent for a
+		 * literal / NULL default (the module bulk-writes the folded value). The engine
+		 * builds this from the column's DEFAULT evaluated against the existing row, so a
+		 * module that appends the new column should call it per existing row instead of
+		 * writing a single default value.
+		 */
+		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
+	}
 	| { type: 'dropColumn'; columnName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string; newColumnDefAst?: ColumnDef }
 	| { type: 'alterPrimaryKey'; newPkColumns: ReadonlyArray<{ index: number; desc: boolean }> }

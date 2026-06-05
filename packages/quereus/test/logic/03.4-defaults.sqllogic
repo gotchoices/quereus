@@ -213,3 +213,60 @@ insert into sd_drop (id) values (2);
 select w from sd_drop where id = 2;
 → [{"w":null}]
 DROP TABLE sd_drop;
+
+-- ===================================
+-- ALTER TABLE ADD COLUMN with a new.<column> DEFAULT backfills existing rows
+-- per-row from their OWN sibling, and a later insert derives the column from the
+-- INSERT-supplied sibling (parity with the single-source path).
+-- ===================================
+
+create table ac_t (id integer primary key, base integer);
+insert into ac_t (id, base) values (1, 10), (2, 5), (3, 0);
+
+-- new.<col> default: each existing row backfills from its own base.
+alter table ac_t add column doubled integer default (new.base * 2);
+select id, base, doubled from ac_t order by id;
+→ [{"id":1,"base":10,"doubled":20},{"id":2,"base":5,"doubled":10},{"id":3,"base":0,"doubled":0}]
+
+-- a later insert supplying base derives doubled.
+insert into ac_t (id, base) values (4, 7);
+select doubled from ac_t where id = 4;
+→ [{"doubled":14}]
+
+-- an explicitly supplied value still overrides the default.
+insert into ac_t (id, base, doubled) values (5, 7, 999);
+select doubled from ac_t where id = 5;
+→ [{"doubled":999}]
+
+-- omitting the sibling the default reads → the same resolution error as the
+-- single-source insert path (new.base has no supplied value).
+insert into ac_t (id) values (6);
+-- error: isn't a column
+
+DROP TABLE ac_t;
+
+-- A literal-folding ADD COLUMN default still bulk-backfills (fast path unchanged).
+create table ac_lit (id integer primary key, a integer);
+insert into ac_lit (id, a) values (1, 1), (2, 2);
+alter table ac_lit add column c integer default (3 + 4);
+select id, c from ac_lit order by id;
+→ [{"id":1,"c":7},{"id":2,"c":7}]
+DROP TABLE ac_lit;
+
+-- ADD COLUMN NOT NULL whose per-row backfill is non-null for every row succeeds.
+create table ac_nn2 (id integer primary key, base integer not null);
+insert into ac_nn2 (id, base) values (1, 10), (2, 4);
+alter table ac_nn2 add column doubled integer not null default (new.base * 2);
+select id, base, doubled from ac_nn2 order by id;
+→ [{"id":1,"base":10,"doubled":20},{"id":2,"base":4,"doubled":8}]
+DROP TABLE ac_nn2;
+
+-- ADD COLUMN NOT NULL whose per-row backfill yields NULL for some row is rejected,
+-- and the table is left unchanged (the new column was not added).
+create table ac_nn (id integer primary key, base integer null);
+insert into ac_nn (id, base) values (1, 10), (2, null);
+alter table ac_nn add column doubled integer not null default (new.base * 2);
+-- error:
+select * from ac_nn order by id;
+→ [{"id":1,"base":10},{"id":2,"base":null}]
+DROP TABLE ac_nn;

@@ -1,8 +1,21 @@
 import type { Scope } from '../scopes/scope.js';
-import { VoidNode, type PhysicalProperties } from './plan-node.js';
+import { VoidNode, type PhysicalProperties, type ScalarPlanNode, type RowDescriptor } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type * as AST from '../../parser/ast.js';
+
+/**
+ * The per-row backfill of an ADD COLUMN whose DEFAULT does not fold to a literal
+ * (e.g. `new.<col>`). `node` is the default compiled against the table's existing
+ * columns as the "supplied" row; `rowDescriptor` maps those fresh attribute ids to
+ * existing-row positions. The emitter installs a row slot over each existing row and
+ * evaluates `node` to produce that row's value for the new column. A literal default
+ * folds and is bulk-written by the module instead, so it carries no backfill node.
+ */
+export interface AddColumnBackfill {
+	readonly node: ScalarPlanNode;
+	readonly rowDescriptor: RowDescriptor;
+}
 
 /**
  * Discriminated union of ALTER TABLE actions handled by AlterTableNode.
@@ -11,7 +24,7 @@ import type * as AST from '../../parser/ast.js';
 export type AlterTableAction =
 	| { type: 'renameTable'; newName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string }
-	| { type: 'addColumn'; column: AST.ColumnDef }
+	| { type: 'addColumn'; column: AST.ColumnDef; backfill?: AddColumnBackfill }
 	| { type: 'dropColumn'; name: string }
 	| { type: 'alterPrimaryKey'; columns: Array<{ name: string; direction?: 'asc' | 'desc' }> }
 	| {

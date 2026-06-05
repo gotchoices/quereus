@@ -1028,6 +1028,7 @@ A column `DEFAULT` supplies the value when an INSERT omits the column; an explic
 - A **bare** (unqualified) column reference is rejected at `CREATE TABLE` — use `new.<column>` to read a supplied value, or `GENERATED ALWAYS AS` to compute from any sibling. (With a `with context (...)` clause an unqualified identifier may instead resolve to a mutation-context variable.)
 - `mutation_ordinal()` (the 1-based per-row ordinal) and mutation-context variables are also available in default position. See [View Updateability § Mutation context](view-updateability.md#mutation-context).
 - `ALTER TABLE … ALTER COLUMN … SET DEFAULT` routes the new default through the **same** validator `CREATE TABLE` uses: bind parameters / bare columns / non-deterministic expressions are rejected at `ALTER` time, and a `new.<column>` default is accepted (its build is deferred to INSERT time, exactly as on `CREATE TABLE`). `DROP DEFAULT` clears the default.
+- `ALTER TABLE … ADD COLUMN … DEFAULT (…)` accepts the same default expressions (the shared validator rejects bind parameters / bare columns / non-determinism). Existing rows are **backfilled per row**: `new.<column>` resolves to the *existing* row's sibling (e.g. `add column doubled integer default (new.base * 2)` sets each existing row's `doubled` from its own `base`), while a literal default is bulk-written. Future inserts derive the column from the INSERT-supplied sibling, so an insert that omits that sibling raises the same resolution error as the single-source path. An `ADD COLUMN NOT NULL` whose per-row backfill yields NULL for any existing row is rejected and the column is not added.
 
 ### 2.6.1 CREATE/DROP ASSERTION (Global Integrity Constraints)
 
@@ -1263,10 +1264,10 @@ Renames a column. Data is preserved. Fails if the new name conflicts with an exi
 ALTER TABLE table_name ADD COLUMN col_name type [constraints];
 ```
 
-Adds a new column to the table. Existing rows are backfilled with the column's DEFAULT value (or NULL if no default). Restrictions:
+Adds a new column to the table. Existing rows are backfilled with the column's DEFAULT value (or NULL if no default). A literal default is bulk-written to every existing row; a non-foldable expression default (including one that reads `new.<column>`) is evaluated **per existing row** — `new.<column>` resolves to that row's own sibling value (the existing-row backfill semantics described under *Default Values* above). Restrictions:
 
 - Cannot add a PRIMARY KEY column.
-- Cannot add a NOT NULL column without a DEFAULT if the table has existing rows — unless the table's module advertises the `delegatesNotNullBackfill` capability, in which case the engine skips this pre-check and the module's `alterTable` owns the decision (intended for structurally-total modules that carry pre-existing rows forward and enforce NOT NULL at write time going forward). Native modules (memory, store) leave the capability off, so this restriction applies to them.
+- Cannot add a NOT NULL column without a DEFAULT if the table has existing rows — unless the table's module advertises the `delegatesNotNullBackfill` capability, in which case the engine skips this pre-check and the module's `alterTable` owns the decision (intended for structurally-total modules that carry pre-existing rows forward and enforce NOT NULL at write time going forward). Native modules (memory, store) leave the capability off, so this restriction applies to them. A NOT NULL column *with* a per-row default whose backfill yields NULL for some existing row is likewise rejected (after backfill), and the column add is reverted.
 
 **DROP COLUMN**
 

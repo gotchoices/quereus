@@ -1419,6 +1419,35 @@ export class SchemaManager {
 		tableName: string,
 		hasMutationContext: boolean,
 	): void {
+		this.validateDdlDefault(defaultExpr, columnName, tableName, hasMutationContext, 'ALTER COLUMN SET DEFAULT');
+	}
+
+	/**
+	 * Validate a DEFAULT supplied by `ALTER TABLE ADD COLUMN`, routing it through the
+	 * same checks CREATE TABLE / ALTER COLUMN apply so the stored default is consistent
+	 * with what INSERT (and the per-row backfill) will accept: bind parameters and
+	 * (absent a mutation context) bare columns are rejected, non-determinism is rejected
+	 * unless `nondeterministic_schema` is set, and a `new.<column>` default is accepted
+	 * with its build deferred — it reads the existing row's sibling during backfill and
+	 * the INSERT-supplied sibling for future inserts. Called from the ALTER TABLE emitter.
+	 */
+	validateAddColumnDefault(
+		defaultExpr: AST.Expression,
+		columnName: string,
+		tableName: string,
+		hasMutationContext: boolean,
+	): void {
+		this.validateDdlDefault(defaultExpr, columnName, tableName, hasMutationContext, 'ALTER TABLE ADD COLUMN');
+	}
+
+	/** Shared body for the ALTER-time DEFAULT validators (ALTER COLUMN SET DEFAULT / ADD COLUMN). */
+	private validateDdlDefault(
+		defaultExpr: AST.Expression,
+		columnName: string,
+		tableName: string,
+		hasMutationContext: boolean,
+		ddlPhase: string,
+	): void {
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
 		this.validateOneDefault(
 			this.makeDdlValidationContext(),
@@ -1427,7 +1456,7 @@ export class SchemaManager {
 			tableName,
 			hasMutationContext,
 			allowNonDet,
-			'ALTER COLUMN SET DEFAULT',
+			ddlPhase,
 		);
 	}
 

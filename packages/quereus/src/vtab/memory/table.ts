@@ -321,7 +321,7 @@ export class MemoryTable extends VirtualTable {
 		try {
 			switch (changeInfo.type) {
 				case 'addColumn':
-					await this.manager.addColumn(changeInfo.columnDef);
+					await this.manager.addColumn(changeInfo.columnDef, changeInfo.backfillEvaluator);
 					break;
 				case 'dropColumn':
 					await this.manager.dropColumn(changeInfo.columnName);

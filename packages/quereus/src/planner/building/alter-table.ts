@@ -1,11 +1,16 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { AddConstraintNode } from '../nodes/add-constraint-node.js';
-import { AlterTableNode } from '../nodes/alter-table-node.js';
+import { AlterTableNode, type AddColumnBackfill } from '../nodes/alter-table-node.js';
 import { buildTableReference } from './table.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import type { VoidNode } from '../nodes/plan-node.js';
+import { PlanNode, type VoidNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
+import type { TableReferenceNode } from '../nodes/reference.js';
+import { buildExpression } from './expression.js';
+import { buildRowDefaultScope } from './default-scope.js';
+import { validateDeterministicDefault } from '../validation/determinism-validator.js';
+import { tryFoldLiteral } from '../../parser/utils.js';
 
 export function buildAlterTableStmt(
   ctx: PlanningContext,
@@ -44,11 +49,27 @@ export function buildAlterTableStmt(
         newName: stmt.action.newName,
       });
 
-    case 'addColumn':
+    case 'addColumn': {
+      const column = stmt.action.column;
+      // Validate the DEFAULT through the shared DDL validator (bind params / bare
+      // columns / non-determinism rejected; `new.<column>` accepted with its build
+      // deferred). This runs before building the backfill so a bare-column default
+      // is rejected here rather than silently resolving against the existing columns
+      // the backfill scope exposes.
+      const defaultConstraint = column.constraints?.find(c => c.type === 'default');
+      if (defaultConstraint?.expr) {
+        const hasMutationContext = !!tableReference.tableSchema.mutationContext
+          && tableReference.tableSchema.mutationContext.length > 0;
+        ctx.schemaManager.validateAddColumnDefault(
+          defaultConstraint.expr, column.name, tableReference.tableSchema.name, hasMutationContext,
+        );
+      }
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'addColumn',
-        column: stmt.action.column,
+        column,
+        backfill: buildAddColumnBackfill(ctx, tableReference, column),
       });
+		}
 
     case 'dropColumn':
       return new AlterTableNode(ctx.scope, tableReference, {
@@ -78,4 +99,52 @@ export function buildAlterTableStmt(
         StatusCode.INTERNAL
       );
   }
+}
+
+/**
+ * Compile the per-row backfill of an ADD COLUMN whose DEFAULT does not fold to a
+ * literal (e.g. `new.<col>`). Mirrors the single-source INSERT row-expansion and the
+ * view-write key default: the default is built against the table's *existing* columns
+ * as the "supplied" row, so `new.<col>` resolves to the existing row's sibling during
+ * backfill. Returns `undefined` for a missing or literal-folding default (the module
+ * bulk-writes those), so the common case allocates nothing.
+ */
+function buildAddColumnBackfill(
+  ctx: PlanningContext,
+  tableReference: TableReferenceNode,
+  columnDef: AST.ColumnDef,
+): AddColumnBackfill | undefined {
+  const defaultExpr = columnDef.constraints?.find(c => c.type === 'default')?.expr;
+  if (!defaultExpr) return undefined;
+  // Literal / NULL defaults fold and are bulk-written by the module — no per-row node.
+  if (tryFoldLiteral(defaultExpr) !== undefined) return undefined;
+
+  const tableSchema = tableReference.tableSchema;
+  // Fresh attributes for the existing columns, referenced only by this default's
+  // `new.<col>` column refs and resolved at runtime via the row slot the emitter
+  // installs over each existing row. Minting fresh (rather than reusing the table
+  // reference's attributes) keeps the node self-contained so the optimizer can't
+  // dangle it.
+  const rowAttrs: Attribute[] = tableSchema.columns.map(column => ({
+    id: PlanNode.nextAttrId(),
+    name: column.name,
+    type: {
+      typeClass: 'scalar' as const,
+      logicalType: column.logicalType,
+      nullable: !column.notNull,
+      isReadOnly: false,
+      collationName: column.collation,
+    },
+    sourceRelation: 'add-column-backfill',
+  }));
+  const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
+  const node = buildExpression({ ...ctx, scope: rowScope }, defaultExpr) as ScalarPlanNode;
+
+  if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+    validateDeterministicDefault(node, columnDef.name, tableSchema.name);
+  }
+
+  const rowDescriptor: RowDescriptor = [];
+  rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
+  return { node, rowDescriptor };
 }

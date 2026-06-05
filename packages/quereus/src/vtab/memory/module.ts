@@ -840,7 +840,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		switch (change.type) {
 			case 'addColumn':
-				await manager.addColumn(change.columnDef);
+				await manager.addColumn(change.columnDef, change.backfillEvaluator);
 				break;
 			case 'dropColumn':
 				await manager.dropColumn(change.columnName);

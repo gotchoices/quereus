@@ -145,7 +145,11 @@ export class BaseLayer implements Layer {
 		return value !== undefined;
 	};
 
-	async addColumnToBase(newColumnSchema: ColumnSchema, defaultValue: SqlValue): Promise<void> {
+	async addColumnToBase(
+		newColumnSchema: ColumnSchema,
+		defaultValue: SqlValue,
+		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>,
+	): Promise<void> {
 		logger.operation('Add Column', this.tableSchema.name, {
 			columnName: newColumnSchema.name,
 			defaultValue
@@ -157,29 +161,48 @@ export class BaseLayer implements Layer {
 		this.initializePrimaryKeyFunctions();
 
 		// Create new primary tree with the updated schema and migrate data
-		this.recreatePrimaryTreeWithNewColumn(oldPrimaryTree, defaultValue);
+		await this.recreatePrimaryTreeWithNewColumn(oldPrimaryTree, newColumnSchema, defaultValue, backfillEvaluator);
 
 		this.rebuildAllSecondaryIndexes();
 	}
 
-	private recreatePrimaryTreeWithNewColumn(
+	private async recreatePrimaryTreeWithNewColumn(
 		oldTree: BTree<BTreeKeyForPrimary, Row>,
-		defaultValue: SqlValue
-	): void {
+		newColumnSchema: ColumnSchema,
+		defaultValue: SqlValue,
+		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>,
+	): Promise<void> {
 		// Use the updated primary key functions for the new tree
 		const btreeKeyFromValue = (value: Row): BTreeKeyForPrimary =>
 			this.primaryKeyFunctions.extractFromRow(value);
 
-		this.primaryTree = new BTree<BTreeKeyForPrimary, Row>(
+		// Build into a local tree and only swap it in once every row migrates, so a
+		// throwing per-row backfill evaluator (or a NOT NULL violation below) leaves the
+		// live tree intact for the caller's rollback.
+		const newTree = new BTree<BTreeKeyForPrimary, Row>(
 			btreeKeyFromValue,
 			this.primaryKeyFunctions.compare
 		);
 
 		for (const path of oldTree.ascending(oldTree.first())) {
 			const oldRow = oldTree.at(path)!;
-			const newRow = [...oldRow, defaultValue];
-			this.primaryTree.insert(newRow);
+			// A non-foldable DEFAULT (e.g. `new.<col>`) derives the new column's value from
+			// the existing row; a literal/NULL default uses the single folded value.
+			const value = backfillEvaluator ? await backfillEvaluator(oldRow) : defaultValue;
+			// A per-row default that produces NULL for a NOT NULL column cannot backfill that
+			// row; reject before swapping the tree (the caller reverts the column add). This
+			// applies only to the per-row evaluator path — a literal/NULL default's nullability
+			// is gated up-front by the engine and the manager's pre-check.
+			if (backfillEvaluator && newColumnSchema.notNull && value === null) {
+				throw new QuereusError(
+					`NOT NULL constraint failed: backfilling column '${this.tableSchema.name}.${newColumnSchema.name}' produced NULL for an existing row`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			newTree.insert([...oldRow, value]);
 		}
+
+		this.primaryTree = newTree;
 	}
 
 	async dropColumnFromBase(columnIndexInOldSchema: number): Promise<void> {

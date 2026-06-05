@@ -1,8 +1,10 @@
-import type { AlterTableNode } from '../../planner/nodes/alter-table-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { AlterTableNode, AddColumnBackfill } from '../../planner/nodes/alter-table-node.js';
+import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
+import { emitCallFromPlan } from '../emitters.js';
+import { createRowSlot } from '../context-helpers.js';
 import { QuereusError } from '../../common/errors.js';
-import { type SqlValue, StatusCode } from '../../common/types.js';
+import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule } from '../../schema/table.js';
@@ -15,6 +17,9 @@ import { tryFoldLiteral } from '../../parser/utils.js';
 
 const log = createLogger('runtime:emit:alter-table');
 
+/** A scheduled sub-program resolved to a callback the emitter invokes per row. */
+type Callback = (ctx: RuntimeContext) => OutputValue;
+
 function qualifyTableName(schemaName: string | undefined, tableName: string): string {
 	const prefix = (schemaName && schemaName.toLowerCase() !== 'main')
 		? `${quoteIdentifier(schemaName)}.`
@@ -22,11 +27,17 @@ function qualifyTableName(schemaName: string | undefined, tableName: string): st
 	return `${prefix}${quoteIdentifier(tableName)}`;
 }
 
-export function emitAlterTable(plan: AlterTableNode, _ctx: EmissionContext): Instruction {
+export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Instruction {
 	const tableSchema = plan.table.tableSchema;
 	const action = plan.action;
 
-	async function run(rctx: RuntimeContext): Promise<SqlValue> {
+	// An ADD COLUMN with a non-foldable DEFAULT carries a backfill scalar; emit it as a
+	// scheduled sub-program so the scheduler resolves it into a callback the run() body
+	// evaluates per existing row (via a row slot over the default's row descriptor).
+	const backfill: AddColumnBackfill | undefined = action.type === 'addColumn' ? action.backfill : undefined;
+	const params: Instruction[] = backfill ? [emitCallFromPlan(backfill.node, ctx)] : [];
+
+	async function run(rctx: RuntimeContext, ...args: unknown[]): Promise<SqlValue> {
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
@@ -39,7 +50,7 @@ export function emitAlterTable(plan: AlterTableNode, _ctx: EmissionContext): Ins
 			case 'renameColumn':
 				return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName);
 			case 'addColumn':
-				return runAddColumn(rctx, tableSchema, schema, action.column);
+				return runAddColumn(rctx, tableSchema, schema, action.column, backfill, args[0] as Callback | undefined);
 			case 'dropColumn':
 				return runDropColumn(rctx, tableSchema, schema, action.name);
 			case 'alterPrimaryKey':
@@ -61,7 +72,7 @@ export function emitAlterTable(plan: AlterTableNode, _ctx: EmissionContext): Ins
 	})();
 
 	return {
-		params: [],
+		params,
 		run: run as InstructionRun,
 		note,
 	};
@@ -190,6 +201,8 @@ async function runAddColumn(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	columnDef: ColumnDef,
+	backfill?: AddColumnBackfill,
+	backfillCb?: Callback,
 ): Promise<SqlValue> {
 	// Validate column doesn't already exist
 	if (tableSchema.columnIndexMap.has(columnDef.name.toLowerCase())) {
@@ -201,18 +214,11 @@ async function runAddColumn(
 		throw new QuereusError(`Cannot add a PRIMARY KEY column via ALTER TABLE`, StatusCode.ERROR);
 	}
 
-	// Reject non-foldable DEFAULT expressions at DDL time. ADD COLUMN backfills
-	// existing rows with the DEFAULT value, so the expression must evaluate to a
-	// concrete literal at ALTER time. Column references, bind parameters, and
-	// non-deterministic function calls don't fold and are rejected per the
-	// determinism rule (consistent with CREATE TABLE's DEFAULT validation).
+	// The DEFAULT was validated at plan-build time through the shared DDL validator
+	// (bind params / bare columns / non-determinism rejected; `new.<column>` accepted)
+	// and, when it does not fold to a literal, compiled into `backfill` — the default
+	// evaluated against the existing row, so `new.<column>` reads that row's sibling.
 	const defaultConstraint = columnDef.constraints?.find(c => c.type === 'default');
-	if (defaultConstraint && defaultConstraint.expr && tryFoldLiteral(defaultConstraint.expr) === undefined) {
-		throw new QuereusError(
-			`ALTER TABLE ADD COLUMN DEFAULT for '${columnDef.name}' must fold to a literal — column references, bind parameters, and non-deterministic expressions are not allowed`,
-			StatusCode.ERROR,
-		);
-	}
 
 	// Call module.alterTable for data + schema update
 	const module = requireVtabModule(tableSchema);
@@ -224,8 +230,10 @@ async function runAddColumn(
 	}
 
 	// NOT NULL without a usable DEFAULT cannot backfill existing rows. A DEFAULT whose
-	// folded value is NULL is equivalent to "no DEFAULT" for this purpose. If the table
-	// is non-empty, reject before mutating any schema or data.
+	// folded value is NULL is equivalent to "no DEFAULT" for this purpose. A non-foldable
+	// expression default (carried in `backfill`) IS usable — its NOT NULL enforcement is
+	// deferred to the post-backfill scan — so it is not rejected here. If the table is
+	// non-empty and the default is nullish, reject before mutating any schema or data.
 	//
 	// A module may opt out of this engine-generic rejection via the
 	// `delegatesNotNullBackfill` capability (structurally-total modules that
@@ -234,9 +242,9 @@ async function runAddColumn(
 	// `alterTable`. Native modules leave it off, so this still fires for them.
 	const delegatesBackfill = module.getCapabilities?.().delegatesNotNullBackfill === true;
 	const hasNotNull = columnDef.constraints?.some(c => c.type === 'notNull') ?? false;
-	if (hasNotNull && !delegatesBackfill) {
+	if (hasNotNull && !delegatesBackfill && !backfill) {
 		const folded = defaultConstraint?.expr ? tryFoldLiteral(defaultConstraint.expr) : undefined;
-		const defaultIsNullish = !defaultConstraint || folded === undefined || folded === null;
+		const defaultIsNullish = !defaultConstraint?.expr || folded === null;
 		if (defaultIsNullish) {
 			await validateNotNullBackfill(rctx, tableSchema, columnDef.name);
 		}
@@ -247,10 +255,32 @@ async function runAddColumn(
 	const newCheckConstraints = extractColumnLevelCheckConstraints(columnDef);
 	const newForeignKeys = extractColumnLevelForeignKeys(columnDef, tableSchema.schemaName);
 
-	const updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
-		type: 'addColumn',
-		columnDef,
-	});
+	// A non-foldable default backfills each existing row from its own value. Install a row
+	// slot over the default's row descriptor; the evaluator the module calls per existing
+	// row sets the slot to that row, so the default's `new.<col>` refs resolve to it.
+	const rowSlot = backfill ? createRowSlot(rctx, backfill.rowDescriptor) : undefined;
+	const backfillEvaluator = backfill && backfillCb && rowSlot
+		? async (row: Row): Promise<SqlValue> => {
+			rowSlot.set(row);
+			const value = backfillCb(rctx);
+			return (value instanceof Promise ? await value : value) as SqlValue;
+		}
+		: undefined;
+
+	// The slot is only needed while the module is appending the column (it calls the
+	// evaluator per existing row); close it as soon as that returns — before the CHECK
+	// scan below re-reads the table — so the backfill's context does not shadow the
+	// scan's own row context.
+	let updatedTableSchema: TableSchema;
+	try {
+		updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+			type: 'addColumn',
+			columnDef,
+			backfillEvaluator,
+		});
+	} finally {
+		rowSlot?.close();
+	}
 
 	// Resolve the new child column index in the freshly returned schema for any FK constraints.
 	const newColIdx = updatedTableSchema.columnIndexMap.get(columnDef.name.toLowerCase());
@@ -283,6 +313,10 @@ async function runAddColumn(
 	// during validation can resolve the new column.
 	schema.addTable(enhancedTableSchema);
 
+	// Validate new CHECK constraints against the (already-backfilled) rows, reverting
+	// (drop the column + restore the original catalog entry) on a violation. NOT NULL of
+	// a per-row default is enforced by the module during backfill (it has the values
+	// in-hand and throws before the column is committed), so it needs no post-scan here.
 	if (newCheckConstraints.length > 0) {
 		try {
 			await validateBackfillAgainstChecks(rctx, enhancedTableSchema, newCheckConstraints);

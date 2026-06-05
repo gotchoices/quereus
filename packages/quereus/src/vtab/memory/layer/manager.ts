@@ -1404,7 +1404,7 @@ export class MemoryTableManager {
 	}
 
 	// --- Schema Operations (simplified with inherited BTrees) ---
-	async addColumn(columnDefAst: ASTColumnDef): Promise<void> {
+	async addColumn(columnDefAst: ASTColumnDef, backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await Latches.acquire(lockKey);
@@ -1429,13 +1429,19 @@ export class MemoryTableManager {
 					defaultValue = folded;
 					defaultIsLiteral = true;
 				} else {
-					logger.warn('Add Column', this._tableName, 'Default for new col is expr; existing rows get NULL.', { columnName: newColumnSchema.name });
+					// A non-literal expression default (e.g. `new.<col>`) is written as NULL
+					// here; the engine backfills these rows per-row immediately after.
+					logger.debugLog(`[Add Column] '${newColumnSchema.name}' default is a non-literal expression; existing rows are backfilled by the engine.`);
 				}
 			}
-			// Check for NOT NULL constraint (could be explicit or from default behavior)
-			// Allow NOT NULL without DEFAULT if table is empty (SQLite-compatible)
+			// Check for NOT NULL constraint (could be explicit or from default behavior).
+			// Allow NOT NULL without DEFAULT if the table is empty (SQLite-compatible).
+			// A non-literal *expression* default (e.g. `new.<col>`) is backfilled per-row by
+			// the engine right after this returns, which then enforces NOT NULL on the
+			// backfilled values — so don't reject it here as "without a DEFAULT".
 			const tableHasRows = this.baseLayer.primaryTree.at(this.baseLayer.primaryTree.first()) !== undefined;
-			if (newColumnSchema.notNull && defaultValue === null && !defaultIsLiteral && tableHasRows) {
+			const hasDefaultExpr = !!(defaultConstraint && defaultConstraint.expr);
+			if (newColumnSchema.notNull && defaultValue === null && !defaultIsLiteral && !hasDefaultExpr && tableHasRows) {
 				throw new QuereusError(
 					`Cannot add NOT NULL column '${newColumnSchema.name}' to non-empty table `
 						+ `'${this.schemaName}.${this._tableName}' without a DEFAULT value`,
@@ -1449,7 +1455,10 @@ export class MemoryTableManager {
 				columnIndexMap: buildColumnIndexMap(updatedColumnsSchema),
 			});
 			this.baseLayer.updateSchema(finalNewTableSchema);
-			await this.baseLayer.addColumnToBase(newColumnSchema, defaultValue);
+			// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
+			// its own value via the engine-supplied evaluator; a literal/NULL default
+			// uses the single folded `defaultValue` for every row.
+			await this.baseLayer.addColumnToBase(newColumnSchema, defaultValue, backfillEvaluator);
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();
 

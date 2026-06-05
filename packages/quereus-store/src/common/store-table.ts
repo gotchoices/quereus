@@ -292,17 +292,37 @@ export class StoreTable extends VirtualTable {
 	 * Migrate all stored rows from the old column layout to a new one.
 	 * The remap array maps newColumnIndex -> oldColumnIndex | -1.
 	 * -1 means the column is new (fill with defaultValue).
+	 *
+	 * `backfill`, when supplied (ADD COLUMN with a non-foldable DEFAULT such as
+	 * `new.<col>`), derives the new column's value from each existing row instead of the
+	 * single `defaultValue`, and rejects a NULL it produces for a NOT NULL column. The
+	 * batch is only written once every row migrates, so a throwing evaluator / NOT NULL
+	 * violation leaves the store untouched for the caller's rollback.
 	 */
-	async migrateRows(remap: number[], defaultValue: SqlValue): Promise<void> {
+	async migrateRows(
+		remap: number[],
+		defaultValue: SqlValue,
+		backfill?: { evaluator: (row: Row) => SqlValue | Promise<SqlValue>; notNull: boolean; columnName: string },
+	): Promise<void> {
 		const store = await this.ensureStore();
 		const bounds = buildFullScanBounds();
 		const batch = store.batch();
 
 		for await (const entry of store.iterate(bounds)) {
 			const oldRow = deserializeRow(entry.value);
+			let newColumnValue = defaultValue;
+			if (backfill) {
+				newColumnValue = await backfill.evaluator(oldRow);
+				if (backfill.notNull && newColumnValue === null) {
+					throw new QuereusError(
+						`NOT NULL constraint failed: backfilling column '${this.schemaName}.${this.tableName}.${backfill.columnName}' produced NULL for an existing row`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+			}
 			const newRow: Row = new Array(remap.length);
 			for (let i = 0; i < remap.length; i++) {
-				newRow[i] = remap[i] === -1 ? defaultValue : oldRow[remap[i]];
+				newRow[i] = remap[i] === -1 ? newColumnValue : oldRow[remap[i]];
 			}
 			batch.put(entry.key, serializeRow(newRow));
 		}

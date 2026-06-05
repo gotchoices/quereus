@@ -582,8 +582,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					}
 				}
 
-				// Refuse NOT NULL without a literal DEFAULT on a non-empty table (SQLite-compatible).
-				if (newColSchema.notNull && defaultValue === null) {
+				// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
+				// its own value via the engine-supplied evaluator (mirrors the memory path).
+				const backfillEvaluator = change.backfillEvaluator;
+
+				// Refuse NOT NULL without a usable DEFAULT on a non-empty table
+				// (SQLite-compatible). A per-row evaluator IS usable — its NOT NULL is enforced
+				// per row during migration — so it is exempt from this no-default rejection.
+				if (newColSchema.notNull && defaultValue === null && !backfillEvaluator) {
 					if (await table.hasAnyRows()) {
 						throw new QuereusError(
 							`Cannot add NOT NULL column '${newColSchema.name}' to non-empty table `
@@ -601,12 +607,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					columnIndexMap: buildColumnIndexMap(updatedColumns),
 				};
 
-				// Migrate rows: append default value to each row
+				// Migrate rows: append the new column's value — a single literal default, or a
+				// per-row value derived from the existing row when a backfill evaluator is set.
 				const remap = buildColumnRemap(
 					oldSchema.columns.map(c => c.name),
 					updatedColumns.map(c => c.name),
 				);
-				await table.migrateRows(remap, defaultValue);
+				await table.migrateRows(
+					remap,
+					defaultValue,
+					backfillEvaluator
+						? { evaluator: backfillEvaluator, notNull: newColSchema.notNull, columnName: newColSchema.name }
+						: undefined,
+				);
 
 				// Update table schema and persist DDL
 				table.updateSchema(updatedSchema);

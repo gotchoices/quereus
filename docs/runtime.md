@@ -1101,10 +1101,21 @@ determinism checks).
 **same** validator (`SchemaManager.validateAlterColumnDefault`): bind
 parameters / bare columns / non-determinism are rejected at `ALTER` time, and a
 `new.<column>` default is accepted with the build/determinism check deferred to
-INSERT time. The remaining DDL DEFAULT path — `ALTER TABLE ADD COLUMN` — still
-folds its default to a literal and does **not** yet route through the shared
-validator (so a `new.<column>` ADD COLUMN default + per-row backfill is a known
-follow-up); `ADD CONSTRAINT` likewise validates at first INSERT/UPDATE.
+INSERT time. `ALTER TABLE ADD COLUMN` routes its default through the same shared
+validator (`SchemaManager.validateAddColumnDefault`, at plan-build time) — a
+non-foldable, deterministic default (including `new.<column>`) is now accepted.
+A literal / NULL default is bulk-written to every existing row by the module's
+`addColumn` (the fast path). A non-foldable default is **backfilled per existing
+row**: the planner compiles it against the table's *existing* columns as the
+"supplied" row (the same `buildRowDefaultScope` the single-source INSERT and
+view-write key default use) and hangs the scalar on the `AlterTableNode`; the
+emitter installs a row slot over each existing row and passes a per-row evaluator
+to `module.alterTable`, so `new.<column>` resolves to the existing row's sibling.
+The memory module applies the evaluator while it appends the column (building the
+new tree locally and swapping it in only once every row migrates), enforcing the
+column's NOT NULL on the produced value before commit. New CHECK constraints are
+validated against the backfilled rows afterward, reverting the column add on a
+violation. `ADD CONSTRAINT` likewise validates at first INSERT/UPDATE.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion
