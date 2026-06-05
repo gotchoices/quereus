@@ -39,7 +39,7 @@ export type MutationDiagnosticReason =
 	| 'lens-set-level-conflict-resolution' // or replace / or ignore / upsert against a commit-time set-level lens key (needs a covering structure)
 	// --- decomposition (lens multi-source put) fan-out, advertisement-driven ---
 	| 'unsupported-decomposition-insert'    // internal guard: a decomposition INSERT is built via buildDecompositionInsert (envelope), not propagate
-	| 'unsupported-decomposition-update'    // UPDATE targets an optional/EAV/key column whose write needs insert/delete branching (deferred)
+	| 'unsupported-decomposition-update'    // UPDATE targets a decomposition shared-key (identity) column, or assigns an optional/EAV member a non-constant value (which would need the per-row capture substrate) — the optional/EAV constant-value materialization itself is supported
 	| 'unsupported-decomposition-predicate' // a decomposition DELETE/UPDATE WHERE references a non-anchor member — needs snapshot-consistent multi-member execution (deferred)
 	| 'unsupported-decomposition-key'       // a decomposition member has a composite/absent shared key (v1 is single-column)
 	| 'unsupported-decomposition-member';   // two decomposition members resolve to the same base relation (a self-decomposition) — member routing is ambiguous

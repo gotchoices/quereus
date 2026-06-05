@@ -4198,12 +4198,13 @@ describe('Property-Based Tests', () => {
 
 				await fc.assert(fc.asyncProperty(
 					fc.array(colRowArb, { maxLength: 8 }),
-					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'delete'),
+					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-null', 'delete'),
 					fc.integer({ min: 1, max: 6 }),    // id predicate
 					fc.integer({ min: 10, max: 20 }),  // NV  (a)
 					fc.integer({ min: 21, max: 30 }),  // NV2 (b)
 					fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }), // inserted optional c
-					async (seed, op, K, NV, NV2, insC) => {
+					fc.integer({ min: 31, max: 40 }),  // NV3 (c) — disjoint from the seed/predicate ranges
+					async (seed, op, K, NV, NV2, insC, NV3) => {
 						opsSeen.add(op);
 						await db.exec('delete from main.T_core');
 						await db.exec('delete from main.T_b');
@@ -4237,6 +4238,16 @@ describe('Property-Based Tests', () => {
 						} else if (op === 'update-ab') {
 							await db.exec(`update x.T set a = ${NV}, b = ${NV2} where id = ${K}`);
 							if (core.has(K)) { core.set(K, NV); bMap.set(K, NV2); mutated++; }
+						} else if (op === 'update-c') {
+							// Optional-member write: matched rows update T_c, anchor rows lacking T_c
+							// materialize it. Either way the post-state is c=NV3 for a matched anchor.
+							await db.exec(`update x.T set c = ${NV3} where id = ${K}`);
+							if (core.has(K)) { cMap.set(K, NV3); mutated++; }
+						} else if (op === 'update-c-null') {
+							// All of T_c's value columns (just `c`) set null → the component row is
+							// emptied (deleted); an absent T_c stays absent (no-op).
+							await db.exec(`update x.T set c = null where id = ${K}`);
+							if (core.has(K) && cMap.has(K)) { cMap.delete(K); mutated++; }
 						} else { // delete
 							await db.exec(`delete from x.T where id = ${K}`);
 							if (core.has(K)) { core.delete(K); bMap.delete(K); cMap.delete(K); mutated++; }
@@ -4256,7 +4267,7 @@ describe('Property-Based Tests', () => {
 						assertRowsEqual('view image', await readRows('select id, a, b, c from x.T'),
 							expView, ['id', 'a', 'b', 'c']);
 					},
-				), { numRuns: 60 });
+				), { numRuns: 100 });
 
 				expect(mutated, 'columnar PutGet degenerated into all no-op runs').to.be.greaterThan(0);
 				expect(opsSeen.size, 'columnar PutGet did not exercise a spread of ops').to.be.greaterThan(2);
@@ -4403,11 +4414,12 @@ describe('Property-Based Tests', () => {
 						p: fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }),
 						q: fc.option(fc.integer({ min: 1, max: 9 }), { nil: null }),
 					}), { maxLength: 8 }),
-					fc.constantFrom('insert', 'delete'),
+					fc.constantFrom('insert', 'delete', 'update-p', 'update-p-null'),
 					fc.integer({ min: 1, max: 6 }),
 					fc.option(fc.integer({ min: 10, max: 20 }), { nil: null }),  // inserted p
 					fc.option(fc.integer({ min: 21, max: 30 }), { nil: null }),  // inserted q
-					async (seed, op, K, insP, insQ) => {
+					fc.integer({ min: 31, max: 40 }),  // NVP — the update-p triple value (disjoint range)
+					async (seed, op, K, insP, insQ, NVP) => {
 						opsSeen.add(op);
 						await db.exec('delete from main.E_core');
 						await db.exec('delete from main.E_eav');
@@ -4432,6 +4444,15 @@ describe('Property-Based Tests', () => {
 							core.add(fresh);
 							eav.set(fresh, { p: insP, q: insQ });
 							mutated++;
+						} else if (op === 'update-p') {
+							// Non-null EAV write: upsert the (entity, 'p', NVP) triple — update the
+							// matched entity's triple, materialize it for an entity that lacks one.
+							await db.exec(`update x.E set p = ${NVP} where id = ${K}`);
+							if (core.has(K)) { eav.get(K)!.p = NVP; mutated++; }
+						} else if (op === 'update-p-null') {
+							// Null EAV write: delete the matched entity's 'p' triple (no-op if absent).
+							await db.exec(`update x.E set p = null where id = ${K}`);
+							if (core.has(K)) { if (eav.get(K)!.p !== null) mutated++; eav.get(K)!.p = null; }
 						} else {
 							await db.exec(`delete from x.E where id = ${K}`);
 							if (core.has(K)) { core.delete(K); eav.delete(K); mutated++; }
@@ -4449,9 +4470,9 @@ describe('Property-Based Tests', () => {
 						const expView = [...core].map(id => ({ id, p: eav.get(id)?.p ?? null, q: eav.get(id)?.q ?? null }));
 						assertRowsEqual('E view', await readRows('select id, p, q from x.E'), expView, ['id', 'p', 'q']);
 					},
-				), { numRuns: 50 });
+				), { numRuns: 80 });
 				expect(mutated, 'EAV PutGet degenerated into all no-op runs').to.be.greaterThan(0);
-				expect(opsSeen.size, 'EAV PutGet did not exercise both insert and delete').to.equal(2);
+				expect(opsSeen.size, 'EAV PutGet did not exercise a spread of ops (insert/delete/update-p/update-p-null)').to.be.greaterThan(2);
 			});
 
 			// ----- PutGet (surrogate): one minted key threaded into every member -----
@@ -4658,22 +4679,67 @@ describe('Property-Based Tests', () => {
 					'the surrogate anchor key is a substrate key, not any logical column base').to.equal(false);
 			});
 
+			// ----- accepts: optional-member / EAV value writes materialize per row -----
+			// The deterministic dual of the PutGet randomization above — pins each of the
+			// three optional-columnar branches (matched UPDATE / absent INSERT / all-null
+			// DELETE) and the two EAV branches (upsert / delete) by direct base inspection.
+			it('accepts: an optional-member write updates, materializes, or deletes the component row', async () => {
+				await deployColumnar();
+				await db.exec('insert into main.T_core values (1, 10)');  // has T_c
+				await db.exec('insert into main.T_b values (1, 100)');
+				await db.exec('insert into main.T_c values (1, 1000)');
+				await db.exec('insert into main.T_core values (2, 20)');  // lacks T_c
+				await db.exec('insert into main.T_b values (2, 200)');
+
+				// matched → UPDATE the existing T_c row.
+				await db.exec('update x.T set c = 5 where id = 1');
+				expect(await readRows('select c from main.T_c where id = 1')).to.deep.equal([{ c: 5 }]);
+				// absent → materialize the missing T_c row (anchor key threads the member key).
+				await db.exec('update x.T set c = 7 where id = 2');
+				expect(await readRows('select c from main.T_c where id = 2')).to.deep.equal([{ c: 7 }]);
+				// all value columns set null → DELETE the component row; the view still reads null.
+				await db.exec('update x.T set c = null where id = 1');
+				expect(await readRows('select c from main.T_c where id = 1')).to.deep.equal([]);
+				expect(await readRows('select c from x.T where id = 1')).to.deep.equal([{ c: null }]);
+				// null write to an already-absent component is a clean no-op (nothing materialized).
+				await db.exec('update x.T set c = null where id = 1');
+				expect(await readRows('select count(*) as n from main.T_c where id = 1')).to.deep.equal([{ n: 0 }]);
+			});
+
+			it('accepts: an EAV write upserts the triple (non-null) or deletes it (null)', async () => {
+				await deployEav();
+				await db.exec('insert into main.E_core values (1)');
+				await db.exec("insert into main.E_eav values (1, 'p', 11)");  // has a 'p' triple
+				await db.exec('insert into main.E_core values (2)');          // lacks a 'p' triple
+
+				// matched → UPDATE the existing triple's value.
+				await db.exec('update x.E set p = 99 where id = 1');
+				expect(await readRows("select val from main.E_eav where entity = 1 and attr = 'p'")).to.deep.equal([{ val: 99 }]);
+				// absent → materialize the (entity, 'p', value) triple.
+				await db.exec('update x.E set p = 42 where id = 2');
+				expect(await readRows("select val from main.E_eav where entity = 2 and attr = 'p'")).to.deep.equal([{ val: 42 }]);
+				// null → delete the triple; the view reads null for that attribute.
+				await db.exec('update x.E set p = null where id = 1');
+				expect(await readRows("select count(*) as n from main.E_eav where entity = 1 and attr = 'p'")).to.deep.equal([{ n: 0 }]);
+				expect(await readRows('select p from x.E where id = 1')).to.deep.equal([{ p: null }]);
+			});
+
 			// ----- reject-don't-widen: deferred decomposition shapes -----
-			it('reject-do-not-widen: non-anchor predicate / optional / shared-key writes are deferred', async () => {
+			it('reject-do-not-widen: non-anchor predicate / shared-key writes are deferred', async () => {
 				await deployColumnar();
 				await db.exec('insert into main.T_core values (1, 10)');
 				await db.exec('insert into main.T_b values (1, 100)');
 				await db.exec('insert into main.T_c values (1, 1000)');
 				await expectMutationReject('delete from x.T where b = 100', 'unsupported-decomposition-predicate'); // non-anchor predicate
-				await expectMutationReject('update x.T set c = 5 where id = 1', 'unsupported-decomposition-update'); // optional member
-				await expectMutationReject('update x.T set id = 9 where id = 1', 'unsupported-decomposition-update'); // shared key
+				await expectMutationReject('update x.T set id = 9 where id = 1', 'unsupported-decomposition-update'); // shared key (identity change)
+				// A non-constant optional-member value needs the per-row capture substrate (deferred).
+				await expectMutationReject('update x.T set c = a + 1 where id = 1', 'unsupported-decomposition-update');
 			});
 
-			it('reject-do-not-widen: EAV column update is deferred', async () => {
+			it('reject-do-not-widen: an EAV non-anchor predicate is deferred', async () => {
 				await deployEav();
 				await db.exec('insert into main.E_core values (1)');
 				await db.exec("insert into main.E_eav values (1, 'p', 11)");
-				await expectMutationReject('update x.E set p = 99 where id = 1', 'unsupported-decomposition-update'); // EAV pivot member
 				await expectMutationReject('delete from x.E where p = 11', 'unsupported-decomposition-predicate');    // non-anchor predicate
 			});
 

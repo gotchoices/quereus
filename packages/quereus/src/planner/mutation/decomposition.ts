@@ -8,6 +8,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import type { SqlValue } from '../../common/types.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
+import { combineAnd } from './single-source.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
@@ -36,8 +37,16 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   the **anchor alone** (never the full join), so an earlier member's delete can
  *   never shrink a later member's identifying set. This is what keeps the fan-out
  *   sound without the snapshot-consistent multi-member execution substrate.
- * - **UPDATE** routes each assignment to the single **mandatory, non-EAV** member
- *   that backs it, keyed off the anchor the same anchor-last way.
+ * - **UPDATE** routes each assignment to the member that backs it, keyed off the
+ *   anchor the same anchor-last way. A **mandatory, non-EAV** member takes one base
+ *   UPDATE. An **optional columnar** member's write is a per-row materialization
+ *   transition realized as plain AST base ops over the anchor: **matched** rows take
+ *   the base UPDATE, **absent** rows take a null-extended INSERT (anchor-keyed
+ *   insert-select gated `<anchorKey> not in (select <memberKey> from <member>)`), and
+ *   when every one of the member's value columns is assigned null the component row is
+ *   emptied → a base DELETE instead. An **EAV pivot** member's write is the triple
+ *   analogue, per attribute: a non-null value upserts the `(entity, attr, value)`
+ *   triple (matched UPDATE + materialize INSERT), a null deletes it.
  * - **INSERT** fans out to one insert per member, **anchor first** (FK-order root).
  *   It rides the shared-surrogate mutation envelope `view-mutation-shared-surrogate-insert`
  *   ships (`ViewMutationNode.envelope` + `EnvelopeScanNode`): the user source is
@@ -65,11 +74,9 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   mapping whose basis lives on the anchor (`bumped = a + 1`, `combined = a || b`) —
  *   is *supported*: it substitutes into a predicate over the anchor's own base columns,
  *   which the anchor subquery already evaluates, so it does not defer.
- * - **UPDATE of an optional-member / EAV / shared-key column** — an optional or
- *   EAV write transition (null→non-null materializes a member row, non-null→all-null
- *   deletes it) needs per-row insert-or-delete branching inside an update group,
- *   which the static base-op fan-out cannot yet express; a key write is an identity
- *   change.
+ * - **UPDATE of a shared-key column** — a key write is an identity change, not a
+ *   value write. (Optional-member and EAV value writes are **supported** — see
+ *   the UPDATE bullet above; only a key/identity write stays rejected.)
  * - **composite shared keys** — v1 threads a single-column key (mirrors the
  *   single-column-PK boundary in `multi-source.ts`).
  */
@@ -674,49 +681,83 @@ function anchorDeleteOp(
 // --- UPDATE ---------------------------------------------------------------
 
 /**
- * Route each assignment to the mandatory, non-EAV member that backs it and emit
- * one per-member UPDATE, anchor-last (so a member whose column the predicate reads
- * is not mutated before a sibling's identifying set is computed). Optional / EAV /
- * key / computed targets and cross-member value references are deferred or rejected.
+ * Route each assignment to the member that backs it and emit the per-member base
+ * ops, anchor-last (so a member whose column the predicate reads is not mutated
+ * before a sibling's identifying set is computed, and so every materialization
+ * branch reads the still-intact anchor). A **mandatory, non-EAV** member takes one
+ * base UPDATE (the legacy path). An **optional columnar** member's write is a per-row
+ * materialization transition — matched → base UPDATE, absent → null-extended INSERT,
+ * all value columns set null → base DELETE — and an **EAV pivot** member's write is
+ * the per-attribute triple analogue (non-null → upsert, null → delete). The branches
+ * are ordinary AST base ops keyed off the anchor subquery, not a new plan-node
+ * substrate (the same realization consumer 1 used for the outer-join dual). Shared-key
+ * (identity) / computed targets and cross-member value reads stay rejected.
  */
 function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: DecompShape, stmt: AST.UpdateStmt): BaseOp[] {
 	rejectReturning(view, stmt.returning);
 	const pred = anchorPredicate(view, shape, stmt.where);
+	const declaredNames = declaredColumnNames(view);
 
-	// member relationId → its routed (basisColumn, value) assignments.
-	const perMember = new Map<string, Array<{ column: string; value: AST.Expression }>>();
-	// member relationId → (basis column lower → first view-column spelling). Two
-	// distinct logical columns can route to the same basis column on one member
-	// (e.g. a duplicate rename `b, b as b2`); the per-member UPDATE would then assign
-	// it twice. Reject view-aware so the message names both logical columns. (Cross-
-	// member collisions are impossible — distinct members are distinct tables; a
-	// shared-key target is already rejected in routeAssignment.)
+	// Per-member accumulation. A member is exactly one kind (mandatory-columnar /
+	// optional-columnar / EAV), so at most one of the three maps holds a given member.
+	const mandatory = new Map<string, Array<{ column: string; value: AST.Expression }>>();
+	const optional = new Map<string, { member: DecompositionMember; cells: OptionalCell[] }>();
+	const eav = new Map<string, { member: DecompositionMember; cells: EavCell[] }>();
+	// member relationId → (target-key lower → first view-column spelling). Two distinct
+	// logical columns can route to the same basis column / EAV attribute on one member
+	// (e.g. a duplicate rename `b, b as b2`); the per-member UPDATE / triple would then
+	// assign it twice. Reject view-aware so the message names both logical columns.
 	const seenPerMember = new Map<string, Map<string, string>>();
-	for (const asg of stmt.assignments) {
-		const routed = routeAssignment(view, shape, asg);
-		let seen = seenPerMember.get(routed.relationId);
-		if (!seen) { seen = new Map<string, string>(); seenPerMember.set(routed.relationId, seen); }
-		const basisKey = routed.basisColumn.toLowerCase();
-		const prior = seen.get(basisKey);
+	const noteTarget = (relationId: string, targetKey: string, viewCol: string): void => {
+		let seen = seenPerMember.get(relationId);
+		if (!seen) { seen = new Map<string, string>(); seenPerMember.set(relationId, seen); }
+		const prior = seen.get(targetKey);
 		if (prior !== undefined) {
 			raiseMutationDiagnostic({
 				reason: 'conflicting-assignment',
-				column: routed.basisColumn,
+				column: viewCol,
 				table: view.name,
-				message: `cannot update logical table '${view.name}': columns '${prior}' and '${asg.column}' both target base column '${routed.basisColumn}' on member '${routed.relationId}'; an UPDATE cannot assign one column twice`,
+				message: `cannot update logical table '${view.name}': columns '${prior}' and '${viewCol}' both target '${targetKey}' on member '${relationId}'; an UPDATE cannot assign one column twice`,
 			});
 		}
-		seen.set(basisKey, asg.column);
-		let list = perMember.get(routed.relationId);
-		if (!list) { list = []; perMember.set(routed.relationId, list); }
-		list.push({ column: routed.basisColumn, value: routed.value });
+		seen.set(targetKey, viewCol);
+	};
+
+	for (const asg of stmt.assignments) {
+		const routed = routeAssignment(view, shape, declaredNames, asg);
+		switch (routed.kind) {
+			case 'mandatory': {
+				noteTarget(routed.member.relationId, routed.basisColumn.toLowerCase(), asg.column);
+				let list = mandatory.get(routed.member.relationId);
+				if (!list) { list = []; mandatory.set(routed.member.relationId, list); }
+				list.push({ column: routed.basisColumn, value: routed.value });
+				break;
+			}
+			case 'optional': {
+				noteTarget(routed.member.relationId, routed.basisColumn.toLowerCase(), asg.column);
+				let g = optional.get(routed.member.relationId);
+				if (!g) { g = { member: routed.member, cells: [] }; optional.set(routed.member.relationId, g); }
+				g.cells.push({ basisColumn: routed.basisColumn, value: routed.value, isNull: routed.isNull });
+				break;
+			}
+			case 'eav': {
+				noteTarget(routed.member.relationId, `attr:${routed.attribute.toLowerCase()}`, asg.column);
+				let g = eav.get(routed.member.relationId);
+				if (!g) { g = { member: routed.member, cells: [] }; eav.set(routed.member.relationId, g); }
+				g.cells.push({ attribute: routed.attribute, value: routed.value, isNull: routed.isNull });
+				break;
+			}
+		}
 	}
 
 	const ops: BaseOp[] = [];
 	const emit = (member: DecompositionMember): void => {
-		const assignments = perMember.get(member.relationId);
-		if (!assignments || assignments.length === 0) return;
-		ops.push(memberUpdateOp(ctx, view, shape, member, assignments, pred, stmt));
+		const m = mandatory.get(member.relationId);
+		if (m && m.length > 0) ops.push(memberUpdateOp(ctx, view, shape, member, m, pred, stmt));
+		const o = optional.get(member.relationId);
+		if (o) emitOptionalMemberUpdate(ctx, view, shape, member, o.cells, pred, stmt, ops);
+		const e = eav.get(member.relationId);
+		if (e) emitEavMemberUpdate(ctx, view, shape, member, e.cells, pred, stmt, ops);
 	};
 	for (const member of shape.storage.members) {
 		if (member.relationId === shape.anchor.relationId) continue;
@@ -726,19 +767,39 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 	return ops;
 }
 
-interface RoutedAssignment {
-	readonly relationId: string;
+/** One assigned cell of an optional columnar member's update group. */
+interface OptionalCell {
 	readonly basisColumn: string;
+	/** Assigned value, already lowered to base terms (a constant, or a null literal). */
 	readonly value: AST.Expression;
+	readonly isNull: boolean;
 }
 
+/** One assigned cell of an EAV pivot member's update group (per attribute). */
+interface EavCell {
+	/** The declared (case-preserved) attribute literal the get body matches by value. */
+	readonly attribute: string;
+	readonly value: AST.Expression;
+	readonly isNull: boolean;
+}
+
+type RoutedAssignment =
+	/** A mandatory, non-EAV identity member — the legacy single base UPDATE. */
+	| { readonly kind: 'mandatory'; readonly member: DecompositionMember; readonly basisColumn: string; readonly value: AST.Expression }
+	/** An optional (outer-joined) columnar member — a per-row materialization transition. */
+	| { readonly kind: 'optional'; readonly member: DecompositionMember; readonly basisColumn: string; readonly value: AST.Expression; readonly isNull: boolean }
+	/** An EAV pivot member — a per-attribute triple upsert/delete. */
+	| { readonly kind: 'eav'; readonly member: DecompositionMember; readonly attribute: string; readonly value: AST.Expression; readonly isNull: boolean };
+
 /**
- * Resolve one `set <col> = <value>` to its backing member + basis column off the
- * threaded backward lineage ({@link classifyColumn}). Only a mandatory, non-EAV,
- * identity-mapped member is value-writable; an optional / EAV / non-identity / key /
- * unbacked target is rejected or deferred with its precise diagnostic.
+ * Resolve one `set <col> = <value>` to its backing member off the threaded backward
+ * lineage ({@link classifyColumn}). A mandatory, non-EAV identity member is the legacy
+ * value-write; an **optional columnar** member and an **EAV pivot** member are now
+ * routed to a per-row materialization transition (matched update / absent insert /
+ * emptied delete) instead of rejected. A shared-key (identity) / computed / unbacked
+ * target stays rejected with its precise diagnostic.
  */
-function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.UpdateStmt['assignments'][number]): RoutedAssignment {
+function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredNames: ReadonlyMap<string, string>, asg: AST.UpdateStmt['assignments'][number]): RoutedAssignment {
 	const logical = asg.column.toLowerCase();
 	if (isSharedKeyColumn(shape, logical)) {
 		raiseMutationDiagnostic({
@@ -751,27 +812,21 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.Upd
 	const route = classifyColumn(view, shape, logical);
 	switch (route.kind) {
 		case 'member': {
-			// An optional member is outer-joined (null-extended lineage): writing it is
-			// a per-row insert-or-delete transition the static fan-out cannot express.
+			// An optional member is outer-joined (null-extended lineage): writing it is a
+			// per-row materialization transition (matched → update, absent → insert, all
+			// value columns null → delete), realized as anchor-keyed AST base ops below.
 			if (route.member.presence !== 'mandatory' || route.nullExtended) {
-				raiseMutationDiagnostic({
-					reason: 'unsupported-decomposition-update',
-					column: asg.column,
-					table: view.name,
-					message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by an optional member ('${route.member.relationId}'); materializing/removing that component row needs the insert/delete fan-out (deferred)`,
-				});
+				const { value, isNull } = lowerMaterializedValue(view, shape, asg);
+				return { kind: 'optional', member: route.member, basisColumn: route.baseColumn, value, isNull };
 			}
-			return { relationId: route.member.relationId, basisColumn: route.baseColumn, value: rewriteAssignedValue(view, shape, route.member, asg.value) };
+			return { kind: 'mandatory', member: route.member, basisColumn: route.baseColumn, value: rewriteAssignedValue(view, shape, route.member, asg.value) };
 		}
-		case 'eav':
-			// An EAV pivot member backs its logical columns as attribute *rows*; writing
-			// one is an insert-or-delete of a triple — the deferred component fan-out.
-			return raiseMutationDiagnostic({
-				reason: 'unsupported-decomposition-update',
-				column: asg.column,
-				table: view.name,
-				message: `cannot update logical table '${view.name}': column '${asg.column}' is backed by an EAV pivot member ('${route.member.relationId}'); materializing/removing that component needs the insert/delete fan-out (deferred)`,
-			});
+		case 'eav': {
+			// An EAV pivot backs its logical columns as attribute triples: a non-null value
+			// upserts the triple, a null deletes it (the EAV analogue of the optional case).
+			const { value, isNull } = lowerMaterializedValue(view, shape, asg);
+			return { kind: 'eav', member: route.member, attribute: declaredNames.get(logical) ?? asg.column, value, isNull };
+		}
 		case 'computed-mapping':
 			return raiseMutationDiagnostic({
 				reason: 'no-inverse',
@@ -787,6 +842,30 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, asg: AST.Upd
 				message: `cannot update logical table '${view.name}': column '${asg.column}' is not backed by any decomposition member`,
 			});
 	}
+}
+
+/**
+ * Lower an optional/EAV-member assigned value to base terms and classify it. The
+ * matched-UPDATE evaluates the value in the **member's** scope while the materialize
+ * INSERT evaluates it over the **anchor** — so a value that survives both scopes must
+ * be scope-independent. v1 admits a **constant** (or a null literal, the delete
+ * trigger); a value referencing any column (a member self-reference, an anchor column,
+ * a cross-member read, a subquery) is rejected — the per-row capture substrate that
+ * would thread a non-constant value across both branches is the outer-join path's, not
+ * yet wired here.
+ */
+function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, asg: AST.UpdateStmt['assignments'][number]): { value: AST.Expression; isNull: boolean } {
+	const lowered = substituteViewColumns(asg.value, shape, view);
+	const isNull = isNullLiteral(lowered);
+	if (!isNull && exprHasColumnRef(lowered)) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-decomposition-update',
+			column: asg.column,
+			table: view.name,
+			message: `cannot update logical table '${view.name}': writing optional/EAV-member column '${asg.column}' supports a constant (or null) value in v1; a value that references other columns needs the per-row capture substrate to thread it across the matched-update and materialize-insert branches (deferred)`,
+		});
+	}
+	return { value: lowered, isNull };
 }
 
 /** `update <member> set <cols> where <memberKey> in (select <anchorKey> from <anchor> where <pred>)`. */
@@ -835,6 +914,292 @@ function rewriteAssignedValue(view: MutableViewLike, shape: DecompShape, owner: 
 			message: `cannot update logical table '${view.name}': an update value references column '${col.name}' on decomposition member '${col.table}', a different member than the column it assigns; cross-member assignment is not supported`,
 		});
 	});
+}
+
+// --- UPDATE materialization (optional columnar / EAV) ---------------------
+
+/**
+ * Emit the per-row base ops for an optional (outer-joined) columnar member's update
+ * group. Three branches off the value-null shape:
+ *
+ * - **all value columns assigned null** → the component row becomes empty, which the
+ *   read renders identically to absence, so `delete from <member> where <memberKey> in
+ *   (<anchor subquery>)` (the matched rows; absent rows are already empty). No insert.
+ * - **otherwise** → the **matched** rows take the legacy member UPDATE; and when ≥1
+ *   value is non-null, the **absent** rows take a null-extended materialization INSERT.
+ *   (An all-null *partial* assignment — every assigned value null but not every value
+ *   column assigned — keeps the matched UPDATE only: an absent row stays all-null, i.e.
+ *   absent, so there is nothing to materialize.)
+ */
+function emitOptionalMemberUpdate(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	cells: readonly OptionalCell[],
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+	ops: BaseOp[],
+): void {
+	const valueBasisCols = optionalValueColumns(view, shape, member);
+	const assignedBasis = new Set(cells.map(c => c.basisColumn.toLowerCase()));
+	const allValueColsAssigned = valueBasisCols.every(bc => assignedBasis.has(bc.toLowerCase()));
+	const allAssignedNull = cells.every(c => c.isNull);
+
+	if (allAssignedNull && allValueColsAssigned) {
+		// The component row is emptied across every value column → delete it. Reuse the
+		// member-delete builder via a metadata-only synthetic DeleteStmt (it rebuilds the
+		// `<memberKey> in (<anchor subquery>)` predicate, and a no-WHERE update truncates
+		// the member — correct, since every logical row's value columns become null).
+		const asDelete: AST.DeleteStmt = {
+			type: 'delete',
+			table: memberIdentifier(member),
+			contextValues: stmt.contextValues,
+			schemaPath: stmt.schemaPath,
+			loc: stmt.loc,
+		};
+		ops.push(memberDeleteOp(ctx, view, shape, member, pred, asDelete));
+		return;
+	}
+
+	// Matched rows: the legacy member UPDATE over the assigned (constant) values.
+	ops.push(memberUpdateOp(ctx, view, shape, member,
+		cells.map(c => ({ column: c.basisColumn, value: cloneExpr(c.value) })), pred, stmt));
+
+	// Absent rows: materialize only when at least one assigned value is non-null (an
+	// all-null partial assignment leaves the absent row absent — nothing to create).
+	if (cells.some(c => !c.isNull)) {
+		ops.push(buildOptionalMaterializeInsert(ctx, view, shape, member, cells, valueBasisCols, pred, stmt));
+	}
+}
+
+/**
+ * Build the null-extended materialization INSERT for an optional columnar member:
+ * `insert into <member> (<memberKey>, <assigned cols…>) select <anchorKey>, <values…>
+ * from <anchor> where <pred> on conflict (<memberKey>) do nothing`. The anchor key
+ * threads the member key (EC); each assigned value fills its column; unassigned value
+ * columns take base defaults. The `on conflict … do nothing` skips the matched anchors
+ * (whose member row already exists — the matched UPDATE owns those), so the matched
+ * UPDATE and this INSERT partition the affected rows without the insert source having
+ * to scan its own target (which the planner cannot assign an access path to).
+ *
+ * Two soundness gates (data-independent, plan-time):
+ * - a member **value** column the statement does not assign must materialize as null
+ *   (nullable + no declared default), else its base default would silently widen the
+ *   absent row's logical image — rejected `unsupported-decomposition-update`;
+ * - a NOT NULL base column with no default that no value covers cannot be created —
+ *   rejected via {@link assertNoMissingNotNull} (the decomposition create-conflict).
+ */
+function buildOptionalMaterializeInsert(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	cells: readonly OptionalCell[],
+	valueBasisCols: readonly string[],
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+): BaseOp {
+	const ref = resolveMemberTable(ctx, member);
+	const schema = ref.tableSchema;
+	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	const memberKey = singleKeyColumn(view, shape, member);
+	const assignedBasis = new Set(cells.map(c => c.basisColumn.toLowerCase()));
+
+	// View-soundness: an unassigned value column that would not land null (it is NOT
+	// NULL, or carries a declared default) cannot be materialized without changing the
+	// absent row's image. Reject conservatively rather than silently widen the view.
+	for (const bc of valueBasisCols) {
+		if (assignedBasis.has(bc.toLowerCase())) continue;
+		const col = columnByName(view, schema, bc);
+		if (col.notNull || col.defaultValue !== null) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-decomposition-update',
+				column: bc,
+				table: view.name,
+				message: `cannot update logical table '${view.name}': materializing an absent row of optional member '${member.relationId}' would leave value column '${bc}' to a base default (it is NOT NULL or declares a default), silently widening the row; assign every value column of the member in this statement, or restrict the update to present rows`,
+			});
+		}
+	}
+
+	const targetColumns: string[] = [memberKey];
+	const projections: AST.ResultColumn[] = [
+		{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } },
+	];
+	for (const c of cells) {
+		targetColumns.push(c.basisColumn);
+		projections.push({ type: 'column', expr: cloneExpr(c.value) });
+	}
+	assertNoMissingNotNull(view, schema, targetColumns.map((baseColumn): DecompInsertColumn => ({ baseColumn })));
+
+	const select: AST.SelectStmt = {
+		type: 'select',
+		columns: projections,
+		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
+		where: pred ? cloneExpr(pred) : undefined,
+	};
+	const statement: AST.InsertStmt = {
+		type: 'insert',
+		table: memberIdentifier(member),
+		columns: targetColumns,
+		source: select,
+		upsertClauses: [{ type: 'upsert', conflictTarget: [memberKey], action: 'nothing' }],
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	return { table: ref, op: 'insert', statement };
+}
+
+/**
+ * Emit the per-attribute base ops for an EAV pivot member's update group. Each
+ * attribute is an independent triple: a **null** value deletes its triple for the
+ * matched entities; a **non-null** value upserts it — a matched UPDATE of the value
+ * column plus a materialization INSERT for entities lacking the triple.
+ */
+function emitEavMemberUpdate(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	cells: readonly EavCell[],
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+	ops: BaseOp[],
+): void {
+	const pivot = member.attributePivot!;
+	for (const cell of cells) {
+		if (cell.isNull) {
+			ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'delete'));
+		} else {
+			ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'update'));
+			ops.push(buildEavMaterializeInsert(ctx, view, shape, member, pivot, cell, pred, stmt));
+		}
+	}
+}
+
+/**
+ * One matched EAV op for an attribute: `update <pivot> set <valCol> = <value>` (upsert
+ * value branch) or `delete from <pivot>` (null branch), each scoped
+ * `where <attrCol> = '<attribute>' and <entityCol> in (<anchor subquery>)`.
+ */
+function buildEavAttrOp(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	pivot: NonNullable<DecompositionMember['attributePivot']>,
+	cell: EavCell,
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+	op: 'update' | 'delete',
+): BaseOp {
+	const where = combineAnd(eavAttrEquals(pivot, cell.attribute), {
+		type: 'in',
+		expr: { type: 'column', name: pivot.entityColumn },
+		subquery: anchorKeySubquery(shape, pred),
+	})!;
+	const table = memberIdentifier(member);
+	const resolved = resolveMemberTable(ctx, member);
+	if (op === 'delete') {
+		const statement: AST.DeleteStmt = {
+			type: 'delete', table, where,
+			contextValues: stmt.contextValues, schemaPath: stmt.schemaPath, loc: stmt.loc,
+		};
+		return { table: resolved, op: 'delete', statement };
+	}
+	const statement: AST.UpdateStmt = {
+		type: 'update', table,
+		assignments: [{ column: pivot.valueColumn, value: cloneExpr(cell.value) }],
+		where,
+		contextValues: stmt.contextValues, schemaPath: stmt.schemaPath, loc: stmt.loc,
+	};
+	return { table: resolved, op: 'update', statement };
+}
+
+/**
+ * Build the EAV materialization INSERT for one attribute: `insert into <pivot>
+ * (<entity>, <attr>, <val>) select <anchorKey>, '<attribute>', <value> from <anchor>
+ * where <pred> on conflict (<entity>, <attr>) do nothing` — one new triple per matched
+ * entity that lacks this attribute (the entities whose triple exists conflict on the
+ * `(entity, attr)` key and are owned by the matched UPDATE, so they are skipped).
+ */
+function buildEavMaterializeInsert(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	pivot: NonNullable<DecompositionMember['attributePivot']>,
+	cell: EavCell,
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+): BaseOp {
+	const ref = resolveMemberTable(ctx, member);
+	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	const projections: AST.ResultColumn[] = [
+		{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } },
+		{ type: 'column', expr: { type: 'literal', value: cell.attribute } },
+		{ type: 'column', expr: cloneExpr(cell.value) },
+	];
+	const select: AST.SelectStmt = {
+		type: 'select',
+		columns: projections,
+		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
+		where: pred ? cloneExpr(pred) : undefined,
+	};
+	const statement: AST.InsertStmt = {
+		type: 'insert',
+		table: memberIdentifier(member),
+		columns: [pivot.entityColumn, pivot.attributeColumn, pivot.valueColumn],
+		source: select,
+		upsertClauses: [{ type: 'upsert', conflictTarget: [pivot.entityColumn, pivot.attributeColumn], action: 'nothing' }],
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	return { table: ref, op: 'insert', statement };
+}
+
+/** `<attrCol> = '<attribute>'` — the pivot attribute selector (matched by value). */
+function eavAttrEquals(pivot: NonNullable<DecompositionMember['attributePivot']>, attribute: string): AST.BinaryExpr {
+	return { type: 'binary', operator: '=', left: { type: 'column', name: pivot.attributeColumn }, right: { type: 'literal', value: attribute } };
+}
+
+/**
+ * The optional member's **value** basis columns (its non-key logical mappings) — the
+ * set the all-null delete gate ranges over. The shared key is threaded separately and
+ * is never a value column.
+ */
+function optionalValueColumns(view: MutableViewLike, shape: DecompShape, member: DecompositionMember): string[] {
+	const keyLower = singleKeyColumn(view, shape, member).toLowerCase();
+	const out: string[] = [];
+	for (const m of member.columns) {
+		const expr = m.basisExpr;
+		if (expr.type !== 'column') continue; // a computed mapping is read-only, not a value column
+		if (expr.name.toLowerCase() === keyLower) continue;
+		out.push(expr.name);
+	}
+	return out;
+}
+
+/** True for a syntactic null literal (the delete / absent-no-op trigger). */
+function isNullLiteral(expr: AST.Expression): boolean {
+	return expr.type === 'literal' && expr.value === null;
+}
+
+/** True when an expression references any column (after lowering to base terms). */
+function exprHasColumnRef(expr: AST.Expression): boolean {
+	let found = false;
+	const walk = (node: unknown): void => {
+		if (found) return;
+		if (Array.isArray(node)) { node.forEach(walk); return; }
+		if (!node || typeof node !== 'object' || !('type' in (node as object))) return;
+		const n = node as Record<string, unknown> & { type: string };
+		if (n.type === 'column') { found = true; return; }
+		for (const v of Object.values(n)) walk(v);
+	};
+	walk(expr);
+	return found;
 }
 
 // --- predicate / subquery construction ------------------------------------

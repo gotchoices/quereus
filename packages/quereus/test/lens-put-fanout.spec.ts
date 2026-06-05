@@ -10,7 +10,11 @@
  *
  * - DELETE across every member (anchor-last, anchor-resolvable predicate — an anchor
  *   identity column or a computed mapping whose basis lives on the anchor).
- * - UPDATE routed to the mandatory, non-EAV member backing each column.
+ * - UPDATE routed to the member backing each column: a mandatory, non-EAV member takes
+ *   one base UPDATE; an **optional** columnar member's write is a per-row materialization
+ *   transition (matched → base UPDATE, absent → `on conflict do nothing` materialize
+ *   INSERT, all value columns null → base DELETE); an **EAV pivot** member's write is the
+ *   per-attribute triple analogue (non-null → upsert, null → delete).
  * - INSERT one per member (anchor first) off the shared-surrogate envelope
  *   (`view-mutation-shared-surrogate-insert`): a surrogate sourced from the anchor key
  *   column's declared `default` (evaluated once per row, with `mutation_ordinal()` in
@@ -19,8 +23,10 @@
  *   supplied attribute; singleton over the empty key.
  *
  * Still deferred onto absent substrate (asserted to raise a precise diagnostic): a
- * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution) and
- * an optional/EAV/key UPDATE transition (per-row insert-or-delete branching).
+ * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution), a
+ * shared-key (identity) UPDATE, and a non-constant value written to an optional/EAV
+ * member (which would need the per-row capture substrate to thread it across both the
+ * matched-update and materialize-insert branches).
  */
 
 import { expect } from 'chai';
@@ -239,11 +245,38 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		}
 	});
 
-	it('defers an update to an optional member', async () => {
+	it('materializes / updates / deletes an optional member per row', async () => {
 		const db = new Database();
 		try {
 			await setup(db);
-			await expectThrows(() => db.exec('update x.T set c = 5 where id = 1'), /optional member/i);
+			// matched (row 1 has a T_c row) → base UPDATE.
+			await db.exec('update x.T set c = 5 where id = 1');
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 5 }]);
+			// absent (row 2 has no T_c) → null-extended materialization INSERT (anchor key
+			// threads the member key).
+			await db.exec('update x.T set c = 7 where id = 2');
+			expect(await rows(db, 'select id, c from main.T_c order by id')).to.deep.equal([{ id: 1, c: 5 }, { id: 2, c: 7 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 7 }]);
+			// all value columns null (T_c's only value column is c) → DELETE the component
+			// row; the view still reads null for an absent optional member.
+			await db.exec('update x.T set c = null where id = 1');
+			expect(await rows(db, 'select id from main.T_c order by id')).to.deep.equal([{ id: 2 }]);
+			expect(await rows(db, 'select c from x.T where id = 1')).to.deep.equal([{ c: null }]);
+			// null write to an already-absent component is a clean no-op (id=1 just deleted).
+			await db.exec('update x.T set c = null where id = 1');
+			expect(await rows(db, 'select id from main.T_c order by id')).to.deep.equal([{ id: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('defers a non-constant optional-member value (needs the per-row capture substrate)', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			// A value referencing another column cannot be threaded across the matched-update
+			// (member scope) and materialize-insert (anchor scope) branches without capture.
+			await expectThrows(() => db.exec('update x.T set c = a + 1 where id = 1'), /constant \(or null\) value/i);
 		} finally {
 			await db.close();
 		}
@@ -254,6 +287,93 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		try {
 			await setup(db);
 			await expectThrows(() => db.exec('update x.T set id = 9 where id = 1'), /shared key/i);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Optional members backing **more than one** value column — the partial-null and
+ * default-widen branches the single-value-column split above cannot exercise. `M_opt`
+ * (c1, c2 both nullable) drives the partial cases; `M_def` (e2 carries a base default)
+ * drives the conservative reject that would otherwise silently widen the view.
+ */
+describe('lens decomposition put: UPDATE of a multi-value-column optional member', () => {
+	function multiSplit(): MappingAdvertisement {
+		return {
+			id: 'M_core',
+			logicalTable: 'M',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'M_core',
+				members: [
+					{ relationId: 'M_core', relation: { schema: 'main', table: 'M_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+					{ relationId: 'M_opt', relation: { schema: 'main', table: 'M_opt' }, presence: 'optional', columns: [colMap('c1', 'c1'), colMap('c2', 'c2')] },
+					{ relationId: 'M_def', relation: { schema: 'main', table: 'M_def' }, presence: 'optional', columns: [colMap('e1', 'e1'), colMap('e2', 'e2')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['M_core', ['id']], ['M_opt', ['id']], ['M_def', ['id']]) },
+			},
+		};
+	}
+
+	async function setupMulti(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [multiSplit()];
+		db.registerModule('mmod', mod);
+		await db.exec('create table M_core (id integer primary key, a integer null) using mmod');
+		await db.exec('create table M_opt (id integer primary key, c1 integer null, c2 integer null) using mmod');
+		await db.exec('create table M_def (id integer primary key, e1 integer null, e2 integer null default 7) using mmod');
+		await db.exec('declare logical schema x { table M { id integer primary key, a integer null, c1 integer null, c2 integer null, e1 integer null, e2 integer null } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.M_core values (1, 10), (2, 20)');
+		await db.exec('insert into main.M_opt values (1, 100, 200)');     // id 1 present, id 2 absent
+		await db.exec('insert into main.M_def values (1, 1, 1)');
+	}
+
+	it('partial non-null write updates a present row and materializes an absent one with the other value null', async () => {
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = 5 where id = 1');   // present → UPDATE, c2 untouched
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 5, c2: 200 }]);
+			await db.exec('update x.M set c1 = 9 where id = 2');   // absent → materialize, c2 lands null
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 5, c2: 200 }, { id: 2, c1: 9, c2: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a partial all-null write updates (does not delete) — the other value column may still be non-null', async () => {
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = null where id = 1');   // only c1 assigned → UPDATE, row survives
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: null, c2: 200 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a full all-null write (every value column) deletes the component row', async () => {
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = null, c2 = null where id = 1');
+			expect(await rows(db, 'select count(*) as n from main.M_opt where id = 1')).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select c1, c2 from x.M where id = 1')).to.deep.equal([{ c1: null, c2: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a partial write that would materialize an unassigned value column to a non-null base default', async () => {
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			// e2 carries `default 7`; materializing an absent row with only e1 assigned would
+			// set e2 = 7, silently widening the absent row's image — rejected at plan time.
+			await expectThrows(() => db.exec('update x.M set e1 = 5 where id = 2'), /silently widening|base default/i);
 		} finally {
 			await db.close();
 		}
@@ -305,20 +425,25 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 		}
 	});
 
-	it('defers an update of an EAV-served column with the pivot diagnostic (not a bare no-inverse)', async () => {
+	it('upserts a non-null EAV-served column and deletes it on null', async () => {
 		// An EAV column is projected by the get body as a correlated subquery, never a
-		// member `columns` entry, so the value-routing loop cannot match it. It must
-		// still defer with the EAV-pivot reason (writing it is an insert/delete of a
-		// triple) — distinct from a genuine non-column, which stays a plain no-inverse.
+		// member `columns` entry. A non-null write upserts its triple (matched UPDATE of
+		// the value + materialize INSERT for entities lacking it); a null write deletes it.
 		const db = new Database();
 		try {
 			await setupEav(db);
-			await expectThrows(() => db.exec('update x.E set p = 99 where id = 1'), /EAV pivot member/i);
+			// matched (entity 1 has a 'p' triple) → UPDATE the value.
+			await db.exec('update x.E set p = 99 where id = 1');
+			expect(await rows(db, "select val from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 99 }]);
+			// absent (entity 2 has no 'q' triple) → materialize the (2, 'q', 88) triple.
+			await db.exec('update x.E set q = 88 where id = 2');
+			expect(await rows(db, "select val from main.E_eav where eid = 2 and attr = 'q'")).to.deep.equal([{ val: 88 }]);
+			// null write → delete the matched entity's 'p' triple; the view reads null.
+			await db.exec('update x.E set p = null where id = 1');
+			expect(await rows(db, "select count(*) as n from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select p from x.E where id = 1')).to.deep.equal([{ p: null }]);
+			// An unbacked column is still a plain no-inverse (not an EAV route).
 			await expectThrows(() => db.exec('update x.E set notacol = 1 where id = 1'), /not backed by any decomposition member/i);
-			// Atomic: the deferred writes left every triple intact.
-			expect(await rows(db, 'select eid, attr, val from main.E_eav order by eid, attr')).to.deep.equal([
-				{ eid: 1, attr: 'p', val: 11 }, { eid: 1, attr: 'q', val: 12 }, { eid: 2, attr: 'p', val: 21 },
-			]);
 		} finally {
 			await db.close();
 		}
