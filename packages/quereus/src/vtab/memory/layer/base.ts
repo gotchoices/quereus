@@ -309,13 +309,6 @@ export class BaseLayer implements Layer {
 	 * the caller is expected to roll back the schema change in that case.
 	 */
 	private populateNewIndex(newIndex: MemoryIndex, indexSchema: IndexSchema): void {
-		// Track index keys we've already inserted so we can detect duplicates
-		// without doing a get() per row (the BTree merges duplicates by primaryKey
-		// set; we want the first duplicate to surface as a CONSTRAINT error).
-		const seen = indexSchema.unique
-			? new Map<string, boolean>()
-			: undefined;
-
 		for (const path of this.primaryTree.ascending(this.primaryTree.first())) {
 			const currentRow = this.primaryTree.at(path)!;
 			if (!newIndex.rowMatchesPredicate(currentRow)) continue;
@@ -323,27 +316,45 @@ export class BaseLayer implements Layer {
 			const indexKey = newIndex.keyFromRow(currentRow);
 			const primaryKey = this.primaryKeyFunctions.extractFromRow(currentRow);
 
-			if (seen) {
+			if (this.indexEnforcesUnique(indexSchema)) {
 				const cols = newIndex.specColumns.map(c => currentRow[c.index]);
 				// SQL UNIQUE allows multiple NULLs: skip dup detection if any key value is NULL.
 				const hasNull = cols.some(v => v === null);
-				if (!hasNull) {
-					const keySig = JSON.stringify(cols);
-					if (seen.has(keySig)) {
-						const colNames = newIndex.specColumns
-							.map(c => this.tableSchema.columns[c.index]?.name ?? String(c.index))
-							.join(', ');
-						throw new QuereusError(
-							`UNIQUE constraint failed: ${this.tableSchema.name} (${colNames})`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-					seen.set(keySig, true);
+				// Detect duplicates through the index's own collation-aware comparator
+				// (its BTree keys by compareKeys), so a value set unique under BINARY but
+				// colliding under e.g. NOCASE surfaces here — a raw value signature would
+				// miss it. A non-empty key means a prior in-scope row already inserted it.
+				if (!hasNull && newIndex.getPrimaryKeys(indexKey).length > 0) {
+					const colNames = newIndex.specColumns
+						.map(c => this.tableSchema.columns[c.index]?.name ?? String(c.index))
+						.join(', ');
+					throw new QuereusError(
+						`UNIQUE constraint failed: ${this.tableSchema.name} (${colNames})`,
+						StatusCode.CONSTRAINT,
+					);
 				}
 			}
 
 			newIndex.addEntry(indexKey, primaryKey);
 		}
+	}
+
+	/**
+	 * True when populating `indexSchema` must reject duplicate keys: either the
+	 * index is itself declared UNIQUE, or it is the auto-built covering structure
+	 * for a declared UNIQUE constraint (same column set). The latter never carries
+	 * `unique: true` — insert-time enforcement runs through `uniqueConstraints` —
+	 * so without this check a strict rebuild (e.g. `ALTER COLUMN ... SET COLLATE`)
+	 * would silently accept rows that collide under the new collation.
+	 */
+	private indexEnforcesUnique(indexSchema: IndexSchema): boolean {
+		if (indexSchema.unique) return true;
+		const ucs = this.tableSchema.uniqueConstraints;
+		if (!ucs) return false;
+		return ucs.some(uc =>
+			uc.columns.length === indexSchema.columns.length &&
+			uc.columns.every((colIdx, i) => indexSchema.columns[i].index === colIdx),
+		);
 	}
 
 	async dropIndexFromBase(indexName: string): Promise<void> {
