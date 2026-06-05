@@ -12,6 +12,7 @@ import type { ColumnSchema } from './column.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule } from './table.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import { backingTableNameFor } from './view.js';
+import { isHiddenImplicitIndex } from './catalog.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
@@ -729,6 +730,93 @@ export class SchemaManager {
 			);
 		}
 		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
+	}
+
+	/**
+	 * Sets metadata tags on an existing view, replacing any existing tags (empty
+	 * record clears). Catalog-only: swaps the in-memory {@link ViewSchema} and
+	 * re-registers it. Mirrors the no-event create path (`emitCreateView`) — a plain
+	 * view carries no schema-change event, so none is fired here either.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the view does not exist.
+	 */
+	setViewTags(viewName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const schema = this.getSchemaOrFail(targetSchemaName);
+		const view = schema.getView(viewName);
+		if (!view) {
+			throw new QuereusError(`View '${viewName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+		}
+		const updated: ViewSchema = { ...view, tags: this.freezeTags(tags) };
+		schema.addView(updated);
+	}
+
+	/**
+	 * Sets metadata tags on an existing materialized view, replacing any existing
+	 * tags (empty record clears). Catalog-only: swaps the in-memory
+	 * {@link MaterializedViewSchema} and re-registers it. The backing table and the
+	 * row-time maintenance plan are untouched (tags do not affect maintenance), so
+	 * this never re-materializes. No change event is fired — `materialized_view_added`
+	 * (what create emits) would mislead listeners into re-registering maintenance,
+	 * and there is no `_modified` event.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the materialized view does not exist.
+	 */
+	setMaterializedViewTags(name: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const schema = this.getSchemaOrFail(targetSchemaName);
+		const mv = schema.getMaterializedView(name);
+		if (!mv) {
+			throw new QuereusError(`Materialized view '${name}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+		}
+		const updated: MaterializedViewSchema = { ...mv, tags: this.freezeTags(tags) };
+		schema.addMaterializedView(updated);
+	}
+
+	/**
+	 * Sets metadata tags on an existing index, replacing any existing tags (empty
+	 * record clears). Indexes live on their owning {@link TableSchema}, so this
+	 * resolves the owner by index name, swaps the matching {@link IndexSchema}, and
+	 * re-registers the table — firing `table_modified` (mirroring create/drop index)
+	 * so optimizer caches invalidate.
+	 *
+	 * Hidden implicit covering structures (the auto-built BTree backing a UNIQUE
+	 * constraint, not opted into catalog visibility) are not user-addressable and
+	 * surface as NOTFOUND — their tags live on the originating constraint.
+	 *
+	 * @throws QuereusError(NOTFOUND) if no user-visible index matches.
+	 */
+	setIndexTags(indexName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const schema = this.getSchemaOrFail(targetSchemaName);
+		const lower = indexName.toLowerCase();
+		let ownerTable: TableSchema | undefined;
+		let matched: IndexSchema | undefined;
+		for (const table of schema.getAllTables()) {
+			const found = table.indexes?.find(idx => idx.name.toLowerCase() === lower);
+			if (found) {
+				ownerTable = table;
+				matched = found;
+				break;
+			}
+		}
+		if (!ownerTable || !matched || isHiddenImplicitIndex(ownerTable, matched.name)) {
+			throw new QuereusError(`Index '${indexName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+		}
+		const frozen = this.freezeTags(tags);
+		const updatedIndexes = ownerTable.indexes!.map(idx => (idx.name.toLowerCase() === lower ? { ...idx, tags: frozen } : idx));
+		const updatedTableSchema: TableSchema = {
+			...ownerTable,
+			indexes: Object.freeze(updatedIndexes),
+		};
+		schema.addTable(updatedTableSchema);
+		this.changeNotifier.notifyChange({
+			type: 'table_modified',
+			schemaName: targetSchemaName,
+			objectName: ownerTable.name,
+			oldObject: ownerTable,
+			newObject: updatedTableSchema,
+		});
 	}
 
 	/**

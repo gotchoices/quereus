@@ -20,6 +20,7 @@ import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { buildAlterTableStmt } from './alter-table.js';
+import { buildAlterViewStmt, buildAlterMaterializedViewStmt, buildAlterIndexStmt } from './set-object-tags.js';
 import { buildBeginStmt, buildCommitStmt, buildRollbackStmt, buildSavepointStmt, buildReleaseStmt } from './transaction.js';
 import { buildPragmaStmt } from './pragma.js';
 import { buildAnalyzeStmt } from './analyze.js';
@@ -90,6 +91,12 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 				return buildAnalyzeStmt(ctx, stmt as AST.AnalyzeStmt);
 			case 'alterTable':
 				return buildAlterTableStmt(ctx, stmt as AST.AlterTableStmt);
+			case 'alterView':
+				return buildAlterViewStmt(ctx, stmt as AST.AlterViewStmt);
+			case 'alterMaterializedView':
+				return buildAlterMaterializedViewStmt(ctx, stmt as AST.AlterMaterializedViewStmt);
+			case 'alterIndex':
+				return buildAlterIndexStmt(ctx, stmt as AST.AlterIndexStmt);
 			case 'values':
 				return buildValuesStmt(ctx, stmt as AST.ValuesStmt);
 			case 'declareSchema':

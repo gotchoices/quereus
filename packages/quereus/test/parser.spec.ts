@@ -352,6 +352,44 @@ describe('Parser', () => {
 		});
 	});
 
+	describe('ALTER VIEW / MATERIALIZED VIEW / INDEX SET TAGS', () => {
+		it('parses ALTER VIEW ... SET TAGS', () => {
+			const stmt = parse(`alter view v set tags (cacheable = true)`) as import('../src/parser/ast.js').AlterViewStmt;
+			expect(stmt.type).to.equal('alterView');
+			expect(stmt.name.name).to.equal('v');
+			expect(stmt.action).to.deep.equal({ type: 'setTags', tags: { cacheable: true } });
+		});
+
+		it('parses ALTER MATERIALIZED VIEW ... SET TAGS', () => {
+			const stmt = parse(`alter materialized view mv set tags (owner = 'analytics')`) as import('../src/parser/ast.js').AlterMaterializedViewStmt;
+			expect(stmt.type).to.equal('alterMaterializedView');
+			expect(stmt.name.name).to.equal('mv');
+			expect(stmt.action).to.deep.equal({ type: 'setTags', tags: { owner: 'analytics' } });
+		});
+
+		it('parses ALTER INDEX ... SET TAGS', () => {
+			const stmt = parse(`alter index idx set tags (purpose = 'search')`) as import('../src/parser/ast.js').AlterIndexStmt;
+			expect(stmt.type).to.equal('alterIndex');
+			expect(stmt.name.name).to.equal('idx');
+			expect(stmt.action).to.deep.equal({ type: 'setTags', tags: { purpose: 'search' } });
+		});
+
+		it('parses an empty SET TAGS () as the clear-all form', () => {
+			const stmt = parse(`alter index idx set tags ()`) as import('../src/parser/ast.js').AlterIndexStmt;
+			expect(stmt.action.tags).to.deep.equal({});
+		});
+
+		it('honors a schema-qualified object name', () => {
+			const stmt = parse(`alter view main.v set tags (a = 1)`) as import('../src/parser/ast.js').AlterViewStmt;
+			expect(stmt.name.schema).to.equal('main');
+			expect(stmt.name.name).to.equal('v');
+		});
+
+		it('rejects ALTER on an unsupported object keyword', () => {
+			expect(() => parse(`alter sequence s set tags (a = 1)`)).to.throw();
+		});
+	});
+
 	// Guards the shared CONTEXTUAL_KEYWORDS constant in parser.ts: these tokenized-but-contextual
 	// reserved words must still be accepted as identifiers in every context, and the two extended
 	// sets (+temp/temporary in tableIdentifier, +replace in the function-call path) must keep working.

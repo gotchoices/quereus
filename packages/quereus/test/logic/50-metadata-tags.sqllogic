@@ -305,3 +305,110 @@ CREATE TABLE AmbiguousCon (
 
 ALTER TABLE AmbiguousCon ALTER CONSTRAINT dup SET TAGS (m = 'x');
 -- error: ambiguous
+
+-- ===================================================================
+-- Phase 17: ALTER VIEW ... SET TAGS (whole-set replace + clear)
+-- ===================================================================
+
+-- ActiveOrders (Phase 4) was created with cacheable/purpose tags.
+SELECT json_extract(tags, '$.cacheable') AS cacheable, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"cacheable":true,"purpose":"active orders filter"}]
+
+-- Whole-set replace: previous keys are gone, only the new ones remain.
+ALTER VIEW ActiveOrders SET TAGS (owner = 'team-x', cacheable = false);
+SELECT json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.cacheable') AS cacheable,
+       json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"owner":"team-x","cacheable":false,"purpose":null}]
+
+-- The view still resolves and returns rows after the tag mutation.
+SELECT * FROM ActiveOrders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Clear all tags → tags IS NULL.
+ALTER VIEW ActiveOrders SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 18: ALTER INDEX ... SET TAGS (whole-set replace + clear)
+-- ===================================================================
+
+-- idx_product_name (Phase 5) was created with a purpose tag.
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"purpose":"search optimization"}]
+
+-- Whole-set replace.
+ALTER INDEX idx_product_name SET TAGS (owner = 'search-team', purpose = 'fulltext');
+SELECT index_name, json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('Products') WHERE index_name = 'idx_product_name';
+→ [{"index_name":"idx_product_name","owner":"search-team","purpose":"fulltext"}]
+
+-- The index still answers lookups after the tag mutation.
+SELECT name FROM Products WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- Clear all tags → tags IS NULL.
+ALTER INDEX idx_product_name SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 19: ALTER MATERIALIZED VIEW ... SET TAGS (no re-materialization)
+-- ===================================================================
+
+CREATE MATERIALIZED VIEW mv_orders AS SELECT id, name FROM Orders;
+
+-- The MV is materialized from Orders (rows inserted in Phase 1).
+SELECT id, name FROM mv_orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Tag mutation executes as a catalog-only change.
+ALTER MATERIALIZED VIEW mv_orders SET TAGS (owner = 'analytics');
+
+-- The materialized data is unchanged by the tag mutation (no rebuild).
+SELECT id, name FROM mv_orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Replace then clear still leave the data intact.
+ALTER MATERIALIZED VIEW mv_orders SET TAGS (owner = 'platform', tier = 'gold');
+ALTER MATERIALIZED VIEW mv_orders SET TAGS ();
+SELECT id, name FROM mv_orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- ===================================================================
+-- Phase 20: NOTFOUND for unknown view / index / materialized view
+-- ===================================================================
+
+ALTER VIEW NoSuchView SET TAGS (a = 1);
+-- error: not found
+
+ALTER INDEX NoSuchIndex SET TAGS (a = 1);
+-- error: not found
+
+ALTER MATERIALIZED VIEW NoSuchMv SET TAGS (a = 1);
+-- error: not found
+
+-- ===================================================================
+-- Phase 21: reserved-tag typo rejection on the view / index ALTER paths
+-- ===================================================================
+
+-- A misspelled reserved key is rejected loudly (view-ddl site).
+ALTER VIEW ActiveOrders SET TAGS ("quereus.update.taget" = 1);
+-- error: reserved tag
+
+-- physical-index site rejects an unknown reserved key.
+ALTER INDEX idx_product_name SET TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- ===================================================================
+-- Phase 22: hidden implicit covering index is not addressable (NOTFOUND)
+-- ===================================================================
+
+-- Employees (Phase 3) has a named UNIQUE constraint uq_email whose implicit
+-- covering structure is hidden — ALTER INDEX must treat it as NOTFOUND (its
+-- tags live on the constraint, set via ALTER TABLE ... ALTER CONSTRAINT).
+ALTER INDEX uq_email SET TAGS (a = 1);
+-- error: not found

@@ -120,6 +120,12 @@ export function astToString(node: AST.AstNode): string {
 			return createAssertionToString(node as AST.CreateAssertionStmt);
 		case 'alterTable':
 			return alterTableToString(node as AST.AlterTableStmt);
+		case 'alterView':
+			return alterViewToString(node as AST.AlterViewStmt);
+		case 'alterMaterializedView':
+			return alterMaterializedViewToString(node as AST.AlterMaterializedViewStmt);
+		case 'alterIndex':
+			return alterIndexToString(node as AST.AlterIndexStmt);
 		case 'analyze':
 			return analyzeToString(node as AST.AnalyzeStmt);
 		case 'drop':
@@ -927,6 +933,18 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 			return `alter table ${table} set tags ${body}`;
 		}
 	}
+}
+
+function alterViewToString(stmt: AST.AlterViewStmt): string {
+	return `alter view ${expressionToString(stmt.name)} set tags ${tagsBodyToString(stmt.action.tags)}`;
+}
+
+function alterMaterializedViewToString(stmt: AST.AlterMaterializedViewStmt): string {
+	return `alter materialized view ${expressionToString(stmt.name)} set tags ${tagsBodyToString(stmt.action.tags)}`;
+}
+
+function alterIndexToString(stmt: AST.AlterIndexStmt): string {
+	return `alter index ${expressionToString(stmt.name)} set tags ${tagsBodyToString(stmt.action.tags)}`;
 }
 
 function analyzeToString(stmt: AST.AnalyzeStmt): string {

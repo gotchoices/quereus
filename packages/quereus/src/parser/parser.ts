@@ -340,7 +340,7 @@ export class Parser {
 			case 'CREATE': this.advance(); stmt = this.createStatement(startToken, withClause); break;
 			case 'REFRESH': this.advance(); stmt = this.refreshStatement(startToken, withClause); break;
 			case 'DROP': this.advance(); stmt = this.dropStatement(startToken, withClause); break;
-			case 'ALTER': this.advance(); stmt = this.alterTableStatement(startToken, withClause); break;
+			case 'ALTER': this.advance(); stmt = this.alterStatement(startToken, withClause); break;
 			case 'BEGIN': this.advance(); stmt = this.beginStatement(startToken, withClause); break;
 			case 'COMMIT': this.advance(); stmt = this.commitStatement(startToken, withClause); break;
 			case 'ROLLBACK': this.advance(); stmt = this.rollbackStatement(startToken, withClause); break;
@@ -2843,6 +2843,64 @@ export class Parser {
 			ifExists,
 			loc: _createLoc(startToken, this.previous()),
 		};
+	}
+
+	/**
+	 * Top-level ALTER dispatch. `ALTER` has already been consumed. Branches on the
+	 * object keyword: TABLE → the full ALTER TABLE grammar; VIEW / MATERIALIZED VIEW
+	 * / INDEX → the v1 `SET TAGS`-only metadata grammar. MATERIALIZED is checked
+	 * before VIEW so `MATERIALIZED VIEW` is not mis-parsed as a plain view.
+	 */
+	private alterStatement(startToken: Token, withClause?: AST.WithClause): AST.AstNode {
+		if (this.peekKeyword('TABLE')) {
+			return this.alterTableStatement(startToken, withClause);
+		}
+		if (this.peekKeyword('MATERIALIZED')) {
+			return this.alterMaterializedViewStatement(startToken);
+		}
+		if (this.peekKeyword('VIEW')) {
+			return this.alterViewStatement(startToken);
+		}
+		if (this.peekKeyword('INDEX')) {
+			return this.alterIndexStatement(startToken);
+		}
+		throw this.error(this.peek(), "Expected 'TABLE', 'VIEW', 'MATERIALIZED VIEW', or 'INDEX' after ALTER.");
+	}
+
+	/**
+	 * Parse the trailing `SET TAGS (...)` of an ALTER VIEW / MATERIALIZED VIEW /
+	 * INDEX statement (object name already consumed). An empty list clears all tags.
+	 */
+	private parseSetObjectTagsAction(): AST.AlterObjectTagsAction {
+		this.consumeKeyword('SET', "Expected 'SET' after object name.");
+		this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
+		const tags = this.parseTags();
+		return { type: 'setTags', tags };
+	}
+
+	/** Parse `ALTER VIEW <name> SET TAGS (...)`. */
+	private alterViewStatement(startToken: Token): AST.AlterViewStmt {
+		this.consumeKeyword('VIEW', "Expected 'VIEW' after ALTER.");
+		const name = this.tableIdentifier();
+		const action = this.parseSetObjectTagsAction();
+		return { type: 'alterView', name, action, loc: _createLoc(startToken, this.previous()) };
+	}
+
+	/** Parse `ALTER MATERIALIZED VIEW <name> SET TAGS (...)`. */
+	private alterMaterializedViewStatement(startToken: Token): AST.AlterMaterializedViewStmt {
+		this.consumeKeyword('MATERIALIZED', "Expected 'MATERIALIZED' after ALTER.");
+		this.consumeKeyword('VIEW', "Expected 'VIEW' after MATERIALIZED.");
+		const name = this.tableIdentifier();
+		const action = this.parseSetObjectTagsAction();
+		return { type: 'alterMaterializedView', name, action, loc: _createLoc(startToken, this.previous()) };
+	}
+
+	/** Parse `ALTER INDEX <name> SET TAGS (...)`. */
+	private alterIndexStatement(startToken: Token): AST.AlterIndexStmt {
+		this.consumeKeyword('INDEX', "Expected 'INDEX' after ALTER.");
+		const name = this.tableIdentifier();
+		const action = this.parseSetObjectTagsAction();
+		return { type: 'alterIndex', name, action, loc: _createLoc(startToken, this.previous()) };
 	}
 
 	/**

@@ -9,7 +9,7 @@ import type { ConflictResolution } from '../common/constants.js';
 // Base for all AST nodes
 export interface AstNode {
 	type: 'literal' | 'identifier' | 'column' | 'binary' | 'unary' | 'function' | 'cast' | 'parameter' | 'subquery' | 'select'
-		| 'insert' | 'update' | 'delete' | 'createTable' | 'createIndex' | 'createView' | 'createMaterializedView' | 'refreshMaterializedView' | 'createAssertion' | 'alterTable' | 'drop' | 'begin' | 'commit'
+		| 'insert' | 'update' | 'delete' | 'createTable' | 'createIndex' | 'createView' | 'createMaterializedView' | 'refreshMaterializedView' | 'createAssertion' | 'alterTable' | 'alterView' | 'alterMaterializedView' | 'alterIndex' | 'drop' | 'begin' | 'commit'
 		| 'rollback' | 'table' | 'join' | 'savepoint' | 'release' | 'functionSource' | 'with' | 'commonTableExpr' | 'pragma'
 		| 'collate' | 'primaryKey' | 'notNull' | 'null' | 'unique' | 'check' | 'default' | 'foreignKey' | 'generated' | 'windowFunction'
 		| 'windowDefinition' | 'windowFrame' | 'currentRow' | 'unboundedPreceding' | 'unboundedFollowing' | 'preceding' | 'following'
@@ -367,6 +367,33 @@ export interface AlterTableStmt extends AstNode {
 	action: AlterTableAction;
 }
 
+/**
+ * ALTER VIEW / ALTER MATERIALIZED VIEW / ALTER INDEX … SET TAGS — whole-set
+ * metadata-tag replacement on the named object (empty list clears). These are
+ * catalog-only mutations (no module / data round-trip); v1 scope is `SET TAGS`
+ * only. The `action` envelope keeps `setTags` as its sole member so structural
+ * alter follow-ups have a home without reshaping these statements.
+ */
+export type AlterObjectTagsAction = { type: 'setTags'; tags: Record<string, SqlValue> };
+
+export interface AlterViewStmt extends AstNode {
+	type: 'alterView';
+	name: IdentifierExpr;
+	action: AlterObjectTagsAction;
+}
+
+export interface AlterMaterializedViewStmt extends AstNode {
+	type: 'alterMaterializedView';
+	name: IdentifierExpr;
+	action: AlterObjectTagsAction;
+}
+
+export interface AlterIndexStmt extends AstNode {
+	type: 'alterIndex';
+	name: IdentifierExpr;
+	action: AlterObjectTagsAction;
+}
+
 // DROP statement
 export interface DropStmt extends AstNode {
 	type: 'drop';
@@ -664,6 +691,9 @@ export type Statement =
 	| CreateAssertionStmt
 	| DropStmt
 	| AlterTableStmt
+	| AlterViewStmt
+	| AlterMaterializedViewStmt
+	| AlterIndexStmt
 	| BeginStmt
 	| CommitStmt
 	| RollbackStmt

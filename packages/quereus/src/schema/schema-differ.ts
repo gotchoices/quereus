@@ -47,6 +47,17 @@ export interface SchemaDiff {
 	indexesToDrop: string[];
 	assertionsToCreate: string[];
 	assertionsToDrop: string[];
+	/**
+	 * In-place metadata-tag changes on name-matched views / materialized views /
+	 * indexes (whole-set replacement; `tags: {}` clears). These take the new
+	 * `ALTER … SET TAGS` primitive rather than a drop+recreate — crucially, a
+	 * materialized-view tag change avoids a needless re-materialization. A MV whose
+	 * *body* changed drops+recreates instead (the recreate carries the declared
+	 * tags), so the two are mutually exclusive per object.
+	 */
+	viewTagsChanges: Array<{ name: string; tags: Record<string, SqlValue> }>;
+	materializedViewTagsChanges: Array<{ name: string; tags: Record<string, SqlValue> }>;
+	indexTagsChanges: Array<{ name: string; tags: Record<string, SqlValue> }>;
 	/** Renames detected via `quereus.id` / `quereus.previous_name` hints. */
 	renames: RenameOp[];
 	/**
@@ -131,6 +142,9 @@ export function computeSchemaDiff(
 		indexesToDrop: [],
 		assertionsToCreate: [],
 		assertionsToDrop: [],
+		viewTagsChanges: [],
+		materializedViewTagsChanges: [],
+		indexTagsChanges: [],
 		renames: [],
 		lensToAttach: [],
 		lensToDetach: [],
@@ -299,10 +313,16 @@ export function computeSchemaDiff(
 	}
 	diff.tablesToDrop = orderDropsByFKDependency(dropSet, actualTables);
 
-	// Views: creates / drops
+	// Views: creates / drops / in-place tag changes. A pure name match (no rename)
+	// whose tags drifted takes the in-place `ALTER VIEW … SET TAGS` primitive; a
+	// rename-matched view has no in-place primitive, so its tags ride the
+	// drop+recreate the standard buckets already drive.
 	for (const [name, declaredView] of declaredViews) {
-		if (!viewRenames.pairs.has(name)) {
+		const matchedActual = viewRenames.pairs.get(name);
+		if (!matchedActual) {
 			diff.viewsToCreate.push(createViewToString(declaredView.viewStmt));
+		} else if (matchedActual.name.toLowerCase() === name && tagsDrifted(declaredView.viewStmt.tags, matchedActual.tags)) {
+			diff.viewTagsChanges.push({ name: declaredView.viewStmt.view.name, tags: desiredTagSet(declaredView.viewStmt.tags) });
 		}
 	}
 	for (const [name] of actualViews) {
@@ -323,8 +343,13 @@ export function computeSchemaDiff(
 		} else {
 			const declaredBodyHash = computeBodyHash(astToString(declaredMv.viewStmt.select));
 			if (declaredBodyHash !== actual.bodyHash) {
+				// Body changed → drop+recreate (the recreate re-materializes AND carries
+				// the declared tags); never also emit a SET TAGS for this MV.
 				diff.materializedViewsToDrop.push(name);
 				diff.materializedViewsToCreate.push(createMaterializedViewToString(declaredMv.viewStmt));
+			} else if (tagsDrifted(declaredMv.viewStmt.tags, actual.tags)) {
+				// Body unchanged but tags drifted → in-place SET TAGS, no rebuild.
+				diff.materializedViewTagsChanges.push({ name: declaredMv.viewStmt.view.name, tags: desiredTagSet(declaredMv.viewStmt.tags) });
 			}
 		}
 	}
@@ -332,11 +357,15 @@ export function computeSchemaDiff(
 		if (!declaredMaterializedViews.has(name)) diff.materializedViewsToDrop.push(name);
 	}
 
-	// Indexes: creates / drops
+	// Indexes: creates / drops / in-place tag changes (pure name match only, as
+	// with views — a renamed index drops+recreates and carries its tags then).
 	for (const [name, declaredIndex] of declaredIndexes) {
-		if (!indexRenames.pairs.has(name)) {
+		const matchedActual = indexRenames.pairs.get(name);
+		if (!matchedActual) {
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
 			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
+		} else if (matchedActual.name.toLowerCase() === name && tagsDrifted(declaredIndex.indexStmt.tags, matchedActual.tags)) {
+			diff.indexTagsChanges.push({ name: declaredIndex.indexStmt.index.name, tags: desiredTagSet(declaredIndex.indexStmt.tags) });
 		}
 	}
 	for (const [name] of actualIndexes) {
@@ -1089,6 +1118,21 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		for (const ctc of alter.constraintTagsChanges ?? []) {
 			statements.push(`ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)} SET TAGS ${tagsBodyToString(ctc.tags)}`);
 		}
+	}
+
+	// In-place tag changes on views / materialized views / indexes. These are leaf
+	// metadata writes (no dependency ordering vs the table-alter block), and an MV
+	// tag change here is mutually exclusive with a body-rebuild drop+recreate. The
+	// `?? []` keeps generateMigrationDDL robust against hand-built diffs (some tests
+	// construct partial SchemaDiff literals), mirroring `constraintTagsChanges`.
+	for (const vtc of diff.viewTagsChanges ?? []) {
+		statements.push(`ALTER VIEW ${schemaPrefix}${quoteIdentifier(vtc.name)} SET TAGS ${tagsBodyToString(vtc.tags)}`);
+	}
+	for (const mvtc of diff.materializedViewTagsChanges ?? []) {
+		statements.push(`ALTER MATERIALIZED VIEW ${schemaPrefix}${quoteIdentifier(mvtc.name)} SET TAGS ${tagsBodyToString(mvtc.tags)}`);
+	}
+	for (const itc of diff.indexTagsChanges ?? []) {
+		statements.push(`ALTER INDEX ${schemaPrefix}${quoteIdentifier(itc.name)} SET TAGS ${tagsBodyToString(itc.tags)}`);
 	}
 
 	return statements;

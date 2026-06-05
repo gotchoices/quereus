@@ -1328,6 +1328,27 @@ Replaces the metadata tags on the table itself, one of its columns, or one of it
 
 The declarative schema differ detects tag drift at all three sites and emits the matching `SET TAGS` statements **after** the structural ALTER phases (rename/add/alter/pk/drop), so a tag set lands on the post-rename column / constraint name. The rename-hint keys `"quereus.id"` and `"quereus.previous_name"` are excluded from the tag-drift comparison (they drive rename detection, not data state, so a declaration carrying only a hint does not churn out a `SET TAGS` after the rename completes); behavioral reserved tags (`quereus.update.*`, `quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared.
 
+#### SET TAGS on views, materialized views, and indexes
+
+The other tagged catalog objects — views, materialized views, and indexes — also carry their tags from `CREATE` time, and can be re-tagged in place:
+
+```sql
+ALTER VIEW view_name               SET TAGS (key = value [, ...]);  -- view tags
+ALTER MATERIALIZED VIEW mv_name    SET TAGS (key = value [, ...]);  -- materialized-view tags
+ALTER INDEX index_name             SET TAGS (key = value [, ...]);  -- index tags
+ALTER VIEW view_name               SET TAGS ();                     -- clear all tags (any kind)
+```
+
+These share the `ALTER TABLE … SET TAGS` semantics above — **whole-set replacement** (empty list clears, after which `schema()` / `index_info()` report `tags IS NULL`), **catalog-only** (no module / data round-trip; a view / MV / index tag change re-registers the in-memory schema object only), and **schema-hash-neutral**. Notes specific to these objects:
+
+- **Reserved-tag validation site.** A `quereus.*` key on `ALTER VIEW` / `ALTER MATERIALIZED VIEW` is validated at the `view-ddl` site, and on `ALTER INDEX` at the `physical-index` site — the same registry and sites `CREATE` / `declare schema` use, so a typo (e.g. `"quereus.bogus"`) fails loudly.
+- **Materialized views never re-materialize.** An MV tag change is a pure metadata write; it does **not** touch the backing table or re-run the body. The declarative differ enforces this: a tag-only MV change takes the in-place `SET TAGS` path, while a **body** change still drops+recreates (carrying the declared tags through the recreate) — the two are mutually exclusive per MV in one migration.
+- **Updatable-view tags are behavioral.** A view's `quereus.update.*` tags drive write-through routing (see [§2.9](#29-updatable-views)); a `SET TAGS` that adds, changes, or drops them changes that routing — intentional and version-tracked, but worth noting since it is not a purely cosmetic edit.
+- **Index resolution and implicit covering structures.** `ALTER INDEX` resolves the owning table from the index name (index names are unique per schema). The auto-built covering structure backing a UNIQUE constraint is **not** a user-addressable index — `ALTER INDEX` on its name raises `NOTFOUND`; its tags live on the originating constraint (`ALTER TABLE … ALTER CONSTRAINT … SET TAGS`), unless the constraint opted the structure into visibility via `quereus.expose_implicit_index`.
+- **v1 scope is `SET TAGS` only.** There is no other `ALTER VIEW` / `ALTER MATERIALIZED VIEW` / `ALTER INDEX` verb yet; structural changes to these objects still go through drop+recreate (which the declarative pipeline drives automatically).
+
+The declarative schema differ detects tag drift on a name-matched view / materialized view / index and emits the corresponding `ALTER … SET TAGS` in the migration's alter phase.
+
 ### 2.8 CREATE VIEW Statement
 
 A view is a named query. Selecting from it re-evaluates the body on every reference (a view is not cached — see [Materialized Views](#210-create-materialized-view-statement) for the stored, kept-consistent variant).
@@ -3937,6 +3958,13 @@ alter_column_stmt  = "alter" "column" column_name
 set_table_tags_stmt = "set" "tags" tags_body ;
 
 alter_constraint_tags_stmt = "alter" "constraint" constraint_name "set" "tags" tags_body ;
+
+/* ALTER VIEW / MATERIALIZED VIEW / INDEX — SET TAGS only (v1 scope) */
+alter_view_stmt    = "alter" "view" view_name "set" "tags" tags_body ;
+
+alter_mat_view_stmt = "alter" "materialized" "view" mat_view_name "set" "tags" tags_body ;
+
+alter_index_stmt   = "alter" "index" index_name "set" "tags" tags_body ;
 
 /* Like tags_clause's body but without the "with tags" prefix; empty "()" clears all tags. */
 tags_body          = "(" [ tag_entry { "," tag_entry } ] ")" ;

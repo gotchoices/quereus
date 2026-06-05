@@ -40,6 +40,7 @@ export enum PlanNodeType {
   CreateAssertion = 'CreateAssertion',
   DropAssertion = 'DropAssertion',
   AlterTable = 'AlterTable',
+  SetObjectTags = 'SetObjectTags',  // ALTER VIEW / MATERIALIZED VIEW / INDEX ... SET TAGS
   AddConstraint = 'AddConstraint',
 
   // Physical Nodes (from optimizer)

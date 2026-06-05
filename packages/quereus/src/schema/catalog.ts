@@ -246,6 +246,20 @@ function implicitCoveringIndexExposure(tableSchema: TableSchema): Map<string, bo
 	return map;
 }
 
+/**
+ * True when `indexName` names an index that is a **hidden** implicit covering
+ * structure on `tableSchema` — the auto-built secondary BTree backing a declared
+ * UNIQUE constraint that has NOT opted into catalog visibility via
+ * {@link EXPOSE_IMPLICIT_INDEX_TAG}. Such an index is a backing detail, not a
+ * user-addressable object, so `ALTER INDEX … SET TAGS` treats it as NOTFOUND (its
+ * tags live on the originating constraint — use `ALTER TABLE … ALTER CONSTRAINT
+ * … SET TAGS`). An *exposed* implicit index (flag true) and any ordinary index
+ * are not hidden. Match is by exact stored index name (as the catalog uses it).
+ */
+export function isHiddenImplicitIndex(tableSchema: TableSchema, indexName: string): boolean {
+	return implicitCoveringIndexExposure(tableSchema).get(indexName) === false;
+}
+
 function indexSchemaToCatalog(
 	indexSchema: IndexSchema,
 	tableSchema: TableSchema,

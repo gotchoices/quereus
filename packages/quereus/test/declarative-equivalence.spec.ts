@@ -1077,3 +1077,181 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 });
+
+// ============================================================================
+// In-place tag changes on views / materialized views / indexes (declarative)
+// ============================================================================
+
+describe('declarative-equivalence: in-place view / MV / index tag drift', () => {
+	function indexTags(db: Database, name: string): Record<string, unknown> | undefined {
+		return collectSchemaCatalog(db, 'main').indexes.find(i => i.name.toLowerCase() === name.toLowerCase())?.tags as
+			| Record<string, unknown>
+			| undefined;
+	}
+
+	it('view tag drift converges via in-place SET TAGS (no drop+recreate), idempotent on re-apply', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT NOT NULL }
+				view v as select id, name from t with tags (cacheable = true, owner = 'team-a')
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT NOT NULL }
+				view v as select id, name from t with tags (cacheable = false, layer = 'core')
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			// Drift takes the in-place primitive — never a drop+recreate of the view.
+			expect(diff.viewsToCreate, 'no view recreate on tag-only drift').to.deep.equal([]);
+			expect(diff.viewsToDrop, 'no view drop on tag-only drift').to.deep.equal([]);
+			expect(diff.viewTagsChanges).to.deep.equal([{ name: 'v', tags: { cacheable: false, layer: 'core' } }]);
+
+			await db.exec('apply schema main');
+			expect(db.schemaManager.getView('main', 'v')!.tags).to.deep.equal({ cacheable: false, layer: 'core' });
+
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.viewTagsChanges, 'idempotent re-apply produces no view tag change').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('index tag drift converges via in-place SET TAGS (no drop+recreate), idempotent on re-apply', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT }
+				index t_name_idx on t (name) with tags (purpose = 'search')
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT }
+				index t_name_idx on t (name) with tags (purpose = 'fulltext', owner = 'search-team')
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.indexesToCreate, 'no index recreate on tag-only drift').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'no index drop on tag-only drift').to.deep.equal([]);
+			expect(diff.indexTagsChanges).to.deep.equal([{ name: 't_name_idx', tags: { purpose: 'fulltext', owner: 'search-team' } }]);
+
+			await db.exec('apply schema main');
+			expect(indexTags(db, 't_name_idx')).to.deep.equal({ purpose: 'fulltext', owner: 'search-team' });
+
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.indexTagsChanges, 'idempotent re-apply produces no index tag change').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('MV tag-only drift converges via in-place SET TAGS without a rebuild, idempotent on re-apply', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t with tags (owner = 'analytics')
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec('refresh materialized view mv');
+			const bodyHashBefore = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t with tags (owner = 'platform', tier = 'gold')
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			// Body unchanged → no rebuild; only the in-place tag change appears.
+			expect(diff.materializedViewsToCreate, 'tag-only MV drift must not recreate').to.deep.equal([]);
+			expect(diff.materializedViewsToDrop, 'tag-only MV drift must not drop').to.deep.equal([]);
+			expect(diff.materializedViewTagsChanges).to.deep.equal([{ name: 'mv', tags: { owner: 'platform', tier: 'gold' } }]);
+
+			await db.exec('apply schema main');
+			const mvAfter = db.schemaManager.getMaterializedView('main', 'mv')!;
+			expect(mvAfter.tags).to.deep.equal({ owner: 'platform', tier: 'gold' });
+			// No re-materialization: the body hash is unchanged and the row survives.
+			expect(mvAfter.bodyHash, 'tag change must not perturb the body hash').to.equal(bodyHashBefore);
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from mv')) rows.push(r);
+			expect(rows).to.deep.equal([{ id: 1, x: 10 }]);
+
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.materializedViewTagsChanges, 'idempotent re-apply produces no MV tag change').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an MV whose body AND tags both changed rebuilds (drop+create) and emits no SET TAGS', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL }
+				materialized view mv as select id, x from t with tags (owner = 'analytics')
+			}`);
+			await db.exec('apply schema main');
+
+			// Change both the body (x → y) and the tags in the same re-declaration.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL }
+				materialized view mv as select id, y from t with tags (owner = 'platform')
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			// Body change wins: rebuild carries the declared tags; the two are mutually
+			// exclusive, so no separate SET TAGS is emitted for this MV.
+			expect(diff.materializedViewsToDrop).to.deep.equal(['mv']);
+			expect(diff.materializedViewsToCreate.length, 'rebuild recreate present').to.equal(1);
+			expect(diff.materializedViewTagsChanges, 'no in-place SET TAGS when the body rebuilds').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+			// The recreate carried the new tags through the create path.
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.deep.equal({ owner: 'platform' });
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a tag-value-only change does not perturb the schema hash for view / MV / index', async function () {
+		const a = new Database();
+		const b = new Database();
+		try {
+			const decl = (owner: string) => `declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT NOT NULL }
+				view v as select id, name from t with tags (owner = '${owner}')
+				index t_name_idx on t (name) with tags (owner = '${owner}')
+				materialized view mv as select id, name from t with tags (owner = '${owner}')
+			}`;
+			await a.exec(decl('team-a'));
+			await b.exec(decl('team-b'));
+			const ha = computeSchemaHash(a.declaredSchemaManager.getDeclaredSchema('main')!);
+			const hb = computeSchemaHash(b.declaredSchemaManager.getDeclaredSchema('main')!);
+			expect(ha, 'view / index / MV tag values must not change the schema hash').to.equal(hb);
+		} finally {
+			await a.close();
+			await b.close();
+		}
+	});
+});

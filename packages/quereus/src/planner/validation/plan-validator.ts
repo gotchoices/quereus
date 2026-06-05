@@ -308,6 +308,7 @@ function isDDLNode(nodeType: PlanNodeType): boolean {
 		PlanNodeType.Pragma,
 		PlanNodeType.AddConstraint,
 		PlanNodeType.AlterTable,
+		PlanNodeType.SetObjectTags,
 	]);
 
 	return ddlTypes.has(nodeType);

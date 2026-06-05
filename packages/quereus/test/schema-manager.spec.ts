@@ -253,6 +253,76 @@ describe('Schema Manager', () => {
 			await db.exec('create table t1 (id integer primary key)');
 			expect(() => db.schemaManager.setConstraintTags('t1', 'nope', { a: 1 })).to.throw(/not found/i);
 		});
+
+		// ── setViewTags ──
+		it('should set view tags via setViewTags (whole-set replace)', async () => {
+			await db.exec('create table base (id integer primary key)');
+			await db.exec("create view v1 as select * from base with tags (cacheable = true, owner = 'team-a')");
+			db.schemaManager.setViewTags('v1', { owner: 'team-b', layer: 'core' });
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.deep.equal({ owner: 'team-b', layer: 'core' });
+		});
+
+		it('should clear view tags when setting empty object', async () => {
+			await db.exec('create table base (id integer primary key)');
+			await db.exec("create view v1 as select * from base with tags (x = 1)");
+			db.schemaManager.setViewTags('v1', {});
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND when setting tags on an unknown view', () => {
+			expect(() => db.schemaManager.setViewTags('nope', { a: 1 })).to.throw(/not found/i);
+		});
+
+		// ── setMaterializedViewTags ──
+		it('should set materialized-view tags via setMaterializedViewTags without perturbing the body', async () => {
+			await db.exec('create table t (id integer primary key, x integer not null)');
+			await db.exec("create materialized view mv as select id, x from t with tags (owner = 'analytics')");
+			const bodyHashBefore = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			db.schemaManager.setMaterializedViewTags('mv', { owner: 'platform', tier: 'gold' });
+			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
+			expect(mv.tags).to.deep.equal({ owner: 'platform', tier: 'gold' });
+			expect(mv.bodyHash, 'body hash unchanged by a tag mutation').to.equal(bodyHashBefore);
+		});
+
+		it('should clear materialized-view tags when setting empty object', async () => {
+			await db.exec('create table t (id integer primary key, x integer not null)');
+			await db.exec("create materialized view mv as select id, x from t with tags (owner = 'analytics')");
+			db.schemaManager.setMaterializedViewTags('mv', {});
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND when setting tags on an unknown materialized view', () => {
+			expect(() => db.schemaManager.setMaterializedViewTags('nope', { a: 1 })).to.throw(/not found/i);
+		});
+
+		// ── setIndexTags ──
+		it('should set index tags via setIndexTags (whole-set replace), resolving the owning table', async () => {
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec("create index idx_name on t (name) with tags (purpose = 'search')");
+			db.schemaManager.setIndexTags('idx_name', { purpose: 'fulltext', owner: 'team' });
+			const idx = db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'idx_name');
+			expect(idx!.tags).to.deep.equal({ purpose: 'fulltext', owner: 'team' });
+		});
+
+		it('should clear index tags when setting empty object', async () => {
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec("create index idx_name on t (name) with tags (x = 1)");
+			db.schemaManager.setIndexTags('idx_name', {});
+			const idx = db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'idx_name');
+			expect(idx!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND when setting tags on an unknown index', async () => {
+			await db.exec('create table t (id integer primary key)');
+			expect(() => db.schemaManager.setIndexTags('nope', { a: 1 })).to.throw(/not found/i);
+		});
+
+		it('should throw NOTFOUND when targeting a hidden implicit covering index of a UNIQUE constraint', async () => {
+			// uq_email's auto-built covering structure is hidden from the catalog and is
+			// not addressable by ALTER INDEX — its tags live on the constraint.
+			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email))');
+			expect(() => db.schemaManager.setIndexTags('uq_email', { a: 1 })).to.throw(/not found/i);
+		});
 	});
 
 	// ────────────────── Schema hashing: tags excluded ──────────────────
