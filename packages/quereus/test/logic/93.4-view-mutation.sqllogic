@@ -1728,6 +1728,34 @@ insert into ek_v (seq, name, email) values (100, 'Bo', 'B@X');
 select rid, seq from ek_core order by rid;
 → [{"rid":3,"seq":3},{"rid":5,"seq":5},{"rid":105,"seq":100}]
 
+-- --- (k) a side default reads a CROSS-SIDE supplied sibling via `new.<col>`: the
+--         FK-CHILD side carries a NOT NULL column `derived` whose default references a
+--         logical column (`new.pv`) the PARENT side supplies — one the child's own base
+--         table does NOT carry. This resolves only because the produced row's NEW
+--         context threads into every side insert's default scope (the multi-source dual
+--         of the decomposition cross-member case in 03.4-defaults). Before that threading
+--         it raised `new.pv isn't a column` from the per-side buildInsertStmt. ---
+create table msx_parent (pp integer primary key default (coalesce((select max(pp) from msx_parent), 0) + mutation_ordinal()), pv integer null);
+create table msx_child (cc integer primary key, pr integer null, cv integer null,
+    derived integer not null default (new.pv * 10),
+    foreign key (pr) references msx_parent(pp));
+create view msx_jv as
+    select c.cc as cc, c.cv as cv, p.pv as pv
+    from msx_child c join msx_parent p on p.pp = c.pr;
+
+-- pv=7 is a PARENT-side supplied column; the CHILD's `derived` default reads it
+-- (new.pv * 10 = 70), proving the cross-side resolution through the threaded NEW context.
+insert into msx_jv (cc, cv, pv) values (1, 11, 7);
+select cc, cv, derived from msx_child order by cc;
+→ [{"cc":1,"cv":11,"derived":70}]
+select pp, pv from msx_parent order by pp;
+→ [{"pp":1,"pv":7}]
+
+-- multi-row: each produced row resolves its OWN parent-side pv (per-row NEW context).
+insert into msx_jv (cc, cv, pv) values (2, 22, 3), (3, 33, 9);
+select cc, cv, derived from msx_child order by cc;
+→ [{"cc":1,"cv":11,"derived":70},{"cc":2,"cv":22,"derived":30},{"cc":3,"cv":33,"derived":90}]
+
 -- ===================================
 -- RETURNING through a view (single- and multi-source).
 -- The returned rows are projected through the VIEW's column list (not the base
