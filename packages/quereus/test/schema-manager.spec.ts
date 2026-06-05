@@ -319,9 +319,21 @@ describe('Schema Manager', () => {
 
 		it('should throw NOTFOUND when targeting a hidden implicit covering index of a UNIQUE constraint', async () => {
 			// uq_email's auto-built covering structure is hidden from the catalog and is
-			// not addressable by ALTER INDEX — its tags live on the constraint.
+			// not addressable by ALTER INDEX — its tags live on the constraint. The
+			// implicit index IS present in tableSchema.indexes, so NOTFOUND comes from
+			// the isHiddenImplicitIndex guard (not the no-matching-index path).
 			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email))');
 			expect(() => db.schemaManager.setIndexTags('uq_email', { a: 1 })).to.throw(/not found/i);
+		});
+
+		it('should set tags on an EXPOSED implicit covering index (addressable once exposed)', async () => {
+			// Exercises the isHiddenImplicitIndex===false branch for an *implicit* index:
+			// a UNIQUE constraint that opts its covering structure into catalog visibility
+			// via quereus.expose_implicit_index makes that index user-addressable.
+			await db.exec("create table t (id integer primary key, email text, constraint uq_email unique (email) with tags (\"quereus.expose_implicit_index\" = true))");
+			db.schemaManager.setIndexTags('uq_email', { purpose: 'lookup' });
+			const idx = db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'uq_email');
+			expect(idx!.tags).to.deep.equal({ purpose: 'lookup' });
 		});
 	});
 

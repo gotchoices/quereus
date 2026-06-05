@@ -29,6 +29,17 @@ re-write", not "tags aren't serializable".
 This is a pre-existing latent gap for the programmatic `setTableTags` too; the new
 SQL surface just makes it reachable from SQL.
 
+**Scope extension (ticket `alter-view-index-mv-tag-mutation`):** the same gap now
+applies to `ALTER VIEW` / `ALTER MATERIALIZED VIEW` / `ALTER INDEX … SET TAGS`
+(and the programmatic `setViewTags` / `setMaterializedViewTags` / `setIndexTags`).
+Note the event wrinkle for the change-event subscription option: `setIndexTags`
+fires `table_modified` on the owning table (so a `table_modified` subscription
+would cover indexes), but `setViewTags` / `setMaterializedViewTags` fire **no
+schema-change event at all** (mirroring the no-event view-create path). A store
+subscription must therefore either (a) also persist view/MV DDL on a new
+view/MV-modified event, or (b) have the setters fire some event the store can
+observe. Acceptance below should add view/MV/index round-trip cases too.
+
 ## Options
 
 - **Subscribe the store to `table_modified`.** Register a `SchemaChangeNotifier`

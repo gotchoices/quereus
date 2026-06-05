@@ -11,8 +11,10 @@ import { raiseReservedTagDiagnostics } from '../../schema/reserved-tags-policy.j
  * validates any reserved `quereus.*` tags at the site that matches the object
  * kind (view / materialized view → `view-ddl`, index → `physical-index`) so a
  * typo fails loudly at plan-build time — the same registry the CREATE and
- * declarative paths route through. The schema name defaults to `main` when the
- * identifier is unqualified (matching the CREATE / DROP builders).
+ * declarative paths route through. An unqualified name resolves to the current
+ * default schema (matching the CREATE / DROP MATERIALIZED VIEW builders) so an
+ * unqualified ALTER under a switched current schema targets the right object
+ * rather than always looking in `main`.
  */
 function buildSetObjectTags(
 	ctx: PlanningContext,
@@ -25,7 +27,7 @@ function buildSetObjectTags(
 		validateReservedTags(tags, site),
 		{ log: () => { /* warnings (e.g. empty ack rationale) never block */ } },
 	);
-	const schemaName = name.schema || 'main';
+	const schemaName = name.schema || ctx.schemaManager.getCurrentSchemaName();
 	return new SetObjectTagsNode(ctx.scope, objectKind, schemaName, name.name, tags);
 }
 
