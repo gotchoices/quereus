@@ -640,7 +640,7 @@ export class Parser {
 		}
 
 		// Check for compound set operations (UNION / INTERSECT / EXCEPT) BEFORE ORDER BY/LIMIT
-		let compound: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: AST.QueryExpr } | undefined;
+		let compound: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: AST.QueryExpr; existence?: ReadonlyArray<AST.SetOpMembershipColumn> } | undefined;
 		if (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
 			const tok = this.previous();
 			let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
@@ -657,6 +657,12 @@ export class Parser {
 			} else {
 				op = 'diff';
 			}
+
+			// Optional `<setop> exists <branch> as <name>` membership-column clause(s),
+			// AFTER the operator keyword (and any `all`) and BEFORE the right leg. One-token
+			// lookahead (`exists` followed by `left`/`right`, never `(`) distinguishes it from
+			// the `exists (<subquery>)` predicate, which never legally begins a compound leg.
+			const membershipExistence = this.setOpMembershipClauses(op);
 
 			// Compound leg is any QueryExpr (SELECT/VALUES/DML w/ RETURNING).
 			// For SELECT/VALUES legs we suppress ORDER BY / LIMIT so they bind
@@ -687,7 +693,9 @@ export class Parser {
 			}
 
 			lastConsumedToken = this.previous();
-			compound = { op, select: rightSelect };
+			compound = membershipExistence
+				? { op, select: rightSelect, existence: membershipExistence }
+				: { op, select: rightSelect };
 		}
 
 		// Parse ORDER BY clause if present (applies to final result after compound operations)
@@ -1209,6 +1217,47 @@ export class Parser {
 				`'exists as' is ambiguous on a ${joinType.toUpperCase()} join — specify 'exists left as' or 'exists right as'`);
 		}
 		return nonPreserved[0];
+	}
+
+	/**
+	 * Parse the optional comma-separated `exists <branch> as <name>` membership
+	 * clauses that sit between a set-operation keyword and its right leg. Returns
+	 * `undefined` when none are present. The `branch` is mandatory (`left` = the leg
+	 * already parsed before the operator, `right` = the operand that follows) — there
+	 * is no elided form, so `exists` here is ALWAYS followed by `left`/`right`, never
+	 * `(`; that one-token lookahead distinguishes the clause from the
+	 * `exists (<subquery>)` predicate. Rejected on `diff` (symmetric difference
+	 * desugars to two `except`s, so membership is ambiguous).
+	 */
+	private setOpMembershipClauses(
+		op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff',
+	): ReadonlyArray<AST.SetOpMembershipColumn> | undefined {
+		const atMembershipClause = (): boolean =>
+			this.check(TokenType.EXISTS) &&
+			(this.checkNext(1, TokenType.LEFT) || this.checkNext(1, TokenType.RIGHT));
+
+		if (!atMembershipClause()) return undefined;
+
+		if (op === 'diff') {
+			throw this.error(this.peek(),
+				"'exists <branch> as' membership columns are not valid on DIFF — symmetric difference desugars to two EXCEPTs, so branch membership is ambiguous");
+		}
+
+		const result: AST.SetOpMembershipColumn[] = [];
+		do {
+			this.consume(TokenType.EXISTS, "Expected 'exists'.");
+			let branch: 'left' | 'right';
+			if (this.match(TokenType.LEFT)) branch = 'left';
+			else if (this.match(TokenType.RIGHT)) branch = 'right';
+			else throw this.error(this.peek(), "Expected 'left' or 'right' after 'exists' in a set-operation membership clause.");
+			this.consume(TokenType.AS, "Expected 'as' after 'exists <branch>' membership clause.");
+			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected name after 'exists <branch> as'.");
+			result.push({ branch, name });
+
+			// Continue only on `, exists ...`; a plain comma starts the next leg / clause boundary.
+		} while (this.check(TokenType.COMMA) && this.checkNext(1, TokenType.EXISTS) && this.advance());
+
+		return result;
 	}
 
 	/**
@@ -2310,6 +2359,9 @@ export class Parser {
 			} else {
 				op = 'diff';
 			}
+			// `<setop> exists <branch> as <name>` membership-column clause(s) between the
+			// operator and the right leg (see `setOpMembershipClauses`).
+			const membershipExistence = this.setOpMembershipClauses(op);
 			const usedParen = this.match(TokenType.LPAREN);
 			const legStartToken = this.peek();
 			let rightLeg: AST.QueryExpr;
@@ -2332,7 +2384,9 @@ export class Parser {
 			if (usedParen) {
 				this.consume(TokenType.RPAREN, "Expected ')' after parenthesized set operation.");
 			}
-			sel.compound = { op, select: rightLeg };
+			sel.compound = membershipExistence
+				? { op, select: rightLeg, existence: membershipExistence }
+				: { op, select: rightLeg };
 		}
 		if (isCompoundSubquery) {
 			return sel;

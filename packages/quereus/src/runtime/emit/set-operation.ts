@@ -10,18 +10,23 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
   const leftInst = emitPlanNode(plan.left, ctx);
   const rightInst = emitPlanNode(plan.right, ctx);
 
-  // Pre-resolve collation-based row comparator (safe for mixed-type rows in set operations)
+  // Pre-resolve collation-based row comparator (safe for mixed-type rows in set
+  // operations). The comparator runs over the DATA columns only — membership flags
+  // are appended after, but dedup / probe identity is on data columns alone, so set
+  // identity is never perturbed by the flags.
   const attributes = plan.getAttributes();
-  const collationRowComparator = createCollationRowComparator(
-    attributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
+  const dataColCount = plan.left.getType().columns.length;
+  const dataComparator = createCollationRowComparator(
+    attributes.slice(0, dataColCount).map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
   );
 
-  // Helper function to create a properly structured output row
+  // Helper function to create a properly structured DATA row (flags excluded; the
+  // membership runner appends them after the operator produces its rows).
   function createOutputRow(inputRow: Row): Row {
     const outputRow: Row = [];
-    plan.getAttributes().forEach((attr, idx) => {
-      outputRow[idx] = inputRow[idx]; // Map by position since columns should align
-    });
+    for (let i = 0; i < dataColCount; i++) {
+      outputRow[i] = inputRow[i]; // Map by position since columns should align
+    }
     return outputRow;
   }
 
@@ -41,7 +46,7 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     // Use BTree for proper SQL value comparison instead of JSON.stringify
     const distinctTree = new BTree<Row, Row>(
       (row: Row) => row,
-      collationRowComparator
+      dataComparator
     );
 
     for await (const row of leftRows) {
@@ -66,7 +71,7 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     // Use BTree for proper SQL value comparison
     const leftTree = new BTree<Row, Row>(
       (row: Row) => row,
-      collationRowComparator
+      dataComparator
     );
 
     // Build left set
@@ -78,7 +83,7 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     // Check right rows against left set
     const yielded = new BTree<Row, Row>(
       (row: Row) => row,
-      collationRowComparator
+      dataComparator
     );
 
     for await (const row of rightRows) {
@@ -100,7 +105,7 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     // Use BTree for proper SQL value comparison
     const rightTree = new BTree<Row, Row>(
       (row: Row) => row,
-      collationRowComparator
+      dataComparator
     );
     const leftRowsArray: Row[] = [];
 
@@ -117,7 +122,7 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     // Track already-yielded rows to deduplicate (EXCEPT returns distinct rows)
     const yielded = new BTree<Row, Row>(
       (row: Row) => row,
-      collationRowComparator
+      dataComparator
     );
 
     // Yield left rows that are not in right set
@@ -132,20 +137,90 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     }
   }
 
+  // Membership-flag runner (`<setop> exists <branch> as <name>`, read half). Uniform
+  // across the four operators: buffer each branch's DATA rows into a set (semijoin
+  // probe surface), produce the operator's normal output rows, and append one boolean
+  // per requested flag = `data-tuple ∈ <that branch's set>`. Dedup / multiplicity is
+  // still decided on data columns only, so set identity is unchanged by the flags.
+  async function* runWithMembership(_rctx: RuntimeContext, leftRows: AsyncIterable<Row>, rightRows: AsyncIterable<Row>): AsyncIterable<Row> {
+    const membership = plan.membership!;
+    const leftSet = new BTree<Row, Row>((row: Row) => row, dataComparator);
+    const rightSet = new BTree<Row, Row>((row: Row) => row, dataComparator);
+    const leftBuf: Row[] = [];
+    const rightBuf: Row[] = [];
+
+    for await (const row of leftRows) {
+      const d = createOutputRow(row);
+      leftBuf.push(d);
+      leftSet.insert(d);
+    }
+    for await (const row of rightRows) {
+      const d = createOutputRow(row);
+      rightBuf.push(d);
+      rightSet.insert(d);
+    }
+
+    // Append one boolean per flag: `tuple ∈ <branch set>`. A clean {true,false}.
+    const appendFlags = (data: Row): Row => {
+      const out = data.slice();
+      for (const spec of membership) {
+        const set = spec.branch === 'left' ? leftSet : rightSet;
+        out.push(set.find(data).on ? true : false);
+      }
+      return out;
+    };
+
+    if (plan.op === 'unionAll') {
+      // Bag: preserve multiplicity — every input row yields one output row.
+      for (const d of leftBuf) yield appendFlags(d);
+      for (const d of rightBuf) yield appendFlags(d);
+      return;
+    }
+
+    // Distinct operators: dedup the output on DATA columns only.
+    const yielded = new BTree<Row, Row>((row: Row) => row, dataComparator);
+    switch (plan.op) {
+      case 'union': {
+        for (const d of leftBuf) { if (yielded.insert(d).on) yield appendFlags(d); }
+        for (const d of rightBuf) { if (yielded.insert(d).on) yield appendFlags(d); }
+        break;
+      }
+      case 'intersect': {
+        // Rows present in BOTH branches (deduped). Every visible row probes all-true.
+        for (const d of leftBuf) {
+          if (rightSet.find(d).on && yielded.insert(d).on) yield appendFlags(d);
+        }
+        break;
+      }
+      case 'except': {
+        // Rows in left and NOT in right (deduped). A left flag probes true, a right
+        // flag probes false — exactly the A∖B membership, no special-casing needed.
+        for (const d of leftBuf) {
+          if (!rightSet.find(d).on && yielded.insert(d).on) yield appendFlags(d);
+        }
+        break;
+      }
+    }
+  }
+
   let run: InstructionRun;
-  switch (plan.op) {
-    case 'unionAll':
-      run = runUnionAll as InstructionRun;
-      break;
-    case 'union':
-      run = runUnionDistinct as InstructionRun;
-      break;
-    case 'intersect':
-      run = runIntersect as InstructionRun;
-      break;
-    case 'except':
-      run = runExcept as InstructionRun;
-      break;
+  if (plan.hasMembershipColumns) {
+    run = runWithMembership as InstructionRun;
+  } else {
+    switch (plan.op) {
+      case 'unionAll':
+        run = runUnionAll as InstructionRun;
+        break;
+      case 'union':
+        run = runUnionDistinct as InstructionRun;
+        break;
+      case 'intersect':
+        run = runIntersect as InstructionRun;
+        break;
+      case 'except':
+        run = runExcept as InstructionRun;
+        break;
+    }
   }
 
   return {

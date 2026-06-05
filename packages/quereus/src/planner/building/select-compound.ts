@@ -1,9 +1,10 @@
 import type * as AST from '../../parser/ast.js';
 import type { RelationalPlanNode } from '../nodes/plan-node.js';
+import { PlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { CTEScopeNode } from '../nodes/cte-node.js';
 import type { Scope } from '../scopes/scope.js';
-import { SetOperationNode } from '../nodes/set-operation-node.js';
+import { SetOperationNode, type SetOpMembershipSpec } from '../nodes/set-operation-node.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
 import { LimitOffsetNode } from '../nodes/limit-offset.js';
 import { LiteralNode } from '../nodes/scalar.js';
@@ -61,6 +62,22 @@ export function buildCompoundSelect(
 			break;
 	}
 
+	// Membership-flag columns (`<setop> exists <branch> as <name>`, read half). Mint a
+	// stable attribute id per clause (once, here — so it survives `withChildren`
+	// rebuilds) and pass the specs into the SetOperationNode, which appends one boolean
+	// `{true,false}` NOT NULL flag column per spec AFTER the data columns. The flag
+	// resolves by its `as` name through `createSetOperationScope` (which iterates the
+	// appended columns), so an outer ORDER BY / the enclosing view can reference it.
+	let membership: SetOpMembershipSpec[] | undefined;
+	if (stmt.compound.existence && stmt.compound.existence.length > 0) {
+		if (stmt.compound.op === 'diff') {
+			// Defensive: the parser already rejects membership on DIFF (ambiguous over its
+			// two EXCEPTs). Guard here too so a hand-built AST cannot smuggle it through.
+			throw new QuereusError('membership columns are not valid on DIFF (symmetric difference)', StatusCode.ERROR);
+		}
+		membership = stmt.compound.existence.map(e => ({ attrId: PlanNode.nextAttrId(), name: e.name, branch: e.branch }));
+	}
+
 	// Expand DIFF as (A EXCEPT B) UNION (B EXCEPT A)
 	let setNode: RelationalPlanNode;
 	if (stmt.compound.op === 'diff') {
@@ -68,7 +85,7 @@ export function buildCompoundSelect(
 		const rightMinusLeft = new SetOperationNode(contextWithCTEs.scope, rightPlan, leftPlan, 'except');
 		setNode = new SetOperationNode(contextWithCTEs.scope, leftMinusRight, rightMinusLeft, 'union');
 	} else {
-		setNode = new SetOperationNode(contextWithCTEs.scope, leftPlan, rightPlan, stmt.compound.op);
+		setNode = new SetOperationNode(contextWithCTEs.scope, leftPlan, rightPlan, stmt.compound.op, membership);
 	}
 
 	// After set operation, apply ORDER BY / LIMIT / OFFSET from the *outer* (original) statement

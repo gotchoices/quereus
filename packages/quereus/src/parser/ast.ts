@@ -182,7 +182,7 @@ export interface SelectStmt extends AstNode {
 	all?: boolean;
 	union?: SelectStmt;
 	unionAll?: boolean;
-	compound?: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: QueryExpr };
+	compound?: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: QueryExpr; existence?: ReadonlyArray<SetOpMembershipColumn> };
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
 }
 
@@ -446,6 +446,22 @@ export interface SubquerySource extends AstNode {
  */
 export interface JoinExistenceColumn {
 	side: 'left' | 'right';
+	name: string;
+}
+
+/**
+ * One `<setop> exists <branch> as <name>` membership-column clause on a compound
+ * set operation (the vertical/row analogue of {@link JoinExistenceColumn}). The
+ * flag reifies whether the result tuple is a member of the named immediate
+ * `branch` of the binary combinator — a clean `{true,false}` boolean derived AT
+ * THE COMBINATOR by a per-branch semijoin probe (NOT a stored operand column,
+ * which would re-enter the union schema and dedup). `branch` is `left` (the leg
+ * before the operator) or `right` (the operand after the clause). Read-only in
+ * this half (`set-op-membership-read`); the write half flips the column to a
+ * branch insert/delete. Rejected on `diff` (ambiguous over its two `except`s).
+ */
+export interface SetOpMembershipColumn {
+	branch: 'left' | 'right';
 	name: string;
 }
 

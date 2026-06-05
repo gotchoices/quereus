@@ -267,6 +267,47 @@ hard-coded join side) so the set-operation membership-column work
 >   row also reads back null-extended. The flag controls component existence, not a
 >   per-preserved-row link.
 
+### Set-operation membership columns (read half)
+
+The vertical (row) analogue of the outer-join existence column: the
+`<setop> exists <branch> as <name>` clause manifests a set operation's **branch
+membership** as a first-class boolean column — reading it tells you which immediate
+operand of the binary combinator the result tuple came from. See
+[`sql.md` § Set-operation membership columns](sql.md#set-operation-membership-columns)
+for the grammar. The same two soundness properties as the join existence column hold:
+
+- **Derived at the combinator, not stored.** The flag is computed at the
+  `SetOperationNode` by a **per-branch semijoin probe** over the operand *data*
+  relations (`inA ≡ tuple ∈ A`, `inB ≡ tuple ∈ B`; `runtime/emit/set-operation.ts`),
+  **never** a constant column stored inside a branch. A stored `inA` would re-enter the
+  union's schema and **dedup**, perturbing set identity (the vertical analogue of the
+  join's null-extended `{true, NULL}` symptom). The probe runs *after* the set
+  operation, so dedup still operates on data columns only and the result is a clean
+  `{true,false}` **NOT NULL** column. The derivation is uniform across all four
+  operators: `union` / `union all` may be in either branch (both probes informative);
+  `except` (`A except B`) yields `inLeft = true, inRight = false` by construction;
+  `intersect` yields all flags `true`. For `union all` the probe is against a **set**,
+  so the flag is the boolean "present ≥ once" (bag multiplicity collapses — a documented
+  limit; a count variant is deferred).
+- **FD ramifications (Invariants 1–2).** A **distinct** `union` / `intersect` / `except`
+  is keyed on its all-columns (data) combination, so the forward FD walk emits
+  `key → flag` (the flag is functionally determined by the data tuple it probes), and the
+  flag is **never** claimed as part of a key. A `union all` (a **bag**) makes **no
+  `key → flag` claim** — there is no data-column key to determine the flag from.
+  `except` / `intersect` additionally carry the trivially-determined flags as constant
+  bindings (`inRight = false`, all-true).
+
+The flag is modelled as an extra output **attribute of the `SetOperationNode`** (not a
+`ProjectNode` expression — that could only see set-op *outputs*, never the per-branch
+data relations the probe needs), carrying a read-only `existence` `UpdateSite` whose
+`RelationalComponentRef` is a `set-op-branch` (the owning node + the immediate operand).
+**Read-only in this half** (`resolveBaseSite` resolves a `set-op-branch` component
+non-writable, `column_info` reports `is_updatable = 'NO'` / null base, and a write to the
+column rejects). The routing is **component-generic** (the same `existence` site the join
+existence column uses), so the write half (membership-flip ⇒ branch insert/delete) extends
+it without forking. An **unused** flag is a semijoin probe and is dead-column-eliminable —
+it must not force a branch to be retained or probed when no other column needs it.
+
 ### Union All
 
 ```sql

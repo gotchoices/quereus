@@ -270,9 +270,9 @@ export type UpdateSite =
 
 /**
  * Generalized handle on a relational component an {@link UpdateSite} of kind
- * `existence` reifies the membership of — a join side now; a set-operation
- * branch is added by `set-operator-membership-columns`, so this stays a
- * discriminated union rather than a hard-coded join side.
+ * `existence` reifies the membership of — a join side, or a set-operation branch.
+ * A discriminated union (never a hard-coded join side) precisely so the set-op
+ * membership-column work can route through the same `existence` site.
  */
 export type RelationalComponentRef =
 	| {
@@ -280,6 +280,20 @@ export type RelationalComponentRef =
 			/** The non-preserved side's relational plan-node id (numeric; best-effort handle the write half refines to a `TableReferenceNode`). */
 			readonly table: number;
 			readonly side: 'left' | 'right';
+		}
+	| {
+			/**
+			 * A set-operation branch membership component (`set-op-membership-read`). The
+			 * flag reifies whether the result tuple is a member of one immediate operand
+			 * of a binary {@link SetOperationNode}. Read-only in the read half (the write
+			 * half — `set-op-membership-write` — routes a membership-flip to a branch
+			 * insert/delete via this ref).
+			 */
+			readonly kind: 'set-op-branch';
+			/** The owning `SetOperationNode`'s plan-node id (numeric). */
+			readonly setOp: number;
+			/** Which immediate operand the flag's membership reifies. */
+			readonly branch: 'left' | 'right';
 		};
 
 /**

@@ -70,6 +70,21 @@ describe('Emit: statement round-trips', () => {
 			roundTripStmt('select a from t1 except select b from t2');
 		});
 
+		it('compound UNION with set-op membership columns', () => {
+			// The `exists <branch> as <name>` membership clause sits between the operator
+			// keyword and the right leg and round-trips structurally (branch always explicit).
+			roundTripStmt('select id, x from a union exists left as inA, exists right as inB select id, x from b');
+		});
+
+		it('compound INTERSECT/EXCEPT with single membership column', () => {
+			roundTripStmt('select id, x from a intersect exists right as inB select id, x from b');
+			roundTripStmt('select id, x from a except exists left as inL select id, x from b');
+		});
+
+		it('rejects set-op membership columns on DIFF', () => {
+			expect(() => parse('select id from a diff exists left as inA select id from b')).to.throw();
+		});
+
 		it('subquery in FROM', () => {
 			roundTripStmt('select x from (select 1 as x) as sub');
 		});

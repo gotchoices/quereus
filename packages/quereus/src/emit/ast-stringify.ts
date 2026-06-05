@@ -464,6 +464,13 @@ export function selectToString(stmt: AST.SelectStmt): string {
 
 	if (stmt.compound) {
 		result += ` ${compoundOpToKeyword(stmt.compound.op)} `;
+		// `exists <branch> as <name>` membership columns sit BETWEEN the operator keyword
+		// and the right leg, so `parse(stringify(ast)) ≡ ast`.
+		if (stmt.compound.existence && stmt.compound.existence.length > 0) {
+			result += stmt.compound.existence
+				.map(e => `exists ${e.branch} as ${quoteIdentifier(e.name)}`)
+				.join(', ') + ' ';
+		}
 		// Compound leg is a QueryExpr; astToString dispatches on the discriminator.
 		result += astToString(stmt.compound.select);
 	}

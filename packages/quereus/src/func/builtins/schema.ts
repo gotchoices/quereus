@@ -1053,13 +1053,16 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 			const site = unsupportedJoinShape ? undefined : rootLineage?.get(attr.id);
 			const bs = baseSiteOf(site);
 			const ref = bs ? tableRefsById.get(bs.table) : undefined;
-			// An `exists … as` existence flag has NO base column but is writable through an
-			// *effect* — its flip inserts/deletes the non-preserved side — when a preserved
-			// anchor pins each row's identity (`outer-join-existence-column`). Report it
-			// `is_updatable = 'YES'` with `base_table` / `base_column` = null (it maps to no
-			// base column), matching the dynamic `propagate()` accept. Gated on a preserved
-			// anchor like the non-preserved column: a FULL outer (none) stays deferred.
-			const isExistence = site?.kind === 'existence' && hasPreservedBase;
+			// A join-side `exists … as` existence flag has NO base column but is writable
+			// through an *effect* — its flip inserts/deletes the non-preserved side — when a
+			// preserved anchor pins each row's identity (`outer-join-existence-column`).
+			// Report it `is_updatable = 'YES'` with `base_table` / `base_column` = null (it
+			// maps to no base column), matching the dynamic `propagate()` accept. Gated on a
+			// preserved anchor like the non-preserved column: a FULL outer (none) stays
+			// deferred. A `set-op-branch` existence flag is READ-ONLY in this read half
+			// (`set-op-membership-read`) — it reports `is_updatable = 'NO'` with null base
+			// (a set-op view has no preserved base anchor anyway); the write half flips it on.
+			const isExistence = site?.kind === 'existence' && site.component.kind === 'join-side' && hasPreservedBase;
 			// Updatable iff a base site resolves to a producing TableReferenceNode. A
 			// PRESERVED base column is always updatable; a non-preserved (`null-extended`)
 			// column is updatable when the body has a preserved anchor (the matched-update /

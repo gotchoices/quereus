@@ -311,6 +311,41 @@ select [distinct | all] select_expr [, select_expr ...]
 
 > **Note:** Chained set operations are right-associative: `A except B union C` evaluates as `A except (B union C)`, not `(A except B) union C`. Use CTEs or subqueries to force left-to-right evaluation when needed.
 
+#### Set-operation membership columns
+
+Between a set-operation keyword (`union [all]` / `intersect` / `except`) and its right
+leg, a compound may expose **membership columns** — a clean `{true,false}` NOT NULL flag
+per branch telling you whether the result tuple is a member of that immediate operand of
+the binary combinator (the row analogue of the join [existence column](#existence-columns-on-outer-joins)):
+
+```sql
+-- which branch(es) did each result row come from?
+select id, x, inA, inB
+from a union exists left as inA, exists right as inB select id, x from b;
+```
+
+- The clause sits **after the operator keyword (and any `all`) and before the right leg**.
+  `exists left as <name>` names the leg already parsed before the operator; `exists right
+  as <name>` names the operand that follows. Comma-separated; either or both may be
+  exposed. `exists` here is **always** followed by `left` / `right` — never `(` — so one-token
+  lookahead distinguishes it from the `exists (<subquery>)` predicate (which never legally
+  begins a compound leg). This is additive grammar — it occupies previously-unused space and
+  breaks nothing.
+- Applies to `union` / `union all` / `intersect` / `except`. **Rejected on `diff`** (symmetric
+  difference desugars to `(A except B) union (B except A)`, so branch membership is ambiguous
+  over the two `except`s).
+- The flag is derived **at the combinator** by a per-branch semijoin probe over the operand
+  *data* relations (`inA ≡ tuple ∈ A`), never stored in a branch (a stored flag would re-enter
+  the union schema and dedup, perturbing set identity). For `union all` the probe is against a
+  set, so the flag is the boolean "present ≥ once". `except` reads `inLeft = true, inRight =
+  false`; `intersect` reads all flags `true`.
+- The binary combinator always names its **own** two operands; the n-way case is covered by
+  **nesting** (no global positional "middle branch" naming).
+- **Read-only today.** Reading a membership column is fully supported; *writing* it
+  (membership-flip ⇒ branch insert/delete) is the deferred write half, so a write to the
+  column — or any write through a set-operation view — still rejects. `column_info` reports
+  the column `is_updatable = 'NO'` with null base.
+
 **Examples:**
 ```sql
 -- Basic select with where clause

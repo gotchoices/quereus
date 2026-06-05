@@ -1631,6 +1631,10 @@ describe('Property-Based Tests', () => {
 			'select a, b, c from ta union select d, e, e from tb',               // UNION (set)
 			'select b, c from ta intersect select e, e from tb',                 // INTERSECT (set)
 			'select b, c from ta except select e, e from tb',                    // EXCEPT (set)
+			// Set-op membership columns: the appended inA/inB flags (determined by the
+			// data tuple) must leave the union's claimed keys / isSet unchanged and never
+			// appear inside a claimed key.
+			'select a, b, c from ta union exists left as inA, exists right as inB select d, e, e from tb',
 			'select ta.a as ja, tb.d as jd, ta.b as jb from ta join tb on ta.b = tb.d', // inner join
 			'select ta.a as la, tb.d as ld from ta left join tb on ta.b = tb.d', // left join
 			// Outer-join existence column: the appended `fex` flag must leave the
@@ -2131,6 +2135,214 @@ describe('Property-Based Tests', () => {
 			expect(() => parser.parse('select c.cc from exc c join exp p on p.pp = c.pr exists right as h')).to.throw();
 			expect(() => parser.parse('select c.cc from exc c cross join exp p exists left as h')).to.throw();
 			expect(() => parser.parse('select c.cc from exc c full join exp p on p.pp = c.pr exists as h')).to.throw();
+		});
+	});
+
+	// --- Set-operation membership columns ---
+	// The vertical (row) analogue of the outer-join existence column: the
+	// `<setop> exists <branch> as <name>` clause reifies which immediate operand of a
+	// binary set operation a result tuple is a member of. The flag is a clean
+	// `{true,false}` NOT NULL boolean derived AT THE COMBINATOR by a per-branch semijoin
+	// probe (`inA ≡ tuple ∈ A`), never a stored operand column. These read-half tests pin
+	// the derived flag; *writing* it (membership-flip ⇒ branch insert/delete) is the write
+	// half (`set-op-membership-write`) and still rejects here.
+	describe('Set-operation membership columns', () => {
+		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
+			return out;
+		}
+
+		/** First SetOperationNode in a logically-planned body. */
+		function findSetOp(sql: string): RelationalPlanNode {
+			const ast = new Parser().parse(sql) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			const root = (plan as unknown as { getRelations(): readonly RelationalPlanNode[] }).getRelations()[0];
+			let found: RelationalPlanNode | undefined;
+			const visit = (n: PlanNode): void => {
+				if (found) return;
+				if (n.nodeType === PlanNodeType.SetOperation) { found = n as RelationalPlanNode; return; }
+				for (const c of n.getChildren()) visit(c);
+			};
+			visit(root);
+			if (!found) throw new Error('no SetOperationNode in planned body');
+			return found;
+		}
+
+		// The engine's compound grammar does not accept a parenthesized left leg at the
+		// outer level (a pre-existing limitation — `create view v as (select 1) union
+		// (select 2)` fails identically), so the membership clause is exercised in its
+		// supported non-parenthesized form: `<leg> union exists … <leg>`.
+		async function createSchemas(): Promise<void> {
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+		}
+
+		async function seed(): Promise<void> {
+			await createSchemas();
+			// (1,10) in A only; (2,20) and (3,30) in both; (4,40) in B only.
+			await db.exec('insert into A values (1, 10), (2, 20), (3, 30)');
+			await db.exec('insert into B values (2, 20), (3, 30), (4, 40)');
+			await db.exec('create view U as select id, x from A union exists left as inA, exists right as inB select id, x from B');
+		}
+
+		it('read agreement: inA/inB are true exactly on the rows present in that branch', async () => {
+			await seed();
+			const rows = await readRows('select id, x, inA, inB from U order by id');
+			expect(rows).to.deep.equal([
+				{ id: 1, x: 10, inA: true, inB: false },  // A only
+				{ id: 2, x: 20, inA: true, inB: true },   // both
+				{ id: 3, x: 30, inA: true, inB: true },   // both
+				{ id: 4, x: 40, inA: false, inB: true },  // B only
+			]);
+			// inA/inB agree row-by-row with actual presence in A / B.
+			const inA = new Set((await readRows('select id from A')).map(r => r.id));
+			const inB = new Set((await readRows('select id from B')).map(r => r.id));
+			for (const r of rows) {
+				expect(r.inA, `inA for id=${r.id}`).to.equal(inA.has(r.id));
+				expect(r.inB, `inB for id=${r.id}`).to.equal(inB.has(r.id));
+			}
+		});
+
+		it('clean boolean: every flag is NOT NULL and in {true,false} for every row', async () => {
+			await seed();
+			const rows = await readRows('select id, inA, inB from U');
+			expect(rows.length).to.be.greaterThan(0);
+			for (const r of rows) {
+				for (const f of ['inA', 'inB'] as const) {
+					expect(r[f], `${f} id=${r.id} not null`).to.not.equal(null);
+					expect([true, false], `${f} id=${r.id} clean boolean`).to.include(r[f]);
+				}
+			}
+		});
+
+		it('operator coverage: except is (true,false), intersect is all-true', async () => {
+			await seed();
+			await db.exec('create view Uex as select id, x from A except exists left as inL, exists right as inR select id, x from B');
+			await db.exec('create view Uin as select id, x from A intersect exists left as inL, exists right as inR select id, x from B');
+
+			// A except B = {(1,10)}; every visible row reads inL=true, inR=false.
+			expect(await readRows('select id, x, inL, inR from Uex order by id')).to.deep.equal([
+				{ id: 1, x: 10, inL: true, inR: false },
+			]);
+
+			// A intersect B = {(2,20),(3,30)}; every visible row reads all flags true.
+			expect(await readRows('select id, x, inL, inR from Uin order by id')).to.deep.equal([
+				{ id: 2, x: 20, inL: true, inR: true },
+				{ id: 3, x: 30, inL: true, inR: true },
+			]);
+		});
+
+		it('union all (bag): a tuple duplicated within a branch still reads the flag true', async () => {
+			// g=7 appears twice in the left branch; the probe is against a SET, so the
+			// flag is the boolean "present ≥ once" — both duplicate rows read inL true.
+			await db.exec('create table M (id integer primary key, g integer) using memory');
+			await db.exec('insert into M values (1, 7), (2, 7), (3, 9)');
+			await db.exec('create view Uall as select g from M where id in (1, 2) union all exists left as inL, exists right as inR select g from M where id = 3');
+			const rows = await readRows('select g, inL, inR from Uall order by g, inR');
+			expect(rows).to.deep.equal([
+				{ g: 7, inL: true, inR: false },  // duplicate within left — flag true
+				{ g: 7, inL: true, inR: false },  // ...and again (multiplicity preserved)
+				{ g: 9, inL: false, inR: true },
+			]);
+		});
+
+		it('Key Soundness: flags leave isSet/keys unchanged, key → flag holds, flag never in a key', async () => {
+			await createSchemas();
+			const withFlag = findSetOp('select id, x from A union exists left as inA, exists right as inB select id, x from B');
+			const noFlag = findSetOp('select id, x from A union select id, x from B');
+
+			// Adding the flags leaves the union's claimed keys / isSet unchanged.
+			expect(withFlag.getType().isSet).to.equal(noFlag.getType().isSet);
+			expect(keysOf(withFlag).map(k => k.slice()).sort()).to.deep.equal(keysOf(noFlag).map(k => k.slice()).sort());
+
+			// Flags are appended after the 2 data columns (idx 2, 3) and named.
+			const cols = withFlag.getType().columns;
+			expect(cols.length).to.equal(4);
+			expect(cols[2].name).to.equal('inA');
+			expect(cols[3].name).to.equal('inB');
+
+			// Invariant 1: a flag never appears inside a claimed key.
+			for (const key of keysOf(withFlag)) {
+				expect(key, 'flag must not be in a claimed key').to.not.include(2);
+				expect(key, 'flag must not be in a claimed key').to.not.include(3);
+			}
+
+			// Invariant 1: key → flag is present (distinct union keyed on its data columns).
+			const fds = withFlag.physical?.fds ?? [];
+			const keyDeterminesFlag = fds.some(fd => fd.dependents.includes(2) && fd.determinants.length > 0);
+			expect(keyDeterminesFlag, 'expected a key → flag FD over the distinct union').to.equal(true);
+
+			// Flags are NOT NULL and carry a {true,false} domain constraint.
+			expect(cols[2].type.nullable, 'flag is NOT NULL').to.equal(false);
+			const domains = withFlag.physical?.domainConstraints ?? [];
+			expect(domains.find(d => d.column === 2 && d.kind === 'enum'), 'expected a {true,false} enum domain').to.not.equal(undefined);
+		});
+
+		it('Key Soundness: a UNION ALL (bag) flag-bearing node makes no key → flag claim', async () => {
+			await createSchemas();
+			const bag = findSetOp('select id, x from A union all exists left as inA, exists right as inB select id, x from B');
+			expect(bag.getType().isSet, 'union all is a bag').to.equal(false);
+			const fds = bag.physical?.fds ?? [];
+			// No key → flag FD: a bag has no data-column key to determine the flag from.
+			const claimsKeyToFlag = fds.some(fd => (fd.dependents.includes(2) || fd.dependents.includes(3)) && fd.determinants.length > 0);
+			expect(claimsKeyToFlag, 'union all makes no key → flag claim').to.equal(false);
+		});
+
+		it('lineage: each flag carries a read-only `set-op-branch` existence UpdateSite', async () => {
+			await createSchemas();
+			const setOp = findSetOp('select id, x from A union exists left as inA, exists right as inB select id, x from B');
+			const attrs = setOp.getAttributes();
+			expect(attrs.length).to.equal(4);
+			for (const [name, branch] of [['inA', 'left'], ['inB', 'right']] as const) {
+				const attr = attrs.find(a => a.name === name)!;
+				const site = setOp.physical?.updateLineage?.get(attr.id);
+				expect(site?.kind, `${name} lineage is an existence site`).to.equal('existence');
+				const resolved = resolveBaseSite(site);
+				// Read-only in this half: not writable, no base column, no write effect yet.
+				expect(resolved.writable, `${name} is read-only in the read half`).to.equal(false);
+				expect(resolved.baseColumn, `${name} has no base column`).to.equal(undefined);
+				expect(resolved.existenceComponent, `${name} carries no write component yet`).to.equal(undefined);
+				if (site?.kind === 'existence') {
+					expect(site.component.kind, `${name} is a set-op-branch component`).to.equal('set-op-branch');
+					if (site.component.kind === 'set-op-branch') {
+						expect(site.component.branch, `${name} reifies the ${branch} branch`).to.equal(branch);
+					}
+				}
+			}
+		});
+
+		it('column_info: a membership column reports is_updatable=NO with null base (read half)', async () => {
+			await seed();
+			const rows = await readRows("select column_name, is_updatable, base_table, base_column from column_info('U')");
+			for (const name of ['inA', 'inB']) {
+				const flag = rows.find(r => r.column_name === name);
+				expect(flag, `column_info exposes ${name}`).to.not.equal(undefined);
+				expect(flag!.is_updatable, `${name} is read-only in the read half`).to.equal('NO');
+				expect(flag!.base_table, `${name} has no base table`).to.equal(null);
+				expect(flag!.base_column, `${name} has no base column`).to.equal(null);
+			}
+		});
+
+		it('write still rejects: membership/set-op view writes are read-only here', async () => {
+			await seed();
+			let threw = false;
+			try { await db.exec('update U set inB = true where id = 1'); } catch { threw = true; }
+			expect(threw, 'update of a membership column rejects (write half not wired)').to.equal(true);
+			threw = false;
+			try { await db.exec('insert into U (id, x, inA, inB) values (9, 90, true, false)'); } catch { threw = true; }
+			expect(threw, 'insert through a set-op membership view rejects').to.equal(true);
+		});
+
+		it('grammar: the membership clause is captured in the AST and rejects on DIFF', () => {
+			const parser = new Parser();
+			const ast = parser.parse('select id, x from A union exists left as inA, exists right as inB select id, x from B') as unknown as AST.SelectStmt;
+			expect(ast.compound?.existence).to.deep.equal([
+				{ branch: 'left', name: 'inA' },
+				{ branch: 'right', name: 'inB' },
+			]);
+			// Rejected on DIFF (symmetric difference desugars to two EXCEPTs — ambiguous).
+			expect(() => parser.parse('select id from A diff exists left as inA select id from B')).to.throw();
 		});
 	});
 
