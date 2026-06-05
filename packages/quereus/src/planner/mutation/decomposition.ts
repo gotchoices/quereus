@@ -42,7 +42,8 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   UPDATE. An **optional columnar** member's write is a per-row materialization
  *   transition realized as plain AST base ops over the anchor: **matched** rows take
  *   the base UPDATE, **absent** rows take a null-extended INSERT (anchor-keyed
- *   insert-select gated `<anchorKey> not in (select <memberKey> from <member>)`), and
+ *   insert-select `… on conflict (<memberKey>) do nothing`, which cedes the matched
+ *   rows to the UPDATE without the insert source scanning its own target), and
  *   when every one of the member's value columns is assigned null the component row is
  *   emptied → a base DELETE instead. An **EAV pivot** member's write is the triple
  *   analogue, per attribute: a non-null value upserts the `(entity, attr, value)`
