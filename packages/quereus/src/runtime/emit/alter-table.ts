@@ -516,6 +516,17 @@ async function runAlterColumn(
 		}
 	}
 
+	// Route a SET DEFAULT through the same DDL validator CREATE TABLE uses, so the
+	// stored default is consistent with what INSERT will accept: bind params / bare
+	// columns / non-determinism rejected, `new.<column>` accepted (deferred to INSERT
+	// time). DROP DEFAULT (`setDefault === null`) needs no validation.
+	if (action.setDefault !== undefined && action.setDefault !== null) {
+		const hasMutationContext = !!tableSchema.mutationContext && tableSchema.mutationContext.length > 0;
+		rctx.db.schemaManager.validateAlterColumnDefault(
+			action.setDefault, action.columnName, tableSchema.name, hasMutationContext,
+		);
+	}
+
 	const module = requireVtabModule(tableSchema);
 	if (!module.alterTable) {
 		throw new QuereusError(

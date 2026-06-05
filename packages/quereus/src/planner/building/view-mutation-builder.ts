@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor } from '../nodes/plan-node.js';
+import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor, type RowDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode } from '../nodes/view-mutation-node.js';
@@ -26,6 +26,7 @@ import { parseExpressionString } from '../../parser/index.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
+import { buildRowDefaultScope } from './default-scope.js';
 
 /**
  * Build the view-mutation substrate for a view-/materialized-view-mediated DML.
@@ -486,9 +487,14 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 	});
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault);
+	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.suppliedColumns);
 
-	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, keyDefault });
+	return new ViewMutationNode(ctx.scope, baseOps, undefined, {
+		source: envelopeSource,
+		descriptor,
+		keyDefault: keyDefault?.node,
+		keyDefaultRowDescriptor: keyDefault?.rowDescriptor,
+	});
 }
 
 /**
@@ -517,9 +523,14 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op));
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault);
+	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.suppliedColumns);
 
-	return new ViewMutationNode(ctx.scope, baseOps, undefined, { source: envelopeSource, descriptor, keyDefault });
+	return new ViewMutationNode(ctx.scope, baseOps, undefined, {
+		source: envelopeSource,
+		descriptor,
+		keyDefault: keyDefault?.node,
+		keyDefaultRowDescriptor: keyDefault?.rowDescriptor,
+	});
 }
 
 /**
@@ -567,18 +578,44 @@ function buildEnvelopeShape(
  * default is on the single-source insert path (skipped under
  * `nondeterministic_schema`), so a `uuid7()`-style default rides the same
  * capture-once-and-thread guarantee.
+ *
+ * The key default may read a value the INSERT supplies for a sibling view column via
+ * `new.<col>` (the same surface as the single-source insert path — e.g.
+ * `default (coalesce((select max(rid) from anchor), 0) + new.seq)`). We mint fresh
+ * attributes for the supplied envelope columns and build the default against a row
+ * scope registering them as `new.<col>` (and bare `<col>`); the returned
+ * `rowDescriptor` maps those fresh attribute ids to source-row positions, and the
+ * emitter installs it over each source row while evaluating the default. Minting fresh
+ * (rather than reusing the `EnvelopeScanNode` attributes) keeps the reference
+ * self-contained so the optimizer cannot dangle it.
  */
 function buildKeyDefault(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	keyDefault: AST.Expression | undefined,
-): ScalarPlanNode | undefined {
+	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
+): { node: ScalarPlanNode; rowDescriptor: RowDescriptor } | undefined {
 	if (!keyDefault) return undefined;
-	const node = buildExpression(ctx, keyDefault) as ScalarPlanNode;
+
+	// Fresh attributes for the supplied envelope columns, referenced only by this key
+	// default's `new.<col>` column refs and resolved at runtime via the row slot the
+	// emitter installs over each source row (key minted before `__shared_key` append).
+	const rowAttrs: Attribute[] = suppliedColumns.map(col => ({
+		id: PlanNode.nextAttrId(),
+		name: col.name,
+		type: col.type,
+		sourceRelation: 'envelope-key-default',
+	}));
+	const rowScope = buildRowDefaultScope(ctx.scope, suppliedColumns, rowAttrs);
+
+	const node = buildExpression({ ...ctx, scope: rowScope }, keyDefault) as ScalarPlanNode;
 	if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
 		validateDeterministicDefault(node, '<shared key>', view.name);
 	}
-	return node;
+
+	const rowDescriptor: RowDescriptor = [];
+	rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
+	return { node, rowDescriptor };
 }
 
 /**

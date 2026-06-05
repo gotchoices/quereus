@@ -1278,15 +1278,17 @@ export class SchemaManager {
 		return found;
 	}
 
-	private validateDefaultDeterminism(
-		columns: ReadonlyArray<ColumnSchema>,
-		tableName: string,
-		hasMutationContext: boolean,
-		allowNonDeterministic: boolean = false
-	): void {
+	/**
+	 * Build the throwaway planning context (global + parameter scope, no table/row
+	 * scope) used to compile a DEFAULT expression for DDL-time validation. The table's
+	 * columns are intentionally absent so a bare-column reference fails to build —
+	 * which the bare-column pre-walk has already rejected for the strict case, and
+	 * which the deferral path tolerates for `new.`/subquery/mutation-context defaults.
+	 */
+	private makeDdlValidationContext(): PlanningContext {
 		const globalScope = new GlobalScope(this.db.schemaManager);
 		const parameterScope = new ParameterScope(globalScope);
-		const planningCtx: PlanningContext = {
+		return {
 			db: this.db,
 			schemaManager: this.db.schemaManager,
 			parameters: {},
@@ -1297,71 +1299,136 @@ export class SchemaManager {
 			cteReferenceCache: new Map(),
 			outputScopes: new Map()
 		};
+	}
+
+	/**
+	 * Validate a single DEFAULT expression — the per-default core of
+	 * {@link validateDefaultDeterminism}, factored out so the ALTER COLUMN SET DEFAULT
+	 * path ({@link validateAlterColumnDefault}) routes through the identical checks:
+	 * bind parameters and (absent a mutation context) bare columns rejected up front,
+	 * non-determinism rejected unless `allowNonDeterministic`, and a `new.<column>` /
+	 * subquery / mutation-context default deferred to INSERT time (it cannot build
+	 * here without the row/table scope; determinism is re-checked when the row scope
+	 * is established).
+	 */
+	private validateOneDefault(
+		planningCtx: PlanningContext,
+		defaultValue: AST.Expression,
+		columnName: string,
+		tableName: string,
+		hasMutationContext: boolean,
+		allowNonDeterministic: boolean,
+		ddlPhase: string,
+	): void {
+		this.rejectIllegalReferences(defaultValue as AST.AstNode, {
+			rejectColumns: !hasMutationContext,
+			formatParamError: () =>
+				`DEFAULT for column '${columnName}' in table '${tableName}' may not reference bind parameters.`,
+			formatColumnError: () =>
+				`DEFAULT for column '${columnName}' in table '${tableName}' may not reference a bare column; use 'new.<column>' to read a value supplied by the INSERT, or a generated column instead.`,
+		});
+
+		let defaultExpr: ScalarPlanNode | undefined;
+		// A DEFAULT that embeds a subquery may forward-reference the table being
+		// created (a self-referencing allocator — `select max(rid) from t` on `t`):
+		// the table is not yet registered here, so the build legitimately fails.
+		// A DEFAULT that reads `new.<column>` resolves only against the row scope
+		// established at INSERT time, so it likewise cannot build here. Either way
+		// determinism is re-checked at INSERT time (both the single-source insert
+		// expansion and the shared-key envelope re-validate the compiled default),
+		// so defer rather than reject. Other build failures (a typo'd function /
+		// bare column) stay strict.
+		const defaultEmbedsSubquery = this.defaultEmbedsSubquery(defaultValue as AST.AstNode);
+		const defaultReferencesNewRow = this.defaultReferencesNewRow(defaultValue as AST.AstNode);
+		try {
+			defaultExpr = buildExpression(planningCtx, defaultValue) as ScalarPlanNode;
+		} catch (e) {
+			if (hasMutationContext || defaultEmbedsSubquery || defaultReferencesNewRow) {
+				// Column-style identifiers in DEFAULT may resolve to mutation
+				// context variables at INSERT time; a subquery may forward-reference
+				// the table being created; `new.<column>` resolves against the INSERT
+				// row scope. The row/table scope isn't available here, so a build
+				// failure isn't necessarily a bug. Determinism is re-checked at
+				// INSERT time.
+				log('Skipping determinism validation for default on column %s.%s at %s time (deferred to INSERT%s): %s',
+					tableName, columnName, ddlPhase,
+					hasMutationContext ? ', mutation context present' : defaultEmbedsSubquery ? ', embeds subquery' : ', references new row',
+					(e as Error).message);
+			} else {
+				const message = e instanceof Error ? e.message : String(e);
+				const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
+				throw new QuereusError(
+					`DEFAULT for column '${columnName}' in table '${tableName}' is invalid: ${message}`,
+					code,
+					e instanceof Error ? e : undefined
+				);
+			}
+		}
+
+		if (!defaultExpr) return;
+
+		if (allowNonDeterministic) return;
+
+		const result = checkDeterministic(defaultExpr);
+		if (!result.valid) {
+			throw new QuereusError(
+				`Non-deterministic expression not allowed in DEFAULT for column '${columnName}' in table '${tableName}'. ` +
+				`Expression: ${result.expression}. ` +
+				`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
+				StatusCode.ERROR
+			);
+		}
+	}
+
+	private validateDefaultDeterminism(
+		columns: ReadonlyArray<ColumnSchema>,
+		tableName: string,
+		hasMutationContext: boolean,
+		allowNonDeterministic: boolean = false
+	): void {
+		const planningCtx = this.makeDdlValidationContext();
 
 		for (const col of columns) {
 			if (!col.defaultValue || typeof col.defaultValue !== 'object' || col.defaultValue === null || !('type' in col.defaultValue)) {
 				continue;
 			}
-
-			this.rejectIllegalReferences(col.defaultValue as AST.AstNode, {
-				rejectColumns: !hasMutationContext,
-				formatParamError: () =>
-					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference bind parameters.`,
-				formatColumnError: () =>
-					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference a bare column; use 'new.<column>' to read a value supplied by the INSERT, or a generated column instead.`,
-			});
-
-			let defaultExpr: ScalarPlanNode | undefined;
-			// A DEFAULT that embeds a subquery may forward-reference the table being
-			// created (a self-referencing allocator — `select max(rid) from t` on `t`):
-			// the table is not yet registered here, so the build legitimately fails.
-			// A DEFAULT that reads `new.<column>` resolves only against the row scope
-			// established at INSERT time, so it likewise cannot build here. Either way
-			// determinism is re-checked at INSERT time (both the single-source insert
-			// expansion and the shared-key envelope re-validate the compiled default),
-			// so defer rather than reject. Other build failures (a typo'd function /
-			// bare column) stay strict.
-			const defaultEmbedsSubquery = this.defaultEmbedsSubquery(col.defaultValue as AST.AstNode);
-			const defaultReferencesNewRow = this.defaultReferencesNewRow(col.defaultValue as AST.AstNode);
-			try {
-				defaultExpr = buildExpression(planningCtx, col.defaultValue as AST.Expression) as ScalarPlanNode;
-			} catch (e) {
-				if (hasMutationContext || defaultEmbedsSubquery || defaultReferencesNewRow) {
-					// Column-style identifiers in DEFAULT may resolve to mutation
-					// context variables at INSERT time; a subquery may forward-reference
-					// the table being created; `new.<column>` resolves against the INSERT
-					// row scope. The row/table scope isn't available here, so a build
-					// failure isn't necessarily a bug. Determinism is re-checked at
-					// INSERT time.
-					log('Skipping determinism validation for default on column %s.%s at CREATE TABLE time (deferred to INSERT%s): %s',
-						tableName, col.name,
-						hasMutationContext ? ', mutation context present' : defaultEmbedsSubquery ? ', embeds subquery' : ', references new row',
-						(e as Error).message);
-				} else {
-					const message = e instanceof Error ? e.message : String(e);
-					const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
-					throw new QuereusError(
-						`DEFAULT for column '${col.name}' in table '${tableName}' is invalid: ${message}`,
-						code,
-						e instanceof Error ? e : undefined
-					);
-				}
-			}
-
-			if (!defaultExpr) continue;
-
-			if (allowNonDeterministic) continue;
-
-			const result = checkDeterministic(defaultExpr);
-			if (!result.valid) {
-				throw new QuereusError(
-					`Non-deterministic expression not allowed in DEFAULT for column '${col.name}' in table '${tableName}'. ` +
-					`Expression: ${result.expression}. ` +
-					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
-					StatusCode.ERROR
-				);
-			}
+			this.validateOneDefault(
+				planningCtx,
+				col.defaultValue as AST.Expression,
+				col.name,
+				tableName,
+				hasMutationContext,
+				allowNonDeterministic,
+				'CREATE TABLE',
+			);
 		}
+	}
+
+	/**
+	 * Validate a DEFAULT expression supplied by an `ALTER COLUMN … SET DEFAULT`,
+	 * routing it through the same checks CREATE TABLE applies so the stored default is
+	 * consistent with what INSERT will accept: bind parameters and (absent a mutation
+	 * context) bare columns are rejected, non-determinism is rejected unless the
+	 * `nondeterministic_schema` option is set, and a `new.<column>` default is accepted
+	 * with the build/determinism check deferred to INSERT time. DROP DEFAULT (a null
+	 * expression) never reaches here. Called from the ALTER TABLE runtime emitter.
+	 */
+	validateAlterColumnDefault(
+		defaultExpr: AST.Expression,
+		columnName: string,
+		tableName: string,
+		hasMutationContext: boolean,
+	): void {
+		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
+		this.validateOneDefault(
+			this.makeDdlValidationContext(),
+			defaultExpr,
+			columnName,
+			tableName,
+			hasMutationContext,
+			allowNonDet,
+			'ALTER COLUMN SET DEFAULT',
+		);
 	}
 
 	/**

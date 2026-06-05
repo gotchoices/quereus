@@ -1097,10 +1097,14 @@ determinism checks).
   references inside CHECK predicates are validated later, at INSERT/UPDATE
   time, when the row scope is established.
 
-These DDL-time guards currently fire only on `CREATE TABLE`. The `ALTER
-TABLE` paths (`ADD COLUMN`, `ADD CONSTRAINT`, `ALTER COLUMN ... SET
-DEFAULT`) do not yet route through the same validators — extending them is
-a known follow-up.
+`ALTER TABLE … ALTER COLUMN … SET DEFAULT` routes the new default through the
+**same** validator (`SchemaManager.validateAlterColumnDefault`): bind
+parameters / bare columns / non-determinism are rejected at `ALTER` time, and a
+`new.<column>` default is accepted with the build/determinism check deferred to
+INSERT time. The remaining DDL DEFAULT path — `ALTER TABLE ADD COLUMN` — still
+folds its default to a literal and does **not** yet route through the shared
+validator (so a `new.<column>` ADD COLUMN default + per-row backfill is a known
+follow-up); `ADD CONSTRAINT` likewise validates at first INSERT/UPDATE.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion

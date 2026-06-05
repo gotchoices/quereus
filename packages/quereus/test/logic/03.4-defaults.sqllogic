@@ -161,3 +161,55 @@ SELECT rowId, value FROM h2_uprof ORDER BY rowId;
 
 DROP TABLE h2_uprof;
 DROP TABLE h0_users_id;
+
+-- ===================================
+-- ALTER COLUMN SET DEFAULT routes through the same DDL validator CREATE TABLE uses,
+-- so the stored default is consistent with what INSERT will accept: `new.<column>`
+-- is accepted (deferred to INSERT time); a bare column / non-deterministic default
+-- is rejected at ALTER time (closing the previously-silent-accept gap).
+-- ===================================
+
+create table sd_t (id integer primary key, x integer, y integer);
+
+-- a `new.<col>` SET DEFAULT is accepted (build/determinism deferred to INSERT).
+alter table sd_t alter column y set default (new.x * 10);
+
+-- and is exercised by a later insert that supplies the sibling.
+insert into sd_t (id, x) values (1, 4);
+select x, y from sd_t where id = 1;
+→ [{"x":4,"y":40}]
+
+-- supplying y directly overrides the default.
+insert into sd_t (id, x, y) values (2, 4, 99);
+select x, y from sd_t where id = 2;
+→ [{"x":4,"y":99}]
+
+-- omitting the sibling the default reads → the same resolution error as the
+-- single-source path (new.x has no supplied value).
+insert into sd_t (id) values (3);
+-- error: isn't a column
+
+DROP TABLE sd_t;
+
+-- a bare-column SET DEFAULT is now rejected at ALTER time (no mutation context).
+create table sd_bare (id integer primary key, a integer, b integer);
+alter table sd_bare alter column b set default (a + 1);
+-- error: bare column
+DROP TABLE sd_bare;
+
+-- a non-deterministic SET DEFAULT is rejected at ALTER time.
+create table sd_nd (id integer primary key, v integer);
+alter table sd_nd alter column v set default (random());
+-- error: non-deterministic
+DROP TABLE sd_nd;
+
+-- DROP DEFAULT needs no validation and still works.
+create table sd_drop (id integer primary key, w integer null default 7);
+insert into sd_drop (id) values (1);
+select w from sd_drop where id = 1;
+→ [{"w":7}]
+alter table sd_drop alter column w drop default;
+insert into sd_drop (id) values (2);
+select w from sd_drop where id = 2;
+→ [{"w":null}]
+DROP TABLE sd_drop;

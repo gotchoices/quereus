@@ -1,5 +1,5 @@
 import type { Scope } from '../scopes/scope.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type PhysicalProperties, type TableDescriptor, type Attribute, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type PhysicalProperties, type TableDescriptor, type RowDescriptor, type Attribute, isRelationalNode } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
@@ -55,6 +55,12 @@ export interface IdentityCapture {
  * itself mints nothing — the basis author declares the policy in the column default
  * (`docs/view-updateability.md` § Mutation Context). Absent ⇒ the shared key is
  * directly supplied (no appended column).
+ *
+ * A `keyDefault` may itself read a supplied sibling via `new.<col>` (e.g.
+ * `default (coalesce((select max(rid) from anchor), 0) + new.seq)`); its column
+ * references resolve against {@link keyDefaultRowDescriptor}, which the emitter
+ * installs over each source row (before the `__shared_key` is appended) for the
+ * duration of the per-row evaluation.
  */
 export interface MutationEnvelope {
 	readonly source: RelationalPlanNode;
@@ -65,6 +71,15 @@ export interface MutationEnvelope {
 	 * key is directly supplied.
 	 */
 	readonly keyDefault?: ScalarPlanNode;
+	/**
+	 * The row descriptor over the supplied envelope columns the {@link keyDefault}'s
+	 * `new.<col>` references resolve through — the emitter installs it (as a row slot)
+	 * over each source row while evaluating the key default. Present only when a
+	 * `keyDefault` reads supplied siblings; the descriptor's attribute ids are fresh
+	 * (minted alongside the key default's column refs), so the reference is
+	 * self-contained and the optimizer cannot dangle it.
+	 */
+	readonly keyDefaultRowDescriptor?: RowDescriptor;
 }
 
 /**
@@ -249,6 +264,7 @@ export class ViewMutationNode extends PlanNode {
 				source: newSource,
 				descriptor: this.envelope.descriptor,
 				keyDefault: newKeyDefault,
+				keyDefaultRowDescriptor: this.envelope.keyDefaultRowDescriptor,
 			};
 		}
 

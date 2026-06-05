@@ -5,6 +5,8 @@ import type { RuntimeValue, OutputValue, Row, SqlValue } from '../../common/type
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { isAsyncIterable } from '../utils.js';
+import { createRowSlot } from '../context-helpers.js';
+import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 
 type Callback = (ctx: RuntimeContext) => OutputValue;
 
@@ -128,7 +130,12 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		return rows;
 	}
 
-	async function materializeEnvelope(rctx: RuntimeContext, sourceCb: Callback, keyDefaultCb: Callback | undefined): Promise<Row[]> {
+	async function materializeEnvelope(
+		rctx: RuntimeContext,
+		sourceCb: Callback,
+		keyDefaultCb: Callback | undefined,
+		keyDefaultRowDescriptor: RowDescriptor | undefined,
+	): Promise<Row[]> {
 		const rows: Row[] = [];
 		const sourceResult = sourceCb(rctx);
 		const resolved = sourceResult instanceof Promise ? await sourceResult : sourceResult;
@@ -136,6 +143,13 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 			// Save/restore the ambient ordinal so a nested mutation never sees a stale
 			// value and it does not leak past the envelope.
 			const savedOrdinal = rctx.mutationOrdinal;
+			// When the key default reads supplied siblings via `new.<col>`, expose THIS
+			// row (the supplied columns, before the `__shared_key` is appended) to those
+			// column refs through a row slot over the key default's descriptor. Installed
+			// once, updated by reference per row, torn down in `finally`.
+			const keySlot = keyDefaultCb && keyDefaultRowDescriptor
+				? createRowSlot(rctx, keyDefaultRowDescriptor)
+				: undefined;
 			let ordinal = 0;
 			try {
 				for await (const row of resolved as AsyncIterable<Row>) {
@@ -146,6 +160,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 						// subquery observing pre-mutation state (no base write has fired). The
 						// single value threads into every member's key column via the EC.
 						rctx.mutationOrdinal = ordinal;
+						keySlot?.set(row as Row);
 						const minted = await keyDefaultCb(rctx);
 						rows.push([...row, minted as SqlValue] as Row);
 					} else {
@@ -154,6 +169,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 				}
 			} finally {
 				rctx.mutationOrdinal = savedOrdinal;
+				keySlot?.close();
 			}
 		}
 		return rows;
@@ -222,7 +238,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 
 		const sourceCb = args[envSourceIdx] as Callback;
 		const keyDefaultCb = hasKeyDefault ? (args[keyDefaultIdx] as Callback) : undefined;
-		const rows = await materializeEnvelope(rctx, sourceCb, keyDefaultCb);
+		const rows = await materializeEnvelope(rctx, sourceCb, keyDefaultCb, envelope?.keyDefaultRowDescriptor);
 		rctx.tableContexts.set(descriptor, () => arrayIterable(rows));
 		try {
 			await drainBaseOps(rctx, baseCbs);

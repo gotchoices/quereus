@@ -246,3 +246,48 @@ VALUES (1, 100);
 SELECT bare_label, qual_label FROM collide WHERE id = 1
 → [{"bare_label":999,"qual_label":100}]
 
+-- Test 13: ALTER COLUMN SET DEFAULT coexists with a context variable. The default
+-- is installed via ALTER (not CREATE) yet resolves `new.<col>` (a supplied sibling)
+-- alongside a context variable at INSERT time — mirroring Test 11.
+CREATE TABLE invoice_alt (
+	id INTEGER PRIMARY KEY,
+	subtotal INTEGER,
+	total INTEGER
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+
+ALTER TABLE invoice_alt ALTER COLUMN total SET DEFAULT (new.subtotal + tax);
+
+INSERT INTO invoice_alt (id, subtotal)
+WITH CONTEXT tax = 7
+VALUES (1, 100);
+
+SELECT total FROM invoice_alt WHERE id = 1
+→ [{"total":107}]
+
+-- Test 14: through the shared-surrogate envelope — a member-table column default
+-- reads a supplied sibling via `new.<col>` alongside a per-statement context
+-- variable. The shared key is minted once from the anchor's allocator default; the
+-- member's `total` default combines `new.amount` (supplied) with `tax` (context).
+CREATE TABLE ec_core (
+	rid INTEGER PRIMARY KEY DEFAULT (coalesce((SELECT max(rid) FROM ec_core), 0) + mutation_ordinal()),
+	name TEXT
+) USING memory;
+CREATE TABLE ec_line (
+	rid INTEGER PRIMARY KEY,
+	amount INTEGER,
+	total INTEGER DEFAULT (new.amount + tax)
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+CREATE VIEW ec_v AS SELECT c.name AS name, l.amount AS amount
+	FROM ec_core c JOIN ec_line l ON l.rid = c.rid;
+
+INSERT INTO ec_v WITH CONTEXT tax = 5 VALUES ('Ada', 100), ('Lin', 200);
+
+SELECT rid, amount, total FROM ec_line ORDER BY rid
+→ [{"rid":1,"amount":100,"total":105},{"rid":2,"amount":200,"total":205}]
+

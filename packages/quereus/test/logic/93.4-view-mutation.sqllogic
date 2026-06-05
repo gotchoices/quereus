@@ -1695,6 +1695,39 @@ insert into mo_seq (id, label) values (10, 'a'), (20, 'b'), (30, 'c');
 select id, ord, label from mo_seq order by id;
 → [{"id":10,"ord":1,"label":"a"},{"id":20,"ord":2,"label":"b"},{"id":30,"ord":3,"label":"c"}]
 
+-- --- (j) the anchor key default reads a SUPPLIED sibling via `new.<col>`: the
+--         minted shared key derives from a value the INSERT provides through the view
+--         (the same `new.<col>` surface as the single-source insert path), evaluated
+--         once per row at the envelope and threaded to both members. A member-table
+--         column default also reads a supplied sibling via `new.<col>`. ---
+create table ek_core (
+    rid integer primary key default (coalesce((select max(rid) from ek_core), 0) + new.seq),
+    seq integer,
+    name text
+);
+create table ek_contact (rid integer primary key, email text, label text default (lower(new.email)));
+create view ek_v as select c.seq as seq, c.name as name, k.email as email
+    from ek_core c join ek_contact k on k.rid = c.rid;
+
+-- max(rid)=0 frozen pre-mutation for BOTH rows, so each row's shared key derives from
+-- its supplied `new.seq` (5 and 3 — distinct, and unequal to the 1,2 ordinals, proving
+-- the value comes from the supplied sibling rather than the ordinal).
+insert into ek_v (seq, name, email) values (5, 'Ada', 'A@X'), (3, 'Lin', 'L@X');
+select rid, seq, name from ek_core order by rid;
+→ [{"rid":3,"seq":3,"name":"Lin"},{"rid":5,"seq":5,"name":"Ada"}]
+-- the member-table `label` default read its supplied sibling `new.email`.
+select rid, email, label from ek_contact order by rid;
+→ [{"rid":3,"email":"L@X","label":"l@x"},{"rid":5,"email":"A@X","label":"a@x"}]
+-- every member agrees on the threaded identity (the join recovers both rows).
+select seq, name, email from ek_v order by seq;
+→ [{"seq":3,"name":"Lin","email":"L@X"},{"seq":5,"name":"Ada","email":"A@X"}]
+
+-- a second insert observes the post-first-insert max(rid)=5 (pre-mutation for THIS
+-- statement) and adds the supplied `new.seq`: 5 + 100 = 105.
+insert into ek_v (seq, name, email) values (100, 'Bo', 'B@X');
+select rid, seq from ek_core order by rid;
+→ [{"rid":3,"seq":3},{"rid":5,"seq":5},{"rid":105,"seq":100}]
+
 -- ===================================
 -- RETURNING through a view (single- and multi-source).
 -- The returned rows are projected through the VIEW's column list (not the base

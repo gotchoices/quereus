@@ -14,7 +14,7 @@ import { checkColumnsAssignable, columnSchemaToDef } from '../type-utils.js';
 import type { ColumnDef } from '../../common/datatype.js';
 import type { CTEScopeNode } from '../nodes/cte-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
-import type { ReferenceCallback } from '../scopes/scope.js';
+import { buildRowDefaultScope } from './default-scope.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
@@ -82,18 +82,12 @@ function createRowExpansionProjection(
 		const contextVarNames = new Set(
 			(tableReference.tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
 		);
-		const defaultScope = new RegisteredScope(contextScope ?? ctx.scope);
-		targetColumns.forEach((targetCol, index) => {
-			if (index >= sourceAttributes.length) return;
-			const sourceAttr = sourceAttributes[index];
-			const colNameLower = targetCol.name.toLowerCase();
-			const makeRef: ReferenceCallback = (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, sourceAttr.type, sourceAttr.id, index);
-			defaultScope.registerSymbol(`new.${colNameLower}`, makeRef);
-			if (!contextVarNames.has(colNameLower)) {
-				defaultScope.registerSymbol(colNameLower, makeRef);
-			}
-		});
+		const defaultScope = buildRowDefaultScope(
+			contextScope ?? ctx.scope,
+			targetColumns,
+			sourceAttributes,
+			contextVarNames,
+		);
 		rowScopedDefaultCtx = { ...ctx, scope: defaultScope };
 		return rowScopedDefaultCtx;
 	};
