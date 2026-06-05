@@ -224,3 +224,25 @@ VALUES (1, 100);
 SELECT total FROM invoice WHERE id = 1
 → [{"total":107}]
 
+-- Test 12: bare-vs-new precedence when the colliding column IS supplied.
+-- A context variable and a column share the name `amount`. When `amount` is
+-- supplied by the INSERT, a bare `amount` reference still resolves to the
+-- context variable (context shadows the column), while `new.amount` resolves to
+-- the supplied column value. No "symbol already exists" collision is raised.
+CREATE TABLE collide (
+	id INTEGER PRIMARY KEY,
+	amount INTEGER NULL,
+	bare_label INTEGER DEFAULT amount,
+	qual_label INTEGER DEFAULT (new.amount)
+) USING memory
+WITH CONTEXT (
+	amount INTEGER
+);
+
+INSERT INTO collide (id, amount)
+WITH CONTEXT amount = 999
+VALUES (1, 100);
+
+SELECT bare_label, qual_label FROM collide WHERE id = 1
+→ [{"bare_label":999,"qual_label":100}]
+

@@ -427,6 +427,27 @@ describe('declarative-equivalence: defaults', () => {
 			],
 		});
 	});
+
+	it('new.<column> default survives the declarative round-trip', async function () {
+		// The deferred `new.` default must re-emit and re-apply identically — a
+		// dropped qualifier would silently corrupt the schema under apply.
+		await runCase({
+			name: 'default-new-ref',
+			directDDL: [
+				'create table t (id integer primary key, base integer, doubled integer default (new.base * 2))',
+			],
+			declarativeBody: `table t {
+				id INTEGER PRIMARY KEY,
+				base INTEGER,
+				doubled INTEGER DEFAULT (new.base * 2)
+			}`,
+			expectTables: ['t'],
+			probes: [
+				{ sql: 'insert into t (id, base) values (1, 21)', expect: { rows: [] } },
+				{ sql: 'select doubled from t where id = 1', expect: { rows: [{ doubled: 42 }] } },
+			],
+		});
+	});
 });
 
 // ============================================================================

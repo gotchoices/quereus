@@ -231,6 +231,16 @@ describe('Emit: statement round-trips', () => {
 			roundTripStmt('create table t (a integer default 0)');
 		});
 
+		it('DEFAULT reading a populated sibling via new.<column>', () => {
+			// The `new.` qualifier must survive the round-trip — dropping it would
+			// silently corrupt the feature under schema export / declarative apply.
+			const out = roundTripStmt(
+				'create table t (id integer primary key, base integer, title text, doubled integer default (new.base * 2), slug text default (lower(new.title)))'
+			);
+			expect(out).to.contain('new.base');
+			expect(out).to.contain('new.title');
+		});
+
 		it('CHECK constraint', () => {
 			roundTripStmt('create table t (a integer check (a > 0))');
 		});

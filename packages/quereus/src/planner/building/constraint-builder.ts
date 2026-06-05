@@ -190,8 +190,14 @@ export function buildConstraintChecks(
  * (per SQLite OR REPLACE semantics on NOT NULL).
  *
  * Defaults are evaluated against the same scope used for CHECK constraints:
- * unqualified column names resolve to NEW attributes (which is fine — defaults
- * may not reference columns, but we share the scope for consistency).
+ * every column resolves as `new.<col>` (and unqualified, unless shadowed by a
+ * mutation-context variable), so a NOT NULL default may read a sibling via
+ * `new.<column>` just like the row-expansion path. Note the timing difference:
+ * this substitution fires when REPLACE swaps in a default for an explicit NULL,
+ * by which point the row is fully materialised — so `new.<col>` here sees the
+ * final row value of *any* column, whereas the row-expansion path exposes only
+ * the columns the INSERT actually supplied (omitted siblings are unresolved
+ * there to avoid a default-evaluation-order race).
  */
 export function buildNotNullDefaults(
   ctx: PlanningContext,
