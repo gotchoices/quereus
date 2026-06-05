@@ -211,3 +211,31 @@ alter table e_der drop constraint uq_idx;
 
 drop table e_der;
 -- run
+
+-- ============================================================
+-- 8. DROP CONSTRAINT (CHECK) invalidates optimizer folding
+-- ============================================================
+-- A declared `check (x = 1)` lifts an FD/constant-binding onto the table that
+-- the filter-contradiction rule uses to fold `where x = 2` to EmptyRelation.
+-- Dropping the CHECK fires `table_modified`, which must invalidate that folding
+-- so a row that violates the dropped predicate is actually returned (regression
+-- guard for the cache-invalidation path on the constraint-drop case).
+create table fold_chk (id integer primary key, x integer, constraint chk check (x = 1));
+insert into fold_chk values (1, 1);
+-- run
+
+-- With the CHECK active, `where x = 2` is unsatisfiable (no such row can exist).
+select count(*) as c from fold_chk where x = 2;
+→ [{"c":0}]
+
+alter table fold_chk drop constraint chk;
+-- run
+
+-- A row that would have violated the dropped CHECK now inserts and must be found
+-- (folding no longer applies).
+insert into fold_chk values (2, 2);
+select count(*) as c from fold_chk where x = 2;
+→ [{"c":1}]
+
+drop table fold_chk;
+-- run
