@@ -84,6 +84,31 @@ describe('View tag mutation invalidation of cached write-through plans', () => {
 		await stmt.finalize();
 	});
 
+	it('invalidates a cached plan when ALTER uses a different identifier case than the view was created with', async () => {
+		// SQL identifiers are case-insensitive. The `view` plan dependency records the
+		// canonical stored name (`MyView`), so the `view_modified` event must also carry
+		// the canonical name — not the raw `ALTER` token (`MYVIEW`) — or the listener's
+		// exact-match invalidation misses and the cached plan keeps the stale routing.
+		await db.exec(`
+			create table t (id integer primary key, created integer);
+			create view MyView as select id from t
+				with tags ("quereus.update.default_for.created" = '100');
+		`);
+
+		const stmt = db.prepare('insert into MyView (id) values (?)');
+		await stmt.run([1]);
+		expect(await rows('select created from t where id = 1'))
+			.to.deep.equal([{ created: 100 }], 'precondition: first insert uses the original default');
+
+		await db.exec(`alter view MYVIEW set tags ("quereus.update.default_for.created" = '200');`);
+
+		await stmt.run([2]);
+		expect(await rows('select created from t where id = 2'))
+			.to.deep.equal([{ created: 200 }], 'case-differing ALTER must still invalidate the cached plan');
+
+		await stmt.finalize();
+	});
+
 	it('a fresh prepare always routes with the current tag (control)', async () => {
 		await db.exec(`
 			create table t (id integer primary key, created integer);
