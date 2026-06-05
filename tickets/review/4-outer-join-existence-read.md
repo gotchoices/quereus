@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-05T05:25:04.884Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\4-outer-join-existence-read.review.2026-06-05T05-25-04-883Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Review the read-only front half of the outer-join existence column — the `exists [<side>] as <name>` join clause (parser/AST/stringify), the `existence` UpdateSite, the JoinNode-native `{true,false}` NOT NULL match-flag attribute with its `key → flag` FD, and the read-only static surfaces. No write semantics (writes reject). Build + full quereus test suite (4692 passing) + lint all green.
 files: packages/quereus/src/parser/parser.ts, packages/quereus/src/parser/ast.ts, packages/quereus/src/emit/ast-stringify.ts, packages/quereus/src/planner/building/select.ts, packages/quereus/src/planner/nodes/join-node.ts, packages/quereus/src/planner/nodes/join-utils.ts, packages/quereus/src/planner/nodes/plan-node.ts, packages/quereus/src/planner/analysis/update-lineage.ts, packages/quereus/src/planner/rules/join/rule-join-physical-selection.ts, packages/quereus/src/planner/rules/join/rule-monotonic-merge-join.ts, packages/quereus/src/planner/rules/join/rule-join-elimination.ts, packages/quereus/src/planner/rules/join/rule-fanout-lookup-join.ts, packages/quereus/src/planner/rules/join/rule-lateral-top1-asof.ts, packages/quereus/src/runtime/emit/join.ts, packages/quereus/test/property.spec.ts, packages/quereus/test/emit-roundtrip.spec.ts, docs/view-updateability.md, docs/sql.md
 ----
