@@ -300,6 +300,44 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 		}
 	});
 
+	it('a select* join MV survives a source ALTER+refresh without an intervening query — rewrite forgoes, rows stay correct', async () => {
+		// Regression: the join arm keys the backing column map by the MV body's output
+		// *position*. A source `alter` followed by `refresh` desynchronizes a `select *`
+		// body's output order from the backing (the new source column appends to the
+		// backing but interleaves in the re-planned body), so a naive mapping read the
+		// wrong backing column — or ran off its end — yielding wrong rows / a plan crash.
+		// The arm now verifies positional alignment and forgoes the rewrite on a mismatch.
+		// Critically there is NO query while the MV is stale (the only path that used to
+		// drop the cached body root), so the post-refresh plan must re-validate on its own.
+		const db = await freshDb([
+			'create table customers (id integer primary key, name text null)',
+			'create table orders (id integer primary key, customer_id integer not null, '
+				+ 'foreign key (customer_id) references customers(id))',
+			'create materialized view jstar as select * from orders o join customers c on o.customer_id = c.id',
+			"insert into customers values (1,'ann'),(2,'bob')",
+			'insert into orders values (101,1),(102,2)',
+		]);
+		try {
+			const q = 'select o.id, c.name from orders o join customers c on o.customer_id = c.id order by o.id';
+			const expected = '[101,"ann"]|[102,"bob"]';
+			// Fresh: the select* body aligns with the backing, so the rewrite fires.
+			expect(serializePlanTree(db.getPlan(q)), 'rewrites while fresh').to.contain('_mv_jstar');
+			expect(await readRows(db, q)).to.equal(expected);
+
+			// Alter a non-last source column, then refresh — WITHOUT querying while stale.
+			await db.exec('alter table orders add column extra integer null');
+			await db.exec('refresh materialized view jstar');
+			expect(db.schemaManager.getMaterializedView('main', 'jstar')!.stale).to.not.equal(true);
+
+			// The backing no longer aligns positionally with the re-planned select* body,
+			// so the arm forgoes (no crash) and the base recompute stays exactly correct.
+			expect(serializePlanTree(db.getPlan(q)), 'forgoes after desync').to.not.contain('_mv_jstar');
+			expect(await readRows(db, q)).to.equal(expected);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('MV self-maintenance is never rewritten (a source write maintains the join backing)', async () => {
 		const db = await freshDb([...SCHEMA, ...ROWS]);
 		try {

@@ -293,11 +293,19 @@ function rewriteJoinFragment(
  * flag, avoiding recursion.
  *
  * Staleness: a **stale** MV (some source changed) drops its cache entry and returns
- * `null` — both so it is never a candidate while stale (matching the matcher's stale
- * gate) and so the next plan after a `refresh` re-derives the body against the
- * *current* source schema, never reusing a pre-ALTER root (which would mis-map a
- * `select *` join body's columns onto the rebuilt backing). Only a successfully
- * planned root is cached; a body that fails to plan is re-attempted each fire.
+ * `null`, so it is never a candidate while stale (matching the matcher's stale gate).
+ *
+ * Freshness validation: the stale flag alone is *not* sufficient to invalidate the
+ * cache. A `refresh` clears `stale` (rebuilding the backing) without firing this
+ * rule, so a root cached while the MV was fresh — then invalidated by a source
+ * `alter` and re-materialized by `refresh` *without* an intervening stale-window
+ * query to drop it — would otherwise be served against the rebuilt backing,
+ * mis-mapping a `select *` join body's columns (the body's column set shifts but the
+ * cached root's positions don't). A source `alter` swaps the `TableSchema` object
+ * (new identity), so {@link cachedBodyRootIsCurrent} re-derives whenever any base
+ * table the cached root reads is no longer the schema manager's current object.
+ * Only a successfully planned root is cached; a body that fails to plan is
+ * re-attempted each fire.
  */
 const MV_BODY_ROOT_CACHE = new WeakMap<MaterializedViewSchema, RelationalPlanNode>();
 
@@ -307,7 +315,7 @@ function plannedMvBodyRoot(db: OptContext['db'], mv: MaterializedViewSchema): Re
 		return null;
 	}
 	const cached = MV_BODY_ROOT_CACHE.get(mv);
-	if (cached !== undefined) return cached;
+	if (cached !== undefined && cachedBodyRootIsCurrent(cached, db)) return cached;
 	let root: RelationalPlanNode | null = null;
 	try {
 		root = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
@@ -317,8 +325,27 @@ function plannedMvBodyRoot(db: OptContext['db'], mv: MaterializedViewSchema): Re
 	} catch {
 		root = null; // a body that no longer plans is simply not a candidate
 	}
-	if (root !== null) MV_BODY_ROOT_CACHE.set(mv, root);
+	if (root !== null) MV_BODY_ROOT_CACHE.set(mv, root); else MV_BODY_ROOT_CACHE.delete(mv);
 	return root;
+}
+
+/** True iff every base table the cached body `root` reads is still the schema
+ *  manager's current `TableSchema` object. A source `alter` replaces the object
+ *  (new identity), so an identity mismatch means the root was planned against a
+ *  superseded source schema and must be re-derived (see the cache doc). */
+function cachedBodyRootIsCurrent(root: RelationalPlanNode, db: OptContext['db']): boolean {
+	const sm = db.schemaManager;
+	for (const ref of collectBodyTableRefs(root)) {
+		if (sm.getTable(ref.tableSchema.schemaName, ref.tableSchema.name) !== ref.tableSchema) return false;
+	}
+	return true;
+}
+
+/** Every `TableReferenceNode` in `node`'s subtree (depth-first). */
+function collectBodyTableRefs(node: RelationalPlanNode, out: TableReferenceNode[] = []): TableReferenceNode[] {
+	if (node instanceof TableReferenceNode) { out.push(node); return out; }
+	for (const rel of node.getRelations()) collectBodyTableRefs(rel, out);
+	return out;
 }
 
 /** `schema.table` lowercased — the qualified key matching an MV's `sourceTables`. */

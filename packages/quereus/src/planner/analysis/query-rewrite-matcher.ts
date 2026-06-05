@@ -852,6 +852,16 @@ export function matchJoinFragmentToMv(
 	if (!mvBodyRoot) return fail('no-candidate'); // body did not plan
 	if (mvBodyHasNonDeterminism(mv.selectAst, isDeterministic)) return fail('no-candidate');
 
+	// ---- Backing alignment: the stored-column map keys each backing column by the
+	//      MV body's output *position*, which is only sound while the backing columns
+	//      correspond positionally to the body output (the invariant established when
+	//      the backing is built from the body). A source `alter` can desynchronize
+	//      them — `refresh` does not reorder the backing to match a re-planned
+	//      `select *` body, which interleaves the new column — so a stale mapping would
+	//      read the wrong backing column or run off its end. Verify positional name
+	//      alignment up front and forgo (→ correct base recompute) on any mismatch. ----
+	if (!backingAlignsWithBody(mvBodyRoot, backing)) return fail('no-candidate');
+
 	// ---- Source-set match: the MV must read exactly the fragment's two tables. ----
 	const qualA = qualifiedOf(shape.tableRefs[0].tableSchema);
 	const qualB = qualifiedOf(shape.tableRefs[1].tableSchema);
@@ -1125,6 +1135,26 @@ function conjunctColumnAttrIds(node: ScalarPlanNode): number[] {
 	};
 	visit(node as PlanNode);
 	return out;
+}
+
+/**
+ * True iff the backing table's columns correspond positionally — same count, same
+ * names in order — to the MV body root's output attributes. This is the invariant
+ * the position-keyed stored-column map relies on (the backing is built column-for-
+ * column from the body output). A source `alter` followed by `refresh` can break it
+ * without marking the MV permanently unusable: the backing's column order and a
+ * re-planned `select *` body's output order diverge (a new source column appends to
+ * the backing but interleaves in the body). The join arm verifies the invariant
+ * here rather than trusting position, so a desynchronized MV forgoes the rewrite
+ * (the base recompute stays correct) instead of reading the wrong column.
+ */
+function backingAlignsWithBody(mvBodyRoot: RelationalPlanNode, backing: TableSchema): boolean {
+	const attrs = mvBodyRoot.getAttributes();
+	if (attrs.length !== backing.columns.length) return false;
+	for (let i = 0; i < attrs.length; i++) {
+		if (attrs[i].name.toLowerCase() !== backing.columns[i].name.toLowerCase()) return false;
+	}
+	return true;
 }
 
 /** `schema.table` lowercased — the canonical qualified key matching `sourceTables`. */
