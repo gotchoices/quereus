@@ -314,6 +314,48 @@ select * from ac_chk_all order by id;
 → [{"id":1,"base":5},{"id":2,"base":3}]
 DROP TABLE ac_chk_all;
 
+-- MULTIPLE CHECKs on one ADD COLUMN, all satisfied → column added (each predicate
+-- compiled and evaluated per backfilled row).
+create table ac_chk_multi_ok (id integer primary key, base integer null);
+insert into ac_chk_multi_ok (id, base) values (1, 5), (2, 3);
+alter table ac_chk_multi_ok add column c integer default (new.base * 2) check (c > 0) check (c < 100);
+select id, base, c from ac_chk_multi_ok order by id;
+→ [{"id":1,"base":5,"c":10},{"id":2,"base":3,"c":6}]
+DROP TABLE ac_chk_multi_ok;
+
+-- MULTIPLE CHECKs where the SECOND fails for one row (row 1: c=10 fails c < 8): the ALTER
+-- aborts and the table is left unchanged — confirms every predicate is enforced, not just
+-- the first.
+create table ac_chk_multi_bad (id integer primary key, base integer null);
+insert into ac_chk_multi_bad (id, base) values (1, 5), (2, 3);
+alter table ac_chk_multi_bad add column c integer default (new.base * 2) check (c > 0) check (c < 8);
+-- error:
+select * from ac_chk_multi_bad order by id;
+→ [{"id":1,"base":5},{"id":2,"base":3}]
+DROP TABLE ac_chk_multi_bad;
+
+-- After a successful per-row CHECK ADD COLUMN, the CHECK is merged into the table-level
+-- constraint set, so a FUTURE insert violating it is rejected (the backfill enforcement
+-- and write-time enforcement share the same predicate).
+create table ac_chk_future (id integer primary key, base integer null);
+insert into ac_chk_future (id, base) values (1, 5);
+alter table ac_chk_future add column c integer default (new.base * 2) check (c > 0);
+insert into ac_chk_future (id, base, c) values (2, 1, -5);
+-- error:
+select id, base, c from ac_chk_future order by id;
+→ [{"id":1,"base":5,"c":10}]
+DROP TABLE ac_chk_future;
+
+-- COLLATION parity: a `collate nocase` new column with a CHECK comparing it to a lowercase
+-- literal. The backfilled value 'ABC' equals 'abc' only under NOCASE — so this passes iff the
+-- new column's declared collation drives the backfill-time CHECK (matching write-time).
+create table ac_chk_coll (id integer primary key, name text);
+insert into ac_chk_coll (id, name) values (1, 'ABC');
+alter table ac_chk_coll add column c text collate nocase default (new.name) check (c = 'abc');
+select id, name, c from ac_chk_coll order by id;
+→ [{"id":1,"name":"ABC","c":"ABC"}]
+DROP TABLE ac_chk_coll;
+
 -- ADD COLUMN with a new.<col> default on an EMPTY table: no rows to backfill, so
 -- even a NOT NULL per-row default adds cleanly; future inserts derive the value.
 create table ac_empty (id integer primary key, base integer);

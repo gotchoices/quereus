@@ -1112,16 +1112,28 @@ view-write key default use) and hangs the scalar on the `AlterTableNode`; the
 emitter installs a row slot over each existing row and passes a per-row evaluator
 to `module.alterTable`, so `new.<column>` resolves to the existing row's sibling.
 The memory module applies the evaluator while it appends the column (building the
-new tree locally and swapping it in only once every row migrates), enforcing the
-column's NOT NULL on the produced value before commit. New CHECK constraints are
-validated against the backfilled rows afterward (a post-`alterTable` scan),
-reverting the column add on a violation — but **only for the literal-default
-path**: the post-scan reads a pre-backfill snapshot for the per-row evaluator
-path, so ADD COLUMN with both a non-foldable default and a CHECK on the new
-column is currently rejected at plan-build time (`StatusCode.UNSUPPORTED`) rather
-than admitting unvalidated rows (fix ticket
-`alter-add-column-backfill-check-enforcement`). `ADD CONSTRAINT` likewise
-validates at first INSERT/UPDATE.
+new tree locally and swapping it in only once every row migrates; the store module
+likewise accumulates into a batch and writes only after the loop), enforcing the
+column's NOT NULL on the produced value before commit. CHECK enforcement splits by
+default kind:
+
+- **Literal / NULL default** — new CHECK constraints are validated against the
+  backfilled rows by a post-`alterTable` scan, reverting the column add on a
+  violation.
+- **Non-foldable (per-row) default** — each column-level CHECK is compiled at
+  plan-build time (against the existing columns plus the new column) and evaluated
+  *inside the per-row backfill hook* against `[...existingRow, backfilledValue]`,
+  mirroring the per-row NOT NULL path. A violating row throws mid-loop, so the
+  module's local tree/batch is discarded before any swap and the catalog is never
+  mutated — no separate revert needed. The post-scan is skipped on this path
+  (it would read a stale pre-backfill snapshot). Truthiness matches write-time
+  CHECK semantics (fails on `false`/`0`, passes on truthy/NULL), and the new
+  column's declared collation is carried into the predicate so comparisons resolve
+  the same collation as at write time.
+
+The compiled CHECKs are also merged into the table-level constraint set, so future
+INSERT/UPDATE enforce them the same way. `ADD CONSTRAINT` likewise validates at
+first INSERT/UPDATE.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion

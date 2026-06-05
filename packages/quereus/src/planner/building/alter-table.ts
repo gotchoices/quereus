@@ -230,6 +230,10 @@ function buildAddColumnChecks(
     sourceRelation: 'add-column-check',
   }));
   const newColNotNull = (columnDef.constraints ?? []).some(c => c.type === 'notNull');
+  // Carry the new column's declared collation so a CHECK comparison over it (e.g.
+  // `c = 'ABC'` on a `collate nocase` column) resolves the same collation at backfill
+  // time as it would at write time.
+  const newColCollation = columnDef.constraints?.find(c => c.type === 'collate')?.collation;
   const newColAttr: Attribute = {
     id: PlanNode.nextAttrId(),
     name: columnDef.name,
@@ -238,6 +242,7 @@ function buildAddColumnChecks(
       logicalType: inferType(columnDef.dataType),
       nullable: !newColNotNull,
       isReadOnly: false,
+      collationName: newColCollation,
     },
     sourceRelation: 'add-column-check',
   };
