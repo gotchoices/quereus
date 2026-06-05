@@ -2132,3 +2132,39 @@ select cc, cv, pv from ojv order by cc;
 -- carrying the pv=99 written through the matched non-preserved-side update above.
 select pv from ojp order by pv;
 → [{"pv":99},{"pv":333}]
+
+-- ===================================
+-- Outer-join INSERT with FK ENFORCEMENT ON (the per-row conditional key thread).
+-- The preserved (FK-child) side threads the minted shared key into its join column
+-- only for rows whose non-preserved (FK-parent) partner is present that row; for a row
+-- whose pv is null the partner insert is dropped and the child's `pr` is nulled — so
+-- the FK never dangles (previously: `CHECK constraint failed: _fk_ojc2_pr`).
+-- ===================================
+pragma foreign_keys = true;
+create table ojp2 (pp integer primary key default (coalesce((select max(pp) from ojp2), 0) + mutation_ordinal()), pv integer null);
+create table ojc2 (cc integer primary key, pr integer null references ojp2(pp), cv integer null);
+create view ojv2 as select c.cc as cc, c.cv as cv, p.pv as pv from ojc2 c left join ojp2 p on p.pp = c.pr;
+
+-- Both-side insert with a NULL pv: the parent is dropped (presence-gated absent), the
+-- child's `pr` is nulled, no FK violation. The row reads back null-extended.
+insert into ojv2 (cc, cv, pv) values (5, 55, null);
+select cc, cv, pv from ojv2 where cc = 5;
+→ [{"cc":5,"cv":55,"pv":null}]
+-- ojc2.pr is null (no dangling FK), and no parent was minted.
+select pr from ojc2 where cc = 5;
+→ [{"pr":null}]
+select count(*) as n from ojp2;
+→ [{"n":0}]
+
+-- A non-null pv in the SAME multi-row insert still mints + threads the real key: the
+-- parent materializes and the child's `pr` points at it (null pv row stays null-extended).
+insert into ojv2 (cc, cv, pv) values (6, 66, null), (7, 77, 777);
+select cc, cv, pv from ojv2 where cc in (6, 7) order by cc;
+→ [{"cc":6,"cv":66,"pv":null},{"cc":7,"cv":77,"pv":777}]
+-- cc=6 (null pv) reads pr null; cc=7 (non-null pv) reads pr = the minted parent key.
+select cc, case when pr is null then 'null' else 'fk' end as pr_kind from ojc2 where cc in (6, 7) order by cc;
+→ [{"cc":6,"pr_kind":"null"},{"cc":7,"pr_kind":"fk"}]
+-- exactly one parent row materialized (for cc=7); its pv is the supplied 777.
+select pv from ojp2 order by pv;
+→ [{"pv":777}]
+pragma foreign_keys = false;

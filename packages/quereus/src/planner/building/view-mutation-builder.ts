@@ -474,6 +474,14 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 			: scan;
 		const projections: Projection[] = side.targetColumns.map((baseColumn, k) => {
 			const envIdx = side.envelopeIndices[k];
+			// The shared-key column of an FK-child side is threaded conditionally: it
+			// projects null for a row whose presence-gated partner is absent, so the FK
+			// does not dangle (§ Outer Joins — Inserts). Every other column — and the key
+			// of an unconditional (parent/anchor) side — is a plain envelope reference.
+			if (side.keyGate && k === side.keyGate.keyTargetIndex) {
+				const node = buildGatedKeyProjection(ctx, envelopeAttrs, envIdx, side.keyGate.groups);
+				return { node, alias: baseColumn };
+			}
 			const attr = envelopeAttrs[envIdx];
 			const ref = new ColumnReferenceNode(
 				ctx.scope,
@@ -727,20 +735,59 @@ function buildMemberDefaultRowScope(
 }
 
 /**
+ * A scope resolving each envelope column by name to a `ColumnReferenceNode` over the
+ * materialized envelope rows (by the attribute's stable id + position). Shared by
+ * {@link buildPresenceGate} and {@link buildGatedKeyProjection}, so a parsed predicate /
+ * CASE over the envelope columns binds identically to the inlined plan nodes.
+ */
+function envelopeColumnScope(ctx: PlanningContext, envelopeAttrs: Attribute[]): RegisteredScope {
+	const scope = new RegisteredScope(ctx.scope);
+	envelopeAttrs.forEach((attr, i) => {
+		scope.registerSymbol(attr.name.toLowerCase(), (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
+	});
+	return scope;
+}
+
+/** The `<col> is not null` OR-disjunction over the envelope columns named by `indices`. */
+function presencePredicateSql(envelopeAttrs: Attribute[], indices: readonly number[]): string {
+	return indices.map(i => `${quoteIdent(envelopeAttrs[i].name)} is not null`).join(' or ');
+}
+
+/**
  * Build the per-row presence predicate gating an optional / EAV member insert:
  * `<col> is not null [or <col> is not null …]` over the envelope columns named by
  * `gateIndices`. Resolved against a scope registering the envelope attributes (by
  * their stable ids), so the predicate reads the materialized envelope rows.
  */
 function buildPresenceGate(ctx: PlanningContext, envelopeAttrs: Attribute[], gateIndices: readonly number[]): ScalarPlanNode {
-	const gateScope = new RegisteredScope(ctx.scope);
-	envelopeAttrs.forEach((attr, i) => {
-		gateScope.registerSymbol(attr.name.toLowerCase(), (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
-	});
-	const predicateSql = gateIndices.map(i => `${quoteIdent(envelopeAttrs[i].name)} is not null`).join(' or ');
-	const ast = parseExpressionString(predicateSql);
+	const gateScope = envelopeColumnScope(ctx, envelopeAttrs);
+	const ast = parseExpressionString(presencePredicateSql(envelopeAttrs, gateIndices));
 	return buildExpression({ ...ctx, scope: gateScope }, ast) as ScalarPlanNode;
+}
+
+/**
+ * Build the conditional shared-key projection for an FK-child side whose key column
+ * must not dangle: `case when <pred> then "<keyCol>" else null end`, where `<pred>` is
+ * the AND, over each presence-gated FK-parent partner, of that partner's presence
+ * predicate (the OR of its supplied columns being non-null). When every referenced
+ * partner is absent for a row, the key projects null — the correct "no partner" marker —
+ * so the preserved FK-child row does not reference a shared key with no partner row
+ * (§ Outer Joins — Inserts). `keyEnvIdx` names the key column (the appended
+ * `__shared_key` or a supplied key view column); resolved against the same envelope
+ * column scope {@link buildPresenceGate} uses.
+ */
+function buildGatedKeyProjection(
+	ctx: PlanningContext,
+	envelopeAttrs: Attribute[],
+	keyEnvIdx: number,
+	groups: readonly (readonly number[])[],
+): ScalarPlanNode {
+	const scope = envelopeColumnScope(ctx, envelopeAttrs);
+	const pred = groups.map(g => `(${presencePredicateSql(envelopeAttrs, g)})`).join(' and ');
+	const keyCol = quoteIdent(envelopeAttrs[keyEnvIdx].name);
+	const ast = parseExpressionString(`case when ${pred} then ${keyCol} else null end`);
+	return buildExpression({ ...ctx, scope }, ast) as ScalarPlanNode;
 }
 
 /**

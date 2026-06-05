@@ -347,6 +347,17 @@ export interface MsInsertSide {
 	 * (`buildDecompositionMemberInsert`).
 	 */
 	readonly presenceGateIndices: readonly number[];
+	/**
+	 * Set when this side's shared-key (FK-child) column must be threaded conditionally:
+	 * `keyTargetIndex` is its position in `targetColumns` (0 — the key is pushed first
+	 * when `needsSharedKey`), and `groups` is an AND-of-(OR-within) list of envelope
+	 * indices — one inner group per presence-gated FK-parent partner — that gates the
+	 * key. When all referenced presence-gated partners are absent for a row, the key
+	 * column projects null (the correct "no partner" marker), so the FK does not dangle
+	 * (§ Outer Joins — Inserts). Absent ⇒ the key threads unconditionally (a
+	 * parent/anchor side, or a key shared only among always-active sides).
+	 */
+	readonly keyGate?: { readonly keyTargetIndex: number; readonly groups: readonly (readonly number[])[] };
 }
 
 /**
@@ -553,15 +564,16 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	// Per active side: the shared key (when needed) plus the supplied view columns it
 	// owns. A non-preserved active side carries a presence gate over its supplied columns.
 	//
-	// v1 caveat: when a non-preserved side IS active but a *given row's* supplied values are
-	// all null (its presence gate fails for that row), that row's non-preserved insert is
-	// dropped while the preserved side still threads the minted key into its join column —
-	// so a preserved row whose optional partner is absent for that row points its FK column
-	// at a key with no partner row (it reads back correctly null-extended, but with FK
-	// enforcement on this is a dangling reference). The tested path is single-row inserts
-	// with FK off; the per-row conditional key thread (`pr = case when <present> then key
-	// else null`) is deferred. The *statically* absent case (a non-preserved side with NO
-	// supplied columns) is handled cleanly above: it is inactive ⇒ no key is threaded.
+	// When a non-preserved side IS active but a *given row's* supplied values are all null
+	// (its presence gate fails for that row), that row's non-preserved insert is dropped.
+	// An FK-child side that threads the minted key into its join column unconditionally
+	// would then point that FK column at a key with no partner row (a dangling reference —
+	// an FK violation under enforcement, a latent spooky-join otherwise). The per-row
+	// conditional key thread below (`keyGate`) closes that: the FK-child's key column is
+	// nulled for exactly the rows whose presence-gated partner is absent, so the
+	// preserved row reads back cleanly null-extended with no dangling FK. The *statically*
+	// absent case (a non-preserved side with NO supplied columns) needs no gate — it is
+	// inactive ⇒ no key is threaded at all.
 	const specByIndex = new Map<number, MsInsertSide>();
 	for (const sideIndex of activeIndices) {
 		const side = sides[sideIndex];
@@ -583,6 +595,35 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		});
 		assertNoMissingNotNull(view, side.schema, targetColumns);
 		specByIndex.set(sideIndex, { table: side.table, schema: side.schema, targetColumns, envelopeIndices, presenceGateIndices });
+	}
+
+	// Per-row conditional key thread (the FK-dangling-key fix). With the key minted/threaded,
+	// any active side `S` that declares a foreign key onto a presence-gated active partner
+	// `P` must NOT point its key (FK) column at the shared key for a row where `P` is
+	// per-row absent (its presence gate fails, dropping its insert) — otherwise `S`'s row
+	// references a key with no partner row. Gate `S`'s key column on the AND, over each
+	// such partner, of that partner's presence predicate (the OR of its supplied columns
+	// being non-null — its own `presenceGateIndices`), nulling the key when all such
+	// partners are absent. A parent/anchor side (whose key is its own referenced PK)
+	// declares no FK onto the partner ⇒ no gate ⇒ its key threads unconditionally (nulling
+	// a NOT NULL PK would be wrong); a key shared only among always-active sides likewise
+	// stays unconditional. The key sits at target index 0 (pushed first under
+	// `needsSharedKey`).
+	if (needsSharedKey) {
+		for (const sideIndex of activeIndices) {
+			const groups: number[][] = [];
+			for (const partnerIndex of activeIndices) {
+				if (partnerIndex === sideIndex) continue;
+				const partner = specByIndex.get(partnerIndex)!;
+				if (partner.presenceGateIndices.length === 0) continue; // an always-active partner
+				if (!sideDeclaresFkOnto(sides[sideIndex], sides[partnerIndex])) continue;
+				groups.push([...partner.presenceGateIndices]);
+			}
+			if (groups.length > 0) {
+				const spec = specByIndex.get(sideIndex)!;
+				specByIndex.set(sideIndex, { ...spec, keyGate: { keyTargetIndex: 0, groups } });
+			}
+		}
 	}
 
 	const order = orderSides(sides).filter(i => specByIndex.has(i));

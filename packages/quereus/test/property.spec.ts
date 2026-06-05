@@ -4609,6 +4609,50 @@ describe('Property-Based Tests', () => {
 				), { numRuns: 50 });
 			});
 
+			// ----- Outer (LEFT) join INSERT under FK ENFORCEMENT: per-row conditional key thread -----
+			// With `pragma foreign_keys = true`, a both-side insert whose non-preserved (FK-parent)
+			// value is null drops the parent insert for that row; the preserved (FK-child) side must
+			// then NULL its join column rather than thread the minted key — else the child's FK points
+			// at a minted key with no partner row (a dangling reference: the synthesized `_fk_*` CHECK
+			// fails at deferred-constraint commit time). The non-null rows in the SAME multi-row insert
+			// still mint + thread the real key and materialize the parent. Mirrors the fix ticket's repro.
+			it('outer (left) join insert: FK-enforced per-row conditional key thread (no dangling FK)', async () => {
+				await db.exec('pragma foreign_keys = true');
+				await db.exec('drop view if exists fkojv');
+				await db.exec('drop table if exists fkojc');
+				await db.exec('drop table if exists fkojp');
+				// The preserved anchor's partner (parent) declares the high-water-mark allocator the
+				// both-side insert mints the shared key from; the child carries the FK onto it.
+				await db.exec('create table fkojp (pp integer primary key default (coalesce((select max(pp) from fkojp), 0) + mutation_ordinal()), pv integer null) using memory');
+				await db.exec('create table fkojc (cc integer primary key, pr integer null references fkojp(pp), cv integer null) using memory');
+				await db.exec('create view fkojv as select c.cc as cc, c.cv as cv, p.pv as pv from fkojc c left join fkojp p on p.pp = c.pr');
+
+				// Single-row both-side insert with a NULL non-preserved value: the parent is dropped,
+				// the child's `pr` is nulled — no FK violation — and the row reads back null-extended.
+				await db.exec('insert into fkojv (cc, cv, pv) values (5, 55, null)');
+				assertRowsEqual('fk dangling-key view', await readRows('select cc, cv, pv from fkojv where cc = 5'),
+					[{ cc: 5, cv: 55, pv: null }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('fk dangling-key child pr is null', await readRows('select pr from fkojc where cc = 5'),
+					[{ pr: null }], ['pr']);
+				expect((await readRows('select pp from fkojp')).length, 'no parent minted for the null partner').to.equal(0);
+
+				// Multi-row insert mixing null and non-null non-preserved values: each row routes
+				// independently (per-row CASE). The non-null row mints + threads the real key and
+				// materializes the parent; the null row stays null-extended with `pr` null.
+				await db.exec('insert into fkojv (cc, cv, pv) values (6, 66, null), (7, 77, 777)');
+				assertRowsEqual('fk mixed insert view', await readRows('select cc, cv, pv from fkojv where cc in (6, 7) order by cc'),
+					[{ cc: 6, cv: 66, pv: null }, { cc: 7, cv: 77, pv: 777 }], ['cc', 'cv', 'pv']);
+				const childRows = await readRows('select cc, pr from fkojc where cc in (6, 7) order by cc');
+				expect(childRows.find(r => r.cc === 6)!.pr, 'null-partner child pr is null').to.equal(null);
+				expect(childRows.find(r => r.cc === 7)!.pr, 'non-null-partner child pr threads the minted key').to.not.equal(null);
+				// Exactly one parent materialized (for cc=7), carrying the supplied pv=777 — the
+				// threaded FK references a real row, so FK enforcement passed (no dangling key).
+				assertRowsEqual('fk mixed insert parent', await readRows('select pv from fkojp order by pv'),
+					[{ pv: 777 }], ['pv']);
+
+				await db.exec('pragma foreign_keys = false');
+			});
+
 			// ----- Outer (LEFT) join: non-preserved-side UPDATE (matched + null-extended) -----
 			// `npv` = np_child LEFT JOIN np_parent on parent.pp = child.pr. Updating the
 			// non-preserved column `pv` splits per row: a MATCHED row updates the joined parent
