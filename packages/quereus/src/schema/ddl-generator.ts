@@ -26,8 +26,17 @@ import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 
 /**
  * Unconditionally double-quote an identifier, escaping internal quotes.
- * Used for table/column names in DDL where consistent quoting is safer than
- * the context-sensitive behavior of `quoteIdentifier` (which is for AST stringification).
+ *
+ * This generator deliberately uses two quoting policies:
+ *   - `quoteName` (here, unconditional) for *structural* names — table, column,
+ *     schema, index, and primary-key columns — so they always emit quoted.
+ *   - `quoteIdentifier` (conditional; from `../emit/ast-stringify.js`) for
+ *     *operand* identifiers — collation name, USING module name, vtab-arg key,
+ *     and tag key — which stay bare unless they are reserved words / non-bare-
+ *     valid. This keeps the common forms readable and re-parseable
+ *     (`USING store`, `COLLATE NOCASE`) while still quoting a reserved-word name
+ *     (`USING "select"`). Both forms re-parse; the split matches the canonical
+ *     DDL convention pinned by the quereus-store ddl-generator spec.
  */
 function quoteName(name: string): string {
 	return `"${name.replace(/"/g, '""')}"`;
