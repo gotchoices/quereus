@@ -218,4 +218,51 @@ describe('Materialized-view query rewrite — aggregate-rollup equivalence (rewr
 			expect(plan, `expected a backing rewrite for: ${q}`).to.match(/_mv_/);
 		}
 	});
+
+	/* The property corpus only emits bare `group by … agg(…)` queries. These deterministic
+	 * cases pin the shapes that wrap or nest the rewritten Aggregate — a HAVING / ORDER BY
+	 * parent, a computed-over-aggregate top Project, and a subquery wrapper — where the rule
+	 * fires on the inner Aggregate and must leave the parent's output (and order) intact. */
+	const WRAPPED_QUERIES: readonly string[] = [
+		'select k, sum(x) as s from t group by k having sum(x) > 2',          // HAVING over a rollup
+		'select k, j, sum(x) as s from t group by k, j having count(*) > 1',  // HAVING over exact-key
+		'select k, sum(x) + 1, count(*) * 2 from t group by k',               // computed-over-aggregate parent (rollup)
+		'select sum(x) + 100, avg(x), count(*) from t',                       // computed-over-aggregate parent (global)
+		'select * from (select k, sum(x) as s from t group by k) z where s is not null', // nested in a subquery
+	];
+
+	it('wrapped / nested aggregate fragments stay row-identical with the rewrite on vs off', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(aggRowArb, { minLength: 0, maxLength: 8 }),
+			async (rows) => {
+				await loadAggRows(db, rows);
+				for (const q of WRAPPED_QUERIES) {
+					db.optimizer.updateTuning(DEFAULT_TUNING);
+					const on = await readMultiset(db, q);
+					db.optimizer.updateTuning(REWRITE_OFF);
+					const off = await readMultiset(db, q);
+					db.optimizer.updateTuning(DEFAULT_TUNING);
+					expect(on, `rewrite changed rows for: ${q}`).to.deep.equal(off);
+				}
+			},
+		), { numRuns: 25 });
+	});
+
+	it('an ORDER BY over a rollup preserves row order with the rewrite on vs off', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(aggRowArb, { minLength: 0, maxLength: 8 }),
+			async (rows) => {
+				await loadAggRows(db, rows);
+				const q = 'select k, sum(x) as s from t group by k order by k desc';
+				db.optimizer.updateTuning(DEFAULT_TUNING);
+				const on: string[] = [];
+				for await (const row of db.eval(q)) on.push(JSON.stringify(Object.values(row) as SqlValue[]));
+				db.optimizer.updateTuning(REWRITE_OFF);
+				const off: string[] = [];
+				for await (const row of db.eval(q)) off.push(JSON.stringify(Object.values(row) as SqlValue[]));
+				db.optimizer.updateTuning(DEFAULT_TUNING);
+				expect(on, 'ordered rollup diverged').to.deep.equal(off); // ordered compare (NOT sorted)
+			},
+		), { numRuns: 25 });
+	});
 });
