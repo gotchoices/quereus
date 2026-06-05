@@ -10,6 +10,9 @@ packages/sync-coordinator/.data
 # Task runner agent logs
 tasks/.logs/
 
+# Transient scheduled-tasks lock (per-session pid/lock; must not be committed)
+.claude/scheduled_tasks.lock
+
 # Benchmark results
 packages/quereus/bench/results/
 
