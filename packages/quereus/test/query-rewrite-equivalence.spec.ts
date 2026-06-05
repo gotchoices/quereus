@@ -266,3 +266,109 @@ describe('Materialized-view query rewrite — aggregate-rollup equivalence (rewr
 		), { numRuns: 25 });
 	});
 });
+
+/* ── Join-subsumption equivalence ─────────────────────────────────────────────
+ * Extends the harness with the join arm: an MV `jmv` materializing the 1:1 FK→PK
+ * inner join `orders ⋈ customers` answers 1:1-join queries (with driving-side and
+ * lookup-side residual WHEREs) from the backing. Random data spans the load-bearing
+ * boundaries the join rewrite must preserve exactly:
+ *   - the FK→PK boundary — every order's customer_id references an existing customer
+ *     (the generator only emits orders for existing customers, so RI holds);
+ *   - NULL lookup columns — `c.name` / `c.region` are nullable and frequently NULL;
+ *   - the empty-lookup case — with no customers there are no orders, so the join is
+ *     empty and both sides must still agree. */
+
+interface CustRow { id: number; name: string | null; region: number | null }
+interface OrdRow { id: number; customer_id: number; amt: number | null }
+
+const custArb = fc.record({
+	id: fc.integer({ min: 1, max: 4 }),
+	name: fc.option(fc.constantFrom('ann', 'bob', 'cat'), { nil: null }),
+	region: fc.option(fc.integer({ min: -1, max: 3 }), { nil: null }),
+});
+const ordArb = fc.record({
+	id: fc.integer({ min: 1, max: 8 }),
+	customer_id: fc.integer({ min: 1, max: 4 }),
+	amt: fc.option(fc.integer({ min: -3, max: 6 }), { nil: null }),
+});
+
+/** Join queries answerable from `jmv`, plus driving / lookup residual shapes. */
+const JOIN_QUERIES: readonly string[] = [
+	'select o.id, o.amt, c.name from orders o join customers c on o.customer_id = c.id',
+	'select o.id, c.name, c.region from orders o join customers c on o.customer_id = c.id where o.amt > 0',
+	// Lookup-side residual (allowed on the read side).
+	'select c.name, o.amt from orders o join customers c on o.customer_id = c.id where c.region is not null',
+	// Mixed driving + lookup residual.
+	'select o.id, c.name from orders o join customers c on o.customer_id = c.id where o.amt >= 0 and c.region > 0',
+	// NULL-sensitive driving residual.
+	'select o.id from orders o join customers c on o.customer_id = c.id where o.amt is null',
+];
+
+const JOIN_MUST_REWRITE: readonly string[] = [
+	'select o.id, o.amt, c.name from orders o join customers c on o.customer_id = c.id',
+	'select o.id, c.name, c.region from orders o join customers c on o.customer_id = c.id where o.amt > 0',
+];
+
+function litText(v: string | null): string {
+	return v === null ? 'null' : `'${v}'`;
+}
+
+async function loadJoinRows(db: Database, customers: readonly CustRow[], orders: readonly OrdRow[]): Promise<void> {
+	await db.exec('delete from orders'); // child first (FK)
+	await db.exec('delete from customers');
+	const custById = new Map<number, CustRow>();
+	for (const c of customers) custById.set(c.id, c);
+	for (const c of custById.values()) {
+		await db.exec(`insert into customers (id, name, region) values (${c.id}, ${litText(c.name)}, ${lit(c.region)})`);
+	}
+	const ordById = new Map<number, OrdRow>();
+	for (const o of orders) {
+		if (custById.has(o.customer_id)) ordById.set(o.id, o); // RI: only orders for existing customers
+	}
+	for (const o of ordById.values()) {
+		await db.exec(`insert into orders (id, customer_id, amt) values (${o.id}, ${o.customer_id}, ${lit(o.amt)})`);
+	}
+}
+
+describe('Materialized-view query rewrite — join-subsumption equivalence (rewritten == unrewritten)', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec(`
+			create table customers (id integer primary key, name text null, region integer null);
+			create table orders (id integer primary key, customer_id integer not null, amt integer null,
+				foreign key (customer_id) references customers(id));
+			create materialized view jmv as
+				select o.id, o.customer_id, o.amt, c.name, c.region
+				from orders o join customers c on o.customer_id = c.id;
+		`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('every 1:1-join query returns identical rows with the rewrite on vs off', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(custArb, { minLength: 0, maxLength: 4 }),
+			fc.array(ordArb, { minLength: 0, maxLength: 8 }),
+			async (customers, orders) => {
+				await loadJoinRows(db, customers, orders);
+				for (const q of JOIN_QUERIES) {
+					db.optimizer.updateTuning(DEFAULT_TUNING);
+					const on = await readMultiset(db, q);
+					db.optimizer.updateTuning(REWRITE_OFF);
+					const off = await readMultiset(db, q);
+					db.optimizer.updateTuning(DEFAULT_TUNING);
+					expect(on, `rewrite changed rows for: ${q}`).to.deep.equal(off);
+				}
+			},
+		), { numRuns: 40 });
+	});
+
+	it('the harness is non-vacuous: the rewritable join queries actually rewrite', () => {
+		for (const q of JOIN_MUST_REWRITE) {
+			const plan = serializePlanTree(db.getPlan(q));
+			expect(plan, `expected a backing rewrite for: ${q}`).to.match(/_mv_/);
+			expect(plan, `expected the join eliminated for: ${q}`).to.not.match(/Join/i);
+		}
+	});
+});

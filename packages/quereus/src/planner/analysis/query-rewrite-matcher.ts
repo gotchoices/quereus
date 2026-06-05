@@ -49,7 +49,8 @@
  * what the plan computes, so it cannot produce a false Match.
  */
 
-import type { RelationalPlanNode, ScalarPlanNode, GuardClause, Attribute } from '../nodes/plan-node.js';
+import type { RelationalPlanNode, ScalarPlanNode, GuardClause, Attribute, PlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import { ProjectNode } from '../nodes/project-node.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
@@ -59,10 +60,13 @@ import { SeqScanNode, IndexScanNode } from '../nodes/table-access-nodes.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 import { AggregateNode } from '../nodes/aggregate-node.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
+import { JoinNode } from '../nodes/join-node.js';
+import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaterializedViewSchema } from '../../schema/view.js';
 import type { TableSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
+import { proveOneToOneJoin, pureJoinEquiAttrPairs } from './coverage-prover.js';
 import { containsNonDeterministicCall } from './check-extraction.js';
 
 export type RewriteFailureReason =
@@ -107,6 +111,19 @@ export interface RewriteMatch {
 	 * references onto the backing scan.
 	 */
 	readonly backingColOfBaseCol: ReadonlyMap<number, number>;
+	/**
+	 * Present iff this match answers a **join** fragment from a 1:1-join MV (the
+	 * {@link matchJoinFragmentToMv} arm). The single-source arms key their residual
+	 * re-bind on the base column index, which is ambiguous across a join (the same
+	 * index can name a column of either source). The join arm therefore re-binds the
+	 * residual by **stable source attribute id** instead: this maps each fragment
+	 * `T`/`P` source attribute id to the backing column that stores it. Absent ⇒ use
+	 * {@link backingColOfBaseCol}.
+	 */
+	readonly backingColOfSourceAttrId?: ReadonlyMap<number, number>;
+	/** Present iff this is a {@link matchJoinFragmentToMv} match — carries the cost
+	 *  gate's per-side cardinality inputs. Absent for the single-source arms. */
+	readonly joinInfo?: JoinRewriteInfo;
 	/**
 	 * Present iff this match answers an **aggregate** fragment from a grouped MV
 	 * (the {@link matchAggregateFragmentToMv} arm). Absent ⇒ a plain
@@ -158,6 +175,14 @@ export interface AggregateRollup {
 	readonly groupOutAttrs: readonly Attribute[];
 	/** One recipe per fragment aggregate, in fragment aggregate order. */
 	readonly aggregates: readonly AggregateRecipe[];
+}
+
+/** Per-side cardinality inputs for the join arm's cost gate (see the rule). The
+ *  driving `T` side is 1:1 with the joined output, so the backing carries one row
+ *  per governed `T` row; the recompute side additionally pays the `P` scan + join. */
+export interface JoinRewriteInfo {
+	readonly drivingTable: TableSchema;
+	readonly lookupTable: TableSchema;
 }
 
 export type RewriteResult =
@@ -707,6 +732,411 @@ export function matchAggregateMaterializedViewRewrite(
 	const frag = analyzeAggregateFragment(root);
 	if (!frag.ok) return fail(frag.reason);
 	return matchAggregateFragmentToMv(frag.shape, mv, backing, isDeterministic);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Join-subsumption arm — recognize a query whose join is covered by a 1:1
+ * row-preserving inner/cross-join MV body (`mv-query-rewrite-join-subsumption`),
+ * and answer it from the MV's backing table (eliminating the join at read time).
+ *
+ * The hard soundness question — "does this join contribute exactly one row per
+ * governed `T` row?" — is the coverage prover's shared `proveOneToOneJoin`
+ * (no-row-loss descent + `proveJoinNoFanout`). A 1:1 join's output relation is in
+ * bijection with `T`'s governed rows, so two 1:1 joins over the *same tables, same
+ * equi-pairs, same join type* produce the same row set. This arm therefore proves
+ * both the **fragment's** join and the **MV body's** join are 1:1 over the same
+ * `(T, lookup, type, equi-pairs)`, then reuses the foundation's projection /
+ * residual subsumption over the joined output relation.
+ *
+ * The MV body is supplied as its already-optimized relational root (the rule plans
+ * it once, suppressed, and caches it) so `proveOneToOneJoin` runs against the same
+ * shape the create-time `'join-residual'` gate proved.
+ *
+ * Read-side relaxation: a join MV body carries **no WHERE** (the row-time
+ * `'join-residual'` create gate rejects a partial join body), so predicate
+ * entailment is trivial — every fragment WHERE conjunct is residual. Unlike the
+ * row-time arm, a WHERE term on a *lookup-side* column is fine here: we are only
+ * *reading* the already-materialized join, so the residual filters the stored
+ * joined rows directly.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** The recognized shape of a join query fragment: its `Project` root, the single
+ *  binary join, the two base table references, and the post-join WHERE conjuncts. */
+export interface JoinFragmentShape {
+	readonly project: ProjectNode;
+	readonly joinNode: JoinNode;
+	/** The two base-table references under the join (exactly two, distinct tables). */
+	readonly tableRefs: readonly [TableReferenceNode, TableReferenceNode];
+	/** Top-level AND-split conjuncts of the post-join WHERE (empty ⇒ no filter). */
+	readonly conjuncts: readonly ScalarPlanNode[];
+}
+
+export type JoinFragmentResult =
+	| { ok: true; shape: JoinFragmentShape }
+	| { ok: false; reason: RewriteFailureReason };
+
+/**
+ * Recognize a query fragment rooted at a `ProjectNode` whose source descends —
+ * through an optional `Filter` (post-join WHERE) and single-source pass-throughs —
+ * into a single binary {@link JoinNode} over exactly two distinct base tables. Any
+ * other shape (no join, a multi-way join, a non-passthrough node, a row-reducing
+ * scan) ⇒ `'shape'`. The fragment is pristine (the rule fires before
+ * predicate-pushdown / grow-retrieve), so the join's `ON` condition and the WHERE
+ * `Filter` are still explicit.
+ */
+export function analyzeJoinQueryFragment(root: RelationalPlanNode): JoinFragmentResult {
+	if (!(root instanceof ProjectNode)) return { ok: false, reason: 'shape' };
+
+	const walk = walkToFragmentJoin(root.source);
+	if (!walk) return { ok: false, reason: 'shape' };
+	const { joinNode, conjuncts } = walk;
+
+	// Exactly two distinct base tables under the join (a self-join or a 3-way join
+	// is out of scope — the latter is partial-join matching, deferred).
+	const tableRefs = collectBaseTableRefs(joinNode);
+	if (tableRefs.length !== 2) return { ok: false, reason: 'shape' };
+	if (qualifiedOf(tableRefs[0].tableSchema) === qualifiedOf(tableRefs[1].tableSchema)) {
+		return { ok: false, reason: 'shape' }; // self-join
+	}
+
+	return { ok: true, shape: { project: root, joinNode, tableRefs: [tableRefs[0], tableRefs[1]], conjuncts } };
+}
+
+/**
+ * Walk a fragment's `Project.source` down to its single binary join, collecting the
+ * post-join WHERE conjuncts. Passes through `Filter` (splitting its predicate),
+ * `Retrieve`, and `Alias`; returns `undefined` for any other node (so a Distinct /
+ * Aggregate / second join above the first ⇒ NotMatch).
+ */
+function walkToFragmentJoin(
+	start: RelationalPlanNode | undefined,
+): { joinNode: JoinNode; conjuncts: ScalarPlanNode[] } | undefined {
+	const conjuncts: ScalarPlanNode[] = [];
+	let node: RelationalPlanNode | undefined = start;
+	while (node) {
+		if (node instanceof JoinNode) return { joinNode: node, conjuncts };
+		if (node instanceof FilterNode) {
+			splitConjuncts(node.predicate, conjuncts);
+			node = node.source;
+			continue;
+		}
+		if (node instanceof RetrieveNode || node instanceof AliasNode) {
+			node = singleRelation(node);
+			if (!node) return undefined;
+			continue;
+		}
+		return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Decide whether the 1:1-join MV `mv` (optimized body `mvBodyRoot`, backed by
+ * `backing`) answers the join fragment `shape`. See the arm doc above for the
+ * soundness contract; every check forgoes on doubt.
+ *
+ * `mvBodyRoot` is the MV body's optimized relational root (the rule plans it
+ * suppressed and caches it). When the rule could not plan it, pass `undefined` ⇒
+ * `no-candidate`.
+ */
+export function matchJoinFragmentToMv(
+	shape: JoinFragmentShape,
+	mv: MaterializedViewSchema,
+	mvBodyRoot: RelationalPlanNode | undefined,
+	backing: TableSchema | undefined,
+	isDeterministic: DeterminismProbe,
+): RewriteResult {
+	// ---- Candidate gates (a false-positive here only forgoes a speedup). ----
+	if (mv.stale === true) return fail('no-candidate');
+	if (!backing) return fail('no-candidate');
+	if (!mvBodyRoot) return fail('no-candidate'); // body did not plan
+	if (mvBodyHasNonDeterminism(mv.selectAst, isDeterministic)) return fail('no-candidate');
+
+	// ---- Source-set match: the MV must read exactly the fragment's two tables. ----
+	const qualA = qualifiedOf(shape.tableRefs[0].tableSchema);
+	const qualB = qualifiedOf(shape.tableRefs[1].tableSchema);
+	const mvSources = new Set(mv.sourceTables);
+	if (mvSources.size !== 2 || !mvSources.has(qualA) || !mvSources.has(qualB)) {
+		return fail('source-mismatch');
+	}
+
+	// ---- Join equivalence: find a (T, lookup) assignment over which BOTH the
+	//      fragment and the MV body are provably 1:1, with the same inner/cross join
+	//      type and the same equi-pairs. A mismatch on any ⇒ NotMatch (shape). ----
+	const assignment = findJoinAssignment(shape, mvBodyRoot);
+	if (!assignment) return fail('shape');
+	const { drivingRef, lookupRef, mvDrivingRef, mvLookupRef } = assignment;
+
+	// ---- Stored-column map: each MV backing column (by output position) → the
+	//      (side, base column) it passes through. A computed MV column is unmapped. ----
+	const stored = mvStoredJoinColumns(mvBodyRoot, mvDrivingRef, mvLookupRef);
+
+	// Fragment source attribute id → (side, base column).
+	const fragDriving = attrToBaseCol(drivingRef);
+	const fragLookup = attrToBaseCol(lookupRef);
+
+	// ---- Projection coverage: every fragment output column must be a bare
+	//      passthrough of a `T`/`P` column the MV stores. ----
+	const outputColumnMap: { attrId: number; backingCol: number }[] = [];
+	const outAttrs = shape.project.getAttributes();
+	const projections = shape.project.projections;
+	for (let i = 0; i < projections.length; i++) {
+		const proj = projections[i];
+		if (!(proj.node instanceof ColumnReferenceNode)) return fail('missing-column'); // computed output
+		const backingCol = backingColForAttr(proj.node.attributeId, fragDriving, fragLookup, stored);
+		if (backingCol === undefined) return fail('missing-column');
+		outputColumnMap.push({ attrId: outAttrs[i].id, backingCol });
+	}
+
+	// ---- Residual: the MV body has no WHERE (the row-time gate forbids it), so the
+	//      whole fragment WHERE is residual. Every conjunct must be a subquery-free
+	//      predicate over stored `T`/`P` columns so it re-binds onto the backing. ----
+	const backingColOfSourceAttrId = storedSourceAttrIds(fragDriving, fragLookup, stored);
+	for (const conjunct of shape.conjuncts) {
+		if (conjunctHasSubquery(conjunct)) return fail('predicate-not-entailed');
+		for (const attrId of conjunctColumnAttrIds(conjunct)) {
+			if (!backingColOfSourceAttrId.has(attrId)) return fail('missing-column');
+		}
+	}
+
+	return {
+		match: {
+			mv,
+			backing,
+			residualClauses: [],
+			residualConjuncts: shape.conjuncts,
+			outputColumnMap,
+			backingColOfBaseCol: new Map(),
+			backingColOfSourceAttrId,
+			joinInfo: { drivingTable: drivingRef.tableSchema, lookupTable: lookupRef.tableSchema },
+		},
+	};
+}
+
+/**
+ * Convenience entry point (used by the unit tests): analyze `root` as a join
+ * fragment and, on success, match it against `mv` (whose optimized body root is
+ * `mvBodyRoot`).
+ */
+export function matchJoinMaterializedViewRewrite(
+	root: RelationalPlanNode,
+	mv: MaterializedViewSchema,
+	mvBodyRoot: RelationalPlanNode | undefined,
+	backing: TableSchema | undefined,
+	isDeterministic: DeterminismProbe,
+): RewriteResult {
+	const frag = analyzeJoinQueryFragment(root);
+	if (!frag.ok) return fail(frag.reason);
+	return matchJoinFragmentToMv(frag.shape, mv, mvBodyRoot, backing, isDeterministic);
+}
+
+/** A proven (driving `T`, lookup `P`) assignment shared by the fragment and the MV
+ *  body — both provably 1:1 over `T`, same inner/cross type, same equi-pairs. */
+interface JoinAssignment {
+	readonly drivingRef: TableReferenceNode;
+	readonly lookupRef: TableReferenceNode;
+	readonly mvDrivingRef: TableReferenceNode;
+	readonly mvLookupRef: TableReferenceNode;
+}
+
+/**
+ * Find a (driving, lookup) assignment of the fragment's two tables over which the
+ * fragment join *and* the MV body join are both provably 1:1 (inner/cross),
+ * carrying the same equi-pairs in `(driving-col, lookup-col)` terms. Tries each
+ * table as the driver; returns the first that discharges every obligation, else
+ * `undefined` (⇒ a `shape` NotMatch). A 1:1 FK join determines the driver uniquely,
+ * so at most one assignment ever succeeds.
+ */
+function findJoinAssignment(shape: JoinFragmentShape, mvBodyRoot: RelationalPlanNode): JoinAssignment | undefined {
+	const [a, b] = shape.tableRefs;
+	for (const [drivingRef, lookupRef] of [[a, b], [b, a]] as const) {
+		const driving = drivingRef.tableSchema;
+
+		// Both joins must be 1:1 over this driver, via an inner/cross top join.
+		const fragProof = proveOneToOneJoin(shape.joinNode, driving);
+		if (!fragProof.ok || !fragProof.topJoin || !isInnerOrCross(fragProof.topJoin)) continue;
+		const mvProof = proveOneToOneJoin(mvBodyRoot, driving);
+		if (!mvProof.ok || !mvProof.topJoin || !isInnerOrCross(mvProof.topJoin)) continue;
+
+		// Locate the MV body's matching table references (by qualified name).
+		const mvDrivingRef = findTableRef(mvBodyRoot, qualifiedOf(driving));
+		const mvLookupRef = findTableRef(mvBodyRoot, qualifiedOf(lookupRef.tableSchema));
+		if (!mvDrivingRef || !mvLookupRef) continue;
+
+		// Same equi-pairs (as a set, in driving→lookup base-column terms).
+		const fragPairs = equiPairsByBaseCol(fragProof.topJoin, drivingRef, lookupRef);
+		const mvPairs = equiPairsByBaseCol(mvProof.topJoin, mvDrivingRef, mvLookupRef);
+		if (!fragPairs || !mvPairs || !sameStringSet(fragPairs, mvPairs)) continue;
+
+		return { drivingRef, lookupRef, mvDrivingRef, mvLookupRef };
+	}
+	return undefined;
+}
+
+/** True when `join` is an inner or cross join (an outer join is deferred — its
+ *  null-extended rows make the stored relation differ from an inner-join query). */
+function isInnerOrCross(join: RelationalPlanNode): boolean {
+	if (!CapabilityDetectors.isJoin(join)) return false;
+	const t = join.getJoinType();
+	return t === 'inner' || t === 'cross';
+}
+
+/**
+ * The join's equi-pairs as a set of `"drivingCol:lookupCol"` base-column keys, or
+ * `undefined` when the join is not a pure equi-join or a pair does not connect the
+ * driving and lookup tables cleanly. Shared shape for fragment and MV comparison.
+ */
+function equiPairsByBaseCol(
+	topJoin: RelationalPlanNode,
+	drivingRef: TableReferenceNode,
+	lookupRef: TableReferenceNode,
+): Set<string> | undefined {
+	const pairs = pureJoinEquiAttrPairs(topJoin);
+	if (!pairs || pairs.length === 0) return undefined;
+	const dCol = attrToBaseCol(drivingRef);
+	const lCol = attrToBaseCol(lookupRef);
+	const out = new Set<string>();
+	for (const p of pairs) {
+		let d = dCol.get(p.leftAttrId);
+		let l = lCol.get(p.rightAttrId);
+		if (d === undefined || l === undefined) {
+			d = dCol.get(p.rightAttrId);
+			l = lCol.get(p.leftAttrId);
+		}
+		if (d === undefined || l === undefined) return undefined; // not a clean driving↔lookup pair
+		out.add(`${d}:${l}`);
+	}
+	return out;
+}
+
+/** Each MV backing column (by output position) → the `(side, base column)` it
+ *  passes through. A computed MV select item leaves its position unmapped. */
+interface MvStoredJoinColumns {
+	/** Driving-side base column index → backing column index. */
+	readonly driving: ReadonlyMap<number, number>;
+	/** Lookup-side base column index → backing column index. */
+	readonly lookup: ReadonlyMap<number, number>;
+}
+
+function mvStoredJoinColumns(
+	mvBodyRoot: RelationalPlanNode,
+	mvDrivingRef: TableReferenceNode,
+	mvLookupRef: TableReferenceNode,
+): MvStoredJoinColumns {
+	const dAttr = attrToBaseCol(mvDrivingRef);
+	const lAttr = attrToBaseCol(mvLookupRef);
+	const driving = new Map<number, number>();
+	const lookup = new Map<number, number>();
+	// A bare passthrough output column preserves its source attribute id, so the MV
+	// output attribute id resolves back to a driving/lookup base column (cf. the
+	// projection-coverage technique in `coverage-prover.ts`). A computed column gets
+	// a fresh id absent from both maps and is left unmapped.
+	mvBodyRoot.getAttributes().forEach((attr, backingCol) => {
+		const d = dAttr.get(attr.id);
+		if (d !== undefined) { if (!driving.has(d)) driving.set(d, backingCol); return; }
+		const l = lAttr.get(attr.id);
+		if (l !== undefined && !lookup.has(l)) lookup.set(l, backingCol);
+	});
+	return { driving, lookup };
+}
+
+/** The backing column storing the fragment source attribute `attrId` (resolved to a
+ *  driving/lookup base column), or `undefined` when the MV does not store it. */
+function backingColForAttr(
+	attrId: number,
+	fragDriving: ReadonlyMap<number, number>,
+	fragLookup: ReadonlyMap<number, number>,
+	stored: MvStoredJoinColumns,
+): number | undefined {
+	const d = fragDriving.get(attrId);
+	if (d !== undefined) return stored.driving.get(d);
+	const l = fragLookup.get(attrId);
+	if (l !== undefined) return stored.lookup.get(l);
+	return undefined;
+}
+
+/** Fragment source attribute id → backing column, for every `T`/`P` column the MV
+ *  stores — the residual re-bind map (`backingColOfSourceAttrId`). */
+function storedSourceAttrIds(
+	fragDriving: ReadonlyMap<number, number>,
+	fragLookup: ReadonlyMap<number, number>,
+	stored: MvStoredJoinColumns,
+): Map<number, number> {
+	const out = new Map<number, number>();
+	fragDriving.forEach((baseCol, attrId) => {
+		const bc = stored.driving.get(baseCol);
+		if (bc !== undefined) out.set(attrId, bc);
+	});
+	fragLookup.forEach((baseCol, attrId) => {
+		const bc = stored.lookup.get(baseCol);
+		if (bc !== undefined) out.set(attrId, bc);
+	});
+	return out;
+}
+
+/** Stable attribute id → base column index for a table reference. */
+function attrToBaseCol(ref: TableReferenceNode): Map<number, number> {
+	const out = new Map<number, number>();
+	ref.getAttributes().forEach((attr, i) => out.set(attr.id, i));
+	return out;
+}
+
+/** All `TableReferenceNode`s in `node`'s subtree (depth-first, left-to-right). */
+function collectBaseTableRefs(node: RelationalPlanNode): TableReferenceNode[] {
+	if (node instanceof TableReferenceNode) return [node];
+	const out: TableReferenceNode[] = [];
+	for (const rel of node.getRelations()) out.push(...collectBaseTableRefs(rel));
+	return out;
+}
+
+/** The first `TableReferenceNode` in `node`'s subtree over the qualified table, or
+ *  `undefined`. The fragment rejects self-joins upstream, so the first match is
+ *  unambiguous. */
+function findTableRef(node: RelationalPlanNode, qualified: string): TableReferenceNode | undefined {
+	if (node instanceof TableReferenceNode) {
+		return qualifiedOf(node.tableSchema) === qualified ? node : undefined;
+	}
+	for (const rel of node.getRelations()) {
+		const found = findTableRef(rel, qualified);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+/** True iff `conjunct` embeds a relational subquery (an Exists/In/scalar-subquery
+ *  whose child is a relation). Such a predicate is not re-bindable onto a flat
+ *  backing scan, so the join arm forgoes it (matching the foundation's no-subquery
+ *  invariant that licenses `sideEffectMode: 'safe'`). */
+function conjunctHasSubquery(node: ScalarPlanNode): boolean {
+	for (const child of node.getChildren()) {
+		if (isRelationalNode(child as PlanNode)) return true;
+		if (conjunctHasSubquery(child as ScalarPlanNode)) return true;
+	}
+	return false;
+}
+
+/** Every `ColumnReferenceNode` attribute id referenced (transitively) by a
+ *  subquery-free conjunct. */
+function conjunctColumnAttrIds(node: ScalarPlanNode): number[] {
+	const out: number[] = [];
+	const visit = (n: PlanNode): void => {
+		if (n instanceof ColumnReferenceNode) out.push(n.attributeId);
+		for (const child of n.getChildren()) visit(child as PlanNode);
+	};
+	visit(node as PlanNode);
+	return out;
+}
+
+/** `schema.table` lowercased — the canonical qualified key matching `sourceTables`. */
+function qualifiedOf(table: TableSchema): string {
+	return `${table.schemaName}.${table.name}`.toLowerCase();
+}
+
+/** Set equality over two string sets. */
+function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+	if (a.size !== b.size) return false;
+	for (const x of a) if (!b.has(x)) return false;
+	return true;
 }
 
 /** Decomposable rollup aggregates that re-aggregate as plain `sum`/`min`/`max`. */

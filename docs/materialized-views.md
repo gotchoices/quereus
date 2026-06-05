@@ -143,7 +143,7 @@ select customer_id, amt from sales where amt > 0 and customer_id = 7;
 
 The matcher (`planner/analysis/query-rewrite-matcher.ts`) asks **output-relation subsumption**: does the MV's stored rows contain a superset of the rows the fragment produces, keyed so a bounded residual recovers exactly the fragment's output? It reuses the coverage prover's entailment vocabulary (`recognizeConjunctiveClauses` / `guardClausesEntail`), so NULL semantics are identical. Soundness mirrors the prover exactly — **a false NotMatch only forgoes a speedup; a false Match would return wrong rows** — so every check forgoes the rewrite on doubt. The rule (`planner/rules/cache/rule-materialized-view-rewrite.ts`) only ever *replaces* the correct recompute-over-base plan with a provably row-equivalent backing scan, so it is non-regressing (a no-op when nothing matches or the cost gate declines, byte-identical rows when it fires). See [docs/optimizer.md](optimizer.md#materialized-view-query-rewrite-read-side) for the matcher shape rules, the gates (stale / deterministic / source-schema), the cost gate, and pass placement.
 
-The matcher handles two shapes: **projection + filter subsumption** (above) and **aggregate rollup** (below); join subsumption is a pure addition to the same matcher (`mv-query-rewrite-join-subsumption`). The rewrite is **suppressed while planning an MV's own body** to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating (`SchemaManager.withSuppressedMaterializedViewRewrite`).
+The matcher handles three shapes: **projection + filter subsumption** (above), **aggregate rollup**, and **join subsumption** (both below). The rewrite is **suppressed while planning an MV's own body** to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating (`SchemaManager.withSuppressedMaterializedViewRewrite`).
 
 #### Aggregate rollup (indexed-view matching)
 
@@ -173,6 +173,30 @@ select sum(amt) from sales;                  -- rollup     → scan _mv_daily, r
 **Two forgo guards** (both forgo on doubt, mirroring the soundness contract):
 - *Group-key reorder* — when a query `where` constant-pins (`g = 1`, `g is null`) or equates (`g₁ = g₂`) a group key **and** there are ≥2 group keys, the base's `rule-groupby-fd-simplification` drops the functionally-determined group column and re-emits it as a picker `min` at a *shifted* output position, changing the result's column order. The rewrite preserves the pristine order, so it forgoes to stay a faithful drop-in (range / `in` residuals create no determining FD and stay eligible).
 - *Rollup-residual* — a rollup that needs a residual filter is currently forgone, working around a **pre-existing** base-engine bug where `WHERE pk_col = const` is mis-dropped under `GROUP BY` on a composite-PK relation (reproduces with no MV; see `tickets/.pre-existing-error.md`). Exact-key (no re-aggregation) answers residual queries unaffected.
+
+#### Join subsumption
+
+A query whose join is the **same 1:1 row-preserving inner/cross join** as an MV body's join (the row-time [`'join-residual'`](#join-residual-11-innercross-join-shape) shape — eligibility shape 4) is answered from the MV's backing table, **eliminating the join at read time**.
+
+```sql
+create materialized view enriched as
+  select o.id, o.customer_id, o.amt, c.name
+  from orders o join customers c on o.customer_id = c.id;   -- 1:1 (NOT-NULL FK → PK)
+
+select o.id, o.amt, c.name
+from orders o join customers c on o.customer_id = c.id
+where o.amt > 100;                                          -- → scan _mv_enriched, residual filter + project
+```
+
+The hard soundness question — "does this join contribute *exactly one* row per governed `T` row?" — is the coverage prover's shared `proveOneToOneJoin` (no-row-loss descent + `proveJoinNoFanout`). A 1:1 join's output relation is in bijection with `T`'s governed rows, so two 1:1 joins over the *same tables, same equi-pairs, same join type* produce the same row set. The matcher (`matchJoinFragmentToMv`) therefore:
+
+- **proves both joins 1:1 over the same `(T, lookup)`** — runs `proveOneToOneJoin` on *both* the fragment join and the MV body join (the rule plans the MV body once, suppressed, and caches its optimized root). It requires the **same driving table `T`**, the **same lookup table**, an **inner/cross** top join on each side (outer is deferred — its null-extended rows make the stored relation differ from an inner-join query), and **equi-pair equivalence** in `(driving-col, lookup-col)` terms (a mismatch — e.g. a join on a *second* FK to the same lookup — ⇒ NotMatch, the soundness-critical guard);
+- **proves projection coverage** over the joined output — every fragment output column (including lookup-side columns) must be a bare passthrough the MV stores, mapped through stable attribute ids;
+- **carries the post-join WHERE as a residual**. A join MV body has **no WHERE** (the row-time create gate rejects a partial join body), so predicate entailment is trivial: the whole fragment WHERE becomes the residual `Filter` over the backing. **Read-side relaxation:** a WHERE term on a *lookup-side* column is allowed here (unlike the row-time arm's partial-WHERE restriction) — we are only *reading* the already-materialized join, so the residual filters the stored joined rows directly. The residual re-binds onto the backing by **source attribute id** (a base-column index is ambiguous across a join), and every residual column must be a stored backing column.
+
+The replacement is the foundation's emission unchanged — backing scan → residual `Filter` → residual `Project` — because once both joins are proven equal the joined output relations are equal. The cost gate's recompute estimate now includes both base scans **plus the join cost**, so the backing scan wins decisively; cheapest-wins with the same stable-name tiebreak.
+
+**Out of scope (deferred):** outer-join 1:1 bodies (the row-time arm defers them too); multi-join MV bodies covering a sub-join of the query (partial join matching); rollup over a join MV.
 
 ## Write boundary (write-through)
 

@@ -698,7 +698,7 @@ function pureColumnEquiConjunctCount(cond: ScalarPlanNode): number | undefined {
  * cross join (no condition / no equi-pairs) yields an empty list, which the
  * caller treats as "no FK to align".
  */
-function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[] | undefined {
+export function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[] | undefined {
 	if (join instanceof BloomJoinNode || join instanceof MergeJoinNode) {
 		return join.residualCondition === undefined ? join.equiPairs : undefined;
 	}

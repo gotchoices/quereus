@@ -49,16 +49,19 @@ import { BinaryOpNode, LiteralNode } from '../../nodes/scalar.js';
 import { requireVtabModule } from '../../../schema/table.js';
 import { isAggregateFunctionSchema, isScalarFunctionSchema } from '../../../schema/function.js';
 import { FunctionFlags } from '../../../common/constants.js';
-import { seqScanCost, filterCost, projectCost, aggregateCost } from '../../cost/index.js';
+import { seqScanCost, filterCost, projectCost, aggregateCost, hashJoinCost } from '../../cost/index.js';
 import {
 	analyzeQueryFragment,
 	matchFragmentToMv,
 	analyzeAggregateFragment,
 	matchAggregateFragmentToMv,
+	analyzeJoinQueryFragment,
+	matchJoinFragmentToMv,
 	type RewriteMatch,
 	type AggregateRecipe,
 	type DeterminismProbe,
 } from '../../analysis/query-rewrite-matcher.js';
+import type { MaterializedViewSchema } from '../../../schema/view.js';
 import type * as AST from '../../../parser/ast.js';
 
 const log = createLogger('optimizer:rule:materialized-view-rewrite');
@@ -100,7 +103,12 @@ export function ruleMaterializedViewRewrite(node: PlanNode, context: OptContext)
 		return fn ? (fn.flags & FunctionFlags.DETERMINISTIC) !== 0 : true;
 	};
 
-	if (node instanceof ProjectNode) return rewriteProjectionFilter(node, context, mvs, isDeterministic);
+	if (node instanceof ProjectNode) {
+		// Single-source projection/filter first; fall back to the join arm when the
+		// fragment's source descends through a binary join instead of a bare scan.
+		return rewriteProjectionFilter(node, context, mvs, isDeterministic)
+			?? rewriteJoinFragment(node, context, mvs, isDeterministic);
+	}
 	if (node instanceof AggregateNode) return rewriteAggregate(node, context, mvs, isDeterministic);
 	return null;
 }
@@ -218,9 +226,122 @@ function rewriteAggregate(
 	return replacement;
 }
 
+/**
+ * The join-subsumption arm: rewrite a `Project(Filter?(Join(T, P)))` query answered
+ * from a 1:1 row-preserving inner/cross-join MV — scan the MV's backing table
+ * (which materializes the join) with a residual filter / project, eliminating the
+ * join at read time. See `query-rewrite-matcher.ts` § join-subsumption arm.
+ */
+function rewriteJoinFragment(
+	node: ProjectNode,
+	context: OptContext,
+	mvs: MvList,
+	isDeterministic: DeterminismProbe,
+): PlanNode | null {
+	const sm = context.db.schemaManager;
+	const frag = analyzeJoinQueryFragment(node);
+	if (!frag.ok) return null;
+	const shape = frag.shape;
+	const qualA = qualifiedName(shape.tableRefs[0].tableSchema);
+	const qualB = qualifiedName(shape.tableRefs[1].tableSchema);
+
+	// Enumerate candidate MVs whose two source tables are exactly this join's tables.
+	const matches: RewriteMatch[] = [];
+	for (const mv of mvs) {
+		if (mv.sourceTables.length !== 2) continue;
+		const sources = new Set(mv.sourceTables);
+		if (!sources.has(qualA) || !sources.has(qualB)) continue;
+		const backing = sm.getTable(mv.schemaName, mv.backingTableName);
+		const mvBodyRoot = plannedMvBodyRoot(context.db, mv) ?? undefined;
+		const res = matchJoinFragmentToMv(shape, mv, mvBodyRoot, backing, isDeterministic);
+		if (res.match) matches.push(res.match);
+	}
+	if (matches.length === 0) return null;
+
+	// Cost gate: the recompute side now pays both base scans + the join, so the
+	// backing scan wins decisively. Same cheapest-wins + stable-name tiebreak.
+	let best: { match: RewriteMatch; cost: number } | undefined;
+	for (const m of matches) {
+		const info = m.joinInfo!;
+		const tRows = estRows(context.stats.tableRows(info.drivingTable));
+		const pRows = estRows(context.stats.tableRows(info.lookupTable));
+		const backingRows = backingCardinality(context.stats.tableRows(m.backing), tRows, false);
+		const baseCost = recomputeJoinCost(tRows, pRows, shape.conjuncts.length > 0, m.outputColumnMap.length);
+		const cost = scanCost(backingRows, m.residualConjuncts.length > 0, m.outputColumnMap.length);
+		if (cost >= baseCost) continue; // not strictly cheaper → decline this match
+		if (!best
+			|| cost < best.cost
+			|| (cost === best.cost && m.mv.name.toLowerCase() < best.match.mv.name.toLowerCase())) {
+			best = { match: m, cost };
+		}
+	}
+	if (!best) return null;
+
+	const replacement = buildReplacement(node, best.match, context);
+	if (replacement) {
+		log('Rewrote 1:1-join %s ⋈ %s to backing %s', qualA, qualB, best.match.backing.name);
+	}
+	return replacement;
+}
+
+/**
+ * The MV body's optimized relational root, cached per MV schema object. Only the
+ * (rarely-fired) join arm needs it, and the structural 1:1 proof it feeds
+ * (`proveOneToOneJoin`) is stats-independent, so a cached plan stays valid across
+ * rule fires. Planned with the read-side rewrite suppressed (so the body is not
+ * re-pointed at any backing) — the nested optimize then bails on the suppression
+ * flag, avoiding recursion.
+ *
+ * Staleness: a **stale** MV (some source changed) drops its cache entry and returns
+ * `null` — both so it is never a candidate while stale (matching the matcher's stale
+ * gate) and so the next plan after a `refresh` re-derives the body against the
+ * *current* source schema, never reusing a pre-ALTER root (which would mis-map a
+ * `select *` join body's columns onto the rebuilt backing). Only a successfully
+ * planned root is cached; a body that fails to plan is re-attempted each fire.
+ */
+const MV_BODY_ROOT_CACHE = new WeakMap<MaterializedViewSchema, RelationalPlanNode>();
+
+function plannedMvBodyRoot(db: OptContext['db'], mv: MaterializedViewSchema): RelationalPlanNode | null {
+	if (mv.stale === true) {
+		MV_BODY_ROOT_CACHE.delete(mv);
+		return null;
+	}
+	const cached = MV_BODY_ROOT_CACHE.get(mv);
+	if (cached !== undefined) return cached;
+	let root: RelationalPlanNode | null = null;
+	try {
+		root = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
+			const plan = db.getPlan(mv.selectAst as AST.AstNode);
+			return (plan.getRelations()[0] as RelationalPlanNode | undefined) ?? null;
+		});
+	} catch {
+		root = null; // a body that no longer plans is simply not a candidate
+	}
+	if (root !== null) MV_BODY_ROOT_CACHE.set(mv, root);
+	return root;
+}
+
+/** `schema.table` lowercased — the qualified key matching an MV's `sourceTables`. */
+function qualifiedName(table: { schemaName: string; name: string }): string {
+	return `${table.schemaName}.${table.name}`.toLowerCase();
+}
+
 /** Cost of recomputing the fragment against the base table. */
 function recomputeCost(rows: number, hasFilter: boolean, outCount: number): number {
 	return seqScanCost(rows) + (hasFilter ? filterCost(rows) : 0) + projectCost(rows, outCount);
+}
+
+/**
+ * Cost of recomputing a 1:1-join fragment against the base tables: both base scans
+ * plus the join (whose 1:1 output is one row per driving row) plus the residual
+ * filter / project. Uses `hashJoinCost` (the cheaper physical equi-join) so the cost
+ * gate stays conservative — it only rewrites when strictly cheaper than this floor.
+ */
+function recomputeJoinCost(tRows: number, pRows: number, hasFilter: boolean, outCount: number): number {
+	const joinOut = tRows; // 1:1 join → one output row per driving row
+	const join = hashJoinCost(Math.min(tRows, pRows), Math.max(tRows, pRows));
+	return seqScanCost(tRows) + seqScanCost(pRows) + join
+		+ (hasFilter ? filterCost(joinOut) : 0) + projectCost(joinOut, outCount);
 }
 
 /** Cost of answering from the MV backing scan + residual. */
@@ -345,7 +466,7 @@ function buildBackingSource(
 	if (match.residualConjuncts.length > 0) {
 		const remapped: ScalarPlanNode[] = [];
 		for (const conjunct of match.residualConjuncts) {
-			const r = remapToBacking(conjunct, match.backingColOfBaseCol, backingAttrs, scope);
+			const r = remapToBacking(conjunct, match, backingAttrs, scope);
 			if (!r) return null;
 			remapped.push(r);
 		}
@@ -367,20 +488,24 @@ function colRefOnto(scope: Scope, attr: Attribute, col: number): ColumnReference
 }
 
 /**
- * Re-bind a residual conjunct's column references from the fragment's base table
- * onto the backing scan: every `ColumnReferenceNode` (whose `columnIndex` is a
- * base-table column) is replaced with a reference to the backing column that holds
- * it. Other scalar nodes are rebuilt structurally. Returns undefined when a column
- * is not a backing column (the matcher prevents this; the guard is defensive).
+ * Re-bind a residual conjunct's column references onto the backing scan: every
+ * `ColumnReferenceNode` is replaced with a reference to the backing column that
+ * holds it. The single-source arms key on the column's base-table index
+ * (`backingColOfBaseCol`); the join arm keys on the column's stable source
+ * attribute id (`backingColOfSourceAttrId`), since a base column index is ambiguous
+ * across a join. Other scalar nodes are rebuilt structurally. Returns undefined when
+ * a column is not a backing column (the matcher prevents this; the guard is defensive).
  */
 function remapToBacking(
 	node: ScalarPlanNode,
-	backingColOfBaseCol: ReadonlyMap<number, number>,
+	match: RewriteMatch,
 	backingAttrs: readonly Attribute[],
 	scope: ProjectNode['scope'],
 ): ScalarPlanNode | undefined {
 	if (node instanceof ColumnReferenceNode) {
-		const backingCol = backingColOfBaseCol.get(node.columnIndex);
+		const backingCol = match.backingColOfSourceAttrId
+			? match.backingColOfSourceAttrId.get(node.attributeId)
+			: match.backingColOfBaseCol.get(node.columnIndex);
 		if (backingCol === undefined) return undefined;
 		const bAttr = backingAttrs[backingCol];
 		return new ColumnReferenceNode(scope, node.expression, bAttr.type, bAttr.id, backingCol);
@@ -389,7 +514,7 @@ function remapToBacking(
 	if (children.length === 0) return node;
 	const newChildren: PlanNode[] = [];
 	for (const child of children) {
-		const r = remapToBacking(child as ScalarPlanNode, backingColOfBaseCol, backingAttrs, scope);
+		const r = remapToBacking(child as ScalarPlanNode, match, backingAttrs, scope);
 		if (!r) return undefined;
 		newChildren.push(r);
 	}
