@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, validateCollationForType } from '../../../schema/table.js';
 import { type BTreeKeyForPrimary } from '../types.js';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer } from './base.js';
@@ -1619,6 +1619,7 @@ export class MemoryTableManager {
 		setNotNull?: boolean;
 		setDataType?: string;
 		setDefault?: Expression | null;
+		setCollation?: string;
 	}): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
@@ -1634,8 +1635,18 @@ export class MemoryTableManager {
 			}
 			const oldCol = this.tableSchema.columns[colIndex];
 			let newCol: ColumnSchema = oldCol;
+			// A collation change re-keys any PK / UNIQUE / index that orders by this
+			// column, so it needs the structure re-sort + uniqueness re-validation below.
+			let collationChanged = false;
 
-			if (change.setNotNull !== undefined) {
+			if (change.setCollation !== undefined) {
+				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
+				if (normalized === (oldCol.collation || 'BINARY')) {
+					return; // already in desired state — no re-sort needed
+				}
+				newCol = { ...oldCol, collation: normalized };
+				collationChanged = true;
+			} else if (change.setNotNull !== undefined) {
 				if (change.setNotNull === true && !oldCol.notNull) {
 					// Tightening: scan for NULLs. If DEFAULT present, backfill first.
 					const defaultExpr = oldCol.defaultValue;
@@ -1716,13 +1727,43 @@ export class MemoryTableManager {
 			}
 
 			const updatedCols = this.tableSchema.columns.map((c, i) => i === colIndex ? newCol : c);
+
+			// Propagate a collation change into every PK-definition entry and index
+			// column that orders by this column, so their comparators re-key under it.
+			const updatedPkDef = collationChanged
+				? this.tableSchema.primaryKeyDefinition.map(def =>
+					def.index === colIndex ? { ...def, collation: newCol.collation } : def)
+				: this.tableSchema.primaryKeyDefinition;
+			const updatedIndexes = (collationChanged && this.tableSchema.indexes)
+				? this.tableSchema.indexes.map(idx => ({
+					...idx,
+					columns: idx.columns.map(ic =>
+						ic.index === colIndex ? { ...ic, collation: newCol.collation } : ic),
+				}))
+				: this.tableSchema.indexes;
+
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
 				columns: Object.freeze(updatedCols),
 				columnIndexMap: buildColumnIndexMap(updatedCols),
+				primaryKeyDefinition: Object.freeze(updatedPkDef),
+				indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
 			});
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
+
+			// A collation change re-sorts structures that order by the column and
+			// re-validates uniqueness under the new collation. Rebuild the secondary
+			// indexes FIRST (strict — a UNIQUE collision throws CONSTRAINT) and the
+			// primary tree LAST (also strict — a PK collision throws), so a throw at
+			// either step leaves the live primary tree intact for the catch's rollback.
+			if (collationChanged) {
+				this.baseLayer.rebuildAllSecondaryIndexesStrict();
+				if (updatedPkDef.some(def => def.index === colIndex)) {
+					this.baseLayer.rebuildPrimaryTreeStrict();
+				}
+			}
+
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();
 
@@ -1736,7 +1777,12 @@ export class MemoryTableManager {
 
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
 		} catch (e: unknown) {
+			// Restore the prior schema, then rebuild secondary indexes (non-strict) so
+			// a partially-cleared strict rebuild can't strand the index map in an
+			// inconsistent state. The primary tree is only swapped on full success, so
+			// it is already the original here.
 			this.baseLayer.updateSchema(originalManagerSchema);
+			this.baseLayer.rebuildAllSecondaryIndexes();
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
 			logger.error('Alter Column', this._tableName, e);

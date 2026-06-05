@@ -62,6 +62,61 @@ export class BaseLayer implements Layer {
 		this.replaceSecondaryIndexes(newIndexes);
 	}
 
+	/**
+	 * Strict variant of {@link rebuildAllSecondaryIndexes}: rebuilds every
+	 * secondary index from the primary tree but surfaces a UNIQUE-index key
+	 * collision as a thrown CONSTRAINT error (the non-strict variant logs and
+	 * drops duplicates). Used by `ALTER COLUMN ... SET COLLATE`, where a value set
+	 * unique under the old collation may collide under the new one. On throw the
+	 * secondary index map is left cleared; the caller restores the prior schema and
+	 * calls the non-strict rebuild to recover a consistent state.
+	 */
+	public rebuildAllSecondaryIndexesStrict(): void {
+		this.clearExistingSecondaryIndexes();
+		if (!this.hasSecondaryIndexes()) {
+			this.secondaryIndexes.clear();
+			return;
+		}
+
+		const newIndexes = new Map<string, MemoryIndex>();
+		for (const indexSchema of this.tableSchema.indexes!) {
+			const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns);
+			this.populateNewIndex(memoryIndex, indexSchema); // throws CONSTRAINT on duplicate
+			newIndexes.set(indexSchema.name, memoryIndex);
+		}
+		this.replaceSecondaryIndexes(newIndexes);
+	}
+
+	/**
+	 * Rebuild the primary BTree under the *current* primaryKeyFunctions — call
+	 * {@link updateSchema} first so they reflect the new key collation. Re-extracts
+	 * every row's key with the new functions and detects a primary-key collision —
+	 * two rows whose distinct old keys collapse to one under the new comparator
+	 * (e.g. a PK-column collation change BINARY→NOCASE) — throwing CONSTRAINT and
+	 * leaving the live tree intact for the caller's rollback.
+	 */
+	public rebuildPrimaryTreeStrict(): void {
+		const oldTree = this.primaryTree;
+		const btreeKeyFromValue = (value: Row): BTreeKeyForPrimary =>
+			this.primaryKeyFunctions.extractFromRow(value);
+		const newTree = new BTree<BTreeKeyForPrimary, Row>(
+			btreeKeyFromValue,
+			this.primaryKeyFunctions.compare,
+		);
+		for (const path of oldTree.ascending(oldTree.first())) {
+			const row = oldTree.at(path)!;
+			const key = this.primaryKeyFunctions.extractFromRow(row);
+			if (newTree.get(key) !== undefined) {
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${this.tableSchema.name} primary key collides under new collation`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			newTree.insert(row);
+		}
+		this.primaryTree = newTree;
+	}
+
 	private clearExistingSecondaryIndexes(): void {
 		this.secondaryIndexes.forEach(index => index.clear());
 	}

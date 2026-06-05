@@ -53,6 +53,13 @@ export type AlterTableAction =
 		setNotNull?: boolean;
 		setDataType?: string;
 		setDefault?: AST.Expression | null;
+		/**
+		 * SET COLLATE <name> — change the column's collation. Routed through
+		 * `module.alterTable` so a backing module re-keys / re-sorts any PK / UNIQUE
+		 * / index that orders by the column and re-validates uniqueness under the new
+		 * collation. Unlike tags, collation is real schema (moves the schema hash).
+		 */
+		setCollation?: string;
 	}
 	| {
 		/**

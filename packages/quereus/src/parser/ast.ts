@@ -603,7 +603,8 @@ export type AlterTableAction =
 		columnName: string,
 		setNotNull?: boolean,          // true = SET NOT NULL, false = DROP NOT NULL
 		setDataType?: string,
-		setDefault?: Expression | null // null = DROP DEFAULT, Expression = SET DEFAULT
+		setDefault?: Expression | null, // null = DROP DEFAULT, Expression = SET DEFAULT
+		setCollation?: string          // SET COLLATE <name> — re-sorts dependent PK / UNIQUE / index structures
 	}
 	| {
 		/**

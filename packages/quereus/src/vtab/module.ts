@@ -409,12 +409,17 @@ export type SchemaChangeInfo =
 		 *     NaN, overflow).
 		 *   - setDefault / drop default: schema-only. New inserts pick up the
 		 *     new default; existing rows are untouched.
+		 *   - setCollation: change the column's collation. The module must re-key /
+		 *     re-sort any PK / UNIQUE / index that orders by the column and re-validate
+		 *     uniqueness under the new collation (a set unique under BINARY may collide
+		 *     under NOCASE → throw CONSTRAINT). Unlike tags, collation is real schema.
 		 */
 		type: 'alterColumn';
 		columnName: string;
 		setNotNull?: boolean;
 		setDataType?: string;
 		setDefault?: Expression | null;
+		setCollation?: string;
 	};
 
 /**

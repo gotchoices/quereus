@@ -3034,12 +3034,21 @@ export class Parser {
 				const expr = this.expression();
 				return { type: 'alterColumn', columnName, setDefault: expr };
 			}
+			if (this.match(TokenType.COLLATE)) {
+				// ALTER COLUMN <name> SET COLLATE <name> — change the column's collation,
+				// re-sorting / re-validating any PK / UNIQUE / index that orders by it.
+				if (!this.check(TokenType.IDENTIFIER)) {
+					throw this.error(this.peek(), "Expected collation name after SET COLLATE.");
+				}
+				const collation = this.getIdentifierValue(this.advance());
+				return { type: 'alterColumn', columnName, setCollation: collation };
+			}
 			if (this.matchKeyword('TAGS')) {
 				// ALTER COLUMN <name> SET TAGS (...) — whole-set tag replacement on the column.
 				const tags = this.parseTags();
 				return { type: 'setTags', target: { kind: 'column', columnName }, tags };
 			}
-			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, DEFAULT, or TAGS after SET.");
+			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, DEFAULT, COLLATE, or TAGS after SET.");
 		}
 
 		if (this.matchKeyword('DROP')) {

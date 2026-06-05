@@ -7,7 +7,7 @@ import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
-import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass } from '../../schema/table.js';
+import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -679,17 +679,19 @@ async function runAlterColumn(
 		throw new QuereusError(`Column '${action.columnName}' not found in table '${tableSchema.name}'`, StatusCode.ERROR);
 	}
 
-	// Guard: at most one of the three attribute changes per statement.
-	const populated = [action.setNotNull !== undefined, action.setDataType !== undefined, action.setDefault !== undefined];
+	// Guard: at most one of the four attribute changes per statement.
+	const populated = [action.setNotNull !== undefined, action.setDataType !== undefined, action.setDefault !== undefined, action.setCollation !== undefined];
 	const populatedCount = populated.filter(Boolean).length;
 	if (populatedCount !== 1) {
 		throw new QuereusError(
-			`ALTER COLUMN requires exactly one of SET/DROP NOT NULL, SET DATA TYPE, SET/DROP DEFAULT (got ${populatedCount})`,
+			`ALTER COLUMN requires exactly one of SET/DROP NOT NULL, SET DATA TYPE, SET/DROP DEFAULT, SET COLLATE (got ${populatedCount})`,
 			StatusCode.INTERNAL,
 		);
 	}
 
-	// Cannot alter a PRIMARY KEY column's nullability or data type.
+	// Cannot alter a PRIMARY KEY column's nullability or data type. (SET COLLATE on
+	// a PK column IS permitted — the module re-keys the primary structure under the
+	// new collation; see runAlterColumn module contract.)
 	if (tableSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
 		if (action.setNotNull === false) {
 			throw new QuereusError(`Cannot DROP NOT NULL on PRIMARY KEY column '${action.columnName}'`, StatusCode.CONSTRAINT);
@@ -697,6 +699,13 @@ async function runAlterColumn(
 		if (action.setDataType !== undefined) {
 			throw new QuereusError(`Cannot SET DATA TYPE on PRIMARY KEY column '${action.columnName}'`, StatusCode.CONSTRAINT);
 		}
+	}
+
+	// SET COLLATE: validate the collation against the column's logical type up front
+	// (same error shape as CREATE TABLE), so an unknown collation is rejected before
+	// any module round-trip / re-sort. The module re-normalizes and applies it.
+	if (action.setCollation !== undefined) {
+		validateCollationForType(action.setCollation, tableSchema.columns[colIndex].logicalType, action.columnName);
 	}
 
 	// Route a SET DEFAULT through the same DDL validator CREATE TABLE uses, so the
@@ -724,6 +733,7 @@ async function runAlterColumn(
 		setNotNull: action.setNotNull,
 		setDataType: action.setDataType,
 		setDefault: action.setDefault,
+		setCollation: action.setCollation,
 	});
 
 	schema.addTable(updatedTableSchema);

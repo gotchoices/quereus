@@ -918,6 +918,9 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 					? `alter table ${table} alter column ${colName} drop default`
 					: `alter table ${table} alter column ${colName} set default ${expressionToString(a.setDefault)}`;
 			}
+			if (a.setCollation !== undefined) {
+				return `alter table ${table} alter column ${colName} set collate ${a.setCollation}`;
+			}
 			if (a.setNotNull !== undefined) {
 				return a.setNotNull
 					? `alter table ${table} alter column ${colName} set not null`

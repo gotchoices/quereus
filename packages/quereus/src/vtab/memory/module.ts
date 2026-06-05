@@ -873,6 +873,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 					setNotNull: change.setNotNull,
 					setDataType: change.setDataType,
 					setDefault: change.setDefault,
+					setCollation: change.setCollation,
 				});
 				break;
 		}

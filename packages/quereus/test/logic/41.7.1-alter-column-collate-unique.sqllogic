@@ -1,0 +1,99 @@
+-- ALTER COLUMN ... SET COLLATE — structure re-sort + uniqueness re-validation.
+--
+-- MEMORY-ONLY (registered in MEMORY_ONLY_FILES in logic.spec.ts): exercises the
+-- memory module's re-key of the primary tree and re-validation of UNIQUE / index
+-- structures under the new collation. The store module applies SET COLLATE as a
+-- schema-only change (its physical key encoding uses a fixed table-level collation),
+-- so existing-row re-validation at ALTER time is not performed there — see the
+-- store-module limitation note in the ticket handoff. The cross-module query-layer
+-- behavior lives in 41.7-alter-column-collate.sqllogic.
+
+-- ===================================
+-- 1. UNIQUE column, values distinct under BOTH collations → ALTER succeeds, and a
+--    subsequent NOCASE-colliding insert is then rejected under the new collation.
+-- ===================================
+
+create table us (id integer primary key, email text unique);
+insert into us values (1, 'a@x'), (2, 'b@x');
+
+alter table us alter column email set collate nocase;
+-- run
+
+-- the change took effect: a case-only duplicate now collides under NOCASE
+insert into us values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+select id, email from us order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"}]
+
+-- a genuinely distinct value still inserts
+insert into us values (4, 'c@x');
+select id, email from us order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"},{"id":4,"email":"c@x"}]
+
+drop table us;
+
+-- ===================================
+-- 2. UNIQUE column, values distinct under BINARY but COLLIDING under NOCASE →
+--    the ALTER is rejected with CONSTRAINT and the table is left unchanged.
+-- ===================================
+
+create table uc (id integer primary key, email text unique);
+insert into uc values (1, 'a@x'), (2, 'A@x');
+-- run
+
+alter table uc alter column email set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- the rejected ALTER rolled back: both rows survive and the column is still BINARY,
+-- so the two case-distinct values remain valid
+select id, email from uc order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"A@x"}]
+
+select name, collation from table_info('uc') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"email","collation":"BINARY"}]
+
+-- and the table is still writable after the failed ALTER
+insert into uc values (3, 'B@x');
+select count(*) as n from uc;
+→ [{"n":3}]
+
+drop table uc;
+
+-- ===================================
+-- 3. PK column collation change re-keys the primary structure; a PK that is
+--    unique under BINARY but collides under NOCASE is rejected.
+-- ===================================
+
+create table pkc (k text primary key);
+insert into pkc values ('a'), ('A');
+-- run
+
+alter table pkc alter column k set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- rollback: both rows survive, column still BINARY (BINARY order: A before a)
+select k from pkc order by k;
+→ [{"k":"A"},{"k":"a"}]
+
+drop table pkc;
+
+-- ===================================
+-- 4. PK column collation change that does NOT collide succeeds, and a later
+--    NOCASE-colliding PK insert is then rejected under the new collation.
+-- ===================================
+
+create table pko (k text primary key);
+insert into pko values ('alpha'), ('Beta');
+
+alter table pko alter column k set collate nocase;
+-- run
+
+-- a case-only duplicate of an existing PK now collides under NOCASE
+insert into pko values ('ALPHA');
+-- error: UNIQUE constraint failed
+
+select k from pko order by k;
+→ [{"k":"alpha"},{"k":"Beta"}]
+
+drop table pko;

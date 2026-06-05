@@ -10,6 +10,7 @@ import type * as AST from '../parser/ast.js';
 import { quereusError, QuereusError } from '../common/errors.js';
 import { createLogger } from '../common/logger.js';
 import { inferType } from '../types/registry.js';
+import type { LogicalType } from '../types/logical-type.js';
 import { traverseAst } from '../parser/visitor.js';
 import type { TableStatistics } from '../planner/stats/catalog-stats.js';
 
@@ -172,6 +173,33 @@ export function getPrimaryKeyIndices(pkDef: ReadonlyArray<PrimaryKeyColumnDefini
 }
 
 /**
+ * Validates a collation name against a logical type's `supportedCollations` and
+ * returns its canonical (normalized) form. Shared by CREATE TABLE column parsing
+ * (`columnDefToSchema`) and the runtime `ALTER COLUMN ... SET COLLATE` path so
+ * both reject an unsupported collation with the same error shape.
+ *
+ * @param collation Collation name as written
+ * @param logicalType The column's logical type (carries `supportedCollations`)
+ * @param columnName Column name, for the error message
+ * @returns The canonical collation name
+ * @throws QuereusError when the type constrains its collations and this one is not among them
+ */
+export function validateCollationForType(
+	collation: string,
+	logicalType: LogicalType,
+	columnName: string,
+): string {
+	const normalized = normalizeCollationName(collation);
+	if (logicalType.supportedCollations && !logicalType.supportedCollations.includes(normalized)) {
+		throw new QuereusError(
+			`Unknown collation '${collation}' for type '${logicalType.name}' on column '${columnName}' (expected one of: ${logicalType.supportedCollations.join(', ')})`,
+			StatusCode.ERROR,
+		);
+	}
+	return normalized;
+}
+
+/**
  * Converts a parsed ColumnDef AST node into a runtime ColumnSchema object
  *
  * @param def Column definition AST node
@@ -220,18 +248,9 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 				schema.defaultValue = constraint.expr ?? null;
 				break;
 			case 'collate': {
-				if (constraint.collation) {
-					const normalized = normalizeCollationName(constraint.collation);
-					if (logicalType.supportedCollations && !logicalType.supportedCollations.includes(normalized)) {
-						throw new QuereusError(
-							`Unknown collation '${constraint.collation}' for type '${logicalType.name}' on column '${def.name}' (expected one of: ${logicalType.supportedCollations.join(', ')})`,
-							StatusCode.ERROR
-						);
-					}
-					schema.collation = normalized;
-				} else {
-					schema.collation = 'BINARY';
-				}
+				schema.collation = constraint.collation
+					? validateCollationForType(constraint.collation, logicalType, def.name)
+					: 'BINARY';
 				break;
 			}
 			case 'generated':

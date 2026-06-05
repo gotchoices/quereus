@@ -29,7 +29,7 @@ import type {
 	Schema,
 	MappingAdvertisement,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -913,6 +913,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				} else if (change.setDefault !== undefined) {
 					newCol = { ...oldCol, defaultValue: change.setDefault };
+				} else if (change.setCollation !== undefined) {
+					// Schema-only collation update. The store's physical key encoding uses a
+					// fixed table-level collation (`encodeOptions`), so per-column physical
+					// re-keying / store-level uniqueness re-validation under the new collation
+					// is out of scope (see store-module limitation note in the ticket handoff).
+					// Query-layer ORDER BY / `=` / `table_info().collation` pick the new
+					// collation up from the column schema once this updated schema re-registers.
+					newCol = { ...oldCol, collation: validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName) };
 				} else {
 					throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
 				}

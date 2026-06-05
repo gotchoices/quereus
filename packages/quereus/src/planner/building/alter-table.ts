@@ -118,6 +118,7 @@ export function buildAlterTableStmt(
         setNotNull: stmt.action.setNotNull,
         setDataType: stmt.action.setDataType,
         setDefault: stmt.action.setDefault,
+        setCollation: stmt.action.setCollation,
       });
 
     case 'setTags': {

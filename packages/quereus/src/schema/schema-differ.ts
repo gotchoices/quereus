@@ -89,6 +89,12 @@ export interface ColumnAttributeChange {
 	 */
 	defaultValue?: AST.Expression | null;
 	/**
+	 * Desired collation (canonical, e.g. `'NOCASE'`) when the declared column's
+	 * COLLATE differs from actual. Omitted = no change. Absent and `'BINARY'` are
+	 * treated as equal (no spurious diff). Emitted as `SET COLLATE <name>`.
+	 */
+	collation?: string;
+	/**
 	 * Desired metadata tag set (whole-set replacement) when the declared column
 	 * tags differ from actual. Omitted = no change; `{}` = clear all tags. Rename
 	 * hints (`quereus.id` / `quereus.previous_name`) are excluded from the drift
@@ -921,6 +927,17 @@ function extractDeclaredDefault(col: AST.ColumnDef): AST.Expression | null {
 }
 
 /**
+ * Extract a declared column's effective collation from its COLLATE constraint,
+ * canonicalized (uppercase). Defaults to `'BINARY'` when none is declared — so
+ * absent and an explicit `COLLATE BINARY` compare equal against the actual
+ * catalog collation (which is normalized the same way).
+ */
+function extractDeclaredCollation(col: AST.ColumnDef): string {
+	const c = col.constraints?.find(c => c.type === 'collate');
+	return c?.collation ? c.collation.trim().toUpperCase() : 'BINARY';
+}
+
+/**
  * Structural equality for DEFAULT expressions. Compares AST shape by
  * JSON serialization with a stable key order — adequate for literals
  * and common expression shapes typically used as DEFAULT values.
@@ -1007,6 +1024,15 @@ function computeColumnAttributeChange(
 		}
 	} else if (actualDefault !== null) {
 		change.defaultValue = null;
+		any = true;
+	}
+
+	// Collation — declared COLLATE (default BINARY) vs actual, case-insensitive.
+	// Absent and BINARY are equal, so a column that never mentions COLLATE never
+	// churns a diff against an actual BINARY column.
+	const declaredCollation = extractDeclaredCollation(declared);
+	if (declaredCollation !== (actual.collation || 'BINARY').toUpperCase()) {
+		change.collation = declaredCollation;
 		any = true;
 	}
 
@@ -1185,6 +1211,11 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 			const quotedCol = quoteIdentifier(colAlter.columnName);
 			if (colAlter.dataType !== undefined) {
 				statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET DATA TYPE ${colAlter.dataType}`);
+			}
+			// SET COLLATE right after SET DATA TYPE (both are comparison-domain
+			// changes), before DEFAULT / NOT NULL.
+			if (colAlter.collation !== undefined) {
+				statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET COLLATE ${colAlter.collation}`);
 			}
 			if (colAlter.defaultValue !== undefined) {
 				if (colAlter.defaultValue === null) {

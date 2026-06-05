@@ -28,6 +28,8 @@ export interface CatalogTable {
 		notNull: boolean;
 		primaryKey: boolean;
 		defaultValue: AST.Expression | null;
+		/** Canonical collation (normalized, uppercase). Default `'BINARY'`. */
+		collation: string;
 		tags?: Readonly<Record<string, SqlValue>>;
 	}>;
 	primaryKey: Array<{ columnName: string; desc: boolean }>;
@@ -167,6 +169,7 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		notNull: col.notNull,
 		primaryKey: col.primaryKey,
 		defaultValue: col.defaultValue ?? null,
+		collation: col.collation || 'BINARY',
 		tags: col.tags,
 	}));
 
