@@ -305,8 +305,12 @@ data relations the probe needs), carrying a read-only `existence` `UpdateSite` w
 non-writable, `column_info` reports `is_updatable = 'NO'` / null base, and a write to the
 column rejects). The routing is **component-generic** (the same `existence` site the join
 existence column uses), so the write half (membership-flip ⇒ branch insert/delete) extends
-it without forking. An **unused** flag is a semijoin probe and is dead-column-eliminable —
-it must not force a branch to be retained or probed when no other column needs it.
+it without forking. An **unused** flag is a semijoin probe and is *in principle*
+dead-column-eliminable — it ought not force a branch to be retained or probed when no
+other column needs it. No such pruning pass exists yet: the membership runner is selected
+whenever the node carries any flag, so an unused flag on a `union all` currently forces the
+buffering runner instead of the streaming one (correctness is unaffected; a sibling prune
+to `prune-unused-existence-flag` is deferred).
 
 ### Union All
 

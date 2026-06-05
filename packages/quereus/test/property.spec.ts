@@ -2247,6 +2247,37 @@ describe('Property-Based Tests', () => {
 			]);
 		});
 
+		it('union all (bag): a tuple present in BOTH branches reads both flags true (multiplicity preserved)', async () => {
+			// The shipped duplicate-within-one-branch test pins the "present ≥ once" probe on
+			// the SAME branch; this pins the cross-branch case — g=5 is in both legs, so every
+			// emitted copy probes inL AND inR true, and union all keeps all copies.
+			await db.exec('create table L (id integer primary key, g integer) using memory');
+			await db.exec('create table R (id integer primary key, g integer) using memory');
+			await db.exec('insert into L values (1, 5)');
+			await db.exec('insert into R values (1, 5)');
+			await db.exec('create view Uboth as select g from L union all exists left as inL, exists right as inR select g from R');
+			expect(await readRows('select g, inL, inR from Uboth order by g')).to.deep.equal([
+				{ g: 5, inL: true, inR: true },  // the left copy
+				{ g: 5, inL: true, inR: true },  // the right copy (bag keeps both)
+			]);
+		});
+
+		it('null probe: a NULL data tuple present in both branches reads both flags true', async () => {
+			// Set operations treat NULL = NULL as equal for membership (the dedup comparator
+			// does too), so a NULL-bearing tuple in both legs probes both flags true — the
+			// flag stays a clean {true,false}, never NULL-propagated.
+			await db.exec('create table NA (id integer primary key, x integer null) using memory');
+			await db.exec('create table NB (id integer primary key, x integer null) using memory');
+			await db.exec('insert into NA (id, x) values (1, null), (2, 7)');
+			await db.exec('insert into NB (id, x) values (3, null), (4, 8)');
+			await db.exec('create view UN as select x from NA union exists left as inL, exists right as inR select x from NB');
+			expect(await readRows('select x, inL, inR from UN order by inL desc, x')).to.deep.equal([
+				{ x: null, inL: true, inR: true },  // NULL is in both legs → both true (NULL = NULL for sets)
+				{ x: 7, inL: true, inR: false },
+				{ x: 8, inL: false, inR: true },
+			]);
+		});
+
 		it('Key Soundness: flags leave isSet/keys unchanged, key → flag holds, flag never in a key', async () => {
 			await createSchemas();
 			const withFlag = findSetOp('select id, x from A union exists left as inA, exists right as inB select id, x from B');
