@@ -288,3 +288,20 @@ ALTER TABLE Alterable ALTER COLUMN nope SET TAGS (a = 1);
 
 ALTER TABLE Alterable ALTER CONSTRAINT nope SET TAGS (a = 1);
 -- error: not found
+
+-- ===================================================================
+-- Phase 16: ambiguous constraint name (same name across constraint classes)
+-- ===================================================================
+
+-- A name shared by a UNIQUE and a CHECK constraint is constructible (no
+-- create-time dedup across classes), so ALTER CONSTRAINT ... SET TAGS on it
+-- must reject the request as ambiguous rather than silently picking one.
+CREATE TABLE AmbiguousCon (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    CONSTRAINT dup UNIQUE (x),
+    CONSTRAINT dup CHECK (x > 0)
+);
+
+ALTER TABLE AmbiguousCon ALTER CONSTRAINT dup SET TAGS (m = 'x');
+-- error: ambiguous
