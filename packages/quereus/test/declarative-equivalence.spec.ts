@@ -2217,11 +2217,11 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		// The parent IS the current table, so the FK referenced-column reconcile uses
 		// the current table's own entry in the cross-table rename map. The referenced
 		// column is a non-PK UNIQUE column (not the PK) on purpose: renaming the PK
-		// column would additionally emit an `ALTER PRIMARY KEY`, and that PK change on
-		// a *self*-referential FK table trips a separate engine issue in deferred FK
-		// enforcement ("multiple candidate connections") — orthogonal to the FK churn
-		// this ticket targets (see the review handoff). Using a UNIQUE referenced
-		// column isolates the reconciliation cleanly.
+		// column would additionally emit an `ALTER PRIMARY KEY`, whose memory-table
+		// rebuild is a separate concern from the FK churn this case targets. Using a
+		// UNIQUE referenced column isolates the reconciliation cleanly. The PK-rename
+		// path (and the deferred self-FK "multiple candidate connections" bug it once
+		// tripped, now fixed) is covered by the sibling REGRESSION case below.
 		const db = new Database();
 		try {
 			await db.exec('pragma foreign_keys = true');
