@@ -137,6 +137,42 @@ describe('StoreModule catalog-only tag persistence', () => {
 		expect(rejected, 'duplicate email still rejected after reopen').to.be.true;
 	});
 
+	it('named CHECK constraint tags persist across reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, qty integer, constraint chk_qty check (qty >= 0)) using store`);
+		await db.exec(`insert into t values (1, 5)`);
+		await db.exec(`alter table t alter constraint chk_qty set tags (error_message = 'Quantity must be non-negative')`);
+		await mod.closeAll();
+
+		const db2 = await reopen();
+		const cc = db2.schemaManager.findTable('t')!.checkConstraints.find(c => c.name === 'chk_qty')!;
+		expect(cc.tags).to.deep.equal({ error_message: 'Quantity must be non-negative' });
+
+		// The reopened CHECK still enforces (tags are metadata, not a relaxation).
+		let rejected = false;
+		try {
+			await db2.exec(`insert into t values (2, -1)`);
+		} catch (e) {
+			rejected = true;
+			expect(String(e)).to.match(/constraint/i);
+		}
+		expect(rejected, 'CHECK still rejected after reopen').to.be.true;
+	});
+
+	it('named FOREIGN KEY constraint tags persist across reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table parent (id integer primary key) using store`);
+		await db.exec(`insert into parent values (1)`);
+		await db.exec(`create table child (id integer primary key, pid integer, constraint fk_p foreign key (pid) references parent(id)) using store`);
+		await db.exec(`insert into child values (1, 1)`);
+		await db.exec(`alter table child alter constraint fk_p set tags (error_message = 'Unknown parent')`);
+		await mod.closeAll();
+
+		const db2 = await reopen();
+		const fk = db2.schemaManager.findTable('child')!.foreignKeys!.find(c => c.name === 'fk_p')!;
+		expect(fk.tags).to.deep.equal({ error_message: 'Unknown parent' });
+	});
+
 	it('clearing tags (SET TAGS ()) round-trips, and successive swaps serialize in order', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key) using store`);
