@@ -352,6 +352,123 @@ describe('Parser', () => {
 		});
 	});
 
+	describe('ALTER TABLE ADD / DROP TAGS (per-key tag mutation)', () => {
+		type AlterTableStmt = import('../src/parser/ast.js').AlterTableStmt;
+
+		// ── table level ──
+		it('parses ADD TAGS at the table level as a merge setTags', () => {
+			const stmt = parse(`alter table t add tags (audit = true)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'table' }, mode: 'merge', tags: { audit: true },
+			});
+		});
+
+		it('parses DROP TAGS at the table level as a dropTags', () => {
+			const stmt = parse(`alter table t drop tags (audit, legacy)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'dropTags', target: { kind: 'table' }, keys: ['audit', 'legacy'],
+			});
+		});
+
+		it('parses the existing table-level SET TAGS with mode replace', () => {
+			const stmt = parse(`alter table t set tags (a = 1)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'table' }, mode: 'replace', tags: { a: 1 },
+			});
+		});
+
+		it('treats ADD TAGS () / DROP TAGS () as empty (no-op) lists', () => {
+			const add = parse(`alter table t add tags ()`) as AlterTableStmt;
+			expect(add.action).to.deep.equal({ type: 'setTags', target: { kind: 'table' }, mode: 'merge', tags: {} });
+			const drop = parse(`alter table t drop tags ()`) as AlterTableStmt;
+			expect(drop.action).to.deep.equal({ type: 'dropTags', target: { kind: 'table' }, keys: [] });
+		});
+
+		// ── column level ──
+		it('parses ALTER COLUMN ADD TAGS as a column merge', () => {
+			const stmt = parse(`alter table t alter column c add tags (searchable = true)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'column', columnName: 'c' }, mode: 'merge', tags: { searchable: true },
+			});
+		});
+
+		it('parses ALTER COLUMN DROP TAGS as a column dropTags', () => {
+			const stmt = parse(`alter table t alter column c drop tags (searchable)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'dropTags', target: { kind: 'column', columnName: 'c' }, keys: ['searchable'],
+			});
+		});
+
+		it('parses ALTER COLUMN SET TAGS with mode replace', () => {
+			const stmt = parse(`alter table t alter column c set tags (a = 1)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'column', columnName: 'c' }, mode: 'replace', tags: { a: 1 },
+			});
+		});
+
+		// ── named-constraint level ──
+		it('parses ALTER CONSTRAINT ADD TAGS as a constraint merge', () => {
+			const stmt = parse(`alter table t alter constraint uq add tags (msg = 'dup')`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'constraint', constraintName: 'uq' }, mode: 'merge', tags: { msg: 'dup' },
+			});
+		});
+
+		it('parses ALTER CONSTRAINT DROP TAGS as a constraint dropTags', () => {
+			const stmt = parse(`alter table t alter constraint uq drop tags (msg)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'dropTags', target: { kind: 'constraint', constraintName: 'uq' }, keys: ['msg'],
+			});
+		});
+
+		it('parses ALTER CONSTRAINT SET TAGS with mode replace', () => {
+			const stmt = parse(`alter table t alter constraint uq set tags (a = 1)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'constraint', constraintName: 'uq' }, mode: 'replace', tags: { a: 1 },
+			});
+		});
+
+		it('rejects an ALTER CONSTRAINT verb that is not SET / ADD / DROP', () => {
+			expect(() => parse(`alter table t alter constraint uq rename tags (a)`)).to.throw();
+		});
+
+		// ── column-named-`tags` disambiguation (the `(` look-ahead guard) ──
+		it('keeps ADD <col> / ADD COLUMN <col> parsing as ADD COLUMN even when the column is named tags', () => {
+			const noKw = parse(`alter table t add tags integer`) as AlterTableStmt;
+			expect(noKw.action.type).to.equal('addColumn');
+			expect((noKw.action as Extract<typeof noKw.action, { type: 'addColumn' }>).column.name).to.equal('tags');
+
+			const withKw = parse(`alter table t add column tags integer`) as AlterTableStmt;
+			expect(withKw.action.type).to.equal('addColumn');
+			expect((withKw.action as Extract<typeof withKw.action, { type: 'addColumn' }>).column.name).to.equal('tags');
+		});
+
+		it('keeps DROP <col> / DROP COLUMN <col> parsing as DROP COLUMN even when the column is named tags', () => {
+			const noKw = parse(`alter table t drop tags`) as AlterTableStmt;
+			expect(noKw.action).to.deep.equal({ type: 'dropColumn', name: 'tags' });
+
+			const withKw = parse(`alter table t drop column tags`) as AlterTableStmt;
+			expect(withKw.action).to.deep.equal({ type: 'dropColumn', name: 'tags' });
+		});
+
+		it('round-trips ADD / DROP TAGS through astToString', () => {
+			for (const sql of [
+				`alter table t add tags (audit = true)`,
+				`alter table t drop tags (audit, legacy)`,
+				`alter table t alter column c add tags (searchable = true)`,
+				`alter table t alter column c drop tags (searchable)`,
+				`alter table t alter constraint uq add tags (msg = 'dup')`,
+				`alter table t alter constraint uq drop tags (msg)`,
+			]) {
+				const stmt = parse(sql);
+				// Re-parse the stringified form and compare the action — proves the
+				// emitter is parseable and structurally identical.
+				const reparsed = parse(astToString(stmt));
+				expect((reparsed as AlterTableStmt).action).to.deep.equal((stmt as AlterTableStmt).action);
+			}
+		});
+	});
+
 	describe('ALTER VIEW / MATERIALIZED VIEW / INDEX SET TAGS', () => {
 		it('parses ALTER VIEW ... SET TAGS', () => {
 			const stmt = parse(`alter view v set tags (cacheable = true)`) as import('../src/parser/ast.js').AlterViewStmt;

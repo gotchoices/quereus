@@ -46,6 +46,20 @@ export interface GenericModuleCallOptions extends BaseModuleConfig {
 }
 
 /**
+ * A per-key tag mutation descriptor consumed by {@link SchemaManager.mutateTagRecord}:
+ * `merge` overlays keys onto the current set, `drop` removes listed keys (atomically).
+ */
+type TagMutation =
+	| { op: 'merge'; tags: Record<string, SqlValue> }
+	| { op: 'drop'; keys: readonly string[] };
+
+/**
+ * Computes the next (frozen) tag record from the current one. Used to share the
+ * per-site read-modify-write across the replace / merge / drop tag setters.
+ */
+type TagCompute = (current: Readonly<Record<string, SqlValue>> | undefined) => Readonly<Record<string, SqlValue>> | undefined;
+
+/**
  * Manages all schemas associated with a database connection (main, temp, attached).
  * Handles lookup resolution according to SQLite's rules.
  */
@@ -623,6 +637,34 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Computes the next frozen tag record from the current one plus a per-key
+	 * mutation, reusing {@link freezeTags} for the empty→`undefined` collapse.
+	 *
+	 *  - `merge`: shallow-overlay the new keys onto the current set (overwrite on
+	 *    collision), keeping the rest. A merge of a non-empty payload can never empty
+	 *    the set; an empty merge of an empty set collapses to `undefined`.
+	 *  - `drop`: every listed key must currently be present (atomic). Any missing key
+	 *    raises `NOTFOUND` naming the offenders and mutates nothing; otherwise the keys
+	 *    are deleted and dropping the last key collapses to `undefined`. Key matching
+	 *    is verbatim (case-sensitive), matching how `parseTags` stores keys.
+	 */
+	private mutateTagRecord(
+		current: Readonly<Record<string, SqlValue>> | undefined,
+		mutation: TagMutation,
+	): Readonly<Record<string, SqlValue>> | undefined {
+		if (mutation.op === 'merge') {
+			return this.freezeTags({ ...(current ?? {}), ...mutation.tags });
+		}
+		const next: Record<string, SqlValue> = { ...(current ?? {}) };
+		const missing = mutation.keys.filter(k => !(k in next));
+		if (missing.length > 0) {
+			throw new QuereusError(`Tag key(s) not found: ${missing.join(', ')}`, StatusCode.NOTFOUND);
+		}
+		for (const k of mutation.keys) delete next[k];
+		return this.freezeTags(next);
+	}
+
+	/**
 	 * Re-registers a tag-only schema swap and fires `table_modified` so optimizer
 	 * caches invalidate. Tags are excluded from the schema hash, so a tag-only swap
 	 * is a structural no-op except for the metadata itself.
@@ -640,13 +682,14 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Sets metadata tags on an existing table, replacing any existing tags.
-	 *
-	 * @param tableName The table name
-	 * @param tags The tags to set (pass empty object to clear)
-	 * @param schemaName Optional schema name (defaults to current schema)
+	 * Shared table-tag read-modify-write: fetches the live table (NOTFOUND if
+	 * absent), computes the next tag record from its current `tags` via `compute`,
+	 * and commits the swap (firing `table_modified`). `compute` decides
+	 * replace / merge / drop; it may throw before any mutation (e.g. drop-of-absent
+	 * NOTFOUND), leaving the catalog untouched. Reads the *live* schema each call so
+	 * back-to-back ALTERs and prepared-statement reuse see the prior result.
 	 */
-	setTableTags(tableName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+	private updateTableTags(tableName: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const tableSchema = this.getTable(targetSchemaName, tableName);
 		if (!tableSchema) {
@@ -654,7 +697,65 @@ export class SchemaManager {
 		}
 		const updatedSchema: TableSchema = {
 			...tableSchema,
-			tags: this.freezeTags(tags),
+			tags: compute(tableSchema.tags),
+		};
+		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
+	}
+
+	/**
+	 * Sets metadata tags on an existing table, replacing any existing tags.
+	 *
+	 * @param tableName The table name
+	 * @param tags The tags to set (pass empty object to clear)
+	 * @param schemaName Optional schema name (defaults to current schema)
+	 */
+	setTableTags(tableName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateTableTags(tableName, () => this.freezeTags(tags), schemaName);
+	}
+
+	/**
+	 * Merges `tags` into an existing table's tags — set/overwrite the listed keys,
+	 * keep the rest (the `ALTER TABLE … ADD TAGS` primitive). An empty `tags` is a
+	 * no-op (it does NOT clear). Reads the table's live tags at call time.
+	 */
+	mergeTableTags(tableName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateTableTags(tableName, current => this.mutateTagRecord(current, { op: 'merge', tags }), schemaName);
+	}
+
+	/**
+	 * Drops the listed keys from an existing table's tags (the `ALTER TABLE …
+	 * DROP TAGS` primitive). Atomic: every key must be present, else `NOTFOUND`
+	 * names the missing key(s) and nothing is dropped. Dropping the last key(s)
+	 * leaves `tags` undefined. An empty `keys` is a no-op.
+	 */
+	dropTableTags(tableName: string, keys: readonly string[], schemaName?: string): void {
+		this.updateTableTags(tableName, current => this.mutateTagRecord(current, { op: 'drop', keys }), schemaName);
+	}
+
+	/**
+	 * Shared column-tag read-modify-write: resolves the table and column (NOTFOUND
+	 * on either miss), computes the column's next tag record from its current `tags`
+	 * via `compute`, and commits the swap. Only the column's `tags` field changes;
+	 * nullability / type / default / PK membership are untouched. `compute` may throw
+	 * before any mutation (drop-of-absent NOTFOUND), leaving the catalog untouched.
+	 */
+	private updateColumnTags(tableName: string, columnName: string, compute: TagCompute, schemaName?: string): void {
+		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const tableSchema = this.getTable(targetSchemaName, tableName);
+		if (!tableSchema) {
+			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+		}
+		const colIndex = tableSchema.columnIndexMap.get(columnName.toLowerCase());
+		if (colIndex === undefined) {
+			throw new QuereusError(`Column '${columnName}' not found in table '${tableName}'`, StatusCode.NOTFOUND);
+		}
+		// Compute before building the new column array so a drop-of-absent NOTFOUND
+		// aborts before any swap.
+		const nextTags = compute(tableSchema.columns[colIndex].tags);
+		const newColumns = tableSchema.columns.map((c, i) => (i === colIndex ? { ...c, tags: nextTags } : c));
+		const updatedSchema: TableSchema = {
+			...tableSchema,
+			columns: Object.freeze(newColumns),
 		};
 		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
 	}
@@ -668,21 +769,64 @@ export class SchemaManager {
 	 * @throws QuereusError(NOTFOUND) if the table or column does not exist.
 	 */
 	setColumnTags(tableName: string, columnName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateColumnTags(tableName, columnName, () => this.freezeTags(tags), schemaName);
+	}
+
+	/**
+	 * Merges `tags` into a column's existing tags — set/overwrite the listed keys,
+	 * keep the rest (`ALTER TABLE … ALTER COLUMN … ADD TAGS`). Empty `tags` is a
+	 * no-op (does NOT clear).
+	 *
+	 * @throws QuereusError(NOTFOUND) if the table or column does not exist.
+	 */
+	mergeColumnTags(tableName: string, columnName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateColumnTags(tableName, columnName, current => this.mutateTagRecord(current, { op: 'merge', tags }), schemaName);
+	}
+
+	/**
+	 * Drops the listed keys from a column's tags (`ALTER TABLE … ALTER COLUMN …
+	 * DROP TAGS`). Atomic: every key must be present, else `NOTFOUND` names the
+	 * missing key(s) and nothing is dropped. Empty `keys` is a no-op.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the table or column does not exist, or any
+	 *   listed key is absent.
+	 */
+	dropColumnTags(tableName: string, columnName: string, keys: readonly string[], schemaName?: string): void {
+		this.updateColumnTags(tableName, columnName, current => this.mutateTagRecord(current, { op: 'drop', keys }), schemaName);
+	}
+
+	/**
+	 * Shared named-constraint-tag read-modify-write: resolves the table (NOTFOUND if
+	 * absent) and the single matching constraint class (check → unique → fk;
+	 * NOTFOUND / ambiguous via {@link resolveNamedConstraintClass}), computes the
+	 * matching constraint's next tag record from its current `tags` via `compute`,
+	 * and commits. `compute` may throw before any mutation (drop-of-absent NOTFOUND);
+	 * since it runs inside the array rebuild prior to `commitTagUpdate`, a throw
+	 * leaves the catalog untouched.
+	 */
+	private updateConstraintTags(tableName: string, constraintName: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const tableSchema = this.getTable(targetSchemaName, tableName);
 		if (!tableSchema) {
 			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
-		const colIndex = tableSchema.columnIndexMap.get(columnName.toLowerCase());
-		if (colIndex === undefined) {
-			throw new QuereusError(`Column '${columnName}' not found in table '${tableName}'`, StatusCode.NOTFOUND);
+		const lower = constraintName.toLowerCase();
+		// Resolve to exactly one class (check → unique → fk), or throw NOTFOUND/ambiguous.
+		const constraintClass = resolveNamedConstraintClass(tableSchema, constraintName);
+		const updatedSchema: TableSchema = { ...tableSchema };
+		if (constraintClass === 'check') {
+			updatedSchema.checkConstraints = Object.freeze(
+				tableSchema.checkConstraints.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: compute(c.tags) } : c)),
+			);
+		} else if (constraintClass === 'unique') {
+			updatedSchema.uniqueConstraints = Object.freeze(
+				tableSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: compute(c.tags) } : c)),
+			);
+		} else {
+			updatedSchema.foreignKeys = Object.freeze(
+				tableSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: compute(c.tags) } : c)),
+			);
 		}
-		const frozen = this.freezeTags(tags);
-		const newColumns = tableSchema.columns.map((c, i) => (i === colIndex ? { ...c, tags: frozen } : c));
-		const updatedSchema: TableSchema = {
-			...tableSchema,
-			columns: Object.freeze(newColumns),
-		};
 		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
 	}
 
@@ -696,30 +840,32 @@ export class SchemaManager {
 	 * @throws QuereusError(ERROR) if the name is ambiguous across constraint classes.
 	 */
 	setConstraintTags(tableName: string, constraintName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
-		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
-		const tableSchema = this.getTable(targetSchemaName, tableName);
-		if (!tableSchema) {
-			throw new QuereusError(`Table '${tableName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
-		}
-		const lower = constraintName.toLowerCase();
-		// Resolve to exactly one class (check → unique → fk), or throw NOTFOUND/ambiguous.
-		const constraintClass = resolveNamedConstraintClass(tableSchema, constraintName);
-		const frozen = this.freezeTags(tags);
-		const updatedSchema: TableSchema = { ...tableSchema };
-		if (constraintClass === 'check') {
-			updatedSchema.checkConstraints = Object.freeze(
-				tableSchema.checkConstraints.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
-			);
-		} else if (constraintClass === 'unique') {
-			updatedSchema.uniqueConstraints = Object.freeze(
-				tableSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
-			);
-		} else {
-			updatedSchema.foreignKeys = Object.freeze(
-				tableSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === lower ? { ...c, tags: frozen } : c)),
-			);
-		}
-		this.commitTagUpdate(targetSchemaName, tableSchema, updatedSchema);
+		this.updateConstraintTags(tableName, constraintName, () => this.freezeTags(tags), schemaName);
+	}
+
+	/**
+	 * Merges `tags` into a named constraint's existing tags — set/overwrite the
+	 * listed keys, keep the rest (`ALTER TABLE … ALTER CONSTRAINT … ADD TAGS`).
+	 * Empty `tags` is a no-op (does NOT clear).
+	 *
+	 * @throws QuereusError(NOTFOUND) if no named constraint matches.
+	 * @throws QuereusError(ERROR) if the name is ambiguous across constraint classes.
+	 */
+	mergeConstraintTags(tableName: string, constraintName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateConstraintTags(tableName, constraintName, current => this.mutateTagRecord(current, { op: 'merge', tags }), schemaName);
+	}
+
+	/**
+	 * Drops the listed keys from a named constraint's tags (`ALTER TABLE … ALTER
+	 * CONSTRAINT … DROP TAGS`). Atomic: every key must be present, else `NOTFOUND`
+	 * names the missing key(s) and nothing is dropped. Empty `keys` is a no-op.
+	 *
+	 * @throws QuereusError(NOTFOUND) if no named constraint matches, or any listed
+	 *   key is absent.
+	 * @throws QuereusError(ERROR) if the name is ambiguous across constraint classes.
+	 */
+	dropConstraintTags(tableName: string, constraintName: string, keys: readonly string[], schemaName?: string): void {
+		this.updateConstraintTags(tableName, constraintName, current => this.mutateTagRecord(current, { op: 'drop', keys }), schemaName);
 	}
 
 	/**

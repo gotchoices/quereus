@@ -254,6 +254,137 @@ describe('Schema Manager', () => {
 			expect(() => db.schemaManager.setConstraintTags('t1', 'nope', { a: 1 })).to.throw(/not found/i);
 		});
 
+		// ── mergeTableTags / dropTableTags (ADD/DROP TAGS) ──
+		it('should merge table tags, overwriting collisions and keeping the rest', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (a = 1, b = 2)");
+			db.schemaManager.mergeTableTags('t1', { b: 99, c: 3 });
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ a: 1, b: 99, c: 3 });
+		});
+
+		it('should create the tag set when merging onto a table with no tags', async () => {
+			await db.exec('create table t1 (id integer primary key)');
+			db.schemaManager.mergeTableTags('t1', { k: 'v' });
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ k: 'v' });
+		});
+
+		it('should store a null tag value on merge (distinct from dropping the key)', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (a = 1)");
+			db.schemaManager.mergeTableTags('t1', { a: null });
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ a: null });
+		});
+
+		it('should treat an empty merge as a no-op (not a clear)', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (a = 1)");
+			db.schemaManager.mergeTableTags('t1', {});
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ a: 1 });
+		});
+
+		it('should drop listed table tag keys and leave the rest', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (a = 1, b = 2, c = 3)");
+			db.schemaManager.dropTableTags('t1', ['a', 'c']);
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ b: 2 });
+		});
+
+		it('should collapse tags to undefined when dropping the last table key', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (a = 1)");
+			db.schemaManager.dropTableTags('t1', ['a']);
+			expect(db.schemaManager.getTableTags('t1')).to.be.undefined;
+		});
+
+		it('should drop nothing and throw NOTFOUND when any listed table key is absent (atomic)', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (present = 1)");
+			expect(() => db.schemaManager.dropTableTags('t1', ['present', 'absent'])).to.throw(/absent/i);
+			// Atomic: the present key is untouched.
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ present: 1 });
+		});
+
+		it('should treat an empty drop as a no-op', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (a = 1)");
+			db.schemaManager.dropTableTags('t1', []);
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ a: 1 });
+		});
+
+		it('should match tag keys case-sensitively on drop (verbatim)', async () => {
+			await db.exec("create table t1 (id integer primary key) with tags (Audit = 1)");
+			// Wrong case is a different key → NOTFOUND, nothing dropped.
+			expect(() => db.schemaManager.dropTableTags('t1', ['audit'])).to.throw(/not found/i);
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ Audit: 1 });
+			// Exact case succeeds.
+			db.schemaManager.dropTableTags('t1', ['Audit']);
+			expect(db.schemaManager.getTableTags('t1')).to.be.undefined;
+		});
+
+		it('should read live tags so back-to-back merges compose', async () => {
+			await db.exec('create table t1 (id integer primary key)');
+			db.schemaManager.mergeTableTags('t1', { a: 1 });
+			db.schemaManager.mergeTableTags('t1', { b: 2 });
+			expect(db.schemaManager.getTableTags('t1')).to.deep.equal({ a: 1, b: 2 });
+		});
+
+		// ── mergeColumnTags / dropColumnTags ──
+		it('should merge and drop column tags', async () => {
+			await db.exec("create table t1 (id integer primary key, name text with tags (a = 1))");
+			db.schemaManager.mergeColumnTags('t1', 'name', { b: 2 });
+			expect(db.schemaManager.findTable('t1')!.columns[1].tags).to.deep.equal({ a: 1, b: 2 });
+			db.schemaManager.dropColumnTags('t1', 'name', ['a']);
+			expect(db.schemaManager.findTable('t1')!.columns[1].tags).to.deep.equal({ b: 2 });
+			db.schemaManager.dropColumnTags('t1', 'name', ['b']);
+			expect(db.schemaManager.findTable('t1')!.columns[1].tags).to.be.undefined;
+		});
+
+		it('should not disturb other column attributes on merge/drop', async () => {
+			await db.exec("create table t1 (id integer primary key, name text not null default 'x' with tags (a = 1))");
+			db.schemaManager.mergeColumnTags('t1', 'name', { b: 2 });
+			const col = db.schemaManager.findTable('t1')!.columns[1];
+			expect(col.notNull, 'NOT NULL preserved').to.be.true;
+			expect(col.defaultValue, 'DEFAULT preserved').to.not.be.null;
+		});
+
+		it('should throw NOTFOUND (atomic) on dropColumnTags with an absent key', async () => {
+			await db.exec("create table t1 (id integer primary key, name text with tags (a = 1))");
+			expect(() => db.schemaManager.dropColumnTags('t1', 'name', ['a', 'nope'])).to.throw(/nope/i);
+			expect(db.schemaManager.findTable('t1')!.columns[1].tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should throw NOTFOUND for merge/drop column tags on an unknown column', async () => {
+			await db.exec('create table t1 (id integer primary key)');
+			expect(() => db.schemaManager.mergeColumnTags('t1', 'nope', { a: 1 })).to.throw(/not found/i);
+			expect(() => db.schemaManager.dropColumnTags('t1', 'nope', ['a'])).to.throw(/not found/i);
+		});
+
+		// ── mergeConstraintTags / dropConstraintTags ──
+		it('should merge and drop named-constraint tags', async () => {
+			await db.exec("create table t1 (id integer primary key, email text, constraint uq_e unique (email) with tags (a = 1))");
+			db.schemaManager.mergeConstraintTags('t1', 'uq_e', { b: 2 });
+			const uc = () => db.schemaManager.findTable('t1')!.uniqueConstraints!.find(c => c.name === 'uq_e');
+			expect(uc()!.tags).to.deep.equal({ a: 1, b: 2 });
+			db.schemaManager.dropConstraintTags('t1', 'uq_e', ['a']);
+			expect(uc()!.tags).to.deep.equal({ b: 2 });
+			db.schemaManager.dropConstraintTags('t1', 'uq_e', ['b']);
+			expect(uc()!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND (atomic) on dropConstraintTags with an absent key', async () => {
+			await db.exec("create table t1 (id integer primary key, qty integer, constraint chk_q check (qty > 0) with tags (a = 1))");
+			expect(() => db.schemaManager.dropConstraintTags('t1', 'chk_q', ['nope'])).to.throw(/nope/i);
+			const cc = db.schemaManager.findTable('t1')!.checkConstraints.find(c => c.name === 'chk_q');
+			expect(cc!.tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should drop a reserved constraint tag key without value validation', async () => {
+			// DROP removes by key, so removing a reserved override is legitimate.
+			await db.exec("create table t1 (id integer primary key, email text, constraint uq_e unique (email) with tags (\"quereus.expose_implicit_index\" = true))");
+			db.schemaManager.dropConstraintTags('t1', 'uq_e', ['quereus.expose_implicit_index']);
+			const uc = db.schemaManager.findTable('t1')!.uniqueConstraints!.find(c => c.name === 'uq_e');
+			expect(uc!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND for merge/drop constraint tags on an unknown constraint', async () => {
+			await db.exec('create table t1 (id integer primary key)');
+			expect(() => db.schemaManager.mergeConstraintTags('t1', 'nope', { a: 1 })).to.throw(/not found/i);
+			expect(() => db.schemaManager.dropConstraintTags('t1', 'nope', ['a'])).to.throw(/not found/i);
+		});
+
 		// ── setViewTags ──
 		it('should set view tags via setViewTags (whole-set replace)', async () => {
 			await db.exec('create table base (id integer primary key)');

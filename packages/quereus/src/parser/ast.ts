@@ -608,9 +608,14 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * ALTER TABLE … SET TAGS — whole-set replacement of the metadata tags on the
-		 * table itself, one of its columns, or one of its named table-level constraints.
-		 * `tags` is the complete desired tag set; an empty record clears all tags.
+		 * ALTER TABLE … SET TAGS / ADD TAGS — metadata-tag mutation on the table
+		 * itself, one of its columns, or one of its named table-level constraints.
+		 * `mode` selects the semantics:
+		 *   - `'replace'` (SET TAGS): whole-set replacement; `tags` is the complete
+		 *     desired tag set and an empty record clears all tags.
+		 *   - `'merge'` (ADD TAGS): per-key merge; set/overwrite the listed keys and
+		 *     keep the rest. An empty list is a no-op (it does NOT clear — that
+		 *     distinguishes `ADD TAGS ()` from `SET TAGS ()`).
 		 * Tags are catalog-only metadata (no stored-row / physical effect), so this
 		 * never round-trips through `module.alterTable`.
 		 */
@@ -619,7 +624,26 @@ export type AlterTableAction =
 			| { kind: 'table' }
 			| { kind: 'column'; columnName: string }
 			| { kind: 'constraint'; constraintName: string },
-		tags: Record<string, SqlValue> // empty record = clear all tags
+		mode: 'replace' | 'merge',
+		tags: Record<string, SqlValue> // replace: empty = clear; merge: empty = no-op
+	}
+	| {
+		/**
+		 * ALTER TABLE … DROP TAGS — per-key deletion of the metadata tags on the
+		 * table itself, one of its columns, or one of its named table-level
+		 * constraints. `keys` is the bare list of tag keys to remove (no `= value`).
+		 * Atomic: every listed key must currently be present, else a NOTFOUND error
+		 * names the missing key(s) and nothing is dropped. Dropping the last
+		 * remaining key(s) leaves `tags IS NULL`. An empty list is a no-op. Key
+		 * matching is verbatim (case-sensitive). Catalog-only like SET/ADD TAGS, with
+		 * no value validation — dropping a reserved `quereus.*` key is legitimate.
+		 */
+		type: 'dropTags',
+		target:
+			| { kind: 'table' }
+			| { kind: 'column'; columnName: string }
+			| { kind: 'constraint'; constraintName: string },
+		keys: string[] // empty list = no-op
 	};
 
 // Add PragmaStmt interface

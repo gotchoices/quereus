@@ -148,7 +148,20 @@ export function buildAlterTableStmt(
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'setTags',
         target,
+        mode: stmt.action.mode,
         tags: stmt.action.tags,
+      });
+    }
+
+    case 'dropTags': {
+      // DROP TAGS removes tags by key, so there is NO reserved-tag value
+      // validation here (dropping a reserved key is legitimate — it removes an
+      // override). Resolve the same target plumbing as setTags and let the
+      // SchemaManager raise NOTFOUND atomically when a listed key is absent.
+      return new AlterTableNode(ctx.scope, tableReference, {
+        type: 'dropTags',
+        target: stmt.action.target,
+        keys: stmt.action.keys,
       });
     }
 

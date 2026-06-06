@@ -931,13 +931,25 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 		case 'setTags': {
 			const a = stmt.action;
 			const body = tagsBodyToString(a.tags);
+			const verb = a.mode === 'merge' ? 'add tags' : 'set tags';
 			if (a.target.kind === 'column') {
-				return `alter table ${table} alter column ${quoteIdentifier(a.target.columnName)} set tags ${body}`;
+				return `alter table ${table} alter column ${quoteIdentifier(a.target.columnName)} ${verb} ${body}`;
 			}
 			if (a.target.kind === 'constraint') {
-				return `alter table ${table} alter constraint ${quoteIdentifier(a.target.constraintName)} set tags ${body}`;
+				return `alter table ${table} alter constraint ${quoteIdentifier(a.target.constraintName)} ${verb} ${body}`;
 			}
-			return `alter table ${table} set tags ${body}`;
+			return `alter table ${table} ${verb} ${body}`;
+		}
+		case 'dropTags': {
+			const a = stmt.action;
+			const body = tagKeysBodyToString(a.keys);
+			if (a.target.kind === 'column') {
+				return `alter table ${table} alter column ${quoteIdentifier(a.target.columnName)} drop tags ${body}`;
+			}
+			if (a.target.kind === 'constraint') {
+				return `alter table ${table} alter constraint ${quoteIdentifier(a.target.constraintName)} drop tags ${body}`;
+			}
+			return `alter table ${table} drop tags ${body}`;
 		}
 	}
 }
@@ -1343,6 +1355,14 @@ export function tagsBodyToString(tags: Record<string, SqlValue> | undefined): st
 		.map(([key, value]) => `${quoteIdentifier(key)} = ${tagValueToString(value)}`)
 		.join(', ');
 	return `(${entries})`;
+}
+
+/**
+ * Renders the inner `(k[, …])` body of a bare tag-key list for the
+ * `ALTER TABLE … DROP TAGS` form. An empty list renders `()` (a no-op drop).
+ */
+export function tagKeysBodyToString(keys: readonly string[]): string {
+	return `(${keys.map(quoteIdentifier).join(', ')})`;
 }
 
 function tagsClauseToString(tags: Record<string, SqlValue> | undefined): string {

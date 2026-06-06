@@ -676,3 +676,176 @@ ALTER TABLE AddCon ADD CHECK (id < 1000) WITH TAGS ("quereus.bogus" = 1);
 -- constraint kind, not just check/unique).
 ALTER TABLE AddCon ADD CONSTRAINT fk_self FOREIGN KEY (code) REFERENCES AddCon (id) WITH TAGS ("quereus.bogus" = 1);
 -- error: reserved tag
+
+-- ===================================================================
+-- Phase 25: ALTER TABLE ... ADD TAGS (per-key merge at the table level)
+-- ===================================================================
+
+CREATE TABLE Mergeable (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+-- ADD onto a target with no tags creates the set.
+ALTER TABLE Mergeable ADD TAGS (audit = true);
+SELECT json_extract(tags, '$.audit') AS audit FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"audit":true}]
+
+-- ADD overwrites the listed key and keeps the rest (merge, not replace).
+ALTER TABLE Mergeable ADD TAGS (display_name = 'M', audit = false);
+SELECT json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"dn":"M","audit":false}]
+
+-- Back-to-back ADD composes onto the prior result (live read at execution time).
+ALTER TABLE Mergeable ADD TAGS (extra = 1);
+SELECT json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.audit') AS audit,
+       json_extract(tags, '$.extra') AS extra
+    FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"dn":"M","audit":false,"extra":1}]
+
+-- ADD with a null value stores the key PRESENT with null (json_type reports 'null'),
+-- distinct from dropping it. Other keys are untouched.
+ALTER TABLE Mergeable ADD TAGS (display_name = null);
+SELECT json_type(tags, '$.display_name') AS dn_type, json_extract(tags, '$.extra') AS extra
+    FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"dn_type":"null","extra":1}]
+
+-- ADD TAGS () is a no-op (does NOT clear) — distinct from SET TAGS ().
+ALTER TABLE Mergeable ADD TAGS ();
+SELECT json_extract(tags, '$.extra') AS extra FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"extra":1}]
+
+-- ===================================================================
+-- Phase 26: ALTER TABLE ... DROP TAGS (per-key delete at the table level)
+-- ===================================================================
+
+-- Current keys: audit=false, display_name=null, extra=1. Drop one, keep the rest.
+ALTER TABLE Mergeable DROP TAGS (extra);
+SELECT json_type(tags, '$.extra') AS extra_type, json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"extra_type":null,"audit":false}]
+
+-- DROP of an absent key fails (NOTFOUND) and drops NOTHING (atomic): audit survives.
+ALTER TABLE Mergeable DROP TAGS (audit, nonexistent);
+-- error: not found
+
+SELECT json_extract(tags, '$.audit') AS audit FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"audit":false}]
+
+-- DROP TAGS () is a no-op.
+ALTER TABLE Mergeable DROP TAGS ();
+SELECT json_extract(tags, '$.audit') AS audit FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"audit":false}]
+
+-- Drop all remaining keys → tags IS NULL (same end-state as SET TAGS ()).
+ALTER TABLE Mergeable DROP TAGS (audit, display_name);
+SELECT tags FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"tags":null}]
+
+-- The table still works after the tag churn.
+INSERT INTO Mergeable VALUES (1, 'row');
+SELECT * FROM Mergeable;
+→ [{"id":1,"name":"row"}]
+
+-- ===================================================================
+-- Phase 27: ALTER COLUMN ... ADD / DROP TAGS
+-- ===================================================================
+
+ALTER TABLE Mergeable ALTER COLUMN name ADD TAGS (searchable = true);
+ALTER TABLE Mergeable ALTER COLUMN name ADD TAGS (display_name = 'Name');
+SELECT json_extract(tags, '$.searchable') AS s, json_extract(tags, '$.display_name') AS dn
+    FROM table_info('Mergeable') WHERE name = 'name';
+→ [{"s":true,"dn":"Name"}]
+
+-- Column attributes (NOT NULL, type) are untouched by the tag merge.
+SELECT name, type, notnull FROM table_info('Mergeable') WHERE name = 'name';
+→ [{"name":"name","type":"TEXT","notnull":1}]
+
+-- DROP one column key, keep the rest.
+ALTER TABLE Mergeable ALTER COLUMN name DROP TAGS (searchable);
+SELECT json_type(tags, '$.searchable') AS s_type, json_extract(tags, '$.display_name') AS dn
+    FROM table_info('Mergeable') WHERE name = 'name';
+→ [{"s_type":null,"dn":"Name"}]
+
+-- DROP of an absent column key → NOTFOUND (atomic).
+ALTER TABLE Mergeable ALTER COLUMN name DROP TAGS (nope);
+-- error: not found
+
+-- DROP the last column key → tags IS NULL.
+ALTER TABLE Mergeable ALTER COLUMN name DROP TAGS (display_name);
+SELECT tags FROM table_info('Mergeable') WHERE name = 'name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 28: ALTER CONSTRAINT ... ADD / DROP TAGS (named constraint)
+-- ===================================================================
+
+CREATE TABLE MergeCon (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    CONSTRAINT uq_mc UNIQUE (email)
+);
+
+ALTER TABLE MergeCon ALTER CONSTRAINT uq_mc ADD TAGS (msg = 'dup');
+ALTER TABLE MergeCon ALTER CONSTRAINT uq_mc ADD TAGS (sev = 'high');
+SELECT json_extract(tags, '$.msg') AS msg, json_extract(tags, '$.sev') AS sev
+    FROM unique_constraint_info('MergeCon') WHERE name = 'uq_mc';
+→ [{"msg":"dup","sev":"high"}]
+
+-- The UNIQUE constraint still enforces after the tag churn.
+INSERT INTO MergeCon VALUES (1, 'a@x'), (2, 'b@x');
+INSERT INTO MergeCon VALUES (3, 'a@x');
+-- error: constraint
+
+ALTER TABLE MergeCon ALTER CONSTRAINT uq_mc DROP TAGS (msg);
+SELECT json_type(tags, '$.msg') AS msg_type, json_extract(tags, '$.sev') AS sev
+    FROM unique_constraint_info('MergeCon') WHERE name = 'uq_mc';
+→ [{"msg_type":null,"sev":"high"}]
+
+-- DROP of an absent constraint key → NOTFOUND.
+ALTER TABLE MergeCon ALTER CONSTRAINT uq_mc DROP TAGS (nope);
+-- error: not found
+
+-- ===================================================================
+-- Phase 29: ADD validates reserved keys; DROP does not (drop reserved succeeds)
+-- ===================================================================
+
+-- ADD validates reserved `quereus.*` keys at plan-build, same as SET TAGS: a typo
+-- fails loudly rather than being stored.
+ALTER TABLE Mergeable ADD TAGS ("quereus.update.taget" = 1);
+-- error: reserved tag
+
+-- A valid reserved key at the right site is stored by ADD.
+ALTER TABLE Mergeable ADD TAGS ("quereus.id" = 'tbl-id');
+SELECT json_extract(tags, '$."quereus.id"') AS qid FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"qid":"tbl-id"}]
+
+-- DROP does no value validation — dropping a reserved key is legitimate and succeeds.
+ALTER TABLE Mergeable DROP TAGS ("quereus.id");
+SELECT tags FROM schema() WHERE type = 'table' AND name = 'Mergeable';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 30: column-named-`tags` disambiguation at the table level
+-- ===================================================================
+
+-- Only `ADD TAGS (` / `DROP TAGS (` (TAGS immediately followed by '(') routes to a
+-- tag mutation; `ADD tags <type>` and `DROP [COLUMN] tags` still operate on a column
+-- literally named `tags`.
+
+CREATE TABLE DropColTags (id INTEGER PRIMARY KEY, tags TEXT);
+-- `DROP TAGS` with no parens drops the COLUMN named `tags`.
+ALTER TABLE DropColTags DROP TAGS;
+SELECT name FROM table_info('DropColTags') ORDER BY cid;
+→ [{"name":"id"}]
+
+CREATE TABLE AddColTags (id INTEGER PRIMARY KEY);
+-- `ADD tags <type>` adds a COLUMN named `tags`.
+ALTER TABLE AddColTags ADD tags integer;
+SELECT name FROM table_info('AddColTags') ORDER BY cid;
+→ [{"name":"id"},{"name":"tags"}]
+
+-- Schema-hash neutrality of ADD/DROP TAGS rides the same tag-exclusion path as
+-- SET TAGS; the declarative tag-value-hash-neutral cases live in
+-- test/schema-manager.spec.ts (§ "Schema hashing with tags").

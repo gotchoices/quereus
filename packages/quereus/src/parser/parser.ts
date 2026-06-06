@@ -2935,7 +2935,16 @@ export class Parser {
 			}
 		} else if (this.peekKeyword('ADD')) {
 			this.consumeKeyword('ADD', "Expected ADD.");
-			if (this.peekKeyword('CONSTRAINT')
+			if (this.peekKeyword('TAGS') && this.checkNext(1, TokenType.LPAREN)) {
+				// ADD TAGS (...) — per-key merge of table tags. Gated on TAGS being
+				// immediately followed by '(' so a column literally named `tags`
+				// (e.g. `ADD tags integer` / `ADD COLUMN tags ...`) still parses as
+				// ADD COLUMN. `TAGS` is a contextual keyword (a plain identifier), so
+				// without the '(' guard it would shadow such columns.
+				this.consumeKeyword('TAGS', "Expected 'TAGS'.");
+				const tags = this.parseTags();
+				action = { type: 'setTags', target: { kind: 'table' }, mode: 'merge', tags };
+			} else if (this.peekKeyword('CONSTRAINT')
 				|| this.check(TokenType.UNIQUE)
 				|| this.check(TokenType.FOREIGN)
 				|| this.check(TokenType.CHECK)) {
@@ -2952,7 +2961,13 @@ export class Parser {
 			}
 		} else if (this.peekKeyword('DROP')) {
 			this.consumeKeyword('DROP', "Expected DROP.");
-			if (this.matchKeyword('CONSTRAINT')) {
+			if (this.peekKeyword('TAGS') && this.checkNext(1, TokenType.LPAREN)) {
+				// DROP TAGS (...) — per-key delete of table tags. Same '(' guard as
+				// ADD TAGS so `DROP COLUMN tags` / `DROP tags` (a column named `tags`)
+				// still parse as DROP COLUMN.
+				this.consumeKeyword('TAGS', "Expected 'TAGS'.");
+				action = { type: 'dropTags', target: { kind: 'table' }, keys: this.parseTagKeys() };
+			} else if (this.matchKeyword('CONSTRAINT')) {
 				// DROP CONSTRAINT <name> — drop a named table-level constraint
 				// (CHECK / UNIQUE / FOREIGN KEY).
 				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected constraint name after DROP CONSTRAINT.");
@@ -2967,21 +2982,31 @@ export class Parser {
 			this.consumeKeyword('SET', "Expected SET.");
 			this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
 			const tags = this.parseTags();
-			action = { type: 'setTags', target: { kind: 'table' }, tags };
+			action = { type: 'setTags', target: { kind: 'table' }, mode: 'replace', tags };
 		} else if (this.peekKeyword('ALTER')) {
 			this.consumeKeyword('ALTER', "Expected ALTER.");
 			if (this.peekKeyword('COLUMN')) {
 				this.consumeKeyword('COLUMN', "Expected COLUMN.");
 				action = this.alterColumnAction();
 			} else if (this.peekKeyword('CONSTRAINT')) {
-				// ALTER CONSTRAINT <name> SET TAGS (...) — whole-set tag replacement on
-				// a named table-level constraint (only named constraints are addressable).
+				// ALTER CONSTRAINT <name> {SET|ADD|DROP} TAGS (...) — tag mutation on a
+				// named table-level constraint (only named constraints are addressable):
+				//   SET TAGS  → whole-set replace, ADD TAGS → per-key merge,
+				//   DROP TAGS → per-key delete.
 				this.consumeKeyword('CONSTRAINT', "Expected CONSTRAINT.");
 				const constraintName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected constraint name after ALTER CONSTRAINT.");
-				this.consumeKeyword('SET', "Expected 'SET' after constraint name.");
-				this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
-				const tags = this.parseTags();
-				action = { type: 'setTags', target: { kind: 'constraint', constraintName }, tags };
+				if (this.matchKeyword('SET')) {
+					this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
+					action = { type: 'setTags', target: { kind: 'constraint', constraintName }, mode: 'replace', tags: this.parseTags() };
+				} else if (this.matchKeyword('ADD')) {
+					this.consumeKeyword('TAGS', "Expected 'TAGS' after ADD.");
+					action = { type: 'setTags', target: { kind: 'constraint', constraintName }, mode: 'merge', tags: this.parseTags() };
+				} else if (this.matchKeyword('DROP')) {
+					this.consumeKeyword('TAGS', "Expected 'TAGS' after DROP.");
+					action = { type: 'dropTags', target: { kind: 'constraint', constraintName }, keys: this.parseTagKeys() };
+				} else {
+					throw this.error(this.peek(), `Expected SET, ADD, or DROP after ALTER CONSTRAINT ${constraintName}.`);
+				}
 			} else {
 				this.consumeKeyword('PRIMARY', "Expected 'PRIMARY', 'COLUMN', or 'CONSTRAINT' after ALTER.");
 				this.consumeKeyword('KEY', "Expected 'KEY' after PRIMARY.");
@@ -3051,9 +3076,18 @@ export class Parser {
 			if (this.matchKeyword('TAGS')) {
 				// ALTER COLUMN <name> SET TAGS (...) — whole-set tag replacement on the column.
 				const tags = this.parseTags();
-				return { type: 'setTags', target: { kind: 'column', columnName }, tags };
+				return { type: 'setTags', target: { kind: 'column', columnName }, mode: 'replace', tags };
 			}
 			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, DEFAULT, COLLATE, or TAGS after SET.");
+		}
+
+		if (this.matchKeyword('ADD')) {
+			// ALTER COLUMN <name> ADD TAGS (...) — per-key merge on the column. TAGS is
+			// unambiguous here (the grammar after ALTER COLUMN <name> ADD is fixed), so
+			// no '(' look-ahead guard is needed as it is at the table level.
+			this.consumeKeyword('TAGS', "Expected 'TAGS' after ADD.");
+			const tags = this.parseTags();
+			return { type: 'setTags', target: { kind: 'column', columnName }, mode: 'merge', tags };
 		}
 
 		if (this.matchKeyword('DROP')) {
@@ -3064,10 +3098,14 @@ export class Parser {
 			if (this.matchKeyword('DEFAULT')) {
 				return { type: 'alterColumn', columnName, setDefault: null };
 			}
-			throw this.error(this.peek(), "Expected NOT NULL or DEFAULT after DROP.");
+			if (this.matchKeyword('TAGS')) {
+				// ALTER COLUMN <name> DROP TAGS (...) — per-key delete on the column.
+				return { type: 'dropTags', target: { kind: 'column', columnName }, keys: this.parseTagKeys() };
+			}
+			throw this.error(this.peek(), "Expected NOT NULL, DEFAULT, or TAGS after DROP.");
 		}
 
-		throw this.error(this.peek(), "Expected SET or DROP after ALTER COLUMN name.");
+		throw this.error(this.peek(), "Expected SET, ADD, or DROP after ALTER COLUMN name.");
 	}
 
 	/**
@@ -4029,6 +4067,25 @@ export class Parser {
 
 		this.consume(TokenType.RPAREN, "Expected ')' after tag list.");
 		return tags;
+	}
+
+	/**
+	 * @internal Parses a bare comma-list of tag keys — `(key [, key ...])` with no
+	 * `= value`, used by the DROP TAGS form. Mirrors {@link parseTags} but yields
+	 * just the keys. An empty list `()` yields `[]`.
+	 */
+	private parseTagKeys(): string[] {
+		this.consume(TokenType.LPAREN, "Expected '(' after TAGS.");
+		const keys: string[] = [];
+
+		if (!this.check(TokenType.RPAREN)) {
+			do {
+				keys.push(this.consumeIdentifier("Expected tag key identifier."));
+			} while (this.match(TokenType.COMMA));
+		}
+
+		this.consume(TokenType.RPAREN, "Expected ')' after tag key list.");
+		return keys;
 	}
 
 	/** @internal Parses a tag value: string, number, TRUE, FALSE, or NULL */

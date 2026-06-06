@@ -75,9 +75,23 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runAlterColumn(rctx, tableSchema, schema, action);
 			case 'setTags': {
 				const target = action.target;
+				if (action.mode === 'merge') {
+					// ADD TAGS — per-key merge onto the live tag set.
+					if (target.kind === 'column') return runMergeColumnTags(rctx, tableSchema, target.columnName, action.tags);
+					if (target.kind === 'constraint') return runMergeConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
+					return runMergeTableTags(rctx, tableSchema, action.tags);
+				}
+				// SET TAGS — whole-set replace.
 				if (target.kind === 'column') return runSetColumnTags(rctx, tableSchema, target.columnName, action.tags);
 				if (target.kind === 'constraint') return runSetConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
 				return runSetTableTags(rctx, tableSchema, action.tags);
+			}
+			case 'dropTags': {
+				// DROP TAGS — per-key delete (atomic NOTFOUND if any key absent).
+				const target = action.target;
+				if (target.kind === 'column') return runDropColumnTags(rctx, tableSchema, target.columnName, action.keys);
+				if (target.kind === 'constraint') return runDropConstraintTags(rctx, tableSchema, target.constraintName, action.keys);
+				return runDropTableTags(rctx, tableSchema, action.keys);
 			}
 		}
 	}
@@ -97,7 +111,14 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				const where = t.kind === 'column' ? `${tableSchema.name}.${t.columnName}`
 					: t.kind === 'constraint' ? `${tableSchema.name}.constraint ${t.constraintName}`
 					: tableSchema.name;
-				return `setTags(${where})`;
+				return action.mode === 'merge' ? `mergeTags(${where})` : `setTags(${where})`;
+			}
+			case 'dropTags': {
+				const t = action.target;
+				const where = t.kind === 'column' ? `${tableSchema.name}.${t.columnName}`
+					: t.kind === 'constraint' ? `${tableSchema.name}.constraint ${t.constraintName}`
+					: tableSchema.name;
+				return `dropTags(${where})`;
 			}
 		}
 	})();
@@ -882,6 +903,80 @@ function runSetConstraintTags(
 ): SqlValue {
 	rctx.db.schemaManager.setConstraintTags(tableSchema.name, constraintName, tags, tableSchema.schemaName);
 	log('Set tags on constraint %s.%s.%s', tableSchema.schemaName, tableSchema.name, constraintName);
+	return null;
+}
+
+// ── ADD TAGS (per-key merge) ──
+// Each delegates to the matching SchemaManager merge setter, which reads the
+// table's *live* tags at execution time (not the plan-time snapshot), so a
+// prepared/reused ADD TAGS or back-to-back ALTERs compose onto the prior result.
+
+function runMergeTableTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	tags: Record<string, SqlValue>,
+): SqlValue {
+	rctx.db.schemaManager.mergeTableTags(tableSchema.name, tags, tableSchema.schemaName);
+	log('Merged tags on table %s.%s', tableSchema.schemaName, tableSchema.name);
+	return null;
+}
+
+function runMergeColumnTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	columnName: string,
+	tags: Record<string, SqlValue>,
+): SqlValue {
+	rctx.db.schemaManager.mergeColumnTags(tableSchema.name, columnName, tags, tableSchema.schemaName);
+	log('Merged tags on column %s.%s.%s', tableSchema.schemaName, tableSchema.name, columnName);
+	return null;
+}
+
+function runMergeConstraintTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	constraintName: string,
+	tags: Record<string, SqlValue>,
+): SqlValue {
+	rctx.db.schemaManager.mergeConstraintTags(tableSchema.name, constraintName, tags, tableSchema.schemaName);
+	log('Merged tags on constraint %s.%s.%s', tableSchema.schemaName, tableSchema.name, constraintName);
+	return null;
+}
+
+// ── DROP TAGS (per-key delete) ──
+// Each delegates to the matching SchemaManager drop setter, which validates that
+// every listed key is present (atomic NOTFOUND) before mutating, again against the
+// live tags at execution time.
+
+function runDropTableTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	keys: readonly string[],
+): SqlValue {
+	rctx.db.schemaManager.dropTableTags(tableSchema.name, keys, tableSchema.schemaName);
+	log('Dropped tags on table %s.%s', tableSchema.schemaName, tableSchema.name);
+	return null;
+}
+
+function runDropColumnTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	columnName: string,
+	keys: readonly string[],
+): SqlValue {
+	rctx.db.schemaManager.dropColumnTags(tableSchema.name, columnName, keys, tableSchema.schemaName);
+	log('Dropped tags on column %s.%s.%s', tableSchema.schemaName, tableSchema.name, columnName);
+	return null;
+}
+
+function runDropConstraintTags(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	constraintName: string,
+	keys: readonly string[],
+): SqlValue {
+	rctx.db.schemaManager.dropConstraintTags(tableSchema.name, constraintName, keys, tableSchema.schemaName);
+	log('Dropped tags on constraint %s.%s.%s', tableSchema.schemaName, tableSchema.name, constraintName);
 	return null;
 }
 

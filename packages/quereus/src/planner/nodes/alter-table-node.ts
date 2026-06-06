@@ -79,16 +79,35 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * SET TAGS — catalog-only whole-set replacement of metadata tags on the
-		 * table, a column, or a named table-level constraint. `tags` is the complete
-		 * desired set (empty = clear). No module round-trip (see runtime emitter).
+		 * SET TAGS / ADD TAGS — catalog-only metadata-tag mutation on the table, a
+		 * column, or a named table-level constraint. `mode` selects the semantics:
+		 * `'replace'` (SET TAGS) swaps the whole set (`tags` empty = clear);
+		 * `'merge'` (ADD TAGS) overlays the listed keys onto the current set
+		 * (`tags` empty = no-op). No module round-trip (see runtime emitter).
 		 */
 		type: 'setTags';
 		target:
 			| { kind: 'table' }
 			| { kind: 'column'; columnName: string }
 			| { kind: 'constraint'; constraintName: string };
+		mode: 'replace' | 'merge';
 		tags: Record<string, SqlValue>;
+	}
+	| {
+		/**
+		 * DROP TAGS — catalog-only per-key deletion of metadata tags on the table, a
+		 * column, or a named table-level constraint. `keys` is the bare list of keys
+		 * to remove. Atomic: every listed key must be present, else NOTFOUND names the
+		 * missing key(s) and nothing is dropped. Dropping the last key(s) leaves
+		 * `tags IS NULL`; an empty list is a no-op. No value validation (a reserved
+		 * key may be dropped). No module round-trip (see runtime emitter).
+		 */
+		type: 'dropTags';
+		target:
+			| { kind: 'table' }
+			| { kind: 'column'; columnName: string }
+			| { kind: 'constraint'; constraintName: string };
+		keys: string[];
 	};
 
 /**
@@ -130,9 +149,16 @@ export class AlterTableNode extends VoidNode {
 				return `ALTER TABLE ALTER COLUMN ${this.action.columnName}`;
 			case 'setTags': {
 				const target = this.action.target;
-				if (target.kind === 'column') return `ALTER TABLE ALTER COLUMN ${target.columnName} SET TAGS`;
-				if (target.kind === 'constraint') return `ALTER TABLE ALTER CONSTRAINT ${target.constraintName} SET TAGS`;
-				return `ALTER TABLE SET TAGS`;
+				const verb = this.action.mode === 'merge' ? 'ADD TAGS' : 'SET TAGS';
+				if (target.kind === 'column') return `ALTER TABLE ALTER COLUMN ${target.columnName} ${verb}`;
+				if (target.kind === 'constraint') return `ALTER TABLE ALTER CONSTRAINT ${target.constraintName} ${verb}`;
+				return `ALTER TABLE ${verb}`;
+			}
+			case 'dropTags': {
+				const target = this.action.target;
+				if (target.kind === 'column') return `ALTER TABLE ALTER COLUMN ${target.columnName} DROP TAGS`;
+				if (target.kind === 'constraint') return `ALTER TABLE ALTER CONSTRAINT ${target.constraintName} DROP TAGS`;
+				return `ALTER TABLE DROP TAGS`;
 			}
 		}
 	}
