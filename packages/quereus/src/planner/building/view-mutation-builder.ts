@@ -27,6 +27,9 @@ import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { buildRowDefaultScope } from './default-scope.js';
+import { createLogger } from '../../common/logger.js';
+
+const log = createLogger('planner:view-mutation');
 
 /**
  * Build the view-mutation substrate for a view-/materialized-view-mediated DML.
@@ -172,8 +175,31 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// semantics. Threaded onto each single-source-spine base op's DmlExecutorNode so the
 	// runtime can distinguish a lens-routed basis write from a basis-direct one.
 	const isLensWrite = !!ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
-	const children = baseOps.map(op =>
-		buildBaseOp(injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx, op, extraConstraints, isLensWrite));
+	// A lens-synthesized constraint (set-level uniqueness / row-local CHECK / child-FK
+	// EXISTS / parent-FK NOT EXISTS) references write-row columns in *basis* terms. On a
+	// multi-op fan-out (a decomposition UPDATE) those columns may live on only some
+	// members, so threading the SAME `extraConstraints` onto every base op would make a
+	// member op that lacks a referenced column fail to build (`NEW.<col> isn't a column`).
+	// Gate per op: a constraint rides a base op iff every write-row column it references
+	// resolves on that op's target table — so a uniqueness CHECK rides only the op that
+	// owns (and can change) the key, and a cross-member CHECK/FK rides the single member
+	// that resolves it (or none — deferred, as on decomposition INSERT). Single-source has
+	// exactly one base op carrying all basis columns, so this is a no-op there.
+	const riddenConstraints = new Set<RowConstraintSchema>();
+	const children = baseOps.map(op => {
+		const opCtx = injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx;
+		const opConstraints = constraintsForOp(op, extraConstraints, riddenConstraints);
+		return buildBaseOp(opCtx, op, opConstraints, isLensWrite);
+	});
+	// A lens-synthesized constraint that resolves on NO base op of the fan-out is silently
+	// non-enforced (a key-unchanged UPDATE drops its uniqueness scan — correct; a CHECK/FK
+	// spanning more than one member is deferred — as on decomposition INSERT). Trace it so
+	// the non-enforcement is at least visible in debug logs.
+	for (const c of extraConstraints) {
+		if (!riddenConstraints.has(c)) {
+			log('lens constraint %s references write-row columns no base op of the %s fan-out carries; not enforced on this write', c.name ?? '<anon>', req.op);
+		}
+	}
 
 	// RETURNING-through-view. Single-source already embedded the (rewritten)
 	// RETURNING onto its base op (it now plans to a relational ReturningNode the
@@ -837,6 +863,163 @@ function assertSourceArity(view: MutableViewLike, got: number, expected: number)
 
 function quoteIdent(name: string): string {
 	return `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Filter the lens-synthesized `extraConstraints` to those a base op can build: a
+ * constraint rides `op` iff every write-row column it references
+ * ({@link writeRowColumns}) resolves on the op's target-table columns
+ * (case-insensitive). Each constraint that rides ≥1 op is recorded in `ridden` so the
+ * caller can trace any that rode none (a silently-deferred cross-member CHECK/FK, or a
+ * dropped uniqueness scan on a key-unchanged UPDATE).
+ *
+ * `extraConstraints` is exclusively lens-synthesized (the basis table's own checks are
+ * added inside `buildConstraintChecks` from `tableSchema.checkConstraints`, never via
+ * this seam), so gating every entry is safe.
+ */
+function constraintsForOp(
+	op: BaseOp,
+	extraConstraints: ReadonlyArray<RowConstraintSchema>,
+	ridden: Set<RowConstraintSchema>,
+): RowConstraintSchema[] {
+	if (extraConstraints.length === 0) return [];
+	const opCols = new Set(op.table.tableSchema.columns.map(c => c.name.toLowerCase()));
+	const kept: RowConstraintSchema[] = [];
+	for (const c of extraConstraints) {
+		const refs = writeRowColumns(c.expr);
+		let resolvable = true;
+		for (const col of refs) {
+			if (!opCols.has(col)) { resolvable = false; break; }
+		}
+		if (resolvable) {
+			ridden.add(c);
+			kept.push(c);
+		}
+	}
+	return kept;
+}
+
+/**
+ * The lowercased set of **write-row** column names a lens-synthesized constraint
+ * references — the columns that must resolve on a base op's target table for the
+ * constraint to build there. Two reference classes count:
+ *  - any `NEW.*` / `OLD.*`-qualified column **anywhere** (including nested in a
+ *    subquery): the correlated write-row side of a set-level count subquery, a child-FK
+ *    `EXISTS`, or a parent-FK `NOT EXISTS` (+ its UPDATE short-circuit guard);
+ *  - any **bare** (unqualified) column **not** inside a subquery: a row-local CHECK
+ *    rewritten to bare basis terms (`rewriteToBasisTerms`), whose `enforced-row-local`
+ *    class is subquery-free by the prover's definition, so a bare top-level ref is a
+ *    write-row ref.
+ * Subquery-internal bare / alias-qualified refs (the count subquery's `_u.docKey`, an FK
+ * child/parent alias) resolve against the subquery's own FROM, not the write row, so they
+ * are ignored.
+ */
+function writeRowColumns(expr: AST.Expression): Set<string> {
+	const cols = new Set<string>();
+	collectWriteRowColumns(expr, false, cols);
+	return cols;
+}
+
+/** Walk an expression collecting write-row column names (see {@link writeRowColumns}). */
+function collectWriteRowColumns(expr: AST.Expression, insideSubquery: boolean, cols: Set<string>): void {
+	switch (expr.type) {
+		case 'column': {
+			const qualifier = expr.table?.toLowerCase();
+			if (qualifier === 'new' || qualifier === 'old') {
+				cols.add(expr.name.toLowerCase());
+			} else if (!insideSubquery && !expr.table && !expr.schema) {
+				cols.add(expr.name.toLowerCase());
+			}
+			return;
+		}
+		case 'binary':
+			collectWriteRowColumns(expr.left, insideSubquery, cols);
+			collectWriteRowColumns(expr.right, insideSubquery, cols);
+			return;
+		case 'unary':
+		case 'cast':
+		case 'collate':
+			collectWriteRowColumns(expr.expr, insideSubquery, cols);
+			return;
+		case 'function':
+			expr.args.forEach(a => collectWriteRowColumns(a, insideSubquery, cols));
+			return;
+		case 'between':
+			collectWriteRowColumns(expr.expr, insideSubquery, cols);
+			collectWriteRowColumns(expr.lower, insideSubquery, cols);
+			collectWriteRowColumns(expr.upper, insideSubquery, cols);
+			return;
+		case 'case':
+			if (expr.baseExpr) collectWriteRowColumns(expr.baseExpr, insideSubquery, cols);
+			expr.whenThenClauses.forEach(w => {
+				collectWriteRowColumns(w.when, insideSubquery, cols);
+				collectWriteRowColumns(w.then, insideSubquery, cols);
+			});
+			if (expr.elseExpr) collectWriteRowColumns(expr.elseExpr, insideSubquery, cols);
+			return;
+		case 'in':
+			collectWriteRowColumns(expr.expr, insideSubquery, cols);
+			if (expr.values) expr.values.forEach(v => collectWriteRowColumns(v, insideSubquery, cols));
+			if (expr.subquery) collectQueryWriteRowColumns(expr.subquery, cols);
+			return;
+		case 'subquery':
+			collectQueryWriteRowColumns(expr.query, cols);
+			return;
+		case 'exists':
+			collectQueryWriteRowColumns(expr.subquery, cols);
+			return;
+		default:
+			// literal / identifier / parameter / windowFunction / functionSource — no
+			// write-row column ref to collect.
+			return;
+	}
+}
+
+/**
+ * Descend into a subquery operand collecting only its `NEW.*` / `OLD.*`-qualified
+ * (correlated write-row) refs — bare / alias-qualified refs resolve against the
+ * subquery's own FROM and are skipped (`insideSubquery = true`).
+ */
+function collectQueryWriteRowColumns(query: AST.QueryExpr, cols: Set<string>): void {
+	if (query.type === 'select') {
+		for (const rc of query.columns) {
+			if (rc.type !== 'all') collectWriteRowColumns(rc.expr, true, cols);
+		}
+		if (query.from) query.from.forEach(fc => collectFromWriteRowColumns(fc, cols));
+		if (query.where) collectWriteRowColumns(query.where, true, cols);
+		if (query.groupBy) query.groupBy.forEach(e => collectWriteRowColumns(e, true, cols));
+		if (query.having) collectWriteRowColumns(query.having, true, cols);
+		if (query.orderBy) query.orderBy.forEach(ob => collectWriteRowColumns(ob.expr, true, cols));
+		if (query.limit) collectWriteRowColumns(query.limit, true, cols);
+		if (query.offset) collectWriteRowColumns(query.offset, true, cols);
+		if (query.compound) collectQueryWriteRowColumns(query.compound.select, cols);
+		if (query.union) collectQueryWriteRowColumns(query.union, cols);
+		return;
+	}
+	if (query.type === 'values') {
+		query.values.forEach(row => row.forEach(e => collectWriteRowColumns(e, true, cols)));
+	}
+	// An INSERT/UPDATE/DELETE … RETURNING subquery: lens collectors never synthesize one,
+	// so there is nothing to collect.
+}
+
+/** Collect write-row refs in a subquery's FROM (join conditions, TVF args, nested subqueries). */
+function collectFromWriteRowColumns(fc: AST.FromClause, cols: Set<string>): void {
+	switch (fc.type) {
+		case 'table':
+			return;
+		case 'join':
+			collectFromWriteRowColumns(fc.left, cols);
+			collectFromWriteRowColumns(fc.right, cols);
+			if (fc.condition) collectWriteRowColumns(fc.condition, true, cols);
+			return;
+		case 'functionSource':
+			fc.args.forEach(a => collectWriteRowColumns(a, true, cols));
+			return;
+		case 'subquerySource':
+			collectQueryWriteRowColumns(fc.subquery, cols);
+			return;
+	}
 }
 
 /**

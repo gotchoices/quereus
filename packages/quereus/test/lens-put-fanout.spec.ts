@@ -1455,14 +1455,18 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		const mod = new AdvertisingModule();
 		mod.ads = [surrogateOptionalAd()];
 		db.registerModule('docmetamod', mod);
-		// `doc_key` carries a basis UNIQUE: the logical PK `docKey` is the user-facing
-		// natural key (the surrogate `sid` is the internal stitch). That basis covering
-		// structure keeps the logical-PK uniqueness obligation OFF the commit-time
-		// set-level seam — which would otherwise synthesize a `NEW.doc_key`-referencing
-		// CHECK and thread it onto the Doc_meta member UPDATE (a member lacking doc_key),
-		// failing to build. (See the review handoff: a surrogate decomposition whose
-		// logical PK has NO basis uniqueness still trips that thread on a member UPDATE.)
-		await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text unique, title text) using docmetamod');
+		// `doc_key` carries NO basis UNIQUE: the logical PK `docKey` (the user-facing
+		// natural key; the surrogate `sid` is the internal stitch) has no basis covering
+		// structure, so its uniqueness obligation is `enforced-set-level` / commit-time —
+		// the lens synthesizes a deferred `NEW.doc_key`-referencing count CHECK. The
+		// per-op resolvability gate (view-mutation-builder) threads that CHECK only onto
+		// the fan-out op whose target carries `doc_key` (the Doc_core anchor). A member-
+		// only UPDATE like `set note=…` fans out to Doc_meta ops alone (no doc_key), so the
+		// CHECK rides no op and is dropped — correct, a key-unchanged UPDATE can't dup the
+		// key — and the Doc_meta member UPDATE / materialize-INSERT build cleanly. An
+		// `update … set docKey=…` routes the CHECK onto the Doc_core anchor (pinned by the
+		// `commit-time uniqueness CHECK` regression below).
+		await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text) using docmetamod');
 		await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docmetamod');
 		await db.exec('create table Doc_meta (meta_sid integer primary key, note text) using docmetamod');
 		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text } }');
@@ -1528,6 +1532,37 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 			await db.exec("update x.Doc set note = null where docKey = 'k2'");
 			expect(await rows(db, 'select meta_sid, note from main.Doc_meta order by meta_sid')).to.deep.equal([{ meta_sid: 100, note: 'm1' }]);
 			expect(await rows(db, 'select count(*) as n from main.Doc_meta where meta_sid = 101')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// The per-op resolvability gate's other arm: with NO basis uniqueness on `doc_key`, the
+	// logical-PK uniqueness obligation is `enforced-set-level` / commit-time, so the lens
+	// synthesizes a `NEW.doc_key`-referencing count CHECK. The member-only tests above pin
+	// that it rides NO op (dropped) on a `set note=…` fan-out (Doc_meta members lack
+	// doc_key). This test pins the dual: a `set docKey=…` fans out to the Doc_core anchor
+	// (which owns doc_key), so the CHECK rides THAT op and still fires — a unique re-key
+	// builds and runs, a duplicate re-key ABORTs at commit (count ≥ 2). Together they prove
+	// the gate routes the CHECK precisely onto the op that owns the key, never onto a member
+	// that cannot resolve it.
+	it('a docKey re-key routes the commit-time uniqueness CHECK onto the Doc_core anchor op', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateOptional(db);
+			// Re-key k1 to a fresh, unique docKey → the count CHECK sees count 1 and passes;
+			// it must build (the CHECK rides the Doc_core anchor UPDATE, which owns doc_key).
+			await db.exec("update x.Doc set docKey = 'k3' where docKey = 'k1'");
+			expect(await rows(db, 'select sid, doc_key from main.Doc_core order by sid')).to.deep.equal([
+				{ sid: 100, doc_key: 'k3' }, { sid: 101, doc_key: 'k2' },
+			]);
+			// Re-key k3 onto k2's existing docKey → a duplicate logical PK ⇒ the commit-time
+			// count CHECK sees count 2 ⇒ ABORT. Proves the CHECK still fires on the key-owning op.
+			await expectThrows(() => db.exec("update x.Doc set docKey = 'k2' where docKey = 'k3'"), /primary|unique|constraint/i);
+			// The aborted re-key rolled back: k3 survives, no duplicate landed.
+			expect(await rows(db, 'select sid, doc_key from main.Doc_core order by sid')).to.deep.equal([
+				{ sid: 100, doc_key: 'k3' }, { sid: 101, doc_key: 'k2' },
+			]);
 		} finally {
 			await db.close();
 		}
