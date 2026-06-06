@@ -1150,13 +1150,18 @@ child) and for the parent-absent case (any fully-non-NULL backfilled row is an
 orphan). The new column-level FK is also merged into the table-level constraint set
 for forward INSERT/UPDATE enforcement.
 
-> The FK existing-row validator uses a `LEFT JOIN … WHERE <parent col> IS NULL`
-> left-anti-join rather than a `NOT EXISTS` subquery. The two are equivalent under
-> MATCH SIMPLE, but the `NOT EXISTS` decorrelation misreads a CHILD column added
-> earlier in the *same* ALTER statement (the hash-anti-join reports no orphans, so a
-> violation would be silently admitted); the explicit outer join takes a plan path
-> that reads the freshly-added column correctly. Tracked by the fix ticket
-> `altered-column-not-exists-antijoin-misread`.
+> The validator issues a `NOT EXISTS` correlated subquery (a fully-non-NULL child row
+> with no matching parent is an orphan), the same form `ADD CONSTRAINT` uses. The
+> decorrelator may materialize that as an anti-join, which is normally a candidate for
+> `ruleAntiJoinFkEmpty` to fold to `EmptyRelation` under the inclusion dependency
+> `child.fk ⊆ parent.pk`. To keep that fold from trusting the very invariant the scan
+> is checking, ADD COLUMN registers the new **column but not the new FK** for the
+> validation pass (an intermediate `validationSchema`); the full schema with the FK is
+> committed to the catalog only **after** validation passes. The live schema the
+> planner reads during validation therefore declares no FK to fold against, so the
+> anti-join reads the freshly-backfilled column directly and surfaces real orphans.
+> This mirrors `ADD CONSTRAINT`, which likewise validates before swapping the FK into
+> the live schema.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion

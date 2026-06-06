@@ -230,9 +230,9 @@ drop table fk_parent;
 
 -- ============================================================
 -- 10. Composite ADD FOREIGN KEY over existing rows — exercises the shared
--- existing-row validator's LEFT-anti-join `<first parent col> is null` orphan
--- test across MORE THAN ONE referenced column (single-column cases above only
--- argue the composite path in comments).
+-- existing-row validator's `not exists` orphan test across MORE THAN ONE
+-- referenced column (the multi-column match chain in the correlated subquery;
+-- single-column cases above only argue the composite path in comments).
 -- ============================================================
 create table fk_cparent (a integer, b integer, primary key (a, b));
 insert into fk_cparent values (1, 10), (2, 20);

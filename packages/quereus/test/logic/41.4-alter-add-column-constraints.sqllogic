@@ -288,6 +288,48 @@ drop table t_child;
 drop table t_parent;
 -- run
 
+-- 2m. Engine-bug guard (altered-column-not-exists-antijoin-misread).
+-- The existing-row FK validator issues a `not exists` anti-join. FK-IND folding
+-- (ruleAntiJoinFkEmpty + seeded INDs) folds an anti-join over a DECLARED non-null FK
+-- to EmptyRelation under the inclusion dependency `child.fk ⊆ parent.pk`. If the new
+-- FK were live during validation, the validator's own anti-join would fold to empty,
+-- trusting the unvalidated invariant and silently admitting an orphan — and every
+-- later anti-join on the table would stay mis-folded. The fix registers the new
+-- COLUMN but NOT the new FK for the validation pass, committing the FK only after
+-- validation passes.
+create table p (pid integer primary key);
+insert into p values (1), (2);
+create table c (id integer primary key, name text);
+insert into c values (1, 'x');
+-- run
+
+-- ORPHAN: 99 ∉ {1,2}. The validator's `not exists` MUST surface the orphan and abort
+-- (pre-fix it folded to empty and admitted the violation).
+alter table c add column parent integer default 99 references p(pid);
+-- error: foreign key
+
+-- Reverted to the original shape: the column was dropped and no stale FK left
+-- declared, so a standalone scan reads the unchanged pre-ALTER table.
+select * from c order by id;
+→ [{"id":1,"name":"x"}]
+
+-- VALID: every row references an existing parent (1 ∈ {1,2}) → succeeds and backfills.
+alter table c add column parent integer default 1 references p(pid);
+-- run
+
+-- `select *` shows the backfilled column.
+select * from c order by id;
+→ [{"id":1,"name":"x","parent":1}]
+
+-- Standalone `not exists` anti-join over the now-committed FK: the correct empty set,
+-- because the FK genuinely holds (whether or not it folds, the answer is empty).
+select id from c where not exists (select 1 from p where p.pid = c.parent);
+→ []
+
+drop table c;
+drop table p;
+-- run
+
 -- ===================================
 -- 3. ADD COLUMN with COLLATE clause — Quereus rejects NOCASE on TEXT
 -- ===================================

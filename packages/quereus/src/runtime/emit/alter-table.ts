@@ -368,9 +368,21 @@ async function runAddColumn(
 	// new schema in the catalog.
 	const enhancedTableSchema = withGeneratedColumnGraph(enhancedBase);
 
-	// Register the enhanced schema BEFORE backfill validation so that SQL bound
-	// during validation can resolve the new column.
-	schema.addTable(enhancedTableSchema);
+	// FK-IND folding (`ruleAntiJoinFkEmpty` + the INDs seeded at TableReferenceNode)
+	// treats a DECLARED FK as a proven inclusion dependency `child.fk ⊆ parent.pk`.
+	// The existing-row validation below runs a `not exists` anti-join to find
+	// orphans; if the new FK were already in the LIVE schema the optimizer would
+	// fold that anti-join to EmptyRelation — trusting the very invariant we are
+	// checking — and silently admit a violating row (and every later anti-join on
+	// the table would stay folded while the data violates the declared FK). So
+	// register the new COLUMN but NOT the new FK(s) for the validation pass, then
+	// register the full schema only once validation passes. This mirrors the ADD
+	// CONSTRAINT path, which validates before swapping the FK into the live schema.
+	const hasNewForeignKeys = resolvedForeignKeys.length > 0;
+	const validationSchema = hasNewForeignKeys
+		? withGeneratedColumnGraph({ ...enhancedBase, foreignKeys: updatedTableSchema.foreignKeys })
+		: enhancedTableSchema;
+	schema.addTable(validationSchema);
 
 	// Validate new CHECK constraints against the (already-backfilled) rows AND validate
 	// existing rows against any new column-level FK, reverting (drop the column + restore
@@ -392,12 +404,15 @@ async function runAddColumn(
 	// rebuilt). It reuses `validateForeignKeyOverExistingRows` — the same MATCH-SIMPLE,
 	// pragma-gated validator the ADD CONSTRAINT path calls — so the two paths can never drift.
 	const runCheckScan = !backfill && newCheckConstraints.length > 0;
-	if (runCheckScan || resolvedForeignKeys.length > 0) {
+	if (runCheckScan || hasNewForeignKeys) {
 		try {
 			if (runCheckScan) {
-				await validateBackfillAgainstChecks(rctx, enhancedTableSchema, newCheckConstraints);
+				await validateBackfillAgainstChecks(rctx, validationSchema, newCheckConstraints);
 			}
 			for (const fk of resolvedForeignKeys) {
+				// `enhancedTableSchema` supplies only column-name resolution here; the LIVE
+				// schema the planner reads is `validationSchema`, which lacks the new FK, so
+				// the anti-join is not folded.
 				await validateForeignKeyOverExistingRows(rctx.db, enhancedTableSchema, fk);
 			}
 		} catch (err) {
@@ -413,6 +428,11 @@ async function runAddColumn(
 			schema.addTable(tableSchema);
 			throw err;
 		}
+	}
+
+	// Validation passed — commit the full schema (with the new FK) into the catalog.
+	if (hasNewForeignKeys) {
+		schema.addTable(enhancedTableSchema);
 	}
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
