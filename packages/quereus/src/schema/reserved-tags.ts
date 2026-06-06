@@ -70,6 +70,7 @@ export const DECOMP_KEYKIND_VALUES = ['surrogate', 'logical-tuple'] as const;
  */
 export type TagValueSchema =
 	| 'string'
+	| 'boolean'                            // a SQL boolean (true/false); e.g. expose_implicit_index
 	| 'csv-of-identifiers'                 // comma-separated identifier names (e.g. decomp shared-key columns)
 	| { readonly enum: readonly string[] } // closed value set, e.g. a lens decomp role/presence/keykind
 	| 'required-nonempty-rationale'        // non-empty TEXT; empty => warning
@@ -141,6 +142,23 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		sites: siteSet('physical-table', 'physical-column', 'view-ddl', 'physical-index', 'physical-constraint'),
 		valueSchema: 'string',
 		description: 'Comma-separated former name(s) of a declared object; the differ pairs it across a rename when no id matches.',
+	},
+	// --- quereus.expose_implicit_index : catalog-visibility opt-in on a UNIQUE constraint ---
+	// A declared/inline UNIQUE constraint's enforcement BTree (its implicit covering
+	// structure) is hidden from the catalog / export_schema by default; this boolean tag
+	// surfaces it under the constraint name. Read by `catalog.ts`
+	// (`implicitCoveringIndexExposure`) and treated as real (compared) schema state by the
+	// differ (`schema-differ.ts` § RENAME_HINT_KEYS). It is a constraint-only physical tag,
+	// so it is legal solely at the physical-constraint site — the position shared by the
+	// direct CREATE TABLE named constraint, the `ALTER TABLE … ALTER CONSTRAINT … SET TAGS`
+	// target, and the declarative differ's declared constraint. (First-class spec rather
+	// than a catalog-local string so a typo — `expose_implicit_indx` — fails loudly on every
+	// one of those paths, the same posture the rest of the namespace has.)
+	{
+		key: 'quereus.expose_implicit_index',
+		sites: siteSet('physical-constraint'),
+		valueSchema: 'boolean',
+		description: 'Surface a UNIQUE constraint\'s implicit covering structure in the catalog / export_schema (boolean; default hidden).',
 	},
 	// --- quereus.update.* : the sole retained view-mutation override ---
 	{
@@ -419,6 +437,10 @@ function validateTagValue(
 			return isText(value)
 				? undefined
 				: invalidValue(key, site, `must be a text value`, 'error');
+		case 'boolean':
+			return typeof value === 'boolean'
+				? undefined
+				: invalidValue(key, site, `must be a boolean value`, 'error');
 		case 'csv-of-identifiers':
 			return validateCsvOfIdentifiers(key, value, site);
 		case 'required-nonempty-rationale':
@@ -493,7 +515,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.update.default_for.<column>, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.update.default_for.<column>, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 

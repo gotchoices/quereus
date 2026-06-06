@@ -406,15 +406,20 @@ describe('lens advertisement: tag builder (buildAdvertisementsFromTags via memor
 		}
 	});
 
-	it('a malformed decomp tag fails through the validateReservedTags path', async () => {
+	it('a malformed decomp tag is rejected at CREATE TABLE (validateReservedTags, create-time)', async () => {
 		const db = new Database();
 		try {
-			await db.exec(`create table T_core (id integer primary key, a integer) with tags (
-				"quereus.lens.decomp.logical.d1" = 'T',
-				"quereus.lens.decomp.role.d1" = 'bogus-role'
-			)`);
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer } }');
-			await expectThrows(() => db.exec('apply schema x'), /quereus\.lens\.decomp\.role\.d1.*expected one of: primary-storage/i);
+			// The decomp facts sit on a table-level WITH TAGS (the physical-table site), so the
+			// direct CREATE path now validates them at plan-build: a bad enum value fails loudly
+			// here rather than later through the advertisement builder at `apply schema`. The
+			// builder uses the SAME validateReservedTags check, so create-time is the gate now.
+			await expectThrows(
+				() => db.exec(`create table T_core (id integer primary key, a integer) with tags (
+					"quereus.lens.decomp.logical.d1" = 'T',
+					"quereus.lens.decomp.role.d1" = 'bogus-role'
+				)`),
+				/quereus\.lens\.decomp\.role\.d1.*expected one of: primary-storage/i,
+			);
 		} finally {
 			await db.close();
 		}

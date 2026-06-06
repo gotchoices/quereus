@@ -412,3 +412,90 @@ ALTER INDEX idx_product_name SET TAGS ("quereus.bogus" = 1);
 -- tags live on the constraint, set via ALTER TABLE ... ALTER CONSTRAINT).
 ALTER INDEX uq_email SET TAGS (a = 1);
 -- error: not found
+
+-- ===================================================================
+-- Phase 23: reserved-tag validation on the direct CREATE TABLE / CREATE INDEX paths
+-- ===================================================================
+
+-- The direct CREATE path now validates reserved `quereus.*` tags at plan-build,
+-- mirroring ALTER ... SET TAGS (Phase 14/21) and the declarative differ, so a
+-- typo / mis-site fails loudly here instead of being silently stored.
+
+-- Table-level unknown reserved key rejected (physical-table site).
+CREATE TABLE RsvBadTbl (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Column-level unknown reserved key rejected (physical-column site).
+CREATE TABLE RsvBadCol (id INTEGER PRIMARY KEY, x INTEGER WITH TAGS ("quereus.bogus" = 1));
+-- error: reserved tag
+
+-- Table-level NAMED-constraint unknown reserved key rejected (physical-constraint site).
+CREATE TABLE RsvBadCon (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    CONSTRAINT c CHECK (x > 0) WITH TAGS ("quereus.bogus" = 1)
+);
+-- error: reserved tag
+
+-- Mis-sited but otherwise-valid key rejected: quereus.lens.access.<col> is legal
+-- only on a logical table, not on a physical CREATE TABLE ⇒ tag-not-allowed-here.
+CREATE TABLE RsvMissite (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.lens.access.id" = 'eq');
+-- error: not allowed
+
+-- CREATE INDEX unknown reserved key rejected (physical-index site).
+CREATE INDEX ix_rsv_bad ON Products (price) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Multiple offending tags in one statement: diagnostics accumulate table → column,
+-- and the first error (the table-level one) is raised — deterministic ordering.
+CREATE TABLE RsvMulti (
+    id INTEGER PRIMARY KEY,
+    x INTEGER WITH TAGS ("quereus.also_bogus" = 1)
+) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- IF NOT EXISTS still validates at build time: Orders (Phase 1) already exists, so
+-- the create would be skipped at runtime, but the malformed reserved tag is rejected
+-- at plan-build regardless (matches ALTER's build-time semantics).
+CREATE TABLE IF NOT EXISTS Orders (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Valid rename hint quereus.id accepted on a table and round-trips through schema().
+CREATE TABLE RsvOkTbl (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.id" = 'tbl-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid
+    FROM schema() WHERE type = 'table' AND name = 'RsvOkTbl';
+→ [{"qid":"tbl-thing"}]
+
+-- Valid quereus.id accepted on a column and round-trips through table_info().
+CREATE TABLE RsvOkCol (id INTEGER PRIMARY KEY WITH TAGS ("quereus.id" = 'col-pk'), x INTEGER);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('RsvOkCol') WHERE name = 'id';
+→ [{"name":"id","qid":"col-pk"}]
+
+-- Valid quereus.id accepted on a table-level NAMED constraint and round-trips
+-- through unique_constraint_info() (the physical-constraint surface accepts the hint).
+CREATE TABLE RsvOkConTbl (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    CONSTRAINT uq_rsv UNIQUE (email) WITH TAGS ("quereus.id" = 'con-uq')
+);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM unique_constraint_info('RsvOkConTbl') WHERE name = 'uq_rsv';
+→ [{"name":"uq_rsv","qid":"con-uq"}]
+
+-- Valid quereus.id accepted on an index and round-trips through schema() / index_info().
+CREATE INDEX ix_rsv_ok ON RsvOkCol (x) WITH TAGS ("quereus.id" = 'idx-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid
+    FROM schema() WHERE type = 'index' AND name = 'ix_rsv_ok';
+→ [{"qid":"idx-thing"}]
+
+SELECT index_name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM index_info('RsvOkCol') WHERE index_name = 'ix_rsv_ok';
+→ [{"index_name":"ix_rsv_ok","qid":"idx-thing"}]
+
+-- Free-form (non-quereus.*) tags are unaffected and still create cleanly
+-- (guard against over-rejection — validateReservedTags skips non-reserved keys).
+CREATE TABLE RsvFreeform (id INTEGER PRIMARY KEY) WITH TAGS (display_name = 'x', audit = true);
+INSERT INTO RsvFreeform VALUES (1);
+SELECT * FROM RsvFreeform;
+→ [{"id":1}]
