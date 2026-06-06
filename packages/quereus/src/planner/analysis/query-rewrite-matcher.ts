@@ -78,7 +78,6 @@ export type RewriteFailureReason =
 	| 'aggregate-shape'        // fragment isn't a recognizable bare-key aggregate, or MV isn't a grouped MV
 	| 'group-key-mismatch'     // fragment GROUP BY key is not a subset of the MV's group key
 	| 'group-key-pinned'       // a query WHERE pins/equates a group key (the base reorders output cols; forgo)
-	| 'rollup-residual'        // a rollup would need a residual filter over the backing (pre-existing engine bug; forgo)
 	| 'aggregate-not-decomposable' // a fragment aggregate has no sound recombine recipe from the MV
 	| 'cost-declined';         // matched, but the MV scan is not cheaper (set by the rule, not the matcher)
 
@@ -676,22 +675,23 @@ export function matchAggregateFragmentToMv(
 		return fail('group-key-pinned');
 	}
 
-	// PRE-EXISTING ENGINE BUG WORKAROUND. A rollup re-aggregates over the backing,
-	// whose primary key is the (often composite) MV group key. A query of the form
-	// `<group-by-aggregate> WHERE pk_col = const` over a composite-PK relation
-	// currently mis-drops the WHERE when the filtered column is part of the PK but
-	// not in the GROUP BY (reproduces on a plain `create table … primary key (a, b)`
-	// — see tickets/.pre-existing-error.md). The rollup re-aggregate hits exactly
-	// that shape, so until the base bug is fixed, forgo a rollup that needs a
-	// residual filter. Exact-key answers residual queries via a direct scan (no
-	// GROUP BY), so it is unaffected.
-	if (!exact && residualConjuncts.length > 0) return fail('rollup-residual');
+	// A rollup with a residual is sound: the residual coverage check above admits only
+	// conjuncts over MV group-key columns, which partition whole MV groups — so the
+	// residual `Filter` on the backing scan keeps or drops each backing group entire,
+	// and the re-aggregate over the survivors commutes with it (filtering whole groups
+	// pre- vs post-rollup is identical). The rule builds that residual `Filter` on the
+	// backing scan before the re-aggregate (the same `buildBackingSource` the exact-key
+	// and projection-filter arms use). This shape — `group by k` re-aggregating a
+	// composite-PK backing with a `WHERE` on a non-grouped PK column — previously
+	// tripped a base streaming-aggregate filter-drop bug, which is now fixed
+	// (`streaming-aggregate-stale-group-context-shadows-child-filter`); the equivalence
+	// harness covers the rollup+residual shapes as the soundness backstop.
 
 	// ---- Exact-key: assemble the output column map for the group-key passthroughs so
 	//      the foundation's `buildReplacement` can re-emit the whole row directly. ----
 	if (exact) {
 		const groupOut: { attrId: number; backingCol: number }[] = [];
-		shape.groupBaseCols.forEach((gc, i) => {
+		shape.groupBaseCols.forEach((_gc, i) => {
 			groupOut.push({ attrId: shape.groupOutAttrs[i].id, backingCol: groupKeyBackingCols[i] });
 		});
 		// outputColumnMap currently holds the aggregate outputs; prepend the group outputs

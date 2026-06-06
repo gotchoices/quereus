@@ -177,9 +177,10 @@ select sum(amt) from sales;                  -- rollup     → scan _mv_daily, r
 
 **Soundness witnesses.** The backing's primary key must equal the MV's group key (`backingPkIsGroupKey`) — the schema-level form of the coverage prover's `proveEffectiveKeyUnique`, certifying the backing is one row per MV group, so the exact-key scan returns one row per query group and the rollup re-aggregates a *set*, not a bag. A residual `Filter` may reference only MV group-key columns (it partitions whole groups, commuting with the rollup); a `where` on a non-group column ⇒ NotMatch (the MV already aggregated those rows away).
 
-**Two forgo guards** (both forgo on doubt, mirroring the soundness contract):
+**Forgo guard** (forgoes on doubt, mirroring the soundness contract):
 - *Group-key reorder* — when a query `where` constant-pins (`g = 1`, `g is null`) or equates (`g₁ = g₂`) a group key **and** there are ≥2 group keys, the base's `rule-groupby-fd-simplification` drops the functionally-determined group column and re-emits it as a picker `min` at a *shifted* output position, changing the result's column order. The rewrite preserves the pristine order, so it forgoes to stay a faithful drop-in (range / `in` residuals create no determining FD and stay eligible).
-- *Rollup-residual* — a rollup that needs a residual filter is currently forgone, working around a **pre-existing** base-engine bug where `WHERE pk_col = const` is mis-dropped under `GROUP BY` on a composite-PK relation (reproduces with no MV; see `tickets/.pre-existing-error.md`). Exact-key (no re-aggregation) answers residual queries unaffected.
+
+A **rollup with a residual** is now sound and admitted: the residual references only MV group-key columns (per the soundness witnesses above), so it partitions whole backing groups and the rule builds a residual `Filter` on the backing scan *before* the re-aggregate, commuting with it. This shape — `group by k` re-aggregating a composite-PK backing under `where j = const` on a non-grouped key — previously forwent the rewrite to dodge a base streaming-aggregate filter-drop bug, now fixed (`streaming-aggregate-stale-group-context-shadows-child-filter`); the equivalence harness covers the rollup+residual shapes.
 
 #### Join subsumption
 

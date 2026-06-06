@@ -129,17 +129,22 @@ describe('Materialized-view query rewrite — aggregate rollup golden plans', ()
 		expect(plan).to.contain('sales');
 	});
 
-	it('rollup with a residual filter is forgone (pre-existing composite-PK filter-drop bug)', async () => {
+	it('rollup with a residual on a dropped MV group key rewrites to the backing + re-aggregate', async () => {
 		const db2 = new Database();
 		try {
 			await db2.exec(`
 				create table regsales (id integer primary key, d integer not null, r integer not null, amt integer null);
 				create materialized view byregion as select d, r, sum(amt) as total from regsales group by d, r;
 			`);
-			// rollup to {d} with a residual on r (a non-query-group backing PK column) → forgo.
+			// rollup to {d} with a residual on r (a non-query-group MV group-key column): the
+			// residual partitions whole (d, r) backing groups, so it re-binds as a Filter on the
+			// backing scan before the re-aggregate down to {d}. (The base streaming-aggregate
+			// filter-drop bug this used to dodge is fixed.)
 			const plan = serializePlanTree(db2.getPlan('select d, sum(amt) from regsales where r = 1 group by d'));
-			expect(plan).to.not.contain('_mv_byregion');
-			expect(plan).to.contain('regsales');
+			expect(plan, 'rewrote to backing').to.contain('_mv_byregion');
+			expect(plan, 'base no longer recomputed').to.not.contain('"main.regsales"');
+			// Rollup re-aggregates the surviving backing rows down to {d}.
+			expect(plan).to.match(/StreamAggregate|HashAggregate/);
 		} finally {
 			await db2.close();
 		}

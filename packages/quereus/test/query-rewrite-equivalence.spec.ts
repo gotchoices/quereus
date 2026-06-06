@@ -155,6 +155,12 @@ const AGG_QUERIES: readonly string[] = [
 	'select k, sum(x) from t group by k',
 	'select k, count(*), count(x) from t group by k',
 	'select k, avg(x), min(x), max(x) from t group by k',
+	// Rollup to {k} with a residual on the dropped MV group key `j` (the shape the
+	// `rollup-residual` forgo used to refuse). The residual partitions whole (k, j)
+	// backing groups, so it re-binds as a Filter on the backing before the re-aggregate.
+	'select k, sum(x) from t where j = 1 group by k',               // equality residual on a dropped MV key
+	'select k, count(*), count(x) from t where j >= 0 group by k',  // range residual; count recombine
+	'select k, min(x), max(x), avg(x) from t where j = 0 group by k', // min/max/avg recombine under a residual
 	// Global-scalar rollup (the empty/zero-row cases live here).
 	'select sum(x) from t',
 	'select count(*) from t',
@@ -167,6 +173,7 @@ const AGG_QUERIES: readonly string[] = [
 const AGG_MUST_REWRITE: readonly string[] = [
 	'select k, j, sum(x) from t group by k, j',
 	'select k, sum(x) from t group by k',
+	'select k, sum(x) from t where j = 1 group by k', // rollup + residual on a dropped MV key
 	'select sum(x) from t',
 	'select count(*) from t',
 	'select avg(x) from t',

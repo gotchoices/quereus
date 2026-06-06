@@ -255,14 +255,18 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 		}
 	});
 
-	it('rollup-residual: a rollup needing a residual filter is forgone (pre-existing engine bug)', async () => {
+	it('rollup-residual: a rollup with a residual on a dropped MV group key matches (filter on the backing)', async () => {
 		const db = await freshDb(SALES);
 		try {
 			// `r` is a group key of the MV but not of the query (rollup); the residual r=20
-			// over the composite-PK backing would trigger the base filter-drop bug.
+			// references a stored group-key column, so it re-binds onto the backing as a
+			// residual Filter before the re-aggregate down to {d}. The base filter-drop bug
+			// this used to dodge is fixed, so the match now proceeds.
 			const res = matchAgg(db, 'select d, sum(amt) from sales where r = 20 group by d', 'byregion');
-			expect(res.match).to.be.undefined;
-			expect(reason(res)).to.equal('rollup-residual');
+			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
+			expect(res.match!.rollup!.exact).to.equal(false);
+			expect(res.match!.residualConjuncts).to.have.lengthOf(1);
+			expect(res.match!.rollup!.aggregates[0].kind).to.equal('sum');
 		} finally {
 			await db.close();
 		}
