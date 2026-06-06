@@ -24,6 +24,7 @@ import type { ColumnSchema } from './column.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
 import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, tableConstraintsToString } from '../emit/ast-stringify.js';
+import { normalizeCollationName } from '../util/comparison.js';
 
 /**
  * Unconditionally double-quote an identifier, escaping internal quotes.
@@ -288,6 +289,17 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 
 	const nullAnnotation = nullabilityAnnotation(col.notNull, defaultNotNull);
 	if (nullAnnotation) colDef += ` ${nullAnnotation}`;
+
+	// Column COLLATE: emit only a non-default collation (BINARY / '' are elided),
+	// mirroring the index column path (generateIndexDDL). Without this, a re-parse
+	// of the canonical DDL (e.g. the @quereus/store persistence round-trip) silently
+	// reverts the column to BINARY, changing its comparison / sort / unique semantics.
+	// Quote conditionally (quoteIdentifier) so an ordinary collation stays bare
+	// (COLLATE NOCASE) and only a reserved-word collation quotes (COLLATE "select").
+	// Collation has no session-default elision, so both emit branches agree byte-for-byte.
+	if (col.collation && normalizeCollationName(col.collation) !== 'BINARY') {
+		colDef += ` COLLATE ${quoteIdentifier(col.collation)}`;
+	}
 
 	// Inline column-level PK only for a genuine single-column declared PK. A
 	// synthesized single-column key (a one-column no-PK table) emits no PK clause.

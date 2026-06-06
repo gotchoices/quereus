@@ -36,8 +36,9 @@ import { generateTableDDL, generateIndexDDL } from '../src/schema/ddl-generator.
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
 import { expressionToString } from '../src/emit/ast-stringify.js';
 import { Database } from '../src/core/database.js';
-import { INTEGER_TYPE } from '../src/types/builtin-types.js';
-import type { Statement, IndexedColumn } from '../src/parser/ast.js';
+import { INTEGER_TYPE, TEXT_TYPE } from '../src/types/builtin-types.js';
+import { columnDefToSchema } from '../src/schema/table.js';
+import type { Statement, IndexedColumn, ColumnDef, ColumnConstraint } from '../src/parser/ast.js';
 import type { TableSchema, IndexSchema } from '../src/schema/table.js';
 import type { ColumnSchema } from '../src/schema/column.js';
 
@@ -57,6 +58,16 @@ function collationOf(col: IndexedColumn): string | undefined {
 	if (col.collation) return col.collation;
 	if (col.expr?.type === 'collate') return col.expr.collation;
 	return undefined;
+}
+
+/**
+ * The collation a re-parsed CREATE TABLE column carries. A column-level
+ * `c TEXT COLLATE x` parses to a `collate` column constraint whose `.collation`
+ * holds the name.
+ */
+function columnCollationOf(col: ColumnDef): string | undefined {
+	const c = col.constraints?.find((k: ColumnConstraint) => k.type === 'collate');
+	return c && c.type === 'collate' ? c.collation : undefined;
 }
 
 /** Build a minimal ColumnSchema (mirrors the store ddl-generator spec helper). */
@@ -116,6 +127,34 @@ describe('Generator: reserved word survives every generator-only identifier posi
 			const got = stmt.columns[0] ? collationOf(stmt.columns[0])?.toLowerCase() : undefined;
 			if (got !== kw) {
 				failures.push(`[${kw}] collation did not survive: got ${String(got)}\n      ddl: ${ddl}`);
+			}
+		}
+
+		expect(failures, `\n${failures.join('\n')}\n`).to.have.length(0);
+	});
+
+	it('COLLATE name — table column (generateTableDDL → parse)', () => {
+		const failures: string[] = [];
+
+		for (const kw of RESERVED_WORDS) {
+			// Single-column table whose column carries a reserved-word collation.
+			const table = makeTableSchema({ name: 't', columns: [makeColumn('c', { collation: kw })] });
+			const ddl = generateTableDDL(table);
+
+			let stmt: Statement;
+			try {
+				stmt = parse(ddl);
+			} catch (e) {
+				failures.push(`[${kw}] re-parse failed (forgot to quote?): ${errText(e)}\n      ddl: ${ddl}`);
+				continue;
+			}
+			if (stmt.type !== 'createTable') {
+				failures.push(`[${kw}] expected createTable, got ${stmt.type}\n      ddl: ${ddl}`);
+				continue;
+			}
+			const got = stmt.columns[0] ? columnCollationOf(stmt.columns[0])?.toLowerCase() : undefined;
+			if (got !== kw) {
+				failures.push(`[${kw}] column collation did not survive: got ${String(got)}\n      ddl: ${ddl}`);
 			}
 		}
 
@@ -243,6 +282,15 @@ describe('Generator: ordinary identifiers are never over-quoted', () => {
 		expect(ddl).to.not.include('USING "mymod"');
 	});
 
+	it('table-column COLLATE name stays bare; reserved-word quotes', () => {
+		const bare = generateTableDDL(makeTableSchema({ name: 't', columns: [makeColumn('c', { collation: 'NOCASE' })] }));
+		expect(bare).to.include('COLLATE NOCASE');
+		expect(bare).to.not.include('COLLATE "NOCASE"');
+
+		const reserved = generateTableDDL(makeTableSchema({ name: 't', columns: [makeColumn('c', { collation: 'select' })] }));
+		expect(reserved).to.include('COLLATE "select"');
+	});
+
 	it('vtab-arg key stays bare', () => {
 		const table = makeTableSchema({
 			name: 't',
@@ -253,6 +301,36 @@ describe('Generator: ordinary identifiers are never over-quoted', () => {
 		const ddl = generateTableDDL(table);
 		expect(ddl).to.include('cache_size = 100');
 		expect(ddl).to.not.include('"cache_size"');
+	});
+});
+
+describe('Generator: table-column COLLATE default elision + round-trip', () => {
+	it('elides a default collation (BINARY and empty-string both emit no COLLATE)', () => {
+		const binary = generateTableDDL(makeTableSchema({ name: 't', columns: [makeColumn('c', { collation: 'BINARY' })] }));
+		expect(binary).to.not.include('COLLATE');
+
+		const empty = generateTableDDL(makeTableSchema({ name: 't', columns: [makeColumn('c', { collation: '' })] }));
+		expect(empty).to.not.include('COLLATE');
+
+		// Case-folded default also elides.
+		const lower = generateTableDDL(makeTableSchema({ name: 't', columns: [makeColumn('c', { collation: 'binary' })] }));
+		expect(lower).to.not.include('COLLATE');
+	});
+
+	it('round-trips a non-default collation back to canonical NOCASE via columnDefToSchema', () => {
+		const table = makeTableSchema({
+			name: 't',
+			columns: [makeColumn('name', { logicalType: TEXT_TYPE, collation: 'NOCASE' })],
+		});
+		const ddl = generateTableDDL(table);
+		const stmt = parse(ddl);
+		expect(stmt.type).to.equal('createTable');
+		if (stmt.type === 'createTable') {
+			const col = stmt.columns.find(c => c.name === 'name')!;
+			const schema = columnDefToSchema(col);
+			// The schema stores the canonical UPPERCASE name; re-normalization is idempotent.
+			expect(schema.collation).to.equal('NOCASE');
+		}
 	});
 });
 

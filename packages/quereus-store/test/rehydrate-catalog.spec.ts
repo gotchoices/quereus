@@ -530,6 +530,31 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		expect(rows2).to.deep.equal([{ a: null, b: 5 }, { a: null, b: 6 }]);
 	});
 
+	// A non-default column COLLATE must survive the persistence round-trip: the catalog
+	// stores the canonical CREATE TABLE DDL and rehydrates by re-parsing it, so if
+	// generateTableDDL drops COLLATE the column silently reverts to BINARY on reopen —
+	// changing its comparison / sort / unique semantics. Pins that the rehydrated
+	// schema carries `collation === 'NOCASE'` (deterministic, authoritative assert).
+	it('non-default column COLLATE survives reopen', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec(`CREATE TABLE ci (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE) USING store`);
+		// Insert a row so the table (and its DDL) is persisted.
+		await db1.exec(`INSERT INTO ci (id, name) VALUES (1, 'Alice')`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed collated DDL parses cleanly').to.have.lengthOf(0);
+
+		// Primary assert: the rehydrated schema preserved the column collation.
+		// Before the generator fix this would be 'BINARY'.
+		const t = db2.schemaManager.findTable('ci')!;
+		expect(t.columns.find(c => c.name === 'name')!.collation, 'name keeps NOCASE after reopen').to.equal('NOCASE');
+	});
+
 	// A single ADD COLUMN declaring BOTH a CHECK and an FK exercises the store's two
 	// independent merge arms (checkConstraints AND foreignKeys both extended on
 	// `persistedSchema`). Both must persist and enforce after reopen.
