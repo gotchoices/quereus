@@ -277,6 +277,68 @@ describe('ruleJoinExistencePruning', () => {
 		});
 	});
 
+	describe('demand detection edge cases', () => {
+		it('retained when referenced ONLY inside a correlated scalar subquery', async () => {
+			await seedExisting();
+			// hasP appears nowhere in the top-level projection list except inside a
+			// correlated subquery — `collectAttrIds` must recurse into the subquery
+			// subtree to see the dependency, or the flag would be wrongly pruned.
+			const q =
+				'select c.cc as cc, (select count(*) from exp p2 where p2.pp = 0 or hasP) as k ' +
+				'from exc c left join exp p on p.pp = c.pr exists right as hasP order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), 'flag retained for the subquery ref').to.deep.equal(['exists right as hasP']);
+
+			// hasP true ⇒ predicate true for all 2 exp rows ⇒ k=2; hasP false ⇒ k=0.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ cc: 1, k: 2 },
+				{ cc: 2, k: 0 },
+				{ cc: 3, k: 2 },
+				{ cc: 4, k: 0 },
+			]);
+		});
+
+		it('three flags, only the MIDDLE selected: both ends pruned, middle reads correctly', async () => {
+			await seedExisting();
+			// Stronger array-order stress than the two-flag case: the kept flag is
+			// neither first nor last, so a stale columnIndex would mis-resolve it.
+			const q =
+				'select c.cc as cc, hasB from exc c left join exp p on p.pp = c.pr ' +
+				'exists right as hasA, exists right as hasB, exists right as hasC order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows)).to.deep.equal(['exists right as hasB']);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ cc: 1, hasB: true },
+				{ cc: 2, hasB: false },
+				{ cc: 3, hasB: true },
+				{ cc: 4, hasB: false },
+			]);
+		});
+
+		it('divergent demand across two consumers of one flag-bearing CTE join', async () => {
+			await seedExisting();
+			// `j` is consumed twice with different demand: one branch SELECTs hasP
+			// (retain), the other never references it (prune). Both must be correct.
+			const q =
+				'with j as (select c.cc as cc, hasP from exc c left join exp p on p.pp = c.pr exists right as hasP) ' +
+				'select cc, hasP from j where cc <= 2 ' +
+				'union all select cc, null as hasP from j where cc > 2 order by cc';
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ cc: 1, hasP: true },
+				{ cc: 2, hasP: false },
+				{ cc: 3, hasP: null },
+				{ cc: 4, hasP: null },
+			]);
+		});
+	});
+
 	describe('no-op cases', () => {
 		it('does not fire (and the rule is a true no-op) when disabled', async () => {
 			await setupNonEliminable();
