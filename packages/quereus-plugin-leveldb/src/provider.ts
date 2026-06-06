@@ -44,8 +44,14 @@ export class LevelDBProvider implements KVStoreProvider {
 	private createIfMissing: boolean;
 	private stores = new Map<string, LevelDBStore>();
 	private storePaths = new Map<string, string>();
+	// In-flight opens, keyed by store name, so concurrent getOrCreateStore calls
+	// for the same store share a single LevelDB handle instead of each racing to
+	// open the directory (LevelDB holds an exclusive LOCK; the loser throws).
+	private storeOpening = new Map<string, Promise<LevelDBStore>>();
 	private catalogStore: LevelDBStore | null = null;
+	private catalogStoreOpening: Promise<LevelDBStore> | null = null;
 	private statsStore: LevelDBStore | null = null;
+	private statsStoreOpening: Promise<LevelDBStore> | null = null;
 
 	constructor(options: LevelDBProviderOptions) {
 		this.basePath = options.basePath;
@@ -65,26 +71,46 @@ export class LevelDBProvider implements KVStoreProvider {
 	}
 
 	async getStatsStore(_schemaName: string, _tableName: string): Promise<KVStore> {
-		// Use the unified __stats__ store for all tables
-		if (!this.statsStore) {
+		// Use the unified __stats__ store for all tables.
+		if (this.statsStore) return this.statsStore;
+		if (!this.statsStoreOpening) {
 			const statsPath = path.join(this.basePath, STATS_STORE_NAME);
-			this.statsStore = await LevelDBStore.open({
+			this.statsStoreOpening = LevelDBStore.open({
 				path: statsPath,
 				createIfMissing: this.createIfMissing,
+			}).then(store => {
+				this.statsStore = store;
+				this.statsStoreOpening = null;
+				return store;
+			}).catch(err => {
+				this.statsStoreOpening = null;
+				throw err;
 			});
 		}
-		return this.statsStore;
+		return this.statsStoreOpening;
 	}
 
 	async getCatalogStore(): Promise<KVStore> {
-		if (!this.catalogStore) {
+		// Memoize the in-flight open so concurrent callers (e.g. a lazy DDL flush
+		// racing an ALTER's own catalog write) share a single handle. Caching only
+		// the resolved store left a window where a second caller passed the null
+		// check and opened a duplicate handle, which LevelDB's exclusive LOCK rejects.
+		if (this.catalogStore) return this.catalogStore;
+		if (!this.catalogStoreOpening) {
 			const catalogPath = path.join(this.basePath, CATALOG_STORE_NAME);
-			this.catalogStore = await LevelDBStore.open({
+			this.catalogStoreOpening = LevelDBStore.open({
 				path: catalogPath,
 				createIfMissing: this.createIfMissing,
+			}).then(store => {
+				this.catalogStore = store;
+				this.catalogStoreOpening = null;
+				return store;
+			}).catch(err => {
+				this.catalogStoreOpening = null;
+				throw err;
 			});
 		}
-		return this.catalogStore;
+		return this.catalogStoreOpening;
 	}
 
 	async closeStore(schemaName: string, tableName: string): Promise<void> {
@@ -98,20 +124,31 @@ export class LevelDBProvider implements KVStoreProvider {
 	}
 
 	async closeAll(): Promise<void> {
+		// Await any in-flight opens first so we don't strand a freshly-opened
+		// handle (and its file LOCK) after clearing the maps below.
+		await Promise.allSettled([
+			...this.storeOpening.values(),
+			this.catalogStoreOpening,
+			this.statsStoreOpening,
+		].filter(Boolean) as Promise<unknown>[]);
+
 		for (const store of this.stores.values()) {
 			await store.close();
 		}
 		this.stores.clear();
+		this.storeOpening.clear();
 
 		if (this.catalogStore) {
 			await this.catalogStore.close();
 			this.catalogStore = null;
 		}
+		this.catalogStoreOpening = null;
 
 		if (this.statsStore) {
 			await this.statsStore.close();
 			this.statsStore = null;
 		}
+		this.statsStoreOpening = null;
 	}
 
 	async deleteIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void> {
@@ -214,18 +251,29 @@ export class LevelDBProvider implements KVStoreProvider {
 	}
 
 	private async getOrCreateStore(storeName: string, storePath: string): Promise<LevelDBStore> {
-		let store = this.stores.get(storeName);
+		const existing = this.stores.get(storeName);
+		if (existing) return existing;
 
-		if (!store) {
-			store = await LevelDBStore.open({
+		// Share a single in-flight open across concurrent callers for the same
+		// store name; opening a second LevelDB handle on the same directory while
+		// the first is still open trips the exclusive LOCK.
+		let opening = this.storeOpening.get(storeName);
+		if (!opening) {
+			opening = LevelDBStore.open({
 				path: storePath,
 				createIfMissing: this.createIfMissing,
+			}).then(store => {
+				this.stores.set(storeName, store);
+				this.storePaths.set(storeName, storePath);
+				this.storeOpening.delete(storeName);
+				return store;
+			}).catch(err => {
+				this.storeOpening.delete(storeName);
+				throw err;
 			});
-			this.stores.set(storeName, store);
-			this.storePaths.set(storeName, storePath);
+			this.storeOpening.set(storeName, opening);
 		}
-
-		return store;
+		return opening;
 	}
 
 	private async closeStoreByName(storeName: string): Promise<void> {
