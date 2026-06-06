@@ -10,6 +10,7 @@ import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js'
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass } from './table.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema } from './constraint-builder.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import { backingTableNameFor } from './view.js';
 import { isHiddenImplicitIndex } from './catalog.js';
@@ -1184,36 +1185,11 @@ export class SchemaManager {
 			}
 		}
 
-		// Table-level foreign keys
+		// Table-level foreign keys — delegate to the shared builder so the module
+		// `ADD CONSTRAINT` path and CREATE TABLE produce byte-identical schemas.
 		for (const con of astConstraints ?? []) {
 			if (con.type === 'foreignKey' && con.foreignKey && con.columns) {
-				const fk = con.foreignKey;
-				const childColIndices = con.columns.map(col => {
-					const idx = columnIndexMap.get(col.name.toLowerCase());
-					if (idx === undefined) {
-						throw new QuereusError(`FK column '${col.name}' not found in table '${tableName}'`, StatusCode.ERROR);
-					}
-					return idx;
-				});
-
-				if (fk.columns && fk.columns.length !== childColIndices.length) {
-					throw new QuereusError(
-						`FK constraint '${con.name ?? `_fk_${tableName}_${con.columns.map(c => c.name).join('_')}`}' on table '${tableName}': child column count (${childColIndices.length}) does not match parent column count (${fk.columns.length})`,
-						StatusCode.ERROR,
-					);
-				}
-				result.push({
-					name: con.name ?? `_fk_${tableName}_${con.columns.map(c => c.name).join('_')}`,
-					columns: Object.freeze(childColIndices),
-					referencedTable: fk.table,
-					referencedSchema: schemaName,
-					referencedColumns: Object.freeze([]), // resolved at enforcement time
-					referencedColumnNames: fk.columns, // deferred resolution via resolveReferencedColumns
-					onDelete: fk.onDelete ?? 'restrict',
-					onUpdate: fk.onUpdate ?? 'restrict',
-					deferred: fk.initiallyDeferred ?? false,
-					tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
-				});
+				result.push(buildForeignKeyConstraintSchema(con, columnIndexMap, tableName, schemaName));
 			}
 		}
 
@@ -1248,22 +1224,11 @@ export class SchemaManager {
 			}
 		}
 
-		// Table-level unique constraints
+		// Table-level unique constraints — delegate to the shared builder (DRY with
+		// the module `ADD CONSTRAINT` path).
 		for (const con of astConstraints ?? []) {
 			if (con.type === 'unique' && con.columns && con.columns.length > 0) {
-				const colIndices = con.columns.map(col => {
-					const idx = columnIndexMap.get(col.name.toLowerCase());
-					if (idx === undefined) {
-						throw new QuereusError(`UNIQUE constraint column '${col.name}' not found`, StatusCode.ERROR);
-					}
-					return idx;
-				});
-				result.push({
-					name: con.name,
-					columns: Object.freeze(colIndices),
-					defaultConflict: con.onConflict,
-					tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
-				});
+				result.push(buildUniqueConstraintSchema(con, columnIndexMap));
 			}
 		}
 

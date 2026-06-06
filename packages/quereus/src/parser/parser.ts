@@ -2935,8 +2935,13 @@ export class Parser {
 			}
 		} else if (this.peekKeyword('ADD')) {
 			this.consumeKeyword('ADD', "Expected ADD.");
-			if (this.peekKeyword('CONSTRAINT')) {
-				// ADD CONSTRAINT ... - let tableConstraint parse everything including CONSTRAINT keyword
+			if (this.peekKeyword('CONSTRAINT')
+				|| this.check(TokenType.UNIQUE)
+				|| this.check(TokenType.FOREIGN)
+				|| this.check(TokenType.CHECK)) {
+				// ADD CONSTRAINT <name> <body>, or the unnamed table-constraint forms
+				// ADD UNIQUE (...) / ADD FOREIGN KEY (...) / ADD CHECK (...).
+				// tableConstraint() consumes the optional CONSTRAINT <name> prefix.
 				const constraint = this.tableConstraint();
 				action = { type: 'addConstraint', constraint };
 			} else {

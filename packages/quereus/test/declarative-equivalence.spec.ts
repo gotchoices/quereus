@@ -1307,6 +1307,141 @@ describe('declarative-equivalence: named-constraint lifecycle', () => {
 		}
 	});
 
+	it('a declared named-UNIQUE add converges via ADD CONSTRAINT over populated data and is idempotent', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, email TEXT }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec("insert into t values (1, 'a@x'), (2, 'b@x')");
+
+			// Re-declare adding a named UNIQUE.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					email TEXT,
+					constraint uq_email unique (email)
+				}
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the added constraint').to.equal(1);
+			expect(diff.tablesToAlter[0].constraintsToAdd?.length, 'one add').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// Enforces going forward and converges (gap #1 closed — 10.2 could not assert this).
+			const uq = db.schemaManager.getTable('main', 't')!.uniqueConstraints?.find(c => c.name === 'uq_email');
+			expect(uq, 'uq_email present after apply').to.not.be.undefined;
+			let rejected = false;
+			try { await db.exec("insert into t values (3, 'a@x')"); } catch { rejected = true; }
+			expect(rejected, 'duplicate rejected by added UNIQUE').to.be.true;
+
+			// Idempotent: a second apply is a no-op.
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a declared named-UNIQUE add over violating data fails atomically (schema unchanged)', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, email TEXT }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec("insert into t values (1, 'a@x'), (2, 'a@x')"); // duplicate
+
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					email TEXT,
+					constraint uq_email unique (email)
+				}
+			}`);
+
+			// The migration batch rolls back atomically: apply throws, schema unchanged.
+			let threw = false;
+			try { await db.exec('apply schema main'); } catch { threw = true; }
+			expect(threw, 'apply over duplicated data must fail').to.be.true;
+			const uq = db.schemaManager.getTable('main', 't')!.uniqueConstraints?.find(c => c.name === 'uq_email');
+			expect(uq, 'uq_email must be absent after the failed apply').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a declared named-FK add converges via ADD CONSTRAINT over populated data and is idempotent', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1), (2)');
+			await db.exec('insert into child values (1, 1), (2, 2)');
+
+			// Re-declare adding a named FK on child.
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					pa INTEGER,
+					constraint fk_pa foreign key (pa) references parent(pid)
+				}
+			}`);
+			const diff = diffOf(db);
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToAdd?.length, 'one FK add on child').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			const fk = db.schemaManager.getTable('main', 'child')!.foreignKeys?.find(c => c.name === 'fk_pa');
+			expect(fk, 'fk_pa present after apply').to.not.be.undefined;
+			let rejected = false;
+			try { await db.exec('insert into child values (3, 99)'); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by added FK').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a declared named-FK add over orphaned data fails atomically (schema unchanged)', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1)');
+			await db.exec('insert into child values (1, 1), (2, 99)'); // 99 is an orphan
+
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					pa INTEGER,
+					constraint fk_pa foreign key (pa) references parent(pid)
+				}
+			}`);
+
+			let threw = false;
+			try { await db.exec('apply schema main'); } catch { threw = true; }
+			expect(threw, 'apply over orphaned data must fail').to.be.true;
+			const fk = db.schemaManager.getTable('main', 'child')!.foreignKeys?.find(c => c.name === 'fk_pa');
+			expect(fk, 'fk_pa must be absent after the failed apply').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a declared named-CHECK drop converges via DROP CONSTRAINT and is idempotent', async function () {
 		const db = new Database();
 		try {

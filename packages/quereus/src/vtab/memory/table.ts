@@ -338,10 +338,8 @@ export class MemoryTable extends VirtualTable {
 						StatusCode.UNSUPPORTED,
 					);
 				case 'addConstraint':
-					throw new QuereusError(
-						`MemoryTable does not support ADD CONSTRAINT ${changeInfo.constraint.type}`,
-						StatusCode.UNSUPPORTED,
-					);
+					await this.manager.addConstraint(changeInfo.constraint);
+					break;
 				case 'dropConstraint':
 					await this.manager.dropConstraint(changeInfo.constraintName);
 					break;

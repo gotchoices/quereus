@@ -17,6 +17,7 @@ import type {
 	Database,
 	TableSchema,
 	TableIndexSchema,
+	UniqueConstraintSchema,
 	VirtualTableModule,
 	BaseModuleConfig,
 	BestAccessPlanRequest,
@@ -29,7 +30,7 @@ import type {
 	Schema,
 	MappingAdvertisement,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -523,6 +524,51 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Validates the existing rows in `dataStore` against a newly-added UNIQUE
+	 * constraint, throwing `CONSTRAINT` on the first duplicate before any schema
+	 * mutation. Mirrors the duplicate detection in {@link buildIndexEntries}: a
+	 * `seen` Set keyed on a JSON signature of the constrained values, with SQL
+	 * NULL semantics (a row with any NULL constrained value never counts as a
+	 * duplicate) and the partial `predicate` honored.
+	 *
+	 * No index store is written — store UNIQUE enforcement is a full-scan over
+	 * `uniqueConstraints` at write time. The signature is value-exact (BINARY),
+	 * matching the store's `CREATE UNIQUE INDEX` path; it does not honor a
+	 * per-column NOCASE collation (see docs/schema.md store-collation note).
+	 */
+	private async validateUniqueOverExistingRows(
+		dataStore: KVStore,
+		tableSchema: TableSchema,
+		uc: UniqueConstraintSchema,
+	): Promise<void> {
+		const predicate: CompiledPredicate | undefined = uc.predicate
+			? compilePredicate(uc.predicate, tableSchema.columns)
+			: undefined;
+		const seen = new Set<string>();
+
+		for await (const entry of dataStore.iterate(buildFullScanBounds())) {
+			const row = deserializeRow(entry.value);
+
+			// Partial constraint: only rows the predicate unambiguously accepts count.
+			if (predicate && predicate.evaluate(row) !== true) continue;
+
+			const values = uc.columns.map(idx => row[idx]);
+			// SQL UNIQUE allows multiple NULLs: skip rows with any NULL constrained value.
+			if (values.some(v => v === null)) continue;
+
+			const keySig = JSON.stringify(values);
+			if (seen.has(keySig)) {
+				const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i)).join(', ');
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${tableSchema.name} (${colNames})`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			seen.add(keySig);
+		}
+	}
+
+	/**
 	 * Alters an existing store table's structure (ADD/DROP/RENAME COLUMN).
 	 * Performs eager row migration for ADD and DROP, schema-only update for RENAME.
 	 * Returns the updated TableSchema for the engine to register.
@@ -772,10 +818,46 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			}
 
 			case 'addConstraint': {
-				throw new QuereusError(
-					`Store table does not support ADD CONSTRAINT ${change.constraint.type}`,
-					StatusCode.UNSUPPORTED,
-				);
+				const constraint = change.constraint;
+				let updatedSchema: TableSchema;
+
+				if (constraint.type === 'unique') {
+					// Store enforces inline UNIQUE by full-scan over `uniqueConstraints`
+					// (no separate index store), so there is nothing physical to build —
+					// but we must validate the existing rows before persisting.
+					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
+					const dataStore = await this.getStore(tableKey, table.getConfig());
+					await this.validateUniqueOverExistingRows(dataStore, oldSchema, uc);
+					updatedSchema = {
+						...oldSchema,
+						uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
+					};
+				} else if (constraint.type === 'foreignKey') {
+					const fk = buildForeignKeyConstraintSchema(constraint, oldSchema.columnIndexMap, oldSchema.name, oldSchema.schemaName);
+					updatedSchema = {
+						...oldSchema,
+						foreignKeys: Object.freeze([...(oldSchema.foreignKeys ?? []), fk]),
+					};
+					// Pragma-gated existing-row validation; throws before persistence on an orphan.
+					await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
+				} else {
+					throw new QuereusError(
+						`Store table ADD CONSTRAINT does not support constraint type '${constraint.type}'`,
+						StatusCode.UNSUPPORTED,
+					);
+				}
+
+				table.updateSchema(updatedSchema);
+				await this.saveTableDDL(updatedSchema);
+
+				this.eventEmitter?.emitSchemaChange({
+					type: 'alter',
+					objectType: 'table',
+					schemaName,
+					objectName: tableName,
+				});
+
+				return updatedSchema;
 			}
 
 			case 'dropConstraint': {

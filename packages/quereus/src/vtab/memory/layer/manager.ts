@@ -9,7 +9,8 @@ import { MemoryTableConnection } from './connection.js';
 import { Latches } from '../../../util/latches.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
-import type { ColumnDef as ASTColumnDef } from '../../../parser/ast.js';
+import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows } from '../../../schema/constraint-builder.js';
 import { compareSqlValues } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -2064,6 +2065,159 @@ export class MemoryTableManager {
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * Adds a table-level UNIQUE or FOREIGN KEY constraint to an existing table,
+	 * re-validating the current rows against it and failing atomically with
+	 * `CONSTRAINT` (no schema mutation) when the data violates it. Mirrors the
+	 * latch + `ensureSchemaChangeSafety()` + snapshot/restore scaffolding of
+	 * {@link createIndex} / {@link dropConstraint}.
+	 *
+	 * - UNIQUE builds (or reuses) the implicit covering secondary index; the build
+	 *   raises `CONSTRAINT` on the first duplicate among in-scope rows (partial
+	 *   predicate + per-column collation honored, NULLs distinct).
+	 * - FOREIGN KEY appends the constraint and runs the pragma-gated existing-row
+	 *   validation (engine-side enforcement needs no physical structure).
+	 *
+	 * CHECK is handled engine-side (`runtime/emit/add-constraint.ts`) and never
+	 * routes here.
+	 */
+	async addConstraint(constraint: ASTTableConstraint): Promise<void> {
+		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
+		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
+		const release = await Latches.acquire(lockKey);
+		const originalManagerSchema = this.tableSchema;
+		try {
+			await this.ensureSchemaChangeSafety();
+
+			if (constraint.type === 'unique') {
+				await this.addUniqueConstraint(constraint);
+			} else if (constraint.type === 'foreignKey') {
+				await this.addForeignKeyConstraint(constraint);
+			} else {
+				throw new QuereusError(
+					`MemoryTable ADD CONSTRAINT does not support constraint type '${constraint.type}'`,
+					StatusCode.UNSUPPORTED,
+				);
+			}
+
+			this.eventEmitter?.emitSchemaChange?.({
+				type: 'alter',
+				objectType: 'table',
+				schemaName: this.schemaName,
+				objectName: this._tableName,
+			});
+
+			logger.operation('Add Constraint', this._tableName, { type: constraint.type, name: constraint.name });
+		} catch (e: unknown) {
+			// Restore the prior schema and rebuild secondary indexes (non-strict) so a
+			// half-built covering index can't strand the base layer's index map.
+			this.baseLayer.updateSchema(originalManagerSchema);
+			this.baseLayer.rebuildAllSecondaryIndexes();
+			this.tableSchema = originalManagerSchema;
+			this.initializePrimaryKeyFunctions();
+			logger.error('Add Constraint', this._tableName, e);
+			throw e;
+		} finally {
+			release();
+		}
+	}
+
+	/**
+	 * UNIQUE arm of {@link addConstraint}. Builds the covering secondary index the
+	 * same way {@link ensureUniqueConstraintIndexes} does (validating existing rows
+	 * via `addIndexToBase` → `populateNewIndex`), unless an existing *unique* index
+	 * already covers the exact columns — in which case the data is already
+	 * validated and we only register the covering structure.
+	 */
+	private async addUniqueConstraint(constraint: ASTTableConstraint): Promise<void> {
+		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap);
+		const columns = this.tableSchema.columns;
+		const existingIndexes = this.tableSchema.indexes ?? [];
+
+		const appendedUcs = Object.freeze([...(this.tableSchema.uniqueConstraints ?? []), uc]);
+
+		// Reuse: an existing UNIQUE index over the exact columns already guarantees
+		// uniqueness, so skip the rebuild. A non-unique index gives no such guarantee
+		// — fall through to build-and-validate.
+		const matchingUniqueIndex = existingIndexes.find(idx =>
+			idx.unique &&
+			idx.columns.length === uc.columns.length &&
+			idx.columns.every((col, i) => col.index === uc.columns[i]),
+		);
+
+		if (matchingUniqueIndex) {
+			const newSchema: TableSchema = Object.freeze({
+				...this.tableSchema,
+				uniqueConstraints: appendedUcs,
+			});
+			this.baseLayer.updateSchema(newSchema);
+			this.tableSchema = newSchema;
+			this.initializePrimaryKeyFunctions();
+			this.implicitCoveringStructures.set(
+				uc.name ?? matchingUniqueIndex.name,
+				{ indexName: matchingUniqueIndex.name, origin: 'implicit-from-unique-constraint' },
+			);
+			return;
+		}
+
+		const colNames = uc.columns.map(i => columns[i]?.name ?? String(i));
+		const indexName = uc.name ?? `_uc_${colNames.join('_')}`;
+		const indexSchema: IndexSchema = {
+			name: indexName,
+			// Carry per-column collation so enforcement honors e.g. NOCASE (mirrors
+			// ensureUniqueConstraintIndexes). The covering index is NOT flagged unique
+			// — insert-time enforcement routes through `uniqueConstraints`.
+			columns: uc.columns.map(colIdx => ({ index: colIdx, collation: columns[colIdx]?.collation })),
+			predicate: uc.predicate,
+		};
+
+		const newSchema: TableSchema = Object.freeze({
+			...this.tableSchema,
+			uniqueConstraints: appendedUcs,
+			indexes: Object.freeze([...existingIndexes, indexSchema]),
+		});
+
+		// Swap the schema FIRST so `addIndexToBase` → `indexEnforcesUnique` sees the
+		// new constraint and rejects duplicates, then populate (throws CONSTRAINT on
+		// the first in-scope duplicate). A throw rolls back via the catch in addConstraint.
+		this.baseLayer.updateSchema(newSchema);
+		await this.baseLayer.addIndexToBase(indexSchema);
+		this.tableSchema = newSchema;
+		this.initializePrimaryKeyFunctions();
+		this.implicitCoveringStructures.set(
+			uc.name ?? indexName,
+			{ indexName, origin: 'implicit-from-unique-constraint' },
+		);
+	}
+
+	/**
+	 * FOREIGN KEY arm of {@link addConstraint}. Validates existing child rows
+	 * against the new FK (pragma-gated; throws CONSTRAINT on an orphan), then
+	 * appends it to the cached schema. No physical structure — FK enforcement is
+	 * engine-side (synthesized EXISTS checks at plan time).
+	 */
+	private async addForeignKeyConstraint(constraint: ASTTableConstraint): Promise<void> {
+		const fk = buildForeignKeyConstraintSchema(
+			constraint,
+			this.tableSchema.columnIndexMap,
+			this._tableName,
+			this.schemaName,
+		);
+		const newSchema: TableSchema = Object.freeze({
+			...this.tableSchema,
+			foreignKeys: Object.freeze([...(this.tableSchema.foreignKeys ?? []), fk]),
+		});
+
+		// Validate BEFORE swapping the cached schema — a throw leaves the table
+		// unmodified. The scan only reads (no schema-change latch), so holding our
+		// own latch here is safe; ensureSchemaChangeSafety already drained to base.
+		await validateForeignKeyOverExistingRows(this.db, newSchema, fk);
+
+		this.baseLayer.updateSchema(newSchema);
+		this.tableSchema = newSchema;
+		this.initializePrimaryKeyFunctions();
 	}
 
 	public async destroy(): Promise<void> {
