@@ -31,6 +31,7 @@ import { ruleSargableRangeRewrite } from './rules/predicate/rule-sargable-range-
 import { ruleJoinKeyInference } from './rules/join/rule-join-key-inference.js';
 import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js';
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
+import { ruleJoinExistencePruning } from './rules/join/rule-join-existence-pruning.js';
 import { ruleFanOutLookupJoin } from './rules/join/rule-fanout-lookup-join.js';
 import { ruleFanOutBatchedOuter } from './rules/join/rule-fanout-batched-outer.js';
 import { ruleAsyncGatherUnionAll } from './rules/parallel/rule-async-gather-union-all.js';
@@ -349,6 +350,28 @@ export class Optimizer {
 			// Drops bare-column GROUP BY entries (re-emitting them as picker
 			// aggregates). The dropped expressions are pure ColumnReferenceNodes
 			// by construction, so no side-effect-bearing scalar can be lost.
+			sideEffectMode: 'safe',
+		});
+
+		// Join existence-flag pruning (demand-gated): drop an `exists … as` match
+		// flag from a JoinNode when no ancestor demands its output attribute id, so
+		// `hasExistenceColumns` flips false on the last drop and the five
+		// flag-guarded join rules re-enable. Registered AFTER projection-pruning
+		// (19) / predicate-pushdown (20) / scalar-cse (22) so the demand set is
+		// settled, and BEFORE fanout-lookup-join (23) and join-elimination (24) so
+		// the freshly-pruned Project threads through them in the same applyRules
+		// loop. The PostOptimization join rules (join-physical-selection,
+		// monotonic-merge-join) and the Structural Join-typed lateral-top1-asof
+		// (visited top-down after this ancestor Project) see the flag-free join
+		// automatically.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'join-existence-pruning',
+			nodeType: PlanNodeType.Project,
+			phase: 'rewrite',
+			fn: ruleJoinExistencePruning,
+			priority: 22,
+			// Drops only a derived, read-only `{true,false}` boolean column; both
+			// join sides survive verbatim, so no write can be skipped or reordered.
 			sideEffectMode: 'safe',
 		});
 

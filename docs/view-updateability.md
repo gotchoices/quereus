@@ -217,10 +217,21 @@ The flag is modelled as an extra output **attribute of the `JoinNode`** (not a
 `ProjectNode` expression — that could only see join *outputs* and would have to
 re-derive the match from nullability, the unsound path), carrying a new
 `existence` `UpdateSite` (kind `existence`, with a `RelationalComponentRef`
-component + the join-predicate guard). The flag-bearing `JoinNode` stays the
-nested-loop join (the join-physical-selection / merge / fanout / elimination rules
-bail on it) so the appended flag column is never dropped by a physical rewrite —
-a documented read-half limitation (existence joins forgo hash/merge selection).
+component + the join-predicate guard). A **live** (demanded) flag-bearing
+`JoinNode` stays the nested-loop join (the join-physical-selection / merge /
+fanout / elimination rules bail on it) so the appended flag column is never
+dropped by a physical rewrite — the limitation (existence joins forgo hash/merge
+selection, and a flag-bearing join cannot be eliminated) applies only **while the
+flag is demanded**. An **unused** flag — one no ancestor reads — is removed by the
+demand-gated `join-existence-pruning` rule (Structural / Project / priority 22):
+it anchors on the nearest enclosing Project, walks the pass-through chain to the
+join (the same demand analysis `join-elimination` uses), and rebuilds the
+`JoinNode` without that `ExistenceColumnSpec`. Once the last spec is dropped the
+join is flag-free, `hasExistenceColumns` flips `false`, and the five guarded
+rules re-enable automatically — the join can then be eliminated or pick a
+hash/merge variant like any other (a pure optimization; the write half is
+unaffected because a writable flag is always SELECTed by its view's projection,
+which keeps it demanded and retained).
 
 **Writing the flag (the write half).** The existence column is the explicit, per-row
 control surface for the non-preserved side's existence — *writing* the flag **is** the
@@ -311,10 +322,12 @@ base, and a write drives a per-branch insert/delete — see § Set-operation mem
 writes). The routing is **component-generic** (the same `existence` site the join
 existence column uses), so the write half extends it without forking. An **unused** flag
 is a semijoin probe and is *in principle* dead-column-eliminable — it ought not force a
-branch to be retained or probed when no other column needs it. No such pruning pass exists
-yet: the membership runner is selected whenever the node carries any flag, so an unused
-flag on a `union all` currently forces the buffering runner instead of the streaming one
-(correctness is unaffected; a sibling prune to `prune-unused-existence-flag` is deferred).
+branch to be retained or probed when no other column needs it. The analogous **join**
+existence-flag pruning (`prune-unused-existence-flag`, the `join-existence-pruning` rule)
+has landed, but the set-op membership analogue does not yet exist: the membership runner is
+selected whenever the node carries any flag, so an unused flag on a `union all` currently
+forces the buffering runner instead of the streaming one (correctness is unaffected; the
+set-op sibling prune is deferred).
 
 ### Set-operation membership writes
 

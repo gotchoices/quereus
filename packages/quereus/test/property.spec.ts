@@ -2130,6 +2130,34 @@ describe('Property-Based Tests', () => {
 			expect(pv!.is_updatable, 'non-preserved base column stays per-side updatable').to.equal('YES');
 		});
 
+		it('pruning preserves read agreement: an unused flag yields the same data rows as the flag-selected read', async () => {
+			await seed();
+			// hasP omitted ⇒ the demand-gated `join-existence-pruning` rule drops the
+			// flag (the join is no longer pinned to the nested-loop shape). The surviving
+			// data columns must match exactly what the flag-selecting view returns,
+			// minus the flag column.
+			const pruned = await readRows('select c.cc as cc, p.pv as pv from exc c left join exp p on p.pp = c.pr exists right as hasP order by cc');
+			const selected = await readRows('select cc, pv from ex_v order by cc');
+			expect(pruned).to.deep.equal(selected);
+		});
+
+		it('pruning leaves the write half intact: a flag-selecting view keeps the flag and routes the write', async () => {
+			await seed();
+			// ex_v SELECTs hasP, so the demand gate RETAINS it (the join stays the
+			// flag-bearing nested-loop JoinNode — never pruned or physically rewritten).
+			const plan = await readRows("select op, properties from query_plan('select cc, hasP, pv from ex_v')");
+			const joinRow = plan.find(r => r.op === 'JOIN' && r.properties);
+			expect(joinRow, 'flag-bearing join retained for the writable view').to.not.equal(undefined);
+			expect((JSON.parse(joinRow!.properties as string) as { existence?: string[] }).existence)
+				.to.deep.equal(['exists right as hasP']);
+
+			// The representative existence write still routes to the non-preserved side.
+			await db.exec('update ex_v set hasP = false where cc = 1');
+			expect((await readRows('select cc, hasP, pv from ex_v where cc = 1'))[0])
+				.to.deep.equal({ cc: 1, hasP: false, pv: null });
+			expect((await readRows('select pp from exp where pp = 1')).length, 'matched parent deleted').to.equal(0);
+		});
+
 		it('grammar: exists existence rejects on inner/cross and full-without-side', () => {
 			const parser = new Parser();
 			expect(() => parser.parse('select c.cc from exc c join exp p on p.pp = c.pr exists right as h')).to.throw();

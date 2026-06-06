@@ -43,14 +43,14 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:join-elimination');
 
-type ChainEntry =
+export type ChainEntry =
 	| { kind: 'filter'; node: FilterNode }
 	| { kind: 'sort'; node: SortNode }
 	| { kind: 'limit'; node: LimitOffsetNode }
 	| { kind: 'distinct'; node: DistinctNode }
 	| { kind: 'alias'; node: AliasNode };
 
-interface ChainWalkResult {
+export interface ChainWalkResult {
 	join: JoinNode;
 	chain: ChainEntry[];
 }
@@ -117,7 +117,7 @@ export function ruleJoinElimination(node: PlanNode, _context: OptContext): PlanN
 	return rebuildProject(node, newSource);
 }
 
-function collectAttrIds(expr: PlanNode, out: Set<number>): void {
+export function collectAttrIds(expr: PlanNode, out: Set<number>): void {
 	if (expr instanceof ColumnReferenceNode) {
 		out.add(expr.attributeId);
 		return;
@@ -127,7 +127,7 @@ function collectAttrIds(expr: PlanNode, out: Set<number>): void {
 	}
 }
 
-function walkChain(root: RelationalPlanNode, demanded: Set<number>): ChainWalkResult | null {
+export function walkChain(root: RelationalPlanNode, demanded: Set<number>): ChainWalkResult | null {
 	const chain: ChainEntry[] = [];
 	let current: RelationalPlanNode = root;
 
@@ -250,7 +250,7 @@ function tryEliminate(
 	return (sideToRemove === 'right' ? join.left : join.right) as RelationalPlanNode;
 }
 
-function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: RelationalPlanNode): RelationalPlanNode {
+export function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: RelationalPlanNode): RelationalPlanNode {
 	let current = bottom;
 	// Chain was collected top→bottom (root pushed first); rebuild bottom→top.
 	for (let i = chain.length - 1; i >= 0; i--) {
@@ -365,7 +365,7 @@ export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptC
 	);
 }
 
-function rebuildProject(project: ProjectNode, newSource: RelationalPlanNode): ProjectNode {
+export function rebuildProject(project: ProjectNode, newSource: RelationalPlanNode): ProjectNode {
 	const attributes = project.getAttributes();
 	const newProjections = project.projections.map((p, i) => ({
 		node: p.node,
