@@ -2313,27 +2313,12 @@ export class MemoryTableManager {
 
 		logger.debugLog(`[Consolidate] Collected ${allRows.length} rows from transaction layer. Row widths: ${allRows.map(r => r.length).join(',')}`);
 
-		// Count base layer rows before
-		let baseCount = 0;
-		for (const _path of this.baseLayer.primaryTree.ascending(this.baseLayer.primaryTree.first())) {
-			baseCount++;
-		}
-		logger.debugLog(`[Consolidate] Base layer had ${baseCount} rows before copy`);
-
-		// Now insert collected rows into the base layer
-		for (const row of allRows) {
-			this.baseLayer.primaryTree.insert(row);
-		}
-
-		// Count base layer rows after
-		let baseCountAfter = 0;
-		for (const _path of this.baseLayer.primaryTree.ascending(this.baseLayer.primaryTree.first())) {
-			baseCountAfter++;
-		}
-		logger.debugLog(`[Consolidate] Base layer has ${baseCountAfter} rows after copy`);
-
-		// Also need to rebuild secondary indexes in the base layer
-		await this.baseLayer.rebuildAllSecondaryIndexes();
+		// Replace (do not union into) the base primary tree: `allRows` is the layer's
+		// merged view with deletes already applied, so any row deleted in the
+		// transaction layer must be physically removed from the base — otherwise a
+		// later base-direct scan (e.g. a UNIQUE index build) resurrects it. This also
+		// rebuilds the base secondary indexes from the new tree.
+		this.baseLayer.rebuildPrimaryTreeFromRows(allRows);
 	}
 
 	/** Scans a layer according to the given plan, yielding matching rows. */

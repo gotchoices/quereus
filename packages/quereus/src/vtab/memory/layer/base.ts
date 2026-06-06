@@ -117,6 +117,28 @@ export class BaseLayer implements Layer {
 		this.primaryTree = newTree;
 	}
 
+	/**
+	 * Replaces the primary tree with a fresh tree containing exactly `rows`, then
+	 * rebuilds all secondary indexes from it. Used when consolidating a committed
+	 * transaction layer into the base: `rows` is that layer's merged view (deletes
+	 * already applied), so the base must be *replaced* — not unioned — or rows
+	 * deleted in the transaction layer would remain physically resident in the base
+	 * and resurface in base-direct scans (e.g. UNIQUE index builds).
+	 */
+	public rebuildPrimaryTreeFromRows(rows: Row[]): void {
+		const btreeKeyFromValue = (value: Row): BTreeKeyForPrimary =>
+			this.primaryKeyFunctions.extractFromRow(value);
+		const newTree = new BTree<BTreeKeyForPrimary, Row>(
+			btreeKeyFromValue,
+			this.primaryKeyFunctions.compare,
+		);
+		for (const row of rows) {
+			newTree.insert(row);
+		}
+		this.primaryTree = newTree;
+		this.rebuildAllSecondaryIndexes();
+	}
+
 	private clearExistingSecondaryIndexes(): void {
 		this.secondaryIndexes.forEach(index => index.clear());
 	}
