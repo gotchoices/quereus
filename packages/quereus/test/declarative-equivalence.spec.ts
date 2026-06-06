@@ -889,6 +889,117 @@ describe('declarative-equivalence: decorations (tags)', () => {
 });
 
 // ============================================================================
+// Column collation drift — declarative detection + in-place SET COLLATE.
+// Unlike tags (non-behavioral, hash-stable), collation is real schema: it
+// changes `=` / ORDER BY semantics and so MUST move the schema hash. These tests
+// are the inverse of the tag-hash-stable assertions above.
+// ============================================================================
+
+describe('declarative-equivalence: column collation drift', () => {
+	it('apply schema converges a drifted column collation via SET COLLATE, changes semantics, and is idempotent', async function () {
+		const db = new Database();
+		try {
+			// Apply an initial schema with a BINARY (default-collation) text column.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`insert into t values (1, 'abc'), (2, 'ABC'), (3, 'abd')`);
+
+			// Under BINARY only the exact-case match counts.
+			const countMatches = async (): Promise<number> => {
+				const out: Array<Record<string, unknown>> = [];
+				for await (const r of db.eval(`select count(*) as n from t where name = 'ABC'`)) out.push(r as Record<string, unknown>);
+				return Number(out[0].n);
+			};
+			expect(await countMatches(), 'BINARY: only exact-case match').to.equal(1);
+
+			// Re-declare the column with COLLATE NOCASE (no other structural change).
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE }
+			}`);
+
+			// The differ detects the collation drift — and nothing structural.
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, collectSchemaCatalog(db, 'main'));
+			expect(diff.tablesToAlter.length, 'collation drift produces exactly one alter').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToAdd, 'no column adds').to.deep.equal([]);
+			expect(alter.columnsToDrop, 'no column drops').to.deep.equal([]);
+			const colChange = alter.columnsToAlter.find(c => c.columnName.toLowerCase() === 'name');
+			expect(colChange?.collation, 'declared NOCASE is the desired collation').to.equal('NOCASE');
+			expect(colChange?.dataType, 'no type drift').to.be.undefined;
+			expect(colChange?.notNull, 'no nullability drift').to.be.undefined;
+
+			// The emitted migration carries the SET COLLATE verb.
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /alter column .*name.* set collate nocase/i.test(s)), `expected SET COLLATE in: ${ddl.join(' | ')}`).to.be.true;
+
+			await db.exec('apply schema main');
+
+			// The live catalog converged: the column collation is now NOCASE…
+			const nameCol = db.schemaManager.getTable('main', 't')!.columns.find(c => c.name.toLowerCase() === 'name')!;
+			expect(nameCol.collation, 'column collation converged to NOCASE').to.equal('NOCASE');
+
+			// …and the `=` semantics changed accordingly (case-insensitive now).
+			expect(await countMatches(), 'NOCASE: case-insensitive match').to.equal(2);
+
+			// Re-applying the same declaration is a no-op — no collation drift remains.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('absent COLLATE and an explicit COLLATE BINARY are equal — no spurious diff', async function () {
+		const db = new Database();
+		try {
+			// Apply with no COLLATE (defaults to BINARY).
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT }
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare with an explicit COLLATE BINARY — semantically identical, so
+			// the differ must NOT churn a SET COLLATE.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT COLLATE BINARY }
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.tablesToAlter, 'BINARY == absent: no spurious collation alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a column collation change DOES move the schema hash (unlike a tag change)', async function () {
+		const a = new Database();
+		const b = new Database();
+		try {
+			await a.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT }
+			}`);
+			await b.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE }
+			}`);
+			const ha = computeSchemaHash(a.declaredSchemaManager.getDeclaredSchema('main')!);
+			const hb = computeSchemaHash(b.declaredSchemaManager.getDeclaredSchema('main')!);
+			expect(ha, 'collation is real schema — the hash must move').to.not.equal(hb);
+		} finally {
+			await a.close();
+			await b.close();
+		}
+	});
+});
+
+// ============================================================================
 // Materialized views — declarative round-trip, body-change rebuild, hash
 // ============================================================================
 

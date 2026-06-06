@@ -1315,6 +1315,7 @@ ALTER TABLE table_name ALTER COLUMN col_name DROP NOT NULL;
 ALTER TABLE table_name ALTER COLUMN col_name SET DATA TYPE type_name;
 ALTER TABLE table_name ALTER COLUMN col_name SET DEFAULT expr;
 ALTER TABLE table_name ALTER COLUMN col_name DROP DEFAULT;
+ALTER TABLE table_name ALTER COLUMN col_name SET COLLATE collation_name;
 ```
 
 Changes a single column attribute. Each statement carries exactly one attribute; combine multiple attributes by issuing multiple statements. Restrictions:
@@ -1323,8 +1324,9 @@ Changes a single column attribute. Each statement carries exactly one attribute;
 - `DROP NOT NULL` is rejected on PRIMARY KEY columns.
 - `SET DATA TYPE` is a schema-only change when the new type shares the same physical representation; otherwise each row's value is re-validated and converted, failing with `MISMATCH` on any value that cannot be coerced. Rejected on PRIMARY KEY columns.
 - `SET/DROP DEFAULT` is schema-only; existing rows are not touched.
+- `SET COLLATE` changes the column's collation (its comparison/ordering rule, default `BINARY`). The collation name is validated against the column's logical type up front — an unknown/unsupported collation is rejected with `Unknown collation '…' for type '…'`, the same error shape as `CREATE TABLE`. Because collation is **semantic** (it changes `=` and `ORDER BY`), the module re-keys / re-sorts any PRIMARY KEY, UNIQUE, or index that orders by the column and **re-validates uniqueness under the new collation**: a value set that was unique under `BINARY` but collides under `NOCASE` fails with `CONSTRAINT`, leaving the table unchanged. `SET COLLATE` is permitted on PRIMARY KEY columns (the primary structure is re-keyed). `SET COLLATE BINARY` restores the default. Unlike `SET TAGS`, a collation change **does move the schema hash** (`explain schema` reports a new hash). *Store-module note:* the LevelDB store applies `SET COLLATE` as a schema-only change — query-layer `=` / `ORDER BY` / `table_info().collation` pick up the new collation, but existing-row physical re-keying and re-validation at ALTER time are not performed there (its physical key encoding uses a fixed table-level collation).
 
-The declarative schema differ (`diff schema`) detects column-attribute drift and emits the matching `ALTER COLUMN` statements in the order `SET DATA TYPE` → `SET/DROP DEFAULT` → `SET/DROP NOT NULL` so that a newly-declared DEFAULT is in place before any NOT NULL tightening relies on it for backfill.
+The declarative schema differ (`diff schema`) detects column-attribute drift and emits the matching `ALTER COLUMN` statements in the order `SET DATA TYPE` → `SET COLLATE` → `SET/DROP DEFAULT` → `SET/DROP NOT NULL` (the two comparison-domain changes first, so a newly-declared DEFAULT is in place before any NOT NULL tightening relies on it for backfill). A declared `COLLATE BINARY` and an absent `COLLATE` are treated as equal — no spurious diff.
 
 **SET TAGS**
 
