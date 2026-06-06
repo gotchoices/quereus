@@ -34,6 +34,7 @@ import { parse } from '../src/parser/index.js';
 import { KEYWORDS } from '../src/parser/lexer.js';
 import { generateTableDDL, generateIndexDDL } from '../src/schema/ddl-generator.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
+import { expressionToString } from '../src/emit/ast-stringify.js';
 import { Database } from '../src/core/database.js';
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
 import type { Statement, IndexedColumn } from '../src/parser/ast.js';
@@ -316,6 +317,15 @@ describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 		expect(stmt.type, `ddl re-parsed to wrong statement: ${a!.ddl}`).to.equal('createAssertion');
 		if (stmt.type === 'createAssertion') {
 			expect(stmt.name.toLowerCase()).to.equal('a2');
+			// Faithfulness, not just shape: the re-parsed CHECK predicate must
+			// canonicalise to the same expression as the original. A structure-only
+			// check would miss a precedence/paren-drop bug in `expressionToString`
+			// that yields *a* valid-but-different predicate.
+			const ref = parse('create assertion a2 check (not exists (select 1 from t where v < 0))');
+			expect(ref.type).to.equal('createAssertion');
+			if (ref.type === 'createAssertion') {
+				expect(expressionToString(stmt.check)).to.equal(expressionToString(ref.check));
+			}
 		}
 	});
 });
