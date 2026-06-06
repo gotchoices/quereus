@@ -2025,6 +2025,51 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		}
 	});
 
+	it('an FK whose LOCAL (child) column is renamed emits ONLY the column rename (no FK drop+recreate)', async function () {
+		// Exercises the foreignKey-case child-column reconciliation
+		// (inverseRenameConstraintColumns on clone.columns), distinct from the
+		// parent-table-rename path above.
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1), (2)');
+			await db.exec('insert into child values (10, 1)');
+
+			// Rename the child's local FK column pa → parent_id; the FK body is
+			// otherwise unchanged (still references parent(pid)).
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					parent_id INTEGER with tags ("quereus.previous_name" = 'pa'),
+					constraint fk foreign key (parent_id) references parent(pid)
+				}
+			}`);
+			const diff = diffOf(db);
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.columnsToRename, 'child column rename detected').to.deep.equal([{ oldName: 'pa', newName: 'parent_id' }]);
+			expect(childAlter?.constraintsToDrop ?? [], 'no spurious FK drop on child').to.deep.equal([]);
+			expect(childAlter?.constraintsToAdd ?? [], 'no spurious FK add on child').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The FK still enforces under the renamed local column.
+			await db.exec('insert into child values (11, 2)'); // valid reference
+			let rejected = false;
+			try { await db.exec('insert into child values (12, 99)'); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by FK under the renamed local column').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('REGRESSION: a genuine body edit layered on a column rename still drops+recreates', async function () {
 		// Precedence guard: reconciliation must NOT mask a real body change that
 		// happens to coincide with a rename.
