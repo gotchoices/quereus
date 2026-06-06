@@ -139,7 +139,7 @@ function collectSourceTables(plan: PlanNode): string[] {
  * the logical `keysOf` identity. The covering ticket replaces this seeding with a
  * proper materialized index.
  */
-function computeBackingPrimaryKey(shape: BackingShape): ReadonlyArray<{ index: number; desc: boolean }> {
+export function computeBackingPrimaryKey(shape: BackingShape): ReadonlyArray<{ index: number; desc: boolean }> {
 	if (!shape.ordering || shape.ordering.length === 0) {
 		return shape.primaryKey;
 	}
@@ -240,6 +240,83 @@ export async function rebuildBacking(db: Database, mv: MaterializedViewSchema): 
 	}
 	const manager = getBackingManager(backing);
 	await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
+}
+
+/**
+ * True iff the live backing `TableSchema` is structurally identical to what the
+ * derived `shape` would build — so a `refresh` can take the data-only fast path
+ * (`rebuildBacking`, preserving the backing identity and warm caches) instead of
+ * rebuilding the backing table. Compares, in order:
+ *  - column **count**;
+ *  - per column: **name** (case-insensitive — matching the matcher's name compare),
+ *    **logical type**, **not-null**, **collation**;
+ *  - the **physical** PK ({@link computeBackingPrimaryKey} vs the backing's
+ *    `primaryKeyDefinition`, by index + desc + collation, in order).
+ *
+ * Returns false when a source schema change has shifted the body's output shape
+ * (most visibly a `select *` body whose new source column interleaves into the
+ * output) — the caller then rebuilds the backing to match the re-planned body.
+ */
+export function backingShapeMatches(current: TableSchema, shape: BackingShape): boolean {
+	if (current.columns.length !== shape.columns.length) return false;
+	for (let i = 0; i < shape.columns.length; i++) {
+		const a = current.columns[i];
+		const b = shape.columns[i];
+		if (a.name.toLowerCase() !== b.name.toLowerCase()) return false;
+		if (a.logicalType !== b.logicalType) return false;
+		if ((a.notNull === true) !== (b.notNull === true)) return false;
+		if ((a.collation ?? 'BINARY') !== (b.collation ?? 'BINARY')) return false;
+	}
+	const shapePk = computeBackingPrimaryKey(shape);
+	const currentPk = current.primaryKeyDefinition;
+	if (currentPk.length !== shapePk.length) return false;
+	for (let i = 0; i < shapePk.length; i++) {
+		if (currentPk[i].index !== shapePk[i].index) return false;
+		if ((currentPk[i].desc === true) !== (shapePk[i].desc === true)) return false;
+		const shapeColl = shape.columns[shapePk[i].index]?.collation ?? 'BINARY';
+		if ((currentPk[i].collation ?? 'BINARY') !== shapeColl) return false;
+	}
+	return true;
+}
+
+/**
+ * Drop-and-recreate rebuild of a materialized view's backing table when a source
+ * schema change has shifted the body's output shape (columns/types/PK/ordering),
+ * so the backing no longer corresponds column-for-column to the re-planned body.
+ * Mirrors the create path (`emitCreateMaterializedView`) exactly —
+ * `buildBackingTableSchema` → `createBackingTable` → fill via `replaceBaseLayer` —
+ * so there is one code path for "make the backing match the body".
+ *
+ * The body rows are collected BEFORE the old backing is dropped (the body reads
+ * the sources with the rewrite suppressed, never the backing it populates), so
+ * the window in which no backing exists is minimal. The drop fires `table_removed`
+ * and the create fires `table_added` on `_mv_<name>`, which (a) invalidate any
+ * cached prepared plan scanning the backing directly and (b) cascade staleness to
+ * any consumer MV whose source is this backing. On a fill failure (e.g. the
+ * reshaped body is duplicate-producing under the new PK) the half-built backing is
+ * dropped so the next read errors rather than serving an empty relation; the caller
+ * leaves the MV `stale` (it clears the flag only on success).
+ */
+export async function rebuildBackingTable(
+	db: Database,
+	mv: MaterializedViewSchema,
+	shape: BackingShape,
+): Promise<void> {
+	const sm = db.schemaManager;
+	const rows: Row[] = await collectBodyRows(db, astToString(mv.selectAst));
+
+	await sm.dropTable(mv.schemaName, mv.backingTableName, /*ifExists*/ true);
+	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.backingTableName, shape);
+	const completeBacking = await sm.createBackingTable(backingSchema);
+	try {
+		const manager = getBackingManager(completeBacking);
+		await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
+	} catch (e) {
+		try {
+			await sm.dropTable(mv.schemaName, mv.backingTableName, /*ifExists*/ true);
+		} catch { /* best-effort cleanup */ }
+		throw e;
+	}
 }
 
 /** Resolves the {@link MemoryTableManager} backing a materialized view's table. */

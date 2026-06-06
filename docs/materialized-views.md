@@ -66,7 +66,14 @@ refresh materialized view mv;
 
 Re-evaluates the body against current source data and atomically replaces the backing table's contents (`replaceBaseLayer` builds a fresh base layer and swaps it under the schema-change latch; readers use start-of-call snapshot isolation, so a concurrent scan sees either the old contents or the new — never a torn state).
 
-Because row-time maintenance keeps the backing consistent continuously, `REFRESH` is **not required for currency**. It is retained as an explicit resync verb — useful to recover a [`stale`](#schema-change-staleness) MV after a source schema change, and as the mechanism behind declarative drop-and-recreate on a body change.
+**Shape-aware.** Refresh first re-derives the backing's *shape* (columns/types/PK/ordering) from the re-planned body (`deriveBackingShape`) and compares it to the live backing (`backingShapeMatches`):
+
+- **Unchanged shape (the fast path):** the data-only `replaceBaseLayer` above runs, so the backing `TableSchema` identity is preserved and cached prepared plans / the optimizer's MV-body-root cache stay warm. This is the common periodic-refresh case.
+- **Shifted shape (rebuild):** a source `alter` can shift the body's output shape — most visibly a `select *` body, whose new source column *interleaves* into the output while the create-time backing did not reorder. Stuffing the new rows into the stale backing schema would surface body values under the wrong column labels (a latent direct-read corruption) and break the positional backing↔body alignment the [join read-rewrite](#join-subsumption) relies on. So refresh **rebuilds the backing table** (`rebuildBackingTable`: drop + recreate at the new shape via the same `buildBackingTableSchema` → `createBackingTable` → fill path as create, then re-derives `mv.primaryKey`/`ordering`/`sourceTables`). The drop/create fire `table_removed`/`table_added` on `_mv_<name>`, which invalidate any cached prepared plan scanning the backing and cascade staleness to any consumer MV over this backing. A fill failure (e.g. the reshaped body is duplicate-producing under the new PK) drops the half-built backing and leaves the MV `stale` so the next read errors rather than serving an empty relation.
+
+An MV with an **explicit column list** (`mv(a, b, c)`) whose body output *count* shifts under a source change is **not** silently reshaped — refresh errors with a "drop and recreate" diagnostic, since the column list is a declared interface. After the rebuild, row-time maintenance is re-registered against the new backing shape (see [Schema-change staleness](#schema-change-staleness)).
+
+Because row-time maintenance keeps the backing consistent continuously, `REFRESH` is **not required for currency**. It is retained as an explicit resync verb — useful to recover a [`stale`](#schema-change-staleness) MV after a source schema change (including a body-shape shift, which the rebuild above repairs), and as the mechanism behind declarative drop-and-recreate on a body change.
 
 ### `DROP MATERIALIZED VIEW`
 

@@ -152,3 +152,51 @@ select * from smv2;
 -- error: stale
 drop materialized view smv2;
 drop table s2;
+
+-- ===================================
+-- 9. refresh rebuilds the backing SCHEMA when a source ALTER shifts the body's
+--    output shape. A `select *` join MV interleaves the new source column into its
+--    output; refresh must rebuild the backing to match — not stuff the new rows into
+--    the stale create-time schema (which surfaced values under the wrong labels: a
+--    latent direct-read corruption). The colliding c.id surfaces as id:1.
+-- ===================================
+
+create table rs_cust (id integer primary key, name text not null);
+create table rs_ord (id integer primary key, customer_id integer not null references rs_cust(id), amt integer not null);
+create materialized view rsv as select * from rs_ord o join rs_cust c on o.customer_id = c.id;
+insert into rs_cust values (1, 'alice');
+insert into rs_ord values (10, 1, 100);
+
+-- before the alter: 5 columns
+select * from rsv;
+→ [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
+
+alter table rs_ord add column extra text default 'x';
+refresh materialized view rsv;
+
+-- after: the backing is rebuilt to the 6-column body — every value under the right label
+select * from rsv;
+→ [{"id":10,"customer_id":1,"amt":100,"extra":"x","id:1":1,"name":"alice"}]
+
+-- row-time maintenance binds to the rebuilt backing — a later source row carries the new column
+insert into rs_ord values (20, 1, 200, 'custom');
+select * from rsv where id = 20;
+→ [{"id":20,"customer_id":1,"amt":200,"extra":"custom","id:1":1,"name":"alice"}]
+
+drop materialized view rsv;
+drop table rs_ord;
+drop table rs_cust;
+
+-- ===================================
+-- 10. An explicit column list is a declared interface: a refresh whose body output
+--     count shifted under it errors (rather than silently widening the list).
+-- ===================================
+
+create table rs_t (x integer primary key, y text);
+insert into rs_t values (1, 'a');
+create materialized view rs_decl(a, b) as select * from rs_t;
+alter table rs_t add column z integer null;
+refresh materialized view rs_decl;
+-- error: drop and recreate
+drop materialized view rs_decl;
+drop table rs_t;
