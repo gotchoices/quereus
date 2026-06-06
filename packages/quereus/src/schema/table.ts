@@ -419,6 +419,20 @@ export function opsToMask(list?: RowOp[]): RowOpMask {
 }
 
 /**
+ * Converts an operation bitmask back to a `RowOp[]` in canonical insert→update→
+ * delete order. Inverse of {@link opsToMask}. Used by the declarative differ's
+ * constraint-body canonicalization (a stored CHECK keeps its operations as a
+ * mask; comparing against a declared AST requires the array form).
+ */
+export function maskToOps(mask: RowOpMask): RowOp[] {
+	const ops: RowOp[] = [];
+	if (mask & RowOpFlag.INSERT) ops.push('insert');
+	if (mask & RowOpFlag.UPDATE) ops.push('update');
+	if (mask & RowOpFlag.DELETE) ops.push('delete');
+	return ops;
+}
+
+/**
  * Represents a CHECK constraint with operation flags
  */
 export interface RowConstraintSchema {

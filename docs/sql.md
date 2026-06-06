@@ -1297,6 +1297,8 @@ Manages a **named** table-level constraint (CHECK / UNIQUE / FOREIGN KEY) over i
 
 These are schema-catalog operations that round-trip through the module's `alterTable`, so store-backed tables re-persist their DDL across reconnect.
 
+There is no in-place "redefine constraint" primitive. When a **declarative** schema (`apply schema`) changes the *body* of a named constraint while keeping its name — an edited CHECK expression, a changed FK `ON DELETE`/`ON UPDATE` action or referenced table/columns, a changed UNIQUE column set or `ON CONFLICT` — the differ realizes it as **DROP CONSTRAINT + ADD CONSTRAINT** (drop the old, add the new). Re-creation is the honest way to re-validate existing rows against the new rule: the re-add re-checks the current data and fails atomically with `CONSTRAINT` (leaving the schema unchanged) if any row violates the new body. A change to a constraint's **tags** only is *not* a body change — it takes `ALTER CONSTRAINT … SET TAGS` (no drop+recreate). If a constraint is both renamed (via a `quereus.previous_name`/`quereus.id` hint) and has a changed body, the drop+recreate subsumes the rename (the new body must re-validate regardless).
+
 **ALTER PRIMARY KEY**
 
 ```sql

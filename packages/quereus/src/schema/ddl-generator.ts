@@ -18,11 +18,12 @@
  */
 
 import type { Database } from '../core/database.js';
-import type { TableSchema, IndexSchema } from './table.js';
+import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
+import { maskToOps } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString } from '../emit/ast-stringify.js';
 
 /**
  * Unconditionally double-quote an identifier, escaping internal quotes.
@@ -105,6 +106,59 @@ export function generateIndexDDL(
 	}
 
 	return parts.join(' ');
+}
+
+/**
+ * Canonical DDL **body fragment** for a stored named constraint (CHECK / UNIQUE /
+ * FOREIGN KEY), excluding its `constraint <name>` prefix and `with tags (...)`
+ * suffix. This is the actual-catalog comparison key the declarative differ
+ * diffs against the declared-AST fragment (rendered by the same
+ * {@link constraintBodyToCanonicalString}) to detect a constraint whose name is
+ * unchanged but whose body changed. The schema constraint is first lifted back
+ * into the equivalent {@link AST.TableConstraint} (column indices → names,
+ * operation mask → `RowOp[]`, `defaultConflict` → `onConflict`, FK actions and
+ * deferred resolution mapped over), so both sides share one rendering path and
+ * stay byte-comparable.
+ */
+export function constraintToCanonicalDDL(
+	kind: NamedConstraintClass,
+	constraint: RowConstraintSchema | UniqueConstraintSchema | ForeignKeyConstraintSchema,
+	tableSchema: TableSchema,
+): string {
+	return constraintBodyToCanonicalString(schemaConstraintToTableConstraint(kind, constraint, tableSchema));
+}
+
+/** Lifts a stored named constraint back into the equivalent AST.TableConstraint. */
+function schemaConstraintToTableConstraint(
+	kind: NamedConstraintClass,
+	constraint: RowConstraintSchema | UniqueConstraintSchema | ForeignKeyConstraintSchema,
+	tableSchema: TableSchema,
+): AST.TableConstraint {
+	const colName = (i: number): string => tableSchema.columns[i]?.name ?? String(i);
+	switch (kind) {
+		case 'check': {
+			const c = constraint as RowConstraintSchema;
+			return { type: 'check', expr: c.expr, operations: maskToOps(c.operations), onConflict: c.defaultConflict };
+		}
+		case 'unique': {
+			const c = constraint as UniqueConstraintSchema;
+			return { type: 'unique', columns: c.columns.map(i => ({ name: colName(i) })), onConflict: c.defaultConflict };
+		}
+		case 'foreignKey': {
+			const c = constraint as ForeignKeyConstraintSchema;
+			return {
+				type: 'foreignKey',
+				columns: c.columns.map(i => ({ name: colName(i) })),
+				foreignKey: {
+					table: c.referencedTable,
+					columns: c.referencedColumnNames ? [...c.referencedColumnNames] : undefined,
+					onDelete: c.onDelete,
+					onUpdate: c.onUpdate,
+				},
+				onConflict: c.defaultConflict,
+			};
+		}
+	}
 }
 
 // --- Internals ---

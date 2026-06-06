@@ -32,7 +32,7 @@ import type * as AST from '../parser/ast.js';
 import { ConflictResolution } from '../common/constants.js';
 import { KEYWORDS, CONTEXTUAL_KEYWORDS } from '../parser/lexer.js';
 import { uint8ArrayToHex } from '../util/serialization.js';
-import type { SqlValue } from '../common/types.js';
+import type { SqlValue, RowOp } from '../common/types.js';
 
 // --- Identifier Quoting Logic ---
 
@@ -1232,6 +1232,69 @@ export function tableConstraintsToString(constraints: AST.TableConstraint[]): st
 		s += tagsClauseToString(c.tags);
 		return s;
 	}).filter(s => s.length > 0).join(', ');
+}
+
+/** Canonical insert→update→delete ordering for a CHECK `on` operation list. */
+const ROWOP_CANONICAL_ORDER: readonly RowOp[] = ['insert', 'update', 'delete'];
+
+/**
+ * Normalizes a CHECK constraint's `on` operation list to its canonical form for
+ * body comparison: the bare-CHECK default (INSERT + UPDATE) renders identically
+ * whether written as `check (...)` (parser leaves `operations` undefined) or
+ * `check on insert, update (...)`, so the default collapses to `undefined` (no
+ * `on` clause). Any other mask emits in fixed insert→update→delete order.
+ */
+function canonicalCheckOperations(ops: RowOp[] | undefined): RowOp[] | undefined {
+	const set = new Set<RowOp>(ops && ops.length > 0 ? ops : ['insert', 'update']);
+	if (set.size === 2 && set.has('insert') && set.has('update')) return undefined;
+	return ROWOP_CANONICAL_ORDER.filter(op => set.has(op));
+}
+
+/**
+ * Normalizes a foreign-key clause for body comparison: the default `restrict`
+ * action on DELETE / UPDATE renders the same whether written explicitly or
+ * omitted, so it collapses to `undefined` (no `on delete/update` clause); an
+ * empty referenced-column list collapses to `undefined` (bare `references t`);
+ * and the deferrable clause is dropped entirely (it is not a body-change
+ * channel the declarative differ tracks).
+ */
+function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClause {
+	return {
+		table: fk.table,
+		columns: fk.columns && fk.columns.length > 0 ? fk.columns : undefined,
+		onDelete: fk.onDelete && fk.onDelete !== 'restrict' ? fk.onDelete : undefined,
+		onUpdate: fk.onUpdate && fk.onUpdate !== 'restrict' ? fk.onUpdate : undefined,
+	};
+}
+
+/**
+ * Renders the **canonical body fragment** of a named table constraint — the
+ * comparison key the declarative differ uses to detect a constraint whose name
+ * is unchanged but whose body changed (an edited CHECK expression, a changed FK
+ * action / referenced table / columns, a changed UNIQUE column set / conflict
+ * action). Two semantically-equal constraints must render identically here or a
+ * spurious drop+recreate churns; two semantically-different ones must render
+ * differently or a real change silently no-ops.
+ *
+ * Excludes the `constraint <name>` prefix (constraints are matched by name first,
+ * and a rename must not block body comparison) AND the `with tags (...)` suffix
+ * (tags are a separate diff channel — `ALTER CONSTRAINT … SET TAGS`, so a
+ * tag-only change must NOT masquerade as a body change). Parser-default-
+ * equivalent forms are normalized (see {@link canonicalCheckOperations},
+ * {@link canonicalForeignKeyClause}). Both the declared-AST side
+ * (`schema-differ`) and the actual-catalog side (`ddl-generator`'s
+ * `constraintToCanonicalDDL`) funnel through here so their fragments are
+ * byte-comparable.
+ */
+export function constraintBodyToCanonicalString(tc: AST.TableConstraint): string {
+	const normalized: AST.TableConstraint = { ...tc, name: undefined, tags: undefined };
+	if (normalized.type === 'check') {
+		normalized.operations = canonicalCheckOperations(normalized.operations);
+	}
+	if (normalized.type === 'foreignKey' && normalized.foreignKey) {
+		normalized.foreignKey = canonicalForeignKeyClause(normalized.foreignKey);
+	}
+	return tableConstraintsToString([normalized]);
 }
 
 function foreignKeyActionToString(action: AST.ForeignKeyAction): string {

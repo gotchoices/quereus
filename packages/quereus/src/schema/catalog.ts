@@ -5,7 +5,7 @@ import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { generateTableDDL, generateIndexDDL } from './ddl-generator.js';
+import { generateTableDDL, generateIndexDDL, constraintToCanonicalDDL } from './ddl-generator.js';
 
 /**
  * Represents a catalog snapshot of the current database schema state
@@ -36,8 +36,16 @@ export interface CatalogTable {
 	/** Lowercased names of tables this table FK-references (within the same schema). */
 	referencedTables: string[];
 	tags?: Readonly<Record<string, SqlValue>>;
-	/** Named constraints (CHECK / UNIQUE / FOREIGN KEY) carrying their tags. Constraints without a name are excluded. */
-	namedConstraints: Array<{ name: string; tags?: Readonly<Record<string, SqlValue>> }>;
+	/**
+	 * Named constraints (CHECK / UNIQUE / FOREIGN KEY) carrying their tags and a
+	 * canonical body fragment. Constraints without a user-supplied name are excluded.
+	 * `definition` is the order/format-stable body DDL (name + tags excluded) the
+	 * differ compares against a declared constraint's body to detect a
+	 * name-unchanged-but-body-changed constraint (→ drop+recreate). Tags are kept
+	 * separate (and out of `definition`) so a tag-only change takes `ALTER
+	 * CONSTRAINT … SET TAGS`, not a needless drop+recreate.
+	 */
+	namedConstraints: Array<{ name: string; tags?: Readonly<Record<string, SqlValue>>; definition: string }>;
 }
 
 export interface CatalogView {
@@ -206,13 +214,19 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 	//     index buckets), not as table constraints.
 	const namedConstraints: CatalogTable['namedConstraints'] = [];
 	for (const c of tableSchema.checkConstraints ?? []) {
-		if (c.name && !isAutoConstraintName(c.name)) namedConstraints.push({ name: c.name, tags: c.tags });
+		if (c.name && !isAutoConstraintName(c.name)) {
+			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('check', c, tableSchema) });
+		}
 	}
 	for (const c of tableSchema.uniqueConstraints ?? []) {
-		if (c.name && !isAutoConstraintName(c.name) && !c.derivedFromIndex) namedConstraints.push({ name: c.name, tags: c.tags });
+		if (c.name && !isAutoConstraintName(c.name) && !c.derivedFromIndex) {
+			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('unique', c, tableSchema) });
+		}
 	}
 	for (const c of tableSchema.foreignKeys ?? []) {
-		if (c.name && !isAutoConstraintName(c.name)) namedConstraints.push({ name: c.name, tags: c.tags });
+		if (c.name && !isAutoConstraintName(c.name)) {
+			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('foreignKey', c, tableSchema) });
+		}
 	}
 
 	return {

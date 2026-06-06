@@ -100,6 +100,79 @@ describe('Schema Catalog', () => {
 		});
 	});
 
+	// The differ compares a constraint's canonical body fragment (`definition`,
+	// name + tags excluded) to detect a name-unchanged-but-body-changed constraint.
+	// These pin the exact canonical form per class so the declared and actual sides
+	// stay byte-comparable (a drift here would churn spurious drop+recreates).
+	describe('namedConstraints definition canonicalization', () => {
+		async function definitionOf(createSql: string, table: string, constraintName: string): Promise<string> {
+			await db.exec(createSql);
+			const cat = collectSchemaCatalog(db, 'main');
+			const t = cat.tables.find(t => t.name === table)!;
+			const c = t.namedConstraints.find(c => c.name === constraintName)!;
+			expect(c, `constraint ${constraintName} surfaced`).to.exist;
+			return c.definition;
+		}
+
+		it('CHECK: default (insert+update) operation mask is elided', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, CONSTRAINT chk_qty CHECK (qty > 0))',
+				't', 'chk_qty',
+			);
+			expect(def).to.equal('check (qty > 0)');
+		});
+
+		it('CHECK: a non-default operation mask is preserved', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, CONSTRAINT c1 CHECK ON DELETE (v > 0))',
+				't', 'c1',
+			);
+			expect(def).to.equal('check on delete (v > 0)');
+		});
+
+		it('UNIQUE: lists columns and elides the default ABORT conflict', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, CONSTRAINT uq UNIQUE (a, b))',
+				't', 'uq',
+			);
+			expect(def).to.equal('unique (a, b)');
+		});
+
+		it('UNIQUE: a non-default conflict action is preserved', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CONSTRAINT uq UNIQUE (a) ON CONFLICT REPLACE)',
+				't', 'uq',
+			);
+			expect(def).to.equal('unique (a) on conflict replace');
+		});
+
+		it('FOREIGN KEY: elides default RESTRICT actions', async () => {
+			await db.exec('CREATE TABLE parent (pid INTEGER PRIMARY KEY)');
+			const def = await definitionOf(
+				'CREATE TABLE child (id INTEGER PRIMARY KEY, pa INTEGER, CONSTRAINT fk FOREIGN KEY (pa) REFERENCES parent(pid))',
+				'child', 'fk',
+			);
+			expect(def).to.equal('foreign key (pa) references parent(pid)');
+		});
+
+		it('FOREIGN KEY: a non-default ON DELETE action is preserved', async () => {
+			await db.exec('CREATE TABLE parent (pid INTEGER PRIMARY KEY)');
+			const def = await definitionOf(
+				'CREATE TABLE child (id INTEGER PRIMARY KEY, pa INTEGER, CONSTRAINT fk FOREIGN KEY (pa) REFERENCES parent(pid) ON DELETE CASCADE)',
+				'child', 'fk',
+			);
+			expect(def).to.equal('foreign key (pa) references parent(pid) on delete cascade');
+		});
+
+		it('definition excludes the constraint tags (tag-only change is not a body change)', async () => {
+			const def = await definitionOf(
+				"CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CONSTRAINT uq UNIQUE (a) WITH TAGS (msg = 'hi'))",
+				't', 'uq',
+			);
+			expect(def, 'tags must not appear in the canonical body').to.equal('unique (a)');
+		});
+	});
+
 	// Roundtrip tests: catalog DDL must parse back into an equivalent schema.
 	// These catch drift between generator branches and the parser — e.g. a
 	// singleton table silently losing its PRIMARY KEY () on re-persistence.

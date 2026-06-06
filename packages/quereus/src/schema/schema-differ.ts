@@ -1,7 +1,7 @@
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString } from '../emit/ast-stringify.js';
 import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
@@ -113,17 +113,22 @@ export interface TableAlterDiff {
 	/** Constraint renames discovered via tag hints (user-named CHECK / UNIQUE / FK). */
 	constraintsToRename?: ColumnRenameOp[];
 	/**
-	 * User-named constraints present in the actual catalog but absent from the
-	 * declaration (and not consumed by a rename) → `DROP CONSTRAINT <name>`.
+	 * User-named constraints to remove via `DROP CONSTRAINT <name>`: those present
+	 * in the actual catalog but absent from the declaration (and not consumed by a
+	 * rename), PLUS the old side of a **body change** — a name-matched constraint
+	 * whose canonical body drifted is realized as drop-old + add-new (it pairs with
+	 * an entry in {@link constraintsToAdd}).
 	 */
 	constraintsToDrop?: string[];
 	/**
-	 * Declared user-named constraints absent from the actual catalog (and not a
-	 * rename target) → `ADD <constraint-fragment>`. Each entry is the constraint
-	 * DDL fragment (`constraint <name> check (...)` etc.) the `ALTER TABLE … ADD`
-	 * primitive consumes. NOTE: the engine's `ADD CONSTRAINT` only implements CHECK
-	 * in-place today; an emitted UNIQUE / FOREIGN KEY add will fail at apply with
-	 * UNSUPPORTED (a pre-existing `ADD CONSTRAINT` limitation, not introduced here).
+	 * Declared user-named constraints to install via `ALTER TABLE … ADD
+	 * <constraint-fragment>`: those absent from the actual catalog (and not a rename
+	 * target), PLUS the new side of a **body change** (paired with a
+	 * {@link constraintsToDrop} entry under the old name). Each entry is the full
+	 * constraint DDL fragment (`constraint <name> check (...)` with any tags) the
+	 * `ADD` primitive consumes. ADD applies a CHECK in place; a UNIQUE / FOREIGN
+	 * KEY add routes through the module's `addConstraint`, re-validating existing
+	 * rows (so a body-change recreate re-validates against the new rule).
 	 */
 	constraintsToAdd?: string[];
 	primaryKeyChange?: {
@@ -686,13 +691,16 @@ function applyIndexDefaults(
 
 /**
  * A declared user-named table constraint, normalized for lifecycle detection.
- * `ddl` is the constraint fragment (`constraint <name> check (...)` etc.) consumed
- * by `ALTER TABLE … ADD <fragment>`.
+ * `ddl` is the full constraint fragment (`constraint <name> check (...)` with
+ * tags) consumed by `ALTER TABLE … ADD <fragment>`. `definition` is the canonical
+ * body fragment (name + tags excluded) compared against the actual catalog's
+ * `definition` to detect a name-unchanged-but-body-changed constraint.
  */
 interface DeclaredNamedConstraint {
 	name: string;
 	tags?: Readonly<Record<string, SqlValue>>;
 	ddl: string;
+	definition: string;
 }
 
 /**
@@ -732,7 +740,7 @@ function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable): Map<
 		const lower = name.toLowerCase();
 		if (lower.startsWith('_')) return;
 		if (out.has(lower)) return;
-		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]) });
+		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]), definition: constraintBodyToCanonicalString(tc) });
 	};
 	for (const c of declaredTable.tableStmt.constraints ?? []) {
 		if (c.type === 'primaryKey') continue;
@@ -841,38 +849,80 @@ function computeTableAlterDiff(
 		getActualTags: a => a.tags,
 		policy,
 	});
-	if (constraintRenames.renames.length > 0) {
-		diff.constraintsToRename = constraintRenames.renames.map(r => ({ oldName: r.oldName, newName: r.newName }));
+	// Adds / drops / body-change recreates. A declared constraint is matched (by
+	// name or by rename hint) to at most one actual via `constraintRenames.pairs`:
+	//   - no match           → create (ADD declared fragment)
+	//   - match, same body    → no-op here (rename, if any, handled below; tags below)
+	//   - match, body changed → drop the old + add the declared (drop+recreate); a
+	//                           constraint body change has no in-place "redefine"
+	//                           primitive, and re-creation re-validates existing rows
+	//                           against the new rule.
+	// Precedence: when a constraint was rename-matched AND its body changed, prefer
+	// the drop+recreate (under the declared name/def) and SUPPRESS the RENAME — one
+	// coherent op, and the new body must re-validate regardless.
+	const constraintsToAdd: string[] = [];
+	const constraintsToDrop: string[] = [];
+	const renamesSuppressedByBodyChange = new Set<string>(); // declared lower-names
+	const bodyChangedNames = new Set<string>();              // declared lower-names recreated
+	// Counts that feed the `require-hint` guard: only a PURE create + PURE drop
+	// (the unhinted-rename shape) trips it. A same-constraint body-change drop+add
+	// is a deliberate recreate, not an ambiguous rename, so it is excluded here.
+	let pureCreateCount = 0;
+	let pureDropCount = 0;
+
+	for (const [lower, d] of declaredNamedConstraints) {
+		const matchedActual = constraintRenames.pairs.get(lower);
+		if (!matchedActual) {
+			constraintsToAdd.push(d.ddl); // create (name- or rename-unmatched)
+			pureCreateCount++;
+			continue;
+		}
+		if (d.definition !== matchedActual.definition) {
+			constraintsToDrop.push(matchedActual.name); // drop old
+			constraintsToAdd.push(d.ddl);               // add new (declared name + tags)
+			bodyChangedNames.add(lower);
+			if (matchedActual.name.toLowerCase() !== lower) renamesSuppressedByBodyChange.add(lower);
+		}
 	}
 
-	// Adds: declared constraint not matched (by name or rename) to any actual →
-	// emit its DDL fragment as an `ALTER TABLE … ADD`.
-	const constraintsToAdd: string[] = [];
-	for (const [lower, d] of declaredNamedConstraints) {
-		if (constraintRenames.pairs.has(lower)) continue; // exists (name- or rename-matched)
-		constraintsToAdd.push(d.ddl);
+	// Renames, minus any subsumed by a same-constraint body change.
+	const effectiveConstraintRenames = constraintRenames.renames.filter(
+		r => !renamesSuppressedByBodyChange.has(r.newName.toLowerCase()),
+	);
+	if (effectiveConstraintRenames.length > 0) {
+		diff.constraintsToRename = effectiveConstraintRenames.map(r => ({ oldName: r.oldName, newName: r.newName }));
 	}
-	if (constraintsToAdd.length > 0) diff.constraintsToAdd = constraintsToAdd;
 
 	// Drops: actual constraint neither declared nor consumed by a rename → DROP.
-	const constraintsToDrop: string[] = [];
+	// (A rename-consumed actual whose body also changed was already dropped above;
+	// it stays in `consumedActuals`, so it is skipped here — no double drop.)
 	for (const [lower, a] of actualNamedConstraints) {
 		if (constraintRenames.consumedActuals.has(lower)) continue;
-		if (!declaredNamedConstraints.has(lower)) constraintsToDrop.push(a.name);
+		if (!declaredNamedConstraints.has(lower)) {
+			constraintsToDrop.push(a.name);
+			pureDropCount++;
+		}
 	}
+
+	if (constraintsToAdd.length > 0) diff.constraintsToAdd = constraintsToAdd;
 	if (constraintsToDrop.length > 0) diff.constraintsToDrop = constraintsToDrop;
 
-	// Apply require-hint to constraints within this table (an add + a drop with no
-	// rename hint is the ambiguous case the policy guards).
+	// Apply require-hint to constraints within this table (a PURE add + a PURE drop
+	// with no rename hint is the ambiguous case the policy guards — body-change
+	// recreates are excluded from the counts).
 	if (policy === 'require-hint') {
-		enforceRequireHint(`constraint (${actualTable.name})`, constraintsToAdd.length, constraintsToDrop.length);
+		enforceRequireHint(`constraint (${actualTable.name})`, pureCreateCount, pureDropCount);
 	}
 
 	// Detect named-constraint tag drift (name-matched constraints only — a
 	// renamed constraint is not addressable by ALTER CONSTRAINT, see the runtime
-	// emitter). Whole-set replacement; rename hints excluded from the compare.
+	// emitter). Whole-set replacement; rename hints excluded from the compare. A
+	// constraint that is being body-change-recreated is skipped: its recreate
+	// fragment already carries the declared tags, so a separate SET TAGS would be
+	// redundant (and would target a constraint that no longer exists at that point).
 	const constraintTagsChanges: Array<{ constraintName: string; tags: Record<string, SqlValue> }> = [];
 	for (const [name, declaredConstraint] of declaredNamedConstraints) {
+		if (bodyChangedNames.has(name)) continue;
 		const actualConstraint = actualNamedConstraints.get(name);
 		if (!actualConstraint) continue; // a rename/create — not a same-name tag change
 		if (tagsDrifted(declaredConstraint.tags, actualConstraint.tags)) {

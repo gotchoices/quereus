@@ -1607,3 +1607,279 @@ describe('declarative-equivalence: named-constraint lifecycle', () => {
 		}
 	});
 });
+
+// ============================================================================
+// Named-constraint BODY change — drop+recreate (ticket 10.3)
+// ============================================================================
+
+describe('declarative-equivalence: named-constraint body change (drop+recreate)', () => {
+	function diffOf(db: Database) {
+		return computeSchemaDiff(
+			db.declaredSchemaManager.getDeclaredSchema('main')!,
+			collectSchemaCatalog(db, 'main'),
+		);
+	}
+
+	it('a CHECK body change converges via drop+add, is idempotent, and enforces the new predicate', async function () {
+		// NOTE: CHECK `ADD CONSTRAINT` applies in place and does NOT re-validate
+		// existing rows (a pre-existing limitation of the CHECK add path — UNIQUE / FK
+		// re-validate, CHECK does not). So a CHECK body change is forward-enforcing
+		// only; existing rows that violate the new predicate are not re-checked.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk_qty check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 5)');
+
+			// Edit the CHECK body (qty > 0 → qty >= 0), name unchanged.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk_qty check (qty >= 0) }
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.constraintsToDrop, 'drops old chk_qty').to.deep.equal(['chk_qty']);
+			expect(alter.constraintsToAdd?.length, 'adds new chk_qty').to.equal(1);
+			expect(alter.constraintsToRename ?? [], 'not a rename').to.deep.equal([]);
+			expect(alter.constraintTagsChanges ?? [], 'not a tag change').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// New predicate enforced: qty = 0 now allowed (was rejected under qty > 0).
+			await db.exec('insert into t values (2, 0)');
+			// qty < 0 still rejected by the new predicate.
+			let rejected = false;
+			try { await db.exec('insert into t values (3, -1)'); } catch { rejected = true; }
+			expect(rejected, 'qty < 0 rejected by new CHECK').to.be.true;
+
+			// Existing data preserved across the drop+recreate.
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, qty from t order by id')) rows.push(r);
+			expect(rows).to.deep.equal([{ id: 1, qty: 5 }, { id: 2, qty: 0 }]);
+
+			// Idempotent: re-diff produces no constraint churn (canonical fragments match).
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a UNIQUE body change converges via drop+add over satisfying data and is idempotent', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, constraint uq unique (a) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10, 100)');
+
+			// Widen the UNIQUE column set (a) → (a, b).
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, constraint uq unique (a, b) }
+			}`);
+			const alter = diffOf(db).tablesToAlter[0];
+			expect(alter.constraintsToDrop, 'drops old uq').to.deep.equal(['uq']);
+			expect(alter.constraintsToAdd?.length, 'adds new uq').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// Under unique(a,b): a duplicate `a` with distinct `b` is now allowed
+			// (was rejected by unique(a)); a full (a,b) duplicate is still rejected.
+			await db.exec('insert into t values (2, 10, 200)');
+			let rejected = false;
+			try { await db.exec('insert into t values (3, 10, 100)'); } catch { rejected = true; }
+			expect(rejected, 'full (a,b) duplicate rejected by new UNIQUE').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a UNIQUE body change the existing data violates is rejected by the re-add (apply fails)', async function () {
+		// The re-add re-validates existing rows and aborts the apply when they
+		// violate the new body. NOTE: a body change is two statements (DROP + ADD),
+		// and a multi-statement migration is NOT atomic for schema mutations on the
+		// memory backend — the DROP commits immediately, so a failed re-ADD leaves
+		// the OLD constraint dropped (it is not restored). We therefore assert only
+		// that the apply fails (a row that satisfies the OLD body is no longer
+		// guarded), not that the schema is unchanged. See the handoff "known gaps".
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, constraint uq unique (a, b) }
+			}`);
+			await db.exec('apply schema main');
+			// Distinct on (a,b), but duplicated on `a` alone.
+			await db.exec('insert into t values (1, 10, 100), (2, 10, 200)');
+
+			// Narrow the UNIQUE to (a): existing data has a=10 twice → re-validation fails.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, constraint uq unique (a) }
+			}`);
+			let threw = false;
+			try { await db.exec('apply schema main'); } catch { threw = true; }
+			expect(threw, 'apply over UNIQUE-violating data must fail on the re-add').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK body change (ON DELETE action) converges via drop+add and changes behavior', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk_pa foreign key (pa) references parent(pid) on delete restrict }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1)');
+			await db.exec('insert into child values (10, 1)');
+
+			// Change ON DELETE restrict → cascade (a body change of the FK).
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk_pa foreign key (pa) references parent(pid) on delete cascade }
+			}`);
+			const childAlter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 'child')!;
+			expect(childAlter.constraintsToDrop, 'drops old fk_pa').to.deep.equal(['fk_pa']);
+			expect(childAlter.constraintsToAdd?.length, 'adds new fk_pa').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// New behavior: deleting the parent now cascades (was restricted before).
+			await db.exec('delete from parent where pid = 1');
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select count(*) as n from child')) rows.push(r);
+			expect(rows, 'child rows cascade-deleted under the new ON DELETE CASCADE').to.deep.equal([{ n: 0 }]);
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// --- Disambiguation: tag-only vs body-only vs both ---
+
+	it('a tag-only constraint change takes ALTER CONSTRAINT SET TAGS, not a drop+recreate', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, constraint uq_a unique (a) with tags (msg = 'orig') }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, constraint uq_a unique (a) with tags (msg = 'updated') }
+			}`);
+			const alter = diffOf(db).tablesToAlter[0];
+			expect(alter.constraintsToDrop ?? [], 'no drop on a tag-only change').to.deep.equal([]);
+			expect(alter.constraintsToAdd ?? [], 'no add on a tag-only change').to.deep.equal([]);
+			expect(alter.constraintTagsChanges).to.deep.equal([{ constraintName: 'uq_a', tags: { msg: 'updated' } }]);
+
+			await db.exec('apply schema main');
+			expect(diffOf(db).tablesToAlter, 'idempotent').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a simultaneous body+tag change does drop+add carrying the declared tags (no separate SET TAGS)', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, constraint uq unique (a) with tags (msg = 'orig') }
+			}`);
+			await db.exec('apply schema main');
+			// Change BOTH the body (a → a,b) and the tag value in the same re-declaration.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, constraint uq unique (a, b) with tags (msg = 'updated') }
+			}`);
+			const alter = diffOf(db).tablesToAlter[0];
+			expect(alter.constraintsToDrop, 'drops old uq').to.deep.equal(['uq']);
+			expect(alter.constraintsToAdd?.length, 'adds new uq').to.equal(1);
+			// Body change wins: the recreate carries the declared tags; no separate SET TAGS.
+			expect(alter.constraintTagsChanges ?? [], 'no SET TAGS when the body recreates').to.deep.equal([]);
+			expect(alter.constraintsToAdd![0], 'recreate fragment carries the declared tags').to.match(/with tags \(msg = 'updated'\)/i);
+
+			await db.exec('apply schema main');
+			const uq = db.schemaManager.getTable('main', 't')!.uniqueConstraints!.find(c => c.name === 'uq')!;
+			expect(uq.tags, 'recreate applied the new tags').to.deep.equal({ msg: 'updated' });
+			expect(diffOf(db).tablesToAlter, 'idempotent').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// --- Rename + body precedence ---
+
+	it('a hinted constraint rename whose body ALSO changed suppresses the RENAME and does drop+add', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk_old check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			// Rename chk_old → chk_new AND change the body in one re-declaration.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER,
+					constraint chk_new check (qty >= 0) with tags ("quereus.previous_name" = 'chk_old')
+				}
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.constraintsToRename ?? [], 'RENAME suppressed by the body change').to.deep.equal([]);
+			expect(alter.constraintsToDrop, 'old name dropped').to.deep.equal(['chk_old']);
+			expect(alter.constraintsToAdd?.length, 'declared constraint added').to.equal(1);
+
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /RENAME CONSTRAINT/i.test(s)), `no RENAME CONSTRAINT emitted, got:\n${ddl.join('\n')}`).to.be.false;
+			expect(ddl.some(s => /DROP CONSTRAINT .*chk_old/i.test(s)), 'DROP old emitted').to.be.true;
+
+			await db.exec('apply schema main');
+			const checks = db.schemaManager.getTable('main', 't')!.checkConstraints;
+			expect(checks.some(c => c.name === 'chk_old'), 'old name gone').to.be.false;
+			expect(checks.some(c => c.name === 'chk_new'), 'new name present').to.be.true;
+			// New body enforced (qty >= 0 allows 0).
+			await db.exec('insert into t values (1, 0)');
+
+			// Idempotent: the previous_name hint must not re-trigger after the recreate.
+			const diff2 = diffOf(db);
+			expect(diff2.renames, 'no further rename').to.deep.equal([]);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// --- Canonicalization fidelity: default-elided forms must not churn ---
+
+	it('default-form constraint bodies (default mask / ABORT / RESTRICT) do not churn a drop+recreate', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table t {
+					id INTEGER PRIMARY KEY,
+					qty INTEGER,
+					pa INTEGER,
+					constraint chk check on insert, update (qty > 0),
+					constraint uq unique (qty) on conflict abort,
+					constraint fk foreign key (pa) references parent(pid) on delete restrict
+				}
+			}`);
+			await db.exec('apply schema main');
+			// The declared default-form clauses canonicalize to the same fragments the
+			// catalog stores, so re-diffing the identical schema yields zero churn.
+			expect(diffOf(db).tablesToAlter, 'default-form bodies must not churn drop+recreate').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});
