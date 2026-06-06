@@ -1213,14 +1213,14 @@ Tag values can be strings, numbers, booleans (`true`/`false`), or `null`. Tag ke
 
 Tags are available on the schema interfaces (`TableSchema.tags`, `ColumnSchema.tags`, etc.) and via the programmatic API (`SchemaManager.getTableTags()`, `SchemaManager.setTableTags()`, `SchemaManager.setColumnTags()`, `SchemaManager.setConstraintTags()`). Tags set at `CREATE` time can be changed later from SQL with `ALTER TABLE … SET TAGS` (whole-set replacement; see [§2.7](#27-alter-table-statement)).
 
-**Reserved namespace `quereus.*`:** keys whose name starts with `quereus.` are reserved for the engine. Tag keys with dots must use the quoted-identifier form (`"quereus.id"`). Currently recognized keys:
+**Reserved namespace `quereus.*`:** keys whose name starts with `quereus.` are reserved for the engine and validated against a typed registry (`src/schema/reserved-tags.ts`). The two most common keys, both rename hints, are:
 
 | Key | Used by | Effect |
 |-----|---------|--------|
 | `"quereus.id"` | `apply schema` / `diff schema` | Stable identifier — when a declared and actual object share the same `quereus.id` but have different names, the differ emits a rename instead of a drop+create. Authoritative; wins over `previous_name`. |
 | `"quereus.previous_name"` | `apply schema` / `diff schema` | One or more comma-separated old names. The differ matches a declared object whose name is missing in the catalog against an actual object whose name appears in this list. |
 
-Unrecognized `quereus.*` keys are accepted with a soft warning so future versions may add new keys without breaking older parsers.
+This is only a subset; other reserved keys include `quereus.expose_implicit_index`, the `quereus.update.*` view-mutation overrides, and the `quereus.lens.*` family (see the registry for the full set). An **unrecognized or mis-sited** `quereus.*` key is a **hard error** — rejected loudly at plan-build on every authoring path (`CREATE TABLE` / `CREATE INDEX … WITH TAGS`, `ALTER … SET TAGS`, and `apply schema` / `diff schema`) rather than silently stored — so a typo (`quereus.idd`) or a view-only key on a physical table fails the statement. Tag keys with dots must use the quoted-identifier form (`"quereus.id"`). Non-reserved (free-form) keys outside the `quereus.*` namespace are accepted untouched.
 
 Example — declaring a renamed table and column:
 
