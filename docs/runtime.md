@@ -1135,6 +1135,29 @@ The compiled CHECKs are also merged into the table-level constraint set, so futu
 INSERT/UPDATE enforce them the same way. `ADD CONSTRAINT` likewise validates at
 first INSERT/UPDATE.
 
+A **column-level FOREIGN KEY** added via `ADD COLUMN` validates the existing
+(backfilled) rows against the referenced parent, for **both** default kinds, via a
+single post-`alterTable` scan using the shared `validateForeignKeyOverExistingRows`
+primitive — the same one `ADD CONSTRAINT` calls, so the two paths cannot drift. It is
+MATCH SIMPLE (a fully-non-NULL backfilled value with no matching parent row aborts; a
+NULL value satisfies the FK), pragma-gated (`pragma foreign_keys = false` skips it),
+and runs in the **same try/revert region** as the literal-default CHECK scan, so a
+violation drops the new column and restores the original catalog entry. Unlike CHECK,
+FK validation runs for **all** default kinds (literal and per-row): it is a
+cross-table existence check, not a per-row predicate, and a post-scan reads a
+consistent post-alter table — correct even for a self-referential FK (parent ==
+child) and for the parent-absent case (any fully-non-NULL backfilled row is an
+orphan). The new column-level FK is also merged into the table-level constraint set
+for forward INSERT/UPDATE enforcement.
+
+> The FK existing-row validator uses a `LEFT JOIN … WHERE <parent col> IS NULL`
+> left-anti-join rather than a `NOT EXISTS` subquery. The two are equivalent under
+> MATCH SIMPLE, but the `NOT EXISTS` decorrelation misreads a CHILD column added
+> earlier in the *same* ALTER statement (the hash-anti-join reports no orphans, so a
+> violation would be silently admitted); the explicit outer join takes a plan path
+> that reads the freshly-added column correctly. Tracked by the fix ticket
+> `altered-column-not-exists-antijoin-misread`.
+
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion
 - CHECK constraints validated when building constraint checks (full

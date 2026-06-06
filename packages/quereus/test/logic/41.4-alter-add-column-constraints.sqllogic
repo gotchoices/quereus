@@ -29,8 +29,16 @@ drop table t_chk;
 
 -- ===================================
 -- 2. ADD COLUMN with REFERENCES (column-level FK)
+--
+-- Adding a column-level FK validates the EXISTING (backfilled) rows against the
+-- referenced parent — MATCH SIMPLE, pragma-gated — via the same post-scan the
+-- ADD CONSTRAINT path uses (validateForeignKeyOverExistingRows), for BOTH the
+-- literal-default and per-row (evaluator) default paths. A fully-non-NULL orphan
+-- aborts the ALTER and leaves the table unchanged (column not added); a NULL
+-- backfill satisfies the FK.
 -- ===================================
 
+-- 2a. NULL backfill is allowed (MATCH SIMPLE), and forward enforcement fires.
 create table t_parent (pid integer primary key);
 insert into t_parent values (1), (2);
 
@@ -46,12 +54,239 @@ select parent from t_child where id = 1;
 -- valid FK insert
 insert into t_child values (2, 'y', 1);
 
--- FK violation
+-- FK violation (forward enforcement via merged table-level FK)
 insert into t_child values (3, 'z', 99);
 -- error:
 
 drop table t_child;
 drop table t_parent;
+-- run
+
+-- 2b. Literal-default ORPHAN over populated rows → ALTER aborts, table unchanged.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 99 references t_parent(pid);
+-- error: foreign key
+
+-- the column was NOT added (revert dropped it + restored the catalog)
+select count(*) as c from table_info('t_child') where name = 'parent';
+→ [{"c":0}]
+
+-- ...and the FK was never installed: forward enforcement is absent and a plain
+-- insert over the original (id, name) shape still succeeds.
+insert into t_child values (2, 'y');
+select count(*) as c from t_child;
+→ [{"c":2}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2c. Literal-default SATISFIED → ALTER succeeds, backfills, forward enforcement active.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 1 references t_parent(pid);
+-- run
+
+-- backfilled value present and satisfied
+select parent from t_child where id = 1;
+→ [{"parent":1}]
+
+-- the FK is installed (introspection)
+select count(*) as c from foreign_key_info('t_child') where referenced_table = 't_parent';
+→ [{"c":1}]
+
+-- forward enforcement: an orphan insert is now rejected
+insert into t_child values (2, 'y', 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2d. Per-row (evaluator) default ORPHAN → ALTER aborts, table unchanged.
+-- The default (new.a + 100) lands each row on a value with no parent row.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, a integer);
+insert into t_child values (1, 1), (2, 2);
+-- run
+
+alter table t_child add column parent integer default (new.a + 100) references t_parent(pid);
+-- error: foreign key
+
+-- table unchanged: the per-row backfilled column was reverted
+select * from t_child order by id;
+→ [{"id":1,"a":1},{"id":2,"a":2}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2e. Per-row (evaluator) default SATISFIED → ALTER succeeds, backfills per-row.
+-- The default (new.a + 100) lands each row on an existing parent (101, 102).
+create table t_parent (pid integer primary key);
+insert into t_parent values (101), (102);
+create table t_child (id integer primary key, a integer);
+insert into t_child values (1, 1), (2, 2);
+-- run
+
+alter table t_child add column parent integer default (new.a + 100) references t_parent(pid);
+-- run
+
+select id, parent from t_child order by id;
+→ [{"id":1,"parent":101},{"id":2,"parent":102}]
+
+-- forward enforcement active
+insert into t_child values (3, 3, 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2f. Self-referential FK (parent == child) — SATISFIED.
+-- Each row backfills parent = its own id, which exists, so all rows are satisfied.
+create table t_self (id integer primary key, name text);
+insert into t_self values (1, 'a'), (2, 'b');
+-- run
+
+alter table t_self add column parent integer default (new.id) references t_self(id);
+-- run
+
+select id, parent from t_self order by id;
+→ [{"id":1,"parent":1},{"id":2,"parent":2}]
+
+drop table t_self;
+-- run
+
+-- 2g. Self-referential FK (parent == child) — ORPHAN.
+-- parent = id + 100 → 101, 102 are not ids in the table → orphans → abort.
+create table t_self (id integer primary key, name text);
+insert into t_self values (1, 'a'), (2, 'b');
+-- run
+
+alter table t_self add column parent integer default (new.id + 100) references t_self(id);
+-- error: foreign key
+
+-- table unchanged (self-ref post-scan read a consistent post-alter table)
+select * from t_self order by id;
+→ [{"id":1,"name":"a"},{"id":2,"name":"b"}]
+
+drop table t_self;
+-- run
+
+-- 2h. Bare `REFERENCES parent` (no parent column) resolves to the parent PK.
+-- Satisfied literal default succeeds; forward enforcement active.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 1 references t_parent;
+-- run
+
+select parent from t_child where id = 1;
+→ [{"parent":1}]
+
+insert into t_child values (2, 'y', 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2i. Bare `REFERENCES parent` ORPHAN (PK fallback) → abort, table unchanged.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 99 references t_parent;
+-- error: foreign key
+
+select count(*) as c from table_info('t_child') where name = 'parent';
+→ [{"c":0}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2j. pragma foreign_keys = false → validator no-ops; orphan ADD COLUMN succeeds.
+pragma foreign_keys = false;
+create table t_parent (pid integer primary key);
+insert into t_parent values (1);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+-- pragma off: the orphan backfill (99 ∉ parent) is NOT validated → the add succeeds
+alter table t_child add column parent integer default 99 references t_parent(pid);
+-- run
+
+select parent from t_child where id = 1;
+→ [{"parent":99}]
+
+drop table t_child;
+drop table t_parent;
+pragma foreign_keys = true;
+-- run
+
+-- 2k. Parent table ABSENT — any fully-non-NULL backfilled row is an orphan ⇒ abort;
+-- a NULL-only backfill still succeeds (MATCH SIMPLE exempts NULL).
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+-- non-NULL default to a non-existent parent → orphan → abort, table unchanged
+alter table t_child add column parent integer default 5 references no_such_parent(pid);
+-- error: foreign key
+
+select * from t_child order by id;
+→ [{"id":1,"name":"x"}]
+
+-- NULL backfill (no default) to a non-existent parent → succeeds
+alter table t_child add column parent2 integer null references no_such_parent(pid);
+-- run
+
+select parent2 from t_child where id = 1;
+→ [{"parent2":null}]
+
+drop table t_child;
+-- run
+
+-- 2l. Empty table → no rows to validate; ALTER succeeds even with an orphan-shaped default.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1);
+create table t_child (id integer primary key, name text);
+-- run
+
+-- no existing rows ⇒ the FK post-scan finds nothing to validate ⇒ the add succeeds
+alter table t_child add column parent integer default 99 references t_parent(pid);
+-- run
+
+-- forward enforcement is still installed: an orphan insert is rejected
+insert into t_child values (1, 'x', 99);
+-- error:
+
+-- a satisfied insert succeeds
+insert into t_child values (2, 'y', 1);
+select count(*) as c from t_child;
+→ [{"c":1}]
+
+drop table t_child;
+drop table t_parent;
+-- run
 
 -- ===================================
 -- 3. ADD COLUMN with COLLATE clause — Quereus rejects NOCASE on TEXT

@@ -8,6 +8,7 @@ import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
+import { validateForeignKeyOverExistingRows } from '../../schema/constraint-builder.js';
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -348,10 +349,6 @@ async function runAddColumn(
 
 	// Merge new column-level CHECK / FK into the table-level constraint sets so the
 	// existing constraint-builder picks them up for INSERT/UPDATE enforcement.
-	// FOLLOW-UP: column-level FK is merged for future INSERT/UPDATE only — existing
-	// backfilled rows are NOT validated against it for any default kind. The per-row
-	// backfill hook used here for CHECK could be reused to validate FKs against
-	// backfilled rows; not implemented (see ticket out-of-scope note).
 	const mergedChecks = newCheckConstraints.length > 0
 		? Object.freeze([...updatedTableSchema.checkConstraints, ...newCheckConstraints])
 		: updatedTableSchema.checkConstraints;
@@ -375,18 +372,34 @@ async function runAddColumn(
 	// during validation can resolve the new column.
 	schema.addTable(enhancedTableSchema);
 
-	// Validate new CHECK constraints against the (already-backfilled) rows, reverting
-	// (drop the column + restore the original catalog entry) on a violation. NOT NULL of
-	// a per-row default is enforced by the module during backfill (it has the values
-	// in-hand and throws before the column is committed), so it needs no post-scan here.
+	// Validate new CHECK constraints against the (already-backfilled) rows AND validate
+	// existing rows against any new column-level FK, reverting (drop the column + restore
+	// the original catalog entry) on a violation. Both run inside a single try/revert
+	// region so that when both a new CHECK and a new FK exist and either fails, the same
+	// revert path fires.
 	//
-	// The per-row (evaluator) default path already enforced each CHECK inside the backfill
-	// hook above (against the freshly-computed value, not a stale snapshot), so skip the
-	// post-scan there — it is only correct for the literal-default path (`!backfill`), whose
-	// values were bulk-written by the module without a per-row hook.
-	if (!backfill && newCheckConstraints.length > 0) {
+	// CHECK is gated on `!backfill`: NOT NULL of a per-row default is enforced by the module
+	// during backfill (it has the values in-hand and throws before the column is committed),
+	// and the per-row (evaluator) default path already enforced each CHECK inside the backfill
+	// hook above (against the freshly-computed value, not a stale snapshot). The CHECK post-scan
+	// is therefore only correct for the literal-default path, whose values were bulk-written by
+	// the module without a per-row hook.
+	//
+	// FK runs for ALL default kinds. It is a cross-table existence check, not a per-row
+	// predicate, so it must be a post-`alterTable` scan: the scan sees both the bulk-written
+	// (literal) and per-row-evaluated backfilled values, and for a self-referential FK it reads
+	// a consistent post-alter table (a per-row hook would have to query the very table being
+	// rebuilt). It reuses `validateForeignKeyOverExistingRows` — the same MATCH-SIMPLE,
+	// pragma-gated validator the ADD CONSTRAINT path calls — so the two paths can never drift.
+	const runCheckScan = !backfill && newCheckConstraints.length > 0;
+	if (runCheckScan || resolvedForeignKeys.length > 0) {
 		try {
-			await validateBackfillAgainstChecks(rctx, enhancedTableSchema, newCheckConstraints);
+			if (runCheckScan) {
+				await validateBackfillAgainstChecks(rctx, enhancedTableSchema, newCheckConstraints);
+			}
+			for (const fk of resolvedForeignKeys) {
+				await validateForeignKeyOverExistingRows(rctx.db, enhancedTableSchema, fk);
+			}
 		} catch (err) {
 			// Revert: drop the column and restore the original catalog entry.
 			try {
@@ -395,7 +408,7 @@ async function runAddColumn(
 					columnName: columnDef.name,
 				});
 			} catch (revertErr) {
-				log('Failed to revert ADD COLUMN after CHECK violation: %s', (revertErr as Error).message);
+				log('Failed to revert ADD COLUMN after constraint violation: %s', (revertErr as Error).message);
 			}
 			schema.addTable(tableSchema);
 			throw err;

@@ -159,8 +159,20 @@ export async function validateForeignKeyOverExistingRows(
 			.map((childIdx, i) =>
 				`${parentAlias}.${quoteIdentifier(parentTable.columns[parentColIndices[i]].name)} = ${childAlias}.${quoteIdentifier(childSchema.columns[childIdx].name)}`)
 			.join(' and ');
-		sql = `select 1 from ${childRef} as ${childAlias} where ${notNullChain} `
-			+ `and not exists (select 1 from ${parentRef} as ${parentAlias} where ${matchChain}) limit 1`;
+		// LEFT-anti-join (LEFT JOIN … WHERE parent IS NULL) rather than a `not exists`
+		// subquery. The two are logically equivalent under MATCH SIMPLE, but the explicit
+		// outer join is robust to a CHILD column added earlier in the SAME ALTER statement
+		// (the ADD COLUMN existing-row path): the `not exists` → hash-anti-join decorrelation
+		// misreads such a freshly-added column and reports no orphans, so the post-scan would
+		// silently admit a violation. See `tickets/fix/altered-column-not-exists-antijoin-misread`.
+		// The referenced parent columns are PK/UNIQUE (non-NULL), and the join requires every
+		// FK column to match a non-NULL child value (guarded by `notNullChain`), so a
+		// non-matching child row leaves every `${parentAlias}.<col>` NULL — testing the first
+		// referenced column identifies the orphan (composite FKs included).
+		const firstParentCol = quoteIdentifier(parentTable.columns[parentColIndices[0]].name);
+		sql = `select 1 from ${childRef} as ${childAlias} `
+			+ `left join ${parentRef} as ${parentAlias} on ${matchChain} `
+			+ `where ${notNullChain} and ${parentAlias}.${firstParentCol} is null limit 1`;
 	}
 
 	log('FK existing-row validation for %s.%s: %s', childSchema.schemaName, childSchema.name, sql);
