@@ -8,6 +8,8 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
+import { renameColumnInCheckExpression } from './rename-rewriter.js';
+import { cloneExpr } from '../planner/mutation/scope-transform.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
@@ -307,7 +309,10 @@ export function computeSchemaDiff(
 		const matchedActual = tableRenames.pairs.get(name);
 		if (matchedActual) {
 			// Either a rename match or a name-based match — compute alter diff against the matched actual.
-			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy);
+			// Thread the table renames (all `kind: 'table'` from this resolver) and the
+			// schema name so the constraint body comparison can reconcile a renamed
+			// column / FK-parent-table against the actual (pre-rename) catalog body.
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName);
 			// If this was a rename, set the alter target to the new name (post-rename)
 			if (matchedActual.name.toLowerCase() !== name) {
 				alterDiff.tableName = tableStmt.table.name;
@@ -701,6 +706,14 @@ interface DeclaredNamedConstraint {
 	tags?: Readonly<Record<string, SqlValue>>;
 	ddl: string;
 	definition: string;
+	/**
+	 * The lifted table-level constraint AST `definition` was rendered from. Kept so
+	 * the body comparison can build a rename-reconciled body (see
+	 * {@link reconciledDeclaredBody}) by inverse-rewriting a renamed identifier back
+	 * to its actual (pre-rename) name. MUST NOT be mutated — it backs `ddl` /
+	 * `definition`; reconciliation clones before rewriting.
+	 */
+	bodyAst: AST.TableConstraint;
 }
 
 /**
@@ -740,7 +753,7 @@ function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable): Map<
 		const lower = name.toLowerCase();
 		if (lower.startsWith('_')) return;
 		if (out.has(lower)) return;
-		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]), definition: constraintBodyToCanonicalString(tc) });
+		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]), definition: constraintBodyToCanonicalString(tc), bodyAst: tc });
 	};
 	for (const c of declaredTable.tableStmt.constraints ?? []) {
 		if (c.type === 'primaryKey') continue;
@@ -756,10 +769,102 @@ function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable): Map<
 	return out;
 }
 
+/**
+ * Inverse-applies the in-diff column renames to a constraint's column list: maps
+ * each `{ name }` entry from its NEW name back to its OLD name (case-insensitive).
+ * Used to reconcile a UNIQUE column set / an FK's local (child) column set against
+ * the actual catalog body, which still renders the pre-rename names at diff time.
+ * Mutates the supplied (already-cloned) array in place.
+ */
+function inverseRenameConstraintColumns(
+	columns: Array<{ name: string; direction?: 'asc' | 'desc' }> | undefined,
+	colRenames: ReadonlyArray<ColumnRenameOp>,
+): void {
+	if (!columns) return;
+	for (const col of columns) {
+		const lower = col.name.toLowerCase();
+		const r = colRenames.find(cr => cr.newName.toLowerCase() === lower);
+		if (r) col.name = r.oldName;
+	}
+}
+
+/**
+ * Renders the declared constraint's canonical body with the in-diff renames
+ * inverse-applied — i.e. each renamed identifier rewritten from its NEW name
+ * back to the ACTUAL (pre-rename) name the catalog still carries at diff time.
+ * Comparing this against `actual.definition` lets the body-change detector
+ * distinguish a *pure rename* (bodies match after reconciliation → no churn) from
+ * a *genuine body edit* (still differ → drop+recreate). A body edit layered on a
+ * rename survives the reconciliation, so the existing rename-vs-body precedence is
+ * preserved.
+ *
+ * Reconciles only what each kind needs (surgical clone, never the whole tree):
+ *   - CHECK:  inverse column renames on the expression (runtime CHECK rewriter).
+ *   - UNIQUE: inverse column renames on the column list.
+ *   - FK:     inverse column renames on the LOCAL (child) column list AND inverse
+ *             table renames on the referenced parent `foreignKey.table`.
+ *
+ * KNOWN LIMITATION (out of scope; not a regression): an FK *referenced column*
+ * renamed on the *parent* table is not reconciled here — the parent's column
+ * renames live in the parent's own per-table diff and aren't visible cross-table
+ * in this single-pass architecture, so that case still churns a drop+recreate
+ * exactly as before. A two-pass fix is a follow-up.
+ */
+function reconciledDeclaredBody(
+	d: DeclaredNamedConstraint,
+	colRenames: ReadonlyArray<ColumnRenameOp>,
+	tableRenames: ReadonlyArray<RenameOp>,
+	tableName: string,
+	schemaName: string,
+): string {
+	const tc = d.bodyAst;
+	switch (tc.type) {
+		case 'check': {
+			if (!tc.expr) return d.definition;
+			// cloneExpr: the rewriter mutates in place; bodyAst backs ddl/definition.
+			const clone: AST.TableConstraint = { ...tc, expr: cloneExpr(tc.expr) };
+			for (const r of colRenames) {
+				// Inverse: rewrite the declared NEW column name back to its OLD name.
+				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName, schemaName);
+			}
+			return constraintBodyToCanonicalString(clone);
+		}
+		case 'unique': {
+			const clone: AST.TableConstraint = { ...tc, columns: tc.columns?.map(c => ({ ...c })) };
+			inverseRenameConstraintColumns(clone.columns, colRenames);
+			return constraintBodyToCanonicalString(clone);
+		}
+		case 'foreignKey': {
+			const clone: AST.TableConstraint = {
+				...tc,
+				columns: tc.columns?.map(c => ({ ...c })),
+				foreignKey: tc.foreignKey
+					? { ...tc.foreignKey, columns: tc.foreignKey.columns ? [...tc.foreignKey.columns] : undefined }
+					: tc.foreignKey,
+			};
+			// Local (child) columns live on THIS table → inverse column rename.
+			inverseRenameConstraintColumns(clone.columns, colRenames);
+			// Parent table reference → inverse table rename (newTable → oldTable).
+			if (clone.foreignKey) {
+				const parentLower = clone.foreignKey.table.toLowerCase();
+				const tr = tableRenames.find(r => r.newName.toLowerCase() === parentLower);
+				if (tr) clone.foreignKey = { ...clone.foreignKey, table: tr.oldName };
+			}
+			return constraintBodyToCanonicalString(clone);
+		}
+		default:
+			return d.definition;
+	}
+}
+
 function computeTableAlterDiff(
 	declaredTable: AST.DeclaredTable,
 	actualTable: CatalogTable,
 	policy: RenamePolicy,
+	/** Table renames detected in this same diff (used to reconcile FK parent-table refs). */
+	tableRenames: ReadonlyArray<RenameOp>,
+	/** Schema name — the default schema for the CHECK column-rename rewriter. */
+	schemaName: string,
 ): TableAlterDiff {
 	const diff: TableAlterDiff = {
 		// Default to actual's name; caller may override to declared name when this is a rename target.
@@ -877,7 +982,18 @@ function computeTableAlterDiff(
 			pureCreateCount++;
 			continue;
 		}
-		if (d.definition !== matchedActual.definition) {
+		// Body comparison. The actual side (`matchedActual.definition`) renders the
+		// PRE-rename identifier names (a column/parent-table rename has not landed at
+		// diff time); the declared side uses the NEW names. So a string mismatch that
+		// is purely a renamed identifier — already emitted as a rename in this same
+		// diff — must NOT churn a drop+recreate. Short-circuit the common no-rename
+		// case (raw strings equal) first; only then reconcile the declared body back
+		// to the old names and re-compare. A genuine body edit still differs after
+		// reconciliation, so the drop+recreate (and its rename-suppression) is kept.
+		if (
+			d.definition !== matchedActual.definition &&
+			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName) !== matchedActual.definition
+		) {
 			constraintsToDrop.push(matchedActual.name); // drop old
 			constraintsToAdd.push(d.ddl);               // add new (declared name + tags)
 			bodyChangedNames.add(lower);

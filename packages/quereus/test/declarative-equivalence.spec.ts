@@ -1883,3 +1883,183 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 		}
 	});
 });
+
+// ============================================================================
+// Rename without constraint churn — a named constraint whose body is unchanged
+// except for a renamed identifier (handled by the rename pass in the SAME diff)
+// must emit ONLY the rename, not a redundant DROP+ADD (ticket
+// constraint-body-change-rename-churn).
+// ============================================================================
+
+describe('declarative-equivalence: rename without constraint churn', () => {
+	function diffOf(db: Database) {
+		return computeSchemaDiff(
+			db.declaredSchemaManager.getDeclaredSchema('main')!,
+			collectSchemaCatalog(db, 'main'),
+		);
+	}
+
+	it('a CHECK over a renamed column emits ONLY the column rename (no constraint drop+recreate)', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			// Rename qty → quantity (column previous_name hint); CHECK body semantically
+			// unchanged — it just references the renamed column.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					quantity INTEGER with tags ("quereus.previous_name" = 'qty'),
+					constraint chk check (quantity > 0)
+				}
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the column rename').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'column rename detected').to.deep.equal([{ oldName: 'qty', newName: 'quantity' }]);
+			expect(alter.constraintsToDrop ?? [], 'no spurious constraint drop').to.deep.equal([]);
+			expect(alter.constraintsToAdd ?? [], 'no spurious constraint add').to.deep.equal([]);
+
+			// The migration DDL must carry the RENAME COLUMN and NO constraint drop/add.
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /RENAME COLUMN .*qty.* TO .*quantity/i.test(s)), `expected RENAME COLUMN, got:\n${ddl.join('\n')}`).to.be.true;
+			expect(ddl.some(s => /DROP CONSTRAINT/i.test(s)), `no DROP CONSTRAINT, got:\n${ddl.join('\n')}`).to.be.false;
+			expect(ddl.some(s => /ADD .*constraint/i.test(s)), `no ADD constraint, got:\n${ddl.join('\n')}`).to.be.false;
+
+			await db.exec('apply schema main');
+
+			// The CHECK still enforces under the new column name (the rename rewrote it).
+			await db.exec('insert into t values (1, 5)');
+			let rejected = false;
+			try { await db.exec('insert into t values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'CHECK still enforces under quantity').to.be.true;
+
+			// Idempotent: the previous_name hint must not re-trigger after the rename lands.
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a UNIQUE over a renamed column emits ONLY the column rename (no re-add / re-scan)', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, email TEXT, constraint uq unique (email) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec("insert into t values (1, 'a@x'), (2, 'b@x')");
+
+			// Rename email → addr; UNIQUE body unchanged except the renamed column.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					addr TEXT with tags ("quereus.previous_name" = 'email'),
+					constraint uq unique (addr)
+				}
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the column rename').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'column rename detected').to.deep.equal([{ oldName: 'email', newName: 'addr' }]);
+			// No drop+add ⇒ the metadata-only rename never re-validates (no full-table scan).
+			expect(alter.constraintsToDrop ?? [], 'no spurious constraint drop').to.deep.equal([]);
+			expect(alter.constraintsToAdd ?? [], 'no spurious constraint add').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// UNIQUE still enforces under the new column name.
+			let rejected = false;
+			try { await db.exec("insert into t values (3, 'a@x')"); } catch { rejected = true; }
+			expect(rejected, 'UNIQUE still enforces under addr').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK whose PARENT TABLE is renamed emits ONLY the table rename on the child (no constraint drop+recreate)', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1), (2)');
+			await db.exec('insert into child values (10, 1)');
+
+			// Rename the parent table parent → p2 (table previous_name hint). The child FK
+			// now references p2; its body is otherwise unchanged.
+			await db.exec(`declare schema main {
+				table p2 { pid INTEGER PRIMARY KEY } with tags ("quereus.previous_name" = 'parent')
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references p2(pid) }
+			}`);
+			const diff = diffOf(db);
+			// The table rename rides the top-level renames bucket.
+			expect(diff.renames, 'table rename detected at top level').to.deep.include({ kind: 'table', oldName: 'parent', newName: 'p2' });
+			// The child alter (if any) must NOT churn the FK.
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop ?? [], 'no spurious FK drop on child').to.deep.equal([]);
+			expect(childAlter?.constraintsToAdd ?? [], 'no spurious FK add on child').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The FK still enforces against the renamed parent.
+			expect(db.schemaManager.getTable('main', 'parent'), 'old parent name gone').to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'p2'), 'renamed parent present').to.not.be.undefined;
+			await db.exec('insert into child values (11, 2)'); // valid reference
+			let rejected = false;
+			try { await db.exec('insert into child values (12, 99)'); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by FK against renamed parent').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a genuine body edit layered on a column rename still drops+recreates', async function () {
+		// Precedence guard: reconciliation must NOT mask a real body change that
+		// happens to coincide with a rename.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			// Rename qty → quantity AND tighten the predicate (> 0 → >= 0) at once.
+			await db.exec(`declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					quantity INTEGER with tags ("quereus.previous_name" = 'qty'),
+					constraint chk check (quantity >= 0)
+				}
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'column rename still detected').to.deep.equal([{ oldName: 'qty', newName: 'quantity' }]);
+			expect(alter.constraintsToDrop, 'genuine body edit drops old chk').to.deep.equal(['chk']);
+			expect(alter.constraintsToAdd?.length, 'genuine body edit adds new chk').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// New predicate enforced: quantity = 0 now allowed (was rejected under > 0).
+			await db.exec('insert into t values (1, 0)');
+			let rejected = false;
+			try { await db.exec('insert into t values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'quantity < 0 rejected by the new predicate').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});
