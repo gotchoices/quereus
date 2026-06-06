@@ -8,7 +8,7 @@ import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
-import { validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from '../../schema/constraint-builder.js';
+import { validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -283,8 +283,11 @@ async function runAddColumn(
 		}
 	}
 
-	// Extract column-level CHECK / FK constraints. Column-level UNIQUE is not enforced via
-	// table-level constraints; the existing rejection path in the manager handles it.
+	// Extract column-level CHECK / FK constraints to merge into the engine-side schema below.
+	// Column-level UNIQUE is handled separately, right after the column is materialized (see
+	// the inline-UNIQUE block below): it routes through the module's `addConstraint` UNIQUE
+	// path — the same path `ALTER TABLE ADD CONSTRAINT … UNIQUE` uses — so it is materialized,
+	// enforced, and (for store-backed modules) persisted, symmetric with CREATE TABLE.
 	const newCheckConstraints = extractColumnLevelCheckConstraints(columnDef);
 	const newForeignKeys = extractColumnLevelForeignKeys(columnDef, tableSchema.schemaName);
 
@@ -339,6 +342,43 @@ async function runAddColumn(
 	} finally {
 		rowSlot?.close();
 		checkSlot?.close();
+	}
+
+	// Materialize + enforce any inline column-level UNIQUE(s) on the new column. CREATE TABLE
+	// routes inline UNIQUE through `extractUniqueConstraints`; `ALTER TABLE ADD CONSTRAINT …
+	// UNIQUE` routes it through `module.alterTable({ addConstraint })`. The imperative ADD
+	// COLUMN path reaches neither, so without this an inline UNIQUE would be silently dropped —
+	// never materialized, enforced, or rejected. Convert each into the equivalent table-level
+	// constraint over the just-added column and feed it to the same addConstraint path, so the
+	// module builds/reuses its covering structure, validates the existing rows (throwing
+	// CONSTRAINT on the first duplicate), and (store) persists. Each call returns a schema
+	// carrying the new column + the unique constraint (+ memory covering index); thread the
+	// latest forward so the CHECK/FK merge below layers naturally on top.
+	//
+	// Ordering: the column is already materialized (so it resolves in `columnIndexMap`), and the
+	// engine catalog is untouched until the first `schema.addTable` below. So on a UNIQUE failure
+	// (e.g. a literal DEFAULT that backfills the same value to ≥2 existing rows → immediate
+	// duplicate) we only drop the just-added column from the module and rethrow — no catalog
+	// restore. The module's own addConstraint already rolled back its half-built covering
+	// structure before throwing.
+	const inlineUniqueConstraints = extractColumnLevelUniqueConstraints(columnDef);
+	for (const uniqueConstraint of inlineUniqueConstraints) {
+		try {
+			updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+				type: 'addConstraint',
+				constraint: uniqueConstraint,
+			});
+		} catch (err) {
+			try {
+				await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+					type: 'dropColumn',
+					columnName: columnDef.name,
+				});
+			} catch (revertErr) {
+				log('Failed to revert ADD COLUMN after inline UNIQUE violation: %s', (revertErr as Error).message);
+			}
+			throw err;
+		}
 	}
 
 	// Resolve the new child column index in the freshly returned schema for any FK constraints.

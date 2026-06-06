@@ -1511,18 +1511,41 @@ export class MemoryTableManager {
 					.filter(ic => ic.index !== colIndex)
 			})).filter(idx => idx.columns.length > 0);
 
+			// Prune any UNIQUE constraint over the dropped column, mirroring how indexes are
+			// filtered above. A UNIQUE that includes the dropped column is removed outright (a
+			// UNIQUE missing one of its columns is a different, stronger constraint, not a
+			// silently-narrowed one); the covering index it backed is already gone from
+			// `updatedIndexes` and discarded by `dropColumnFromBase`'s secondary-index rebuild.
+			// Remaining constraints have their column indices shifted to track the removed slot.
+			// Without this, dropping a uniquely-constrained column (including the ADD COLUMN +
+			// inline-UNIQUE revert path) would strand a constraint whose column index dangles
+			// past the end of the column array.
+			const oldUniqueConstraints = this.tableSchema.uniqueConstraints ?? [];
+			const droppedUcKeys = oldUniqueConstraints
+				.filter(uc => uc.columns.includes(colIndex))
+				.map(uc => uc.name ?? this.implicitIndexNameFor(uc));
+			const remainingUniqueConstraints = oldUniqueConstraints
+				.filter(uc => !uc.columns.includes(colIndex))
+				.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
+
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
 				columns: Object.freeze(updatedColumnsSchema),
 				columnIndexMap: buildColumnIndexMap(updatedColumnsSchema),
 				primaryKeyDefinition: Object.freeze(updatedPkDefinition),
 				primaryKey: Object.freeze(updatedPrimaryKeyNames),
-				indexes: Object.freeze(updatedIndexes)
+				indexes: Object.freeze(updatedIndexes),
+				uniqueConstraints: remainingUniqueConstraints.length > 0
+					? Object.freeze(remainingUniqueConstraints)
+					: undefined,
 			});
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			await this.baseLayer.dropColumnFromBase(colIndex);
 			this.tableSchema = finalNewTableSchema;
+			// The covering-structure records for the dropped constraints are now stale —
+			// clear them (keys computed against the pre-drop column names above).
+			for (const key of droppedUcKeys) this.implicitCoveringStructures.delete(key);
 			this.initializePrimaryKeyFunctions();
 
 			// Emit schema change event

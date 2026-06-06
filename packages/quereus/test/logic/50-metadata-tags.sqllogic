@@ -625,16 +625,24 @@ SELECT name, json_extract(tags, '$."quereus.id"') AS qid
 
 -- Valid quereus.id accepted on an ADD COLUMN inline NAMED constraint: the tag
 -- validates at the physical-constraint site (quereus.id is legal there), so the
--- statement is admitted and the column is added. NOTE: the memory module's ADD
--- COLUMN path materializes only the column (inline UNIQUE is dropped; inline CHECK
--- becomes a row-constraint), so the inline constraint's tag is not surfaced via
--- unique_constraint_info on this path — a persistence asymmetry orthogonal to this
--- validation ticket (see review handoff). The acceptance (no over-rejection) is what
--- this case proves; the constraint-tag round-trip is covered by the ADD CONSTRAINT
--- uq_code case above.
+-- statement is admitted and the column is added. An inline CHECK becomes an
+-- engine-side row-constraint (surfaced via check_constraint_info, not
+-- unique_constraint_info); the c2 case only proves acceptance (no over-rejection).
+-- The inline-UNIQUE constraint-tag round-trip is asserted by the c5 case below
+-- (inline UNIQUE on ADD COLUMN is now materialized via the module's addConstraint
+-- path), and table-level ADD CONSTRAINT by the uq_code case above.
 ALTER TABLE AddCol ADD COLUMN c2 INT CONSTRAINT ck_c2 CHECK (c2 > 0) WITH TAGS ("quereus.id" = 'con-c2');
 SELECT name FROM table_info('AddCol') WHERE name = 'c2';
 → [{"name":"c2"}]
+
+-- Inline UNIQUE on ADD COLUMN is materialized + enforced (routed through the same
+-- module addConstraint UNIQUE path as ALTER … ADD CONSTRAINT … UNIQUE), so a named
+-- inline UNIQUE round-trips its name AND its constraint tag via unique_constraint_info
+-- — closing the prior gap where the inline UNIQUE was silently dropped on this path.
+ALTER TABLE AddCol ADD COLUMN c5 INT CONSTRAINT uq_c5 UNIQUE WITH TAGS ("quereus.id" = 'con-c5');
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM unique_constraint_info('AddCol') WHERE name = 'uq_c5';
+→ [{"name":"uq_c5","qid":"con-c5"}]
 
 -- Unnamed inline constraint on ADD COLUMN with a trailing WITH TAGS: the parser
 -- defers the tag to the COLUMN (physical-column site), so it validates/stores there

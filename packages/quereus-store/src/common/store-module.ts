@@ -756,12 +756,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					}))
 					.filter(idx => idx.columns.length > 0);
 
+				// Prune any UNIQUE constraint over the dropped column, mirroring the index
+				// filtering above. Store-backed UNIQUE is enforced by a full scan over
+				// `uniqueConstraints`, so a stranded constraint whose column index dangles past
+				// the column array would break the next insert's validation (and the persisted
+				// DDL). A UNIQUE that includes the dropped column is removed outright; remaining
+				// constraints have their column indices shifted to track the removed slot. This
+				// also covers the engine's ADD COLUMN + inline-UNIQUE revert, which drops the
+				// just-added (uniquely-constrained) column.
+				const updatedUniqueConstraints = (oldSchema.uniqueConstraints ?? [])
+					.filter(uc => !uc.columns.includes(colIndex))
+					.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
+
 				const updatedSchema: TableSchema = {
 					...oldSchema,
 					columns: Object.freeze(updatedColumns),
 					columnIndexMap: buildColumnIndexMap(updatedColumns),
 					primaryKeyDefinition: Object.freeze(updatedPkDef),
 					indexes: Object.freeze(updatedIndexes),
+					uniqueConstraints: updatedUniqueConstraints.length > 0
+						? Object.freeze(updatedUniqueConstraints)
+						: undefined,
 				};
 
 				// Migrate rows: remove the dropped column slot

@@ -165,6 +165,38 @@ export function extractColumnLevelForeignKeys(
 	return result;
 }
 
+/**
+ * Extracts the column-level UNIQUE constraints declared on a single `ALTER TABLE
+ * ADD COLUMN` ColumnDef into the equivalent **table-level** {@link AST.TableConstraint}s
+ * over the new column. Unlike the CHECK / FK extractors above (which return schema
+ * objects merged into the live schema), this returns AST table-constraints so the
+ * caller can feed each straight to `module.alterTable({ type: 'addConstraint',
+ * constraint })` — the same materialize + validate + persist path that
+ * `ALTER TABLE … ADD CONSTRAINT … UNIQUE` uses. Without this, an inline UNIQUE on
+ * an ADD COLUMN reaches neither CREATE TABLE's `extractUniqueConstraints` nor the
+ * ADD CONSTRAINT path, so it would be silently dropped.
+ *
+ * The synthetic constraint preserves a named inline UNIQUE's name (so it
+ * round-trips), `ON CONFLICT`, and tags. `buildUniqueConstraintSchema` reads only
+ * those fields plus `columns[].name`, so no `operations` / `direction` is emitted.
+ * Each inline `unique` ColumnConstraint becomes its own single-column table
+ * constraint over `columnDef.name` (multiple are rare but handled like CHECK / FK).
+ */
+export function extractColumnLevelUniqueConstraints(columnDef: AST.ColumnDef): AST.TableConstraint[] {
+	const result: AST.TableConstraint[] = [];
+	for (const con of columnDef.constraints ?? []) {
+		if (con.type !== 'unique') continue;
+		result.push({
+			type: 'unique',
+			name: con.name,
+			columns: [{ name: columnDef.name }],
+			onConflict: con.onConflict,
+			tags: con.tags,
+		});
+	}
+	return result;
+}
+
 /** Qualify a relation reference, eliding the `main.` prefix (the default schema). */
 function qualifyRelation(schemaName: string, tableName: string): string {
 	const prefix = schemaName.toLowerCase() !== 'main' ? `${quoteIdentifier(schemaName)}.` : '';
