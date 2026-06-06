@@ -653,6 +653,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					columnIndexMap: buildColumnIndexMap(updatedColumns),
 				};
 
+				// Extract any column-level CHECK / FK to persist (see the persist block below).
+				// Hoisted above the row migration so a malformed constraint (e.g. a multi-column
+				// FK on a single ADD COLUMN, which `extractColumnLevelForeignKeys` rejects) throws
+				// BEFORE any rows are migrated or the in-memory schema is swapped — validate-before-
+				// mutate, matching the engine's ordering in `runAddColumn`.
+				const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
+				const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
+
 				// Migrate rows: append the new column's value — a single literal default, or a
 				// per-row value derived from the existing row when a backfill evaluator is set.
 				const remap = buildColumnRemap(
@@ -682,8 +690,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// same AST constraints as a literal one.
 				table.updateSchema(updatedSchema);
 
-				const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
-				const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
 				let persistedSchema = updatedSchema;
 				if (newCheckConstraints.length > 0 || newForeignKeys.length > 0) {
 					// The new column is appended last; resolve each FK's child column to its index

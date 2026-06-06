@@ -453,4 +453,67 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		// A valid child (parent pid=1 exists) still succeeds.
 		await db2.exec(`INSERT INTO cc VALUES (21, 1)`);
 	});
+
+	// An explicitly-NAMED column-level constraint takes the `con.name` branch of the
+	// extraction (not the `_fk_<col>` auto-name). The persisted DDL must carry that name
+	// so the re-parsed constraint enforces identically after reopen.
+	it('ADD COLUMN explicitly-named column-level FK survives reopen', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec('PRAGMA foreign_keys = true');
+		await db1.exec(`CREATE TABLE np (pid INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`CREATE TABLE nc (id INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`INSERT INTO np VALUES (1)`);
+		await db1.exec(`INSERT INTO nc VALUES (10)`);
+		await db1.exec(`ALTER TABLE nc ADD COLUMN pref INTEGER NULL CONSTRAINT my_named_fk REFERENCES np (pid)`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		await db2.exec('PRAGMA foreign_keys = true');
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed named ADD COLUMN FK DDL parses cleanly').to.have.lengthOf(0);
+
+		await expectRejected(
+			() => db2.exec(`INSERT INTO nc VALUES (12, 99)`),
+			'orphan child rejected after reopen (named FK)',
+		);
+		await db2.exec(`INSERT INTO nc VALUES (13, 1)`);
+	});
+
+	// A single ADD COLUMN declaring BOTH a CHECK and an FK exercises the store's two
+	// independent merge arms (checkConstraints AND foreignKeys both extended on
+	// `persistedSchema`). Both must persist and enforce after reopen.
+	it('ADD COLUMN with combined CHECK + FK survives reopen', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec('PRAGMA foreign_keys = true');
+		await db1.exec(`CREATE TABLE bp (pid INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`CREATE TABLE bc (id INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`INSERT INTO bp VALUES (1)`);
+		await db1.exec(`INSERT INTO bc VALUES (10)`);
+		await db1.exec(`ALTER TABLE bc ADD COLUMN pref INTEGER NULL CHECK (pref > 0) REFERENCES bp (pid)`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		await db2.exec('PRAGMA foreign_keys = true');
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed combined CHECK+FK ADD COLUMN DDL parses cleanly').to.have.lengthOf(0);
+
+		// CHECK arm: pref must be > 0 (parent 1 exists, so FK alone would admit it).
+		await expectRejected(
+			() => db2.exec(`INSERT INTO bc VALUES (12, 0)`),
+			'CHECK violation (pref=0) rejected after reopen (combined)',
+		);
+		// FK arm: pref=99 passes the CHECK but has no parent.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO bc VALUES (13, 99)`),
+			'orphan (pref=99) rejected after reopen (combined)',
+		);
+		// Satisfies both: > 0 AND parent pid=1 exists.
+		await db2.exec(`INSERT INTO bc VALUES (14, 1)`);
+	});
 });
