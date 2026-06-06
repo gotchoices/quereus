@@ -520,6 +520,8 @@ The affected overlays are partitioned into the **issuer's own** (the connection 
 
 **Poison lifecycle.** Poison is cleared only by discarding the `ConnectionOverlayState`: a **full rollback** (`onConnectionRollback`) or a rollback to a **pre-overlay savepoint** drops the overlay (and its poison). A rollback to a savepoint taken **after** the overlay existed does *not* replace the state, so poison correctly persists — the schema change is permanent and the overlay's rows are still in the pre-alter layout, so even if the offending row was rolled back the overlay stays structurally inconsistent until the transaction ends.
 
+A poisoned overlay must also never be carried through the layer's other overlay-rebuilding paths, which would copy its layout-mismatched rows and (because the rebuilt state carries no `poison`) silently un-poison a connection that must still roll back. Both such paths therefore **skip** a poisoned overlay, leaving it poisoned: `alterTable` skips it *before* the issuer/foreign split (so even the poisoned connection's own later ALTER does not migrate it), and `dropIndex` skips it in its post-drop rebuild loop. `renameTable` is safe as-is — it re-keys the state object in place, carrying the `poison` field along.
+
 ---
 
 ## Relationship to Memory VTab

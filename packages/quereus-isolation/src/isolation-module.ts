@@ -590,6 +590,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
 		for (const [key, overlayState] of this.connectionOverlays.entries()) {
 			if (key.endsWith(suffix)) {
+				// A poisoned overlay (cross-connection ALTER) holds rows in the pre-alter column
+				// layout, narrower/wider than `updatedSchema`. Rebuilding it here would copy
+				// layout-mismatched rows AND drop the poison flag (the new state carries none),
+				// silently un-poisoning a connection that must still roll back. Leave it as-is.
+				if (overlayState.poison) continue;
 				const newState = await this.migrateOverlayForDropIndex(db, overlayState, updatedSchema);
 				this.connectionOverlays.set(key, newState);
 			}
@@ -660,18 +665,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// the data and the DDL, so its own un-backfillable overlay aborts the ALTER up
 		// front (atomic); a foreign un-backfillable overlay must not — it is poisoned and
 		// left for its owning connection to error on, while the issuer's ALTER proceeds.
-		// Already-poisoned foreign overlays are skipped entirely: they hold rows from
-		// before an earlier ALTER, stay poisoned, and must not be re-read/migrated.
+		// Already-poisoned overlays (own or foreign) are skipped entirely: they hold rows
+		// from before an earlier ALTER, stay poisoned, and must not be re-read/migrated.
 		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
 		const ownKey = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		let ownEntry: [string, ConnectionOverlayState] | undefined;
 		const foreign: [string, ConnectionOverlayState][] = [];
 		for (const [key, state] of this.connectionOverlays.entries()) {
 			if (!key.endsWith(suffix)) continue;
+			// An already-poisoned overlay (from an earlier ALTER) holds pre-alter rows and must
+			// never be re-read or migrated — checked BEFORE the ownKey split so the poisoned
+			// connection's OWN later ALTER cannot route its overlay through migration, which
+			// would silently clear the poison and rebuild a layout-mismatched overlay. A
+			// poisoned connection recovers only by rolling back, regardless of who issues the ALTER.
+			if (state.poison) continue;
 			if (key === ownKey) {
 				ownEntry = [key, state];
-			} else if (state.poison) {
-				continue;
 			} else {
 				foreign.push([key, state]);
 			}

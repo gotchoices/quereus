@@ -1360,6 +1360,27 @@ describe('IsolationModule', () => {
 			};
 		}
 
+		/**
+		 * An `addColumn` change whose backfill ALWAYS succeeds: a literal DEFAULT (0). The
+		 * folded literal satisfies the NOT NULL column for every staged row (no per-row
+		 * evaluator path), and the literal lets the underlying accept the column on a
+		 * non-empty table. Used to prove a migration would proceed (and thus could clear
+		 * poison) were the poisoned overlay not skipped.
+		 */
+		function addBackfillableCol(colName: string): SchemaChangeInfo {
+			return {
+				type: 'addColumn',
+				columnDef: {
+					name: colName,
+					dataType: 'INTEGER',
+					constraints: [
+						{ type: 'notNull' },
+						{ type: 'default', expr: { type: 'literal', value: 0 } },
+					],
+				},
+			};
+		}
+
 		/** Injects a staged-insert overlay (rows = [id, x][]) for `forDb`, hasChanges=true. */
 		async function injectOverlay(forDb: Database, rows: SqlValue[][]): Promise<void> {
 			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
@@ -1538,6 +1559,44 @@ describe('IsolationModule', () => {
 			// so the connection must remain poisoned until the transaction ends.
 			await (await reader(dbB)).onConnectionRollbackToSavepoint(1);
 			expect(overlayState(dbB)!.poison, 'post-overlay savepoint rollback keeps poison').to.not.be.undefined;
+		});
+
+		it("a poisoned connection's own later ALTER neither clears its poison nor migrates its stale overlay", async () => {
+			await injectOverlay(dbB, [[10, null]]);
+			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			const poisonMsg = overlayState(dbB)!.poison!.message;
+			const staleOverlay = overlayState(dbB)!.overlayTable;
+
+			// B, already poisoned, issues its OWN ALTER on the same table (e.g. mid-transaction,
+			// before rolling back). A literal-default column backfills cleanly, so WITHOUT the
+			// poison skip B's stale overlay would pass validation and migrate — rebuilding a
+			// layout-mismatched overlay (its rows are a column short of the now-altered base)
+			// AND dropping the poison, silently un-poisoning a connection that must still roll back.
+			const updated = await iso.alterTable(dbB, 'main', 't', addBackfillableCol('d'));
+			expect(updated.columns.some(col => col.name === 'd'), "B's ALTER still applies to the shared base").to.equal(true);
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B stays poisoned across its own ALTER').to.not.be.undefined;
+			expect(bState.poison!.message, 'poison message unchanged — overlay never rebuilt').to.equal(poisonMsg);
+			expect(bState.overlayTable, 'overlay object left untouched, not migrated').to.equal(staleOverlay);
+		});
+
+		it('DROP INDEX on the table neither migrates nor un-poisons a poisoned overlay', async () => {
+			await dbA.exec('create index t_idx on t(x)');
+			await injectOverlay(dbB, [[10, null]]);
+			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			const poisonMsg = overlayState(dbB)!.poison!.message;
+			const staleOverlay = overlayState(dbB)!.overlayTable;
+
+			// dropIndex rebuilds affected overlays under the post-drop schema. A poisoned overlay
+			// holds rows in the narrower pre-alter layout — rebuilding would copy layout-mismatched
+			// rows and drop the poison. It must be skipped, staying poisoned for its owner.
+			await iso.dropIndex(dbA, 'main', 't', 't_idx');
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'poison survives an unrelated DROP INDEX').to.not.be.undefined;
+			expect(bState.poison!.message).to.equal(poisonMsg);
+			expect(bState.overlayTable, 'poisoned overlay not rebuilt').to.equal(staleOverlay);
 		});
 	});
 
