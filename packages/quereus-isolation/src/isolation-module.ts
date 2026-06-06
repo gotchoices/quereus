@@ -1,5 +1,5 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection } from '@quereus/quereus';
-import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, ColumnSchema } from '@quereus/quereus';
+import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 
@@ -60,6 +60,24 @@ export interface UnderlyingTableState {
 export interface ConnectionOverlayState {
 	overlayTable: VirtualTable;
 	hasChanges: boolean;
+}
+
+/**
+ * Per-ALTER constants for backfilling a freshly added column into staged overlay
+ * rows. Precomputed once per `addColumn` (see `deriveAddColumnBackfill`) so the
+ * per-row loop only branches on tombstone / evaluator / literal.
+ */
+interface AddColumnBackfillContext {
+	/** The folded literal DEFAULT, or `null` when there is no usable literal default. */
+	foldedDefault: SqlValue;
+	/** Per-row evaluator for a non-foldable `new.<col>` default; absent for a literal default. */
+	evaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
+	/** Whether the new column is NOT NULL (enforced on the evaluator path only). */
+	newColNotNull: boolean;
+	/** New column name, for the NOT NULL error message. */
+	newColName: string;
+	/** Owning table name, for the NOT NULL error message. */
+	tableName: string;
 }
 
 /**
@@ -597,7 +615,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Delegates ALTER TABLE to the underlying module and migrates any per-connection
 	 * overlays to the post-alter schema without discarding staged rows.
 	 *
-	 * ADD COLUMN  — appends null to each overlay row's data columns.
+	 * ADD COLUMN  — appends the new column's value to each overlay row's data columns,
+	 *               backfilled per row exactly as the committed path does (literal default,
+	 *               per-row `new.<col>` evaluator, or NULL); tombstone rows get NULL.
 	 * DROP COLUMN — removes the dropped column from each overlay row.
 	 * RENAME / ALTER COLUMN — data column indices are unchanged; only schema metadata rotates.
 	 */
@@ -724,8 +744,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			if (oldTombstoneIdx === undefined) {
 				throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
 			}
+			// Precompute the addColumn backfill context once per ALTER (folded literal default,
+			// the per-row evaluator, and the new column's NOT NULL flag); undefined for other
+			// change types, which append nothing to staged rows.
+			const addColumnCtx = this.deriveAddColumnBackfill(change, updatedSchema);
 			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
-				const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx);
+				const addColumnValue = addColumnCtx
+					? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
+					: undefined;
+				const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue);
 				await newOverlayTable.update({ operation: 'insert', values: newRow, preCoerced: true });
 			}
 		}
@@ -734,14 +761,80 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Precomputes the per-ALTER constants an `addColumn` overlay backfill needs:
+	 * the folded literal DEFAULT (the `tryFoldLiteral` of the DEFAULT expr, or `null`
+	 * when there is no DEFAULT or it folds to NULL), the engine-supplied per-row
+	 * evaluator (present only for a non-foldable `new.<col>` default), and whether
+	 * the new column is NOT NULL. The new column is always the last entry in the
+	 * post-ALTER schema. Returns undefined for every non-`addColumn` change so the
+	 * row loop appends nothing.
+	 */
+	private deriveAddColumnBackfill(
+		change: SchemaChangeInfo,
+		updatedSchema: TableSchema,
+	): AddColumnBackfillContext | undefined {
+		if (change.type !== 'addColumn') return undefined;
+		const defaultExpr = change.columnDef.constraints?.find(c => c.type === 'default')?.expr;
+		// tryFoldLiteral returns undefined for a non-foldable expr and null for one that
+		// folds to NULL; collapse both to null (the no-usable-literal default).
+		const foldedDefault: SqlValue = defaultExpr ? (tryFoldLiteral(defaultExpr) ?? null) : null;
+		const newColumn: ColumnSchema = updatedSchema.columns[updatedSchema.columns.length - 1];
+		return {
+			foldedDefault,
+			evaluator: change.backfillEvaluator,
+			newColNotNull: newColumn.notNull,
+			newColName: newColumn.name,
+			tableName: updatedSchema.name,
+		};
+	}
+
+	/**
+	 * Computes one staged row's value for a freshly added column, mirroring the
+	 * committed-row backfill (see `base.ts` `recreatePrimaryTreeWithNewColumn` and
+	 * `store-module.ts` `migrateRows`):
+	 *
+	 * - Tombstone rows carry NULL placeholders and their appended value is never read,
+	 *   so append `null` and never run the evaluator against them (it could reference
+	 *   NULL siblings or spuriously trip the NOT NULL check).
+	 * - With a per-row evaluator, derive the value from the existing-columns slice and
+	 *   enforce NOT NULL on that path only (a literal/NULL default's nullability is gated
+	 *   up-front by the engine, exactly as `base.ts` does).
+	 * - Otherwise use the folded literal default.
+	 */
+	private async computeAddColumnValue(
+		ctx: AddColumnBackfillContext,
+		oldRow: Row,
+		oldTombstoneIdx: number,
+	): Promise<SqlValue> {
+		if (oldRow[oldTombstoneIdx] === 1) return null;
+		if (ctx.evaluator) {
+			const data = Array.from(oldRow.slice(0, oldTombstoneIdx)) as SqlValue[];
+			const value = await ctx.evaluator(data);
+			if (ctx.newColNotNull && value === null) {
+				throw new QuereusError(
+					`NOT NULL constraint failed: backfilling column '${ctx.tableName}.${ctx.newColName}' produced NULL for a staged row`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			return value;
+		}
+		return ctx.foldedDefault;
+	}
+
+	/**
 	 * Translates a single overlay row from the pre-alter to the post-alter column layout.
 	 * The tombstone value is preserved in the last position.
+	 *
+	 * `addColumnValue` is the per-row value the caller computed for an `addColumn`
+	 * (via {@link computeAddColumnValue}); it is `undefined` for every other change
+	 * type. Keeping the (async) backfill in the caller's loop lets this stay synchronous.
 	 */
 	private translateOverlayRow(
 		oldRow: Row,
 		oldTombstoneIdx: number,
 		change: SchemaChangeInfo,
 		dropColumnIdx: number | undefined,
+		addColumnValue: SqlValue | undefined,
 	): SqlValue[] {
 		const tombstoneValue = oldRow[oldTombstoneIdx] as SqlValue;
 		const data = Array.from(oldRow.slice(0, oldTombstoneIdx)) as SqlValue[];
@@ -749,8 +842,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		let newData: SqlValue[];
 		switch (change.type) {
 			case 'addColumn':
-				// New column is always appended after existing data columns.
-				newData = [...data, null];
+				// New column is always appended after existing data columns, backfilled per
+				// row by the caller (literal default, per-row evaluator, or NULL).
+				newData = [...data, addColumnValue ?? null];
 				break;
 			case 'dropColumn':
 				newData = dropColumnIdx !== undefined

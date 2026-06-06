@@ -294,6 +294,106 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('ROLLBACK');
 		});
+
+		it('INSERT then ADD COLUMN with literal DEFAULT: staged row backfills the default (not NULL)', async () => {
+			// Regression: a staged overlay row must receive the column's DEFAULT, mirroring
+			// committed-row backfill. Pre-fix the overlay hardcoded NULL.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_lit (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_lit VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t_lit ADD COLUMN score INTEGER DEFAULT 7`);
+
+			const inTxn = await db.get('SELECT * FROM t_lit WHERE id = 1');
+			expect(inTxn?.score).to.equal(7);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await db.get('SELECT score FROM t_lit WHERE id = 1');
+			expect(afterCommit?.score).to.equal(7);
+		});
+
+		it('INSERT then ADD COLUMN with signed-literal DEFAULT: staged row backfills the negative value', async () => {
+			// DEFAULT -5 is a UnaryExpr in the AST; tryFoldLiteral must recognize it so the
+			// staged row reads -5 rather than dropping it to NULL.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_neg (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_neg VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t_neg ADD COLUMN delta INTEGER DEFAULT -5`);
+
+			const inTxn = await db.get('SELECT delta FROM t_neg WHERE id = 1');
+			expect(inTxn?.delta).to.equal(-5);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('INSERT then ADD COLUMN with per-row new.<col> DEFAULT: each staged row computes its own value', async () => {
+			// A non-foldable default (new.qty * 2) backfills each staged row from its own
+			// sibling value, so two rows with different qty get different qty2.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_pr (id INTEGER PRIMARY KEY, qty INTEGER) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_pr VALUES (1, 10), (2, 25)`);
+			await db.exec(`ALTER TABLE t_pr ADD COLUMN qty2 INTEGER DEFAULT (new.qty * 2)`);
+
+			const inTxn = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_pr ORDER BY id'));
+			expect(inTxn.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_pr ORDER BY id'));
+			expect(afterCommit.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
+		});
+
+		it('INSERT then ADD COLUMN NOT NULL with per-row default yielding NULL throws CONSTRAINT', async () => {
+			// Parallels committed-row behavior: a per-row default that produces NULL for a
+			// NOT NULL column on a staged row aborts the ALTER.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			// `val` is explicitly nullable so the staged row can carry NULL (columns default
+			// to NOT NULL under the engine's Third-Manifesto default_column_nullability).
+			await db.exec(`CREATE TABLE t_nn (id INTEGER PRIMARY KEY, val INTEGER NULL) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_nn VALUES (1, NULL)`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`ALTER TABLE t_nn ADD COLUMN c INTEGER NOT NULL DEFAULT (new.val)`);
+			} catch (e) { err = e as Error; }
+			expect(err, 'ALTER should throw for a NULL-yielding NOT NULL backfill').to.not.be.null;
+			expect(err!.message.toLowerCase()).to.include('not null');
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('DELETE (tombstone) then ADD COLUMN with per-row NOT NULL DEFAULT: no spurious throw, row stays deleted', async () => {
+			// A staged tombstone's data columns are NULL placeholders; the evaluator must NOT
+			// run against it (it would trip the NOT NULL check), and the deleted row stays gone.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_ts (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO t_ts VALUES (1, 'Alice'), (2, 'Bob')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM t_ts WHERE id = 1`); // tombstones PK 1 in the overlay
+
+			// new.id is non-null for the surviving committed row (id=2); the tombstone for id=1
+			// must be skipped so the evaluator never sees its NULL placeholders.
+			await db.exec(`ALTER TABLE t_ts ADD COLUMN tag INTEGER NOT NULL DEFAULT (new.id)`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT id, tag FROM t_ts ORDER BY id'));
+			expect(rows.map((r: any) => [r.id, r.tag])).to.deep.equal([[2, 2]]);
+
+			await db.exec('ROLLBACK');
+		});
 	});
 
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
