@@ -6,6 +6,7 @@ import { BaseLayer } from './base.js';
 import { TransactionLayer } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
+import { MemoryVirtualTableConnection } from '../connection.js';
 import { Latches } from '../../../util/latches.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
@@ -2293,7 +2294,38 @@ export class MemoryTableManager {
 			}
 		}
 
+		// The manager's `connections` map covers only connections still attached to this
+		// manager. A connection can be DETACHED from the map (removed by disconnect after an
+		// autocommit collapse) while remaining REGISTERED in the Database connection registry —
+		// `MemoryTable.ensureConnection` reuses exactly such a connection for a later scan. The
+		// loop above misses it, so after an in-transaction schema change (e.g. ALTER TABLE ADD
+		// COLUMN, now permitted inside an explicit transaction) it keeps reading a stale
+		// pre-change layer carrying the OLD column shape — the materialized-view-source-stale-read
+		// bug. A detached connection always has `pendingTransactionLayer === null` (disconnect
+		// defers while a pending layer is uncommitted), so this never discards in-flight writes.
+		this.repointRegisteredConnections();
+
 		logger.debugLog(`Schema change safety check passed for ${this._tableName}. Current committed layer is base.`);
+	}
+
+	/**
+	 * Re-point every Database-registered {@link MemoryTableConnection} backed by this
+	 * manager (including ones detached from {@link connections}) at the current base layer,
+	 * when it carries no uncommitted pending layer. Companion to the `connections`-map sweep
+	 * in {@link ensureSchemaChangeSafety}: it closes the gap for a connection that lives in
+	 * the Database registry but not in the manager's map.
+	 */
+	private repointRegisteredConnections(): void {
+		const qualifiedName = `${this.schemaName}.${this._tableName}`;
+		for (const c of this.db.getConnectionsForTable(qualifiedName)) {
+			if (!(c instanceof MemoryVirtualTableConnection)) continue;
+			const mc = c.getMemoryConnection();
+			if (mc.tableManager !== this) continue;
+			if (mc.pendingTransactionLayer !== null) continue;
+			if (mc.readLayer === this.baseLayer) continue;
+			logger.debugLog(`[Schema Safety] Re-pointing registered connection ${mc.connectionId} to base layer`);
+			mc.readLayer = this.baseLayer;
+		}
 	}
 
 	/** Consolidates all transaction data into the base layer for schema changes */

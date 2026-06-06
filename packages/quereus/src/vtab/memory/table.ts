@@ -98,9 +98,12 @@ export class MemoryTable extends VirtualTable {
 					// Skip the reset during an active transaction: readLayer may be
 					// a savepoint snapshot (eager-swap) holding in-transaction writes
 					// that aren't yet in currentCommittedLayer; resetting would lose
-					// those writes. Schema changes can't happen during a transaction
-					// (ensureSchemaChangeSafety throws on active transactions), so
-					// staleness is not a concern here.
+					// those writes. An in-transaction schema change (e.g. ALTER TABLE
+					// ADD COLUMN, which IS permitted inside an explicit transaction)
+					// is not a staleness concern here: ensureSchemaChangeSafety
+					// re-points every registered connection — including a detached one
+					// reused on this path — at the post-change base layer, so by the
+					// time reuse reaches this branch the readLayer is already current.
 					if (!this.connection.explicitTransaction
 						&& !this.connection.pendingTransactionLayer) {
 						this.connection.readLayer = this.manager.currentCommittedLayer;

@@ -200,3 +200,51 @@ refresh materialized view rs_decl;
 -- error: drop and recreate
 drop materialized view rs_decl;
 drop table rs_t;
+
+-- ===================================
+-- 11. In-transaction source ALTER + REFRESH (mv-refresh-intxn-altered-source-stale-read).
+--     §9 is the autocommit analog; here the alter+refresh run inside one explicit
+--     transaction. With an MV over the source, an autocommit-collapsed source
+--     connection is detached from its manager's map but stays in the Database
+--     registry; `MemoryTable.ensureConnection` reuses it for the in-transaction read.
+--     ensureSchemaChangeSafety formerly re-pointed only connections still in the map,
+--     so the detached one kept a stale pre-alter readLayer (3-column shape) — the
+--     same-transaction source read missed `extra`, and refresh refilled the backing
+--     with misaligned data (`extra` holding c.id, etc.). The fix re-points every
+--     registered source connection at the new base, so both the direct source read
+--     and the refresh observe the post-alter 4-column shape.
+-- ===================================
+
+create table itx_cust (id integer primary key, name text not null);
+create table itx_ord (id integer primary key, customer_id integer not null references itx_cust(id), amt integer not null);
+create materialized view itxv as select * from itx_ord o join itx_cust c on o.customer_id = c.id;
+insert into itx_cust values (1, 'alice');
+insert into itx_ord values (10, 1, 100);
+
+-- a direct autocommit source scan leaves a detached-but-registered source connection
+select * from itx_ord order by id;
+→ [{"id":10,"customer_id":1,"amt":100}]
+
+select * from itxv;
+→ [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
+
+begin;
+alter table itx_ord add column extra text default 'x';
+-- (b) the same-transaction direct source read returns the new column + backfilled default
+select * from itx_ord order by id;
+→ [{"id":10,"customer_id":1,"amt":100,"extra":"x"}]
+-- (a) refresh rebuilds the backing from the post-alter source — values under the right labels
+refresh materialized view itxv;
+commit;
+
+select * from itxv;
+→ [{"id":10,"customer_id":1,"amt":100,"extra":"x","id:1":1,"name":"alice"}]
+
+-- row-time maintenance still binds to the rebuilt backing post-commit
+insert into itx_ord values (20, 1, 200, 'custom');
+select * from itxv where id = 20;
+→ [{"id":20,"customer_id":1,"amt":200,"extra":"custom","id:1":1,"name":"alice"}]
+
+drop materialized view itxv;
+drop table itx_ord;
+drop table itx_cust;
