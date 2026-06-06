@@ -1205,8 +1205,8 @@ describe('lens decomposition put: column-classification robustness', () => {
 
 /**
  * Stitch-key / EAV-conflict-target uniqueness guard
- * (`view-write-decomp-stitch-key-unique-guard`, docs/view-updateability.md
- * § Decomposition put fan-out).
+ * (`view-write-decomp-stitch-key-unique-guard`, docs/lens.md
+ * § The `put` fan-out).
  *
  * The put fan-out cedes the matched rows to the matched UPDATE only through the
  * materialize INSERT's `on conflict (<target>) do nothing`, which the runtime fires
@@ -1353,6 +1353,58 @@ describe('lens decomposition put: stitch-key uniqueness guard', () => {
 				threw = true;
 			}
 			expect(threw, 'a singleton (empty stitch key) must deploy, not be rejected by the uniqueness guard').to.be.false;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('reject: a partial UNIQUE on the stitch column does not satisfy the guard', async () => {
+		// `id` carries only a *partial* unique (`create unique index … where`), whose
+		// `predicate !== undefined` — it guarantees uniqueness only within its scope and
+		// cannot back an unqualified `on conflict (id)`. `indicesFormDeclaredUnique` skips
+		// it, so the stitch key still resolves to no whole-table key → rejected. (Reuses
+		// the columnar shape: stitch `id` on U_c, whose PK is the unrelated `rid`.)
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [nonUniqueColumnarAd()];
+			db.registerModule('umod', mod);
+			await db.exec('create table U_core (id integer primary key, a integer) using umod');
+			await db.exec('create table U_c (rid integer primary key, id integer, c integer) using umod');
+			await db.exec('create unique index ix_uc_id on U_c (id) where id > 0'); // partial — does not qualify
+			await db.exec('declare logical schema x { table U { id integer primary key, a integer, c integer } }');
+			await expectThrows(() => db.exec('apply schema x'), /stitch key.*not a declared|1:1 stitch/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Anchor whose own stitch key (`id`) is a plain non-unique column — the basis PK is
+	// the unrelated `rid`. The guard validates the anchor like any other member, so a
+	// non-unique anchor identity must be rejected (the logical-PK identity is not 1:1).
+	function nonUniqueAnchorAd(): MappingAdvertisement {
+		return {
+			id: 'An_core', logicalTable: 'An', role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'An_core',
+				members: [
+					{ relationId: 'An_core', relation: { schema: 'main', table: 'An_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['An_core', ['id']]) },
+			},
+		};
+	}
+
+	it('reject: a non-unique anchor stitch key fails to deploy', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [nonUniqueAnchorAd()];
+			db.registerModule('anmod', mod);
+			// `id` is a plain non-unique column; the PK is the unrelated `rid`.
+			await db.exec('create table An_core (rid integer primary key, id integer, a integer) using anmod');
+			await db.exec('declare logical schema x { table An { id integer primary key, a integer } }');
+			await expectThrows(() => db.exec('apply schema x'), /stitch key.*not a declared|1:1 stitch/i);
 		} finally {
 			await db.close();
 		}

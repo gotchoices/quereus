@@ -1646,8 +1646,8 @@ function validatePrimaryAdvertisement(
 		}
 	}
 
-	// Stitch-key / EAV-conflict-target uniqueness (docs/view-updateability.md §
-	// Decomposition put fan-out). The put fan-out cedes the matched rows to the matched
+	// Stitch-key / EAV-conflict-target uniqueness (docs/lens.md § The `put`
+	// fan-out). The put fan-out cedes the matched rows to the matched
 	// UPDATE only through the materialize INSERT's `on conflict (<target>) do nothing`,
 	// which the runtime fires solely on a declared PK / UNIQUE violation; the get side
 	// is sound only when that same target is 1:1 (a non-unique columnar stitch key
