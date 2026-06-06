@@ -88,18 +88,23 @@ export function isSetOpMembershipBody(selectAst: AST.QueryExpr): boolean {
 }
 
 /**
- * True iff both operands of a set-op membership body are recursively writable *at the
- * branch-shape level* — the static (no-plan) shadow of the four branch rejections in
- * {@link analyzeSetOpView}: a non-SELECT right operand, a `select *` leg, a computed
- * (non-plain-column) leg, or legs whose plain-column counts disagree. Lets the
- * `column_info` / `view_info` static surfaces gate the membership-writable claim on the
- * SAME shape the dynamic write enforces, instead of reporting writable from the membership
- * flag's presence alone. Non-recursive (one level): a nested-compound operand whose first
- * leg is plain still passes here, matching that `analyzeSetOpView` also defers the nested
- * reject to write-time `propagate` (`set-op-membership-nested`).
+ * True iff a set-op membership body is reportable-writable by the static surfaces — the
+ * no-plan shadow of {@link analyzeSetOpView}'s pre-write rejections: an outer LIMIT/OFFSET
+ * (the body is not decomposable — a write would escape the limited window), a non-SELECT
+ * right operand, a `select *` leg, a computed (non-plain-column) leg, or legs whose
+ * plain-column counts disagree. Lets the `column_info` / `view_info` static surfaces gate
+ * the membership-writable claim on the SAME shape the dynamic write enforces, instead of
+ * reporting writable from the membership flag's presence alone. The branch-shape half is
+ * non-recursive (one level): a nested-compound operand whose first leg is plain still passes
+ * here, matching that `analyzeSetOpView` also defers the nested reject to write-time
+ * `propagate` (`set-op-membership-nested`).
  */
 export function isSetOpBranchWritable(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.compound) return false;
+	// The dynamic `unsupported-limit` reject: an outer LIMIT/OFFSET puts the capture's filter
+	// above the window, so a write would escape it (`analyzeSetOpView` rejects this before any
+	// branch analysis). Mirror it so the static surface does not over-claim a windowed body.
+	if (selectAst.limit || selectAst.offset) return false;
 	const right = selectAst.compound.select;
 	// The dynamic `rightBranchSelect` reject: a non-SELECT right operand is not a
 	// recursively-writable body (v1 supports SELECT operands).

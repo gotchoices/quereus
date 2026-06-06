@@ -727,9 +727,10 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// `targetIds.size === 0` conservative row below (no membership column to address a branch).
 	if (isSetOpMembershipBody(view.selectAst)) {
 		// Branch-writability shape gate (mirrors the non-decomposable join shape gate below):
-		// a membership body whose operands are not themselves branch-writable (a non-SELECT
-		// right operand, a `select *` leg, a computed leg, or legs with mismatched column
-		// counts) is REJECTED by the dynamic write (`analyzeSetOpView`). Without this gate the
+		// a membership body the dynamic write (`analyzeSetOpView`) would reject — an outer
+		// LIMIT/OFFSET (non-decomposable window), a non-SELECT right operand, a `select *`
+		// leg, a computed leg, or legs with mismatched column counts — is gated out here.
+		// Without this gate the
 		// surface would over-claim writable from the membership flag's presence alone; report
 		// the conservative all-`NO` row to agree with the dynamic `propagate()` reject.
 		if (!isSetOpBranchWritable(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
@@ -1046,8 +1047,8 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		// column), the same writable-through-effect shape a join-side existence flag reports.
 		//
 		// Gated on the branch-writability shape probe (parity with `deriveViewInfo`): a body
-		// the dynamic write rejects for a non-writable operand (non-SELECT right, `select *`
-		// leg, computed leg, mismatched leg arity) falls THROUGH to the per-column walk below
+		// the dynamic write rejects (outer LIMIT/OFFSET, non-SELECT right, `select *` leg,
+		// computed leg, mismatched leg arity) falls THROUGH to the per-column walk below
 		// instead of the all-`YES` short-circuit. That walk reports every column non-updatable
 		// with null base — a `SetOperationNode` root threads `updateLineage` ONLY for its
 		// membership flags (a read-only `set-op-branch` existence site) and NONE for its data

@@ -409,8 +409,9 @@ column in a writable branch is rejected.
 membership body now mirror the **non-decomposable join shape gate**: they confirm the
 membership shape *and* that both operands are themselves branch-writable before reporting
 writable, via an AST-only probe (`isSetOpBranchWritable`) that is the static shadow of the
-four dynamic branch rejections above — a non-SELECT right operand, a `select *` leg, a
-computed leg, or legs whose plain-column counts disagree. A body that fails the probe
+dynamic write's pre-write rejections — an outer `LIMIT`/`OFFSET` (the body is not
+decomposable, a write would escape the window), a non-SELECT right operand, a `select *`
+leg, a computed leg, or legs whose plain-column counts disagree. A body that fails the probe
 reports the conservative shape (`view_info` all-`NO`, every `column_info` row
 `is_updatable = 'NO'` with null base), agreeing with the dynamic write's reject instead of
 over-claiming writable from the membership flag's presence alone. The probe is

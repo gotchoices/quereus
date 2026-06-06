@@ -2491,6 +2491,27 @@ describe('Property-Based Tests', () => {
 			}
 		});
 
+		it('an outer LIMIT/OFFSET set-op view reports the non-writable shape (static agrees with dynamic reject)', async () => {
+			await seed();
+			// An outer LIMIT makes the body non-decomposable — `analyzeSetOpView` rejects it
+			// (`unsupported-limit`) before any branch analysis. The static surface must agree:
+			// reporting writable here would over-claim (the branch legs are plain, but the
+			// windowed body is not write-through-able).
+			await db.exec('create view Ul as select id, x from A union exists left as inA, exists right as inB select id, x from B limit 5');
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Ul')"))[0];
+			expect(info.is_insertable_into).to.equal('NO');
+			expect(info.is_updatable).to.equal('NO');
+			expect(info.is_deletable).to.equal('NO');
+			for (const c of await readRows("select column_name, is_updatable, base_table from column_info('Ul')")) {
+				expect(c.is_updatable, `${c.column_name} is_updatable`).to.equal('NO');
+				expect(c.base_table, `${c.column_name} base_table`).to.equal(null);
+			}
+			// Cross-check: the dynamic write still rejects — the static 'NO' is honest.
+			let threw = false;
+			try { await db.exec('update Ul set x = 5 where id = 1'); } catch { threw = true; }
+			expect(threw, 'a LIMIT set-op data write rejects dynamically').to.equal(true);
+		});
+
 		it('grammar: the membership clause is captured in the AST and rejects on DIFF', () => {
 			const parser = new Parser();
 			const ast = parser.parse('select id, x from A union exists left as inA, exists right as inB select id, x from B') as unknown as AST.SelectStmt;
