@@ -23,6 +23,8 @@ Describes a table's structure: columns, primary key definition, CHECK constraint
 
 Defines a single column: name, logical type, nullability, primary key membership, default value expression, collation, and whether the column is generated. Columns default to NOT NULL (Third Manifesto) unless `pragma default_column_nullability = 'nullable'` is set. Optional `tags` field holds arbitrary key-value metadata.
 
+**Primary-key nullability.** A column forced NOT NULL by primary-key membership is forced **only by an *explicitly-declared* PK** — a column-level `primary key` or a table-level `primary key (...)`. When a table declares no PRIMARY KEY, Quereus synthesizes an all-columns key (the whole row is the row identity); that **synthesized** key does *not* promote nullability — each column keeps its declared (or session-default) nullability. A nullable synthesized-key column is a valid row identity because NULL participates in keys on both backends (memory compares `NULL == NULL` as equal and orders NULL first; the store key codec encodes `TYPE_NULL` first), so two fully-identical rows collide as a duplicate key.
+
 ### IndexSchema / IndexColumnSchema
 
 Describes a secondary index by name and an ordered list of column references (by index into `TableSchema.columns`) with optional sort direction and collation. Optional `tags` field holds arbitrary key-value metadata.
@@ -189,6 +191,8 @@ Both generators accept an optional `Database` argument that provides session con
 Use the no-`db` form when persisting DDL to storage, so the output survives re-parsing under any session's `default_column_nullability` setting. Use the with-`db` form for display or round-trip within the same session to produce more readable output.
 
 Feature coverage (both forms): `TEMP`, schema qualification, inline single-column `PRIMARY KEY`, table-level `PRIMARY KEY (...)` (including singleton `PRIMARY KEY ()`), `DEFAULT <expr>`, `USING <module>` with SQL-literal args, and `WITH TAGS (...)` at table, column, and index levels.
+
+A **synthesized all-columns key** (a table with no declared PRIMARY KEY) emits **no** `PRIMARY KEY` clause — neither inline nor table-level. Naming it would make a re-parse treat it as an *explicitly-declared* PK and force its columns NOT NULL, silently dropping a nullable declaration on a store persistence round-trip; omitting it lets the re-parse re-synthesize the same key while preserving each column's declared nullability.
 
 `@quereus/store` re-exports these symbols for backward compatibility:
 

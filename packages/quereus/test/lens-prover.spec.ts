@@ -260,6 +260,44 @@ describe('lens prover: blocking errors', () => {
 	});
 });
 
+describe('lens prover: synthesized (no-PK) all-columns key', () => {
+	it('a no-PK logical table with nullable columns over a nullable basis deploys clean and writable', async () => {
+		const db = new Database();
+		try {
+			// No PRIMARY KEY ⇒ Quereus synthesizes an all-columns key. After the
+			// nullability fix, a synthesized key does NOT force its columns NOT NULL,
+			// so a nullable logical column over a nullable basis is sound — this used
+			// to false-trip lens.nullability-mismatch on `a`/`b`.
+			await db.exec('declare schema y { table t (a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (a integer null, b integer null) }');
+			await db.exec('apply schema x'); // must not throw
+
+			const s = slot(db, 't');
+			expect(s.readOnly ?? false, 'no-PK logical table stays writable').to.equal(false);
+			// No nullability-mismatch (or any) error was emitted for this deploy.
+			expect(report(db).errors ?? [], 'clean deploy').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a no-PK logical table over a NOT NULL basis still deploys clean', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (a integer not null, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (a integer not null, b integer not null) }');
+			await db.exec('apply schema x'); // must not throw
+
+			expect((slot(db, 't').readOnly) ?? false, 'writable').to.equal(false);
+			expect(report(db).errors ?? [], 'clean deploy').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens prover: unenforceable conflict action (commit-time set-level)', () => {
 	it('a commit-time unique declaring `on conflict replace` blocks the deploy', async () => {
 		const db = new Database();

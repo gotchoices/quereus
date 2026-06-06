@@ -19,7 +19,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
-import { maskToOps } from './table.js';
+import { maskToOps, isSynthesizedAllColumnsKey } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -50,16 +50,23 @@ export function generateTableDDL(tableSchema: TableSchema, db?: Database): strin
 	const parts: string[] = ['CREATE'];
 	parts.push('TABLE', qualifiedName(tableSchema.schemaName, tableSchema.name, ctx.currentSchemaName));
 
+	// A synthesized all-columns key (the no-PK fallback) must NOT round-trip as a
+	// named PRIMARY KEY: re-parsing one would force its columns NOT NULL, dropping
+	// a nullable declaration. Omit the clause entirely so the re-parse re-synthesizes
+	// the key and preserves nullability (see isSynthesizedAllColumnsKey).
+	const synthesizedKey = isSynthesizedAllColumnsKey(tableSchema);
+
 	const columnDefs: string[] = [];
 	for (const col of tableSchema.columns) {
-		columnDefs.push(formatColumnDef(col, tableSchema, ctx.defaultNotNull));
+		columnDefs.push(formatColumnDef(col, tableSchema, ctx.defaultNotNull, synthesizedKey));
 	}
 
 	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
-	// Single-column PK is emitted inline on the column above.
+	// Single-column PK is emitted inline on the column above. A synthesized
+	// all-columns key emits no clause at all (neither here nor inline).
 	if (tableSchema.primaryKeyDefinition.length === 0) {
 		columnDefs.push('PRIMARY KEY ()');
-	} else if (tableSchema.primaryKeyDefinition.length > 1) {
+	} else if (!synthesizedKey && tableSchema.primaryKeyDefinition.length > 1) {
 		const pkCols = tableSchema.primaryKeyDefinition
 			.map(pk => quoteName(tableSchema.columns[pk.index].name))
 			.join(', ');
@@ -275,14 +282,16 @@ function qualifiedName(schemaName: string | undefined, name: string, currentSche
 	return `${quoteName(schemaName)}.${quotedName}`;
 }
 
-function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined): string {
+function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, synthesizedKey: boolean): string {
 	let colDef = quoteName(col.name);
 	if (col.logicalType) colDef += ` ${col.logicalType.name}`;
 
 	const nullAnnotation = nullabilityAnnotation(col.notNull, defaultNotNull);
 	if (nullAnnotation) colDef += ` ${nullAnnotation}`;
 
-	if (col.primaryKey && tableSchema.primaryKeyDefinition.length === 1) {
+	// Inline column-level PK only for a genuine single-column declared PK. A
+	// synthesized single-column key (a one-column no-PK table) emits no PK clause.
+	if (col.primaryKey && tableSchema.primaryKeyDefinition.length === 1 && !synthesizedKey) {
 		colDef += ' PRIMARY KEY';
 	}
 

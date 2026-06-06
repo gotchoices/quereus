@@ -1081,18 +1081,21 @@ export class SchemaManager {
 		pkDefaultConflict: import('../common/constants.js').ConflictResolution | undefined;
 	} {
 		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull));
-		const { pkDef: pkDefinition, defaultConflict: pkDefaultConflict } = findPKDefinition(preliminaryColumnSchemas, astConstraints);
+		const { pkDef: pkDefinition, defaultConflict: pkDefaultConflict, synthesized } = findPKDefinition(preliminaryColumnSchemas, astConstraints);
 
 		const columns = preliminaryColumnSchemas.map((col, idx) => {
 			const isPkColumn = pkDefinition.some(pkCol => pkCol.index === idx);
 			const pkOrder = isPkColumn
 				? pkDefinition.findIndex(pkC => pkC.index === idx) + 1
 				: 0;
+			// Only an explicitly-declared PK forces NOT NULL. A synthesized
+			// all-columns key (the no-PK fallback) leaves each column's declared
+			// nullability intact — see findPKDefinition.
 			return {
 				...col,
 				primaryKey: isPkColumn,
 				pkOrder,
-				notNull: isPkColumn ? true : col.notNull,
+				notNull: (isPkColumn && !synthesized) ? true : col.notNull,
 			};
 		});
 

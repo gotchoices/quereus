@@ -571,10 +571,14 @@ export interface PrimaryKeyColumnDefinition {
  * @param columns Parsed column definitions from AST.
  * @param constraints Parsed table constraints from AST.
  * @returns The primary-key column list plus any table-level
- * `PRIMARY KEY (...) ON CONFLICT <action>` directive. `defaultConflict` is
- * undefined when the PK was column-declared (column-level `ON CONFLICT`
- * lives on `ColumnSchema.defaultConflict`) or when no `ON CONFLICT` was
- * declared on the table-level constraint.
+ * `PRIMARY KEY (...) ON CONFLICT <action>` directive, and a `synthesized` flag.
+ * `defaultConflict` is undefined when the PK was column-declared (column-level
+ * `ON CONFLICT` lives on `ColumnSchema.defaultConflict`) or when no `ON CONFLICT`
+ * was declared on the table-level constraint. `synthesized` is `true` only on the
+ * no-PK all-columns fallback below (`false` for any explicitly-declared PK,
+ * including the empty-key `primary key ()` singleton). Callers must NOT promote a
+ * synthesized key's columns to NOT NULL — the whole row is the identity, but each
+ * column keeps its declared (or session-default) nullability.
  * @throws QuereusError if multiple primary keys are defined or PK column not found.
  */
 export function findPKDefinition(
@@ -583,6 +587,7 @@ export function findPKDefinition(
 ): {
 	pkDef: ReadonlyArray<PrimaryKeyColumnDefinition>;
 	defaultConflict: ConflictResolution | undefined;
+	synthesized: boolean;
 } {
 	const columnPK = findColumnPKDefinition(columns);
 	const constraintPK = findConstraintPKDefinition(columns, constraints);
@@ -591,29 +596,68 @@ export function findPKDefinition(
 		throw new QuereusError("Cannot define both table-level and column-level PRIMARY KEYs", StatusCode.CONSTRAINT);
 	}
 
-	let finalPkDef: ReadonlyArray<PrimaryKeyColumnDefinition> | undefined =
+	const declaredPkDef: ReadonlyArray<PrimaryKeyColumnDefinition> | undefined =
 		constraintPK?.pkDef ?? columnPK;
 
-	if (!finalPkDef) {
-		// Quereus-specific behavior: Include all columns in the primary key when no explicit primary key is defined
-		// This differs from SQLite which would use the first INTEGER column or an implicit rowid
-		// This design choice ensures predictable behavior and avoids potential confusion with SQLite's implicit rules
-		warnLog(`No PRIMARY KEY explicitly defined. Including all columns in primary key.`);
-		finalPkDef = Object.freeze(
-			columns.map((col, index) => ({
-				index,
-				desc: false,
-				collation: col.collation || 'BINARY'
-			}))
-		);
+	if (declaredPkDef) {
+		return {
+			pkDef: declaredPkDef,
+			defaultConflict: constraintPK?.defaultConflict,
+			synthesized: false,
+		};
 	}
 
-	// Don't require NOT NULL, we want to be more flexible
+	// Quereus-specific behavior: Include all columns in the primary key when no explicit primary key is defined
+	// This differs from SQLite which would use the first INTEGER column or an implicit rowid
+	// This design choice ensures predictable behavior and avoids potential confusion with SQLite's implicit rules
+	warnLog(`No PRIMARY KEY explicitly defined. Including all columns in primary key.`);
+	const synthesizedPkDef = Object.freeze(
+		columns.map((col, index) => ({
+			index,
+			desc: false,
+			collation: col.collation || 'BINARY'
+		}))
+	);
 
+	// A synthesized all-columns key does NOT force NOT NULL on its members — each
+	// column keeps the nullability the author declared (or the session default).
+	// NULL-in-key is supported by both backends (memory: NULL == NULL sorts first;
+	// store: TYPE_NULL=0x00), so the whole-row identity stays valid with nullable
+	// members. Only an explicitly-declared PK promotes nullability (see
+	// `buildColumnSchemas` and `columnDefToSchema`).
 	return {
-		pkDef: finalPkDef,
-		defaultConflict: constraintPK?.defaultConflict,
+		pkDef: synthesizedPkDef,
+		defaultConflict: undefined,
+		synthesized: true,
 	};
+}
+
+/**
+ * True when a table's primary key is the **synthesized all-columns key** — the
+ * no-PK fallback produced by {@link findPKDefinition}: every column index in
+ * declaration order, ascending, with no declared PK conflict action.
+ *
+ * Canonical-DDL emitters ({@link generateTableDDL}) use this to OMIT the PRIMARY
+ * KEY clause for such a key. Re-parsing DDL that names an all-columns PK would
+ * treat it as an *explicitly-declared* PK and force its columns NOT NULL —
+ * silently dropping a nullable declaration on a store persistence round-trip
+ * (the very promotion {@link findPKDefinition} deliberately avoids for a
+ * synthesized key). Omitting the clause lets the re-parse re-synthesize the same
+ * key while preserving each column's declared nullability.
+ *
+ * Detection is by shape rather than a stored flag so it holds regardless of how
+ * the schema was constructed (CREATE, store rehydrate, module rebuild). An
+ * explicitly-declared all-columns PK has the identical shape and re-synthesizes
+ * to an identical schema (a declared PK has already forced its columns NOT NULL),
+ * so treating the two alike is sound. The conflict-action guard keeps an explicit
+ * `primary key (...) on conflict X` on its own declared emission path.
+ */
+export function isSynthesizedAllColumnsKey(tableSchema: TableSchema): boolean {
+	const pk = tableSchema.primaryKeyDefinition;
+	const n = tableSchema.columns.length;
+	if (n === 0 || pk.length !== n) return false;
+	if (tableSchema.primaryKeyDefaultConflict !== undefined) return false;
+	return pk.every((def, i) => def.index === i && !def.desc);
 }
 
 /**
