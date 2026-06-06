@@ -30,7 +30,7 @@ import type {
 	Schema,
 	MappingAdvertisement,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -667,9 +667,36 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 						: undefined,
 				);
 
-				// Update table schema and persist DDL
+				// Update table schema (column-only) and persist DDL.
+				//
+				// The engine's `runAddColumn` re-merges the column-level FK/CHECK extracted
+				// from `columnDef.constraints` into the LIVE in-memory schema AFTER this hook
+				// returns, so the schema handed back to it must stay column-only — returning a
+				// constrained schema would double the constraint in the live SchemaManager (and,
+				// on the next persist, in the DDL). But that engine-side merge is in-memory only:
+				// it never reaches the catalog, so persistence must carry the column-level
+				// CHECK/FK itself or they vanish on `rehydrateCatalog`. Build a separate
+				// `persistedSchema` for `saveTableDDL` when (and only when) the column declares
+				// such a constraint; the common path persists `updatedSchema` unchanged. This is
+				// unconditional on the default kind — a per-row (evaluator) DEFAULT extracts the
+				// same AST constraints as a literal one.
 				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
+
+				const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
+				const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
+				let persistedSchema = updatedSchema;
+				if (newCheckConstraints.length > 0 || newForeignKeys.length > 0) {
+					// The new column is appended last; resolve each FK's child column to its index
+					// (matching how the engine resolves `resolvedForeignKeys` via columnIndexMap).
+					const newColIdx = updatedColumns.length - 1;
+					const resolvedForeignKeys = newForeignKeys.map(fk => ({ ...fk, columns: Object.freeze([newColIdx]) }));
+					persistedSchema = {
+						...updatedSchema,
+						checkConstraints: Object.freeze([...updatedSchema.checkConstraints, ...newCheckConstraints]),
+						foreignKeys: Object.freeze([...(updatedSchema.foreignKeys ?? []), ...resolvedForeignKeys]),
+					};
+				}
+				await this.saveTableDDL(persistedSchema);
 
 				this.eventEmitter?.emitSchemaChange({
 					type: 'alter',

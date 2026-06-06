@@ -16,8 +16,8 @@
  */
 
 import type { Database } from '../core/database.js';
-import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema } from './table.js';
-import { resolveReferencedColumns } from './table.js';
+import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
+import { resolveReferencedColumns, opsToMask } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -99,6 +99,70 @@ export function buildForeignKeyConstraintSchema(
 		deferred: fk.initiallyDeferred ?? false,
 		tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 	};
+}
+
+/**
+ * Extracts the column-level CHECK constraints declared on a single `ALTER TABLE
+ * ADD COLUMN` ColumnDef into {@link RowConstraintSchema}s. Used by both the
+ * engine's emit layer (to merge into the live in-memory schema) and the store
+ * module (to persist into the catalog DDL), so the live and persisted constraint
+ * sets cannot drift. Auto-names an unnamed CHECK `_check_<column>`, matching the
+ * engine's enforcement naming.
+ */
+export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef): RowConstraintSchema[] {
+	const result: RowConstraintSchema[] = [];
+	for (const con of columnDef.constraints ?? []) {
+		if (con.type !== 'check' || !con.expr) continue;
+		result.push({
+			name: con.name ?? `_check_${columnDef.name}`,
+			expr: con.expr,
+			operations: opsToMask(con.operations),
+			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+		});
+	}
+	return result;
+}
+
+/**
+ * Extracts the column-level FOREIGN KEY constraints declared on a single `ALTER
+ * TABLE ADD COLUMN` ColumnDef into {@link ForeignKeyConstraintSchema}s. The
+ * child column index is NOT resolved here (`columns: Object.freeze([])`) — the
+ * caller resolves it once the new column's index is known (the engine via
+ * `columnIndexMap`, the store to `[newColIdx]`). Used by both the engine's emit
+ * layer and the store module so the live and persisted FK sets cannot drift.
+ * Auto-names an unnamed FK `_fk_<column>` and enforces the single-child-column
+ * count match against the parent column list.
+ */
+export function extractColumnLevelForeignKeys(
+	columnDef: AST.ColumnDef,
+	defaultSchemaName: string,
+): ForeignKeyConstraintSchema[] {
+	const result: ForeignKeyConstraintSchema[] = [];
+	for (const con of columnDef.constraints ?? []) {
+		if (con.type !== 'foreignKey' || !con.foreignKey) continue;
+		const fk = con.foreignKey;
+		// child column index gets resolved by caller after module.alterTable returns
+		// the updated schema with the new column appended.
+		if (fk.columns && fk.columns.length !== 1) {
+			throw new QuereusError(
+				`FK constraint '${con.name ?? `_fk_${columnDef.name}`}' on ADD COLUMN '${columnDef.name}': child column count (1) does not match parent column count (${fk.columns.length})`,
+				StatusCode.ERROR,
+			);
+		}
+		result.push({
+			name: con.name ?? `_fk_${columnDef.name}`,
+			columns: Object.freeze([]),
+			referencedTable: fk.table,
+			referencedSchema: defaultSchemaName,
+			referencedColumns: Object.freeze([]),
+			referencedColumnNames: fk.columns,
+			onDelete: fk.onDelete ?? 'restrict',
+			onUpdate: fk.onUpdate ?? 'restrict',
+			deferred: fk.initiallyDeferred ?? false,
+			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+		});
+	}
+	return result;
 }
 
 /** Qualify a relation reference, eliding the `main.` prefix (the default schema). */

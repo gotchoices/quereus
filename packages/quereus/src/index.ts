@@ -134,7 +134,7 @@ export { quoteIdentifier } from './emit/ast-stringify.js';
 // Schema management
 export { SchemaManager } from './schema/manager.js';
 export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType } from './schema/table.js';
-export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows } from './schema/constraint-builder.js';
+export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';

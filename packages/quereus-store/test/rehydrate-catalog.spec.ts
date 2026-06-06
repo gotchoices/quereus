@@ -351,4 +351,106 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		// A valid child (parent pid=1 exists) still succeeds.
 		await db2.exec(`INSERT INTO fk_child VALUES (21, 1)`);
 	});
+
+	// ALTER TABLE ADD COLUMN with a column-level constraint must persist that
+	// constraint into the catalog DDL — the engine merges it into the live
+	// in-memory schema, but only the store's persisted DDL survives reopen.
+	it('ADD COLUMN column-level FOREIGN KEY survives reopen and still rejects orphans', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec('PRAGMA foreign_keys = true');
+		await db1.exec(`CREATE TABLE p (pid INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`CREATE TABLE c (id INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`INSERT INTO p VALUES (1)`);
+		await db1.exec(`INSERT INTO c VALUES (10)`);
+		// Add a column carrying a column-level FK. The column is nullable, so the
+		// existing row's new value is NULL, which MATCH-SIMPLE exempts from the FK —
+		// the ALTER succeeds. (Without NULL the store defaults to NOT NULL and rejects
+		// the no-default backfill on a non-empty table.)
+		await db1.exec(`ALTER TABLE c ADD COLUMN pref INTEGER NULL REFERENCES p (pid)`);
+		// Live enforcement: an orphan is rejected in the same session.
+		await expectRejected(
+			() => db1.exec(`INSERT INTO c VALUES (11, 99)`),
+			'orphan rejected live (pre-reopen)',
+		);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		await db2.exec('PRAGMA foreign_keys = true');
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed ADD COLUMN FK DDL parses cleanly').to.have.lengthOf(0);
+
+		// The persisted column-level FK must still reject an orphan after reopen.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO c VALUES (12, 99)`),
+			'orphan child rejected after reopen',
+		);
+		// A valid child (parent pid=1 exists) still succeeds.
+		await db2.exec(`INSERT INTO c VALUES (13, 1)`);
+	});
+
+	it('ADD COLUMN column-level CHECK survives reopen and still rejects violations', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec(`CREATE TABLE chk_add (id INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`INSERT INTO chk_add VALUES (1)`);
+		// Column-level CHECK on the added column. The nullable column leaves the
+		// existing row's qty NULL, which CHECK admits (passes on NULL), so the ALTER
+		// succeeds. (NULL also dodges the store's NOT NULL no-default backfill reject.)
+		await db1.exec(`ALTER TABLE chk_add ADD COLUMN qty INTEGER NULL CHECK (qty > 0)`);
+		await expectRejected(
+			() => db1.exec(`INSERT INTO chk_add VALUES (2, -1)`),
+			'CHECK violation rejected live (pre-reopen)',
+		);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed ADD COLUMN CHECK DDL parses cleanly').to.have.lengthOf(0);
+
+		// A CHECK-violating insert is still rejected after reopen.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO chk_add VALUES (3, -5)`),
+			'CHECK violation rejected after reopen',
+		);
+		// A satisfying insert still succeeds.
+		await db2.exec(`INSERT INTO chk_add VALUES (4, 10)`);
+	});
+
+	// Persistence must NOT be gated on a foldable (literal) DEFAULT: a per-row
+	// (non-foldable) DEFAULT like `new.id` rides a backfill evaluator, but the
+	// column-level FK is extracted from the AST regardless and must still persist.
+	it('ADD COLUMN with per-row DEFAULT + column-level FK survives reopen', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec('PRAGMA foreign_keys = true');
+		await db1.exec(`CREATE TABLE pp (pid INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`CREATE TABLE cc (id INTEGER PRIMARY KEY) USING store`);
+		// Parent must contain every existing child id, since the new column backfills
+		// each existing row to `new.id` and the FK validates those backfilled values.
+		await db1.exec(`INSERT INTO pp VALUES (1)`);
+		await db1.exec(`INSERT INTO cc VALUES (1)`);
+		// Per-row (non-foldable) DEFAULT `new.id` + column-level FK to pp(pid).
+		await db1.exec(`ALTER TABLE cc ADD COLUMN pref INTEGER DEFAULT (new.id) REFERENCES pp (pid)`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		await db2.exec('PRAGMA foreign_keys = true');
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed per-row-default ADD COLUMN FK DDL parses cleanly').to.have.lengthOf(0);
+
+		// The persisted FK must still reject an orphan after reopen.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO cc VALUES (20, 99)`),
+			'orphan child rejected after reopen (per-row default path)',
+		);
+		// A valid child (parent pid=1 exists) still succeeds.
+		await db2.exec(`INSERT INTO cc VALUES (21, 1)`);
+	});
 });

@@ -6,9 +6,9 @@ import { createRowSlot } from '../context-helpers.js';
 import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
-import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
-import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
-import { validateForeignKeyOverExistingRows } from '../../schema/constraint-builder.js';
+import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
+import { validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from '../../schema/constraint-builder.js';
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -459,52 +459,6 @@ async function runAddColumn(
 
 	log('Added column %s to table %s.%s', columnDef.name, tableSchema.schemaName, tableSchema.name);
 	return null;
-}
-
-function extractColumnLevelCheckConstraints(columnDef: ColumnDef): RowConstraintSchema[] {
-	const result: RowConstraintSchema[] = [];
-	for (const con of columnDef.constraints ?? []) {
-		if (con.type !== 'check' || !con.expr) continue;
-		result.push({
-			name: con.name ?? `_check_${columnDef.name}`,
-			expr: con.expr,
-			operations: opsToMask(con.operations),
-			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
-		});
-	}
-	return result;
-}
-
-function extractColumnLevelForeignKeys(
-	columnDef: ColumnDef,
-	defaultSchemaName: string,
-): ForeignKeyConstraintSchema[] {
-	const result: ForeignKeyConstraintSchema[] = [];
-	for (const con of columnDef.constraints ?? []) {
-		if (con.type !== 'foreignKey' || !con.foreignKey) continue;
-		const fk = con.foreignKey;
-		// child column index gets resolved by caller after module.alterTable returns
-		// the updated schema with the new column appended.
-		if (fk.columns && fk.columns.length !== 1) {
-			throw new QuereusError(
-				`FK constraint '${con.name ?? `_fk_${columnDef.name}`}' on ADD COLUMN '${columnDef.name}': child column count (1) does not match parent column count (${fk.columns.length})`,
-				StatusCode.ERROR,
-			);
-		}
-		result.push({
-			name: con.name ?? `_fk_${columnDef.name}`,
-			columns: Object.freeze([]),
-			referencedTable: fk.table,
-			referencedSchema: defaultSchemaName,
-			referencedColumns: Object.freeze([]),
-			referencedColumnNames: fk.columns,
-			onDelete: fk.onDelete ?? 'restrict',
-			onUpdate: fk.onUpdate ?? 'restrict',
-			deferred: fk.initiallyDeferred ?? false,
-			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
-		});
-	}
-	return result;
 }
 
 /**
