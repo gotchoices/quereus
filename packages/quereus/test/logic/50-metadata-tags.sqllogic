@@ -483,6 +483,64 @@ SELECT name, json_extract(tags, '$."quereus.id"') AS qid
     FROM unique_constraint_info('RsvOkConTbl') WHERE name = 'uq_rsv';
 → [{"name":"uq_rsv","qid":"con-uq"}]
 
+-- -------------------------------------------------------------------
+-- Inline NAMED column-constraint reserved-tag validation
+-- (ColumnDef.constraints[].tags). The parser lifts a trailing WITH TAGS onto an
+-- inline constraint only when it is NAMED; the direct CREATE path validates it at
+-- the same physical-constraint site as a table-level constraint (mirrors the
+-- differ — see 50.2-declare-schema-renames.sqllogic § 10).
+-- -------------------------------------------------------------------
+
+-- Typo'd reserved key on an inline NAMED CHECK constraint rejected
+-- (physical-constraint site) — the core gap this change closes.
+CREATE TABLE RsvInlineBadCon (
+    id INTEGER PRIMARY KEY,
+    qty INTEGER CONSTRAINT chk_qty CHECK (qty > 0) WITH TAGS ("quereus.bogus" = 1)
+);
+-- error: reserved tag
+
+-- Mis-sited but otherwise-valid key on an inline named constraint rejected:
+-- quereus.update.default_for.<col> is view-ddl / projection / dml-stmt only ⇒
+-- tag-not-allowed-here at the physical-constraint site.
+CREATE TABLE RsvInlineMissite (
+    id INTEGER PRIMARY KEY,
+    qty INTEGER CONSTRAINT chk_qty2 CHECK (qty > 0) WITH TAGS ("quereus.update.default_for.qty" = '0')
+);
+-- error: not allowed
+
+-- Valid functional tag quereus.expose_implicit_index accepted on an inline NAMED
+-- UNIQUE constraint and round-trips through unique_constraint_info (the same tag
+-- catalog.ts reads to surface the implicit covering structure).
+CREATE TABLE RsvInlineUq (
+    id INTEGER PRIMARY KEY,
+    vin TEXT CONSTRAINT uq_vin UNIQUE WITH TAGS ("quereus.expose_implicit_index" = true)
+);
+SELECT name, json_extract(tags, '$."quereus.expose_implicit_index"') AS exposed
+    FROM unique_constraint_info('RsvInlineUq') WHERE name = 'uq_vin';
+→ [{"name":"uq_vin","exposed":true}]
+
+-- Valid rename hint quereus.id accepted on an inline named UNIQUE constraint and
+-- round-trips (mirrors the table-level RsvOkConTbl case above).
+CREATE TABLE RsvInlineId (
+    id INTEGER PRIMARY KEY,
+    email TEXT CONSTRAINT uq_email_inline UNIQUE WITH TAGS ("quereus.id" = 'con-inline')
+);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM unique_constraint_info('RsvInlineId') WHERE name = 'uq_email_inline';
+→ [{"name":"uq_email_inline","qid":"con-inline"}]
+
+-- Unnamed inline constraint with trailing WITH TAGS: the parser defers the tag to
+-- the COLUMN (physical-column site), so it validates/stores there and round-trips
+-- on the column via table_info — NOT on the constraint (no regression, no double
+-- error). quereus.id is legal at physical-column, so this is accepted.
+CREATE TABLE RsvInlineUnnamed (
+    id INTEGER PRIMARY KEY,
+    x INTEGER CHECK (x > 0) WITH TAGS ("quereus.id" = 'col-x-tag')
+);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('RsvInlineUnnamed') WHERE name = 'x';
+→ [{"name":"x","qid":"col-x-tag"}]
+
 -- Valid quereus.id accepted on an index and round-trips through schema() / index_info().
 CREATE INDEX ix_rsv_ok ON RsvOkCol (x) WITH TAGS ("quereus.id" = 'idx-thing');
 SELECT json_extract(tags, '$."quereus.id"') AS qid

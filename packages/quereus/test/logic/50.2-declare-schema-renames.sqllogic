@@ -306,3 +306,28 @@ apply schema main;
 -- error: unknown reserved tag
 
 drop table gadget;
+
+-- ===================================
+-- 10. Typo'd reserved tag on an INLINE NAMED column constraint → hard error at apply
+-- ===================================
+
+-- The differ also validates ColumnDef.constraints[].tags at the physical-constraint
+-- site, symmetric with the direct CREATE path (50-metadata-tags § inline named
+-- column-constraint). A trailing WITH TAGS lands on the constraint only when it is
+-- NAMED; a typo on an inline named CHECK constraint fails the apply just as a
+-- table-level constraint typo does (§ 9).
+create table widget (id integer primary key, qty integer);
+
+declare schema main {
+	table widget {
+		id integer primary key,
+		qty integer constraint chk_qty check (qty > 0) with tags ("quereus.bogus" = 1)
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: unknown reserved tag
+
+drop table widget;

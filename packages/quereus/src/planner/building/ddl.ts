@@ -32,19 +32,24 @@ export function buildCreateIndexStmt(
 }
 
 /**
- * Validate the three reserved-tag surfaces of a direct CREATE TABLE — table-level
- * `WITH TAGS`, each column's tags, and each table-level (named or unnamed)
- * constraint's tags — at their matching physical sites, mirroring the declarative
- * differ (`schema-differ.ts`). Diagnostics accumulate table → columns → constraints
- * and raise once via the shared policy. Inline *named* column-constraint tags
- * (`ColumnDef.constraints[].tags`) are intentionally excluded to stay symmetric with
- * the differ (see the ticket's Scope decisions).
+ * Validate the four reserved-tag surfaces of a direct CREATE TABLE — table-level
+ * `WITH TAGS`, each column's tags, each table-level (named or unnamed) constraint's
+ * tags, and each inline column constraint's tags — at their matching physical sites,
+ * mirroring the declarative differ (`schema-differ.ts`). Diagnostics accumulate
+ * table → columns → table-constraints → column-constraints and raise once via the
+ * shared policy. Inline column-constraint tags (`ColumnDef.constraints[].tags`) ARE
+ * validated here at the physical-constraint site (kept symmetric with the differ):
+ * the parser lifts a trailing `WITH TAGS` onto an inline constraint only when it is
+ * *named*, so an unnamed inline constraint defers its tags to the column (where
+ * `cc.tags` is undefined and validateReservedTags is a no-op) — hence no `cc.name`
+ * guard, and the iteration covers every constraint kind, not just check/unique/fk.
  */
 function raiseCreateTableTagDiagnostics(stmt: AST.CreateTableStmt): void {
 	const diagnostics = [
 		...validateReservedTags(stmt.tags, 'physical-table'),
 		...stmt.columns.flatMap(c => validateReservedTags(c.tags, 'physical-column')),
 		...(stmt.constraints ?? []).flatMap(c => validateReservedTags(c.tags, 'physical-constraint')),
+		...stmt.columns.flatMap(c => (c.constraints ?? []).flatMap(cc => validateReservedTags(cc.tags, 'physical-constraint'))),
 	];
 	raiseStmtTagDiagnostics(diagnostics, stmt);
 }

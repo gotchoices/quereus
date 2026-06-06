@@ -205,7 +205,7 @@ describe('Schema Differ', () => {
 					tableStmt: {
 						type: 'createTable',
 						table: { name: 'items' },
-						columns: [{ name: 'id', constraints: {} }],
+						columns: [{ name: 'id', constraints: [] }],
 						constraints: [],
 						ifNotExists: false,
 					} as AST.CreateTableStmt,

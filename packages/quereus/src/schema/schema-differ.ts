@@ -234,6 +234,23 @@ export function computeSchemaDiff(
 					// only; this is validation-only and harmless on unnamed ones.
 					tagDiagnostics.push(...validateReservedTags(c.tags, 'physical-constraint'));
 				}
+				// Inline *named* column constraints carry their own trailing `WITH TAGS`
+				// on `cc.tags` at the SAME physical-constraint site as a table-level
+				// constraint (the parser lifts a trailing tag onto the constraint only
+				// when it is named; an unnamed inline constraint defers its tags to the
+				// column, so `cc.tags` is undefined there and validateReservedTags returns
+				// [] — a harmless no-op, no `cc.name` guard needed). Validate regardless of
+				// constraint *kind* (validation is independent of the lifecycle lift that
+				// handles only check/unique/fk) so a typo'd or mis-sited reserved key on
+				// e.g. `qty integer constraint chk check (qty>0) with tags (...)` fails
+				// here too. Appended LAST (after the table-level constraint loop) so the
+				// accumulated diagnostic order is identical to the direct CREATE path:
+				// table → columns → table-constraints → column-constraints.
+				for (const col of item.tableStmt.columns) {
+					for (const cc of col.constraints ?? []) {
+						tagDiagnostics.push(...validateReservedTags(cc.tags, 'physical-constraint'));
+					}
+				}
 				break;
 			case 'declaredView':
 				declaredViews.set(item.viewStmt.view.name.toLowerCase(), item);
