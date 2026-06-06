@@ -1023,6 +1023,17 @@ async function rebuildMemoryTable(
 		// Update catalog
 		schema.removeTable(tableName);
 		schema.addTable(shadowMgr.tableSchema);
+
+		// The old manager is now orphaned. Any active VirtualTableConnection bound
+		// to it (e.g. from a prior insert in this session) is stale and must not be
+		// reused against the rebuilt table — a reused-stale + fresh connection pair
+		// leaves two candidates registered for the same table name, which trips
+		// DeferredConstraintQueue.findConnection at the next commit. Mirror the
+		// drop-table path's cleanup (schema/manager.ts dropTable). The orphaned
+		// manager and its pending layer are discarded with the old manager, so no
+		// rollback is needed; this intentionally bypasses implicit-transaction
+		// deferral, exactly as drop table relies on.
+		rctx.db.removeConnectionsForTable(schemaName, tableName);
 	} catch (e) {
 		// Clean up shadow on failure
 		try {

@@ -2269,6 +2269,50 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		}
 	});
 
+	it('REGRESSION: a self-referential FK over a renamed PK column (→ ALTER PRIMARY KEY) commits with the deferred self-FK enforced', async function () {
+		// Sibling of the case above, but the referenced (self) column IS the PK. Renaming
+		// it emits an ALTER PRIMARY KEY, which on a memory table rebuilds the manager
+		// (rebuildMemoryTable). That rebuild used to orphan the old manager while leaving
+		// its VirtualTableConnection registered; the next insert then registered a second
+		// connection under the same name, tripping DeferredConstraintQueue.findConnection
+		// ("multiple candidate connections") when the deferred self-FK fired at commit.
+		// rebuildMemoryTable now removes the stale connections after the swap, so the
+		// post-rebuild insert commits and the self-FK enforces normally.
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table node {
+					code INTEGER PRIMARY KEY,
+					parent_code INTEGER null,
+					constraint fk foreign key (parent_code) references node(code)
+				}
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into node values (1, null), (2, 1)');
+
+			// Rename the PK column code → ucode; the self-FK references node(ucode).
+			await db.exec(`declare schema main {
+				table node {
+					ucode INTEGER PRIMARY KEY with tags ("quereus.previous_name" = 'code'),
+					parent_code INTEGER null,
+					constraint fk foreign key (parent_code) references node(ucode)
+				}
+			}`);
+			await db.exec('apply schema main');
+
+			// Valid self reference commits (this is the insert that previously threw at commit).
+			await db.exec('insert into node values (3, 2)');
+
+			// An orphaned parent reference is still rejected by the deferred self-FK at commit.
+			let rejected = false;
+			try { await db.exec('insert into node values (4, 999)'); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by self-FK against the renamed PK column').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('REGRESSION: a genuine FK body edit layered on a parent-column rename still drops+recreates', async function () {
 		// Precedence guard: reconciling the referenced-parent-column rename must NOT
 		// mask a real FK body change (here, adding ON DELETE CASCADE) that coincides
