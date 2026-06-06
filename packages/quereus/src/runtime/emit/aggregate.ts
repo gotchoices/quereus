@@ -328,11 +328,6 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 			// Process all rows
 			for await (const row of sourceRows) {
-				if (cleanupPreviousGroupContext) {
-					cleanupPreviousGroupContext();
-					cleanupPreviousGroupContext = null;
-				}
-
 				// Set the current row in the runtime context for Filter and GROUP BY evaluation
 				ctx.context.set(scanRowDescriptor, () => row);
 				logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
@@ -431,6 +426,17 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 						yield aggregateRow;
 
+						// Tear down the just-yielded group's representative-row context
+						// BEFORE pulling the next source row. These descriptors are built
+						// from the source's attribute IDs, so leaving them live would shadow
+						// a streaming child's own row slot (same attr IDs) when the child
+						// evaluates the next row — e.g. a Filter directly below would read
+						// the stale representative row instead of its current row.
+						if (cleanupPreviousGroupContext) {
+							cleanupPreviousGroupContext();
+							cleanupPreviousGroupContext = null;
+						}
+
 						// Reset for new group
 						currentAccumulators = aggregateSchemas.map(schema => {
 							return cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined);
@@ -490,11 +496,6 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 					logContextPop(scanRowDescriptor, 'scan-row');
 					ctx.context.delete(scanRowDescriptor);
 				}
-			}
-
-			if (cleanupPreviousGroupContext) {
-				cleanupPreviousGroupContext();
-				cleanupPreviousGroupContext = null;
 			}
 
 			// Yield the final group if any rows were processed
