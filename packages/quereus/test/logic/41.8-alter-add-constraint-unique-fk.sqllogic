@@ -55,9 +55,19 @@ insert into u_dup values (3, 'a@x');
 select count(*) as c from u_dup;
 → [{"c":3}]
 
--- NOTE: the "delete the dup then re-run the same ADD ⇒ succeeds" retry is deferred — it trips a
--- pre-existing memory-vtab consolidation bug (a DELETE after a schema change resurrects the row in
--- the base tree). See tickets/.pre-existing-error.md. Section 1 covers the clean success path.
+-- retry after removing the offending rows ⇒ the same ADD now converges. (Exercises the
+-- DELETE-after-schema-change consolidation path: the base primary tree is replaced, not unioned,
+-- so the deleted duplicates do not resurface in the UNIQUE index build.)
+delete from u_dup where id in (2, 3);
+alter table u_dup add constraint uq_email unique (email);
+-- run
+
+select count(*) as c from unique_constraint_info('u_dup') where name = 'uq_email';
+→ [{"c":1}]
+
+-- forward enforcement is now active under the retried constraint
+insert into u_dup values (4, 'a@x');
+-- error: unique
 
 drop table u_dup;
 -- run

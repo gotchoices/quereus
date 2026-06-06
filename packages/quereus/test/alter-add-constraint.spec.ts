@@ -82,12 +82,30 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 			const cnt: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select count(*) as c from t')) cnt.push(r);
 			expect(cnt).to.deep.equal([{ c: 3 }]);
+		});
 
-			// NOTE: the natural follow-up — delete the dup, then re-run the SAME add and expect
-			// success — is deferred. It trips a pre-existing memory-vtab consolidation bug (a DELETE
-			// after a schema change can resurrect the deleted row in the base tree). See
-			// tickets/.pre-existing-error.md. The "add over conforming data" case above covers the
-			// success path on a clean table.
+		it('succeeds on retry after the offending rows are removed', async () => {
+			await db.exec('create table t (id integer primary key, email text)');
+			await db.exec("insert into t values (1, 'a@x'), (2, 'a@x')"); // duplicate
+
+			// First add fails atomically over the duplicate.
+			const err = await expectThrows(() => db.exec('alter table t add constraint u_email unique (email)'));
+			expect(err.code).to.equal(StatusCode.CONSTRAINT);
+
+			// Remove the offending row, then re-run the SAME add — it now converges.
+			// (This exercises the DELETE-after-schema-change → consolidation path that the
+			// memory base layer must replace, not union, into its primary tree.)
+			await db.exec('delete from t where id = 2');
+			await db.exec('alter table t add constraint u_email unique (email)');
+
+			// The constraint is now installed and enforces going forward.
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval("select count(*) as c from unique_constraint_info('t') where name = 'u_email'")) {
+				rows.push(r);
+			}
+			expect(rows, 'constraint present after the successful retry').to.deep.equal([{ c: 1 }]);
+			const dupErr = await expectThrows(() => db.exec("insert into t values (3, 'a@x')"));
+			expect(dupErr.code).to.equal(StatusCode.CONSTRAINT);
 		});
 
 		it('allows multiple existing NULLs (NULLs distinct)', async () => {
@@ -104,6 +122,25 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 			await db.exec('alter table t add unique (email)');
 			const err = await expectThrows(() => db.exec("insert into t values (2, 'a@x')"));
 			expect(err.code).to.equal(StatusCode.CONSTRAINT);
+		});
+
+		it('reuses an existing unique index over the same columns (no rebuilt covering index)', async () => {
+			await db.exec('create table t (id integer primary key, email text)');
+			await db.exec("insert into t values (1, 'a@x'), (2, 'b@x')");
+			await db.exec('create unique index ue on t (email)');
+
+			// The explicit UNIQUE add reuses the user's unique index rather than building
+			// a second covering structure.
+			await db.exec('alter table t add constraint uq unique (email)');
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.indexes?.map(i => i.name), 'no extra covering index built').to.deep.equal(['ue']);
+
+			// Dropping the constraint must NOT tear down the user's own index.
+			await db.exec('alter table t drop constraint uq');
+			const t2 = db.schemaManager.getTable('main', 't')!;
+			expect(t2.indexes?.map(i => i.name), "user's unique index survives the drop").to.deep.equal(['ue']);
+			const err = await expectThrows(() => db.exec("insert into t values (3, 'b@x')"));
+			expect(err.code, 'user unique index still enforces').to.equal(StatusCode.CONSTRAINT);
 		});
 	});
 
