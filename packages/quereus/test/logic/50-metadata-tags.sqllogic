@@ -651,3 +651,20 @@ ALTER TABLE AddCol ADD COLUMN c4 INT WITH TAGS (display_name = 'C4', searchable 
 SELECT name, json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.searchable') AS searchable
     FROM table_info('AddCol') WHERE name = 'c4';
 → [{"name":"c4","dn":"C4","searchable":true}]
+
+-- -------------------------------------------------------------------
+-- Adversarial coverage: named-ness does not gate ADD CONSTRAINT validation,
+-- and every constraint kind is covered (not just check/unique).
+-- -------------------------------------------------------------------
+
+-- Validation fires on an *unnamed* ADD CONSTRAINT too (the tag lives on the
+-- table-level constraint regardless of the optional CONSTRAINT <name> prefix), and
+-- it fires at plan-build *before* any constraint machinery — so the bad tag is the
+-- error, not e.g. a duplicate-constraint complaint.
+ALTER TABLE AddCon ADD CHECK (id < 1000) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- A bad tag on an ADD CONSTRAINT FOREIGN KEY is rejected too (the leg iterates every
+-- constraint kind, not just check/unique).
+ALTER TABLE AddCon ADD CONSTRAINT fk_self FOREIGN KEY (code) REFERENCES AddCon (id) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
