@@ -122,6 +122,15 @@ insert or ignore into c2 (id, b) values (5, null);
 select id from c2 where id = 5;
 → []
 
+-- IGNORE asymmetry — substitution is REPLACE-only. Here the DEFAULT *could*
+-- satisfy NOT NULL (a=7 ⇒ new.a=7), yet OR IGNORE still skips the row: it bails
+-- on the NOT NULL violation BEFORE attempting substitution. The id=5 case above
+-- can't distinguish this from "substitute then re-check" (new.a is NULL there
+-- regardless); a non-NULL sibling makes the row's absence the proof.
+insert or ignore into c2 (id, a, b) values (6, 7, null);
+select id from c2 where id = 6;
+→ []
+
 DROP TABLE c2;
 
 -- Column ordering — first violator wins. The NOT NULL DEFAULTED column `b` is
