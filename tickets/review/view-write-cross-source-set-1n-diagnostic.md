@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-06T18:21:16.697Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\view-write-cross-source-set-1n-diagnostic.review.2026-06-06T18-21-16-697Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Review the plan-time rejection of a 1:many cross-source `update v set owner.x = partner.y` — where the owning (assigned) side joins more than one partner row — with a dedicated `cross-source-ambiguous-cardinality` diagnostic naming the ambiguity, instead of the generic runtime `Scalar subquery returned more than one row`. The proof is partner-side uniqueness (PK / non-partial UNIQUE constraint / non-partial UNIQUE index ⊆ the join-pinned partner columns); the FK-child-reads-parent direction stays accepted.
 files: packages/quereus/src/planner/mutation/multi-source.ts (ownerJoinsAtMostOnePartner, stripSideQualifier, decomposeUpdate gate closure), packages/quereus/src/planner/mutation/mutation-diagnostic.ts (MutationDiagnosticReason), packages/quereus/test/logic/93.4-view-mutation.sqllogic (~L630 new reject + accept), packages/quereus/test/quereus/view-mutation-substrate.spec.ts (structured-reason spec), docs/view-updateability.md (§ Inner Join cross-source `set`, § Current limitations)
 ----
