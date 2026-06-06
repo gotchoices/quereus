@@ -15,17 +15,18 @@
  *   - USING module name   — generateTableDDL  → parse  (module name survives)
  *   - vtab-arg key        — generateTableDDL  → parse  (arg key survives)
  *   - CREATE ASSERTION name — collectSchemaCatalog over a real keyword-named
- *     assertion → assert the emitted catalog `ddl` quotes the name.
+ *     assertion → assert the emitted catalog `ddl` quotes the name AND
+ *     re-parses to a `createAssertion` statement.
  *
  * The keyword set is driven straight off the lexer `KEYWORDS` table (as in the
  * AST suite) so it can never drift from the lexer.
  *
- * Deferred: a *full* re-parse of the assertion catalog `ddl` is intentionally
- * not attempted — `assertionSchemaToCatalog` embeds `violationSql` (a
- * `select 1 where not (…)` query) in the CHECK slot, which is not itself a
- * CHECK-*expression* and so never round-trips through `parse()` regardless of
- * the name. The name-quoting — the property this ticket fixes — is what the
- * assertion site asserts here.
+ * The assertion catalog `ddl` is now a faithful, re-parseable
+ * `CREATE ASSERTION <name> CHECK (<expr>)`: `assertionSchemaToCatalog` emits the
+ * CHECK slot from the stored `checkExpression` AST via `expressionToString`
+ * (not the `select 1 where not (…)` `violationSql`, which is not a
+ * CHECK-*expression* and never parsed). The assertion site below therefore
+ * exercises a full `parse(ddl)` round-trip in addition to name quoting.
  */
 
 import { expect } from 'chai';
@@ -257,9 +258,9 @@ describe('Generator: ordinary identifiers are never over-quoted', () => {
 describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 	// The assertion DDL is emitted inside the private `assertionSchemaToCatalog`;
 	// `collectSchemaCatalog` is the public driver that reaches it. We create a
-	// real assertion (CHECK with no table dependency, as in 95-assertions.sqllogic)
-	// and inspect the emitted catalog `ddl`. See the file header re: why a full
-	// re-parse of the assertion `ddl` is not asserted.
+	// real assertion (CHECK as in 95-assertions.sqllogic) and inspect the emitted
+	// catalog `ddl` — both that the name is quoted correctly and that the now-
+	// faithful `ddl` re-parses back to a `createAssertion` statement.
 	let db: Database;
 
 	beforeEach(() => {
@@ -285,5 +286,36 @@ describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 		expect(a, 'ordinary-named assertion present in catalog').to.exist;
 		expect(a!.ddl).to.include('CREATE ASSERTION my_assert CHECK');
 		expect(a!.ddl).to.not.include('"my_assert"');
+	});
+
+	it('emits a re-parseable CHECK for a literal predicate', async () => {
+		await db.exec('create assertion my_assert check (1 = 1)');
+		const catalog = collectSchemaCatalog(db, 'main');
+		const a = catalog.assertions.find(x => x.name.toLowerCase() === 'my_assert');
+		expect(a, 'assertion present in catalog').to.exist;
+		// Previously the embedded `select 1 where not (…)` in the CHECK slot made
+		// this throw; the faithful `ddl` now re-parses to a `createAssertion`.
+		const stmt = parse(a!.ddl);
+		expect(stmt.type, `ddl re-parsed to wrong statement: ${a!.ddl}`).to.equal('createAssertion');
+		if (stmt.type === 'createAssertion') {
+			expect(stmt.name.toLowerCase()).to.equal('my_assert');
+		}
+	});
+
+	it('emits a re-parseable CHECK for an identifier-bearing predicate', async () => {
+		// Exercises identifier quoting inside the CHECK: the predicate carries a
+		// table reference (`t`) and a column reference (`v`), so the round-trip
+		// depends on `expressionToString` reproducing parseable identifiers — not
+		// just a bare literal like `1 = 1`.
+		await db.exec('create table t (id integer primary key, v integer)');
+		await db.exec('create assertion a2 check (not exists (select 1 from t where v < 0))');
+		const catalog = collectSchemaCatalog(db, 'main');
+		const a = catalog.assertions.find(x => x.name.toLowerCase() === 'a2');
+		expect(a, 'assertion present in catalog').to.exist;
+		const stmt = parse(a!.ddl);
+		expect(stmt.type, `ddl re-parsed to wrong statement: ${a!.ddl}`).to.equal('createAssertion');
+		if (stmt.type === 'createAssertion') {
+			expect(stmt.name.toLowerCase()).to.equal('a2');
+		}
 	});
 });

@@ -2,7 +2,7 @@ import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema } from './table.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { generateTableDDL, generateIndexDDL, constraintToCanonicalDDL } from './ddl-generator.js';
@@ -314,9 +314,24 @@ function indexSchemaToCatalog(
 }
 
 function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): CatalogAssertion {
+	// Emit a faithful, re-parseable `CREATE ASSERTION <name> CHECK (<expr>)` by
+	// stringifying the original CHECK expression AST — the same `expressionToString`
+	// call `emitCreateAssertion` already uses, so it is proven to produce a
+	// parseable expression for this input. Using the stored `violationSql` here
+	// instead would embed a full `select 1 where not (...)` query in the CHECK
+	// slot, which is not a CHECK-expression and never round-trips through `parse()`.
+	//
+	// `checkExpression` is absent only for assertions reconstructed from persisted
+	// `violationSql` alone — a path that does not exist today (`importSingleDDL`
+	// throws on assertion DDL), so the primary branch always fires. The fallback
+	// keeps a descriptive (non-reparseable) string for that hypothetical case
+	// rather than throwing. See assertion.ts:21-27.
+	const checkSql = assertionSchema.checkExpression
+		? expressionToString(assertionSchema.checkExpression)
+		: assertionSchema.violationSql;
 	return {
 		name: assertionSchema.name,
-		ddl: `CREATE ASSERTION ${quoteIdentifier(assertionSchema.name)} CHECK (${assertionSchema.violationSql})`
+		ddl: `CREATE ASSERTION ${quoteIdentifier(assertionSchema.name)} CHECK (${checkSql})`
 	};
 }
 
