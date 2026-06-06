@@ -10,6 +10,7 @@ import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { renameColumnInCheckExpression } from './rename-rewriter.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
+import { normalizeCollationName } from '../util/comparison.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
@@ -1203,7 +1204,7 @@ function extractDeclaredDefault(col: AST.ColumnDef): AST.Expression | null {
  */
 function extractDeclaredCollation(col: AST.ColumnDef): string {
 	const c = col.constraints?.find(c => c.type === 'collate');
-	return c?.collation ? c.collation.trim().toUpperCase() : 'BINARY';
+	return c?.collation ? normalizeCollationName(c.collation) : 'BINARY';
 }
 
 /**

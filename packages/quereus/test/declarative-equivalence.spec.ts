@@ -997,6 +997,57 @@ describe('declarative-equivalence: column collation drift', () => {
 			await b.close();
 		}
 	});
+
+	it('detects and converges a PRIMARY KEY column collation drift (re-keys the primary structure)', async function () {
+		const db = new Database();
+		try {
+			// A text PRIMARY KEY column, declared BINARY (default).
+			await db.exec(`declare schema main {
+				table t { k TEXT PRIMARY KEY }
+			}`);
+			await db.exec('apply schema main');
+			// Values distinct under BOTH collations so the PK re-key cannot collide.
+			await db.exec(`insert into t values ('alpha'), ('Beta')`);
+
+			// Re-declare the PK column with COLLATE NOCASE.
+			await db.exec(`declare schema main {
+				table t { k TEXT PRIMARY KEY COLLATE NOCASE }
+			}`);
+
+			// The differ detects the PK-column collation drift (membership-agnostic).
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.tablesToAlter.length, 'PK collation drift produces one alter').to.equal(1);
+			const colChange = diff.tablesToAlter[0].columnsToAlter.find(c => c.columnName.toLowerCase() === 'k');
+			expect(colChange?.collation, 'declared NOCASE is the desired PK collation').to.equal('NOCASE');
+
+			await db.exec('apply schema main');
+
+			// The live PK column converged…
+			const kCol = db.schemaManager.getTable('main', 't')!.columns.find(c => c.name.toLowerCase() === 'k')!;
+			expect(kCol.collation, 'PK column collation converged to NOCASE').to.equal('NOCASE');
+
+			// …and the primary structure re-keyed: a case-only duplicate now collides.
+			let collided = false;
+			try {
+				await db.exec(`insert into t values ('ALPHA')`);
+			} catch {
+				collided = true;
+			}
+			expect(collided, 'NOCASE PK rejects a case-only duplicate of an existing key').to.be.true;
+
+			// Re-applying the same declaration is a no-op.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================
