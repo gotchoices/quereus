@@ -849,3 +849,34 @@ SELECT name FROM table_info('AddColTags') ORDER BY cid;
 -- Schema-hash neutrality of ADD/DROP TAGS rides the same tag-exclusion path as
 -- SET TAGS; the declarative tag-value-hash-neutral cases live in
 -- test/schema-manager.spec.ts (§ "Schema hashing with tags").
+
+-- ===================================================================
+-- Phase 31: adversarial edge cases (ambiguous constraint, dup key, mix)
+-- ===================================================================
+
+-- ADD / DROP TAGS share resolveNamedConstraintClass with SET TAGS, so an
+-- ambiguous name (AmbiguousCon from Phase 16 has a UNIQUE and a CHECK both
+-- named `dup`) is rejected identically — not just on SET.
+ALTER TABLE AmbiguousCon ALTER CONSTRAINT dup ADD TAGS (m = 'x');
+-- error: ambiguous
+
+ALTER TABLE AmbiguousCon ALTER CONSTRAINT dup DROP TAGS (m);
+-- error: ambiguous
+
+-- Dropping the SAME key twice in one list is harmless — the key is present once,
+-- so the presence check passes and the key is removed (the second delete is a
+-- no-op), leaving the rest intact rather than erroring.
+CREATE TABLE DupDropKey (id INTEGER PRIMARY KEY) WITH TAGS (a = 1, b = 2);
+ALTER TABLE DupDropKey DROP TAGS (a, a);
+SELECT json_type(tags, '$.a') AS a_type, json_extract(tags, '$.b') AS b
+    FROM schema() WHERE type = 'table' AND name = 'DupDropKey';
+→ [{"a_type":null,"b":2}]
+
+-- merge-then-drop across separate statements composes on the live tag set:
+-- the drop sees the merged key and removes it, leaving the survivor.
+CREATE TABLE MixMergeDrop (id INTEGER PRIMARY KEY) WITH TAGS (keep = 1);
+ALTER TABLE MixMergeDrop ADD TAGS (scratch = 2);
+ALTER TABLE MixMergeDrop DROP TAGS (scratch);
+SELECT json_extract(tags, '$.keep') AS keep, json_type(tags, '$.scratch') AS scratch_type
+    FROM schema() WHERE type = 'table' AND name = 'MixMergeDrop';
+→ [{"keep":1,"scratch_type":null}]
