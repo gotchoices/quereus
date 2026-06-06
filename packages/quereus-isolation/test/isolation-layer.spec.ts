@@ -1,8 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
+import type { ConnectionOverlayState } from '../src/index.js';
 
 describe('IsolationModule', () => {
 	let db: Database;
@@ -1268,6 +1269,275 @@ describe('IsolationModule', () => {
 
 			const afterCommit = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_hp ORDER BY id'));
 			expect(afterCommit.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
+		});
+	});
+
+	describe('ALTER TABLE ADD COLUMN cross-connection poison semantics', () => {
+		// The hybrid (B) blast radius: an ALTER no longer aborts because of ANOTHER
+		// connection's uncommitted, un-backfillable overlay. The issuer's own
+		// un-backfillable overlay still aborts atomically (unchanged); a foreign one is
+		// POISONED — its owning connection errors on its next read/write/commit — while
+		// the issuer's ALTER applies and every migratable overlay is carried forward.
+		//
+		// These are white-box tests: two+ Database instances share ONE IsolationModule so
+		// each connection gets a distinct dbId (the module keys overlays by getDbId(db)).
+		// Overlays are injected directly via setConnectionOverlay (deterministic connection
+		// counts, following setupStagedOverlay) and the ALTER is driven straight through
+		// iso.alterTable(dbA, ...) with a manually-built addColumn change.
+		let iso: IsolationModule;
+		let dbA: Database; // the ALTER issuer
+		let dbB: Database; // a foreign connection (poison target)
+		let dbC: Database; // a second foreign connection (migratable peer)
+
+		beforeEach(async () => {
+			iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			dbA = new Database();
+			dbB = new Database();
+			dbC = new Database();
+			dbA.registerModule('isolated', iso);
+			// Created through dbA → builds the shared underlying (columns: id, x).
+			await dbA.exec('create table t (id integer primary key, x integer null) using isolated');
+			// One committed baseline row whose own backfill always succeeds (x is non-null),
+			// so the underlying's NOT NULL backfill never trips — only staged overlay rows do.
+			await dbA.exec('insert into t values (5, 5)');
+		});
+
+		afterEach(async () => {
+			await dbA.close();
+			await dbB.close();
+			await dbC.close();
+		});
+
+		/** Primary-key full-scan FilterInfo (idxStr === null). */
+		function fullScan(): FilterInfo {
+			return {
+				idxNum: 0,
+				idxStr: null,
+				constraints: [],
+				args: [],
+				indexInfoOutput: {
+					nConstraint: 0,
+					aConstraint: [],
+					nOrderBy: 0,
+					aOrderBy: [],
+					colUsed: 0n,
+					aConstraintUsage: [],
+					idxNum: 0,
+					idxStr: null,
+					orderByConsumed: false,
+					estimatedCost: 1000000,
+					estimatedRows: 1000000n,
+					idxFlags: 0,
+				},
+			};
+		}
+
+		/**
+		 * An `addColumn` change for a NOT NULL column whose per-row backfill is the staged
+		 * row's `x` value (column index 1). A staged row with x = NULL therefore yields NULL
+		 * and is un-backfillable; a staged row with a non-null x backfills successfully.
+		 *
+		 * Mirrors the engine's real `ADD COLUMN c INTEGER NOT NULL DEFAULT (new.x)` shape:
+		 * the columnDef carries the non-foldable `new.x` DEFAULT expression AND a matching
+		 * `backfillEvaluator`. The DEFAULT expr is what lets the underlying's
+		 * `addColumn` accept a NOT NULL column on a non-empty table (it backfills per row
+		 * via the evaluator instead of demanding a literal default), while
+		 * `deriveAddColumnBackfill` folds the same expr to `null` and drives the overlay
+		 * backfill off the evaluator — yielding the CONSTRAINT that poisons a foreign overlay.
+		 */
+		function addNotNullCol(colName: string): SchemaChangeInfo {
+			return {
+				type: 'addColumn',
+				columnDef: {
+					name: colName,
+					dataType: 'INTEGER',
+					constraints: [
+						{ type: 'notNull' },
+						{ type: 'default', expr: { type: 'column', name: 'x', table: 'new' } },
+					],
+				},
+				backfillEvaluator: (row: Row) => row[1],
+			};
+		}
+
+		/** Injects a staged-insert overlay (rows = [id, x][]) for `forDb`, hasChanges=true. */
+		async function injectOverlay(forDb: Database, rows: SqlValue[][]): Promise<void> {
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
+			for (const r of rows) {
+				await overlay.update({ operation: 'insert', values: [...r, 0] }); // trailing 0 = live (not tombstone)
+			}
+			iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true });
+		}
+
+		function overlayState(forDb: Database): ConnectionOverlayState | undefined {
+			return iso.getConnectionOverlay(forDb, 'main', 't');
+		}
+
+		/**
+		 * Live underlying column count via the MemoryTable's getSchema() — the canonical
+		 * schema the manager mutates in place. The per-instance `.tableSchema` field is a
+		 * connect-time snapshot the module-level alterTable never refreshes, so reading it
+		 * would make the atomicity assertion vacuous (companion ticket's note).
+		 */
+		function underlyingColumnCount(): number {
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable as unknown as {
+				getSchema(): TableSchema | undefined;
+			};
+			return underlying.getSchema()!.columns.length;
+		}
+
+		async function reader(forDb: Database, readCommitted = false): Promise<IsolatedTable> {
+			const opts = (readCommitted ? { _readCommitted: true } : {}) as unknown as BaseModuleConfig;
+			return await iso.connect(forDb, undefined, 'isolated', 'main', 't', opts) as IsolatedTable;
+		}
+
+		it('applies the ALTER and poisons a foreign overlay whose staged row cannot backfill', async () => {
+			await injectOverlay(dbB, [[10, null]]); // B stages an un-backfillable row (x = NULL)
+			const before = underlyingColumnCount();  // id, x = 2
+
+			const updated = await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+
+			// The ALTER applied: returned schema AND the live underlying both gained 'c'.
+			expect(updated.columns.some(col => col.name === 'c'), 'returned schema has new column').to.equal(true);
+			expect(underlyingColumnCount(), 'underlying gained the new column').to.equal(before + 1);
+
+			// B's overlay is poisoned (left in the pre-alter layout, not migrated).
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B overlay must be poisoned').to.not.be.undefined;
+			expect(bState.poison!.message).to.match(/cannot satisfy/i);
+
+			// A (issuer, clean) is unaffected: its read shows the backfilled new column.
+			const aRows = await asyncIterableToArray((await reader(dbA)).query(fullScan()));
+			expect(aRows.length).to.equal(1);
+			expect(aRows[0][2], 'committed row backfilled c = x = 5').to.equal(5);
+		});
+
+		it('errors a poisoned connection at read, write, and commit; committed reads still succeed', async () => {
+			await injectOverlay(dbB, [[10, null]]);
+			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			expect(overlayState(dbB)!.poison).to.not.be.undefined;
+
+			const tableB = await reader(dbB);
+
+			// Merged read throws CONSTRAINT.
+			let readErr: unknown;
+			try { await asyncIterableToArray(tableB.query(fullScan())); } catch (e) { readErr = e; }
+			expect(readErr, 'merged read on a poisoned overlay must throw').to.be.instanceOf(QuereusError);
+			expect((readErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			// Write throws CONSTRAINT before staging anything.
+			let writeErr: unknown;
+			try { await tableB.update({ operation: 'insert', values: [11, 5] }); } catch (e) { writeErr = e; }
+			expect(writeErr, 'write on a poisoned overlay must throw').to.be.instanceOf(QuereusError);
+			expect((writeErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			// Commit flush throws — this is how a connection that never touches the table
+			// again still fails its commit.
+			let commitErr: unknown;
+			try { await tableB.onConnectionCommit(); } catch (e) { commitErr = e; }
+			expect(commitErr, 'commit flush on a poisoned overlay must throw').to.be.instanceOf(QuereusError);
+			expect((commitErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			// A committed-snapshot reader bypasses the overlay entirely and succeeds,
+			// returning the (backfilled) underlying rows.
+			const tableBRC = await reader(dbB, true);
+			const rc = await asyncIterableToArray(tableBRC.query(fullScan()));
+			expect(rc.length, 'read-committed reader returns underlying rows without throwing').to.equal(1);
+			expect(rc[0][2]).to.equal(5);
+		});
+
+		it("rejects atomically when the issuer's own overlay cannot backfill", async () => {
+			await injectOverlay(dbA, [[1, null]]); // A itself stages the un-backfillable row
+			const before = underlyingColumnCount();
+
+			let err: unknown;
+			try { await iso.alterTable(dbA, 'main', 't', addNotNullCol('c')); } catch (e) { err = e; }
+			expect(err, 'issuer-own un-backfillable overlay must abort the ALTER').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			expect((err as QuereusError).message.toLowerCase()).to.include('not null');
+
+			// Atomic: the shared underlying is untouched (no phantom column).
+			expect(underlyingColumnCount(), 'underlying untouched after atomic rejection').to.equal(before);
+
+			// A's overlay is intact and NOT poisoned (it aborted up front).
+			const aState = overlayState(dbA)!;
+			expect(aState.poison, 'issuer-own overlay is rejected, never poisoned').to.be.undefined;
+			expect(aState.hasChanges).to.equal(true);
+		});
+
+		it('aborts on the issuer-own overlay first, poisoning no foreign overlay', async () => {
+			// Both the issuer's own AND a foreign overlay are un-backfillable. The issuer-own
+			// check runs first and aborts before the underlying is mutated, so the foreign
+			// overlay is never reached and stays un-poisoned (full atomicity).
+			await injectOverlay(dbA, [[1, null]]);
+			await injectOverlay(dbB, [[10, null]]);
+			const before = underlyingColumnCount();
+
+			let err: unknown;
+			try { await iso.alterTable(dbA, 'main', 't', addNotNullCol('c')); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(QuereusError);
+			expect(underlyingColumnCount(), 'nothing mutated').to.equal(before);
+			expect(overlayState(dbB)!.poison, 'no foreign overlay poisoned on atomic abort').to.be.undefined;
+		});
+
+		it('poisons only the un-backfillable foreign overlay and migrates a healthy peer', async () => {
+			await injectOverlay(dbB, [[10, null]]); // un-backfillable (x = NULL)
+			await injectOverlay(dbC, [[20, 99]]);   // backfillable (x = 99)
+
+			const updated = await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			expect(updated.columns.some(col => col.name === 'c')).to.equal(true);
+
+			// B poisoned; C migrated forward (new state object, no poison).
+			expect(overlayState(dbB)!.poison, 'B poisoned').to.not.be.undefined;
+			const cState = overlayState(dbC)!;
+			expect(cState.poison, 'C must NOT be poisoned').to.be.undefined;
+
+			// C's staged row survives under the new layout with c backfilled from x.
+			const cRows = await asyncIterableToArray(cState.overlayTable.query!(fullScan()));
+			expect(cRows.length).to.equal(1);
+			expect(cRows[0][0], 'id preserved').to.equal(20);   // [id, x, c, _tombstone]
+			expect(cRows[0][2], 'c backfilled = x = 99').to.equal(99);
+		});
+
+		it('skips an already-poisoned foreign overlay on a second ALTER, preserving its message', async () => {
+			await injectOverlay(dbB, [[10, null]]);
+			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			const firstMsg = overlayState(dbB)!.poison!.message;
+			expect(firstMsg).to.match(/'c'/); // names the FIRST added column
+
+			// Second ALTER: B's overlay is already poisoned → skipped (not re-read / re-validated /
+			// re-migrated). The ALTER still succeeds and B's poison message is unchanged.
+			const updated2 = await iso.alterTable(dbA, 'main', 't', addNotNullCol('d'));
+			expect(updated2.columns.some(col => col.name === 'd')).to.equal(true);
+			expect(overlayState(dbB)!.poison!.message, 'poison message stays the original').to.equal(firstMsg);
+		});
+
+		it('full rollback on a poisoned connection clears the poison', async () => {
+			await injectOverlay(dbB, [[10, null]]);
+			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			expect(overlayState(dbB)!.poison).to.not.be.undefined;
+
+			// Full rollback discards the overlay (and its poison) entirely.
+			await (await reader(dbB)).onConnectionRollback();
+			expect(overlayState(dbB), 'full rollback drops the overlay state').to.be.undefined;
+
+			// A subsequent read takes the no-overlay fast path and does not throw.
+			const rows = await asyncIterableToArray((await reader(dbB)).query(fullScan()));
+			expect(rows.length, 'committed underlying still readable').to.equal(1);
+		});
+
+		it('rollback to a post-overlay savepoint leaves the poison set', async () => {
+			await injectOverlay(dbB, [[10, null]]);
+			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
+			expect(overlayState(dbB)!.poison).to.not.be.undefined;
+
+			// Index 1 is NOT in savepointsBeforeOverlay (the overlay pre-exists this savepoint),
+			// so this rollback does NOT replace the ConnectionOverlayState — its poison persists.
+			// The schema change is permanent and the overlay rows stay in the pre-alter layout,
+			// so the connection must remain poisoned until the transaction ends.
+			await (await reader(dbB)).onConnectionRollbackToSavepoint(1);
+			expect(overlayState(dbB)!.poison, 'post-overlay savepoint rollback keeps poison').to.not.be.undefined;
 		});
 	});
 

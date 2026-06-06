@@ -83,6 +83,22 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
+	 * Throws if this connection's overlay was poisoned by a cross-connection ALTER
+	 * (see `IsolationModule.alterTable`). A poisoned overlay still holds rows in the
+	 * PRE-alter column layout, so it can neither be merged into a read nor flushed to
+	 * the now-altered underlying. Called at the data-op chokepoints (write, the merged
+	 * read branch, and the commit flush) — never on the committed-snapshot read path,
+	 * which bypasses the overlay entirely and stays safe. The connection recovers by
+	 * rolling back, which discards the overlay (and its poison).
+	 */
+	private assertOverlayUsable(): void {
+		const state = this.getOverlayState();
+		if (state?.poison) {
+			throw new QuereusError(state.poison.message, StatusCode.CONSTRAINT);
+		}
+	}
+
+	/**
 	 * Gets the overlay table, or undefined if no overlay exists yet.
 	 */
 	private get overlayTable(): VirtualTable | undefined {
@@ -292,10 +308,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			throw new Error('Underlying table does not support query');
 		}
 
-		// Fast path: no overlay or no changes, or a committed-snapshot read — skip overlay
+		// Fast path: no overlay or no changes, or a committed-snapshot read — skip overlay.
+		// A poisoned overlay always has hasChanges === true, so this path never serves it;
+		// a committed.<table> (readCommitted) read reaches here and stays safe — it reads
+		// only the underlying and never merges the poisoned overlay.
 		if (this.readCommitted || !this.overlayTable || !this.hasChanges) {
 			return this.underlyingTable.query(filterInfo);
 		}
+
+		// Merged branch: a poisoned overlay cannot be merged (its rows are in the
+		// pre-alter layout) — error before touching it.
+		this.assertOverlayUsable();
 
 		// Merge overlay with underlying (with connection ensured)
 		return this.mergedQueryWithConnection(filterInfo);
@@ -654,6 +677,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * The overlay is created lazily on first write, using schema from the underlying table.
 	 */
 	async update(args: UpdateArgs): Promise<UpdateResult> {
+		// A poisoned overlay (cross-connection ALTER) cannot accept further writes — its
+		// staged rows are in the pre-alter layout. Error before staging anything.
+		this.assertOverlayUsable();
+
 		// Ensure connection is registered for transaction coordination
 		await this.ensureConnection();
 
@@ -1269,6 +1296,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * Shared by commit() and onConnectionCommit().
 	 */
 	private async flushAndClearOverlay(): Promise<void> {
+		// A poisoned overlay must never be flushed to the (already-altered) underlying:
+		// its rows are in the pre-alter layout. Throwing here is how a connection that
+		// never touches the poisoned table again still errors at commit, failing the
+		// whole transaction. The overlay is left intact so a subsequent rollback clears
+		// it (and the poison).
+		this.assertOverlayUsable();
 		const overlay = this.overlayTable;
 		if (this.hasChanges && overlay) {
 			await this.flushOverlayToUnderlying(overlay);

@@ -502,9 +502,23 @@ PK that has a tombstone in the overlay.
 **Challenge:** CREATE INDEX, ALTER TABLE, DROP TABLE don't fit the row-based overlay model.
 
 **Mitigation:**
-- DDL operations bypass the overlay and go directly to underlying module
-- Schema changes may have their own transactional semantics
-- Document that DDL is not isolated in the same way as DML
+- DDL mutates the shared underlying module directly — it is not transaction-scoped and the underlying auto-commits immediately, so it is not isolated in the same way as DML.
+- Schema changes may have their own transactional semantics.
+- **Open overlays are migrated, not bypassed.** Any per-connection overlay holding staged rows in the *old* column layout would be structurally inconsistent with the post-DDL schema, so `IsolationModule` migrates each affected overlay forward rather than ignoring it. `dropIndex` rebuilds each overlay under the post-drop schema (preserving rows + tombstones); `alterTable` translates every staged row to the new column layout. See *ALTER overlay migration & cross-connection poison* below.
+
+#### ALTER overlay migration & cross-connection poison
+
+`alterTable` is the one DDL that can change row shape (ADD/DROP COLUMN), so its overlay handling is the most involved. Because the underlying base auto-commits irreversibly, the blast radius is made **isolation-faithful**: an ALTER never depends on another connection's uncommitted data.
+
+The affected overlays are partitioned into the **issuer's own** (the connection that ran the ALTER) and **foreign** ones, handled in three tiers:
+
+1. **Partition.** Compare each affected overlay's key against the issuer's `makeConnectionOverlayKey(db, …)`. Foreign overlays already marked poisoned (from an earlier ALTER) are skipped entirely — they hold pre-alter rows and must not be re-read or re-migrated.
+2. **Validate issuer-own first (atomic abort).** The issuer's own overlay is dry-run validated (per-row `NOT NULL` backfill + tombstone-present guard) **before** the irreversible `underlying.alterTable`. Any throw here leaves underlying + catalog + every overlay untouched — the issuer's ALTER fails clean or fully applies. (The issuer staged both the data and the DDL, so rejecting up front is least-surprising and matches the engine's own pre-mutation `validateNotNullBackfill`.)
+3. **Mutate, then per-foreign migrate-or-poison.** After the underlying is altered, the issuer's own overlay migrates normally. Each foreign overlay is then validated individually: a per-row `NOT NULL` (`CONSTRAINT`) failure **poisons** that one overlay (`ConnectionOverlayState.poison = { message }`) and leaves its pre-alter rows in place; a healthy foreign overlay migrates forward. A layer-invariant failure (`INTERNAL`, e.g. a missing tombstone column) is **rethrown** loud for everyone rather than poisoned. Validation is per overlay, so one bad foreign overlay poisons only itself.
+
+**Observing poison.** A poisoned overlay still has `hasChanges === true`, so `IsolatedTable` errors (`QuereusError`, `CONSTRAINT`) at the data-op chokepoints — `update` (before staging), the *merged* branch of `query`, and the commit flush (`flushAndClearOverlay`) — but never on the committed-snapshot (`readCommitted`) read path, which bypasses the overlay and stays usable. This means a poisoned connection fails its next read/write/commit even if it never touches the table again, while a `committed.<table>` reader keeps working.
+
+**Poison lifecycle.** Poison is cleared only by discarding the `ConnectionOverlayState`: a **full rollback** (`onConnectionRollback`) or a rollback to a **pre-overlay savepoint** drops the overlay (and its poison). A rollback to a savepoint taken **after** the overlay existed does *not* replace the state, so poison correctly persists — the schema change is permanent and the overlay's rows are still in the pre-alter layout, so even if the offending row was rolled back the overlay stays structurally inconsistent until the transaction ends.
 
 ---
 

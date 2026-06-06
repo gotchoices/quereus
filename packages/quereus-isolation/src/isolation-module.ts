@@ -60,6 +60,15 @@ export interface UnderlyingTableState {
 export interface ConnectionOverlayState {
 	overlayTable: VirtualTable;
 	hasChanges: boolean;
+	/**
+	 * Set by a cross-connection ALTER that could not migrate this (foreign)
+	 * overlay to the post-alter column layout. The overlay still holds
+	 * PRE-alter rows, so it is structurally inconsistent with the now-committed
+	 * schema; any data op that would merge or flush it must throw this message.
+	 * Undefined = healthy. Cleared only by discarding the overlay (rollback /
+	 * commit-failure → rollback).
+	 */
+	poison?: { message: string };
 }
 
 /**
@@ -646,19 +655,38 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			);
 		}
 
-		// Collect affected overlays before the underlying schema is mutated.
+		// Partition affected overlays into the ISSUER's own (the connection that issued
+		// the ALTER) and FOREIGN ones (other open connections). The issuer staged both
+		// the data and the DDL, so its own un-backfillable overlay aborts the ALTER up
+		// front (atomic); a foreign un-backfillable overlay must not — it is poisoned and
+		// left for its owning connection to error on, while the issuer's ALTER proceeds.
+		// Already-poisoned foreign overlays are skipped entirely: they hold rows from
+		// before an earlier ALTER, stay poisoned, and must not be re-read/migrated.
 		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
-		const affected: [string, ConnectionOverlayState][] = [];
+		const ownKey = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		let ownEntry: [string, ConnectionOverlayState] | undefined;
+		const foreign: [string, ConnectionOverlayState][] = [];
 		for (const [key, state] of this.connectionOverlays.entries()) {
-			if (key.endsWith(suffix)) {
-				affected.push([key, state]);
+			if (!key.endsWith(suffix)) continue;
+			if (key === ownKey) {
+				ownEntry = [key, state];
+			} else if (state.poison) {
+				continue;
+			} else {
+				foreign.push([key, state]);
 			}
 		}
 
-		// For dropColumn we need the pre-alter column index, readable from any overlay schema.
+		// Overlays we will actually migrate forward (issuer-own first). The shared
+		// dropColumn index is probed from one of these, never from a skipped poisoned
+		// overlay whose schema may be a stale pre-alter layout.
+		const toMigrate = ownEntry ? [ownEntry, ...foreign] : foreign;
+
+		// For dropColumn we need the pre-alter column index, readable from any
+		// to-be-migrated overlay's schema.
 		let dropColumnIdx: number | undefined;
-		if (change.type === 'dropColumn' && affected.length > 0) {
-			const overlaySchema = affected[0][1].overlayTable.tableSchema;
+		if (change.type === 'dropColumn' && toMigrate.length > 0) {
+			const overlaySchema = toMigrate[0][1].overlayTable.tableSchema;
 			dropColumnIdx = overlaySchema?.columnIndexMap.get(change.columnName.toLowerCase());
 		}
 
@@ -668,23 +696,57 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// same context drives the post-mutation migration.
 		const addColumnCtx = this.deriveAddColumnBackfill(change, db, tableName);
 
-		// Dry-run every affected overlay's migration-fallible work (the tombstone-present
-		// guard and the per-row NOT NULL backfill) BEFORE mutating the shared underlying,
-		// so a rejection leaves underlying + catalog + overlays untouched.
-		for (const [, oldState] of affected) {
-			await this.validateOverlayMigration(oldState, addColumnCtx);
+		// Tier 2: validate the ISSUER's own overlay BEFORE mutating the shared underlying.
+		// Any throw here (CONSTRAINT backfill or INTERNAL tombstone guard) propagates while
+		// underlying + catalog + every overlay are still untouched — the companion ticket's
+		// atomic-abort guarantee, preserved unchanged for the issuer.
+		if (ownEntry) {
+			await this.validateOverlayMigration(ownEntry[1], addColumnCtx);
 		}
 
 		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
 
-		// Migrate each affected overlay to the new schema, preserving staged rows. After
-		// pre-validation the migration's NOT NULL / tombstone throw sites are unreachable.
-		for (const [key, oldState] of affected) {
+		// Migrate the issuer's own overlay (already validated above). Its NOT NULL /
+		// tombstone throw sites are unreachable after pre-validation.
+		if (ownEntry) {
+			const newState = await this.migrateOverlayForAlter(db, ownEntry[1], updated, change, dropColumnIdx, addColumnCtx);
+			this.connectionOverlays.set(ownEntry[0], newState);
+		}
+
+		// Tier 3: per FOREIGN overlay, validate then migrate — but a per-row NOT NULL
+		// (CONSTRAINT) failure poisons that one overlay instead of aborting the issuer's
+		// ALTER. An INTERNAL failure (e.g. missing tombstone column) is a layer-invariant
+		// violation, not a data condition, so it rethrows loud for everyone. Validation
+		// runs per overlay, so one bad foreign overlay poisons only itself; healthy peers
+		// still migrate.
+		for (const [key, oldState] of foreign) {
+			try {
+				await this.validateOverlayMigration(oldState, addColumnCtx);
+			} catch (e) {
+				if (e instanceof QuereusError && e.code === StatusCode.CONSTRAINT) {
+					oldState.poison = { message: this.buildAlterPoisonMessage(schemaName, tableName, change) };
+					continue; // poisoned — do NOT migrate; leave pre-alter rows in place
+				}
+				throw e;
+			}
 			const newState = await this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx);
 			this.connectionOverlays.set(key, newState);
 		}
 
 		return updated;
+	}
+
+	/**
+	 * Builds the poison message stamped onto a foreign overlay whose backfill could not
+	 * satisfy a cross-connection ALTER (see {@link alterTable} tier 3). Names the
+	 * schema.table and the offending column so the owning connection's eventual
+	 * read/write/commit error is self-explanatory. Poison only arises on the addColumn
+	 * NOT NULL path, so the column name is taken from the addColumn change; other change
+	 * types never reach here but are handled defensively.
+	 */
+	private buildAlterPoisonMessage(schemaName: string, tableName: string, change: SchemaChangeInfo): string {
+		const col = change.type === 'addColumn' ? change.columnDef.name : '<column>';
+		return `ALTER on '${schemaName}.${tableName}' added column '${col}' (NOT NULL) that this connection's uncommitted row cannot satisfy; roll back this transaction.`;
 	}
 
 	/**

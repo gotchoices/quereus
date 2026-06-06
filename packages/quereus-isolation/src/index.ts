@@ -4,7 +4,7 @@ export { mergeStreams, createMergeEntry, createTombstone } from './merge-iterato
 
 // Isolation layer types
 export type { IsolationModuleConfig } from './isolation-types.js';
-export type { UnderlyingTableState } from './isolation-module.js';
+export type { UnderlyingTableState, ConnectionOverlayState } from './isolation-module.js';
 
 // Isolation layer classes
 export { IsolationModule } from './isolation-module.js';
