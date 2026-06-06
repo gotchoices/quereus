@@ -807,9 +807,11 @@ async function runAlterColumn(
  * without an `alterTable` hook.
  *
  * NOTE: store-backed modules persist DDL from their own `alterTable`, which this
- * path deliberately bypasses, so a tag-only change does not re-persist for a
- * store table across reconnect (the same gap the programmatic `setTableTags`
- * already has). Tracked by backlog ticket `tag-mutation-store-persistence`.
+ * path deliberately bypasses. The generic store module recovers the tag change by
+ * subscribing to these `table_modified` events and re-writing its catalog DDL, so
+ * table / column / named-constraint tag swaps now survive reconnect for store
+ * tables (index and view/MV tag persistence is still pending — see backlog tickets
+ * `store-secondary-index-persistence` / `store-view-mv-persistence`).
  */
 function runSetTableTags(
 	rctx: RuntimeContext,

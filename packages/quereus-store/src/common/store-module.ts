@@ -29,6 +29,7 @@ import type {
 	ColumnSchema,
 	Schema,
 	MappingAdvertisement,
+	SchemaChangeEvent as EngineSchemaChangeEvent,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
@@ -93,6 +94,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	private coordinators: Map<string, TransactionCoordinator> = new Map();
 	private tables: Map<string, StoreTable> = new Map();
 	private eventEmitter?: StoreEventEmitter;
+
+	/** Unsubscribe thunk for the engine `SchemaChangeNotifier` listener, set on first hook with a `db`. */
+	private schemaListenerUnsub?: () => void;
+	/** The `Database` whose notifier we subscribed to. One module instance serves one `Database`. */
+	private subscribedDb?: Database;
+	/**
+	 * Serialized chain of pending catalog writes triggered by engine schema-change
+	 * events (catalog-only tag swaps). `notifyChange` invokes listeners synchronously
+	 * and does not await them, so the actual read-compare-write runs here, in order,
+	 * and is drained by `closeAll` (and `whenCatalogPersisted`) before the provider closes.
+	 */
+	private persistQueue: Promise<unknown> = Promise.resolve();
 
 	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
 		this.provider = provider;
@@ -161,6 +174,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * event handlers (like sync module) try to access it.
 	 */
 	async create(db: Database, tableSchema: TableSchema): Promise<StoreTable> {
+		this.ensureSchemaSubscription(db);
 		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
 
 		if (this.tables.has(tableKey)) {
@@ -214,6 +228,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		options: StoreModuleConfig,
 		importedTableSchema?: TableSchema
 	): Promise<StoreTable> {
+		this.ensureSchemaSubscription(db);
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 
 		// Check if we already have this table connected
@@ -579,6 +594,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		tableName: string,
 		change: SchemaChangeInfo,
 	): Promise<TableSchema> {
+		this.ensureSchemaSubscription(db);
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		// Lazy-connect: `renameTable` evicts the old key from `this.tables` and
 		// expects the next `connect()` to repopulate under the new name, but
@@ -1456,10 +1472,118 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		};
 	}
 
+	// --- Engine schema-change subscription (catalog-only tag persistence) ---
+
+	/**
+	 * Subscribe (once) to the engine's `SchemaChangeNotifier` so catalog-only
+	 * mutations that bypass `module.alterTable` — notably `ALTER … SET TAGS` and the
+	 * programmatic `setTableTags`/`setColumnTags`/`setConstraintTags` — still re-persist
+	 * the table's catalog DDL. Called lazily from the first `create`/`connect`/
+	 * `alterTable` hook that hands us a `db`.
+	 *
+	 * One `StoreModule` instance is assumed to serve one `Database`. A later hook
+	 * carrying a *different* `db` keeps the existing subscription (multi-database
+	 * sharing of a single module instance is out of scope) and logs.
+	 */
+	private ensureSchemaSubscription(db: Database): void {
+		if (this.schemaListenerUnsub) {
+			if (this.subscribedDb && this.subscribedDb !== db) {
+				console.warn(
+					'[StoreModule] ensureSchemaSubscription called with a different Database; '
+						+ 'keeping the existing subscription (one module instance is assumed to serve one Database).',
+				);
+			}
+			return;
+		}
+		this.subscribedDb = db;
+		this.schemaListenerUnsub = db.schemaManager.getChangeNotifier().addListener(this.onEngineSchemaChange);
+	}
+
+	/**
+	 * Engine schema-change listener. Handles `table_modified` only (the event every
+	 * catalog-only tag swap fires via `commitTagUpdate`); all other event types are
+	 * ignored. Keeps a connected `StoreTable`'s cached schema consistent (SET TAGS
+	 * does not call `updateSchema`) and queues a read-compare-write that re-persists
+	 * the table's catalog DDL when (and only when) it actually changed.
+	 *
+	 * Synchronous by contract (`notifyChange` does not await listeners); the async
+	 * write rides `persistQueue`, drained by `closeAll`/`whenCatalogPersisted`.
+	 */
+	private onEngineSchemaChange = (event: EngineSchemaChangeEvent): void => {
+		if (event.type !== 'table_modified') return;
+
+		const newObject = event.newObject;
+		const tableKey = `${event.schemaName}.${event.objectName}`.toLowerCase();
+
+		// SET TAGS does not call `table.updateSchema`, so a connected instance's cached
+		// schema would otherwise go stale (and a later lazy `saveTableDDL` could re-write
+		// tag-less DDL). Persistence below always reads `newObject`, never this cache.
+		const connected = this.tables.get(tableKey);
+		if (connected) {
+			connected.updateSchema(newObject);
+		}
+
+		// Serialize per the queue so successive swaps (e.g. SET TAGS (a=1) then SET TAGS ())
+		// apply in order. Errors are swallowed+logged to mirror `notifyChange`'s own
+		// try/catch contract — a listener rejection must never escape.
+		const key = buildCatalogKey(event.schemaName, event.objectName);
+		this.persistQueue = this.persistQueue
+			.then(() => this.persistCatalogIfChanged(key, newObject))
+			.catch((err: unknown) => {
+				const message = err instanceof Error ? err.message : String(err);
+				console.warn(`[StoreModule] Failed to persist catalog DDL after schema change: ${message}`);
+			});
+	};
+
+	/**
+	 * Read-compare-write the catalog DDL for a table that just fired `table_modified`.
+	 *
+	 * - **Absent** catalog entry → the table is not store-backed in this catalog (a
+	 *   memory table in the same `db`, or a store table never persisted) → skip. This
+	 *   self-filters foreign-module tables without relying on `vtabModule` identity
+	 *   (which points at the isolation wrapper when wrapped).
+	 * - **Present** but identical DDL → skip (no redundant write). This is what makes a
+	 *   structural ALTER — whose own `alterTable` already wrote the final DDL, then fires
+	 *   `table_modified` with that same final schema — a no-op here (no double-write).
+	 * - **Present** and different DDL → re-persist (the tag swap; or a beneficial
+	 *   propagated rewrite of a dependent store table).
+	 */
+	private async persistCatalogIfChanged(key: Uint8Array, newObject: TableSchema): Promise<void> {
+		const catalogStore = await this.provider.getCatalogStore();
+		const existing = await catalogStore.get(key);
+		if (existing === undefined) return; // not store-backed in this catalog — skip
+
+		const newDDL = generateTableDDL(newObject);
+		const existingDDL = new TextDecoder().decode(existing);
+		if (existingDDL === newDDL) return; // identical — no redundant write
+
+		await catalogStore.put(key, new TextEncoder().encode(newDDL));
+	}
+
+	/**
+	 * Resolve once all catalog writes queued by async schema-change listeners
+	 * (catalog-only tag swaps) have settled. A durability barrier: `closeAll` awaits
+	 * it internally; callers/tests that need the persisted catalog current without a
+	 * full close can await it directly. Never rejects — queued errors are logged in
+	 * the chain.
+	 */
+	async whenCatalogPersisted(): Promise<void> {
+		await this.persistQueue;
+	}
+
 	/**
 	 * Close all stores.
 	 */
 	async closeAll(): Promise<void> {
+		// Stop listening first so no new persist work is enqueued mid-close, then drain
+		// the queued catalog writes (tag swaps) before the provider closes.
+		if (this.schemaListenerUnsub) {
+			this.schemaListenerUnsub();
+			this.schemaListenerUnsub = undefined;
+			this.subscribedDb = undefined;
+		}
+		await this.persistQueue;
+
 		for (const table of this.tables.values()) {
 			await table.disconnect();
 		}

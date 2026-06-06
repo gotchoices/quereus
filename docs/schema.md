@@ -88,6 +88,8 @@ These links are informational in the current release (enforcement still routes t
 | `findSchemasContainingTable(tableName)` | Returns all schema names containing the table — useful for error messages |
 | `findFunction(funcName, nArg)` | Finds a function by name and argument count |
 
+**Persistence of catalog-only tag swaps (store-backed tables).** The tag setters above (and the equivalent `ALTER … SET TAGS`) are catalog-only — they swap the in-memory schema and fire a change event but deliberately do **not** call `module.alterTable`. The generic store module (`@quereus/store`) still re-persists them: it subscribes to the engine's `table_modified` events and re-writes the table's catalog DDL (via `generateTableDDL`) whenever the serialized form changes. So **table**, **column**, and **named-constraint** tags now survive close → reopen → `rehydrateCatalog` for `using store` tables. The re-write is a read-compare-write keyed by `{schema}.{table}`: a table with no catalog entry (a memory table, or a store table never persisted) is skipped, and a structural ALTER — whose own `alterTable` already wrote the final DDL — produces identical bytes and is skipped (no double-write). **Index** tags (`setIndexTags`) and **view / materialized-view** tags (`setViewTags` / `setMaterializedViewTags`) do **not** yet round-trip for store-backed databases, because the store catalog persists neither index nor view/MV DDL — tracked by backlog tickets `store-secondary-index-persistence` and `store-view-mv-persistence`.
+
 ### DDL Operations
 
 #### `createTable(stmt): Promise<TableSchema>`

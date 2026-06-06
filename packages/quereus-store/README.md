@@ -44,6 +44,8 @@ The store module uses separate logical stores for different data types:
 
 This design eliminates redundant prefixes and groups related stores together by table name.
 
+**Catalog DDL is re-persisted on catalog-only tag swaps.** `ALTER … SET TAGS` (and the programmatic `setTableTags` / `setColumnTags` / `setConstraintTags`) never reach `alterTable`, so the module subscribes to the engine's `table_modified` events and re-writes the `__catalog__` entry when `generateTableDDL` output changes — table / column / named-constraint tags survive close → reopen. These async writes are serialized and drained by `closeAll()` (or the `whenCatalogPersisted()` barrier) before the provider closes. Index and view/MV tag persistence is still pending (see backlog tickets `store-secondary-index-persistence` / `store-view-mv-persistence`), since the catalog persists neither index nor view/MV DDL.
+
 ## Installation
 
 ```bash
