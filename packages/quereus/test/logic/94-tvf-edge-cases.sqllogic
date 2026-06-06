@@ -1,0 +1,58 @@
+-- tvf-edge-cases.sqllogic - Table-valued function edge cases
+-- Targets: table-valued-function.ts — empty results, single elements, subquery usage
+
+-- json_each on empty array → empty result set
+SELECT key, value FROM json_each('[]');
+→ []
+
+-- json_each on empty object → empty result set
+SELECT key, value FROM json_each('{}');
+→ []
+
+-- json_each with single element array
+SELECT key, value, type FROM json_each('[42]');
+→ [{"key":0,"value":42,"type":"integer"}]
+
+-- json_each with single key object
+SELECT key, value, type FROM json_each('{"x": true}');
+→ [{"key":"x","value":true,"type":"true"}]
+
+-- json_each with null value in array
+SELECT key, value, type FROM json_each('[1, null, 3]');
+→ [{"key":0,"value":1,"type":"integer"},{"key":1,"value":null,"type":"null"},{"key":2,"value":3,"type":"integer"}]
+
+-- json_each with nested containers (no recursion)
+SELECT key, type FROM json_each('{"a": [1, 2], "b": {"c": 3}}') ORDER BY key;
+→ [{"key":"a","type":"array"},{"key":"b","type":"object"}]
+
+-- json_each in subquery context
+SELECT count(*) AS cnt FROM (SELECT * FROM json_each('[10, 20, 30]'));
+→ [{"cnt":3}]
+
+-- json_each with WHERE filter eliminating all rows
+SELECT key, value FROM json_each('[1, 2, 3]') WHERE value > 100;
+→ []
+
+-- json_each with WHERE filter keeping some rows
+SELECT value FROM json_each('[10, 20, 30, 40, 50]') WHERE value > 25;
+→ [{"value":30},{"value":40},{"value":50}]
+
+-- json_each with root path on nested object
+SELECT key, value FROM json_each('{"a": {"x": 1, "y": 2}}', '$.a') ORDER BY key;
+→ [{"key":"x","value":1},{"key":"y","value":2}]
+
+-- json_each with aggregation in subquery
+SELECT sum(value) AS total FROM json_each('[10, 20, 30]');
+→ [{"total":60}]
+
+-- json_each with LIMIT
+SELECT value FROM json_each('[1, 2, 3, 4, 5]') LIMIT 3;
+→ [{"value":1},{"value":2},{"value":3}]
+
+-- json_each with boolean values
+SELECT key, value, type FROM json_each('[true, false]');
+→ [{"key":0,"value":true,"type":"true"},{"key":1,"value":false,"type":"false"}]
+
+-- json_each with mixed types
+SELECT key, type FROM json_each('[1, "hello", true, null, 3.14]');
+→ [{"key":0,"type":"integer"},{"key":1,"type":"text"},{"key":2,"type":"true"},{"key":3,"type":"null"},{"key":4,"type":"real"}]

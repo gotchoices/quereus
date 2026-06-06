@@ -1,0 +1,51 @@
+-- adapted from SQLite test/alter*.test
+-- Additional ALTER TABLE error paths beyond 90.2-alter-table-errors.
+
+-- ===================================
+-- 1. ALTER on non-existent table
+-- ===================================
+
+alter table no_such_table rename to other;
+-- error: not found
+
+alter table no_such_table add column x integer null;
+-- error: not found
+
+alter table no_such_table drop column x;
+-- error: not found
+
+-- ===================================
+-- 2. ALTER TABLE with non-constant DEFAULT in ADD COLUMN
+-- ===================================
+-- Quereus rejects non-deterministic / parameterized defaults at DDL time
+-- per the determinism rule. Constant numeric and string defaults work.
+
+create table t_alt_nc (id integer primary key, a integer not null);
+insert into t_alt_nc values (1, 1);
+
+-- bind parameter in DEFAULT rejected
+alter table t_alt_nc add column p text default (:foo);
+-- error:
+
+-- column reference in DEFAULT rejected
+alter table t_alt_nc add column q integer default (a + 1);
+-- error:
+
+drop table t_alt_nc;
+
+-- ===================================
+-- 3. ADD COLUMN whose backfill default would violate a CHECK
+-- ===================================
+
+create table t_bf (id integer primary key, a integer not null);
+insert into t_bf values (1, 5), (2, 0);
+
+-- default 0 backfilled into 'd', but CHECK requires d <> 0 → ALTER fails
+alter table t_bf add column d integer not null default 0 check (d <> 0);
+-- error:
+
+-- table unchanged
+select * from t_bf order by id;
+→ [{"id":1,"a":5},{"id":2,"a":0}]
+
+drop table t_bf;

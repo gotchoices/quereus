@@ -1,0 +1,13 @@
+-- adapted from SQLite test/window1.test, test/window2.test, test/window7.test, test/window8.test
+-- GROUPS frame mode is not yet supported by the Quereus parser. Document
+-- the rejection.
+
+create table gf (id integer primary key, val integer);
+insert into gf values (1, 10), (2, 10), (3, 20);
+
+select id, val,
+       count(*) over (order by val groups current row) as peer_count
+from gf order by id;
+-- error: groups
+
+drop table gf;

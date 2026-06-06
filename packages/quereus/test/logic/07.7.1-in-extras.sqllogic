@@ -1,0 +1,64 @@
+-- adapted from SQLite test/in.test, test/in2.test, test/in4.test, test/in5.test
+-- IN operator surface gaps: row-value (tuple) IN with literal list and subquery,
+-- IN with extra parens around subquery, IN with CASE expression as operand,
+-- DML with IN-subquery filters, and IN list with duplicate values.
+
+create table inx_t (id integer primary key, a integer, b integer);
+insert into inx_t values (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 4, 40);
+
+-- =============================================================================
+-- Row-value (tuple) IN with literal list — Quereus parser does not support
+-- row-value tuple syntax in IN; convert to error assertion.
+-- =============================================================================
+
+select id from inx_t where (a, b) in ((1, 10), (3, 30), (99, 99)) order by id;
+-- error: Expected ')'
+
+-- =============================================================================
+-- IN with extra parens around subquery: Quereus interprets extra parens as
+-- forcing scalar context, so a multi-row subquery becomes a scalar-error case.
+-- These do not apply.
+-- =============================================================================
+
+-- =============================================================================
+-- IN with CASE expression as operand
+-- =============================================================================
+
+select id, (case when a > 2 then a else a + 100 end) in (101, 102, 3, 4) as matched from inx_t order by id;
+→ [{"id":1,"matched":true},{"id":2,"matched":true},{"id":3,"matched":true},{"id":4,"matched":true}]
+
+-- IN where the list contains expressions
+select id from inx_t where a in (1 + 1, 1 + 2) order by id;
+→ [{"id":2},{"id":3}]
+
+-- =============================================================================
+-- IN list with duplicate values (must dedupe — should not change result)
+-- =============================================================================
+
+select id from inx_t where a in (1, 1, 2, 2, 1) order by id;
+→ [{"id":1},{"id":2}]
+
+-- =============================================================================
+-- UPDATE / DELETE with IN-subquery filter
+-- =============================================================================
+
+create table inx_dml (id integer primary key, val integer);
+insert into inx_dml values (1, 10), (2, 20), (3, 30), (4, 40);
+
+create table inx_keep (id integer primary key);
+insert into inx_keep values (1), (3);
+
+-- UPDATE WHERE id IN (subquery)
+update inx_dml set val = val * 10 where id in (select id from inx_keep);
+select id, val from inx_dml order by id;
+→ [{"id":1,"val":100},{"id":2,"val":20},{"id":3,"val":300},{"id":4,"val":40}]
+
+-- DELETE WHERE id NOT IN (subquery)
+delete from inx_dml where id not in (select id from inx_keep);
+select id, val from inx_dml order by id;
+→ [{"id":1,"val":100},{"id":3,"val":300}]
+
+drop table inx_dml;
+drop table inx_keep;
+
+drop table inx_t;

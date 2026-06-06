@@ -1,0 +1,218 @@
+import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
+	TableValuedFunctionSchema, AggregateFunctionSchema, TVFAdvertisement } from '../schema/function.js';
+import { FunctionFlags } from '../common/constants.js';
+import type { ScalarType, RelationType } from '../common/datatype.js';
+import { REAL_TYPE } from '../types/builtin-types.js';
+import type { LogicalType } from '../types/logical-type.js';
+import type { DeepReadonly } from '../common/types.js';
+
+/**
+ * Configuration options for scalar functions
+ */
+interface ScalarFuncOptions {
+	/** Function name as it will be called in SQL */
+	name: string;
+	/** Number of arguments, or -1 for variable number */
+	numArgs: number;
+	/** Function behavior flags */
+	flags?: FunctionFlags;
+	/** Whether the function is deterministic (affects caching) */
+	deterministic?: boolean;
+	/** Return type information */
+	returnType?: ScalarType;
+	/**
+	 * Optional type inference function for polymorphic functions.
+	 * If provided, this function will be called at planning time to determine
+	 * the return type based on the actual argument types.
+	 */
+	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
+	/**
+	 * Optional argument type validation function.
+	 * If provided, this function will be called at planning time to validate
+	 * that the argument types are acceptable for this function.
+	 */
+	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+	/** Argument indices on which this function is injective when all other arguments are held constant. */
+	injectiveOnArgs?: readonly number[];
+	/** Per-argument monotonicity when all other arguments are held constant. */
+	monotoneOnArgs?: { readonly [argIndex: number]: 'increasing' | 'decreasing' };
+	/**
+	 * Per-argument range-rewrite kind for monotone-but-lossy functions. The
+	 * actual boundary computation lives on the argument's logical type
+	 * (`LogicalType.bucketBounds(kind, value)`).
+	 */
+	rangeRewriteOnArg?: { readonly [argIndex: number]: { readonly kind: string } };
+}
+
+/**
+ * Configuration options for table-valued functions
+ */
+interface TableValuedFuncOptions {
+	/** Function name as it will be called in SQL */
+	name: string;
+	/** Number of arguments, or -1 for variable number */
+	numArgs: number;
+	/** Function behavior flags */
+	flags?: FunctionFlags;
+	/** Whether the function is deterministic (affects caching) */
+	deterministic?: boolean;
+	/** Return type (relation) information */
+	returnType?: RelationType;
+	/** Optional relational / physical property advertisement */
+	relationalAdvertisement?: TVFAdvertisement;
+}
+
+/* Interim values for aggregate functions don't have to be SqlValue; they can be anything */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AggValue = any;
+
+/**
+ * Configuration options for aggregate functions
+ */
+interface AggregateFuncOptions {
+	/** Function name as it will be called in SQL */
+	name: string;
+	/** Number of arguments, or -1 for variable number */
+	numArgs: number;
+	/** Function behavior flags */
+	flags?: FunctionFlags;
+	/** Whether the function is deterministic (affects caching) */
+	deterministic?: boolean;
+	/** Initial accumulator value */
+	initialValue?: AggValue;
+	/** Return type information */
+	returnType?: ScalarType;
+	/**
+	 * Optional type inference function for polymorphic aggregate functions.
+	 * If provided, this function will be called at planning time to determine
+	 * the return type based on the actual argument types.
+	 */
+	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
+	/**
+	 * Optional argument type validation function.
+	 * If provided, this function will be called at planning time to validate
+	 * that the argument types are acceptable for this function.
+	 */
+	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+}
+
+/**
+ * Creates a function schema for a scalar SQL function.
+ * This is the primary way to register scalar functions in Quereus.
+ *
+ * @param options Configuration options for the function
+ * @param jsFunc The JavaScript implementation function
+ * @returns A FunctionSchema ready for registration
+ */
+export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarFunc): ScalarFunctionSchema {
+	const returnType: ScalarType = options.returnType ?? {
+		typeClass: 'scalar',
+		logicalType: REAL_TYPE,
+		nullable: true,
+		isReadOnly: true
+	};
+
+	return {
+		name: options.name,
+		numArgs: options.numArgs,
+		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
+		returnType,
+		implementation: jsFunc,
+		inferReturnType: options.inferReturnType,
+		validateArgTypes: options.validateArgTypes,
+		injectiveOnArgs: options.injectiveOnArgs,
+		monotoneOnArgs: options.monotoneOnArgs,
+		rangeRewriteOnArg: options.rangeRewriteOnArg,
+	};
+}
+
+/**
+ * Creates a function schema for a table-valued function.
+ * Table-valued functions return AsyncIterable<Row> and can be used in FROM clauses.
+ *
+ * @param options Configuration options for the function
+ * @param jsFunc The JavaScript implementation function
+ * @returns A FunctionSchema ready for registration
+ */
+export function createTableValuedFunction(options: TableValuedFuncOptions, jsFunc: TableValuedFunc): TableValuedFunctionSchema {
+	const returnType: RelationType = options.returnType ?? {
+		typeClass: 'relation',
+		isReadOnly: true,
+		isSet: false, // Table functions can return duplicates by default
+		columns: [],
+		keys: [],
+		rowConstraints: []
+	};
+
+	return {
+		name: options.name,
+		numArgs: options.numArgs,
+		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
+		returnType,
+		implementation: jsFunc,
+		relationalAdvertisement: options.relationalAdvertisement
+	};
+}
+
+/**
+ * Creates a function schema for an integrated table-valued function.
+ * Integrated functions receive the database instance as their first parameter.
+ *
+ * @param options Configuration options for the function
+ * @param jsFunc The JavaScript implementation function
+ * @returns A FunctionSchema ready for registration
+ */
+export function createIntegratedTableValuedFunction(options: TableValuedFuncOptions, jsFunc: IntegratedTableValuedFunc): TableValuedFunctionSchema {
+	const returnType: RelationType = options.returnType ?? {
+		typeClass: 'relation',
+		isReadOnly: true,
+		isSet: false, // Table functions can return duplicates by default
+		columns: [],
+		keys: [],
+		rowConstraints: []
+	};
+
+	return {
+		name: options.name,
+		numArgs: options.numArgs,
+		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
+		returnType,
+		implementation: jsFunc,
+		isIntegrated: true,
+		relationalAdvertisement: options.relationalAdvertisement
+	};
+}
+
+/**
+ * Creates a function schema for an aggregate function.
+ * Aggregate functions use a step/finalize pattern to accumulate values.
+ *
+ * @param options Configuration options for the function
+ * @param stepFunc Function called for each row
+ * @param finalizeFunc Function called to get final result
+ * @returns A FunctionSchema ready for registration
+ */
+export function createAggregateFunction(
+	options: AggregateFuncOptions,
+	stepFunc: AggregateReducer,
+	finalizeFunc: AggregateFinalizer
+): AggregateFunctionSchema {
+	const returnType: ScalarType = options.returnType ?? {
+		typeClass: 'scalar',
+		logicalType: REAL_TYPE,
+		nullable: true,
+		isReadOnly: true
+	};
+
+	return {
+		name: options.name,
+		numArgs: options.numArgs,
+		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
+		returnType,
+		stepFunction: stepFunc,
+		finalizeFunction: finalizeFunc,
+		initialValue: options.initialValue,
+		inferReturnType: options.inferReturnType,
+		validateArgTypes: options.validateArgTypes
+	};
+}

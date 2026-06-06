@@ -1,0 +1,90 @@
+-- adapted from SQLite test/having.test
+-- HAVING edge cases: predicates over aggregate results, multiple aggregates in
+-- one expression, NULL-aware predicates, and rejection of non-grouped columns.
+
+create table he (id integer primary key, grp text, val integer null);
+insert into he values
+  (1, 'a', 10),
+  (2, 'a', 20),
+  (3, 'b', null),
+  (4, 'b', null),
+  (5, 'c', 30),
+  (6, 'c', 40);
+
+-- HAVING with IS NULL on aggregate output
+-- Group 'b' has only NULL values, so min(val) is NULL
+select grp from he group by grp having min(val) is null order by grp;
+→ [{"grp":"b"}]
+
+-- HAVING with IS NOT NULL on aggregate
+select grp from he group by grp having min(val) is not null order by grp;
+→ [{"grp":"a"},{"grp":"c"}]
+
+-- HAVING comparing two aggregates
+-- For 'a': sum=30, avg=15 → sum > avg*2? 30 > 30 → false
+-- For 'c': sum=70, avg=35 → 70 > 70 → false
+-- (none qualify)
+select grp from he group by grp having sum(val) > avg(val) * 2 order by grp;
+→ []
+
+-- HAVING comparing two aggregates with strict inequality
+-- For 'a': sum=30 vs count(*)*5 = 10 → 30 > 10 true
+-- For 'b': sum=NULL vs count(*)*5 = 10 → NULL>10 false
+-- For 'c': sum=70 vs count(*)*5 = 10 → 70 > 10 true
+select grp from he group by grp having sum(val) > count(*) * 5 order by grp;
+→ [{"grp":"a"},{"grp":"c"}]
+
+-- HAVING uses an aggregate alias from the SELECT list
+select grp, sum(val) as total from he group by grp having total > 30 order by grp;
+→ [{"grp":"c","total":70}]
+
+-- HAVING with arithmetic on aggregates: average of squared sums per group
+-- (a's sum=30, b's sum=NULL → treated as no contribution, c's sum=70)
+select grp from he group by grp having sum(val) + count(*) > 35 order by grp;
+→ [{"grp":"c"}]
+
+-- HAVING that filters out the only candidate group
+select grp from he group by grp having sum(val) > 1000;
+→ []
+
+drop table he;
+
+-- =============================================================================
+-- HAVING referencing a non-grouped column should be rejected
+-- =============================================================================
+
+create table hu (id integer primary key, grp text, val integer);
+insert into hu values (1, 'a', 10), (2, 'a', 20);
+
+-- HAVING referencing a non-grouped, non-aggregated column (id) is rejected.
+select grp from hu group by grp having id > 0;
+-- error: id
+
+-- HAVING referencing a non-grouped column alongside an aggregate in SELECT.
+select grp, sum(val) from hu group by grp having val > 0;
+-- error: val
+
+-- HAVING with a mix of grouped and ungrouped columns is rejected for the
+-- ungrouped reference (the AND'd `grp` reference itself is fine).
+select grp, sum(val) from hu group by grp having grp = 'a' and val > 0;
+-- error: val
+
+-- HAVING over the implicit single group (no GROUP BY, aggregate in SELECT)
+-- may not reference bare columns.
+select count(*) from hu having id > 0;
+-- error: id
+
+-- Positive: HAVING with an aggregate is fine.
+select grp from hu group by grp having sum(val) > 0 order by grp;
+→ [{"grp":"a"}]
+
+-- Positive: HAVING with a GROUP BY column is fine.
+select grp from hu group by grp having grp = 'a';
+→ [{"grp":"a"}]
+
+-- Positive: HAVING references the same expression that appears in GROUP BY
+-- (fingerprint-match path). val=10 → 20, val=20 → 40; only `val=20` group qualifies.
+select val * 2 as v2 from hu group by val * 2 having val * 2 > 30 order by v2;
+→ [{"v2":40}]
+
+drop table hu;

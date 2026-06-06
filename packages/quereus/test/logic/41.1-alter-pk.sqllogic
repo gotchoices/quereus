@@ -1,0 +1,210 @@
+-- ALTER TABLE ... ALTER PRIMARY KEY tests
+
+-- ===================================
+-- 1. Rekey on empty table
+-- ===================================
+
+create table t_rekey_empty (a integer primary key, b integer not null);
+-- run
+
+alter table t_rekey_empty alter primary key (b);
+-- run
+
+-- Verify new PK via table_info: b should be pk, a should not
+select name, pk from table_info('t_rekey_empty') order by name;
+→ [{"name": "a", "pk": 0}, {"name": "b", "pk": 1}]
+
+-- Insert and verify the new key works
+insert into t_rekey_empty values (1, 10), (2, 20);
+-- run
+
+select * from t_rekey_empty order by b;
+→ [{"a": 1, "b": 10}, {"a": 2, "b": 20}]
+
+drop table t_rekey_empty;
+-- run
+
+-- ===================================
+-- 2. Rekey on populated table
+-- ===================================
+
+create table t_rekey_pop (id integer primary key, code integer not null, name text);
+insert into t_rekey_pop values (1, 100, 'Alice'), (2, 200, 'Bob'), (3, 300, 'Charlie');
+-- run
+
+alter table t_rekey_pop alter primary key (code);
+-- run
+
+-- Row count should be preserved
+select count(*) as cnt from t_rekey_pop;
+→ [{"cnt": 3}]
+
+-- Data should be intact
+select * from t_rekey_pop order by code;
+→ [{"id": 1, "code": 100, "name": "Alice"}, {"id": 2, "code": 200, "name": "Bob"}, {"id": 3, "code": 300, "name": "Charlie"}]
+
+-- Verify PK changed
+select name, pk from table_info('t_rekey_pop') where pk > 0;
+→ [{"name": "code", "pk": 1}]
+
+drop table t_rekey_pop;
+-- run
+
+-- ===================================
+-- 3. Rekey that creates a duplicate-key violation
+-- ===================================
+
+create table t_rekey_dup (id integer primary key, category integer not null);
+insert into t_rekey_dup values (1, 10), (2, 10), (3, 20);
+-- run
+
+-- Rekey to (category) — should fail because categories are not unique
+alter table t_rekey_dup alter primary key (category);
+-- error:
+
+-- Table should be unchanged
+select count(*) as cnt from t_rekey_dup;
+→ [{"cnt": 3}]
+
+-- PK should still be id
+select name, pk from table_info('t_rekey_dup') where pk > 0;
+→ [{"name": "id", "pk": 1}]
+
+drop table t_rekey_dup;
+-- run
+
+-- ===================================
+-- 4. Empty PK
+-- ===================================
+
+create table t_empty_pk (a integer not null, b text);
+-- run
+
+alter table t_empty_pk alter primary key ();
+-- run
+
+select count(*) as cnt from t_empty_pk;
+→ [{"cnt": 0}]
+
+drop table t_empty_pk;
+-- run
+
+-- ===================================
+-- 5. Rekey to nullable column should fail
+-- ===================================
+
+create table t_rekey_null (id integer primary key, val text null);
+-- run
+
+alter table t_rekey_null alter primary key (val);
+-- error: NOT NULL
+
+drop table t_rekey_null;
+-- run
+
+-- ===================================
+-- 6. Rekey with DESC direction
+-- ===================================
+
+create table t_rekey_dir (a integer primary key, b integer not null);
+insert into t_rekey_dir values (1, 30), (2, 10), (3, 20);
+-- run
+
+alter table t_rekey_dir alter primary key (b desc);
+-- run
+
+select * from t_rekey_dir order by b desc;
+→ [{"a": 1, "b": 30}, {"a": 3, "b": 20}, {"a": 2, "b": 10}]
+
+drop table t_rekey_dir;
+-- run
+
+-- ===================================
+-- 7. Composite PK rekey
+-- ===================================
+
+create table t_rekey_comp (id integer primary key, a integer not null, b integer not null);
+insert into t_rekey_comp values (1, 10, 100), (2, 20, 200), (3, 10, 200);
+-- run
+
+alter table t_rekey_comp alter primary key (a, b);
+-- run
+
+select count(*) as cnt from t_rekey_comp;
+→ [{"cnt": 3}]
+
+-- Verify composite PK
+select name, pk from table_info('t_rekey_comp') where pk > 0 order by name;
+→ [{"name": "a", "pk": 1}, {"name": "b", "pk": 1}]
+
+drop table t_rekey_comp;
+-- run
+
+-- ===================================
+-- 8. Nonexistent column in PK should fail
+-- ===================================
+
+create table t_rekey_noexist (id integer primary key, val text);
+-- run
+
+alter table t_rekey_noexist alter primary key (nonexistent);
+-- error: not found
+
+drop table t_rekey_noexist;
+-- run
+
+-- ===================================
+-- 9. Duplicate column in PK should fail
+-- ===================================
+
+create table t_rekey_dupcolpk (id integer primary key, val integer not null);
+-- run
+
+alter table t_rekey_dupcolpk alter primary key (val, val);
+-- error: Duplicate
+
+drop table t_rekey_dupcolpk;
+-- run
+
+-- ===================================
+-- 10a. Rekey preserves nullable columns (regression)
+-- ===================================
+-- Regression test: a nullable non-PK column with a NULL value must survive
+-- the rebuild. (The MemoryTable path copies ColumnSchema directly and was
+-- never affected; the non-memory path — rebuildViaShadowTable — omitted
+-- explicit nullability and silently recreated nullable columns as NOT NULL.
+-- See runtime/shadow-ddl.spec.ts for the pure-DDL coverage.)
+
+create table t_rekey_nullable (id integer primary key, note text null, rate real default 1.0);
+insert into t_rekey_nullable (id, note) values (1, null), (2, 'hi');
+-- run
+
+alter table t_rekey_nullable alter primary key (id);
+-- run
+
+-- Row with NULL in nullable column must survive:
+select id, note, rate from t_rekey_nullable order by id;
+→ [{"id": 1, "note": null, "rate": 1.0}, {"id": 2, "note": "hi", "rate": 1.0}]
+
+-- Nullability of the non-PK column must be preserved:
+select name, "notnull" from table_info('t_rekey_nullable') where name = 'note';
+→ [{"name": "note", "notnull": 0}]
+
+drop table t_rekey_nullable;
+-- run
+
+-- ===================================
+-- 11. Parser round-trip via stringifier
+-- ===================================
+
+create table t_roundtrip (x integer primary key, y integer not null, z integer not null);
+-- run
+
+alter table t_roundtrip alter primary key (y, z desc);
+-- run
+
+select count(*) as cnt from t_roundtrip;
+→ [{"cnt": 0}]
+
+drop table t_roundtrip;
+-- run

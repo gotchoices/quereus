@@ -1,0 +1,99 @@
+-- adapted from SQLite test/default.test
+-- DEFAULT expression edge cases beyond 03.4-defaults.sqllogic.
+-- Quereus rejects non-deterministic defaults (CURRENT_TIMESTAMP, random()),
+-- so those scenarios are excluded by design — see 44-determinism-validation.
+
+-- ===================================
+-- 1. Negative integer literal default
+-- ===================================
+
+create table t_neg (id integer primary key, n integer default -42);
+insert into t_neg (id) values (1);
+
+select n from t_neg where id = 1;
+→ [{"n":-42}]
+
+drop table t_neg;
+
+-- ===================================
+-- 2. Boundary integer literal defaults
+-- ===================================
+
+create table t_bounds (
+	id integer primary key,
+	a integer default 2147483647,
+	b integer default 2147483648,
+	c integer default 9223372036854775807,
+	d integer default -2147483648,
+	e integer default -9223372036854775808
+);
+
+insert into t_bounds (id) values (1);
+
+select a, b, c, d, e from t_bounds where id = 1;
+→ [{"a":2147483647,"b":2147483648,"c":9223372036854775807,"d":-2147483648,"e":-9223372036854775808}]
+
+drop table t_bounds;
+
+-- ===================================
+-- 3. REAL literal default
+-- ===================================
+
+create table t_real (id integer primary key, r real default 4.36);
+insert into t_real (id) values (1);
+
+select typeof(r), r from t_real where id = 1;
+→ [{"typeof(r)":"real","r":4.36}]
+
+drop table t_real;
+
+-- ===================================
+-- 4. INSERT DEFAULT VALUES — Quereus requires explicit VALUES or SELECT
+-- ===================================
+
+create table t_dv (
+	id integer primary key default 1,
+	a integer default 7,
+	b text default 'x'
+);
+
+insert into t_dv default values;
+-- error: Expected VALUES, SELECT, or DML
+
+drop table t_dv;
+
+-- ===================================
+-- 5. DEFAULT combined with NOT NULL + UNIQUE + CHECK
+-- ===================================
+
+create table t_combo (
+	id integer primary key,
+	b integer default 12345 unique not null check (b >= 0 and b < 99999)
+);
+
+insert into t_combo (id) values (1);
+
+select b from t_combo where id = 1;
+→ [{"b":12345}]
+
+-- second insert reuses default → UNIQUE conflict
+insert into t_combo (id) values (2);
+-- error:
+
+drop table t_combo;
+
+-- ===================================
+-- 6. Bind parameter in DEFAULT rejected at DDL time
+-- ===================================
+
+create table t_param (id integer primary key, b text default (:xyz));
+-- error: bind parameters
+drop table if exists t_param;
+
+-- ===================================
+-- 7. Column reference inside DEFAULT rejected
+-- ===================================
+
+create table t_colref (id integer primary key, x integer not null, y integer default (x + 1));
+-- error: generated column
+drop table if exists t_colref;

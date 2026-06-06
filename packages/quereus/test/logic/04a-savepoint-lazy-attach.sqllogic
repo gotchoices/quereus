@@ -1,0 +1,122 @@
+-- 04a-savepoint-lazy-attach.sqllogic
+-- Regression coverage for the case where a SAVEPOINT is created before a
+-- table's VirtualTableConnection has been registered with the database.
+--
+-- For modules whose connections register lazily on first read/write
+-- (memory module, isolation layer, etc.), the active savepoint stack must
+-- be replayed onto the new connection so that subsequent ROLLBACK TO /
+-- RELEASE broadcasts targeting earlier depths land on real entries rather
+-- than silently no-op'ing on an out-of-range index.
+
+-- ===================================
+-- Case 1: SAVEPOINT before any access on a never-touched table
+-- ===================================
+
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+-- run
+
+BEGIN;
+SAVEPOINT sp;
+INSERT INTO t1 VALUES (1, 'x');
+-- visible inside the savepoint
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+ROLLBACK TO SAVEPOINT sp;
+-- the INSERT must be undone
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 0 }]
+ROLLBACK;
+
+-- Outside the transaction the table is still empty
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 0 }]
+
+-- ===================================
+-- Case 2: Nested savepoints before any access; ROLLBACK TO outer + RELEASE outer
+-- ===================================
+
+BEGIN;
+SAVEPOINT outer_sp;
+SAVEPOINT inner_sp;
+INSERT INTO t1 VALUES (10, 'y');
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+ROLLBACK TO SAVEPOINT outer_sp;
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 0 }]
+RELEASE SAVEPOINT outer_sp;
+COMMIT;
+
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 0 }]
+
+-- ===================================
+-- Case 3: Prior committed write + nested savepoint rollbacks
+-- ===================================
+-- Verifies that the existing committed row stays put while nested writes
+-- inside lazily-attached transactions are correctly undone at each level.
+
+INSERT INTO t1 VALUES (100, 'committed');
+-- run
+
+BEGIN;
+SAVEPOINT outer_sp;
+INSERT INTO t1 VALUES (101, 'outer-era');
+SAVEPOINT inner_sp;
+INSERT INTO t1 VALUES (102, 'inner-era');
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 3 }]
+ROLLBACK TO SAVEPOINT inner_sp;
+-- inner-era gone, outer-era stays
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 2 }]
+SELECT v FROM t1 WHERE id = 101;
+→ [{ "v": "outer-era" }]
+ROLLBACK TO SAVEPOINT outer_sp;
+-- outer-era now gone too; committed row remains
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+SELECT v FROM t1 WHERE id = 100;
+→ [{ "v": "committed" }]
+COMMIT;
+
+-- After commit, only the originally-committed row survives
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+SELECT v FROM t1 WHERE id = 100;
+→ [{ "v": "committed" }]
+
+-- Clean up
+DELETE FROM t1;
+-- run
+
+-- ===================================
+-- Case 4: SELECT before SAVEPOINT (isolation-specific)
+-- ===================================
+-- The SELECT registers an IsolatedConnection for t1 before the savepoint, so
+-- onConnectionSavepoint fires and populates savepointsBeforeOverlay. The
+-- subsequent INSERT creates the overlay lazily, and ROLLBACK TO sp must wipe
+-- it. This exercises the pre-existing pre-overlay path which remains live as
+-- a secondary guard alongside the registerConnection replay.
+
+INSERT INTO t1 VALUES (200, 'pre-tx');
+-- run
+
+BEGIN;
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+SAVEPOINT sp;
+INSERT INTO t1 VALUES (201, 'will-vanish');
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 2 }]
+ROLLBACK TO SAVEPOINT sp;
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+SELECT v FROM t1 WHERE id = 200;
+→ [{ "v": "pre-tx" }]
+COMMIT;
+
+SELECT count(*) FROM t1;
+→ [{ "count(*)": 1 }]
+
+DROP TABLE t1;

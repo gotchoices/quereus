@@ -1,0 +1,95 @@
+-- ALTER TABLE ALTER COLUMN: per-attribute changes
+-- Covers SET/DROP NOT NULL, SET DATA TYPE, SET/DROP DEFAULT.
+
+-- ===================================
+-- 1. DROP NOT NULL (relax) then insert null
+-- ===================================
+
+create table t_notnull (id integer primary key, c integer not null);
+insert into t_notnull values (1, 10);
+alter table t_notnull alter column c drop not null;
+insert into t_notnull values (2, null);
+
+select * from t_notnull order by id;
+→ [{"id": 1, "c": 10}, {"id": 2, "c": null}]
+
+drop table t_notnull;
+
+-- ===================================
+-- 2. SET NOT NULL (tighten) — fails on existing NULL
+-- ===================================
+
+create table t_tighten (id integer primary key, c integer null);
+insert into t_tighten values (1, 10);
+insert into t_tighten values (2, null);
+-- run
+
+alter table t_tighten alter column c set not null;
+-- error: contains NULL values
+
+drop table t_tighten;
+
+-- ===================================
+-- 3. SET NOT NULL succeeds when no NULLs present, rejects null insert
+-- ===================================
+
+create table t_ok (id integer primary key, c integer null);
+insert into t_ok values (1, 10);
+insert into t_ok values (2, 20);
+alter table t_ok alter column c set not null;
+-- run
+
+insert into t_ok values (3, null);
+-- error: NOT NULL
+
+-- Confirm pre-existing rows unharmed
+select * from t_ok order by id;
+→ [{"id": 1, "c": 10}, {"id": 2, "c": 20}]
+
+drop table t_ok;
+
+-- ===================================
+-- 4. SET DEFAULT, then DROP DEFAULT
+-- ===================================
+
+create table t_def (id integer primary key, c integer null);
+insert into t_def values (1, 10);
+alter table t_def alter column c set default 99;
+insert into t_def (id) values (2);
+
+select * from t_def order by id;
+→ [{"id": 1, "c": 10}, {"id": 2, "c": 99}]
+
+alter table t_def alter column c drop default;
+insert into t_def (id) values (3);
+
+select * from t_def where id = 3;
+→ [{"id": 3, "c": null}]
+
+drop table t_def;
+
+-- ===================================
+-- 5. SET DATA TYPE — integer → real preserves numeric values
+-- ===================================
+
+create table t_type (id integer primary key, c integer null);
+insert into t_type values (1, 10);
+insert into t_type values (2, 20);
+alter table t_type alter column c set data type real;
+
+select * from t_type order by id;
+→ [{"id": 1, "c": 10}, {"id": 2, "c": 20}]
+
+drop table t_type;
+
+-- ===================================
+-- 6. Cannot drop NOT NULL on PK column
+-- ===================================
+
+create table t_pk (id integer primary key, c integer);
+-- run
+
+alter table t_pk alter column id drop not null;
+-- error: PRIMARY KEY
+
+drop table t_pk;

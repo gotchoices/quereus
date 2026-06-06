@@ -1,0 +1,97 @@
+-- json-path-operators.sqllogic - Testing -> and ->> JSON path operators
+
+-- Basic -> with full JSON path
+select '{"a":1}' -> '$.a';
+→ [1]
+
+-- -> with nested path
+select '{"a":{"b":2}}' -> '$.a.b';
+→ [2]
+
+-- -> with string shorthand (auto-prepends $.)
+select '{"name":"alice"}' -> 'name';
+→ ["alice"]
+
+-- -> with integer shorthand (array index)
+select '[10,20,30]' -> 0;
+→ [10]
+
+select '[10,20,30]' -> 2;
+→ [30]
+
+-- -> extracts nested objects as native JSON
+select '{"a":[1,2]}' -> '$.a';
+→ [[1,2]]
+
+-- ->> returns TEXT (using alias for clean output)
+select '{"a":"hello"}' ->> '$.a' as val;
+→ [{"val":"hello"}]
+
+-- ->> coerces number to TEXT
+select '{"a":42}' ->> '$.a' as val;
+→ [{"val":"42"}]
+
+-- ->> coerces array to TEXT
+select '{"a":[1,2]}' ->> '$.a' as val;
+→ [{"val":"1,2"}]
+
+-- ->> with string shorthand
+select '{"x":"y"}' ->> 'x' as val;
+→ [{"val":"y"}]
+
+-- ->> with integer shorthand
+select '["a","b"]' ->> 1 as val;
+→ [{"val":"b"}]
+
+-- Chained -> operators
+select '{"a":{"b":{"c":3}}}' -> 'a' -> 'b' -> 'c';
+→ [3]
+
+-- NULL propagation
+select null -> '$.a';
+→ [null]
+
+select null ->> '$.a' as val;
+→ [{"val":null}]
+
+-- Non-existent path returns NULL
+select '{"a":1}' -> '$.b';
+→ [null]
+
+-- -> with table data
+create table jdoc (id integer primary key, data text);
+insert into jdoc values (1, '{"name":"alice","age":30}'), (2, '{"name":"bob","age":25}');
+
+select data -> 'name' from jdoc order by id;
+→ ["alice","bob"]
+
+select data ->> 'age' as age from jdoc where id = 1;
+→ [{"age":"30"}]
+
+-- -> with aliased result
+select data -> 'name' as person_name from jdoc order by id;
+→ [{"person_name":"alice"},{"person_name":"bob"}]
+
+-- -> in WHERE clause with subexpression
+select id from jdoc where cast(data -> 'name' as text) = 'bob';
+→ [{"id":2}]
+
+-- ->> in WHERE clause (returns text directly, no cast needed)
+select id from jdoc where data ->> 'name' = 'bob';
+→ [{"id":2}]
+
+-- Mixed -> and ->> chaining
+select '{"a":{"b":"deep"}}' -> 'a' ->> 'b' as val;
+→ [{"val":"deep"}]
+
+-- -> with boolean value
+select '{"t":true}' -> 't';
+→ [true]
+
+-- -> with JSON null value (distinct from SQL NULL for non-existent path)
+select '{"n":null}' -> 'n';
+→ [null]
+
+-- ->> with nested object returns text
+select '{"a":{"x":1}}' ->> 'a' as val;
+→ [{"val":"[object Object]"}]

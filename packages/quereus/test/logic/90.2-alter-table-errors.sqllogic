@@ -1,0 +1,53 @@
+-- 90.2-alter-table-errors.sqllogic - ALTER TABLE error paths
+-- Tests ALTER TABLE error conditions not already covered in 41-alter-table.sqllogic
+
+-- Setup
+CREATE TABLE t_alt_rename (a INTEGER, b INTEGER);
+-- run
+
+-- RENAME COLUMN: source column not found
+ALTER TABLE t_alt_rename RENAME COLUMN c TO d;
+-- error: Column 'c' not found in table 't_alt_rename'
+
+-- RENAME COLUMN: target column name already exists
+ALTER TABLE t_alt_rename RENAME COLUMN a TO b;
+-- error: Column 'b' already exists in table 't_alt_rename'
+
+DROP TABLE t_alt_rename;
+-- run
+
+-- DROP COLUMN: column not found
+CREATE TABLE t_alt_drop (a INTEGER, b INTEGER);
+-- run
+
+ALTER TABLE t_alt_drop DROP COLUMN c;
+-- error: Column 'c' not found
+
+-- DROP COLUMN: cannot drop primary key column
+DROP TABLE t_alt_drop;
+CREATE TABLE t_alt_pk (id INTEGER PRIMARY KEY, val INTEGER);
+-- run
+
+ALTER TABLE t_alt_pk DROP COLUMN id;
+-- error: Cannot drop PRIMARY KEY column
+
+-- DROP COLUMN: single column is implicitly PK in key-based system
+DROP TABLE t_alt_pk;
+CREATE TABLE t_alt_single (only_col INTEGER);
+-- run
+
+ALTER TABLE t_alt_single DROP COLUMN only_col;
+-- error: Cannot drop PRIMARY KEY column
+
+-- RENAME TABLE: target table already exists
+DROP TABLE t_alt_single;
+CREATE TABLE t_alt_src (a INTEGER);
+CREATE TABLE t_alt_dst (b INTEGER);
+-- run
+
+ALTER TABLE t_alt_src RENAME TO t_alt_dst;
+-- error: Table 't_alt_dst' already exists
+
+-- Cleanup
+DROP TABLE t_alt_src;
+DROP TABLE t_alt_dst;

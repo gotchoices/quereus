@@ -1,0 +1,333 @@
+-- join-edge-cases.sqllogic - Edge-case tests for join subsystem
+
+-- ==================================
+-- Setup
+-- ==================================
+
+create table je_a (id integer primary key, x integer, y integer, label text);
+create table je_b (id integer primary key, x integer, y integer, tag text);
+
+insert into je_a values (1, 10, 100, 'a1'), (2, 20, 200, 'a2'), (3, 30, 300, 'a3'), (4, 10, 400, 'a4');
+insert into je_b values (1, 10, 100, 'b1'), (2, 20, 999, 'b2'), (3, 99, 100, 'b3'), (4, 10, 400, 'b4');
+
+-- ==================================
+-- 1. Complex residual predicates post-join
+-- ==================================
+
+-- ON with equality + inequality: only rows where x matches AND a.y < b.y
+select a.id as aid, b.id as bid
+  from je_a a join je_b b on a.x = b.x and a.y < b.y
+  order by aid, bid;
+→ [{"aid":1,"bid":4},{"aid":2,"bid":2}]
+
+-- ON equality + residual inequality the other direction
+select a.id as aid, b.id as bid
+  from je_a a join je_b b on a.x = b.x and a.y > b.y
+  order by aid, bid;
+→ [{"aid":4,"bid":1}]
+
+-- ON equality + non-trivial expression residual
+select a.id as aid, b.id as bid
+  from je_a a join je_b b on a.x = b.x and (a.y + b.y) > 300
+  order by aid, bid;
+→ [{"aid":1,"bid":4},{"aid":2,"bid":2},{"aid":4,"bid":1},{"aid":4,"bid":4}]
+
+-- LEFT JOIN with residual: unmatched rows should still appear with nulls
+select a.id as aid, a.label, b.id as bid, b.tag
+  from je_a a left join je_b b on a.x = b.x and a.y = b.y
+  order by aid;
+→ [{"aid":1,"label":"a1","bid":1,"tag":"b1"},{"aid":2,"label":"a2","bid":null,"tag":null},{"aid":3,"label":"a3","bid":null,"tag":null},{"aid":4,"label":"a4","bid":4,"tag":"b4"}]
+
+-- ==================================
+-- 2. Cross joins with filter expressions
+-- ==================================
+
+create table je_cx (id integer primary key, v integer);
+create table je_cy (id integer primary key, v integer);
+insert into je_cx values (1, 3), (2, 7), (3, 5);
+insert into je_cy values (1, 4), (2, 6);
+
+-- Cross join with arithmetic filter
+select cx.id as cxid, cy.id as cyid, cx.v + cy.v as total
+  from je_cx cx cross join je_cy cy
+  where cx.v + cy.v > 10
+  order by cxid, cyid;
+→ [{"cxid":2,"cyid":1,"total":11},{"cxid":2,"cyid":2,"total":13},{"cxid":3,"cyid":2,"total":11}]
+
+-- Cross join producing full cartesian (no filter)
+select count(*) as cnt from je_cx cross join je_cy;
+→ [{"cnt":6}]
+
+-- Cross join with filter eliminating all rows
+select cx.id as cxid, cy.id as cyid
+  from je_cx cx cross join je_cy cy
+  where cx.v + cy.v > 100;
+→ []
+
+drop table je_cx;
+drop table je_cy;
+
+-- ==================================
+-- 3. Join with all-NULL columns on both sides
+-- ==================================
+
+create table je_nl (id integer primary key, k integer null, val text);
+create table je_nr (id integer primary key, k integer null, val text);
+
+insert into je_nl values (1, null, 'L1'), (2, null, 'L2');
+insert into je_nr values (1, null, 'R1'), (2, null, 'R2'), (3, null, 'R3');
+
+-- Inner join on all-NULL keys: zero rows (NULL != NULL)
+select nl.id as lid, nr.id as rid
+  from je_nl nl join je_nr nr on nl.k = nr.k;
+→ []
+
+-- Left join on all-NULL keys: all left rows, right side null-padded
+select nl.id as lid, nl.val as lval, nr.id as rid, nr.val as rval
+  from je_nl nl left join je_nr nr on nl.k = nr.k
+  order by lid;
+→ [{"lid":1,"lval":"L1","rid":null,"rval":null},{"lid":2,"lval":"L2","rid":null,"rval":null}]
+
+-- Mixed: some non-null keys on left, all-null on right
+insert into je_nl values (3, 5, 'L3');
+insert into je_nr values (4, 5, 'R4');
+
+select nl.id as lid, nr.id as rid
+  from je_nl nl join je_nr nr on nl.k = nr.k
+  order by lid;
+→ [{"lid":3,"rid":4}]
+
+-- Left join: null-key rows unmatched, non-null key matched
+select nl.id as lid, nr.id as rid
+  from je_nl nl left join je_nr nr on nl.k = nr.k
+  order by lid;
+→ [{"lid":1,"rid":null},{"lid":2,"rid":null},{"lid":3,"rid":4}]
+
+drop table je_nl;
+drop table je_nr;
+
+-- ==================================
+-- 4. Multi-condition join keys with partial NULLs
+-- ==================================
+
+create table je_mc1 (id integer primary key, a integer null, b integer null, v text);
+create table je_mc2 (id integer primary key, a integer null, b integer null, w text);
+
+insert into je_mc1 values (1, 1, 10, 'm1'), (2, 2, null, 'm2'), (3, null, 30, 'm3'), (4, null, null, 'm4'), (5, 1, 10, 'm5');
+insert into je_mc2 values (1, 1, 10, 'n1'), (2, 2, null, 'n2'), (3, null, 30, 'n3'), (4, 1, 10, 'n4');
+
+-- Multi-key inner join: only rows where BOTH keys match (non-null)
+select mc1.id as m1id, mc2.id as m2id
+  from je_mc1 mc1 join je_mc2 mc2 on mc1.a = mc2.a and mc1.b = mc2.b
+  order by m1id, m2id;
+→ [{"m1id":1,"m2id":1},{"m1id":1,"m2id":4},{"m1id":5,"m2id":1},{"m1id":5,"m2id":4}]
+
+-- Partial NULL match (a=2, b=NULL): should NOT match (NULL != NULL)
+select mc1.id as m1id, mc2.id as m2id
+  from je_mc1 mc1 join je_mc2 mc2 on mc1.a = mc2.a and mc1.b = mc2.b
+  where mc1.id = 2;
+→ []
+
+-- Left join with multi-key: null-key rows get padding
+select mc1.id as m1id, mc1.v, mc2.id as m2id, mc2.w
+  from je_mc1 mc1 left join je_mc2 mc2 on mc1.a = mc2.a and mc1.b = mc2.b
+  order by m1id, m2id;
+→ [{"m1id":1,"v":"m1","m2id":1,"w":"n1"},{"m1id":1,"v":"m1","m2id":4,"w":"n4"},{"m1id":2,"v":"m2","m2id":null,"w":null},{"m1id":3,"v":"m3","m2id":null,"w":null},{"m1id":4,"v":"m4","m2id":null,"w":null},{"m1id":5,"v":"m5","m2id":1,"w":"n1"},{"m1id":5,"v":"m5","m2id":4,"w":"n4"}]
+
+drop table je_mc1;
+drop table je_mc2;
+
+-- ==================================
+-- 5. Self-join with duplicate keys (combinatorial explosion)
+-- ==================================
+
+create table je_dup (id integer primary key, grp integer);
+insert into je_dup values (1, 1), (2, 1), (3, 1), (4, 2), (5, 2);
+
+-- Self-join on grp: group 1 has 3 rows → 3*3=9 pairs; group 2 has 2 rows → 2*2=4 pairs; total=13
+select count(*) as cnt from je_dup a join je_dup b on a.grp = b.grp;
+→ [{"cnt":13}]
+
+-- Verify actual pairs for group 1 (3x3)
+select a.id as aid, b.id as bid
+  from je_dup a join je_dup b on a.grp = b.grp
+  where a.grp = 1
+  order by aid, bid;
+→ [{"aid":1,"bid":1},{"aid":1,"bid":2},{"aid":1,"bid":3},{"aid":2,"bid":1},{"aid":2,"bid":2},{"aid":2,"bid":3},{"aid":3,"bid":1},{"aid":3,"bid":2},{"aid":3,"bid":3}]
+
+-- Self-join excluding self-matches (a.id != b.id)
+select count(*) as cnt from je_dup a join je_dup b on a.grp = b.grp and a.id != b.id;
+→ [{"cnt":8}]
+
+-- Self-join with inequality: only a.id < b.id (unique pairs)
+select a.id as aid, b.id as bid
+  from je_dup a join je_dup b on a.grp = b.grp and a.id < b.id
+  order by aid, bid;
+→ [{"aid":1,"bid":2},{"aid":1,"bid":3},{"aid":2,"bid":3},{"aid":4,"bid":5}]
+
+drop table je_dup;
+
+-- ==================================
+-- 6. Semi/anti join with empty subquery table
+-- ==================================
+
+create table je_main (id integer primary key, val text);
+create table je_empty (id integer primary key, ref_id integer);
+
+insert into je_main values (1, 'one'), (2, 'two'), (3, 'three');
+-- je_empty has no rows
+
+-- EXISTS on empty table: eliminates all rows
+select id, val from je_main where exists (select 1 from je_empty where je_empty.ref_id = je_main.id);
+→ []
+
+-- NOT EXISTS on empty table: keeps all rows
+select id, val from je_main where not exists (select 1 from je_empty where je_empty.ref_id = je_main.id) order by id;
+→ [{"id":1,"val":"one"},{"id":2,"val":"two"},{"id":3,"val":"three"}]
+
+-- IN with empty subquery: no matches
+select id, val from je_main where id in (select ref_id from je_empty);
+→ []
+
+-- NOT IN with empty subquery: all rows returned
+select id, val from je_main where id not in (select ref_id from je_empty) order by id;
+→ [{"id":1,"val":"one"},{"id":2,"val":"two"},{"id":3,"val":"three"}]
+
+-- Uncorrelated EXISTS on empty: eliminates all
+select id, val from je_main where exists (select 1 from je_empty);
+→ []
+
+-- Uncorrelated NOT EXISTS on empty: keeps all
+select id, val from je_main where not exists (select 1 from je_empty) order by id;
+→ [{"id":1,"val":"one"},{"id":2,"val":"two"},{"id":3,"val":"three"}]
+
+drop table je_main;
+drop table je_empty;
+
+-- ==================================
+-- 7. Join reordering correctness (three-way join)
+-- ==================================
+
+create table je_t1 (id integer primary key, val integer);
+create table je_t2 (id integer primary key, t1_id integer, val integer);
+create table je_t3 (id integer primary key, t2_id integer, val integer);
+
+insert into je_t1 values (1, 10), (2, 20), (3, 30);
+insert into je_t2 values (10, 1, 100), (20, 2, 200), (30, 3, 300), (40, 1, 400);
+insert into je_t3 values (100, 10, 1000), (200, 20, 2000), (300, 40, 3000);
+
+-- Three-way join: t1 → t2 → t3
+select t1.id as t1id, t2.id as t2id, t3.id as t3id
+  from je_t1 t1
+  join je_t2 t2 on t2.t1_id = t1.id
+  join je_t3 t3 on t3.t2_id = t2.id
+  order by t1id, t2id, t3id;
+→ [{"t1id":1,"t2id":10,"t3id":100},{"t1id":1,"t2id":40,"t3id":300},{"t1id":2,"t2id":20,"t3id":200}]
+
+-- Same join with different FROM order: t3 → t2 → t1 (should produce same results)
+select t1.id as t1id, t2.id as t2id, t3.id as t3id
+  from je_t3 t3
+  join je_t2 t2 on t3.t2_id = t2.id
+  join je_t1 t1 on t2.t1_id = t1.id
+  order by t1id, t2id, t3id;
+→ [{"t1id":1,"t2id":10,"t3id":100},{"t1id":1,"t2id":40,"t3id":300},{"t1id":2,"t2id":20,"t3id":200}]
+
+-- Mixed order: t2 → t1 → t3
+select t1.id as t1id, t2.id as t2id, t3.id as t3id
+  from je_t2 t2
+  join je_t1 t1 on t2.t1_id = t1.id
+  join je_t3 t3 on t3.t2_id = t2.id
+  order by t1id, t2id, t3id;
+→ [{"t1id":1,"t2id":10,"t3id":100},{"t1id":1,"t2id":40,"t3id":300},{"t1id":2,"t2id":20,"t3id":200}]
+
+-- Three-way with predicate that could be misattributed
+select t1.id as t1id, t2.id as t2id, t3.id as t3id
+  from je_t1 t1
+  join je_t2 t2 on t2.t1_id = t1.id
+  join je_t3 t3 on t3.t2_id = t2.id
+  where t1.val > 10 and t3.val < 3000
+  order by t1id, t2id, t3id;
+→ [{"t1id":2,"t2id":20,"t3id":200}]
+
+-- Three-way LEFT JOIN: unmatched rows preserved
+select t1.id as t1id, t2.id as t2id, t3.id as t3id
+  from je_t1 t1
+  left join je_t2 t2 on t2.t1_id = t1.id
+  left join je_t3 t3 on t3.t2_id = t2.id
+  order by t1id, t2id, t3id;
+→ [{"t1id":1,"t2id":10,"t3id":100},{"t1id":1,"t2id":40,"t3id":300},{"t1id":2,"t2id":20,"t3id":200},{"t1id":3,"t2id":30,"t3id":null}]
+
+drop table je_t1;
+drop table je_t2;
+drop table je_t3;
+
+-- ==================================
+-- 8. Outer join + aggregate interaction
+-- ==================================
+
+create table je_orders (id integer primary key, customer text);
+create table je_items (id integer primary key, order_id integer, amount integer);
+
+insert into je_orders values (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+insert into je_items values (10, 1, 50), (20, 1, 30), (30, 2, 100);
+-- Carol (order 3) has no items
+
+-- count(items.col) should NOT count null-padded rows
+select o.customer, count(i.id) as item_count
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  order by o.customer;
+→ [{"customer":"Alice","item_count":2},{"customer":"Bob","item_count":1},{"customer":"Carol","item_count":0}]
+
+-- count(*) SHOULD count null-padded rows (one row per unmatched left)
+select o.customer, count(*) as row_count
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  order by o.customer;
+→ [{"customer":"Alice","row_count":2},{"customer":"Bob","row_count":1},{"customer":"Carol","row_count":1}]
+
+-- sum on nullable side: NULL for unmatched groups
+select o.customer, sum(i.amount) as total
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  order by o.customer;
+→ [{"customer":"Alice","total":80},{"customer":"Bob","total":100},{"customer":"Carol","total":null}]
+
+-- coalesce to handle null aggregate
+select o.customer, coalesce(sum(i.amount), 0) as total
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  order by o.customer;
+→ [{"customer":"Alice","total":80},{"customer":"Bob","total":100},{"customer":"Carol","total":0}]
+
+-- avg on nullable side: null for empty group
+select o.customer, avg(i.amount) as avg_amount
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  order by o.customer;
+→ [{"customer":"Alice","avg_amount":40},{"customer":"Bob","avg_amount":100},{"customer":"Carol","avg_amount":null}]
+
+-- max/min on nullable side
+select o.customer, max(i.amount) as mx, min(i.amount) as mn
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  order by o.customer;
+→ [{"customer":"Alice","mx":50,"mn":30},{"customer":"Bob","mx":100,"mn":100},{"customer":"Carol","mx":null,"mn":null}]
+
+-- HAVING with outer join aggregate: filter out groups with zero items
+select o.customer, count(i.id) as item_count
+  from je_orders o left join je_items i on i.order_id = o.id
+  group by o.customer
+  having count(i.id) > 0
+  order by o.customer;
+→ [{"customer":"Alice","item_count":2},{"customer":"Bob","item_count":1}]
+
+drop table je_orders;
+drop table je_items;
+
+-- ==================================
+-- Cleanup
+-- ==================================
+
+drop table je_a;
+drop table je_b;

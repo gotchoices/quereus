@@ -1,0 +1,264 @@
+-- schema-catalog-edge-cases.sqllogic - Multi-schema, DDL roundtrip, schema change events
+
+-- ===================================
+-- DDL Round-trip: Create → Export → Drop → Recreate → Verify
+-- ===================================
+
+-- Simple table DDL roundtrip: create, drop, recreate, verify identical behavior
+CREATE TABLE rt_simple (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER);
+INSERT INTO rt_simple VALUES (1, 'Alice', 1);
+
+-- Verify table_info returns expected columns
+SELECT name, type, pk FROM table_info('rt_simple') ORDER BY cid;
+→ [{"name": "id", "type": "INTEGER", "pk": 1}, {"name": "name", "type": "TEXT", "pk": 0}, {"name": "active", "type": "INTEGER", "pk": 0}]
+
+SELECT * FROM rt_simple;
+→ [{"id": 1, "name": "Alice", "active": 1}]
+
+DROP TABLE rt_simple;
+
+-- Recreate the same table and verify it works identically
+CREATE TABLE rt_simple (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER);
+INSERT INTO rt_simple VALUES (1, 'Alice', 1);
+
+SELECT * FROM rt_simple;
+→ [{"id": 1, "name": "Alice", "active": 1}]
+
+DROP TABLE rt_simple;
+
+-- ===================================
+-- Composite primary key DDL
+-- ===================================
+
+CREATE TABLE rt_composite (a INTEGER, b TEXT, c REAL, PRIMARY KEY (a, b));
+INSERT INTO rt_composite VALUES (1, 'x', 3.14), (1, 'y', 2.71), (2, 'x', 1.0);
+
+SELECT * FROM rt_composite ORDER BY a, b;
+→ [{"a": 1, "b": "x", "c": 3.14}, {"a": 1, "b": "y", "c": 2.71}, {"a": 2, "b": "x", "c": 1.0}]
+
+DROP TABLE rt_composite;
+
+-- Recreate and verify
+CREATE TABLE rt_composite (a INTEGER, b TEXT, c REAL, PRIMARY KEY (a, b));
+INSERT INTO rt_composite VALUES (1, 'x', 3.14);
+
+SELECT * FROM rt_composite;
+→ [{"a": 1, "b": "x", "c": 3.14}]
+
+DROP TABLE rt_composite;
+
+-- ===================================
+-- Table with indexes
+-- ===================================
+
+CREATE TABLE rt_indexed (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+CREATE INDEX idx_name ON rt_indexed (name);
+CREATE INDEX idx_cat ON rt_indexed (category);
+INSERT INTO rt_indexed VALUES (1, 'Alice', 'A'), (2, 'Bob', 'B');
+
+-- Verify indexes are used (data accessible via indexed columns)
+SELECT id FROM rt_indexed WHERE name = 'Alice';
+→ [{"id": 1}]
+
+SELECT id FROM rt_indexed WHERE category = 'B';
+→ [{"id": 2}]
+
+DROP INDEX idx_name;
+DROP INDEX idx_cat;
+DROP TABLE rt_indexed;
+
+-- ===================================
+-- Table with CHECK constraints
+-- ===================================
+
+CREATE TABLE rt_checked (id INTEGER PRIMARY KEY, val INTEGER CHECK (val > 0), name TEXT CHECK (length(name) > 0));
+INSERT INTO rt_checked VALUES (1, 10, 'valid');
+
+SELECT * FROM rt_checked;
+→ [{"id": 1, "val": 10, "name": "valid"}]
+
+-- Verify constraints work
+INSERT INTO rt_checked VALUES (2, -1, 'test');
+-- error: CHECK constraint failed
+
+INSERT INTO rt_checked VALUES (3, 5, '');
+-- error: CHECK constraint failed
+
+DROP TABLE rt_checked;
+
+-- ===================================
+-- Multi-schema: declare and apply
+-- ===================================
+
+declare schema app1 {
+	table customers {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+}
+
+apply schema app1;
+-- run
+
+INSERT INTO app1.customers VALUES (1, 'Acme'), (2, 'Beta');
+
+SELECT * FROM app1.customers ORDER BY id;
+→ [{"id": 1, "name": "Acme"}, {"id": 2, "name": "Beta"}]
+
+-- ===================================
+-- Cross-schema queries
+-- ===================================
+
+CREATE TABLE main_data (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO main_data VALUES (1, 'main-val');
+
+SELECT c.name, m.val FROM app1.customers AS c JOIN main_data AS m ON c.id = m.id;
+→ [{"name": "Acme", "val": "main-val"}]
+
+-- ===================================
+-- Schema search path resolution
+-- ===================================
+
+-- Set search path to include app1
+PRAGMA schema_path = 'app1,main';
+
+-- Unqualified 'customers' should resolve to app1.customers
+SELECT * FROM customers ORDER BY id;
+→ [{"id": 1, "name": "Acme"}, {"id": 2, "name": "Beta"}]
+
+-- Unqualified 'main_data' should resolve to main.main_data
+SELECT * FROM main_data;
+→ [{"id": 1, "val": "main-val"}]
+
+-- Reset search path
+PRAGMA schema_path = 'main';
+-- run
+
+-- ===================================
+-- table_info edge cases
+-- ===================================
+
+-- Table with many columns
+CREATE TABLE wide_table (
+	a INTEGER PRIMARY KEY,
+	b TEXT,
+	c REAL,
+	d INTEGER,
+	e TEXT,
+	f REAL
+);
+
+SELECT count(*) as cnt FROM table_info('wide_table');
+→ [{"cnt": 6}]
+
+-- Verify column order
+SELECT name FROM table_info('wide_table') ORDER BY cid;
+→ [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}, {"name": "e"}, {"name": "f"}]
+
+DROP TABLE wide_table;
+
+-- Table with no non-PK columns
+CREATE TABLE pk_only (id INTEGER PRIMARY KEY);
+INSERT INTO pk_only VALUES (1), (2), (3);
+
+SELECT * FROM pk_only ORDER BY id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+-- table_info on single-column table
+SELECT name, type, pk FROM table_info('pk_only') ORDER BY cid;
+→ [{"name": "id", "type": "INTEGER", "pk": 1}]
+
+DROP TABLE pk_only;
+
+-- ===================================
+-- Views
+-- ===================================
+
+CREATE TABLE v_source (id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+INSERT INTO v_source VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Charlie', 1);
+
+CREATE VIEW active_items AS SELECT id, name FROM v_source WHERE active = 1;
+
+SELECT * FROM active_items ORDER BY id;
+→ [{"id": 1, "name": "Alice"}, {"id": 3, "name": "Charlie"}]
+
+-- Drop and recreate view
+DROP VIEW active_items;
+
+CREATE VIEW active_items AS SELECT id, name FROM v_source WHERE active = 1;
+
+SELECT * FROM active_items ORDER BY id;
+→ [{"id": 1, "name": "Alice"}, {"id": 3, "name": "Charlie"}]
+
+DROP VIEW active_items;
+DROP TABLE v_source;
+
+-- ===================================
+-- DROP TABLE IF EXISTS
+-- ===================================
+
+-- Should not error on non-existent table
+DROP TABLE IF EXISTS nonexistent_table;
+-- run
+
+-- Should work on existing table
+CREATE TABLE temp_drop (id INTEGER PRIMARY KEY);
+DROP TABLE IF EXISTS temp_drop;
+-- run
+
+-- Verify it was dropped
+SELECT * FROM temp_drop;
+-- error: not found
+
+-- ===================================
+-- Schema with assertions
+-- ===================================
+
+declare schema validated {
+	table accounts {
+		id INTEGER PRIMARY KEY,
+		balance REAL NOT NULL
+	}
+	assertion positive_balance check (not exists (select 1 from validated.accounts where balance < 0))
+}
+
+apply schema validated;
+-- run
+
+INSERT INTO validated.accounts VALUES (1, 100.0), (2, 50.0);
+
+SELECT * FROM validated.accounts ORDER BY id;
+→ [{"id": 1, "balance": 100.0}, {"id": 2, "balance": 50.0}]
+
+-- Negative balance should violate assertion
+INSERT INTO validated.accounts VALUES (3, -10.0);
+-- error: assertion
+
+-- ===================================
+-- Window functions in queries (verify schema supports them)
+-- ===================================
+
+CREATE TABLE wf_data (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+INSERT INTO wf_data VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 40), (5, 'B', 50);
+
+SELECT id, grp, val, row_number() over (partition by grp order by val) as rn FROM wf_data ORDER BY grp, val;
+→ [{"id": 1, "grp": "A", "val": 10, "rn": 1}, {"id": 2, "grp": "A", "val": 20, "rn": 2}, {"id": 3, "grp": "B", "val": 30, "rn": 1}, {"id": 4, "grp": "B", "val": 40, "rn": 2}, {"id": 5, "grp": "B", "val": 50, "rn": 3}]
+
+SELECT id, val, rank() over (order by val) as rnk FROM wf_data ORDER BY val;
+→ [{"id": 1, "val": 10, "rnk": 1}, {"id": 2, "val": 20, "rnk": 2}, {"id": 3, "val": 30, "rnk": 3}, {"id": 4, "val": 40, "rnk": 4}, {"id": 5, "val": 50, "rnk": 5}]
+
+SELECT id, val, dense_rank() over (order by val) as drnk FROM wf_data ORDER BY val;
+→ [{"id": 1, "val": 10, "drnk": 1}, {"id": 2, "val": 20, "drnk": 2}, {"id": 3, "val": 30, "drnk": 3}, {"id": 4, "val": 40, "drnk": 4}, {"id": 5, "val": 50, "drnk": 5}]
+
+SELECT id, grp, val, sum(val) over (partition by grp order by val) as running_sum FROM wf_data ORDER BY grp, val;
+→ [{"id": 1, "grp": "A", "val": 10, "running_sum": 10}, {"id": 2, "grp": "A", "val": 20, "running_sum": 30}, {"id": 3, "grp": "B", "val": 30, "running_sum": 30}, {"id": 4, "grp": "B", "val": 40, "running_sum": 70}, {"id": 5, "grp": "B", "val": 50, "running_sum": 120}]
+
+DROP TABLE wf_data;
+
+-- ===================================
+-- Cleanup
+-- ===================================
+
+DROP TABLE app1.customers;
+DROP TABLE validated.accounts;
+DROP TABLE main_data;

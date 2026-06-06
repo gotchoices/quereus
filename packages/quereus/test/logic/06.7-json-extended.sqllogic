@@ -1,0 +1,53 @@
+-- json-extended.sqllogic - Testing JSON functions not covered in 06-builtin_functions
+
+-- json_patch replace
+select json_patch('{"a":1,"b":2}', '[{"op":"replace","path":"/a","value":3}]');
+→ [{"json_patch('{\"a\":1,\"b\":2}', '[{\"op\":\"replace\",\"path\":\"/a\",\"value\":3}]')":{"a":3,"b":2}}]
+
+-- json_patch add
+select json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2}]');
+→ [{"json_patch('{\"a\":1}', '[{\"op\":\"add\",\"path\":\"/b\",\"value\":2}]')":{"a":1,"b":2}}]
+
+-- json_patch remove
+select json_patch('{"a":1,"b":2}', '[{"op":"remove","path":"/b"}]');
+→ [{"json_patch('{\"a\":1,\"b\":2}', '[{\"op\":\"remove\",\"path\":\"/b\"}]')":{"a":1}}]
+
+-- json_extract with path
+select json_extract('{"a":1,"b":2}', '$.a');
+→ [1]
+
+-- json_array_length with nested path
+select json_array_length('{"items":[1,2,3]}', '$.items');
+→ [3]
+
+-- json_array_length with non-array returns 0
+select json_array_length('{"a":1}');
+→ [0]
+
+-- json_set creates new keys
+select json_set('{"a":1}', '$.b', 'new');
+→ [{"a":1,"b":"new"}]
+
+-- json_insert does NOT overwrite existing
+select json_insert('{"a":1}', '$.a', 99);
+→ [{"a":1}]
+
+-- json_replace does NOT create new keys
+select json_replace('{"a":1}', '$.b', 99);
+→ [{"a":1}]
+
+-- NULL handling
+select json_valid(null), json_type(null), json_extract(null, '$.a');
+→ [{"json_valid(null)":false,"json_type(null)":"null","json_extract(null, '$.a')":null}]
+
+-- json_array_length of empty array
+select json_array_length('[]');
+→ [0]
+
+-- json_set overwrite existing
+select json_set('{"a":1}', '$.a', 99);
+→ [{"a":99}]
+
+-- json_remove non-existent path (no change)
+select json_remove('{"a":1}', '$.b');
+→ [{"a":1}]

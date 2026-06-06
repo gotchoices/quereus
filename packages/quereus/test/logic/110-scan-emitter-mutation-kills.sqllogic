@@ -1,0 +1,153 @@
+-- scan-emitter-mutation-kills.sqllogic — Mutation-killing tests for runtime/emit/scan.ts
+-- Exercises SeqScan, IndexScan, IndexSeek paths through the memory vtab
+
+-- =============================================================================
+-- SeqScan — empty table, single row, multi-row
+-- =============================================================================
+
+create table scan_empty (id integer primary key, val text);
+
+-- Empty table scan returns no rows
+select * from scan_empty;
+→ []
+
+-- Single-row insertion + scan
+insert into scan_empty values (1, 'only');
+select id, val from scan_empty;
+→ [{"id":1,"val":"only"}]
+
+drop table scan_empty;
+
+-- Multi-row sequential scan (verifies iteration loop)
+create table scan_multi (id integer primary key, name text);
+insert into scan_multi values (1, 'alice'), (2, 'bob'), (3, 'charlie');
+
+select id, name from scan_multi order by id;
+→ [{"id":1,"name":"alice"},{"id":2,"name":"bob"},{"id":3,"name":"charlie"}]
+
+-- Larger scan — verify iteration handles multiple rows correctly
+create table scan_many (id integer primary key, v integer);
+insert into scan_many values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90), (10, 100);
+
+-- Verify count
+select count(*) as c from scan_many;
+→ [{"c":10}]
+
+-- Verify sum to catch off-by-one in iteration
+select sum(id) as s from scan_many;
+→ [{"s":55}]
+
+-- Verify first and last
+select id, v from scan_many where id = 1;
+→ [{"id":1,"v":10}]
+
+select id, v from scan_many where id = 10;
+→ [{"id":10,"v":100}]
+
+drop table scan_many;
+
+-- =============================================================================
+-- IndexScan — ordered access via index
+-- =============================================================================
+
+create table scan_idx (id integer primary key, score integer);
+create index idx_score on scan_idx(score);
+insert into scan_idx values (1, 30), (2, 10), (3, 20);
+
+-- Index scan with ordering by indexed column
+select id, score from scan_idx order by score;
+→ [{"id":2,"score":10},{"id":3,"score":20},{"id":1,"score":30}]
+
+-- Descending index scan
+select id, score from scan_idx order by score desc;
+→ [{"id":1,"score":30},{"id":3,"score":20},{"id":2,"score":10}]
+
+drop table scan_idx;
+
+-- =============================================================================
+-- IndexSeek — point lookup with literal key
+-- =============================================================================
+
+create table seek_pk (id integer primary key, data text);
+insert into seek_pk values (10, 'ten'), (20, 'twenty'), (30, 'thirty');
+
+-- Primary key seek with literal
+select data from seek_pk where id = 20;
+→ [{"data":"twenty"}]
+
+-- Seek miss returns empty
+select data from seek_pk where id = 99;
+→ []
+
+drop table seek_pk;
+
+-- =============================================================================
+-- IndexSeek — composite key
+-- =============================================================================
+
+create table seek_comp (a integer, b integer, val text, primary key (a, b));
+insert into seek_comp values (1, 1, 'one-one'), (1, 2, 'one-two'), (2, 1, 'two-one');
+
+-- Composite key seek
+select val from seek_comp where a = 1 and b = 2;
+→ [{"val":"one-two"}]
+
+-- Partial composite key (range scan on first part)
+select val from seek_comp where a = 1 order by b;
+→ [{"val":"one-one"},{"val":"one-two"}]
+
+drop table seek_comp;
+
+-- =============================================================================
+-- IndexSeek — NULL seek key
+-- =============================================================================
+
+create table seek_null (id integer primary key, val text null);
+insert into seek_null values (1, 'a'), (2, null), (3, 'c');
+
+-- Seek with NULL — should not match anything (NULL ≠ NULL)
+select id from seek_null where val = null;
+→ []
+
+-- IS NULL check
+select id from seek_null where val is null;
+→ [{"id":2}]
+
+drop table seek_null;
+
+-- =============================================================================
+-- IndexScan — secondary index with range
+-- =============================================================================
+
+create table scan_range (id integer primary key, v integer);
+create index idx_v on scan_range(v);
+insert into scan_range values (1, 100), (2, 200), (3, 300), (4, 400), (5, 500);
+
+-- Range scan on indexed column
+select id from scan_range where v >= 200 and v <= 400 order by v;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- Range scan with single bound
+select id from scan_range where v > 300 order by v;
+→ [{"id":4},{"id":5}]
+
+drop table scan_range;
+
+-- =============================================================================
+-- SeqScan — verify columns are mapped correctly (row descriptor)
+-- =============================================================================
+
+create table scan_cols (a integer primary key, b text, c real, d integer);
+insert into scan_cols values (1, 'hello', 3.14, 42);
+
+-- Access columns in different orders
+select c, a from scan_cols;
+→ [{"c":3.14,"a":1}]
+
+select d, b, a from scan_cols;
+→ [{"d":42,"b":"hello","a":1}]
+
+drop table scan_cols;
+
+-- Clean up the multi-row table
+drop table scan_multi;

@@ -1,0 +1,39 @@
+-- Schema() TVF: schema column and non-default schema enumeration
+
+-- Setup: create a table in main
+CREATE TABLE main_t (id INTEGER PRIMARY KEY, val TEXT);
+
+-- Test 1: schema column exists and shows 'main' for main-schema objects
+SELECT schema, type, name FROM schema() WHERE name = 'main_t';
+→ [{"schema":"main","type":"table","name":"main_t"}]
+
+-- Test 2: all rows have a non-null schema column
+SELECT count(*) as bad FROM schema() WHERE schema IS NULL;
+→ [{"bad":0}]
+
+-- Test 3: create a non-default schema with a table, verify it appears
+declare schema myschema {
+	table other_t {
+		id INTEGER PRIMARY KEY,
+		label TEXT
+	}
+}
+
+apply schema myschema;
+
+-- run
+
+SELECT schema, type, name FROM schema() WHERE name = 'other_t';
+→ [{"schema":"myschema","type":"table","name":"other_t"}]
+
+-- Test 4: both main and myschema tables appear together
+SELECT schema, name FROM schema() WHERE type = 'table' AND name IN ('main_t', 'other_t') ORDER BY schema, name;
+→ [{"schema":"main","name":"main_t"},{"schema":"myschema","name":"other_t"}]
+
+-- Test 5: functions from all schemas appear (built-in functions are in main)
+SELECT DISTINCT schema FROM schema() WHERE type = 'function' ORDER BY schema;
+→ [{"schema":"main"}]
+
+-- Cleanup
+DROP TABLE main_t;
+DROP TABLE myschema.other_t;

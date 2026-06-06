@@ -1,0 +1,261 @@
+-- empty-single-row.sqllogic - Edge-case tests for empty tables, single-row tables, and empty set operations
+
+-- =============================================================================
+-- Empty table tests (0 rows)
+-- =============================================================================
+
+-- Setup empty table
+create table e (id integer primary key, val text, num integer);
+
+-- Setup populated table
+create table p (id integer primary key, val text);
+insert into p values (1, 'p1'), (2, 'p2'), (3, 'p3');
+
+-- -----------------------------------------------------------------------------
+-- 1. SELECT from empty table
+-- -----------------------------------------------------------------------------
+
+select * from e;
+→ []
+
+select * from e where id > 0;
+→ []
+
+select id, val from e;
+→ []
+
+-- -----------------------------------------------------------------------------
+-- 2. Aggregates over empty table
+-- -----------------------------------------------------------------------------
+
+select count(*) from e;
+→ [{"count(*)":0}]
+
+select count(val) from e;
+→ [{"count(val)":0}]
+
+select sum(num) from e;
+→ [{"sum(num)":null}]
+
+select avg(num) from e;
+→ [{"avg(num)":null}]
+
+select min(num) from e;
+→ [{"min(num)":null}]
+
+select max(num) from e;
+→ [{"max(num)":null}]
+
+select group_concat(val, ',') from e;
+→ [{"group_concat(val, ',')":null}]
+
+-- Multiple aggregates in one query
+select count(*), sum(num), min(val) from e;
+→ [{"count(*)":0,"sum(num)":null,"min(val)":null}]
+
+-- -----------------------------------------------------------------------------
+-- 3. JOINs where one or both sides are empty
+-- -----------------------------------------------------------------------------
+
+-- INNER JOIN empty × populated
+select e.id, p.id from e inner join p on e.id = p.id;
+→ []
+
+-- INNER JOIN populated × empty
+select p.id, e.id from p inner join e on p.id = e.id;
+→ []
+
+-- LEFT JOIN populated × empty — rows with null on right side
+select p.id, p.val, e.id from p left join e on p.id = e.id order by p.id;
+→ [{"id":1,"val":"p1","id:1":null},{"id":2,"val":"p2","id:1":null},{"id":3,"val":"p3","id:1":null}]
+
+-- LEFT JOIN empty × populated
+select e.id, p.id from e left join p on e.id = p.id;
+→ []
+
+-- CROSS JOIN empty × populated
+select e.id, p.id from e cross join p;
+→ []
+
+-- CROSS JOIN populated × empty
+select p.id, e.id from p cross join e;
+→ []
+
+-- INNER JOIN empty × empty (self-join)
+select e1.id, e2.id from e e1 inner join e e2 on e1.id = e2.id;
+→ []
+
+-- -----------------------------------------------------------------------------
+-- 4. Subqueries returning empty
+-- -----------------------------------------------------------------------------
+
+select * from p where id in (select id from e);
+→ []
+
+select * from p where exists (select 1 from e);
+→ []
+
+select * from p where not exists (select 1 from e) order by id;
+→ [{"id":1,"val":"p1"},{"id":2,"val":"p2"},{"id":3,"val":"p3"}]
+
+-- Scalar subquery from empty table
+select (select val from e);
+→ [{"(select val from e)":null}]
+
+-- -----------------------------------------------------------------------------
+-- 5. CTE producing 0 rows
+-- -----------------------------------------------------------------------------
+
+with empty_cte as (select * from e) select count(*) from empty_cte;
+→ [{"count(*)":0}]
+
+-- CTE empty joined with populated table
+with empty_cte as (select * from e) select p.id from empty_cte inner join p on empty_cte.id = p.id;
+→ []
+
+-- -----------------------------------------------------------------------------
+-- 6. Set operations with empty side
+-- -----------------------------------------------------------------------------
+
+select id from e union select id from p order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from p union select id from e order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from e intersect select id from p;
+→ []
+
+select id from e except select id from p;
+→ []
+
+select id from e union all select id from e;
+→ []
+
+-- -----------------------------------------------------------------------------
+-- 7. DML on empty table
+-- -----------------------------------------------------------------------------
+
+update e set val = 'x' where id = 1;
+
+delete from e where id = 1;
+
+-- Verify table still empty after DML
+select count(*) from e;
+→ [{"count(*)":0}]
+
+-- -----------------------------------------------------------------------------
+-- 8. INSERT ... SELECT from empty source
+-- -----------------------------------------------------------------------------
+
+-- Save row count before
+select count(*) from p;
+→ [{"count(*)":3}]
+
+insert into p (id, val) select id, val from e;
+
+-- Verify p unchanged
+select count(*) from p;
+→ [{"count(*)":3}]
+
+-- -----------------------------------------------------------------------------
+-- 9. Window functions over empty result set
+-- -----------------------------------------------------------------------------
+
+select id, row_number() over (order by id) from e;
+→ []
+
+select id, sum(num) over () from e;
+→ []
+
+-- =============================================================================
+-- Single-row table tests
+-- =============================================================================
+
+-- Setup single-row table
+create table s (id integer primary key, val text, num integer);
+insert into s values (1, 'only', 42);
+
+-- Setup single-row join partner
+create table s2 (id integer primary key, val text);
+insert into s2 values (1, 'solo');
+
+-- -----------------------------------------------------------------------------
+-- 1. All join types with single-row on one or both sides
+-- -----------------------------------------------------------------------------
+
+-- INNER JOIN s × s2 with matching condition
+select s.id, s.val, s2.id, s2.val from s inner join s2 on s.id = s2.id;
+→ [{"id":1,"val":"only","id:1":1,"val:1":"solo"}]
+
+-- INNER JOIN s × s2 with non-matching condition
+select s.id, s2.id from s inner join s2 on s.id = s2.id + 1;
+→ []
+
+-- LEFT JOIN s × s2 matching
+select s.id, s.val, s2.id, s2.val from s left join s2 on s.id = s2.id;
+→ [{"id":1,"val":"only","id:1":1,"val:1":"solo"}]
+
+-- LEFT JOIN s × s2 non-matching
+select s.id, s.val, s2.id, s2.val from s left join s2 on s.id = s2.id + 1;
+→ [{"id":1,"val":"only","id:1":null,"val:1":null}]
+
+-- CROSS JOIN s × s2
+select s.id, s2.id from s cross join s2;
+→ [{"id":1,"id:1":1}]
+
+-- CROSS JOIN single-row × multi-row
+select s.id, p.id from s cross join p order by p.id;
+→ [{"id":1,"id:1":1},{"id":1,"id:1":2},{"id":1,"id:1":3}]
+
+-- Join with populated table p on matching key
+select s.id, s.val, p.val from s inner join p on s.id = p.id;
+→ [{"id":1,"val":"only","val:1":"p1"}]
+
+-- -----------------------------------------------------------------------------
+-- 2. GROUP BY on single row
+-- -----------------------------------------------------------------------------
+
+select val, count(*) from s group by val;
+→ [{"val":"only","count(*)":1}]
+
+select val, sum(num) from s group by val;
+→ [{"val":"only","sum(num)":42}]
+
+-- GROUP BY with HAVING that matches
+select val, count(*) as cnt from s group by val having cnt = 1;
+→ [{"val":"only","cnt":1}]
+
+-- GROUP BY with HAVING that doesn't match
+select val, count(*) as cnt from s group by val having cnt > 1;
+→ []
+
+-- -----------------------------------------------------------------------------
+-- 3. Window functions with single-row partition
+-- -----------------------------------------------------------------------------
+
+select id, row_number() over (order by id) as rn from s;
+→ [{"id":1,"rn":1}]
+
+select id, rank() over (order by id) as rnk from s;
+→ [{"id":1,"rnk":1}]
+
+select id, sum(num) over () as total from s;
+→ [{"id":1,"total":42}]
+
+-- lag: no previous row
+select id, lag(num) over (order by id) as prev from s;
+→ [{"id":1,"prev":null}]
+
+-- lead: no next row
+select id, lead(num) over (order by id) as nxt from s;
+→ [{"id":1,"nxt":null}]
+
+-- =============================================================================
+-- Cleanup
+-- =============================================================================
+
+drop table e;
+drop table p;
+drop table s;
+drop table s2;

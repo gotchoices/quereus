@@ -1,0 +1,1012 @@
+-- Test declarative schema full lifecycle
+
+-- Step 1: Declare a schema with a table
+declare schema main {
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT
+	}
+}
+
+-- run
+
+-- Step 2: Diff against empty database (should show CREATE TABLE as DDL row)
+diff schema main;
+→ [{"ddl": "create table users (id INTEGER primary key, name TEXT not null, email TEXT)"}]
+
+-- Step 3: Apply the schema (creates the table, returns nothing)
+apply schema main;
+
+-- run
+
+-- Step 4: Verify table was created
+select count(*) from users;
+→ [{"count(*)": 0}]
+
+-- Step 5: Diff again - should now be empty (no rows) since schema matches
+diff schema main;
+→ []
+
+-- Step 6: Declare schema with seed data
+declare schema main {
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT
+	}
+
+	seed users (
+		(1, 'Alice', 'alice@example.com'),
+		(2, 'Bob', 'bob@example.com')
+	)
+}
+
+-- run
+
+-- Step 7: Apply with seed (no rows returned)
+apply schema main with seed;
+
+-- run
+
+-- Step 8: Verify seed data was inserted
+select * from users order by id;
+→ [{"id": 1, "name": "Alice", "email": "alice@example.com"}, {"id": 2, "name": "Bob", "email": "bob@example.com"}]
+
+-- Step 9: Test forward references - declare tables out of order with foreign keys
+declare schema main {
+	table posts {
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		content TEXT,
+		constraint fk_user foreign key (user_id) references users(id)
+	}
+
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT
+	}
+
+	table comments {
+		id INTEGER PRIMARY KEY,
+		post_id INTEGER NOT NULL,
+		user_id INTEGER NOT NULL,
+		text TEXT NOT NULL,
+		constraint fk_post foreign key (post_id) references posts(id),
+		constraint fk_comment_user foreign key (user_id) references users(id)
+	}
+}
+
+-- run
+
+-- Step 10: Diff should show posts and comments to create (users already exists)
+diff schema main;
+→ [{"ddl": "create table posts (id INTEGER primary key, user_id INTEGER not null, title TEXT not null, content TEXT, constraint fk_user foreign key (user_id) references users(id))"}, {"ddl": "create table comments (id INTEGER primary key, post_id INTEGER not null, user_id INTEGER not null, text TEXT not null, constraint fk_post foreign key (post_id) references posts(id), constraint fk_comment_user foreign key (user_id) references users(id))"}]
+
+-- Step 11: Apply the forward-referenced schema
+apply schema main;
+
+-- run
+
+-- Step 12: Verify all three tables exist
+select count(*) from users;
+→ [{"count(*)": 2}]
+
+select count(*) from posts;
+→ [{"count(*)": 0}]
+
+select count(*) from comments;
+→ [{"count(*)": 0}]
+
+-- Step 13: Insert data respecting foreign key order
+insert into posts (id, user_id, title, content) values (1, 1, 'First Post', 'This is the content');
+insert into comments (id, post_id, user_id, text) values (1, 1, 2, 'Great post!');
+
+select p.title, c.text, u.name as commenter
+from posts p
+join comments c on p.id = c.post_id
+join users u on c.user_id = u.id;
+→ [{"title": "First Post", "text": "Great post!", "commenter": "Bob"}]
+
+-- Step 14: Test table removal via redeclaration (only keep users)
+declare schema main {
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT
+	}
+}
+
+-- run
+
+-- Step 15: Diff should show DROP statements for posts and comments
+-- (comments must be dropped before posts because it FK-references posts)
+diff schema main;
+→ [{"ddl": "DROP TABLE IF EXISTS comments"}, {"ddl": "DROP TABLE IF EXISTS posts"}]
+
+-- Step 16: Apply to drop extra tables
+apply schema main;
+
+-- run
+
+-- Step 17: Verify posts and comments are gone
+select count(*) from users;
+→ [{"count(*)": 2}]
+
+select count(*) from posts;
+-- error: Table 'posts' not found in schema path
+
+select count(*) from comments;
+-- error: Table 'comments' not found in schema path
+
+-- Step 18: Test composite schema with multiple seeds and forward refs
+-- Declare a completely new schema (replacing the previous one)
+declare schema main {
+	table categories {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+
+	table products {
+		id INTEGER PRIMARY KEY,
+		category_id INTEGER NOT NULL,
+		name TEXT NOT NULL,
+		price REAL NOT NULL,
+		constraint fk_category foreign key (category_id) references categories(id)
+	}
+
+	seed categories (
+		(1, 'Electronics'),
+		(2, 'Books'),
+		(3, 'Clothing')
+	)
+
+	seed products (
+		(1, 1, 'Laptop', 999.99),
+		(2, 1, 'Mouse', 29.99),
+		(3, 2, 'SQL Guide', 49.99)
+	)
+}
+
+-- run
+
+-- Step 19: Apply complete replacement (drops users, creates categories/products)
+apply schema main with seed;
+
+-- run
+
+-- Step 20: Verify relational integrity with join
+select p.name as product, c.name as category, p.price
+from products p
+join categories c on p.category_id = c.id
+order by c.id, p.id;
+→ [{"product": "Laptop", "category": "Electronics", "price": 999.99}, {"product": "Mouse", "category": "Electronics", "price": 29.99}, {"product": "SQL Guide", "category": "Books", "price": 49.99}]
+
+-- Step 21: Verify old tables are gone
+select count(*) from users;
+-- error: not found in schema path:
+
+-- Step 22: Test trailing commas in table definitions
+declare schema main {
+	table config {
+		config_key TEXT PRIMARY KEY,
+		value TEXT,
+		description TEXT,
+	}
+}
+
+-- run
+
+apply schema main with seed;
+
+-- run
+
+select count(*) from config;
+→ [{"count(*)": 0}]
+
+-- Verify products table was dropped
+select count(*) from products;
+-- error: not found in schema path:
+
+-- Verify categories table was dropped
+select count(*) from categories;
+-- error: not found in schema path:
+
+-- Step 23: Test explicit main schema qualification
+select count(*) from main.config;
+→ [{"count(*)": 0}]
+
+-- Step 24: Verify trailing comma test passed
+declare schema main {
+	table test_trailing {
+		a INTEGER PRIMARY KEY,
+		b TEXT,
+		c TEXT,
+	}
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select count(*) from test_trailing;
+→ [{"count(*)": 0}]
+
+-- Step 25: Test custom schema with forward references and CHECK constraints
+declare schema Test2 {
+	table A {
+		Col1 TEXT,
+		constraint Col1InB check on insert, update (exists (select 1 from B where new.Col1 = B.Col1))
+	}
+
+	table B {
+		Col1 TEXT,
+		primary key (Col1)
+	}
+
+	seed B (
+		('valid1'),
+		('valid2')
+	)
+}
+
+-- run
+
+apply schema Test2 with seed;
+
+-- run
+
+-- Verify B has seed data
+select * from Test2.B order by Col1;
+→ [{"Col1": "valid1"}, {"Col1": "valid2"}]
+
+-- Insert into A with value that exists in B (should succeed)
+insert into Test2.A (Col1) values ('valid1');
+
+select * from Test2.A;
+→ [{"Col1": "valid1"}]
+
+-- Insert into A with value that doesn't exist in B (should fail)
+insert into Test2.A (Col1) values ('invalid');
+-- error: CHECK constraint failed
+
+-- Verify schema isolation: Test2 and main are separate
+select count(*) from Test2.A;
+→ [{"count(*)": 1}]
+
+select count(*) from main.test_trailing;
+→ [{"count(*)": 0}]
+
+-- Step 26: Test views in declarative schema
+declare schema main {
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT,
+		active INTEGER DEFAULT 1
+	}
+
+	table posts {
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		content TEXT,
+		constraint fk_user foreign key (user_id) references users(id)
+	}
+
+	view active_users AS select id, name, email from users where active = 1
+
+	view user_posts AS select
+		u.name as author,
+		p.title,
+		p.content
+	from users u
+	join posts p on u.id = p.user_id
+	where u.active = 1
+
+	seed users (
+		(1, 'Alice', 'alice@example.com', 1),
+		(2, 'Bob', 'bob@example.com', 1),
+		(3, 'Charlie', 'charlie@example.com', 0)
+	)
+
+	seed posts (
+		(1, 1, 'First Post', 'Hello world'),
+		(2, 2, 'Second Post', 'Another post'),
+		(3, 3, 'Inactive Post', 'This should not appear in view')
+	)
+}
+
+-- run
+
+-- Step 27: Diff should show tables and views to create
+diff schema main;
+→ [{"ddl": "DROP TABLE IF EXISTS test_trailing"}, {"ddl": "create table users (id INTEGER primary key, name TEXT not null, email TEXT, active INTEGER default 1)"}, {"ddl": "create table posts (id INTEGER primary key, user_id INTEGER not null, title TEXT not null, content TEXT, constraint fk_user foreign key (user_id) references users(id))"}, {"ddl": "create view active_users as select id, name, email from users where active = 1"}, {"ddl": "create view user_posts as select u.name as author, p.title, p.content from users as u inner join posts as p on u.id = p.user_id where u.active = 1"}]
+
+-- Step 28: Apply schema with views
+apply schema main with seed;
+
+-- run
+
+-- Step 29: Test views work correctly
+select * from active_users order by id;
+→ [{"id": 1, "name": "Alice", "email": "alice@example.com"}, {"id": 2, "name": "Bob", "email": "bob@example.com"}]
+
+select * from user_posts order by author;
+→ [{"author": "Alice", "title": "First Post", "content": "Hello world"}, {"author": "Bob", "title": "Second Post", "content": "Another post"}]
+
+-- Step 30: Test view with explicit column names
+declare schema main {
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT,
+		active INTEGER DEFAULT 1
+	}
+
+	view user_summary (user_id, full_name, contact) AS select id, name, email from users where active = 1
+}
+
+-- run
+
+-- Step 31: Diff should show view changes (drop old views, create new one)
+diff schema main;
+→ [{"ddl": "DROP TABLE IF EXISTS posts"}, {"ddl": "DROP VIEW IF EXISTS active_users"}, {"ddl": "DROP VIEW IF EXISTS user_posts"}, {"ddl": "create view user_summary (user_id, full_name, contact) as select id, name, email from users where active = 1"}]
+
+-- Step 32: Apply view changes
+apply schema main;
+
+-- run
+
+-- Step 33: Test new view with explicit columns
+select * from user_summary order by user_id;
+→ [{"user_id": 1, "full_name": "Alice", "contact": "alice@example.com"}, {"user_id": 2, "full_name": "Bob", "contact": "bob@example.com"}]
+
+-- Step 34: Test view removal
+declare schema main {
+	table users {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT,
+		active INTEGER DEFAULT 1
+	}
+}
+
+-- run
+
+-- Step 35: Diff should show view to drop
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS user_summary"}]
+
+-- Step 36: Apply to remove view
+apply schema main;
+
+-- run
+
+-- Step 37: Verify view is gone
+select count(*) from user_summary;
+-- error: not found in schema path:
+
+-- Step 38: Test indexes in declarative schema
+-- Note: Using a unique table name to avoid DROP TABLE bug where data persists
+declare schema main {
+	table products_with_indexes {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		category TEXT,
+		price REAL
+	}
+
+	index idx_products_name on products_with_indexes(name)
+	index idx_products_category on products_with_indexes(category, price)
+}
+
+-- run
+
+-- Step 39: Diff should show table and indexes to create
+diff schema main;
+→ [{"ddl": "DROP TABLE IF EXISTS users"}, {"ddl": "create table products_with_indexes (id INTEGER primary key, name TEXT not null, category TEXT, price REAL)"}, {"ddl": "create index idx_products_name on products_with_indexes (name)"}, {"ddl": "create index idx_products_category on products_with_indexes (category, price)"}]
+
+-- Step 40: Apply schema with indexes
+apply schema main;
+
+-- run
+
+-- Step 41: Verify table was created
+select count(*) from products_with_indexes;
+→ [{"count(*)": 0}]
+
+-- Step 42: Insert test data
+insert into products_with_indexes values (1, 'Laptop', 'Electronics', 999.99);
+insert into products_with_indexes values (2, 'Book', 'Books', 29.99);
+insert into products_with_indexes values (3, 'Shirt', 'Clothing', 19.99);
+
+-- Step 43: Verify data
+select * from products_with_indexes order by name;
+→ [{"id": 2, "name": "Book", "category": "Books", "price": 29.99}, {"id": 1, "name": "Laptop", "category": "Electronics", "price": 999.99}, {"id": 3, "name": "Shirt", "category": "Clothing", "price": 19.99}]
+
+-- Step 44: Diff again - should be empty since schema matches
+diff schema main;
+→ []
+
+-- Step 45: Test index removal
+declare schema main {
+	table products_with_indexes {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		category TEXT,
+		price REAL
+	}
+
+	index idx_products_name on products_with_indexes(name)
+}
+
+-- run
+
+-- Step 46: Diff should show one index to drop
+diff schema main;
+→ [{"ddl": "DROP INDEX IF EXISTS idx_products_category"}]
+
+-- Step 47: Apply to remove index
+apply schema main;
+
+-- run
+
+-- Step 48: Diff again - should be empty
+diff schema main;
+
+-- Test NOT EXISTS in CHECK constraint (regression test for operator spacing)
+-- This tests that "NOT EXISTS" is properly stringified with a space between NOT and EXISTS
+-- The bug was that "not exists" was being concatenated as "notexists" without a space
+
+declare schema check_not_exists {
+	table B (x int);
+	table A (
+		x int check (not exists(select 1 from B))
+	)
+}
+
+-- run
+
+-- The key test: DDL should have "not exists" with a space, not "notexists"
+diff schema check_not_exists;
+→ [{"ddl": "create table check_not_exists.B (x int)"}, {"ddl": "create table check_not_exists.A (x int check (not exists (select 1 from B)))"}]
+
+-- This should apply without parse errors (would fail with "notexists" syntax error)
+apply schema check_not_exists;
+
+-- run
+
+-- Step 49: Test schema-level default vtab module
+-- When using (default_vtab_module = 'memory') is specified, tables without explicit USING
+-- should inherit the schema-level default module
+declare schema test_default_module using (default_vtab_module = 'memory') {
+	table items {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+}
+
+-- run
+
+-- Diff should show the table with USING memory clause applied
+diff schema test_default_module;
+→ [{"ddl": "create table test_default_module.items (id INTEGER primary key, name TEXT not null) using memory"}]
+
+-- Apply the schema
+apply schema test_default_module;
+
+-- run
+
+-- Verify table works
+insert into test_default_module.items values (1, 'Test Item');
+select * from test_default_module.items;
+→ [{"id": 1, "name": "Test Item"}]
+
+-- Step 50: Test that explicit USING clause takes precedence over schema default
+declare schema test_explicit_module using (default_vtab_module = 'memory') {
+	table default_table {
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	}
+
+	table explicit_table using memory {
+		id INTEGER PRIMARY KEY,
+		value TEXT
+	}
+}
+
+-- run
+
+-- Both tables should use memory module (one from default, one explicit)
+diff schema test_explicit_module;
+→ [{"ddl": "create table test_explicit_module.default_table (id INTEGER primary key, name TEXT) using memory"}, {"ddl": "create table test_explicit_module.explicit_table (id INTEGER primary key, value TEXT) using memory"}]
+
+apply schema test_explicit_module;
+
+-- run
+
+-- Verify both tables work
+insert into test_explicit_module.default_table values (1, 'Default');
+insert into test_explicit_module.explicit_table values (1, 'Explicit');
+select dt.name, et.value from test_explicit_module.default_table as dt cross join test_explicit_module.explicit_table as et;
+→ [{"name": "Default", "value": "Explicit"}]
+
+-- Step 51: Test WITH CONTEXT in declared table
+-- This tests that mutation context variables are properly parsed for tables inside declare schema blocks
+declare schema test_mutation_context using (default_vtab_module = 'memory') {
+	table secure_items (
+		id INTEGER PRIMARY KEY,
+		value TEXT,
+		CONSTRAINT auth_check CHECK (context.allowed = 1)
+	) with context (allowed INTEGER)
+}
+
+-- run
+
+-- Diff should include the WITH CONTEXT clause
+diff schema test_mutation_context;
+→ [{"ddl": "create table test_mutation_context.secure_items (id INTEGER primary key, value TEXT, constraint auth_check check (context.allowed = 1)) using memory with context (allowed INTEGER)"}]
+
+-- Apply the schema
+apply schema test_mutation_context;
+
+-- run
+
+-- Insert with allowed = 1 should succeed
+insert into test_mutation_context.secure_items (id, value)
+with context allowed = 1
+values (1, 'test value');
+
+select * from test_mutation_context.secure_items;
+→ [{"id": 1, "value": "test value"}]
+
+-- Insert with allowed = 0 should fail the CHECK constraint
+insert into test_mutation_context.secure_items (id, value)
+with context allowed = 0
+values (2, 'should fail');
+-- error: CHECK constraint failed
+
+-- Verify only the first row exists
+select count(*) from test_mutation_context.secure_items;
+→ [{"count(*)": 1}]
+
+-- Step 52: Test WITH CONTEXT with default values in declared table
+declare schema test_context_defaults using (default_vtab_module = 'memory') {
+	table orders (
+		id INTEGER PRIMARY KEY,
+		amount INTEGER DEFAULT base_amount + tax
+	) with context (base_amount INTEGER, tax INTEGER)
+}
+
+-- run
+
+apply schema test_context_defaults;
+
+-- run
+
+-- Insert using context for defaults
+insert into test_context_defaults.orders (id)
+with context base_amount = 100, tax = 15
+values (1);
+
+select * from test_context_defaults.orders;
+→ [{"id": 1, "amount": 115}]
+
+-- Step 53: Test boolean and blob seed data types
+-- Regression: boolean and Uint8Array values were silently NULLed in seed data interpolation
+declare schema test_seed_types using (default_vtab_module = 'memory') {
+	table typed_data {
+		id INTEGER PRIMARY KEY,
+		flag INTEGER,
+		data BLOB
+	}
+
+	seed typed_data (
+		(1, true, X'cafebabe'),
+		(2, false, X'deadbeef')
+	)
+}
+
+-- run
+
+apply schema test_seed_types with seed;
+
+-- run
+
+-- Verify boolean values were converted to 0/1 (not NULL)
+select id, flag from test_seed_types.typed_data order by id;
+→ [{"id": 1, "flag": 1}, {"id": 2, "flag": 0}]
+
+-- Verify blob values were preserved (not NULL)
+select id, typeof(data), length(data) from test_seed_types.typed_data order by id;
+→ [{"id": 1, "typeof(data)": "blob", "length(data)": 4}, {"id": 2, "typeof(data)": "blob", "length(data)": 4}]
+
+-- Step 54: Test assertions in declarative schema (using main since assertions live in main)
+-- First clean up: redeclare main as empty to clear leftover tables
+declare schema main {
+	table assert_accounts {
+		id INTEGER PRIMARY KEY,
+		balance INTEGER NOT NULL
+	}
+
+	assertion positive_balance check (not exists (select 1 from assert_accounts where balance < 0))
+
+	seed assert_accounts (
+		(1, 100),
+		(2, 200)
+	)
+}
+
+-- run
+
+-- Step 55: Diff should show drops for old main objects plus CREATE TABLE and CREATE ASSERTION
+diff schema main;
+→ [{"ddl": "DROP TABLE IF EXISTS products_with_indexes"}, {"ddl": "DROP INDEX IF EXISTS idx_products_name"}, {"ddl": "create table assert_accounts (id INTEGER primary key, balance INTEGER not null)"}, {"ddl": "create assertion positive_balance check (not exists (select 1 from assert_accounts where balance < 0))"}]
+
+-- Step 56: Apply creates the table and assertion
+apply schema main with seed;
+
+-- run
+
+-- Step 57: Verify seed data
+select * from assert_accounts order by id;
+→ [{"id": 1, "balance": 100}, {"id": 2, "balance": 200}]
+
+-- Step 58: Diff should be empty now
+diff schema main;
+→ []
+
+-- Step 59: Assertion is enforced — commit with violation fails
+begin;
+insert into assert_accounts values (3, -50);
+commit;
+-- error: Integrity assertion failed: positive_balance
+
+-- Step 60: Verify state unchanged
+select count(*) from assert_accounts;
+→ [{"count(*)": 2}]
+
+-- Step 61: Valid insert works
+begin;
+insert into assert_accounts values (3, 50);
+commit;
+
+-- run
+
+select count(*) from assert_accounts;
+→ [{"count(*)": 3}]
+
+-- Step 62: Redeclare schema without the assertion — diff shows DROP ASSERTION
+declare schema main {
+	table assert_accounts {
+		id INTEGER PRIMARY KEY,
+		balance INTEGER NOT NULL
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP ASSERTION IF EXISTS positive_balance"}]
+
+-- Step 63: Apply removes the assertion
+apply schema main;
+
+-- run
+
+-- Step 64: Violation no longer fails (assertion removed)
+begin;
+insert into assert_accounts values (4, -99);
+commit;
+
+-- run
+
+select count(*) from assert_accounts;
+→ [{"count(*)": 4}]
+
+-- Step 65: Multiple assertions in one declaration
+declare schema main {
+	table assert_items {
+		id INTEGER PRIMARY KEY,
+		qty INTEGER NOT NULL,
+		price INTEGER NOT NULL
+	}
+
+	assertion qty_positive check (not exists (select 1 from assert_items where qty < 0))
+	assertion price_positive check (not exists (select 1 from assert_items where price < 0))
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP TABLE IF EXISTS assert_accounts"}, {"ddl": "create table assert_items (id INTEGER primary key, qty INTEGER not null, price INTEGER not null)"}, {"ddl": "create assertion qty_positive check (not exists (select 1 from assert_items where qty < 0))"}, {"ddl": "create assertion price_positive check (not exists (select 1 from assert_items where price < 0))"}]
+
+apply schema main;
+
+-- run
+
+-- Both assertions enforced
+begin;
+insert into assert_items values (1, -1, 10);
+commit;
+-- error: Integrity assertion failed: qty_positive
+
+begin;
+insert into assert_items values (1, 1, -10);
+commit;
+-- error: Integrity assertion failed: price_positive
+
+-- Valid insert
+begin;
+insert into assert_items values (1, 5, 10);
+commit;
+
+-- run
+
+select * from assert_items;
+→ [{"id": 1, "qty": 5, "price": 10}]
+
+-- ===================================================================
+-- Declarative `unique index` — parser admits the UNIQUE qualifier and
+-- the diff stringifies it back as `create unique index` so that the
+-- apply path enforces uniqueness the same way a top-level
+-- `CREATE UNIQUE INDEX` does.
+-- ===================================================================
+
+declare schema decl_uniq {
+	table T (
+		id INTEGER PRIMARY KEY,
+		email TEXT NOT NULL,
+		a TEXT,
+		b TEXT
+	)
+
+	unique index ix_T_email on T(email)
+	unique index ix_T_a_b on T(a, b)
+}
+
+-- run
+
+-- Diff stringifies the declared indexes with the `unique` qualifier.
+diff schema decl_uniq;
+→ [{"ddl": "create table decl_uniq.T (id INTEGER primary key, email TEXT not null, a TEXT, b TEXT)"}, {"ddl": "create unique index decl_uniq.ix_T_email on decl_uniq.T (email)"}, {"ddl": "create unique index decl_uniq.ix_T_a_b on decl_uniq.T (a, b)"}]
+
+apply schema decl_uniq;
+
+-- run
+
+-- Apply was idempotent; re-diff is empty.
+diff schema decl_uniq;
+→ []
+
+-- Single-column unique enforcement.
+insert into decl_uniq.T values (1, 'x@y', 'p', 'q');
+insert into decl_uniq.T values (2, 'x@y', 'r', 's');
+-- error: UNIQUE
+
+-- Multi-column unique enforcement (compound key collides on (p,q)).
+insert into decl_uniq.T values (3, 'a@y', 'p', 'q');
+-- error: UNIQUE
+
+-- Distinct compound key is accepted.
+insert into decl_uniq.T values (4, 'b@y', 'p', 'r');
+
+select count(*) as cnt from decl_uniq.T;
+→ [{"cnt": 2}]
+
+-- Regression for github.com/gotchoices/quereus/issues/22 — prefix NOT against
+-- a subquery predicate inside CHECK, through the declare/apply round-trip.
+-- This exercises stringify → re-parse and must produce a semantically
+-- equivalent CHECK constraint (not one that rejects every row).
+declare schema decl_not_in
+{
+	table Block (Code text primary key);
+	table TIn (
+		Id int, Color text,
+		primary key (Id),
+		constraint NoBlocked check (Color not in (select Code from Block))
+	);
+}
+
+-- run
+
+apply schema decl_not_in;
+
+-- run
+
+insert into decl_not_in.Block (Code) values ('r');
+insert into decl_not_in.Block (Code) values ('y');
+insert into decl_not_in.TIn (Id, Color) values (1, 'g');
+select Color from decl_not_in.TIn;
+→ [{"Color":"g"}]
+
+insert into decl_not_in.TIn (Id, Color) values (2, 'r');
+-- error: CHECK constraint failed: NoBlocked
+
+drop table decl_not_in.TIn;
+drop table decl_not_in.Block;
+
+-- ===================================================================
+-- Regression for github.com/gotchoices/quereus/issues/23 — CHECK
+-- `on delete` operations clause survives the declare/apply round-trip.
+-- The stringifier used to drop the `operations` list, so the constraint
+-- defaulted to the all-ops mask (INSERT+UPDATE+DELETE) and fired on
+-- INSERT instead of only on DELETE.
+-- ===================================================================
+
+declare schema decl_check_ops
+{
+	table NoDelete (
+		Id int,
+		primary key (Id),
+		constraint NoDeleteEver check on delete (false)
+	);
+}
+
+-- run
+
+apply schema decl_check_ops;
+
+-- run
+
+-- INSERT must succeed (operations list excludes insert).
+insert into decl_check_ops.NoDelete (Id) values (1);
+select Id from decl_check_ops.NoDelete;
+→ [{"Id":1}]
+
+-- DELETE must fail.
+delete from decl_check_ops.NoDelete where Id = 1;
+-- error: CHECK constraint failed: NoDeleteEver
+
+drop table decl_check_ops.NoDelete;
+
+-- CHECK `on update` (the other half of the default-mask, distinct from
+-- the on-delete case so a mistakenly-defaulted mask still surfaces).
+declare schema decl_check_upd
+{
+	table OnUpdOnly (
+		Id int,
+		Val int,
+		primary key (Id),
+		constraint NoNegOnUpdate check on update (new.Val >= 0)
+	);
+}
+
+-- run
+
+apply schema decl_check_upd;
+
+-- run
+
+-- INSERT must succeed regardless of the bad value (constraint excludes insert).
+insert into decl_check_upd.OnUpdOnly (Id, Val) values (1, -5);
+select Val from decl_check_upd.OnUpdOnly;
+→ [{"Val":-5}]
+
+-- UPDATE must fail when the new value violates the constraint.
+update decl_check_upd.OnUpdOnly set Val = -1 where Id = 1;
+-- error: CHECK constraint failed: NoNegOnUpdate
+
+-- UPDATE that satisfies the constraint succeeds.
+update decl_check_upd.OnUpdOnly set Val = 7 where Id = 1;
+select Val from decl_check_upd.OnUpdOnly;
+→ [{"Val":7}]
+
+drop table decl_check_upd.OnUpdOnly;
+
+-- ===================================================================
+-- Regression for github.com/gotchoices/quereus/issues/21 — compound
+-- SELECT tail survives the declare/apply round-trip. The stringifier
+-- read `stmt.union` / `stmt.unionAll` (dead fields the parser never
+-- populates) instead of `stmt.compound`, silently dropping every leg
+-- beyond the first. Views are declared in `main` since declarative
+-- views in non-main schemas are emitted without a schema prefix (a
+-- separate concern outside this fix).
+-- ===================================================================
+
+declare schema main {
+	view rgb_codes as
+		select 'r' as Code, 'Red' as Name
+		union all select 'g' as Code, 'Green' as Name
+		union all select 'b' as Code, 'Blue' as Name
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+-- All three legs must be present; previously only 'r' survived.
+select Code from rgb_codes order by Code;
+→ [{"Code":"b"}, {"Code":"g"}, {"Code":"r"}]
+
+drop view rgb_codes;
+
+-- UNION (DISTINCT) — duplicate row collapses.
+declare schema main {
+	view distinct_union as
+		select 1 as N union select 2 as N union select 1 as N
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select N from distinct_union order by N;
+→ [{"N": 1}, {"N": 2}]
+
+drop view distinct_union;
+
+-- INTERSECT — only common row survives. (Compound operators are
+-- right-associative in this parser, so the test uses single-leg sides
+-- to keep the test focused on the stringifier emitting `intersect`.)
+declare schema main {
+	view two_only as
+		select 2 as N intersect select 2 as N
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select N from two_only;
+→ [{"N": 2}]
+
+drop view two_only;
+
+-- EXCEPT — left minus right.
+declare schema main {
+	view one_only as
+		select 1 as N except select 2 as N
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select N from one_only;
+→ [{"N": 1}]
+
+drop view one_only;
+
+-- Cross-fix smoke: CHECK whose expression is a compound subquery. Both
+-- the operations list and the compound tail must survive the round-trip
+-- for the constraint to evaluate as written.
+declare schema decl_check_cmpd
+{
+	table Palette (
+		Color text primary key,
+		constraint InPalette check (Color in (
+			select 'r' as c union all
+			select 'g'      union all
+			select 'b'
+		))
+	);
+}
+
+-- run
+
+apply schema decl_check_cmpd;
+
+-- run
+
+insert into decl_check_cmpd.Palette values ('g');
+select Color from decl_check_cmpd.Palette;
+→ [{"Color":"g"}]
+
+insert into decl_check_cmpd.Palette values ('z');
+-- error: CHECK constraint failed: InPalette
+
+drop table decl_check_cmpd.Palette;

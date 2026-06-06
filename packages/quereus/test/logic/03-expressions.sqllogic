@@ -1,0 +1,135 @@
+-- expressions.sqllogic - Testing various expression types and operators
+
+CREATE TABLE expr_t (i INTEGER PRIMARY KEY, n NUMERIC, t TEXT NULL, b BLOB NULL);
+INSERT INTO expr_t VALUES (1, 10.5, 'hello', x'01ff'), (2, -5, 'world', x'02'), (3, 0, null, null);
+-- No expected output for setup
+
+-- Arithmetic
+SELECT i + 1, n * 2, i / 2.0, i % 2 FROM expr_t WHERE i = 1;
+→ [{"i + 1":2,"n * 2":21,"i / 2.0":0.5,"i % 2":1}]
+SELECT i + 1, n * 2, i / 2.0, i % 2 FROM expr_t WHERE i = 2;
+→ [{"i + 1":3,"n * 2":-10,"i / 2.0":1,"i % 2":0}]
+
+-- Stacked unary operators
+SELECT - -1;
+→ [{"--1":1}]
+SELECT NOT NOT 1;
+→ [{"not not 1":true}]
+SELECT ~-1;
+→ [{"~-1":0}]
+
+-- String Concatenation
+SELECT t || ' ' || t FROM expr_t WHERE i = 1;
+→ [{"t || ' ' || t":"hello hello"}]
+
+-- Comparisons
+SELECT i > 1, n <= 10.5, t = 'hello', b != x'01ff' FROM expr_t WHERE i = 1;
+→ [{"i > 1":false,"n <= 10.5":true,"t = 'hello'":true,"b != x'01ff'":false}]
+SELECT i > 1, n <= 10.5, t == 'world' FROM expr_t WHERE i = 2;
+→ [{"i > 1":true,"n <= 10.5":true,"t == 'world'":true}]
+
+-- Logical Operators
+SELECT i > 1 AND n < 0 FROM expr_t WHERE i = 2;
+→ [{"i > 1 and n < 0":true}]
+SELECT i = 1 OR t = 'world' FROM expr_t ORDER BY i;
+→ [{"i = 1 or t = 'world'":true},{"i = 1 or t = 'world'":true},{"i = 1 or t = 'world'":null}]
+SELECT NOT (n = 0) FROM expr_t WHERE i = 3;
+→ [{"not (n = 0)":false}]
+
+-- XOR Operator (3VL)
+SELECT 1 XOR 1, 1 XOR 0, 0 XOR 1, 0 XOR 0;
+→ [{"1 xor 1":false,"1 xor 0":true,"0 xor 1":true,"0 xor 0":false}]
+SELECT NULL XOR 1, NULL XOR 0, 1 XOR NULL, 0 XOR NULL, NULL XOR NULL;
+→ [{"null xor 1":null,"null xor 0":null,"1 xor null":null,"0 xor null":null,"null xor null":null}]
+SELECT (i > 1) XOR (n < 0) FROM expr_t WHERE i = 2; -- TRUE XOR TRUE -> FALSE
+→ [{"i > 1 xor n < 0":false}]
+SELECT (i > 1) XOR (t = 'hello') FROM expr_t WHERE i = 1; -- FALSE XOR TRUE -> TRUE
+→ [{"i > 1 xor t = 'hello'":true}]
+SELECT (i > 1) XOR n IS NULL FROM expr_t WHERE i = 1; -- FALSE XOR FALSE -> FALSE
+→ [{"i > 1 xor n is null":false}]
+SELECT (i > 1) XOR t IS NULL FROM expr_t WHERE i = 3; -- FALSE XOR NULL -> NULL
+→ [{"i > 1 xor t is null":false}]
+
+-- NULL Handling
+SELECT t is null, t IS NOT NULL, n + NULL FROM expr_t WHERE i = 3;
+→ [{"t is null":true,"t is not null":false,"n + null":null}]
+SELECT coalesce(t, 'default') FROM expr_t ORDER BY i;
+→ [{"coalesce(t, 'default')":"hello"},{"coalesce(t, 'default')":"world"},{"coalesce(t, 'default')":"default"}]
+SELECT nullif(i, 2) FROM expr_t ORDER BY i;
+→ [{"nullif(i, 2)":1},{"nullif(i, 2)":null},{"nullif(i, 2)":3}]
+
+-- CASE expressions
+SELECT CASE i WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM expr_t ORDER BY i;
+→ [{"case i when 1 then 'one' when 2 then 'two' else 'other' end":"one"},{"case i when 1 then 'one' when 2 then 'two' else 'other' end":"two"},{"case i when 1 then 'one' when 2 then 'two' else 'other' end":"other"}]
+SELECT CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM expr_t ORDER BY i;
+→ [{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"pos"},{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"neg"},{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"zero"}]
+
+-- CAST expressions
+SELECT cast(i as TEXT), cast(n as INTEGER), cast(t as REAL) FROM expr_t WHERE i = 1;
+→ [{"cast(i as text)":"1","cast(n as integer)":10,"cast(t as real)":0}]
+SELECT cast('123' as INTEGER), cast('12.3' as REAL), cast(123 as TEXT);
+→ [{"cast('123' as integer)":123,"cast('12.3' as real)":12.3,"cast(123 as text)":"123"}]
+
+-- COLLATE (basic syntax check, assumes default collation)
+SELECT t FROM expr_t WHERE t = 'HELLO' COLLATE NOCASE ORDER BY i;
+→ [{"t":"hello"}]
+
+DROP TABLE expr_t;
+
+SELECT typeof(1 + 2), typeof(1.5 + 2), typeof('a' || 'b');
+→ [{"typeof(1 + 2)":"integer","typeof(1.5 + 2)":"real","typeof('a' || 'b')":"text"}]
+
+-- BETWEEN
+SELECT 3 BETWEEN 2 and 6 AS isbetwixt, 'a' between 'f' and 'z' AS notbetwixt;
+→ [{"isbetwixt":true,"notbetwixt":false}]
+
+-- BETWEEN with COLLATE NOCASE
+SELECT 'Hello' COLLATE NOCASE BETWEEN 'a' AND 'z' AS yes1, 'Hello' BETWEEN 'a' AND 'z' AS no1;
+→ [{"yes1":true,"no1":false}]
+
+SELECT 'B' COLLATE NOCASE BETWEEN 'a' AND 'c' AS yes2, 'B' BETWEEN 'a' AND 'c' AS no2;
+→ [{"yes2":true,"no2":false}]
+
+-- NOT BETWEEN with COLLATE NOCASE
+SELECT 'Hello' COLLATE NOCASE NOT BETWEEN 'a' AND 'z' AS no3, 'Hello' NOT BETWEEN 'a' AND 'z' AS yes3;
+→ [{"no3":false,"yes3":true}]
+
+-- COLLATE on lower bound propagates to BETWEEN
+SELECT 'hello' BETWEEN 'A' COLLATE NOCASE AND 'Z' AS yes4, 'hello' BETWEEN 'A' AND 'Z' AS no4;
+→ [{"yes4":true,"no4":false}]
+
+-- BETWEEN with NULL operands still returns NULL under COLLATE
+SELECT null COLLATE NOCASE BETWEEN 'a' AND 'z' AS r1, 'b' COLLATE NOCASE BETWEEN null AND 'z' AS r2;
+→ [{"r1":null,"r2":null}]
+
+-- Expression evaluation consistency across contexts
+CREATE TABLE expr_context_test (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER NULL);
+INSERT INTO expr_context_test VALUES (1, 5, 3, null), (2, -2, 4, 7), (3, 0, 1, 0);
+
+-- Test that expressions evaluate consistently across SELECT, WHERE, HAVING
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test ORDER BY id;
+→ [{"id":1,"expr_result":11},{"id":2,"expr_result":6},{"id":3,"expr_result":2}]
+
+-- Same expression in WHERE - should find matching rows
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test WHERE (a + b * 2) = 11;
+→ [{"id":1,"expr_result":11}]
+
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test WHERE (a + b * 2) = 6;
+→ [{"id":2,"expr_result":6}]
+
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test WHERE (a + b * 2) = 2;
+→ [{"id":3,"expr_result":2}]
+
+-- Same expression in HAVING (a, b in GROUP BY for SQL-92 column coverage; id alone would
+-- need PK-based functional-dependency analysis which Quereus does not implement)
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test GROUP BY id, a, b HAVING (a + b * 2) = 11;
+→ [{"id":1,"expr_result":11}]
+
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test GROUP BY id, a, b HAVING (a + b * 2) IN (2, 6) ORDER BY id;
+→ [{"id":2,"expr_result":6},{"id":3,"expr_result":2}]
+
+-- Test more complex expressions
+SELECT id, (a * b + COALESCE(c, 0)) as complex_expr FROM expr_context_test ORDER BY id;
+→ [{"id":1,"complex_expr":15},{"id":2,"complex_expr":-1},{"id":3,"complex_expr":0}]
+
+DROP TABLE expr_context_test;

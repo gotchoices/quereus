@@ -1,0 +1,155 @@
+-- fk-cross-schema.sqllogic - FK parent-side check must respect schema boundaries
+-- Regression: buildParentSideFKChecks matches by table name only, ignoring schema
+
+PRAGMA foreign_keys = true;
+
+-- ===================================================================
+-- Setup: Two schemas, each with an identically-named "items" table.
+-- Only s1 has a child table with FK referencing s1.items.
+-- ===================================================================
+
+declare schema s1 {
+	table items {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+
+	table orders {
+		id INTEGER PRIMARY KEY,
+		item_id INTEGER,
+		FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE RESTRICT
+	}
+}
+
+declare schema s2 {
+	table items {
+		id INTEGER PRIMARY KEY,
+		label TEXT
+	}
+}
+
+apply schema s1;
+apply schema s2;
+
+-- run
+
+-- Seed both schemas
+INSERT INTO s1.items VALUES (1, 'Widget'), (2, 'Gadget');
+INSERT INTO s1.orders VALUES (100, 1), (200, 2);
+
+INSERT INTO s2.items VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma');
+
+-- Verify setup
+SELECT count(*) as cnt FROM s1.orders;
+→ [{"cnt":2}]
+
+SELECT count(*) as cnt FROM s2.items;
+→ [{"cnt":3}]
+
+-- ===================================================================
+-- Test: DELETE from s2.items should succeed — no FK references s2.items
+-- With the bug, it incorrectly matches s1.orders FK (which targets s1.items)
+-- ===================================================================
+
+DELETE FROM s2.items WHERE id = 3;
+
+SELECT count(*) as cnt FROM s2.items;
+→ [{"cnt":2}]
+
+-- DELETE from s1.items that IS referenced should fail (RESTRICT)
+DELETE FROM s1.items WHERE id = 1;
+-- error: constraint failed
+
+-- Verify s1.items unchanged
+SELECT count(*) as cnt FROM s1.items;
+→ [{"cnt":2}]
+
+-- ===================================================================
+-- Test: UPDATE on s2.items should also succeed
+-- ===================================================================
+
+UPDATE s2.items SET id = 99 WHERE id = 2;
+
+SELECT id FROM s2.items ORDER BY id;
+→ [{"id":1},{"id":99}]
+
+-- Cleanup
+DROP TABLE s1.orders;
+DROP TABLE s1.items;
+DROP TABLE s2.items;
+
+-- ===================================================================
+-- Test: CASCADE/SET NULL/SET DEFAULT actions across schemas must
+-- target the schema-qualified child table, not whichever 'children'
+-- happens to live in the default schema.
+-- Regression: executeSingleFKAction generated unqualified DELETE/UPDATE
+-- which would target the wrong table when child is in a non-default schema.
+-- ===================================================================
+
+declare schema sa {
+	table parents {
+		id INTEGER PRIMARY KEY,
+		val TEXT NULL
+	}
+
+	table cascade_children {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER NULL,
+		FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE CASCADE ON UPDATE CASCADE
+	}
+
+	table setnull_children {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER NULL,
+		FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE SET NULL
+	}
+
+	table setdefault_children {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER NULL DEFAULT 99,
+		FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE SET DEFAULT
+	}
+}
+
+apply schema sa;
+
+-- run
+
+-- Seed: parent 99 acts as the default-target row for SET DEFAULT.
+-- Each child references a distinct parent so that one action does not
+-- cascade into another.
+INSERT INTO sa.parents VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (99, 'default');
+INSERT INTO sa.cascade_children VALUES (10, 1), (11, 1);
+INSERT INTO sa.cascade_children VALUES (12, 2);
+INSERT INTO sa.setnull_children VALUES (20, 3);
+INSERT INTO sa.setdefault_children VALUES (30, 4);
+
+-- CASCADE DELETE across schema
+DELETE FROM sa.parents WHERE id = 1;
+
+SELECT count(*) as cnt FROM sa.cascade_children WHERE parent_id = 1;
+→ [{"cnt":0}]
+
+-- CASCADE UPDATE across schema
+UPDATE sa.parents SET id = 222 WHERE id = 2;
+
+SELECT parent_id FROM sa.cascade_children WHERE id = 12;
+→ [{"parent_id":222}]
+
+-- SET NULL across schema
+DELETE FROM sa.parents WHERE id = 3;
+
+SELECT parent_id FROM sa.setnull_children WHERE id = 20;
+→ [{"parent_id":null}]
+
+-- SET DEFAULT across schema
+DELETE FROM sa.parents WHERE id = 4;
+
+SELECT parent_id FROM sa.setdefault_children WHERE id = 30;
+→ [{"parent_id":99}]
+
+DROP TABLE sa.cascade_children;
+DROP TABLE sa.setnull_children;
+DROP TABLE sa.setdefault_children;
+DROP TABLE sa.parents;
+

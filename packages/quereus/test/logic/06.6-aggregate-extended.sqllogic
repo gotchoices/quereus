@@ -1,0 +1,50 @@
+-- aggregate-extended.sqllogic - Testing aggregate functions not covered in 07-aggregates
+
+-- Create test table
+create table agg_ext (id integer primary key, val real null, grp text);
+insert into agg_ext values (1, 10.0, 'a'), (2, 20.0, 'a'), (3, 30.0, 'a'), (4, 40.0, 'b'), (5, 50.0, 'b'), (6, null, 'b');
+
+-- total (returns 0.0 for empty set, unlike sum which returns null)
+select total(val) from agg_ext;
+→ [{"total(val)":150}]
+
+-- total vs sum with empty set
+create table empty_t (id integer primary key, x real null);
+select total(x), sum(x) from empty_t;
+→ [{"total(x)":0,"sum(x)":null}]
+drop table empty_t;
+
+-- statistical aggregates: population variance
+select var_pop(val) from agg_ext where grp = 'a';
+→ [{"var_pop(val)":66.66666666666669}]
+
+-- sample variance
+select var_samp(val) from agg_ext where grp = 'a';
+→ [{"var_samp(val)":100}]
+
+-- population standard deviation
+select stddev_pop(val) from agg_ext where grp = 'a';
+→ [{"stddev_pop(val)":8.16496580927726}]
+
+-- var_samp with single value returns null
+select var_samp(val) from agg_ext where id = 1;
+→ [{"var_samp(val)":null}]
+
+-- string_concat aggregate
+select string_concat(grp) from agg_ext;
+→ [{"string_concat(grp)":"a,a,a,b,b,b"}]
+
+drop table agg_ext;
+
+-- total with null-only values
+create table null_t (id integer primary key, x real null);
+insert into null_t values (1, null), (2, null);
+select total(x), sum(x) from null_t;
+→ [{"total(x)":0,"sum(x)":null}]
+drop table null_t;
+
+-- var_pop with empty set returns null
+create table empty_var (id integer primary key, x real null);
+select var_pop(x) from empty_var;
+→ [{"var_pop(x)":null}]
+drop table empty_var;

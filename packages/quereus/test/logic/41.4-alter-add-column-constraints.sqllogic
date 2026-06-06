@@ -1,0 +1,470 @@
+-- adapted from SQLite test/alter3.test, test/alter4.test, test/alter.test
+-- ADD COLUMN with various constraints. Existing 41-alter-table covers
+-- NULL backfill, text DEFAULT, NOT NULL+DEFAULT — this fills in CHECK,
+-- REFERENCES, COLLATE, UNIQUE rejection, and various default literal types.
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- 1. ADD COLUMN with CHECK constraint
+-- ===================================
+
+create table t_chk (id integer primary key, a integer not null);
+insert into t_chk values (1, 10);
+
+alter table t_chk add column b integer null check (b is null or b > 0);
+
+-- existing rows backfilled with NULL (allowed by CHECK)
+select b from t_chk where id = 1;
+→ [{"b":null}]
+
+-- valid insert
+insert into t_chk values (2, 20, 5);
+
+-- CHECK violation
+insert into t_chk values (3, 30, -1);
+-- error: CHECK
+
+drop table t_chk;
+-- run
+
+-- 1b. Engine-bug guard (CHECK analogue of altered-column-not-exists-antijoin-misread).
+-- The literal-default CHECK post-scan runs `select 1 from <t> where not (<check>)`. A
+-- DECLARED CHECK seeds a domain constraint on the scan, so if the new CHECK were live
+-- during validation, `ruleFilterContradiction` would fold the scan's own `not (<check>)`
+-- to EmptyRelation and silently admit a violating backfilled row. The fix validates
+-- against a schema carrying the new COLUMN but NOT the new CHECK, committing the CHECK
+-- only after the scan passes. Existing row 1 backfilled with 0 violates `v > 0` → abort.
+create table t_chk2 (id integer primary key);
+insert into t_chk2 values (1);
+-- run
+
+alter table t_chk2 add column v integer default 0 check (v > 0);
+-- error: CHECK
+
+-- Reverted: the column was dropped and no stale CHECK left declared.
+select * from t_chk2 order by id;
+→ [{"id":1}]
+
+-- A satisfying literal default succeeds and backfills.
+alter table t_chk2 add column v integer default 7 check (v > 0);
+-- run
+
+select * from t_chk2 order by id;
+→ [{"id":1,"v":7}]
+
+drop table t_chk2;
+
+-- ===================================
+-- 2. ADD COLUMN with REFERENCES (column-level FK)
+--
+-- Adding a column-level FK validates the EXISTING (backfilled) rows against the
+-- referenced parent — MATCH SIMPLE, pragma-gated — via the same post-scan the
+-- ADD CONSTRAINT path uses (validateForeignKeyOverExistingRows), for BOTH the
+-- literal-default and per-row (evaluator) default paths. A fully-non-NULL orphan
+-- aborts the ALTER and leaves the table unchanged (column not added); a NULL
+-- backfill satisfies the FK.
+-- ===================================
+
+-- 2a. NULL backfill is allowed (MATCH SIMPLE), and forward enforcement fires.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+
+alter table t_child add column parent integer null references t_parent(pid);
+
+-- backfilled NULL is allowed (MATCH SIMPLE)
+select parent from t_child where id = 1;
+→ [{"parent":null}]
+
+-- valid FK insert
+insert into t_child values (2, 'y', 1);
+
+-- FK violation (forward enforcement via merged table-level FK)
+insert into t_child values (3, 'z', 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2b. Literal-default ORPHAN over populated rows → ALTER aborts, table unchanged.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 99 references t_parent(pid);
+-- error: foreign key
+
+-- the column was NOT added (revert dropped it + restored the catalog)
+select count(*) as c from table_info('t_child') where name = 'parent';
+→ [{"c":0}]
+
+-- ...and the FK was never installed: forward enforcement is absent and a plain
+-- insert over the original (id, name) shape still succeeds.
+insert into t_child values (2, 'y');
+select count(*) as c from t_child;
+→ [{"c":2}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2c. Literal-default SATISFIED → ALTER succeeds, backfills, forward enforcement active.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 1 references t_parent(pid);
+-- run
+
+-- backfilled value present and satisfied
+select parent from t_child where id = 1;
+→ [{"parent":1}]
+
+-- the FK is installed (introspection)
+select count(*) as c from foreign_key_info('t_child') where referenced_table = 't_parent';
+→ [{"c":1}]
+
+-- forward enforcement: an orphan insert is now rejected
+insert into t_child values (2, 'y', 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2d. Per-row (evaluator) default ORPHAN → ALTER aborts, table unchanged.
+-- The default (new.a + 100) lands each row on a value with no parent row.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, a integer);
+insert into t_child values (1, 1), (2, 2);
+-- run
+
+alter table t_child add column parent integer default (new.a + 100) references t_parent(pid);
+-- error: foreign key
+
+-- table unchanged: the per-row backfilled column was reverted
+select * from t_child order by id;
+→ [{"id":1,"a":1},{"id":2,"a":2}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2e. Per-row (evaluator) default SATISFIED → ALTER succeeds, backfills per-row.
+-- The default (new.a + 100) lands each row on an existing parent (101, 102).
+create table t_parent (pid integer primary key);
+insert into t_parent values (101), (102);
+create table t_child (id integer primary key, a integer);
+insert into t_child values (1, 1), (2, 2);
+-- run
+
+alter table t_child add column parent integer default (new.a + 100) references t_parent(pid);
+-- run
+
+select id, parent from t_child order by id;
+→ [{"id":1,"parent":101},{"id":2,"parent":102}]
+
+-- forward enforcement active
+insert into t_child values (3, 3, 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2f. Self-referential FK (parent == child) — SATISFIED.
+-- Each row backfills parent = its own id, which exists, so all rows are satisfied.
+create table t_self (id integer primary key, name text);
+insert into t_self values (1, 'a'), (2, 'b');
+-- run
+
+alter table t_self add column parent integer default (new.id) references t_self(id);
+-- run
+
+select id, parent from t_self order by id;
+→ [{"id":1,"parent":1},{"id":2,"parent":2}]
+
+drop table t_self;
+-- run
+
+-- 2g. Self-referential FK (parent == child) — ORPHAN.
+-- parent = id + 100 → 101, 102 are not ids in the table → orphans → abort.
+create table t_self (id integer primary key, name text);
+insert into t_self values (1, 'a'), (2, 'b');
+-- run
+
+alter table t_self add column parent integer default (new.id + 100) references t_self(id);
+-- error: foreign key
+
+-- table unchanged (self-ref post-scan read a consistent post-alter table)
+select * from t_self order by id;
+→ [{"id":1,"name":"a"},{"id":2,"name":"b"}]
+
+drop table t_self;
+-- run
+
+-- 2h. Bare `REFERENCES parent` (no parent column) resolves to the parent PK.
+-- Satisfied literal default succeeds; forward enforcement active.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 1 references t_parent;
+-- run
+
+select parent from t_child where id = 1;
+→ [{"parent":1}]
+
+insert into t_child values (2, 'y', 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2i. Bare `REFERENCES parent` ORPHAN (PK fallback) → abort, table unchanged.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+alter table t_child add column parent integer default 99 references t_parent;
+-- error: foreign key
+
+select count(*) as c from table_info('t_child') where name = 'parent';
+→ [{"c":0}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2j. pragma foreign_keys = false → validator no-ops; orphan ADD COLUMN succeeds.
+pragma foreign_keys = false;
+create table t_parent (pid integer primary key);
+insert into t_parent values (1);
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+-- pragma off: the orphan backfill (99 ∉ parent) is NOT validated → the add succeeds
+alter table t_child add column parent integer default 99 references t_parent(pid);
+-- run
+
+select parent from t_child where id = 1;
+→ [{"parent":99}]
+
+drop table t_child;
+drop table t_parent;
+pragma foreign_keys = true;
+-- run
+
+-- 2k. Parent table ABSENT — any fully-non-NULL backfilled row is an orphan ⇒ abort;
+-- a NULL-only backfill still succeeds (MATCH SIMPLE exempts NULL).
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+-- run
+
+-- non-NULL default to a non-existent parent → orphan → abort, table unchanged
+alter table t_child add column parent integer default 5 references no_such_parent(pid);
+-- error: foreign key
+
+select * from t_child order by id;
+→ [{"id":1,"name":"x"}]
+
+-- NULL backfill (no default) to a non-existent parent → succeeds
+alter table t_child add column parent2 integer null references no_such_parent(pid);
+-- run
+
+select parent2 from t_child where id = 1;
+→ [{"parent2":null}]
+
+drop table t_child;
+-- run
+
+-- 2l. Empty table → no rows to validate; ALTER succeeds even with an orphan-shaped default.
+create table t_parent (pid integer primary key);
+insert into t_parent values (1);
+create table t_child (id integer primary key, name text);
+-- run
+
+-- no existing rows ⇒ the FK post-scan finds nothing to validate ⇒ the add succeeds
+alter table t_child add column parent integer default 99 references t_parent(pid);
+-- run
+
+-- forward enforcement is still installed: an orphan insert is rejected
+insert into t_child values (1, 'x', 99);
+-- error:
+
+-- a satisfied insert succeeds
+insert into t_child values (2, 'y', 1);
+select count(*) as c from t_child;
+→ [{"c":1}]
+
+drop table t_child;
+drop table t_parent;
+-- run
+
+-- 2m. Engine-bug guard (altered-column-not-exists-antijoin-misread).
+-- The existing-row FK validator issues a `not exists` anti-join. FK-IND folding
+-- (ruleAntiJoinFkEmpty + seeded INDs) folds an anti-join over a DECLARED non-null FK
+-- to EmptyRelation under the inclusion dependency `child.fk ⊆ parent.pk`. If the new
+-- FK were live during validation, the validator's own anti-join would fold to empty,
+-- trusting the unvalidated invariant and silently admitting an orphan — and every
+-- later anti-join on the table would stay mis-folded. The fix registers the new
+-- COLUMN but NOT the new FK for the validation pass, committing the FK only after
+-- validation passes.
+create table p (pid integer primary key);
+insert into p values (1), (2);
+create table c (id integer primary key, name text);
+insert into c values (1, 'x');
+-- run
+
+-- ORPHAN: 99 ∉ {1,2}. The validator's `not exists` MUST surface the orphan and abort
+-- (pre-fix it folded to empty and admitted the violation).
+alter table c add column parent integer default 99 references p(pid);
+-- error: foreign key
+
+-- Reverted to the original shape: the column was dropped and no stale FK left
+-- declared, so a standalone scan reads the unchanged pre-ALTER table.
+select * from c order by id;
+→ [{"id":1,"name":"x"}]
+
+-- VALID: every row references an existing parent (1 ∈ {1,2}) → succeeds and backfills.
+alter table c add column parent integer default 1 references p(pid);
+-- run
+
+-- `select *` shows the backfilled column.
+select * from c order by id;
+→ [{"id":1,"name":"x","parent":1}]
+
+-- Standalone `not exists` anti-join over the now-committed FK: the correct empty set,
+-- because the FK genuinely holds (whether or not it folds, the answer is empty).
+select id from c where not exists (select 1 from p where p.pid = c.parent);
+→ []
+
+drop table c;
+drop table p;
+-- run
+
+-- 2n. CHECK + FK on the SAME ADD COLUMN (combination coverage).
+-- The validation schema carries the new CHECK (`mergedChecks`) but NOT the new FK,
+-- so the CHECK post-scan and the FK `not exists` scan run together in the one
+-- try/revert region. Each arm must abort independently, and a doubly-valid add must
+-- succeed and enforce both constraints forward.
+create table p (pid integer primary key);
+insert into p values (1), (2);
+create table c (id integer primary key);
+insert into c values (1);
+-- run
+
+-- CHECK arm aborts first: default 0 violates `parent > 0` (it is also an FK orphan,
+-- but the CHECK scan runs before the FK scan).
+alter table c add column parent integer default 0 check (parent > 0) references p(pid);
+-- error: CHECK
+
+-- FK arm aborts: default 99 satisfies the CHECK but references a missing parent.
+alter table c add column parent integer default 99 check (parent > 0) references p(pid);
+-- error: foreign key
+
+-- Both arms satisfied → succeeds and backfills.
+alter table c add column parent integer default 1 check (parent > 0) references p(pid);
+-- run
+
+select * from c order by id;
+→ [{"id":1,"parent":1}]
+
+-- Forward enforcement of BOTH constraints still fires post-add.
+insert into c values (2, 0);
+-- error: CHECK
+
+insert into c values (3, 99);
+-- error:
+
+drop table c;
+drop table p;
+-- run
+
+-- ===================================
+-- 3. ADD COLUMN with COLLATE clause — Quereus rejects NOCASE on TEXT
+-- ===================================
+
+create table t_col (id integer primary key, name text);
+insert into t_col values (1, 'Alice'), (2, 'BOB');
+
+alter table t_col add column nick text null collate nocase;
+
+drop table t_col;
+
+-- ===================================
+-- 4. ADD COLUMN UNIQUE rejected on populated table
+-- ===================================
+
+create table t_addunq (id integer primary key, a integer not null);
+insert into t_addunq values (1, 10), (2, 20);
+
+alter table t_addunq add column u integer unique;
+-- error:
+
+drop table t_addunq;
+
+-- ===================================
+-- 5. ADD COLUMN default value backfilled to existing rows
+-- ===================================
+
+-- integer default
+create table t_int (id integer primary key);
+insert into t_int values (1), (2);
+
+alter table t_int add column n integer default 7;
+
+select n from t_int order by id;
+→ [{"n":7},{"n":7}]
+
+drop table t_int;
+
+create table t_real_t (id integer primary key);
+insert into t_real_t values (1), (2);
+
+alter table t_real_t add column r real default -123.0;
+
+select r from t_real_t where id = 1;
+→ [{"r":-123}]
+
+drop table t_real_t;
+
+-- positive real default works
+create table t_real_p (id integer primary key);
+insert into t_real_p values (1), (2);
+
+alter table t_real_p add column r real default 123.0;
+
+select r from t_real_p where id = 1;
+→ [{"r":123}]
+
+drop table t_real_p;
+
+-- ===================================
+-- 6. Default backfill participates in aggregates over pre-existing rows
+-- ===================================
+
+create table t_agg (id integer primary key);
+insert into t_agg values (1), (2), (3);
+
+alter table t_agg add column score integer default 7;
+
+select sum(score) as s, count(score) as c from t_agg;
+→ [{"s":21,"c":3}]
+
+drop table t_agg;

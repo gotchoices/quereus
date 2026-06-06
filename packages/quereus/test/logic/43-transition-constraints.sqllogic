@@ -1,0 +1,341 @@
+-- transition-constraints.sqllogic - Testing transition constraints using committed.* pseudo-schema
+-- These tests verify that CHECK constraints and assertions can reference committed.*
+-- to express transition rules (comparing before/after state).
+
+-- ===================================
+-- CHECK constraint with committed subquery: auto-deferred
+-- ===================================
+
+CREATE TABLE accounts (
+  id INTEGER PRIMARY KEY,
+  balance INTEGER,
+  CONSTRAINT no_decrease CHECK (
+    balance >= coalesce((SELECT balance FROM committed.accounts ca WHERE ca.id = new.id), 0)
+  )
+) USING memory;
+
+-- Insert initial data (no committed counterpart → COALESCE to 0)
+INSERT INTO accounts VALUES (1, 100);
+INSERT INTO accounts VALUES (2, 200);
+COMMIT;
+
+-- Valid: increase balance
+BEGIN;
+UPDATE accounts SET balance = 150 WHERE id = 1;
+COMMIT;
+-- run
+
+SELECT balance FROM accounts WHERE id = 1;
+→ [{ "balance": 150 }]
+
+-- Valid: balance stays the same
+BEGIN;
+UPDATE accounts SET balance = 150 WHERE id = 1;
+COMMIT;
+-- run
+
+-- Invalid: decrease balance → CHECK fires at commit
+BEGIN;
+UPDATE accounts SET balance = 50 WHERE id = 1;
+COMMIT;
+-- error: CHECK constraint failed: no_decrease
+
+-- Verify state unchanged
+SELECT balance FROM accounts WHERE id = 1;
+→ [{ "balance": 150 }]
+
+DROP TABLE accounts;
+-- run
+
+-- ===================================
+-- CHECK constraint: new rows pass (no committed counterpart)
+-- ===================================
+
+CREATE TABLE items (
+  id INTEGER PRIMARY KEY,
+  score INTEGER,
+  CONSTRAINT score_no_decrease CHECK (
+    score >= coalesce((SELECT score FROM committed.items ci WHERE ci.id = new.id), 0)
+  )
+) USING memory;
+
+-- New rows with positive score: OK (COALESCE to 0)
+INSERT INTO items VALUES (1, 10);
+INSERT INTO items VALUES (2, 20);
+COMMIT;
+
+SELECT score FROM items ORDER BY id;
+→ [{ "score": 10 }, { "score": 20 }]
+
+-- New row with zero score: OK (COALESCE to 0)
+INSERT INTO items VALUES (3, 0);
+COMMIT;
+-- run
+
+-- New row with negative score: fails (< 0 default)
+BEGIN;
+INSERT INTO items VALUES (4, -5);
+COMMIT;
+-- error: CHECK constraint failed: score_no_decrease
+
+SELECT count(*) FROM items;
+→ [{ "count(*)": 3 }]
+
+DROP TABLE items;
+-- run
+
+-- ===================================
+-- Assertion: count preservation (cardinality can only grow)
+-- ===================================
+
+CREATE TABLE entries (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO entries VALUES (1, 'a');
+INSERT INTO entries VALUES (2, 'b');
+COMMIT;
+
+CREATE ASSERTION no_shrink CHECK (
+  (SELECT count(*) FROM entries) >= (SELECT count(*) FROM committed.entries)
+);
+-- run
+
+-- Insert: count grows → OK
+BEGIN;
+INSERT INTO entries VALUES (3, 'c');
+COMMIT;
+-- run
+
+SELECT count(*) FROM entries;
+→ [{ "count(*)": 3 }]
+
+-- Delete: count shrinks → fails
+BEGIN;
+DELETE FROM entries WHERE id = 3;
+COMMIT;
+-- error: Integrity assertion failed: no_shrink
+
+-- Verify state unchanged
+SELECT count(*) FROM entries;
+→ [{ "count(*)": 3 }]
+
+DROP ASSERTION no_shrink;
+DROP TABLE entries;
+-- run
+
+-- ===================================
+-- Assertion: multiple committed refs in same expression
+-- ===================================
+
+CREATE TABLE balances (id INTEGER PRIMARY KEY, amount INTEGER);
+CREATE TABLE totals (id INTEGER PRIMARY KEY, total INTEGER);
+INSERT INTO balances VALUES (1, 100);
+INSERT INTO totals VALUES (1, 100);
+COMMIT;
+
+-- Assert both tables' counts can only increase
+CREATE ASSERTION multi_committed CHECK (
+  (SELECT count(*) FROM balances) >= (SELECT count(*) FROM committed.balances)
+  AND
+  (SELECT count(*) FROM totals) >= (SELECT count(*) FROM committed.totals)
+);
+-- run
+
+-- Valid: insert into both (count grows)
+BEGIN;
+INSERT INTO balances VALUES (2, 200);
+INSERT INTO totals VALUES (2, 200);
+COMMIT;
+-- run
+
+-- Invalid: delete from balances (count shrinks)
+BEGIN;
+DELETE FROM balances WHERE id = 2;
+COMMIT;
+-- error: Integrity assertion failed: multi_committed
+
+-- Invalid: delete from totals (count shrinks)
+BEGIN;
+DELETE FROM totals WHERE id = 2;
+COMMIT;
+-- error: Integrity assertion failed: multi_committed
+
+-- Verify state unchanged
+SELECT count(*) FROM balances;
+→ [{ "count(*)": 2 }]
+SELECT count(*) FROM totals;
+→ [{ "count(*)": 2 }]
+
+DROP ASSERTION multi_committed;
+DROP TABLE totals;
+DROP TABLE balances;
+-- run
+
+-- ===================================
+-- Assertion: deleted rows detection (exist in committed but not current)
+-- ===================================
+
+CREATE TABLE protected (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO protected VALUES (1, 'keep');
+INSERT INTO protected VALUES (2, 'keep');
+COMMIT;
+
+-- Assert no rows are deleted
+CREATE ASSERTION no_deletes CHECK (NOT EXISTS (
+  SELECT 1 FROM committed.protected cp
+  WHERE NOT EXISTS (SELECT 1 FROM protected p WHERE p.id = cp.id)
+));
+-- run
+
+-- Insert new row: OK (doesn't delete anything)
+BEGIN;
+INSERT INTO protected VALUES (3, 'new');
+COMMIT;
+-- run
+
+-- Update existing row: OK
+BEGIN;
+UPDATE protected SET val = 'updated' WHERE id = 1;
+COMMIT;
+-- run
+
+-- Delete a row: fails
+BEGIN;
+DELETE FROM protected WHERE id = 2;
+COMMIT;
+-- error: Integrity assertion failed: no_deletes
+
+-- Verify state unchanged
+SELECT count(*) FROM protected;
+→ [{ "count(*)": 3 }]
+
+DROP ASSERTION no_deletes;
+DROP TABLE protected;
+-- run
+
+-- ===================================
+-- CHECK constraint + assertion together with committed refs
+-- ===================================
+
+CREATE TABLE ledger (
+  id INTEGER PRIMARY KEY,
+  amount INTEGER,
+  CONSTRAINT amount_no_decrease CHECK (
+    amount >= coalesce((SELECT amount FROM committed.ledger cl WHERE cl.id = new.id), 0)
+  )
+) USING memory;
+
+INSERT INTO ledger VALUES (1, 50);
+INSERT INTO ledger VALUES (2, 100);
+COMMIT;
+
+-- Also add an assertion for count preservation
+CREATE ASSERTION ledger_no_deletes CHECK (
+  (SELECT count(*) FROM ledger) >= (SELECT count(*) FROM committed.ledger)
+);
+-- run
+
+-- Valid: increase individual amounts
+BEGIN;
+UPDATE ledger SET amount = 75 WHERE id = 1;
+COMMIT;
+-- run
+
+-- Invalid: decrease individual amount (CHECK catches it)
+BEGIN;
+UPDATE ledger SET amount = 10 WHERE id = 1;
+COMMIT;
+-- error: CHECK constraint failed: amount_no_decrease
+
+-- Verify state
+SELECT amount FROM ledger WHERE id = 1;
+→ [{ "amount": 75 }]
+
+DROP ASSERTION ledger_no_deletes;
+DROP TABLE ledger;
+-- run
+
+-- ===================================
+-- Deferred CHECK across tables with datetime coercion (GitHub #25)
+-- The deferred subquery compares new.* against an already-coerced stored row.
+-- A datetime column rewrites its value on parse, so the comparison must run
+-- coerced-vs-coerced or it spuriously fails.
+-- ===================================
+
+CREATE TABLE Parent (Id TEXT, TS datetime, PRIMARY KEY (Id, TS)) USING memory;
+CREATE TABLE Child (
+  Id TEXT PRIMARY KEY,
+  ParentTS datetime,
+  CONSTRAINT ParentExists CHECK (
+    EXISTS (SELECT 1 FROM Parent P WHERE P.TS = new.ParentTS)
+  )
+) USING memory;
+
+-- Parent.TS coerced from numeric literal to the datetime logical representation
+INSERT INTO Parent VALUES ('p1', 1700000000000);
+COMMIT;
+
+-- Positive: matching parent (numeric literal coerces to the same value) → OK
+BEGIN;
+INSERT INTO Child VALUES ('c1', 1700000000000);
+COMMIT;
+-- run
+
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 1 }]
+
+-- Negative: no matching parent → deferred CHECK still fires at commit
+BEGIN;
+INSERT INTO Child VALUES ('c2', 1800000000000);
+COMMIT;
+-- error: CHECK constraint failed: ParentExists
+
+-- Verify the failed row did not land
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 1 }]
+
+-- Alternate textual representation on both sides — Z-suffixed input now
+-- canonicalizes through the column-type parse, so this exercises that path.
+INSERT INTO Parent VALUES ('p2', '2023-11-14T22:13:20Z');
+COMMIT;
+
+BEGIN;
+INSERT INTO Child VALUES ('c3', '2023-11-14T22:13:20Z');
+COMMIT;
+-- run
+
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 2 }]
+
+-- UPDATE shares the deferred-queue call site, so NEW is coerced there too.
+-- p3 stored from a numeric literal; the matching deferred-CHECK UPDATE below
+-- uses a textual representation of the same instant. Since datetime coercion
+-- is now canonical across input representations, the numeric-stored value
+-- and the textual NEW compare equal.
+INSERT INTO Parent VALUES ('p3', 1500000000000);
+COMMIT;
+
+BEGIN;
+UPDATE Child SET ParentTS = 1500000000000 WHERE Id = 'c1';
+COMMIT;
+-- run
+
+-- Textual-NEW vs numeric-stored UPDATE: 1600000000000 ms = 2020-09-13T12:26:40Z.
+INSERT INTO Parent VALUES ('p4', 1600000000000);
+COMMIT;
+
+BEGIN;
+UPDATE Child SET ParentTS = '2020-09-13T12:26:40Z' WHERE Id = 'c3';
+COMMIT;
+-- run
+
+-- Negative UPDATE: no matching parent → deferred CHECK still fires at commit
+BEGIN;
+UPDATE Child SET ParentTS = 1900000000000 WHERE Id = 'c1';
+COMMIT;
+-- error: CHECK constraint failed: ParentExists
+
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 2 }]
+
+DROP TABLE Child;
+DROP TABLE Parent;
+-- run

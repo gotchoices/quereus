@@ -1,0 +1,78 @@
+-- math-functions.sqllogic - Testing math functions not covered in 06-builtin_functions
+
+-- sqrt
+select sqrt(16), sqrt(2), sqrt(0);
+→ [{"sqrt(16)":4,"sqrt(2)":1.4142135623730951,"sqrt(0)":0}]
+
+-- sqrt of negative returns null
+select sqrt(-1);
+→ [{"sqrt(-1)":null}]
+
+-- pow/power
+select pow(2, 10), power(3, 3);
+→ [{"pow(2, 10)":1024,"power(3, 3)":27}]
+
+-- floor and ceil
+select floor(3.7), floor(-3.7), ceil(3.2), ceiling(-3.2);
+→ [{"floor(3.7)":3,"floor(-3.7)":-4,"ceil(3.2)":4,"ceiling(-3.2)":-3}]
+
+-- clamp
+select clamp(5, 1, 10), clamp(-5, 0, 100), clamp(50, 0, 10);
+→ [{"clamp(5, 1, 10)":5,"clamp(-5, 0, 100)":0,"clamp(50, 0, 10)":10}]
+
+-- greatest/least
+select greatest(1, 3, 2), least(1, 3, 2);
+→ [{"greatest(1, 3, 2)":3,"least(1, 3, 2)":1}]
+
+-- greatest/least with strings
+select greatest('apple', 'banana', 'cherry'), least('apple', 'banana', 'cherry');
+→ [{"greatest('apple', 'banana', 'cherry')":"cherry","least('apple', 'banana', 'cherry')":"apple"}]
+
+-- choose (1-based index)
+select choose(2, 'a', 'b', 'c');
+→ [{"choose(2, 'a', 'b', 'c')":"b"}]
+
+-- choose out of range returns null
+select choose(0, 'a', 'b');
+→ [{"choose(0, 'a', 'b')":null}]
+
+select choose(5, 'a', 'b');
+→ [{"choose(5, 'a', 'b')":null}]
+
+-- iif
+select iif(1, 'yes', 'no'), iif(0, 'yes', 'no'), iif(null, 'yes', 'no');
+→ [{"iif(1, 'yes', 'no')":"yes","iif(0, 'yes', 'no')":"no","iif(null, 'yes', 'no')":"no"}]
+
+-- random returns integer type
+select typeof(random());
+→ [{"typeof(random())":"integer"}]
+
+-- NULL propagation for math (through table columns to avoid type validation)
+create table null_math (id integer primary key, v real null);
+insert into null_math values (1, null);
+select abs(v), round(v), sqrt(v), pow(v, 2), floor(v), ceil(v) from null_math;
+→ [{"abs(v)":null,"round(v)":null,"sqrt(v)":null,"pow(v, 2)":null,"floor(v)":null,"ceil(v)":null}]
+drop table null_math;
+
+-- pow with zero exponent
+select pow(5, 0), pow(0, 0);
+→ [{"pow(5, 0)":1,"pow(0, 0)":1}]
+
+-- floor/ceil with integers (no change)
+select floor(5), ceil(5);
+→ [{"floor(5)":5,"ceil(5)":5}]
+
+-- clamp with null (through table column)
+create table null_clamp (id integer primary key, v real null);
+insert into null_clamp values (1, null);
+select clamp(v, 0, 10) from null_clamp;
+→ [{"clamp(v, 0, 10)":0}]
+drop table null_clamp;
+
+-- greatest/least with single argument
+select greatest(42), least(42);
+→ [{"greatest(42)":42,"least(42)":42}]
+
+-- pow with negative exponent
+select pow(2, -1);
+→ [{"pow(2, -1)":0.5}]

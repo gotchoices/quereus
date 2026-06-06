@@ -1,0 +1,50 @@
+-- key-cardinality.sqllogic - Key-driven cardinality and DISTINCT elimination tests
+
+-- Setup: customers (PK) and orders (FK → customers)
+CREATE TABLE kc_customers (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE kc_orders (oid INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER);
+
+INSERT INTO kc_customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT INTO kc_orders VALUES (100, 1, 50), (101, 1, 75), (102, 2, 30), (103, 3, 10);
+
+-- FK→PK join: orders JOIN customers ON customer_id = id
+-- PK side (customers.id) is covered, so uniqueKeys should be preserved
+SELECT o.oid, c.name FROM kc_orders o INNER JOIN kc_customers c ON o.customer_id = c.id ORDER BY o.oid;
+→ [{"oid":100,"name":"Alice"},{"oid":101,"name":"Alice"},{"oid":102,"name":"Bob"},{"oid":103,"name":"Carol"}]
+
+-- Reverse join direction should also work
+SELECT o.oid, c.name FROM kc_customers c INNER JOIN kc_orders o ON c.id = o.customer_id ORDER BY o.oid;
+→ [{"oid":100,"name":"Alice"},{"oid":101,"name":"Alice"},{"oid":102,"name":"Bob"},{"oid":103,"name":"Carol"}]
+
+-- DISTINCT on PK column is redundant — should be eliminated
+SELECT DISTINCT id FROM kc_customers ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- DISTINCT on non-key column is NOT redundant — should still work
+SELECT DISTINCT customer_id FROM kc_orders ORDER BY customer_id;
+→ [{"customer_id":1},{"customer_id":2},{"customer_id":3}]
+
+-- Unique constraint test
+CREATE TABLE kc_users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT);
+INSERT INTO kc_users VALUES (1, 'alice@test.com', 'Alice'), (2, 'bob@test.com', 'Bob');
+
+-- Join on unique column: email is a unique key, so PK-like behavior
+CREATE TABLE kc_logins (login_email TEXT, ts INTEGER);
+INSERT INTO kc_logins VALUES ('alice@test.com', 1000), ('bob@test.com', 2000), ('alice@test.com', 3000);
+
+SELECT l.ts, u.name FROM kc_logins l INNER JOIN kc_users u ON l.login_email = u.email ORDER BY l.ts;
+→ [{"ts":1000,"name":"Alice"},{"ts":2000,"name":"Bob"},{"ts":3000,"name":"Alice"}]
+
+-- Multi-table join with keys
+CREATE TABLE kc_products (pid INTEGER PRIMARY KEY, pname TEXT);
+CREATE TABLE kc_order_items (item_id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER);
+
+INSERT INTO kc_products VALUES (1, 'Widget'), (2, 'Gadget');
+INSERT INTO kc_order_items VALUES (1, 100, 1), (2, 100, 2), (3, 101, 1);
+
+SELECT oi.item_id, o.oid, p.pname
+FROM kc_order_items oi
+INNER JOIN kc_orders o ON oi.order_id = o.oid
+INNER JOIN kc_products p ON oi.product_id = p.pid
+ORDER BY oi.item_id;
+→ [{"item_id":1,"oid":100,"pname":"Widget"},{"item_id":2,"oid":100,"pname":"Gadget"},{"item_id":3,"oid":101,"pname":"Widget"}]

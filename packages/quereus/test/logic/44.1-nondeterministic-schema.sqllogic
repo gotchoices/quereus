@@ -1,0 +1,317 @@
+-- 44.1-nondeterministic-schema.sqllogic
+-- Exercise the `nondeterministic_schema` database option / PRAGMA: it relaxes
+-- the static prohibition on non-deterministic expressions in DEFAULT, CHECK,
+-- and GENERATED ALWAYS AS clauses. Capture is at the resolved-row frontier
+-- in vtab.update(); replay applies primitives at the module-layer boundary.
+
+-- ===================================
+-- Pragma roundtrip + default value
+-- ===================================
+
+-- Defaults to false (strict rejection — matches 44-determinism-validation).
+PRAGMA nondeterministic_schema;
+→ [{"name":"nondeterministic_schema","value":false}]
+
+-- ===================================
+-- Strict mode (default): rejection paths unchanged
+-- ===================================
+
+CREATE TABLE strict_default (
+    id INTEGER PRIMARY KEY,
+    value INTEGER DEFAULT random()
+);
+-- error: Non-deterministic expression not allowed in DEFAULT
+
+CREATE TABLE strict_check (
+    id INTEGER PRIMARY KEY,
+    value INTEGER CHECK (random() > 0)
+);
+-- error: Non-deterministic expression not allowed in CHECK
+
+-- GENERATED column determinism is validated at DML build time (the expression
+-- is built into a plan node when the row is expanded), not at CREATE TABLE.
+CREATE TABLE strict_generated (
+    id INTEGER PRIMARY KEY,
+    v INTEGER,
+    g INTEGER GENERATED ALWAYS AS (random()) STORED
+);
+
+INSERT INTO strict_generated (id, v) VALUES (1, 10);
+-- error: Non-deterministic expression not allowed
+
+DROP TABLE strict_generated;
+
+-- ===================================
+-- Flip the gate and read it back
+-- ===================================
+
+PRAGMA nondeterministic_schema = true;
+
+PRAGMA nondeterministic_schema;
+→ [{"name":"nondeterministic_schema","value":true}]
+
+-- Alias also resolves to the same underlying value (the pragma echoes the
+-- name as written, but the value reflects the canonical option).
+PRAGMA allow_nondeterministic_schema_expressions;
+→ [{"name":"allow_nondeterministic_schema_expressions","value":true}]
+
+-- ===================================
+-- Relaxed mode: DEFAULT random()
+-- ===================================
+
+-- CREATE TABLE no longer rejects. Per-row capture resolves the default into a
+-- literal at INSERT time, so the row stored in the table is fully concrete.
+CREATE TABLE relaxed_default (
+    id INTEGER PRIMARY KEY,
+    rnd INTEGER DEFAULT random()
+);
+
+INSERT INTO relaxed_default (id) VALUES (1);
+INSERT INTO relaxed_default (id) VALUES (2);
+INSERT INTO relaxed_default (id) VALUES (3);
+
+-- Three rows landed; each row's rnd column is concrete (non-null) because the
+-- default fired per row.
+SELECT COUNT(*) AS n, COUNT(rnd) AS non_null_rnd FROM relaxed_default;
+→ [{"n":3,"non_null_rnd":3}]
+
+-- Distinct PKs is independent of the relaxation, but verify the relaxed DEFAULT
+-- doesn't break the regular INSERT path.
+SELECT id FROM relaxed_default ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+DROP TABLE relaxed_default;
+
+-- ===================================
+-- Relaxed mode: DEFAULT datetime('now')
+-- ===================================
+
+CREATE TABLE relaxed_default_now (
+    id INTEGER PRIMARY KEY,
+    ts TEXT DEFAULT datetime('now')
+);
+
+INSERT INTO relaxed_default_now (id) VALUES (1);
+
+-- Captured timestamp is a real string (not null, not the literal "datetime").
+SELECT COUNT(*) AS n, COUNT(ts) AS non_null_ts FROM relaxed_default_now;
+→ [{"n":1,"non_null_ts":1}]
+
+SELECT id FROM relaxed_default_now WHERE ts >= '2020-01-01';
+→ [{"id":1}]
+
+DROP TABLE relaxed_default_now;
+
+-- ===================================
+-- Relaxed mode: immediate CHECK using datetime('now') predicate
+-- This avoids probabilistic flakiness while still exercising the relaxed gate
+-- (the strict validator would reject this CREATE TABLE).
+-- ===================================
+
+CREATE TABLE relaxed_check (
+    id INTEGER PRIMARY KEY,
+    note TEXT,
+    CONSTRAINT after_epoch CHECK (datetime('now') >= '2020-01-01')
+);
+
+INSERT INTO relaxed_check VALUES (1, 'first');
+INSERT INTO relaxed_check VALUES (2, 'second');
+
+SELECT COUNT(*) FROM relaxed_check;
+→ [{"count(*)":2}]
+
+DROP TABLE relaxed_check;
+
+-- ===================================
+-- Relaxed mode: CHECK with random() — pure non-det in a row CHECK
+-- random() returns a BigInt in [MIN_SAFE_INT, MAX_SAFE_INT]; "random() IS NOT NULL"
+-- always passes, so this exercises the relaxed-gate path without probabilistic
+-- flakiness.
+-- ===================================
+
+CREATE TABLE relaxed_check_random (
+    id INTEGER PRIMARY KEY,
+    v INTEGER,
+    CONSTRAINT rnd_nonnull CHECK (random() IS NOT NULL)
+);
+
+INSERT INTO relaxed_check_random VALUES (1, 100);
+INSERT INTO relaxed_check_random VALUES (2, 200);
+
+SELECT COUNT(*) FROM relaxed_check_random;
+→ [{"count(*)":2}]
+
+DROP TABLE relaxed_check_random;
+
+-- ===================================
+-- Relaxed mode: stored GENERATED ALWAYS AS (random())
+-- The expression is evaluated per row before the module write; the resolved
+-- value is captured.
+-- ===================================
+
+CREATE TABLE relaxed_generated (
+    id INTEGER PRIMARY KEY,
+    payload TEXT,
+    g INTEGER GENERATED ALWAYS AS (random()) STORED
+);
+
+INSERT INTO relaxed_generated (id, payload) VALUES (1, 'a');
+INSERT INTO relaxed_generated (id, payload) VALUES (2, 'b');
+
+-- The generated column is materialised with a concrete value per row.
+SELECT COUNT(*) AS n, COUNT(g) AS non_null_g FROM relaxed_generated;
+→ [{"n":2,"non_null_g":2}]
+
+DROP TABLE relaxed_generated;
+
+-- ===================================
+-- Relaxed mode: deferred CHECK via CREATE ASSERTION with non-det
+-- The assertion evaluates once at COMMIT; non-determinism in the body is
+-- replay-safe by transaction atomicity (commit-or-rollback is decided once,
+-- replay applies the module-layer writes).
+-- ===================================
+
+CREATE TABLE assertion_target (id INTEGER PRIMARY KEY, val INTEGER);
+
+CREATE ASSERTION rnd_assertion CHECK (random() IS NOT NULL);
+
+BEGIN;
+INSERT INTO assertion_target VALUES (1, 10);
+COMMIT;
+
+SELECT id, val FROM assertion_target;
+→ [{"id":1,"val":10}]
+
+DROP ASSERTION rnd_assertion;
+
+DROP TABLE assertion_target;
+
+-- ===================================
+-- Pragma scope: turning the gate OFF after creating a relaxed table leaves the
+-- table's schema in place. Validation is re-evaluated at DML build time, so
+-- INSERTs into a table whose stored expressions are non-deterministic require
+-- the gate to be on at the time of compilation; flipping the gate back ON
+-- restores INSERT compilability without re-creating the table.
+-- ===================================
+
+CREATE TABLE keeper (
+    id INTEGER PRIMARY KEY,
+    rnd INTEGER DEFAULT random()
+);
+
+INSERT INTO keeper (id) VALUES (10);
+
+PRAGMA nondeterministic_schema = false;
+
+PRAGMA nondeterministic_schema;
+→ [{"name":"nondeterministic_schema","value":false}]
+
+-- New DDL with non-det is rejected again.
+CREATE TABLE strict_after (
+    id INTEGER PRIMARY KEY,
+    value INTEGER DEFAULT random()
+);
+-- error: Non-deterministic expression not allowed in DEFAULT
+
+-- Existing table's schema is intact (rows already in the table read back fine —
+-- the read path doesn't re-validate stored expressions).
+SELECT COUNT(*) AS n, COUNT(rnd) AS non_null_rnd FROM keeper;
+→ [{"n":1,"non_null_rnd":1}]
+
+-- An INSERT that doesn't fire the non-deterministic DEFAULT (because the
+-- column is supplied explicitly) compiles even under strict mode.
+INSERT INTO keeper (id, rnd) VALUES (11, 99);
+SELECT id, rnd FROM keeper WHERE id = 11;
+→ [{"id":11,"rnd":99}]
+
+-- But an INSERT that *would* fire the DEFAULT re-evaluates determinism against
+-- the current pragma value and is rejected.
+INSERT INTO keeper (id) VALUES (12);
+-- error: Non-deterministic expression not allowed in DEFAULT
+
+-- Flipping the gate back on restores INSERT compilability without touching
+-- the table.
+PRAGMA nondeterministic_schema = true;
+
+INSERT INTO keeper (id) VALUES (13);
+SELECT COUNT(*) AS n, COUNT(rnd) AS non_null_rnd FROM keeper;
+→ [{"n":3,"non_null_rnd":3}]
+
+DROP TABLE keeper;
+
+-- ===================================
+-- Scope-check pre-walks remain active even under relaxed mode. Bind parameters
+-- and bare column references in DEFAULT, and bind parameters in CHECK, are
+-- still rejected at CREATE TABLE time regardless of the pragma — these are
+-- scope checks, not determinism checks.
+-- ===================================
+
+PRAGMA nondeterministic_schema = true;
+
+CREATE TABLE relaxed_default_bindparam (
+    id INTEGER PRIMARY KEY,
+    v INTEGER DEFAULT (?)
+);
+-- error: may not reference bind parameters
+
+CREATE TABLE relaxed_default_colref (
+    id INTEGER PRIMARY KEY,
+    a INTEGER,
+    b INTEGER DEFAULT (a)
+);
+-- error: may not reference a bare column
+
+CREATE TABLE relaxed_check_bindparam (
+    id INTEGER PRIMARY KEY,
+    v INTEGER,
+    CHECK (v > ?)
+);
+-- error: may not reference bind parameters
+
+PRAGMA nondeterministic_schema = false;
+
+-- ===================================
+-- new.<column> DEFAULT determinism: the DDL build/determinism check is deferred
+-- to INSERT time (the row scope isn't available at CREATE TABLE), so the
+-- determinism gate is re-evaluated when the row is expanded. A pure `new.<col>`
+-- reference is deterministic; wrapping it around a non-deterministic function is
+-- not — and must be rejected under strict mode but allowed under the relaxed gate.
+-- ===================================
+
+-- Strict mode: a pure new.<col> default is deterministic and inserts cleanly.
+CREATE TABLE newref_det (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER DEFAULT (new.x + 1)
+);
+INSERT INTO newref_det (id, x) VALUES (1, 5);
+SELECT y FROM newref_det WHERE id = 1;
+→ [{"y":6}]
+DROP TABLE newref_det;
+
+-- Strict mode: new.<col> combined with a non-deterministic function is rejected
+-- at INSERT time (the deferred determinism check fires when the default fires).
+CREATE TABLE newref_nondet (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER DEFAULT (new.x + random())
+);
+INSERT INTO newref_nondet (id, x) VALUES (1, 5);
+-- error: Non-deterministic expression not allowed in DEFAULT
+DROP TABLE newref_nondet;
+
+-- Relaxed mode: the same non-deterministic new.<col> default is permitted; the
+-- value is resolved into a concrete literal per row.
+PRAGMA nondeterministic_schema = true;
+
+CREATE TABLE newref_relaxed (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER DEFAULT (new.x + random())
+);
+INSERT INTO newref_relaxed (id, x) VALUES (1, 5);
+SELECT COUNT(*) AS n, COUNT(y) AS non_null_y FROM newref_relaxed;
+→ [{"n":1,"non_null_y":1}]
+DROP TABLE newref_relaxed;
+
+PRAGMA nondeterministic_schema = false;

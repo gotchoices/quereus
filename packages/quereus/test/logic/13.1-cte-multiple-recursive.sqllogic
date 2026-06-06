@@ -1,0 +1,104 @@
+-- Testing multiple CTEs in a WITH RECURSIVE clause where later CTEs reference earlier ones
+
+CREATE TABLE Entity (
+  id INTEGER PRIMARY KEY,
+  component_id INTEGER NULL,
+  p_x REAL, p_y REAL, p_z REAL,
+  r_x REAL, r_y REAL, r_z REAL,
+  s_x REAL, s_y REAL, s_z REAL
+);
+
+INSERT INTO Entity VALUES
+  (1, null, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+  (2, 1, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+  (3, 1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+  (4, 2, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5);
+
+-- Test case 1: Simple multiple CTEs in WITH RECURSIVE, second references first
+-- This tests that entity_tree is in scope when building ancestor_walk
+WITH RECURSIVE
+  entity_tree(id) AS (
+    SELECT id FROM Entity WHERE id = 1
+    UNION ALL
+    SELECT E.id FROM Entity E JOIN entity_tree T ON E.component_id = T.id
+  ),
+  ancestor_walk(entity_id, ancestor_id, depth) AS (
+    SELECT E.id, E.component_id, 0
+    FROM Entity E
+    WHERE E.id IN (SELECT id FROM entity_tree) AND E.component_id IS NOT NULL
+    UNION ALL
+    SELECT W.entity_id, P.component_id, W.depth + 1
+    FROM ancestor_walk W
+    JOIN Entity P ON W.ancestor_id = P.id
+    WHERE P.component_id IS NOT NULL
+  )
+SELECT entity_id, ancestor_id, depth
+FROM ancestor_walk
+ORDER BY entity_id, depth DESC;
+→ [{"entity_id":2,"ancestor_id":1,"depth":0},{"entity_id":3,"ancestor_id":1,"depth":0},{"entity_id":4,"ancestor_id":1,"depth":1},{"entity_id":4,"ancestor_id":2,"depth":0}]
+
+-- Test case 2: Full query from the bug report (with joins to get entity attributes)
+WITH RECURSIVE
+  entity_tree(id) AS (
+    SELECT id FROM Entity WHERE id = 1
+    UNION ALL
+    SELECT E.id FROM Entity E JOIN entity_tree T ON E.component_id = T.id
+  ),
+  ancestor_walk(entity_id, ancestor_id, depth) AS (
+    SELECT E.id, E.component_id, 0
+    FROM Entity E
+    WHERE E.id IN (SELECT id FROM entity_tree) AND E.component_id IS NOT NULL
+    UNION ALL
+    SELECT W.entity_id, P.component_id, W.depth + 1
+    FROM ancestor_walk W
+    JOIN Entity P ON W.ancestor_id = P.id
+    WHERE P.component_id IS NOT NULL
+  )
+SELECT
+  W.entity_id,
+  W.ancestor_id,
+  W.depth as ancestor_depth,
+  A.p_x, A.p_y, A.p_z,
+  A.r_x, A.r_y, A.r_z,
+  A.s_x, A.s_y, A.s_z
+FROM ancestor_walk W
+JOIN Entity A ON W.ancestor_id = A.id
+ORDER BY W.entity_id, W.depth DESC;
+→ [{"entity_id":2,"ancestor_id":1,"ancestor_depth":0,"p_x":0.0,"p_y":0.0,"p_z":0.0,"r_x":0.0,"r_y":0.0,"r_z":0.0,"s_x":1.0,"s_y":1.0,"s_z":1.0},{"entity_id":3,"ancestor_id":1,"ancestor_depth":0,"p_x":0.0,"p_y":0.0,"p_z":0.0,"r_x":0.0,"r_y":0.0,"r_z":0.0,"s_x":1.0,"s_y":1.0,"s_z":1.0},{"entity_id":4,"ancestor_id":1,"ancestor_depth":1,"p_x":0.0,"p_y":0.0,"p_z":0.0,"r_x":0.0,"r_y":0.0,"r_z":0.0,"s_x":1.0,"s_y":1.0,"s_z":1.0},{"entity_id":4,"ancestor_id":2,"ancestor_depth":0,"p_x":1.0,"p_y":0.0,"p_z":0.0,"r_x":0.0,"r_y":0.0,"r_z":0.0,"s_x":1.0,"s_y":1.0,"s_z":1.0}]
+
+-- Test case 3: Non-recursive CTE followed by recursive CTE referencing it
+WITH RECURSIVE
+  filtered_entities(id) AS (
+    SELECT id FROM Entity WHERE p_x >= 0.0
+  ),
+  entity_tree(id) AS (
+    SELECT id FROM filtered_entities WHERE id = 1
+    UNION ALL
+    SELECT E.id FROM Entity E JOIN entity_tree T ON E.component_id = T.id
+  )
+SELECT id FROM entity_tree ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+-- Test case 4: Three CTEs where third references first two
+-- Note: cte3 uses UNION (not UNION ALL) to avoid being treated as recursive
+WITH RECURSIVE
+  cte1(id) AS (
+    SELECT 1
+    UNION ALL
+    SELECT id + 1 FROM cte1 WHERE id < 3
+  ),
+  cte2(id) AS (
+    SELECT 10
+    UNION ALL
+    SELECT id + 1 FROM cte2 WHERE id < 12
+  ),
+  cte3(id) AS (
+    SELECT id FROM cte1
+    UNION
+    SELECT id FROM cte2
+  )
+SELECT id FROM cte3 ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3},{"id":10},{"id":11},{"id":12}]
+
+DROP TABLE Entity;
+

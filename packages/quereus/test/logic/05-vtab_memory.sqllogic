@@ -1,0 +1,47 @@
+-- vtab_memory.sqllogic - Testing MemoryTable specific features, especially indexing
+
+PRAGMA default_vtab_module='memory';
+
+-- Setup with PRIMARY KEY and another index potential
+CREATE TABLE mem_t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, city TEXT);
+INSERT INTO mem_t VALUES (1, 'Alice', 30, 'New York'), (2, 'Bob', 25, 'London'), (3, 'Charlie', 35, 'New York'), (4, 'David', 30, 'Paris');
+
+-- Expect PK point lookup (idxNum=1 likely)
+-- NOTE: We can't directly assert idxNum here, but verify behavior
+SELECT * FROM mem_t WHERE id = 3;
+→ [{"id":3,"name":"Charlie","age":35,"city":"New York"}]
+
+-- Expect PK range scan
+SELECT name FROM mem_t WHERE id > 1 AND id < 4 ORDER BY id;
+→ [{"name":"Bob"},{"name":"Charlie"}]
+
+-- Expect full table scan (no usable index on name directly for EQ)
+SELECT id FROM mem_t WHERE name = 'Bob';
+→ [{"id":2}]
+
+-- ORDER BY PK should be consumed by index scan
+SELECT id FROM mem_t WHERE id > 1 ORDER BY id LIMIT 2;
+→ [{"id":2},{"id":3}]
+
+-- ORDER BY non-indexed column requires VDBE sort
+SELECT id FROM mem_t ORDER BY age, name;
+→ [{"id":2},{"id":1},{"id":4},{"id":3}]
+
+-- Filter and Order interaction
+SELECT name FROM mem_t WHERE city = 'New York' ORDER BY age;
+→ [{"name":"Alice"},{"name":"Charlie"}]
+
+-- Test transactions (covered more in transactions.sqllogic, but include a basic check)
+BEGIN;
+INSERT INTO mem_t VALUES (5, 'Eve', 28, 'London');
+SELECT count(*) FROM mem_t WHERE city = 'London';
+→ [{ "count(*)": 2 }]
+ROLLBACK;
+SELECT count(*) FROM mem_t WHERE city = 'London';
+→ [{ "count(*)": 1 }]
+
+-- Test multiple constraints - PK likely preferred
+SELECT name FROM mem_t WHERE id > 1 AND age = 30;
+→ [{"name":"David"}]
+
+DROP TABLE mem_t;

@@ -1,0 +1,371 @@
+-- 28-set-ops-sort-edge-cases.sqllogic
+-- Edge-case tests for set operations (UNION/INTERSECT/EXCEPT/DIFF) and ORDER BY
+
+-- ============================================================
+-- Setup tables
+-- ============================================================
+
+CREATE TABLE sose_t (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO sose_t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+
+-- ============================================================
+-- SET OPERATIONS: Empty inputs
+-- ============================================================
+
+-- UNION: empty left, non-empty right
+SELECT val FROM sose_t WHERE 1=0
+UNION
+SELECT val FROM sose_t
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- UNION: non-empty left, empty right
+SELECT val FROM sose_t
+UNION
+SELECT val FROM sose_t WHERE 1=0
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- UNION: both sides empty
+SELECT val FROM sose_t WHERE 1=0
+UNION
+SELECT val FROM sose_t WHERE 1=0;
+→ []
+
+-- UNION ALL: empty left, non-empty right
+SELECT val FROM sose_t WHERE 1=0
+UNION ALL
+SELECT val FROM sose_t
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- UNION ALL: non-empty left, empty right
+SELECT val FROM sose_t
+UNION ALL
+SELECT val FROM sose_t WHERE 1=0
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- INTERSECT: empty left
+SELECT val FROM sose_t WHERE 1=0
+INTERSECT
+SELECT val FROM sose_t;
+→ []
+
+-- INTERSECT: empty right
+SELECT val FROM sose_t
+INTERSECT
+SELECT val FROM sose_t WHERE 1=0;
+→ []
+
+-- INTERSECT: both empty
+SELECT val FROM sose_t WHERE 1=0
+INTERSECT
+SELECT val FROM sose_t WHERE 1=0;
+→ []
+
+-- EXCEPT: empty left
+SELECT val FROM sose_t WHERE 1=0
+EXCEPT
+SELECT val FROM sose_t;
+→ []
+
+-- EXCEPT: empty right — should return all of left
+SELECT val FROM sose_t
+EXCEPT
+SELECT val FROM sose_t WHERE 1=0
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- EXCEPT: both empty
+SELECT val FROM sose_t WHERE 1=0
+EXCEPT
+SELECT val FROM sose_t WHERE 1=0;
+→ []
+
+-- DIFF: empty left
+SELECT val FROM sose_t WHERE 1=0
+DIFF
+SELECT val FROM sose_t
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- DIFF: empty right — should return all of left
+SELECT val FROM sose_t
+DIFF
+SELECT val FROM sose_t WHERE 1=0
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"beta"},{"val":"gamma"}]
+
+-- DIFF: both empty
+SELECT val FROM sose_t WHERE 1=0
+DIFF
+SELECT val FROM sose_t WHERE 1=0;
+→ []
+
+-- ============================================================
+-- SET OPERATIONS: All-duplicate inputs
+-- ============================================================
+
+-- UNION on all-duplicate rows deduplicates to one
+SELECT v FROM (VALUES ('dup'), ('dup'), ('dup')) AS t(v)
+UNION
+SELECT v FROM (VALUES ('dup'), ('dup')) AS t(v);
+→ [{"v":"dup"}]
+
+-- UNION ALL preserves all duplicates
+SELECT v FROM (VALUES ('dup'), ('dup'), ('dup')) AS t(v)
+UNION ALL
+SELECT v FROM (VALUES ('dup'), ('dup')) AS t(v);
+→ [{"v":"dup"},{"v":"dup"},{"v":"dup"},{"v":"dup"},{"v":"dup"}]
+
+-- INTERSECT on all-duplicate rows returns one
+SELECT v FROM (VALUES ('dup'), ('dup'), ('dup')) AS t(v)
+INTERSECT
+SELECT v FROM (VALUES ('dup'), ('dup')) AS t(v);
+→ [{"v":"dup"}]
+
+-- EXCEPT on all-duplicate rows (both sides same) returns empty
+SELECT v FROM (VALUES ('dup'), ('dup'), ('dup')) AS t(v)
+EXCEPT
+SELECT v FROM (VALUES ('dup')) AS t(v);
+→ []
+
+-- ============================================================
+-- SET OPERATIONS: Three-way / precedence
+-- ============================================================
+
+-- Parser is right-associative: A UNION B EXCEPT C = A UNION (B EXCEPT C)
+-- A={1,2}, B={3,4}, C={2,3} → A UNION ({3,4} EXCEPT {2,3}) = {1,2} UNION {4} = {1,2,4}
+SELECT v FROM (VALUES (1), (2)) AS a(v)
+UNION
+SELECT v FROM (VALUES (3), (4)) AS b(v)
+EXCEPT
+SELECT v FROM (VALUES (2), (3)) AS c(v)
+ORDER BY v;
+→ [{"v":1},{"v":2},{"v":4}]
+
+-- A EXCEPT B UNION C = A EXCEPT (B UNION C) (right-assoc)
+-- A={1,2,3}, B={2}, C={4} → {1,2,3} EXCEPT ({2} UNION {4}) = {1,2,3} EXCEPT {2,4} = {1,3}
+SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+EXCEPT
+SELECT v FROM (VALUES (2)) AS b(v)
+UNION
+SELECT v FROM (VALUES (4)) AS c(v)
+ORDER BY v;
+→ [{"v":1},{"v":3}]
+
+-- Explicit CTE to force left-to-right: (A EXCEPT B) UNION C
+-- A={1,2,3}, B={2}, C={4} → {1,3} UNION {4} = {1,3,4}
+WITH ab AS (
+  SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+  EXCEPT
+  SELECT v FROM (VALUES (2)) AS b(v)
+)
+SELECT v FROM ab
+UNION
+SELECT v FROM (VALUES (4)) AS c(v)
+ORDER BY v;
+→ [{"v":1},{"v":3},{"v":4}]
+
+-- A INTERSECT B UNION C = A INTERSECT (B UNION C) (right-assoc)
+-- A={1,2,3}, B={2,3,4}, C={5} → {1,2,3} INTERSECT ({2,3,4} UNION {5}) = {1,2,3} INTERSECT {2,3,4,5} = {2,3}
+SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+INTERSECT
+SELECT v FROM (VALUES (2), (3), (4)) AS b(v)
+UNION
+SELECT v FROM (VALUES (5)) AS c(v)
+ORDER BY v;
+→ [{"v":2},{"v":3}]
+
+-- ============================================================
+-- SET OPERATIONS: Column count mismatch (error)
+-- ============================================================
+
+SELECT 1
+UNION
+SELECT 1, 2;
+-- error: column count mismatch
+
+SELECT 1, 2
+INTERSECT
+SELECT 1;
+-- error: column count mismatch
+
+-- ============================================================
+-- SET OPERATIONS: ORDER BY on combined result
+-- ============================================================
+
+-- ORDER BY applies to the full result, not just the last branch
+SELECT val FROM sose_t WHERE id = 3
+UNION
+SELECT val FROM sose_t WHERE id = 1
+ORDER BY val;
+→ [{"val":"alpha"},{"val":"gamma"}]
+
+-- ORDER BY with DESC on set operation result
+SELECT val FROM sose_t WHERE id IN (1, 3)
+UNION
+SELECT val FROM sose_t WHERE id = 2
+ORDER BY val DESC;
+→ [{"val":"gamma"},{"val":"beta"},{"val":"alpha"}]
+
+-- ============================================================
+-- SET OPERATIONS: Type preservation
+-- ============================================================
+
+-- integer union real: left-side type preserved for matching values;
+-- non-matching values from right side keep their own type
+-- Note: 3.0 has no fractional part, so JS normalizes it to integer
+SELECT typeof(v) AS t, v FROM (
+  SELECT v FROM (VALUES (1), (2)) AS a(v)
+  UNION
+  SELECT v FROM (VALUES (1.0), (3.5)) AS b(v)
+) AS r
+ORDER BY v;
+→ [{"t":"integer","v":1},{"t":"integer","v":2},{"t":"real","v":3.5}]
+
+-- ============================================================
+-- SET OPERATIONS: EXCEPT with no overlap (disjoint sets)
+-- ============================================================
+
+-- A and B are completely disjoint — EXCEPT should return all of A
+SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+EXCEPT
+SELECT v FROM (VALUES (4), (5), (6)) AS b(v)
+ORDER BY v;
+→ [{"v":1},{"v":2},{"v":3}]
+
+-- ============================================================
+-- SET OPERATIONS: DIFF identity properties
+-- ============================================================
+
+-- A DIFF A is always empty
+SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+DIFF
+SELECT v FROM (VALUES (1), (2), (3)) AS b(v);
+→ []
+
+-- A DIFF empty = A
+SELECT v FROM (VALUES (10), (20)) AS a(v)
+DIFF
+SELECT v FROM (VALUES (99)) AS b(v) WHERE 1=0
+ORDER BY v;
+→ [{"v":10},{"v":20}]
+
+-- empty DIFF A = A (DIFF is symmetric)
+SELECT v FROM (VALUES (99)) AS a(v) WHERE 1=0
+DIFF
+SELECT v FROM (VALUES (10), (20)) AS b(v)
+ORDER BY v;
+→ [{"v":10},{"v":20}]
+
+DROP TABLE sose_t;
+
+-- ============================================================
+-- SORT: Setup for sort edge cases
+-- ============================================================
+
+CREATE TABLE sort_t (id INTEGER PRIMARY KEY, key TEXT, seq INTEGER);
+INSERT INTO sort_t VALUES (1, 'X', 10);
+INSERT INTO sort_t VALUES (2, 'X', 20);
+INSERT INTO sort_t VALUES (3, 'X', 30);
+INSERT INTO sort_t VALUES (4, 'Y', 40);
+INSERT INTO sort_t VALUES (5, 'Y', 50);
+-- run
+
+-- ============================================================
+-- SORT: Stability with duplicate keys
+-- ============================================================
+
+-- Rows with identical sort key 'X' should retain insertion order (stable sort)
+SELECT id, key FROM sort_t WHERE key = 'X' ORDER BY key;
+→ [{"id":1,"key":"X"},{"id":2,"key":"X"},{"id":3,"key":"X"}]
+
+-- All rows sorted by key; within same key, insertion order preserved
+SELECT id, key FROM sort_t ORDER BY key;
+→ [{"id":1,"key":"X"},{"id":2,"key":"X"},{"id":3,"key":"X"},{"id":4,"key":"Y"},{"id":5,"key":"Y"}]
+
+-- ============================================================
+-- SORT: Expression-based ORDER BY with NULLs
+-- ============================================================
+
+CREATE TABLE sort_nulls (id INTEGER PRIMARY KEY, x INTEGER NULL);
+INSERT INTO sort_nulls VALUES (1, NULL);
+INSERT INTO sort_nulls VALUES (2, 5);
+INSERT INTO sort_nulls VALUES (3, NULL);
+INSERT INTO sort_nulls VALUES (4, 1);
+INSERT INTO sort_nulls VALUES (5, 10);
+-- run
+
+-- ORDER BY coalesce(x, 0) — NULLs become 0 and sort before positive values
+SELECT id, x FROM sort_nulls ORDER BY coalesce(x, 0);
+→ [{"id":1,"x":null},{"id":3,"x":null},{"id":4,"x":1},{"id":2,"x":5},{"id":5,"x":10}]
+
+-- ORDER BY expression: x IS NULL puts NULLs last (false=0 < true=1)
+SELECT id, x FROM sort_nulls ORDER BY x IS NULL, x;
+→ [{"id":4,"x":1},{"id":2,"x":5},{"id":5,"x":10},{"id":1,"x":null},{"id":3,"x":null}]
+
+-- ============================================================
+-- SORT: ORDER BY on aliased expressions
+-- ============================================================
+
+SELECT x + 10 AS y FROM sort_nulls WHERE x IS NOT NULL ORDER BY y;
+→ [{"y":11},{"y":15},{"y":20}]
+
+SELECT id, coalesce(x, -1) AS cx FROM sort_nulls ORDER BY cx;
+→ [{"id":1,"cx":-1},{"id":3,"cx":-1},{"id":4,"cx":1},{"id":2,"cx":5},{"id":5,"cx":10}]
+
+-- ============================================================
+-- SORT: Large multi-column sort with mixed directions and NULLS FIRST/LAST
+-- ============================================================
+
+CREATE TABLE sort_multi (
+  id INTEGER PRIMARY KEY,
+  a INTEGER,
+  b TEXT,
+  c INTEGER,
+  d TEXT,
+  e INTEGER NULL
+);
+INSERT INTO sort_multi VALUES (1,  1, 'x', 10, 'p', NULL);
+INSERT INTO sort_multi VALUES (2,  1, 'x', 10, 'q', 5);
+INSERT INTO sort_multi VALUES (3,  1, 'x', 20, 'p', 3);
+INSERT INTO sort_multi VALUES (4,  1, 'y', 10, 'p', 1);
+INSERT INTO sort_multi VALUES (5,  2, 'x', 10, 'p', NULL);
+INSERT INTO sort_multi VALUES (6,  2, 'x', 10, 'p', 2);
+INSERT INTO sort_multi VALUES (7,  2, 'y', 30, 'q', 4);
+INSERT INTO sort_multi VALUES (8,  1, 'x', 10, 'p', 7);
+-- run
+
+-- 5-column ORDER BY: a ASC, b DESC, c ASC, d DESC, e ASC NULLS FIRST
+-- a=1,b='y' first; then a=1,b='x': c=10,d='q'(id=2) before c=10,d='p'; NULLs first in e
+SELECT id FROM sort_multi
+ORDER BY a ASC, b DESC, c ASC, d DESC, e ASC NULLS FIRST;
+→ [{"id":4},{"id":2},{"id":1},{"id":8},{"id":3},{"id":7},{"id":5},{"id":6}]
+
+-- ============================================================
+-- SORT: ORDER BY in subquery vs outer — outer wins
+-- ============================================================
+
+-- Inner ORDER BY x DESC, outer ORDER BY id ASC — outer should win
+SELECT id, x FROM (
+  SELECT id, x FROM sort_nulls WHERE x IS NOT NULL ORDER BY x DESC
+) AS sub
+ORDER BY id;
+→ [{"id":2,"x":5},{"id":4,"x":1},{"id":5,"x":10}]
+
+-- Inner ORDER BY id DESC, outer ORDER BY x ASC — outer should win
+SELECT id, x FROM (
+  SELECT id, x FROM sort_nulls WHERE x IS NOT NULL ORDER BY id DESC
+) AS sub
+ORDER BY x;
+→ [{"id":4,"x":1},{"id":2,"x":5},{"id":5,"x":10}]
+
+-- ============================================================
+-- Cleanup
+-- ============================================================
+
+DROP TABLE sort_t;
+DROP TABLE sort_nulls;
+DROP TABLE sort_multi;

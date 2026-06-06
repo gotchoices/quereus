@@ -1,0 +1,442 @@
+-- constraint-edge-cases.sqllogic - Edge-case interactions between constraints, FK cascades, and assertions
+
+PRAGMA foreign_keys = true;
+
+-- ===================================================================
+-- Multi-row DELETE with cascading FKs
+-- Delete multiple parent rows in a single statement where each parent
+-- has children — verify all children are cascaded correctly.
+-- ===================================================================
+
+CREATE TABLE mr_parent (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+
+CREATE TABLE mr_child (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER,
+    info TEXT,
+    FOREIGN KEY (parent_id) REFERENCES mr_parent(id) ON DELETE CASCADE
+);
+
+INSERT INTO mr_parent VALUES (1, 'P1'), (2, 'P2'), (3, 'P3');
+INSERT INTO mr_child VALUES (10, 1, 'C1a'), (11, 1, 'C1b'), (20, 2, 'C2a'), (21, 2, 'C2b'), (30, 3, 'C3a');
+
+SELECT count(*) FROM mr_child;
+→ [{"count(*)":5}]
+
+-- Delete two parents at once — children of both should be cascaded
+DELETE FROM mr_parent WHERE id IN (1, 2);
+
+SELECT count(*) FROM mr_parent;
+→ [{"count(*)":1}]
+
+SELECT count(*) FROM mr_child;
+→ [{"count(*)":1}]
+
+-- Only P3's child remains
+SELECT id, parent_id FROM mr_child;
+→ [{"id":30,"parent_id":3}]
+
+DROP TABLE mr_child;
+DROP TABLE mr_parent;
+
+-- ===================================================================
+-- CASCADE across three levels
+-- grandparent → parent → child FK chain with CASCADE DELETE
+-- ===================================================================
+
+CREATE TABLE gp (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+
+CREATE TABLE par (
+    id INTEGER PRIMARY KEY,
+    gp_id INTEGER,
+    FOREIGN KEY (gp_id) REFERENCES gp(id) ON DELETE CASCADE
+);
+
+CREATE TABLE ch (
+    id INTEGER PRIMARY KEY,
+    par_id INTEGER,
+    FOREIGN KEY (par_id) REFERENCES par(id) ON DELETE CASCADE
+);
+
+INSERT INTO gp VALUES (1, 'G1'), (2, 'G2');
+INSERT INTO par VALUES (10, 1), (11, 1), (20, 2);
+INSERT INTO ch VALUES (100, 10), (101, 10), (110, 11), (200, 20);
+
+SELECT count(*) FROM ch;
+→ [{"count(*)":4}]
+
+-- Delete grandparent — should cascade through parent to child
+DELETE FROM gp WHERE id = 1;
+
+SELECT count(*) FROM gp;
+→ [{"count(*)":1}]
+
+SELECT count(*) FROM par;
+→ [{"count(*)":1}]
+
+-- Only children of G2's parent (par id=20) remain
+SELECT count(*) FROM ch;
+→ [{"count(*)":1}]
+
+SELECT id, par_id FROM ch;
+→ [{"id":200,"par_id":20}]
+
+DROP TABLE ch;
+DROP TABLE par;
+DROP TABLE gp;
+
+-- ===================================================================
+-- SET NULL cascade on multi-row delete
+-- Delete multiple parents with SET NULL children — verify all affected
+-- children have NULLed FK columns.
+-- ===================================================================
+
+CREATE TABLE snm_parent (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+
+CREATE TABLE snm_child (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER NULL,
+    FOREIGN KEY (parent_id) REFERENCES snm_parent(id) ON DELETE SET NULL
+);
+
+INSERT INTO snm_parent VALUES (1, 'X'), (2, 'Y'), (3, 'Z');
+INSERT INTO snm_child VALUES (10, 1), (11, 1), (20, 2), (30, 3);
+
+-- Delete two parents at once
+DELETE FROM snm_parent WHERE id IN (1, 2);
+
+SELECT id, parent_id FROM snm_child ORDER BY id;
+→ [{"id":10,"parent_id":null},{"id":11,"parent_id":null},{"id":20,"parent_id":null},{"id":30,"parent_id":3}]
+
+DROP TABLE snm_child;
+DROP TABLE snm_parent;
+
+-- ===================================================================
+-- Multiple assertions in same transaction
+-- Two independent assertions, one passes and one fails — verify the
+-- failing one prevents COMMIT and the error identifies which assertion.
+-- ===================================================================
+
+CREATE TABLE ma_data (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+INSERT INTO ma_data VALUES (1, 10, 20);
+-- run
+
+CREATE ASSERTION ma_a_positive CHECK (NOT EXISTS (SELECT 1 FROM ma_data WHERE a < 0));
+CREATE ASSERTION ma_b_small CHECK (NOT EXISTS (SELECT 1 FROM ma_data WHERE b > 100));
+-- run
+
+-- Both pass: valid insert
+BEGIN;
+INSERT INTO ma_data VALUES (2, 5, 50);
+COMMIT;
+-- run
+
+SELECT count(*) FROM ma_data;
+→ [{"count(*)":2}]
+
+-- a passes, b fails → should identify ma_b_small
+BEGIN;
+INSERT INTO ma_data VALUES (3, 1, 200);
+COMMIT;
+-- error: Integrity assertion failed: ma_b_small
+
+-- a fails → should identify ma_a_positive
+BEGIN;
+INSERT INTO ma_data VALUES (4, -5, 10);
+COMMIT;
+-- error: Integrity assertion failed: ma_a_positive
+
+-- Verify only original 2 rows
+SELECT count(*) FROM ma_data;
+→ [{"count(*)":2}]
+
+DROP ASSERTION ma_a_positive;
+DROP ASSERTION ma_b_small;
+DROP TABLE ma_data;
+-- run
+
+-- ===================================================================
+-- Deferred CHECK + assertion in same transaction
+-- A deferred row-level CHECK and a global assertion both evaluated at
+-- COMMIT — verify both are checked and the first failure is reported.
+-- ===================================================================
+
+CREATE TABLE ref_lookup (id TEXT PRIMARY KEY, label TEXT);
+INSERT INTO ref_lookup VALUES ('valid', 'Valid Ref');
+-- run
+
+CREATE TABLE da_data (
+    id INTEGER PRIMARY KEY,
+    ref_id TEXT,
+    val INTEGER,
+    CONSTRAINT ref_exists CHECK ON INSERT, UPDATE (
+        EXISTS (SELECT 1 FROM ref_lookup WHERE ref_lookup.id = NEW.ref_id)
+    )
+);
+-- run
+
+CREATE ASSERTION da_val_positive CHECK (NOT EXISTS (SELECT 1 FROM da_data WHERE val < 0));
+-- run
+
+-- Both pass
+BEGIN;
+INSERT INTO da_data VALUES (1, 'valid', 10);
+COMMIT;
+-- run
+
+SELECT count(*) FROM da_data;
+→ [{"count(*)":1}]
+
+-- Deferred CHECK fails (bad ref_id)
+BEGIN;
+INSERT INTO da_data VALUES (2, 'missing', 5);
+COMMIT;
+-- error: CHECK constraint failed: ref_exists
+
+-- Assertion fails (negative val, valid ref)
+BEGIN;
+INSERT INTO da_data VALUES (3, 'valid', -10);
+COMMIT;
+-- error: Integrity assertion failed: da_val_positive
+
+-- Verify only original row exists
+SELECT count(*) FROM da_data;
+→ [{"count(*)":1}]
+
+DROP ASSERTION da_val_positive;
+DROP TABLE da_data;
+DROP TABLE ref_lookup;
+-- run
+
+-- ===================================================================
+-- Multiple child tables with different cascade actions on same parent
+-- One child uses CASCADE, another uses SET NULL — both should fire
+-- correctly on parent delete.
+-- ===================================================================
+
+CREATE TABLE mc_parent (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+
+CREATE TABLE mc_cascade_child (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER,
+    FOREIGN KEY (parent_id) REFERENCES mc_parent(id) ON DELETE CASCADE
+);
+
+CREATE TABLE mc_setnull_child (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER NULL,
+    FOREIGN KEY (parent_id) REFERENCES mc_parent(id) ON DELETE SET NULL
+);
+
+INSERT INTO mc_parent VALUES (1, 'P1'), (2, 'P2');
+INSERT INTO mc_cascade_child VALUES (10, 1), (11, 1), (20, 2);
+INSERT INTO mc_setnull_child VALUES (100, 1), (101, 1), (200, 2);
+
+-- Delete parent 1 — cascade child rows deleted, setnull child rows nulled
+DELETE FROM mc_parent WHERE id = 1;
+
+-- CASCADE child: rows for parent 1 gone
+SELECT count(*) FROM mc_cascade_child WHERE parent_id = 1;
+→ [{"count(*)":0}]
+
+-- CASCADE child: parent 2 rows untouched
+SELECT count(*) FROM mc_cascade_child WHERE parent_id = 2;
+→ [{"count(*)":1}]
+
+-- SET NULL child: rows for parent 1 have null FK
+SELECT id, parent_id FROM mc_setnull_child ORDER BY id;
+→ [{"id":100,"parent_id":null},{"id":101,"parent_id":null},{"id":200,"parent_id":2}]
+
+DROP TABLE mc_cascade_child;
+DROP TABLE mc_setnull_child;
+DROP TABLE mc_parent;
+
+-- ===================================================================
+-- Savepoint interaction with deferred constraints
+-- Insert violating row, create savepoint, fix the violation, rollback
+-- savepoint (restoring violation), then attempt COMMIT — should fail.
+-- ===================================================================
+
+CREATE TABLE sp_ref (id TEXT PRIMARY KEY, name TEXT);
+INSERT INTO sp_ref VALUES ('ok', 'OK');
+-- run
+
+CREATE TABLE sp_data (
+    id INTEGER PRIMARY KEY,
+    ref_id TEXT,
+    CONSTRAINT sp_ref_exists CHECK ON INSERT, UPDATE (
+        EXISTS (SELECT 1 FROM sp_ref WHERE sp_ref.id = NEW.ref_id)
+    )
+);
+-- run
+
+BEGIN;
+-- Insert violating row (bad ref_id) — deferred until COMMIT
+INSERT INTO sp_data VALUES (1, 'bad');
+-- Create savepoint
+SAVEPOINT sp1;
+-- Fix the violation by adding the missing ref
+INSERT INTO sp_ref VALUES ('bad', 'Now Valid');
+-- Rollback savepoint — restoring the violation (ref 'bad' no longer exists)
+ROLLBACK TO SAVEPOINT sp1;
+-- Attempt COMMIT — should fail because 'bad' ref doesn't exist
+COMMIT;
+-- error: CHECK constraint failed: sp_ref_exists
+
+-- Verify nothing was committed
+SELECT count(*) FROM sp_data;
+→ [{"count(*)":0}]
+
+DROP TABLE sp_data;
+DROP TABLE sp_ref;
+-- run
+
+-- ===================================================================
+-- Constraint violation in multi-statement transaction
+-- First statement valid, second violates a deferred constraint, third
+-- fixes it — COMMIT should succeed since end-state is valid.
+-- ===================================================================
+
+CREATE TABLE fix_ref (id TEXT PRIMARY KEY, name TEXT);
+INSERT INTO fix_ref VALUES ('a', 'Alpha'), ('b', 'Beta');
+-- run
+
+CREATE TABLE fix_data (
+    id INTEGER PRIMARY KEY,
+    ref_id TEXT,
+    CONSTRAINT fix_ref_exists CHECK ON INSERT, UPDATE (
+        EXISTS (SELECT 1 FROM fix_ref WHERE fix_ref.id = NEW.ref_id)
+    )
+);
+-- run
+
+BEGIN;
+-- Valid insert
+INSERT INTO fix_data VALUES (1, 'a');
+-- Violating insert (ref 'missing' doesn't exist yet)
+INSERT INTO fix_data VALUES (2, 'missing');
+-- Fix violation by adding the missing reference
+INSERT INTO fix_ref VALUES ('missing', 'Now Exists');
+-- COMMIT should succeed because end-state is valid
+COMMIT;
+-- run
+
+SELECT count(*) FROM fix_data;
+→ [{"count(*)":2}]
+
+SELECT ref_id FROM fix_data ORDER BY id;
+→ [{"ref_id":"a"},{"ref_id":"missing"}]
+
+DROP TABLE fix_data;
+DROP TABLE fix_ref;
+-- run
+
+-- ===================================================================
+-- FK cascade triggering a CHECK violation
+-- Parent delete cascades SET NULL to child, but the child table has a
+-- NOT NULL constraint on the FK column — the cascade cannot satisfy the
+-- constraint, so the operation should fail.
+-- ===================================================================
+
+CREATE TABLE fkc_parent (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+
+CREATE TABLE fkc_child (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER NOT NULL,
+    FOREIGN KEY (parent_id) REFERENCES fkc_parent(id) ON DELETE SET NULL
+);
+
+INSERT INTO fkc_parent VALUES (1, 'P1'), (2, 'P2');
+INSERT INTO fkc_child VALUES (10, 1), (20, 2);
+
+-- Commit setup
+SELECT count(*) FROM fkc_child;
+→ [{"count(*)":2}]
+
+-- Delete parent — cascade tries SET NULL but column is NOT NULL → should fail
+DELETE FROM fkc_parent WHERE id = 1;
+-- error: NOT NULL constraint failed: fkc_child.parent_id
+
+-- Verify nothing was deleted
+SELECT count(*) FROM fkc_parent;
+→ [{"count(*)":2}]
+
+SELECT count(*) FROM fkc_child;
+→ [{"count(*)":2}]
+
+DROP TABLE fkc_child;
+DROP TABLE fkc_parent;
+
+-- ===================================================================
+-- Assertion referencing multiple tables
+-- CREATE ASSERTION checking that count(*) from table a equals
+-- count(*) from table b — verify evaluation across tables at commit.
+-- ===================================================================
+
+CREATE TABLE tbl_a (id INTEGER PRIMARY KEY, val TEXT);
+CREATE TABLE tbl_b (id INTEGER PRIMARY KEY, val TEXT);
+-- run
+
+CREATE ASSERTION counts_equal CHECK (
+    (SELECT count(*) FROM tbl_a) = (SELECT count(*) FROM tbl_b)
+);
+-- run
+
+-- Both empty: OK
+BEGIN;
+COMMIT;
+-- run
+
+-- Insert into both equally: OK
+BEGIN;
+INSERT INTO tbl_a VALUES (1, 'a1');
+INSERT INTO tbl_b VALUES (1, 'b1');
+COMMIT;
+-- run
+
+SELECT count(*) FROM tbl_a;
+→ [{"count(*)":1}]
+
+-- Insert into a only → counts diverge → fails
+BEGIN;
+INSERT INTO tbl_a VALUES (2, 'a2');
+COMMIT;
+-- error: Integrity assertion failed: counts_equal
+
+-- Insert into b only → counts diverge → fails
+BEGIN;
+INSERT INTO tbl_b VALUES (2, 'b2');
+COMMIT;
+-- error: Integrity assertion failed: counts_equal
+
+-- Insert into both → counts match again → OK
+BEGIN;
+INSERT INTO tbl_a VALUES (2, 'a2');
+INSERT INTO tbl_b VALUES (2, 'b2');
+COMMIT;
+-- run
+
+SELECT count(*) FROM tbl_a;
+→ [{"count(*)":2}]
+SELECT count(*) FROM tbl_b;
+→ [{"count(*)":2}]
+
+DROP ASSERTION counts_equal;
+DROP TABLE tbl_b;
+DROP TABLE tbl_a;
+-- run

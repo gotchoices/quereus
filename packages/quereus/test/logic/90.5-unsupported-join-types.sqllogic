@@ -1,0 +1,37 @@
+-- adapted from SQLite test/join.test, join7.test, joinB.test, joinH.test
+-- Pin the current behavior for join types Quereus does not yet support:
+-- RIGHT [OUTER] JOIN, FULL [OUTER] JOIN, NATURAL JOIN.
+
+create table uj_l (id integer primary key, val text);
+create table uj_r (id integer primary key, val text);
+
+insert into uj_l values (1, 'L1'), (2, 'L2');
+insert into uj_r values (1, 'R1'), (3, 'R3');
+-- run
+
+-- RIGHT JOIN: parser accepts the syntax; runtime rejects.
+select uj_l.id, uj_r.id from uj_l right join uj_r on uj_l.id = uj_r.id;
+-- error: RIGHT JOIN is not supported yet
+
+-- RIGHT OUTER JOIN: same path.
+select uj_l.id, uj_r.id from uj_l right outer join uj_r on uj_l.id = uj_r.id;
+-- error: RIGHT JOIN is not supported yet
+
+-- FULL OUTER JOIN: parser accepts; runtime rejects.
+select uj_l.id, uj_r.id from uj_l full outer join uj_r on uj_l.id = uj_r.id;
+-- error: FULL JOIN is not supported yet
+
+-- FULL JOIN (no OUTER keyword): same path.
+select uj_l.id, uj_r.id from uj_l full join uj_r on uj_l.id = uj_r.id;
+-- error: FULL JOIN is not supported yet
+
+-- NATURAL JOIN: not currently parsed.
+select * from uj_l natural join uj_r;
+-- error: NATURAL
+
+-- NATURAL LEFT JOIN: not currently parsed.
+select * from uj_l natural left join uj_r;
+-- error: NATURAL
+
+drop table uj_l;
+drop table uj_r;

@@ -1,0 +1,55 @@
+-- quoted-identifiers.sqllogic - Testing quoted identifier syntax
+-- Tests double-quoted, backtick, and bracket identifier quoting
+
+-- Test double-quoted table name
+CREATE TABLE "QuotedTable" (id INTEGER PRIMARY KEY, value TEXT);
+INSERT INTO "QuotedTable" VALUES (1, 'test');
+SELECT * FROM "QuotedTable";
+→ [{"id":1,"value":"test"}]
+
+-- Test double-quoted column names
+CREATE TABLE test_quoted_cols ("Column One" INTEGER PRIMARY KEY, "Column Two" TEXT);
+INSERT INTO test_quoted_cols ("Column One", "Column Two") VALUES (1, 'hello');
+SELECT "Column One", "Column Two" FROM test_quoted_cols;
+→ [{"Column One":1,"Column Two":"hello"}]
+
+-- Test backtick-quoted table name
+CREATE TABLE `BacktickTable` (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO `BacktickTable` VALUES (1, 'backtick test');
+SELECT * FROM `BacktickTable`;
+→ [{"id":1,"name":"backtick test"}]
+
+-- Test bracket-quoted table name (SQL Server style)
+CREATE TABLE [BracketTable] (id INTEGER PRIMARY KEY, data TEXT);
+INSERT INTO [BracketTable] VALUES (1, 'bracket test');
+SELECT * FROM [BracketTable];
+→ [{"id":1,"data":"bracket test"}]
+
+-- Test quoted identifiers that are reserved words
+CREATE TABLE "SELECT" (id INTEGER PRIMARY KEY, "FROM" TEXT, "WHERE" INTEGER);
+INSERT INTO "SELECT" ("id", "FROM", "WHERE") VALUES (1, 'table', 42);
+SELECT "FROM", "WHERE" FROM "SELECT";
+→ [{"FROM":"table","WHERE":42}]
+
+-- Test quoted alias
+SELECT id AS "My ID", value AS "The Value" FROM "QuotedTable";
+→ [{"My ID":1,"The Value":"test"}]
+
+-- Test quoted identifiers with spaces
+CREATE TABLE "Table With Spaces" ("Column With Spaces" TEXT PRIMARY KEY);
+INSERT INTO "Table With Spaces" VALUES ('spacy');
+SELECT "Column With Spaces" FROM "Table With Spaces";
+→ [{"Column With Spaces":"spacy"}]
+
+-- Test mixed quoting styles in same query
+SELECT q.id, b.id AS bid FROM "QuotedTable" q JOIN `BacktickTable` b ON q.id = b.id;
+→ [{"id":1,"bid":1}]
+
+-- Clean up
+DROP TABLE "QuotedTable";
+DROP TABLE test_quoted_cols;
+DROP TABLE `BacktickTable`;
+DROP TABLE [BracketTable];
+DROP TABLE "SELECT";
+DROP TABLE "Table With Spaces";
+

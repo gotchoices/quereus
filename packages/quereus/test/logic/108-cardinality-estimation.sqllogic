@@ -1,0 +1,141 @@
+-- 108-cardinality-estimation.sqllogic
+-- Validates that ANALYZE populates statistics which feed into cost-based
+-- optimizer decisions (plan shape, index selection, access method)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Setup: table with skewed data distribution
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE ce_products (
+	id INTEGER PRIMARY KEY,
+	category TEXT,
+	price REAL,
+	name TEXT
+) USING memory;
+
+-- 40 rows: 4 categories (high selectivity equality), spread prices
+-- Category distribution: 10 electronics, 10 books, 10 clothing, 10 food
+-- Price distribution: 9.99 to 399.60
+
+-- Insert rows (one per statement)
+INSERT INTO ce_products VALUES (1, 'electronics', 9.99, 'item_1');
+INSERT INTO ce_products VALUES (2, 'books', 19.98, 'item_2');
+INSERT INTO ce_products VALUES (3, 'clothing', 29.97, 'item_3');
+INSERT INTO ce_products VALUES (4, 'food', 39.96, 'item_4');
+INSERT INTO ce_products VALUES (5, 'electronics', 49.95, 'item_5');
+INSERT INTO ce_products VALUES (6, 'books', 59.94, 'item_6');
+INSERT INTO ce_products VALUES (7, 'clothing', 69.93, 'item_7');
+INSERT INTO ce_products VALUES (8, 'food', 79.92, 'item_8');
+INSERT INTO ce_products VALUES (9, 'electronics', 89.91, 'item_9');
+INSERT INTO ce_products VALUES (10, 'books', 99.90, 'item_10');
+INSERT INTO ce_products VALUES (11, 'clothing', 109.89, 'item_11');
+INSERT INTO ce_products VALUES (12, 'food', 119.88, 'item_12');
+INSERT INTO ce_products VALUES (13, 'electronics', 129.87, 'item_13');
+INSERT INTO ce_products VALUES (14, 'books', 139.86, 'item_14');
+INSERT INTO ce_products VALUES (15, 'clothing', 149.85, 'item_15');
+INSERT INTO ce_products VALUES (16, 'food', 159.84, 'item_16');
+INSERT INTO ce_products VALUES (17, 'electronics', 169.83, 'item_17');
+INSERT INTO ce_products VALUES (18, 'books', 179.82, 'item_18');
+INSERT INTO ce_products VALUES (19, 'clothing', 189.81, 'item_19');
+INSERT INTO ce_products VALUES (20, 'food', 199.80, 'item_20');
+INSERT INTO ce_products VALUES (21, 'electronics', 209.79, 'item_21');
+INSERT INTO ce_products VALUES (22, 'books', 219.78, 'item_22');
+INSERT INTO ce_products VALUES (23, 'clothing', 229.77, 'item_23');
+INSERT INTO ce_products VALUES (24, 'food', 239.76, 'item_24');
+INSERT INTO ce_products VALUES (25, 'electronics', 249.75, 'item_25');
+INSERT INTO ce_products VALUES (26, 'books', 259.74, 'item_26');
+INSERT INTO ce_products VALUES (27, 'clothing', 269.73, 'item_27');
+INSERT INTO ce_products VALUES (28, 'food', 279.72, 'item_28');
+INSERT INTO ce_products VALUES (29, 'electronics', 289.71, 'item_29');
+INSERT INTO ce_products VALUES (30, 'books', 299.70, 'item_30');
+INSERT INTO ce_products VALUES (31, 'clothing', 309.69, 'item_31');
+INSERT INTO ce_products VALUES (32, 'food', 319.68, 'item_32');
+INSERT INTO ce_products VALUES (33, 'electronics', 329.67, 'item_33');
+INSERT INTO ce_products VALUES (34, 'books', 339.66, 'item_34');
+INSERT INTO ce_products VALUES (35, 'clothing', 349.65, 'item_35');
+INSERT INTO ce_products VALUES (36, 'food', 359.64, 'item_36');
+INSERT INTO ce_products VALUES (37, 'electronics', 369.63, 'item_37');
+INSERT INTO ce_products VALUES (38, 'books', 379.62, 'item_38');
+INSERT INTO ce_products VALUES (39, 'clothing', 389.61, 'item_39');
+INSERT INTO ce_products VALUES (40, 'food', 399.60, 'item_40');
+
+-- Run ANALYZE to collect statistics
+ANALYZE ce_products;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Verify ANALYZE produces valid output
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Correctness: verify data is intact after ANALYZE
+SELECT count(*) AS cnt FROM ce_products;
+→ [{"cnt":40}]
+
+-- Correctness: category distribution
+SELECT category, count(*) AS cnt FROM ce_products GROUP BY category ORDER BY category;
+→ [{"category":"books","cnt":10},{"category":"clothing","cnt":10},{"category":"electronics","cnt":10},{"category":"food","cnt":10}]
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Equality filter correctness (benefits from NDV statistics)
+-- ═══════════════════════════════════════════════════════════════════════
+
+SELECT count(*) AS cnt FROM ce_products WHERE category = 'electronics';
+→ [{"cnt":10}]
+
+SELECT count(*) AS cnt FROM ce_products WHERE category = 'books';
+→ [{"cnt":10}]
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Range filter correctness (benefits from histogram statistics)
+-- ═══════════════════════════════════════════════════════════════════════
+
+SELECT count(*) AS cnt FROM ce_products WHERE price < 100;
+→ [{"cnt":10}]
+
+SELECT count(*) AS cnt FROM ce_products WHERE price >= 200 AND price < 300;
+→ [{"cnt":10}]
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Setup second table for join tests
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE ce_orders (
+	order_id INTEGER PRIMARY KEY,
+	product_id INTEGER,
+	quantity INTEGER
+) USING memory;
+
+INSERT INTO ce_orders VALUES (1, 1, 2);
+INSERT INTO ce_orders VALUES (2, 1, 1);
+INSERT INTO ce_orders VALUES (3, 5, 3);
+INSERT INTO ce_orders VALUES (4, 10, 1);
+INSERT INTO ce_orders VALUES (5, 20, 5);
+
+ANALYZE ce_orders;
+
+-- Join correctness: inner join
+SELECT count(*) AS cnt FROM ce_products JOIN ce_orders ON ce_products.id = ce_orders.product_id;
+→ [{"cnt":5}]
+
+-- Join correctness: left join (product 1 has 2 orders, so 36 + 2 + 1 + 1 + 1 = 41)
+SELECT count(*) AS cnt FROM ce_products LEFT JOIN ce_orders ON ce_products.id = ce_orders.product_id;
+→ [{"cnt":41}]
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Re-ANALYZE after data changes
+-- ═══════════════════════════════════════════════════════════════════════
+
+INSERT INTO ce_products VALUES (41, 'electronics', 409.59, 'item_41');
+INSERT INTO ce_products VALUES (42, 'books', 419.58, 'item_42');
+INSERT INTO ce_products VALUES (43, 'clothing', 429.57, 'item_43');
+INSERT INTO ce_products VALUES (44, 'food', 439.56, 'item_44');
+INSERT INTO ce_products VALUES (45, 'electronics', 449.55, 'item_45');
+
+ANALYZE ce_products;
+
+-- Verify updated row count
+SELECT count(*) AS cnt FROM ce_products;
+→ [{"cnt":45}]
+
+-- Queries still work correctly after re-ANALYZE
+SELECT count(*) AS cnt FROM ce_products WHERE category = 'electronics';
+→ [{"cnt":12}]

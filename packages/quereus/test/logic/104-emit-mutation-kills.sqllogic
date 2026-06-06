@@ -1,0 +1,236 @@
+-- emit-mutation-kills.sqllogic - Mutation-killing tests for runtime/emit/ subsystem
+-- Targets surviving mutants in: cast.ts, filter.ts, limit-offset.ts, binary.ts, unary.ts
+
+-- =============================================================================
+-- cast.ts — null passthrough and non-numeric fallback
+-- =============================================================================
+
+-- Line 15: cast(null as X) must return null, not skip the null check
+select cast(null as integer) as r;
+→ [{"r":null}]
+
+select cast(null as real) as r;
+→ [{"r":null}]
+
+select cast(null as text) as r;
+→ [{"r":null}]
+
+-- Lines 43-45: non-numeric string cast falls back to 0 / 0.0
+select cast('abc' as integer) as r;
+→ [{"r":0}]
+
+select cast('abc' as real) as r;
+→ [{"r":0}]
+
+-- Verify the fallback type is integer (0 is integer, not real)
+select typeof(cast('abc' as real)) as r;
+→ [{"r":"integer"}]
+
+-- =============================================================================
+-- filter.ts — bigint truthiness in WHERE clause
+-- =============================================================================
+
+-- Line 13: typeof value === 'bigint' branch — value > MAX_SAFE_INTEGER stored as bigint
+create table bigint_filter (id integer primary key, val integer);
+insert into bigint_filter values (1, 9007199254740993), (2, 0);
+
+-- Bigint truthy: 9007199254740993n is truthy → row returned
+select id from bigint_filter where val;
+→ [{"id":1}]
+
+-- Bigint zero is falsy → no row for id=2
+select id from bigint_filter where val order by id;
+→ [{"id":1}]
+
+drop table bigint_filter;
+
+-- =============================================================================
+-- limit-offset.ts — negative, null, and boundary limit/offset values
+-- =============================================================================
+
+create table lo (id integer primary key);
+insert into lo values (1),(2),(3),(4),(5);
+
+-- Negative limit → treated as 0, no rows
+select id from lo order by id limit -1;
+→ []
+
+-- Negative offset → treated as 0, no skip
+select id from lo order by id limit 5 offset -1;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+
+-- LIMIT 0 → empty
+select id from lo order by id limit 0;
+→ []
+
+-- Negative limit with offset → still 0 rows
+select id from lo order by id limit -1 offset 2;
+→ []
+
+-- LIMIT and OFFSET together
+select id from lo order by id limit 2 offset 2;
+→ [{"id":3},{"id":4}]
+
+-- NULL limit → Infinity → caught by isFinite check → 0 rows
+select id from lo order by id limit null;
+→ []
+
+-- NULL offset → treated as 0 offset
+select id from lo order by id limit 3 offset null;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- OFFSET beyond row count
+select id from lo order by id limit 10 offset 100;
+→ []
+
+-- OFFSET exactly at row count
+select id from lo order by id limit 10 offset 5;
+→ []
+
+drop table lo;
+
+-- =============================================================================
+-- binary.ts — null arithmetic, bigint ops, concat, comparison
+-- =============================================================================
+
+-- Null propagation in arithmetic (both operand positions)
+select 1 + null as r;
+→ [{"r":null}]
+
+select null + 1 as r;
+→ [{"r":null}]
+
+select null * 5 as r;
+→ [{"r":null}]
+
+select null - 3 as r;
+→ [{"r":null}]
+
+select null / 2 as r;
+→ [{"r":null}]
+
+select null % 7 as r;
+→ [{"r":null}]
+
+-- Division by zero → null (non-finite result)
+select 1 / 0 as r;
+→ [{"r":null}]
+
+-- Modulo by zero → null
+select 1 % 0 as r;
+→ [{"r":null}]
+
+-- Integer division (JS float division, not truncated)
+select 10 / 3 as r;
+→ [{"r":3.3333333333333335}]
+
+-- Integer modulo
+select 10 % 3 as r;
+→ [{"r":1}]
+
+-- Bigint + bigint
+select 9007199254740993 + 1 as r;
+→ [{"r":9007199254740994}]
+
+-- Bigint - bigint
+select 9007199254740994 - 1 as r;
+→ [{"r":9007199254740992}]
+
+-- Bigint * bigint
+select 9007199254740993 * 2 as r;
+→ [{"r":18014398509481986}]
+
+-- Bigint / bigint (exact)
+select 9007199254740993 / 9007199254740993 as r;
+→ [{"r":1}]
+
+-- Bigint % integer
+select 9007199254740993 % 2 as r;
+→ [{"r":1}]
+
+-- Null in comparisons
+select 1 = null as r;
+→ [{"r":null}]
+
+select null = null as r;
+→ [{"r":null}]
+
+select null != 1 as r;
+→ [{"r":null}]
+
+select null < 1 as r;
+→ [{"r":null}]
+
+select null > 1 as r;
+→ [{"r":null}]
+
+select null <= 1 as r;
+→ [{"r":null}]
+
+select null >= 1 as r;
+→ [{"r":null}]
+
+-- String concatenation
+select 'hello' || ' ' || 'world' as r;
+→ [{"r":"hello world"}]
+
+-- Null concat propagation
+select 'hello' || null as r;
+→ [{"r":null}]
+
+select null || 'world' as r;
+→ [{"r":null}]
+
+-- Cross-type comparison coercion (text vs number via planner CastNodes)
+select 1 < '2' as r;
+→ [{"r":true}]
+
+select '10' > 2 as r;
+→ [{"r":true}]
+
+-- LIKE with nulls
+select 'abc' like null as r;
+→ [{"r":null}]
+
+select null like '%' as r;
+→ [{"r":null}]
+
+-- =============================================================================
+-- unary.ts — minus of non-numeric string, null, bigint, bitwise NOT
+-- =============================================================================
+
+-- Line 84: isNaN guard — non-numeric string yields null
+select -'abc' as r;
+→ [{"r":null}]
+
+-- Numeric string converts and negates
+select -'42' as r;
+→ [{"r":-42}]
+
+-- Null passthrough
+select -null as r;
+→ [{"r":null}]
+
+-- Unary plus of non-numeric string → null
+select +'abc' as r;
+→ [{"r":null}]
+
+-- Unary plus of numeric string → number
+select +'42' as r;
+→ [{"r":42}]
+
+-- Unary plus null
+select +null as r;
+→ [{"r":null}]
+
+-- Bitwise NOT of non-numeric string → null
+select ~'abc' as r;
+→ [{"r":null}]
+
+-- Bitwise NOT of zero
+select ~0 as r;
+→ [{"r":-1}]
+
+-- Bitwise NOT of numeric string
+select ~'5' as r;
+→ [{"r":-6}]

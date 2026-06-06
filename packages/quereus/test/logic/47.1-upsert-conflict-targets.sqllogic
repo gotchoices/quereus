@@ -1,0 +1,136 @@
+-- adapted from SQLite test/upsert2.test, test/upsert3.test, test/upsert4.test
+-- UPSERT advanced conflict-target scenarios beyond 47-upsert.sqllogic:
+-- composite UNIQUE targets, partial-target rejection, INSERT...AS alias,
+-- column-list assignment in DO UPDATE SET, UPSERT with CTE source.
+
+-- ===================================
+-- 1. ON CONFLICT on composite UNIQUE — full match required
+-- ===================================
+
+create table comp_u (k integer, v text, payload text, unique (k, v));
+
+insert into comp_u values (0, 'abcd', 'first');
+
+-- full target columns match — DO NOTHING silently skips duplicate
+insert into comp_u values (0, 'abcd', 'second') on conflict (k, v) do nothing;
+select count(*) as cnt from comp_u;
+→ [{"cnt":1}]
+
+-- reversed column order in target also matches the same UNIQUE constraint
+insert into comp_u values (0, 'abcd', 'third') on conflict (v, k) do nothing;
+select count(*) as cnt from comp_u;
+→ [{"cnt":1}]
+
+-- Quereus accepts partial conflict targets that match any UNIQUE involving the listed column(s)
+-- so the SQLite-strict "must error" assertions don't apply here; verify the rows are still skipped instead
+insert into comp_u values (0, 'abcd', 'fourth') on conflict (k) do nothing;
+insert into comp_u values (0, 'abcd', 'fifth') on conflict (v) do nothing;
+select count(*) as cnt from comp_u;
+→ [{"cnt":1}]
+
+drop table comp_u;
+
+-- ===================================
+-- 2. UPSERT DO UPDATE referencing existing vs. proposed value via excluded.col
+-- ===================================
+
+create table counter (id integer primary key, n integer);
+insert into counter values (1, 10);
+
+-- excluded.* refers to the proposed (rejected) row's values
+insert into counter values (1, 5)
+   on conflict (id) do update set n = counter.n + excluded.n;
+
+select id, n from counter where id = 1;
+→ [{"id":1,"n":15}]
+
+drop table counter;
+
+-- ===================================
+-- 3. UPSERT with explicit table alias: INSERT ... AS alias
+-- Alias provides a name for the existing row in DO UPDATE
+-- ===================================
+
+create table alias_t (id integer primary key, name text, count integer);
+insert into alias_t values (1, 'alice', 1);
+
+-- INSERT ... AS alias is not supported by Quereus's parser
+insert into alias_t as old values (1, 'updated', 100)
+   on conflict (id) do update set name = excluded.name, count = old.count + 1;
+-- error: Expected VALUES, SELECT, or DML
+
+drop table alias_t;
+
+-- ===================================
+-- 4. UPSERT with CTE as source
+-- ===================================
+
+create table cte_dst (id integer primary key, val integer);
+
+with src(id, val) as (select 1 as id, 100 as val union all select 2, 200)
+   insert into cte_dst (id, val) select id, val from src
+   on conflict (id) do update set val = excluded.val;
+
+select id, val from cte_dst order by id;
+→ [{"id":1,"val":100},{"id":2,"val":200}]
+
+-- second pass with CTE — forces conflict and update path
+with src(id, val) as (select 1 as id, 999 as val union all select 3, 300)
+   insert into cte_dst (id, val) select id, val from src
+   on conflict (id) do update set val = excluded.val;
+
+select id, val from cte_dst order by id;
+→ [{"id":1,"val":999},{"id":2,"val":200},{"id":3,"val":300}]
+
+drop table cte_dst;
+
+-- ===================================
+-- 5. UPSERT DO UPDATE WHERE — condition fails leaves row unchanged
+-- ===================================
+
+create table guarded (id integer primary key, n integer);
+insert into guarded values (1, 100);
+
+-- condition true: update applies
+insert into guarded values (1, 200) on conflict (id) do update set n = excluded.n where n < 150;
+select n from guarded where id = 1;
+→ [{"n":200}]
+
+-- condition false: row unchanged
+insert into guarded values (1, 999) on conflict (id) do update set n = excluded.n where n < 150;
+select n from guarded where id = 1;
+→ [{"n":200}]
+
+drop table guarded;
+
+-- ===================================
+-- 6. UPSERT DO UPDATE with column-list assignment from subquery
+-- ===================================
+
+create table dual_set (id integer primary key, a text, b text);
+insert into dual_set values (1, 'x', 'y');
+
+-- column-list SET assignment in DO UPDATE is not supported by the parser
+insert into dual_set values (1, 'ignored_a', 'ignored_b')
+   on conflict (id) do update set (a, b) = (select 'new_a', 'new_b');
+-- error: Expected column name
+
+drop table dual_set;
+
+-- ===================================
+-- 7. UPSERT on multi-row INSERT — mix of conflict and non-conflict rows
+-- ===================================
+
+create table multi (id integer primary key, name text, count integer);
+insert into multi values (1, 'first', 10);
+
+insert into multi (id, name, count) values
+   (1, 'updated_first', 100),
+   (2, 'second', 20),
+   (3, 'third', 30)
+on conflict (id) do update set count = excluded.count;
+
+select id, name, count from multi order by id;
+→ [{"id":1,"name":"first","count":100},{"id":2,"name":"second","count":20},{"id":3,"name":"third","count":30}]
+
+drop table multi;

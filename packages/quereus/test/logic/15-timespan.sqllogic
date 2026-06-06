@@ -1,0 +1,266 @@
+-- timespan.sqllogic - Testing TIMESPAN type and temporal arithmetic
+
+-- Test TIMESPAN conversion function with ISO 8601 format
+SELECT timespan('PT1H');
+→ [{"timespan('PT1H')":"PT1H"}]
+
+SELECT timespan('P1D');
+→ [{"timespan('P1D')":"P1D"}]
+
+SELECT timespan('PT1H30M');
+→ [{"timespan('PT1H30M')":"PT1H30M"}]
+
+-- Test TIMESPAN with human-readable format
+SELECT timespan('1 hour');
+→ [{"timespan('1 hour')":"PT1H"}]
+
+SELECT timespan('30 minutes');
+→ [{"timespan('30 minutes')":"PT30M"}]
+
+SELECT timespan('2 days');
+→ [{"timespan('2 days')":"P2D"}]
+
+SELECT timespan('1 week');
+→ [{"timespan('1 week')":"P1W"}]
+
+SELECT timespan('2 hours 30 minutes');
+→ [{"timespan('2 hours 30 minutes')":"PT2H30M"}]
+
+-- Test TIMESPAN with numeric format (seconds)
+SELECT timespan(3600);
+→ [{"timespan(3600)":"PT3600S"}]
+
+SELECT timespan(86400);
+→ [{"timespan(86400)":"PT86400S"}]
+
+SELECT timespan(90);
+→ [{"timespan(90)":"PT90S"}]
+
+-- Test negative timespans
+SELECT timespan('-PT1H');
+→ [{"timespan('-PT1H')":"-PT1H"}]
+
+SELECT timespan(-3600);
+→ [{"timespan(-3600)":"-PT3600S"}]
+
+-- Test DATE - DATE → TIMESPAN
+SELECT date('2024-01-15') - date('2024-01-01');
+→ ["P14D"]
+
+-- Test DATE + TIMESPAN → DATE
+SELECT date('2024-01-01') + timespan('P1D');
+→ ["2024-01-02"]
+
+SELECT date('2024-01-01') + timespan('P1W');
+→ ["2024-01-08"]
+
+-- Test DATE - TIMESPAN → DATE
+SELECT date('2024-01-15') - timespan('P5D');
+→ ["2024-01-10"]
+
+-- Test TIMESPAN + DATE → DATE (commutative)
+SELECT timespan('P1D') + date('2024-01-01');
+→ [{"timespan('P1D') + date('2024-01-01')":"2024-01-02"}]
+
+-- Test TIME - TIME → TIMESPAN
+SELECT time('14:30:00') - time('09:00:00');
+→ ["PT5H30M"]
+
+-- Test TIME + TIMESPAN → TIME
+SELECT time('09:00:00') + timespan('PT1H30M');
+→ ["10:30:00"]
+
+-- Test TIME - TIMESPAN → TIME
+SELECT time('14:30:00') - timespan('PT2H');
+→ ["12:30:00"]
+
+-- Test TIMESPAN + TIMESPAN → TIMESPAN
+SELECT timespan('PT1H') + timespan('PT30M');
+→ [{"timespan('PT1H') + timespan('PT30M')":"PT1H30M"}]
+
+SELECT timespan('P1D') + timespan('PT12H');
+→ [{"timespan('P1D') + timespan('PT12H')":"P1DT12H"}]
+
+-- Test TIMESPAN - TIMESPAN → TIMESPAN
+SELECT timespan('PT2H') - timespan('PT30M');
+→ ["PT1H30M"]
+
+-- Test TIMESPAN * NUMBER → TIMESPAN
+SELECT timespan('PT1H') * 2;
+→ [{"timespan('PT1H') * 2":"PT7200S"}]
+
+SELECT timespan('PT30M') * 3;
+→ [{"timespan('PT30M') * 3":"PT5400S"}]
+
+-- Test NUMBER * TIMESPAN → TIMESPAN (commutative)
+SELECT 2 * timespan('PT1H');
+→ [{"2 * timespan('PT1H')":"PT7200S"}]
+
+-- Test TIMESPAN / NUMBER → TIMESPAN
+SELECT timespan('PT2H') / 2;
+→ [{"timespan('PT2H') / 2":"PT3600S"}]
+
+SELECT timespan('PT1H') / 4;
+→ [{"timespan('PT1H') / 4":"PT900S"}]
+
+-- Test TIMESPAN / TIMESPAN → NUMBER (ratio)
+SELECT timespan('PT2H') / timespan('PT1H');
+→ [{"timespan('PT2H') / timespan('PT1H')":2}]
+
+SELECT timespan('PT1H') / timespan('PT30M');
+→ [{"timespan('PT1H') / timespan('PT30M')":2}]
+
+-- Test TIMESPAN * NUMBER with calendar units (months, years)
+SELECT timespan('P2M') * 3;
+→ [{"timespan('P2M') * 3":"P6M"}]
+
+SELECT timespan('P1Y6M') * 2;
+→ [{"timespan('P1Y6M') * 2":"P2Y12M"}]
+
+SELECT 4 * timespan('P3M');
+→ [{"4 * timespan('P3M')":"P12M"}]
+
+-- Test TIMESPAN / NUMBER with calendar units
+SELECT timespan('P1Y6M') / 2;
+→ [{"timespan('P1Y6M') / 2":"P9M"}]
+
+SELECT timespan('P6M') / 3;
+→ [{"timespan('P6M') / 3":"P2M"}]
+
+-- Test TIMESPAN * NUMBER with mixed calendar and time units
+SELECT timespan('P1Y2M3DT4H') * 2;
+→ [{"timespan('P1Y2M3DT4H') * 2":"P2Y4M6DT8H"}]
+
+-- Test TIMESPAN / NUMBER with mixed calendar and time units
+SELECT timespan('P2Y4M6DT8H') / 2;
+→ [{"timespan('P2Y4M6DT8H') / 2":"P1Y2M3DT4H"}]
+
+-- Test TIMESPAN / TIMESPAN ratio with calendar units returns null
+SELECT timespan('P6M') / timespan('P2M');
+→ [{"timespan('P6M') / timespan('P2M')":null}]
+
+-- Test unary negation of TIMESPAN
+SELECT -timespan('PT1H');
+→ [{"-timespan('PT1H')":"-PT1H"}]
+
+SELECT -timespan('P1D');
+→ [{"-timespan('P1D')":"-P1D"}]
+
+-- Test NULL handling
+SELECT timespan(NULL);
+→ [{"timespan(null)":null}]
+
+SELECT date('2024-01-01') + timespan(NULL);
+→ [null]
+
+SELECT timespan('PT1H') + NULL;
+→ [{"timespan('PT1H') + null":null}]
+
+-- Test TIMESPAN in table
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    duration TIMESPAN
+);
+
+INSERT INTO events VALUES (1, 'Meeting', timespan('1 hour'));
+INSERT INTO events VALUES (2, 'Lunch', timespan('PT30M'));
+INSERT INTO events VALUES (3, 'Project', timespan('P2D'));
+
+SELECT * FROM events ORDER BY id;
+→ [{"id":1,"name":"Meeting","duration":"PT1H"},{"id":2,"name":"Lunch","duration":"PT30M"},{"id":3,"name":"Project","duration":"P2D"}]
+
+-- Test TIMESPAN comparison
+SELECT * FROM events WHERE duration > timespan('PT1H') ORDER BY id;
+→ [{"id":3,"name":"Project","duration":"P2D"}]
+
+SELECT * FROM events WHERE duration <= timespan('PT1H') ORDER BY id;
+→ [{"id":1,"name":"Meeting","duration":"PT1H"},{"id":2,"name":"Lunch","duration":"PT30M"}]
+
+DROP TABLE events;
+
+-- Test TIMESPAN extraction functions
+SELECT timespan_years(timespan('P1Y2M3D'));
+→ [{"timespan_years(timespan('P1Y2M3D'))":1}]
+
+SELECT timespan_months(timespan('P1Y2M3D'));
+→ [{"timespan_months(timespan('P1Y2M3D'))":2}]
+
+SELECT timespan_days(timespan('P1Y2M3D'));
+→ [{"timespan_days(timespan('P1Y2M3D'))":3}]
+
+SELECT timespan_weeks(timespan('P2W3D'));
+→ [{"timespan_weeks(timespan('P2W3D'))":2}]
+
+SELECT timespan_hours(timespan('P2DT3H'));
+→ [{"timespan_hours(timespan('P2DT3H'))":3}]
+
+SELECT timespan_minutes(timespan('PT1H30M'));
+→ [{"timespan_minutes(timespan('PT1H30M'))":30}]
+
+SELECT timespan_seconds(timespan('PT1M30S'));
+→ [{"timespan_seconds(timespan('PT1M30S'))":30}]
+
+-- Test extraction with fractional seconds
+SELECT timespan_seconds(timespan('PT1M30.5S'));
+→ [{"timespan_seconds(timespan('PT1M30.5S'))":30.5}]
+
+-- Test extraction with human-readable format
+SELECT timespan_hours(timespan('2 days 3 hours'));
+→ [{"timespan_hours(timespan('2 days 3 hours'))":3}]
+
+SELECT timespan_minutes(timespan('1 hour 30 minutes'));
+→ [{"timespan_minutes(timespan('1 hour 30 minutes'))":30}]
+
+-- Test TIMESPAN total functions
+SELECT timespan_total_seconds(timespan('PT1H'));
+→ [{"timespan_total_seconds(timespan('PT1H'))":3600}]
+
+SELECT timespan_total_minutes(timespan('PT1H30M'));
+→ [{"timespan_total_minutes(timespan('PT1H30M'))":90}]
+
+SELECT timespan_total_hours(timespan('P2D'));
+→ [{"timespan_total_hours(timespan('P2D'))":48}]
+
+SELECT timespan_total_days(timespan('P1W'));
+→ [{"timespan_total_days(timespan('P1W'))":7}]
+
+-- Test total functions with human-readable format
+SELECT timespan_total_seconds(timespan('1 hour'));
+→ [{"timespan_total_seconds(timespan('1 hour'))":3600}]
+
+SELECT timespan_total_minutes(timespan('1 hour 30 minutes'));
+→ [{"timespan_total_minutes(timespan('1 hour 30 minutes'))":90}]
+
+SELECT timespan_total_hours(timespan('2 days'));
+→ [{"timespan_total_hours(timespan('2 days'))":48}]
+
+SELECT timespan_total_days(timespan('1 week'));
+→ [{"timespan_total_days(timespan('1 week'))":7}]
+
+-- Test extraction/total functions with NULL
+SELECT timespan_years(NULL);
+→ [{"timespan_years(null)":null}]
+
+SELECT timespan_total_seconds(NULL);
+→ [{"timespan_total_seconds(null)":null}]
+
+-- Test extraction functions in table queries
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    duration TIMESPAN
+);
+
+INSERT INTO tasks VALUES (1, 'Quick task', timespan('30 minutes'));
+INSERT INTO tasks VALUES (2, 'Long project', timespan('2 weeks'));
+INSERT INTO tasks VALUES (3, 'Sprint', timespan('P14D'));
+
+SELECT name, timespan_total_hours(duration) as hours FROM tasks ORDER BY id;
+→ [{"name":"Quick task","hours":0.5},{"name":"Long project","hours":336},{"name":"Sprint","hours":336}]
+
+SELECT name, timespan_total_days(duration) as days FROM tasks WHERE timespan_total_days(duration) > 1 ORDER BY id;
+→ [{"name":"Long project","days":14},{"name":"Sprint","days":14}]
+
+DROP TABLE tasks;
+

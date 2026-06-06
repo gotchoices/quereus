@@ -1,0 +1,78 @@
+-- weekday modifier tests
+-- SQLite "weekday N" advances the date forward to the next occurrence of
+-- weekday N (0=Sunday..6=Saturday). If the date is already on that weekday,
+-- no change is made.
+
+-- 2024-07-22 is a Monday (weekday 1)
+
+-- Same weekday → no change
+SELECT date('2024-07-22', 'weekday 1');
+→ ["2024-07-22"]
+
+-- Monday → next Tuesday (1 day forward)
+SELECT date('2024-07-22', 'weekday 2');
+→ ["2024-07-23"]
+
+-- Monday → next Wednesday (2 days forward)
+SELECT date('2024-07-22', 'weekday 3');
+→ ["2024-07-24"]
+
+-- Monday → next Thursday (3 days forward)
+SELECT date('2024-07-22', 'weekday 4');
+→ ["2024-07-25"]
+
+-- Monday → next Friday (4 days forward)
+SELECT date('2024-07-22', 'weekday 5');
+→ ["2024-07-26"]
+
+-- Monday → next Saturday (5 days forward)
+SELECT date('2024-07-22', 'weekday 6');
+→ ["2024-07-27"]
+
+-- Monday → next Sunday (6 days forward)
+SELECT date('2024-07-22', 'weekday 0');
+→ ["2024-07-28"]
+
+-- 2024-07-26 is a Friday (weekday 5)
+
+-- Friday → same Friday (no change)
+SELECT date('2024-07-26', 'weekday 5');
+→ ["2024-07-26"]
+
+-- Friday → next Saturday (1 day forward)
+SELECT date('2024-07-26', 'weekday 6');
+→ ["2024-07-27"]
+
+-- Friday → next Sunday (2 days forward)
+SELECT date('2024-07-26', 'weekday 0');
+→ ["2024-07-28"]
+
+-- Friday → next Monday (3 days forward)
+SELECT date('2024-07-26', 'weekday 1');
+→ ["2024-07-29"]
+
+-- Friday → next Wednesday (5 days forward)
+SELECT date('2024-07-26', 'weekday 3');
+→ ["2024-07-31"]
+
+-- 2024-07-28 is a Sunday (weekday 0)
+
+-- Sunday → same Sunday (no change)
+SELECT date('2024-07-28', 'weekday 0');
+→ ["2024-07-28"]
+
+-- Sunday → next Monday (1 day forward)
+SELECT date('2024-07-28', 'weekday 1');
+→ ["2024-07-29"]
+
+-- Sunday → next Saturday (6 days forward)
+SELECT date('2024-07-28', 'weekday 6');
+→ ["2024-08-03"]
+
+-- Weekday modifier with datetime function
+SELECT datetime('2024-07-22 10:30:00', 'weekday 3');
+→ ["2024-07-24 10:30:00"]
+
+-- Weekday modifier combined with start of day
+SELECT datetime('2024-07-22 10:30:00', 'weekday 3', 'start of day');
+→ ["2024-07-24 00:00:00"]

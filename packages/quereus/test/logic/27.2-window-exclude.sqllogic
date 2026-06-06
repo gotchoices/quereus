@@ -1,0 +1,13 @@
+-- adapted from SQLite test/window1.test, test/window2.test, test/window5.test, test/window8.test
+-- EXCLUDE clause modifiers (NO OTHERS / CURRENT ROW / GROUP / TIES) are not
+-- yet supported by the Quereus parser. Document the rejection.
+
+create table ex (id integer primary key, val integer);
+insert into ex values (1, 10), (2, 20);
+
+select id, val,
+       sum(val) over (order by val rows between unbounded preceding and unbounded following exclude no others) as s
+from ex order by id;
+-- error: exclude
+
+drop table ex;

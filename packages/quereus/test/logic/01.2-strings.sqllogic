@@ -1,0 +1,43 @@
+-- various string literals
+
+-- Basic multi-line single-quoted string
+SELECT 'hello
+world' as multiline;
+→ [{"multiline":"hello\nworld"}]
+
+-- Multi-line string with explicit content
+SELECT 'line one
+line two
+line three' as text;
+→ [{"text":"line one\nline two\nline three"}]
+
+-- Multi-line string in WHERE clause
+CREATE TABLE test_multiline (id INTEGER PRIMARY KEY, content TEXT);
+INSERT INTO test_multiline VALUES (1, 'hello
+world');
+SELECT * FROM test_multiline WHERE content = 'hello
+world';
+→ [{"id":1,"content":"hello\nworld"}]
+
+-- Multi-line string with special characters
+SELECT 'first line
+second line with spaces
+third line' as formatted;
+→ [{"formatted":"first line\nsecond line with spaces\nthird line"}]
+
+-- String concatenation with multi-line strings
+SELECT 'multi
+line' || ' ' || 'another
+multi
+line' as concatenated;
+→ [{"concatenated":"multi\nline another\nmulti\nline"}]
+
+-- SQL standard escaped quotes ('' represents a single quote)
+SELECT 'hello''world' as escaped;
+→ [{"escaped":"hello'world"}]
+
+-- Escaped quotes in multi-line string (inch marks example)
+SELECT '60'''' total: 36'''' center' as measurement;
+→ [{"measurement":"60'' total: 36'' center"}]
+
+DROP TABLE test_multiline;

@@ -1,0 +1,191 @@
+-- generated-columns.sqllogic - Testing GENERATED ALWAYS AS computed columns
+
+-- === STORED Generated Columns ===
+
+-- Basic STORED generated column (use integers to avoid floating point)
+CREATE TABLE t_gen_stored (
+    id INTEGER PRIMARY KEY,
+    base_price INTEGER NOT NULL,
+    multiplier INTEGER NOT NULL DEFAULT 2,
+    total_price INTEGER GENERATED ALWAYS AS (base_price * multiplier) STORED
+);
+
+-- INSERT with generated column computed automatically (named columns)
+INSERT INTO t_gen_stored (id, base_price, multiplier) VALUES (1, 100, 3);
+SELECT id, base_price, multiplier, total_price FROM t_gen_stored WHERE id = 1;
+→ [{"id":1,"base_price":100,"multiplier":3,"total_price":300}]
+
+-- INSERT with default multiplier
+INSERT INTO t_gen_stored (id, base_price) VALUES (2, 200);
+SELECT id, total_price FROM t_gen_stored WHERE id = 2;
+→ [{"id":2,"total_price":400}]
+
+-- UPDATE triggers recomputation of stored generated column
+UPDATE t_gen_stored SET base_price = 50 WHERE id = 1;
+SELECT id, base_price, total_price FROM t_gen_stored WHERE id = 1;
+→ [{"id":1,"base_price":50,"total_price":150}]
+
+-- UPDATE multiplier also triggers recomputation
+UPDATE t_gen_stored SET multiplier = 5 WHERE id = 1;
+SELECT id, total_price FROM t_gen_stored WHERE id = 1;
+→ [{"id":1,"total_price":250}]
+
+-- Cannot INSERT into generated column (explicit column list)
+INSERT INTO t_gen_stored (id, base_price, multiplier, total_price) VALUES (3, 100, 2, 999);
+-- error: Cannot INSERT into generated column 'total_price'
+
+-- Cannot UPDATE a generated column
+UPDATE t_gen_stored SET total_price = 999 WHERE id = 1;
+-- error: Cannot UPDATE generated column 'total_price'
+
+-- SELECT * includes generated columns
+SELECT * FROM t_gen_stored WHERE id = 2;
+→ [{"id":2,"base_price":200,"multiplier":2,"total_price":400}]
+
+DROP TABLE t_gen_stored;
+
+-- === STORED generated column with string concatenation ===
+
+CREATE TABLE t_gen_concat (
+    id INTEGER PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    full_name TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED
+);
+
+INSERT INTO t_gen_concat (id, first_name, last_name) VALUES (1, 'John', 'Doe');
+SELECT full_name FROM t_gen_concat WHERE id = 1;
+→ [{"full_name":"John Doe"}]
+
+UPDATE t_gen_concat SET first_name = 'Jane' WHERE id = 1;
+SELECT full_name FROM t_gen_concat WHERE id = 1;
+→ [{"full_name":"Jane Doe"}]
+
+DROP TABLE t_gen_concat;
+
+-- === Interaction with NOT NULL ===
+
+CREATE TABLE t_gen_notnull (
+    id INTEGER PRIMARY KEY,
+    a INTEGER NULL,
+    b INTEGER GENERATED ALWAYS AS (a * 2) STORED NOT NULL
+);
+
+-- NULL input causes generated column to be NULL, violating NOT NULL
+INSERT INTO t_gen_notnull (id, a) VALUES (1, NULL);
+-- error: NOT NULL constraint failed: t_gen_notnull.b
+
+-- Non-null input succeeds
+INSERT INTO t_gen_notnull (id, a) VALUES (1, 5);
+SELECT b FROM t_gen_notnull WHERE id = 1;
+→ [{"b":10}]
+
+DROP TABLE t_gen_notnull;
+
+-- === Interaction with CHECK constraints ===
+
+CREATE TABLE t_gen_check (
+    id INTEGER PRIMARY KEY,
+    price INTEGER NOT NULL,
+    discount INTEGER NOT NULL DEFAULT 0,
+    final_price INTEGER GENERATED ALWAYS AS (price - discount) STORED,
+    CHECK (final_price >= 0)
+);
+
+-- Valid: final_price = 100 - 10 = 90
+INSERT INTO t_gen_check (id, price, discount) VALUES (1, 100, 10);
+SELECT final_price FROM t_gen_check WHERE id = 1;
+→ [{"final_price":90}]
+
+-- Invalid: final_price = 50 - 100 = -50 violates CHECK
+INSERT INTO t_gen_check (id, price, discount) VALUES (2, 50, 100);
+-- error: CHECK constraint failed
+
+DROP TABLE t_gen_check;
+
+-- === Cannot have both DEFAULT and GENERATED ===
+
+CREATE TABLE t_gen_default_err (
+    id INTEGER PRIMARY KEY,
+    a INTEGER DEFAULT 5 GENERATED ALWAYS AS (id * 2) STORED
+);
+-- error: cannot have both DEFAULT and GENERATED
+
+-- === Multiple generated columns ===
+
+CREATE TABLE t_gen_multi (
+    id INTEGER PRIMARY KEY,
+    a INTEGER NOT NULL,
+    b INTEGER NOT NULL,
+    sum_ab INTEGER GENERATED ALWAYS AS (a + b) STORED,
+    diff_ab INTEGER GENERATED ALWAYS AS (a - b) STORED
+);
+
+INSERT INTO t_gen_multi (id, a, b) VALUES (1, 10, 3);
+SELECT sum_ab, diff_ab FROM t_gen_multi WHERE id = 1;
+→ [{"sum_ab":13,"diff_ab":7}]
+
+UPDATE t_gen_multi SET a = 20 WHERE id = 1;
+SELECT sum_ab, diff_ab FROM t_gen_multi WHERE id = 1;
+→ [{"sum_ab":23,"diff_ab":17}]
+
+DROP TABLE t_gen_multi;
+
+-- === RETURNING with generated columns ===
+
+CREATE TABLE t_gen_returning (
+    id INTEGER PRIMARY KEY,
+    x INTEGER NOT NULL,
+    y INTEGER GENERATED ALWAYS AS (x * x) STORED
+);
+
+INSERT INTO t_gen_returning (id, x) VALUES (1, 5) RETURNING id, x, y;
+→ [{"id":1,"x":5,"y":25}]
+
+UPDATE t_gen_returning SET x = 7 WHERE id = 1 RETURNING id, y;
+→ [{"id":1,"y":49}]
+
+DROP TABLE t_gen_returning;
+
+-- === VIRTUAL Generated Columns ===
+-- Note: VIRTUAL columns currently behave like STORED (storage optimization deferred).
+-- The semantic behavior is correct: cannot INSERT/UPDATE, expression is evaluated.
+
+CREATE TABLE t_gen_virtual (
+    id INTEGER PRIMARY KEY,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    area INTEGER GENERATED ALWAYS AS (width * height) VIRTUAL
+);
+
+-- INSERT computes the virtual column
+INSERT INTO t_gen_virtual (id, width, height) VALUES (1, 5, 10);
+SELECT id, width, height, area FROM t_gen_virtual WHERE id = 1;
+→ [{"id":1,"width":5,"height":10,"area":50}]
+
+-- Cannot INSERT into virtual column
+INSERT INTO t_gen_virtual (id, width, height, area) VALUES (2, 3, 4, 99);
+-- error: Cannot INSERT into generated column 'area'
+
+-- Cannot UPDATE virtual column
+UPDATE t_gen_virtual SET area = 100 WHERE id = 1;
+-- error: Cannot UPDATE generated column 'area'
+
+-- UPDATE recalculates virtual column
+UPDATE t_gen_virtual SET width = 8 WHERE id = 1;
+SELECT area FROM t_gen_virtual WHERE id = 1;
+→ [{"area":80}]
+
+-- Default VIRTUAL (no STORED/VIRTUAL keyword defaults to VIRTUAL per SQL standard)
+CREATE TABLE t_gen_default_mode (
+    id INTEGER PRIMARY KEY,
+    x INTEGER NOT NULL,
+    doubled INTEGER GENERATED ALWAYS AS (x * 2)
+);
+
+INSERT INTO t_gen_default_mode (id, x) VALUES (1, 7);
+SELECT doubled FROM t_gen_default_mode WHERE id = 1;
+→ [{"doubled":14}]
+
+DROP TABLE t_gen_default_mode;
+DROP TABLE t_gen_virtual;

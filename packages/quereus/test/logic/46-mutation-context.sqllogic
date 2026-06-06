@@ -1,0 +1,293 @@
+-- Mutation Context Tests
+-- Tests for table-level mutation context variables used in defaults and constraints
+-- Primary use case: application-specific security, rights, signatures, and audit
+
+-- Test 1: Use mutation context in default values
+CREATE TABLE products (
+	id INTEGER PRIMARY KEY,
+	base_price INTEGER,
+	final_price INTEGER DEFAULT base_price + markup
+) USING memory
+WITH CONTEXT (
+	markup INTEGER
+);
+
+INSERT INTO products (id, base_price)
+WITH CONTEXT markup = 50
+VALUES (1, 100);
+
+SELECT id, base_price, final_price FROM products
+→ [{"id":1,"base_price":100,"final_price":150}]
+
+-- Test 2: Use mutation context in CHECK constraints
+CREATE TABLE stock (
+	sku TEXT PRIMARY KEY,
+	quantity INTEGER,
+	CONSTRAINT qty_check CHECK (NEW.quantity >= min_qty)
+) USING memory
+WITH CONTEXT (
+	min_qty INTEGER
+);
+
+-- Should succeed with quantity >= min_qty
+INSERT INTO stock (sku, quantity)
+WITH CONTEXT min_qty = 10
+VALUES ('SKU001', 20);
+
+SELECT sku, quantity FROM stock
+→ [{"sku":"SKU001","quantity":20}]
+
+-- Should fail with quantity < min_qty
+INSERT INTO stock (sku, quantity)
+WITH CONTEXT min_qty = 50
+VALUES ('SKU002', 30);
+-- error: CHECK constraint failed
+
+-- Test 3: Qualified context.varName references
+CREATE TABLE items (
+	id INTEGER PRIMARY KEY,
+	value INTEGER,
+	CONSTRAINT value_check CHECK (NEW.value >= context.threshold)
+) USING memory
+WITH CONTEXT (
+	threshold INTEGER
+);
+
+INSERT INTO items (id, value)
+WITH CONTEXT threshold = 100
+VALUES (1, 150);
+
+SELECT id, value FROM items
+→ [{"id":1,"value":150}]
+
+-- Test 4: UPDATE with mutation context
+CREATE TABLE prices (
+	product_id INTEGER PRIMARY KEY,
+	price INTEGER,
+	CONSTRAINT price_check CHECK (NEW.price >= min_price)
+) USING memory
+WITH CONTEXT (
+	min_price INTEGER
+);
+
+INSERT INTO prices
+WITH CONTEXT min_price = 0
+VALUES (1, 100);
+
+UPDATE prices
+WITH CONTEXT min_price = 50
+SET price = 75
+WHERE product_id = 1;
+
+SELECT price FROM prices WHERE product_id = 1
+→ [{"price":75}]
+
+-- Update with invalid context should fail
+UPDATE prices
+WITH CONTEXT min_price = 100
+SET price = 80
+WHERE product_id = 1;
+-- error: CHECK constraint failed
+
+-- Test 5: DELETE with mutation context
+CREATE TABLE audit (
+	sku TEXT PRIMARY KEY,
+	quantity INTEGER,
+	CONSTRAINT delete_check CHECK ON DELETE (allow_delete = 1)
+) USING memory
+WITH CONTEXT (
+	allow_delete INTEGER
+);
+
+INSERT INTO audit
+WITH CONTEXT allow_delete = 1
+VALUES ('A', 10), ('B', 20);
+
+DELETE FROM audit
+WITH CONTEXT allow_delete = 1
+WHERE sku = 'A';
+
+SELECT sku FROM audit
+→ [{"sku":"B"}]
+
+-- Delete with allow_delete = 0 should fail
+DELETE FROM audit
+WITH CONTEXT allow_delete = 0
+WHERE sku = 'B';
+-- error: CHECK constraint failed
+
+-- Test 6: Multiple context variables
+CREATE TABLE orders (
+	id INTEGER PRIMARY KEY,
+	amount INTEGER DEFAULT base + tax + shipping
+) USING memory
+WITH CONTEXT (
+	base INTEGER,
+	tax INTEGER,
+	shipping INTEGER
+);
+
+INSERT INTO orders (id)
+WITH CONTEXT base = 100, tax = 15, shipping = 5
+VALUES (1);
+
+SELECT amount FROM orders WHERE id = 1
+→ [{"amount":120}]
+
+-- Test 7: NULL context variables
+CREATE TABLE config (
+	id INTEGER PRIMARY KEY,
+	max_val INTEGER DEFAULT coalesce(limit_val, 999)
+) USING memory
+WITH CONTEXT (
+	limit_val INTEGER NULL
+);
+
+INSERT INTO config (id)
+WITH CONTEXT limit_val = NULL
+VALUES (1);
+
+SELECT max_val FROM config WHERE id = 1
+→ [{"max_val":999}]
+
+-- Test 8: RETURNING with mutation context
+CREATE TABLE computed (
+	id INTEGER PRIMARY KEY,
+	result INTEGER DEFAULT base * multiplier
+) USING memory
+WITH CONTEXT (
+	base INTEGER,
+	multiplier INTEGER
+);
+
+INSERT INTO computed (id)
+WITH CONTEXT base = 10, multiplier = 5
+VALUES (1)
+RETURNING id, result
+→ [{"id":1,"result":50}]
+
+-- Test 9: Context variable shadowing column names
+CREATE TABLE shadowing (
+	id INTEGER PRIMARY KEY,
+	value TEXT NULL,
+	label TEXT DEFAULT value
+) USING memory
+WITH CONTEXT (
+	value TEXT
+);
+
+INSERT INTO shadowing (id)
+WITH CONTEXT value = 'from_context'
+VALUES (1);
+
+SELECT label FROM shadowing WHERE id = 1
+→ [{"label":"from_context"}]
+
+-- Test 10: Deferred constraints with mutation context
+CREATE TABLE deferred_test (
+	id INTEGER PRIMARY KEY,
+	stock INTEGER,
+	CONSTRAINT stock_check CHECK (
+		NEW.stock >= min_stock OR
+		EXISTS (SELECT 1 FROM deferred_test WHERE id = NEW.id AND stock > 0)
+	)
+) USING memory
+WITH CONTEXT (
+	min_stock INTEGER
+);
+
+BEGIN;
+
+INSERT INTO deferred_test (id, stock)
+WITH CONTEXT min_stock = 10
+VALUES (1, 15);
+
+COMMIT;
+
+SELECT stock FROM deferred_test WHERE id = 1
+→ [{"stock":15}]
+
+-- Test 11: new.<column> reads a supplied sibling alongside a context variable
+CREATE TABLE invoice (
+	id INTEGER PRIMARY KEY,
+	subtotal INTEGER,
+	total INTEGER DEFAULT (new.subtotal + tax)
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+
+INSERT INTO invoice (id, subtotal)
+WITH CONTEXT tax = 7
+VALUES (1, 100);
+
+SELECT total FROM invoice WHERE id = 1
+→ [{"total":107}]
+
+-- Test 12: bare-vs-new precedence when the colliding column IS supplied.
+-- A context variable and a column share the name `amount`. When `amount` is
+-- supplied by the INSERT, a bare `amount` reference still resolves to the
+-- context variable (context shadows the column), while `new.amount` resolves to
+-- the supplied column value. No "symbol already exists" collision is raised.
+CREATE TABLE collide (
+	id INTEGER PRIMARY KEY,
+	amount INTEGER NULL,
+	bare_label INTEGER DEFAULT amount,
+	qual_label INTEGER DEFAULT (new.amount)
+) USING memory
+WITH CONTEXT (
+	amount INTEGER
+);
+
+INSERT INTO collide (id, amount)
+WITH CONTEXT amount = 999
+VALUES (1, 100);
+
+SELECT bare_label, qual_label FROM collide WHERE id = 1
+→ [{"bare_label":999,"qual_label":100}]
+
+-- Test 13: ALTER COLUMN SET DEFAULT coexists with a context variable. The default
+-- is installed via ALTER (not CREATE) yet resolves `new.<col>` (a supplied sibling)
+-- alongside a context variable at INSERT time — mirroring Test 11.
+CREATE TABLE invoice_alt (
+	id INTEGER PRIMARY KEY,
+	subtotal INTEGER,
+	total INTEGER
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+
+ALTER TABLE invoice_alt ALTER COLUMN total SET DEFAULT (new.subtotal + tax);
+
+INSERT INTO invoice_alt (id, subtotal)
+WITH CONTEXT tax = 7
+VALUES (1, 100);
+
+SELECT total FROM invoice_alt WHERE id = 1
+→ [{"total":107}]
+
+-- Test 14: through the shared-surrogate envelope — a member-table column default
+-- reads a supplied sibling via `new.<col>` alongside a per-statement context
+-- variable. The shared key is minted once from the anchor's allocator default; the
+-- member's `total` default combines `new.amount` (supplied) with `tax` (context).
+CREATE TABLE ec_core (
+	rid INTEGER PRIMARY KEY DEFAULT (coalesce((SELECT max(rid) FROM ec_core), 0) + mutation_ordinal()),
+	name TEXT
+) USING memory;
+CREATE TABLE ec_line (
+	rid INTEGER PRIMARY KEY,
+	amount INTEGER,
+	total INTEGER DEFAULT (new.amount + tax)
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+CREATE VIEW ec_v AS SELECT c.name AS name, l.amount AS amount
+	FROM ec_core c JOIN ec_line l ON l.rid = c.rid;
+
+INSERT INTO ec_v WITH CONTEXT tax = 5 VALUES ('Ada', 100), ('Lin', 200);
+
+SELECT rid, amount, total FROM ec_line ORDER BY rid
+→ [{"rid":1,"amount":100,"total":105},{"rid":2,"amount":200,"total":205}]
+

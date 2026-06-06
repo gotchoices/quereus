@@ -1,0 +1,250 @@
+-- DDL lifecycle: CREATE, INSERT, ALTER, DROP, and schema+transaction interaction
+
+-- ===================================
+-- 1. Basic DDL Lifecycle
+-- ===================================
+-- CREATE TABLE → INSERT data → verify → DROP TABLE → verify table gone
+
+create table lifecycle (id integer primary key, name text);
+
+insert into lifecycle values (1, 'Alice'), (2, 'Bob');
+
+select * from lifecycle order by id;
+→ [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+-- Verify count
+select count(*) as cnt from lifecycle;
+→ [{"cnt": 2}]
+
+-- Update a row
+update lifecycle set name = 'Alicia' where id = 1;
+
+select name from lifecycle where id = 1;
+→ [{"name": "Alicia"}]
+
+-- Delete a row
+delete from lifecycle where id = 2;
+
+select count(*) as cnt from lifecycle;
+→ [{"cnt": 1}]
+
+-- Drop the table
+drop table lifecycle;
+
+-- Verify table is gone
+select * from lifecycle;
+-- error: not found in schema path
+
+-- ===================================
+-- 2. IF NOT EXISTS / IF EXISTS
+-- ===================================
+
+create table safe_create (id integer primary key, val text);
+insert into safe_create values (1, 'original');
+
+-- CREATE TABLE IF NOT EXISTS on existing table is a no-op
+create table if not exists safe_create (id integer primary key, val text);
+
+-- Data should be intact (not reset)
+select val from safe_create where id = 1;
+→ [{"val": "original"}]
+
+-- Insert still works
+insert into safe_create values (2, 'added');
+
+select count(*) as cnt from safe_create;
+→ [{"cnt": 2}]
+
+-- DROP TABLE IF EXISTS on existing table removes it
+drop table if exists safe_create;
+
+-- DROP TABLE IF EXISTS on missing table is a no-op
+drop table if exists safe_create;
+
+-- Verify table is gone
+select * from safe_create;
+-- error: not found in schema path
+
+-- ===================================
+-- 3. CREATE INDEX Lifecycle
+-- ===================================
+
+create table idx_lifecycle (id integer primary key, name text, score integer);
+
+insert into idx_lifecycle values
+	(1, 'Alice', 90),
+	(2, 'Bob', 80),
+	(3, 'Charlie', 95);
+
+-- Create an index
+create index idx_lc_score on idx_lifecycle (score);
+
+-- Queries should still work with the index present
+select name from idx_lifecycle where score > 85 order by name;
+→ [{"name": "Alice"}, {"name": "Charlie"}]
+
+-- CREATE INDEX IF NOT EXISTS on existing index is a no-op
+create index if not exists idx_lc_score on idx_lifecycle (score);
+
+-- Create a second index on a different column
+create index idx_lc_name on idx_lifecycle (name);
+
+select name from idx_lifecycle where name = 'Bob';
+→ [{"name": "Bob"}]
+
+-- Verify indexes are visible in schema()
+select name from schema() where type = 'index' and tbl_name = 'idx_lifecycle' order by name;
+→ [{"name": "idx_lc_name"}, {"name": "idx_lc_score"}]
+
+-- Clean up
+drop table idx_lifecycle;
+
+-- ===================================
+-- 4. Schema + Transaction Interaction
+-- ===================================
+-- Note: Schema (DDL) changes take effect immediately and are NOT
+-- rolled back by transaction rollback. Only data changes are rolled back.
+
+-- 4a. INSERT data, BEGIN, INSERT more, ROLLBACK — new inserts gone, old data intact
+create table tx_schema (id integer primary key, val text);
+insert into tx_schema values (1, 'committed');
+
+begin;
+insert into tx_schema values (2, 'will-rollback');
+
+select count(*) as cnt from tx_schema;
+→ [{"cnt": 2}]
+
+rollback;
+
+-- Row 2 should be rolled back, row 1 intact
+select count(*) as cnt from tx_schema;
+→ [{"cnt": 1}]
+
+select val from tx_schema where id = 1;
+→ [{"val": "committed"}]
+
+-- 4b. Data committed inside explicit transaction persists
+begin;
+insert into tx_schema values (3, 'will-commit');
+commit;
+
+select val from tx_schema where id = 3;
+→ [{"val": "will-commit"}]
+
+-- 4c. Rollback undoes deletes too
+begin;
+delete from tx_schema where id = 1;
+
+select count(*) as cnt from tx_schema;
+→ [{"cnt": 1}]
+
+rollback;
+
+-- Row 1 should be restored
+select count(*) as cnt from tx_schema;
+→ [{"cnt": 2}]
+
+-- 4d. Rollback undoes updates
+begin;
+update tx_schema set val = 'changed' where id = 1;
+
+select val from tx_schema where id = 1;
+→ [{"val": "changed"}]
+
+rollback;
+
+select val from tx_schema where id = 1;
+→ [{"val": "committed"}]
+
+drop table tx_schema;
+
+-- ===================================
+-- 5. Error Cases
+-- ===================================
+
+-- 5a. CREATE TABLE with duplicate name
+create table dup_table (x integer);
+
+create table dup_table (y integer);
+-- error: already exists
+
+drop table dup_table;
+
+-- 5b. DROP TABLE on non-existent table
+drop table no_such_table;
+-- error: not found
+
+-- 5c. CREATE TABLE with duplicate column names
+create table dup_cols (a integer, a text);
+-- error: Duplicate column name
+
+-- 5d. CREATE INDEX on non-existent table
+create index idx_bad on no_such_table (col);
+-- error: no such table
+
+-- 5e. CREATE INDEX on non-existent column
+create table idx_err (id integer primary key, name text);
+
+create index idx_bad_col on idx_err (missing_col);
+-- error: not found
+
+drop table idx_err;
+
+-- 5f. Duplicate index name without IF NOT EXISTS
+create table idx_dup_test (id integer primary key, val integer);
+create index idx_dup on idx_dup_test (val);
+
+create index idx_dup on idx_dup_test (val);
+-- error: already exists
+
+drop table idx_dup_test;
+
+-- ===================================
+-- 6. Multi-table DDL Sequence
+-- ===================================
+-- Verify creating, using, and dropping multiple tables in sequence
+
+create table t_first (id integer primary key, label text);
+create table t_second (id integer primary key, ref_id integer, data text);
+
+insert into t_first values (10, 'ten'), (20, 'twenty');
+insert into t_second values (1, 10, 'alpha'), (2, 20, 'beta');
+
+select f.label, s.data
+from t_first f join t_second s on f.id = s.ref_id
+order by f.id;
+→ [{"label": "ten", "data": "alpha"}, {"label": "twenty", "data": "beta"}]
+
+-- Drop in reverse dependency order
+drop table t_second;
+drop table t_first;
+
+-- Both tables should be gone
+select * from t_first;
+-- error: not found in schema path
+
+select * from t_second;
+-- error: not found in schema path
+
+-- ===================================
+-- 7. Re-create Table After Drop
+-- ===================================
+-- Verify a table can be re-created with a different schema after drop
+
+create table reuse (x integer primary key);
+insert into reuse values (1), (2);
+
+select count(*) as cnt from reuse;
+→ [{"cnt": 2}]
+
+drop table reuse;
+
+-- Re-create with different columns
+create table reuse (a text, b real);
+insert into reuse values ('hello', 3.14);
+
+select a, b from reuse;
+→ [{"a": "hello", "b": 3.14}]
+
+drop table reuse;

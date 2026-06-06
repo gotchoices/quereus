@@ -1,0 +1,365 @@
+-- transaction-edge-cases.sqllogic - Edge cases for savepoint nesting, empty txns, commit-after-fail
+
+-- ===================================
+-- Empty Transactions
+-- ===================================
+
+CREATE TABLE txe (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO txe VALUES (1, 'initial');
+
+-- BEGIN + COMMIT with no mutations
+BEGIN;
+COMMIT;
+
+SELECT val FROM txe WHERE id = 1;
+→ [{"val": "initial"}]
+
+-- BEGIN + ROLLBACK with no mutations
+BEGIN;
+ROLLBACK;
+
+SELECT val FROM txe WHERE id = 1;
+→ [{"val": "initial"}]
+
+-- ===================================
+-- Double BEGIN (should error)
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (2, 'in-txn');
+COMMIT;
+-- run
+
+-- Second BEGIN while already in transaction
+BEGIN;
+BEGIN;
+-- error: already in a transaction
+
+ROLLBACK;
+-- run
+
+SELECT val FROM txe WHERE id = 2;
+→ [{"val": "in-txn"}]
+
+-- ===================================
+-- Double COMMIT (second is no-op)
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (3, 'commit-twice');
+COMMIT;
+COMMIT;
+-- run
+
+SELECT val FROM txe WHERE id = 3;
+→ [{"val": "commit-twice"}]
+
+-- ===================================
+-- Double ROLLBACK (second is no-op)
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (99, 'will-rollback');
+ROLLBACK;
+ROLLBACK;
+-- run
+
+SELECT count(*) as cnt FROM txe WHERE id = 99;
+→ [{"cnt": 0}]
+
+-- ===================================
+-- Commit After Failed Statement
+-- ===================================
+-- A failed statement mid-transaction should not prevent subsequent operations
+
+BEGIN;
+INSERT INTO txe VALUES (4, 'before-fail');
+-- run
+
+-- This should fail (duplicate key)
+INSERT INTO txe VALUES (1, 'duplicate');
+-- error: UNIQUE constraint failed
+
+-- Transaction should still be usable after the failed statement
+INSERT INTO txe VALUES (5, 'after-fail');
+COMMIT;
+-- run
+
+SELECT val FROM txe WHERE id = 4;
+→ [{"val": "before-fail"}]
+
+SELECT val FROM txe WHERE id = 5;
+→ [{"val": "after-fail"}]
+
+-- ===================================
+-- Deeply Nested Savepoints (3+ levels)
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (10, 'base');
+SAVEPOINT sp_a;
+INSERT INTO txe VALUES (11, 'level-1');
+SAVEPOINT sp_b;
+INSERT INTO txe VALUES (12, 'level-2');
+SAVEPOINT sp_c;
+INSERT INTO txe VALUES (13, 'level-3');
+
+-- Verify all visible within transaction
+SELECT count(*) as cnt FROM txe WHERE id >= 10;
+→ [{"cnt": 4}]
+
+-- Rollback innermost only
+ROLLBACK TO SAVEPOINT sp_c;
+SELECT count(*) as cnt FROM txe WHERE id >= 10;
+→ [{"cnt": 3}]
+
+-- sp_c is preserved after rollback — can reuse
+INSERT INTO txe VALUES (14, 'reuse-sp_c');
+RELEASE SAVEPOINT sp_c;
+
+-- Rollback to sp_b discards sp_c's released data plus sp_b's data
+ROLLBACK TO SAVEPOINT sp_b;
+SELECT count(*) as cnt FROM txe WHERE id >= 10;
+→ [{"cnt": 2}]
+
+-- Release sp_b and sp_a, then commit
+RELEASE SAVEPOINT sp_b;
+RELEASE SAVEPOINT sp_a;
+COMMIT;
+
+-- Only base + level-1 should survive
+SELECT val FROM txe WHERE id IN (10, 11) ORDER BY id;
+→ [{"val": "base"}, {"val": "level-1"}]
+
+SELECT count(*) as cnt FROM txe WHERE id >= 12;
+→ [{"cnt": 0}]
+
+-- ===================================
+-- Release inner savepoint then rollback outer
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (20, 'outer');
+SAVEPOINT sp_outer;
+INSERT INTO txe VALUES (21, 'inner-pre');
+SAVEPOINT sp_inner;
+INSERT INTO txe VALUES (22, 'inner-post');
+RELEASE SAVEPOINT sp_inner;
+
+-- inner-post is now merged into sp_outer scope
+SELECT count(*) as cnt FROM txe WHERE id >= 20;
+→ [{"cnt": 3}]
+
+-- Rollback sp_outer undoes everything including released inner data
+ROLLBACK TO SAVEPOINT sp_outer;
+SELECT count(*) as cnt FROM txe WHERE id >= 20;
+→ [{"cnt": 1}]
+
+RELEASE SAVEPOINT sp_outer;
+COMMIT;
+
+SELECT val FROM txe WHERE id = 20;
+→ [{"val": "outer"}]
+
+SELECT count(*) as cnt FROM txe WHERE id IN (21, 22);
+→ [{"cnt": 0}]
+
+-- ===================================
+-- Savepoint with same name at different nesting levels
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (30, 'base');
+SAVEPOINT dup;
+INSERT INTO txe VALUES (31, 'dup-level-1');
+SAVEPOINT dup;
+INSERT INTO txe VALUES (32, 'dup-level-2');
+
+-- ROLLBACK TO dup goes to the most recent (innermost) 'dup'
+ROLLBACK TO SAVEPOINT dup;
+SELECT count(*) as cnt FROM txe WHERE id = 32;
+→ [{"cnt": 0}]
+
+-- level-1 data should still be visible
+SELECT count(*) as cnt FROM txe WHERE id = 31;
+→ [{"cnt": 1}]
+
+RELEASE SAVEPOINT dup;
+RELEASE SAVEPOINT dup;
+COMMIT;
+
+SELECT val FROM txe WHERE id IN (30, 31) ORDER BY id;
+→ [{"val": "base"}, {"val": "dup-level-1"}]
+
+-- ===================================
+-- Mutation types across savepoints
+-- ===================================
+-- INSERT, UPDATE, DELETE across savepoint boundaries
+
+BEGIN;
+INSERT INTO txe VALUES (40, 'inserted');
+SAVEPOINT sp_mut;
+UPDATE txe SET val = 'updated' WHERE id = 40;
+SAVEPOINT sp_del;
+DELETE FROM txe WHERE id = 40;
+
+-- Row is gone within innermost scope
+SELECT count(*) as cnt FROM txe WHERE id = 40;
+→ [{"cnt": 0}]
+
+-- Rollback the delete
+ROLLBACK TO SAVEPOINT sp_del;
+SELECT val FROM txe WHERE id = 40;
+→ [{"val": "updated"}]
+
+-- Rollback the update too
+ROLLBACK TO SAVEPOINT sp_mut;
+SELECT val FROM txe WHERE id = 40;
+→ [{"val": "inserted"}]
+
+RELEASE SAVEPOINT sp_mut;
+COMMIT;
+
+SELECT val FROM txe WHERE id = 40;
+→ [{"val": "inserted"}]
+
+-- ===================================
+-- Large transaction with many inserts
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (100, 'r100');
+INSERT INTO txe VALUES (101, 'r101');
+INSERT INTO txe VALUES (102, 'r102');
+INSERT INTO txe VALUES (103, 'r103');
+INSERT INTO txe VALUES (104, 'r104');
+INSERT INTO txe VALUES (105, 'r105');
+INSERT INTO txe VALUES (106, 'r106');
+INSERT INTO txe VALUES (107, 'r107');
+INSERT INTO txe VALUES (108, 'r108');
+INSERT INTO txe VALUES (109, 'r109');
+COMMIT;
+
+SELECT count(*) as cnt FROM txe WHERE id >= 100;
+→ [{"cnt": 10}]
+
+-- ===================================
+-- Rollback large transaction
+-- ===================================
+
+BEGIN;
+INSERT INTO txe VALUES (200, 'will-rollback');
+INSERT INTO txe VALUES (201, 'will-rollback');
+INSERT INTO txe VALUES (202, 'will-rollback');
+INSERT INTO txe VALUES (203, 'will-rollback');
+INSERT INTO txe VALUES (204, 'will-rollback');
+ROLLBACK;
+
+SELECT count(*) as cnt FROM txe WHERE id >= 200;
+→ [{"cnt": 0}]
+
+-- ===================================
+-- Implicit transaction auto-commits on success
+-- ===================================
+
+INSERT INTO txe VALUES (300, 'auto');
+
+SELECT val FROM txe WHERE id = 300;
+→ [{"val": "auto"}]
+
+-- ===================================
+-- Savepoint without explicit BEGIN (creates implicit transaction)
+-- ===================================
+
+SAVEPOINT implicit_sp;
+INSERT INTO txe VALUES (301, 'in-implicit-sp');
+RELEASE SAVEPOINT implicit_sp;
+
+SELECT val FROM txe WHERE id = 301;
+→ [{"val": "in-implicit-sp"}]
+
+-- ===================================
+-- Statement-level atomicity inside an explicit transaction (UPDATE)
+-- ===================================
+-- A multi-row UPDATE whose Nth row throws must roll back the WHOLE statement
+-- (rows 1..N-1 included), mirroring SQLite's implicit-savepoint-per-statement.
+-- The autocommit path is already atomic via implicit-transaction rollback, so
+-- this MUST wrap in begin/rollback to exercise the statement savepoint. Without
+-- it, id=1's update (x=11) would survive the aborted statement.
+
+-- The preceding section upgraded an implicit savepoint to an explicit
+-- transaction that is still open; commit it so our BEGIN starts clean
+-- (a no-op if autocommit is already active).
+COMMIT;
+-- run
+
+CREATE TABLE atom_u (id INTEGER PRIMARY KEY, x INTEGER NOT NULL);
+INSERT INTO atom_u VALUES (1, 10), (2, 20), (3, 30);
+-- run
+
+-- Row id=1 updates to x=11 first, then id=2 violates NOT NULL (x -> NULL).
+BEGIN;
+UPDATE atom_u SET x = CASE WHEN id = 2 THEN NULL ELSE x + 1 END WHERE id IN (1, 2);
+-- error: NOT NULL constraint failed: atom_u.x
+
+-- Inside the still-open transaction: id=1's update must NOT have survived.
+SELECT id, x FROM atom_u ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+ROLLBACK;
+-- run
+
+-- After rollback nothing persisted either.
+SELECT id, x FROM atom_u ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- Same guarantee when the later row trips a UNIQUE collision rather than a
+-- NOT NULL check: id=1's k moves to 15 (fine), then id=2's k -> 30 collides
+-- with id=3. The whole statement must revert id=1's move.
+CREATE TABLE atom_uq (id INTEGER PRIMARY KEY, k INTEGER UNIQUE);
+INSERT INTO atom_uq VALUES (1, 10), (2, 20), (3, 30);
+-- run
+
+BEGIN;
+UPDATE atom_uq SET k = CASE WHEN id = 1 THEN 15 WHEN id = 2 THEN 30 END WHERE id IN (1, 2);
+-- error: constraint failed
+
+SELECT id, k FROM atom_uq ORDER BY id;
+→ [{"id":1,"k":10},{"id":2,"k":20},{"id":3,"k":30}]
+ROLLBACK;
+-- run
+
+-- ===================================
+-- Statement-level atomicity inside an explicit transaction (DELETE)
+-- ===================================
+-- A multi-row DELETE whose Nth row throws (FK RESTRICT child reference) must
+-- roll back the whole statement. id=1 (unreferenced) deletes first, then id=2
+-- (referenced by a RESTRICT child) trips the parent-side FK check.
+
+CREATE TABLE atom_dp (id INTEGER PRIMARY KEY);
+CREATE TABLE atom_dc (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES atom_dp(id) ON DELETE RESTRICT);
+INSERT INTO atom_dp VALUES (1), (2), (3);
+INSERT INTO atom_dc VALUES (100, 2);
+-- run
+
+BEGIN;
+DELETE FROM atom_dp WHERE id IN (1, 2);
+-- error: constraint failed
+
+-- id=1's delete must NOT have survived the aborted statement.
+SELECT id FROM atom_dp ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+ROLLBACK;
+-- run
+
+SELECT id FROM atom_dp ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- ===================================
+-- Cleanup
+-- ===================================
+
+DROP TABLE txe;
+DROP TABLE atom_dc;
+DROP TABLE atom_dp;
+DROP TABLE atom_uq;
+DROP TABLE atom_u;

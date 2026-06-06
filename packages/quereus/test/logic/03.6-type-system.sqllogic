@@ -1,0 +1,351 @@
+-- type-system.sqllogic - Regression tests for type system: CAST, comparisons, ordering
+
+-- === CAST via LogicalType.parse ===
+
+-- CAST to INTEGER
+select cast(3.7 as integer) as r;
+→ [{"r":3}]
+
+select cast(-2.9 as integer) as r;
+→ [{"r":-2}]
+
+select cast('42' as integer) as r;
+→ [{"r":42}]
+
+select cast(true as integer) as r;
+→ [{"r":1}]
+
+select cast(false as integer) as r;
+→ [{"r":0}]
+
+-- Non-numeric string: CAST should yield 0 (SQLite-compatible lenient behavior)
+select cast('abc' as integer) as r;
+→ [{"r":0}]
+
+select cast(null as integer) as r;
+→ [{"r":null}]
+
+-- CAST to REAL
+select cast(42 as real) as r;
+→ [{"r":42}]
+
+select cast('3.14' as real) as r;
+→ [{"r":3.14}]
+
+select cast(true as real) as r;
+→ [{"r":1}]
+
+select cast(null as real) as r;
+→ [{"r":null}]
+
+-- CAST to TEXT
+select cast(123 as text) as r;
+→ [{"r":"123"}]
+
+select cast(3.14 as text) as r;
+→ [{"r":"3.14"}]
+
+select cast(true as text) as r;
+→ [{"r":"true"}]
+
+select cast(null as text) as r;
+→ [{"r":null}]
+
+-- CAST to BLOB
+select typeof(cast('hello' as blob)) as r;
+→ [{"r":"blob"}]
+
+select typeof(cast(123 as blob)) as r;
+→ [{"r":"blob"}]
+
+select cast(null as blob) as r;
+→ [{"r":null}]
+
+-- CAST to NUMERIC (integer if possible, otherwise real)
+select cast('42' as numeric) as r;
+→ [{"r":42}]
+
+select cast('3.14' as numeric) as r;
+→ [{"r":3.14}]
+
+select cast(null as numeric) as r;
+→ [{"r":null}]
+
+-- CAST to BOOLEAN
+select cast(1 as boolean) as r;
+→ [{"r":true}]
+
+select cast(0 as boolean) as r;
+→ [{"r":false}]
+
+select cast(42 as boolean) as r;
+→ [{"r":true}]
+
+-- CAST aliases
+select cast(3.7 as int) as r;
+→ [{"r":3}]
+
+select cast('42' as float) as r;
+→ [{"r":42}]
+
+select cast(42 as varchar) as r;
+→ [{"r":"42"}]
+
+-- === Cross-type comparison ordering ===
+-- SQLite ordering: NULL < Numeric < TEXT < BLOB
+
+CREATE TABLE order_test (id INTEGER PRIMARY KEY, v ANY NULL);
+INSERT INTO order_test VALUES (1, null);
+INSERT INTO order_test VALUES (2, -1);
+INSERT INTO order_test VALUES (3, 0);
+INSERT INTO order_test VALUES (4, 1);
+INSERT INTO order_test VALUES (5, 'aaa');
+INSERT INTO order_test VALUES (6, 'zzz');
+INSERT INTO order_test VALUES (7, x'00');
+INSERT INTO order_test VALUES (8, x'ff');
+
+-- Verify cross-type ordering: NULL < numeric < text < blob
+select id from order_test order by v;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8}]
+
+DROP TABLE order_test;
+
+-- === BLOB comparison (byte-by-byte, then length) ===
+
+CREATE TABLE blob_cmp (id INTEGER PRIMARY KEY, b BLOB);
+INSERT INTO blob_cmp VALUES (1, x'01'), (2, x'02'), (3, x'01ff'), (4, x'0200'), (5, x'0100'), (6, x'abcd');
+
+-- Byte-by-byte: x'01...' < x'02'
+select id from blob_cmp where b < x'02' order by b;
+→ [{"id":1},{"id":5},{"id":3}]
+
+-- Full ordering: byte-by-byte then length
+select id from blob_cmp order by b;
+→ [{"id":1},{"id":5},{"id":3},{"id":2},{"id":4},{"id":6}]
+
+-- Equality
+select id from blob_cmp where b = x'abcd';
+→ [{"id":6}]
+
+DROP TABLE blob_cmp;
+
+-- === Date/time ordering uses binary comparison (not locale) ===
+
+CREATE TABLE date_cmp (id INTEGER PRIMARY KEY, d TEXT);
+INSERT INTO date_cmp VALUES (1, '2024-01-15'), (2, '2024-02-01'), (3, '2024-12-31'), (4, '2024-06-15');
+
+select d from date_cmp order by d;
+→ [{"d":"2024-01-15"},{"d":"2024-02-01"},{"d":"2024-06-15"},{"d":"2024-12-31"}]
+
+select d from date_cmp where d < '2024-02-01' order by d;
+→ [{"d":"2024-01-15"}]
+
+DROP TABLE date_cmp;
+
+CREATE TABLE time_cmp (id INTEGER PRIMARY KEY, t TEXT);
+INSERT INTO time_cmp VALUES (1, '09:00:00'), (2, '17:00:00'), (3, '23:59:59'), (4, '00:00:00');
+
+select t from time_cmp order by t;
+→ [{"t":"00:00:00"},{"t":"09:00:00"},{"t":"17:00:00"},{"t":"23:59:59"}]
+
+DROP TABLE time_cmp;
+
+CREATE TABLE dt_cmp (id INTEGER PRIMARY KEY, dt TEXT);
+INSERT INTO dt_cmp VALUES (1, '2024-01-01T00:00:00'), (2, '2024-12-31T23:59:59'), (3, '2024-06-15T12:00:00');
+
+select dt from dt_cmp order by dt;
+→ [{"dt":"2024-01-01T00:00:00"},{"dt":"2024-06-15T12:00:00"},{"dt":"2024-12-31T23:59:59"}]
+
+DROP TABLE dt_cmp;
+
+-- === NULL ordering in ORDER BY ===
+
+CREATE TABLE null_order (id INTEGER PRIMARY KEY, v INTEGER null);
+INSERT INTO null_order VALUES (1, null), (2, 10), (3, null), (4, 5);
+
+-- Nulls sort first in ASC
+select v from null_order order by v;
+→ [{"v":null},{"v":null},{"v":5},{"v":10}]
+
+DROP TABLE null_order;
+
+-- === BOOLEAN ordering and CAST ===
+
+select cast(0 as boolean) as r;
+→ [{"r":false}]
+
+select cast(1 as boolean) as r;
+→ [{"r":true}]
+
+select cast(-1 as boolean) as r;
+→ [{"r":true}]
+
+select cast(42 as boolean) as r;
+→ [{"r":true}]
+
+-- Boolean ordering: false < true
+CREATE TABLE bool_order (id INTEGER PRIMARY KEY, b BOOLEAN);
+INSERT INTO bool_order VALUES (1, true), (2, false), (3, true), (4, false);
+
+select b from bool_order order by b, id;
+→ [{"b":false},{"b":false},{"b":true},{"b":true}]
+
+DROP TABLE bool_order;
+
+-- === TEXT collation in comparisons ===
+
+CREATE TABLE text_cmp (id INTEGER PRIMARY KEY, t TEXT);
+INSERT INTO text_cmp VALUES (1, 'abc'), (2, 'ABC'), (3, 'abd'), (4, 'abc  ');
+
+-- Binary: 'ABC' < 'abc' (uppercase letters have lower code points)
+select t from text_cmp where t < 'abc' order by t;
+→ [{"t":"ABC"}]
+
+-- NOCASE: 'ABC' = 'abc'
+select id from text_cmp where t = 'abc' collate nocase order by id;
+→ [{"id":1},{"id":2}]
+
+-- RTRIM: 'abc  ' = 'abc'
+select id from text_cmp where t = 'abc' collate rtrim order by id;
+→ [{"id":1},{"id":4}]
+
+DROP TABLE text_cmp;
+
+-- === CAST in ORDER BY context ===
+
+CREATE TABLE cast_order (id INTEGER PRIMARY KEY, v TEXT);
+INSERT INTO cast_order VALUES (1, '10'), (2, '2'), (3, '1'), (4, '20');
+
+-- Text ordering (lexicographic)
+select v from cast_order order by v;
+→ [{"v":"1"},{"v":"10"},{"v":"2"},{"v":"20"}]
+
+-- Numeric ordering via CAST
+select v from cast_order order by cast(v as integer);
+→ [{"v":"1"},{"v":"2"},{"v":"10"},{"v":"20"}]
+
+DROP TABLE cast_order;
+
+-- === JSON validation on insert ===
+
+CREATE TABLE json_tbl (id INTEGER PRIMARY KEY, j JSON);
+INSERT INTO json_tbl VALUES (1, '{"a":1}'), (2, '[1,2,3]'), (3, '"hello"');
+
+select j from json_tbl order by id;
+→ [{"j":{"a":1}},{"j":[1,2,3]},{"j":"hello"}]
+
+-- Invalid JSON rejected
+INSERT INTO json_tbl VALUES (4, '{invalid');
+-- error: Type conversion failed
+
+-- typeof returns 'json' for native JSON objects
+select typeof(j) as t from json_tbl where id = 1;
+→ [{"t":"json"}]
+
+DROP TABLE json_tbl;
+
+-- === json() conversion function returns native objects ===
+
+select json('{"a":1}') as r;
+→ [{"r":{"a":1}}]
+
+select json('[1,2,3]') as r;
+→ [{"r":[1,2,3]}]
+
+select json('null') as r;
+→ [{"r":null}]
+
+select typeof(json('{"a":1}')) as t;
+→ [{"t":"json"}]
+
+-- === JSON deep comparison ===
+
+select json('{"a":1}') = json('{"a":1}') as eq;
+→ [{"eq":true}]
+
+select json('{"a":1}') = json('{"a":2}') as eq;
+→ [{"eq":false}]
+
+select json('[1,2,3]') = json('[1,2,3]') as eq;
+→ [{"eq":true}]
+
+select json('[1,2,3]') = json('[1,2,4]') as eq;
+→ [{"eq":false}]
+
+-- === Numeric type coercion in comparisons (table context) ===
+
+CREATE TABLE num_cmp (id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT);
+INSERT INTO num_cmp VALUES (1, 42, 42.0, '42');
+
+-- Integer vs real equality
+select i = r as r1 from num_cmp;
+→ [{"r1":true}]
+
+-- Text coerced to numeric for comparison
+select i = t as r1 from num_cmp;
+→ [{"r1":true}]
+
+-- Integer column vs text literal (planner inserts cast on text)
+select i = '42' as eq, i > '10' as gt, i < '100' as lt from num_cmp;
+→ [{"eq":true,"gt":true,"lt":true}]
+
+-- Real column vs text literal
+select r = '42.0' as eq from num_cmp;
+→ [{"eq":true}]
+
+-- Text column vs integer literal (planner inserts cast on text column)
+select t = 42 as eq from num_cmp;
+→ [{"eq":true}]
+
+-- Non-numeric text compared to integer: cast produces 0
+select '42' = 42 as r1, 'abc' = 0 as r2;
+→ [{"r1":true,"r2":true}]
+
+-- BETWEEN with mixed types: integer BETWEEN text bounds
+select i from num_cmp where i between '10' and '100';
+→ [{"i":42}]
+
+-- BETWEEN with text expr and numeric bounds
+select t from num_cmp where t between 10 and 100;
+→ [{"t":"42"}]
+
+DROP TABLE num_cmp;
+
+-- === Cross-category comparison edge cases ===
+
+-- Literal cross-category comparisons (no table needed)
+select 42 = '42' as r;
+→ [{"r":true}]
+
+select 42 != '43' as r;
+→ [{"r":true}]
+
+select 10 < '20' as r;
+→ [{"r":true}]
+
+select 100 > '50' as r;
+→ [{"r":true}]
+
+select 10 <= '10' as r;
+→ [{"r":true}]
+
+select 10 >= '10' as r;
+→ [{"r":true}]
+
+-- BETWEEN with all-literal cross-category
+select 5 between '1' and '10' as r;
+→ [{"r":true}]
+
+select '5' between 1 and 10 as r;
+→ [{"r":true}]
+
+-- NOT BETWEEN with cross-category
+select 50 not between '1' and '10' as r;
+→ [{"r":true}]
+
+-- NULL handling in cross-category (NULL propagates)
+select null = '42' as r;
+→ [{"r":null}]
+
+select 42 = null as r;
+→ [{"r":null}]

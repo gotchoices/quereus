@@ -1,0 +1,83 @@
+-- Schema Case-Insensitive Name Tests
+-- Verifies that schema names are case-insensitive throughout the system
+
+-- Setup: Create a custom schema with mixed-case name via declarative schema
+declare schema MyApp {
+	table items {
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	}
+
+	seed items (
+		(1, 'Widget'),
+		(2, 'Gadget')
+	)
+}
+
+-- run
+
+apply schema MyApp with seed;
+
+-- run
+
+-- Test 1: Access table using original case
+SELECT * FROM MyApp.items ORDER BY id;
+→ [{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]
+
+-- Test 2: Access table using lowercase schema name
+SELECT * FROM myapp.items ORDER BY id;
+→ [{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]
+
+-- Test 3: Access table using uppercase schema name
+SELECT * FROM MYAPP.items ORDER BY id;
+→ [{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]
+
+-- Test 4: Access table using mixed case schema name
+SELECT * FROM mYaPp.items ORDER BY id;
+→ [{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]
+
+-- Test 5: INSERT using different case schema name
+INSERT INTO myapp.items VALUES (3, 'Doohickey');
+
+SELECT * FROM MyApp.items WHERE id = 3;
+→ [{"id":3,"name":"Doohickey"}]
+
+-- Test 6: UPDATE using different case schema name
+UPDATE MYAPP.items SET name = 'Updated Widget' WHERE id = 1;
+
+SELECT name FROM myapp.items WHERE id = 1;
+→ [{"name":"Updated Widget"}]
+
+-- Test 7: DELETE using different case schema name
+DELETE FROM mYaPp.items WHERE id = 3;
+
+SELECT COUNT(*) as cnt FROM MyApp.items;
+→ [{"cnt":2}]
+
+-- Test 8: Main schema is also case-insensitive
+CREATE TABLE test_main (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO test_main VALUES (1, 'hello');
+
+SELECT * FROM Main.test_main;
+→ [{"id":1,"val":"hello"}]
+
+SELECT * FROM MAIN.test_main;
+→ [{"id":1,"val":"hello"}]
+
+DROP TABLE test_main;
+
+-- Test 9: Views with mixed-case schema names
+CREATE VIEW myapp.item_names AS SELECT name FROM myapp.items;
+
+SELECT * FROM MyApp.item_names ORDER BY name;
+→ [{"name":"Gadget"},{"name":"Updated Widget"}]
+
+SELECT * FROM MYAPP.item_names ORDER BY name;
+→ [{"name":"Gadget"},{"name":"Updated Widget"}]
+
+-- Test 10: Drop view with different case
+DROP VIEW MyApp.item_names;
+
+SELECT * FROM myapp.item_names;
+-- error:
+

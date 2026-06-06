@@ -1,0 +1,63 @@
+-- adapted from SQLite test/tableopts.test
+-- Quereus has no WITHOUT ROWID and uses logical/physical type separation
+-- (STRICT semantics by design). These fixtures pin the parser hygiene and
+-- the type-enforcement story for SQLite-style table options.
+
+-- ===================================
+-- 1. Unknown trailing table option rejected
+-- ===================================
+
+create table t_bad_opt (id integer primary key, b text) unknown_option;
+-- error:
+
+-- bare "without" is a parse error
+create table t_bare_without (id integer primary key, b text) without;
+-- error:
+
+-- "without" remains usable as a table name (not a reserved word)
+create table without_t (id integer primary key, b text);
+insert into without_t values (1, 'xyzzy');
+select * from without_t where b = 'xyzzy';
+→ [{"id":1,"b":"xyzzy"}]
+drop table without_t;
+
+-- ===================================
+-- 2. WITHOUT ROWID rejected (Quereus has no rowids)
+-- ===================================
+
+create table t_wr (id integer primary key, b text) without rowid;
+-- error:
+
+drop table if exists t_wr;
+
+-- ===================================
+-- 3. STRICT-equivalent type enforcement (Quereus is STRICT-by-design)
+-- ===================================
+
+create table t_strict (
+	i integer primary key,
+	t text,
+	r real,
+	b blob
+);
+
+-- matching types succeed
+insert into t_strict values (1, 'hello', 3.14, x'ab');
+
+select typeof(i), typeof(t), typeof(r), typeof(b) from t_strict where i = 1;
+→ [{"typeof(i)":"integer","typeof(t)":"text","typeof(r)":"real","typeof(b)":"blob"}]
+
+-- non-numeric text into integer column rejected (no implicit affinity coercion)
+insert into t_strict values (2, 'x', 'not-a-number', x'00');
+-- error:
+
+drop table t_strict;
+
+-- 'any' columns are the explicit opt-out for mixed types
+create table t_any (id integer primary key, v any null);
+insert into t_any values (1, 1), (2, 'two'), (3, 3.14), (4, x'ab'), (5, null);
+
+select typeof(v) from t_any order by id;
+→ [{"typeof(v)":"integer"},{"typeof(v)":"text"},{"typeof(v)":"real"},{"typeof(v)":"blob"},{"typeof(v)":"null"}]
+
+drop table t_any;

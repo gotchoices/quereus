@@ -1,0 +1,65 @@
+-- bigint-mixed-arithmetic.sqllogic - Test mixed bigint/number arithmetic
+-- Regression: mixed bigint + number silently returns null instead of numeric result
+
+-- 9007199254740993 exceeds Number.MAX_SAFE_INTEGER, so it's stored as bigint
+-- Adding a float (1.5) to it should produce float arithmetic, not null
+-- Note: converting bigint to Number loses precision (expected for float ops)
+
+SELECT 9007199254740993 + 1.5;
+→ [{"9007199254740993 + 1.5":9007199254740994}]
+
+-- bigint + integer (number): number promotes to bigint, stays in bigint domain
+SELECT 9007199254740993 + 1;
+→ [{"9007199254740993 + 1":9007199254740994}]
+
+-- bigint - number (float) — test harness returns bare value for subtraction expressions
+SELECT 9007199254740993 - 0.5;
+→ [9007199254740992]
+
+-- bigint * number (integer 2.0 promotes to BigInt)
+SELECT 9007199254740993 * 2.0;
+→ [{"9007199254740993 * 2.0":18014398509481986}]
+
+-- number + bigint (reversed operand order)
+SELECT 1.5 + 9007199254740993;
+→ [{"1.5 + 9007199254740993":9007199254740994}]
+
+-- bigint / number
+SELECT 9007199254740993 / 2.0;
+→ [{"9007199254740993 / 2.0":4503599627370496}]
+
+-- bigint % number (integer 2.0 promotes to BigInt, gives exact result)
+SELECT 9007199254740993 % 2.0;
+→ [{"9007199254740993 % 2.0":1}]
+
+-- Verify pure bigint + bigint still works
+SELECT 9007199254740993 + 9007199254740993;
+→ [{"9007199254740993 + 9007199254740993":18014398509481986}]
+
+-- Verify typeof results
+-- Float result is 9007199254740994 which is integer-valued (IEEE 754 rounding)
+SELECT typeof(9007199254740993 + 1.5);
+→ [{"typeof(9007199254740993 + 1.5)":"integer"}]
+
+SELECT typeof(9007199254740993 + 1);
+→ [{"typeof(9007199254740993 + 1)":"integer"}]
+
+-- bigint + numeric string: text coerced through arithmetic affinity, then BigInt-promoted
+SELECT 9007199254740993 + '3';
+→ [{"9007199254740993 + '3'":9007199254740996}]
+
+-- numeric string + bigint (reversed order)
+SELECT '3' + 9007199254740993;
+→ [{"'3' + 9007199254740993":9007199254740996}]
+
+-- bigint + non-numeric string: string coerces to 0, stays in BigInt domain
+SELECT 9007199254740993 + 'abc';
+→ [{"9007199254740993 + 'abc'":9007199254740993}]
+
+-- bigint + boolean: boolean coerces to 0/1, BigInt-promoted
+SELECT 9007199254740993 + true;
+→ [{"9007199254740993 + true":9007199254740994}]
+
+-- bigint + fractional numeric string: float path
+SELECT 9007199254740993 + '0.5';
+→ [{"9007199254740993 + '0.5'":9007199254740992}]

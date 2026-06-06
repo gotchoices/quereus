@@ -1,0 +1,247 @@
+-- function-features.sqllogic - Testing function registration, usage patterns, and edge cases
+
+-- ============================================================
+-- Section 1: Aggregate vs scalar function behavior
+-- ============================================================
+
+create table items (
+    id integer primary key,
+    category text,
+    name text,
+    price numeric null
+);
+
+insert into items values
+    (1, 'fruit', 'Apple', 1.50),
+    (2, 'fruit', 'Banana', 0.75),
+    (3, 'veggie', 'Carrot', 2.00),
+    (4, 'veggie', 'Daikon', 3.25),
+    (5, 'fruit', 'Elderberry', null),
+    (6, 'veggie', 'Fennel', 1.80);
+
+-- Aggregates with GROUP BY
+select category, count(*) as cnt, sum(price) as total, avg(price) as mean, min(price) as lo, max(price) as hi
+from items group by category order by category;
+→ [{"category":"fruit","cnt":3,"total":2.25,"mean":1.125,"lo":0.75,"hi":1.5},{"category":"veggie","cnt":3,"total":7.05,"mean":2.35,"lo":1.8,"hi":3.25}]
+
+-- Scalar functions in SELECT
+select id, lower(name) as lname, upper(name) as uname, length(name) as len
+from items where id <= 3 order by id;
+→ [{"id":1,"lname":"apple","uname":"APPLE","len":5},{"id":2,"lname":"banana","uname":"BANANA","len":6},{"id":3,"lname":"carrot","uname":"CARROT","len":6}]
+
+-- Scalar functions in WHERE
+select name from items where length(name) > 5 order by name;
+→ [{"name":"Banana"},{"name":"Carrot"},{"name":"Daikon"},{"name":"Elderberry"},{"name":"Fennel"}]
+
+select name from items where lower(name) = 'apple';
+→ [{"name":"Apple"}]
+
+-- Scalar functions in ORDER BY
+select name from items where price is not null order by length(name), name;
+→ [{"name":"Apple"},{"name":"Banana"},{"name":"Carrot"},{"name":"Daikon"},{"name":"Fennel"}]
+
+-- abs and round on table data
+select id, round(abs(price - 2.0), 2) as delta, round(price, 1) as rounded
+from items where price is not null order by id;
+→ [{"id":1,"delta":0.5,"rounded":1.5},{"id":2,"delta":1.25,"rounded":0.8},{"id":3,"delta":0,"rounded":2},{"id":4,"delta":1.25,"rounded":3.3},{"id":6,"delta":0.2,"rounded":1.8}]
+
+-- Nested function calls
+select upper(substr(name, 1, 3)) as prefix from items order by id;
+→ [{"prefix":"APP"},{"prefix":"BAN"},{"prefix":"CAR"},{"prefix":"DAI"},{"prefix":"ELD"},{"prefix":"FEN"}]
+
+select lower(substr(name, length(name) - 2, 3)) as suffix from items where id <= 3 order by id;
+→ [{"suffix":"ple"},{"suffix":"ana"},{"suffix":"rot"}]
+
+-- Mix scalar inside aggregate
+select category, max(length(name)) as longest from items group by category order by category;
+→ [{"category":"fruit","longest":10},{"category":"veggie","longest":6}]
+
+drop table items;
+
+-- ============================================================
+-- Section 2: Function argument validation
+-- ============================================================
+
+-- Wrong number of args: abs() with no args
+select abs();
+-- error: Function not found
+
+-- Wrong number of args: abs() with too many args
+select abs(1, 2);
+-- error: Function not found
+
+-- Wrong number of args: length() with no args
+select length();
+-- error: Function not found
+
+-- Wrong number of args: round() with too many args
+select round(1.5, 2, 3);
+-- error: Function not found
+
+-- Non-existent function
+select non_existent_function(1);
+-- error: Function not found
+
+-- Non-existent function with multiple args
+select totally_made_up(1, 2, 3);
+-- error: Function not found
+
+-- coalesce() is variadic: 1 arg
+select coalesce(42) as result;
+→ [{"result":42}]
+
+-- coalesce() variadic: 2 args
+select coalesce(null, 'fallback') as result;
+→ [{"result":"fallback"}]
+
+-- coalesce() variadic: 3 args
+select coalesce(null, null, 'last') as result;
+→ [{"result":"last"}]
+
+-- coalesce() variadic: 5 args
+select coalesce(null, null, null, null, 99) as result;
+→ [{"result":99}]
+
+-- coalesce() returns first non-null
+select coalesce('first', 'second', 'third') as result;
+→ [{"result":"first"}]
+
+-- greatest/least are variadic
+select greatest(3, 1, 4, 1, 5, 9, 2, 6) as g, least(3, 1, 4, 1, 5, 9, 2, 6) as l;
+→ [{"g":9,"l":1}]
+
+-- ============================================================
+-- Section 3: Window functions
+-- ============================================================
+
+create table scores (
+    id integer primary key,
+    student text,
+    subject text,
+    score integer
+);
+
+insert into scores values
+    (1, 'Alice', 'Math', 90),
+    (2, 'Alice', 'Science', 85),
+    (3, 'Bob', 'Math', 90),
+    (4, 'Bob', 'Science', 95),
+    (5, 'Carol', 'Math', 80),
+    (6, 'Carol', 'Science', 88);
+
+-- Running sum with ORDER BY
+select student, subject, score,
+    sum(score) over (order by id rows unbounded preceding) as running_total
+from scores order by id;
+→ [{"student":"Alice","subject":"Math","score":90,"running_total":90},{"student":"Alice","subject":"Science","score":85,"running_total":175},{"student":"Bob","subject":"Math","score":90,"running_total":265},{"student":"Bob","subject":"Science","score":95,"running_total":360},{"student":"Carol","subject":"Math","score":80,"running_total":440},{"student":"Carol","subject":"Science","score":88,"running_total":528}]
+
+-- count() OVER (PARTITION BY ...)
+select student, subject,
+    count(*) over (partition by student) as exams_taken
+from scores order by student, subject;
+→ [{"student":"Alice","subject":"Math","exams_taken":2},{"student":"Alice","subject":"Science","exams_taken":2},{"student":"Bob","subject":"Math","exams_taken":2},{"student":"Bob","subject":"Science","exams_taken":2},{"student":"Carol","subject":"Math","exams_taken":2},{"student":"Carol","subject":"Science","exams_taken":2}]
+
+-- row_number() OVER (ORDER BY ...)
+select student, score,
+    row_number() over (order by score desc, student) as rank_pos
+from scores order by score desc, student;
+→ [{"student":"Bob","score":95,"rank_pos":1},{"student":"Alice","score":90,"rank_pos":2},{"student":"Bob","score":90,"rank_pos":3},{"student":"Carol","score":88,"rank_pos":4},{"student":"Alice","score":85,"rank_pos":5},{"student":"Carol","score":80,"rank_pos":6}]
+
+-- rank() with ties
+select subject, score,
+    rank() over (order by score desc) as rnk
+from scores order by score desc, subject;
+→ [{"subject":"Science","score":95,"rnk":1},{"subject":"Math","score":90,"rnk":2},{"subject":"Math","score":90,"rnk":2},{"subject":"Science","score":88,"rnk":4},{"subject":"Science","score":85,"rnk":5},{"subject":"Math","score":80,"rnk":6}]
+
+-- dense_rank() with ties (no gaps)
+select subject, score,
+    dense_rank() over (order by score desc) as drnk
+from scores order by score desc, subject;
+→ [{"subject":"Science","score":95,"drnk":1},{"subject":"Math","score":90,"drnk":2},{"subject":"Math","score":90,"drnk":2},{"subject":"Science","score":88,"drnk":3},{"subject":"Science","score":85,"drnk":4},{"subject":"Math","score":80,"drnk":5}]
+
+-- Partitioned running sum
+select student, score,
+    sum(score) over (partition by student order by id rows unbounded preceding) as student_running
+from scores order by student, id;
+→ [{"student":"Alice","score":90,"student_running":90},{"student":"Alice","score":85,"student_running":175},{"student":"Bob","score":90,"student_running":90},{"student":"Bob","score":95,"student_running":185},{"student":"Carol","score":80,"student_running":80},{"student":"Carol","score":88,"student_running":168}]
+
+-- Multiple window functions in one query
+select student, score,
+    row_number() over (partition by student order by score desc) as rn,
+    sum(score) over (partition by student) as total
+from scores order by student, score desc;
+→ [{"student":"Alice","score":90,"rn":1,"total":175},{"student":"Alice","score":85,"rn":2,"total":175},{"student":"Bob","score":95,"rn":1,"total":185},{"student":"Bob","score":90,"rn":2,"total":185},{"student":"Carol","score":88,"rn":1,"total":168},{"student":"Carol","score":80,"rn":2,"total":168}]
+
+drop table scores;
+
+-- ============================================================
+-- Section 4: Type coercion in functions
+-- ============================================================
+
+-- abs() on numeric column types
+create table nums (id integer primary key, ival integer null, rval real null);
+insert into nums values (1, -42, -3.14), (2, 7, 2.5), (3, null, null);
+
+select id, abs(ival) as ai, abs(rval) as ar from nums order by id;
+→ [{"id":1,"ai":42,"ar":3.14},{"id":2,"ai":7,"ar":2.5},{"id":3,"ai":null,"ar":null}]
+
+-- length() on text column
+create table strs (id integer primary key, val text null);
+insert into strs values (1, 'hello'), (2, ''), (3, null);
+
+select id, length(val) as len from strs order by id;
+→ [{"id":1,"len":5},{"id":2,"len":0},{"id":3,"len":null}]
+
+-- length() on text literals
+select length('hello') as a, length('') as b, length('quereus') as c;
+→ [{"a":5,"b":0,"c":7}]
+
+-- length() on non-text returns null (type-strict)
+select length(12345) as int_len, length(3.14) as real_len;
+→ [{"int_len":null,"real_len":null}]
+
+-- round() with different precision values
+select round(3.14159, 0) as r0, round(3.14159, 1) as r1, round(3.14159, 2) as r2, round(3.14159, 4) as r4;
+→ [{"r0":3,"r1":3.1,"r2":3.14,"r4":3.1416}]
+
+-- round() with no precision
+select round(2.7) as r;
+→ [{"r":3}]
+
+-- round() with negative precision (rounds to tens)
+select round(12345, -1) as r1, round(12345, -2) as r2;
+→ [{"r1":12350,"r2":12300}]
+
+-- round on column data
+select id, round(rval, 1) as rounded from nums where rval is not null order by id;
+→ [{"id":1,"rounded":-3.1},{"id":2,"rounded":2.5}]
+
+-- typeof() showing result types
+select typeof(42) as t_int, typeof(3.14) as t_real, typeof('text') as t_text, typeof(null) as t_null;
+→ [{"t_int":"integer","t_real":"real","t_text":"text","t_null":"null"}]
+
+-- typeof on expressions
+select typeof(1 + 2) as t_add, typeof(1.0 + 2) as t_mixed, typeof('a' || 'b') as t_concat;
+→ [{"t_add":"integer","t_mixed":"integer","t_concat":"text"}]
+
+-- typeof on function results
+select typeof(abs(-5)) as t_abs, typeof(length('hi')) as t_len, typeof(lower('HI')) as t_lower;
+→ [{"t_abs":"integer","t_len":"integer","t_lower":"text"}]
+
+-- typeof on column data
+select id, typeof(ival) as ti, typeof(rval) as tr from nums order by id;
+→ [{"id":1,"ti":"integer","tr":"real"},{"id":2,"ti":"integer","tr":"real"},{"id":3,"ti":"null","tr":"null"}]
+
+-- coalesce type behavior
+select typeof(coalesce(null, 42)) as t1, typeof(coalesce(null, 'text')) as t2;
+→ [{"t1":"integer","t2":"text"}]
+
+-- abs() rejects text type at plan time
+create table text_vals (id integer primary key, val text);
+insert into text_vals values (1, '42');
+select abs(val) from text_vals;
+-- error: Invalid argument types
+
+drop table nums;
+drop table strs;
+drop table text_vals;

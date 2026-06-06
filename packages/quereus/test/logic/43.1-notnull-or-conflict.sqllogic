@@ -1,0 +1,79 @@
+-- adapted from SQLite test/notnull.test
+-- INSERT/UPDATE OR IGNORE / OR REPLACE / OR ABORT semantics on NOT NULL columns.
+-- Existing 102-unique-constraints covers the UNIQUE flavor; this covers NOT NULL.
+
+-- ===================================
+-- 1. INSERT OR IGNORE silently skips NOT NULL violations
+-- ===================================
+
+create table t_oi (id integer primary key, name text, score integer);
+insert into t_oi values (1, 'Alice', 10);
+
+-- NULL into NOT NULL column with OR IGNORE → row skipped, no error
+insert or ignore into t_oi values (2, null, 20);
+
+select count(*) as cnt from t_oi;
+→ [{"cnt":1}]
+
+insert or ignore into t_oi values (3, 'Bob', null);
+
+select count(*) as cnt from t_oi;
+→ [{"cnt":1}]
+
+-- valid row inserted
+insert or ignore into t_oi values (4, 'Carol', 40);
+
+select count(*) as cnt from t_oi;
+→ [{"cnt":2}]
+
+drop table t_oi;
+
+-- ===================================
+-- 2. INSERT OR REPLACE on NOT NULL with no DEFAULT → still errors
+-- ===================================
+
+create table t_or_no_def (id integer primary key, name text);
+
+insert or replace into t_or_no_def values (1, null);
+-- error: NOT NULL
+
+drop table t_or_no_def;
+
+-- ===================================
+-- 3. INSERT OR REPLACE on NOT NULL with DEFAULT — substitutes the default
+-- ===================================
+
+create table t_or_def (id integer primary key, name text default 'unknown');
+
+insert or replace into t_or_def values (1, null);
+
+select * from t_or_def where id = 1;
+→ [{"id":1,"name":"unknown"}]
+
+drop table t_or_def;
+
+-- ===================================
+-- 4. UPDATE OR IGNORE / OR REPLACE — intentionally not supported.
+-- ===================================
+-- Per-statement conflict overrides on UPDATE are SQLite-only syntax; pinned closed.
+-- Schema-level ON CONFLICT on the NOT NULL constraint covers the IGNORE/REPLACE defaults.
+-- See docs/sql.md §11.
+
+-- ===================================
+-- 5. INSERT...SELECT propagates a NOT NULL violation from source
+-- ===================================
+
+create table src (id integer primary key, name text null);
+create table dst (id integer primary key, name text);
+
+insert into src values (1, 'a'), (2, null), (3, 'c');
+
+insert into dst select id, name from src;
+-- error: NOT NULL
+
+-- whole INSERT aborted; nothing committed
+select count(*) as cnt from dst;
+→ [{"cnt":0}]
+
+drop table dst;
+drop table src;

@@ -1,0 +1,387 @@
+import type { HashAggregateNode } from '../../planner/nodes/hash-aggregate.js';
+import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
+import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
+import type { EmissionContext } from '../emission-context.js';
+import type { FunctionSchema } from '../../schema/function.js';
+import { isAggregateFunctionSchema } from '../../schema/function.js';
+import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
+import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
+import { isRelationalNode } from '../../planner/nodes/plan-node.js';
+import { BTree } from 'inheritree';
+import { logContextPush, logContextPop } from '../utils.js';
+import { coerceForAggregate } from '../../util/coercion.js';
+import { quereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
+import { buildRowDescriptor } from '../../util/row-descriptor.js';
+import { AggValue } from '../../func/registration.js';
+import { serializeKeyNullGrouping, resolveKeyNormalizer } from '../../util/key-serializer.js';
+import { createTypedComparator } from '../../util/comparison.js';
+import type { LogicalType } from '../../types/logical-type.js';
+import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
+
+interface GroupState {
+	groupValues: SqlValue[];
+	accumulators: AggValue[];
+	distinctTrees: (BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]> | null)[];
+	representativeSourceRow: Row;
+}
+
+export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext): Instruction {
+	const sourceRelation = findSourceRelation(plan.source);
+
+	const sourceAttributes = plan.source.getAttributes();
+
+	const groupSourceRowDescriptor = buildRowDescriptor(sourceAttributes);
+	const groupSourceRelationRowDescriptor = sourceRelation !== plan.source
+		? buildRowDescriptor(isRelationalNode(sourceRelation) ? sourceRelation.getAttributes() : sourceAttributes)
+		: groupSourceRowDescriptor;
+
+	ctxLog('HashAggregate setup: source=%s, sourceRelation=%s', plan.source.nodeType, sourceRelation.nodeType);
+
+	const outputRowDescriptor = buildRowDescriptor(plan.getAttributes());
+	const scanRowDescriptor = buildRowDescriptor(sourceAttributes);
+
+	const combinedRowDescriptor: RowDescriptor = {...outputRowDescriptor};
+	sourceAttributes.forEach((attr, index) => {
+		if (combinedRowDescriptor[attr.id] === undefined) {
+			combinedRowDescriptor[attr.id] = Object.keys(outputRowDescriptor).length + index;
+		}
+	});
+
+	// Pre-resolve collation normalizers for GROUP BY key serialization
+	const keyNormalizers = plan.groupBy.map(expr => {
+		const exprType = expr.getType();
+		return resolveKeyNormalizer(exprType.collationName);
+	});
+
+	// Pre-resolve typed comparators for DISTINCT aggregate tracking per aggregate
+	const distinctComparators: ((a: SqlValue | SqlValue[], b: SqlValue | SqlValue[]) => number)[] = [];
+	for (const agg of plan.aggregates) {
+		const funcNode = agg.expression;
+		if (funcNode instanceof AggregateFunctionCallNode) {
+			const args = funcNode.args || [];
+			if (args.length === 1) {
+				const argType = args[0].getType();
+				const collation = argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined;
+				const cmp = createTypedComparator(argType.logicalType as LogicalType, collation);
+				distinctComparators.push((a, b) => cmp(a as SqlValue, b as SqlValue));
+			} else if (args.length > 1) {
+				const argComparators = args.map(arg => {
+					const argType = arg.getType();
+					const collation = argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined;
+					return createTypedComparator(argType.logicalType as LogicalType, collation);
+				});
+				distinctComparators.push((a, b) => {
+					const arrA = a as SqlValue[];
+					const arrB = b as SqlValue[];
+					for (let i = 0; i < argComparators.length; i++) {
+						const cmp = argComparators[i](arrA[i], arrB[i]);
+						if (cmp !== 0) return cmp;
+					}
+					return 0;
+				});
+			} else {
+				distinctComparators.push(() => 0);
+			}
+		} else {
+			distinctComparators.push(() => 0);
+		}
+	}
+
+	// Pre-compute per-aggregate whether coercion can be skipped
+	const aggregateSkipCoercion: boolean[] = plan.aggregates.map(agg => {
+		const funcNode = agg.expression;
+		if (!(funcNode instanceof AggregateFunctionCallNode)) return false;
+		const funcName = (funcNode.functionName || '').toUpperCase();
+		if (funcName === 'COUNT' || funcName === 'GROUP_CONCAT' || funcName.startsWith('JSON_')) return false;
+		const args = funcNode.args || [];
+		return args.length > 0 && args.every(arg => arg.getType().logicalType.isNumeric);
+	});
+
+	async function* run(
+		ctx: RuntimeContext,
+		sourceRows: AsyncIterable<Row>,
+		...groupByAndAggregateArgs: Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>
+	): AsyncIterable<Row> {
+
+		const numGroupBy = plan.groupBy.length;
+		const groupByFunctions = groupByAndAggregateArgs.slice(0, numGroupBy);
+
+		let aggregateArgOffset = numGroupBy;
+		const aggregateArgFunctions: Array<Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>> = [];
+
+		for (const agg of plan.aggregates) {
+			const funcNode = agg.expression;
+			if (!(funcNode instanceof AggregateFunctionCallNode)) {
+				quereusError(
+					`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
+					StatusCode.INTERNAL
+				);
+			}
+			const args = funcNode.args || [];
+			const aggregateArgs = groupByAndAggregateArgs.slice(aggregateArgOffset, aggregateArgOffset + args.length);
+			aggregateArgFunctions.push(aggregateArgs);
+			aggregateArgOffset += args.length;
+		}
+
+		// Pre-resolve aggregate schemas and distinct flags
+		const aggregateSchemas: FunctionSchema[] = [];
+		const aggregateDistinctFlags: boolean[] = [];
+		for (const agg of plan.aggregates) {
+			const funcNode = agg.expression;
+			if (!(funcNode instanceof AggregateFunctionCallNode)) {
+				quereusError(
+					`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
+					StatusCode.INTERNAL
+				);
+			}
+
+			const funcSchema = funcNode.functionSchema;
+			if (!isAggregateFunctionSchema(funcSchema)) {
+				quereusError(
+					`Function ${funcNode.functionName || 'unknown'} is not an aggregate function`,
+					StatusCode.INTERNAL
+				);
+			}
+
+			aggregateSchemas.push(funcSchema);
+			aggregateDistinctFlags.push(funcNode.isDistinct);
+		}
+
+		function createAccumulators(): AggValue[] {
+			return aggregateSchemas.map(schema =>
+				cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined)
+			);
+		}
+
+		function createDistinctTrees(): (BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]> | null)[] {
+			return aggregateDistinctFlags.map((isDistinct, i) =>
+				isDistinct ? new BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]>(
+					(val: SqlValue | SqlValue[]) => val,
+					distinctComparators[i]
+				) : null
+			);
+		}
+
+		// No GROUP BY case — identical to stream aggregate (single accumulator, no hash map)
+		if (plan.groupBy.length === 0) {
+			const accumulators = createAccumulators();
+			const distinctTrees = createDistinctTrees();
+			let lastSourceRow: Row | null = null;
+
+			for await (const row of sourceRows) {
+				lastSourceRow = row;
+				ctx.context.set(scanRowDescriptor, () => row);
+				logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
+
+				try {
+					for (let i = 0; i < plan.aggregates.length; i++) {
+						const schema = aggregateSchemas[i];
+						const isDistinct = aggregateDistinctFlags[i];
+
+						const funcNode = plan.aggregates[i].expression;
+						if (!(funcNode instanceof AggregateFunctionCallNode)) {
+							quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
+						}
+						const args = funcNode.args || [];
+						const argFunctions = aggregateArgFunctions[i];
+
+						const skipCoercion = aggregateSkipCoercion[i];
+						const argValues: SqlValue[] = [];
+						for (let j = 0; j < args.length; j++) {
+							const rawValue = await argFunctions[j](ctx);
+							const coercedValue = skipCoercion ? rawValue : coerceForAggregate(rawValue, funcNode.functionName || 'unknown');
+							argValues.push(coercedValue);
+						}
+
+						if (isDistinct) {
+							const distinctValue = argValues.length === 1 ? argValues[0] : argValues;
+							const existingPath = distinctTrees[i]!.insert(distinctValue);
+							if (!existingPath.on) continue;
+						}
+
+						if (isAggregateFunctionSchema(schema)) {
+							accumulators[i] = schema.stepFunction(accumulators[i], ...argValues);
+						}
+					}
+				} finally {
+					logContextPop(scanRowDescriptor, 'scan-row');
+					ctx.context.delete(scanRowDescriptor);
+				}
+			}
+
+			const aggregateRow: SqlValue[] = [];
+			for (let i = 0; i < plan.aggregates.length; i++) {
+				const schema = aggregateSchemas[i];
+				let finalValue: SqlValue;
+				if (isAggregateFunctionSchema(schema)) {
+					finalValue = schema.finalizeFunction(accumulators[i]);
+				} else {
+					finalValue = accumulators[i];
+				}
+				aggregateRow.push(finalValue);
+			}
+
+			const fullRow = lastSourceRow ? [...aggregateRow, ...lastSourceRow] : aggregateRow;
+
+			if (lastSourceRow) {
+				ctx.context.set(scanRowDescriptor, () => lastSourceRow);
+				logContextPush(scanRowDescriptor, 'aggregate-rep-row');
+			}
+			ctx.context.set(combinedRowDescriptor, () => fullRow);
+			logContextPush(combinedRowDescriptor, 'aggregate-full-row');
+			try {
+				yield aggregateRow;
+			} finally {
+				logContextPop(combinedRowDescriptor, 'aggregate-full-row');
+				ctx.context.delete(combinedRowDescriptor);
+				if (lastSourceRow) {
+					logContextPop(scanRowDescriptor, 'aggregate-rep-row');
+					ctx.context.delete(scanRowDescriptor);
+				}
+			}
+			return;
+		}
+
+		// GROUP BY case — hash aggregate with Map
+		const groups = new Map<string, GroupState>();
+
+		// Build phase: iterate all source rows
+		for await (const row of sourceRows) {
+			ctx.context.set(scanRowDescriptor, () => row);
+			logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
+
+			try {
+				// Evaluate GROUP BY expressions
+				const groupValues: SqlValue[] = [];
+				for (const groupByFunc of groupByFunctions) {
+					groupValues.push(await groupByFunc(ctx));
+				}
+
+				// Serialize key using collation-aware serialization (NULLs group together per SQL standard)
+				const key = serializeKeyNullGrouping(groupValues, keyNormalizers);
+
+				// Look up or create group entry
+				let group = groups.get(key);
+				if (!group) {
+					group = {
+						groupValues,
+						accumulators: createAccumulators(),
+						distinctTrees: createDistinctTrees(),
+						representativeSourceRow: row,
+					};
+					groups.set(key, group);
+				}
+
+				// Evaluate aggregate arguments and step accumulators
+				for (let i = 0; i < plan.aggregates.length; i++) {
+					const schema = aggregateSchemas[i];
+					const isDistinct = aggregateDistinctFlags[i];
+
+					const funcNode = plan.aggregates[i].expression;
+					if (!(funcNode instanceof AggregateFunctionCallNode)) {
+						quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
+					}
+					const args = funcNode.args || [];
+					const argFunctions = aggregateArgFunctions[i];
+
+					const skipCoercion = aggregateSkipCoercion[i];
+					const argValues: SqlValue[] = [];
+					for (let j = 0; j < args.length; j++) {
+						const rawValue = await argFunctions[j](ctx);
+						const coercedValue = skipCoercion ? rawValue : coerceForAggregate(rawValue, funcNode.functionName || 'unknown');
+						argValues.push(coercedValue);
+					}
+
+					if (isDistinct) {
+						const distinctValue = argValues.length === 1 ? argValues[0] : argValues;
+						const existingPath = group.distinctTrees[i]!.insert(distinctValue);
+						if (!existingPath.on) continue;
+					}
+
+					if (isAggregateFunctionSchema(schema)) {
+						group.accumulators[i] = schema.stepFunction(group.accumulators[i], ...argValues);
+					}
+				}
+			} finally {
+				logContextPop(scanRowDescriptor, 'scan-row');
+				ctx.context.delete(scanRowDescriptor);
+			}
+		}
+
+		// Emit phase: iterate all groups and yield results
+		for (const group of groups.values()) {
+			const aggregateRow: SqlValue[] = [];
+
+			// GROUP BY values first
+			aggregateRow.push(...group.groupValues);
+
+			// Finalized aggregate values
+			for (let i = 0; i < plan.aggregates.length; i++) {
+				const schema = aggregateSchemas[i];
+				let finalValue: SqlValue;
+				if (isAggregateFunctionSchema(schema)) {
+					finalValue = schema.finalizeFunction(group.accumulators[i]);
+				} else {
+					finalValue = group.accumulators[i];
+				}
+				aggregateRow.push(finalValue);
+			}
+
+			// Set up combined context (output + representative source row) for HAVING
+			const fullRow = [...aggregateRow, ...group.representativeSourceRow];
+
+			ctx.context.set(scanRowDescriptor, () => group.representativeSourceRow);
+			logContextPush(scanRowDescriptor, 'group-rep-row');
+			ctx.context.set(combinedRowDescriptor, () => fullRow);
+			logContextPush(combinedRowDescriptor, 'output-row-groupby');
+			ctx.context.set(groupSourceRowDescriptor, () => group.representativeSourceRow);
+			logContextPush(groupSourceRowDescriptor, 'source-row-groupby', sourceAttributes);
+			if (sourceRelation !== plan.source) {
+				ctx.context.set(groupSourceRelationRowDescriptor, () => group.representativeSourceRow);
+				logContextPush(groupSourceRelationRowDescriptor, 'source-relation-row-groupby');
+			}
+
+			try {
+				yield aggregateRow;
+			} finally {
+				logContextPop(combinedRowDescriptor, 'output-row-groupby');
+				ctx.context.delete(combinedRowDescriptor);
+				logContextPop(scanRowDescriptor, 'group-rep-row');
+				ctx.context.delete(scanRowDescriptor);
+				logContextPop(groupSourceRowDescriptor, 'source-row-groupby');
+				ctx.context.delete(groupSourceRowDescriptor);
+				if (sourceRelation !== plan.source) {
+					logContextPop(groupSourceRelationRowDescriptor, 'source-relation-row-groupby');
+					ctx.context.delete(groupSourceRelationRowDescriptor);
+				}
+			}
+		}
+	}
+
+	const sourceInstruction = emitPlanNode(plan.source, ctx);
+
+	const groupByInstructions = plan.groupBy.map(expr => emitCallFromPlan(expr, ctx));
+
+	const aggregateArgInstructions: Instruction[] = [];
+	for (const agg of plan.aggregates) {
+		const funcNode = agg.expression;
+		if (!(funcNode instanceof AggregateFunctionCallNode)) {
+			quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
+		}
+		const args = funcNode.args || [];
+		for (const arg of args) {
+			if (!arg) {
+				quereusError(`Aggregate argument is undefined for function ${funcNode.functionName}`, StatusCode.INTERNAL);
+			}
+			aggregateArgInstructions.push(emitCallFromPlan(arg, ctx));
+		}
+	}
+
+	return {
+		params: [sourceInstruction, ...groupByInstructions, ...aggregateArgInstructions],
+		run: run as InstructionRun,
+		note: `hash_aggregate(${plan.groupBy.length > 0 ? `GROUP BY ${plan.groupBy.length}` : 'no grouping'}, ${plan.aggregates.length} aggs)`
+	};
+}

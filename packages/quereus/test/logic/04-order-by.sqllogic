@@ -1,0 +1,38 @@
+-- Coverage for ORDER BY FD pruning (see rules/sort/rule-orderby-fd-pruning.ts).
+-- The optimizer drops trailing ORDER BY keys functionally determined by the
+-- preceding bare-column keys; result rows must match the pre-pruned reference
+-- output.
+
+-- =============================================================================
+-- PK-driven: trailing keys after a PK column add nothing
+-- =============================================================================
+
+create table pkdriven (pk integer primary key, name text, email text);
+insert into pkdriven values
+  (1, 'beta',  'b@x'),
+  (2, 'alpha', 'a@x'),
+  (3, 'gamma', 'g@x');
+
+-- ORDER BY pk, name → pruned to ORDER BY pk; result is by pk.
+select pk, name from pkdriven order by pk, name;
+→ [{"pk":1,"name":"beta"},{"pk":2,"name":"alpha"},{"pk":3,"name":"gamma"}]
+
+-- ORDER BY pk, name, email → pruned to ORDER BY pk; result still by pk.
+select pk, name, email from pkdriven order by pk, name, email;
+→ [{"pk":1,"name":"beta","email":"b@x"},{"pk":2,"name":"alpha","email":"a@x"},{"pk":3,"name":"gamma","email":"g@x"}]
+
+drop table pkdriven;
+
+-- =============================================================================
+-- EC-driven: a WHERE a = b filter equates the columns, so the second key
+-- functions as a tiebreaker that can never re-order.
+-- =============================================================================
+
+create table ecdriven (a integer, b integer);
+insert into ecdriven values
+  (3, 3), (1, 1), (2, 2);
+
+select a, b from ecdriven where a = b order by a, b;
+→ [{"a":1,"b":1},{"a":2,"b":2},{"a":3,"b":3}]
+
+drop table ecdriven;

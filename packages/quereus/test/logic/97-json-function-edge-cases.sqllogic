@@ -1,0 +1,633 @@
+-- 97-json-function-edge-cases.sqllogic
+-- Targeted coverage for uncovered branches in json.ts and json-helpers.ts:
+-- json_valid Uint8Array, json_schema, json_type paths, json_extract fallback,
+-- json_quote special types, json_object odd args, json_array_length non-string path,
+-- json_patch error paths, json_insert/replace/set/remove edge cases,
+-- json_group_array/object aggregation, coerceToJsonValue, prepareJsonValue,
+-- resolveJsonPathForModify createParents, deepCopyJson, getJsonType, evaluateJsonPathBasic
+
+-- ============================================================
+-- json_valid: additional edge cases
+-- ============================================================
+
+-- Null input returns false
+SELECT json_valid(null) as result;
+→ [{"result":false}]
+
+-- Numeric types are valid JSON
+SELECT json_valid(0) as result;
+→ [{"result":true}]
+
+SELECT json_valid(3.14) as result;
+→ [{"result":true}]
+
+-- Boolean types are valid JSON
+SELECT json_valid(true) as result;
+→ [{"result":true}]
+
+SELECT json_valid(false) as result;
+→ [{"result":true}]
+
+-- Native objects are valid
+SELECT json_valid(json_object('a', 1)) as result;
+→ [{"result":true}]
+
+-- Malformed JSON strings
+SELECT json_valid('{missing_quotes: 1}') as result;
+→ [{"result":false}]
+
+SELECT json_valid('{"truncated":') as result;
+→ [{"result":false}]
+
+SELECT json_valid('{]') as result;
+→ [{"result":false}]
+
+-- ============================================================
+-- json_schema: validation
+-- ============================================================
+
+-- Valid schema matching (use comma-separated fields to avoid semicolons)
+SELECT json_schema('{"name":"Alice","age":30}', '{ name: string, age: number }') as result;
+→ [{"result":true}]
+
+-- Schema mismatch
+SELECT json_schema('{"name":"Alice","age":"thirty"}', '{ name: string, age: number }') as result;
+→ [{"result":false}]
+
+-- Non-string schema returns false
+SELECT json_schema('{"a":1}', 42) as result;
+→ [{"result":false}]
+
+-- Invalid JSON input returns false
+SELECT json_schema('not-json', '{ name: string }') as result;
+→ [{"result":false}]
+
+-- Invalid schema syntax returns false
+SELECT json_schema('{"a":1}', '!!!invalid!!!') as result;
+→ [{"result":false}]
+
+-- Null input returns false
+SELECT json_schema(null, '{ name: string }') as result;
+→ [{"result":false}]
+
+-- ============================================================
+-- json_type: path and edge cases
+-- ============================================================
+
+-- json_type with path argument
+SELECT json_type('{"a":42}', '$.a') as result;
+→ [{"result":"integer"}]
+
+SELECT json_type('{"a":3.14}', '$.a') as result;
+→ [{"result":"real"}]
+
+SELECT json_type('{"a":"hello"}', '$.a') as result;
+→ [{"result":"text"}]
+
+SELECT json_type('{"a":true}', '$.a') as result;
+→ [{"result":"true"}]
+
+SELECT json_type('{"a":false}', '$.a') as result;
+→ [{"result":"false"}]
+
+SELECT json_type('{"a":null}', '$.a') as result;
+→ [{"result":"null"}]
+
+SELECT json_type('{"a":[1,2]}', '$.a') as result;
+→ [{"result":"array"}]
+
+SELECT json_type('{"a":{"b":1}}', '$.a') as result;
+→ [{"result":"object"}]
+
+-- Non-existent path returns null
+SELECT json_type('{"a":1}', '$.b') as result;
+→ [{"result":null}]
+
+-- Non-string path returns 'null'
+SELECT json_type('{"a":1}', 42) as result;
+→ [{"result":"null"}]
+
+-- Invalid JSON returns null
+SELECT json_type('not-json') as result;
+→ [{"result":null}]
+
+-- Null input: coerceToJsonValue(null) returns JSON null, getJsonType(null) returns 'null' string
+SELECT json_type(null) as result;
+→ [{"result":"null"}]
+
+-- No-path call on each type
+SELECT json_type('42') as result;
+→ [{"result":"integer"}]
+
+SELECT json_type('"hello"') as result;
+→ [{"result":"text"}]
+
+-- ============================================================
+-- json_extract: edge cases
+-- ============================================================
+
+-- No paths returns null
+SELECT json_extract('{"a":1}') as result;
+→ [{"result":null}]
+
+-- Non-string path returns null
+SELECT json_extract('{"a":1}', 42) as result;
+→ [{"result":null}]
+
+-- Boolean value extraction
+SELECT json_extract('{"a":true}', '$.a') as result;
+→ [{"result":true}]
+
+SELECT json_extract('{"a":false}', '$.a') as result;
+→ [{"result":false}]
+
+-- Nested object extraction (returns native object)
+SELECT json_extract('{"a":{"b":{"c":42}}}', '$.a.b') as result;
+→ [{"result":{"c":42}}]
+
+-- Array extraction
+SELECT json_extract('{"a":[10,20,30]}', '$.a') as result;
+→ [{"result":[10,20,30]}]
+
+-- Array index extraction
+SELECT json_extract('[10,20,30]', '$[1]') as result;
+→ [{"result":20}]
+
+-- Deep nesting
+SELECT json_extract('{"a":{"b":{"c":{"d":99}}}}', '$.a.b.c.d') as result;
+→ [{"result":99}]
+
+-- Multiple paths: first found wins
+SELECT json_extract('{"a":1,"b":2}', '$.x', '$.y', '$.b') as result;
+→ [{"result":2}]
+
+-- All paths miss returns null
+SELECT json_extract('{"a":1}', '$.x', '$.y', '$.z') as result;
+→ [{"result":null}]
+
+-- Root path extraction
+SELECT json_extract('42', '$') as result;
+→ [{"result":42}]
+
+SELECT json_extract('"hello"', '$') as result;
+→ [{"result":"hello"}]
+
+-- ============================================================
+-- json_quote: edge cases
+-- ============================================================
+
+-- Null returns 'null' string
+SELECT json_quote(null) as result;
+→ [{"result":"null"}]
+
+-- Integer
+SELECT json_quote(42) as result;
+→ [{"result":"42"}]
+
+-- Float
+SELECT json_quote(3.14) as result;
+→ [{"result":"3.14"}]
+
+-- Boolean
+SELECT json_quote(true) as result;
+→ [{"result":"true"}]
+
+SELECT json_quote(false) as result;
+→ [{"result":"false"}]
+
+-- String with special characters
+SELECT json_quote('hello "world"') as result;
+→ [{"result":"\"hello \\\"world\\\"\""}]
+
+-- Native object
+SELECT json_quote(json_object('a', 1)) as result;
+→ [{"result":"{\"a\":1}"}]
+
+-- ============================================================
+-- json_object: edge cases
+-- ============================================================
+
+-- Odd number of args returns null
+SELECT json_object('a') as result;
+→ [{"result":null}]
+
+-- Non-string key returns null
+SELECT json_object(42, 'value') as result;
+→ [{"result":null}]
+
+-- Empty args returns empty object
+SELECT json_object() as result;
+→ [{"result":{}}]
+
+-- Multiple key-value pairs
+SELECT json_object('a', 1, 'b', 'two', 'c', true) as result;
+→ [{"result":{"a":1,"b":"two","c":true}}]
+
+-- ============================================================
+-- json_array: edge cases
+-- ============================================================
+
+-- Empty args returns empty array
+SELECT json_array() as result;
+→ [{"result":[]}]
+
+-- Mixed types
+SELECT json_array(1, 'two', true, null) as result;
+→ [{"result":[1,"two",true,null]}]
+
+-- ============================================================
+-- json_array_length: edge cases
+-- ============================================================
+
+-- Non-array returns 0
+SELECT json_array_length('42') as result;
+→ [{"result":0}]
+
+SELECT json_array_length('{}') as result;
+→ [{"result":0}]
+
+-- Empty array
+SELECT json_array_length('[]') as result;
+→ [{"result":0}]
+
+-- Normal array
+SELECT json_array_length('[1,2,3]') as result;
+→ [{"result":3}]
+
+-- With path to array
+SELECT json_array_length('{"a":[1,2,3,4]}', '$.a') as result;
+→ [{"result":4}]
+
+-- Path to non-array returns 0
+SELECT json_array_length('{"a":42}', '$.a') as result;
+→ [{"result":0}]
+
+-- Non-string path returns 0
+SELECT json_array_length('[1,2,3]', 42) as result;
+→ [{"result":0}]
+
+-- Missing path returns 0
+SELECT json_array_length('{"a":[1]}', '$.b') as result;
+→ [{"result":0}]
+
+-- Null input: coerceToJsonValue(null) = JSON null, not undefined, so returns 0
+SELECT json_array_length(null) as result;
+→ [{"result":0}]
+
+-- ============================================================
+-- json_patch: edge cases
+-- ============================================================
+
+-- Valid add operation
+SELECT json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2}]') as result;
+→ [{"result":{"a":1,"b":2}}]
+
+-- Valid replace operation
+SELECT json_patch('{"a":1}', '[{"op":"replace","path":"/a","value":99}]') as result;
+→ [{"result":{"a":99}}]
+
+-- Valid remove operation
+SELECT json_patch('{"a":1,"b":2}', '[{"op":"remove","path":"/b"}]') as result;
+→ [{"result":{"a":1}}]
+
+-- Invalid first arg returns null
+SELECT json_patch('not-json', '[{"op":"add","path":"/a","value":1}]') as result;
+→ [{"result":null}]
+
+-- Invalid second arg returns null
+SELECT json_patch('{"a":1}', 'not-json') as result;
+→ [{"result":null}]
+
+-- Null first arg returns null
+SELECT json_patch(null, '[{"op":"add","path":"/a","value":1}]') as result;
+→ [{"result":null}]
+
+-- Patch with invalid path (triggers catch block)
+SELECT json_patch('{"a":1}', '[{"op":"replace","path":"/nonexistent/deep/path","value":99}]') as result;
+→ [{"result":null}]
+
+-- Patch operation missing required fields returns null
+SELECT json_patch('{"a":1}', '[{"value":1}]') as result;
+→ [{"result":null}]
+
+-- Multiple operations
+SELECT json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2},{"op":"remove","path":"/a"}]') as result;
+→ [{"result":{"b":2}}]
+
+-- ============================================================
+-- json_insert: edge cases
+-- ============================================================
+
+-- No args (odd) returns null
+SELECT json_insert('{"a":1}') as result;
+→ [{"result":null}]
+
+-- Non-string path returns null
+SELECT json_insert('{"a":1}', 42, 'val') as result;
+→ [{"result":null}]
+
+-- Insert doesn't overwrite existing
+SELECT json_insert('{"a":1}', '$.a', 99) as result;
+→ [{"result":{"a":1}}]
+
+-- Insert creates new key
+SELECT json_insert('{"a":1}', '$.b', 2) as result;
+→ [{"result":{"a":1,"b":2}}]
+
+-- Insert at array index within bounds (splice)
+SELECT json_insert('[1,2,3]', '$[1]', 99) as result;
+→ [{"result":[1,2,3]}]
+
+-- Insert at array end (append)
+SELECT json_insert('[1,2]', '$[2]', 3) as result;
+→ [{"result":[1,2,3]}]
+
+-- Invalid path syntax continues
+SELECT json_insert('{"a":1}', '$invalid', 99) as result;
+→ [{"result":{"a":1}}]
+
+-- Multiple inserts
+SELECT json_insert('{}', '$.a', 1, '$.b', 2) as result;
+→ [{"result":{"a":1,"b":2}}]
+
+-- Invalid JSON input
+SELECT json_insert('not-json', '$.a', 1) as result;
+→ [{"result":null}]
+
+-- Odd number of path/value args returns null
+SELECT json_insert('{"a":1}', '$.b') as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- json_replace: edge cases
+-- ============================================================
+
+-- Replace existing key
+SELECT json_replace('{"a":1,"b":2}', '$.a', 99) as result;
+→ [{"result":{"a":99,"b":2}}]
+
+-- Replace non-existing key does nothing
+SELECT json_replace('{"a":1}', '$.b', 99) as result;
+→ [{"result":{"a":1}}]
+
+-- Replace root path
+SELECT json_replace('{"a":1}', '$', 42) as result;
+→ [{"result":42}]
+
+-- Replace array element
+SELECT json_replace('[10,20,30]', '$[1]', 99) as result;
+→ [{"result":[10,99,30]}]
+
+-- Replace array element out of bounds does nothing
+SELECT json_replace('[10,20,30]', '$[5]', 99) as result;
+→ [{"result":[10,20,30]}]
+
+-- Invalid JSON
+SELECT json_replace('not-json', '$.a', 1) as result;
+→ [{"result":null}]
+
+-- No args returns null
+SELECT json_replace('{"a":1}') as result;
+→ [{"result":null}]
+
+-- Non-string path returns null
+SELECT json_replace('{"a":1}', 42, 99) as result;
+→ [{"result":null}]
+
+-- Multiple replacements
+SELECT json_replace('{"a":1,"b":2}', '$.a', 10, '$.b', 20) as result;
+→ [{"result":{"a":10,"b":20}}]
+
+-- ============================================================
+-- json_set: edge cases
+-- ============================================================
+
+-- Set existing key (replace)
+SELECT json_set('{"a":1}', '$.a', 99) as result;
+→ [{"result":{"a":99}}]
+
+-- Set new key (create)
+SELECT json_set('{"a":1}', '$.b', 2) as result;
+→ [{"result":{"a":1,"b":2}}]
+
+-- Set root path
+SELECT json_set('{"a":1}', '$', 42) as result;
+→ [{"result":42}]
+
+-- Set array element in bounds
+SELECT json_set('[10,20,30]', '$[1]', 99) as result;
+→ [{"result":[10,99,30]}]
+
+-- Set array element at end (append)
+SELECT json_set('[10,20]', '$[2]', 30) as result;
+→ [{"result":[10,20,30]}]
+
+-- Set array element beyond end (gap-fill with nulls)
+SELECT json_set('[1]', '$[4]', 'x') as result;
+→ [{"result":[1,null,null,null,"x"]}]
+
+-- Set on deeply nested missing path: pathInfo null means continue (no-op)
+SELECT json_set('{}', '$.a.b', 42) as result;
+→ [{"result":{}}]
+
+-- Invalid JSON
+SELECT json_set('not-json', '$.a', 1) as result;
+→ [{"result":null}]
+
+-- No args returns null
+SELECT json_set('{}') as result;
+→ [{"result":null}]
+
+-- Non-string path returns null
+SELECT json_set('{}', 42, 'val') as result;
+→ [{"result":null}]
+
+-- Multiple sets
+SELECT json_set('{}', '$.a', 1, '$.b', 2, '$.c', 3) as result;
+→ [{"result":{"a":1,"b":2,"c":3}}]
+
+-- ============================================================
+-- json_remove: edge cases
+-- ============================================================
+
+-- No paths returns original data
+SELECT json_remove('{"a":1,"b":2}') as result;
+→ [{"result":{"a":1,"b":2}}]
+
+-- Remove existing key
+SELECT json_remove('{"a":1,"b":2}', '$.a') as result;
+→ [{"result":{"b":2}}]
+
+-- Remove non-existing key does nothing
+SELECT json_remove('{"a":1}', '$.z') as result;
+→ [{"result":{"a":1}}]
+
+-- Remove array element
+SELECT json_remove('[10,20,30]', '$[0]') as result;
+→ [{"result":[20,30]}]
+
+-- Remove array element out of bounds does nothing
+SELECT json_remove('[10,20,30]', '$[5]') as result;
+→ [{"result":[10,20,30]}]
+
+-- Non-string path returns null
+SELECT json_remove('{"a":1}', 42) as result;
+→ [{"result":null}]
+
+-- Invalid JSON
+SELECT json_remove('not-json', '$.a') as result;
+→ [{"result":null}]
+
+-- Null JSON
+SELECT json_remove(null, '$.a') as result;
+→ [{"result":null}]
+
+-- Multiple removals
+SELECT json_remove('{"a":1,"b":2,"c":3}', '$.a', '$.c') as result;
+→ [{"result":{"b":2}}]
+
+-- Invalid path syntax continues silently
+SELECT json_remove('{"a":1}', '$[invalid') as result;
+→ [{"result":{"a":1}}]
+
+-- ============================================================
+-- json_group_array / json_group_object: aggregation
+-- ============================================================
+
+CREATE TABLE json_agg_t (id INTEGER PRIMARY KEY, name TEXT NULL, val INTEGER NULL);
+INSERT INTO json_agg_t VALUES (1, 'a', 10), (2, 'b', 20), (3, null, 30);
+-- run
+
+-- json_group_array collects non-null and null values
+SELECT json_group_array(val) as result FROM json_agg_t;
+→ [{"result":[10,20,30]}]
+
+-- json_group_object skips null keys
+SELECT json_group_object(name, val) as result FROM json_agg_t;
+→ [{"result":{"a":10,"b":20}}]
+
+-- json_group_array with all nulls still collects them
+CREATE TABLE json_agg_nulls (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO json_agg_nulls VALUES (1, null), (2, null);
+-- run
+
+SELECT json_group_array(val) as result FROM json_agg_nulls;
+→ [{"result":[null,null]}]
+
+-- json_group_object with empty table
+CREATE TABLE json_agg_empty2 (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
+SELECT json_group_object(name, val) as result FROM json_agg_empty2;
+→ [{"result":null}]
+
+DROP TABLE json_agg_t;
+DROP TABLE json_agg_nulls;
+DROP TABLE json_agg_empty2;
+
+-- ============================================================
+-- json path: quoted keys, bracket notation, edge cases
+-- ============================================================
+
+-- Quoted key with dot in name
+SELECT json_extract('{"a.b":42}', '$."a.b"') as result;
+→ [{"result":42}]
+
+-- Bracket notation for arrays
+SELECT json_extract('[[1,2],[3,4]]', '$[0][1]') as result;
+→ [{"result":2}]
+
+-- Deeply nested mixed paths
+SELECT json_extract('{"a":[{"b":99}]}', '$.a[0].b') as result;
+→ [{"result":99}]
+
+-- Invalid path: unclosed bracket
+SELECT json_extract('{"a":1}', '$[0') as result;
+→ [{"result":null}]
+
+-- Invalid path: negative index
+SELECT json_extract('[1,2,3]', '$[-1]') as result;
+→ [{"result":null}]
+
+-- Invalid path: empty string
+SELECT json_extract('{"a":1}', '') as result;
+→ [{"result":null}]
+
+-- Root path returns full value
+SELECT json_extract('{"a":1,"b":2}', '$') as result;
+→ [{"result":{"a":1,"b":2}}]
+
+-- Path through null parent
+SELECT json_extract('{"a":null}', '$.a.b') as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- json_insert into nested structures
+-- ============================================================
+
+-- Insert into nested object
+SELECT json_insert('{"a":{"b":1}}', '$.a.c', 2) as result;
+→ [{"result":{"a":{"b":1,"c":2}}}]
+
+-- Insert into nested array
+SELECT json_insert('{"a":[1,2]}', '$.a[2]', 3) as result;
+→ [{"result":{"a":[1,2,3]}}]
+
+-- ============================================================
+-- json_set with createParents on deep paths
+-- ============================================================
+
+-- Deep path where intermediate doesn't exist: returns unchanged
+SELECT json_set('{"a":{}}', '$.a.b[0]', 'first') as result;
+→ [{"result":{"a":{}}}]
+
+-- createParents: set new key on existing object
+SELECT json_set('{"a":{"b":1}}', '$.a.c', 2) as result;
+→ [{"result":{"a":{"b":1,"c":2}}}]
+
+-- ============================================================
+-- json type detection on native objects
+-- ============================================================
+
+SELECT json_type(json_array(1, 2, 3)) as result;
+→ [{"result":"array"}]
+
+SELECT json_type(json_object('a', 1)) as result;
+→ [{"result":"object"}]
+
+SELECT json_type(42) as result;
+→ [{"result":"integer"}]
+
+SELECT json_type(3.14) as result;
+→ [{"result":"real"}]
+
+SELECT json_type(true) as result;
+→ [{"result":"true"}]
+
+SELECT json_type(false) as result;
+→ [{"result":"false"}]
+
+SELECT json_type(null) as result;
+→ [{"result":"null"}]
+
+-- ============================================================
+-- json_extract with string value
+-- ============================================================
+
+SELECT json_extract('{"a":"hello"}', '$.a') as result;
+→ [{"result":"hello"}]
+
+-- ============================================================
+-- Mutation doesn't affect original (deep copy verification)
+-- ============================================================
+
+CREATE TABLE json_mut (id INTEGER PRIMARY KEY, data JSON);
+INSERT INTO json_mut VALUES (1, '{"a":[1,2,3]}');
+-- run
+
+-- json_set returns new data, original should be unchanged
+SELECT json_set(data, '$.a[0]', 99) as modified FROM json_mut WHERE id = 1;
+→ [{"modified":{"a":[99,2,3]}}]
+
+SELECT data FROM json_mut WHERE id = 1;
+→ [{"data":{"a":[1,2,3]}}]
+
+DROP TABLE json_mut;

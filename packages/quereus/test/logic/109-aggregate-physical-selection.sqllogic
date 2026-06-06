@@ -1,0 +1,103 @@
+-- aggregate-physical-selection.sqllogic
+-- Validates physical aggregate operator selection across decision branches
+-- of ruleAggregatePhysical
+
+-- Setup: table with single PK (sorted by id)
+CREATE TABLE aps_single (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER) USING memory;
+INSERT INTO aps_single VALUES (1,'a',10),(2,'b',20),(3,'a',30),(4,'b',40),(5,'c',50);
+
+-- Setup: table with composite PK (sorted by a, b)
+CREATE TABLE aps_comp (a INTEGER, b INTEGER, c INTEGER, PRIMARY KEY (a, b)) USING memory;
+INSERT INTO aps_comp VALUES (1,1,10),(1,2,20),(2,1,30),(2,2,40),(3,1,50);
+
+-- ===== Scalar aggregate → StreamAggregate =====
+
+-- Plan: scalar aggregate uses StreamAggregate
+SELECT 1 AS ok FROM query_plan('SELECT count(*), sum(val) FROM aps_single')
+WHERE op = 'STREAMAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Plan: scalar aggregate does not use HashAggregate
+SELECT count(*) AS cnt FROM query_plan('SELECT count(*), sum(val) FROM aps_single')
+WHERE op = 'HASHAGGREGATE';
+→ [{"cnt":0}]
+
+-- Correctness: scalar aggregate
+SELECT count(*) AS c, sum(val) AS s FROM aps_single;
+→ [{"c":5,"s":150}]
+
+-- ===== Already-sorted → StreamAggregate without Sort =====
+
+-- Plan: GROUP BY PK uses StreamAggregate
+SELECT 1 AS ok FROM query_plan('SELECT id, count(*) FROM aps_single GROUP BY id')
+WHERE op = 'STREAMAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Plan: GROUP BY PK does not insert Sort
+SELECT count(*) AS cnt FROM query_plan('SELECT id, count(*) FROM aps_single GROUP BY id')
+WHERE op = 'SORT';
+→ [{"cnt":0}]
+
+-- Plan: GROUP BY full composite PK uses StreamAggregate
+SELECT 1 AS ok FROM query_plan('SELECT a, b, count(*) FROM aps_comp GROUP BY a, b')
+WHERE op = 'STREAMAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Plan: GROUP BY composite PK prefix uses StreamAggregate
+SELECT 1 AS ok FROM query_plan('SELECT a, count(*) FROM aps_comp GROUP BY a')
+WHERE op = 'STREAMAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- ===== Unsorted → HashAggregate =====
+
+-- Plan: GROUP BY non-PK column uses HashAggregate
+SELECT 1 AS ok FROM query_plan('SELECT grp, count(*) FROM aps_single GROUP BY grp')
+WHERE op = 'HASHAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Correctness: grouped aggregate on non-sorted column
+SELECT grp, count(*) AS cnt FROM aps_single GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","cnt":2},{"grp":"b","cnt":2},{"grp":"c","cnt":1}]
+
+-- ===== isOrderedForGrouping edge cases =====
+
+-- Expression grouping (non-column-ref) → HashAggregate
+SELECT 1 AS ok FROM query_plan('SELECT id + 1, count(*) FROM aps_single GROUP BY id + 1')
+WHERE op = 'HASHAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Reversed composite PK order → HashAggregate (prefix mismatch)
+SELECT 1 AS ok FROM query_plan('SELECT b, a, count(*) FROM aps_comp GROUP BY b, a')
+WHERE op = 'HASHAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- More grouping keys than PK columns: GROUP-BY FD simplification drops the
+-- PK-determined column (`c` is functionally determined by the PK `(a, b)`)
+-- and rewrites the aggregate over `GROUP BY a, b` with a MIN(c) picker.
+-- The resulting GROUP BY is a prefix of the source ordering, so we land on
+-- StreamAggregate (no Sort needed).
+SELECT 1 AS ok FROM query_plan('SELECT a, b, c, count(*) FROM aps_comp GROUP BY a, b, c')
+WHERE op = 'STREAMAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Second key only (not prefix) → HashAggregate
+SELECT 1 AS ok FROM query_plan('SELECT b, count(*) FROM aps_comp GROUP BY b')
+WHERE op = 'HASHAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- First PK key + non-PK key → HashAggregate (column mismatch at position 1)
+SELECT 1 AS ok FROM query_plan('SELECT a, c, count(*) FROM aps_comp GROUP BY a, c')
+WHERE op = 'HASHAGGREGATE' LIMIT 1;
+→ [{"ok":1}]
+
+-- Correctness: expression GROUP BY
+SELECT id + 1 AS e, count(*) AS cnt FROM aps_single GROUP BY id + 1 ORDER BY id + 1;
+→ [{"e":2,"cnt":1},{"e":3,"cnt":1},{"e":4,"cnt":1},{"e":5,"cnt":1},{"e":6,"cnt":1}]
+
+-- Correctness: composite PK grouped aggregate
+SELECT a, b, count(*) AS c FROM aps_comp GROUP BY a, b ORDER BY a, b;
+→ [{"a":1,"b":1,"c":1},{"a":1,"b":2,"c":1},{"a":2,"b":1,"c":1},{"a":2,"b":2,"c":1},{"a":3,"b":1,"c":1}]
+
+-- Correctness: prefix GROUP BY on composite PK
+SELECT a, sum(c) AS total FROM aps_comp GROUP BY a ORDER BY a;
+→ [{"a":1,"total":30},{"a":2,"total":70},{"a":3,"total":50}]

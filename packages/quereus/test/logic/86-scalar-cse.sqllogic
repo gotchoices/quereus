@@ -1,0 +1,42 @@
+-- scalar-cse.sqllogic - Scalar common subexpression elimination tests
+
+CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER) USING memory;
+INSERT INTO t VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 5), (4, 'delta', 15);
+
+CREATE TABLE orders (id INTEGER PRIMARY KEY, price INTEGER, qty INTEGER) USING memory;
+INSERT INTO orders VALUES (1, 10, 5), (2, 20, 3), (3, 5, 100), (4, 8, 2);
+
+-- Function shared between projection and filter
+select length(name) as len FROM t WHERE length(name) > 4 ORDER BY id;
+→ [{"len":5},{"len":5},{"len":5}]
+
+-- Arithmetic expression shared across projection, filter, and ORDER BY
+select price * qty as total FROM orders WHERE price * qty > 20 ORDER BY price * qty;
+→ [{"total":50},{"total":60},{"total":500}]
+
+-- Multiple filter conditions sharing same expression
+select length(name) as len FROM t WHERE length(name) > 3 AND length(name) < 6 ORDER BY id;
+→ [{"len":5},{"len":4},{"len":5},{"len":5}]
+
+-- Intra-projection duplicates
+select length(name) as len1, length(name) as len2 FROM t WHERE id = 1;
+→ [{"len1":5,"len2":5}]
+
+-- Expression in projection and ORDER BY
+select value * 2 as doubled FROM t ORDER BY value * 2;
+→ [{"doubled":10},{"doubled":20},{"doubled":30},{"doubled":40}]
+
+-- Bare column references NOT affected (cheap to recompute)
+select name FROM t WHERE name > 'b' ORDER BY name;
+→ [{"name":"beta"},{"name":"delta"},{"name":"gamma"}]
+
+-- Nested function calls with shared subexpression
+select upper(name) as u FROM t WHERE length(upper(name)) > 4 ORDER BY upper(name);
+→ [{"u":"ALPHA"},{"u":"DELTA"},{"u":"GAMMA"}]
+
+-- No duplicates, no transformation needed
+select length(name) as len, value * 2 as doubled FROM t WHERE id = 1;
+→ [{"len":5,"doubled":20}]
+
+DROP TABLE orders;
+DROP TABLE t;

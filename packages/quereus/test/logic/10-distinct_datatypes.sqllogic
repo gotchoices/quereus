@@ -1,0 +1,127 @@
+-- distinct_datatypes.sqllogic - Testing DISTINCT operations and data type behavior
+
+-- Test DISTINCT operations
+CREATE TABLE distinct_test (id INTEGER PRIMARY KEY, category TEXT, value INTEGER);
+INSERT INTO distinct_test VALUES
+    (1, 'A', 100),
+    (2, 'B', 200),
+    (3, 'A', 100),
+    (4, 'B', 300),
+    (5, 'A', 200);
+
+-- Basic DISTINCT
+SELECT DISTINCT category FROM distinct_test ORDER BY category;
+→ [{"category":"A"},{"category":"B"}]
+
+-- DISTINCT with multiple columns
+SELECT DISTINCT category, value FROM distinct_test ORDER BY category, value;
+→ [{"category":"A","value":100},{"category":"A","value":200},{"category":"B","value":200},{"category":"B","value":300}]
+
+-- DISTINCT with expressions
+SELECT DISTINCT category, value * 2 as doubled FROM distinct_test ORDER BY category, doubled;
+→ [{"category":"A","doubled":200},{"category":"A","doubled":400},{"category":"B","doubled":400},{"category":"B","doubled":600}]
+
+-- DISTINCT in subqueries
+SELECT category, (SELECT COUNT(DISTINCT value) FROM distinct_test d2 WHERE d2.category = d1.category) as unique_values
+FROM distinct_test d1
+GROUP BY category
+ORDER BY category;
+→ [{"category":"A","unique_values":2},{"category":"B","unique_values":2}]
+
+DROP TABLE distinct_test;
+
+-- Data type behavior tests
+CREATE TABLE types_test (
+    id INTEGER PRIMARY KEY,
+    int_val INTEGER,
+    real_val REAL,
+    text_val TEXT,
+    blob_val BLOB,
+    null_val NULL
+);
+
+INSERT INTO types_test VALUES
+    (1, 42, 3.14, 'hello', x'deadbeef', NULL),
+    (2, -10, 0.0, '', x'', NULL),
+    (3, 0, -1.5, 'world', x'ff', NULL);
+
+-- Test type coercion and comparison
+SELECT int_val = '42' FROM types_test WHERE id = 1;
+→ [{"int_val = '42'":true}]
+
+-- Test NULL handling
+SELECT null_val IS NULL, null_val = NULL FROM types_test WHERE id = 1;
+→ [{"null_val is null":true,"null_val = null":null}]
+
+-- Test type functions
+SELECT typeof(int_val), typeof(real_val), typeof(text_val), typeof(blob_val), typeof(null_val)
+FROM types_test WHERE id = 1;
+→ [{"typeof(int_val)":"integer","typeof(real_val)":"real","typeof(text_val)":"text","typeof(blob_val)":"blob","typeof(null_val)":"null"}]
+
+-- Test comparison across types
+SELECT int_val < real_val FROM types_test WHERE id = 1;
+→ [{"int_val < real_val":false}]
+
+-- Test text/numeric conversion
+SELECT '123' + 0, 'abc' + 0, '' + 0;
+→ [{"'123' + 0":123,"'abc' + 0":0,"'' + 0":0}]
+
+-- Test type affinity in tables
+CREATE TABLE affinity_test (
+    int_col INTEGER,
+    real_col REAL,
+    text_col TEXT,
+    blob_col BLOB,
+    numeric_col NUMERIC
+);
+
+INSERT INTO affinity_test VALUES ('123', '45.6', 789, 'text_as_blob', '999.99');
+SELECT typeof(int_col), typeof(real_col), typeof(text_col), typeof(blob_col), typeof(numeric_col)
+FROM affinity_test;
+→ [{"typeof(int_col)":"integer","typeof(real_col)":"real","typeof(text_col)":"text","typeof(blob_col)":"blob","typeof(numeric_col)":"real"}]
+
+DROP TABLE affinity_test;
+DROP TABLE types_test;
+
+-- Type coercion consistency tests
+CREATE TABLE coerce_test (id INTEGER PRIMARY KEY, a ANY, b ANY);
+
+-- Test numeric coercion consistency
+INSERT INTO coerce_test VALUES (1, 5, '3'), (2, '2.5', 4), (3, true, false);
+
+-- Expression should work consistently in different contexts
+SELECT (a + b) FROM coerce_test WHERE id = 1;
+→ [{"a + b":8}]
+
+SELECT id FROM coerce_test WHERE (a + b) = 8;
+→ [{"id":1}]
+
+SELECT (a + b) FROM coerce_test WHERE id = 2;
+→ [{"a + b":6.5}]
+
+SELECT id FROM coerce_test WHERE (a + b) = 6.5;
+→ [{"id":2}]
+
+-- Boolean arithmetic
+SELECT (a + b) FROM coerce_test WHERE id = 3;
+→ [{"a + b":1}]
+
+SELECT id FROM coerce_test WHERE (a + b) = 1;
+→ [{"id":3}]
+
+-- Test string/numeric boundary cases
+DELETE FROM coerce_test;
+INSERT INTO coerce_test VALUES (1, '10', '20'), (2, 'abc', 'def');
+
+-- Numeric strings should work
+SELECT (a + b) FROM coerce_test WHERE id = 1;
+→ [{"a + b":30}]
+
+-- Non-numeric strings should fail gracefully - test that it errors consistently
+-- error: Invalid operation
+-- SELECT (a + b) FROM coerce_test WHERE id = 2;
+
+-- error: Invalid operation
+-- SELECT id FROM coerce_test WHERE (a + b) = 'should_fail';
+
+DROP TABLE coerce_test;

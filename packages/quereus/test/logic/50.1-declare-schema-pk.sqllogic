@@ -1,0 +1,150 @@
+-- Declarative schema: PRIMARY KEY alteration via apply schema
+
+-- ===================================
+-- 1. Apply schema that re-keys a table (no column changes)
+-- ===================================
+
+-- Create initial table with id as PK
+create table t_pk (id integer primary key, code integer not null, name text);
+insert into t_pk values (1, 100, 'Alice'), (2, 200, 'Bob');
+
+-- Declare schema with code as PK instead of id
+declare schema main {
+	table t_pk (
+		id integer,
+		code integer primary key,
+		name text
+	)
+}
+
+-- run
+
+-- Diff should show ALTER PRIMARY KEY
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_pk ALTER PRIMARY KEY (code)"}]
+
+-- Apply should succeed
+apply schema main;
+
+-- run
+
+-- Data preserved
+select count(*) as cnt from t_pk;
+→ [{"cnt": 2}]
+
+-- PK changed
+select name, pk from table_info('t_pk') where pk > 0;
+→ [{"name": "code", "pk": 1}]
+
+-- Round-trip: diff should be empty
+diff schema main;
+→ []
+
+drop table t_pk;
+
+-- ===================================
+-- 2. Apply schema that re-keys and drops old PK column
+-- ===================================
+
+create table t_pk_drop (old_id integer primary key, new_id integer not null, name text);
+insert into t_pk_drop values (1, 100, 'Alice'), (2, 200, 'Bob');
+
+-- Declare schema without old_id, with new_id as PK
+declare schema main {
+	table t_pk_drop (
+		new_id integer primary key,
+		name text
+	)
+}
+
+-- run
+
+-- Diff should show ALTER PRIMARY KEY and DROP COLUMN
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_pk_drop ALTER PRIMARY KEY (new_id)"}, {"ddl": "ALTER TABLE t_pk_drop DROP COLUMN old_id"}]
+
+-- Apply should succeed (rekey happens before drop)
+apply schema main;
+
+-- run
+
+-- Data preserved (minus dropped column)
+select count(*) as cnt from t_pk_drop;
+→ [{"cnt": 2}]
+
+select * from t_pk_drop order by new_id;
+→ [{"new_id": 100, "name": "Alice"}, {"new_id": 200, "name": "Bob"}]
+
+-- Round-trip: diff should be empty
+diff schema main;
+→ []
+
+drop table t_pk_drop;
+
+-- ===================================
+-- 3. Apply schema that only reorders PK columns
+-- ===================================
+
+create table t_pk_reorder (a integer not null, b integer not null, primary key (a, b));
+insert into t_pk_reorder values (1, 10), (2, 20);
+
+-- Declare same columns but PK order reversed
+declare schema main {
+	table t_pk_reorder (
+		a integer not null,
+		b integer not null,
+		primary key (b, a)
+	)
+}
+
+-- run
+
+-- Should detect the PK reorder
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_pk_reorder ALTER PRIMARY KEY (b, a)"}]
+
+apply schema main;
+
+-- run
+
+-- Data preserved
+select count(*) as cnt from t_pk_reorder;
+→ [{"cnt": 2}]
+
+-- Round-trip
+diff schema main;
+→ []
+
+drop table t_pk_reorder;
+
+-- ===================================
+-- 4. Round-trip: declare → apply → diff is empty
+-- ===================================
+
+create table t_pk_rt (a integer not null, b integer not null, primary key (a));
+insert into t_pk_rt values (1, 10), (2, 20);
+-- run
+
+declare schema main {
+	table t_pk_rt (
+		a integer not null,
+		b integer not null,
+		primary key (b)
+	)
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+-- Round-trip: diff should be empty
+diff schema main;
+→ []
+
+-- Data preserved
+select count(*) as cnt from t_pk_rt;
+→ [{"cnt": 2}]
+
+drop table t_pk_rt;

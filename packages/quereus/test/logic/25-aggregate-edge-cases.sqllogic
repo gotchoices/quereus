@@ -1,0 +1,289 @@
+-- 25-aggregate-edge-cases.sqllogic
+-- Edge-case tests for the aggregate subsystem: type coercion, NULL-only groups,
+-- HAVING eliminating all groups, group_concat separator edge cases,
+-- nested aggregates over window output, json aggregate edge cases.
+
+-- ============================================================
+-- Setup
+-- ============================================================
+
+CREATE TABLE aec (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER NULL);
+INSERT INTO aec VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40), (5, 'c', null);
+
+-- ============================================================
+-- HAVING that eliminates all groups
+-- ============================================================
+
+-- Multiple groups exist but HAVING filters every one — zero rows, not an error
+SELECT grp, sum(val) AS total FROM aec GROUP BY grp HAVING sum(val) > 9999;
+→ []
+
+-- HAVING with count(*) that eliminates all groups
+SELECT grp, count(*) AS cnt FROM aec GROUP BY grp HAVING count(*) > 100;
+→ []
+
+-- HAVING on avg that eliminates all groups
+SELECT grp, avg(val) AS a FROM aec GROUP BY grp HAVING avg(val) > 9999;
+→ []
+
+-- HAVING with complex expression eliminating all groups
+SELECT grp FROM aec GROUP BY grp HAVING sum(val) * 2 + count(*) < 0;
+→ []
+
+DROP TABLE aec;
+
+-- ============================================================
+-- Type coercion in aggregates: string values that look numeric
+-- ============================================================
+
+CREATE TABLE aec_coerce (id INTEGER PRIMARY KEY, val TEXT NULL);
+INSERT INTO aec_coerce VALUES (1, '10'), (2, '20'), (3, '30.5');
+
+-- sum() should coerce numeric-looking strings
+SELECT sum(val) AS s FROM aec_coerce;
+→ [{"s":60.5}]
+
+-- avg() should coerce numeric-looking strings
+SELECT avg(val) AS a FROM aec_coerce;
+→ [{"a":20.166666666666668}]
+
+-- Non-numeric strings should be ignored by sum/avg (treated as 0 or skipped)
+INSERT INTO aec_coerce VALUES (4, 'hello'), (5, 'world');
+
+SELECT sum(val) AS s FROM aec_coerce;
+→ [{"s":60.5}]
+
+SELECT avg(val) AS a FROM aec_coerce;
+→ [{"a":20.166666666666668}]
+
+-- count(val) counts all non-null values regardless of coercion
+SELECT count(val) AS c FROM aec_coerce;
+→ [{"c":5}]
+
+-- min/max on string values — min of numeric-looking strings may coerce
+SELECT min(val) AS mn, max(val) AS mx FROM aec_coerce;
+→ [{"mn":10,"mx":"world"}]
+
+DROP TABLE aec_coerce;
+
+-- ============================================================
+-- Aggregate over empty GROUP BY with no matching rows
+-- ============================================================
+
+-- When GROUP BY is present but the source table has rows that are
+-- all filtered out by WHERE, result should be zero rows
+CREATE TABLE aec_empty (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+INSERT INTO aec_empty VALUES (1, 'a', 10), (2, 'b', 20);
+
+SELECT grp, count(*) AS cnt, sum(val) AS total
+FROM aec_empty WHERE 1 = 0 GROUP BY grp;
+→ []
+
+SELECT grp, avg(val) AS a FROM aec_empty WHERE val > 9999 GROUP BY grp;
+→ []
+
+-- Contrast: without GROUP BY on empty result set → single row with defaults
+SELECT count(*) AS cnt, sum(val) AS total FROM aec_empty WHERE 1 = 0;
+→ [{"cnt":0,"total":null}]
+
+DROP TABLE aec_empty;
+
+-- ============================================================
+-- NULL-only column fed to every aggregate type simultaneously
+-- ============================================================
+
+CREATE TABLE aec_nullonly (id INTEGER PRIMARY KEY, grp TEXT, x INTEGER NULL);
+INSERT INTO aec_nullonly VALUES (1, 'a', null), (2, 'a', null), (3, 'b', null);
+
+-- All-NULL column with GROUP BY: every aggregate except count(*) returns null
+SELECT grp,
+       count(*) AS c_star,
+       count(x) AS c_x,
+       sum(x) AS s,
+       avg(x) AS a,
+       min(x) AS mn,
+       max(x) AS mx,
+       group_concat(x) AS gc
+FROM aec_nullonly GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","c_star":2,"c_x":0,"s":null,"a":null,"mn":null,"mx":null,"gc":null},{"grp":"b","c_star":1,"c_x":0,"s":null,"a":null,"mn":null,"mx":null,"gc":null}]
+
+-- total() returns 0.0 instead of null for all-NULL input
+SELECT grp, total(x) AS t FROM aec_nullonly GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","t":0},{"grp":"b","t":0}]
+
+DROP TABLE aec_nullonly;
+
+-- ============================================================
+-- Nested aggregates over window function output
+-- ============================================================
+
+CREATE TABLE aec_win (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER);
+INSERT INTO aec_win VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30), (4, 'y', 40);
+
+-- Aggregate consuming row_number() from subquery
+SELECT sum(rn) AS total_rn FROM (
+  SELECT row_number() OVER (ORDER BY id) AS rn FROM aec_win
+);
+→ [{"total_rn":10}]
+
+-- Aggregate consuming rank() partitioned output
+SELECT cat, sum(rnk) AS sum_rnk FROM (
+  SELECT cat, rank() OVER (PARTITION BY cat ORDER BY val) AS rnk FROM aec_win
+) GROUP BY cat ORDER BY cat;
+→ [{"cat":"x","sum_rnk":3},{"cat":"y","sum_rnk":3}]
+
+-- avg of window output
+SELECT avg(rn) AS avg_rn FROM (
+  SELECT row_number() OVER (ORDER BY id) AS rn FROM aec_win
+);
+→ [{"avg_rn":2.5}]
+
+-- count distinct on window output
+SELECT count(distinct rn) AS cd FROM (
+  SELECT row_number() OVER (PARTITION BY cat ORDER BY val) AS rn FROM aec_win
+);
+→ [{"cd":2}]
+
+DROP TABLE aec_win;
+
+-- ============================================================
+-- group_concat: NULL separator behavior
+-- ============================================================
+
+CREATE TABLE aec_gc (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO aec_gc VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+-- NULL separator falls back to default comma
+SELECT group_concat(val, null) AS gc FROM aec_gc;
+→ [{"gc":"a,b,c"}]
+
+DROP TABLE aec_gc;
+
+-- ============================================================
+-- group_concat on empty groups within GROUP BY
+-- ============================================================
+
+CREATE TABLE aec_gc2 (id INTEGER PRIMARY KEY, grp TEXT, val TEXT NULL);
+INSERT INTO aec_gc2 VALUES (1, 'a', 'x'), (2, 'a', null), (3, 'b', null), (4, 'b', null);
+
+-- group 'a' has one non-null value; group 'b' has only nulls
+SELECT grp, group_concat(val) AS gc FROM aec_gc2 GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","gc":"x"},{"grp":"b","gc":null}]
+
+DROP TABLE aec_gc2;
+
+-- ============================================================
+-- json_group_array on empty input
+-- ============================================================
+
+CREATE TABLE aec_jga (id INTEGER PRIMARY KEY, val INTEGER NULL);
+
+-- Empty table: json_group_array returns null (not empty array)
+SELECT json_group_array(val) AS result FROM aec_jga;
+→ [{"result":null}]
+
+INSERT INTO aec_jga VALUES (1, 10), (2, null), (3, 30);
+
+-- Includes NULLs in the array
+SELECT json_group_array(val) AS result FROM aec_jga;
+→ [{"result":[10,null,30]}]
+
+DROP TABLE aec_jga;
+
+-- ============================================================
+-- json_group_object: all NULL keys → empty/null result
+-- ============================================================
+
+CREATE TABLE aec_jgo (id INTEGER PRIMARY KEY, k TEXT NULL, v INTEGER);
+INSERT INTO aec_jgo VALUES (1, null, 10), (2, null, 20);
+
+-- All keys are NULL → skipped → null result (no entries)
+SELECT json_group_object(k, v) AS result FROM aec_jgo;
+→ [{"result":null}]
+
+-- Mix of NULL and non-NULL keys
+INSERT INTO aec_jgo VALUES (3, 'a', 30);
+
+SELECT json_group_object(k, v) AS result FROM aec_jgo;
+→ [{"result":{"a":30}}]
+
+DROP TABLE aec_jgo;
+
+-- ============================================================
+-- json_group_array / json_group_object with GROUP BY
+-- ============================================================
+
+CREATE TABLE aec_jg_grp (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER NULL);
+INSERT INTO aec_jg_grp VALUES (1, 'a', 10), (2, 'a', null), (3, 'b', 20), (4, 'b', 30);
+
+SELECT grp, json_group_array(val) AS arr FROM aec_jg_grp GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","arr":[10,null]},{"grp":"b","arr":[20,30]}]
+
+DROP TABLE aec_jg_grp;
+
+-- ============================================================
+-- Boolean coercion in aggregates
+-- ============================================================
+
+CREATE TABLE aec_bool (id INTEGER PRIMARY KEY, b INTEGER);
+INSERT INTO aec_bool VALUES (1, 1), (2, 0), (3, 1), (4, 1);
+
+-- sum/avg of boolean-ish values (0/1)
+SELECT sum(b) AS s, avg(b) AS a FROM aec_bool;
+→ [{"s":3,"a":0.75}]
+
+DROP TABLE aec_bool;
+
+-- ============================================================
+-- Aggregate with ORDER BY in outer query (not GROUP BY column)
+-- ============================================================
+
+CREATE TABLE aec_ord (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+INSERT INTO aec_ord VALUES (1, 'x', 50), (2, 'y', 10), (3, 'x', 30), (4, 'y', 40);
+
+-- ORDER BY aggregate alias ascending
+SELECT grp, sum(val) AS total FROM aec_ord GROUP BY grp ORDER BY total;
+→ [{"grp":"y","total":50},{"grp":"x","total":80}]
+
+-- ORDER BY aggregate alias descending
+SELECT grp, sum(val) AS total FROM aec_ord GROUP BY grp ORDER BY total DESC;
+→ [{"grp":"x","total":80},{"grp":"y","total":50}]
+
+DROP TABLE aec_ord;
+
+-- ============================================================
+-- Multiple different aggregates with DISTINCT
+-- ============================================================
+
+CREATE TABLE aec_mdist (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO aec_mdist VALUES (1, 10), (2, 20), (3, 10), (4, 20), (5, null), (6, 30);
+
+-- Mix of DISTINCT and non-DISTINCT aggregates in same query
+SELECT count(*) AS c_star,
+       count(val) AS c_val,
+       count(distinct val) AS c_dval,
+       sum(val) AS s,
+       sum(distinct val) AS s_dist,
+       avg(val) AS a,
+       avg(distinct val) AS a_dist
+FROM aec_mdist;
+→ [{"c_star":6,"c_val":5,"c_dval":3,"s":90,"s_dist":60,"a":18,"a_dist":20}]
+
+DROP TABLE aec_mdist;
+
+-- ============================================================
+-- Single-value groups: each group has exactly 1 row
+-- ============================================================
+
+CREATE TABLE aec_single (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO aec_single VALUES (1, 100), (2, 200), (3, 300);
+
+SELECT id, count(*) AS c, sum(val) AS s, avg(val) AS a, min(val) AS mn, max(val) AS mx
+FROM aec_single GROUP BY id ORDER BY id;
+→ [{"id":1,"c":1,"s":100,"a":100,"mn":100,"mx":100},{"id":2,"c":1,"s":200,"a":200,"mn":200,"mx":200},{"id":3,"c":1,"s":300,"a":300,"mn":300,"mx":300}]
+
+-- var_samp returns NULL for single-value group (n-1 = 0)
+SELECT id, var_samp(val) AS vs FROM aec_single GROUP BY id ORDER BY id;
+→ [{"id":1,"vs":null},{"id":2,"vs":null},{"id":3,"vs":null}]
+
+DROP TABLE aec_single;

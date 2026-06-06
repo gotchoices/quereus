@@ -1,0 +1,175 @@
+-- boundary-values.sqllogic - Boundary values for each type and mixed-type expression edge cases
+
+-- =============================================================================
+-- INTEGER boundaries
+-- =============================================================================
+
+create table b_int (id integer primary key, val integer);
+insert into b_int values (1, 0), (2, -1), (3, 1), (4, 9007199254740991), (5, -9007199254740991);
+
+-- Correct ordering across full range
+select val from b_int order by val;
+→ [{"val":-9007199254740991},{"val":-1},{"val":0},{"val":1},{"val":9007199254740991}]
+
+-- Arithmetic at boundaries
+select 9007199254740991 + 0 as r;
+→ [{"r":9007199254740991}]
+
+select -9007199254740991 - 0 as r;
+→ [{"r":-9007199254740991}]
+
+select 0 * 9007199254740991 as r;
+→ [{"r":0}]
+
+select -1 * -1 as r;
+→ [{"r":1}]
+
+-- Comparison at boundaries
+select 9007199254740991 > -9007199254740991 as r;
+→ [{"r":true}]
+
+drop table b_int;
+
+-- =============================================================================
+-- REAL boundaries
+-- =============================================================================
+
+create table b_real (id integer primary key, val real);
+insert into b_real values (1, 0.0), (2, 1e-15), (3, 1e15);
+
+select val from b_real order by val;
+→ [{"val":0},{"val":1e-15},{"val":1000000000000000}]
+
+-- Floating point behavior
+select 0.1 + 0.2 as r;
+→ [{"r":0.30000000000000004}]
+
+-- IEEE 754: 0.0 == -0.0
+select cast(0.0 as real) = cast(-0.0 as real) as r;
+→ [{"r":true}]
+
+drop table b_real;
+
+-- =============================================================================
+-- TEXT boundaries
+-- =============================================================================
+
+create table b_text (id integer primary key, val text);
+insert into b_text values (1, '');
+
+-- Empty string
+select val = '' as r from b_text where id = 1;
+→ [{"r":true}]
+
+select length('') as r;
+→ [{"r":0}]
+
+-- Empty string is NOT null
+select '' is null as r;
+→ [{"r":false}]
+
+-- Empty string compared to null → null (unknown)
+select '' = null as r;
+→ [{"r":null}]
+
+-- Single char
+select length('x') as r;
+→ [{"r":1}]
+
+-- Embedded single quotes
+select 'it''s' as r;
+→ [{"r":"it's"}]
+
+-- Unicode character length
+select length('héllo') as r;
+→ [{"r":5}]
+
+drop table b_text;
+
+-- =============================================================================
+-- BLOB boundaries
+-- =============================================================================
+
+-- Empty blob
+select typeof(x'') as r;
+→ [{"r":"blob"}]
+
+select length(x'') as r;
+→ [{"r":0}]
+
+-- Single byte
+select length(x'FF') as r;
+→ [{"r":1}]
+
+-- Empty blob equality
+select x'' = x'' as r;
+→ [{"r":true}]
+
+-- =============================================================================
+-- Mixed-type arithmetic
+-- =============================================================================
+
+-- integer + real → real
+select 1 + 1.5 as r;
+→ [{"r":2.5}]
+
+-- integer / integer → real (no truncation)
+select 10 / 3 as r;
+→ [{"r":3.3333333333333335}]
+
+-- integer / real → real
+select 10 / 2.5 as r;
+→ [{"r":4}]
+
+-- real / integer → real
+select 10.0 / 4 as r;
+→ [{"r":2.5}]
+
+-- string coercion in arithmetic
+select 1 + '2' as r;
+→ [{"r":3}]
+
+-- =============================================================================
+-- Cross-type comparisons
+-- =============================================================================
+
+select 1 = 1.0 as r;
+→ [{"r":true}]
+
+select 1 < 1.5 as r;
+→ [{"r":true}]
+
+-- Verify types
+select typeof(1) as t1, typeof(1.0) as t2, typeof('1') as t3;
+→ [{"t1":"integer","t2":"integer","t3":"text"}]
+
+-- =============================================================================
+-- CASE with branches returning different types
+-- =============================================================================
+
+-- True branch returns integer
+select case when 1=1 then 42 else 'text' end as r;
+→ [{"r":42}]
+
+-- False branch returns text
+select case when 1=0 then 42 else 'text' end as r;
+→ [{"r":"text"}]
+
+-- typeof follows actual branch taken
+select typeof(case when 1=1 then 42 else 'text' end) as r;
+→ [{"r":"integer"}]
+
+select typeof(case when 1=0 then 42 else 'text' end) as r;
+→ [{"r":"text"}]
+
+-- =============================================================================
+-- UNION with different types in corresponding columns
+-- =============================================================================
+
+-- Mixed types in same column
+select 1 as v union all select 'text' as v;
+→ [{"v":1},{"v":"text"}]
+
+-- typeof reflects per-row type
+select typeof(v) as t from (select 1 as v union all select 'text' as v) order by v;
+→ [{"t":"integer"},{"t":"text"}]

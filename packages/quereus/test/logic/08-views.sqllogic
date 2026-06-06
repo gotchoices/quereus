@@ -1,0 +1,64 @@
+-- views.sqllogic - Testing VIEW functionality
+
+-- -- Setup base table
+CREATE TABLE base_data (id INTEGER PRIMARY KEY, name TEXT, category TEXT, value INTEGER);
+INSERT INTO base_data VALUES (1, 'Alpha', 'A', 100), (2, 'Beta', 'B', 200), (3, 'Gamma', 'A', 150), (4, 'Delta', 'B', 300);
+
+-- Basic view creation
+CREATE VIEW category_a_view AS SELECT id, name, value FROM base_data WHERE category = 'A';
+
+-- Query the view
+SELECT * FROM category_a_view ORDER BY id;
+→ [{"id":1,"name":"Alpha","value":100},{"id":3,"name":"Gamma","value":150}]
+
+-- View with computed columns
+CREATE VIEW summary_view AS SELECT category, count(*) as item_count, sum(value) as total_value FROM base_data GROUP BY category;
+
+SELECT * FROM summary_view ORDER BY category;
+→ [{"category":"A","item_count":2,"total_value":250},{"category":"B","item_count":2,"total_value":500}]
+
+-- View with complex WHERE clause
+CREATE VIEW high_value_view AS SELECT name, value FROM base_data WHERE value > 150;
+
+SELECT * FROM high_value_view ORDER BY value;
+→ [{"name":"Beta","value":200},{"name":"Delta","value":300}]
+
+-- Verify view reflects changes to underlying table
+INSERT INTO base_data VALUES (5, 'Zeta', 'A', 125);
+SELECT * FROM category_a_view ORDER BY id;
+→ [{"id":1,"name":"Alpha","value":100},{"id":3,"name":"Gamma","value":150},{"id":5,"name":"Zeta","value":125}]
+
+-- Test view with alias and qualified SELECT *
+SELECT v.* FROM category_a_view v ORDER BY id;
+→ [{"id":1,"name":"Alpha","value":100},{"id":3,"name":"Gamma","value":150},{"id":5,"name":"Zeta","value":125}]
+
+-- Filter merge: view WHERE + outer WHERE should produce correct results
+CREATE VIEW filtered_items AS SELECT id, name, value FROM base_data WHERE category = 'A';
+SELECT * FROM filtered_items WHERE value > 100 ORDER BY id;
+→ [{"id":3,"name":"Gamma","value":150},{"id":5,"name":"Zeta","value":125}]
+DROP VIEW filtered_items;
+
+-- Predicate pushdown through view alias boundary
+-- id = 1 should push through AliasNode into the view's underlying plan (index seek, no residual FILTER)
+SELECT * FROM category_a_view WHERE id = 1;
+→ [{"id":1,"name":"Alpha","value":100}]
+
+-- Qualified column references should also work after pushdown
+SELECT v.name FROM category_a_view v WHERE v.id = 3;
+→ [{"name":"Gamma"}]
+
+-- Projection pruning: selecting a subset of a wide view should return correct results
+CREATE VIEW wide_view AS SELECT id, name, category, value FROM base_data;
+SELECT name FROM wide_view ORDER BY name;
+→ [{"name":"Alpha"},{"name":"Beta"},{"name":"Delta"},{"name":"Gamma"},{"name":"Zeta"}]
+
+SELECT name, value FROM wide_view WHERE id = 2;
+→ [{"name":"Beta","value":200}]
+DROP VIEW wide_view;
+
+-- Drop views
+DROP VIEW category_a_view;
+DROP VIEW summary_view;
+DROP VIEW high_value_view;
+
+DROP TABLE base_data;

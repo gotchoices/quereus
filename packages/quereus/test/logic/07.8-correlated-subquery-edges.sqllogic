@@ -1,0 +1,71 @@
+-- correlated-subquery-edges.sqllogic - Correlated subquery edge cases
+
+-- Setup tables
+create table o (id integer primary key, cat text);
+insert into o values (1, 'X'), (2, 'Y'), (3, 'X');
+
+create table i (id integer primary key, o_id integer null, val integer);
+insert into i values (10, 1, 100), (20, 1, 200), (30, 2, 300), (40, null, 400);
+
+-- ===== Correlated subquery with empty correlation =====
+
+-- Outer row id=3 has no matching inner rows — sum should be null
+select o.id, (select sum(val) from i where i.o_id = o.id) as total from o order by o.id;
+→ [{"id":1,"total":300},{"id":2,"total":300},{"id":3,"total":null}]
+
+-- ===== Multi-level correlation =====
+
+-- Subquery of subquery referencing outermost table
+-- For o.id=1: inner vals 100,200; min=100; count where val>100 = 1
+-- For o.id=2: inner val 300; min=300; count where val>300 = 0
+-- For o.id=3: no inner rows; count = 0
+select o.id,
+  (select count(*) from i i1
+   where i1.o_id = o.id
+   and i1.val > (select min(val) from i i2 where i2.o_id = o.id)
+  ) as cnt
+from o order by o.id;
+→ [{"id":1,"cnt":1},{"id":2,"cnt":0},{"id":3,"cnt":0}]
+
+-- ===== Correlated EXISTS vs IN equivalence =====
+
+-- EXISTS form
+select id from o where exists (select 1 from i where i.o_id = o.id) order by id;
+→ [{"id":1},{"id":2}]
+
+-- IN form (should return same results)
+select id from o where id in (select o_id from i where o_id is not null) order by id;
+→ [{"id":1},{"id":2}]
+
+-- ===== Correlated subquery in different positions =====
+
+-- In SELECT list
+select o.id, (select max(val) from i where i.o_id = o.id) as max_val from o order by o.id;
+→ [{"id":1,"max_val":200},{"id":2,"max_val":300},{"id":3,"max_val":null}]
+
+-- In WHERE
+select * from o where (select count(*) from i where i.o_id = o.id) > 1 order by o.id;
+→ [{"id":1,"cat":"X"}]
+
+-- In HAVING
+select o.cat, count(*) as cnt from o group by o.cat having count(*) > (select 1) order by o.cat;
+→ [{"cat":"X","cnt":2}]
+
+-- Correlated subquery with aggregation that returns NULL for no-match, coalesced
+select o.id, coalesce((select sum(val) from i where i.o_id = o.id), 0) as total from o order by o.id;
+→ [{"id":1,"total":300},{"id":2,"total":300},{"id":3,"total":0}]
+
+-- ===== NOT IN with NULLs in subquery =====
+
+-- Classic SQL gotcha: NOT IN with NULL in subquery list
+-- i has o_id=NULL, so x NOT IN (..., NULL) is UNKNOWN for all x → empty result
+select * from o where id not in (select o_id from i);
+→ []
+
+-- NOT IN excluding NULLs works as expected
+select * from o where id not in (select o_id from i where o_id is not null) order by id;
+→ [{"id":3,"cat":"X"}]
+
+-- Cleanup
+drop table o;
+drop table i;

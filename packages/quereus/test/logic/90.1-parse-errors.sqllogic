@@ -1,0 +1,77 @@
+-- 90.1-parse-errors.sqllogic - Parser/syntax error edge cases
+-- Tests parse errors not already covered in 90-error_paths.sqllogic
+
+-- Unterminated parenthesis in function call
+SELECT abs(1
+-- error: Unterminated '('
+
+-- CTE: missing name
+WITH AS (SELECT 1) SELECT 1;
+-- error: Expected CTE name
+
+-- CTE: missing AS keyword
+WITH c SELECT * FROM c;
+-- error: Expected 'AS' after CTE name
+
+-- CTE: non-identifier in column list
+WITH c (1) AS (SELECT 1) SELECT * FROM c;
+-- error: Expected column name in CTE definition
+
+-- CTE: missing opening paren for query
+WITH c AS SELECT 1;
+-- error: Expected '(' before CTE query
+
+-- Unterminated string literal
+SELECT 'unterminated;
+-- error: Unterminated string
+
+-- Incomplete CREATE statement
+CREATE;
+-- error: Expected TABLE,
+
+-- Incomplete INSERT (missing table name)
+INSERT INTO;
+-- error: Expected table name
+
+-- Incomplete UPDATE (missing table name)
+UPDATE;
+-- error: Expected table name
+
+-- Incomplete DELETE (missing table)
+DELETE;
+-- error: Expected table name
+
+-- Missing column list or VALUES in CREATE TABLE
+CREATE TABLE t_parse_empty ();
+-- error: Expected column
+
+-- DROP with unsupported object type
+DROP TRIGGER some_trigger;
+-- error: Expected TABLE, VIEW, MATERIALIZED VIEW, INDEX, or ASSERTION after DROP
+
+-- Incomplete CASE expression
+SELECT CASE WHEN 1 THEN 2;
+-- error: Expected 'END'
+
+-- Missing expression after WHERE
+CREATE TABLE t_parse_where (id INTEGER);
+-- run
+
+SELECT * FROM t_parse_where WHERE;
+-- error: Expected expression
+
+DROP TABLE t_parse_where;
+-- run
+
+-- @-prefixed parameter form (not supported in Quereus; lexer rejects)
+SELECT 1 WHERE 1 = @x;
+-- error: Unexpected character
+
+-- ?-followed-by-digit (sqlite ?N form not supported; ? is consumed
+-- as positional placeholder, leaving the digit as a stray token)
+SELECT 1 WHERE 1 = ?1;
+-- error:
+
+-- Named parameter prefix with neither identifier nor integer
+SELECT :;
+-- error: Expected identifier or number after parameter prefix

@@ -1,0 +1,53 @@
+-- like-glob-edges.sqllogic - LIKE / GLOB scenarios beyond 06-builtin_functions and
+-- 24-builtin-branches: case-sensitivity invariant, BLOB operands, GLOB character classes.
+-- adapted from SQLite test/like.test and test/like2.test
+-- Notes vs SQLite:
+--   * char() builtin is not present in Quereus; multi-byte LIKE checks via char()
+--     concatenation are dropped here.
+--   * ESCAPE clause for LIKE is not supported; cases dropped.
+
+-- Quereus LIKE is case-SENSITIVE by design (no PRAGMA case_sensitive_like)
+select like('A%', 'apple') as result;
+→ [{"result":false}]
+
+select like('a%', 'apple') as result;
+→ [{"result":true}]
+
+select like('apple', 'APPLE') as result;
+→ [{"result":false}]
+
+-- LIKE with multi-byte UTF-8 literal: `_` should match a single character (code point), not byte
+select like('a_b', 'aäb') as result;
+→ [{"result":true}]
+
+-- LIKE `_` matches a single Unicode code point (non-BMP chars count as one)
+select like('_', '😀') as result;
+→ [{"result":true}]
+
+-- LIKE on numeric: assert observable behavior on a text column
+create table like_num (id integer primary key, n integer);
+insert into like_num values (1, 1234);
+select like('12%', n) from like_num;
+→ [{"like('12%', n)":true}]
+drop table like_num;
+
+-- GLOB is also case-sensitive
+select glob('ABC*', 'abcdef') as result;
+→ [{"result":false}]
+
+select glob('abc*', 'abcdef') as result;
+→ [{"result":true}]
+
+-- GLOB character classes: `[abc]`, `[a-c]`, `[^abc]`
+select glob('[abc]', 'a') as result;
+→ [{"result":true}]
+select glob('[abc]', 'd') as result;
+→ [{"result":false}]
+select glob('[a-c]', 'b') as result;
+→ [{"result":true}]
+select glob('[a-c]', 'd') as result;
+→ [{"result":false}]
+select glob('[^abc]', 'd') as result;
+→ [{"result":true}]
+select glob('[^abc]', 'a') as result;
+→ [{"result":false}]

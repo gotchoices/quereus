@@ -1,0 +1,174 @@
+-- subquery-edge-cases.sqllogic - Subquery emitter edge cases
+-- Targets: subquery.ts — IN with NULLs, scalar empty, EXISTS empty, deeply nested
+
+-- ===== IN VALUE LIST EDGE CASES =====
+
+-- IN value list: match → true
+SELECT 10 IN (10, 20, 30) AS result;
+→ [{"result":true}]
+
+-- IN value list: no match, no nulls → false
+SELECT 99 IN (10, 20, 30) AS result;
+→ [{"result":false}]
+
+-- IN value list: no match but has null → null (SQL three-valued logic)
+SELECT 99 IN (10, null, 30) AS result;
+→ [{"result":null}]
+
+-- IN value list: match despite null → true (match takes priority)
+SELECT 10 IN (10, null, 30) AS result;
+→ [{"result":true}]
+
+-- IN value list: null condition → null
+SELECT null IN (10, 20, 30) AS result;
+→ [{"result":null}]
+
+-- IN value list: null condition with nulls in list → null
+SELECT null IN (10, null, 30) AS result;
+→ [{"result":null}]
+
+-- IN single value: match
+SELECT 5 IN (5) AS result;
+→ [{"result":true}]
+
+-- IN single value: no match
+SELECT 5 IN (6) AS result;
+→ [{"result":false}]
+
+-- ===== IN SUBQUERY EDGE CASES =====
+
+CREATE TABLE sq_vals (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO sq_vals VALUES (1, 10), (2, 20), (3, null), (4, 30), (5, null);
+
+-- IN subquery: match found
+SELECT 10 IN (SELECT val FROM sq_vals WHERE val IS NOT NULL) AS result;
+→ [{"result":true}]
+
+-- IN subquery: no match, subquery has NULLs → null
+SELECT 99 IN (SELECT val FROM sq_vals) AS result;
+→ [{"result":null}]
+
+-- IN subquery: match found despite NULLs → true
+SELECT 20 IN (SELECT val FROM sq_vals) AS result;
+→ [{"result":true}]
+
+-- IN subquery: null condition → null
+SELECT null IN (SELECT val FROM sq_vals) AS result;
+→ [{"result":null}]
+
+-- IN subquery: empty subquery → false
+SELECT 10 IN (SELECT val FROM sq_vals WHERE val > 1000) AS result;
+→ [{"result":false}]
+
+-- IN subquery: no match, no NULLs → false
+SELECT 99 IN (SELECT val FROM sq_vals WHERE val IS NOT NULL) AS result;
+→ [{"result":false}]
+
+-- ===== EXISTS EDGE CASES =====
+
+-- EXISTS: non-empty → true
+SELECT EXISTS (SELECT 1 FROM sq_vals) AS result;
+→ [{"result":true}]
+
+-- EXISTS: empty → false
+SELECT EXISTS (SELECT 1 FROM sq_vals WHERE val > 1000) AS result;
+→ [{"result":false}]
+
+-- EXISTS: subquery returns NULLs (still true — rows exist)
+SELECT EXISTS (SELECT val FROM sq_vals WHERE val IS NULL) AS result;
+→ [{"result":true}]
+
+-- NOT EXISTS: non-empty → false
+SELECT NOT EXISTS (SELECT 1 FROM sq_vals) AS result;
+→ [{"result":false}]
+
+-- NOT EXISTS: empty → true
+SELECT NOT EXISTS (SELECT 1 FROM sq_vals WHERE val > 1000) AS result;
+→ [{"result":true}]
+
+-- ===== SCALAR SUBQUERY EDGE CASES =====
+
+-- Scalar subquery: 0 rows → null
+SELECT (SELECT val FROM sq_vals WHERE val > 1000) AS result;
+→ [{"result":null}]
+
+-- Scalar subquery: 1 row with null value → null
+SELECT (SELECT val FROM sq_vals WHERE id = 3) AS result;
+→ [{"result":null}]
+
+-- Scalar subquery: 1 row with non-null value
+SELECT (SELECT val FROM sq_vals WHERE id = 1) AS result;
+→ [{"result":10}]
+
+-- Scalar subquery: multiple rows → error
+SELECT (SELECT val FROM sq_vals WHERE val IS NOT NULL);
+-- error: Scalar subquery returned more than one row
+
+DROP TABLE sq_vals;
+
+-- ===== DEEPLY NESTED CORRELATED SUBQUERIES =====
+
+CREATE TABLE sq_a (id INTEGER PRIMARY KEY, val INTEGER);
+CREATE TABLE sq_b (id INTEGER PRIMARY KEY, a_id INTEGER, val INTEGER);
+CREATE TABLE sq_c (id INTEGER PRIMARY KEY, b_id INTEGER, val INTEGER);
+
+INSERT INTO sq_a VALUES (1, 100), (2, 200);
+INSERT INTO sq_b VALUES (10, 1, 50), (20, 1, 60), (30, 2, 70);
+INSERT INTO sq_c VALUES (100, 10, 5), (200, 20, 6), (300, 30, 7);
+
+-- Three-level correlated: sum of sums
+-- a.id=1: b rows {10,20} → c sums {5, 6} → outer sum = 11
+-- a.id=2: b rows {30} → c sums {7} → outer sum = 7
+SELECT a.id,
+  (SELECT sum(
+    (SELECT sum(c.val) FROM sq_c c WHERE c.b_id = b.id)
+  ) FROM sq_b b WHERE b.a_id = a.id) AS deep_sum
+FROM sq_a a ORDER BY a.id;
+→ [{"id":1,"deep_sum":11},{"id":2,"deep_sum":7}]
+
+-- Correlated subquery in HAVING
+SELECT a.id, count(*) AS cnt
+FROM sq_b b JOIN sq_a a ON b.a_id = a.id
+GROUP BY a.id
+HAVING count(*) > (SELECT 1)
+ORDER BY a.id;
+→ [{"id":1,"cnt":2}]
+
+-- Correlated subquery with no matching rows → null aggregate
+SELECT a.id,
+  (SELECT sum(b.val) FROM sq_b b WHERE b.a_id = a.id AND b.val > 1000) AS filtered_sum
+FROM sq_a a ORDER BY a.id;
+→ [{"id":1,"filtered_sum":null},{"id":2,"filtered_sum":null}]
+
+-- IN subquery used in WHERE with correlated condition
+SELECT a.id FROM sq_a a
+WHERE a.id IN (SELECT b.a_id FROM sq_b b WHERE b.val > 55)
+ORDER BY a.id;
+→ [{"id":1},{"id":2}]
+
+DROP TABLE sq_c;
+DROP TABLE sq_b;
+DROP TABLE sq_a;
+
+-- ===== IN WITH COLUMN VALUES (tests dynamic vs constant path) =====
+
+CREATE TABLE sq_in_t (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO sq_in_t VALUES (1, 10), (2, 20), (3, null), (4, 30);
+
+-- Column IN constant list: exercises constant BTree path
+SELECT id, val IN (10, 30) AS matched FROM sq_in_t ORDER BY id;
+→ [{"id":1,"matched":true},{"id":2,"matched":false},{"id":3,"matched":null},{"id":4,"matched":true}]
+
+-- Column IN constant list with null: null column → null, non-match → null
+SELECT id, val IN (10, null) AS matched FROM sq_in_t ORDER BY id;
+→ [{"id":1,"matched":true},{"id":2,"matched":null},{"id":3,"matched":null},{"id":4,"matched":null}]
+
+-- NOT IN with nulls: classic SQL gotcha
+SELECT id FROM sq_in_t WHERE val NOT IN (10, null);
+→ []
+
+-- NOT IN without nulls
+SELECT id FROM sq_in_t WHERE val NOT IN (10, 30) ORDER BY id;
+→ [{"id":2}]
+
+DROP TABLE sq_in_t;

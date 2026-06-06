@@ -1,0 +1,974 @@
+-- 101-builtin-mutation-kills.sqllogic
+-- Mutation-killing tests for builtin functions in scalar.ts, string.ts,
+-- aggregate.ts, and conversion.ts.  Each test targets a specific code path
+-- that a common mutant (flipped comparison, removed null guard, off-by-one,
+-- swapped operator) would break.
+
+-- ============================================================
+-- SETUP
+-- ============================================================
+
+create table mk (id integer primary key, v_int integer null, v_real real null, v_text text null);
+insert into mk values (1, null, null, null);
+insert into mk values (2, 0, 0.0, '');
+insert into mk values (3, -5, -3.14, 'hello');
+insert into mk values (4, 42, 2.718, 'world');
+
+-- ============================================================
+-- scalar.ts: abs
+-- ============================================================
+
+-- Kill: remove "if (arg === null) return null" guard
+select abs(v_int) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: abs(0) must return 0, not null (guards n<0 vs n<=0 mutations)
+select abs(v_int) as r from mk where id = 2;
+→ [{"r":0}]
+
+-- Kill: abs of negative integer
+select abs(v_int) as r from mk where id = 3;
+→ [{"r":5}]
+
+-- Kill: abs of positive integer unchanged
+select abs(v_int) as r from mk where id = 4;
+→ [{"r":42}]
+
+-- Kill: abs of negative real
+select abs(v_real) as r from mk where id = 3;
+→ [{"r":3.14}]
+
+-- Kill: abs(0.0) must return 0
+select abs(v_real) as r from mk where id = 2;
+→ [{"r":0}]
+
+-- ============================================================
+-- scalar.ts: round
+-- ============================================================
+
+-- Kill: remove null guard for first argument
+select round(v_real) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: round(0.0) must be 0, not null
+select round(v_real) as r from mk where id = 2;
+→ [{"r":0}]
+
+-- Kill: round with explicit 0 decimal places
+select round(v_real, 0) as r from mk where id = 3;
+→ [{"r":-3}]
+
+-- Kill: round with negative precision
+select round(12345, -3) as r;
+→ [{"r":12000}]
+
+-- Kill: round(x, null) treats null places as 0
+select round(3.7, null) as r;
+→ [{"r":4}]
+
+-- ============================================================
+-- scalar.ts: sqrt
+-- ============================================================
+
+-- Kill: remove null guard
+select sqrt(v_real) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: sqrt(0) must return 0, not null (guards num < 0 vs num <= 0)
+select sqrt(0) as r;
+→ [{"r":0}]
+
+-- Kill: sqrt of negative returns null
+select sqrt(-4) as r;
+→ [{"r":null}]
+
+-- Kill: sqrt of perfect square
+select sqrt(25) as r;
+→ [{"r":5}]
+
+-- ============================================================
+-- scalar.ts: pow / power
+-- ============================================================
+
+-- Kill: null propagation in base
+select pow(v_real, 2) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: null propagation in exponent
+select pow(2, v_real) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: pow(0, 0) = 1 (JavaScript Math.pow behavior)
+select pow(0, 0) as r;
+→ [{"r":1}]
+
+-- Kill: pow(x, 1) = x
+select pow(7, 1) as r;
+→ [{"r":7}]
+
+-- Kill: pow with negative base, even exponent
+select pow(-3, 2) as r;
+→ [{"r":9}]
+
+-- Kill: pow with negative base, odd exponent
+select pow(-2, 3) as r;
+→ [{"r":-8}]
+
+-- ============================================================
+-- scalar.ts: floor / ceil
+-- ============================================================
+
+-- Kill: floor null guard
+select floor(v_real) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: ceil null guard
+select ceil(v_real) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: floor(0.0) = 0 (not null)
+select floor(0.0) as r;
+→ [{"r":0}]
+
+-- Kill: ceil(0.0) = 0 (not null)
+select ceil(0.0) as r;
+→ [{"r":0}]
+
+-- Kill: floor of negative fraction rounds toward negative infinity
+select floor(-0.1) as r;
+→ [{"r":-1}]
+
+-- Kill: ceil of negative fraction rounds toward zero (JS: -0 == 0)
+select ceil(-0.1) = 0 as r;
+→ [{"r":true}]
+
+-- Kill: floor of positive fraction rounds toward zero
+select floor(0.9) as r;
+→ [{"r":0}]
+
+-- Kill: ceil of positive fraction rounds toward positive infinity
+select ceil(0.1) as r;
+→ [{"r":1}]
+
+-- Kill: ceiling is alias for ceil
+select ceiling(2.3) as r;
+→ [{"r":3}]
+
+-- ============================================================
+-- scalar.ts: clamp
+-- ============================================================
+
+-- Kill: value exactly at min boundary
+select clamp(0, 0, 10) as r;
+→ [{"r":0}]
+
+-- Kill: value exactly at max boundary
+select clamp(10, 0, 10) as r;
+→ [{"r":10}]
+
+-- Kill: value one below min
+select clamp(-1, 0, 10) as r;
+→ [{"r":0}]
+
+-- Kill: value one above max
+select clamp(11, 0, 10) as r;
+→ [{"r":10}]
+
+-- Kill: min == max, value equal
+select clamp(5, 5, 5) as r;
+→ [{"r":5}]
+
+-- Kill: min == max, value below
+select clamp(3, 5, 5) as r;
+→ [{"r":5}]
+
+-- Kill: min == max, value above
+select clamp(7, 5, 5) as r;
+→ [{"r":5}]
+
+-- ============================================================
+-- scalar.ts: coalesce
+-- ============================================================
+
+-- Kill: single non-null arg returns it (not null)
+select coalesce(42) as r;
+→ [{"r":42}]
+
+-- Kill: all null returns null
+select coalesce(null, null) as r;
+→ [{"r":null}]
+
+-- Kill: first non-null wins (not second, not last)
+select coalesce(null, 'first', 'second') as r;
+→ [{"r":"first"}]
+
+-- Kill: zero is non-null (not treated as falsy)
+select coalesce(null, 0) as r;
+→ [{"r":0}]
+
+-- Kill: empty string is non-null
+select coalesce(null, '') as r;
+→ [{"r":""}]
+
+-- Kill: false is non-null
+select coalesce(null, false) as r;
+→ [{"r":false}]
+
+-- ============================================================
+-- scalar.ts: nullif
+-- ============================================================
+
+-- Kill: nullif returns null when args equal
+select nullif(5, 5) as r;
+→ [{"r":null}]
+
+-- Kill: nullif returns first arg when different
+select nullif(5, 10) as r;
+→ [{"r":5}]
+
+-- Kill: nullif with zero — 0 equals 0
+select nullif(0, 0) as r;
+→ [{"r":null}]
+
+-- Kill: nullif with zero and non-zero
+select nullif(0, 1) as r;
+→ [{"r":0}]
+
+-- Kill: nullif(null, 1) — null first arg
+select nullif(null, 1) as r;
+→ [{"r":null}]
+
+-- ============================================================
+-- scalar.ts: iif
+-- ============================================================
+
+-- Kill: iif with bigint-like large integer condition (truthy)
+select iif(999999, 'yes', 'no') as r;
+→ [{"r":"yes"}]
+
+-- Kill: iif with negative number (truthy, not zero)
+select iif(-1, 'yes', 'no') as r;
+→ [{"r":"yes"}]
+
+-- Kill: iif with string '0' is falsy
+select iif('0', 'yes', 'no') as r;
+→ [{"r":"no"}]
+
+-- Kill: iif with string '1' is truthy
+select iif('1', 'yes', 'no') as r;
+→ [{"r":"yes"}]
+
+-- Kill: iif with non-numeric string is falsy (NaN → false)
+select iif('abc', 'yes', 'no') as r;
+→ [{"r":"no"}]
+
+-- Kill: iif returns the actual value of the branch (not boolean)
+select iif(1, 42, 99) as r;
+→ [{"r":42}]
+
+select iif(0, 42, 99) as r;
+→ [{"r":99}]
+
+-- ============================================================
+-- scalar.ts: choose
+-- ============================================================
+
+-- Kill: index 1 returns first value arg
+select choose(1, 'a', 'b', 'c') as r;
+→ [{"r":"a"}]
+
+-- Kill: index 3 returns last value arg
+select choose(3, 'a', 'b', 'c') as r;
+→ [{"r":"c"}]
+
+-- Kill: index 0 out of range (1-based)
+select choose(0, 'a', 'b') as r;
+→ [{"r":null}]
+
+-- Kill: index beyond length returns null
+select choose(4, 'a', 'b', 'c') as r;
+→ [{"r":null}]
+
+-- Kill: negative index returns null
+select choose(-1, 'a') as r;
+→ [{"r":null}]
+
+-- ============================================================
+-- scalar.ts: greatest / least
+-- ============================================================
+
+-- Kill: greatest with all nulls returns null (not first arg)
+select greatest(null, null, null) as r;
+→ [{"r":null}]
+
+-- Kill: greatest skips nulls and finds max
+select greatest(null, 5, null, 3) as r;
+→ [{"r":5}]
+
+-- Kill: least with all nulls returns null
+select least(null, null) as r;
+→ [{"r":null}]
+
+-- Kill: least skips nulls and finds min
+select least(null, 5, null, 3) as r;
+→ [{"r":3}]
+
+-- Kill: least with negative values
+select least(-10, -5, 0) as r;
+→ [{"r":-10}]
+
+-- Kill: greatest with negative values
+select greatest(-10, -5, 0) as r;
+→ [{"r":0}]
+
+-- Kill: single-element greatest/least
+select greatest(7) as g, least(7) as l;
+→ [{"g":7,"l":7}]
+
+-- ============================================================
+-- string.ts: length
+-- ============================================================
+
+-- Kill: length(null) returns null
+select length(v_text) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: length('') returns 0, not null
+select length(v_text) as r from mk where id = 2;
+→ [{"r":0}]
+
+-- Kill: length of non-empty string
+select length(v_text) as r from mk where id = 3;
+→ [{"r":5}]
+
+-- ============================================================
+-- string.ts: substr
+-- ============================================================
+
+-- Kill: substr(null, ...) returns null
+select substr(v_text, 1) as r from mk where id = 1;
+→ [{"r":null}]
+
+-- Kill: substr with null start returns null
+select substr('hello', null) as r;
+→ [{"r":null}]
+
+-- Kill: substr start=1 returns full string (1-based indexing)
+select substr('hello', 1) as r;
+→ [{"r":"hello"}]
+
+-- Kill: substr start=1 len=0 returns empty string
+select substr('hello', 1, 0) as r;
+→ [{"r":""}]
+
+-- Kill: substr on empty string
+select substr('', 1) as r;
+→ [{"r":""}]
+
+-- Kill: substr start past end of string
+select substr('hi', 5) as r;
+→ [{"r":""}]
+
+-- Kill: substr start=1 len=1 gets first character
+select substr('hello', 1, 1) as r;
+→ [{"r":"h"}]
+
+-- Kill: substr len longer than remaining string
+select substr('hello', 3, 100) as r;
+→ [{"r":"llo"}]
+
+-- ============================================================
+-- string.ts: replace
+-- ============================================================
+
+-- Kill: all args null returns null
+select replace(null, null, null) as r;
+→ [{"r":null}]
+
+-- Kill: null string returns null
+select replace(null, 'a', 'b') as r;
+→ [{"r":null}]
+
+-- Kill: null pattern returns null
+select replace('hello', null, 'b') as r;
+→ [{"r":null}]
+
+-- Kill: null replacement returns null
+select replace('hello', 'l', null) as r;
+→ [{"r":null}]
+
+-- Kill: empty pattern returns original string unchanged
+select replace('hello', '', 'x') as r;
+→ [{"r":"hello"}]
+
+-- Kill: replace when pattern not found returns original
+select replace('hello', 'xyz', 'abc') as r;
+→ [{"r":"hello"}]
+
+-- Kill: replace all occurrences (not just first)
+select replace('banana', 'a', 'o') as r;
+→ [{"r":"bonono"}]
+
+-- Kill: replace with empty replacement (deletion)
+select replace('hello world', ' world', '') as r;
+→ [{"r":"hello"}]
+
+-- ============================================================
+-- string.ts: instr
+-- ============================================================
+
+-- Kill: null propagation
+select instr(null, 'a') as r;
+→ [{"r":null}]
+
+select instr('hello', null) as r;
+→ [{"r":null}]
+
+-- Kill: found at position 1 (not 0)
+select instr('hello', 'h') as r;
+→ [{"r":1}]
+
+-- Kill: found at last position
+select instr('hello', 'o') as r;
+→ [{"r":5}]
+
+-- Kill: not found returns 0 (not -1, not null)
+select instr('hello', 'z') as r;
+→ [{"r":0}]
+
+-- Kill: empty substring returns 0
+select instr('hello', '') as r;
+→ [{"r":0}]
+
+-- Kill: empty string searched returns 0
+select instr('', 'a') as r;
+→ [{"r":0}]
+
+-- Kill: both empty returns 0
+select instr('', '') as r;
+→ [{"r":0}]
+
+-- ============================================================
+-- string.ts: trim / ltrim / rtrim
+-- ============================================================
+
+-- Kill: trim(null) returns null
+select trim(null) as r;
+→ [{"r":null}]
+
+-- Kill: ltrim(null) returns null
+select ltrim(null) as r;
+→ [{"r":null}]
+
+-- Kill: rtrim(null) returns null
+select rtrim(null) as r;
+→ [{"r":null}]
+
+-- Kill: trim whitespace from both sides
+select trim('  hello  ') as r;
+→ [{"r":"hello"}]
+
+-- Kill: ltrim removes left only
+select ltrim('  hello  ') as r;
+→ [{"r":"hello  "}]
+
+-- Kill: rtrim removes right only
+select rtrim('  hello  ') as r;
+→ [{"r":"  hello"}]
+
+-- Kill: trim with no whitespace returns same string
+select trim('hello') as r;
+→ [{"r":"hello"}]
+
+-- Kill: trim empty string returns empty
+select trim('') as r;
+→ [{"r":""}]
+
+-- Kill: trim with custom chars null → default whitespace trim
+select trim('  hello  ', null) as r;
+→ [{"r":"hello"}]
+
+-- Kill: ltrim with custom chars
+select ltrim('xxxhello', 'x') as r;
+→ [{"r":"hello"}]
+
+-- Kill: rtrim with custom chars
+select rtrim('helloyyy', 'y') as r;
+→ [{"r":"hello"}]
+
+-- ============================================================
+-- string.ts: lower / upper
+-- ============================================================
+
+-- Kill: lower(null) returns null
+select lower(null) as r;
+→ [{"r":null}]
+
+-- Kill: upper(null) returns null
+select upper(null) as r;
+→ [{"r":null}]
+
+-- Kill: lower of empty string
+select lower('') as r;
+→ [{"r":""}]
+
+-- Kill: upper of empty string
+select upper('') as r;
+→ [{"r":""}]
+
+-- Kill: lower of already-lowercase
+select lower('hello') as r;
+→ [{"r":"hello"}]
+
+-- Kill: upper of already-uppercase
+select upper('HELLO') as r;
+→ [{"r":"HELLO"}]
+
+-- Kill: lower on non-string returns null (not coerced)
+select lower(v_int) as r from mk where id = 4;
+→ [{"r":null}]
+
+-- Kill: upper on non-string returns null
+select upper(v_int) as r from mk where id = 4;
+→ [{"r":null}]
+
+-- ============================================================
+-- string.ts: reverse
+-- ============================================================
+
+-- Kill: reverse of null returns null (non-string → null)
+select reverse(null) as r;
+→ [{"r":null}]
+
+-- Kill: reverse of empty string
+select reverse('') as r;
+→ [{"r":""}]
+
+-- Kill: reverse of single character
+select reverse('x') as r;
+→ [{"r":"x"}]
+
+-- Kill: reverse of palindrome unchanged
+select reverse('aba') as r;
+→ [{"r":"aba"}]
+
+-- ============================================================
+-- string.ts: like / glob null propagation
+-- ============================================================
+
+-- Kill: like with null text returns null
+select like('a%', null) as r;
+→ [{"r":null}]
+
+-- Kill: like with null pattern returns null
+select like(null, 'abc') as r;
+→ [{"r":null}]
+
+-- Kill: glob with null text returns null
+select glob('a*', null) as r;
+→ [{"r":null}]
+
+-- Kill: glob with null pattern returns null
+select glob(null, 'abc') as r;
+→ [{"r":null}]
+
+-- ============================================================
+-- string.ts: lpad / rpad
+-- ============================================================
+
+-- Kill: lpad with null string returns null
+select lpad(null, 5, '*') as r;
+→ [{"r":null}]
+
+-- Kill: rpad with null string returns null
+select rpad(null, 5, '*') as r;
+→ [{"r":null}]
+
+-- Kill: lpad when string already at target length (no padding needed)
+select lpad('hello', 5, '*') as r;
+→ [{"r":"hello"}]
+
+-- Kill: rpad when string already at target length
+select rpad('hello', 5, '*') as r;
+→ [{"r":"hello"}]
+
+-- Kill: lpad shorter than target
+select lpad('hi', 4, '-') as r;
+→ [{"r":"--hi"}]
+
+-- Kill: rpad shorter than target
+select rpad('hi', 4, '-') as r;
+→ [{"r":"hi--"}]
+
+-- ============================================================
+-- aggregate.ts: count(*) vs count(X) on empty table
+-- ============================================================
+
+create table mk_agg_empty (id integer primary key, val integer null);
+
+-- Kill: count(*) on empty table must be 0
+select count(*) as r from mk_agg_empty;
+→ [{"r":0}]
+
+-- Kill: count(x) on empty table must be 0
+select count(val) as r from mk_agg_empty;
+→ [{"r":0}]
+
+-- Kill: sum on empty table must be null (not 0)
+select sum(val) as r from mk_agg_empty;
+→ [{"r":null}]
+
+-- Kill: avg on empty table must be null
+select avg(val) as r from mk_agg_empty;
+→ [{"r":null}]
+
+-- Kill: min on empty table must be null
+select min(val) as r from mk_agg_empty;
+→ [{"r":null}]
+
+-- Kill: max on empty table must be null
+select max(val) as r from mk_agg_empty;
+→ [{"r":null}]
+
+-- Kill: total on empty table must be 0.0 (not null — SQLite compat)
+select total(val) as r from mk_agg_empty;
+→ [{"r":0}]
+
+drop table mk_agg_empty;
+
+-- ============================================================
+-- aggregate.ts: count(X) skips nulls
+-- ============================================================
+
+create table mk_agg_nulls (id integer primary key, val integer null);
+insert into mk_agg_nulls values (1, null), (2, 10), (3, null), (4, 20);
+
+-- Kill: count(*) counts all rows including null
+select count(*) as r from mk_agg_nulls;
+→ [{"r":4}]
+
+-- Kill: count(val) skips nulls
+select count(val) as r from mk_agg_nulls;
+→ [{"r":2}]
+
+-- Kill: sum skips nulls
+select sum(val) as r from mk_agg_nulls;
+→ [{"r":30}]
+
+-- Kill: avg skips nulls (30/2 = 15)
+select avg(val) as r from mk_agg_nulls;
+→ [{"r":15}]
+
+-- Kill: min skips nulls
+select min(val) as r from mk_agg_nulls;
+→ [{"r":10}]
+
+-- Kill: max skips nulls
+select max(val) as r from mk_agg_nulls;
+→ [{"r":20}]
+
+drop table mk_agg_nulls;
+
+-- ============================================================
+-- aggregate.ts: all-null values
+-- ============================================================
+
+create table mk_agg_allnull (id integer primary key, val integer null);
+insert into mk_agg_allnull values (1, null), (2, null);
+
+-- Kill: sum of all-null is null (not 0)
+select sum(val) as r from mk_agg_allnull;
+→ [{"r":null}]
+
+-- Kill: avg of all-null is null
+select avg(val) as r from mk_agg_allnull;
+→ [{"r":null}]
+
+-- Kill: min of all-null is null
+select min(val) as r from mk_agg_allnull;
+→ [{"r":null}]
+
+-- Kill: max of all-null is null
+select max(val) as r from mk_agg_allnull;
+→ [{"r":null}]
+
+-- Kill: total of all-null is 0 (not null — total never returns null)
+select total(val) as r from mk_agg_allnull;
+→ [{"r":0}]
+
+-- Kill: count(val) of all-null is 0
+select count(val) as r from mk_agg_allnull;
+→ [{"r":0}]
+
+-- Kill: count(*) counts rows regardless of null values
+select count(*) as r from mk_agg_allnull;
+→ [{"r":2}]
+
+drop table mk_agg_allnull;
+
+-- ============================================================
+-- aggregate.ts: single-value aggregates
+-- ============================================================
+
+create table mk_agg_one (id integer primary key, val real);
+insert into mk_agg_one values (1, 7.5);
+
+-- Kill: sum of single value
+select sum(val) as r from mk_agg_one;
+→ [{"r":7.5}]
+
+-- Kill: avg of single value equals the value itself
+select avg(val) as r from mk_agg_one;
+→ [{"r":7.5}]
+
+-- Kill: min == max for single value
+select min(val) as r, max(val) as r2 from mk_agg_one;
+→ [{"r":7.5,"r2":7.5}]
+
+-- Kill: var_pop of single value is 0
+select var_pop(val) as r from mk_agg_one;
+→ [{"r":0}]
+
+-- Kill: var_samp of single value is null (needs n > 1)
+select var_samp(val) as r from mk_agg_one;
+→ [{"r":null}]
+
+-- Kill: stddev_pop of single value is 0
+select stddev_pop(val) as r from mk_agg_one;
+→ [{"r":0}]
+
+-- Kill: stddev_samp of single value is null
+select stddev_samp(val) as r from mk_agg_one;
+→ [{"r":null}]
+
+drop table mk_agg_one;
+
+-- ============================================================
+-- aggregate.ts: statistical functions on empty set
+-- ============================================================
+
+create table mk_agg_stat_empty (id integer primary key, val real null);
+
+select var_pop(val) as r from mk_agg_stat_empty;
+→ [{"r":null}]
+
+select var_samp(val) as r from mk_agg_stat_empty;
+→ [{"r":null}]
+
+select stddev_pop(val) as r from mk_agg_stat_empty;
+→ [{"r":null}]
+
+select stddev_samp(val) as r from mk_agg_stat_empty;
+→ [{"r":null}]
+
+drop table mk_agg_stat_empty;
+
+-- ============================================================
+-- aggregate.ts: two-value var_samp (not null, unlike single-value)
+-- ============================================================
+
+create table mk_agg_two (id integer primary key, val real);
+insert into mk_agg_two values (1, 10.0), (2, 20.0);
+
+-- var_samp([10, 20]) = (sumSq - sum*sum/n) / (n-1)
+-- = (100+400 - 900/2) / 1 = (500 - 450) / 1 = 50
+select var_samp(val) as r from mk_agg_two;
+→ [{"r":50}]
+
+-- stddev_samp([10, 20]) = sqrt(50)
+select stddev_samp(val) as r from mk_agg_two;
+→ [{"r":7.0710678118654755}]
+
+drop table mk_agg_two;
+
+-- ============================================================
+-- aggregate.ts: total always returns 0 for non-numeric
+-- ============================================================
+
+create table mk_total_text (id integer primary key, val text);
+insert into mk_total_text values (1, 'hello'), (2, 'world');
+
+-- Kill: total of non-numeric text → 0 (NaN treated as 0)
+select total(val) as r from mk_total_text;
+→ [{"r":0}]
+
+drop table mk_total_text;
+
+-- ============================================================
+-- aggregate.ts: total with mixed numeric strings
+-- ============================================================
+
+create table mk_total_mixed (id integer primary key, val text null);
+insert into mk_total_mixed values (1, '10'), (2, 'abc'), (3, '20'), (4, null);
+
+-- Kill: total coerces numeric strings, treats non-numeric as 0, skips null
+select total(val) as r from mk_total_mixed;
+→ [{"r":30}]
+
+drop table mk_total_mixed;
+
+-- ============================================================
+-- aggregate.ts: group_concat
+-- ============================================================
+
+create table mk_gc (id integer primary key, val text null);
+insert into mk_gc values (1, 'a'), (2, null), (3, 'b'), (4, 'c');
+
+-- Kill: group_concat with default separator (comma)
+select group_concat(val) as r from mk_gc;
+→ [{"r":"a,b,c"}]
+
+-- Kill: group_concat skips nulls
+select group_concat(val, '-') as r from mk_gc;
+→ [{"r":"a-b-c"}]
+
+-- Kill: group_concat empty separator joins directly
+select group_concat(val, '') as r from mk_gc;
+→ [{"r":"abc"}]
+
+drop table mk_gc;
+
+-- ============================================================
+-- aggregate.ts: group_concat all nulls returns null
+-- ============================================================
+
+create table mk_gc_null (id integer primary key, val text null);
+insert into mk_gc_null values (1, null), (2, null);
+
+select group_concat(val) as r from mk_gc_null;
+→ [{"r":null}]
+
+drop table mk_gc_null;
+
+-- ============================================================
+-- conversion.ts: null handling for all conversion functions
+-- ============================================================
+
+select integer(null) as r;
+→ [{"r":null}]
+
+select real(null) as r;
+→ [{"r":null}]
+
+select text(null) as r;
+→ [{"r":null}]
+
+select boolean(null) as r;
+→ [{"r":null}]
+
+-- ============================================================
+-- conversion.ts: identity conversions (already correct type)
+-- ============================================================
+
+select integer(42) as r;
+→ [{"r":42}]
+
+select real(3.14) as r;
+→ [{"r":3.14}]
+
+select text('hello') as r;
+→ [{"r":"hello"}]
+
+select boolean(true) as r;
+→ [{"r":true}]
+
+select boolean(false) as r;
+→ [{"r":false}]
+
+-- ============================================================
+-- conversion.ts: cross-type conversions
+-- ============================================================
+
+-- Kill: integer from real truncates
+select integer(3.9) as r;
+→ [{"r":3}]
+
+-- Kill: integer from negative real truncates toward zero
+select integer(-3.9) as r;
+→ [{"r":-3}]
+
+-- Kill: integer from string
+select integer('42') as r;
+→ [{"r":42}]
+
+-- Kill: integer from true/false
+select integer(true) as r;
+→ [{"r":1}]
+
+select integer(false) as r;
+→ [{"r":0}]
+
+-- Kill: integer(0) is not null
+select integer(0) as r;
+→ [{"r":0}]
+
+-- Kill: real from integer
+select real(42) as r;
+→ [{"r":42}]
+
+-- Kill: real from string
+select real('3.14') as r;
+→ [{"r":3.14}]
+
+-- Kill: text from integer
+select text(42) as r;
+→ [{"r":"42"}]
+
+-- Kill: text from real
+select text(3.14) as r;
+→ [{"r":"3.14"}]
+
+-- Kill: text from boolean
+select text(true) as r;
+→ [{"r":"true"}]
+
+select text(false) as r;
+→ [{"r":"false"}]
+
+-- Kill: text of zero
+select text(0) as r;
+→ [{"r":"0"}]
+
+-- Kill: text of empty string is empty string
+select text('') as r;
+→ [{"r":""}]
+
+-- Kill: boolean from 1 and 0
+select boolean(1) as r;
+→ [{"r":true}]
+
+select boolean(0) as r;
+→ [{"r":false}]
+
+-- Kill: boolean from 'yes'/'no'
+select boolean('yes') as r;
+→ [{"r":true}]
+
+select boolean('no') as r;
+→ [{"r":false}]
+
+-- Kill: boolean from 'on'/'off'
+select boolean('on') as r;
+→ [{"r":true}]
+
+select boolean('off') as r;
+→ [{"r":false}]
+
+-- ============================================================
+-- conversion.ts: error paths
+-- ============================================================
+
+select integer('not_a_number');
+-- error: Cannot convert to INTEGER
+
+select real('not_a_number');
+-- error: Cannot convert to REAL
+
+select boolean('maybe');
+-- error: Cannot convert to BOOLEAN
+
+-- ============================================================
+-- CLEANUP
+-- ============================================================
+
+drop table mk;

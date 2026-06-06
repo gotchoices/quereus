@@ -1,0 +1,254 @@
+-- committed-snapshot.sqllogic - Testing committed.tablename pseudo-schema access
+
+-- ===================================
+-- Basic: committed.* returns pre-transaction data
+-- ===================================
+
+CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);
+INSERT INTO accounts VALUES (1, 100);
+INSERT INTO accounts VALUES (2, 200);
+COMMIT;
+
+-- Within a transaction, committed.accounts should show original data
+BEGIN;
+UPDATE accounts SET balance = 50 WHERE id = 1;
+SELECT balance FROM accounts WHERE id = 1;
+→ [{ "balance": 50 }]
+SELECT balance FROM committed.accounts WHERE id = 1;
+→ [{ "balance": 100 }]
+COMMIT;
+
+-- After commit, committed.accounts shows the new committed state
+SELECT balance FROM committed.accounts WHERE id = 1;
+→ [{ "balance": 50 }]
+
+DROP TABLE accounts;
+-- run
+
+-- ===================================
+-- committed.* outside a transaction returns current data
+-- ===================================
+
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO t1 VALUES (1, 'hello');
+COMMIT;
+
+-- Outside a transaction (autocommit), committed should match current
+SELECT val FROM committed.t1 WHERE id = 1;
+→ [{ "val": "hello" }]
+
+DROP TABLE t1;
+-- run
+
+-- ===================================
+-- committed.* is read-only (INSERT error)
+-- ===================================
+
+CREATE TABLE ro_test (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO ro_test VALUES (1, 'x');
+-- run
+
+INSERT INTO committed.ro_test VALUES (2, 'y');
+-- error: Cannot modify committed-state table 'committed.ro_test'
+
+DROP TABLE ro_test;
+-- run
+
+-- ===================================
+-- committed.* is read-only (UPDATE error)
+-- ===================================
+
+CREATE TABLE ro_test2 (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO ro_test2 VALUES (1, 'x');
+-- run
+
+UPDATE committed.ro_test2 SET val = 'z' WHERE id = 1;
+-- error: Cannot modify committed-state table 'committed.ro_test2'
+
+DROP TABLE ro_test2;
+-- run
+
+-- ===================================
+-- committed.* is read-only (DELETE error)
+-- ===================================
+
+CREATE TABLE ro_test3 (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO ro_test3 VALUES (1, 'x');
+-- run
+
+DELETE FROM committed.ro_test3 WHERE id = 1;
+-- error: Cannot modify committed-state table 'committed.ro_test3'
+
+DROP TABLE ro_test3;
+-- run
+
+-- ===================================
+-- JOIN between current and committed state
+-- ===================================
+
+CREATE TABLE products (id INTEGER PRIMARY KEY, price INTEGER);
+INSERT INTO products VALUES (1, 10);
+INSERT INTO products VALUES (2, 20);
+COMMIT;
+
+BEGIN;
+UPDATE products SET price = 15 WHERE id = 1;
+UPDATE products SET price = 25 WHERE id = 2;
+
+-- Join current with committed to see price changes
+SELECT p.id, p.price AS new_price, cp.price AS old_price
+FROM products p
+JOIN committed.products cp ON p.id = cp.id
+ORDER BY p.id;
+→ [{ "id": 1, "new_price": 15, "old_price": 10 }, { "id": 2, "new_price": 25, "old_price": 20 }]
+COMMIT;
+
+DROP TABLE products;
+-- run
+
+-- ===================================
+-- committed.* with multiple tables
+-- ===================================
+
+CREATE TABLE t_a (id INTEGER PRIMARY KEY, val INTEGER);
+CREATE TABLE t_b (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO t_a VALUES (1, 100);
+INSERT INTO t_b VALUES (1, 200);
+COMMIT;
+
+BEGIN;
+UPDATE t_a SET val = 111 WHERE id = 1;
+UPDATE t_b SET val = 222 WHERE id = 1;
+
+SELECT a.val AS a_new, ca.val AS a_old, b.val AS b_new, cb.val AS b_old
+FROM t_a a
+JOIN committed.t_a ca ON a.id = ca.id
+JOIN t_b b ON a.id = b.id
+JOIN committed.t_b cb ON b.id = cb.id
+WHERE a.id = 1;
+→ [{ "a_new": 111, "a_old": 100, "b_new": 222, "b_old": 200 }]
+COMMIT;
+
+DROP TABLE t_b;
+DROP TABLE t_a;
+-- run
+
+-- ===================================
+-- Savepoint: committed state doesn't change after savepoints
+-- ===================================
+
+CREATE TABLE sp_test (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO sp_test VALUES (1, 10);
+COMMIT;
+
+BEGIN;
+UPDATE sp_test SET val = 20 WHERE id = 1;
+SAVEPOINT sp1;
+UPDATE sp_test SET val = 30 WHERE id = 1;
+
+-- committed.sp_test should still show the pre-transaction value
+SELECT val FROM committed.sp_test WHERE id = 1;
+→ [{ "val": 10 }]
+
+-- Current state shows latest update
+SELECT val FROM sp_test WHERE id = 1;
+→ [{ "val": 30 }]
+
+ROLLBACK TO SAVEPOINT sp1;
+
+-- committed.sp_test still shows original
+SELECT val FROM committed.sp_test WHERE id = 1;
+→ [{ "val": 10 }]
+
+-- Current state shows value before savepoint
+SELECT val FROM sp_test WHERE id = 1;
+→ [{ "val": 20 }]
+
+COMMIT;
+
+DROP TABLE sp_test;
+-- run
+
+-- ===================================
+-- Assertion with committed reference: detect balance decrease
+-- ===================================
+
+CREATE TABLE accts (id INTEGER PRIMARY KEY, balance INTEGER);
+INSERT INTO accts VALUES (1, 100);
+INSERT INTO accts VALUES (2, 200);
+COMMIT;
+
+-- Assertion: no account's balance may decrease
+CREATE ASSERTION no_balance_decrease CHECK (NOT EXISTS (
+  SELECT 1 FROM accts a
+  JOIN committed.accts ca ON a.id = ca.id
+  WHERE a.balance < ca.balance
+));
+-- run
+
+-- Valid: increase balance
+BEGIN;
+UPDATE accts SET balance = 150 WHERE id = 1;
+COMMIT;
+-- run
+
+SELECT balance FROM accts WHERE id = 1;
+→ [{ "balance": 150 }]
+
+-- Invalid: decrease balance
+BEGIN;
+UPDATE accts SET balance = 50 WHERE id = 1;
+COMMIT;
+-- error: Integrity assertion failed: no_balance_decrease
+
+-- State should be unchanged
+SELECT balance FROM accts WHERE id = 1;
+→ [{ "balance": 150 }]
+
+DROP ASSERTION no_balance_decrease;
+DROP TABLE accts;
+-- run
+
+-- ===================================
+-- Assertion with committed reference: passes when constraint holds
+-- ===================================
+
+CREATE TABLE vals (id INTEGER PRIMARY KEY, v INTEGER);
+INSERT INTO vals VALUES (1, 10);
+COMMIT;
+
+-- Assertion: values can only increase or stay the same
+CREATE ASSERTION monotonic CHECK (NOT EXISTS (
+  SELECT 1 FROM vals curr
+  JOIN committed.vals prev ON curr.id = prev.id
+  WHERE curr.v < prev.v
+));
+-- run
+
+-- Equal value: OK
+BEGIN;
+UPDATE vals SET v = 10 WHERE id = 1;
+COMMIT;
+-- run
+
+-- Increase: OK
+BEGIN;
+UPDATE vals SET v = 20 WHERE id = 1;
+COMMIT;
+-- run
+
+SELECT v FROM vals WHERE id = 1;
+→ [{ "v": 20 }]
+
+-- New row (no committed counterpart): OK
+BEGIN;
+INSERT INTO vals VALUES (2, 5);
+COMMIT;
+-- run
+
+SELECT v FROM vals WHERE id = 2;
+→ [{ "v": 5 }]
+
+DROP ASSERTION monotonic;
+DROP TABLE vals;
+-- run

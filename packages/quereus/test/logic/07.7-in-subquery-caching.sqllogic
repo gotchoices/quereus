@@ -1,0 +1,60 @@
+-- in-subquery-caching.sqllogic - Testing IN subquery materialization via CacheNode
+
+-- Setup tables
+CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, val INTEGER);
+CREATE TABLE categories (name TEXT PRIMARY KEY);
+
+INSERT INTO categories VALUES ('A'), ('B'), ('C');
+INSERT INTO items VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'C', 40), (5, 'A', 50);
+
+-- Basic uncorrelated IN subquery (should be cached)
+SELECT id FROM items WHERE category IN (SELECT name FROM categories WHERE name <> 'C') ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3},{"id":5}]
+
+-- IN subquery with NULLs in the subquery result set
+-- SQL three-valued logic: if value not found and NULLs present, result is NULL (not FALSE)
+CREATE TABLE nullable_ids (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO nullable_ids VALUES (1, 1), (2, NULL), (3, 3);
+
+-- id=2 is not in {1, NULL, 3}, but NULL is present, so result is NULL (not TRUE) — excluded from WHERE
+SELECT id FROM items WHERE id IN (SELECT val FROM nullable_ids) ORDER BY id;
+→ [{"id":1},{"id":3}]
+
+-- NOT IN with NULLs — any NULL in subquery makes NOT IN return NULL for non-matching rows
+-- Only rows whose id IS in the set (after ignoring NULLs) would return FALSE for IN, i.e., TRUE for NOT IN
+-- But since NULL is present, non-matching rows get NULL (not FALSE) for IN, so NOT IN is NULL (not TRUE)
+SELECT id FROM items WHERE id NOT IN (SELECT val FROM nullable_ids) ORDER BY id;
+→ []
+
+-- IN subquery returning empty set (should return no rows)
+SELECT id FROM items WHERE id IN (SELECT val FROM nullable_ids WHERE val > 100) ORDER BY id;
+→ []
+
+-- Correlated IN subquery — must NOT get CacheNode (should still work correctly)
+SELECT c.name FROM categories c WHERE c.name IN (SELECT i.category FROM items i WHERE i.val > 20 AND i.category = c.name) ORDER BY c.name;
+→ [{"name":"A"},{"name":"B"},{"name":"C"}]
+
+-- Uncorrelated IN subquery inside a CTE-based query (the motivating pattern)
+WITH RECURSIVE
+  nums(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 5
+  )
+SELECT id FROM items WHERE id IN (SELECT n FROM nums) ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+
+-- Nested: uncorrelated IN subquery referencing a CTE that itself is recursive
+WITH RECURSIVE
+  tree(id) AS (
+    SELECT id FROM items WHERE id = 1
+    UNION ALL
+    SELECT i.id FROM items i JOIN tree t ON i.id = t.id + 1 WHERE i.id <= 3
+  )
+SELECT val FROM items WHERE id IN (SELECT id FROM tree) ORDER BY val;
+→ [{"val":10},{"val":20},{"val":30}]
+
+-- Cleanup
+DROP TABLE nullable_ids;
+DROP TABLE items;
+DROP TABLE categories;

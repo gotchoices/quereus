@@ -1,0 +1,86 @@
+-- 18-json-string-escapes.sqllogic
+-- adapted from SQLite test/json101.test (json101-1.2 and surrounding escape coverage)
+-- Standard JSON string-escape sequences round-trip through JSON construction
+-- and quoting. Quereus uses native JSON.parse / JSON.stringify, so the standard
+-- two-character escapes (\" \\ \/ \b \f \n \r \t) and \uXXXX must round-trip.
+
+-- ============================================================
+-- json_quote: escape characters in strings
+-- ============================================================
+
+SELECT json_quote('String "\ Test');
+→ [{"json_quote('String \"\\ Test')":"\"String \\\"\\\\ Test\""}]
+
+-- Double quote (use char(92) to obtain a literal backslash safely)
+SELECT json_quote('he said "hi"');
+→ [{"json_quote('he said \"hi\"')":"\"he said \\\"hi\\\"\""}]
+
+-- Newline character inside string literal (real LF)
+SELECT json_quote('a
+b');
+→ [{"json_quote('a\nb')":"\"a\\nb\""}]
+
+-- ============================================================
+-- json_array: round-trip strings with embedded escapes
+-- ============================================================
+
+-- Embedded double-quote in array element
+SELECT json_array('he said "hi"');
+→ [["he said \"hi\""]]
+
+SELECT json_array('a\\b');
+→ [["a\\\\b"]]
+
+-- Embedded forward slash (no escape required)
+SELECT json_array('a/b');
+→ [["a/b"]]
+
+-- ============================================================
+-- json_extract: parse strings with standard escape sequences
+-- ============================================================
+
+SELECT json_extract('{"a":"he said \"hi\""}', '$.a');
+→ ["he said \"hi\""]
+
+SELECT json_extract('{"a":"a\\b"}', '$.a');
+→ ["a\\b"]
+
+SELECT json_extract('{"a":"line1\nline2"}', '$.a');
+→ ["line1\nline2"]
+
+SELECT json_extract('{"a":"col1\tcol2"}', '$.a');
+→ ["col1\tcol2"]
+
+-- \uXXXX: ASCII letter (no backslash so not affected)
+SELECT json_extract('{"a":"A"}', '$.a');
+→ ["A"]
+
+-- \uXXXX: Latin-1 supplement (literal char in SQL source)
+SELECT json_extract('{"a":"é"}', '$.a');
+→ ["é"]
+
+-- Surrogate pair: U+1D11E (musical G clef, literal)
+SELECT json_extract('{"a":"𝄞"}', '$.a');
+→ ["𝄞"]
+
+-- ============================================================
+-- json_valid: malformed escape sequences rejected
+-- ============================================================
+
+SELECT json_valid('{"a":"\xZZ"}');
+→ [{"json_valid('{\"a\":\"\\xZZ\"}')":false}]
+
+SELECT json_valid('{"a":"\u00"}');
+→ [{"json_valid('{\"a\":\"\\u00\"}')":false}]
+
+-- ============================================================
+-- json_array_length on a string containing a structural character
+-- ============================================================
+
+-- Comma inside a quoted string must not be treated as element separator
+SELECT json_array_length('["a,b","c,d","e"]');
+→ [3]
+
+-- Bracket inside a quoted string must not break parsing
+SELECT json_array_length('["[","]","["]');
+→ [3]

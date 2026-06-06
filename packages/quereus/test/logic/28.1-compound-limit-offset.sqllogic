@@ -1,0 +1,143 @@
+-- adapted from SQLite test/select4.test, test/select8.test, test/select9.test,
+-- test/selectA.test, test/limit.test
+-- LIMIT / OFFSET applied to the result of a compound SELECT, plus VALUES
+-- clauses appearing as compound operands and compound queries used as
+-- derived tables.
+
+create table c_left (id integer primary key, val text);
+create table c_right (id integer primary key, val text);
+insert into c_left values (1, 'a'), (2, 'b'), (3, 'c');
+insert into c_right values (1, 'a'), (4, 'd'), (5, 'e');
+
+-- LIMIT applies to the dedup'd UNION result, not to the final branch alone
+select val from c_left union select val from c_right order by val limit 3;
+→ [{"val":"a"},{"val":"b"},{"val":"c"}]
+
+-- LIMIT + OFFSET on UNION
+select val from c_left union select val from c_right order by val limit 2 offset 1;
+→ [{"val":"b"},{"val":"c"}]
+
+-- UNION ALL retains duplicates; LIMIT trims the merged stream
+select val from c_left union all select val from c_right order by val limit 4;
+→ [{"val":"a"},{"val":"a"},{"val":"b"},{"val":"c"}]
+
+-- UNION ALL with OFFSET past duplicates
+select val from c_left union all select val from c_right order by val limit 100 offset 2;
+→ [{"val":"b"},{"val":"c"},{"val":"d"},{"val":"e"}]
+
+-- INTERSECT with LIMIT
+select val from c_left intersect select val from c_right limit 1;
+→ [{"val":"a"}]
+
+-- EXCEPT with LIMIT — left-only values, ordered, capped
+select val from c_left except select val from c_right order by val limit 2;
+→ [{"val":"b"},{"val":"c"}]
+
+-- LIMIT 0 on a compound — empty result regardless of operands
+select val from c_left union select val from c_right order by val limit 0;
+→ []
+
+-- Compound + LIMIT in DESC direction
+select val from c_left union select val from c_right order by val desc limit 2;
+→ [{"val":"e"},{"val":"d"}]
+
+drop table c_right;
+drop table c_left;
+
+-- =============================================================================
+-- VALUES clause as compound operand
+-- =============================================================================
+
+-- VALUES UNION VALUES — orthogonal QueryExpr surface now accepts bare
+-- VALUES at top-level participating in a compound. Column names are
+-- synthesized (`column_0`, `column_1`); a SELECT FROM (VALUES ...) form
+-- below preserves user-chosen aliases.
+values (1, 'x'), (2, 'y')
+union
+values (2, 'y'), (3, 'z')
+order by column_0;
+→ [{"column_0":1,"column_1":"x"},{"column_0":2,"column_1":"y"},{"column_0":3,"column_1":"z"}]
+
+-- Equivalent expressed via SELECT-FROM-VALUES wrapping with explicit aliases
+select c1, c2 from (values (1, 'x'), (2, 'y')) as v(c1, c2)
+union
+select c1, c2 from (values (2, 'y'), (3, 'z')) as v(c1, c2)
+order by c1;
+→ [{"c1":1,"c2":"x"},{"c1":2,"c2":"y"},{"c1":3,"c2":"z"}]
+
+-- VALUES INTERSECT VALUES (wrapped form)
+select c1 from (values (1), (2), (3)) as v(c1)
+intersect
+select c1 from (values (2), (4), (5)) as v(c1);
+→ [{"c1":2}]
+
+-- VALUES EXCEPT VALUES (wrapped form)
+select c1 from (values (1), (2), (3)) as v(c1)
+except
+select c1 from (values (2)) as v(c1)
+order by c1;
+→ [{"c1":1},{"c1":3}]
+
+-- Mixed: SELECT UNION VALUES (wrapped form)
+create table v_t (id integer primary key, val integer);
+insert into v_t values (1, 10), (2, 20);
+
+select val from v_t
+union
+select c1 as val from (values (30), (10)) as v(c1)
+order by val;
+→ [{"val":10},{"val":20},{"val":30}]
+
+drop table v_t;
+
+-- =============================================================================
+-- Compound SELECT used as derived table; outer WHERE / DISTINCT / GROUP BY apply
+-- =============================================================================
+
+create table dt_a (id integer primary key, k integer);
+create table dt_b (id integer primary key, k integer);
+insert into dt_a values (1, 10), (2, 20), (3, 30);
+insert into dt_b values (4, 20), (5, 30), (6, 40);
+
+-- UNION ALL inside FROM clause; outer WHERE filters the merged stream
+select k from (
+  select k from dt_a
+  union all
+  select k from dt_b
+) sub
+where k >= 20
+order by k;
+→ [{"k":20},{"k":20},{"k":30},{"k":30},{"k":40}]
+
+-- DISTINCT applied to the compound result via the outer SELECT
+select distinct k from (
+  select k from dt_a
+  union all
+  select k from dt_b
+) sub
+order by k;
+→ [{"k":10},{"k":20},{"k":30},{"k":40}]
+
+-- GROUP BY + COUNT(*) over compound merge
+select k, count(*) as cnt from (
+  select k from dt_a
+  union all
+  select k from dt_b
+) sub
+group by k
+order by k;
+→ [{"k":10,"cnt":1},{"k":20,"cnt":2},{"k":30,"cnt":2},{"k":40,"cnt":1}]
+
+-- LIMIT inside derived table is independent of the outer ORDER BY
+select k from (
+  select k from dt_a
+  union all
+  select k from dt_b
+  order by k
+  limit 3
+) sub
+order by k;
+→ [{"k":10},{"k":20},{"k":20}]
+
+drop table dt_b;
+drop table dt_a;

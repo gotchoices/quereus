@@ -1,0 +1,356 @@
+-- 107-temporal-arithmetic-mutation-kills.sqllogic
+-- Mutation-killing tests for temporal arithmetic and comparison paths in
+-- binary.ts and temporal-arithmetic.ts.
+
+-- ============================================================
+-- DATE + TIMESPAN arithmetic
+-- ============================================================
+
+-- Basic addition
+SELECT date('2024-01-15') + timespan('P10D') as result;
+→ [{"result":"2024-01-25"}]
+
+-- Month addition
+SELECT date('2024-01-15') + timespan('P3M') as result;
+→ [{"result":"2024-04-15"}]
+
+-- Year addition
+SELECT date('2024-01-15') + timespan('P1Y') as result;
+→ [{"result":"2025-01-15"}]
+
+-- Month rollover: Jan 31 + 1 month (leap year)
+SELECT date('2024-01-31') + timespan('P1M') as result;
+→ [{"result":"2024-02-29"}]
+
+-- Month rollover: Jan 31 + 1 month (non-leap year)
+SELECT date('2023-01-31') + timespan('P1M') as result;
+→ [{"result":"2023-02-28"}]
+
+-- Leap year: Feb 29 + 1 year
+SELECT date('2024-02-29') + timespan('P1Y') as result;
+→ [{"result":"2025-02-28"}]
+
+-- Negative timespan
+SELECT date('2024-03-15') + timespan('-P10D') as result;
+→ [{"result":"2024-03-05"}]
+
+-- Zero timespan is identity
+SELECT date('2024-06-15') + timespan('PT0S') as result;
+→ [{"result":"2024-06-15"}]
+
+-- ============================================================
+-- TIMESPAN + DATE (commutative)
+-- ============================================================
+
+SELECT timespan('P10D') + date('2024-01-15') as result;
+→ [{"result":"2024-01-25"}]
+
+SELECT timespan('P2M') + date('2024-01-31') as result;
+→ [{"result":"2024-03-31"}]
+
+-- ============================================================
+-- DATE - TIMESPAN
+-- ============================================================
+
+SELECT date('2024-01-25') - timespan('P10D') as result;
+→ [{"result":"2024-01-15"}]
+
+SELECT date('2024-03-31') - timespan('P1M') as result;
+→ [{"result":"2024-02-29"}]
+
+-- Subtracting negative timespan (effectively adds)
+SELECT date('2024-01-15') - timespan('-P10D') as result;
+→ [{"result":"2024-01-25"}]
+
+-- ============================================================
+-- DATE - DATE → TIMESPAN
+-- ============================================================
+
+-- Same date → zero
+SELECT date('2024-01-15') - date('2024-01-15') as result;
+→ [{"result":"PT0S"}]
+
+-- Later - earlier
+SELECT date('2024-01-25') - date('2024-01-15') as result;
+→ [{"result":"P10D"}]
+
+-- Earlier - later → negative
+SELECT date('2024-01-15') - date('2024-01-25') as result;
+→ [{"result":"-P10D"}]
+
+-- ============================================================
+-- DATETIME + TIMESPAN
+-- ============================================================
+
+SELECT datetime('2024-01-15T10:00:00') + timespan('PT2H') as result;
+→ [{"result":"2024-01-15T12:00:00"}]
+
+-- Crossing midnight
+SELECT datetime('2024-01-15T23:00:00') + timespan('PT2H') as result;
+→ [{"result":"2024-01-16T01:00:00"}]
+
+-- Month rollover in datetime
+SELECT datetime('2024-01-31T12:00:00') + timespan('P1M') as result;
+→ [{"result":"2024-02-29T12:00:00"}]
+
+-- Negative timespan on datetime
+SELECT datetime('2024-01-15T12:00:00') + timespan('-PT3H') as result;
+→ [{"result":"2024-01-15T09:00:00"}]
+
+-- ============================================================
+-- TIMESPAN + DATETIME (commutative)
+-- ============================================================
+
+SELECT timespan('PT2H') + datetime('2024-01-15T10:00:00') as result;
+→ [{"result":"2024-01-15T12:00:00"}]
+
+-- ============================================================
+-- DATETIME - TIMESPAN
+-- ============================================================
+
+SELECT datetime('2024-01-15T12:00:00') - timespan('PT2H') as result;
+→ [{"result":"2024-01-15T10:00:00"}]
+
+-- Across day boundary
+SELECT datetime('2024-01-16T01:00:00') - timespan('PT2H') as result;
+→ [{"result":"2024-01-15T23:00:00"}]
+
+-- ============================================================
+-- DATETIME - DATETIME → TIMESPAN
+-- ============================================================
+
+SELECT datetime('2024-01-15T12:00:00') - datetime('2024-01-15T12:00:00') as result;
+→ [{"result":"PT0S"}]
+
+SELECT datetime('2024-01-25T00:00:00') - datetime('2024-01-15T00:00:00') as result;
+→ [{"result":"P10D"}]
+
+-- ============================================================
+-- Mixed DATE/DATETIME subtraction
+-- ============================================================
+
+SELECT date('2024-01-25') - datetime('2024-01-15T10:00:00') as result;
+→ [{"result":"P10D"}]
+
+SELECT datetime('2024-01-25T10:00:00') - date('2024-01-15') as result;
+→ [{"result":"P10D"}]
+
+-- ============================================================
+-- TIME + TIMESPAN
+-- ============================================================
+
+SELECT time('10:00:00') + timespan('PT2H') as result;
+→ [{"result":"12:00:00"}]
+
+SELECT time('10:00:00') + timespan('PT30M') as result;
+→ [{"result":"10:30:00"}]
+
+-- Wrap around midnight
+SELECT time('23:00:00') + timespan('PT2H') as result;
+→ [{"result":"01:00:00"}]
+
+-- ============================================================
+-- TIMESPAN + TIME (commutative)
+-- ============================================================
+
+SELECT timespan('PT2H') + time('10:00:00') as result;
+→ [{"result":"12:00:00"}]
+
+-- ============================================================
+-- TIME - TIMESPAN
+-- ============================================================
+
+SELECT time('12:00:00') - timespan('PT2H') as result;
+→ [{"result":"10:00:00"}]
+
+-- Wrap before midnight
+SELECT time('01:00:00') - timespan('PT2H') as result;
+→ [{"result":"23:00:00"}]
+
+-- ============================================================
+-- TIME - TIME → TIMESPAN
+-- ============================================================
+
+SELECT time('12:00:00') - time('12:00:00') as result;
+→ [{"result":"PT0S"}]
+
+SELECT time('14:00:00') - time('12:00:00') as result;
+→ [{"result":"PT2H"}]
+
+SELECT time('10:00:00') - time('12:00:00') as result;
+→ [{"result":"-PT2H"}]
+
+-- ============================================================
+-- TIMESPAN + TIMESPAN
+-- ============================================================
+
+SELECT timespan('PT1H') + timespan('PT30M') as result;
+→ [{"result":"PT1H30M"}]
+
+SELECT timespan('P1D') + timespan('PT12H') as result;
+→ [{"result":"P1DT12H"}]
+
+-- Adding zero
+SELECT timespan('PT1H') + timespan('PT0S') as result;
+→ [{"result":"PT1H"}]
+
+-- ============================================================
+-- TIMESPAN - TIMESPAN
+-- ============================================================
+
+SELECT timespan('PT2H') - timespan('PT30M') as result;
+→ [{"result":"PT1H30M"}]
+
+-- Subtracting equal → zero
+SELECT timespan('PT1H') - timespan('PT1H') as result;
+→ [{"result":"PT0S"}]
+
+-- Subtracting larger → negative
+SELECT timespan('PT30M') - timespan('PT1H') as result;
+→ [{"result":"-PT30M"}]
+
+-- ============================================================
+-- TIMESPAN * NUMBER
+-- ============================================================
+
+SELECT timespan('PT1H') * 2 as result;
+→ [{"result":"PT7200S"}]
+
+SELECT timespan('PT1H') * 0.5 as result;
+→ [{"result":"PT1800S"}]
+
+-- Times zero
+SELECT timespan('PT1H') * 0 as result;
+→ [{"result":"PT0S"}]
+
+-- Calendar-unit scaling
+SELECT timespan('P1Y') * 2 as result;
+→ [{"result":"P2Y"}]
+
+-- ============================================================
+-- NUMBER * TIMESPAN (commutative)
+-- ============================================================
+
+SELECT 2 * timespan('PT1H') as result;
+→ [{"result":"PT7200S"}]
+
+SELECT 3 * timespan('P1M') as result;
+→ [{"result":"P3M"}]
+
+-- ============================================================
+-- TIMESPAN / NUMBER
+-- ============================================================
+
+SELECT timespan('PT2H') / 2 as result;
+→ [{"result":"PT3600S"}]
+
+-- Divide by zero returns null
+SELECT timespan('PT1H') / 0 as result;
+→ [{"result":null}]
+
+-- Calendar-unit division
+SELECT timespan('P6M') / 2 as result;
+→ [{"result":"P3M"}]
+
+-- ============================================================
+-- TIMESPAN / TIMESPAN → NUMBER
+-- ============================================================
+
+SELECT timespan('PT2H') / timespan('PT1H') as result;
+→ [{"result":2}]
+
+SELECT timespan('PT30M') / timespan('PT1H') as result;
+→ [{"result":0.5}]
+
+-- Divide by zero timespan → null
+SELECT timespan('PT1H') / timespan('PT0S') as result;
+→ [{"result":null}]
+
+-- Calendar unit ratio → null
+SELECT timespan('P1Y') / timespan('P1M') as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- NULL propagation — temporal operand with NULL
+-- ============================================================
+
+SELECT date('2024-01-15') + null as result;
+→ [{"result":null}]
+
+SELECT null + date('2024-01-15') as result;
+→ [{"result":null}]
+
+SELECT null - date('2024-01-15') as result;
+→ [{"result":null}]
+
+SELECT datetime('2024-01-15T12:00:00') + null as result;
+→ [{"result":null}]
+
+SELECT null + timespan('PT1H') as result;
+→ [{"result":null}]
+
+SELECT timespan('PT1H') * null as result;
+→ [{"result":null}]
+
+SELECT timespan('PT1H') / null as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- TIMESPAN comparisons (semantic, not lexicographic)
+-- ============================================================
+
+-- Create table with timespan column for comparison tests
+CREATE TABLE ts_test (id INTEGER PRIMARY KEY, dur TIMESPAN);
+INSERT INTO ts_test VALUES (1, 'PT30M'), (2, 'PT1H'), (3, 'PT2H'), (4, 'P1D'), (5, 'PT0S');
+-- run
+
+-- Equality with equivalent representations
+SELECT id FROM ts_test WHERE dur = 'PT60M';
+→ [{"id":2}]
+
+-- Less-than
+SELECT id FROM ts_test WHERE dur < 'PT1H' ORDER BY id;
+→ [{"id":1},{"id":5}]
+
+-- Greater-than
+SELECT id FROM ts_test WHERE dur > 'PT1H' ORDER BY id;
+→ [{"id":3},{"id":4}]
+
+-- Less-than-or-equal
+SELECT id FROM ts_test WHERE dur <= 'PT1H' ORDER BY id;
+→ [{"id":1},{"id":2},{"id":5}]
+
+-- Greater-than-or-equal
+SELECT id FROM ts_test WHERE dur >= 'PT1H' ORDER BY id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- Not-equal
+SELECT id FROM ts_test WHERE dur != 'PT1H' ORDER BY id;
+→ [{"id":1},{"id":3},{"id":4},{"id":5}]
+
+-- ORDER BY with timespans (lexicographic on stored TEXT — P1D < PT*)
+SELECT id, dur FROM ts_test ORDER BY dur;
+→ [{"id":4,"dur":"P1D"},{"id":5,"dur":"PT0S"},{"id":2,"dur":"PT1H"},{"id":3,"dur":"PT2H"},{"id":1,"dur":"PT30M"}]
+
+-- MIN / MAX aggregation (lexicographic)
+SELECT min(dur) as mn, max(dur) as mx FROM ts_test;
+→ [{"mn":"P1D","mx":"PT30M"}]
+
+DROP TABLE ts_test;
+
+-- ============================================================
+-- Temporal arithmetic in WHERE clause (ensures dispatch path is exercised)
+-- ============================================================
+
+CREATE TABLE events (id INTEGER PRIMARY KEY, dt DATE);
+INSERT INTO events VALUES (1, '2024-01-10'), (2, '2024-01-20'), (3, '2024-02-15');
+-- run
+
+-- Filter using date arithmetic
+SELECT id FROM events WHERE dt + timespan('P10D') > date('2024-01-25') ORDER BY id;
+→ [{"id":2},{"id":3}]
+
+SELECT id FROM events WHERE dt - timespan('P5D') < date('2024-01-10') ORDER BY id;
+→ [{"id":1}]
+
+DROP TABLE events;

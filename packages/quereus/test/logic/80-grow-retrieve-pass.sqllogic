@@ -1,0 +1,79 @@
+-- Test for grow-retrieve rule with the new pass system
+-- This test verifies that the structural pass correctly identifies and grows RetrieveNodes
+
+-- Create a simple memory table
+CREATE TABLE test_table (id INTEGER PRIMARY KEY, name TEXT, age INTEGER) USING memory;
+
+-- Insert test data
+INSERT INTO test_table VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35);
+
+-- Basic filter test - should work
+SELECT id, name FROM test_table WHERE id = 1;
+→ [{"id": 1, "name": "Alice"}]
+
+-- Range filter test
+SELECT name, age FROM test_table WHERE age > 25;
+→ [{"name": "Alice", "age": 30}, {"name": "Charlie", "age": 35}]
+
+-- Compound predicate test
+SELECT name FROM test_table WHERE id = 2 AND age > 20;
+→ [{"name": "Bob"}]
+
+-- Project with filter test
+SELECT name FROM test_table WHERE age < 35;
+→ [{"name": "Alice"}, {"name": "Bob"}]
+
+-- TODO: Once grow-retrieve is fully working with memory tables, these tests should verify
+-- that the Filter nodes are being pushed into the RetrieveNode boundary.
+
+-- Plan checks using query_plan()
+
+-- Equality predicate on primary key: IndexSeek handles the constraint directly (no FILTER needed)
+SELECT COUNT(*) AS filters FROM query_plan('SELECT id, name FROM test_table WHERE id = 1') WHERE op = 'FILTER';
+→ [{"filters": 0}]
+SELECT COUNT(*) AS accesses FROM query_plan('SELECT id, name FROM test_table WHERE id = 1') WHERE op = 'SEQSCAN' OR op = 'INDEXSCAN' OR op = 'INDEXSEEK';
+→ [{"accesses": 1}]
+
+-- Range predicate on non-indexed column should retain a FILTER above access
+SELECT COUNT(*) AS filters FROM query_plan('SELECT name, age FROM test_table WHERE age > 25') WHERE op = 'FILTER';
+→ [{"filters": 1}]
+SELECT COUNT(*) AS accesses FROM query_plan('SELECT name, age FROM test_table WHERE age > 25') WHERE op = 'SEQSCAN' OR op = 'INDEXSCAN' OR op = 'INDEXSEEK';
+→ [{"accesses": 1}]
+
+-- Sort placement test: ensure access still chosen and one filter remains (if any)
+SELECT COUNT(*) AS sorts FROM query_plan('SELECT name FROM test_table WHERE age > 20 ORDER BY name') WHERE op = 'SORT';
+→ [{"sorts": 1}]
+SELECT COUNT(*) AS accesses FROM query_plan('SELECT name FROM test_table WHERE age > 20 ORDER BY name') WHERE op = 'SEQSCAN' OR op = 'INDEXSCAN' OR op = 'INDEXSEEK';
+→ [{"accesses": 1}]
+
+-- Limit placement test: ensure access still chosen
+SELECT COUNT(*) AS accesses FROM query_plan('SELECT name FROM test_table WHERE age > 20 ORDER BY name LIMIT 2') WHERE op = 'SEQSCAN' OR op = 'INDEXSCAN' OR op = 'INDEXSEEK';
+→ [{"accesses": 1}]
+
+-- Query-based push-down smoke (TestQueryModule) when available (non-assertive)
+-- SELECT json_group_array(op) as ops FROM query_plan('SELECT id FROM test_table WHERE id = 2');
+-- → [{"ops":"[\"FILTER\",\"SEQSCAN\"]"}]
+
+-- Identity projection optimization: SELECT * should not create a PROJECT node
+SELECT COUNT(*) AS projects FROM query_plan('SELECT * FROM test_table') WHERE op = 'PROJECT';
+→ [{"projects": 0}]
+
+-- Identity projection: selecting all columns in order should also skip PROJECT
+SELECT COUNT(*) AS projects FROM query_plan('SELECT id, name, age FROM test_table') WHERE op = 'PROJECT';
+→ [{"projects": 0}]
+
+-- Non-identity: reordered columns SHOULD have PROJECT
+SELECT COUNT(*) AS projects FROM query_plan('SELECT age, name, id FROM test_table') WHERE op = 'PROJECT';
+→ [{"projects": 1}]
+
+-- Non-identity: partial columns SHOULD have PROJECT
+SELECT COUNT(*) AS projects FROM query_plan('SELECT id, name FROM test_table') WHERE op = 'PROJECT';
+→ [{"projects": 1}]
+
+-- Non-identity: alias SHOULD have PROJECT
+SELECT COUNT(*) AS projects FROM query_plan('SELECT id AS identifier, name, age FROM test_table') WHERE op = 'PROJECT';
+→ [{"projects": 1}]
+
+-- Non-identity: computed expression SHOULD have PROJECT
+SELECT COUNT(*) AS projects FROM query_plan('SELECT id, name, age + 1 FROM test_table') WHERE op = 'PROJECT';
+→ [{"projects": 1}]

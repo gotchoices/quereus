@@ -1,0 +1,182 @@
+-- 47-upsert.sqllogic - Testing UPSERT (ON CONFLICT) clauses
+
+-- === Setup ===
+
+DROP TABLE IF EXISTS upsert_test;
+CREATE TABLE upsert_test (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    count INTEGER DEFAULT 1
+);
+
+-- === Basic DO NOTHING tests ===
+
+-- Insert a row
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'first', 10);
+SELECT * FROM upsert_test;
+→ [{"id":1,"name":"first","count":10}]
+
+-- ON CONFLICT DO NOTHING - should silently skip duplicate
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'duplicate', 99)
+ON CONFLICT DO NOTHING;
+SELECT * FROM upsert_test;
+→ [{"id":1,"name":"first","count":10}]
+
+-- Insert a new row (no conflict) with ON CONFLICT DO NOTHING
+INSERT INTO upsert_test (id, name, count) VALUES (2, 'second', 20)
+ON CONFLICT DO NOTHING;
+SELECT * FROM upsert_test ORDER BY id;
+→ [{"id":1,"name":"first","count":10},{"id":2,"name":"second","count":20}]
+
+-- === Basic DO UPDATE tests ===
+
+-- Update on conflict using NEW.* to reference proposed values
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'updated_name', 100)
+ON CONFLICT DO UPDATE SET name = NEW.name, count = NEW.count;
+SELECT * FROM upsert_test ORDER BY id;
+→ [{"id":1,"name":"updated_name","count":100},{"id":2,"name":"second","count":20}]
+
+-- Update on conflict using unqualified column (existing value)
+INSERT INTO upsert_test (id, name, count) VALUES (2, 'ignored', 999)
+ON CONFLICT DO UPDATE SET count = count + 1;
+SELECT * FROM upsert_test ORDER BY id;
+→ [{"id":1,"name":"updated_name","count":100},{"id":2,"name":"second","count":21}]
+
+-- === Increment pattern ===
+
+-- Classic UPSERT increment pattern: increment if exists, insert if not
+INSERT INTO upsert_test (id, name, count) VALUES (3, 'new_entry', 1)
+ON CONFLICT DO UPDATE SET count = count + 1;
+SELECT * FROM upsert_test WHERE id = 3;
+→ [{"id":3,"name":"new_entry","count":1}]
+
+-- Now increment the existing row
+INSERT INTO upsert_test (id, name, count) VALUES (3, 'new_entry', 1)
+ON CONFLICT DO UPDATE SET count = count + 1;
+SELECT * FROM upsert_test WHERE id = 3;
+→ [{"id":3,"name":"new_entry","count":2}]
+
+-- Another increment
+INSERT INTO upsert_test (id, name, count) VALUES (3, 'ignored', 999)
+ON CONFLICT DO UPDATE SET count = count + 1;
+SELECT * FROM upsert_test WHERE id = 3;
+→ [{"id":3,"name":"new_entry","count":3}]
+
+-- === DO UPDATE with excluded.* (PostgreSQL compatibility) ===
+
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'via_excluded', 500)
+ON CONFLICT DO UPDATE SET name = excluded.name, count = excluded.count;
+SELECT * FROM upsert_test WHERE id = 1;
+→ [{"id":1,"name":"via_excluded","count":500}]
+
+-- === DO UPDATE with mixed references ===
+
+-- Combine existing values with proposed values
+INSERT INTO upsert_test (id, name, count) VALUES (2, 'combined', 100)
+ON CONFLICT DO UPDATE SET name = name || '_' || NEW.name, count = count + NEW.count;
+SELECT * FROM upsert_test WHERE id = 2;
+→ [{"id":2,"name":"second_combined","count":121}]
+
+-- === DO UPDATE with WHERE condition ===
+
+-- Only update if condition is met (condition passes)
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'conditional', 600)
+ON CONFLICT DO UPDATE SET count = NEW.count WHERE count < 600;
+SELECT * FROM upsert_test WHERE id = 1;
+→ [{"id":1,"name":"via_excluded","count":600}]
+
+-- Only update if condition is met (condition fails - should skip update)
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'should_skip', 700)
+ON CONFLICT DO UPDATE SET count = NEW.count WHERE count < 100;
+SELECT * FROM upsert_test WHERE id = 1;
+→ [{"id":1,"name":"via_excluded","count":600}]
+
+-- === UPSERT with RETURNING ===
+
+-- DO NOTHING with RETURNING (returns nothing when conflict is skipped)
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'ignored', 999)
+ON CONFLICT DO NOTHING
+RETURNING id, name, count;
+→ []
+
+-- DO UPDATE with RETURNING
+INSERT INTO upsert_test (id, name, count) VALUES (1, 'returned', 700)
+ON CONFLICT DO UPDATE SET name = NEW.name, count = NEW.count
+RETURNING id, name, count;
+→ [{"id":1,"name":"returned","count":700}]
+
+-- Verify the update was applied
+SELECT * FROM upsert_test WHERE id = 1;
+→ [{"id":1,"name":"returned","count":700}]
+
+-- Insert without conflict with RETURNING
+INSERT INTO upsert_test (id, name, count) VALUES (10, 'new_row', 50)
+ON CONFLICT DO NOTHING
+RETURNING id, name;
+→ [{"id":10,"name":"new_row"}]
+
+-- === Multiple rows with UPSERT ===
+
+-- Insert multiple rows, some conflict, some don't
+INSERT INTO upsert_test (id, name, count) VALUES
+    (10, 'update_existing', 100),
+    (11, 'brand_new', 200)
+ON CONFLICT DO UPDATE SET count = NEW.count;
+SELECT * FROM upsert_test WHERE id IN (10, 11) ORDER BY id;
+→ [{"id":10,"name":"new_row","count":100},{"id":11,"name":"brand_new","count":200}]
+
+-- === Conflict target specification ===
+
+-- Create table with explicit conflict target
+DROP TABLE IF EXISTS upsert_target;
+CREATE TABLE upsert_target (
+    id INTEGER PRIMARY KEY,
+    email TEXT UNIQUE,
+    name TEXT
+);
+
+INSERT INTO upsert_target VALUES (1, 'a@test.com', 'Alice');
+SELECT * FROM upsert_target;
+→ [{"id":1,"email":"a@test.com","name":"Alice"}]
+
+-- Conflict on primary key (id)
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'new@test.com', 'Updated')
+ON CONFLICT (id) DO UPDATE SET name = NEW.name;
+SELECT * FROM upsert_target;
+→ [{"id":1,"email":"a@test.com","name":"Updated"}]
+
+-- === Error cases ===
+
+-- Cannot use both OR clause and ON CONFLICT
+INSERT OR REPLACE INTO upsert_target (id, email, name) VALUES (1, 'test@test.com', 'Test')
+ON CONFLICT DO NOTHING;
+-- error: Cannot use both 'INSERT OR ...' and 'ON CONFLICT' in the same statement
+
+-- ON CONFLICT DO UPDATE assigning the same column twice is rejected (no silent
+-- last-wins). This path never routes through buildUpdateStmt, so it carries its
+-- own backstop mirroring the UPDATE side. See ticket
+-- insert-family-duplicate-column-targets-silent-last-wins.
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'x@test.com', 'X')
+ON CONFLICT (id) DO UPDATE SET name = 'one', name = 'two';
+-- error: duplicate assignment
+
+-- the rejected upsert made no change (name keeps its pre-conflict value, not
+-- last-wins 'two' or 'one').
+SELECT id, name FROM upsert_target;
+→ [{"id":1,"name":"Updated"}]
+
+-- The duplicate-target guard is case-insensitive: `name` and `NAME` collide.
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'x@test.com', 'X')
+ON CONFLICT (id) DO UPDATE SET name = 'one', NAME = 'two';
+-- error: duplicate assignment
+
+-- A legitimate DO UPDATE assigning two *distinct* columns still works — the
+-- guard keys on exact-name collision, never on distinct columns.
+INSERT INTO upsert_target (id, email, name) VALUES (1, 'x@test.com', 'X')
+ON CONFLICT (id) DO UPDATE SET email = 'multi@test.com', name = 'Multi';
+SELECT id, email, name FROM upsert_target;
+→ [{"id":1,"email":"multi@test.com","name":"Multi"}]
+
+-- Clean up
+DROP TABLE upsert_test;
+DROP TABLE upsert_target;

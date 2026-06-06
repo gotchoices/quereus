@@ -1,0 +1,206 @@
+-- schema-scale.sqllogic - Performance test for large schema operations
+-- Tests schema manager with 20 tables, indexes, and cross-table queries
+
+-- ===================================
+-- 1. Create 20 tables with varied schemas
+-- ===================================
+
+create table t01 (id integer primary key, name text, value integer);
+create table t02 (id integer primary key, code text, amount real);
+create table t03 (id integer primary key, label text, count integer, active integer);
+create table t04 (id integer primary key, title text, score real);
+create table t05 (id integer primary key, details text, quantity integer);
+create table t06 (id integer primary key, tag text, price real);
+create table t07 (id integer primary key, category text, stock integer);
+create table t08 (id integer primary key, type text, level integer);
+create table t09 (id integer primary key, status text, priority integer);
+create table t10 (id integer primary key, role text, rank integer);
+create table t11 (id integer primary key, name text, value integer);
+create table t12 (id integer primary key, code text, amount real);
+create table t13 (id integer primary key, label text, count integer, active integer);
+create table t14 (id integer primary key, title text, score real);
+create table t15 (id integer primary key, details text, quantity integer);
+create table t16 (id integer primary key, tag text, price real);
+create table t17 (id integer primary key, category text, stock integer);
+create table t18 (id integer primary key, type text, level integer);
+create table t19 (id integer primary key, status text, priority integer);
+create table t20 (id integer primary key, role text, rank integer);
+
+-- ===================================
+-- 2. Insert data into all tables
+-- ===================================
+
+insert into t01 values (1, 'a1', 10), (2, 'a2', 20), (3, 'a3', 30);
+insert into t02 values (1, 'b1', 1.5), (2, 'b2', 2.5), (3, 'b3', 3.5);
+insert into t03 values (1, 'c1', 100, 1), (2, 'c2', 200, 0), (3, 'c3', 300, 1);
+insert into t04 values (1, 'd1', 50.0), (2, 'd2', 60.0), (3, 'd3', 70.0);
+insert into t05 values (1, 'e1', 5), (2, 'e2', 6), (3, 'e3', 7);
+insert into t06 values (1, 'f1', 10.1), (2, 'f2', 20.2), (3, 'f3', 30.3);
+insert into t07 values (1, 'g1', 15), (2, 'g2', 25), (3, 'g3', 35);
+insert into t08 values (1, 'h1', 8), (2, 'h2', 9), (3, 'h3', 10);
+insert into t09 values (1, 'i1', 1), (2, 'i2', 2), (3, 'i3', 3);
+insert into t10 values (1, 'j1', 11), (2, 'j2', 12), (3, 'j3', 13);
+insert into t11 values (1, 'k1', 40), (2, 'k2', 50), (3, 'k3', 60);
+insert into t12 values (1, 'l1', 4.1), (2, 'l2', 5.2), (3, 'l3', 6.3);
+insert into t13 values (1, 'm1', 400, 1), (2, 'm2', 500, 0), (3, 'm3', 600, 1);
+insert into t14 values (1, 'n1', 80.0), (2, 'n2', 90.0), (3, 'n3', 100.0);
+insert into t15 values (1, 'o1', 9), (2, 'o2', 10), (3, 'o3', 11);
+insert into t16 values (1, 'p1', 11.1), (2, 'p2', 22.2), (3, 'p3', 33.3);
+insert into t17 values (1, 'q1', 45), (2, 'q2', 55), (3, 'q3', 65);
+insert into t18 values (1, 'r1', 18), (2, 'r2', 19), (3, 'r3', 20);
+insert into t19 values (1, 's1', 4), (2, 's2', 5), (3, 's3', 6);
+insert into t20 values (1, 't1', 21), (2, 't2', 22), (3, 't3', 23);
+
+-- ===================================
+-- 3. Create indexes on several tables
+-- ===================================
+
+create index idx_t01_name on t01 (name);
+create index idx_t01_value on t01 (value);
+create index idx_t02_code on t02 (code);
+create index idx_t03_label on t03 (label);
+create index idx_t03_active on t03 (active);
+create index idx_t04_title on t04 (title);
+create index idx_t05_details on t05 (details);
+create index idx_t06_tag on t06 (tag);
+create index idx_t07_category on t07 (category);
+create index idx_t08_type on t08 (type);
+create index idx_t09_status on t09 (status);
+create index idx_t10_role on t10 (role);
+create index idx_t11_name on t11 (name);
+create index idx_t12_code on t12 (code);
+create index idx_t13_label on t13 (label);
+create index idx_t14_title on t14 (title);
+create index idx_t15_details on t15 (details);
+create index idx_t16_tag on t16 (tag);
+create index idx_t17_category on t17 (category);
+create index idx_t18_type on t18 (type);
+create index idx_t19_status on t19 (status);
+create index idx_t20_role on t20 (role);
+
+-- ===================================
+-- 4. Query across multiple tables using joins
+-- ===================================
+
+-- Join t01 to t02
+select t01.name, t02.code, t01.value, t02.amount
+from t01 join t02 on t01.id = t02.id
+order by t01.id;
+→ [{"name":"a1","code":"b1","value":10,"amount":1.5},{"name":"a2","code":"b2","value":20,"amount":2.5},{"name":"a3","code":"b3","value":30,"amount":3.5}]
+
+-- Join t03 to t04
+select t03.label, t04.title, t03.count, t04.score
+from t03 join t04 on t03.id = t04.id
+order by t03.id;
+→ [{"label":"c1","title":"d1","count":100,"score":50.0},{"label":"c2","title":"d2","count":200,"score":60.0},{"label":"c3","title":"d3","count":300,"score":70.0}]
+
+-- Join t05 to t06
+select t05.details, t06.tag, t05.quantity, t06.price
+from t05 join t06 on t05.id = t06.id
+order by t05.id;
+→ [{"details":"e1","tag":"f1","quantity":5,"price":10.1},{"details":"e2","tag":"f2","quantity":6,"price":20.2},{"details":"e3","tag":"f3","quantity":7,"price":30.3}]
+
+-- Join t07 to t08
+select t07.category, t08.type, t07.stock, t08.level
+from t07 join t08 on t07.id = t08.id
+order by t07.id;
+→ [{"category":"g1","type":"h1","stock":15,"level":8},{"category":"g2","type":"h2","stock":25,"level":9},{"category":"g3","type":"h3","stock":35,"level":10}]
+
+-- Join t09 to t10
+select t09.status, t10.role, t09.priority, t10.rank
+from t09 join t10 on t09.id = t10.id
+order by t09.id;
+→ [{"status":"i1","role":"j1","priority":1,"rank":11},{"status":"i2","role":"j2","priority":2,"rank":12},{"status":"i3","role":"j3","priority":3,"rank":13}]
+
+-- Three-way join: t11, t12, t13
+select t11.name, t12.code, t13.label, t11.value, t12.amount, t13.count
+from t11 join t12 on t11.id = t12.id join t13 on t12.id = t13.id
+order by t11.id;
+→ [{"name":"k1","code":"l1","label":"m1","value":40,"amount":4.1,"count":400},{"name":"k2","code":"l2","label":"m2","value":50,"amount":5.2,"count":500},{"name":"k3","code":"l3","label":"m3","value":60,"amount":6.3,"count":600}]
+
+-- Join t14 to t15
+select t14.title, t15.details, t14.score, t15.quantity
+from t14 join t15 on t14.id = t15.id
+order by t14.id;
+→ [{"title":"n1","details":"o1","score":80.0,"quantity":9},{"title":"n2","details":"o2","score":90.0,"quantity":10},{"title":"n3","details":"o3","score":100.0,"quantity":11}]
+
+-- Join t16 to t17
+select t16.tag, t17.category, t16.price, t17.stock
+from t16 join t17 on t16.id = t17.id
+order by t16.id;
+→ [{"tag":"p1","category":"q1","price":11.1,"stock":45},{"tag":"p2","category":"q2","price":22.2,"stock":55},{"tag":"p3","category":"q3","price":33.3,"stock":65}]
+
+-- Join t18 to t19
+select t18.type, t19.status, t18.level, t19.priority
+from t18 join t19 on t18.id = t19.id
+order by t18.id;
+→ [{"type":"r1","status":"s1","level":18,"priority":4},{"type":"r2","status":"s2","level":19,"priority":5},{"type":"r3","status":"s3","level":20,"priority":6}]
+
+-- Cross join across multiple tables
+select count(*) as total
+from t01 cross join t02 cross join t03;
+→ [{"total":27}]
+
+-- ===================================
+-- 5. Verify indexes are working
+-- ===================================
+
+select name from t01 where name = 'a2';
+→ [{"name":"a2"}]
+
+select code from t02 where code = 'b3';
+→ [{"code":"b3"}]
+
+select label from t03 where active = 1 order by id;
+→ [{"label":"c1"},{"label":"c3"}]
+
+-- ===================================
+-- 6. Verify all tables exist in schema
+-- ===================================
+
+select count(*) as table_count from schema() where type = 'table' and name like 't%';
+→ [{"table_count":20}]
+
+select count(*) as index_count from schema() where type = 'index' and tbl_name like 't%';
+→ [{"index_count":22}]
+
+-- ===================================
+-- 7. Drop all tables
+-- ===================================
+
+drop table t01;
+drop table t02;
+drop table t03;
+drop table t04;
+drop table t05;
+drop table t06;
+drop table t07;
+drop table t08;
+drop table t09;
+drop table t10;
+drop table t11;
+drop table t12;
+drop table t13;
+drop table t14;
+drop table t15;
+drop table t16;
+drop table t17;
+drop table t18;
+drop table t19;
+drop table t20;
+
+-- ===================================
+-- 8. Verify all tables are gone
+-- ===================================
+
+select * from t01;
+-- error: not found in schema path
+
+select * from t10;
+-- error: not found in schema path
+
+select * from t20;
+-- error: not found in schema path
+
+select count(*) as table_count from schema() where type = 'table' and name like 't%';
+→ [{"table_count":0}]

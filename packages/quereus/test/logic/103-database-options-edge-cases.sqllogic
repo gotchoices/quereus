@@ -1,0 +1,108 @@
+-- database-options-edge-cases.sqllogic - Pragma edge cases and option handling
+
+-- ===================================
+-- PRAGMA default_vtab_module
+-- ===================================
+
+-- Default should be 'memory'
+PRAGMA default_vtab_module;
+→ [{"name": "default_vtab_module", "value": "memory"}]
+
+-- Set to 'memory' explicitly (same value, should be no-op)
+PRAGMA default_vtab_module = 'memory';
+-- run
+
+PRAGMA default_vtab_module;
+→ [{"name": "default_vtab_module", "value": "memory"}]
+
+-- ===================================
+-- PRAGMA schema_path basics
+-- ===================================
+
+-- Default should be 'main'
+PRAGMA schema_path;
+→ [{"name": "schema_path", "value": "main"}]
+
+-- Set and read back
+PRAGMA schema_path = 'main,temp';
+
+PRAGMA schema_path;
+→ [{"name": "schema_path", "value": "main,temp"}]
+
+-- Reset
+PRAGMA schema_path = 'main';
+-- run
+
+-- ===================================
+-- Invalid pragma names
+-- ===================================
+
+PRAGMA nonexistent_pragma;
+-- error: Unknown pragma
+
+PRAGMA nonexistent_pragma = 'value';
+-- error: Unknown pragma
+
+-- ===================================
+-- Boolean pragma values (various forms)
+-- ===================================
+
+-- Create a table to use for testing
+CREATE TABLE pragma_test (id INTEGER PRIMARY KEY, val TEXT);
+
+-- Test boolean conversion forms via PRAGMA (using known boolean pragmas)
+-- The exact boolean pragmas depend on what's registered, but we can test
+-- that the system handles queries correctly after pragma changes
+
+INSERT INTO pragma_test VALUES (1, 'test');
+
+SELECT * FROM pragma_test;
+→ [{"id": 1, "val": "test"}]
+
+DROP TABLE pragma_test;
+
+-- ===================================
+-- Multiple pragmas in sequence
+-- ===================================
+
+PRAGMA schema_path = 'main';
+PRAGMA default_vtab_module = 'memory';
+-- run
+
+PRAGMA schema_path;
+→ [{"name": "schema_path", "value": "main"}]
+
+PRAGMA default_vtab_module;
+→ [{"name": "default_vtab_module", "value": "memory"}]
+
+-- ===================================
+-- table_info on various table shapes
+-- ===================================
+
+-- Simple table
+CREATE TABLE pi_simple (id INTEGER PRIMARY KEY, name TEXT);
+
+SELECT name, type, pk FROM table_info('pi_simple') ORDER BY cid;
+→ [{"name": "id", "type": "INTEGER", "pk": 1}, {"name": "name", "type": "TEXT", "pk": 0}]
+
+DROP TABLE pi_simple;
+
+-- Table with many column types
+CREATE TABLE pi_types (
+	a INTEGER PRIMARY KEY,
+	b TEXT NOT NULL,
+	c REAL,
+	d BLOB
+);
+
+SELECT name, type, pk FROM table_info('pi_types') ORDER BY cid;
+→ [{"name": "a", "type": "INTEGER", "pk": 1}, {"name": "b", "type": "TEXT", "pk": 0}, {"name": "c", "type": "REAL", "pk": 0}, {"name": "d", "type": "BLOB", "pk": 0}]
+
+DROP TABLE pi_types;
+
+-- ===================================
+-- table_info on non-existent table should error
+-- ===================================
+
+SELECT * FROM table_info('does_not_exist');
+-- error: not found

@@ -1,0 +1,76 @@
+-- Test: PRIMARY KEY DESC direction should work for all column types, not just INTEGER
+-- Bug: findColumnPKDefinition only applies DESC for INTEGER PKs
+
+-- ============================================================
+-- Test 1: INTEGER PRIMARY KEY DESC (column-level) — should work (baseline)
+-- ============================================================
+CREATE TABLE int_desc (id INTEGER PRIMARY KEY DESC);
+INSERT INTO int_desc VALUES (1);
+INSERT INTO int_desc VALUES (3);
+INSERT INTO int_desc VALUES (2);
+
+-- Natural scan order should be descending because PK is DESC
+select id from int_desc;
+→ [{"id": 3}, {"id": 2}, {"id": 1}]
+
+DROP TABLE int_desc;
+
+-- ============================================================
+-- Test 2: TEXT PRIMARY KEY DESC (column-level) — currently broken
+-- The desc flag is ignored because type is not INTEGER
+-- ============================================================
+CREATE TABLE text_desc (name TEXT PRIMARY KEY DESC);
+INSERT INTO text_desc VALUES ('banana');
+INSERT INTO text_desc VALUES ('cherry');
+INSERT INTO text_desc VALUES ('apple');
+
+-- Natural scan order should be descending because PK is DESC
+select name from text_desc;
+→ [{"name": "cherry"}, {"name": "banana"}, {"name": "apple"}]
+
+DROP TABLE text_desc;
+
+-- ============================================================
+-- Test 3: TEXT PRIMARY KEY DESC (table-level constraint) — should work
+-- findConstraintPKDefinition correctly uses direction regardless of type
+-- ============================================================
+CREATE TABLE text_desc_constraint (name TEXT, PRIMARY KEY (name DESC));
+INSERT INTO text_desc_constraint VALUES ('banana');
+INSERT INTO text_desc_constraint VALUES ('cherry');
+INSERT INTO text_desc_constraint VALUES ('apple');
+
+-- Natural scan order should be descending because PK is DESC
+select name from text_desc_constraint;
+→ [{"name": "cherry"}, {"name": "banana"}, {"name": "apple"}]
+
+DROP TABLE text_desc_constraint;
+
+-- ============================================================
+-- Test 4: REAL PRIMARY KEY DESC (column-level) — also broken
+-- ============================================================
+CREATE TABLE real_desc (val REAL PRIMARY KEY DESC);
+INSERT INTO real_desc VALUES (1.5);
+INSERT INTO real_desc VALUES (3.7);
+INSERT INTO real_desc VALUES (2.1);
+
+select val from real_desc;
+→ [{"val": 3.7}, {"val": 2.1}, {"val": 1.5}]
+
+DROP TABLE real_desc;
+
+-- ============================================================
+-- Test 5: Composite PK with mixed types, column-level DESC
+-- ============================================================
+CREATE TABLE composite_desc (
+	category TEXT,
+	seq INTEGER PRIMARY KEY DESC
+);
+INSERT INTO composite_desc VALUES ('a', 1);
+INSERT INTO composite_desc VALUES ('a', 3);
+INSERT INTO composite_desc VALUES ('a', 2);
+
+-- INTEGER column DESC should work (it does today)
+select category, seq from composite_desc;
+→ [{"category": "a", "seq": 3}, {"category": "a", "seq": 2}, {"category": "a", "seq": 1}]
+
+DROP TABLE composite_desc;

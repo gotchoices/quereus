@@ -1,0 +1,93 @@
+-- adapted from SQLite test/subquery.test, test/subquery2.test, test/exists.test
+-- Subquery surface gaps: scalar in UPDATE SET, dynamic LIMIT/OFFSET via scalar
+-- subquery, scalar subquery with DISTINCT/LIMIT in projection, EXISTS in SELECT
+-- list (not just WHERE), and EXISTS with arithmetic correlation predicates.
+
+create table sqx_outer (id integer primary key, val integer);
+create table sqx_inner (id integer primary key, ref_id integer, amount integer);
+insert into sqx_outer values (1, 0), (2, 0), (3, 0);
+insert into sqx_inner values (10, 1, 50), (20, 1, 30), (30, 2, 40);
+
+-- =============================================================================
+-- Correlated scalar subquery in UPDATE SET clause
+-- =============================================================================
+
+update sqx_outer set val = (select coalesce(sum(amount), 0) from sqx_inner where sqx_inner.ref_id = sqx_outer.id);
+select id, val from sqx_outer order by id;
+→ [{"id":1,"val":80},{"id":2,"val":40},{"id":3,"val":0}]
+
+-- =============================================================================
+-- Dynamic LIMIT / OFFSET via scalar subquery
+-- =============================================================================
+
+create table sqx_limits (lim integer primary key, off integer);
+insert into sqx_limits values (2, 0), (3, 1);
+
+-- LIMIT from scalar subquery
+select id from sqx_outer order by id limit (select lim from sqx_limits where lim = 2);
+→ [{"id":1},{"id":2}]
+
+-- LIMIT and OFFSET both from scalar subqueries
+select id from sqx_outer order by id limit (select lim from sqx_limits where lim = 3) offset (select off from sqx_limits where lim = 3);
+→ [{"id":2},{"id":3}]
+
+drop table sqx_limits;
+
+-- =============================================================================
+-- Scalar subquery in projection with DISTINCT + ORDER BY + LIMIT
+-- =============================================================================
+
+create table sqx_dups (id integer primary key, v integer);
+insert into sqx_dups values (1, 100), (2, 100), (3, 200), (4, 200), (5, 300);
+
+-- DISTINCT inside scalar subquery: pick the second-smallest distinct value
+select (select distinct v from sqx_dups order by v limit 1 offset 1) as second_distinct;
+→ [{"second_distinct":200}]
+
+-- Scalar subquery with constant projection + ORDER BY + LIMIT
+select (select 'k' from sqx_dups order by v limit 1) as constant_proj;
+→ [{"constant_proj":"k"}]
+
+-- Scalar subquery with ORDER BY + LIMIT past end yields null
+select (select v from sqx_dups order by v limit 1 offset 100) as past_end;
+→ [{"past_end":null}]
+
+drop table sqx_dups;
+
+-- =============================================================================
+-- EXISTS in SELECT projection (not just WHERE)
+-- =============================================================================
+
+select id, exists (select 1 from sqx_inner where sqx_inner.ref_id = sqx_outer.id) as has_child from sqx_outer order by id;
+→ [{"id":1,"has_child":true},{"id":2,"has_child":true},{"id":3,"has_child":false}]
+
+-- NOT EXISTS in SELECT projection
+select id, not exists (select 1 from sqx_inner where sqx_inner.ref_id = sqx_outer.id) as is_leaf from sqx_outer order by id;
+→ [{"id":1,"is_leaf":false},{"id":2,"is_leaf":false},{"id":3,"is_leaf":true}]
+
+-- EXISTS inside CASE expression in projection
+select id, case when exists (select 1 from sqx_inner where sqx_inner.ref_id = sqx_outer.id and amount > 45) then 'large' else 'small' end as bucket from sqx_outer order by id;
+→ [{"id":1,"bucket":"large"},{"id":2,"bucket":"small"},{"id":3,"bucket":"small"}]
+
+-- =============================================================================
+-- EXISTS with arithmetic correlation predicate (not just plain equality)
+-- =============================================================================
+
+create table sqx_a (id integer primary key, x integer);
+create table sqx_b (id integer primary key, y integer);
+insert into sqx_a values (1, 10), (2, 20), (3, 30);
+insert into sqx_b values (10, 0), (20, 10), (30, 20);
+
+-- EXISTS where correlation is `b.y = a.x - 10`
+select sqx_a.id from sqx_a where exists (select 1 from sqx_b where sqx_b.y = sqx_a.x - 10) order by sqx_a.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- EXISTS where correlation includes a function call
+select sqx_a.id from sqx_a where exists (select 1 from sqx_b where sqx_b.y = abs(sqx_a.x - 30)) order by sqx_a.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+drop table sqx_a;
+drop table sqx_b;
+
+drop table sqx_inner;
+drop table sqx_outer;

@@ -1,0 +1,336 @@
+-- 99-conversion-edge-cases.sqllogic
+-- Targeted coverage for uncovered branches in conversion.ts, json-type.ts,
+-- logical-type.ts, and schema.ts:
+-- Type conversion error paths, json() function, schema introspection functions
+
+-- ============================================================
+-- integer() conversion edge cases
+-- ============================================================
+
+-- Null returns null
+SELECT integer(null) as result;
+→ [{"result":null}]
+
+-- Integer from integer (identity)
+SELECT integer(42) as result;
+→ [{"result":42}]
+
+-- Integer from float (truncates/rounds)
+SELECT integer(3.7) as result;
+→ [{"result":3}]
+
+-- Integer from negative float
+SELECT integer(-2.9) as result;
+→ [{"result":-2}]
+
+-- Integer from string
+SELECT integer('123') as result;
+→ [{"result":123}]
+
+-- Integer from negative string
+SELECT integer('-456') as result;
+→ [{"result":-456}]
+
+-- Integer from boolean
+SELECT integer(true) as result;
+→ [{"result":1}]
+
+SELECT integer(false) as result;
+→ [{"result":0}]
+
+-- Integer from zero
+SELECT integer(0) as result;
+→ [{"result":0}]
+
+-- Integer from empty string returns null (not error)
+SELECT integer('') as result;
+→ [{"result":null}]
+
+-- Integer from non-numeric string errors
+SELECT integer('hello');
+-- error: Cannot convert to INTEGER
+
+-- ============================================================
+-- real() conversion edge cases
+-- ============================================================
+
+-- Null
+SELECT real(null) as result;
+→ [{"result":null}]
+
+-- Real from integer
+SELECT real(42) as result;
+→ [{"result":42}]
+
+-- Real from float (identity)
+SELECT real(3.14) as result;
+→ [{"result":3.14}]
+
+-- Real from string
+SELECT real('2.718') as result;
+→ [{"result":2.718}]
+
+-- Real from boolean
+SELECT real(true) as result;
+→ [{"result":1}]
+
+SELECT real(false) as result;
+→ [{"result":0}]
+
+-- Real from empty string returns null
+SELECT real('') as result;
+→ [{"result":null}]
+
+-- Real from non-numeric string errors
+SELECT real('hello');
+-- error: Cannot convert to REAL
+
+-- ============================================================
+-- text() conversion edge cases
+-- ============================================================
+
+-- Null
+SELECT text(null) as result;
+→ [{"result":null}]
+
+-- Text from integer
+SELECT text(42) as result;
+→ [{"result":"42"}]
+
+-- Text from float
+SELECT text(3.14) as result;
+→ [{"result":"3.14"}]
+
+-- Text from boolean
+SELECT text(true) as result;
+→ [{"result":"true"}]
+
+SELECT text(false) as result;
+→ [{"result":"false"}]
+
+-- Text from string (identity)
+SELECT text('hello') as result;
+→ [{"result":"hello"}]
+
+-- Text from empty string
+SELECT text('') as result;
+→ [{"result":""}]
+
+-- ============================================================
+-- boolean() conversion edge cases
+-- ============================================================
+
+-- Null
+SELECT boolean(null) as result;
+→ [{"result":null}]
+
+-- Boolean from boolean (identity)
+SELECT boolean(true) as result;
+→ [{"result":true}]
+
+SELECT boolean(false) as result;
+→ [{"result":false}]
+
+-- Boolean from integer
+SELECT boolean(1) as result;
+→ [{"result":true}]
+
+SELECT boolean(0) as result;
+→ [{"result":false}]
+
+-- Boolean from string
+SELECT boolean('true') as result;
+→ [{"result":true}]
+
+SELECT boolean('false') as result;
+→ [{"result":false}]
+
+SELECT boolean('yes') as result;
+→ [{"result":true}]
+
+SELECT boolean('no') as result;
+→ [{"result":false}]
+
+SELECT boolean('on') as result;
+→ [{"result":true}]
+
+SELECT boolean('off') as result;
+→ [{"result":false}]
+
+-- Boolean from invalid string errors
+SELECT boolean('maybe');
+-- error: Cannot convert to BOOLEAN
+
+SELECT boolean('');
+-- error: Cannot convert to BOOLEAN
+
+-- ============================================================
+-- json() conversion edge cases
+-- ============================================================
+
+-- Null
+SELECT json(null) as result;
+→ [{"result":null}]
+
+-- JSON from valid JSON string
+SELECT json('{"a":1}') as result;
+→ [{"result":{"a":1}}]
+
+-- JSON from array string
+SELECT json('[1,2,3]') as result;
+→ [{"result":[1,2,3]}]
+
+-- JSON from number
+SELECT json(42) as result;
+→ [{"result":42}]
+
+-- JSON from boolean
+SELECT json(true) as result;
+→ [{"result":true}]
+
+-- JSON from 'null' string
+SELECT json('null') as result;
+→ [{"result":null}]
+
+-- JSON from invalid string errors
+SELECT json('not-valid-json');
+-- error: Cannot convert to JSON
+
+-- ============================================================
+-- timespan() conversion error path
+-- ============================================================
+
+-- Valid conversion
+SELECT timespan('PT1H') as result;
+→ [{"result":"PT1H"}]
+
+-- Null
+SELECT timespan(null) as result;
+→ [{"result":null}]
+
+-- Invalid string errors
+SELECT timespan('invalid');
+-- error: Cannot convert to TIMESPAN
+
+-- ============================================================
+-- Schema introspection: schema() function
+-- ============================================================
+
+CREATE TABLE schema_test (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+-- run
+
+-- schema() returns rows with schema info
+SELECT type, name FROM schema() WHERE name = 'schema_test';
+→ [{"type":"table","name":"schema_test"}]
+
+-- table_info() returns column information
+SELECT name, type, pk FROM table_info('schema_test') ORDER BY cid;
+→ [{"name":"id","type":"INTEGER","pk":1},{"name":"name","type":"TEXT","pk":0},{"name":"score","type":"REAL","pk":0}]
+
+-- table_info with non-existent table
+SELECT name FROM table_info('nonexistent_table');
+-- error: not found
+
+DROP TABLE schema_test;
+
+-- ============================================================
+-- function_info() introspection
+-- ============================================================
+
+-- function_info() returns functions (check a known function)
+SELECT name, type FROM function_info('json_valid');
+→ [{"name":"json_valid","type":"scalar"}]
+
+-- function_info with filter
+SELECT name, type FROM function_info('json_extract');
+→ [{"name":"json_extract","type":"scalar"}]
+
+-- function_info without filter returns many rows (just check it works)
+SELECT count(*) > 0 as has_functions FROM function_info();
+→ [{"has_functions":true}]
+
+-- ============================================================
+-- Schema: tables with indexes
+-- ============================================================
+
+CREATE TABLE idx_test (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+CREATE INDEX idx_name ON idx_test (name);
+-- run
+
+-- Should show both table and index in schema
+SELECT type, name FROM schema() WHERE name = 'idx_test' OR name = 'idx_name' ORDER BY type;
+→ [{"type":"index","name":"idx_name"},{"type":"table","name":"idx_test"}]
+
+DROP TABLE idx_test;
+
+-- ============================================================
+-- Schema: foreign keys
+-- ============================================================
+
+CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent(id));
+-- run
+
+-- foreign_key_info returns FK relationships
+SELECT "from", referenced_table, "to" FROM foreign_key_info('fk_child');
+→ [{"from":"parent_id","referenced_table":"fk_parent","to":"id"}]
+
+-- foreign_key_info on table without FKs returns nothing
+SELECT count(*) as cnt FROM foreign_key_info('fk_parent');
+→ [{"cnt":0}]
+
+-- foreign_key_info on non-existent table errors
+SELECT "from" FROM foreign_key_info('nonexistent');
+-- error: not found
+
+-- Non-string table name errors
+SELECT "from" FROM foreign_key_info(42);
+-- error: requires a table name string
+
+DROP TABLE fk_child;
+DROP TABLE fk_parent;
+
+-- ============================================================
+-- typeof: all types
+-- ============================================================
+
+SELECT typeof(null) as result;
+→ [{"result":"null"}]
+
+SELECT typeof(42) as result;
+→ [{"result":"integer"}]
+
+SELECT typeof(3.14) as result;
+→ [{"result":"real"}]
+
+SELECT typeof('hello') as result;
+→ [{"result":"text"}]
+
+SELECT typeof(true) as result;
+→ [{"result":"integer"}]
+
+SELECT typeof(json_array(1,2)) as result;
+→ [{"result":"json"}]
+
+-- ============================================================
+-- Cross-type conversion chains
+-- ============================================================
+
+-- integer -> text -> integer roundtrip
+SELECT integer(text(42)) as result;
+→ [{"result":42}]
+
+-- real -> text -> real roundtrip
+SELECT real(text(3.14)) as result;
+→ [{"result":3.14}]
+
+-- boolean -> integer -> boolean roundtrip
+SELECT boolean(integer(true)) as result;
+→ [{"result":true}]
+
+SELECT boolean(integer(false)) as result;
+→ [{"result":false}]
+
+-- json -> text -> json roundtrip (via json_extract)
+SELECT json('{"a":1}') as result;
+→ [{"result":{"a":1}}]

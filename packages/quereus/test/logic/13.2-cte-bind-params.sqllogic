@@ -1,0 +1,98 @@
+-- Testing recursive CTEs with bind parameters in termination conditions
+-- Uses -- params: directive to supply bind parameter values
+
+-- Setup: hierarchy table for tree-walking tests
+CREATE TABLE Node (id INTEGER PRIMARY KEY, parent_id INTEGER NULL, name TEXT);
+INSERT INTO Node VALUES
+  (1, null, 'Root'),
+  (2, 1, 'A'),
+  (3, 1, 'B'),
+  (4, 2, 'A1'),
+  (5, 2, 'A2'),
+  (6, 3, 'B1');
+
+-- Test 1: Bind parameter in base case seed (WHERE id = ?)
+-- params: [1]
+WITH RECURSIVE tree(id) AS (
+  SELECT id FROM Node WHERE id = ?
+  UNION ALL
+  SELECT N.id FROM Node N JOIN tree T ON N.parent_id = T.id
+)
+SELECT id FROM tree ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6}]
+
+-- Test 2: Different seed value via bind parameter
+-- params: [2]
+WITH RECURSIVE tree(id) AS (
+  SELECT id FROM Node WHERE id = ?
+  UNION ALL
+  SELECT N.id FROM Node N JOIN tree T ON N.parent_id = T.id
+)
+SELECT id FROM tree ORDER BY id;
+→ [{"id":2},{"id":4},{"id":5}]
+
+-- Test 3: Bind parameter in recursive termination (depth < ?)
+-- params: [2]
+WITH RECURSIVE tree(id, depth) AS (
+  SELECT id, 0 FROM Node WHERE parent_id IS NULL
+  UNION ALL
+  SELECT N.id, T.depth + 1 FROM Node N JOIN tree T ON N.parent_id = T.id
+  WHERE T.depth + 1 < ?
+)
+SELECT id, depth FROM tree ORDER BY depth, id;
+→ [{"id":1,"depth":0},{"id":2,"depth":1},{"id":3,"depth":1}]
+
+-- Test 4: Bind parameter as exclusion (id != ?)
+-- params: [4]
+WITH RECURSIVE tree(id) AS (
+  SELECT id FROM Node WHERE parent_id IS NULL
+  UNION ALL
+  SELECT N.id FROM Node N JOIN tree T ON N.parent_id = T.id
+  WHERE N.id != ?
+)
+SELECT id FROM tree ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3},{"id":5},{"id":6}]
+
+-- Test 5: Multiple bind parameters — seed + termination
+-- params: [2, 1]
+WITH RECURSIVE tree(id, depth) AS (
+  SELECT id, 0 FROM Node WHERE id = ?
+  UNION ALL
+  SELECT N.id, T.depth + 1 FROM Node N JOIN tree T ON N.parent_id = T.id
+  WHERE T.depth < ?
+)
+SELECT id, depth FROM tree ORDER BY depth, id;
+→ [{"id":2,"depth":0},{"id":4,"depth":1},{"id":5,"depth":1}]
+
+-- Test 6: Bind parameter in both seed and exclusion
+-- params: [1, 3]
+WITH RECURSIVE tree(id) AS (
+  SELECT id FROM Node WHERE id = ?
+  UNION ALL
+  SELECT N.id FROM Node N JOIN tree T ON N.parent_id = T.id
+  WHERE N.id != ?
+)
+SELECT id FROM tree ORDER BY id;
+→ [{"id":1},{"id":2},{"id":4},{"id":5}]
+
+-- Test 7: Simple counting CTE with parameterized limit
+-- params: [4]
+WITH RECURSIVE counter(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM counter WHERE n < ?
+)
+SELECT n FROM counter ORDER BY n;
+→ [{"n":1},{"n":2},{"n":3},{"n":4}]
+
+-- Test 8: Parameterized start and limit in counting CTE
+-- params: [10, 13]
+WITH RECURSIVE counter(n) AS (
+  SELECT ?
+  UNION ALL
+  SELECT n + 1 FROM counter WHERE n < ?
+)
+SELECT n FROM counter ORDER BY n;
+→ [{"n":10},{"n":11},{"n":12},{"n":13}]
+
+DROP TABLE Node;

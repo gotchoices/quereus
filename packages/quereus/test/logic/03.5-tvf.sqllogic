@@ -1,0 +1,61 @@
+-- test/logic/tvf.sqllogic
+
+-- Check query plan using the new TVF
+-- After relational constant folding, SELECT 1+1 collapses to Block → TableLiteral
+SELECT op FROM query_plan('SELECT 1 + 1');
+→ [{"op":"BLOCK"},{"op":"TABLELITERAL"}]
+
+-- Check scheduler program dump TVF (basic execution check)
+-- After relational constant folding, SELECT 1 collapses to Block → TableLiteral
+SELECT description FROM scheduler_program('SELECT 1');
+→ [{"description":"tableLiteral(1 rows, 1 cols)"},{"description":"block(1 stmts, result idx: 0)"}]
+
+-- json_each: array immediate children only
+SELECT key, value FROM json_each('[10, 20, {"a": 30}]');
+→ [{"key":0,"value":10},{"key":1,"value":20},{"key":2,"value":"{\"a\":30}"}]
+
+-- json_each: object immediate children only (does NOT recurse into nested containers)
+SELECT key, value, type FROM json_each('{"a":{"b":1},"c":2}');
+→ [{"key":"a","value":"{\"b\":1}","type":"object"},{"key":"c","value":2,"type":"integer"}]
+
+-- Basic json_tree (just test it runs for now)
+SELECT id, fullkey, type, atom FROM json_tree('{"a": [1, 2], "b": true}');
+
+-- TVF with alias and WHERE filter
+SELECT j.key FROM json_each('[5,6]') AS j WHERE j.value > 5;
+→ [{"key":1}]
+
+-- TVF with alias and qualified SELECT *
+SELECT j.* FROM json_each('[5,6]') AS j WHERE j.value > 5;
+→ [{"key":1,"value":6,"type":"integer","atom":6,"id":1,"parent":null,"fullkey":"[1]","path":""}]
+
+-- json_each with root path
+SELECT key, value FROM json_each('{"data": [1, 2]}', '$.data');
+→ [{"key":0,"value":1},{"key":1,"value":2}]
+
+-- TVF with root path (json_tree) (just test it runs for now)
+SELECT fullkey, value FROM json_tree('{"a": 1, "nested": {"b": 2}}', '$.nested');
+
+-- expect error: Invalid JSON
+SELECT * FROM json_each('invalid json');
+-- error: Error: Invalid JSON provided to json_each
+
+-- expect error: Function not found
+SELECT * FROM non_existent_tvf(1);
+-- error: Function not found: non_existent_tvf/1
+
+-- expect error: Incorrect number of arguments (json_each - no args)
+SELECT * FROM json_each();
+-- error: Error: json_each requires 1 or 2 arguments (jsonSource, [rootPath])
+
+-- expect error: Incorrect number of arguments (json_each - too many args)
+SELECT * FROM json_each('[]', '$', 'extra');
+-- error: Error: json_each requires 1 or 2 arguments (jsonSource, [rootPath])
+
+-- expect error: Incorrect number of arguments (json_tree - no args)
+SELECT * FROM json_tree();
+-- error: Error: json_tree requires 1 or 2 arguments (jsonSource, [rootPath])
+
+-- expect error: Incorrect number of arguments (json_tree - too many args)
+SELECT * FROM json_tree('{}', '$', 'extra');
+-- error: Error: json_tree requires 1 or 2 arguments (jsonSource, [rootPath])

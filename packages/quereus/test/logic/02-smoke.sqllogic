@@ -1,0 +1,62 @@
+-- smoke.sqllogic - Basic sanity checks for core operations
+
+-- Test basic operations
+
+-- Set default VTab for subsequent CREATE TABLE
+-- Create a table
+CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+--SELECT name FROM schema() WHERE type = 'table' AND name = 't1';
+--→ [{"name":"t1"}]
+
+-- Insert some rows
+INSERT INTO t1 VALUES (1, 'one');
+INSERT INTO t1 (a, b) VALUES (2, 'two');
+--SELECT count(*) FROM t1;
+--→ [{"count(*)": 2}]
+
+-- Select data with ordering
+--SELECT * FROM t1 ORDER BY a;
+--→ [{"a":1,"b":"one"},{"a":2,"b":"two"}]
+
+-- Select specific columns
+--SELECT b FROM t1 WHERE a = 1;
+--→ [{"b":"one"}]
+
+-- Update data
+UPDATE t1 SET b = 'deux' WHERE a = 2;
+--SELECT b FROM t1 WHERE a = 2;
+--→ [{"b":"deux"}]
+SELECT * FROM t1 ORDER BY a;
+→ [{"a":1,"b":"one"},{"a":2,"b":"deux"}]
+
+-- Delete data
+DELETE FROM t1 WHERE a = 1;
+SELECT count(*) FROM t1;
+→ [{"count(*)": 1}]
+SELECT * FROM t1;
+→ [{"a":2,"b":"deux"}]
+
+-- Block 1: Drop the table
+DROP TABLE t1;
+-- No expected output for DROP
+
+-- Block 2: Verify table is gone
+SELECT name FROM schema() WHERE type = 'table' AND name = 't1';
+→ []
+
+-- Test NULL handling (column val explicitly nullable for NULL testing)
+CREATE TABLE t_null(id INTEGER PRIMARY KEY, val NUMERIC NULL);
+INSERT INTO t_null VALUES (1, NULL), (2, 10), (3, 20.5);
+SELECT * FROM t_null ORDER BY id;
+→ [{"id":1,"val":null},{"id":2,"val":10},{"id":3,"val":20.5}]
+DROP TABLE t_null;
+
+-- Test updating NULL column to non-NULL value (regression test)
+CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, description TEXT NULL);
+INSERT INTO items (id, name, description) VALUES ('item-1', 'Coffee', null);
+SELECT description FROM items WHERE id = 'item-1';
+→ [{"description":null}]
+UPDATE items SET description = 'dddd' WHERE id = 'item-1';
+SELECT description FROM items WHERE id = 'item-1';
+→ [{"description":"dddd"}]
+DROP TABLE items;

@@ -1,0 +1,145 @@
+-- semi-anti-join.sqllogic - Semi/anti join decorrelation tests
+
+-- Setup tables
+CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER NULL, salary INTEGER);
+CREATE TABLE projects (id INTEGER PRIMARY KEY, title TEXT, lead_id INTEGER NULL);
+
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'Marketing'), (4, 'HR');
+INSERT INTO employees VALUES (10, 'Alice', 1, 100), (20, 'Bob', 1, 120), (30, 'Carol', 2, 90), (40, 'Dave', 3, 110), (50, 'Eve', null, 80);
+INSERT INTO projects VALUES (100, 'Alpha', 10), (200, 'Beta', 30), (300, 'Gamma', null);
+
+-- ===== Correlated EXISTS → Semi Join =====
+
+-- Basic correlated EXISTS
+SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id) ORDER BY d.name;
+→ [{"name":"Engineering"},{"name":"Marketing"},{"name":"Sales"}]
+
+-- EXISTS with inner-only filter (residual preserved)
+SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary > 100) ORDER BY d.name;
+→ [{"name":"Engineering"},{"name":"Marketing"}]
+
+-- EXISTS returning no matches
+SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary > 1000) ORDER BY d.name;
+→ []
+
+-- ===== NOT EXISTS → Anti Join =====
+
+-- Basic NOT EXISTS
+SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id) ORDER BY d.name;
+→ [{"name":"HR"}]
+
+-- NOT EXISTS with inner filter
+SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary > 100) ORDER BY d.name;
+→ [{"name":"HR"},{"name":"Sales"}]
+
+-- NOT EXISTS where all rows match (empty result for anti)
+SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary > 0) ORDER BY d.name;
+→ [{"name":"HR"}]
+
+-- ===== IN (correlated subquery) → Semi Join =====
+
+-- Basic correlated IN subquery
+SELECT e.name FROM employees e WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.id = e.dept_id) ORDER BY e.name;
+→ [{"name":"Alice"},{"name":"Bob"},{"name":"Carol"},{"name":"Dave"}]
+
+-- IN with additional inner filter
+SELECT e.name FROM employees e WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.id = e.dept_id AND d.name = 'Engineering') ORDER BY e.name;
+→ [{"name":"Alice"},{"name":"Bob"}]
+
+-- ===== Multi-column correlation predicates =====
+
+-- Multiple equi-join columns (not yet decorrelated if inner filter isn't simple equi)
+-- Using a self-join pattern
+CREATE TABLE t1 (a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+CREATE TABLE t2 (x INTEGER, y INTEGER, PRIMARY KEY(x, y));
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t2 VALUES (1, 10), (2, 99), (3, 30);
+
+SELECT a, b FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a AND t2.y = t1.b) ORDER BY a;
+→ [{"a":1,"b":10},{"a":3,"b":30}]
+
+SELECT a, b FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a AND t2.y = t1.b) ORDER BY a;
+→ [{"a":2,"b":20}]
+
+DROP TABLE t1;
+DROP TABLE t2;
+
+-- ===== NULL handling edge cases =====
+
+-- EXISTS with NULLs in correlation column (NULLs don't match)
+SELECT e.name FROM employees e WHERE EXISTS (SELECT 1 FROM departments d WHERE d.id = e.dept_id) ORDER BY e.name;
+→ [{"name":"Alice"},{"name":"Bob"},{"name":"Carol"},{"name":"Dave"}]
+
+-- Eve has NULL dept_id, so she should not appear
+SELECT e.name FROM employees e WHERE NOT EXISTS (SELECT 1 FROM departments d WHERE d.id = e.dept_id) ORDER BY e.name;
+→ [{"name":"Eve"}]
+
+-- Projects with NULL lead_id
+SELECT p.title FROM projects p WHERE EXISTS (SELECT 1 FROM employees e WHERE e.id = p.lead_id) ORDER BY p.title;
+→ [{"title":"Alpha"},{"title":"Beta"}]
+
+SELECT p.title FROM projects p WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.id = p.lead_id) ORDER BY p.title;
+→ [{"title":"Gamma"}]
+
+-- ===== Mixed predicates: EXISTS AND other_condition =====
+
+SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id) AND d.id > 1 ORDER BY d.name;
+→ [{"name":"Marketing"},{"name":"Sales"}]
+
+SELECT d.name FROM departments d WHERE d.id < 4 AND EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary >= 100) ORDER BY d.name;
+→ [{"name":"Engineering"},{"name":"Marketing"}]
+
+-- NOT EXISTS AND other_condition
+SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id) AND d.name != 'HR';
+→ []
+
+-- ===== Uncorrelated subqueries NOT decorrelated =====
+
+-- Uncorrelated EXISTS should remain as-is (not transformed to a join)
+SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.salary > 1000) ORDER BY d.name;
+→ []
+
+SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.salary > 50) ORDER BY d.name;
+→ [{"name":"Engineering"},{"name":"HR"},{"name":"Marketing"},{"name":"Sales"}]
+
+-- Uncorrelated IN subquery should not be decorrelated
+SELECT d.name FROM departments d WHERE d.id IN (SELECT dept_id FROM employees WHERE salary > 100) ORDER BY d.name;
+→ [{"name":"Engineering"},{"name":"Marketing"}]
+
+-- ===== Scalar subqueries NOT affected =====
+
+-- Scalar subquery in WHERE (not EXISTS/IN pattern)
+SELECT d.name FROM departments d WHERE d.id = (SELECT min(dept_id) FROM employees WHERE dept_id IS NOT NULL);
+→ [{"name":"Engineering"}]
+
+-- ===== query_plan() introspection: verify semi/anti join appears =====
+
+-- Verify correlated EXISTS produces a semi join (node_type and joinType property)
+SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin') ORDER BY id;
+→ [{"node_type":"HashJoin","jt":"semi"}]
+
+-- Verify NOT EXISTS produces an anti join
+SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin') ORDER BY id;
+→ [{"node_type":"HashJoin","jt":"anti"}]
+
+DROP TABLE projects;
+DROP TABLE employees;
+DROP TABLE departments;
+
+-- ===== Type-coerced correlation: must NOT be decorrelated =====
+
+-- Correlation `outer.real = inner.text` is rewritten as `outer.real = cast(inner.text as real)`.
+-- The cast hides the equi-pattern; the rule must abort decorrelation rather than
+-- leave the correlation conjunct as a residual filter on the inner side
+-- (which would fail at runtime with "no row context for outer column").
+create table tt1 (c_text0 text unique, c_text1 text not null unique);
+create table tt2 (c_int0 integer unique, c_real1 real, c_text2 text not null primary key);
+insert into tt1 values ('a','x'),('b','y');
+insert into tt2 values (1, 1.5, 'p'),(2, 2.5, 'q');
+
+select count(*) as n from tt2 left join tt1 on c_real1 in (select c_text1 from tt1 where tt2.c_real1 = tt1.c_text1) where c_real1 in (select c_text1 from tt1 where tt2.c_real1 = tt1.c_text1) limit 50;
+→ [{"n":0}]
+
+drop table tt1;
+drop table tt2;

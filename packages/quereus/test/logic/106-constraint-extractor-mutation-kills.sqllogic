@@ -1,0 +1,350 @@
+-- Constraint extractor mutation kills — end-to-end SQL tests
+-- Each query exercises a specific constraint extraction path.
+-- A surviving mutant that corrupts the pushed-down predicate will
+-- produce wrong rows.
+
+-- Setup
+CREATE TABLE ce (id INTEGER PRIMARY KEY, a INTEGER NULL, b INTEGER NULL, c TEXT NULL);
+INSERT INTO ce VALUES (1, 10, 100, 'alpha');
+INSERT INTO ce VALUES (2, 20, 200, 'beta');
+INSERT INTO ce VALUES (3, 30, 300, 'gamma');
+INSERT INTO ce VALUES (4, 40, 400, 'delta');
+INSERT INTO ce VALUES (5, NULL, NULL, NULL);
+
+-- ---------------------------------------------------------------
+-- Binary operators: col op lit
+-- ---------------------------------------------------------------
+
+-- equality
+select id from ce where a = 20 order by id;
+→ [{"id": 2}]
+
+-- greater than
+select id from ce where a > 20 order by id;
+→ [{"id": 3}, {"id": 4}]
+
+-- greater than or equal
+select id from ce where a >= 20 order by id;
+→ [{"id": 2}, {"id": 3}, {"id": 4}]
+
+-- less than
+select id from ce where a < 20 order by id;
+→ [{"id": 1}]
+
+-- less than or equal
+select id from ce where a <= 20 order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- ---------------------------------------------------------------
+-- flipOperator: lit op col (reversed pattern)
+-- ---------------------------------------------------------------
+
+-- 20 = a (same as a = 20)
+select id from ce where 20 = a order by id;
+→ [{"id": 2}]
+
+-- 20 < a (same as a > 20)
+select id from ce where 20 < a order by id;
+→ [{"id": 3}, {"id": 4}]
+
+-- 20 <= a (same as a >= 20)
+select id from ce where 20 <= a order by id;
+→ [{"id": 2}, {"id": 3}, {"id": 4}]
+
+-- 20 > a (same as a < 20)
+select id from ce where 20 > a order by id;
+→ [{"id": 1}]
+
+-- 20 >= a (same as a <= 20)
+select id from ce where 20 >= a order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- ---------------------------------------------------------------
+-- BETWEEN (inclusive bounds)
+-- ---------------------------------------------------------------
+
+select id from ce where a between 20 and 30 order by id;
+→ [{"id": 2}, {"id": 3}]
+
+-- boundary: exact match on lower
+select id from ce where a between 10 and 10 order by id;
+→ [{"id": 1}]
+
+-- NOT BETWEEN — should still produce correct rows (residual filter)
+select id from ce where a not between 20 and 30 order by id;
+→ [{"id": 1}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- IN / NOT IN
+-- ---------------------------------------------------------------
+
+select id from ce where a in (10, 30) order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- single element IN
+select id from ce where a in (20) order by id;
+→ [{"id": 2}]
+
+-- multi-element
+select id from ce where a in (10, 20, 30, 40) order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- IS NULL / IS NOT NULL
+-- ---------------------------------------------------------------
+
+select id from ce where a is null order by id;
+→ [{"id": 5}]
+
+select id from ce where a is not null order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+select id from ce where c is null order by id;
+→ [{"id": 5}]
+
+select id from ce where c is not null order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- AND decomposition
+-- ---------------------------------------------------------------
+
+select id from ce where a > 10 and a < 40 order by id;
+→ [{"id": 2}, {"id": 3}]
+
+-- deeply nested AND
+select id from ce where a >= 10 and a <= 40 and b > 100 order by id;
+→ [{"id": 2}, {"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- OR → IN collapse (a=1 OR a=2 OR a=3)
+-- ---------------------------------------------------------------
+
+select id from ce where a = 10 or a = 30 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+select id from ce where a = 10 or a = 20 or a = 30 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+-- mixed col=lit and lit=col in OR
+select id from ce where 10 = a or a = 30 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- OR with different columns — should NOT collapse to IN
+select id from ce where a = 10 or b = 200 order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- ---------------------------------------------------------------
+-- OR → range gaps
+-- ---------------------------------------------------------------
+
+-- a < 20 OR a > 30 → range gap
+select id from ce where a < 20 or a > 30 order by id;
+→ [{"id": 1}, {"id": 4}]
+
+-- a <= 10 OR a >= 40 → inclusive bounds
+select id from ce where a <= 10 or a >= 40 order by id;
+→ [{"id": 1}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Per-table slicing (two-table join predicates)
+-- ---------------------------------------------------------------
+
+CREATE TABLE ce2 (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
+INSERT INTO ce2 VALUES (1, 100, 1000);
+INSERT INTO ce2 VALUES (2, 200, 2000);
+INSERT INTO ce2 VALUES (3, 300, 3000);
+
+-- Join with per-table predicates
+select ce.id, ce2.id as id2
+from ce join ce2 on ce.b = ce2.x
+where ce.a > 10 and ce2.y < 3000
+order by ce.id;
+→ [{"id": 2, "id2": 2}]
+
+-- ---------------------------------------------------------------
+-- Mixed extractable + residual
+-- ---------------------------------------------------------------
+
+-- CASE expression is residual, equality is extractable
+select id from ce where a = 10 and case when b > 50 then 1 else 0 end = 1 order by id;
+→ [{"id": 1}]
+
+-- ---------------------------------------------------------------
+-- BETWEEN inside AND
+-- ---------------------------------------------------------------
+
+select id from ce where a between 10 and 30 and b > 100 order by id;
+→ [{"id": 2}, {"id": 3}]
+
+-- ---------------------------------------------------------------
+-- IN inside AND
+-- ---------------------------------------------------------------
+
+select id from ce where a in (10, 20) and b < 300 order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- ---------------------------------------------------------------
+-- Covered key: equality on primary key returns exactly one row
+-- ---------------------------------------------------------------
+
+select id, a from ce where id = 3;
+→ [{"id": 3, "a": 30}]
+
+-- ---------------------------------------------------------------
+-- LIKE / GLOB operators
+-- ---------------------------------------------------------------
+
+select id from ce where c like 'al%' order by id;
+→ [{"id": 1}]
+
+select id from ce where c like '%ta' order by id;
+→ [{"id": 2}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Boundary: > vs >= distinction
+-- ---------------------------------------------------------------
+
+select id from ce where a > 10 order by id;
+→ [{"id": 2}, {"id": 3}, {"id": 4}]
+
+select id from ce where a >= 10 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+-- Boundary: < vs <= distinction
+select id from ce where a < 40 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+select id from ce where a <= 40 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Parameterized queries
+-- ---------------------------------------------------------------
+
+select id from ce where a = :val;
+-- params: {"val": 30}
+→ [{"id": 3}]
+
+-- ---------------------------------------------------------------
+-- Multiple predicates on same column
+-- ---------------------------------------------------------------
+
+select id from ce where a > 10 and a < 30 order by id;
+→ [{"id": 2}]
+
+select id from ce where a >= 10 and a <= 30 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+-- ---------------------------------------------------------------
+-- BETWEEN boundary values
+-- ---------------------------------------------------------------
+
+select id from ce where a between 20 and 20 order by id;
+→ [{"id": 2}]
+
+select id from ce where a between 10 and 40 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Complex AND + OR
+-- ---------------------------------------------------------------
+
+select id from ce where (a = 10 or a = 20) and b > 100 order by id;
+→ [{"id": 2}]
+
+select id from ce where a in (10, 30) and b between 100 and 300 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- ---------------------------------------------------------------
+-- IS NULL with AND/OR
+-- ---------------------------------------------------------------
+
+select id from ce where a is null or b is null order by id;
+→ [{"id": 5}]
+
+select id from ce where a is not null and b > 200 order by id;
+→ [{"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Cross-table join constraint slicing
+-- ---------------------------------------------------------------
+
+select ce.id from ce join ce2 on ce.b = ce2.x where ce2.x = 100;
+→ [{"id": 1}]
+
+select ce.id, ce2.id as id2 from ce join ce2 on ce.a * 10 = ce2.x order by ce.id;
+→ [{"id": 1, "id2": 1}, {"id": 2, "id2": 2}, {"id": 3, "id2": 3}]
+
+-- ---------------------------------------------------------------
+-- OR range: a>30 OR a<20 (gap in the middle)
+-- ---------------------------------------------------------------
+
+select id from ce where a > 30 or a < 20 order by id;
+→ [{"id": 1}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Subquery IN (should not extract — goes through different path)
+-- ---------------------------------------------------------------
+
+select id from ce where b in (select x from ce2) order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+-- ---------------------------------------------------------------
+-- NOT IN
+-- ---------------------------------------------------------------
+
+select id from ce where a not in (10, 20) order by id;
+→ [{"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- OR of 4 equalities → IN collapse
+-- ---------------------------------------------------------------
+
+select id from ce where a = 10 or a = 20 or a = 30 or a = 40 order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- OR of inequality + equality → mixed
+-- ---------------------------------------------------------------
+
+select id from ce where a = 10 or a > 30 order by id;
+→ [{"id": 1}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- CAST in WHERE clause
+-- ---------------------------------------------------------------
+
+select id from ce where cast(a as text) = '20' order by id;
+→ [{"id": 2}]
+
+-- ---------------------------------------------------------------
+-- Aggregate with constraint on grouped column
+-- ---------------------------------------------------------------
+
+select a, count(*) as cnt from ce where a is not null group by a having count(*) > 0 order by a;
+→ [{"a": 10, "cnt": 1}, {"a": 20, "cnt": 1}, {"a": 30, "cnt": 1}, {"a": 40, "cnt": 1}]
+
+-- ---------------------------------------------------------------
+-- Join + constraint on each table
+-- ---------------------------------------------------------------
+
+select ce.id, ce2.id as id2
+from ce cross join ce2
+where ce.a = 10 and ce2.x = 200
+order by ce.id;
+→ [{"id": 1, "id2": 2}]
+
+-- ---------------------------------------------------------------
+-- Multiple OR ranges
+-- ---------------------------------------------------------------
+
+select id from ce where (a < 15 or a > 35) and b is not null order by id;
+→ [{"id": 1}, {"id": 4}]
+
+-- ---------------------------------------------------------------
+-- Cleanup
+-- ---------------------------------------------------------------
+
+DROP TABLE ce;
+DROP TABLE ce2;

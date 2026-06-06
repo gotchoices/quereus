@@ -1,0 +1,145 @@
+-- Tests for non-PK UNIQUE constraint enforcement
+
+-- === Basic UNIQUE column enforcement ===
+
+CREATE TABLE t_uc (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT);
+INSERT INTO t_uc VALUES (1, 'alice@test.com', 'Alice');
+INSERT INTO t_uc VALUES (2, 'bob@test.com', 'Bob');
+-- run
+
+SELECT * FROM t_uc ORDER BY id;
+→ [{"id":1,"email":"alice@test.com","name":"Alice"},{"id":2,"email":"bob@test.com","name":"Bob"}]
+
+-- Duplicate UNIQUE value should fail
+INSERT INTO t_uc VALUES (3, 'alice@test.com', 'Eve');
+-- error: UNIQUE constraint failed
+
+-- Original data unchanged after failed insert
+SELECT count(*) as cnt FROM t_uc;
+→ [{"cnt":2}]
+
+-- === INSERT OR IGNORE with UNIQUE violation ===
+
+INSERT OR IGNORE INTO t_uc VALUES (4, 'alice@test.com', 'Ignored');
+SELECT count(*) as cnt FROM t_uc;
+→ [{"cnt":2}]
+
+-- === INSERT OR REPLACE with UNIQUE violation ===
+
+INSERT OR REPLACE INTO t_uc VALUES (5, 'alice@test.com', 'Replaced');
+SELECT * FROM t_uc ORDER BY id;
+→ [{"id":2,"email":"bob@test.com","name":"Bob"},{"id":5,"email":"alice@test.com","name":"Replaced"}]
+
+-- The old row (id=1) with the conflicting email was deleted
+SELECT count(*) as cnt FROM t_uc WHERE id = 1;
+→ [{"cnt":0}]
+
+DROP TABLE t_uc;
+-- run
+
+-- === NULL values in UNIQUE columns ===
+
+CREATE TABLE t_uc_null (id INTEGER PRIMARY KEY, code TEXT NULL UNIQUE);
+INSERT INTO t_uc_null VALUES (1, null);
+INSERT INTO t_uc_null VALUES (2, null);
+INSERT INTO t_uc_null VALUES (3, 'abc');
+-- run
+
+-- Multiple NULLs are allowed per SQL standard
+SELECT count(*) as cnt FROM t_uc_null;
+→ [{"cnt":3}]
+
+-- But duplicate non-NULL values still fail
+INSERT INTO t_uc_null VALUES (4, 'abc');
+-- error: UNIQUE constraint failed
+
+DROP TABLE t_uc_null;
+-- run
+
+-- === UPDATE changing UNIQUE column to conflicting value ===
+
+CREATE TABLE t_uc_upd (id INTEGER PRIMARY KEY, tag TEXT UNIQUE, val INTEGER);
+INSERT INTO t_uc_upd VALUES (1, 'alpha', 10);
+INSERT INTO t_uc_upd VALUES (2, 'beta', 20);
+-- run
+
+-- Updating to a conflicting UNIQUE value should fail
+UPDATE t_uc_upd SET tag = 'alpha' WHERE id = 2;
+-- error: UNIQUE constraint failed
+
+-- Data unchanged
+SELECT * FROM t_uc_upd ORDER BY id;
+→ [{"id":1,"tag":"alpha","val":10},{"id":2,"tag":"beta","val":20}]
+
+-- Updating non-UNIQUE column is fine
+UPDATE t_uc_upd SET val = 99 WHERE id = 2;
+-- run
+
+SELECT * FROM t_uc_upd ORDER BY id;
+→ [{"id":1,"tag":"alpha","val":10},{"id":2,"tag":"beta","val":99}]
+
+-- Updating UNIQUE column to its own value is fine (no conflict)
+UPDATE t_uc_upd SET tag = 'beta' WHERE id = 2;
+-- run
+
+SELECT * FROM t_uc_upd ORDER BY id;
+→ [{"id":1,"tag":"alpha","val":10},{"id":2,"tag":"beta","val":99}]
+
+-- Updating UNIQUE column to a new value is fine
+UPDATE t_uc_upd SET tag = 'gamma' WHERE id = 2;
+-- run
+
+SELECT * FROM t_uc_upd ORDER BY id;
+→ [{"id":1,"tag":"alpha","val":10},{"id":2,"tag":"gamma","val":99}]
+
+DROP TABLE t_uc_upd;
+-- run
+
+-- === Composite UNIQUE constraint ===
+
+CREATE TABLE t_uc_comp (
+    id INTEGER PRIMARY KEY,
+    a TEXT,
+    b INTEGER,
+    UNIQUE (a, b)
+);
+INSERT INTO t_uc_comp VALUES (1, 'x', 1);
+INSERT INTO t_uc_comp VALUES (2, 'x', 2);
+INSERT INTO t_uc_comp VALUES (3, 'y', 1);
+-- run
+
+-- Same combination should fail
+INSERT INTO t_uc_comp VALUES (4, 'x', 1);
+-- error: UNIQUE constraint failed
+
+-- Different combinations are fine
+SELECT count(*) as cnt FROM t_uc_comp;
+→ [{"cnt":3}]
+
+DROP TABLE t_uc_comp;
+-- run
+
+-- === UNIQUE with PK-change UPDATE ===
+
+CREATE TABLE t_uc_pkchg (id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+INSERT INTO t_uc_pkchg VALUES (1, 'aaa');
+INSERT INTO t_uc_pkchg VALUES (2, 'bbb');
+-- run
+
+-- PK-change update that also conflicts on UNIQUE should fail
+UPDATE t_uc_pkchg SET id = 3, code = 'aaa' WHERE id = 2;
+-- error: UNIQUE constraint failed
+
+-- Old row should be preserved after failed PK-change update
+SELECT * FROM t_uc_pkchg ORDER BY id;
+→ [{"id":1,"code":"aaa"},{"id":2,"code":"bbb"}]
+
+-- PK-change update without UNIQUE conflict should succeed
+UPDATE t_uc_pkchg SET id = 3, code = 'ccc' WHERE id = 2;
+-- run
+
+SELECT * FROM t_uc_pkchg ORDER BY id;
+→ [{"id":1,"code":"aaa"},{"id":3,"code":"ccc"}]
+
+DROP TABLE t_uc_pkchg;
+-- run

@@ -1,0 +1,169 @@
+-- adapted from SQLite test/collate1-9.test
+-- Collation propagation across query parts: ORDER BY, JOIN, DISTINCT, set operations,
+-- aggregates, indexes. Quereus supports BINARY (default), NOCASE, and RTRIM on TEXT.
+-- Existing 06.4.1-schema-case-insensitive covers schema-name case handling.
+-- Existing 03-expressions, 03.6-type-system, 07.5-window, 07.3-group-by-extras cover
+-- basic WHERE / BETWEEN / GROUP BY / PARTITION BY usage. This file fills the gaps.
+
+-- =============================================================================
+-- ORDER BY with column-level COLLATE NOCASE
+-- =============================================================================
+
+create table coll_ord (id integer primary key, name text collate NOCASE);
+insert into coll_ord values (1, 'charlie'), (2, 'Alice'), (3, 'bob'), (4, 'BANANA');
+
+-- NOCASE column ordering: case-insensitive
+select name from coll_ord order by name;
+→ [{"name":"Alice"},{"name":"BANANA"},{"name":"bob"},{"name":"charlie"}]
+
+-- Explicit COLLATE BINARY in ORDER BY overrides column collation
+select name from coll_ord order by name collate BINARY;
+→ [{"name":"Alice"},{"name":"BANANA"},{"name":"bob"},{"name":"charlie"}]
+
+drop table coll_ord;
+
+-- =============================================================================
+-- ORDER BY with explicit COLLATE override on a BINARY-default column
+-- =============================================================================
+
+create table coll_bin (id integer primary key, name text);
+insert into coll_bin values (1, 'charlie'), (2, 'Alice'), (3, 'bob'), (4, 'BANANA');
+
+-- Default BINARY: uppercase letters sort before lowercase
+select name from coll_bin order by name;
+→ [{"name":"Alice"},{"name":"BANANA"},{"name":"bob"},{"name":"charlie"}]
+
+-- Force NOCASE: reorders alphabetically ignoring case
+select name from coll_bin order by name collate NOCASE;
+→ [{"name":"Alice"},{"name":"BANANA"},{"name":"bob"},{"name":"charlie"}]
+
+drop table coll_bin;
+
+-- =============================================================================
+-- RTRIM collation: trailing spaces ignored
+-- =============================================================================
+
+create table coll_rtrim (id integer primary key, val text collate RTRIM);
+insert into coll_rtrim values (1, 'cat'), (2, 'cat '), (3, 'cat  '), (4, 'dog'), (5, 'dog ');
+
+-- Equality treats 'cat', 'cat ', 'cat  ' as equal
+select id from coll_rtrim where val = 'cat' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- ORDER BY groups RTRIM-equal values
+select id from coll_rtrim order by val, id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+
+-- DISTINCT under RTRIM dedups trailing-space variants
+select distinct val from coll_rtrim order by val;
+→ [{"val":"cat"},{"val":"dog"}]
+
+drop table coll_rtrim;
+
+-- =============================================================================
+-- JOIN ON with COLLATE NOCASE — explicit collation on predicate
+-- =============================================================================
+
+create table jt1 (id integer primary key, name text);
+create table jt2 (id integer primary key, name text);
+insert into jt1 values (1, 'Alice'), (2, 'Bob');
+insert into jt2 values (10, 'ALICE'), (20, 'bob');
+
+-- Explicit COLLATE NOCASE on the join predicate matches case-insensitively
+select jt1.id as l, jt2.id as r from jt1 join jt2 on jt1.name = jt2.name collate NOCASE order by jt1.id;
+→ [{"l":1,"r":10},{"l":2,"r":20}]
+
+-- Default BINARY: case-sensitive, no matches
+select jt1.id as l, jt2.id as r from jt1 join jt2 on jt1.name = jt2.name order by jt1.id;
+→ []
+
+drop table jt1;
+drop table jt2;
+
+-- =============================================================================
+-- DISTINCT with COLLATE NOCASE column
+-- =============================================================================
+
+create table coll_dist (id integer primary key, name text collate NOCASE);
+insert into coll_dist values (1, 'Bob'), (2, 'bob'), (3, 'BOB'), (4, 'Alice'), (5, 'alice');
+
+-- DISTINCT under NOCASE merges case-equal values
+select distinct name from coll_dist order by name;
+→ [{"name":"Alice"},{"name":"Bob"}]
+
+drop table coll_dist;
+
+-- =============================================================================
+-- UNION / INTERSECT / EXCEPT with COLLATE NOCASE
+-- =============================================================================
+
+create table set_a (name text collate NOCASE);
+create table set_b (name text collate NOCASE);
+insert into set_a values ('Alice'), ('Bob');
+insert into set_b values ('ALICE'), ('charlie');
+
+-- UNION dedups using column collation: 'Alice' and 'ALICE' merge
+select name from set_a union select name from set_b order by name;
+→ [{"name":"Alice"},{"name":"Bob"},{"name":"charlie"}]
+
+-- UNION ALL keeps duplicates as-is (no dedup)
+select name from set_a union all select name from set_b order by name;
+→ [{"name":"Alice"},{"name":"ALICE"},{"name":"Bob"},{"name":"charlie"}]
+
+-- INTERSECT under NOCASE matches case-insensitively
+select name from set_a intersect select name from set_b order by name;
+→ [{"name":"Alice"}]
+
+-- EXCEPT under NOCASE removes case-equal rows
+select name from set_a except select name from set_b order by name;
+→ [{"name":"Bob"}]
+
+drop table set_a;
+drop table set_b;
+
+-- =============================================================================
+-- MIN / MAX aggregates respect column collation
+-- =============================================================================
+
+create table coll_agg (id integer primary key, val text collate NOCASE);
+insert into coll_agg values (1, 'apple'), (2, 'APPLE'), (3, 'Banana'), (4, 'banana'), (5, 'cherry');
+
+-- MIN/MAX under NOCASE: comparison is case-insensitive, so first/last by case-folded order
+-- (NOCASE-equal values may resolve to any of the case-equal members; engine picks first encountered)
+select min(val) as mn, max(val) as mx from coll_agg;
+→ [{"mn":"APPLE","mx":"cherry"}]
+
+drop table coll_agg;
+
+-- =============================================================================
+-- INDEX with COLLATE expression: Quereus does not support indexes on expressions
+-- =============================================================================
+
+create table coll_idx (id integer primary key, name text);
+insert into coll_idx values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+
+create index idx_name_nc on coll_idx (name collate NOCASE);
+-- error: Indices on expressions are not supported
+
+-- Equality search using inline COLLATE NOCASE on the predicate (no index)
+select id from coll_idx where name = 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Default BINARY equality (no COLLATE override) finds exact case
+select id from coll_idx where name = 'BOB' order by id;
+→ [{"id":2}]
+
+drop table coll_idx;
+
+-- =============================================================================
+-- COLLATE in CASE expression
+-- =============================================================================
+
+create table coll_case (id integer primary key, status text);
+insert into coll_case values (1, 'active'), (2, 'PENDING'), (3, 'closed'), (4, 'ACTIVE');
+
+select id, case when status = 'active' collate NOCASE then 'match' else 'other' end as r
+  from coll_case order by id;
+→ [{"id":1,"r":"match"},{"id":2,"r":"other"},{"id":3,"r":"other"},{"id":4,"r":"match"}]
+
+drop table coll_case;

@@ -1,0 +1,1191 @@
+-- 105-vtab-memory-mutation-kills.sqllogic
+-- Mutation-killing tests targeting packages/quereus/src/vtab/memory/ (module.ts, table.ts, connection.ts)
+
+-- ===================================================================
+-- SECTION 1: IS NULL on NOT NULL column → empty result (module.ts:145-158)
+-- ===================================================================
+
+create table nn_test (id integer primary key, a integer not null, b text null);
+insert into nn_test values (1, 10, 'x'), (2, 20, null), (3, 30, 'z');
+
+-- IS NULL on NOT NULL column should return empty (planner marks all filters handled, returns 0 rows)
+select * from nn_test where a is null;
+→ []
+
+-- IS NULL on nullable column should return matching rows
+select id from nn_test where b is null;
+→ [{"id": 2}]
+
+-- IS NULL on PK (always NOT NULL) should return empty
+select * from nn_test where id is null;
+→ []
+
+-- Combine IS NULL NOT NULL with other filters — the IS NULL short-circuits
+select id from nn_test where a is null and b = 'x';
+→ []
+
+drop table nn_test;
+
+-- ===================================================================
+-- SECTION 2: IS NOT NULL on NOT NULL column → tautology (module.ts:212-227)
+-- ===================================================================
+
+create table isnn_test (id integer primary key, a integer not null, b text null);
+insert into isnn_test values (1, 10, 'x'), (2, 20, null), (3, 30, 'z');
+
+-- IS NOT NULL on NOT NULL column is a tautology — all rows returned
+select id from isnn_test where a is not null order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+-- IS NOT NULL on PK is a tautology — all rows returned
+select id from isnn_test where id is not null order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+-- IS NOT NULL on nullable column filters correctly
+select id from isnn_test where b is not null order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- Combine IS NOT NULL tautology with a real filter
+select id from isnn_test where a is not null and b = 'z';
+→ [{"id": 3}]
+
+drop table isnn_test;
+
+-- ===================================================================
+-- SECTION 3: PK ordering advertisement (module.ts:188-204)
+-- B-tree scans produce PK order naturally.
+-- ===================================================================
+
+create table pk_order (id integer primary key, val text);
+insert into pk_order values (3, 'c'), (1, 'a'), (5, 'e'), (2, 'b'), (4, 'd');
+
+-- Full scan should produce rows in PK order without explicit ORDER BY
+select id, val from pk_order;
+→ [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}, {"id": 3, "val": "c"}, {"id": 4, "val": "d"}, {"id": 5, "val": "e"}]
+
+-- ORDER BY pk should be satisfied by the natural BTree order
+select id from pk_order order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5}]
+
+-- DESC PK table
+drop table pk_order;
+create table pk_desc (id integer primary key desc, val text);
+insert into pk_desc values (3, 'c'), (1, 'a'), (5, 'e'), (2, 'b'), (4, 'd');
+
+-- Natural order should be descending
+select id, val from pk_desc;
+→ [{"id": 5, "val": "e"}, {"id": 4, "val": "d"}, {"id": 3, "val": "c"}, {"id": 2, "val": "b"}, {"id": 1, "val": "a"}]
+
+drop table pk_desc;
+
+-- ===================================================================
+-- SECTION 4: Full scan fallback (module.ts:172-177)
+-- ===================================================================
+
+create table no_idx (id integer primary key, name text, age integer);
+insert into no_idx values (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35);
+
+-- Filter on non-indexed column forces full scan
+select name from no_idx where name = 'Bob';
+→ [{"name": "Bob"}]
+
+-- Filter on non-indexed column with range
+select name from no_idx where age > 28 order by id;
+→ [{"name": "Alice"}, {"name": "Charlie"}]
+
+drop table no_idx;
+
+-- ===================================================================
+-- SECTION 5: Index equality matching / prefix matching (module.ts:325-363)
+-- ===================================================================
+
+create table idx_eq (id integer primary key, a integer, b integer, c integer);
+create index idx_ab on idx_eq (a, b);
+insert into idx_eq values (1, 10, 100, 1000), (2, 10, 200, 2000), (3, 20, 100, 3000), (4, 20, 200, 4000), (5, 30, 300, 5000);
+
+-- Exact match on full composite index (a, b)
+select id from idx_eq where a = 10 and b = 200;
+→ [{"id": 2}]
+
+-- Prefix match on first column of composite index
+select id from idx_eq where a = 20 order by id;
+→ [{"id": 3}, {"id": 4}]
+
+-- No match
+select id from idx_eq where a = 99;
+→ []
+
+-- IN on first index column
+select id from idx_eq where a in (10, 30) order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 5}]
+
+-- IN on second index column with equality on first (composite)
+select id from idx_eq where a = 10 and b in (100, 200) order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- IN with single value (treated as equality)
+select id from idx_eq where a in (20) order by id;
+→ [{"id": 3}, {"id": 4}]
+
+drop table idx_eq;
+
+-- ===================================================================
+-- SECTION 6: Index range matching (module.ts:368-389)
+-- ===================================================================
+
+create table idx_range (id integer primary key, val integer);
+create index idx_val on idx_range (val);
+insert into idx_range values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+-- Greater than
+select id from idx_range where val > 25 order by id;
+→ [{"id": 3}, {"id": 4}, {"id": 5}]
+
+-- Greater than or equal
+select id from idx_range where val >= 30 order by id;
+→ [{"id": 3}, {"id": 4}, {"id": 5}]
+
+-- Less than
+select id from idx_range where val < 25 order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- Less than or equal
+select id from idx_range where val <= 20 order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- Between (range with both bounds)
+select id from idx_range where val >= 20 and val <= 40 order by id;
+→ [{"id": 2}, {"id": 3}, {"id": 4}]
+
+-- Half-open range (lower bound only)
+select id from idx_range where val > 40 order by id;
+→ [{"id": 5}]
+
+-- Half-open range (upper bound only)
+select id from idx_range where val < 20 order by id;
+→ [{"id": 1}]
+
+-- Range that matches no rows
+select id from idx_range where val > 100;
+→ []
+
+-- Range on PK column
+select id from idx_range where id > 2 and id < 5 order by id;
+→ [{"id": 3}, {"id": 4}]
+
+drop table idx_range;
+
+-- ===================================================================
+-- SECTION 7: Prefix-equality + trailing-range on composite index (module.ts:264-281)
+-- ===================================================================
+
+create table prefix_range (id integer primary key, cat integer, score integer, detail text);
+create index idx_cat_score on prefix_range (cat, score);
+insert into prefix_range values
+	(1, 1, 10, 'a'), (2, 1, 20, 'b'), (3, 1, 30, 'c'),
+	(4, 2, 15, 'd'), (5, 2, 25, 'e'), (6, 2, 35, 'f');
+
+-- Equality on first column + range on second column
+select id from prefix_range where cat = 1 and score > 15 order by id;
+→ [{"id": 2}, {"id": 3}]
+
+select id from prefix_range where cat = 2 and score <= 25 order by id;
+→ [{"id": 4}, {"id": 5}]
+
+select id from prefix_range where cat = 1 and score >= 10 and score <= 20 order by id;
+→ [{"id": 1}, {"id": 2}]
+
+drop table prefix_range;
+
+-- ===================================================================
+-- SECTION 8: Ordering from index (module.ts:414-461)
+-- ===================================================================
+
+create table idx_order (id integer primary key, name text, score integer);
+create index idx_name_asc on idx_order (name);
+create index idx_score_desc on idx_order (score desc);
+insert into idx_order values (1, 'Charlie', 90), (2, 'Alice', 80), (3, 'Bob', 95), (4, 'David', 85);
+
+-- ORDER BY indexed column ascending
+select name from idx_order order by name;
+→ [{"name": "Alice"}, {"name": "Bob"}, {"name": "Charlie"}, {"name": "David"}]
+
+-- ORDER BY indexed column descending (requires DESC index)
+select score from idx_order order by score desc;
+→ [{"score": 95}, {"score": 90}, {"score": 85}, {"score": 80}]
+
+-- ORDER BY non-indexed column still works (external sort)
+select name from idx_order order by id desc;
+→ [{"name": "David"}, {"name": "Bob"}, {"name": "Alice"}, {"name": "Charlie"}]
+
+drop table idx_order;
+
+-- Composite index ordering
+create table comp_order (id integer primary key, a integer, b integer);
+create index idx_ab on comp_order (a, b);
+insert into comp_order values (1, 1, 30), (2, 1, 10), (3, 2, 20), (4, 2, 10), (5, 1, 20);
+
+-- ORDER BY matches composite index prefix
+select id, a, b from comp_order order by a, b;
+→ [{"id": 2, "a": 1, "b": 10}, {"id": 5, "a": 1, "b": 20}, {"id": 1, "a": 1, "b": 30}, {"id": 4, "a": 2, "b": 10}, {"id": 3, "a": 2, "b": 20}]
+
+drop table comp_order;
+
+-- ===================================================================
+-- SECTION 9: Composite primary keys (table.ts:389-395 comparePrimaryKey)
+-- ===================================================================
+
+create table comp_pk (a integer, b text, c integer, primary key (a, b));
+insert into comp_pk values (1, 'x', 100), (1, 'y', 200), (2, 'x', 300), (2, 'y', 400);
+
+-- Point lookup on composite PK
+select c from comp_pk where a = 1 and b = 'y';
+→ [{"c": 200}]
+
+-- Range on first PK column
+select a, b from comp_pk where a = 2 order by a, b;
+→ [{"a": 2, "b": "x"}, {"a": 2, "b": "y"}]
+
+-- All rows in PK order
+select a, b, c from comp_pk;
+→ [{"a": 1, "b": "x", "c": 100}, {"a": 1, "b": "y", "c": 200}, {"a": 2, "b": "x", "c": 300}, {"a": 2, "b": "y", "c": 400}]
+
+-- Update by composite PK
+update comp_pk set c = 999 where a = 1 and b = 'x';
+select c from comp_pk where a = 1 and b = 'x';
+→ [{"c": 999}]
+
+-- Delete by composite PK
+delete from comp_pk where a = 2 and b = 'y';
+select count(*) as cnt from comp_pk;
+→ [{"cnt": 3}]
+
+-- Duplicate PK should fail
+insert into comp_pk values (1, 'y', 500);
+-- error: UNIQUE constraint
+
+drop table comp_pk;
+
+-- ===================================================================
+-- SECTION 10: Multi-column secondary indexes
+-- ===================================================================
+
+create table multi_idx (id integer primary key, x integer, y integer, z text);
+create index idx_xy on multi_idx (x, y);
+insert into multi_idx values (1, 10, 1, 'a'), (2, 10, 2, 'b'), (3, 20, 1, 'c'), (4, 20, 2, 'd'), (5, 10, 1, 'e');
+
+-- Equality on both columns
+select id from multi_idx where x = 10 and y = 1 order by id;
+→ [{"id": 1}, {"id": 5}]
+
+-- Equality on first only
+select id from multi_idx where x = 20 order by id;
+→ [{"id": 3}, {"id": 4}]
+
+-- Range on second column with equality on first
+select id from multi_idx where x = 10 and y > 1 order by id;
+→ [{"id": 2}]
+
+drop table multi_idx;
+
+-- ===================================================================
+-- SECTION 11: DESC secondary indexes (table.ts:411-428 getIndexComparator)
+-- ===================================================================
+
+create table desc_idx (id integer primary key, score integer, name text);
+create index idx_score_d on desc_idx (score desc);
+insert into desc_idx values (1, 90, 'Alice'), (2, 70, 'Bob'), (3, 85, 'Charlie'), (4, 95, 'David');
+
+-- ORDER BY score DESC should leverage the DESC index
+select name from desc_idx order by score desc;
+→ [{"name": "David"}, {"name": "Alice"}, {"name": "Charlie"}, {"name": "Bob"}]
+
+-- Range on DESC indexed column
+select name from desc_idx where score >= 85 order by score desc;
+→ [{"name": "David"}, {"name": "Alice"}, {"name": "Charlie"}]
+
+select name from desc_idx where score < 90 order by id;
+→ [{"name": "Bob"}, {"name": "Charlie"}]
+
+drop table desc_idx;
+
+-- Mixed ASC/DESC composite index
+create table mixed_dir (id integer primary key, a integer, b integer);
+create index idx_a_asc_b_desc on mixed_dir (a, b desc);
+insert into mixed_dir values (1, 1, 30), (2, 1, 10), (3, 1, 20), (4, 2, 10), (5, 2, 20);
+
+-- Equality on a, range on b (DESC)
+select id, a, b from mixed_dir where a = 1 order by a, b desc;
+→ [{"id": 1, "a": 1, "b": 30}, {"id": 3, "a": 1, "b": 20}, {"id": 2, "a": 1, "b": 10}]
+
+drop table mixed_dir;
+
+-- ===================================================================
+-- SECTION 12: SAVEPOINT / RELEASE / ROLLBACK TO sequences (table.ts:290-303)
+-- ===================================================================
+
+create table sp_data (id integer primary key, val text);
+insert into sp_data values (1, 'original');
+
+-- Basic savepoint + release
+begin;
+savepoint s1;
+insert into sp_data values (2, 'in-s1');
+release savepoint s1;
+commit;
+select val from sp_data where id = 2;
+→ [{"val": "in-s1"}]
+
+-- Savepoint + rollback to
+begin;
+savepoint s2;
+update sp_data set val = 'modified' where id = 1;
+insert into sp_data values (3, 'in-s2');
+select val from sp_data where id = 1;
+→ [{"val": "modified"}]
+rollback to savepoint s2;
+-- Changes after s2 should be undone
+select val from sp_data where id = 1;
+→ [{"val": "original"}]
+select count(*) as cnt from sp_data where id = 3;
+→ [{"cnt": 0}]
+commit;
+
+-- Nested savepoints: rollback to outer discards inner
+begin;
+insert into sp_data values (10, 'base');
+savepoint outer_sp;
+insert into sp_data values (11, 'outer');
+savepoint inner_sp;
+insert into sp_data values (12, 'inner');
+rollback to savepoint outer_sp;
+-- Both inner_sp and outer_sp changes should be gone
+select count(*) as cnt from sp_data where id in (11, 12);
+→ [{"cnt": 0}]
+-- base insert should remain
+select count(*) as cnt from sp_data where id = 10;
+→ [{"cnt": 1}]
+commit;
+
+-- Cleanup
+delete from sp_data where id >= 10;
+-- run
+
+-- Savepoint after rollback-to — can continue working
+begin;
+savepoint reuse;
+insert into sp_data values (20, 'will-undo');
+rollback to savepoint reuse;
+-- Insert after rollback-to
+insert into sp_data values (21, 'after-rollback');
+release savepoint reuse;
+commit;
+select count(*) as cnt from sp_data where id = 20;
+→ [{"cnt": 0}]
+select val from sp_data where id = 21;
+→ [{"val": "after-rollback"}]
+
+drop table sp_data;
+
+-- ===================================================================
+-- SECTION 13: Transaction isolation (BEGIN, INSERT, ROLLBACK)
+-- ===================================================================
+
+create table iso_test (id integer primary key, val text);
+insert into iso_test values (1, 'committed');
+
+-- Rollback should discard all uncommitted changes
+begin;
+insert into iso_test values (2, 'uncommitted');
+update iso_test set val = 'changed' where id = 1;
+select val from iso_test where id = 1;
+→ [{"val": "changed"}]
+select count(*) as cnt from iso_test;
+→ [{"cnt": 2}]
+rollback;
+
+-- After rollback, original state should be restored
+select val from iso_test where id = 1;
+→ [{"val": "committed"}]
+select count(*) as cnt from iso_test;
+→ [{"cnt": 1}]
+
+-- Delete inside transaction then rollback
+begin;
+delete from iso_test where id = 1;
+select count(*) as cnt from iso_test;
+→ [{"cnt": 0}]
+rollback;
+select count(*) as cnt from iso_test;
+→ [{"cnt": 1}]
+
+drop table iso_test;
+
+-- ===================================================================
+-- SECTION 14: committed.* snapshot reads (table.ts:231, 244)
+-- ===================================================================
+
+create table snap_test (id integer primary key, val integer);
+insert into snap_test values (1, 100), (2, 200);
+-- run
+
+begin;
+update snap_test set val = 999 where id = 1;
+insert into snap_test values (3, 300);
+
+-- committed.snap_test should see pre-transaction state
+select val from committed.snap_test where id = 1;
+→ [{"val": 100}]
+select count(*) as cnt from committed.snap_test;
+→ [{"cnt": 2}]
+
+-- Current table sees uncommitted changes
+select val from snap_test where id = 1;
+→ [{"val": 999}]
+select count(*) as cnt from snap_test;
+→ [{"cnt": 3}]
+commit;
+
+-- After commit, committed.* shows the new state
+select val from committed.snap_test where id = 1;
+→ [{"val": 999}]
+select count(*) as cnt from committed.snap_test;
+→ [{"cnt": 3}]
+
+-- committed.* is read-only
+insert into committed.snap_test values (4, 400);
+-- error: Cannot modify committed-state
+
+update committed.snap_test set val = 0 where id = 1;
+-- error: Cannot modify committed-state
+
+delete from committed.snap_test where id = 1;
+-- error: Cannot modify committed-state
+
+drop table snap_test;
+-- run
+
+-- ===================================================================
+-- SECTION 15: ALTER TABLE on memory tables
+-- ===================================================================
+
+-- ADD COLUMN
+create table alt_test (id integer primary key, name text);
+insert into alt_test values (1, 'Alice'), (2, 'Bob');
+
+alter table alt_test add column age integer null;
+select * from alt_test order by id;
+→ [{"id": 1, "name": "Alice", "age": null}, {"id": 2, "name": "Bob", "age": null}]
+
+-- Insert with new column
+insert into alt_test values (3, 'Charlie', 30);
+select * from alt_test where id = 3;
+→ [{"id": 3, "name": "Charlie", "age": 30}]
+
+-- ADD COLUMN with default
+alter table alt_test add column status text default 'active';
+select status from alt_test where id = 1;
+→ [{"status": "active"}]
+
+-- DROP COLUMN
+alter table alt_test drop column status;
+select * from alt_test where id = 1;
+→ [{"id": 1, "name": "Alice", "age": null}]
+
+-- RENAME COLUMN
+alter table alt_test rename column name to full_name;
+select full_name from alt_test where id = 2;
+→ [{"full_name": "Bob"}]
+
+-- Verify data integrity after all alterations
+select * from alt_test order by id;
+→ [{"id": 1, "full_name": "Alice", "age": null}, {"id": 2, "full_name": "Bob", "age": null}, {"id": 3, "full_name": "Charlie", "age": 30}]
+
+drop table alt_test;
+
+-- ===================================================================
+-- SECTION 16: Index CREATE/DROP on populated tables
+-- ===================================================================
+
+create table idx_pop (id integer primary key, category text, value integer);
+insert into idx_pop values (1, 'A', 100), (2, 'B', 200), (3, 'A', 300), (4, 'C', 150), (5, 'B', 250);
+
+-- Create index on populated table
+create index idx_cat on idx_pop (category);
+
+-- Query using the new index
+select id from idx_pop where category = 'A' order by id;
+→ [{"id": 1}, {"id": 3}]
+
+select id from idx_pop where category = 'B' order by id;
+→ [{"id": 2}, {"id": 5}]
+
+-- Create composite index on populated table
+create index idx_cat_val on idx_pop (category, value);
+
+-- Query using composite index
+select id from idx_pop where category = 'B' and value > 200;
+→ [{"id": 5}]
+
+-- Drop index and verify queries still work
+drop index idx_cat;
+select id from idx_pop where category = 'C';
+→ [{"id": 4}]
+
+-- Re-create the dropped index
+create index idx_cat on idx_pop (category);
+select id from idx_pop where category = 'A' order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- Insert after index creation
+insert into idx_pop values (6, 'A', 350);
+select id from idx_pop where category = 'A' order by id;
+→ [{"id": 1}, {"id": 3}, {"id": 6}]
+
+-- Delete and verify index consistency
+delete from idx_pop where id = 3;
+select id from idx_pop where category = 'A' order by id;
+→ [{"id": 1}, {"id": 6}]
+
+drop table idx_pop;
+
+-- ===================================================================
+-- SECTION 17: Edge cases for IS NULL / IS NOT NULL interactions
+-- ===================================================================
+
+create table null_edge (id integer primary key, a integer not null, b text null, c integer null);
+insert into null_edge values (1, 10, null, null), (2, 20, 'x', 100), (3, 30, null, 200);
+
+-- IS NULL on NOT NULL with other non-null conditions: still empty
+select id from null_edge where a is null and c > 0;
+→ []
+
+-- IS NOT NULL on NOT NULL + IS NULL on nullable
+select id from null_edge where a is not null and b is null order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- IS NOT NULL on both NOT NULL and nullable
+select id from null_edge where a is not null and c is not null order by id;
+→ [{"id": 2}, {"id": 3}]
+
+-- IS NOT NULL on NOT NULL col in a join
+create table null_edge2 (id integer primary key, ref integer not null);
+insert into null_edge2 values (1, 1), (2, 2);
+select ne.id, ne2.id as ref_id from null_edge ne join null_edge2 ne2 on ne.id = ne2.ref where ne.a is not null and ne2.ref is not null order by ne.id;
+→ [{"id": 1, "ref_id": 1}, {"id": 2, "ref_id": 2}]
+drop table null_edge2;
+
+drop table null_edge;
+
+-- ===================================================================
+-- SECTION 18: PK point lookup and PK range with LIMIT
+-- ===================================================================
+
+create table pk_lookup (id integer primary key, data text);
+insert into pk_lookup values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+-- PK point lookup
+select data from pk_lookup where id = 3;
+→ [{"data": "c"}]
+
+-- PK point lookup — not found
+select data from pk_lookup where id = 99;
+→ []
+
+-- PK range with LIMIT
+select id from pk_lookup where id > 1 order by id limit 2;
+→ [{"id": 2}, {"id": 3}]
+
+-- PK range with both bounds and LIMIT
+select id from pk_lookup where id >= 2 and id <= 4 order by id limit 2;
+→ [{"id": 2}, {"id": 3}]
+
+drop table pk_lookup;
+
+-- ===================================================================
+-- SECTION 19: Empty table edge cases
+-- ===================================================================
+
+create table empty_t (id integer primary key, val text not null default 'x');
+
+-- IS NULL on NOT NULL column of empty table
+select * from empty_t where val is null;
+→ []
+
+-- IS NOT NULL on NOT NULL column of empty table
+select * from empty_t where val is not null;
+→ []
+
+-- Count of empty table
+select count(*) as cnt from empty_t;
+→ [{"cnt": 0}]
+
+-- Range scan on empty table
+select * from empty_t where id > 0;
+→ []
+
+-- Insert and verify
+insert into empty_t values (1, 'hello');
+select * from empty_t;
+→ [{"id": 1, "val": "hello"}]
+
+drop table empty_t;
+
+-- ===================================================================
+-- SECTION 20: Multiple filters handled — cost nudge (module.ts:206-210)
+-- When no index handles any filter, cost gets a small nudge (+0.01)
+-- ===================================================================
+
+create table cost_nudge (id integer primary key, a text, b text);
+insert into cost_nudge values (1, 'foo', 'bar'), (2, 'baz', 'qux');
+
+-- Filter on non-indexed column (forces full scan, no filters handled)
+select id from cost_nudge where a = 'foo' and b = 'bar';
+→ [{"id": 1}]
+
+-- Verify both filters work
+select id from cost_nudge where a = 'baz' and b = 'qux';
+→ [{"id": 2}]
+
+-- No matches
+select id from cost_nudge where a = 'nope' and b = 'nada';
+→ []
+
+drop table cost_nudge;
+
+-- ===================================================================
+-- SECTION 21: Transaction with index modifications
+-- ===================================================================
+
+create table tx_idx (id integer primary key, category text, val integer);
+insert into tx_idx values (1, 'A', 10), (2, 'B', 20), (3, 'A', 30);
+create index idx_tx_cat on tx_idx (category);
+
+-- Insert within transaction then commit — index is consistent
+begin;
+insert into tx_idx values (4, 'A', 40);
+commit;
+select id from tx_idx where category = 'A' order by id;
+→ [{"id": 1}, {"id": 3}, {"id": 4}]
+
+-- Delete committed row and verify via index
+delete from tx_idx where id = 4;
+select id from tx_idx where category = 'A' order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- Update indexed column and verify via index
+update tx_idx set category = 'C' where id = 2;
+select id from tx_idx where category = 'B';
+→ []
+select id from tx_idx where category = 'C';
+→ [{"id": 2}]
+
+-- Restore
+update tx_idx set category = 'B' where id = 2;
+select id from tx_idx where category = 'B';
+→ [{"id": 2}]
+
+drop table tx_idx;
+
+-- ===================================================================
+-- SECTION 22: Composite PK with different types
+-- ===================================================================
+
+create table comp_pk_types (
+	region text,
+	id integer,
+	detail text,
+	primary key (region, id)
+);
+insert into comp_pk_types values ('us', 1, 'a'), ('us', 2, 'b'), ('eu', 1, 'c'), ('eu', 2, 'd');
+
+-- Lookup by full composite key
+select detail from comp_pk_types where region = 'eu' and id = 2;
+→ [{"detail": "d"}]
+
+-- Lookup by first part of composite key
+select detail from comp_pk_types where region = 'us' order by id;
+→ [{"detail": "a"}, {"detail": "b"}]
+
+-- Update by composite PK
+update comp_pk_types set detail = 'updated' where region = 'eu' and id = 1;
+select detail from comp_pk_types where region = 'eu' and id = 1;
+→ [{"detail": "updated"}]
+
+-- Delete by composite PK
+delete from comp_pk_types where region = 'us' and id = 1;
+select count(*) as cnt from comp_pk_types where region = 'us';
+→ [{"cnt": 1}]
+
+drop table comp_pk_types;
+
+-- ===================================================================
+-- SECTION 23: Three-column composite PK ordering
+-- ===================================================================
+
+create table triple_pk (a integer, b integer, c integer, val text, primary key (a, b, c));
+insert into triple_pk values (1, 1, 1, 'aaa'), (1, 1, 2, 'aab'), (1, 2, 1, 'aba'), (2, 1, 1, 'baa');
+
+-- Natural PK order
+select a, b, c from triple_pk;
+→ [{"a": 1, "b": 1, "c": 1}, {"a": 1, "b": 1, "c": 2}, {"a": 1, "b": 2, "c": 1}, {"a": 2, "b": 1, "c": 1}]
+
+-- Equality on first two, range on third
+select val from triple_pk where a = 1 and b = 1 order by c;
+→ [{"val": "aaa"}, {"val": "aab"}]
+
+-- Equality on first only
+select val from triple_pk where a = 1 order by b, c;
+→ [{"val": "aaa"}, {"val": "aab"}, {"val": "aba"}]
+
+drop table triple_pk;
+
+-- ===================================================================
+-- SECTION 24: Unique index constraint enforcement
+-- ===================================================================
+
+create table uniq_test (id integer primary key, email text null, name text);
+create unique index idx_email on uniq_test (email);
+insert into uniq_test values (1, 'alice@test.com', 'Alice'), (2, 'bob@test.com', 'Bob');
+
+-- Duplicate unique index value should fail
+insert into uniq_test values (3, 'alice@test.com', 'Alice2');
+-- error: UNIQUE constraint
+
+-- Unique lookup
+select name from uniq_test where email = 'bob@test.com';
+→ [{"name": "Bob"}]
+
+-- Update to a conflicting unique value should fail
+update uniq_test set email = 'alice@test.com' where id = 2;
+-- error: UNIQUE constraint
+
+-- Update unique column to a non-conflicting value should succeed
+update uniq_test set email = 'charlie@test.com' where id = 2;
+select email from uniq_test where id = 2;
+→ [{"email": "charlie@test.com"}]
+
+-- NULL values in unique index (multiple NULLs are allowed)
+insert into uniq_test values (10, null, 'Charlie');
+insert into uniq_test values (11, null, 'David');
+select count(*) as cnt from uniq_test where email is null;
+→ [{"cnt": 2}]
+
+drop table uniq_test;
+
+-- ===================================================================
+-- SECTION 25: SAVEPOINT with mutations on indexed table
+-- ===================================================================
+
+create table sp_idx (id integer primary key, category text);
+create index idx_sp_cat on sp_idx (category);
+insert into sp_idx values (1, 'A'), (2, 'B'), (3, 'A');
+
+begin;
+savepoint s1;
+insert into sp_idx values (4, 'C');
+update sp_idx set category = 'D' where id = 1;
+
+-- Index should reflect pending changes
+select id from sp_idx where category = 'C';
+→ [{"id": 4}]
+select id from sp_idx where category = 'A';
+→ [{"id": 3}]
+select id from sp_idx where category = 'D';
+→ [{"id": 1}]
+
+rollback to savepoint s1;
+
+-- After rollback, index should be consistent with pre-savepoint state
+select id from sp_idx where category = 'A' order by id;
+→ [{"id": 1}, {"id": 3}]
+select id from sp_idx where category = 'C';
+→ []
+select id from sp_idx where category = 'D';
+→ []
+
+commit;
+
+drop table sp_idx;
+
+-- ===================================================================
+-- SECTION 26: Large-ish dataset for index effectiveness
+-- ===================================================================
+
+create table bulk_t (id integer primary key, grp integer, val text);
+create index idx_grp on bulk_t (grp);
+
+-- Insert multiple groups
+insert into bulk_t values (1, 1, 'a1'), (2, 1, 'a2'), (3, 1, 'a3');
+insert into bulk_t values (4, 2, 'b1'), (5, 2, 'b2');
+insert into bulk_t values (6, 3, 'c1'), (7, 3, 'c2'), (8, 3, 'c3'), (9, 3, 'c4');
+insert into bulk_t values (10, 4, 'd1');
+
+-- Count per group using index
+select grp, count(*) as cnt from bulk_t group by grp order by grp;
+→ [{"grp": 1, "cnt": 3}, {"grp": 2, "cnt": 2}, {"grp": 3, "cnt": 4}, {"grp": 4, "cnt": 1}]
+
+-- IN on indexed column
+select id from bulk_t where grp in (1, 3) order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 6}, {"id": 7}, {"id": 8}, {"id": 9}]
+
+-- Range on indexed column
+select id from bulk_t where grp >= 3 order by id;
+→ [{"id": 6}, {"id": 7}, {"id": 8}, {"id": 9}, {"id": 10}]
+
+drop table bulk_t;
+
+-- ===================================================================
+-- SECTION 27: RENAME TABLE on memory table
+-- ===================================================================
+
+create table rename_me (id integer primary key, val text);
+insert into rename_me values (1, 'hello');
+alter table rename_me rename to renamed_t;
+-- run
+
+-- Old name should fail
+select * from rename_me;
+-- error: not found
+
+-- New name should work
+select val from renamed_t where id = 1;
+→ [{"val": "hello"}]
+
+-- Can mutate renamed table
+insert into renamed_t values (2, 'world');
+select count(*) as cnt from renamed_t;
+→ [{"cnt": 2}]
+
+drop table renamed_t;
+
+-- ===================================================================
+-- SECTION 28: Connection disconnect cleanup (connection.ts:59-67)
+-- ===================================================================
+
+-- Verify that after a table is dropped and recreated, everything works cleanly
+create table conn_test (id integer primary key, val text);
+insert into conn_test values (1, 'first');
+drop table conn_test;
+
+create table conn_test (id integer primary key, val integer);
+insert into conn_test values (1, 42);
+select val from conn_test where id = 1;
+→ [{"val": 42}]
+drop table conn_test;
+
+-- ===================================================================
+-- SECTION 29: connection.ts — begin/commit/rollback via table operations
+-- ===================================================================
+
+create table conn_tx (id integer primary key, val text);
+insert into conn_tx values (1, 'a');
+
+-- Begin/commit cycle through connection
+begin;
+insert into conn_tx values (2, 'b');
+commit;
+select count(*) as cnt from conn_tx;
+→ [{"cnt": 2}]
+
+-- Begin/rollback cycle through connection
+begin;
+insert into conn_tx values (3, 'c');
+rollback;
+select count(*) as cnt from conn_tx;
+→ [{"cnt": 2}]
+
+-- Multiple begin/commit cycles
+begin;
+insert into conn_tx values (4, 'd');
+commit;
+begin;
+insert into conn_tx values (5, 'e');
+commit;
+select count(*) as cnt from conn_tx;
+→ [{"cnt": 4}]
+
+drop table conn_tx;
+
+-- ===================================================================
+-- SECTION 30: connection.ts — savepoint through connection wrapper
+-- ===================================================================
+
+create table conn_sp (id integer primary key, val text);
+insert into conn_sp values (1, 'orig');
+
+begin;
+savepoint cs1;
+insert into conn_sp values (2, 'in-cs1');
+savepoint cs2;
+insert into conn_sp values (3, 'in-cs2');
+
+-- Both rows visible
+select count(*) as cnt from conn_sp;
+→ [{"cnt": 3}]
+
+-- Rollback to cs2
+rollback to savepoint cs2;
+select count(*) as cnt from conn_sp;
+→ [{"cnt": 2}]
+
+-- Release cs2 (merged into cs1)
+release savepoint cs2;
+
+-- Release cs1 (merged into transaction)
+release savepoint cs1;
+commit;
+
+-- Only id=2 survived (cs2 was rolled back)
+select id, val from conn_sp order by id;
+→ [{"id": 1, "val": "orig"}, {"id": 2, "val": "in-cs1"}]
+
+drop table conn_sp;
+
+-- ===================================================================
+-- SECTION 31: Index on non-integer types
+-- ===================================================================
+
+create table text_idx (id integer primary key, label text null);
+create index idx_label on text_idx (label);
+insert into text_idx values (1, 'banana'), (2, 'apple'), (3, 'cherry'), (4, 'apple'), (5, null);
+
+-- Equality on text index
+select id from text_idx where label = 'apple' order by id;
+→ [{"id": 2}, {"id": 4}]
+
+-- IS NULL through index
+select id from text_idx where label is null;
+→ [{"id": 5}]
+
+-- ORDER BY text indexed column
+select label from text_idx where label is not null order by label;
+→ [{"label": "apple"}, {"label": "apple"}, {"label": "banana"}, {"label": "cherry"}]
+
+drop table text_idx;
+
+-- ===================================================================
+-- SECTION 32: Index on text column (basic)
+-- ===================================================================
+
+create table text_ci (id integer primary key, name text);
+insert into text_ci values (1, 'Alice'), (2, 'bob'), (3, 'CHARLIE');
+create index idx_name_ci on text_ci (name);
+
+-- Index works on text columns
+select id from text_ci where name = 'bob';
+→ [{"id": 2}]
+
+-- ORDER BY text indexed column
+select name from text_ci order by name;
+→ [{"name": "Alice"}, {"name": "CHARLIE"}, {"name": "bob"}]
+
+drop table text_ci;
+
+-- ===================================================================
+-- SECTION 33: ALTER TABLE + index interaction
+-- ===================================================================
+
+create table alt_idx (id integer primary key, a integer, b text);
+create index idx_a on alt_idx (a);
+insert into alt_idx values (1, 10, 'x'), (2, 20, 'y');
+
+-- ADD COLUMN — existing index should still work
+alter table alt_idx add column c integer null;
+select id from alt_idx where a = 10;
+→ [{"id": 1}]
+
+-- Insert with new column
+insert into alt_idx values (3, 10, 'z', 100);
+select id from alt_idx where a = 10 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- RENAME COLUMN on non-indexed column — index should still work
+alter table alt_idx rename column b to label;
+select id from alt_idx where a = 20;
+→ [{"id": 2}]
+
+-- DROP COLUMN on non-indexed column — index should still work
+alter table alt_idx drop column label;
+select id from alt_idx where a = 10 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+drop table alt_idx;
+
+-- ===================================================================
+-- SECTION 34: PK range scan edge cases
+-- ===================================================================
+
+create table pk_range_edge (id integer primary key, val text);
+insert into pk_range_edge values (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd');
+
+-- Range that includes all rows
+select id from pk_range_edge where id >= 10 and id <= 40 order by id;
+→ [{"id": 10}, {"id": 20}, {"id": 30}, {"id": 40}]
+
+-- Range that includes no rows (gap)
+select id from pk_range_edge where id > 10 and id < 20;
+→ []
+
+-- Exact boundary (>= and <=)
+select id from pk_range_edge where id >= 20 and id <= 20;
+→ [{"id": 20}]
+
+-- Range beyond data
+select id from pk_range_edge where id > 40;
+→ []
+select id from pk_range_edge where id < 10;
+→ []
+
+drop table pk_range_edge;
+
+-- ===================================================================
+-- SECTION 35: Multiple secondary indexes on same table
+-- ===================================================================
+
+create table multi_sec (id integer primary key, a integer, b text, c integer);
+create index idx_ms_a on multi_sec (a);
+create index idx_ms_b on multi_sec (b);
+create index idx_ms_c on multi_sec (c);
+insert into multi_sec values (1, 10, 'x', 100), (2, 20, 'y', 200), (3, 10, 'z', 100), (4, 30, 'x', 300);
+
+-- Use each index independently
+select id from multi_sec where a = 10 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+select id from multi_sec where b = 'x' order by id;
+→ [{"id": 1}, {"id": 4}]
+
+select id from multi_sec where c = 100 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- Multiple filter columns — planner chooses best index
+select id from multi_sec where a = 10 and c = 100 order by id;
+→ [{"id": 1}, {"id": 3}]
+
+drop table multi_sec;
+
+-- ===================================================================
+-- SECTION 36: Verify gatherAvailableIndexes includes PK pseudo-index (module.ts:463-477)
+-- ===================================================================
+
+-- Table with no secondary indexes — PK pseudo-index is the only access path
+create table pk_only (id integer primary key, data text);
+insert into pk_only values (1, 'a'), (2, 'b'), (3, 'c');
+
+-- PK equality
+select data from pk_only where id = 2;
+→ [{"data": "b"}]
+
+-- PK range
+select data from pk_only where id > 1 and id < 3;
+→ [{"data": "b"}]
+
+-- Full scan (filter on non-PK)
+select data from pk_only where data = 'c';
+→ [{"data": "c"}]
+
+drop table pk_only;
+
+-- ===================================================================
+-- SECTION 37: UPSERT with ON CONFLICT on memory table
+-- ===================================================================
+
+create table upsert_t (id integer primary key, val text);
+insert into upsert_t values (1, 'original');
+
+-- Upsert: update on conflict
+insert into upsert_t values (1, 'updated') on conflict (id) do update set val = excluded.val;
+select val from upsert_t where id = 1;
+→ [{"val": "updated"}]
+
+-- Upsert: no conflict, insert
+insert into upsert_t values (2, 'new') on conflict (id) do update set val = excluded.val;
+select count(*) as cnt from upsert_t;
+→ [{"cnt": 2}]
+
+-- Upsert: do nothing on conflict
+insert into upsert_t values (1, 'ignored') on conflict (id) do nothing;
+select val from upsert_t where id = 1;
+→ [{"val": "updated"}]
+
+drop table upsert_t;
+
+-- ===================================================================
+-- SECTION 38: DELETE with index and verify index consistency
+-- ===================================================================
+
+create table del_idx (id integer primary key, tag text);
+create index idx_tag on del_idx (tag);
+insert into del_idx values (1, 'A'), (2, 'B'), (3, 'A'), (4, 'B'), (5, 'C');
+
+-- Delete some rows
+delete from del_idx where tag = 'A';
+
+-- Verify through index
+select id from del_idx where tag = 'A';
+→ []
+
+select id from del_idx where tag = 'B' order by id;
+→ [{"id": 2}, {"id": 4}]
+
+select count(*) as cnt from del_idx;
+→ [{"cnt": 3}]
+
+-- Delete all remaining
+delete from del_idx;
+select count(*) as cnt from del_idx;
+→ [{"cnt": 0}]
+
+-- Insert after full delete — index should still work
+insert into del_idx values (10, 'X');
+select id from del_idx where tag = 'X';
+→ [{"id": 10}]
+
+drop table del_idx;
+
+-- ===================================================================
+-- SECTION 39: UPDATE affecting indexed columns
+-- ===================================================================
+
+create table upd_idx (id integer primary key, category text, priority integer);
+create index idx_upd_cat on upd_idx (category);
+create index idx_upd_pri on upd_idx (priority);
+insert into upd_idx values (1, 'A', 1), (2, 'A', 2), (3, 'B', 1), (4, 'B', 3);
+
+-- Update indexed column
+update upd_idx set category = 'C' where id = 1;
+
+-- Old index value should not find the row
+select id from upd_idx where category = 'A';
+→ [{"id": 2}]
+
+-- New index value should find it
+select id from upd_idx where category = 'C';
+→ [{"id": 1}]
+
+-- Update another indexed column
+update upd_idx set priority = 10 where id = 3;
+select id from upd_idx where priority = 1;
+→ [{"id": 1}]
+select id from upd_idx where priority = 10;
+→ [{"id": 3}]
+
+drop table upd_idx;
+
+-- ===================================================================
+-- SECTION 40: Composite PK with DESC direction
+-- ===================================================================
+
+create table comp_pk_desc (a integer, b integer, primary key (a, b desc));
+insert into comp_pk_desc values (1, 3), (1, 1), (1, 2), (2, 2), (2, 1);
+
+-- Natural order should be: a ASC, b DESC
+select a, b from comp_pk_desc;
+→ [{"a": 1, "b": 3}, {"a": 1, "b": 2}, {"a": 1, "b": 1}, {"a": 2, "b": 2}, {"a": 2, "b": 1}]
+
+-- Lookup by first PK column
+select b from comp_pk_desc where a = 1 order by b desc;
+→ [{"b": 3}, {"b": 2}, {"b": 1}]
+
+drop table comp_pk_desc;

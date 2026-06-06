@@ -1,0 +1,43 @@
+-- 90.3-expression-errors.sqllogic - Expression, subquery, and aggregate error paths
+
+-- Scalar subquery with multiple columns
+SELECT (SELECT 1, 2);
+-- error: Scalar subquery must return exactly one column
+
+-- IN subquery with multiple columns
+SELECT 1 WHERE 1 IN (SELECT 1, 2);
+-- error: IN subquery must return exactly one column
+
+-- Duplicate CTE name
+WITH c AS (SELECT 1 AS x), c AS (SELECT 2 AS x) SELECT * FROM c;
+-- error: Duplicate CTE name 'c' in WITH clause
+
+-- Aggregate function in WHERE clause
+CREATE TABLE t_agg_ctx (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO t_agg_ctx VALUES (1, 10), (2, 20);
+-- run
+
+SELECT * FROM t_agg_ctx WHERE count(*) > 1;
+-- error: not allowed in this context
+
+-- Window function requiring ORDER BY
+SELECT rank() OVER () FROM t_agg_ctx;
+-- error: requires ORDER BY clause
+
+-- OLD qualifier in INSERT RETURNING
+INSERT INTO t_agg_ctx VALUES (3, 30) RETURNING OLD.id;
+-- error: OLD qualifier cannot be used in INSERT RETURNING clause
+
+-- Cleanup
+DROP TABLE t_agg_ctx;
+-- run
+
+-- NEW qualifier in DELETE RETURNING
+CREATE TABLE t_del_ret (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO t_del_ret VALUES (1, 10);
+-- run
+
+DELETE FROM t_del_ret WHERE id = 1 RETURNING NEW.id;
+-- error: NEW qualifier cannot be used in DELETE RETURNING clause
+
+DROP TABLE t_del_ret;

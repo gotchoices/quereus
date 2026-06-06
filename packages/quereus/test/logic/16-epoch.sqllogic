@@ -1,0 +1,187 @@
+-- Epoch functions: epoch_s, epoch_ms, epoch_s_frac
+-- Tests cover known-value conversions, round-trips, modifiers, strict parsing,
+-- subsec modifier on datetime/time, and strftime epoch specifiers.
+
+-- ============================================================
+-- epoch_s: known conversions
+-- ============================================================
+
+SELECT epoch_s('1970-01-01 00:00:00');
+→ [0]
+
+SELECT epoch_s('1970-01-01T00:00:00');
+→ [0]
+
+SELECT epoch_s('2000-01-01 00:00:00');
+→ [946684800]
+
+SELECT epoch_s('2024-07-26 12:30:45');
+→ [1721997045]
+
+-- Date-only input (time defaults to 00:00:00)
+SELECT epoch_s('2024-01-01');
+→ [1704067200]
+
+-- With timezone offset in the string
+SELECT epoch_s('2024-01-01T00:00:00Z');
+→ [1704067200]
+
+SELECT epoch_s('2024-01-01T01:00:00+01:00');
+→ [1704067200]
+
+-- ============================================================
+-- epoch_ms: known conversions
+-- ============================================================
+
+SELECT epoch_ms('1970-01-01 00:00:00');
+→ [0]
+
+SELECT epoch_ms('2024-01-01 00:00:00');
+→ [1704067200000]
+
+SELECT epoch_ms('2024-07-26 12:30:45.123');
+→ [1721997045123]
+
+-- Sub-second precision preserved
+SELECT epoch_ms('2024-07-26 12:30:45.999');
+→ [1721997045999]
+
+-- ============================================================
+-- epoch_s_frac: fractional seconds
+-- ============================================================
+
+SELECT epoch_s_frac('1970-01-01 00:00:00');
+→ [0]
+
+SELECT epoch_s_frac('2024-07-26 12:30:45.5');
+→ [1721997045.5]
+
+SELECT epoch_s_frac('2024-07-26 12:30:45.123');
+→ [1721997045.123]
+
+-- ============================================================
+-- epoch_s with modifiers
+-- ============================================================
+
+SELECT epoch_s('2024-01-01', '+1 day');
+→ [1704153600]
+
+SELECT epoch_s('2024-01-15', 'start of month');
+→ [1704067200]
+
+SELECT epoch_s('2024-06-15 12:00:00', 'start of day');
+→ [1718409600]
+
+-- ============================================================
+-- Strict parsing: bare numbers are rejected
+-- ============================================================
+
+SELECT epoch_s(1704067200);
+→ [null]
+
+SELECT epoch_ms(1704067200000);
+→ [null]
+
+SELECT epoch_s_frac(1704067200.5);
+→ [null]
+
+-- Time-only strings are rejected
+SELECT epoch_s('12:30:45');
+→ [null]
+
+-- YYYYMMDD format is rejected (not strict ISO)
+SELECT epoch_s('20240101');
+→ [null]
+
+-- NULL input
+SELECT epoch_s(NULL);
+→ [null]
+
+-- ============================================================
+-- 'now' returns non-null values
+-- ============================================================
+
+SELECT epoch_s('now') IS NOT NULL;
+→ [true]
+
+SELECT epoch_ms('now') IS NOT NULL;
+→ [true]
+
+SELECT epoch_s_frac('now') IS NOT NULL;
+→ [true]
+
+-- ============================================================
+-- Round-trip: epoch_s → datetime via unixepoch modifier
+-- ============================================================
+
+SELECT datetime(epoch_s('2024-07-26 12:30:45'), 'unixepoch');
+→ ["2024-07-26 12:30:45"]
+
+SELECT date(epoch_s('2024-01-15 08:00:00'), 'unixepoch');
+→ ["2024-01-15"]
+
+-- ============================================================
+-- Relationship between epoch_s and epoch_ms
+-- ============================================================
+
+-- epoch_ms / 1000 equals epoch_s for whole-second datetimes
+SELECT epoch_ms('2024-01-01 00:00:00') - epoch_s('2024-01-01 00:00:00') * 1000;
+→ [0]
+
+-- Milliseconds capture sub-second precision that seconds truncate
+SELECT epoch_ms('2024-07-26 12:30:45.500') - epoch_s('2024-07-26 12:30:45.500') * 1000;
+→ [500]
+
+-- ============================================================
+-- subsec modifier on datetime/time
+-- ============================================================
+
+SELECT datetime('2024-07-26 12:30:45.123', 'subsec');
+→ ["2024-07-26 12:30:45.123"]
+
+SELECT time('12:30:45.456', 'subsec');
+→ ["12:30:45.456"]
+
+-- Without subsec, fractional seconds are truncated (2+ args to use datetime.ts path)
+SELECT datetime('2024-07-26 12:30:45.999', '+0 seconds');
+→ ["2024-07-26 12:30:45"]
+
+SELECT time('12:30:45.999', '+0 seconds');
+→ ["12:30:45"]
+
+-- subsec with unixepoch
+SELECT datetime(1721997045.123, 'unixepoch', 'subsec');
+→ ["2024-07-26 12:30:45.123"]
+
+-- subsec with arithmetic modifiers
+SELECT datetime('2024-07-26 12:30:45.500', '+1 second', 'subsec');
+→ ["2024-07-26 12:30:46.500"]
+
+-- ============================================================
+-- strftime epoch specifiers: %E (seconds) and %Q (milliseconds)
+-- ============================================================
+
+SELECT strftime('%E', '2024-01-01 00:00:00');
+→ ["1704067200"]
+
+SELECT strftime('%Q', '2024-01-01 00:00:00');
+→ ["1704067200000"]
+
+SELECT strftime('%Q', '2024-07-26 12:30:45.123');
+→ ["1721997045123"]
+
+-- Epoch specifiers work with modifiers
+SELECT strftime('%E', '2024-01-01', '+1 day');
+→ ["1704153600"]
+
+-- ============================================================
+-- Arithmetic with epoch values
+-- ============================================================
+
+-- Difference in seconds between two datetimes
+SELECT epoch_s('2024-01-02 00:00:00') - epoch_s('2024-01-01 00:00:00');
+→ [86400]
+
+-- Difference in milliseconds
+SELECT epoch_ms('2024-01-02 00:00:00') - epoch_ms('2024-01-01 00:00:00');
+→ [86400000]

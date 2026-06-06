@@ -1,0 +1,37 @@
+-- conversion-functions.sqllogic - Testing type conversion functions
+
+-- integer conversion
+select integer(42), integer('123'), integer(3.14), integer(true), integer(false);
+→ [{"integer(42)":42,"integer('123')":123,"integer(3.14)":3,"integer(true)":1,"integer(false)":0}]
+
+-- integer null
+select integer(null);
+→ [{"integer(null)":null}]
+
+-- real conversion
+select real(42), real('3.14');
+→ [{"real(42)":42,"real('3.14')":3.14}]
+
+-- text conversion
+select text(42), text(3.14), text(true), text(null);
+→ [{"text(42)":"42","text(3.14)":"3.14","text(true)":"true","text(null)":null}]
+
+-- boolean conversion
+select boolean(1), boolean(0), boolean('true'), boolean('false');
+→ [{"boolean(1)":true,"boolean(0)":false,"boolean('true')":true,"boolean('false')":false}]
+
+-- real null
+select real(null);
+→ [{"real(null)":null}]
+
+-- boolean null
+select boolean(null);
+→ [{"boolean(null)":null}]
+
+-- integer from negative
+select integer(-5), integer('-10');
+→ [{"integer(-5)":-5,"integer('-10')":-10}]
+
+-- real from integer string
+select real('42');
+→ [{"real('42')":42}]

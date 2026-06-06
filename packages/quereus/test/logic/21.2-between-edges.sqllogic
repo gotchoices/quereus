@@ -1,0 +1,157 @@
+-- between-edges.sqllogic - BETWEEN edge cases beyond the basic operator
+-- Distilled from SQLite test/between.test
+
+create table bt (id integer primary key, val integer null, lo integer null, hi integer null);
+insert into bt values
+  (1, 5, 1, 10),
+  (2, 15, 5, 12),
+  (3, 8, null, 10),
+  (4, 8, 5, null),
+  (5, null, 1, 10),
+  (6, 25, 30, 20);
+
+-- =============================================================================
+-- Basic NULL propagation in BETWEEN operands (in WHERE: filters out)
+-- =============================================================================
+
+-- value is NULL -> unknown -> no row
+select id from bt where val between 1 and 100 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":6}]
+
+-- lower bound is NULL: row 3 (val=8, lo=null, hi=10): 8 BETWEEN null AND 10 -> unknown
+-- row 2 (val=15, lo=5, hi=12): 15 between 5 and 12 -> false
+-- row 6 (val=25, lo=30, hi=20): reversed bounds -> false
+select id from bt where val between lo and hi order by id;
+→ [{"id":1}]
+
+-- upper bound is NULL alone, value satisfies low side:
+-- 8 BETWEEN 5 AND null -> unknown -> excluded
+select id from bt where id = 4 and val between lo and hi;
+→ []
+
+-- =============================================================================
+-- BETWEEN as a SELECT expression: NULL in any operand returns NULL
+-- =============================================================================
+
+select null between 1 and 10 as r;
+→ [{"r":null}]
+
+select 5 between null and 10 as r;
+→ [{"r":null}]
+
+select 5 between 1 and null as r;
+→ [{"r":null}]
+
+select 50 between 1 and null as r;
+→ [{"r":null}]
+
+select null between null and null as r;
+→ [{"r":null}]
+
+-- =============================================================================
+-- Reversed bounds (lower > upper): always false, never matches
+-- =============================================================================
+
+select id from bt where val between 10 and 5;
+→ []
+
+select 5 between 10 and 1 as r;
+→ [{"r":false}]
+
+-- NOT BETWEEN with reversed bounds: rows with non-null val all qualify (NOT false = true);
+-- rows with null val stay unknown
+select id from bt where val not between 10 and 5 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":6}]
+
+-- BETWEEN against column-stored reversed bounds (id=6 has lo=30, hi=20)
+select id from bt where id = 6 and val between lo and hi;
+→ []
+
+-- =============================================================================
+-- NOT BETWEEN preserves unknown for NULL operands
+-- =============================================================================
+
+-- Row 5 has val=null: NOT (null between 1 and 10) -> NOT unknown -> unknown -> excluded
+select id from bt where val not between 1 and 10 order by id;
+→ [{"id":2},{"id":6}]
+
+select null not between 1 and 10 as r;
+→ [{"r":null}]
+
+-- =============================================================================
+-- Expression bounds (arithmetic in lower / upper / both)
+-- =============================================================================
+
+create table bx (id integer primary key, x integer, a integer, b integer);
+insert into bx values (1, 5, 2, 10), (2, 15, 8, 12), (3, 22, 3, 30);
+
+select id from bx where x between a + 1 and 100 order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from bx where x between 0 and b * 2 order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from bx where x between a + 3 and b * 2 order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- LHS is also an expression
+select id from bx where (x - 5) between a and b order by id;
+→ [{"id":2},{"id":3}]
+
+drop table bx;
+
+-- =============================================================================
+-- BETWEEN with TEXT operands and lexicographic ordering
+-- =============================================================================
+
+create table bs (id integer primary key, s text null);
+insert into bs values (1, 'apple'), (2, 'mango'), (3, 'zebra'), (4, null);
+
+select id from bs where s between 'banana' and 'orange' order by id;
+→ [{"id":2}]
+
+select id from bs where s not between 'banana' and 'orange' order by id;
+→ [{"id":1},{"id":3}]
+
+-- Reversed lexicographic bounds: empty
+select id from bs where s between 'z' and 'a' order by id;
+→ []
+
+drop table bs;
+
+-- =============================================================================
+-- BETWEEN inside HAVING and CASE
+-- =============================================================================
+
+create table bg (id integer primary key, grp text, n integer);
+insert into bg values (1, 'a', 2), (2, 'a', 4), (3, 'b', 7), (4, 'b', 9), (5, 'c', 1);
+
+select grp, sum(n) as s from bg group by grp having sum(n) between 5 and 10 order by grp;
+→ [{"grp":"a","s":6}]
+
+select id, case when n between 3 and 8 then 'mid' else 'edge' end as bucket from bg order by id;
+→ [{"id":1,"bucket":"edge"},{"id":2,"bucket":"mid"},{"id":3,"bucket":"mid"},{"id":4,"bucket":"edge"},{"id":5,"bucket":"edge"}]
+
+drop table bg;
+
+-- =============================================================================
+-- BETWEEN in JOIN ON clause (range join)
+-- =============================================================================
+
+create table bj_l (id integer primary key, x integer);
+create table bj_r (id integer primary key, lo integer, hi integer, tag text);
+insert into bj_l values (1, 5), (2, 15), (3, 25);
+insert into bj_r values (10, 1, 10, 'low'), (20, 11, 20, 'mid'), (30, 21, 30, 'high');
+
+select bj_l.id as lid, bj_r.tag from bj_l join bj_r on bj_l.x between bj_r.lo and bj_r.hi order by lid;
+→ [{"lid":1,"tag":"low"},{"lid":2,"tag":"mid"},{"lid":3,"tag":"high"}]
+
+-- LEFT JOIN with BETWEEN ON clause: unmatched left rows preserved
+insert into bj_l values (4, 100);
+select bj_l.id as lid, bj_r.tag from bj_l left join bj_r on bj_l.x between bj_r.lo and bj_r.hi order by lid;
+→ [{"lid":1,"tag":"low"},{"lid":2,"tag":"mid"},{"lid":3,"tag":"high"},{"lid":4,"tag":null}]
+
+drop table bj_l;
+drop table bj_r;
+
+drop table bt;

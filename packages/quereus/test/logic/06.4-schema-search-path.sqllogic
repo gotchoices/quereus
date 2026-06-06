@@ -1,0 +1,123 @@
+-- Schema Search Path Tests
+-- Tests for WITH SCHEMA clause and PRAGMA schema_path
+
+-- Setup: Create tables in main schema
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);
+INSERT INTO orders VALUES (1, 1, 100.50), (2, 2, 200.75);
+
+-- Test 1: Default behavior - unqualified names resolve to main
+SELECT * FROM users ORDER BY id;
+→ [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+
+-- Test 2: WITH SCHEMA clause with main (should work)
+SELECT * FROM users WITH SCHEMA main ORDER BY id;
+→ [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+
+-- Test 3: WITH SCHEMA on JOIN queries
+SELECT u.id, u.name, o.id as order_id, o.amount FROM users u JOIN orders o ON u.id = o.user_id WITH SCHEMA main ORDER BY u.id;
+→ [{"id":1,"name":"Alice","order_id":1,"amount":100.5},{"id":2,"name":"Bob","order_id":2,"amount":200.75}]
+
+-- Test 4: PRAGMA schema_path - set and query
+PRAGMA schema_path = 'main';
+
+PRAGMA schema_path;
+→ [{"name":"schema_path","value":"main"}]
+
+-- Test 5: After setting pragma, unqualified names still work
+SELECT * FROM users ORDER BY id;
+→ [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+
+-- Test 6: INSERT with WITH SCHEMA
+INSERT INTO users (id, name) VALUES (3, 'Charlie') WITH SCHEMA main;
+
+SELECT * FROM users WHERE id = 3;
+→ [{"id":3,"name":"Charlie"}]
+
+-- Test 7: UPDATE with WITH SCHEMA
+UPDATE users SET name = 'Alice Updated' WHERE id = 1 WITH SCHEMA main;
+
+SELECT name FROM users WHERE id = 1;
+→ [{"name":"Alice Updated"}]
+
+-- Test 8: DELETE with WITH SCHEMA
+DELETE FROM users WHERE id = 3 WITH SCHEMA main;
+
+SELECT COUNT(*) as count FROM users;
+→ [{"count":2}]
+
+-- Test 9: WITH SCHEMA with CTEs
+WITH active_users AS (SELECT * FROM users WHERE id <= 2) SELECT * FROM active_users WITH SCHEMA main ORDER BY id;
+→ [{"id":1,"name":"Alice Updated"},{"id":2,"name":"Bob"}]
+
+-- Test 10: RETURNING with WITH SCHEMA
+INSERT INTO users (id, name) VALUES (4, 'David') WITH SCHEMA main RETURNING id, name;
+→ [{"id":4,"name":"David"}]
+
+-- Test 11: Multiple table references with different schemas via WITH SCHEMA
+SELECT u.name, o.amount, o.id as oid FROM users u JOIN orders o ON u.id = o.user_id WITH SCHEMA main ORDER BY o.id;
+→ [{"name":"Alice Updated","amount":100.5,"oid":1},{"name":"Bob","amount":200.75,"oid":2}]
+
+-- Test 12: Subqueries work with WITH SCHEMA
+SELECT * FROM (SELECT * FROM users WHERE id > 0) sub WITH SCHEMA main ORDER BY id;
+→ [{"id":1,"name":"Alice Updated"},{"id":2,"name":"Bob"},{"id":4,"name":"David"}]
+
+-- Test 13: WITH SCHEMA and WITH CONTEXT can appear in any order
+-- Note: We'd need mutation context tables to fully test this, but we can verify parsing
+
+-- ===================================
+-- Non-default schema: DML with WITH SCHEMA
+-- Tests that INSERT/UPDATE/DELETE properly propagate schema path context
+-- ===================================
+
+-- Create a custom schema with tables
+declare schema myapp {
+	table products {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		status TEXT DEFAULT 'active'
+	}
+}
+
+apply schema myapp;
+
+-- run
+
+-- Seed data via explicit schema qualification (baseline, no bug)
+INSERT INTO myapp.products (id, name) VALUES (1, 'Widget');
+
+SELECT * FROM myapp.products;
+→ [{"id":1,"name":"Widget","status":"active"}]
+
+-- Test 14: UPDATE with WITH SCHEMA on non-default schema (update.ts:68 bug)
+-- The source scan must use contextWithSchemaPath to resolve the unqualified table name
+UPDATE products SET name = 'Gadget' WHERE id = 1 WITH SCHEMA myapp;
+
+SELECT * FROM myapp.products WHERE id = 1;
+→ [{"id":1,"name":"Gadget","status":"active"}]
+
+-- Test 15: INSERT with WITH SCHEMA on non-default schema (insert.ts:528 bug)
+-- Row expansion (default value computation) must use contextWithSchemaPath
+INSERT INTO products (id, name) VALUES (2, 'Doohickey') WITH SCHEMA myapp;
+
+SELECT * FROM myapp.products ORDER BY id;
+→ [{"id":1,"name":"Gadget","status":"active"},{"id":2,"name":"Doohickey","status":"active"}]
+
+-- Test 16: DELETE with WITH SCHEMA on non-default schema (verify parity with delete.ts)
+DELETE FROM products WHERE id = 2 WITH SCHEMA myapp;
+
+SELECT COUNT(*) as count FROM myapp.products;
+→ [{"count":1}]
+
+-- Test 17: INSERT with WITH SCHEMA + RETURNING on non-default schema
+INSERT INTO products (id, name) VALUES (3, 'Thingamajig') WITH SCHEMA myapp RETURNING id, name, status;
+→ [{"id":3,"name":"Thingamajig","status":"active"}]
+
+-- Clean up custom schema
+DROP TABLE myapp.products;
+
+-- Clean up
+DROP TABLE users;
+DROP TABLE orders;

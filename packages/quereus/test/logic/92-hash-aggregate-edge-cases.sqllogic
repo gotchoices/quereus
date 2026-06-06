@@ -1,0 +1,125 @@
+-- hash-aggregate-edge-cases.sqllogic - Edge cases for hash aggregate emitter
+-- Targets: hash-aggregate.ts — empty input, NULL groups, DISTINCT aggregates, expression keys
+
+-- Empty table with GROUP BY → no rows (not a single NULL row)
+CREATE TABLE ha_empty (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER NULL);
+
+SELECT grp, count(*) AS cnt FROM ha_empty GROUP BY grp;
+→ []
+
+SELECT grp, sum(val) AS total FROM ha_empty GROUP BY grp;
+→ []
+
+DROP TABLE ha_empty;
+
+-- All-NULL group key → single NULL group
+CREATE TABLE ha_null_grp (id INTEGER PRIMARY KEY, grp TEXT NULL, val INTEGER);
+INSERT INTO ha_null_grp VALUES (1, null, 10), (2, null, 20), (3, null, 30);
+
+SELECT grp, count(*) AS cnt, sum(val) AS total FROM ha_null_grp GROUP BY grp;
+→ [{"grp":null,"cnt":3,"total":60}]
+
+-- Multiple NULL groups and non-NULL groups coexist
+INSERT INTO ha_null_grp VALUES (4, 'x', 40), (5, 'x', 50);
+
+SELECT grp, count(*) AS cnt FROM ha_null_grp GROUP BY grp ORDER BY grp NULLS FIRST;
+→ [{"grp":null,"cnt":3},{"grp":"x","cnt":2}]
+
+DROP TABLE ha_null_grp;
+
+-- SUM(DISTINCT col) with NULLs: NULLs excluded from distinct tracking
+CREATE TABLE ha_dist (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO ha_dist VALUES (1, 10), (2, 20), (3, 10), (4, null), (5, 20), (6, null);
+
+SELECT sum(distinct val) AS sd FROM ha_dist;
+→ [{"sd":30}]
+
+-- count(*) vs count(col) vs count(distinct col) with NULLs
+SELECT count(*) AS c_star, count(val) AS c_val, count(distinct val) AS c_dval FROM ha_dist;
+→ [{"c_star":6,"c_val":4,"c_dval":2}]
+
+-- AVG(DISTINCT col)
+SELECT avg(distinct val) AS ad FROM ha_dist;
+→ [{"ad":15}]
+
+-- Multiple DISTINCT aggregates in same query
+SELECT count(distinct val) AS cd, sum(distinct val) AS sd, avg(distinct val) AS ad FROM ha_dist;
+→ [{"cd":2,"sd":30,"ad":15}]
+
+DROP TABLE ha_dist;
+
+-- SUM(DISTINCT) with GROUP BY
+CREATE TABLE ha_dist_grp (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER NULL);
+INSERT INTO ha_dist_grp VALUES (1, 'a', 10), (2, 'a', 10), (3, 'a', 20), (4, 'b', 30), (5, 'b', null);
+
+SELECT grp, sum(distinct val) AS sd, count(distinct val) AS cd FROM ha_dist_grp GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","sd":30,"cd":2},{"grp":"b","sd":30,"cd":1}]
+
+DROP TABLE ha_dist_grp;
+
+-- All-NULL value column: aggregates return null (except count(*) and count)
+CREATE TABLE ha_allnull (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO ha_allnull VALUES (1, null), (2, null), (3, null);
+
+SELECT count(*) AS c_star, count(val) AS c_val, sum(val) AS s, avg(val) AS a, min(val) AS mn, max(val) AS mx FROM ha_allnull;
+→ [{"c_star":3,"c_val":0,"s":null,"a":null,"mn":null,"mx":null}]
+
+DROP TABLE ha_allnull;
+
+-- GROUP BY on expression
+CREATE TABLE ha_expr (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
+INSERT INTO ha_expr VALUES (1, 'a', 10), (2, 'bb', 20), (3, 'ccc', 30), (4, 'dd', 40);
+
+SELECT length(name) AS name_len, sum(val) AS total FROM ha_expr GROUP BY length(name) ORDER BY length(name);
+→ [{"name_len":1,"total":10},{"name_len":2,"total":60},{"name_len":3,"total":30}]
+
+DROP TABLE ha_expr;
+
+-- Single-row groups (each row is its own group)
+CREATE TABLE ha_single (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO ha_single VALUES (1, 100), (2, 200), (3, 300);
+
+SELECT id, count(*) AS cnt, sum(val) AS total FROM ha_single GROUP BY id ORDER BY id;
+→ [{"id":1,"cnt":1,"total":100},{"id":2,"cnt":1,"total":200},{"id":3,"cnt":1,"total":300}]
+
+DROP TABLE ha_single;
+
+-- HAVING that filters all groups → empty result
+CREATE TABLE ha_having (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+INSERT INTO ha_having VALUES (1, 'a', 10), (2, 'b', 20);
+
+SELECT grp, sum(val) AS total FROM ha_having GROUP BY grp HAVING sum(val) > 1000;
+→ []
+
+-- HAVING with DISTINCT aggregate
+SELECT grp, count(distinct val) AS cd FROM ha_having GROUP BY grp HAVING count(distinct val) > 5;
+→ []
+
+DROP TABLE ha_having;
+
+-- Aggregate without GROUP BY on empty table: returns single row with initial values
+CREATE TABLE ha_empty_agg (id INTEGER PRIMARY KEY, val INTEGER NULL);
+
+SELECT count(*) AS cnt, sum(val) AS s, min(val) AS mn, max(val) AS mx FROM ha_empty_agg;
+→ [{"cnt":0,"s":null,"mn":null,"mx":null}]
+
+DROP TABLE ha_empty_agg;
+
+-- GROUP BY with multiple columns including NULL
+CREATE TABLE ha_multi_grp (id INTEGER PRIMARY KEY, a TEXT NULL, b INTEGER NULL, val INTEGER);
+INSERT INTO ha_multi_grp VALUES (1, 'x', 1, 10), (2, 'x', 1, 20), (3, 'x', null, 30), (4, null, 1, 40), (5, null, null, 50);
+
+SELECT a, b, count(*) AS cnt, sum(val) AS total
+FROM ha_multi_grp GROUP BY a, b ORDER BY a NULLS FIRST, b NULLS FIRST;
+→ [{"a":null,"b":null,"cnt":1,"total":50},{"a":null,"b":1,"cnt":1,"total":40},{"a":"x","b":null,"cnt":1,"total":30},{"a":"x","b":1,"cnt":2,"total":30}]
+
+DROP TABLE ha_multi_grp;
+
+-- group_concat(DISTINCT) — distinct string aggregation
+CREATE TABLE ha_gc (id INTEGER PRIMARY KEY, grp TEXT, tag TEXT NULL);
+INSERT INTO ha_gc VALUES (1, 'a', 'x'), (2, 'a', 'y'), (3, 'a', 'x'), (4, 'b', null), (5, 'b', 'z');
+
+SELECT grp, group_concat(distinct tag) AS tags FROM ha_gc GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","tags":"x,y"},{"grp":"b","tags":"z"}]
+
+DROP TABLE ha_gc;

@@ -1,0 +1,678 @@
+-- metadata-tags.sqllogic - Testing WITH TAGS metadata on schema objects
+
+-- ===================================================================
+-- Phase 1: Table-level tags
+-- ===================================================================
+
+-- Table with tags
+CREATE TABLE Orders (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+) WITH TAGS (display_name = 'Customer Orders', audit = true);
+
+-- Verify the table works normally with tags
+INSERT INTO Orders VALUES (1, 'Order A'), (2, 'Order B');
+SELECT * FROM Orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Round-trip: tags surface through schema() introspection
+SELECT json_extract(tags, '$.display_name') AS display_name,
+       json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Orders';
+→ [{"display_name":"Customer Orders","audit":true}]
+
+-- ===================================================================
+-- Phase 2: Column-level tags
+-- ===================================================================
+
+CREATE TABLE Products (
+    id INTEGER PRIMARY KEY WITH TAGS (display_name = 'Product ID'),
+    name TEXT NOT NULL WITH TAGS (searchable = true, display_name = 'Product Name'),
+    price REAL NOT NULL
+);
+
+INSERT INTO Products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99);
+SELECT name, price FROM Products ORDER BY name;
+→ [{"name":"Gadget","price":19.99},{"name":"Widget","price":9.99}]
+
+-- Round-trip: column tags via table_info()
+SELECT name, json_extract(tags, '$.display_name') AS display_name,
+       json_extract(tags, '$.searchable') AS searchable
+    FROM table_info('Products') WHERE cid IN (0, 1) ORDER BY cid;
+→ [{"name":"id","display_name":"Product ID","searchable":null},{"name":"name","display_name":"Product Name","searchable":true}]
+
+-- ===================================================================
+-- Phase 3: Constraint-level tags
+-- ===================================================================
+
+-- CHECK constraint with tags
+CREATE TABLE Items (
+    id INTEGER PRIMARY KEY,
+    quantity INTEGER NOT NULL CHECK (quantity > 0) WITH TAGS (error_message = 'Quantity must be positive')
+);
+
+INSERT INTO Items VALUES (1, 5);
+SELECT * FROM Items;
+→ [{"id":1,"quantity":5}]
+
+-- Verify CHECK still works
+INSERT INTO Items VALUES (2, -1);
+-- error: CHECK constraint failed
+
+-- UNIQUE constraint with tags (table-level)
+CREATE TABLE Employees (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    CONSTRAINT uq_email UNIQUE (email) WITH TAGS (error_message = 'Email must be unique')
+);
+
+INSERT INTO Employees VALUES (1, 'alice@test.com'), (2, 'bob@test.com');
+SELECT * FROM Employees ORDER BY id;
+→ [{"id":1,"email":"alice@test.com"},{"id":2,"email":"bob@test.com"}]
+
+-- Round-trip: named UNIQUE constraint tags via unique_constraint_info()
+SELECT name, json_extract(tags, '$.error_message') AS msg
+    FROM unique_constraint_info('Employees') WHERE name = 'uq_email';
+→ [{"name":"uq_email","msg":"Email must be unique"}]
+
+-- ===================================================================
+-- Phase 4: View-level tags
+-- ===================================================================
+
+CREATE VIEW ActiveOrders AS SELECT * FROM Orders WHERE id > 0
+    WITH TAGS (cacheable = true, purpose = 'active orders filter');
+
+SELECT * FROM ActiveOrders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Round-trip: view tags via schema()
+SELECT json_extract(tags, '$.cacheable') AS cacheable,
+       json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"cacheable":true,"purpose":"active orders filter"}]
+
+-- ===================================================================
+-- Phase 5: Index-level tags
+-- ===================================================================
+
+CREATE INDEX idx_product_name ON Products (name)
+    WITH TAGS (purpose = 'search optimization');
+
+-- Verify index works
+SELECT name FROM Products WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- Round-trip: index tags via schema() and index_info()
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"purpose":"search optimization"}]
+
+SELECT index_name, column_name, json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('Products') WHERE index_name = 'idx_product_name';
+→ [{"index_name":"idx_product_name","column_name":"name","purpose":"search optimization"}]
+
+-- ===================================================================
+-- Phase 6: Tag value types
+-- ===================================================================
+
+CREATE TABLE TagTypes (
+    id INTEGER PRIMARY KEY WITH TAGS (
+        str_tag = 'hello',
+        num_tag = 42,
+        float_tag = 3.14,
+        bool_true = true,
+        bool_false = false,
+        null_tag = null,
+        negative = -10
+    )
+);
+
+INSERT INTO TagTypes VALUES (1);
+SELECT * FROM TagTypes;
+→ [{"id":1}]
+
+-- ===================================================================
+-- Phase 7: Combined WITH TAGS and WITH CONTEXT
+-- ===================================================================
+
+-- Tags combined with context in any order
+CREATE TABLE AuditLog (
+    id INTEGER PRIMARY KEY,
+    message TEXT NOT NULL
+) WITH CONTEXT (user_name TEXT) WITH TAGS (audit = true, display_name = 'Audit Log');
+
+INSERT INTO AuditLog VALUES (1, 'action') WITH CONTEXT user_name = 'admin';
+SELECT * FROM AuditLog;
+→ [{"id":1,"message":"action"}]
+
+-- Tags before context
+CREATE TABLE AuditLog2 (
+    id INTEGER PRIMARY KEY,
+    message TEXT NOT NULL
+) WITH TAGS (audit = true) WITH CONTEXT (user_name TEXT);
+
+INSERT INTO AuditLog2 VALUES (1, 'action') WITH CONTEXT user_name = 'admin';
+SELECT * FROM AuditLog2;
+→ [{"id":1,"message":"action"}]
+
+-- ===================================================================
+-- Phase 8: TAGS as a regular identifier (contextual keyword test)
+-- ===================================================================
+
+CREATE TABLE TagsTable (
+    tags TEXT PRIMARY KEY
+);
+
+INSERT INTO TagsTable VALUES ('test');
+SELECT tags FROM TagsTable;
+→ [{"tags":"test"}]
+
+-- ===================================================================
+-- Phase 9: Empty tags (edge case)
+-- ===================================================================
+
+-- Table with single tag
+CREATE TABLE SingleTag (
+    id INTEGER PRIMARY KEY
+) WITH TAGS (label = 'solo');
+
+INSERT INTO SingleTag VALUES (1);
+SELECT * FROM SingleTag;
+→ [{"id":1}]
+
+-- ===================================================================
+-- Phase 10: Tags with special string values
+-- ===================================================================
+
+CREATE TABLE SpecialTags (
+    id INTEGER PRIMARY KEY
+) WITH TAGS (description = 'it''s a "test"', empty = '');
+
+INSERT INTO SpecialTags VALUES (1);
+SELECT * FROM SpecialTags;
+→ [{"id":1}]
+
+-- ===================================================================
+-- Phase 11: ALTER TABLE ... SET TAGS (table-level, whole-set replace + clear)
+-- ===================================================================
+
+CREATE TABLE Alterable (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+-- No tags yet → tags IS NULL
+SELECT tags FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"tags":null}]
+
+-- Set table tags
+ALTER TABLE Alterable SET TAGS (display_name = 'Alterable Table', audit = true);
+SELECT json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"dn":"Alterable Table","audit":true}]
+
+-- Whole-set replace: the previous keys are gone, only the new one remains
+ALTER TABLE Alterable SET TAGS (display_name = 'Renamed');
+SELECT json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"dn":"Renamed","audit":null}]
+
+-- Clear all tags → tags IS NULL
+ALTER TABLE Alterable SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'table' AND name = 'Alterable';
+→ [{"tags":null}]
+
+-- The table still works after tag mutations
+INSERT INTO Alterable VALUES (1, 'row');
+SELECT * FROM Alterable;
+→ [{"id":1,"name":"row"}]
+
+-- ===================================================================
+-- Phase 12: ALTER TABLE ... ALTER COLUMN ... SET TAGS
+-- ===================================================================
+
+ALTER TABLE Alterable ALTER COLUMN name SET TAGS (searchable = true, display_name = 'Name');
+SELECT name, json_extract(tags, '$.searchable') AS searchable, json_extract(tags, '$.display_name') AS dn
+    FROM table_info('Alterable') WHERE name = 'name';
+→ [{"name":"name","searchable":true,"dn":"Name"}]
+
+-- Column attributes (NOT NULL, type) are untouched by SET TAGS
+SELECT name, type, notnull FROM table_info('Alterable') WHERE name = 'name';
+→ [{"name":"name","type":"TEXT","notnull":1}]
+
+-- Clear column tags
+ALTER TABLE Alterable ALTER COLUMN name SET TAGS ();
+SELECT tags FROM table_info('Alterable') WHERE name = 'name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 13: ALTER TABLE ... ALTER CONSTRAINT ... SET TAGS (named constraint)
+-- ===================================================================
+
+CREATE TABLE Staff (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    CONSTRAINT uq_staff_email UNIQUE (email)
+);
+
+ALTER TABLE Staff ALTER CONSTRAINT uq_staff_email SET TAGS (error_message = 'Email must be unique');
+SELECT name, json_extract(tags, '$.error_message') AS msg
+    FROM unique_constraint_info('Staff') WHERE name = 'uq_staff_email';
+→ [{"name":"uq_staff_email","msg":"Email must be unique"}]
+
+-- The UNIQUE constraint still enforces after the tag mutation
+INSERT INTO Staff VALUES (1, 'a@x'), (2, 'b@x');
+SELECT count(*) AS n FROM Staff;
+→ [{"n":2}]
+
+INSERT INTO Staff VALUES (3, 'a@x');
+-- error: constraint
+
+-- ===================================================================
+-- Phase 14: reserved-tag typo rejection on the ALTER path
+-- ===================================================================
+
+-- A misspelled reserved key is rejected loudly (not silently stored)
+ALTER TABLE Alterable SET TAGS ("quereus.update.taget" = 1);
+-- error: reserved tag
+
+ALTER TABLE Alterable ALTER COLUMN name SET TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- ===================================================================
+-- Phase 15: NOTFOUND for unknown column / constraint
+-- ===================================================================
+
+ALTER TABLE Alterable ALTER COLUMN nope SET TAGS (a = 1);
+-- error: not found
+
+ALTER TABLE Alterable ALTER CONSTRAINT nope SET TAGS (a = 1);
+-- error: not found
+
+-- ===================================================================
+-- Phase 16: ambiguous constraint name (same name across constraint classes)
+-- ===================================================================
+
+-- A name shared by a UNIQUE and a CHECK constraint is constructible (no
+-- create-time dedup across classes), so ALTER CONSTRAINT ... SET TAGS on it
+-- must reject the request as ambiguous rather than silently picking one.
+CREATE TABLE AmbiguousCon (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    CONSTRAINT dup UNIQUE (x),
+    CONSTRAINT dup CHECK (x > 0)
+);
+
+ALTER TABLE AmbiguousCon ALTER CONSTRAINT dup SET TAGS (m = 'x');
+-- error: ambiguous
+
+-- ===================================================================
+-- Phase 17: ALTER VIEW ... SET TAGS (whole-set replace + clear)
+-- ===================================================================
+
+-- ActiveOrders (Phase 4) was created with cacheable/purpose tags.
+SELECT json_extract(tags, '$.cacheable') AS cacheable, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"cacheable":true,"purpose":"active orders filter"}]
+
+-- Whole-set replace: previous keys are gone, only the new ones remain.
+ALTER VIEW ActiveOrders SET TAGS (owner = 'team-x', cacheable = false);
+SELECT json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.cacheable') AS cacheable,
+       json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"owner":"team-x","cacheable":false,"purpose":null}]
+
+-- The view still resolves and returns rows after the tag mutation.
+SELECT * FROM ActiveOrders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Clear all tags → tags IS NULL.
+ALTER VIEW ActiveOrders SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 18: ALTER INDEX ... SET TAGS (whole-set replace + clear)
+-- ===================================================================
+
+-- idx_product_name (Phase 5) was created with a purpose tag.
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"purpose":"search optimization"}]
+
+-- Whole-set replace.
+ALTER INDEX idx_product_name SET TAGS (owner = 'search-team', purpose = 'fulltext');
+SELECT index_name, json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('Products') WHERE index_name = 'idx_product_name';
+→ [{"index_name":"idx_product_name","owner":"search-team","purpose":"fulltext"}]
+
+-- The index still answers lookups after the tag mutation.
+SELECT name FROM Products WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- Clear all tags → tags IS NULL.
+ALTER INDEX idx_product_name SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 19: ALTER MATERIALIZED VIEW ... SET TAGS (no re-materialization)
+-- ===================================================================
+
+CREATE MATERIALIZED VIEW mv_orders AS SELECT id, name FROM Orders;
+
+-- The MV is materialized from Orders (rows inserted in Phase 1).
+SELECT id, name FROM mv_orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Tag mutation executes as a catalog-only change.
+ALTER MATERIALIZED VIEW mv_orders SET TAGS (owner = 'analytics');
+
+-- The materialized data is unchanged by the tag mutation (no rebuild).
+SELECT id, name FROM mv_orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Replace then clear still leave the data intact.
+ALTER MATERIALIZED VIEW mv_orders SET TAGS (owner = 'platform', tier = 'gold');
+ALTER MATERIALIZED VIEW mv_orders SET TAGS ();
+SELECT id, name FROM mv_orders ORDER BY id;
+→ [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- ===================================================================
+-- Phase 20: NOTFOUND for unknown view / index / materialized view
+-- ===================================================================
+
+ALTER VIEW NoSuchView SET TAGS (a = 1);
+-- error: not found
+
+ALTER INDEX NoSuchIndex SET TAGS (a = 1);
+-- error: not found
+
+ALTER MATERIALIZED VIEW NoSuchMv SET TAGS (a = 1);
+-- error: not found
+
+-- ===================================================================
+-- Phase 21: reserved-tag typo rejection on the view / index ALTER paths
+-- ===================================================================
+
+-- A misspelled reserved key is rejected loudly (view-ddl site).
+ALTER VIEW ActiveOrders SET TAGS ("quereus.update.taget" = 1);
+-- error: reserved tag
+
+-- physical-index site rejects an unknown reserved key.
+ALTER INDEX idx_product_name SET TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- ===================================================================
+-- Phase 22: hidden implicit covering index is not addressable (NOTFOUND)
+-- ===================================================================
+
+-- Employees (Phase 3) has a named UNIQUE constraint uq_email whose implicit
+-- covering structure is hidden — ALTER INDEX must treat it as NOTFOUND (its
+-- tags live on the constraint, set via ALTER TABLE ... ALTER CONSTRAINT).
+ALTER INDEX uq_email SET TAGS (a = 1);
+-- error: not found
+
+-- ===================================================================
+-- Phase 23: reserved-tag validation on the direct CREATE TABLE / CREATE INDEX paths
+-- ===================================================================
+
+-- The direct CREATE path now validates reserved `quereus.*` tags at plan-build,
+-- mirroring ALTER ... SET TAGS (Phase 14/21) and the declarative differ, so a
+-- typo / mis-site fails loudly here instead of being silently stored.
+
+-- Table-level unknown reserved key rejected (physical-table site).
+CREATE TABLE RsvBadTbl (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Column-level unknown reserved key rejected (physical-column site).
+CREATE TABLE RsvBadCol (id INTEGER PRIMARY KEY, x INTEGER WITH TAGS ("quereus.bogus" = 1));
+-- error: reserved tag
+
+-- Table-level NAMED-constraint unknown reserved key rejected (physical-constraint site).
+CREATE TABLE RsvBadCon (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    CONSTRAINT c CHECK (x > 0) WITH TAGS ("quereus.bogus" = 1)
+);
+-- error: reserved tag
+
+-- Mis-sited but otherwise-valid key rejected: quereus.lens.access.<col> is legal
+-- only on a logical table, not on a physical CREATE TABLE ⇒ tag-not-allowed-here.
+CREATE TABLE RsvMissite (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.lens.access.id" = 'eq');
+-- error: not allowed
+
+-- CREATE INDEX unknown reserved key rejected (physical-index site).
+CREATE INDEX ix_rsv_bad ON Products (price) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Multiple offending tags in one statement: diagnostics accumulate table → column,
+-- and the first error (the table-level one) is raised — deterministic ordering.
+CREATE TABLE RsvMulti (
+    id INTEGER PRIMARY KEY,
+    x INTEGER WITH TAGS ("quereus.also_bogus" = 1)
+) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- IF NOT EXISTS still validates at build time: Orders (Phase 1) already exists, so
+-- the create would be skipped at runtime, but the malformed reserved tag is rejected
+-- at plan-build regardless (matches ALTER's build-time semantics).
+CREATE TABLE IF NOT EXISTS Orders (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Valid rename hint quereus.id accepted on a table and round-trips through schema().
+CREATE TABLE RsvOkTbl (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.id" = 'tbl-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid
+    FROM schema() WHERE type = 'table' AND name = 'RsvOkTbl';
+→ [{"qid":"tbl-thing"}]
+
+-- Valid quereus.id accepted on a column and round-trips through table_info().
+CREATE TABLE RsvOkCol (id INTEGER PRIMARY KEY WITH TAGS ("quereus.id" = 'col-pk'), x INTEGER);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('RsvOkCol') WHERE name = 'id';
+→ [{"name":"id","qid":"col-pk"}]
+
+-- Valid quereus.id accepted on a table-level NAMED constraint and round-trips
+-- through unique_constraint_info() (the physical-constraint surface accepts the hint).
+CREATE TABLE RsvOkConTbl (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    CONSTRAINT uq_rsv UNIQUE (email) WITH TAGS ("quereus.id" = 'con-uq')
+);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM unique_constraint_info('RsvOkConTbl') WHERE name = 'uq_rsv';
+→ [{"name":"uq_rsv","qid":"con-uq"}]
+
+-- -------------------------------------------------------------------
+-- Inline NAMED column-constraint reserved-tag validation
+-- (ColumnDef.constraints[].tags). The parser lifts a trailing WITH TAGS onto an
+-- inline constraint only when it is NAMED; the direct CREATE path validates it at
+-- the same physical-constraint site as a table-level constraint (mirrors the
+-- differ — see 50.2-declare-schema-renames.sqllogic § 10).
+-- -------------------------------------------------------------------
+
+-- Typo'd reserved key on an inline NAMED CHECK constraint rejected
+-- (physical-constraint site) — the core gap this change closes.
+CREATE TABLE RsvInlineBadCon (
+    id INTEGER PRIMARY KEY,
+    qty INTEGER CONSTRAINT chk_qty CHECK (qty > 0) WITH TAGS ("quereus.bogus" = 1)
+);
+-- error: reserved tag
+
+-- Mis-sited but otherwise-valid key on an inline named constraint rejected:
+-- quereus.update.default_for.<col> is view-ddl / projection / dml-stmt only ⇒
+-- tag-not-allowed-here at the physical-constraint site.
+CREATE TABLE RsvInlineMissite (
+    id INTEGER PRIMARY KEY,
+    qty INTEGER CONSTRAINT chk_qty2 CHECK (qty > 0) WITH TAGS ("quereus.update.default_for.qty" = '0')
+);
+-- error: not allowed
+
+-- Valid functional tag quereus.expose_implicit_index accepted on an inline NAMED
+-- UNIQUE constraint and round-trips through unique_constraint_info (the same tag
+-- catalog.ts reads to surface the implicit covering structure).
+CREATE TABLE RsvInlineUq (
+    id INTEGER PRIMARY KEY,
+    vin TEXT CONSTRAINT uq_vin UNIQUE WITH TAGS ("quereus.expose_implicit_index" = true)
+);
+SELECT name, json_extract(tags, '$."quereus.expose_implicit_index"') AS exposed
+    FROM unique_constraint_info('RsvInlineUq') WHERE name = 'uq_vin';
+→ [{"name":"uq_vin","exposed":true}]
+
+-- Valid rename hint quereus.id accepted on an inline named UNIQUE constraint and
+-- round-trips (mirrors the table-level RsvOkConTbl case above).
+CREATE TABLE RsvInlineId (
+    id INTEGER PRIMARY KEY,
+    email TEXT CONSTRAINT uq_email_inline UNIQUE WITH TAGS ("quereus.id" = 'con-inline')
+);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM unique_constraint_info('RsvInlineId') WHERE name = 'uq_email_inline';
+→ [{"name":"uq_email_inline","qid":"con-inline"}]
+
+-- Unnamed inline constraint with trailing WITH TAGS: the parser defers the tag to
+-- the COLUMN (physical-column site), so it validates/stores there and round-trips
+-- on the column via table_info — NOT on the constraint (no regression, no double
+-- error). quereus.id is legal at physical-column, so this is accepted.
+CREATE TABLE RsvInlineUnnamed (
+    id INTEGER PRIMARY KEY,
+    x INTEGER CHECK (x > 0) WITH TAGS ("quereus.id" = 'col-x-tag')
+);
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('RsvInlineUnnamed') WHERE name = 'x';
+→ [{"name":"x","qid":"col-x-tag"}]
+
+-- Valid quereus.id accepted on an index and round-trips through schema() / index_info().
+CREATE INDEX ix_rsv_ok ON RsvOkCol (x) WITH TAGS ("quereus.id" = 'idx-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid
+    FROM schema() WHERE type = 'index' AND name = 'ix_rsv_ok';
+→ [{"qid":"idx-thing"}]
+
+SELECT index_name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM index_info('RsvOkCol') WHERE index_name = 'ix_rsv_ok';
+→ [{"index_name":"ix_rsv_ok","qid":"idx-thing"}]
+
+-- Free-form (non-quereus.*) tags are unaffected and still create cleanly
+-- (guard against over-rejection — validateReservedTags skips non-reserved keys).
+CREATE TABLE RsvFreeform (id INTEGER PRIMARY KEY) WITH TAGS (display_name = 'x', audit = true);
+INSERT INTO RsvFreeform VALUES (1);
+SELECT * FROM RsvFreeform;
+→ [{"id":1}]
+
+-- ===================================================================
+-- Phase 24: reserved-tag validation on the ALTER ... ADD CONSTRAINT /
+--           ADD COLUMN paths
+-- ===================================================================
+
+-- The two imperative ALTER ... ADD arms now validate reserved `quereus.*` tags at
+-- plan-build, mirroring CREATE TABLE (Phase 23) and ALTER ... SET TAGS (Phase 14):
+--   ADD CONSTRAINT ... WITH TAGS  -> physical-constraint
+--   ADD COLUMN ... WITH TAGS      -> physical-column (column) +
+--                                    physical-constraint (each inline named constraint)
+-- so a typo / mis-site fails loudly here instead of being silently stored.
+
+CREATE TABLE AddCon (id INTEGER PRIMARY KEY, email TEXT NOT NULL, code TEXT);
+CREATE TABLE AddCol (id INTEGER PRIMARY KEY);
+
+-- -------------------------------------------------------------------
+-- ADD CONSTRAINT ... WITH TAGS (physical-constraint site)
+-- -------------------------------------------------------------------
+
+-- Typo'd reserved key on ADD CONSTRAINT CHECK rejected (the validation fires at
+-- plan-build, before any runtime ADD CONSTRAINT machinery).
+ALTER TABLE AddCon ADD CONSTRAINT c_chk CHECK (id > 0) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Mis-sited but otherwise-valid key on ADD CONSTRAINT rejected:
+-- quereus.update.default_for.<col> is view-ddl / projection / dml-stmt only ⇒
+-- tag-not-allowed-here at the physical-constraint site.
+ALTER TABLE AddCon ADD CONSTRAINT c_chk2 CHECK (id > 0) WITH TAGS ("quereus.update.default_for.id" = '0');
+-- error: not allowed
+
+-- Valid functional tag quereus.expose_implicit_index accepted on an ADD CONSTRAINT
+-- UNIQUE and round-trips through unique_constraint_info (the same tag catalog.ts
+-- reads to surface the implicit covering structure).
+ALTER TABLE AddCon ADD CONSTRAINT uq_code UNIQUE (code) WITH TAGS ("quereus.expose_implicit_index" = true);
+SELECT name, json_extract(tags, '$."quereus.expose_implicit_index"') AS exposed
+    FROM unique_constraint_info('AddCon') WHERE name = 'uq_code';
+→ [{"name":"uq_code","exposed":true}]
+
+-- Guard against over-rejection: a free-form (non-quereus.*) tag on ADD CONSTRAINT
+-- still applies cleanly and round-trips.
+ALTER TABLE AddCon ADD CONSTRAINT uq_email UNIQUE (email) WITH TAGS (error_message = 'Email must be unique');
+SELECT name, json_extract(tags, '$.error_message') AS msg
+    FROM unique_constraint_info('AddCon') WHERE name = 'uq_email';
+→ [{"name":"uq_email","msg":"Email must be unique"}]
+
+-- -------------------------------------------------------------------
+-- ADD COLUMN ... WITH TAGS (physical-column + inline physical-constraint sites)
+-- -------------------------------------------------------------------
+
+-- Typo'd reserved key on an ADD COLUMN column tag rejected (physical-column site).
+ALTER TABLE AddCol ADD COLUMN y INT WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Typo'd reserved key on an ADD COLUMN inline NAMED constraint tag rejected
+-- (physical-constraint site) — the parser lifts the trailing WITH TAGS onto the
+-- named constraint, and the shared columnTagDiagnostics validates it there.
+ALTER TABLE AddCol ADD COLUMN z INT CONSTRAINT cz CHECK (z > 0) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Valid quereus.id accepted on an ADD COLUMN column tag and round-trips via table_info.
+ALTER TABLE AddCol ADD COLUMN c1 INT WITH TAGS ("quereus.id" = 'col-c1');
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('AddCol') WHERE name = 'c1';
+→ [{"name":"c1","qid":"col-c1"}]
+
+-- Valid quereus.id accepted on an ADD COLUMN inline NAMED constraint: the tag
+-- validates at the physical-constraint site (quereus.id is legal there), so the
+-- statement is admitted and the column is added. An inline CHECK becomes an
+-- engine-side row-constraint (surfaced via check_constraint_info, not
+-- unique_constraint_info); the c2 case only proves acceptance (no over-rejection).
+-- The inline-UNIQUE constraint-tag round-trip is asserted by the c5 case below
+-- (inline UNIQUE on ADD COLUMN is now materialized via the module's addConstraint
+-- path), and table-level ADD CONSTRAINT by the uq_code case above.
+ALTER TABLE AddCol ADD COLUMN c2 INT CONSTRAINT ck_c2 CHECK (c2 > 0) WITH TAGS ("quereus.id" = 'con-c2');
+SELECT name FROM table_info('AddCol') WHERE name = 'c2';
+→ [{"name":"c2"}]
+
+-- Inline UNIQUE on ADD COLUMN is materialized + enforced (routed through the same
+-- module addConstraint UNIQUE path as ALTER … ADD CONSTRAINT … UNIQUE), so a named
+-- inline UNIQUE round-trips its name AND its constraint tag via unique_constraint_info
+-- — closing the prior gap where the inline UNIQUE was silently dropped on this path.
+ALTER TABLE AddCol ADD COLUMN c5 INT CONSTRAINT uq_c5 UNIQUE WITH TAGS ("quereus.id" = 'con-c5');
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM unique_constraint_info('AddCol') WHERE name = 'uq_c5';
+→ [{"name":"uq_c5","qid":"con-c5"}]
+
+-- Unnamed inline constraint on ADD COLUMN with a trailing WITH TAGS: the parser
+-- defers the tag to the COLUMN (physical-column site), so it validates/stores there
+-- and round-trips on the column via table_info — NOT on the constraint (no double
+-- validation). quereus.id is legal at physical-column, so this is accepted.
+ALTER TABLE AddCol ADD COLUMN c3 INT CHECK (c3 > 0) WITH TAGS ("quereus.id" = 'col-c3');
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('AddCol') WHERE name = 'c3';
+→ [{"name":"c3","qid":"col-c3"}]
+
+-- Guard against over-rejection: free-form (non-quereus.*) tags on ADD COLUMN still
+-- apply cleanly and round-trip via table_info.
+ALTER TABLE AddCol ADD COLUMN c4 INT WITH TAGS (display_name = 'C4', searchable = true);
+SELECT name, json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.searchable') AS searchable
+    FROM table_info('AddCol') WHERE name = 'c4';
+→ [{"name":"c4","dn":"C4","searchable":true}]
+
+-- -------------------------------------------------------------------
+-- Adversarial coverage: named-ness does not gate ADD CONSTRAINT validation,
+-- and every constraint kind is covered (not just check/unique).
+-- -------------------------------------------------------------------
+
+-- Validation fires on an *unnamed* ADD CONSTRAINT too (the tag lives on the
+-- table-level constraint regardless of the optional CONSTRAINT <name> prefix), and
+-- it fires at plan-build *before* any constraint machinery — so the bad tag is the
+-- error, not e.g. a duplicate-constraint complaint.
+ALTER TABLE AddCon ADD CHECK (id < 1000) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- A bad tag on an ADD CONSTRAINT FOREIGN KEY is rejected too (the leg iterates every
+-- constraint kind, not just check/unique).
+ALTER TABLE AddCon ADD CONSTRAINT fk_self FOREIGN KEY (code) REFERENCES AddCon (id) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag

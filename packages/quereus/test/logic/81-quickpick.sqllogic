@@ -1,0 +1,24 @@
+-- QuickPick Join Enumeration logic tests
+
+-- Chain schema: a -> b -> c
+CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER) USING memory;
+CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER) USING memory;
+CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER) USING memory;
+
+INSERT INTO a VALUES (1,10),(2,20),(3,30);
+INSERT INTO b VALUES (10,1),(20,2),(30,3);
+INSERT INTO c VALUES (100,10),(200,20),(300,30);
+
+-- Sanity: actual result correctness regardless of order
+select COUNT(*) from a JOIN b ON a.id=b.a_id JOIN c ON b.id=c.b_id;
+→ [{"count(*)":3}]
+
+-- Diagnostics presence: ensure quickpick diagnostics appear in properties (exists)
+select 1 AS ok from query_plan('SELECT * FROM a JOIN b ON a.id=b.a_id JOIN c ON b.id=c.b_id')
+WHERE properties LIKE '%quickpick%'
+LIMIT 1;
+→ [{"ok":1}]
+
+-- Bushy check (indirect): verify results also correct for re-ordered predicates (same semantics)
+select COUNT(*) from c JOIN b ON b.id=c.b_id JOIN a ON a.id=b.a_id;
+→ [{"count(*)":3}]

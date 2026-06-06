@@ -1,0 +1,74 @@
+-- self-joins-duplicates.sqllogic - Self-joins and duplicate value edge cases
+
+-- ===== Self-joins =====
+
+-- Setup: employee hierarchy
+create table emp (id integer primary key, name text, manager_id integer null);
+insert into emp values (1, 'Alice', null), (2, 'Bob', 1), (3, 'Carol', 1), (4, 'Dave', 2);
+
+-- Basic self-join with aliases
+select e.name as employee, m.name as manager from emp e join emp m on e.manager_id = m.id order by e.id;
+→ [{"employee":"Bob","manager":"Alice"},{"employee":"Carol","manager":"Alice"},{"employee":"Dave","manager":"Bob"}]
+
+-- Self-join with LEFT to include root (no manager)
+select e.name as employee, m.name as manager from emp e left join emp m on e.manager_id = m.id order by e.id;
+→ [{"employee":"Alice","manager":null},{"employee":"Bob","manager":"Alice"},{"employee":"Carol","manager":"Alice"},{"employee":"Dave","manager":"Bob"}]
+
+-- Self-join with aggregation — count direct reports
+select m.name, count(e.id) as reports from emp m left join emp e on e.manager_id = m.id group by m.name order by m.name;
+→ [{"name":"Alice","reports":2},{"name":"Bob","reports":1},{"name":"Carol","reports":0},{"name":"Dave","reports":0}]
+
+-- Correlated subquery referencing outer same-table
+select e.name, (select count(*) from emp sub where sub.manager_id = e.id) as direct_reports from emp e order by e.id;
+→ [{"name":"Alice","direct_reports":2},{"name":"Bob","direct_reports":1},{"name":"Carol","direct_reports":0},{"name":"Dave","direct_reports":0}]
+
+-- Multi-level self-join (grandparent)
+select e.name, m.name as manager, gm.name as grand_manager from emp e left join emp m on e.manager_id = m.id left join emp gm on m.manager_id = gm.id order by e.id;
+→ [{"name":"Alice","manager":null,"grand_manager":null},{"name":"Bob","manager":"Alice","grand_manager":null},{"name":"Carol","manager":"Alice","grand_manager":null},{"name":"Dave","manager":"Bob","grand_manager":"Alice"}]
+
+drop table emp;
+
+-- ===== Duplicate values =====
+
+-- Setup: table with duplicate groups and values
+create table d (id integer primary key, grp text, val integer);
+insert into d values (1,'A',10), (2,'A',10), (3,'A',20), (4,'B',10), (5,'B',10), (6,'B',10);
+
+-- GROUP BY with all-duplicate keys
+select grp, count(*) as cnt from d group by grp order by grp;
+→ [{"grp":"A","cnt":3},{"grp":"B","cnt":3}]
+
+-- GROUP BY on all-duplicate column
+select val, count(*) as cnt from d where grp = 'B' group by val;
+→ [{"val":10,"cnt":3}]
+
+-- DISTINCT on all-duplicate column
+select distinct val from d where grp = 'B';
+→ [{"val":10}]
+
+-- ORDER BY on column with ties — deterministic with secondary sort on id
+select id, val from d order by val, id;
+→ [{"id":1,"val":10},{"id":2,"val":10},{"id":4,"val":10},{"id":5,"val":10},{"id":6,"val":10},{"id":3,"val":20}]
+
+-- ORDER BY with only ties (no tiebreaker) — verify all rows returned
+select val from d where grp = 'B' order by val;
+→ [{"val":10},{"val":10},{"val":10}]
+
+-- JOIN with many-to-many matching keys (cartesian within groups)
+create table d2 (id integer primary key, grp text, val2 integer);
+insert into d2 values (1,'A',100), (2,'A',200), (3,'B',300);
+
+select d.id, d2.id as d2_id from d join d2 on d.grp = d2.grp order by d.id, d2.id;
+→ [{"id":1,"d2_id":1},{"id":1,"d2_id":2},{"id":2,"d2_id":1},{"id":2,"d2_id":2},{"id":3,"d2_id":1},{"id":3,"d2_id":2},{"id":4,"d2_id":3},{"id":5,"d2_id":3},{"id":6,"d2_id":3}]
+
+drop table d2;
+
+-- IN subquery returning duplicates — should behave same as distinct
+select * from d where val in (select val from d) order by id;
+→ [{"id":1,"grp":"A","val":10},{"id":2,"grp":"A","val":10},{"id":3,"grp":"A","val":20},{"id":4,"grp":"B","val":10},{"id":5,"grp":"B","val":10},{"id":6,"grp":"B","val":10}]
+
+-- DISTINCT with multiple columns
+select distinct grp, val from d order by grp, val;
+→ [{"grp":"A","val":10},{"grp":"A","val":20},{"grp":"B","val":10}]
+
+drop table d;

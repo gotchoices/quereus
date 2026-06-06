@@ -1,0 +1,124 @@
+-- Empty Primary Key Tests (Third Manifesto Feature)
+-- These tests verify support for PRIMARY KEY () which creates singleton tables
+-- that can contain at most 0 or 1 rows
+
+-- Test 1: Create table with empty primary key directly in CREATE TABLE
+CREATE TABLE settings (
+    app_name TEXT NOT NULL,
+    version TEXT,
+    debug_mode INTEGER,
+    PRIMARY KEY ()
+) USING memory;
+
+-- Test 2: Insert first row should succeed
+INSERT INTO settings (app_name, version, debug_mode) VALUES ('MyApp', '1.0.0', 1);
+
+SELECT app_name, version, debug_mode FROM settings;
+→ [{"app_name": "MyApp", "version": "1.0.0", "debug_mode": 1}]
+
+-- Test 3: Second insert should fail (violates singleton constraint)
+INSERT INTO settings (app_name, version, debug_mode) VALUES ('AnotherApp', '2.0.0', 0);
+-- error: UNIQUE constraint failed: settings PK
+
+-- Test 4: Update should work on the single row
+UPDATE settings SET debug_mode = 0 WHERE app_name = 'MyApp';
+
+SELECT app_name, version, debug_mode FROM settings;
+→ [{"app_name": "MyApp", "version": "1.0.0", "debug_mode": 0}]
+
+-- Test 5: Delete should work
+DELETE FROM settings WHERE app_name = 'MyApp';
+
+SELECT app_name, version, debug_mode FROM settings;
+→ []
+
+-- Test 6: After delete, should be able to insert again
+INSERT INTO settings (app_name, version, debug_mode) VALUES ('NewApp', '2.0.0', 1);
+
+SELECT app_name, version, debug_mode FROM settings;
+→ [{"app_name": "NewApp", "version": "2.0.0", "debug_mode": 1}]
+
+-- Test 7: Test with named constraint (using fresh table)
+CREATE TABLE config1 (
+    config_key TEXT,
+    config_value TEXT,
+    CONSTRAINT singleton_config PRIMARY KEY ()
+) USING memory;
+
+-- Test 8: Insert into named constraint table
+INSERT INTO config1 (config_key, config_value) VALUES ('theme', 'dark');
+
+SELECT config_key, config_value FROM config1;
+→ [{"config_key": "theme", "config_value": "dark"}]
+
+-- Test 9: Second insert should fail with named constraint
+INSERT INTO config1 (config_key, config_value) VALUES ('language', 'en');
+-- error: UNIQUE constraint failed: config1 PK
+
+-- Test 10: Test COUNT and aggregation functions on singleton tables
+SELECT COUNT(*) FROM config1;
+→ [{"count(*)": 1}]
+
+SELECT COUNT(*) FROM settings;
+→ [{"count(*)": 1}]
+
+-- Test 11: Test with transactions using fresh table
+CREATE TABLE config2 (
+    config_key TEXT,
+    config_value TEXT,
+    PRIMARY KEY ()
+) USING memory;
+
+INSERT INTO config2 (config_key, config_value) VALUES ('app_theme', 'light');
+
+BEGIN;
+DELETE FROM config2;
+INSERT INTO config2 (config_key, config_value) VALUES ('temp_config', 'temp_value');
+
+SELECT config_key, config_value FROM config2;
+→ [{"config_key": "temp_config", "config_value": "temp_value"}]
+
+ROLLBACK;
+
+-- Should be back to previous state
+SELECT config_key, config_value FROM config2;
+→ [{"config_key": "app_theme", "config_value": "light"}]
+
+-- Test 12: Test with savepoints
+SAVEPOINT sp1;
+UPDATE config2 SET config_value = 'very_dark';
+
+SELECT config_key, config_value FROM config2;
+→ [{"config_key": "app_theme", "config_value": "very_dark"}]
+
+ROLLBACK TO sp1;
+
+SELECT config_key, config_value FROM config2;
+→ [{"config_key": "app_theme", "config_value": "light"}]
+
+RELEASE sp1;
+
+-- Test 13: Test JOIN with singleton tables
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+) USING memory;
+
+INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+
+-- Cross join with singleton should produce one row per regular table row
+SELECT u.id, u.name, c.config_value 
+FROM users u 
+CROSS JOIN config2 c
+ORDER BY u.id;
+→ [{"id": 1, "name": "Alice", "config_value": "light"}, {"id": 2, "name": "Bob", "config_value": "light"}]
+
+-- Test 14: Test singleton tables work with ORDER BY and LIMIT
+SELECT config_key, config_value FROM config2 ORDER BY config_key LIMIT 5;
+→ [{"config_key": "app_theme", "config_value": "light"}]
+
+-- Test 15: Cleanup
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS config1;
+DROP TABLE IF EXISTS config2;
+DROP TABLE IF EXISTS users;

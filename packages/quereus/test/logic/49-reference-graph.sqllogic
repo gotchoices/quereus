@@ -1,0 +1,83 @@
+-- Test Reference Graph and Materialization Advisory
+
+-- Basic setup
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, value INTEGER);
+CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t2 VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3);
+
+-- Test 1: Multiple references to same subquery should trigger caching
+-- The subquery (SELECT * FROM t1 WHERE value > 15) is referenced twice
+SELECT
+    (SELECT COUNT(*) FROM (SELECT * FROM t1 WHERE value > 15) AS sub1) AS count1,
+    (SELECT SUM(value) FROM (SELECT * FROM t1 WHERE value > 15) AS sub2) AS sum1
+→ [{"count1": 2, "sum1": 50}]
+
+-- Test 2: Nested loop join - right side should be cached
+-- This tests loop context detection
+SELECT t1.id, COUNT(t2.id) AS cnt
+FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+GROUP BY t1.id
+ORDER BY t1.id
+→ [{"id": 1, "cnt": 2}, {"id": 2, "cnt": 2}, {"id": 3, "cnt": 1}]
+
+-- Test 3: Correlated subquery pattern
+-- The subquery executes once per outer row
+SELECT
+    t1.id,
+    (SELECT COUNT(*) FROM t2 WHERE t2.t1_id = t1.id) AS count
+FROM t1
+ORDER BY t1.id
+→ [{"id": 1, "count": 2}, {"id": 2, "count": 2}, {"id": 3, "count": 1}]
+
+-- Test 4: EXISTS subquery pattern
+SELECT COUNT(*) AS cnt
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id)
+→ [{"cnt": 3}]
+
+-- Test 5: IN subquery pattern
+SELECT COUNT(*) AS cnt
+FROM t1
+WHERE id IN (SELECT DISTINCT t1_id FROM t2)
+→ [{"cnt": 3}]
+
+-- Test 6: CTE with multiple references
+-- The CTE is referenced twice and should be cached
+WITH high_values AS (
+    SELECT * FROM t1 WHERE value >= 20
+)
+SELECT
+    (SELECT COUNT(*) FROM high_values) AS count,
+    (SELECT SUM(value) FROM high_values) AS sum
+→ [{"count": 2, "sum": 50}]
+
+-- Test 7: Complex query with multiple caching opportunities
+WITH base AS (
+    SELECT t1.*, COUNT(t2.id) AS ref_count
+    FROM t1
+    LEFT JOIN t2 ON t1.id = t2.t1_id
+    GROUP BY t1.id, t1.value
+)
+SELECT
+    b1.id,
+    b1.ref_count,
+    (SELECT COUNT(*) FROM base b2 WHERE b2.ref_count > b1.ref_count) AS higher_count
+FROM base b1
+ORDER BY b1.id
+→ [{"id": 1, "ref_count": 2, "higher_count": 0}, {"id": 2, "ref_count": 2, "higher_count": 0}, {"id": 3, "ref_count": 1, "higher_count": 2}]
+
+-- Test 8: Non-deterministic functions should not be cached
+-- Verify that query plans with random() do not contain cache nodes
+CREATE TABLE t3 (id INTEGER PRIMARY KEY);
+INSERT INTO t3 VALUES (1), (2), (3);
+
+-- Check that no Cache nodes are present in the plan for non-deterministic subquery
+SELECT COUNT(*) AS cache_count FROM query_plan('SELECT (SELECT id FROM t3 ORDER BY random() LIMIT 1) AS x FROM t3') WHERE op = 'CACHE'
+→ [{"cache_count": 0}]
+
+-- Test 9: CTE with MATERIALIZED hint should trigger caching
+-- This CTE has an explicit materialization hint, so it should inject a cache node
+SELECT COUNT(*) AS cache_count FROM query_plan('WITH high_values AS MATERIALIZED (SELECT * FROM t1 WHERE value >= 20) SELECT COUNT(*) FROM high_values') WHERE op = 'CACHE'
+→ [{"cache_count": 1}]

@@ -1,0 +1,109 @@
+-- limit-offset-edge-cases.sqllogic - Boundary cases for limit/offset emitter
+-- Targets: limit-offset.ts — LIMIT 0, negative, OFFSET beyond count, empty table
+
+CREATE TABLE lo_t (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO lo_t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+-- LIMIT 0 → empty result
+SELECT * FROM lo_t LIMIT 0;
+→ []
+
+-- LIMIT 0 with OFFSET → empty result
+SELECT * FROM lo_t LIMIT 0 OFFSET 2;
+→ []
+
+-- OFFSET beyond row count → empty result
+SELECT * FROM lo_t ORDER BY id LIMIT 100 OFFSET 100;
+→ []
+
+-- OFFSET = exact row count → empty result
+SELECT * FROM lo_t ORDER BY id LIMIT 100 OFFSET 5;
+→ []
+
+-- LIMIT 1 → first row only
+SELECT * FROM lo_t ORDER BY id LIMIT 1;
+→ [{"id":1,"val":"a"}]
+
+-- LIMIT with OFFSET
+SELECT * FROM lo_t ORDER BY id LIMIT 2 OFFSET 2;
+→ [{"id":3,"val":"c"},{"id":4,"val":"d"}]
+
+-- OFFSET skips some, LIMIT takes remainder
+SELECT * FROM lo_t ORDER BY id LIMIT 100 OFFSET 3;
+→ [{"id":4,"val":"d"},{"id":5,"val":"e"}]
+
+-- Negative LIMIT → treated as 0 (no rows)
+SELECT * FROM lo_t LIMIT -1;
+→ []
+
+-- Negative OFFSET → treated as 0 (no offset)
+SELECT * FROM lo_t ORDER BY id LIMIT 3 OFFSET -1;
+→ [{"id":1,"val":"a"},{"id":2,"val":"b"},{"id":3,"val":"c"}]
+
+-- MySQL-style: LIMIT offset, count
+SELECT * FROM lo_t ORDER BY id LIMIT 2, 3;
+→ [{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]
+
+-- LIMIT on empty table → empty
+CREATE TABLE lo_empty (id INTEGER PRIMARY KEY, val TEXT);
+
+SELECT * FROM lo_empty LIMIT 10;
+→ []
+
+SELECT * FROM lo_empty LIMIT 0;
+→ []
+
+SELECT * FROM lo_empty LIMIT 10 OFFSET 5;
+→ []
+
+DROP TABLE lo_empty;
+
+-- LIMIT exactly matches row count
+SELECT * FROM lo_t ORDER BY id LIMIT 5;
+→ [{"id":1,"val":"a"},{"id":2,"val":"b"},{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]
+
+-- Large LIMIT with no practical effect
+SELECT * FROM lo_t ORDER BY id LIMIT 999999;
+→ [{"id":1,"val":"a"},{"id":2,"val":"b"},{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]
+
+-- LIMIT in subquery
+SELECT * FROM (SELECT id FROM lo_t ORDER BY id LIMIT 3) ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- OFFSET in subquery
+SELECT * FROM (SELECT id FROM lo_t ORDER BY id LIMIT 2 OFFSET 1) ORDER BY id;
+→ [{"id":2},{"id":3}]
+
+-- LIMIT 1 with OFFSET at last row
+SELECT * FROM lo_t ORDER BY id LIMIT 1 OFFSET 4;
+→ [{"id":5,"val":"e"}]
+
+-- LIMIT 1 with OFFSET past last row
+SELECT * FROM lo_t ORDER BY id LIMIT 1 OFFSET 5;
+→ []
+
+-- Cast edge cases (exercises cast.ts fallback paths)
+-- CAST null → null
+SELECT CAST(null AS INTEGER) AS r;
+→ [{"r":null}]
+
+-- CAST non-numeric string to INTEGER → 0 (fallback)
+SELECT CAST('abc' AS INTEGER) AS r;
+→ [{"r":0}]
+
+-- CAST non-numeric string to REAL → 0
+SELECT CAST('xyz' AS REAL) AS r;
+→ [{"r":0}]
+
+-- CAST number to TEXT → string
+SELECT CAST(42 AS TEXT) AS r;
+→ [{"r":"42"}]
+
+-- CAST valid numeric string
+SELECT CAST('123' AS INTEGER) AS r;
+→ [{"r":123}]
+
+SELECT CAST('3.14' AS REAL) AS r;
+→ [{"r":3.14}]
+
+DROP TABLE lo_t;

@@ -1,0 +1,565 @@
+-- 24-builtin-branches.sqllogic
+-- Targeted tests for untested branches in builtin functions:
+-- datetime heuristics, JSON edge cases, string patterns,
+-- aggregate overflow, scalar coercion, conversion edge cases
+
+-- ============================================================
+-- DATETIME: heuristic numeric parsing
+-- ============================================================
+
+-- Julian day number: 2451545 = J2000.0 = 2000-01-01 12:00:00 UTC
+SELECT strftime('%Y-%m-%d %H:%M:%S', 2451545);
+→ ["2000-01-01 12:00:00"]
+
+-- Epoch seconds: 86400 = 1 day = 1970-01-02
+SELECT datetime(86400, '+0 seconds');
+→ ["1970-01-02 00:00:00"]
+
+-- Unix epoch zero
+SELECT datetime(0, '+0 seconds');
+→ ["1970-01-01 00:00:00"]
+
+-- Negative epoch seconds
+SELECT date(-86400, '+0 days');
+→ ["1969-12-31"]
+
+-- Epoch milliseconds fallback (value > max epoch seconds range)
+SELECT strftime('%Y-%m-%d', 1704067200000);
+→ ["2024-01-01"]
+
+-- Out-of-range numeric → null
+SELECT strftime('%Y-%m-%d', 999999999999999999);
+→ [null]
+
+-- ============================================================
+-- DATETIME: lenient formats
+-- ============================================================
+
+-- YYYYMMDD compact format
+SELECT strftime('%Y-%m-%d', '20240701');
+→ ["2024-07-01"]
+
+-- Space-separated datetime
+SELECT datetime('2024-01-15 10:30:00', '+0 seconds');
+→ ["2024-01-15 10:30:00"]
+
+-- Fractional seconds with subsec
+SELECT datetime('2024-01-01T12:00:00.500', 'subsec');
+→ ["2024-01-01 12:00:00.500"]
+
+-- ============================================================
+-- DATETIME: invalid inputs → null
+-- ============================================================
+
+SELECT date('not-a-date', '+0 days');
+→ [null]
+
+SELECT time('', '+0 seconds');
+→ [null]
+
+SELECT datetime(null, '+0 seconds');
+→ [null]
+
+-- ============================================================
+-- DATETIME: modifiers
+-- ============================================================
+
+SELECT date('2024-07-15', 'start of month');
+→ ["2024-07-01"]
+
+SELECT date('2024-07-15', 'start of year');
+→ ["2024-01-01"]
+
+SELECT date('2024-01-15', '-5 days');
+→ ["2024-01-10"]
+
+SELECT date('2024-01-15', '+1 year');
+→ ["2025-01-15"]
+
+SELECT date('2024-01-31', '+1 month');
+→ ["2024-02-29"]
+
+SELECT date('2024-01-15', '+1 month', 'start of month');
+→ ["2024-02-01"]
+
+-- ============================================================
+-- STRFTIME: format specifiers (2024-07-26 is Friday, day 208)
+-- ============================================================
+
+SELECT strftime('%j', '2024-07-26 14:30:45');
+→ ["208"]
+
+SELECT strftime('%D', '2024-07-26');
+→ ["07/26/24"]
+
+SELECT strftime('%F', '2024-07-26');
+→ ["2024-07-26"]
+
+SELECT strftime('%C', '2024-07-26');
+→ ["20"]
+
+SELECT strftime('%y', '2024-07-26');
+→ ["24"]
+
+SELECT strftime('%h', '2024-07-26');
+→ ["Jul"]
+
+SELECT strftime('%e', '2024-07-05');
+→ [" 5"]
+
+SELECT strftime('%I', '2024-07-26 14:30:45');
+→ ["02"]
+
+SELECT strftime('%I', '2024-07-26 00:00:00');
+→ ["12"]
+
+SELECT strftime('%k', '2024-07-26 09:00:00');
+→ [" 9"]
+
+SELECT strftime('%l', '2024-07-26 14:00:00');
+→ [" 2"]
+
+SELECT strftime('%p', '2024-07-26 09:00:00');
+→ ["AM"]
+
+SELECT strftime('%p', '2024-07-26 14:00:00');
+→ ["PM"]
+
+SELECT strftime('%P', '2024-07-26 09:00:00');
+→ ["am"]
+
+SELECT strftime('%T', '2024-07-26 14:30:45');
+→ ["14:30:45"]
+
+SELECT strftime('%R', '2024-07-26 14:30:45');
+→ ["14:30"]
+
+SELECT strftime('%r', '2024-07-26 14:30:45');
+→ ["02:30:45 PM"]
+
+SELECT strftime('%w', '2024-07-26');
+→ ["5"]
+
+SELECT strftime('%u', '2024-07-26');
+→ ["5"]
+
+SELECT strftime('%J', '2000-01-01 12:00:00');
+→ ["2451545"]
+
+SELECT strftime('%%', '2024-07-26');
+→ ["%"]
+
+SELECT strftime('%z', '2024-07-26');
+→ ["+0000"]
+
+SELECT strftime('%f', '2024-07-26 14:30:45');
+→ [".000"]
+
+SELECT strftime('%s', '2000-01-01 00:00:00');
+→ ["946684800"]
+
+SELECT strftime('%Y/%m/%d %H:%M', '2024-07-26 14:30:45');
+→ ["2024/07/26 14:30"]
+
+SELECT strftime(null, '2024-07-26');
+→ [null]
+
+-- ============================================================
+-- JSON: validation edge cases
+-- ============================================================
+
+SELECT json_valid(''), json_valid('null'), json_valid('true'), json_valid('false');
+→ [{"json_valid('')":false,"json_valid('null')":true,"json_valid('true')":true,"json_valid('false')":true}]
+
+SELECT json_valid(42), json_valid(true), json_valid(false);
+→ [{"json_valid(42)":true,"json_valid(true)":true,"json_valid(false)":true}]
+
+-- ============================================================
+-- JSON: type detection
+-- ============================================================
+
+SELECT json_type('42'), json_type('3.14');
+→ [{"json_type('42')":"integer","json_type('3.14')":"real"}]
+
+SELECT json_type('true'), json_type('false'), json_type('null');
+→ [{"json_type('true')":"true","json_type('false')":"false","json_type('null')":"null"}]
+
+SELECT json_type('[]'), json_type('{}');
+→ [{"json_type('[]')":"array","json_type('{}')":"object"}]
+
+-- ============================================================
+-- JSON: extract edge cases
+-- ============================================================
+
+SELECT json_extract('{"a":1}', '$.b');
+→ [null]
+
+SELECT json_extract('{"a":null}', '$.a');
+→ [null]
+
+SELECT json_extract('{"a":1,"b":2}', '$.c', '$.b', '$.a');
+→ [2]
+
+-- ============================================================
+-- JSON: manipulation edge cases
+-- ============================================================
+
+-- Array append at length position
+SELECT json_insert('[1,2,3]', '$[3]', 4);
+→ [[1,2,3,4]]
+
+-- Array out-of-bounds fills with nulls
+SELECT json_set('[1,2]', '$[5]', 'x');
+→ [[1,2,null,null,null,"x"]]
+
+-- Root path replacement
+SELECT json_replace('{"a":1}', '$', 42);
+→ [42]
+
+-- Array element removal
+SELECT json_remove('[10,20,30]', '$[1]');
+→ [[10,30]]
+
+-- Multiple path removal
+SELECT json_remove('{"a":1,"b":2,"c":3}', '$.a', '$.c');
+→ [{"b":2}]
+
+-- ============================================================
+-- JSON: patch edge cases
+-- ============================================================
+
+-- Empty patch → no change
+SELECT json_patch('{"a":1}', '[]') as result;
+→ [{"result":{"a":1}}]
+
+-- Invalid patch: missing 'op' field → null
+SELECT json_patch('{"a":1}', '[{"path":"/a"}]') as result;
+→ [{"result":null}]
+
+-- Non-array patch → null
+SELECT json_patch('{"a":1}', '{"op":"add"}') as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- JSON: aggregate edge cases
+-- ============================================================
+
+create table json_agg_empty (id integer primary key, v text null);
+select json_group_array(v) as result from json_agg_empty;
+→ [{"result":null}]
+
+insert into json_agg_empty values (1, null), (2, null);
+-- run
+select json_group_object(v, 1) as result from json_agg_empty;
+→ [{"result":null}]
+drop table json_agg_empty;
+
+-- ============================================================
+-- STRING: substr edge cases
+-- ============================================================
+
+SELECT substr('hello', -2) as result;
+→ [{"result":"lo"}]
+
+SELECT substr('hello', -2, 1) as result;
+→ [{"result":"l"}]
+
+SELECT substr('hello', 0) as result;
+→ [{"result":"hello"}]
+
+SELECT substr('hello', 0, 3) as result;
+→ [{"result":"hel"}]
+
+-- Negative length → empty string
+SELECT substr('hello', 2, -1) as result;
+→ [{"result":""}]
+
+-- Large negative start clamps to 0
+SELECT substr('hello', -100) as result;
+→ [{"result":"hello"}]
+
+-- ============================================================
+-- STRING: trim with regex-special characters
+-- ============================================================
+
+SELECT trim('[hello]', '[]') as result;
+→ [{"result":"hello"}]
+
+SELECT trim('...test...', '.') as result;
+→ [{"result":"test"}]
+
+SELECT trim('***test***', '*') as result;
+→ [{"result":"test"}]
+
+SELECT trim('(test)', '()') as result;
+→ [{"result":"test"}]
+
+-- Empty chars → no change
+SELECT trim('hello', '') as result;
+→ [{"result":"hello"}]
+
+-- ============================================================
+-- STRING: LIKE edge cases
+-- ============================================================
+
+SELECT like('%', '%') as result;
+→ [{"result":true}]
+
+SELECT like('_', 'a') as result;
+→ [{"result":true}]
+
+SELECT like('_', '') as result;
+→ [{"result":false}]
+
+SELECT like('', '') as result;
+→ [{"result":true}]
+
+SELECT like('', 'a') as result;
+→ [{"result":false}]
+
+SELECT like('%', '') as result;
+→ [{"result":true}]
+
+-- ============================================================
+-- AGGREGATE: SUM BigInt promotion on overflow
+-- ============================================================
+
+create table bigint_sum (id integer primary key, v integer);
+insert into bigint_sum values (1, 5000000000000000), (2, 5000000000000000);
+select sum(v) from bigint_sum;
+→ [{"sum(v)":10000000000000000}]
+drop table bigint_sum;
+
+-- ============================================================
+-- AGGREGATE: SUM with string coercion
+-- ============================================================
+
+create table str_sum (id integer primary key, v text null);
+insert into str_sum values (1, '10'), (2, '20'), (3, 'abc'), (4, null);
+select sum(v) from str_sum;
+→ [{"sum(v)":30}]
+drop table str_sum;
+
+-- ============================================================
+-- AGGREGATE: SUM with boolean values
+-- ============================================================
+
+create table bool_sum (id integer primary key, v boolean);
+insert into bool_sum values (1, true), (2, false), (3, true), (4, true);
+select sum(v) from bool_sum;
+→ [{"sum(v)":3}]
+drop table bool_sum;
+
+-- ============================================================
+-- AGGREGATE: GROUP_CONCAT edge cases
+-- Note: ';' as separator avoided due to parser treating ';' in strings as statement boundary
+-- ============================================================
+
+create table gc_t (id integer primary key, grp text, val text null);
+insert into gc_t values (1, 'a', 'x'), (2, 'a', null), (3, 'a', 'y'), (4, 'b', null), (5, 'b', null);
+-- run
+
+-- Custom separator
+select group_concat(val, '|') from gc_t where grp = 'a';
+→ [{"group_concat(val, '|')":"x|y"}]
+
+-- All null values → null
+select group_concat(val) from gc_t where grp = 'b';
+→ [{"group_concat(val)":null}]
+
+-- Empty separator
+select group_concat(val, '') from gc_t where grp = 'a';
+→ [{"group_concat(val, '')":"xy"}]
+
+drop table gc_t;
+
+-- ============================================================
+-- AGGREGATE: statistical functions with known dataset
+-- ============================================================
+
+-- Dataset: [2, 4, 4, 4, 5, 5, 7, 9], n=8, sum=40, sumSq=232, mean=5
+create table stat_t (id integer primary key, v real);
+insert into stat_t values (1, 2.0), (2, 4.0), (3, 4.0), (4, 4.0), (5, 5.0), (6, 5.0), (7, 7.0), (8, 9.0);
+-- run
+
+-- var_pop = 232/8 - 25 = 4
+select var_pop(v) from stat_t;
+→ [{"var_pop(v)":4}]
+
+-- stddev_pop = sqrt(4) = 2
+select stddev_pop(v) from stat_t;
+→ [{"stddev_pop(v)":2}]
+
+-- var_samp = (232 - 1600/8) / 7 = 32/7
+select var_samp(v) from stat_t;
+→ [{"var_samp(v)":4.571428571428571}]
+
+-- stddev_samp = sqrt(32/7)
+select stddev_samp(v) from stat_t;
+→ [{"stddev_samp(v)":2.138089935299395}]
+
+drop table stat_t;
+
+-- Single-value boundaries
+create table stat_one (id integer primary key, v real);
+insert into stat_one values (1, 42.0);
+-- run
+
+select var_pop(v) from stat_one;
+→ [{"var_pop(v)":0}]
+
+select var_samp(v) from stat_one;
+→ [{"var_samp(v)":null}]
+
+select stddev_pop(v) from stat_one;
+→ [{"stddev_pop(v)":0}]
+
+select stddev_samp(v) from stat_one;
+→ [{"stddev_samp(v)":null}]
+
+drop table stat_one;
+
+-- ============================================================
+-- AGGREGATE: MIN/MAX with nulls
+-- ============================================================
+
+create table minmax_t (id integer primary key, v integer null);
+insert into minmax_t values (1, 3), (2, null), (3, 1), (4, null), (5, 7);
+select min(v), max(v) from minmax_t;
+→ [{"min(v)":1,"max(v)":7}]
+drop table minmax_t;
+
+-- All nulls → null for all aggregates
+create table allnull (id integer primary key, v integer null);
+insert into allnull values (1, null), (2, null);
+select min(v), max(v), sum(v), avg(v) from allnull;
+→ [{"min(v)":null,"max(v)":null,"sum(v)":null,"avg(v)":null}]
+drop table allnull;
+
+-- ============================================================
+-- AGGREGATE: TOTAL with non-numeric
+-- ============================================================
+
+create table total_t (id integer primary key, v text null);
+insert into total_t values (1, 'abc'), (2, null), (3, 'def');
+select total(v) from total_t;
+→ [{"total(v)":0}]
+drop table total_t;
+
+-- ============================================================
+-- SCALAR: coalesce
+-- ============================================================
+
+SELECT coalesce(null, null, 3) as result;
+→ [{"result":3}]
+
+SELECT coalesce(null, null, null) as result;
+→ [{"result":null}]
+
+SELECT coalesce(1, 2, 3) as result;
+→ [{"result":1}]
+
+SELECT coalesce(null, 1, 'text') as result;
+→ [{"result":1}]
+
+-- ============================================================
+-- SCALAR: nullif
+-- ============================================================
+
+SELECT nullif(1, 1) as result;
+→ [{"result":null}]
+
+SELECT nullif(1, 2) as result;
+→ [{"result":1}]
+
+SELECT nullif('a', 'a') as result;
+→ [{"result":null}]
+
+SELECT nullif('a', 'b') as result;
+→ [{"result":"a"}]
+
+SELECT nullif(null, null) as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- SCALAR: iif with string conditions
+-- ============================================================
+
+SELECT iif('1', 'yes', 'no') as result;
+→ [{"result":"yes"}]
+
+SELECT iif('0', 'yes', 'no') as result;
+→ [{"result":"no"}]
+
+SELECT iif('abc', 'yes', 'no') as result;
+→ [{"result":"no"}]
+
+SELECT iif(true, 'yes', 'no') as result;
+→ [{"result":"yes"}]
+
+SELECT iif(false, 'yes', 'no') as result;
+→ [{"result":"no"}]
+
+-- ============================================================
+-- SCALAR: choose boundaries
+-- ============================================================
+
+SELECT choose(1, 'a', 'b', 'c') as result;
+→ [{"result":"a"}]
+
+SELECT choose(3, 'a', 'b', 'c') as result;
+→ [{"result":"c"}]
+
+SELECT choose(4, 'a', 'b', 'c') as result;
+→ [{"result":null}]
+
+SELECT choose(-1, 'a', 'b') as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- SCALAR: greatest/least with nulls
+-- ============================================================
+
+SELECT greatest(null, 3, null, 1) as result;
+→ [{"result":3}]
+
+SELECT greatest(null, null) as result;
+→ [{"result":null}]
+
+SELECT greatest(null, 42) as result;
+→ [{"result":42}]
+
+-- ============================================================
+-- SCALAR: typeof edge cases
+-- ============================================================
+
+SELECT typeof(true), typeof(false);
+→ [{"typeof(true)":"integer","typeof(false)":"integer"}]
+
+SELECT typeof(json_object('a', 1));
+→ [{"typeof(json_object('a', 1))":"json"}]
+
+-- ============================================================
+-- CONVERSION: error paths
+-- ============================================================
+
+SELECT integer('not_a_number');
+-- error: Cannot convert to INTEGER
+
+SELECT integer('') as result;
+→ [{"result":null}]
+
+SELECT real('not_a_number');
+-- error: Cannot convert to REAL
+
+SELECT real('') as result;
+→ [{"result":null}]
+
+SELECT boolean('');
+-- error: Cannot convert to BOOLEAN
+
+SELECT boolean('yes'), boolean('no');
+→ [{"boolean('yes')":true,"boolean('no')":false}]
+
+SELECT boolean('on'), boolean('off');
+→ [{"boolean('on')":true,"boolean('off')":false}]

@@ -1,0 +1,51 @@
+-- Tests for relational constant folding
+-- Verifies that constant relational subtrees are folded into TableLiteralNodes
+
+-- Basic VALUES folding: all-literal VALUES should fold to TableLiteral
+SELECT id, name FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name);
+→ [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+
+-- Constant subquery folding: constant projections over SingleRow
+SELECT * FROM (SELECT 1 + 2 AS x, 'hello' AS y);
+→ [{"x": 3, "y": "hello"}]
+
+-- Nested constant VALUES with expressions
+SELECT num, str FROM (VALUES (1 + 1, 'a' || 'b'), (3 * 2, 'cd')) AS t(num, str);
+→ [{"num": 2, "str": "ab"}, {"num": 6, "str": "cd"}]
+
+-- Table references should NOT be folded
+CREATE TABLE fold_test (id INTEGER PRIMARY KEY, name TEXT) USING memory;
+INSERT INTO fold_test VALUES (1, 'Alice'), (2, 'Bob');
+
+SELECT * FROM fold_test ORDER BY id;
+→ [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+-- Mixed: constant subquery joined with table (table part not folded)
+SELECT f.name, c.val FROM fold_test f JOIN (VALUES (10), (20)) AS c(val) ON f.id = 1 ORDER BY c.val;
+→ [{"name": "Alice", "val": 10}, {"name": "Alice", "val": 20}]
+
+-- Constant expression over VALUES with WHERE clause
+SELECT id, letter FROM (VALUES (1, 'x'), (2, 'y'), (3, 'z')) AS t(id, letter) WHERE id > 1;
+→ [{"id": 2, "letter": "y"}, {"id": 3, "letter": "z"}]
+
+-- Prepared statement re-execution: same results on second run
+SELECT a, b FROM (VALUES (100, 200), (300, 400)) AS t(a, b);
+→ [{"a": 100, "b": 200}, {"a": 300, "b": 400}]
+
+SELECT a, b FROM (VALUES (100, 200), (300, 400)) AS t(a, b);
+→ [{"a": 100, "b": 200}, {"a": 300, "b": 400}]
+
+-- Single-row constant subquery
+SELECT * FROM (SELECT 42 AS answer);
+→ [{"answer": 42}]
+
+-- Constant with null values
+SELECT a, b FROM (VALUES (1, null), (null, 'text')) AS t(a, b);
+→ [{"a": 1, "b": null}, {"a": null, "b": "text"}]
+
+-- Boolean constant folding in VALUES
+SELECT a, b FROM (VALUES (1 > 0, 2 < 1)) AS t(a, b);
+→ [{"a": true, "b": false}]
+
+-- Cleanup
+DROP TABLE fold_test;

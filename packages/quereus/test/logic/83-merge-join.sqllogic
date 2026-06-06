@@ -1,0 +1,242 @@
+-- merge-join.sqllogic - Merge join algorithm correctness tests
+
+-- Setup tables
+CREATE TABLE mj_left (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);
+CREATE TABLE mj_right (id INTEGER PRIMARY KEY, val INTEGER, tag TEXT);
+
+INSERT INTO mj_left VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd'), (5, 10, 'e');
+INSERT INTO mj_right VALUES (100, 10, 'x'), (200, 20, 'y'), (300, 50, 'z'), (400, 10, 'w');
+
+-- Basic equi-join
+SELECT l.id, r.id FROM mj_left l JOIN mj_right r ON l.val = r.val ORDER BY l.id, r.id;
+→ [{"id":1,"id:1":100},{"id":1,"id:1":400},{"id":2,"id:1":200},{"id":5,"id:1":100},{"id":5,"id:1":400}]
+
+-- LEFT JOIN with merge join
+SELECT l.id, l.val, r.tag FROM mj_left l LEFT JOIN mj_right r ON l.val = r.val ORDER BY l.id, r.tag;
+→ [{"id":1,"val":10,"tag":"w"},{"id":1,"val":10,"tag":"x"},{"id":2,"val":20,"tag":"y"},{"id":3,"val":30,"tag":null},{"id":4,"val":40,"tag":null},{"id":5,"val":10,"tag":"w"},{"id":5,"val":10,"tag":"x"}]
+
+-- Multi-column equi-join
+CREATE TABLE mj_mc1 (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b));
+CREATE TABLE mj_mc2 (x INTEGER, y INTEGER, w TEXT, PRIMARY KEY (x, y));
+
+INSERT INTO mj_mc1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma');
+INSERT INTO mj_mc2 VALUES (1, 10, 'one'), (2, 20, 'two'), (9, 99, 'nine');
+
+SELECT m1.v, m2.w FROM mj_mc1 m1 JOIN mj_mc2 m2 ON m1.a = m2.x AND m1.b = m2.y ORDER BY m1.a;
+→ [{"v":"alpha","w":"one"},{"v":"beta","w":"two"}]
+
+-- NULL handling: NULLs should not match
+CREATE TABLE mj_nulls (id INTEGER PRIMARY KEY, val INTEGER NULL);
+INSERT INTO mj_nulls VALUES (1, null), (2, 10), (3, null), (4, 10);
+
+SELECT a.id, b.id FROM mj_nulls a JOIN mj_nulls b ON a.val = b.val ORDER BY a.id, b.id;
+→ [{"id":2,"id:1":2},{"id":2,"id:1":4},{"id":4,"id:1":2},{"id":4,"id:1":4}]
+
+-- NULL LEFT JOIN: null keys produce unmatched rows
+SELECT a.id, b.id FROM mj_nulls a LEFT JOIN mj_nulls b ON a.val = b.val ORDER BY a.id, b.id;
+→ [{"id":1,"id:1":null},{"id":2,"id:1":2},{"id":2,"id:1":4},{"id":3,"id:1":null},{"id":4,"id:1":2},{"id":4,"id:1":4}]
+
+-- Empty right side
+CREATE TABLE mj_empty (id INTEGER PRIMARY KEY, val INTEGER);
+
+SELECT l.id FROM mj_left l JOIN mj_empty e ON l.val = e.val;
+→ []
+
+SELECT l.id, e.id FROM mj_left l LEFT JOIN mj_empty e ON l.val = e.val ORDER BY l.id;
+→ [{"id":1,"id:1":null},{"id":2,"id:1":null},{"id":3,"id:1":null},{"id":4,"id:1":null},{"id":5,"id:1":null}]
+
+-- Empty left side
+SELECT e.id FROM mj_empty e JOIN mj_right r ON e.val = r.val;
+→ []
+
+-- Text column join
+CREATE TABLE mj_text_l (id INTEGER PRIMARY KEY, key TEXT);
+CREATE TABLE mj_text_r (id INTEGER PRIMARY KEY, key TEXT);
+INSERT INTO mj_text_l VALUES (1, 'foo'), (2, 'bar'), (3, 'baz');
+INSERT INTO mj_text_r VALUES (10, 'bar'), (20, 'baz'), (30, 'qux');
+
+SELECT l.id, r.id FROM mj_text_l l JOIN mj_text_r r ON l.key = r.key ORDER BY l.id;
+→ [{"id":2,"id:1":10},{"id":3,"id:1":20}]
+
+-- USING clause
+SELECT l.id, r.id FROM mj_text_l l JOIN mj_text_r r USING (key) ORDER BY l.id;
+→ [{"id":2,"id:1":10},{"id":3,"id:1":20}]
+
+-- Duplicate key runs: multiple matches on both sides
+CREATE TABLE mj_dup_l (id INTEGER PRIMARY KEY, val INTEGER);
+CREATE TABLE mj_dup_r (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO mj_dup_l VALUES (1, 5), (2, 5), (3, 5);
+INSERT INTO mj_dup_r VALUES (10, 5), (20, 5);
+
+SELECT count(*) AS cnt FROM mj_dup_l l JOIN mj_dup_r r ON l.val = r.val;
+→ [{"cnt":6}]
+
+-- LEFT JOIN with small left, large right
+CREATE TABLE mj_small (id INTEGER PRIMARY KEY, val INTEGER);
+CREATE TABLE mj_large (id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO mj_small VALUES (1, 100), (2, 200);
+INSERT INTO mj_large VALUES (10, 100), (20, 100), (30, 300), (40, 400), (50, 500), (60, 600), (70, 700);
+
+SELECT s.id, s.val, l.id AS lid FROM mj_small s LEFT JOIN mj_large l ON s.val = l.val ORDER BY s.id, l.id;
+→ [{"id":1,"val":100,"lid":10},{"id":1,"val":100,"lid":20},{"id":2,"val":200,"lid":null}]
+
+-- NOCASE collation: merge join must handle case-insensitive matching
+CREATE TABLE mj_nocase_l (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+CREATE TABLE mj_nocase_r (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+INSERT INTO mj_nocase_l VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT INTO mj_nocase_r VALUES (10, 'alice'), (20, 'BOB'), (30, 'Dave');
+
+SELECT l.id, r.id FROM mj_nocase_l l JOIN mj_nocase_r r ON l.name = r.name ORDER BY l.id;
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20}]
+
+-- NOCASE LEFT JOIN
+SELECT l.id, l.name, r.id AS rid FROM mj_nocase_l l LEFT JOIN mj_nocase_r r ON l.name = r.name ORDER BY l.id;
+→ [{"id":1,"name":"Alice","rid":10},{"id":2,"name":"Bob","rid":20},{"id":3,"name":"Charlie","rid":null}]
+
+-- ===== PK-equi-join tests (trigger MergeJoin via inherent PK ordering) =====
+
+-- Setup: single-column PK tables
+CREATE TABLE mj_pk_a (id INTEGER PRIMARY KEY, x TEXT);
+CREATE TABLE mj_pk_b (id INTEGER PRIMARY KEY, y TEXT);
+INSERT INTO mj_pk_a VALUES (1,'a'),(2,'b'),(3,'c');
+INSERT INTO mj_pk_b VALUES (1,'x'),(2,'y'),(3,'z');
+
+-- Plan shape: PK-equi-join must use MergeJoin (cost 0.6N beats hash 1.2N)
+SELECT node_type FROM query_plan('SELECT * FROM mj_pk_a JOIN mj_pk_b ON mj_pk_a.id = mj_pk_b.id') WHERE node_type LIKE '%Join%';
+→ [{"node_type":"MergeJoin"}]
+
+-- INNER JOIN on PK
+SELECT a.id, a.x, b.y FROM mj_pk_a a JOIN mj_pk_b b ON a.id = b.id ORDER BY a.id;
+→ [{"id":1,"x":"a","y":"x"},{"id":2,"x":"b","y":"y"},{"id":3,"x":"c","y":"z"}]
+
+-- LEFT JOIN on PK
+SELECT node_type FROM query_plan('SELECT * FROM mj_pk_a LEFT JOIN mj_pk_b ON mj_pk_a.id = mj_pk_b.id') WHERE node_type LIKE '%Join%';
+→ [{"node_type":"MergeJoin"}]
+
+INSERT INTO mj_pk_a VALUES (4,'d');
+
+SELECT a.id, a.x, b.y FROM mj_pk_a a LEFT JOIN mj_pk_b b ON a.id = b.id ORDER BY a.id;
+→ [{"id":1,"x":"a","y":"x"},{"id":2,"x":"b","y":"y"},{"id":3,"x":"c","y":"z"},{"id":4,"x":"d","y":null}]
+
+DELETE FROM mj_pk_a WHERE id = 4;
+
+-- SEMI JOIN (via EXISTS) on PK
+SELECT a.id, a.x FROM mj_pk_a a WHERE EXISTS (SELECT 1 FROM mj_pk_b b WHERE b.id = a.id) ORDER BY a.id;
+→ [{"id":1,"x":"a"},{"id":2,"x":"b"},{"id":3,"x":"c"}]
+
+-- ANTI JOIN (via NOT EXISTS) on PK
+INSERT INTO mj_pk_a VALUES (99,'no-match');
+
+SELECT a.id, a.x FROM mj_pk_a a WHERE NOT EXISTS (SELECT 1 FROM mj_pk_b b WHERE b.id = a.id) ORDER BY a.id;
+→ [{"id":99,"x":"no-match"}]
+
+DELETE FROM mj_pk_a WHERE id = 99;
+
+-- Partial overlap: some PKs don't match
+DELETE FROM mj_pk_b WHERE id = 2;
+INSERT INTO mj_pk_b VALUES (5,'v');
+
+SELECT a.id, b.id AS bid FROM mj_pk_a a JOIN mj_pk_b b ON a.id = b.id ORDER BY a.id;
+→ [{"id":1,"bid":1},{"id":3,"bid":3}]
+
+SELECT a.id, b.id AS bid FROM mj_pk_a a LEFT JOIN mj_pk_b b ON a.id = b.id ORDER BY a.id;
+→ [{"id":1,"bid":1},{"id":2,"bid":null},{"id":3,"bid":3}]
+
+-- Multi-column PK merge join
+CREATE TABLE mj_mc_pk1 (k1 INTEGER, k2 INTEGER, v TEXT, PRIMARY KEY (k1, k2));
+CREATE TABLE mj_mc_pk2 (k1 INTEGER, k2 INTEGER, w TEXT, PRIMARY KEY (k1, k2));
+INSERT INTO mj_mc_pk1 VALUES (1,10,'alpha'),(1,20,'beta'),(2,10,'gamma'),(3,30,'delta');
+INSERT INTO mj_mc_pk2 VALUES (1,10,'one'),(1,20,'two'),(2,10,'three'),(9,99,'nine');
+
+-- Plan shape: multi-column PK join should also use MergeJoin
+SELECT node_type FROM query_plan('SELECT * FROM mj_mc_pk1 JOIN mj_mc_pk2 ON mj_mc_pk1.k1 = mj_mc_pk2.k1 AND mj_mc_pk1.k2 = mj_mc_pk2.k2') WHERE node_type LIKE '%Join%';
+→ [{"node_type":"MergeJoin"}]
+
+SELECT m1.v, m2.w FROM mj_mc_pk1 m1 JOIN mj_mc_pk2 m2 ON m1.k1 = m2.k1 AND m1.k2 = m2.k2 ORDER BY m1.k1, m1.k2;
+→ [{"v":"alpha","w":"one"},{"v":"beta","w":"two"},{"v":"gamma","w":"three"}]
+
+SELECT m1.v, m2.w FROM mj_mc_pk1 m1 LEFT JOIN mj_mc_pk2 m2 ON m1.k1 = m2.k1 AND m1.k2 = m2.k2 ORDER BY m1.k1, m1.k2;
+→ [{"v":"alpha","w":"one"},{"v":"beta","w":"two"},{"v":"gamma","w":"three"},{"v":"delta","w":null}]
+
+-- Empty table edge case with PK merge join
+CREATE TABLE mj_pk_empty (id INTEGER PRIMARY KEY, z TEXT);
+
+SELECT a.id FROM mj_pk_a a JOIN mj_pk_empty e ON a.id = e.id;
+→ []
+
+SELECT a.id, e.z FROM mj_pk_a a LEFT JOIN mj_pk_empty e ON a.id = e.id ORDER BY a.id;
+→ [{"id":1,"z":null},{"id":2,"z":null},{"id":3,"z":null}]
+
+-- Cleanup PK tables
+DROP TABLE mj_pk_a;
+DROP TABLE mj_pk_b;
+DROP TABLE mj_mc_pk1;
+DROP TABLE mj_mc_pk2;
+DROP TABLE mj_pk_empty;
+
+-- ===== Monotonic-merge recognition tests =====
+-- These cover the broader "MonotonicOn on equi-pair" recognition (rule:
+-- monotonic-merge-join). The headline case is a three-way join where the
+-- middle MergeJoin's output advertises MonotonicOn on both equi-pair
+-- attributes (left and right ids), but `physical.ordering` only reflects
+-- the left side; the parent join on the right side's id therefore depends
+-- on the MonotonicOn-aware rule rather than ordering-prefix matching.
+
+CREATE TABLE mm_t1 (id INTEGER PRIMARY KEY, x TEXT);
+CREATE TABLE mm_t2 (id INTEGER PRIMARY KEY, y TEXT);
+CREATE TABLE mm_t3 (id INTEGER PRIMARY KEY, z TEXT);
+INSERT INTO mm_t1 VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d');
+INSERT INTO mm_t2 VALUES (1,'x'),(2,'y'),(3,'z');
+INSERT INTO mm_t3 VALUES (1,'p'),(3,'r'),(4,'s');
+
+-- Plan shape: three-way join must use MergeJoin at both join levels.
+SELECT count(*) AS cnt FROM query_plan('SELECT * FROM mm_t1 JOIN mm_t2 ON mm_t1.id = mm_t2.id JOIN mm_t3 ON mm_t2.id = mm_t3.id') WHERE node_type = 'MergeJoin';
+→ [{"cnt":2}]
+
+-- Three-way INNER JOIN correctness
+SELECT mm_t1.id, x, y, z FROM mm_t1 JOIN mm_t2 ON mm_t1.id = mm_t2.id JOIN mm_t3 ON mm_t2.id = mm_t3.id ORDER BY mm_t1.id;
+→ [{"id":1,"x":"a","y":"x","z":"p"},{"id":3,"x":"c","y":"z","z":"r"}]
+
+-- Multi-conjunct ON where only id is monotonic on both sides; the second
+-- conjunct (l.code = r.code) is evaluated as residual without breaking
+-- correctness.
+CREATE TABLE mm_a (id INTEGER PRIMARY KEY, code INTEGER, label TEXT);
+CREATE TABLE mm_b (id INTEGER PRIMARY KEY, code INTEGER, info TEXT);
+INSERT INTO mm_a VALUES (1,100,'a'),(2,200,'b'),(3,200,'c');
+INSERT INTO mm_b VALUES (1,100,'x'),(2,250,'y'),(3,200,'z');
+
+SELECT a.id, label, info FROM mm_a a JOIN mm_b b ON a.id = b.id AND a.code = b.code ORDER BY a.id;
+→ [{"id":1,"label":"a","info":"x"},{"id":3,"label":"c","info":"z"}]
+
+-- LEFT JOIN with the monotonic-merge rule firing
+SELECT mm_t1.id, x, y FROM mm_t1 LEFT JOIN mm_t2 ON mm_t1.id = mm_t2.id ORDER BY mm_t1.id;
+→ [{"id":1,"x":"a","y":"x"},{"id":2,"x":"b","y":"y"},{"id":3,"x":"c","y":"z"},{"id":4,"x":"d","y":null}]
+
+-- SEMI / ANTI join via EXISTS / NOT EXISTS over monotonic equi-pair
+SELECT mm_t1.id FROM mm_t1 WHERE EXISTS (SELECT 1 FROM mm_t2 WHERE mm_t2.id = mm_t1.id) ORDER BY mm_t1.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT mm_t1.id FROM mm_t1 WHERE NOT EXISTS (SELECT 1 FROM mm_t2 WHERE mm_t2.id = mm_t1.id) ORDER BY mm_t1.id;
+→ [{"id":4}]
+
+DROP TABLE mm_t1;
+DROP TABLE mm_t2;
+DROP TABLE mm_t3;
+DROP TABLE mm_a;
+DROP TABLE mm_b;
+
+-- Cleanup
+DROP TABLE mj_left;
+DROP TABLE mj_right;
+DROP TABLE mj_mc1;
+DROP TABLE mj_mc2;
+DROP TABLE mj_nulls;
+DROP TABLE mj_empty;
+DROP TABLE mj_text_l;
+DROP TABLE mj_text_r;
+DROP TABLE mj_dup_l;
+DROP TABLE mj_dup_r;
+DROP TABLE mj_small;
+DROP TABLE mj_large;
+DROP TABLE mj_nocase_l;
+DROP TABLE mj_nocase_r;

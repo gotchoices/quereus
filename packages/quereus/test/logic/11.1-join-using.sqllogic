@@ -1,0 +1,84 @@
+-- adapted from SQLite test/join.test, joinB.test, joinH.test
+-- USING clause: Quereus parses USING as an equi-join shortcut but does NOT merge
+-- the shared column into a single output projection (SQLite-specific semantics).
+-- Tests qualify all column references; an unqualified shared name is ambiguous.
+
+create table u_a (id integer primary key, k integer, va text);
+create table u_b (id integer primary key, k integer, vb text);
+
+insert into u_a values (1, 100, 'a1'), (2, 200, 'a2'), (3, 300, 'a3');
+insert into u_b values (10, 100, 'b1'), (20, 200, 'b2'), (40, 999, 'b4');
+
+-- Single-column USING: filters on shared key; both tables' columns remain selectable
+select u_a.id as aid, u_a.k as ak, va, u_b.id as bid, u_b.k as bk, vb from u_a join u_b using (k) order by u_a.id;
+→ [{"aid":1,"ak":100,"va":"a1","bid":10,"bk":100,"vb":"b1"},{"aid":2,"ak":200,"va":"a2","bid":20,"bk":200,"vb":"b2"}]
+
+-- Unqualified shared-key reference is ambiguous (SQLite would merge USING column;
+-- Quereus does not).
+select k, va, vb from u_a join u_b using (k) order by u_a.id;
+-- error: ambiguous column name: k
+
+-- select * over a USING join exposes both sides' columns with `:N` disambiguation
+-- (matches the same shape as `inner join ... on u_a.k = u_b.k`).
+select * from u_a join u_b using (k) order by u_a.id;
+→ [{"id":1,"k":100,"va":"a1","id:1":10,"k:1":100,"vb":"b1"},{"id":2,"k":200,"va":"a2","id:1":20,"k:1":200,"vb":"b2"}]
+
+-- LEFT JOIN with USING preserves left rows; right side is null on miss
+select u_a.id as aid, u_a.k as ak, u_b.id as bid, vb from u_a left join u_b using (k) order by u_a.id;
+→ [{"aid":1,"ak":100,"bid":10,"vb":"b1"},{"aid":2,"ak":200,"bid":20,"vb":"b2"},{"aid":3,"ak":300,"bid":null,"vb":null}]
+
+-- select * over a LEFT JOIN ... USING also disambiguates and keeps unmatched right side as nulls.
+select * from u_a left join u_b using (k) order by u_a.id;
+→ [{"id":1,"k":100,"va":"a1","id:1":10,"k:1":100,"vb":"b1"},{"id":2,"k":200,"va":"a2","id:1":20,"k:1":200,"vb":"b2"},{"id":3,"k":300,"va":"a3","id:1":null,"k:1":null,"vb":null}]
+
+drop table u_a;
+drop table u_b;
+-- run
+
+-- Multi-column USING (a, b): both keys must match
+create table mu_l (a integer, b integer, vl text, primary key (a, b));
+create table mu_r (a integer, b integer, vr text, primary key (a, b));
+
+insert into mu_l values (1, 10, 'l1'), (2, 20, 'l2'), (3, 10, 'l3');
+insert into mu_r values (1, 10, 'r1'), (2, 30, 'r2'), (3, 10, 'r3');
+
+-- Inner USING join on (a, b) with qualified references
+select mu_l.a as la, mu_l.b as lb, vl, vr from mu_l join mu_r using (a, b) order by mu_l.a, mu_l.b;
+→ [{"la":1,"lb":10,"vl":"l1","vr":"r1"},{"la":3,"lb":10,"vl":"l3","vr":"r3"}]
+
+-- LEFT JOIN with multi-column USING
+select mu_l.a as la, mu_l.b as lb, vl, vr from mu_l left join mu_r using (a, b) order by mu_l.a, mu_l.b;
+→ [{"la":1,"lb":10,"vl":"l1","vr":"r1"},{"la":2,"lb":20,"vl":"l2","vr":null},{"la":3,"lb":10,"vl":"l3","vr":"r3"}]
+
+drop table mu_l;
+drop table mu_r;
+-- run
+
+-- USING with TEXT keys uses default binary collation
+create table cu_a (id integer primary key, name text);
+create table cu_b (id integer primary key, name text);
+
+insert into cu_a values (1, 'alice'), (2, 'BOB'), (3, 'carol');
+insert into cu_b values (10, 'alice'), (20, 'bob'), (30, 'carol');
+
+-- Default binary collation: 'BOB' != 'bob'
+select cu_a.id as aid, cu_a.name as aname, cu_b.id as bid from cu_a join cu_b using (name) order by cu_a.id;
+→ [{"aid":1,"aname":"alice","bid":10},{"aid":3,"aname":"carol","bid":30}]
+
+drop table cu_a;
+drop table cu_b;
+
+-- USING with COLLATE NOCASE TEXT keys folds case: the join honors the columns'
+-- collation, so 'BOB' matches 'bob'
+-- (unique-collation-name-case-insensitive-normalization).
+create table cn_a (id integer primary key, name text collate nocase);
+create table cn_b (id integer primary key, name text collate nocase);
+
+insert into cn_a values (1, 'alice'), (2, 'BOB'), (3, 'carol');
+insert into cn_b values (10, 'alice'), (20, 'bob'), (30, 'carol');
+
+select cn_a.id as aid, cn_a.name as aname, cn_b.id as bid from cn_a join cn_b using (name) order by cn_a.id;
+→ [{"aid":1,"aname":"alice","bid":10},{"aid":2,"aname":"BOB","bid":20},{"aid":3,"aname":"carol","bid":30}]
+
+drop table cn_a;
+drop table cn_b;

@@ -1,0 +1,35 @@
+-- adapted from SQLite test/join3.test, join.test
+-- Quereus does NOT support SQLite's comma syntax in FROM (implicit cross join).
+-- Use explicit JOIN instead. This file pins the rejection.
+
+create table cj_a (id integer primary key, va text);
+create table cj_b (id integer primary key, vb text);
+create table cj_c (id integer primary key, vc text);
+
+insert into cj_a values (1, 'a1'), (2, 'a2');
+insert into cj_b values (10, 'b1'), (20, 'b2'), (30, 'b3');
+insert into cj_c values (100, 'c1'), (200, 'c2');
+-- run
+
+-- Two-table comma list: not supported
+select count(*) as cnt from cj_a, cj_b;
+-- error: multiple FROM sources
+
+-- Two-table comma list with WHERE join condition: not supported
+select cj_a.id, cj_b.id from cj_a, cj_b where cj_a.id = cj_b.id - 9;
+-- error: multiple FROM sources
+
+-- Three-table comma list: not supported
+select cj_a.id, cj_b.id, cj_c.id from cj_a, cj_b, cj_c
+  where cj_a.id = cj_b.id - 9 and cj_b.id = cj_c.id - 90;
+-- error: multiple FROM sources
+
+-- Comma mixed with explicit JOIN: still rejected because of the leading comma list
+select cj_a.id, cj_b.id, cj_c.id
+  from cj_a, cj_b join cj_c on cj_b.id = cj_c.id - 90
+  where cj_a.id = 2;
+-- error: multiple FROM sources
+
+drop table cj_a;
+drop table cj_b;
+drop table cj_c;

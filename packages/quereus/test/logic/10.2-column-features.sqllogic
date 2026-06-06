@@ -1,0 +1,340 @@
+-- Column features: defaults, collation, nullability, and type interactions
+
+-- ===================================
+-- 1. Default Values
+-- ===================================
+
+-- 1a. Column with DEFAULT literal value
+create table t_def_literal (
+	id integer primary key,
+	status text default 'active'
+);
+
+insert into t_def_literal (id) values (1);
+
+select * from t_def_literal where id = 1;
+→ [{"id":1,"status":"active"}]
+
+-- 1b. Override the default with an explicit value
+insert into t_def_literal (id, status) values (2, 'inactive');
+
+select * from t_def_literal where id = 2;
+→ [{"id":2,"status":"inactive"}]
+
+drop table t_def_literal;
+
+-- 1c. Column with DEFAULT expression
+create table t_def_expr (
+	id integer primary key,
+	computed integer default (length('hello'))
+);
+
+insert into t_def_expr (id) values (1);
+
+select * from t_def_expr where id = 1;
+→ [{"id":1,"computed":5}]
+
+-- Override the computed default
+insert into t_def_expr (id, computed) values (2, 99);
+
+select * from t_def_expr where id = 2;
+→ [{"id":2,"computed":99}]
+
+drop table t_def_expr;
+
+-- 1d. Multiple columns with different defaults
+create table t_def_multi (
+	id integer primary key,
+	label text default 'untitled',
+	priority integer default 0,
+	tag text default ('tag_' || 'default')
+);
+
+-- Insert with only primary key — all defaults applied
+insert into t_def_multi (id) values (1);
+
+select * from t_def_multi where id = 1;
+→ [{"id":1,"label":"untitled","priority":0,"tag":"tag_default"}]
+
+-- Insert with some columns specified
+insert into t_def_multi (id, priority) values (2, 5);
+
+select * from t_def_multi where id = 2;
+→ [{"id":2,"label":"untitled","priority":5,"tag":"tag_default"}]
+
+-- Insert with all columns specified
+insert into t_def_multi (id, label, priority, tag) values (3, 'custom', 10, 'special');
+
+select * from t_def_multi where id = 3;
+→ [{"id":3,"label":"custom","priority":10,"tag":"special"}]
+
+-- Verify all rows
+select * from t_def_multi order by id;
+→ [{"id":1,"label":"untitled","priority":0,"tag":"tag_default"},{"id":2,"label":"untitled","priority":5,"tag":"tag_default"},{"id":3,"label":"custom","priority":10,"tag":"special"}]
+
+drop table t_def_multi;
+
+-- ===================================
+-- 2. Collation
+-- ===================================
+
+-- 2a. COLLATE NOCASE — case-insensitive equality
+create table t_nocase (
+	id integer primary key,
+	name text collate NOCASE
+);
+
+insert into t_nocase values (1, 'Alice'), (2, 'bob'), (3, 'CHARLIE'), (4, 'alice');
+
+-- Case-insensitive equality: 'Alice' = 'alice'
+select id from t_nocase where name = 'alice' order by id;
+→ [{"id":1},{"id":4}]
+
+select id from t_nocase where name = 'BOB' order by id;
+→ [{"id":2}]
+
+-- Case-insensitive ordering
+select name from t_nocase order by name, id;
+→ [{"name":"Alice"},{"name":"alice"},{"name":"bob"},{"name":"CHARLIE"}]
+
+drop table t_nocase;
+
+-- 2b. COLLATE BINARY (default) — case-sensitive behavior
+create table t_binary (
+	id integer primary key,
+	name text collate BINARY
+);
+
+insert into t_binary values (1, 'Alice'), (2, 'alice'), (3, 'ALICE');
+
+-- Binary equality is case-sensitive
+select id from t_binary where name = 'Alice';
+→ [{"id":1}]
+
+select id from t_binary where name = 'alice';
+→ [{"id":2}]
+
+-- Binary ordering: uppercase before lowercase (ASCII order)
+select name from t_binary order by name;
+→ [{"name":"ALICE"},{"name":"Alice"},{"name":"alice"}]
+
+drop table t_binary;
+
+-- 2c. COLLATE RTRIM — trailing-space-insensitive comparison
+create table t_rtrim (
+	id integer primary key,
+	val text collate RTRIM
+);
+
+insert into t_rtrim values (1, 'hello'), (2, 'hello   '), (3, 'world'), (4, 'world  ');
+
+-- RTRIM: 'hello' = 'hello   '
+select id from t_rtrim where val = 'hello' order by id;
+→ [{"id":1},{"id":2}]
+
+-- RTRIM: 'world' = 'world  '
+select id from t_rtrim where val = 'world' order by id;
+→ [{"id":3},{"id":4}]
+
+-- Exact match without trailing spaces
+select id from t_rtrim where val = 'hello   ' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table t_rtrim;
+
+-- 2d. Collation in ORDER BY clause (overriding column collation)
+create table t_collate_order (
+	id integer primary key,
+	name text
+);
+
+insert into t_collate_order values (1, 'banana'), (2, 'Apple'), (3, 'cherry'), (4, 'Blueberry');
+
+-- Default (binary) ordering: uppercase sorts before lowercase
+select name from t_collate_order order by name;
+→ [{"name":"Apple"},{"name":"Blueberry"},{"name":"banana"},{"name":"cherry"}]
+
+-- NOCASE ordering in ORDER BY
+select name from t_collate_order order by name collate nocase;
+→ [{"name":"Apple"},{"name":"banana"},{"name":"Blueberry"},{"name":"cherry"}]
+
+drop table t_collate_order;
+
+-- ===================================
+-- 3. NOT NULL / NULL Behavior
+-- ===================================
+
+-- 3a. Default NOT NULL behavior (Third Manifesto)
+create table t_nn_default (
+	id integer primary key,
+	name text,
+	score integer
+);
+
+-- Valid insert
+insert into t_nn_default values (1, 'Alice', 95);
+
+select * from t_nn_default where id = 1;
+→ [{"id":1,"name":"Alice","score":95}]
+
+-- NULL into column without NULL keyword should fail
+insert into t_nn_default values (2, null, 80);
+-- error: NOT NULL constraint failed: t_nn_default.name
+
+insert into t_nn_default values (3, 'Bob', null);
+-- error: NOT NULL constraint failed: t_nn_default.score
+
+-- Omitting a NOT NULL column with no default should fail
+insert into t_nn_default (id, name) values (4, 'Charlie');
+-- error: NOT NULL constraint failed: t_nn_default.score
+
+drop table t_nn_default;
+
+-- 3b. Explicit NULL column — insert NULL should succeed
+create table t_nullable (
+	id integer primary key,
+	required_field text,
+	optional_field text null
+);
+
+-- NULL in optional field succeeds
+insert into t_nullable values (1, 'hello', null);
+
+select * from t_nullable where id = 1;
+→ [{"id":1,"required_field":"hello","optional_field":null}]
+
+-- NULL in required field fails (default NOT NULL)
+insert into t_nullable values (2, null, 'world');
+-- error: NOT NULL constraint failed: t_nullable.required_field
+
+-- Omitting optional field (no default) still needs a value or explicit NULL
+insert into t_nullable (id, required_field) values (3, 'test');
+
+select optional_field from t_nullable where id = 3;
+→ [{"optional_field":null}]
+
+drop table t_nullable;
+
+-- 3c. Primary key column is always NOT NULL
+create table t_pk_nn (
+	id integer primary key,
+	val text
+);
+
+insert into t_pk_nn values (null, 'test');
+-- error: NOT NULL constraint failed: t_pk_nn.id
+
+-- 3d. Update to NULL on NOT NULL column should fail
+drop table t_pk_nn;
+create table t_update_nn (
+	id integer primary key,
+	name text
+);
+insert into t_update_nn values (1, 'original');
+
+select name from t_update_nn where id = 1;
+→ [{"name":"original"}]
+
+update t_update_nn set name = null where id = 1;
+-- error: NOT NULL constraint failed: t_update_nn.name
+
+-- Verify value unchanged after failed update
+select name from t_update_nn where id = 1;
+→ [{"name":"original"}]
+
+drop table t_update_nn;
+
+-- ===================================
+-- 4. Type System Interactions
+-- ===================================
+
+-- 4a. Column with INTEGER type — verify type coercion on insert
+create table t_types (
+	id integer primary key,
+	int_col integer,
+	text_col text,
+	real_col real
+);
+
+-- Insert with matching types
+insert into t_types values (1, 42, 'hello', 3.14);
+
+select typeof(int_col), typeof(text_col), typeof(real_col) from t_types where id = 1;
+→ [{"typeof(int_col)":"integer","typeof(text_col)":"text","typeof(real_col)":"real"}]
+
+-- Insert string that coerces to integer
+insert into t_types values (2, '100', 'world', '2.71');
+
+select typeof(int_col), int_col, typeof(real_col), real_col from t_types where id = 2;
+→ [{"typeof(int_col)":"integer","int_col":100,"typeof(real_col)":"real","real_col":2.71}]
+
+-- Insert integer into text column — stored as text
+insert into t_types values (3, 7, 999, 0);
+
+select typeof(text_col), text_col from t_types where id = 3;
+→ [{"typeof(text_col)":"text","text_col":"999"}]
+
+-- Insert integer into real column — coerced to real
+select typeof(real_col), real_col from t_types where id = 3;
+→ [{"typeof(real_col)":"integer","real_col":0}]
+
+drop table t_types;
+
+-- 4b. typeof() on literal expressions through a table context
+create table t_typeof (
+	id integer primary key,
+	val_int integer,
+	val_text text,
+	val_real real,
+	val_blob blob,
+	val_any any null
+);
+
+insert into t_typeof values (1, 42, 'hello', 3.14, x'cafe', null);
+
+select
+	typeof(val_int) as t_int,
+	typeof(val_text) as t_text,
+	typeof(val_real) as t_real,
+	typeof(val_blob) as t_blob,
+	typeof(val_any) as t_any
+from t_typeof where id = 1;
+→ [{"t_int":"integer","t_text":"text","t_real":"real","t_blob":"blob","t_any":"null"}]
+
+drop table t_typeof;
+
+-- 4c. Type coercion edge cases
+create table t_coerce (
+	id integer primary key,
+	int_col integer,
+	real_col real
+);
+
+-- Boolean to integer
+insert into t_coerce values (1, true, false);
+
+select int_col, real_col from t_coerce where id = 1;
+→ [{"int_col":1,"real_col":0}]
+
+-- Real to integer (truncation)
+insert into t_coerce values (2, 9.7, 9.7);
+
+select int_col, real_col from t_coerce where id = 2;
+→ [{"int_col":9,"real_col":9.7}]
+
+drop table t_coerce;
+
+-- 4d. Interaction of defaults and types
+create table t_def_type (
+	id integer primary key,
+	count integer default 0,
+	label text default 'none',
+	ratio real default 1.5
+);
+
+insert into t_def_type (id) values (1);
+
+select typeof(count), count, typeof(label), label, typeof(ratio), ratio from t_def_type where id = 1;
+→ [{"typeof(count)":"integer","count":0,"typeof(label)":"text","label":"none","typeof(ratio)":"real","ratio":1.5}]
+
+drop table t_def_type;
