@@ -14,7 +14,7 @@ import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
-import { raiseReservedTagDiagnostics } from '../../schema/reserved-tags-policy.js';
+import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
 export function buildAlterTableStmt(
   ctx: PlanningContext,
@@ -25,6 +25,14 @@ export function buildAlterTableStmt(
 
   switch (stmt.action.type) {
     case 'addConstraint': {
+      // Reject a typo'd / mis-sited reserved `quereus.*` tag on the constraint at
+      // plan-build, mirroring CREATE TABLE's named-constraint leg and SET TAGS — a
+      // bad tag can't be silently stored when introduced via ALTER ... ADD CONSTRAINT.
+      raiseStmtTagDiagnostics(
+        validateReservedTags(stmt.action.constraint.tags, 'physical-constraint'),
+        stmt,
+      );
+
       // Convert RowOp[] (e.g., ['insert','update']) to bitmask understood by runtime.
       const operations = stmt.action.constraint.operations ?? ['insert','update'];
 
@@ -55,6 +63,11 @@ export function buildAlterTableStmt(
 
     case 'addColumn': {
       const column = stmt.action.column;
+      // Reject a typo'd / mis-sited reserved `quereus.*` tag on the new column or any
+      // of its inline named constraints at plan-build, before any heavier backfill /
+      // check compilation — shares CREATE TABLE's per-column accumulation
+      // (`columnTagDiagnostics`) so the two authoring surfaces can't drift.
+      raiseStmtTagDiagnostics(columnTagDiagnostics(column), stmt);
       // Validate the DEFAULT through the shared DDL validator (bind params / bare
       // columns / non-determinism rejected; `new.<column>` accepted with its build
       // deferred). This runs before building the backfill so a bare-column default
@@ -128,10 +141,10 @@ export function buildAlterTableStmt(
         target.kind === 'column' ? 'physical-column'
         : target.kind === 'constraint' ? 'physical-constraint'
         : 'physical-table';
-      raiseReservedTagDiagnostics(
-        validateReservedTags(stmt.action.tags, site),
-        { log: () => { /* warnings (e.g. empty ack rationale) never block */ } },
-      );
+      // Routed through the shared helper (rather than the policy call inline) so every
+      // plan-build tag surface raises through one site and a sited error here now
+      // carries the statement's source location too.
+      raiseStmtTagDiagnostics(validateReservedTags(stmt.action.tags, site), stmt);
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'setTags',
         target,

@@ -557,3 +557,97 @@ CREATE TABLE RsvFreeform (id INTEGER PRIMARY KEY) WITH TAGS (display_name = 'x',
 INSERT INTO RsvFreeform VALUES (1);
 SELECT * FROM RsvFreeform;
 → [{"id":1}]
+
+-- ===================================================================
+-- Phase 24: reserved-tag validation on the ALTER ... ADD CONSTRAINT /
+--           ADD COLUMN paths
+-- ===================================================================
+
+-- The two imperative ALTER ... ADD arms now validate reserved `quereus.*` tags at
+-- plan-build, mirroring CREATE TABLE (Phase 23) and ALTER ... SET TAGS (Phase 14):
+--   ADD CONSTRAINT ... WITH TAGS  -> physical-constraint
+--   ADD COLUMN ... WITH TAGS      -> physical-column (column) +
+--                                    physical-constraint (each inline named constraint)
+-- so a typo / mis-site fails loudly here instead of being silently stored.
+
+CREATE TABLE AddCon (id INTEGER PRIMARY KEY, email TEXT NOT NULL, code TEXT);
+CREATE TABLE AddCol (id INTEGER PRIMARY KEY);
+
+-- -------------------------------------------------------------------
+-- ADD CONSTRAINT ... WITH TAGS (physical-constraint site)
+-- -------------------------------------------------------------------
+
+-- Typo'd reserved key on ADD CONSTRAINT CHECK rejected (the validation fires at
+-- plan-build, before any runtime ADD CONSTRAINT machinery).
+ALTER TABLE AddCon ADD CONSTRAINT c_chk CHECK (id > 0) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Mis-sited but otherwise-valid key on ADD CONSTRAINT rejected:
+-- quereus.update.default_for.<col> is view-ddl / projection / dml-stmt only ⇒
+-- tag-not-allowed-here at the physical-constraint site.
+ALTER TABLE AddCon ADD CONSTRAINT c_chk2 CHECK (id > 0) WITH TAGS ("quereus.update.default_for.id" = '0');
+-- error: not allowed
+
+-- Valid functional tag quereus.expose_implicit_index accepted on an ADD CONSTRAINT
+-- UNIQUE and round-trips through unique_constraint_info (the same tag catalog.ts
+-- reads to surface the implicit covering structure).
+ALTER TABLE AddCon ADD CONSTRAINT uq_code UNIQUE (code) WITH TAGS ("quereus.expose_implicit_index" = true);
+SELECT name, json_extract(tags, '$."quereus.expose_implicit_index"') AS exposed
+    FROM unique_constraint_info('AddCon') WHERE name = 'uq_code';
+→ [{"name":"uq_code","exposed":true}]
+
+-- Guard against over-rejection: a free-form (non-quereus.*) tag on ADD CONSTRAINT
+-- still applies cleanly and round-trips.
+ALTER TABLE AddCon ADD CONSTRAINT uq_email UNIQUE (email) WITH TAGS (error_message = 'Email must be unique');
+SELECT name, json_extract(tags, '$.error_message') AS msg
+    FROM unique_constraint_info('AddCon') WHERE name = 'uq_email';
+→ [{"name":"uq_email","msg":"Email must be unique"}]
+
+-- -------------------------------------------------------------------
+-- ADD COLUMN ... WITH TAGS (physical-column + inline physical-constraint sites)
+-- -------------------------------------------------------------------
+
+-- Typo'd reserved key on an ADD COLUMN column tag rejected (physical-column site).
+ALTER TABLE AddCol ADD COLUMN y INT WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Typo'd reserved key on an ADD COLUMN inline NAMED constraint tag rejected
+-- (physical-constraint site) — the parser lifts the trailing WITH TAGS onto the
+-- named constraint, and the shared columnTagDiagnostics validates it there.
+ALTER TABLE AddCol ADD COLUMN z INT CONSTRAINT cz CHECK (z > 0) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Valid quereus.id accepted on an ADD COLUMN column tag and round-trips via table_info.
+ALTER TABLE AddCol ADD COLUMN c1 INT WITH TAGS ("quereus.id" = 'col-c1');
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('AddCol') WHERE name = 'c1';
+→ [{"name":"c1","qid":"col-c1"}]
+
+-- Valid quereus.id accepted on an ADD COLUMN inline NAMED constraint: the tag
+-- validates at the physical-constraint site (quereus.id is legal there), so the
+-- statement is admitted and the column is added. NOTE: the memory module's ADD
+-- COLUMN path materializes only the column (inline UNIQUE is dropped; inline CHECK
+-- becomes a row-constraint), so the inline constraint's tag is not surfaced via
+-- unique_constraint_info on this path — a persistence asymmetry orthogonal to this
+-- validation ticket (see review handoff). The acceptance (no over-rejection) is what
+-- this case proves; the constraint-tag round-trip is covered by the ADD CONSTRAINT
+-- uq_code case above.
+ALTER TABLE AddCol ADD COLUMN c2 INT CONSTRAINT ck_c2 CHECK (c2 > 0) WITH TAGS ("quereus.id" = 'con-c2');
+SELECT name FROM table_info('AddCol') WHERE name = 'c2';
+→ [{"name":"c2"}]
+
+-- Unnamed inline constraint on ADD COLUMN with a trailing WITH TAGS: the parser
+-- defers the tag to the COLUMN (physical-column site), so it validates/stores there
+-- and round-trips on the column via table_info — NOT on the constraint (no double
+-- validation). quereus.id is legal at physical-column, so this is accepted.
+ALTER TABLE AddCol ADD COLUMN c3 INT CHECK (c3 > 0) WITH TAGS ("quereus.id" = 'col-c3');
+SELECT name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM table_info('AddCol') WHERE name = 'c3';
+→ [{"name":"c3","qid":"col-c3"}]
+
+-- Guard against over-rejection: free-form (non-quereus.*) tags on ADD COLUMN still
+-- apply cleanly and round-trip via table_info.
+ALTER TABLE AddCol ADD COLUMN c4 INT WITH TAGS (display_name = 'C4', searchable = true);
+SELECT name, json_extract(tags, '$.display_name') AS dn, json_extract(tags, '$.searchable') AS searchable
+    FROM table_info('AddCol') WHERE name = 'c4';
+→ [{"name":"c4","dn":"C4","searchable":true}]

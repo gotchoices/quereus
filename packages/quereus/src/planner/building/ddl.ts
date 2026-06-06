@@ -2,8 +2,8 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { CreateTableNode } from '../nodes/create-table-node.js';
 import { CreateIndexNode } from '../nodes/create-index-node.js';
-import { validateReservedTags, type TagDiagnostic } from '../../schema/reserved-tags.js';
-import { raiseReservedTagDiagnostics } from '../../schema/reserved-tags-policy.js';
+import { validateReservedTags } from '../../schema/reserved-tags.js';
+import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
 export function buildCreateTableStmt(
 	context: PlanningContext,
@@ -33,35 +33,19 @@ export function buildCreateIndexStmt(
 
 /**
  * Validate the four reserved-tag surfaces of a direct CREATE TABLE — table-level
- * `WITH TAGS`, each column's tags, each table-level (named or unnamed) constraint's
- * tags, and each inline column constraint's tags — at their matching physical sites,
- * mirroring the declarative differ (`schema-differ.ts`). Diagnostics accumulate
- * table → columns → table-constraints → column-constraints and raise once via the
- * shared policy. Inline column-constraint tags (`ColumnDef.constraints[].tags`) ARE
- * validated here at the physical-constraint site (kept symmetric with the differ):
- * the parser lifts a trailing `WITH TAGS` onto an inline constraint only when it is
- * *named*, so an unnamed inline constraint defers its tags to the column (where
- * `cc.tags` is undefined and validateReservedTags is a no-op) — hence no `cc.name`
- * guard, and the iteration covers every constraint kind, not just check/unique/fk.
+ * `WITH TAGS`, each column's tags, each inline column constraint's tags, and each
+ * table-level (named or unnamed) constraint's tags — at their matching physical
+ * sites, mirroring the declarative differ (`schema-differ.ts`). The per-column legs
+ * (a column's own tags + its inline constraints' tags) come from the shared
+ * {@link columnTagDiagnostics} helper, which the ALTER … ADD COLUMN path reuses so the
+ * two authoring surfaces never drift. Diagnostics accumulate table → per-column →
+ * table-constraints and raise once via the shared policy (first error wins).
  */
 function raiseCreateTableTagDiagnostics(stmt: AST.CreateTableStmt): void {
 	const diagnostics = [
 		...validateReservedTags(stmt.tags, 'physical-table'),
-		...stmt.columns.flatMap(c => validateReservedTags(c.tags, 'physical-column')),
+		...stmt.columns.flatMap(columnTagDiagnostics),
 		...(stmt.constraints ?? []).flatMap(c => validateReservedTags(c.tags, 'physical-constraint')),
-		...stmt.columns.flatMap(c => (c.constraints ?? []).flatMap(cc => validateReservedTags(cc.tags, 'physical-constraint'))),
 	];
 	raiseStmtTagDiagnostics(diagnostics, stmt);
-}
-
-/**
- * Raise the first error diagnostic via the shared reserved-tag policy, threading the
- * statement's source location for a sited error. Warnings (e.g. an empty ack
- * rationale) never block — they hit a no-op sink, matching the ALTER arm.
- */
-function raiseStmtTagDiagnostics(diagnostics: TagDiagnostic[], stmt: AST.AstNode): void {
-	raiseReservedTagDiagnostics(diagnostics, {
-		loc: stmt.loc ? { line: stmt.loc.start.line, column: stmt.loc.start.column } : undefined,
-		log: () => { /* warnings (e.g. empty ack rationale) never block */ },
-	});
 }
