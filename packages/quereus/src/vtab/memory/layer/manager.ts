@@ -1504,18 +1504,10 @@ export class MemoryTableManager {
 			}));
 			const updatedPrimaryKeyNames = updatedPkDefinition.map(def => updatedColumnsSchema[def.index]?.name).filter(Boolean) as string[];
 
-			const updatedIndexes = (this.tableSchema.indexes || []).map(idx => ({
-				...idx,
-				columns: idx.columns
-					.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
-					.filter(ic => ic.index !== colIndex)
-			})).filter(idx => idx.columns.length > 0);
-
-			// Prune any UNIQUE constraint over the dropped column, mirroring how indexes are
-			// filtered above. A UNIQUE that includes the dropped column is removed outright (a
-			// UNIQUE missing one of its columns is a different, stronger constraint, not a
-			// silently-narrowed one); the covering index it backed is already gone from
-			// `updatedIndexes` and discarded by `dropColumnFromBase`'s secondary-index rebuild.
+			// Prune any UNIQUE constraint over the dropped column. A UNIQUE that includes the
+			// dropped column is removed outright (a UNIQUE missing one of its columns is a
+			// different, stronger constraint, not a silently-narrowed one); the auto-built
+			// covering index it backed is torn down with it (see the index exclusion below).
 			// Remaining constraints have their column indices shifted to track the removed slot.
 			// Without this, dropping a uniquely-constrained column (including the ADD COLUMN +
 			// inline-UNIQUE revert path) would strand a constraint whose column index dangles
@@ -1527,6 +1519,23 @@ export class MemoryTableManager {
 			const remainingUniqueConstraints = oldUniqueConstraints
 				.filter(uc => !uc.columns.includes(colIndex))
 				.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
+
+			// Drop the implicit covering index of each removed constraint outright (matched by
+			// the same `uc.name ?? '_uc_<cols>'` convention DROP CONSTRAINT uses, so a user
+			// index that merely shares columns is left untouched), then shift/prune the rest
+			// over the removed slot. A *single*-column covering index collapses to empty and is
+			// filtered by the trailing `length > 0` regardless; the explicit name exclusion is
+			// what tears down a *multi*-column covering index, which would otherwise survive
+			// orphaned — narrowed to its surviving columns — in `index_info` and on every write.
+			const droppedCoveringIndexNames = new Set(droppedUcKeys.map(k => k.toLowerCase()));
+			const updatedIndexes = (this.tableSchema.indexes || [])
+				.filter(idx => !droppedCoveringIndexNames.has(idx.name.toLowerCase()))
+				.map(idx => ({
+					...idx,
+					columns: idx.columns
+						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
+						.filter(ic => ic.index !== colIndex)
+				})).filter(idx => idx.columns.length > 0);
 
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,

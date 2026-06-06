@@ -1283,6 +1283,8 @@ Removes a column from the table and all its data. Restrictions:
 - Cannot drop a PRIMARY KEY column.
 - Cannot drop the last remaining column.
 
+Any UNIQUE constraint over the dropped column is removed with it — a single-column UNIQUE outright, and a **multi-column** UNIQUE in full (a UNIQUE missing one of its columns is a different, stronger constraint, not a silently-narrowed one). The auto-built covering index backing such a constraint is torn down at the same time, leaving no orphan in `index_info`. A UNIQUE whose columns do **not** include the dropped column survives, with its column indices shifted over the removed slot. (SQLite rejects dropping a column that participates in a UNIQUE; Quereus permits it and drops the constraint.)
+
 **ADD / DROP / RENAME CONSTRAINT**
 
 ```sql

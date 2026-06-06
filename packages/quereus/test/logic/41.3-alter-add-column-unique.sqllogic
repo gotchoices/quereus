@@ -115,3 +115,70 @@ select count(*) as c from unique_constraint_info('AddCombo');
 → [{"c":1}]
 select u from AddCombo;
 → [{"u":1}]
+
+-- ===================================================================
+-- 6. Standalone DROP COLUMN of a single-column-UNIQUE column. The general
+--    dropColumn fix (prune the dangling UNIQUE + tear down its covering index)
+--    is what the ADD COLUMN revert path relies on; exercise it directly here.
+-- ===================================================================
+
+create table DropU (id integer primary key, a integer, b integer unique);
+insert into DropU values (1, 10, 100);
+-- b is enforced unique while it exists.
+insert into DropU values (2, 20, 100);
+-- error: UNIQUE constraint failed
+alter table DropU drop column b;
+-- Constraint and its covering index are both gone — no orphan.
+select count(*) as c from unique_constraint_info('DropU');
+→ [{"c":0}]
+select count(*) as c from index_info('DropU');
+→ [{"c":0}]
+-- The table is usable under its narrowed shape (b no longer enforced/present).
+insert into DropU values (3, 30);
+select count(*) as c from DropU;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 7. Standalone DROP COLUMN of a column that participates in a MULTI-column
+--    UNIQUE: the whole constraint is removed (a UNIQUE missing a column is a
+--    different constraint), AND its covering index is torn down — not left
+--    orphaned as a narrowed structure over the surviving columns.
+-- ===================================================================
+
+create table DropMultiIn (id integer primary key, a integer, b integer, constraint uq_ab unique (a, b));
+insert into DropMultiIn values (1, 1, 2);
+insert into DropMultiIn values (2, 1, 2);
+-- error: UNIQUE constraint failed
+alter table DropMultiIn drop column b;
+-- The entire uq_ab constraint is gone — and so is its covering index (no orphan
+-- narrowed to column a, which a prior narrow-not-remove bug would have left behind).
+select count(*) as c from unique_constraint_info('DropMultiIn');
+→ [{"c":0}]
+select count(*) as c from index_info('DropMultiIn');
+→ [{"c":0}]
+-- a alone is no longer constrained: a duplicate value is now allowed.
+insert into DropMultiIn values (3, 1);
+insert into DropMultiIn values (4, 1);
+select count(*) as c from DropMultiIn;
+→ [{"c":3}]
+
+-- ===================================================================
+-- 8. Standalone DROP COLUMN of a column NOT in a multi-column UNIQUE: the
+--    constraint survives with its column indices shifted over the removed slot
+--    and still enforces over the correct (renumbered) columns.
+-- ===================================================================
+
+create table DropMultiOut (id integer primary key, x integer, a integer, b integer, constraint uq_ab unique (a, b));
+insert into DropMultiOut values (1, 99, 1, 2);
+-- Drop x (lower index than a and b, not part of uq_ab): the constraint's column
+-- indices shift down by one but it survives intact.
+alter table DropMultiOut drop column x;
+select name, column_name from unique_constraint_info('DropMultiOut') order by column_name;
+→ [{"name":"uq_ab","column_name":"a"},{"name":"uq_ab","column_name":"b"}]
+-- Still enforces (a, b) after the shift: the same (a, b) pair collides…
+insert into DropMultiOut values (2, 1, 2);
+-- error: UNIQUE constraint failed
+-- …but a distinct pair is allowed.
+insert into DropMultiOut values (3, 5, 6);
+select count(*) as c from DropMultiOut;
+→ [{"c":2}]
