@@ -26,6 +26,34 @@ insert into t_chk values (3, 30, -1);
 -- error: CHECK
 
 drop table t_chk;
+-- run
+
+-- 1b. Engine-bug guard (CHECK analogue of altered-column-not-exists-antijoin-misread).
+-- The literal-default CHECK post-scan runs `select 1 from <t> where not (<check>)`. A
+-- DECLARED CHECK seeds a domain constraint on the scan, so if the new CHECK were live
+-- during validation, `ruleFilterContradiction` would fold the scan's own `not (<check>)`
+-- to EmptyRelation and silently admit a violating backfilled row. The fix validates
+-- against a schema carrying the new COLUMN but NOT the new CHECK, committing the CHECK
+-- only after the scan passes. Existing row 1 backfilled with 0 violates `v > 0` → abort.
+create table t_chk2 (id integer primary key);
+insert into t_chk2 values (1);
+-- run
+
+alter table t_chk2 add column v integer default 0 check (v > 0);
+-- error: CHECK
+
+-- Reverted: the column was dropped and no stale CHECK left declared.
+select * from t_chk2 order by id;
+→ [{"id":1}]
+
+-- A satisfying literal default succeeds and backfills.
+alter table t_chk2 add column v integer default 7 check (v > 0);
+-- run
+
+select * from t_chk2 order by id;
+→ [{"id":1,"v":7}]
+
+drop table t_chk2;
 
 -- ===================================
 -- 2. ADD COLUMN with REFERENCES (column-level FK)
@@ -325,6 +353,44 @@ select * from c order by id;
 -- because the FK genuinely holds (whether or not it folds, the answer is empty).
 select id from c where not exists (select 1 from p where p.pid = c.parent);
 → []
+
+drop table c;
+drop table p;
+-- run
+
+-- 2n. CHECK + FK on the SAME ADD COLUMN (combination coverage).
+-- The validation schema carries the new CHECK (`mergedChecks`) but NOT the new FK,
+-- so the CHECK post-scan and the FK `not exists` scan run together in the one
+-- try/revert region. Each arm must abort independently, and a doubly-valid add must
+-- succeed and enforce both constraints forward.
+create table p (pid integer primary key);
+insert into p values (1), (2);
+create table c (id integer primary key);
+insert into c values (1);
+-- run
+
+-- CHECK arm aborts first: default 0 violates `parent > 0` (it is also an FK orphan,
+-- but the CHECK scan runs before the FK scan).
+alter table c add column parent integer default 0 check (parent > 0) references p(pid);
+-- error: CHECK
+
+-- FK arm aborts: default 99 satisfies the CHECK but references a missing parent.
+alter table c add column parent integer default 99 check (parent > 0) references p(pid);
+-- error: foreign key
+
+-- Both arms satisfied → succeeds and backfills.
+alter table c add column parent integer default 1 check (parent > 0) references p(pid);
+-- run
+
+select * from c order by id;
+→ [{"id":1,"parent":1}]
+
+-- Forward enforcement of BOTH constraints still fires post-add.
+insert into c values (2, 0);
+-- error: CHECK
+
+insert into c values (3, 99);
+-- error:
 
 drop table c;
 drop table p;

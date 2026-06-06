@@ -1150,18 +1150,27 @@ child) and for the parent-absent case (any fully-non-NULL backfilled row is an
 orphan). The new column-level FK is also merged into the table-level constraint set
 for forward INSERT/UPDATE enforcement.
 
-> The validator issues a `NOT EXISTS` correlated subquery (a fully-non-NULL child row
-> with no matching parent is an orphan), the same form `ADD CONSTRAINT` uses. The
-> decorrelator may materialize that as an anti-join, which is normally a candidate for
-> `ruleAntiJoinFkEmpty` to fold to `EmptyRelation` under the inclusion dependency
-> `child.fk ⊆ parent.pk`. To keep that fold from trusting the very invariant the scan
-> is checking, ADD COLUMN registers the new **column but not the new FK** for the
-> validation pass (an intermediate `validationSchema`); the full schema with the FK is
-> committed to the catalog only **after** validation passes. The live schema the
-> planner reads during validation therefore declares no FK to fold against, so the
-> anti-join reads the freshly-backfilled column directly and surfaces real orphans.
-> This mirrors `ADD CONSTRAINT`, which likewise validates before swapping the FK into
-> the live schema.
+> **Why validation runs against an intermediate schema.** The optimizer trusts a
+> DECLARED constraint as a proven invariant, which makes each existing-row validator
+> fold away its own work if the new constraint is already live during the pass:
+> - The FK validator issues a `NOT EXISTS` correlated subquery (the same form `ADD
+>   CONSTRAINT` uses). The decorrelator may materialize it as an anti-join, which
+>   `ruleAntiJoinFkEmpty` folds to `EmptyRelation` under the inclusion dependency
+>   `child.fk ⊆ parent.pk`.
+> - The literal-default CHECK scan issues `select 1 from <t> where not (<check>)`. A
+>   declared CHECK `<p>` seeds a domain constraint on the scan, so `ruleFilterContradiction`
+>   folds `where not (<p>)` to `EmptyRelation` (the domain `<p>` and predicate `not <p>`
+>   are jointly unsatisfiable).
+>
+> Either fold makes validation trust the very invariant it is checking and silently admit
+> a violating row. So ADD COLUMN registers the new **column with only the pre-existing
+> (already-proven) constraints** for the validation pass — an intermediate
+> `validationSchema` that omits the new FK(s) **and** the new CHECK(s) — then commits the
+> full schema **after** validation passes. The live schema the planner reads during
+> validation therefore declares neither the new FK nor the new CHECK to fold against, so
+> the validators read the freshly-backfilled column directly and surface real violations.
+> This mirrors `ADD CONSTRAINT`, which likewise validates before swapping the constraint
+> into the live schema.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion

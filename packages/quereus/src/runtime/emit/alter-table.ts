@@ -368,19 +368,31 @@ async function runAddColumn(
 	// new schema in the catalog.
 	const enhancedTableSchema = withGeneratedColumnGraph(enhancedBase);
 
-	// FK-IND folding (`ruleAntiJoinFkEmpty` + the INDs seeded at TableReferenceNode)
-	// treats a DECLARED FK as a proven inclusion dependency `child.fk ⊆ parent.pk`.
-	// The existing-row validation below runs a `not exists` anti-join to find
-	// orphans; if the new FK were already in the LIVE schema the optimizer would
-	// fold that anti-join to EmptyRelation — trusting the very invariant we are
-	// checking — and silently admit a violating row (and every later anti-join on
-	// the table would stay folded while the data violates the declared FK). So
-	// register the new COLUMN but NOT the new FK(s) for the validation pass, then
-	// register the full schema only once validation passes. This mirrors the ADD
-	// CONSTRAINT path, which validates before swapping the FK into the live schema.
+	// The optimizer trusts a DECLARED constraint as a proven invariant, which makes
+	// the existing-row validators below fold away their own work if the new constraint
+	// is already live:
+	//   - A new FK seeds an inclusion dependency `child.fk ⊆ parent.pk`; the FK
+	//     validator's `not exists` anti-join folds to EmptyRelation under
+	//     `ruleAntiJoinFkEmpty` (+ the INDs seeded at TableReferenceNode).
+	//   - A new CHECK `<p>` seeds a domain constraint on the scan; the CHECK post-scan's
+	//     own `where not (<p>)` folds to EmptyRelation under `ruleFilterContradiction`
+	//     (the domain `<p>` and the predicate `not <p>` are jointly unsatisfiable).
+	// Either fold makes validation trust the very invariant it is checking and silently
+	// admit a violating row. So register the new COLUMN with only the PRE-EXISTING
+	// (already-proven) constraints for the validation pass, then register the full schema
+	// — with the new FK(s) and CHECK(s) — only once validation passes. This mirrors the
+	// ADD CONSTRAINT path, which validates before swapping the constraint into the live
+	// schema. Pre-existing constraints are kept: they held before this ALTER, so folding
+	// against them is sound and preserves the optimizer's reach.
 	const hasNewForeignKeys = resolvedForeignKeys.length > 0;
-	const validationSchema = hasNewForeignKeys
-		? withGeneratedColumnGraph({ ...enhancedBase, foreignKeys: updatedTableSchema.foreignKeys })
+	const hasNewChecks = newCheckConstraints.length > 0;
+	const usesIntermediateSchema = hasNewForeignKeys || hasNewChecks;
+	const validationSchema = usesIntermediateSchema
+		? withGeneratedColumnGraph({
+			...enhancedBase,
+			checkConstraints: updatedTableSchema.checkConstraints,
+			foreignKeys: updatedTableSchema.foreignKeys,
+		})
 		: enhancedTableSchema;
 	schema.addTable(validationSchema);
 
@@ -411,8 +423,8 @@ async function runAddColumn(
 			}
 			for (const fk of resolvedForeignKeys) {
 				// `enhancedTableSchema` supplies only column-name resolution here; the LIVE
-				// schema the planner reads is `validationSchema`, which lacks the new FK, so
-				// the anti-join is not folded.
+				// schema the planner reads is `validationSchema`, which omits the new FK(s)
+				// and CHECK(s), so the anti-join is not folded.
 				await validateForeignKeyOverExistingRows(rctx.db, enhancedTableSchema, fk);
 			}
 		} catch (err) {
@@ -430,8 +442,10 @@ async function runAddColumn(
 		}
 	}
 
-	// Validation passed — commit the full schema (with the new FK) into the catalog.
-	if (hasNewForeignKeys) {
+	// Validation passed — commit the full schema (with the new FK(s)/CHECK(s)) into the
+	// catalog. Skipped when no intermediate schema was used, in which case
+	// `validationSchema === enhancedTableSchema` is already registered.
+	if (usesIntermediateSchema) {
 		schema.addTable(enhancedTableSchema);
 	}
 
