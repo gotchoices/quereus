@@ -482,6 +482,54 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		await db2.exec(`INSERT INTO nc VALUES (13, 1)`);
 	});
 
+	// A no-PRIMARY-KEY table synthesizes an all-columns key whose columns keep their
+	// declared nullability (ticket lens-no-pk-nullable-column-deploy-mismatch). The
+	// persistence round-trip is the highest-risk path: generateTableDDL must OMIT the
+	// synthesized PK clause so rehydrateCatalog re-synthesizes the key instead of
+	// treating a named all-columns PK as explicit and re-forcing NOT NULL. This pins
+	// that the nullable declaration AND a stored NULL-in-key row survive a reopen.
+	it('no-PK nullable table preserves nullability and a NULL-in-key row across reopen', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec(`CREATE TABLE npk (a INTEGER NULL, b INTEGER NULL) USING store`);
+		// A NULL participates in the synthesized all-columns key; persists DDL + row.
+		await db1.exec(`INSERT INTO npk (a, b) VALUES (null, 5)`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed no-PK DDL parses cleanly').to.have.lengthOf(0);
+
+		// Nullability survived: a declared PK would have re-forced NOT NULL on reopen.
+		const t = db2.schemaManager.findTable('npk')!;
+		expect(t.columns.find(c => c.name === 'a')!.notNull, 'a nullable after reopen').to.equal(false);
+		expect(t.columns.find(c => c.name === 'b')!.notNull, 'b nullable after reopen').to.equal(false);
+		expect(t.columns.find(c => c.name === 'a')!.primaryKey, 'a still in synthesized key').to.equal(true);
+
+		// The persisted NULL-in-key row is readable.
+		const rows = await asyncIterableToArray(db2.eval('select a, b from npk'));
+		expect(rows).to.deep.equal([{ a: null, b: 5 }]);
+
+		// A fully-identical row collides on the synthesized key — a key/constraint
+		// conflict, NOT a NOT NULL failure (the pre-fix symptom).
+		let dupMsg: string | undefined;
+		try {
+			await db2.exec(`INSERT INTO npk (a, b) VALUES (null, 5)`);
+		} catch (e) {
+			dupMsg = String(e);
+		}
+		expect(dupMsg, 'duplicate NULL-in-key row rejected after reopen').to.not.be.undefined;
+		expect(dupMsg!, 'rejected as a key conflict, not NOT NULL').to.not.match(/NOT NULL/i);
+		expect(dupMsg!, 'a key/constraint conflict').to.match(/constraint|unique|duplicate|primary key/i);
+
+		// A distinct row still inserts and reads back (NULL value preserved).
+		await db2.exec(`INSERT INTO npk (a, b) VALUES (null, 6)`);
+		const rows2 = await asyncIterableToArray(db2.eval('select a, b from npk order by b'));
+		expect(rows2).to.deep.equal([{ a: null, b: 5 }, { a: null, b: 6 }]);
+	});
+
 	// A single ADD COLUMN declaring BOTH a CHECK and an FK exercises the store's two
 	// independent merge arms (checkConstraints AND foreignKeys both extended on
 	// `persistedSchema`). Both must persist and enforce after reopen.
