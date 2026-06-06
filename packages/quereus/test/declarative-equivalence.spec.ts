@@ -2649,4 +2649,40 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			await db.close();
 		}
 	});
+
+	it('REGRESSION: a direction change layered on a renamed PK column still emits primaryKeyChange', async function () {
+		// A rename AND a genuine direction (asc → desc) change on the SAME PK column in
+		// one diff. The reconcile rewrites names only — `pkSequencesEqual` still compares
+		// direction — so the reconciled sequence (a desc) differs from actual (a asc) and
+		// `primaryKeyChange` is emitted, carrying the post-rename name with desc.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1), (2)');
+
+			// Rename id → pk AND flip the key to descending in the same diff.
+			await db.exec(`declare schema main {
+				table t { pk INTEGER PRIMARY KEY desc with tags ("quereus.previous_name" = 'id') }
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'PK column rename detected').to.deep.equal([{ oldName: 'id', newName: 'pk' }]);
+			expect(alter.primaryKeyChange?.oldPkColumns, 'old PK was id').to.deep.equal(['id']);
+			expect(alter.primaryKeyChange?.newPkColumns, 'new PK carries the post-rename name + desc')
+				.to.deep.equal([{ name: 'pk', direction: 'desc' }]);
+
+			// The DDL must RENAME COLUMN first, then ALTER PRIMARY KEY (pk desc).
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /RENAME COLUMN .*id.* TO .*pk/i.test(s)), `expected RENAME COLUMN, got:\n${ddl.join('\n')}`).to.be.true;
+			expect(ddl.some(s => /ALTER PRIMARY KEY \("?pk"? desc\)/i.test(s)), `expected ALTER PRIMARY KEY (pk desc), got:\n${ddl.join('\n')}`).to.be.true;
+
+			await db.exec('apply schema main');
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
 });
