@@ -227,3 +227,49 @@ insert into fk_child values (2, 99);
 drop table fk_child;
 drop table fk_parent;
 -- run
+
+-- ============================================================
+-- 10. Composite ADD FOREIGN KEY over existing rows — exercises the shared
+-- existing-row validator's LEFT-anti-join `<first parent col> is null` orphan
+-- test across MORE THAN ONE referenced column (single-column cases above only
+-- argue the composite path in comments).
+-- ============================================================
+create table fk_cparent (a integer, b integer, primary key (a, b));
+insert into fk_cparent values (1, 10), (2, 20);
+
+-- 10a. Composite SATISFIED — every existing (ref_a, ref_b) pair has a parent row.
+create table fk_cchild (id integer primary key, ref_a integer, ref_b integer);
+insert into fk_cchild values (1, 1, 10), (2, 2, 20);
+-- run
+
+alter table fk_cchild add constraint fk_ab foreign key (ref_a, ref_b) references fk_cparent(a, b);
+-- run
+
+-- installed and enforced going forward; a matching prefix on only ONE column is still an orphan
+insert into fk_cchild values (3, 1, 20);
+-- error:
+
+insert into fk_cchild values (4, 2, 20);
+select count(*) as c from fk_cchild;
+→ [{"c":3}]
+
+drop table fk_cchild;
+-- run
+
+-- 10b. Composite ORPHAN — (2, 99) matches the parent on `a` only ⇒ no full
+-- match ⇒ the add is rejected (the first-parent-col null test must not be
+-- fooled by the partial `a` match).
+create table fk_cchild (id integer primary key, ref_a integer, ref_b integer);
+insert into fk_cchild values (1, 1, 10), (2, 2, 99);
+-- run
+
+alter table fk_cchild add constraint fk_ab foreign key (ref_a, ref_b) references fk_cparent(a, b);
+-- error:
+
+-- not installed, not enforced
+select count(*) as c from foreign_key_info('fk_cchild') where name = 'fk_ab';
+→ [{"c":0}]
+
+drop table fk_cchild;
+drop table fk_cparent;
+-- run
