@@ -1137,10 +1137,20 @@ function computeTableAlterDiff(
 	const declaredPk = extractDeclaredPK(declaredTable);
 	const actualPk = actualTable.primaryKey;
 
-	if (!pkSequencesEqual(declaredPk, actualPk)) {
+	// Inverse-rename declared PK column names (new → old) so a pure PK-column rename
+	// — already emitted as RENAME COLUMN — does not also churn an ALTER PRIMARY KEY.
+	// Mirrors the constraint-body reconciliation (reconciledDeclaredBody). A PK
+	// references only THIS table's own columns, so `diff.columnsToRename` suffices —
+	// no cross-table `columnRenamesByTable` / table renames (unlike the FK body case).
+	// Clone first: inverseRenameConstraintColumns mutates in place, and declaredPk
+	// backs the NEW names carried in `newPkColumns`.
+	const reconciledDeclaredPk = declaredPk.map(c => ({ ...c }));
+	inverseRenameConstraintColumns(reconciledDeclaredPk, diff.columnsToRename);
+
+	if (!pkSequencesEqual(reconciledDeclaredPk, actualPk)) {
 		diff.primaryKeyChange = {
 			oldPkColumns: actualPk.map(pk => pk.columnName),
-			newPkColumns: declaredPk,
+			newPkColumns: declaredPk, // keep NEW (declared) names for the genuine-change DDL
 		};
 	}
 

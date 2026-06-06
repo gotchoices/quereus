@@ -2111,10 +2111,10 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 	it('an FK whose referenced PARENT column is renamed does not drop+recreate the child FK', async function () {
 		// The subject of this ticket: a parent-table column rename must reconcile the
 		// child FK's *referenced parent column* cross-table, so the child FK is not
-		// churned. (Renaming the parent's PK column `pid` additionally emits a benign
-		// `primaryKeyChange` on the parent — an orthogonal, pre-existing PK-column-
-		// rename limitation, NOT the FK churn this ticket targets; it applies cleanly
-		// and is idempotent, so we don't assert it away here.)
+		// churned. (Renaming the parent's PK column `pid` is now reconciled by the PK
+		// pass too — see ticket pk-column-rename-reconciliation — so the parent emits
+		// ONLY a RENAME COLUMN and no `primaryKeyChange`. This case asserts the FK
+		// churn is gone; the parent PK reconciliation has its own dedicated tests.)
 		const db = new Database();
 		try {
 			await db.exec('pragma foreign_keys = true');
@@ -2216,12 +2216,12 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 	it('a self-referential FK whose referenced column is renamed does not churn the FK', async function () {
 		// The parent IS the current table, so the FK referenced-column reconcile uses
 		// the current table's own entry in the cross-table rename map. The referenced
-		// column is a non-PK UNIQUE column (not the PK) on purpose: renaming the PK
-		// column would additionally emit an `ALTER PRIMARY KEY`, whose memory-table
-		// rebuild is a separate concern from the FK churn this case targets. Using a
-		// UNIQUE referenced column isolates the reconciliation cleanly. The PK-rename
-		// path (and the deferred self-FK "multiple candidate connections" bug it once
-		// tripped, now fixed) is covered by the sibling REGRESSION case below.
+		// column is a non-PK UNIQUE column (not the PK) on purpose: it exercises the
+		// UNIQUE + self-FK reconciliation cleanly. (Renaming the PK column instead is
+		// now reconciled by the PK pass too — ticket pk-column-rename-reconciliation —
+		// so it emits ONLY a RENAME COLUMN with no `primaryKeyChange`; that path has its
+		// own dedicated tests. The orthogonal rebuildMemoryTable engine fix is guarded by
+		// the sibling REGRESSION case below via a genuine ALTER PRIMARY KEY.)
 		const db = new Database();
 		try {
 			await db.exec('pragma foreign_keys = true');
@@ -2269,15 +2269,21 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		}
 	});
 
-	it('REGRESSION: a self-referential FK over a renamed PK column (→ ALTER PRIMARY KEY) commits with the deferred self-FK enforced', async function () {
-		// Sibling of the case above, but the referenced (self) column IS the PK. Renaming
-		// it emits an ALTER PRIMARY KEY, which on a memory table rebuilds the manager
+	it('REGRESSION: a genuine ALTER PRIMARY KEY on a self-referential-FK table commits with the deferred self-FK enforced', async function () {
+		// Engine-fix guard (rebuildMemoryTable connection cleanup), isolated from any
+		// column rename. A genuine PK change — here flipping the key to descending —
+		// emits an ALTER PRIMARY KEY, which on a memory table rebuilds the manager
 		// (rebuildMemoryTable). That rebuild used to orphan the old manager while leaving
 		// its VirtualTableConnection registered; the next insert then registered a second
 		// connection under the same name, tripping DeferredConstraintQueue.findConnection
 		// ("multiple candidate connections") when the deferred self-FK fired at commit.
 		// rebuildMemoryTable now removes the stale connections after the swap, so the
 		// post-rebuild insert commits and the self-FK enforces normally.
+		//
+		// This case formerly drove the ALTER PRIMARY KEY via a *pure PK-column rename*;
+		// ticket pk-column-rename-reconciliation now reconciles such a rename to emit ONLY
+		// a RENAME COLUMN (no ALTER PRIMARY KEY), so a genuine PK change is used here to
+		// keep exercising the rebuild path.
 		const db = new Database();
 		try {
 			await db.exec('pragma foreign_keys = true');
@@ -2291,14 +2297,23 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			await db.exec('apply schema main');
 			await db.exec('insert into node values (1, null), (2, 1)');
 
-			// Rename the PK column code → ucode; the self-FK references node(ucode).
+			// Genuine PK change: flip the key to descending. Emits an ALTER PRIMARY KEY
+			// that rebuilds the memory table; the self-FK still references node(code).
 			await db.exec(`declare schema main {
 				table node {
-					ucode INTEGER PRIMARY KEY with tags ("quereus.previous_name" = 'code'),
+					code INTEGER PRIMARY KEY desc,
 					parent_code INTEGER null,
-					constraint fk foreign key (parent_code) references node(ucode)
+					constraint fk foreign key (parent_code) references node(code)
 				}
 			}`);
+
+			// Confirm this is a genuine PK change — it must reach ALTER PRIMARY KEY (the
+			// memory-table rebuild), not silently no-op.
+			const pkDiff = diffOf(db);
+			const nodeAlter = pkDiff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'node');
+			expect(nodeAlter?.primaryKeyChange, 'genuine PK change emits ALTER PRIMARY KEY (rebuild path)').to.not.be.undefined;
+			expect(nodeAlter?.columnsToRename ?? [], 'no column rename in this case').to.deep.equal([]);
+
 			await db.exec('apply schema main');
 
 			// Valid self reference commits (this is the insert that previously threw at commit).
@@ -2307,7 +2322,7 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			// An orphaned parent reference is still rejected by the deferred self-FK at commit.
 			let rejected = false;
 			try { await db.exec('insert into node values (4, 999)'); } catch { rejected = true; }
-			expect(rejected, 'orphan rejected by self-FK against the renamed PK column').to.be.true;
+			expect(rejected, 'orphan rejected by self-FK after the PK rebuild').to.be.true;
 		} finally {
 			await db.close();
 		}
@@ -2452,6 +2467,184 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
 			expect(childAlter?.constraintsToDrop ?? [], 'no spurious FK drop on child (require-hint)').to.deep.equal([]);
 			expect(childAlter?.constraintsToAdd ?? [], 'no spurious FK add on child (require-hint)').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a pure PK-column rename emits ONLY the RENAME COLUMN (no ALTER PRIMARY KEY)', async function () {
+		// The subject of ticket pk-column-rename-reconciliation: renaming a PK column
+		// must reconcile the declared PK sequence against the in-diff column rename, so
+		// only the RENAME COLUMN is emitted — no spurious `primaryKeyChange`. Mirrors the
+		// constraint-body reconciliation (reconciledDeclaredBody).
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1), (2)');
+
+			// Rename the PK column id → pk; the PK is otherwise unchanged.
+			await db.exec(`declare schema main {
+				table t { pk INTEGER PRIMARY KEY with tags ("quereus.previous_name" = 'id') }
+			}`);
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter.length, 'one alter for the column rename').to.equal(1);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'PK column rename detected').to.deep.equal([{ oldName: 'id', newName: 'pk' }]);
+			expect(alter.primaryKeyChange, 'no spurious PK change for a pure PK-column rename').to.be.undefined;
+
+			// The migration DDL must carry the RENAME COLUMN and NO ALTER PRIMARY KEY.
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /RENAME COLUMN .*id.* TO .*pk/i.test(s)), `expected RENAME COLUMN, got:\n${ddl.join('\n')}`).to.be.true;
+			expect(ddl.some(s => /ALTER PRIMARY KEY/i.test(s)), `no ALTER PRIMARY KEY, got:\n${ddl.join('\n')}`).to.be.false;
+
+			await db.exec('apply schema main');
+
+			// The PK still enforces under the renamed column (duplicate rejected).
+			let rejected = false;
+			try { await db.exec('insert into t values (1)'); } catch { rejected = true; }
+			expect(rejected, 'PK uniqueness still enforces under pk').to.be.true;
+
+			// Idempotent: the rename has landed, no further alter.
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a composite PK with one renamed member emits no ALTER PRIMARY KEY', async function () {
+		// One member of a composite PK is renamed; the reconciled PK sequence still
+		// matches the actual (pre-rename) key, so no `primaryKeyChange` is emitted.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { a INTEGER, b INTEGER, constraint pk primary key (a, b) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 2), (3, 4)');
+
+			// Rename a → a2; the composite PK is otherwise unchanged (a2, b).
+			await db.exec(`declare schema main {
+				table t {
+					a2 INTEGER with tags ("quereus.previous_name" = 'a'),
+					b INTEGER,
+					constraint pk primary key (a2, b)
+				}
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'composite PK member rename detected').to.deep.equal([{ oldName: 'a', newName: 'a2' }]);
+			expect(alter.primaryKeyChange, 'no spurious PK change for a composite PK member rename').to.be.undefined;
+
+			await db.exec('apply schema main');
+
+			// The composite PK still enforces (duplicate (a2, b) rejected).
+			let rejected = false;
+			try { await db.exec('insert into t values (1, 2)'); } catch { rejected = true; }
+			expect(rejected, 'composite PK uniqueness still enforces under a2').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a default-PK table (no explicit PRIMARY KEY) renaming a column emits no ALTER PRIMARY KEY', async function () {
+		// A table with no explicit PRIMARY KEY defaults to all columns being the key
+		// (key-based addressing, no rowids), so renaming any column would — without the
+		// PK reconciliation — churn a spurious `primaryKeyChange`. The reconcile fixes it.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { a INTEGER, b INTEGER }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 2), (3, 4)');
+
+			// Rename a → a2; the (implicit, all-columns) PK is otherwise unchanged.
+			await db.exec(`declare schema main {
+				table t { a2 INTEGER with tags ("quereus.previous_name" = 'a'), b INTEGER }
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'column rename detected').to.deep.equal([{ oldName: 'a', newName: 'a2' }]);
+			expect(alter.primaryKeyChange, 'no spurious PK change on a default-PK table').to.be.undefined;
+
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /ALTER PRIMARY KEY/i.test(s)), `no ALTER PRIMARY KEY, got:\n${ddl.join('\n')}`).to.be.false;
+
+			await db.exec('apply schema main');
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a genuine PK membership change still emits primaryKeyChange', async function () {
+		// Guard: reconciliation must NOT mask a real PK membership change. Here the PK
+		// moves from (a) to (b) with no rename hint, so the reconciled sequence differs
+		// from actual and `primaryKeyChange` is emitted with the new column.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { a INTEGER PRIMARY KEY, b INTEGER }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			// Move the PK from a to b (genuine membership change, no rename hint).
+			await db.exec(`declare schema main {
+				table t { a INTEGER, b INTEGER, constraint pk primary key (b) }
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'no column rename for a genuine PK change').to.deep.equal([]);
+			expect(alter.primaryKeyChange?.oldPkColumns, 'old PK was a').to.deep.equal(['a']);
+			expect(alter.primaryKeyChange?.newPkColumns, 'new PK is b').to.deep.equal([{ name: 'b', direction: undefined }]);
+
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /ALTER PRIMARY KEY \("?b"?\)/i.test(s)), `expected ALTER PRIMARY KEY (b), got:\n${ddl.join('\n')}`).to.be.true;
+
+			await db.exec('apply schema main');
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a PK-column rename layered on a genuine membership change keeps the NEW names', async function () {
+		// A rename AND a genuine membership change in the same diff: reconcile (a2, c)
+		// back to (a, c), compare against actual (a, b) → differs → `primaryKeyChange`
+		// emitted. The emitted `newPkColumns` must carry the NEW (declared) names so the
+		// ALTER PRIMARY KEY DDL targets the post-rename columns.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { a INTEGER, b INTEGER, c INTEGER, constraint pk primary key (a, b) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 2, 3), (4, 5, 6)');
+
+			// Rename a → a2 AND swap the PK's second member b → c at once.
+			await db.exec(`declare schema main {
+				table t {
+					a2 INTEGER with tags ("quereus.previous_name" = 'a'),
+					b INTEGER,
+					c INTEGER,
+					constraint pk primary key (a2, c)
+				}
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter[0];
+			expect(alter.columnsToRename, 'column rename still detected').to.deep.equal([{ oldName: 'a', newName: 'a2' }]);
+			expect(alter.primaryKeyChange?.oldPkColumns, 'old PK was (a, b)').to.deep.equal(['a', 'b']);
+			expect(alter.primaryKeyChange?.newPkColumns, 'new PK carries the post-rename names (a2, c)')
+				.to.deep.equal([{ name: 'a2', direction: undefined }, { name: 'c', direction: undefined }]);
+
+			await db.exec('apply schema main');
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
