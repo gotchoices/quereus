@@ -245,4 +245,110 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		const rows = await asyncIterableToArray(db2.eval('select * from items'));
 		expect(rows).to.deep.equal([{ id: 1, name: 'Widget' }]);
 	});
+
+	// Constraint-survival across reopen: generateTableDDL persists the catalog DDL
+	// that rehydrateCatalog re-parses, so a table's UNIQUE / CHECK / FOREIGN KEY
+	// constraints must still ENFORCE after a fresh Database rehydrates the catalog.
+	// Before the fix, generateTableDDL dropped all table constraints, so these
+	// inserts would silently succeed on reopen.
+	async function expectRejected(fn: () => Promise<unknown>, msg: string): Promise<void> {
+		let rejected = false;
+		try {
+			await fn();
+		} catch (e) {
+			rejected = true;
+			expect(String(e), `${msg}: error mentions constraint`).to.match(/constraint/i);
+		}
+		expect(rejected, msg).to.be.true;
+	}
+
+	it('UNIQUE constraint survives reopen and still rejects duplicates', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec(`
+			CREATE TABLE uq_t (
+				id INTEGER PRIMARY KEY,
+				email TEXT,
+				CONSTRAINT uq_email UNIQUE (email)
+			) USING store
+		`);
+		// Insert persists the DDL (and a row) so the constraint must round-trip.
+		await db1.exec(`INSERT INTO uq_t VALUES (1, 'a@x.com')`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed constraint DDL parses cleanly').to.have.lengthOf(0);
+
+		// A duplicate of the persisted email is still rejected after reopen.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO uq_t VALUES (2, 'a@x.com')`),
+			'duplicate email rejected after reopen',
+		);
+		// A distinct email still succeeds.
+		await db2.exec(`INSERT INTO uq_t VALUES (3, 'b@x.com')`);
+	});
+
+	it('CHECK constraint survives reopen and still rejects violations', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec(`
+			CREATE TABLE chk_t (
+				id INTEGER PRIMARY KEY,
+				qty INTEGER,
+				CONSTRAINT chk_qty CHECK (qty > 0)
+			) USING store
+		`);
+		await db1.exec(`INSERT INTO chk_t VALUES (1, 5)`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed constraint DDL parses cleanly').to.have.lengthOf(0);
+
+		// A CHECK-violating insert is still rejected after reopen.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO chk_t VALUES (2, -1)`),
+			'CHECK violation rejected after reopen',
+		);
+		// A satisfying insert still succeeds.
+		await db2.exec(`INSERT INTO chk_t VALUES (3, 10)`);
+	});
+
+	it('FOREIGN KEY constraint survives reopen and still rejects orphans', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec('PRAGMA foreign_keys = true');
+		await db1.exec(`CREATE TABLE fk_parent (pid INTEGER PRIMARY KEY) USING store`);
+		await db1.exec(`
+			CREATE TABLE fk_child (
+				id INTEGER PRIMARY KEY,
+				pref INTEGER,
+				CONSTRAINT fk_pref FOREIGN KEY (pref) REFERENCES fk_parent (pid)
+			) USING store
+		`);
+		await db1.exec(`INSERT INTO fk_parent VALUES (1)`);
+		// Valid child (parent 1 exists); persists both tables' DDL.
+		await db1.exec(`INSERT INTO fk_child VALUES (10, 1)`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		await db2.exec('PRAGMA foreign_keys = true');
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed constraint DDL parses cleanly').to.have.lengthOf(0);
+
+		// An orphan child (no parent pid=99) is still rejected after reopen.
+		await expectRejected(
+			() => db2.exec(`INSERT INTO fk_child VALUES (20, 99)`),
+			'orphan child rejected after reopen',
+		);
+		// A valid child (parent pid=1 exists) still succeeds.
+		await db2.exec(`INSERT INTO fk_child VALUES (21, 1)`);
+	});
 });

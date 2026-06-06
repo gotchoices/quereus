@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { collectSchemaCatalog, generateDeclaredDDL } from '../../src/schema/catalog.js';
 import { computeSchemaHash, computeShortSchemaHash } from '../../src/schema/schema-hasher.js';
+import { parse } from '../../src/parser/index.js';
 import type * as AST from '../../src/parser/ast.js';
 
 describe('Schema Catalog', () => {
@@ -269,6 +270,75 @@ describe('Schema Catalog', () => {
 			expect(after.columns.map(c => c.notNull)).to.deep.equal(beforeNullability);
 			expect(after.columns.map(c => c.defaultValue !== null)).to.deep.equal(beforeDefaults);
 			expect(after.tags).to.deep.equal(beforeTags);
+		});
+
+		it('roundtrips table-level CHECK / UNIQUE / FOREIGN KEY constraints', async () => {
+			// Regression: generateTableDDL historically emitted only columns + PK + USING
+			// + tags, silently dropping every table constraint on persistence round-trip.
+			// Build a table carrying one of each named constraint class plus an unnamed
+			// column-level CHECK (auto `_check_<col>`, exercising the verbose
+			// `check on insert, update (...)` re-parse), then assert the constraints
+			// survive both a raw parse() and a full drop+recreate.
+			await db.exec('CREATE TABLE rt_parent (pid INTEGER PRIMARY KEY) USING memory');
+			await db.exec(`CREATE TABLE rt_cons (
+				id INTEGER PRIMARY KEY,
+				email TEXT,
+				qty INTEGER,
+				pref INTEGER,
+				status INTEGER CHECK (status >= 0),
+				CONSTRAINT uq_email UNIQUE (email),
+				CONSTRAINT chk_qty CHECK (qty > 0),
+				CONSTRAINT fk_pref FOREIGN KEY (pref) REFERENCES rt_parent (pid)
+			) USING memory`);
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			const entry = catalog.tables.find(t => t.name === 'rt_cons')!;
+			expect(entry, 'rt_cons catalog entry').to.exist;
+			// The emitted DDL must actually carry each constraint clause. Constraint
+			// bodies route through quoteIdentifier (bare for non-keywords), so column
+			// refs stay unquoted here even though column DEFS above are always quoted.
+			const lower = entry.ddl.toLowerCase();
+			expect(lower, entry.ddl).to.include('unique (email)');
+			expect(lower, entry.ddl).to.include('(qty > 0)');
+			expect(lower, entry.ddl).to.include('foreign key (pref) references rt_parent(pid)');
+			expect(lower, entry.ddl).to.include('constraint uq_email');
+			expect(lower, entry.ddl).to.include('constraint chk_qty');
+			expect(lower, entry.ddl).to.include('constraint fk_pref');
+
+			// (1) Raw parse-back: the emitted DDL must re-parse into the same constraint set.
+			const parsed = parse(entry.ddl);
+			expect(parsed.type).to.equal('createTable');
+			const parsedConstraints = (parsed as AST.CreateTableStmt).constraints;
+			const byType = (t: string) => parsedConstraints.filter(c => c.type === t);
+			expect(byType('unique').map(c => c.name)).to.deep.equal(['uq_email']);
+			expect(byType('unique')[0].columns!.map(c => c.name)).to.deep.equal(['email']);
+			// Two CHECKs: the named table-level chk_qty and the auto-named column check.
+			expect(byType('check').map(c => c.name).sort()).to.deep.equal(['_check_status', 'chk_qty']);
+			const fk = byType('foreignKey')[0];
+			expect(fk.name).to.equal('fk_pref');
+			expect(fk.columns!.map(c => c.name)).to.deep.equal(['pref']);
+			expect(fk.foreignKey!.table).to.equal('rt_parent');
+			expect(fk.foreignKey!.columns).to.deep.equal(['pid']);
+			expect(fk.foreignKey!.onDelete).to.equal('restrict');
+			expect(fk.foreignKey!.onUpdate).to.equal('restrict');
+
+			// (2) Full drop+recreate: the rebuilt schema's canonical constraint set must
+			// match the original. namedConstraints' `definition` is the canonical body
+			// (columns + FK actions + CHECK expr), so equality proves semantic fidelity.
+			const beforeNamed = [...entry.namedConstraints].sort((a, b) => a.name.localeCompare(b.name));
+			await db.exec('DROP TABLE rt_cons');
+			await db.exec(entry.ddl);
+
+			const after = db.schemaManager.getTable('main', 'rt_cons')!;
+			expect(after, 'rt_cons exists after roundtrip').to.exist;
+			expect((after.uniqueConstraints ?? []).map(c => c.name)).to.deep.equal(['uq_email']);
+			expect((after.foreignKeys ?? []).map(c => c.name)).to.deep.equal(['fk_pref']);
+			// Both CHECKs survive (named + auto-named column check).
+			expect((after.checkConstraints ?? []).map(c => c.name).sort()).to.deep.equal(['_check_status', 'chk_qty']);
+
+			const afterEntry = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'rt_cons')!;
+			const afterNamed = [...afterEntry.namedConstraints].sort((a, b) => a.name.localeCompare(b.name));
+			expect(afterNamed).to.deep.equal(beforeNamed);
 		});
 
 		it('honors default_column_nullability for emission and survives a roundtrip', async () => {

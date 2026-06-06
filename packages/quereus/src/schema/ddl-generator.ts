@@ -23,7 +23,7 @@ import { maskToOps } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, tableConstraintsToString } from '../emit/ast-stringify.js';
 
 /**
  * Unconditionally double-quote an identifier, escaping internal quotes.
@@ -65,6 +65,17 @@ export function generateTableDDL(tableSchema: TableSchema, db?: Database): strin
 			.join(', ');
 		columnDefs.push(`PRIMARY KEY (${pkCols})`);
 	}
+
+	// Table-level CHECK / UNIQUE / FOREIGN KEY constraints. Emitting these is what
+	// lets store-backed tables retain (and keep enforcing) their constraints across
+	// a closeAll() + reopen + rehydrateCatalog, which re-parses this string. Reuse
+	// the AST emitter (tableConstraintsToString) over the schema→AST lift so this
+	// persistence path and the declarative AST→SQL path render constraints
+	// identically and cannot drift. Emission is independent of the session defaults
+	// (constraints have no default-elision), so the no-db and db-context branches
+	// agree byte-for-byte.
+	const constraintClause = emitTableConstraints(tableSchema);
+	if (constraintClause) columnDefs.push(constraintClause);
 
 	parts.push(`(${columnDefs.join(', ')})`);
 
@@ -128,7 +139,19 @@ export function constraintToCanonicalDDL(
 	return constraintBodyToCanonicalString(schemaConstraintToTableConstraint(kind, constraint, tableSchema));
 }
 
-/** Lifts a stored named constraint back into the equivalent AST.TableConstraint. */
+/**
+ * Lifts a stored named constraint back into the equivalent AST.TableConstraint.
+ *
+ * **Full-fidelity**: preserves the constraint `name` and `tags`, and (for FK)
+ * reconstructs the deferrability clause, so the same lift drives both the
+ * persistence emitter ({@link generateTableDDL}, via {@link tableConstraintsToString})
+ * and the canonical-body comparison ({@link constraintToCanonicalDDL}). The
+ * canonical consumer strips `name`/`tags`/deferrable downstream
+ * (`constraintBodyToCanonicalString` does `{ ...tc, name: undefined, tags: undefined }`
+ * and `canonicalForeignKeyClause` drops the deferrable clause), so carrying these
+ * fields here does NOT change `constraintToCanonicalDDL` output — only the
+ * persistence path benefits.
+ */
 function schemaConstraintToTableConstraint(
 	kind: NamedConstraintClass,
 	constraint: RowConstraintSchema | UniqueConstraintSchema | ForeignKeyConstraintSchema,
@@ -138,27 +161,77 @@ function schemaConstraintToTableConstraint(
 	switch (kind) {
 		case 'check': {
 			const c = constraint as RowConstraintSchema;
-			return { type: 'check', expr: c.expr, operations: maskToOps(c.operations), onConflict: c.defaultConflict };
+			return { type: 'check', name: c.name, expr: c.expr, operations: maskToOps(c.operations), onConflict: c.defaultConflict, tags: copyTags(c.tags) };
 		}
 		case 'unique': {
 			const c = constraint as UniqueConstraintSchema;
-			return { type: 'unique', columns: c.columns.map(i => ({ name: colName(i) })), onConflict: c.defaultConflict };
+			return { type: 'unique', name: c.name, columns: c.columns.map(i => ({ name: colName(i) })), onConflict: c.defaultConflict, tags: copyTags(c.tags) };
 		}
 		case 'foreignKey': {
 			const c = constraint as ForeignKeyConstraintSchema;
+			// The schema collapses every deferrability variant to a single `deferred`
+			// boolean (= AST `initiallyDeferred`, see constraint-builder), so the only
+			// form distinguishable here is `deferrable initially deferred`; all
+			// non-deferred forms reconstruct as no clause (re-parses to deferred=false).
+			//
+			// Cross-schema FK limitation: AST.ForeignKeyClause.table is unqualified and
+			// cannot encode `c.referencedSchema`, so a FK referencing a parent in a
+			// different schema loses that qualification on persistence round-trip. This
+			// is a pre-existing fidelity gap (cross-schema FKs are already excluded from
+			// catalog drop-ordering in catalog.ts); same-schema FKs round-trip exactly.
 			return {
 				type: 'foreignKey',
+				name: c.name,
 				columns: c.columns.map(i => ({ name: colName(i) })),
 				foreignKey: {
 					table: c.referencedTable,
 					columns: c.referencedColumnNames ? [...c.referencedColumnNames] : undefined,
 					onDelete: c.onDelete,
 					onUpdate: c.onUpdate,
+					deferrable: c.deferred ? true : undefined,
+					initiallyDeferred: c.deferred ? true : undefined,
 				},
 				onConflict: c.defaultConflict,
+				tags: copyTags(c.tags),
 			};
 		}
 	}
+}
+
+/** Mutable shallow copy of a (readonly) tags record, or undefined when absent. */
+function copyTags(tags: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> | undefined {
+	return tags ? { ...tags } : undefined;
+}
+
+/**
+ * Renders the table-level CHECK / UNIQUE / FOREIGN KEY constraints of a table as
+ * a single comma-joined fragment (or '' when there are none), suitable to append
+ * inside the CREATE TABLE column-def paren list.
+ *
+ * Order is deterministic — CHECK, then UNIQUE, then FOREIGN KEY, each in stored-
+ * array order — so the persisted catalog DDL is byte-stable (which the declarative
+ * differ and any diff-on-disk rely on).
+ *
+ * UNIQUE constraints synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex`)
+ * are skipped: they round-trip via their index, not as a table constraint, so
+ * emitting them here would make the declarative differ churn a spurious
+ * DROP CONSTRAINT. All CHECKs (including the engine's auto `_check_<col>` names)
+ * and every FK are emitted — `_`-prefixed auto-names re-parse stably and stay
+ * excluded from the differ's user-addressable `namedConstraints`.
+ */
+function emitTableConstraints(tableSchema: TableSchema): string {
+	const constraints: AST.TableConstraint[] = [];
+	for (const c of tableSchema.checkConstraints ?? []) {
+		constraints.push(schemaConstraintToTableConstraint('check', c, tableSchema));
+	}
+	for (const c of tableSchema.uniqueConstraints ?? []) {
+		if (c.derivedFromIndex) continue;
+		constraints.push(schemaConstraintToTableConstraint('unique', c, tableSchema));
+	}
+	for (const c of tableSchema.foreignKeys ?? []) {
+		constraints.push(schemaConstraintToTableConstraint('foreignKey', c, tableSchema));
+	}
+	return constraints.length > 0 ? tableConstraintsToString(constraints) : '';
 }
 
 // --- Internals ---
