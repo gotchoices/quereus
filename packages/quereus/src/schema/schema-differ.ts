@@ -303,16 +303,37 @@ export function computeSchemaDiff(
 	});
 	diff.renames.push(...indexRenames.renames);
 
+	// Pre-pass: resolve every name-matched declared table's column renames, keyed by
+	// declared (new) table name (lowercased). This gives the per-table alter loop
+	// cross-table visibility of a *parent* table's column renames, so the FK branch
+	// of `reconciledDeclaredBody` can inverse-rename an FK's referenced PARENT column
+	// (its `foreignKey.table` carries the parent's declared name at diff time — the
+	// same lookup key). A self-referential FK falls out for free: the parent is the
+	// current table, so `map.get(currentTable)` matches `diff.columnsToRename`. Pure
+	// creates (no matched actual) contribute nothing. NOTE: this re-resolves the
+	// current table's renames a second time (once here, once in its own
+	// `computeTableAlterDiff`); see `resolveColumnRenames` for why that's accepted.
+	const columnRenamesByTable = new Map<string, ColumnRenameOp[]>();
+	for (const [name, declaredTable] of declaredTables) {
+		const matchedActual = tableRenames.pairs.get(name);
+		if (!matchedActual) continue;
+		const renames = resolveColumnRenames(declaredTable, matchedActual, policy).renames;
+		if (renames.length > 0) {
+			columnRenamesByTable.set(name, renames.map(r => ({ oldName: r.oldName, newName: r.newName })));
+		}
+	}
+
 	// Tables: creates / alters
 	for (const [name, declaredTable] of declaredTables) {
 		const tableStmt = declaredTable.tableStmt;
 		const matchedActual = tableRenames.pairs.get(name);
 		if (matchedActual) {
 			// Either a rename match or a name-based match — compute alter diff against the matched actual.
-			// Thread the table renames (all `kind: 'table'` from this resolver) and the
-			// schema name so the constraint body comparison can reconcile a renamed
-			// column / FK-parent-table against the actual (pre-rename) catalog body.
-			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName);
+			// Thread the table renames (all `kind: 'table'` from this resolver), the
+			// schema name, and the cross-table column-rename map so the constraint body
+			// comparison can reconcile a renamed local column / FK-parent-table /
+			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable);
 			// If this was a rename, set the alter target to the new name (post-rename)
 			if (matchedActual.name.toLowerCase() !== name) {
 				alterDiff.tableName = tableStmt.table.name;
@@ -789,6 +810,28 @@ function inverseRenameConstraintColumns(
 }
 
 /**
+ * String-list variant of {@link inverseRenameConstraintColumns}: inverse-applies
+ * column renames to a bare `string[]` (an FK's referenced PARENT column list,
+ * which is `string[]` rather than `{ name }[]`), mapping each entry from its NEW
+ * name back to its OLD name (case-insensitive). Used to reconcile an FK whose
+ * *parent* table renamed a referenced column — the parent's column renames are
+ * threaded in from `computeSchemaDiff`'s pre-pass. Mutates the supplied
+ * (already-cloned) array in place; an undefined / elided list is a no-op (so a
+ * `references parent` with no column list never synthesizes one).
+ */
+function inverseRenameStringColumns(
+	columns: string[] | undefined,
+	colRenames: ReadonlyArray<ColumnRenameOp>,
+): void {
+	if (!columns) return;
+	for (let i = 0; i < columns.length; i++) {
+		const lower = columns[i].toLowerCase();
+		const r = colRenames.find(cr => cr.newName.toLowerCase() === lower);
+		if (r) columns[i] = r.oldName;
+	}
+}
+
+/**
  * Renders the declared constraint's canonical body with the in-diff renames
  * inverse-applied — i.e. each renamed identifier rewritten from its NEW name
  * back to the ACTUAL (pre-rename) name the catalog still carries at diff time.
@@ -801,14 +844,14 @@ function inverseRenameConstraintColumns(
  * Reconciles only what each kind needs (surgical clone, never the whole tree):
  *   - CHECK:  inverse column renames on the expression (runtime CHECK rewriter).
  *   - UNIQUE: inverse column renames on the column list.
- *   - FK:     inverse column renames on the LOCAL (child) column list AND inverse
- *             table renames on the referenced parent `foreignKey.table`.
- *
- * KNOWN LIMITATION (out of scope; not a regression): an FK *referenced column*
- * renamed on the *parent* table is not reconciled here — the parent's column
- * renames live in the parent's own per-table diff and aren't visible cross-table
- * in this single-pass architecture, so that case still churns a drop+recreate
- * exactly as before. A two-pass fix is a follow-up.
+ *   - FK:     inverse column renames on the LOCAL (child) column list, inverse
+ *             column renames on the referenced PARENT column list (via the parent
+ *             table's column renames, keyed by the declared parent name in
+ *             `columnRenamesByTable`), AND inverse table renames on the referenced
+ *             parent `foreignKey.table`. A parent-table rename and a parent-column
+ *             rename in the same diff reconcile together: look up the parent's
+ *             column renames by the *new* parent name first, then rewrite the
+ *             table name back to its old form.
  */
 function reconciledDeclaredBody(
 	d: DeclaredNamedConstraint,
@@ -816,6 +859,8 @@ function reconciledDeclaredBody(
 	tableRenames: ReadonlyArray<RenameOp>,
 	tableName: string,
 	schemaName: string,
+	/** Declared (new) table name (lowercased) → that table's column renames; for the FK parent-column reconcile. */
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 ): string {
 	const tc = d.bodyAst;
 	switch (tc.type) {
@@ -844,9 +889,15 @@ function reconciledDeclaredBody(
 			};
 			// Local (child) columns live on THIS table → inverse column rename.
 			inverseRenameConstraintColumns(clone.columns, colRenames);
-			// Parent table reference → inverse table rename (newTable → oldTable).
 			if (clone.foreignKey) {
+				// Referenced PARENT columns → inverse column rename via the parent
+				// table's renames, looked up by the DECLARED (new) parent name —
+				// BEFORE the table inverse-rename below rewrites that name to its old
+				// form. Absent from the map (e.g. a freshly created parent) ⇒ no-op.
 				const parentLower = clone.foreignKey.table.toLowerCase();
+				const parentColRenames = columnRenamesByTable.get(parentLower);
+				if (parentColRenames) inverseRenameStringColumns(clone.foreignKey.columns, parentColRenames);
+				// Parent table reference → inverse table rename (newTable → oldTable).
 				const tr = tableRenames.find(r => r.newName.toLowerCase() === parentLower);
 				if (tr) clone.foreignKey = { ...clone.foreignKey, table: tr.oldName };
 			}
@@ -857,6 +908,43 @@ function reconciledDeclaredBody(
 	}
 }
 
+/**
+ * Resolves a declared table's column renames against its matched actual catalog
+ * table — the map-building + {@link resolveRenames} step shared by both the
+ * `computeSchemaDiff` pre-pass (which keeps only `.renames`, keyed by declared
+ * table name, so the FK branch of {@link reconciledDeclaredBody} can inverse-
+ * rename a parent's referenced column cross-table) and {@link computeTableAlterDiff}
+ * (which uses the full `{ renames, pairs, consumedActuals }` for add/drop/alter).
+ * The current table's renames are therefore resolved twice per diff — once in the
+ * pre-pass and once in its own alter-diff. Accepted: `resolveRenames` over a
+ * table's columns is O(columns) with no I/O, and threading the full result through
+ * the loop for a micro-optimization would widen the blast radius.
+ */
+function resolveColumnRenames(
+	declaredTable: AST.DeclaredTable,
+	actualTable: CatalogTable,
+	policy: RenamePolicy,
+): { renames: RenameOp[]; pairs: Map<string, CatalogTable['columns'][number]>; consumedActuals: Set<string> } {
+	const declaredColumns = new Map<string, AST.ColumnDef>();
+	for (const col of declaredTable.tableStmt.columns) {
+		declaredColumns.set(col.name.toLowerCase(), col);
+	}
+	const actualColumns = new Map<string, CatalogTable['columns'][number]>();
+	for (const col of actualTable.columns) {
+		actualColumns.set(col.name.toLowerCase(), col);
+	}
+	return resolveRenames<AST.ColumnDef, CatalogTable['columns'][number]>({
+		kind: 'constraint', // unused for ColumnRenameOp; kind only flows into RenameOp not surfaced here
+		declared: declaredColumns,
+		actual: actualColumns,
+		getDeclaredName: d => d.name,
+		getActualName: a => a.name,
+		getDeclaredTags: d => d.tags,
+		getActualTags: a => a.tags,
+		policy,
+	});
+}
+
 function computeTableAlterDiff(
 	declaredTable: AST.DeclaredTable,
 	actualTable: CatalogTable,
@@ -865,6 +953,11 @@ function computeTableAlterDiff(
 	tableRenames: ReadonlyArray<RenameOp>,
 	/** Schema name — the default schema for the CHECK column-rename rewriter. */
 	schemaName: string,
+	/**
+	 * Declared (new) table name (lowercased) → that table's column renames, for the
+	 * cross-table FK referenced-parent-column reconcile in {@link reconciledDeclaredBody}.
+	 */
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 ): TableAlterDiff {
 	const diff: TableAlterDiff = {
 		// Default to actual's name; caller may override to declared name when this is a rename target.
@@ -877,25 +970,7 @@ function computeTableAlterDiff(
 
 	// Detect column renames first so subsequent add/drop/alter operate on the
 	// post-rename column set.
-	const declaredColumns = new Map<string, AST.ColumnDef>();
-	for (const col of declaredTable.tableStmt.columns) {
-		declaredColumns.set(col.name.toLowerCase(), col);
-	}
-	const actualColumns = new Map<string, CatalogTable['columns'][number]>();
-	for (const col of actualTable.columns) {
-		actualColumns.set(col.name.toLowerCase(), col);
-	}
-
-	const colRenames = resolveRenames<AST.ColumnDef, CatalogTable['columns'][number]>({
-		kind: 'constraint', // unused for ColumnRenameOp; kind only flows into RenameOp not surfaced here
-		declared: declaredColumns,
-		actual: actualColumns,
-		getDeclaredName: d => d.name,
-		getActualName: a => a.name,
-		getDeclaredTags: d => d.tags,
-		getActualTags: a => a.tags,
-		policy,
-	});
+	const colRenames = resolveColumnRenames(declaredTable, actualTable, policy);
 	for (const r of colRenames.renames) {
 		diff.columnsToRename.push({ oldName: r.oldName, newName: r.newName });
 	}
@@ -908,10 +983,11 @@ function computeTableAlterDiff(
 	}
 
 	// Find columns to drop (skip those consumed by a rename)
+	const declaredColumnNames = new Set(declaredTable.tableStmt.columns.map(c => c.name.toLowerCase()));
 	for (const col of actualTable.columns) {
 		const ln = col.name.toLowerCase();
 		if (colRenames.consumedActuals.has(ln)) continue;
-		if (!declaredColumns.has(ln)) {
+		if (!declaredColumnNames.has(ln)) {
 			diff.columnsToDrop.push(col.name);
 		}
 	}
@@ -992,7 +1068,7 @@ function computeTableAlterDiff(
 		// reconciliation, so the drop+recreate (and its rename-suppression) is kept.
 		if (
 			d.definition !== matchedActual.definition &&
-			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName) !== matchedActual.definition
+			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable) !== matchedActual.definition
 		) {
 			constraintsToDrop.push(matchedActual.name); // drop old
 			constraintsToAdd.push(d.ddl);               // add new (declared name + tags)

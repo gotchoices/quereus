@@ -2107,4 +2107,204 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			await db.close();
 		}
 	});
+
+	it('an FK whose referenced PARENT column is renamed does not drop+recreate the child FK', async function () {
+		// The subject of this ticket: a parent-table column rename must reconcile the
+		// child FK's *referenced parent column* cross-table, so the child FK is not
+		// churned. (Renaming the parent's PK column `pid` additionally emits a benign
+		// `primaryKeyChange` on the parent — an orthogonal, pre-existing PK-column-
+		// rename limitation, NOT the FK churn this ticket targets; it applies cleanly
+		// and is idempotent, so we don't assert it away here.)
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1), (2)');
+			await db.exec('insert into child values (10, 1)');
+
+			// Rename the parent's referenced column pid → key (column previous_name hint).
+			// The child FK now references parent(key); its body is otherwise unchanged.
+			await db.exec(`declare schema main {
+				table parent { key INTEGER PRIMARY KEY with tags ("quereus.previous_name" = 'pid') }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(key) }
+			}`);
+			const diff = diffOf(db);
+
+			// The child FK must NOT churn — the referenced-parent-column rename reconciled.
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop ?? [], 'no spurious FK drop on child').to.deep.equal([]);
+			expect(childAlter?.constraintsToAdd ?? [], 'no spurious FK add on child').to.deep.equal([]);
+
+			// The parent alter carries the column rename.
+			const parentAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'parent');
+			expect(parentAlter?.columnsToRename, 'parent column rename detected').to.deep.equal([{ oldName: 'pid', newName: 'key' }]);
+
+			// DDL carries the parent RENAME COLUMN and NO FK drop/add on the child.
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /RENAME COLUMN .*pid.* TO .*key/i.test(s)), `expected parent RENAME COLUMN, got:\n${ddl.join('\n')}`).to.be.true;
+			expect(ddl.some(s => /DROP CONSTRAINT/i.test(s)), `no DROP CONSTRAINT, got:\n${ddl.join('\n')}`).to.be.false;
+			expect(ddl.some(s => /ADD .*constraint/i.test(s)), `no ADD constraint, got:\n${ddl.join('\n')}`).to.be.false;
+
+			await db.exec('apply schema main');
+
+			// The FK still enforces against the renamed parent column.
+			await db.exec('insert into child values (11, 2)'); // valid reference
+			let rejected = false;
+			try { await db.exec('insert into child values (12, 99)'); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by FK against the renamed parent column').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK whose parent TABLE and referenced PARENT column are renamed together does not churn the child FK', async function () {
+		// Exercises both inverse-rewrites on one clone: look up the parent's column
+		// rename by the NEW parent name, then rewrite the table name back to OLD.
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1), (2)');
+			await db.exec('insert into child values (10, 1)');
+
+			// Rename the parent table parent → p2 AND its column pid → key at once; the
+			// child FK references the doubly-renamed parent under both new names.
+			await db.exec(`declare schema main {
+				table p2 { key INTEGER PRIMARY KEY with tags ("quereus.previous_name" = 'pid') } with tags ("quereus.previous_name" = 'parent')
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references p2(key) }
+			}`);
+			const diff = diffOf(db);
+
+			// The table rename rides the top-level renames bucket.
+			expect(diff.renames, 'table rename detected at top level').to.deep.include({ kind: 'table', oldName: 'parent', newName: 'p2' });
+			// The renamed parent alter carries the column rename.
+			const parentAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'p2');
+			expect(parentAlter?.columnsToRename, 'parent column rename detected').to.deep.equal([{ oldName: 'pid', newName: 'key' }]);
+			// The child FK must NOT churn.
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop ?? [], 'no spurious FK drop on child').to.deep.equal([]);
+			expect(childAlter?.constraintsToAdd ?? [], 'no spurious FK add on child').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The FK still enforces against the doubly-renamed parent.
+			expect(db.schemaManager.getTable('main', 'parent'), 'old parent name gone').to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'p2'), 'renamed parent present').to.not.be.undefined;
+			await db.exec('insert into child values (11, 2)'); // valid reference
+			let rejected = false;
+			try { await db.exec('insert into child values (12, 99)'); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by FK against renamed parent+column').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a self-referential FK whose referenced column is renamed does not churn the FK', async function () {
+		// The parent IS the current table, so the FK referenced-column reconcile uses
+		// the current table's own entry in the cross-table rename map. The referenced
+		// column is a non-PK UNIQUE column (not the PK) on purpose: renaming the PK
+		// column would additionally emit an `ALTER PRIMARY KEY`, and that PK change on
+		// a *self*-referential FK table trips a separate engine issue in deferred FK
+		// enforcement ("multiple candidate connections") — orthogonal to the FK churn
+		// this ticket targets (see the review handoff). Using a UNIQUE referenced
+		// column isolates the reconciliation cleanly.
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table node {
+					id INTEGER PRIMARY KEY,
+					code TEXT,
+					parent_code TEXT null,
+					constraint uq unique (code),
+					constraint fk foreign key (parent_code) references node(code)
+				}
+			}`);
+			await db.exec('apply schema main');
+			await db.exec("insert into node values (1, 'a', null), (2, 'b', 'a')");
+
+			// Rename the referenced (self) column code → ucode; the FK references node(ucode).
+			await db.exec(`declare schema main {
+				table node {
+					id INTEGER PRIMARY KEY,
+					ucode TEXT with tags ("quereus.previous_name" = 'code'),
+					parent_code TEXT null,
+					constraint uq unique (ucode),
+					constraint fk foreign key (parent_code) references node(ucode)
+				}
+			}`);
+			const diff = diffOf(db);
+			const nodeAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'node');
+			expect(nodeAlter?.columnsToRename, 'self column rename detected').to.deep.equal([{ oldName: 'code', newName: 'ucode' }]);
+			// Neither the self-FK nor the UNIQUE over the renamed column churns.
+			expect(nodeAlter?.constraintsToDrop ?? [], 'no spurious self-FK / UNIQUE drop').to.deep.equal([]);
+			expect(nodeAlter?.constraintsToAdd ?? [], 'no spurious self-FK / UNIQUE add').to.deep.equal([]);
+			expect(nodeAlter?.primaryKeyChange, 'no PK change (referenced column is non-PK)').to.be.undefined;
+
+			await db.exec('apply schema main');
+
+			// The self-FK still enforces under the renamed referenced column.
+			await db.exec("insert into node values (3, 'c', 'b')"); // valid self reference
+			let rejected = false;
+			try { await db.exec("insert into node values (4, 'd', 'zzz')"); } catch { rejected = true; }
+			expect(rejected, 'orphan rejected by self-FK against the renamed column').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a genuine FK body edit layered on a parent-column rename still drops+recreates', async function () {
+		// Precedence guard: reconciling the referenced-parent-column rename must NOT
+		// mask a real FK body change (here, adding ON DELETE CASCADE) that coincides
+		// with it.
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into parent values (1), (2)');
+			await db.exec('insert into child values (10, 1)');
+
+			// Rename parent.pid → key AND add ON DELETE CASCADE to the child FK at once.
+			await db.exec(`declare schema main {
+				table parent { key INTEGER PRIMARY KEY with tags ("quereus.previous_name" = 'pid') }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(key) on delete cascade }
+			}`);
+			const diff = diffOf(db);
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop, 'genuine FK body edit drops old fk').to.deep.equal(['fk']);
+			expect(childAlter?.constraintsToAdd?.length, 'genuine FK body edit adds new fk').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// ON DELETE CASCADE now installed: deleting the parent row cascades to the child.
+			await db.exec('delete from parent where key = 1');
+			const survivors: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select count(*) as n from child where pa = 1')) survivors.push(r);
+			expect(survivors[0].n, 'child rows cascaded away with the parent').to.equal(0);
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
 });
