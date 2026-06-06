@@ -1,5 +1,5 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, ColumnSchema } from '@quereus/quereus';
-import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection } from '@quereus/quereus';
+import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 
@@ -620,6 +620,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 *               per-row `new.<col>` evaluator, or NULL); tombstone rows get NULL.
 	 * DROP COLUMN — removes the dropped column from each overlay row.
 	 * RENAME / ALTER COLUMN — data column indices are unchanged; only schema metadata rotates.
+	 *
+	 * **Atomicity guarantee.** DDL through Quereus is not transaction-scoped and the
+	 * underlying (shared, committed) base auto-commits its mutation immediately —
+	 * there is no frame to unwind, and `dropColumn` / type-converting `alterColumn`
+	 * are lossy and not invertible, so "revert the underlying on overlay-migration
+	 * failure" is not viable. Instead this method **pre-validates** every affected
+	 * overlay's backfill (the per-row NOT NULL check and the tombstone-present guard)
+	 * BEFORE calling `underlying.alterTable`. A rejection therefore fires while the
+	 * underlying, the schema catalog, and every overlay are still untouched, so the
+	 * ALTER either fails clean or fully applies — base/catalog can no longer diverge.
+	 * This mirrors the engine's pre-mutation `validateNotNullBackfill` in
+	 * `runtime/emit/alter-table.ts`.
 	 */
 	async alterTable(
 		db: Database,
@@ -650,11 +662,25 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			dropColumnIdx = overlaySchema?.columnIndexMap.get(change.columnName.toLowerCase());
 		}
 
+		// Build the addColumn backfill context up front (undefined for other change types).
+		// Derived purely from `change` + the session nullability option — no post-alter
+		// schema needed — so it is valid here, before the underlying is mutated, and the
+		// same context drives the post-mutation migration.
+		const addColumnCtx = this.deriveAddColumnBackfill(change, db, tableName);
+
+		// Dry-run every affected overlay's migration-fallible work (the tombstone-present
+		// guard and the per-row NOT NULL backfill) BEFORE mutating the shared underlying,
+		// so a rejection leaves underlying + catalog + overlays untouched.
+		for (const [, oldState] of affected) {
+			await this.validateOverlayMigration(oldState, addColumnCtx);
+		}
+
 		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
 
-		// Migrate each affected overlay to the new schema, preserving staged rows.
+		// Migrate each affected overlay to the new schema, preserving staged rows. After
+		// pre-validation the migration's NOT NULL / tombstone throw sites are unreachable.
 		for (const [key, oldState] of affected) {
-			const newState = await this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx);
+			const newState = await this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx);
 			this.connectionOverlays.set(key, newState);
 		}
 
@@ -732,6 +758,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		updatedSchema: TableSchema,
 		change: SchemaChangeInfo,
 		dropColumnIdx: number | undefined,
+		addColumnCtx: AddColumnBackfillContext | undefined,
 	): Promise<ConnectionOverlayState> {
 		const oldOverlay = oldState.overlayTable;
 		const oldOverlaySchema = oldOverlay.tableSchema;
@@ -744,10 +771,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			if (oldTombstoneIdx === undefined) {
 				throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
 			}
-			// Precompute the addColumn backfill context once per ALTER (folded literal default,
-			// the per-row evaluator, and the new column's NOT NULL flag); undefined for other
+			// `addColumnCtx` (folded literal default, the per-row evaluator, and the new
+			// column's NOT NULL flag) was precomputed once per ALTER by the caller and already
+			// dry-run validated against these same staged rows; undefined for non-addColumn
 			// change types, which append nothing to staged rows.
-			const addColumnCtx = this.deriveAddColumnBackfill(change, updatedSchema);
 			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
 				const addColumnValue = addColumnCtx
 					? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
@@ -765,27 +792,74 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * the folded literal DEFAULT (the `tryFoldLiteral` of the DEFAULT expr, or `null`
 	 * when there is no DEFAULT or it folds to NULL), the engine-supplied per-row
 	 * evaluator (present only for a non-foldable `new.<col>` default), and whether
-	 * the new column is NOT NULL. The new column is always the last entry in the
-	 * post-ALTER schema. Returns undefined for every non-`addColumn` change so the
-	 * row loop appends nothing.
+	 * the new column is NOT NULL. Returns undefined for every non-`addColumn` change
+	 * so the row loop appends nothing.
+	 *
+	 * The new column's nullability is resolved exactly as both underlyings resolve it
+	 * (`columnDefToSchema(columnDef, default_column_nullability === 'not_null')`) so the
+	 * pre-validation cannot drift from what the underlying will enforce. Because it is
+	 * derived purely from `change` + the session option — not the post-alter schema,
+	 * which does not exist until `underlying.alterTable` runs — this can be built
+	 * BEFORE the irreversible underlying mutation and reused by the migration after.
 	 */
 	private deriveAddColumnBackfill(
 		change: SchemaChangeInfo,
-		updatedSchema: TableSchema,
+		db: Database,
+		tableName: string,
 	): AddColumnBackfillContext | undefined {
 		if (change.type !== 'addColumn') return undefined;
 		const defaultExpr = change.columnDef.constraints?.find(c => c.type === 'default')?.expr;
 		// tryFoldLiteral returns undefined for a non-foldable expr and null for one that
 		// folds to NULL; collapse both to null (the no-usable-literal default).
 		const foldedDefault: SqlValue = defaultExpr ? (tryFoldLiteral(defaultExpr) ?? null) : null;
-		const newColumn: ColumnSchema = updatedSchema.columns[updatedSchema.columns.length - 1];
+		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
+		const newColumn = columnDefToSchema(change.columnDef, defaultNotNull);
 		return {
 			foldedDefault,
 			evaluator: change.backfillEvaluator,
 			newColNotNull: newColumn.notNull,
 			newColName: newColumn.name,
-			tableName: updatedSchema.name,
+			tableName,
 		};
+	}
+
+	/**
+	 * Dry-runs an overlay's ALTER migration-fallible work without mutating anything,
+	 * so the caller can run it for every affected overlay BEFORE the irreversible
+	 * `underlying.alterTable` (see {@link alterTable}). It exercises the EXACT code
+	 * paths the real migration uses — the tombstone-present guard and, for addColumn,
+	 * `computeAddColumnValue` per staged row — so a dry-run pass and the subsequent
+	 * migrate pass cannot diverge:
+	 *
+	 * - A clean overlay (`!hasChanges`) stages no rows, so there is nothing to validate.
+	 * - A missing tombstone column throws INTERNAL here, before the underlying is touched.
+	 * - For addColumn, each staged row runs through `computeAddColumnValue`: tombstone
+	 *   rows short-circuit to `null` (the evaluator never runs), and a NOT-NULL-violating
+	 *   evaluated row throws CONSTRAINT here, atomically. Computed values are discarded.
+	 *
+	 * Non-addColumn changes (`addColumnCtx === undefined`) only run the tombstone guard;
+	 * their row translation appends/removes nothing fallible on data grounds.
+	 */
+	private async validateOverlayMigration(
+		oldState: ConnectionOverlayState,
+		addColumnCtx: AddColumnBackfillContext | undefined,
+	): Promise<void> {
+		const oldOverlay = oldState.overlayTable;
+		const oldOverlaySchema = oldOverlay.tableSchema;
+		// Mirror the migrate-loop guard exactly: a clean overlay or one without a queryable
+		// schema stages nothing and runs none of the fallible checks.
+		if (!(oldState.hasChanges && oldOverlaySchema && oldOverlay.query)) return;
+
+		const oldTombstoneIdx = oldOverlaySchema.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
+		if (oldTombstoneIdx === undefined) {
+			throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
+		}
+
+		if (!addColumnCtx) return;
+		for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+			// Discard the result — this is validation only. A NOT NULL violation throws here.
+			await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx);
+		}
 	}
 
 	/**

@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTable, VirtualTableConnection } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 
 describe('IsolationModule', () => {
@@ -1147,6 +1147,114 @@ describe('IsolationModule', () => {
 
 			const rows = await asyncIterableToArray(db.eval(`SELECT a, b FROM iso_dtb ORDER BY a`));
 			expect(rows.map((r: any) => [r.a, r.b])).to.deep.equal([[2, 200]]);
+		});
+	});
+
+	describe('ALTER TABLE ADD COLUMN atomic pre-validation', () => {
+		// The isolation layer dry-runs every affected overlay's backfill BEFORE mutating
+		// the shared underlying, so a NOT NULL / tombstone rejection leaves the underlying
+		// base AND the schema catalog untouched (no base/catalog divergence). The
+		// underlying-column-count assertion is the white-box check that the irreversible
+		// `underlying.alterTable` never ran: before the fix it would already have appended
+		// the new column when the overlay migration later threw.
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		/** Pre-alter underlying column count for `main.<table>`. */
+		function underlyingColumnCount(table: string): number {
+			return isolatedModule.getUnderlyingState('main', table)!.underlyingTable.tableSchema!.columns.length;
+		}
+
+		it('rejects atomically when a per-row NOT NULL backfill yields NULL for a staged row', async () => {
+			// `x` is explicitly nullable so the staged row can carry NULL; the committed base
+			// is empty (the INSERT is staged in the overlay), so the underlying's own backfill
+			// would succeed — only the overlay row is un-backfillable. Pre-validation must
+			// reject before the underlying is altered.
+			await db.exec(`CREATE TABLE t_nn (id INTEGER PRIMARY KEY, x INTEGER NULL) USING isolated`);
+			const before = underlyingColumnCount('t_nn'); // id, x
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_nn VALUES (1, NULL)`); // stages an overlay row with x = NULL
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`ALTER TABLE t_nn ADD COLUMN c INTEGER NOT NULL DEFAULT (new.x)`);
+			} catch (e) { err = e as Error; }
+			expect(err, 'ALTER must throw for a NULL-yielding NOT NULL backfill').to.not.be.null;
+			expect(err!.message.toLowerCase()).to.include('not null');
+
+			// White-box: the shared underlying was never mutated (no phantom `c`).
+			expect(underlyingColumnCount('t_nn'), 'underlying must be untouched after atomic rejection').to.equal(before);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('succeeds when a staged tombstone would otherwise trip the NOT NULL backfill', async () => {
+			// A staged DELETE leaves a tombstone row whose data columns are NULL placeholders.
+			// The per-row evaluator must NOT run against it (it would spuriously trip NOT NULL);
+			// a sibling staged insert with a satisfiable value confirms the ALTER still applies.
+			await db.exec(`CREATE TABLE t_ts (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await db.exec(`INSERT INTO t_ts VALUES (1, 'Alice'), (2, 'Bob')`); // committed
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM t_ts WHERE id = 1`);          // stages a tombstone for id=1
+			await db.exec(`INSERT INTO t_ts VALUES (3, 'Carol')`);   // staged insert (new.id = 3, non-null)
+			// new.id is non-null for every live row; the tombstone for id=1 must be skipped.
+			await db.exec(`ALTER TABLE t_ts ADD COLUMN tag INTEGER NOT NULL DEFAULT (new.id)`);
+
+			const inTxn = await asyncIterableToArray(db.eval('SELECT id, tag FROM t_ts ORDER BY id'));
+			expect(inTxn.map((r: any) => [r.id, r.tag])).to.deep.equal([[2, 2], [3, 3]]);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT id, tag FROM t_ts ORDER BY id'));
+			expect(afterCommit.map((r: any) => [r.id, r.tag])).to.deep.equal([[2, 2], [3, 3]]);
+		});
+
+		it('rejects atomically under default_column_nullability=not_null with no explicit NOT NULL', async () => {
+			// The added column carries no explicit `not null`, but the session option resolves
+			// it NOT NULL. Pre-validation must derive nullability via columnDefToSchema + the
+			// option (not from explicit constraints alone) and reject the un-backfillable
+			// staged row, atomically.
+			db.setOption('default_column_nullability', 'not_null');
+			await db.exec(`CREATE TABLE t_opt (id INTEGER PRIMARY KEY, x INTEGER NULL) USING isolated`);
+			const before = underlyingColumnCount('t_opt');
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_opt VALUES (1, NULL)`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`ALTER TABLE t_opt ADD COLUMN c INTEGER DEFAULT (new.x)`); // implicitly NOT NULL
+			} catch (e) { err = e as Error; }
+			expect(err, 'ALTER must throw for an implicitly NOT NULL un-backfillable staged row').to.not.be.null;
+			expect(err!.message.toLowerCase()).to.include('not null');
+			expect(underlyingColumnCount('t_opt'), 'underlying must be untouched after atomic rejection').to.equal(before);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('happy path: satisfiable per-row default backfills staged rows through commit', async () => {
+			// Guards the deriveAddColumnBackfill refactor: a satisfiable per-row default over
+			// staged inserts must still backfill each staged row from its own sibling value
+			// and survive commit (read-your-writes).
+			await db.exec(`CREATE TABLE t_hp (id INTEGER PRIMARY KEY, qty INTEGER) USING isolated`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_hp VALUES (1, 10), (2, 25)`);
+			await db.exec(`ALTER TABLE t_hp ADD COLUMN qty2 INTEGER DEFAULT (new.qty * 2)`);
+
+			const inTxn = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_hp ORDER BY id'));
+			expect(inTxn.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_hp ORDER BY id'));
+			expect(afterCommit.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
 		});
 	});
 
