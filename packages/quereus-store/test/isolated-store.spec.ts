@@ -394,6 +394,45 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('ROLLBACK');
 		});
+
+		it('INSERT then ADD COLUMN with falsy literal DEFAULT 0: staged row reads 0, not NULL', async () => {
+			// Guards the `addColumnValue ?? null` / `tryFoldLiteral(...) ?? null` coalescing:
+			// it must coalesce only null/undefined, never a legitimate falsy 0.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_zero (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_zero VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t_zero ADD COLUMN flag INTEGER DEFAULT 0`);
+
+			const inTxn = await db.get('SELECT flag FROM t_zero WHERE id = 1');
+			expect(inTxn?.flag).to.equal(0);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('UPDATE then ADD COLUMN with per-row new.<col> DEFAULT: evaluator sees the staged (updated) value', async () => {
+			// The per-row test above only stages INSERTs; an overlay UPDATE row holds the
+			// post-update image, so read-your-writes means new.qty must resolve to the
+			// updated value (100), not the committed one (10) → qty2 = 200.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_upd (id INTEGER PRIMARY KEY, qty INTEGER) USING store`);
+			await db.exec(`INSERT INTO t_upd VALUES (1, 10)`); // committed; underlying backfills 20
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t_upd SET qty = 100 WHERE id = 1`); // stages an overlay update
+			await db.exec(`ALTER TABLE t_upd ADD COLUMN qty2 INTEGER DEFAULT (new.qty * 2)`);
+
+			const inTxn = await db.get('SELECT qty, qty2 FROM t_upd WHERE id = 1');
+			expect([inTxn?.qty, inTxn?.qty2]).to.deep.equal([100, 200]);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await db.get('SELECT qty, qty2 FROM t_upd WHERE id = 1');
+			expect([afterCommit?.qty, afterCommit?.qty2]).to.deep.equal([100, 200]);
+		});
 	});
 
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
