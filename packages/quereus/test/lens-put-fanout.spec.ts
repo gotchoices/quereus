@@ -1410,3 +1410,126 @@ describe('lens decomposition put: stitch-key uniqueness guard', () => {
 		}
 	});
 });
+
+/**
+ * Surrogate-keyed OPTIONAL-member UPDATE materialization
+ * (`view-write-decomp-update-test-coverage`, corner #2).
+ *
+ * The optional-member UPDATE/materialize/delete path has only ever been exercised under a
+ * **logical-tuple** key, where the anchor's stitch column and the member's stitch column
+ * are spelled IDENTICALLY. Under a **surrogate** shared key they are spelled DISTINCTLY
+ * (`sid` on the anchor, `meta_sid` on the optional member). `buildOptionalMaterializeInsert`
+ * threads `singleKeyColumn(anchor)` into the materialize INSERT's projection
+ * (`select <anchor>.sid …`) and `singleKeyColumn(member)` as the INSERT target key
+ * (`insert into Doc_meta (meta_sid, …)`). For an optional member of an EXISTING logical row
+ * it reads the existing anchor key — it does NOT re-evaluate the surrogate default (that
+ * fires only for a brand-new logical row at INSERT). These tests pin that the existing
+ * anchor surrogate threads correctly into the distinctly-spelled member key.
+ */
+describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () => {
+	function surrogateOptionalAd(): MappingAdvertisement {
+		return {
+			id: 'Doc_core',
+			logicalTable: 'Doc',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'Doc_core',
+				members: [
+					{ relationId: 'Doc_core', relation: { schema: 'main', table: 'Doc_core' }, presence: 'mandatory', columns: [colMap('docKey', 'doc_key'), colMap('title', 'title')] },
+					{ relationId: 'Doc_body', relation: { schema: 'main', table: 'Doc_body' }, presence: 'mandatory', columns: [colMap('body', 'body')] },
+					{ relationId: 'Doc_meta', relation: { schema: 'main', table: 'Doc_meta' }, presence: 'optional', columns: [colMap('note', 'note')] },
+				],
+				sharedKey: {
+					kind: 'surrogate',
+					keyColumnsByRelation: keyMap(['Doc_core', ['sid']], ['Doc_body', ['doc_sid']], ['Doc_meta', ['meta_sid']]),
+				},
+			},
+		};
+	}
+
+	// Seed: k1 (sid 100) carries the optional Doc_meta component; k2 (sid 101) does not.
+	// The anchor `sid` declares the high-water-mark allocator default (the surrogate's value
+	// source for a brand-new logical INSERT), but the UPDATE-materialize path here must reuse
+	// the EXISTING anchor surrogate — which the meta_sid assertions pin.
+	async function setupSurrogateOptional(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [surrogateOptionalAd()];
+		db.registerModule('docmetamod', mod);
+		// `doc_key` carries a basis UNIQUE: the logical PK `docKey` is the user-facing
+		// natural key (the surrogate `sid` is the internal stitch). That basis covering
+		// structure keeps the logical-PK uniqueness obligation OFF the commit-time
+		// set-level seam — which would otherwise synthesize a `NEW.doc_key`-referencing
+		// CHECK and thread it onto the Doc_meta member UPDATE (a member lacking doc_key),
+		// failing to build. (See the review handoff: a surrogate decomposition whose
+		// logical PK has NO basis uniqueness still trips that thread on a member UPDATE.)
+		await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text unique, title text) using docmetamod');
+		await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docmetamod');
+		await db.exec('create table Doc_meta (meta_sid integer primary key, note text) using docmetamod');
+		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text } }');
+		await db.exec('apply schema x');
+		await db.exec("insert into main.Doc_core (sid, doc_key, title) values (100, 'k1', 'First'), (101, 'k2', 'Second')");
+		await db.exec("insert into main.Doc_body values (100, 'b1'), (101, 'b2')");
+		await db.exec("insert into main.Doc_meta values (100, 'm1')");   // only k1 has the optional component
+	}
+
+	it('matched UPDATE writes the existing optional component through the surrogate stitch', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateOptional(db);
+			// k1 (sid 100) has a Doc_meta row → matched base UPDATE; no new row materializes.
+			await db.exec("update x.Doc set note = 'm1b' where docKey = 'k1'");
+			expect(await rows(db, 'select meta_sid, note from main.Doc_meta order by meta_sid')).to.deep.equal([{ meta_sid: 100, note: 'm1b' }]);
+			expect(await rows(db, "select note from x.Doc where docKey = 'k1'")).to.deep.equal([{ note: 'm1b' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('absent → materialize INSERT threads the existing anchor surrogate into the distinctly-spelled member key', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateOptional(db);
+			// k2 (sid 101) lacks a Doc_meta row. The materialize INSERT reads the EXISTING
+			// anchor key (`select Doc_core.sid …` = 101) — NOT a freshly minted surrogate — and
+			// threads it into the distinctly-spelled member key `meta_sid`.
+			await db.exec("update x.Doc set note = 'm2' where docKey = 'k2'");
+			// The headline thread-through: meta_sid = 101 (the existing anchor sid for k2).
+			expect(await rows(db, "select meta_sid, note from main.Doc_meta where note = 'm2'")).to.deep.equal([{ meta_sid: 101, note: 'm2' }]);
+			// k1's component is untouched; the view surfaces the new note for k2.
+			expect(await rows(db, 'select meta_sid, note from main.Doc_meta order by meta_sid')).to.deep.equal([
+				{ meta_sid: 100, note: 'm1' }, { meta_sid: 101, note: 'm2' },
+			]);
+			expect(await rows(db, "select note from x.Doc where docKey = 'k2'")).to.deep.equal([{ note: 'm2' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it("all-null UPDATE deletes the optional component (note is the member's only value column)", async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateOptional(db);
+			// `note` is Doc_meta's only value column → setting it null empties (deletes) the row.
+			await db.exec("update x.Doc set note = null where docKey = 'k1'");
+			expect(await rows(db, 'select meta_sid from main.Doc_meta order by meta_sid')).to.deep.equal([]);
+			expect(await rows(db, "select note from x.Doc where docKey = 'k1'")).to.deep.equal([{ note: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a null write to an already-absent optional component is a no-op (no materialize INSERT)', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateOptional(db);
+			// k2 already lacks a Doc_meta component. An all-null write emits no materialize
+			// INSERT (the fan-out adds one only when some assigned value is non-null), so the
+			// absent component stays absent and k1's present component is left untouched.
+			await db.exec("update x.Doc set note = null where docKey = 'k2'");
+			expect(await rows(db, 'select meta_sid, note from main.Doc_meta order by meta_sid')).to.deep.equal([{ meta_sid: 100, note: 'm1' }]);
+			expect(await rows(db, 'select count(*) as n from main.Doc_meta where meta_sid = 101')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});

@@ -5411,6 +5411,143 @@ describe('Property-Based Tests', () => {
 				expect(checked, 'columnar GetPut never found a row to write back').to.be.greaterThan(0);
 			});
 
+			// ----- GetPut over the optional value column c: VIEW-IMAGE idempotence -----
+			// The GetPut above writes back only the mandatory writable columns a, b — it never
+			// re-puts c, so the optional member's materialize / delete branches escape an
+			// idempotence check. Re-putting EVERY read column (a, b, AND c) must be
+			// observationally idempotent ON THE VIEW IMAGE. The oracle is deliberately VIEW-IMAGE
+			// equality, NOT a per-member base-multiset GetPut: the lingering-all-null collapse
+			// (see the deterministic test below) reads identically to absence yet rewrites the
+			// base, so a base-diff oracle would (correctly) flag it — view-image idempotence is
+			// the sound floor here. Do NOT "tighten" this into a base diff.
+			it('GetPut (columnar, over c): re-putting every read column is view-image idempotent', async () => {
+				await deployColumnar();
+				let presentReput = 0;   // a visible row carried a non-null c → matched UPDATE + ceded materialize INSERT
+				let absentReput = 0;    // a visible row had c absent → write-back of null is the all-null no-op
+				await fc.assert(fc.asyncProperty(
+					fc.array(colRowArb, { minLength: 1, maxLength: 8 }),
+					async (seed) => {
+						await db.exec('delete from main.T_core');
+						await db.exec('delete from main.T_b');
+						await db.exec('delete from main.T_c');
+						const seen = new Set<number>();
+						for (const r of seed) {
+							if (seen.has(r.id)) continue; seen.add(r.id);
+							await db.exec(`insert into main.T_core values (${r.id}, ${r.a})`);
+							await db.exec(`insert into main.T_b values (${r.id}, ${r.b})`);
+							if (r.c !== null) await db.exec(`insert into main.T_c values (${r.id}, ${r.c})`);
+						}
+						const before = await readRows('select id, a, b, c from x.T');
+						fc.pre(before.length > 0);
+						for (const row of before) {
+							if (row.c !== null) presentReput++; else absentReput++;
+							const cExpr = row.c === null ? 'null' : String(row.c);
+							// Write EVERY read column back, crucially including c. A present c is a
+							// same-value matched UPDATE (the materialize INSERT cedes via on-conflict);
+							// an absent row reads c=null, whose write-back is the all-null no-op.
+							await db.exec(`update x.T set a = ${String(row.a)}, b = ${String(row.b)}, c = ${cExpr} where id = ${String(row.id)}`);
+						}
+						// View-image idempotence: the image is identical after writing read values back.
+						assertRowsEqual('GetPut-over-c view image', await readRows('select id, a, b, c from x.T'), before, ['id', 'a', 'b', 'c']);
+					},
+				), { numRuns: 40 });
+				expect(presentReput, 'GetPut-over-c never re-put a non-null c (materialize arm unexercised)').to.be.greaterThan(0);
+				expect(absentReput, 'GetPut-over-c never re-put a null c on an absent component (no-op arm unexercised)').to.be.greaterThan(0);
+			});
+
+			// ----- GetPut (deterministic): materialize / delete re-put is view-image idempotent -----
+			// Pins the single-value-column optional branches a property run is unlikely to land
+			// deterministically: materialize (absent → INSERT) then re-put, and delete (all-null)
+			// then re-put. Both transitions are observationally idempotent on the view image.
+			it('GetPut (deterministic, single-value c): materialize then delete re-puts are view-image idempotent', async () => {
+				await deployColumnar();
+				await db.exec('insert into main.T_core values (1, 10), (2, 20)');
+				await db.exec('insert into main.T_b values (1, 100), (2, 200)');
+				await db.exec('insert into main.T_c values (1, 1000)');   // id 1 present, id 2 absent
+
+				// materialize: id 2 reads c=null; writing a non-null c materializes the component.
+				await db.exec('update x.T set c = 7 where id = 2');
+				expect(await readRows('select c from x.T where id = 2')).to.deep.equal([{ c: 7 }]);
+				const afterMaterialize = await readRows('select id, a, b, c from x.T');
+				// GetPut: re-put the read value (same value) → matched UPDATE + ceded materialize
+				// INSERT (on conflict do nothing); the view image is unchanged.
+				await db.exec('update x.T set c = 7 where id = 2');
+				assertRowsEqual('re-put after materialize', await readRows('select id, a, b, c from x.T'), afterMaterialize, ['id', 'a', 'b', 'c']);
+
+				// delete: c is T_c's only value column → setting it null removes the component row.
+				await db.exec('update x.T set c = null where id = 1');
+				expect(await readRows('select count(*) as n from main.T_c where id = 1')).to.deep.equal([{ n: 0 }]);
+				expect(await readRows('select c from x.T where id = 1')).to.deep.equal([{ c: null }]);
+				const afterDelete = await readRows('select id, a, b, c from x.T');
+				// GetPut: re-put the read null → all-null no-op on the now-absent component; image unchanged.
+				await db.exec('update x.T set c = null where id = 1');
+				assertRowsEqual('re-put after delete', await readRows('select id, a, b, c from x.T'), afterDelete, ['id', 'a', 'b', 'c']);
+			});
+
+			// Optional member with TWO value columns, for the lingering-all-null collapse the
+			// single-value split above cannot express. anchor T2_core(id,a) + optional
+			// T2_opt(id,c1,c2), logical-tuple key `id` (a declared PK on T2_opt, so it deploys
+			// under the stitch-key uniqueness guard).
+			async function deployMultiValueOptional(): Promise<void> {
+				await db.exec(`create table T2_core (id integer primary key, a integer null) using memory with tags (
+					"quereus.lens.decomp.logical.dT2" = 'T2',
+					"quereus.lens.decomp.role.dT2" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dT2" = 'T2_core',
+					"quereus.lens.decomp.presence.dT2" = 'mandatory',
+					"quereus.lens.decomp.keykind.dT2" = 'logical-tuple',
+					"quereus.lens.decomp.key.dT2" = 'id',
+					"quereus.lens.decomp.col.dT2.id" = 'id',
+					"quereus.lens.decomp.col.dT2.a" = 'a'
+				)`);
+				await db.exec(`create table T2_opt (id integer primary key, c1 integer null, c2 integer null) using memory with tags (
+					"quereus.lens.decomp.logical.dT2" = 'T2',
+					"quereus.lens.decomp.role.dT2" = 'primary-storage',
+					"quereus.lens.decomp.anchor.dT2" = 'T2_core',
+					"quereus.lens.decomp.presence.dT2" = 'optional',
+					"quereus.lens.decomp.keykind.dT2" = 'logical-tuple',
+					"quereus.lens.decomp.key.dT2" = 'id',
+					"quereus.lens.decomp.col.dT2.c1" = 'c1',
+					"quereus.lens.decomp.col.dT2.c2" = 'c2'
+				)`);
+				await db.exec('declare logical schema x { table T2 { id integer primary key, a integer null, c1 integer null, c2 integer null } }');
+				await db.exec('apply schema x');
+			}
+
+			// ----- GetPut (deterministic): the lingering-all-null representational collapse -----
+			// A multi-value optional member left present-but-all-null (via PARTIAL null updates)
+			// reads identically to absence. Writing those read-back nulls back assigns EVERY value
+			// column null → the all-null DELETE fires, collapsing present-all-null to absent. The
+			// view image is identical across the collapse — the precise divergence a per-member
+			// base-multiset GetPut would (correctly) flag, and why the GetPut oracle above is
+			// view-image, not base-diff.
+			it('GetPut (deterministic, lingering-all-null): present-all-null collapses to absence, view image unchanged', async () => {
+				await deployMultiValueOptional();
+				await db.exec('insert into main.T2_core values (1, 10)');
+				await db.exec('insert into main.T2_opt values (1, 5, 6)');   // present, both value columns non-null
+
+				// Drive to the LINGERING-ALL-NULL state via two PARTIAL null writes — each assigns
+				// only ONE value column, so neither is an all-value-columns-null delete and the row
+				// survives present-but-all-null (the partial-null-does-not-delete law).
+				await db.exec('update x.T2 set c2 = null where id = 1');   // c1=5, c2=null (present)
+				await db.exec('update x.T2 set c1 = null where id = 1');   // c1=null, c2=null (present, lingering all-null)
+				expect(await readRows('select id, c1, c2 from main.T2_opt')).to.deep.equal([{ id: 1, c1: null, c2: null }]);
+
+				// The view reads the lingering all-null row identically to absence.
+				const beforeView = await readRows('select id, a, c1, c2 from x.T2');
+				expect(beforeView).to.deep.equal([{ id: 1, a: 10, c1: null, c2: null }]);
+
+				// GetPut: write the read nulls back. Now BOTH value columns are assigned null → the
+				// all-value-columns-null DELETE fires, collapsing present-all-null to absent.
+				await db.exec('update x.T2 set c1 = null, c2 = null where id = 1');
+
+				// VIEW-IMAGE idempotence: identical image even though the base representation changed
+				// (present-all-null → absent). A per-member base-multiset GetPut would (correctly)
+				// report a diff here — view-image equality is the sound oracle.
+				assertRowsEqual('lingering-all-null view image', await readRows('select id, a, c1, c2 from x.T2'), beforeView, ['id', 'a', 'c1', 'c2']);
+				// Document the intended representational collapse: the base component row is gone.
+				expect(await readRows('select count(*) as n from main.T2_opt where id = 1')).to.deep.equal([{ n: 0 }]);
+			});
+
 			// ----- PutGet (EAV pivot): insert/delete fan out to the triple store -----
 			it('PutGet (EAV pivot): insert/delete fan out to the triple store, presence-gated per attribute', async () => {
 				await deployEav();
