@@ -154,4 +154,34 @@ describe('materialized view refresh — backing-schema rebuild', () => {
 			await db.close();
 		}
 	});
+
+	it('a producer reshape cascades staleness to a consumer MV, which a refresh then realigns', async () => {
+		// MV-over-MV: the rebuild drops+recreates `_mv_p`, firing table_removed/table_added.
+		// The manager's source-tracking listener (a consumer's sourceTables include the
+		// producer's backing `_mv_p`) marks the consumer stale and detaches its row-time
+		// plan. Refreshing the consumer re-derives its shape over the now-3-col producer and
+		// picks up the new column — the producer→consumer cascade this ticket relies on.
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, a integer not null)');
+			await db.exec('insert into t values (1,10)');
+			await db.exec('create materialized view p as select * from t');
+			await db.exec('create materialized view c as select * from p');
+
+			expect(await readObjectsSorted(db, 'select * from c')).to.deep.equal(['{"id":1,"a":10}']);
+
+			await db.exec('alter table t add column b integer default 5');
+			await db.exec('refresh materialized view p'); // reshapes _mv_p
+
+			// The producer's backing drop/recreate cascaded staleness to the consumer.
+			expect(db.schemaManager.getMaterializedView('main', 'c')!.stale, 'consumer marked stale by cascade').to.equal(true);
+
+			// Refreshing the consumer realigns it to the reshaped producer (gains `b`).
+			await db.exec('refresh materialized view c');
+			expect(db.schemaManager.getMaterializedView('main', 'c')!.stale).to.not.equal(true);
+			expect(await readObjectsSorted(db, 'select * from c')).to.deep.equal(['{"id":1,"a":10,"b":5}']);
+		} finally {
+			await db.close();
+		}
+	});
 });
