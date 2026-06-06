@@ -199,6 +199,10 @@ export function buildConstraintChecks(
  * final row value of *any* column, whereas the row-expansion path exposes only
  * the columns the INSERT actually supplied (omitted siblings are unresolved
  * there to avoid a default-evaluation-order race).
+ *
+ * Error attribution for a NOT NULL violation is NOT decided here: it happens at
+ * check time in `checkNotNullConstraints` by column index (the first NOT-NULL
+ * column with a NULL effective value), so don't look for it in this builder.
  */
 export function buildNotNullDefaults(
   ctx: PlanningContext,

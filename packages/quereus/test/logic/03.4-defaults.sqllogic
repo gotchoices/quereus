@@ -65,6 +65,79 @@ INSERT INTO t_newref (id, base) VALUES (3, 7);
 DROP TABLE t_newref;
 
 -- ===================================
+-- new.<column> NOT NULL default — error attribution
+-- A NOT NULL violation is always reported against the FIRST NOT-NULL column (in
+-- declaration order) whose effective NEW value is NULL — independent of which
+-- column any DEFAULT references. These cases run through the materialised-row
+-- (buildNotNullDefaults) path via OR REPLACE / explicit values, NOT the
+-- row-expansion `isn't a column` path above. They lock in that attribution
+-- across the nullable / not-null sibling matrix so the historical
+-- "misattribution" concern is not re-filed.
+-- ===================================
+
+-- A BARE sibling is itself NOT NULL (default_column_nullability='not_null', the
+-- engine default — see 43-default-nullability.sqllogic). Omitting `a` makes IT
+-- the first NOT-NULL violator, so the message names the sibling `a`, NOT the
+-- defaulted column `b`. This is CORRECT: `a` violates its OWN NOT NULL and is
+-- checked before `b`. (REPLACE form: `a` has no DEFAULT to substitute.)
+create table c1 (id integer primary key, a integer, b integer not null default (new.a));
+insert or replace into c1 (id, b) values (1, null);
+-- error: NOT NULL constraint failed: c1.a
+
+-- Plain INSERT/ABORT throws via a different site (throwForAction) but names the
+-- same column.
+insert into c1 (id, b) values (1, null);
+-- error: NOT NULL constraint failed: c1.a
+
+DROP TABLE c1;
+
+-- When the sibling is EXPLICITLY nullable, NULL-ing it no longer makes it a
+-- violator, so the defaulted NOT NULL column `b` is named instead.
+create table c2 (id integer primary key, a integer null, b integer not null default (new.a));
+
+-- OR REPLACE substitutes b's DEFAULT (new.a); the sibling is NULL (omitted), so
+-- the substituted value is still NULL → names the defaulted column b.
+insert or replace into c2 (id, b) values (1, null);
+-- error: NOT NULL constraint failed: c2.b
+
+-- Plain INSERT with explicit NULL for b: no substitution, b stays NULL → names b.
+insert into c2 (id, b) values (2, null);
+-- error: NOT NULL constraint failed: c2.b
+
+-- Sibling supplied non-NULL → OR REPLACE substitutes new.a successfully, so b
+-- takes the substituted sibling value (assert the STORED value, not just success).
+insert or replace into c2 (id, a, b) values (3, 7, null);
+select a, b from c2 where id = 3;
+→ [{"a":7,"b":7}]
+
+-- Both sibling and defaulted column explicitly NULL → the default resolves to
+-- NULL → names the defaulted column b.
+insert or replace into c2 (id, a, b) values (4, null, null);
+-- error: NOT NULL constraint failed: c2.b
+
+-- IGNORE: the defaulted column is NULL with no usable default → the row is
+-- silently skipped (IGNORE is handled before DEFAULT substitution), no error and
+-- no row inserted.
+insert or ignore into c2 (id, b) values (5, null);
+select id from c2 where id = 5;
+→ []
+
+DROP TABLE c2;
+
+-- Column ordering — first violator wins. The NOT NULL DEFAULTED column `b` is
+-- declared BEFORE its referenced sibling `a` (a is bare ⇒ also NOT NULL). With
+-- both explicitly NULL, BOTH violate, but the message names `b` because it is
+-- first in declaration order (matches SQLite's first-violation reporting).
+-- Contrast c1, where the sibling came first and was named. Explicit NULLs keep
+-- this on the materialised-row path; omitting both would instead raise the
+-- row-expansion `isn't a column` resolution error.
+create table c_ord (id integer primary key, b integer not null default (new.a), a integer);
+insert or replace into c_ord (id, a, b) values (1, null, null);
+-- error: NOT NULL constraint failed: c_ord.b
+
+DROP TABLE c_ord;
+
+-- ===================================
 -- new.<column> through a single-source VIEW insert
 -- A view INSERT re-plans through the same row-expansion path, so the default
 -- still derives from the supplied sibling.

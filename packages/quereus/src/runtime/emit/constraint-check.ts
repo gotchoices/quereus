@@ -255,6 +255,12 @@ async function checkNotNullConstraints(
 	const numCols = tableSchema.columns.length;
 	let mutableRow: Row | undefined;
 
+	// NOT NULL attribution: report the FIRST NOT-NULL column (in declaration
+	// order) whose effective NEW value is NULL, naming that column itself —
+	// independent of which column any DEFAULT references. A NULL sibling named by
+	// another column's `new.<col>` DEFAULT violates its OWN NOT NULL and is
+	// reported on its own merits, never threaded into the defaulted column's
+	// message. (See test/logic/03.4-defaults.sqllogic, the NOT NULL default section.)
 	for (let i = 0; i < numCols; i++) {
 		const column = tableSchema.columns[i];
 		if (!column.notNull) continue;
