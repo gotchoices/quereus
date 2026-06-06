@@ -20,7 +20,7 @@ import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-no
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { readDefaultFor } from "../../planner/mutation/mutation-tags.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
-import { isSetOpMembershipBody } from "../../planner/mutation/set-op.js";
+import { isSetOpMembershipBody, isSetOpBranchWritable } from "../../planner/mutation/set-op.js";
 import type { ViewSchema } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -726,6 +726,13 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// tables. A plain (flag-less) set-op body is NOT this case — it falls through to the
 	// `targetIds.size === 0` conservative row below (no membership column to address a branch).
 	if (isSetOpMembershipBody(view.selectAst)) {
+		// Branch-writability shape gate (mirrors the non-decomposable join shape gate below):
+		// a membership body whose operands are not themselves branch-writable (a non-SELECT
+		// right operand, a `select *` leg, a computed leg, or legs with mismatched column
+		// counts) is REJECTED by the dynamic write (`analyzeSetOpView`). Without this gate the
+		// surface would over-claim writable from the membership flag's presence alone; report
+		// the conservative all-`NO` row to agree with the dynamic `propagate()` reject.
+		if (!isSetOpBranchWritable(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
 		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
 		return { isInsertableInto: true, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
@@ -1037,7 +1044,15 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		// column fans out to its member branches (`set-op-membership-write`). So each reports
 		// `is_updatable = 'YES'` with `base_table` / `base_column` = null (no single base
 		// column), the same writable-through-effect shape a join-side existence flag reports.
-		if (isSetOpMembershipBody(view.selectAst)) {
+		//
+		// Gated on the branch-writability shape probe (parity with `deriveViewInfo`): a body
+		// the dynamic write rejects for a non-writable operand (non-SELECT right, `select *`
+		// leg, computed leg, mismatched leg arity) falls THROUGH to the per-column walk below
+		// instead of the all-`YES` short-circuit. That walk reports every column non-updatable
+		// with null base — a `SetOperationNode` root threads `updateLineage` ONLY for its
+		// membership flags (a read-only `set-op-branch` existence site) and NONE for its data
+		// columns, so `baseSiteOf` resolves no base for either, matching the dynamic reject.
+		if (isSetOpMembershipBody(view.selectAst) && isSetOpBranchWritable(view.selectAst)) {
 			return root.getAttributes().map((attr, i): ColumnInfoRow => ({
 				schema: schemaName,
 				objectName: view.name,

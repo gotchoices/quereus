@@ -405,6 +405,19 @@ referenced column is not yet remapped); literal values are unaffected. A branch 
 be a plain (optionally renamed) base-column projection — a `select *` or computed leg
 column in a writable branch is rejected.
 
+**Static surfaces gate on branch writability.** `view_info` / `column_info` for a
+membership body now mirror the **non-decomposable join shape gate**: they confirm the
+membership shape *and* that both operands are themselves branch-writable before reporting
+writable, via an AST-only probe (`isSetOpBranchWritable`) that is the static shadow of the
+four dynamic branch rejections above — a non-SELECT right operand, a `select *` leg, a
+computed leg, or legs whose plain-column counts disagree. A body that fails the probe
+reports the conservative shape (`view_info` all-`NO`, every `column_info` row
+`is_updatable = 'NO'` with null base), agreeing with the dynamic write's reject instead of
+over-claiming writable from the membership flag's presence alone. The probe is
+**non-recursive** (one level): a nested-compound operand whose first leg is plain still
+passes both the probe and the dynamic shape check — the nested reject is deferred to
+write-time `propagate` (`set-op-membership-nested`).
+
 > **Implemented surface vs. the design below.** Binary set-op write-through is realized
 > through the **membership columns** above (`set-op-membership-write`): the explicit
 > per-row branch control surface. The predicate-honest fan-out + `quereus.update.*`

@@ -2393,6 +2393,104 @@ describe('Property-Based Tests', () => {
 			expect(info.is_deletable).to.equal('YES');
 		});
 
+		// Branch-writability shape gate (`set-op-membership-static-surface-branch-writability`):
+		// the static surfaces gate the membership-writable claim on the SAME branch shape the
+		// dynamic write (`analyzeSetOpView`) enforces, instead of reporting writable from the
+		// membership flag's presence alone. A non-writable operand (computed leg, `select *`
+		// leg, non-SELECT right operand, mismatched leg arity) now reports the conservative
+		// non-writable shape — agreeing with the dynamic reject rather than over-claiming.
+
+		it('column_info: a computed-leg set-op view reports the non-writable shape (static agrees with dynamic reject)', async () => {
+			await seed();
+			// The right leg `x + 1` is a computed projection — non-writable (the dynamic write
+			// rejects it via `branchColumnNames`). The static surface must agree: no over-claim.
+			await db.exec('create view Uc as select id, x from A union exists left as inA, exists right as inB select id, x + 1 from B');
+			const rows = await readRows("select column_name, is_updatable, base_table, base_column from column_info('Uc')");
+			expect(rows.length, 'Uc exposes its columns').to.be.greaterThan(0);
+			for (const r of rows) {
+				expect(r.is_updatable, `${r.column_name} is_updatable`).to.equal('NO');
+				expect(r.base_table, `${r.column_name} base_table`).to.equal(null);
+				expect(r.base_column, `${r.column_name} base_column`).to.equal(null);
+			}
+			// Cross-check: the dynamic write still rejects — the static 'NO' is honest.
+			let threw = false;
+			try { await db.exec('update Uc set x = 5 where id = 1'); } catch { threw = true; }
+			expect(threw, 'a computed-leg data write rejects dynamically').to.equal(true);
+		});
+
+		it('view_info: a computed-leg set-op view reports all-NO', async () => {
+			await seed();
+			await db.exec('create view Uc as select id, x from A union exists left as inA, exists right as inB select id, x + 1 from B');
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Uc')"))[0];
+			expect(info.is_insertable_into).to.equal('NO');
+			expect(info.is_updatable).to.equal('NO');
+			expect(info.is_deletable).to.equal('NO');
+		});
+
+		it('both legs probed: a computed LEFT leg is equally non-writable', async () => {
+			await seed();
+			// Symmetric to the computed-right-leg case — the probe checks BOTH operands, not
+			// only the right (a left-leg-only check would over-claim this view writable).
+			await db.exec('create view Ucl as select id, x + 1 from A union exists left as inA, exists right as inB select id, x from B');
+			expect((await readRows("select is_updatable from view_info('Ucl')"))[0].is_updatable).to.equal('NO');
+			for (const c of await readRows("select column_name, is_updatable from column_info('Ucl')")) {
+				expect(c.is_updatable, `${c.column_name} is_updatable`).to.equal('NO');
+			}
+		});
+
+		it('column_info / view_info: a select-* leg set-op view reports the non-writable shape', async () => {
+			await seed();
+			// A `*` leg has no static name list to align positionally — non-writable. Authored
+			// in the supported non-parenthesized compound form (a parenthesized left leg is
+			// rejected by the grammar; see the createSchemas comment above).
+			await db.exec('create view Us as select id, x from A union exists left as inA, exists right as inB select * from B');
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Us')"))[0];
+			expect(info.is_insertable_into).to.equal('NO');
+			expect(info.is_updatable).to.equal('NO');
+			expect(info.is_deletable).to.equal('NO');
+			const cols = await readRows("select column_name, is_updatable, base_table, base_column from column_info('Us')");
+			expect(cols.length, 'Us exposes its columns').to.be.greaterThan(0);
+			for (const c of cols) {
+				expect(c.is_updatable, `${c.column_name} is_updatable`).to.equal('NO');
+				expect(c.base_table, `${c.column_name} base_table`).to.equal(null);
+				expect(c.base_column, `${c.column_name} base_column`).to.equal(null);
+			}
+			// Cross-check the shared predicate's throwing path (`branchColumnNames` re-derives
+			// the `select *` reason): the dynamic write still rejects, so the static 'NO' is honest.
+			let threw = false;
+			try { await db.exec('update Us set x = 5 where id = 1'); } catch { threw = true; }
+			expect(threw, 'a select-* leg data write rejects dynamically').to.equal(true);
+		});
+
+		it('view_info: a non-SELECT (VALUES) right operand reports the non-writable shape', async () => {
+			await seed();
+			// A VALUES right operand parses as a membership body but is not a recursively-
+			// writable SELECT body — `isSetOpBranchWritable` rejects it (right.type !== 'select'),
+			// mirroring the dynamic `rightBranchSelect` reject.
+			await db.exec('create view Uv as select id, x from A union exists left as inA, exists right as inB values (1, 2)');
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Uv')"))[0];
+			expect(info.is_insertable_into).to.equal('NO');
+			expect(info.is_updatable).to.equal('NO');
+			expect(info.is_deletable).to.equal('NO');
+			for (const c of await readRows("select column_name, is_updatable from column_info('Uv')")) {
+				expect(c.is_updatable, `${c.column_name} is_updatable`).to.equal('NO');
+			}
+		});
+
+		it('regression: renamed plain-column legs stay writable (the probe keys off the alias path)', async () => {
+			await seed();
+			// `select id as k, x` is still a plain-column leg (renamed) — writable. Guards a
+			// future tightening of "plain column" from silently dropping renamed legs to 'NO'.
+			await db.exec('create view Ur as select id as k, x from A union exists left as inA, exists right as inB select id as k, x from B');
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Ur')"))[0];
+			expect(info.is_insertable_into).to.equal('YES');
+			expect(info.is_updatable).to.equal('YES');
+			expect(info.is_deletable).to.equal('YES');
+			for (const c of await readRows("select column_name, is_updatable from column_info('Ur')")) {
+				expect(c.is_updatable, `${c.column_name} is_updatable`).to.equal('YES');
+			}
+		});
+
 		it('grammar: the membership clause is captured in the AST and rejects on DIFF', () => {
 			const parser = new Parser();
 			const ast = parser.parse('select id, x from A union exists left as inA, exists right as inB select id, x from B') as unknown as AST.SelectStmt;

@@ -87,6 +87,35 @@ export function isSetOpMembershipBody(selectAst: AST.QueryExpr): boolean {
 		&& selectAst.compound.existence.length > 0;
 }
 
+/**
+ * True iff both operands of a set-op membership body are recursively writable *at the
+ * branch-shape level* — the static (no-plan) shadow of the four branch rejections in
+ * {@link analyzeSetOpView}: a non-SELECT right operand, a `select *` leg, a computed
+ * (non-plain-column) leg, or legs whose plain-column counts disagree. Lets the
+ * `column_info` / `view_info` static surfaces gate the membership-writable claim on the
+ * SAME shape the dynamic write enforces, instead of reporting writable from the membership
+ * flag's presence alone. Non-recursive (one level): a nested-compound operand whose first
+ * leg is plain still passes here, matching that `analyzeSetOpView` also defers the nested
+ * reject to write-time `propagate` (`set-op-membership-nested`).
+ */
+export function isSetOpBranchWritable(selectAst: AST.QueryExpr): boolean {
+	if (selectAst.type !== 'select' || !selectAst.compound) return false;
+	const right = selectAst.compound.select;
+	// The dynamic `rightBranchSelect` reject: a non-SELECT right operand is not a
+	// recursively-writable body (v1 supports SELECT operands).
+	if (right.type !== 'select') return false;
+	const leftNames = tryBranchColumnNames(leftBranchSelect(selectAst));
+	const rightNames = tryBranchColumnNames(right);
+	// A `*` or computed leg (either side) probes `null` — non-writable; both legs must also
+	// agree in plain-column arity (the AST-only equivalent of `dataColNames.length !==
+	// dataColCount`, which a `*` leg short-circuits before reaching). A nested-compound
+	// operand whose first leg is plain still passes here (the probe is non-recursive); the
+	// dynamic path likewise defers that nested reject to write-time `propagate`
+	// (`set-op-membership-nested`) — a known, out-of-scope one-level-deep over-claim.
+	if (!leftNames || !rightNames) return false;
+	return leftNames.length === rightNames.length;
+}
+
 /** One membership flag declared on the set operation. */
 interface MembershipFlag {
 	readonly name: string;
@@ -280,7 +309,11 @@ function buildBranch(
  * write a fanned-out value into.
  */
 function branchColumnNames(view: MutableViewLike, side: 'left' | 'right', branchSelect: AST.SelectStmt): string[] {
-	const names: string[] = [];
+	const names = tryBranchColumnNames(branchSelect);
+	if (names) return names;
+	// `tryBranchColumnNames` returned `null` ⇒ a `*` or computed leg; re-derive the
+	// specific reason for the per-side diagnostic (the shared probe only yields the
+	// boolean, so the static surface and this path cannot drift on what counts as writable).
 	for (const rc of branchSelect.columns) {
 		if (rc.type === 'all') {
 			raiseMutationDiagnostic({
@@ -296,6 +329,29 @@ function branchColumnNames(view: MutableViewLike, side: 'left' | 'right', branch
 				message: `cannot write through view '${view.name}': the ${side} branch projects a computed column; v1 supports plain (optionally renamed) base columns in a writable branch`,
 			});
 		}
+	}
+	// Unreachable: `tryBranchColumnNames` returns `null` only for a `*`/computed leg, both
+	// handled above. Guard defensively rather than returning a wrong (empty) name list.
+	raiseMutationDiagnostic({
+		reason: 'unsupported-set-op',
+		table: view.name,
+		message: `cannot write through view '${view.name}': the ${side} branch is not a writable plain-column projection`,
+	});
+}
+
+/**
+ * The non-throwing core of {@link branchColumnNames}: the branch operand's projected
+ * plain-column names (positional, honoring a leg rename via `rc.alias ?? rc.expr.name`),
+ * or `null` when the leg is not a writable shape — a `select *` (`rc.type === 'all'`, no
+ * static name list to align positionally) or a computed (`rc.expr.type !== 'column'`)
+ * projection (no base column to write a fanned-out value into). Shared by the dynamic
+ * write path and the static {@link isSetOpBranchWritable} probe so neither can drift on
+ * what a writable leg is.
+ */
+function tryBranchColumnNames(branchSelect: AST.SelectStmt): string[] | null {
+	const names: string[] = [];
+	for (const rc of branchSelect.columns) {
+		if (rc.type === 'all' || rc.expr.type !== 'column') return null;
 		names.push(rc.alias ?? rc.expr.name);
 	}
 	return names;
