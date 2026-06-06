@@ -627,6 +627,42 @@ create view ax_jv_xc as
 update ax_jv_xc set cval = pvc where cid = 1;
 -- error: cannot write through
 
+-- Cross-source `set` in the 1:MANY direction -> REJECTED at PLAN TIME with a diagnostic
+-- naming the cross-source ambiguity. The owning (assigned) side `p` joins TWO children, so
+-- the partner read `cv` is multi-valued: __vmupd_keys holds one srcN row per joined pair and
+-- the correlated read-back (keyed by the owner's pid) returns >1 row. The cardinality proof
+-- fails — the join only pins xs1n_c.pref, which is no unique key of xs1n_c — so the write is
+-- rejected here rather than failing at runtime with "Scalar subquery returned more than one
+-- row".
+create table xs1n_p (pid integer primary key, pv integer);
+create table xs1n_c (cid integer primary key, pref integer, cv integer,
+    foreign key (pref) references xs1n_p(pid));
+insert into xs1n_p values (10, 100);
+insert into xs1n_c values (1, 10, 11), (2, 10, 22);
+create view xs1n_v as
+    select p.pid as pid, p.pv as pv, c.cv as cv
+    from xs1n_p p join xs1n_c c on c.pref = p.pid;
+update xs1n_v set pv = cv where pid = 10;
+-- error: assigned side joins more than one
+-- ...and the statement never executed (plan-time reject): xs1n_p is unchanged.
+select pid, pv from xs1n_p order by pid;
+→ [{"pid":10,"pv":100}]
+
+-- Cross-source `set` where the partner's join column is UNIQUE but NOT the primary key ->
+-- ACCEPTED via the unique-constraint branch of the cardinality proof. The join pins
+-- xs1u_p.pcode (a non-partial UNIQUE), so the owning child joins at most one parent. For
+-- cid=1 (joined parent pcode=500, pv=100) cv becomes 100; cid=2 (pcode=600, pv=200) untouched.
+create table xs1u_p (pid integer primary key, pcode integer unique, pv integer);
+create table xs1u_c (cid integer primary key, cref integer, cv integer);
+insert into xs1u_p values (10, 500, 100), (20, 600, 200);
+insert into xs1u_c values (1, 500, 1), (2, 600, 2);
+create view xs1u_v as
+    select c.cid as cid, c.cv as cv, p.pv as pv
+    from xs1u_c c join xs1u_p p on p.pcode = c.cref;
+update xs1u_v set cv = pv where cid = 1;
+select cid, cv from xs1u_c order by cid;
+→ [{"cid":1,"cv":100},{"cid":2,"cv":2}]
+
 -- Self-join body -> accepted: `e` and `m` are distinct aliases of one base table,
 -- routed by alias (the column's producing scan), not table name. `mv = m.v` routes to
 -- alias `m`'s side; `where id = 1` identifies via alias `e` (id = e.id). For id=1

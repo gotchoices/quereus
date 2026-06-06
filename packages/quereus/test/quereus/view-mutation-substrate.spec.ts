@@ -8,6 +8,7 @@ import { ParameterScope } from '../../src/planner/scopes/param.js';
 import { buildInsertStmt } from '../../src/planner/building/insert.js';
 import { buildUpdateStmt } from '../../src/planner/building/update.js';
 import { buildDeleteStmt } from '../../src/planner/building/delete.js';
+import { ViewMutationError } from '../../src/planner/mutation/mutation-diagnostic.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { ViewMutationNode } from '../../src/planner/nodes/view-mutation-node.js';
 import type { DmlExecutorNode } from '../../src/planner/nodes/dml-executor-node.js';
@@ -96,5 +97,82 @@ describe('View Mutation Substrate (single-source parity)', () => {
 		// And it still wraps the real base-table DmlExecutorNode on the base table.
 		const dml = findDmlExecutor(vm);
 		expect(dml!.table.tableSchema.name).to.equal('t');
+	});
+});
+
+/**
+ * Structured-reason gate for the 1:many cross-source `set` reject (ticket
+ * `view-write-cross-source-set-1n-diagnostic`). A cross-source `update v set
+ * owner.x = partner.y` is well-defined only when the owning (assigned) side joins
+ * **at most one** partner row; the reverse (1:many) direction is rejected at plan
+ * time with the dedicated `cross-source-ambiguous-cardinality` reason rather than
+ * failing at runtime with the generic `Scalar subquery returned more than one row`.
+ * Asserts the machine-readable `reason` (the sqllogic suite pins only the message).
+ */
+describe('View Mutation Substrate (cross-source cardinality)', () => {
+	async function joinCtx(): Promise<PlanningContext> {
+		const db = new Database();
+		await db.exec(`create table xs1n_p (pid integer primary key, pv integer)`);
+		await db.exec(`create table xs1n_c (cid integer primary key, pref integer, cv integer)`);
+		// Owner side p joins MANY children (the 1:many direction); the join pins only
+		// xs1n_c.pref, which is no unique key of xs1n_c.
+		await db.exec(`create view xs1n_v as
+			select p.pid as pid, p.pv as pv, c.cv as cv
+			from xs1n_p p join xs1n_c c on c.pref = p.pid`);
+		const parameterScope = new ParameterScope(new GlobalScope(db.schemaManager));
+		return {
+			db,
+			schemaManager: db.schemaManager,
+			parameters: {},
+			scope: parameterScope,
+			cteNodes: new Map(),
+			schemaDependencies: new BuildTimeDependencyTracker(),
+			schemaCache: new Map(),
+			cteReferenceCache: new Map(),
+			outputScopes: new Map(),
+		};
+	}
+
+	it('rejects the 1:many cross-source set with cross-source-ambiguous-cardinality', async () => {
+		const ctx = await joinCtx();
+		const ast = new Parser().parseAll(`update xs1n_v set pv = cv where pid = 10`)[0] as AST.UpdateStmt;
+		let caught: unknown;
+		try {
+			buildUpdateStmt(ctx, ast);
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught, 'a ViewMutationError is raised at plan time').to.be.instanceOf(ViewMutationError);
+		const err = caught as ViewMutationError;
+		expect(err.mutationDiagnostic.reason).to.equal('cross-source-ambiguous-cardinality');
+		// The message names the cross-source ambiguity, not the runtime scalar-subquery error.
+		expect(err.message).to.contain('assigned side joins more than one');
+		expect(err.message.toLowerCase()).to.not.contain('scalar subquery');
+	});
+
+	it('accepts the at-most-one direction (FK child reads parent PK)', async () => {
+		const db = new Database();
+		await db.exec(`create table xs1n_p (pid integer primary key, pv integer)`);
+		await db.exec(`create table xs1n_c (cid integer primary key, pref integer, cv integer)`);
+		// Owner side c (child) joins AT MOST ONE parent: the join pins p.pid, the parent's PK.
+		await db.exec(`create view xs1n_cv as
+			select c.cid as cid, c.cv as cv, p.pv as pv
+			from xs1n_c c join xs1n_p p on p.pid = c.pref`);
+		const parameterScope = new ParameterScope(new GlobalScope(db.schemaManager));
+		const ctx: PlanningContext = {
+			db,
+			schemaManager: db.schemaManager,
+			parameters: {},
+			scope: parameterScope,
+			cteNodes: new Map(),
+			schemaDependencies: new BuildTimeDependencyTracker(),
+			schemaCache: new Map(),
+			cteReferenceCache: new Map(),
+			outputScopes: new Map(),
+		};
+		const ast = new Parser().parseAll(`update xs1n_cv set cv = pv where cid = 1`)[0] as AST.UpdateStmt;
+		// Does not throw: the proof admits the at-most-one direction.
+		const plan = buildUpdateStmt(ctx, ast);
+		expect(plan.nodeType).to.equal(PlanNodeType.ViewMutation);
 	});
 });

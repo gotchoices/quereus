@@ -28,6 +28,7 @@ export type MutationDiagnosticReason =
 	| 'unsupported-source'         // INSERT source shape we cannot thread filter defaults through yet
 	| 'unsupported-multisource-insert' // INSERT into a join view — needs the shared-surrogate context (later phase)
 	| 'cross-source-assignment'    // UPDATE value references a base table other than the column it assigns
+	| 'cross-source-ambiguous-cardinality' // cross-source UPDATE value reads a partner column, but the assigned side joins MORE THAN ONE partner row (the join does not constrain the partner to a unique key), so the partner value is ambiguous (the 1:many cross-source `set` reject)
 	| 'unsupported-outer-join-update' // UPDATE assigns a non-preserved (outer-join null-extended) column — the matched→update / null-extended→insert per-row branch needs runtime materialization (deferred to view-write-optional-member-transitions)
 	| 'null-extended-create-conflict' // INSERT supplies only non-preserved-side columns through an outer join with no preserved-side row to attach to (the envelope mints/threads the shared key from the preserved anchor — v1 rejects the non-preserved-only insert)
 	| 'conflicting-assignment'     // two SET targets lower to the same base column (e.g. two view columns over one base column); an UPDATE cannot assign one column twice

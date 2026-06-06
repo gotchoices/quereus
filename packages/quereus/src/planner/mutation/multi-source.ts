@@ -1461,14 +1461,45 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// only when a capture carrier is threaded — the legacy path rejects wholesale.
 		if (registerCrossSource) gateCrossSourceReads(asg.value, out.sideIndex, analysis, view);
 		const side = analysis.sides[out.sideIndex];
+		const owningSideIndex = out.sideIndex;
 		const others = analysis.sides.filter((_, i) => i !== out.sideIndex);
+		// Cross-source cardinality gate (§ Inner Join, cross-source `set`): a cross-source
+		// value `set owner.x = partner.y` is well-defined only when the owning side joins AT
+		// MOST ONE partner row — else the capture's correlated read-back is multi-valued and
+		// the runtime would error `Scalar subquery returned more than one row`. Reject the
+		// 1:many direction at plan time, naming the cross-source ambiguity. Bound to this
+		// assignment's owning side; memoized per partner side so the join equalities are
+		// collected once. Threaded only on the capture-carrier path (symmetric with
+		// `registerCrossSource`); the legacy path rejects cross-source wholesale before this.
+		const cardinalityProven = new Map<number, boolean>();
+		const assignedCol = out.displayName;
+		const gateCrossSourceCardinality = registerCrossSource
+			? (partnerCol: AST.ColumnExpr): void => {
+				const partnerIdx = resolveColumnSide(partnerCol, analysis.sides);
+				if (partnerIdx === undefined || partnerIdx === owningSideIndex) return;
+				let proven = cardinalityProven.get(partnerIdx);
+				if (proven === undefined) {
+					proven = ownerJoinsAtMostOnePartner(owningSideIndex, partnerIdx, analysis.sel, analysis.sides);
+					cardinalityProven.set(partnerIdx, proven);
+				}
+				if (!proven) {
+					const partnerTable = analysis.sides[partnerIdx].schema.name;
+					raiseMutationDiagnostic({
+						reason: 'cross-source-ambiguous-cardinality',
+						column: assignedCol,
+						table: view.name,
+						message: `cannot write through view '${view.name}': the cross-source assignment of column '${assignedCol}' reads column '${partnerCol.name}' on base table '${partnerTable}', but the assigned side joins more than one '${partnerTable}' row (the join does not constrain '${partnerTable}' to a unique key), so the partner value is ambiguous — a cross-source \`set\` value is well-defined only when the assigned side joins at most one partner row`,
+					});
+				}
+			}
+			: undefined;
 		// Rewrite the assigned value into base terms, then strip the owning side's
 		// qualifier (the base UPDATE targets that table directly). A reference to a
 		// partner side is rewritten to a correlated read of its captured pre-mutation
 		// value (`registerCrossSource`); absent the carrier it is rejected.
 		const baseValue = stripSideQualifier(
 			substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view),
-			view, side, out.sideIndex, others, registerCrossSource,
+			view, side, out.sideIndex, others, registerCrossSource, gateCrossSourceCardinality,
 		);
 		// For an `inverse`-profile column the assigned value is in the VIEW domain;
 		// apply the site's inverse to recover the BASE value (`cv1 = cv + 1` ⇒ the
@@ -2253,6 +2284,13 @@ function substituteViewColumns(
  * the lowered UPDATE's own target row, so each row reads the captured pre-mutation
  * partner value of its joined row. The cross-source gate (`gateCrossSourceReads`) has
  * already proved every reached partner column has `base` lineage.
+ *
+ * Before the rewrite, `gateCrossSourceCardinality` (when supplied) rejects the **1:many**
+ * direction at plan time: the capture carries one `srcN` row per joined owner/partner pair,
+ * so the correlated read-back is well-defined only when the owning side joins **at most one**
+ * partner row ({@link ownerJoinsAtMostOnePartner}). Placed here — at the rewrite site — so it
+ * covers a partner ref nested in a value subquery as well as a top-level one (both lower to
+ * {@link capturedValueSubquery}).
  */
 function stripSideQualifier(
 	expr: AST.Expression,
@@ -2261,6 +2299,7 @@ function stripSideQualifier(
 	owningSideIndex: number,
 	others: readonly JoinSide[],
 	registerCrossSource: ((col: AST.ColumnExpr) => string) | undefined,
+	gateCrossSourceCardinality?: (partnerCol: AST.ColumnExpr) => void,
 ): AST.Expression {
 	const owningQuals = new Set([owning.alias, owning.schema.name.toLowerCase()]);
 	const otherQuals = new Set<string>();
@@ -2284,6 +2323,9 @@ function stripSideQualifier(
 					message: `cannot write through view '${view.name}': an update value references column '${col.name}' on a different base table than the column it assigns; cross-source assignment is not supported`,
 				});
 			}
+			// Reject the 1:many direction at plan time before lowering to a (multi-valued)
+			// correlated read of the capture (§ Inner Join, cross-source `set`).
+			gateCrossSourceCardinality?.(col);
 			const srcAlias = registerCrossSource(col);
 			owningPk ??= requireKeyColumns(view, owning);
 			return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
@@ -2572,6 +2614,76 @@ function resolveColumnSide(col: AST.ColumnExpr, sides: readonly JoinSide[]): num
 	const colName = col.name.toLowerCase();
 	const owners = sides.flatMap((s, i) => s.schema.columns.some(c => c.name.toLowerCase() === colName) ? [i] : []);
 	return owners.length === 1 ? owners[0] : undefined;
+}
+
+/**
+ * True when the **owning** side (the side a cross-source `set` assigns) provably joins
+ * **at most one** row of the **partner** side (the side the SET value reads), across the
+ * view's join — the cardinality proof that makes a cross-source `set` value well-defined
+ * (§ Inner Join, cross-source `set`). The up-front `__vmupd_keys` capture carries one
+ * `srcN` row per joined owner/partner pair, so the per-row correlated read-back
+ * ({@link capturedValueSubquery}) is single-valued only when the owning side joins at most
+ * one partner. The **reverse** (1:many) direction returns multiple `srcN` rows for a fixed
+ * owner PK and would fail at runtime with the generic `Scalar subquery returned more than
+ * one row`; the caller rejects it at plan time instead with a diagnostic that names the
+ * cross-source ambiguity.
+ *
+ * The proof: collect the join's **direct** owner↔partner `column = column` equalities
+ * ({@link collectCrossSideEqualities} already walks every nested ON predicate and USING
+ * list across the n-way tree), gather the **partner-side** columns they pin, and check
+ * whether some **unique key** of the partner table is a subset of that pinned set — fixing
+ * each column of a unique key to a per-owner-row value admits ≤1 partner row. Partner
+ * unique keys considered: the PRIMARY KEY; every **non-partial** UNIQUE constraint; every
+ * **non-partial** UNIQUE index. A **partial** unique key (one carrying a `predicate`) does
+ * not bound the rows outside its predicate scope, so it does not prove global at-most-one
+ * and is NOT counted. NULL semantics need no special handling — a `=` join only matches
+ * non-null equal values and a unique key bounds each non-null value to ≤1 row (PK columns
+ * are NOT NULL regardless).
+ *
+ * This is the inverse of the FK-correlation reasoning {@link edgeCorrelated} the delete
+ * path uses, but **FK is not required** — the proof is purely partner-side uniqueness (the
+ * canonical FK-child-reads-parent case is subsumed: the FK references the parent's PK and
+ * the join equates the child's FK column to it, so the parent's PK ⊆ the pinned set).
+ * **Multi-hop / transitive** cross-source (owner and partner not directly joined) pins no
+ * partner column ⇒ NOT proven ⇒ the caller rejects (conservative: this only over-rejects,
+ * never falsely accepts; a transitive value-determinacy proof is a possible follow-up).
+ */
+function ownerJoinsAtMostOnePartner(
+	ownerIdx: number,
+	partnerIdx: number,
+	sel: AST.SelectStmt,
+	sides: readonly JoinSide[],
+): boolean {
+	const partner = sides[partnerIdx];
+	// The partner-side columns the join pins equal to an owner-side value (lowercased).
+	const partnerEquatedCols = new Set<string>();
+	for (const eq of collectCrossSideEqualities(sel.from!, sides)) {
+		if (eq.sideA === ownerIdx && eq.sideB === partnerIdx) partnerEquatedCols.add(eq.colB.toLowerCase());
+		else if (eq.sideB === ownerIdx && eq.sideA === partnerIdx) partnerEquatedCols.add(eq.colA.toLowerCase());
+	}
+	if (partnerEquatedCols.size === 0) return false; // no direct owner↔partner equality — not proven (e.g. multi-hop)
+
+	// A non-empty unique-key column set all of whose columns the join pins ⇒ ≤1 partner row.
+	const provesAtMostOne = (cols: readonly string[]): boolean =>
+		cols.length > 0 && cols.every(c => partnerEquatedCols.has(c.toLowerCase()));
+
+	// The partner's PRIMARY KEY.
+	const pkNames = partner.schema.primaryKeyDefinition.map(def => partner.schema.columns[def.index].name);
+	if (provesAtMostOne(pkNames)) return true;
+
+	// Non-partial UNIQUE constraints (a partial UNIQUE bounds uniqueness only within its predicate scope).
+	for (const uc of partner.schema.uniqueConstraints ?? []) {
+		if (uc.predicate) continue;
+		if (provesAtMostOne(uc.columns.map(idx => partner.schema.columns[idx].name))) return true;
+	}
+
+	// Non-partial UNIQUE indexes (e.g. a CREATE UNIQUE INDEX not mirrored as a constraint).
+	for (const idx of partner.schema.indexes ?? []) {
+		if (!idx.unique || idx.predicate) continue;
+		if (provesAtMostOne(idx.columns.map(c => partner.schema.columns[c.index].name))) return true;
+	}
+
+	return false;
 }
 
 /**
