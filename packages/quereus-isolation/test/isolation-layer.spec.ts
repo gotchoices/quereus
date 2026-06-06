@@ -1164,9 +1164,22 @@ describe('IsolationModule', () => {
 			db.registerModule('isolated', isolatedModule);
 		});
 
-		/** Pre-alter underlying column count for `main.<table>`. */
+		/**
+		 * Live underlying column count for `main.<table>`. Read via the MemoryTable's
+		 * `getSchema()` — the canonical schema the underlying manager mutates in place —
+		 * NOT the `underlyingTable.tableSchema` field, which is a per-instance snapshot
+		 * taken at connect time and is never refreshed by the module-level `alterTable`
+		 * this layer drives. Reading the stale field would report the pre-ALTER count
+		 * even when the underlying HAS been mutated, making the atomicity assertion
+		 * vacuous (it would pass against the pre-fix mutate-then-validate ordering too).
+		 * `getSchema()` is MemoryTable-specific (not on the base `VirtualTable`), so we
+		 * narrow structurally — sound because this suite pins the underlying to memory.
+		 */
 		function underlyingColumnCount(table: string): number {
-			return isolatedModule.getUnderlyingState('main', table)!.underlyingTable.tableSchema!.columns.length;
+			const underlying = isolatedModule.getUnderlyingState('main', table)!.underlyingTable as unknown as {
+				getSchema(): { columns: readonly unknown[] } | undefined;
+			};
+			return underlying.getSchema()!.columns.length;
 		}
 
 		it('rejects atomically when a per-row NOT NULL backfill yields NULL for a staged row', async () => {
