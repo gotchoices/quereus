@@ -130,7 +130,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 		await this.manager.deleteObjectStore(storeName);
 	}
 
-	async renameTableStores(schemaName: string, oldName: string, newName: string): Promise<void> {
+	async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void> {
 		const oldDataStoreName = buildDataStoreName(schemaName, oldName);
 		const newDataStoreName = buildDataStoreName(schemaName, newName);
 
@@ -139,22 +139,24 @@ export class IndexedDBProvider implements KVStoreProvider {
 			throw new Error(`Cannot rename table '${oldName}' to '${newName}': data store '${newDataStoreName}' already exists`);
 		}
 
-		// Build the rename list from the actual object stores: the data store (if
-		// it materialized) plus every secondary-index store under the old name.
+		// Build the rename list from the data store (if it materialized) plus the
+		// table's authoritative index stores. We map each schema index name to its
+		// exact store name rather than prefix-scanning `{oldName}_idx_`, which would
+		// also catch a sibling table named `{oldName}_idx_<x>`.
 		const renameList: Array<{ from: string; to: string }> = [];
 		if (this.manager.hasObjectStore(oldDataStoreName)) {
 			renameList.push({ from: oldDataStoreName, to: newDataStoreName });
 		}
 
-		const oldIndexPrefix = `${oldDataStoreName}${STORE_SUFFIX.INDEX}`;
-		for (const name of this.manager.getObjectStoreNames()) {
-			if (!name.startsWith(oldIndexPrefix)) continue;
-			const indexName = name.substring(oldIndexPrefix.length);
-			const target = buildIndexStoreName(schemaName, newName, indexName);
-			if (this.manager.hasObjectStore(target)) {
-				throw new Error(`Cannot rename table '${oldName}' to '${newName}': index store '${target}' already exists`);
+		for (const indexName of indexNames) {
+			const from = buildIndexStoreName(schemaName, oldName, indexName);
+			// An index store may not have materialized yet; only move what exists.
+			if (!this.manager.hasObjectStore(from)) continue;
+			const to = buildIndexStoreName(schemaName, newName, indexName);
+			if (this.manager.hasObjectStore(to)) {
+				throw new Error(`Cannot rename table '${oldName}' to '${newName}': index store '${to}' already exists`);
 			}
-			renameList.push({ from: name, to: target });
+			renameList.push({ from, to });
 		}
 
 		// Evict cached handles for every source store BEFORE the relocation so no
@@ -168,7 +170,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 		await this.manager.renameObjectStores(renameList);
 	}
 
-	async deleteTableStores(schemaName: string, tableName: string): Promise<void> {
+	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
 		const dataStoreName = buildDataStoreName(schemaName, tableName);
 
 		// Close and delete data store
@@ -180,14 +182,14 @@ export class IndexedDBProvider implements KVStoreProvider {
 		// Stats are in the unified __stats__ store, so no need to delete a separate store
 		// The individual stats entry will be removed by the calling code if needed
 
-		// Find and delete all index stores for this table
-		const indexPrefix = `${dataStoreName}${STORE_SUFFIX.INDEX}`;
-		const allStores = this.manager.getObjectStoreNames();
-		for (const name of allStores) {
-			if (name.startsWith(indexPrefix)) {
-				await this.closeStoreByName(name);
-				await this.manager.deleteObjectStore(name);
-			}
+		// Delete exactly the table's index stores (by name), not every object store
+		// matching the `{table}_idx_` prefix — that prefix also matches a sibling
+		// table literally named `{table}_idx_<x>`.
+		for (const indexName of indexNames) {
+			const storeName = buildIndexStoreName(schemaName, tableName, indexName);
+			if (!this.manager.hasObjectStore(storeName)) continue;
+			await this.closeStoreByName(storeName);
+			await this.manager.deleteObjectStore(storeName);
 		}
 	}
 

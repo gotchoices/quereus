@@ -291,7 +291,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Destroys a store table and its storage.
 	 */
 	async destroy(
-		_db: Database,
+		db: Database,
 		_pAux: unknown,
 		_moduleName: string,
 		schemaName: string,
@@ -299,10 +299,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 
+		// Capture the schema BEFORE we drop in-memory references so we can hand the
+		// provider the authoritative index list (exact store names) rather than let
+		// it prefix-scan `{table}_idx_`, which would also delete a sibling table
+		// literally named `{table}_idx_<x>`. Prefer the cached StoreTable's own
+		// schema; fall back to the schema manager (mirrors renameTable). If neither
+		// yields a schema (already deregistered), fall back to [] — index stores
+		// can't be swept by name then, but that is no worse than today for the
+		// no-sibling case and strictly safer for the sibling case.
+		const table = this.tables.get(tableKey);
+		const currentSchema: TableSchema | undefined =
+			table?.getSchema() ?? db.schemaManager.getTable(schemaName, tableName);
+		const indexNames = (currentSchema?.indexes ?? []).map(i => i.name);
+
 		// Clear internal maps synchronously before any await, so a concurrent
 		// create() cannot observe the stale table/store/coordinator across a
 		// microtask boundary mid-destroy.
-		const table = this.tables.get(tableKey);
 		this.tables.delete(tableKey);
 		this.stores.delete(tableKey);
 		this.coordinators.delete(tableKey);
@@ -313,7 +325,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		// Delete all stores for this table (data, indexes, stats)
 		if (this.provider.deleteTableStores) {
-			await this.provider.deleteTableStores(schemaName, tableName);
+			await this.provider.deleteTableStores(schemaName, tableName, indexNames);
 		} else {
 			// Fallback: just close the data store
 			await this.provider.closeStore(schemaName, tableName);
@@ -1171,6 +1183,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const currentSchema: TableSchema | undefined =
 			existing?.getSchema() ?? db.schemaManager.getTable(schemaName, oldName);
 
+		// Authoritative index list (exact store names): the provider relocates
+		// exactly these index stores instead of prefix-scanning `{oldName}_idx_`,
+		// which would also catch a sibling table named `{oldName}_idx_<x>`.
+		const indexNames = (currentSchema?.indexes ?? []).map(i => i.name);
+
 		// ALTER TABLE is effectively DDL-committing on a store-backed table:
 		// once we move the on-disk directory, prior buffered writes can no
 		// longer be rolled back through the coordinator. Flush any pending
@@ -1198,7 +1215,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		// Move physical storage (data directory + index directories).
 		if (this.provider.renameTableStores) {
-			await this.provider.renameTableStores(schemaName, oldName, newName);
+			await this.provider.renameTableStores(schemaName, oldName, newName, indexNames);
 		}
 
 		// Rewrite persistent catalog under the new name. Write the new DDL first

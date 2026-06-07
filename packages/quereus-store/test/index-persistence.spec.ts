@@ -47,7 +47,6 @@ function createPersistentProvider(): KVStoreProvider & {
 	const dataKey = (s: string, t: string) => `${s}.${t}`;
 	const statsKey = (s: string, t: string) => `${s}.${t}.__stats__`;
 	const idxKey = (s: string, t: string, i: string) => `${s}.${t}_idx_${i}`;
-	const idxPrefix = (s: string, t: string) => `${s}.${t}_idx_`;
 
 	return {
 		stores,
@@ -60,25 +59,22 @@ function createPersistentProvider(): KVStoreProvider & {
 		async deleteIndexStore(s: string, t: string, i: string) {
 			stores.delete(idxKey(s, t, i));
 		},
-		async deleteTableStores(s: string, t: string) {
+		async deleteTableStores(s: string, t: string, indexNames: readonly string[]) {
+			// Key off the authoritative index list (exact store names), matching real
+			// provider semantics — a `{table}_idx_` prefix sweep would also drop a
+			// sibling table named `{table}_idx_<x>`.
 			stores.delete(dataKey(s, t));
 			stores.delete(statsKey(s, t));
-			const prefix = idxPrefix(s, t);
-			for (const key of [...stores.keys()]) {
-				if (key.startsWith(prefix)) stores.delete(key);
-			}
+			for (const i of indexNames) stores.delete(idxKey(s, t, i));
 		},
-		async renameTableStores(s: string, oldName: string, newName: string) {
+		async renameTableStores(s: string, oldName: string, newName: string, indexNames: readonly string[]) {
 			const move = (from: string, to: string) => {
 				const store = stores.get(from);
 				if (store) { stores.set(to, store); stores.delete(from); }
 			};
 			move(dataKey(s, oldName), dataKey(s, newName));
-			const oldPrefix = idxPrefix(s, oldName);
-			for (const key of [...stores.keys()]) {
-				if (key.startsWith(oldPrefix)) {
-					move(key, idxKey(s, newName, key.substring(oldPrefix.length)));
-				}
+			for (const i of indexNames) {
+				move(idxKey(s, oldName, i), idxKey(s, newName, i));
 			}
 		},
 		async closeAll() { /* data survives module close, mirroring real disk */ },

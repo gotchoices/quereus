@@ -159,7 +159,7 @@ export class LevelDBProvider implements KVStoreProvider {
 		await removeDir(storePath);
 	}
 
-	async renameTableStores(schemaName: string, oldName: string, newName: string): Promise<void> {
+	async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void> {
 		const oldDataStoreName = `${schemaName}.${oldName}`.toLowerCase();
 		const newDataStoreName = `${schemaName}.${newName}`.toLowerCase();
 
@@ -168,16 +168,12 @@ export class LevelDBProvider implements KVStoreProvider {
 		}
 
 		// Close all open handles for the old table (data + indexes) so LevelDB
-		// releases its file locks before we move the directories.
+		// releases its file locks before we move the directories. Index handles are
+		// closed by exact store key, not by scanning `{oldName}_idx_` — that prefix
+		// also matches a sibling table named `{oldName}_idx_<x>`.
 		await this.closeStoreByName(oldDataStoreName);
-
-		const oldIndexPrefix = `${schemaName}.${oldName}${STORE_SUFFIX.INDEX}`.toLowerCase();
-		const indexStoreNames: string[] = [];
-		for (const name of this.stores.keys()) {
-			if (name.startsWith(oldIndexPrefix)) indexStoreNames.push(name);
-		}
-		for (const name of indexStoreNames) {
-			await this.closeStoreByName(name);
+		for (const indexName of indexNames) {
+			await this.closeStoreByName(`${schemaName}.${oldName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase());
 		}
 
 		// Move data directory, if present.
@@ -191,27 +187,19 @@ export class LevelDBProvider implements KVStoreProvider {
 			await fs.promises.rename(oldDataPath, newDataPath);
 		}
 
-		// Move each index directory under the new table name.
-		const oldIndexDirPrefix = `${oldName}${STORE_SUFFIX.INDEX}`;
-		try {
-			const entries = await fs.promises.readdir(schemaDir);
-			for (const entry of entries) {
-				if (!entry.startsWith(oldIndexDirPrefix)) continue;
-				const indexSuffix = entry.substring(oldIndexDirPrefix.length);
-				const renamed = `${newName}${STORE_SUFFIX.INDEX}${indexSuffix}`;
-				await fs.promises.rename(
-					path.join(schemaDir, entry),
-					path.join(schemaDir, renamed),
-				);
-			}
-		} catch (e) {
-			// readdir can fail if the schema directory doesn't exist (pre-creation);
-			// that just means there's nothing to move.
-			if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+		// Move exactly the table's index directories under the new table name. The
+		// path mirrors getIndexStore (original-case `{table}_idx_{index}`), and we
+		// move only directories named in the schema rather than readdir-scanning the
+		// `{oldName}_idx_` prefix (which would relocate a sibling's directory too).
+		for (const indexName of indexNames) {
+			const oldIndexPath = path.join(schemaDir, `${oldName}${STORE_SUFFIX.INDEX}${indexName}`);
+			if (!(await pathExists(oldIndexPath))) continue;
+			const newIndexPath = path.join(schemaDir, `${newName}${STORE_SUFFIX.INDEX}${indexName}`);
+			await fs.promises.rename(oldIndexPath, newIndexPath);
 		}
 	}
 
-	async deleteTableStores(schemaName: string, tableName: string): Promise<void> {
+	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
 		// Close and remove data store directory
 		const dataStoreName = `${schemaName}.${tableName}`.toLowerCase();
 		const dataStorePath = this.storePaths.get(dataStoreName)
@@ -222,31 +210,19 @@ export class LevelDBProvider implements KVStoreProvider {
 		// Stats are in the unified __stats__ store, so no need to close a separate store
 		// The individual stats entry will be removed by the calling code if needed
 
-		// Close and remove all index store directories for this table
-		const indexPrefix = `${schemaName}.${tableName}${STORE_SUFFIX.INDEX}`.toLowerCase();
-		const indexStoreNames: string[] = [];
-		for (const name of this.stores.keys()) {
-			if (name.startsWith(indexPrefix)) indexStoreNames.push(name);
-		}
-		for (const name of indexStoreNames) {
-			const indexPath = this.storePaths.get(name);
-			await this.closeStoreByName(name);
-			if (indexPath) await removeDir(indexPath);
-		}
-
-		// Also sweep any on-disk index directories for this table that were never opened
-		// in this session (e.g. after a process restart followed by a DROP).
+		// Close and remove exactly the table's index directories (by name). This
+		// also covers the post-restart case — the names come from the rehydrated
+		// schema — without the ambiguity of a `{tableName}_idx_` directory sweep,
+		// which would also delete a sibling table named `{tableName}_idx_<x>`.
+		// Tradeoff: a truly orphaned index dir not present in the schema (e.g. left
+		// by a crash mid-DROP INDEX) is no longer incidentally swept.
 		const schemaDir = path.join(this.basePath, schemaName);
-		const indexDirPrefix = `${tableName}${STORE_SUFFIX.INDEX}`;
-		try {
-			const entries = await fs.promises.readdir(schemaDir);
-			for (const entry of entries) {
-				if (entry.startsWith(indexDirPrefix)) {
-					await removeDir(path.join(schemaDir, entry));
-				}
-			}
-		} catch {
-			// Schema directory may not exist; nothing to sweep.
+		for (const indexName of indexNames) {
+			const storeName = `${schemaName}.${tableName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase();
+			const indexPath = this.storePaths.get(storeName)
+				?? path.join(schemaDir, `${tableName}${STORE_SUFFIX.INDEX}${indexName}`);
+			await this.closeStoreByName(storeName);
+			await removeDir(indexPath);
 		}
 	}
 

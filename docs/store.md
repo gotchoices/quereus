@@ -189,12 +189,16 @@ interface KVStoreProvider {
   closeIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void>;
   closeAll(): Promise<void>;
   
-  // Optional: Delete stores
+  // Optional: Delete stores. `indexNames` is the table's exact secondary-index
+  // names (from the schema); build index store names from it via
+  // buildIndexStoreName rather than prefix-scanning `{table}_idx_`, which also
+  // matches a sibling table literally named `{table}_idx_<x>`.
   deleteIndexStore?(schemaName: string, tableName: string, indexName: string): Promise<void>;
-  deleteTableStores?(schemaName: string, tableName: string): Promise<void>;
+  deleteTableStores?(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void>;
 
   // Optional: Relocate a table's data + index stores for ALTER TABLE ... RENAME TO
-  renameTableStores?(schemaName: string, oldName: string, newName: string): Promise<void>;
+  // (`indexNames` carries the same authoritative, exact index list).
+  renameTableStores?(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void>;
 }
 ```
 

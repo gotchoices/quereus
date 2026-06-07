@@ -199,10 +199,19 @@ export interface KVStoreProvider {
 	/**
 	 * Delete all stores for a table (data, indexes, stats).
 	 * Called when dropping a table.
+	 *
+	 * `indexNames` is the authoritative list of the table's secondary-index names
+	 * (from `tableSchema.indexes`). Implementations MUST build exact index store
+	 * names from it via `buildIndexStoreName` rather than prefix-scanning the live
+	 * store list — `_idx_` is a legal substring of an ordinary identifier, so a
+	 * prefix scan over `{table}_idx_` also matches a sibling table literally named
+	 * `{table}_idx_<x>` and would destroy its data.
+	 *
 	 * @param schemaName - The schema name
 	 * @param tableName - The table name
+	 * @param indexNames - The table's secondary-index names (exact, from the schema)
 	 */
-	deleteTableStores?(schemaName: string, tableName: string): Promise<void>;
+	deleteTableStores?(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void>;
 
 	/**
 	 * Rename all stores for a table from `oldName` to `newName`. Implementations
@@ -210,10 +219,17 @@ export interface KVStoreProvider {
 	 * and drop all cached references to the old name so that subsequent
 	 * `getStore`/`getIndexStore` calls open the renamed storage.
 	 *
+	 * `indexNames` is the authoritative list of the table's secondary-index names
+	 * (from `tableSchema.indexes`). Implementations MUST relocate exactly those
+	 * index stores (built via `buildIndexStoreName`) rather than prefix-scanning —
+	 * a prefix scan over `{oldName}_idx_` also matches a sibling table literally
+	 * named `{oldName}_idx_<x>` and would silently move its data under `newName`.
+	 *
 	 * Called by StoreModule.renameTable during ALTER TABLE ... RENAME TO.
 	 * @param schemaName - The schema name
 	 * @param oldName - The current table name
 	 * @param newName - The desired table name
+	 * @param indexNames - The table's secondary-index names (exact, from the schema)
 	 */
-	renameTableStores?(schemaName: string, oldName: string, newName: string): Promise<void>;
+	renameTableStores?(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void>;
 }

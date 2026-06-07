@@ -182,7 +182,7 @@ describe('IndexedDB RENAME TABLE persistence', () => {
 
 		let threw = false;
 		try {
-			await provider.renameTableStores('main', 't', 't2');
+			await provider.renameTableStores('main', 't', 't2', ['ix_b']);
 		} catch (e) {
 			threw = true;
 			expect(String(e)).to.match(/already exists/i);
@@ -215,5 +215,59 @@ describe('IndexedDB RENAME TABLE persistence', () => {
 
 		expect(objectStores(), 'data store gone after drop').to.not.include(dataStore);
 		expect(objectStores().filter(n => n.startsWith(idxPrefix)), 'index stores gone after drop').to.have.length(0);
+	});
+
+	// Regression: a sibling table literally named `<table>_idx_<x>` has a data
+	// store (`main.t_idx_archive`) whose name shares the `main.t_idx_` prefix of
+	// table `t`'s index stores. The old prefix-scan discovery treated it as an
+	// index of `t` and silently moved (RENAME) or destroyed (DROP) it. The
+	// authoritative index-name list eliminates the ambiguity.
+	it('RENAME t does not disturb a sibling table named t_idx_archive', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create table "t_idx_archive" (id integer primary key, v integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		await db.exec(`insert into "t_idx_archive" values (1, 100), (2, 200)`);
+
+		const siblingStore = buildDataStoreName('main', 't_idx_archive');
+		expect(objectStores(), 'sibling data store materialized').to.include(siblingStore);
+
+		await db.exec(`alter table t rename to t2`);
+
+		// The sibling is untouched: its data store keeps its name (NOT relocated to
+		// main.t2_idx_archive) and its rows remain reachable through the engine.
+		expect(objectStores(), 'sibling store keeps its name').to.include(siblingStore);
+		expect(objectStores(), 'sibling NOT mis-moved under t2').to.not.include(buildIndexStoreName('main', 't2', 'archive'));
+		expect(await rows(`select v from "t_idx_archive" order by id`)).to.deep.equal([{ v: 100 }, { v: 200 }]);
+
+		// t's REAL index still relocated under the new name, and t2 is fully usable.
+		expect(objectStores(), 'old real index gone').to.not.include(buildIndexStoreName('main', 't', 'ix_b'));
+		expect(objectStores(), 'real index relocated').to.include(buildIndexStoreName('main', 't2', 'ix_b'));
+		expect(await rows(`select id from t2 where b = 20`)).to.deep.equal([{ id: 2 }]);
+
+		// Survives a fresh-provider reopen too.
+		await mod.closeAll();
+		await reopen();
+		expect(await rows(`select v from "t_idx_archive" order by id`), 'sibling rows survive reopen').to.deep.equal([{ v: 100 }, { v: 200 }]);
+		expect(await rows(`select id from t2 where b = 10`)).to.deep.equal([{ id: 1 }]);
+	});
+
+	it('DROP t does not destroy a sibling table named t_idx_archive', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create table "t_idx_archive" (id integer primary key, v integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10)`);
+		await db.exec(`insert into "t_idx_archive" values (1, 100), (2, 200)`);
+
+		const siblingStore = buildDataStoreName('main', 't_idx_archive');
+		expect(objectStores()).to.include(siblingStore);
+
+		await db.exec(`drop table t`);
+
+		// t and its real index are gone; the sibling's data store and rows survive.
+		expect(objectStores(), 't data store gone').to.not.include(buildDataStoreName('main', 't'));
+		expect(objectStores(), 't real index gone').to.not.include(buildIndexStoreName('main', 't', 'ix_b'));
+		expect(objectStores(), 'sibling data store intact').to.include(siblingStore);
+		expect(await rows(`select v from "t_idx_archive" order by id`)).to.deep.equal([{ v: 100 }, { v: 200 }]);
 	});
 });

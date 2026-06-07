@@ -58,7 +58,7 @@ function createInMemoryProvider(): KVStoreProvider {
 			}
 			stores.clear();
 		},
-		async renameTableStores(schemaName: string, oldName: string, newName: string) {
+		async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]) {
 			const oldKey = `${schemaName}.${oldName}`;
 			const newKey = `${schemaName}.${newName}`;
 			const dataStore = stores.get(oldKey);
@@ -66,14 +66,15 @@ function createInMemoryProvider(): KVStoreProvider {
 				stores.delete(oldKey);
 				stores.set(newKey, dataStore);
 			}
-			const oldIndexPrefix = `${schemaName}.${oldName}_idx_`;
-			const newIndexPrefix = `${schemaName}.${newName}_idx_`;
-			for (const key of Array.from(stores.keys())) {
-				if (key.startsWith(oldIndexPrefix)) {
-					const suffix = key.substring(oldIndexPrefix.length);
-					const store = stores.get(key)!;
-					stores.delete(key);
-					stores.set(newIndexPrefix + suffix, store);
+			// Relocate exactly the table's index stores (by name), matching real
+			// provider semantics — a `{oldName}_idx_` prefix sweep would also move a
+			// sibling table named `{oldName}_idx_<x>`.
+			for (const indexName of indexNames) {
+				const from = `${schemaName}.${oldName}_idx_${indexName}`;
+				const store = stores.get(from);
+				if (store) {
+					stores.delete(from);
+					stores.set(`${schemaName}.${newName}_idx_${indexName}`, store);
 				}
 			}
 		},
