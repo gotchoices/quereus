@@ -192,6 +192,9 @@ interface KVStoreProvider {
   // Optional: Delete stores
   deleteIndexStore?(schemaName: string, tableName: string, indexName: string): Promise<void>;
   deleteTableStores?(schemaName: string, tableName: string): Promise<void>;
+
+  // Optional: Relocate a table's data + index stores for ALTER TABLE ... RENAME TO
+  renameTableStores?(schemaName: string, oldName: string, newName: string): Promise<void>;
 }
 ```
 
