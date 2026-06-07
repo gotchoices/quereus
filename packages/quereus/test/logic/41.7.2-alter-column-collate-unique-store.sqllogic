@@ -117,3 +117,136 @@ select id, email from xj order by id;
 → [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"}]
 
 drop table xj;
+
+-- ===================================
+-- 5. COMPOSITE UNIQUE (a, b) where only member `a`'s collation changes. Each member
+--    is normalized by its OWN column collation: after `a`→NOCASE, rows that differ
+--    only by the case of `a` collide; the still-BINARY `b` keeps distinguishing rows
+--    that differ in `b`'s case.
+-- ===================================
+
+-- 5a. distinct under BINARY (a: x vs X), colliding once `a` is NOCASE → ALTER rejected.
+create table cc (id integer primary key, a text, b text, unique (a, b));
+insert into cc values (1, 'x', 'y'), (2, 'X', 'y');
+-- run
+
+alter table cc alter column a set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- rollback: both rows survive, `a` still BINARY
+select id, a, b from cc order by id;
+→ [{"id":1,"a":"x","b":"y"},{"id":2,"a":"X","b":"y"}]
+
+drop table cc;
+
+-- 5b. `a` differs only by case BUT `b` differs by case too → under (NOCASE a, BINARY b)
+--     the rows stay distinct (b is still BINARY) → ALTER succeeds, and the composite
+--     then enforces with `a` NOCASE / `b` BINARY.
+create table cd (id integer primary key, a text, b text, unique (a, b));
+insert into cd values (1, 'x', 'y'), (2, 'X', 'Y');
+
+alter table cd alter column a set collate nocase;
+-- run
+
+-- ('x','y') vs ('X','Y'): a collides under NOCASE, b ('y' vs 'Y') still distinguishes → OK
+select id, a, b from cd order by id;
+→ [{"id":1,"a":"x","b":"y"},{"id":2,"a":"X","b":"Y"}]
+
+-- now a NOCASE-on-a + exact-on-b duplicate collides
+insert into cd values (3, 'X', 'y');
+-- error: UNIQUE constraint failed
+
+-- but a row distinguished by b (still BINARY, value distinct from both rows) inserts fine
+insert into cd values (4, 'x', 'z');
+select count(*) as n from cd;
+→ [{"n":3}]
+
+drop table cd;
+
+-- ===================================
+-- 6. PARTIAL unique index — only rows the predicate accepts are re-validated. A
+--    case-collision among EXCLUDED rows must NOT block the ALTER; a collision among
+--    INCLUDED rows must.
+-- ===================================
+
+-- 6a. the colliding pair is excluded by the predicate → ALTER succeeds.
+create table pp (id integer primary key, code text, active integer);
+create unique index pp_code on pp(code) where active = 1;
+insert into pp values (1, 'a', 0), (2, 'A', 0);
+-- run
+
+alter table pp alter column code set collate nocase;
+-- run
+
+-- the change took effect and the partial index now enforces NOCASE for active rows
+select name, collation from table_info('pp') where name = 'code';
+→ [{"name":"code","collation":"NOCASE"}]
+
+insert into pp values (3, 'a', 1);
+insert into pp values (4, 'A', 1);
+-- error: UNIQUE constraint failed
+
+drop table pp;
+
+-- 6b. the colliding pair is INCLUDED by the predicate → ALTER rejected, rollback.
+create table pq (id integer primary key, code text, active integer);
+create unique index pq_code on pq(code) where active = 1;
+insert into pq values (1, 'a', 1), (2, 'A', 1);
+-- run
+
+alter table pq alter column code set collate nocase;
+-- error: UNIQUE constraint failed
+
+select name, collation from table_info('pq') where name = 'code';
+→ [{"name":"code","collation":"BINARY"}]
+
+drop table pq;
+
+-- ===================================
+-- 7. NULL handling — SQL UNIQUE allows multiple NULLs, so existing NULL rows never
+--    count as collisions during the re-validation scan.
+-- ===================================
+
+create table nn (id integer primary key, email text null unique);
+insert into nn values (1, null), (2, null), (3, 'a@x');
+-- run
+
+alter table nn alter column email set collate nocase;
+-- run
+
+select name, collation from table_info('nn') where name = 'email';
+→ [{"name":"email","collation":"NOCASE"}]
+
+-- multiple NULLs still allowed after the change; a NOCASE duplicate still rejected
+insert into nn values (4, null);
+insert into nn values (5, 'A@X');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from nn;
+→ [{"n":4}]
+
+drop table nn;
+
+-- ===================================
+-- 8. NO-OP guard — setting the collation to the value it already has is a no-op that
+--    neither scans nor rejects (re-applying NOCASE after it is already NOCASE), even
+--    when existing rows would collide under some OTHER collation.
+-- ===================================
+
+create table nopg (id integer primary key, email text collate nocase unique);
+-- two rows distinct under NOCASE
+insert into nopg values (1, 'a@x'), (2, 'b@x');
+-- run
+
+-- idempotent re-apply: already NOCASE → returns the existing schema, no scan
+alter table nopg alter column email set collate nocase;
+-- run
+
+select name, collation from table_info('nopg') where name = 'email';
+→ [{"name":"email","collation":"NOCASE"}]
+
+-- still enforcing NOCASE afterward
+insert into nopg values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+drop table nopg;
