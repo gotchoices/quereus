@@ -107,7 +107,14 @@ export function generateIndexDDL(
 	db?: Database,
 ): string {
 	const ctx = resolveEmitContext(db);
-	const parts: string[] = ['CREATE INDEX'];
+	// Clause order mirrors the parser grammar and the AST emitter
+	// `createIndexToString` (ast-stringify.ts): CREATE [UNIQUE] INDEX <name> ON
+	// <table> (<cols>) [WHERE <predicate>] [WITH TAGS (...)]. Keeping the order
+	// aligned means a UNIQUE / partial index re-parses to the same shape, so the
+	// declarative differ (which round-trips the actual catalog DDL) never churns.
+	const parts: string[] = ['CREATE'];
+	if (indexSchema.unique) parts.push('UNIQUE');
+	parts.push('INDEX');
 	parts.push(quoteName(indexSchema.name));
 	parts.push('ON');
 	parts.push(qualifiedName(tableSchema.schemaName, tableSchema.name, ctx.currentSchemaName));
@@ -119,6 +126,12 @@ export function generateIndexDDL(
 		return colStr;
 	});
 	parts.push(`(${cols.join(', ')})`);
+
+	// Partial-index predicate. Reuse expressionToString (the same emitter used for
+	// DEFAULT / CHECK) so the WHERE clause re-parses to the same AST on import.
+	if (indexSchema.predicate) {
+		parts.push(`WHERE ${expressionToString(indexSchema.predicate)}`);
+	}
 
 	if (hasTags(indexSchema.tags)) {
 		parts.push(formatTagsClause(indexSchema.tags!));

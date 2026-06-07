@@ -344,6 +344,37 @@ export interface IndexSchema {
 }
 
 /**
+ * Returns a new TableSchema with `indexSchema` appended to its index list. When
+ * the index is UNIQUE, also synthesizes a matching `derivedFromIndex`
+ * uniqueConstraint (carrying the partial predicate) so the mutation manager and
+ * the store's full-scan UNIQUE check enforce uniqueness through their existing
+ * paths, and so `emitTableConstraints` knows to skip it (it round-trips via the
+ * index, not as a table constraint).
+ *
+ * **Single source of truth** for the index→schema mutation. The three sites that
+ * must agree all route through here so they cannot drift:
+ *   - {@link SchemaManager.createIndex} — live `CREATE INDEX` DDL.
+ *   - `SchemaManager.importIndex`        — catalog rehydrate (re-parsed DDL).
+ *   - `StoreModule.createIndex`          — store-backed connected-table cache refresh.
+ * The symmetric removal lives in `SchemaManager.dropIndex` / `StoreModule.dropIndex`,
+ * which filter the derived constraint back out by `derivedFromIndex`.
+ */
+export function appendIndexToTableSchema(tableSchema: TableSchema, indexSchema: IndexSchema): TableSchema {
+	const updatedIndexes = Object.freeze([...(tableSchema.indexes ?? []), indexSchema]);
+	const result: TableSchema = { ...tableSchema, indexes: updatedIndexes };
+	if (indexSchema.unique) {
+		const derivedConstraint: UniqueConstraintSchema = {
+			name: indexSchema.name,
+			columns: Object.freeze(indexSchema.columns.map(c => c.index)),
+			predicate: indexSchema.predicate,
+			derivedFromIndex: indexSchema.name,
+		};
+		result.uniqueConstraints = Object.freeze([...(tableSchema.uniqueConstraints ?? []), derivedConstraint]);
+	}
+	return result;
+}
+
+/**
  * Creates a basic TableSchema with minimal configuration
  *
  * @param name Table name
@@ -550,7 +581,7 @@ export interface UniqueConstraintSchema {
 	 *  from a `CREATE UNIQUE INDEX ... WHERE ...`. */
 	predicate?: Expression;
 	/** When set, this constraint was synthesized from a UNIQUE index of the
-	 *  given name (see SchemaManager.addIndexToTableSchema). DROP INDEX of that
+	 *  given name (see appendIndexToTableSchema). DROP INDEX of that
 	 *  index removes this constraint. Unset for constraints declared at
 	 *  CREATE TABLE time. */
 	derivedFromIndex?: string;

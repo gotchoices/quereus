@@ -31,7 +31,7 @@ import type {
 	MappingAdvertisement,
 	SchemaChangeEvent as EngineSchemaChangeEvent,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -361,29 +361,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Refresh the connected table's cached schema so subsequent DML
 		// maintains the new index (the engine's schema registry is updated
 		// separately by SchemaManager.createIndex, but the StoreTable instance
-		// holds its own reference captured at connect time). Mirrors
-		// SchemaManager.addIndexToTableSchema, including the UNIQUE → derived
-		// uniqueConstraint entry so checkUniqueConstraints enforces it.
-		const updatedIndexes = Object.freeze([
-			...(tableSchema.indexes ?? []),
-			indexSchema,
-		]);
-		const updatedSchema: TableSchema = { ...tableSchema, indexes: updatedIndexes };
-		if (indexSchema.unique) {
-			// `derivedFromIndex` tags this synthesized constraint so a future
-			// `StoreModule.dropIndex` can filter it out symmetrically (mirrors
-			// SchemaManager.dropIndex / MemoryTableManager.dropIndex). Without that
-			// filter on the drop side, the UNIQUE check would survive the index.
-			updatedSchema.uniqueConstraints = Object.freeze([
-				...(tableSchema.uniqueConstraints ?? []),
-				{
-					name: indexSchema.name,
-					columns: Object.freeze(indexSchema.columns.map(c => c.index)),
-					predicate: indexSchema.predicate,
-					derivedFromIndex: indexSchema.name,
-				},
-			]);
-		}
+		// holds its own reference captured at connect time). The shared
+		// appendIndexToTableSchema also synthesizes the UNIQUE → derived
+		// uniqueConstraint entry so checkUniqueConstraints enforces it; the
+		// `derivedFromIndex` tag lets StoreModule.dropIndex filter it back out
+		// symmetrically (mirrors SchemaManager.dropIndex / MemoryTableManager.dropIndex).
+		const updatedSchema = appendIndexToTableSchema(tableSchema, indexSchema);
 		table.updateSchema(updatedSchema);
 
 		// Emit schema change event

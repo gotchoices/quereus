@@ -9,7 +9,7 @@ import { StatusCode, type SqlValue } from '../common/types.js';
 import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js';
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
-import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass } from './table.js';
+import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema } from './constraint-builder.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import { backingTableNameFor } from './view.js';
@@ -2005,7 +2005,7 @@ export class SchemaManager {
 			throw new QuereusError(`createIndex failed for index '${indexName}' on table '${tableName}': ${message}`, code, e instanceof Error ? e : undefined, stmt.loc?.start.line, stmt.loc?.start.column);
 		}
 
-		const updatedTableSchema = this.addIndexToTableSchema(tableSchema, indexSchema);
+		const updatedTableSchema = appendIndexToTableSchema(tableSchema, indexSchema);
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		schema.addTable(updatedTableSchema);
 
@@ -2066,30 +2066,6 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Returns a new TableSchema with the given index appended. If the index is
-	 * unique, also adds a matching uniqueConstraint so the mutation manager
-	 * enforces uniqueness on insert/update through its existing checks.
-	 */
-	private addIndexToTableSchema(tableSchema: TableSchema, indexSchema: IndexSchema): TableSchema {
-		const updatedIndexes = [...(tableSchema.indexes || []), indexSchema];
-		const result: TableSchema = {
-			...tableSchema,
-			indexes: Object.freeze(updatedIndexes),
-		};
-		if (indexSchema.unique) {
-			const newConstraint: UniqueConstraintSchema = {
-				name: indexSchema.name,
-				columns: Object.freeze(indexSchema.columns.map(c => c.index)),
-				predicate: indexSchema.predicate,
-				derivedFromIndex: indexSchema.name,
-			};
-			const updatedConstraints = [...(tableSchema.uniqueConstraints ?? []), newConstraint];
-			result.uniqueConstraints = Object.freeze(updatedConstraints);
-		}
-		return result;
-	}
-
-	/**
 	 * Drops a secondary index from the table that owns it.
 	 * Searches all tables in the target schema to find the owning table.
 	 *
@@ -2138,7 +2114,7 @@ export class SchemaManager {
 		}
 
 		// Remove the index from the table schema, along with any uniqueConstraint
-		// that was synthesized from this index (see addIndexToTableSchema).
+		// that was synthesized from this index (see appendIndexToTableSchema).
 		const updatedIndexes = (ownerTable.indexes || []).filter(
 			idx => idx.name.toLowerCase() !== lowerIndexName
 		);
@@ -2346,7 +2322,14 @@ export class SchemaManager {
 	 * 3. Calls module.connect() instead of module.create()
 	 * 4. Skips schema change hooks (since these are existing objects)
 	 *
-	 * @param ddlStatements Array of DDL strings (CREATE TABLE, CREATE INDEX, etc.)
+	 * Each DDL string may hold **one or more** statements: a catalog entry can
+	 * bundle a `CREATE TABLE` immediately followed by the `CREATE INDEX`es that
+	 * belong to it. Statements within an entry are imported in document order, so
+	 * a table always precedes the indexes that reference it. (Because every
+	 * table's indexes are co-located with it in one entry, no global
+	 * table-before-index ordering across entries is required.)
+	 *
+	 * @param ddlStatements Array of DDL strings (each one or more CREATE TABLE / CREATE INDEX, etc.)
 	 * @returns Array of imported object names
 	 */
 	async importCatalog(ddlStatements: string[]): Promise<{ tables: string[]; indexes: string[] }> {
@@ -2354,11 +2337,12 @@ export class SchemaManager {
 
 		for (const ddl of ddlStatements) {
 			try {
-				const result = await this.importSingleDDL(ddl);
-				if (result.type === 'table') {
-					imported.tables.push(result.name);
-				} else if (result.type === 'index') {
-					imported.indexes.push(result.name);
+				for (const result of await this.importDDL(ddl)) {
+					if (result.type === 'table') {
+						imported.tables.push(result.name);
+					} else {
+						imported.indexes.push(result.name);
+					}
 				}
 			} catch (e) {
 				const message = e instanceof Error ? e.message : String(e);
@@ -2372,23 +2356,27 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Import a single DDL statement without creating storage.
+	 * Import every statement in a DDL string without creating storage, in document
+	 * order. A single string may carry several statements (a table bundled with
+	 * its indexes); single-statement entries remain valid. Any unsupported
+	 * statement type throws — `rehydrateCatalog` relies on this fail-loud contract
+	 * to record import errors rather than silently dropping objects.
 	 */
-	private async importSingleDDL(ddl: string): Promise<{ type: 'table' | 'index'; name: string }> {
+	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index'; name: string }>> {
 		const parser = new Parser();
 		const statements = parser.parseAll(ddl);
-		if (statements.length !== 1) {
-			throw new QuereusError(`importCatalog expects exactly one statement per DDL, got ${statements.length}`, StatusCode.ERROR);
-		}
 
-		const stmt = statements[0];
-
-		if (stmt.type === 'createTable') {
-			return this.importTable(stmt as AST.CreateTableStmt);
-		} else if (stmt.type === 'createIndex') {
-			return this.importIndex(stmt as AST.CreateIndexStmt);
+		const results: Array<{ type: 'table' | 'index'; name: string }> = [];
+		for (const stmt of statements) {
+			if (stmt.type === 'createTable') {
+				results.push(await this.importTable(stmt as AST.CreateTableStmt));
+			} else if (stmt.type === 'createIndex') {
+				results.push(await this.importIndex(stmt as AST.CreateIndexStmt));
+			} else {
+				throw new QuereusError(`importCatalog does not support statement type: ${stmt.type}`, StatusCode.ERROR);
+			}
 		}
-		throw new QuereusError(`importCatalog does not support statement type: ${stmt.type}`, StatusCode.ERROR);
+		return results;
 	}
 
 	/**
@@ -2432,6 +2420,13 @@ export class SchemaManager {
 
 	/**
 	 * Import an index schema without calling module.createIndex().
+	 *
+	 * Reconstructs the index with full fidelity from the re-parsed DDL so a
+	 * `CREATE [UNIQUE] INDEX ... (col [COLLATE x]) [WHERE ...]` survives a
+	 * catalog round-trip: per-column collation, the UNIQUE flag, the partial
+	 * predicate, and (for a unique index) the synthesized `derivedFromIndex`
+	 * UNIQUE constraint — mirroring the live `buildIndexSchema` + the shared
+	 * {@link appendIndexToTableSchema} that {@link createIndex} uses.
 	 */
 	private async importIndex(stmt: AST.CreateIndexStmt): Promise<{ type: 'index'; name: string }> {
 		const targetSchemaName = stmt.table.schema || this.getCurrentSchemaName();
@@ -2444,9 +2439,10 @@ export class SchemaManager {
 			throw new QuereusError(`Cannot import index '${indexName}': table '${tableName}' not found`, StatusCode.ERROR);
 		}
 
-		// Build index columns schema
+		// Build index columns schema. Mirrors buildIndexSchema's collation resolution
+		// (per-column COLLATE → table column collation → BINARY).
 		const indexColumns: IndexColumnSchema[] = stmt.columns.map(col => {
-			const colName = col.name;
+			const { name: colName, collation } = resolveImportedIndexColumn(col);
 			if (!colName) {
 				throw new QuereusError(`Expression-based index columns are not supported during import`, StatusCode.ERROR);
 			}
@@ -2454,24 +2450,25 @@ export class SchemaManager {
 			if (colIdx === undefined) {
 				throw new QuereusError(`Column '${colName}' not found in table '${tableName}'`, StatusCode.ERROR);
 			}
+			const tableColSchema = tableSchema.columns[colIdx];
 			return {
 				index: colIdx,
 				desc: col.direction === 'desc',
+				collation: normalizeCollationName(collation || tableColSchema.collation || 'BINARY'),
 			};
 		});
 
 		const indexSchema: IndexSchema = {
 			name: indexName,
 			columns: Object.freeze(indexColumns),
+			unique: stmt.isUnique || undefined,
+			predicate: stmt.where,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 
-		// Add index to table without calling module.createIndex()
-		const updatedIndexes = [...(tableSchema.indexes || []), indexSchema];
-		const updatedTableSchema: TableSchema = {
-			...tableSchema,
-			indexes: Object.freeze(updatedIndexes),
-		};
+		// Append the index (and synthesize the derived UNIQUE constraint when
+		// unique) without calling module.createIndex() — the storage already exists.
+		const updatedTableSchema = appendIndexToTableSchema(tableSchema, indexSchema);
 
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		schema.addTable(updatedTableSchema);
@@ -2479,4 +2476,30 @@ export class SchemaManager {
 
 		return { type: 'index', name: `${targetSchemaName}.${tableName}.${indexName}` };
 	}
+}
+
+/**
+ * Resolves an indexed-column AST node to its underlying column name and optional
+ * collation, for catalog import.
+ *
+ * The parser folds `col COLLATE x` into a `collate` expression wrapping a bare
+ * column reference (see `indexedColumn()` in parser.ts), leaving `col.name`
+ * unset. Since `generateIndexDDL` always emits an explicit `COLLATE <c>` per
+ * column, *every* generated index DDL re-parses into this collate-wrapped form —
+ * so unwrapping it is required for the common case, not just non-BINARY
+ * collations. A genuine expression index (non-column operand) returns an unset
+ * name and is rejected by the caller.
+ */
+function resolveImportedIndexColumn(col: AST.IndexedColumn): { name: string | undefined; collation: string | undefined } {
+	// Bare column reference (`col [ASC|DESC]`) — name set directly by the parser.
+	if (col.name) {
+		return { name: col.name, collation: col.collation };
+	}
+	// Collate-wrapped column (`col COLLATE x`) — unwrap to the column + collation.
+	const expr = col.expr;
+	if (expr?.type === 'collate' && expr.expr.type === 'column' && !expr.expr.table && !expr.expr.schema) {
+		return { name: expr.expr.name, collation: expr.collation };
+	}
+	// Anything else is a genuine expression index — unsupported on import.
+	return { name: undefined, collation: undefined };
 }

@@ -322,7 +322,7 @@ function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): Ca
 	// slot, which is not a CHECK-expression and never round-trips through `parse()`.
 	//
 	// `checkExpression` is absent only for assertions reconstructed from persisted
-	// `violationSql` alone — a path that does not exist today (`importSingleDDL`
+	// `violationSql` alone — a path that does not exist today (`importDDL`
 	// throws on assertion DDL), so the primary branch always fires. The fallback
 	// keeps a descriptive (non-reparseable) string for that hypothetical case
 	// rather than throwing. See assertion.ts:21-27.
