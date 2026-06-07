@@ -333,6 +333,151 @@ export class IndexedDBManager {
   }
 
   /**
+   * Rename one or more object stores within a single versionchange transaction.
+   *
+   * Object stores cannot be renamed in place, so each `{from → to}` is relocated
+   * by an atomic copy-then-delete: create `to`, cursor-copy every entry from
+   * `from` into it, then delete `from`. Because schema ops and the cursor copy
+   * all ride one versionchange transaction, the whole batch is all-or-nothing —
+   * any error aborts the transaction and leaves the database exactly as before
+   * (old stores intact, new stores never created).
+   */
+  async renameObjectStores(renames: Array<{ from: string; to: string }>): Promise<void> {
+    // Wait for any ongoing upgrade to complete
+    if (this.upgradePromise) {
+      await this.upgradePromise;
+    }
+
+    await this.ensureOpen();
+
+    // Only move sources that actually materialized as object stores. A table
+    // that was declared but never connected has no backing store yet — mirrors
+    // LevelDB's pathExists guard for a never-materialized directory.
+    const filtered = renames.filter((r) => this.objectStores.has(r.from));
+    if (filtered.length === 0) {
+      return; // nothing physical to move
+    }
+
+    // Pre-bump collision guard: refuse before mutating anything if any target
+    // already exists, so a failed rename never leaves a half-created store.
+    for (const { from, to } of filtered) {
+      if (this.objectStores.has(to)) {
+        throw new Error(`Cannot rename object store '${from}' to '${to}': object store '${to}' already exists`);
+      }
+    }
+
+    // Serialize against concurrent operations via upgradePromise.
+    this.upgradePromise = this.doRenameObjectStores(filtered);
+    try {
+      await this.upgradePromise;
+    } finally {
+      this.upgradePromise = null;
+    }
+  }
+
+  private async doRenameObjectStores(renames: Array<{ from: string; to: string }>): Promise<void> {
+    // Close current connection and reopen with new version
+    this.db?.close();
+    this.db = null;
+    this.dbVersion++;
+
+    this.db = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('IndexedDB rename upgrade timed out'));
+      }, 10000);
+
+      const request = indexedDB.open(this.dbName, this.dbVersion);
+
+      // Capture a meaningful copy/abort error so the caller sees a real message
+      // rather than a bare AbortError surfaced by the failed open request.
+      let copyError: Error | null = null;
+
+      request.onerror = () => {
+        clearTimeout(timeout);
+        reject(copyError ?? new Error(`Failed to rename IndexedDB object stores: ${request.error?.message}`));
+      };
+
+      request.onblocked = () => {
+        // Don't reject immediately - the onversionchange handler on the blocking
+        // connection should close it, allowing the upgrade to proceed.
+        console.warn('IndexedDB rename upgrade is blocked, waiting for other connections to close...');
+      };
+
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        const tx = (event.target as IDBOpenDBRequest).transaction!;
+
+        tx.onabort = () => {
+          if (!copyError) {
+            copyError = tx.error ?? new Error('IndexedDB rename transaction aborted');
+          }
+        };
+
+        // Drive the renames sequentially with a cursor-chained driver so a
+        // request is always pending — that keeps the versionchange transaction
+        // alive until the last copy completes, at which point it auto-commits.
+        let i = 0;
+        const processNext = () => {
+          if (i >= renames.length) return; // no more requests → tx commits
+          const { from, to } = renames[i];
+
+          if (!db.objectStoreNames.contains(from)) {
+            // Source vanished unexpectedly — skip rather than throw mid-tx.
+            i++;
+            processNext();
+            return;
+          }
+          if (!db.objectStoreNames.contains(to)) {
+            db.createObjectStore(to);
+          }
+
+          const cursorReq = tx.objectStore(from).openCursor();
+          cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result;
+            if (cursor) {
+              // Keys/values are ArrayBuffers; copy them verbatim with out-of-line keys.
+              tx.objectStore(to).put(cursor.value, cursor.key);
+              cursor.continue();
+            } else {
+              // Copy exhausted — drop the old store and advance.
+              db.deleteObjectStore(from);
+              i++;
+              processNext();
+            }
+          };
+          cursorReq.onerror = () => {
+            copyError = cursorReq.error ?? new Error(`Failed to copy object store '${from}' to '${to}'`);
+            try {
+              tx.abort();
+            } catch {
+              /* transaction already aborting */
+            }
+          };
+        };
+
+        processNext();
+      };
+
+      request.onsuccess = () => {
+        clearTimeout(timeout);
+        const db = request.result;
+
+        // Handle version change requests
+        db.onversionchange = () => {
+          db.close();
+          this.db = null;
+        };
+
+        this.objectStores.clear();
+        for (let j = 0; j < db.objectStoreNames.length; j++) {
+          this.objectStores.add(db.objectStoreNames[j]);
+        }
+        resolve(db);
+      };
+    });
+  }
+
+  /**
    * Check if an object store exists.
    */
   hasObjectStore(storeName: string): boolean {

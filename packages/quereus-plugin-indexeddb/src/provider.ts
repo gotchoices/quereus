@@ -130,6 +130,44 @@ export class IndexedDBProvider implements KVStoreProvider {
 		await this.manager.deleteObjectStore(storeName);
 	}
 
+	async renameTableStores(schemaName: string, oldName: string, newName: string): Promise<void> {
+		const oldDataStoreName = buildDataStoreName(schemaName, oldName);
+		const newDataStoreName = buildDataStoreName(schemaName, newName);
+
+		// Up-front collision guard, mirroring LevelDB's "destination already exists".
+		if (this.manager.hasObjectStore(newDataStoreName)) {
+			throw new Error(`Cannot rename table '${oldName}' to '${newName}': data store '${newDataStoreName}' already exists`);
+		}
+
+		// Build the rename list from the actual object stores: the data store (if
+		// it materialized) plus every secondary-index store under the old name.
+		const renameList: Array<{ from: string; to: string }> = [];
+		if (this.manager.hasObjectStore(oldDataStoreName)) {
+			renameList.push({ from: oldDataStoreName, to: newDataStoreName });
+		}
+
+		const oldIndexPrefix = `${oldDataStoreName}${STORE_SUFFIX.INDEX}`;
+		for (const name of this.manager.getObjectStoreNames()) {
+			if (!name.startsWith(oldIndexPrefix)) continue;
+			const indexName = name.substring(oldIndexPrefix.length);
+			const target = buildIndexStoreName(schemaName, newName, indexName);
+			if (this.manager.hasObjectStore(target)) {
+				throw new Error(`Cannot rename table '${oldName}' to '${newName}': index store '${target}' already exists`);
+			}
+			renameList.push({ from: name, to: target });
+		}
+
+		// Evict cached handles for every source store BEFORE the relocation so no
+		// stale IndexedDBStore/CachedKVStore points at an object store that is about
+		// to be deleted. __stats__ is the unified stats store and is left untouched —
+		// StoreModule.renameTable relocates the stats key itself.
+		for (const { from } of renameList) {
+			await this.closeStoreByName(from);
+		}
+
+		await this.manager.renameObjectStores(renameList);
+	}
+
 	async deleteTableStores(schemaName: string, tableName: string): Promise<void> {
 		const dataStoreName = buildDataStoreName(schemaName, tableName);
 
