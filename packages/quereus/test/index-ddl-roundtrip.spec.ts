@@ -483,6 +483,17 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
 	});
 
+	it('a reserved-word index column in mixed case re-quotes identically on both sides', async () => {
+		// Probe: a reserved-word column name must lowercase BEFORE quoteIdentifier so it
+		// re-quotes to `"order"` on both the definition (`Order`) and reference (`ORDER`)
+		// sides — neither over- nor under-quoted, and no case-only churn.
+		const tbl = `table t { id INTEGER PRIMARY KEY, "Order" INTEGER }`;
+		const diff = await diffIndexEdit(`${tbl}\nindex ix on t ("ORDER")`, `${tbl}\nindex ix on t ("ORDER")`);
+		expect(diff.indexesToCreate, 'no index creates').to.deep.equal([]);
+		expect(diff.indexesToDrop, 'no index drops').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
+	});
+
 	it('a tags-only change takes SET TAGS, not a recreate', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_name on t (name) with tags (purpose = 'a')`, `${TABLE}\nindex ix_name on t (name) with tags (purpose = 'b')`);
 		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);

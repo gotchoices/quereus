@@ -2180,6 +2180,31 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 			await db.close();
 		}
 	});
+
+	it('a mixed-case UNIQUE applies once and converges — no spurious migration DDL executes', async function () {
+		// End-to-end (not just the diff decision): the first apply realizes the UNIQUE,
+		// and a re-declare with the SAME column in the SAME case must produce neither a
+		// diff nor any migration DDL — proving the no-churn decision also means no DDL runs.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, Email TEXT, constraint uq unique (email) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec("insert into t values (1, 'a@x')");
+
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter, 'converged: no alter on re-diff').to.deep.equal([]);
+			expect(generateMigrationDDL(diff, 'main'), 'converged: no migration DDL').to.deep.equal([]);
+
+			// The constraint really enforces (it was actually applied, not silently skipped).
+			let rejected = false;
+			try { await db.exec("insert into t values (2, 'a@x')"); } catch { rejected = true; }
+			expect(rejected, 'duplicate rejected by the applied UNIQUE').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================
