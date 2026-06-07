@@ -4992,6 +4992,82 @@ describe('Property-Based Tests', () => {
 				await expectMutationReject('update npv set pv = 7 where cc = 1 returning cc, pv', 'returning-through-view');
 			});
 
+			// ----- Outer (RIGHT) join: non-preserved-side UPDATE (matched + null-extended) -----
+			// The exact mirror of the LEFT `npv` non-preserved-update test with the operands
+			// swapped: `rnp_parent p right join rnp_child c` makes the child (right operand)
+			// PRESERVED and the parent (left) NON-preserved. The non-preserved-column-update
+			// substrate keys off the per-row classification (`nullExtended` / `sideIndex`), not
+			// source order, so every branch and boundary must hold identically — this pins the
+			// matched update, the null-extended dangling-key materialization, the NULL-key no-op,
+			// the NOT NULL `null-extended-create-conflict`, the composite-key
+			// `unsupported-outer-join-update`, and the RETURNING `returning-through-view` rejects
+			// for RIGHT directly (view-write-right-join-readmit).
+			it('outer (right) join: non-preserved-side update materializes matched + null-extended rows', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists rnpv');
+				await db.exec('drop table if exists rnp_child');
+				await db.exec('drop table if exists rnp_parent');
+				await db.exec('create table rnp_parent (pp integer primary key, pv integer null) using memory');
+				await db.exec('create table rnp_child (cc integer primary key, pr integer null, cv integer null) using memory');
+				await db.exec('create view rnpv as select c.cc as cc, c.cv as cv, p.pv as pv from rnp_parent p right join rnp_child c on p.pp = c.pr');
+
+				await db.exec('insert into rnp_parent values (10, 100)');
+				await db.exec('insert into rnp_child values (1, 10, 1000)');   // joined
+				await db.exec('insert into rnp_child values (2, 99, 2000)');   // null-extended, dangling key
+				await db.exec('insert into rnp_child values (3, null, 3000)'); // null-extended, NULL key
+
+				// Matched: updates the joined parent in place — no new parent row.
+				await db.exec('update rnpv set pv = 111 where cc = 1');
+				assertRowsEqual('rnp matched update view', await readRows('select cc, pv from rnpv where cc = 1'),
+					[{ cc: 1, pv: 111 }], ['cc', 'pv']);
+				assertRowsEqual('rnp matched update parent base', await readRows('select pp, pv from rnp_parent order by pp'),
+					[{ pp: 10, pv: 111 }], ['pp', 'pv']);
+
+				// Null-extended with a dangling key: materializes a parent carrying the EC join
+				// key (pp = the child's pr = 99) + pv, so the child now joins it. PutGet green.
+				await db.exec('update rnpv set pv = 222 where cc = 2');
+				assertRowsEqual('rnp null-extended materialization view', await readRows('select cc, cv, pv from rnpv where cc = 2'),
+					[{ cc: 2, cv: 2000, pv: 222 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('rnp null-extended materialization parent base', await readRows('select pp, pv from rnp_parent where pp = 99'),
+					[{ pp: 99, pv: 222 }], ['pp', 'pv']);
+
+				// Null-extended with a NULL key: no joinable key to seed, so the update is a no-op.
+				await db.exec('update rnpv set pv = 333 where cc = 3');
+				assertRowsEqual('rnp null-key update is a no-op', await readRows('select cc, pv from rnpv where cc = 3'),
+					[{ cc: 3, pv: null }], ['cc', 'pv']);
+				expect((await readRows('select pp from rnp_parent where pp = 333')).length,
+					'no stray parent minted for the null-key row').to.equal(0);
+
+				// GetPut: writing each row's own pv back leaves the whole image unchanged.
+				await db.exec('update rnpv set pv = 111 where cc = 1');
+				assertRowsEqual('rnp GetPut idempotent', await readRows('select cc, cv, pv from rnpv order by cc'),
+					[{ cc: 1, cv: 1000, pv: 111 }, { cc: 2, cv: 2000, pv: 222 }, { cc: 3, cv: 3000, pv: null }], ['cc', 'cv', 'pv']);
+
+				// null-extended-create-conflict: a NOT NULL non-preserved column with no default
+				// the materialization create branch cannot supply rejects (a plan-time guard).
+				await db.exec('drop view if exists rnpv2');
+				await db.exec('drop table if exists rnp2_child');
+				await db.exec('drop table if exists rnp2_parent');
+				await db.exec('create table rnp2_parent (pp integer primary key, pv integer null, req integer not null) using memory');
+				await db.exec('create table rnp2_child (cc integer primary key, pr integer null, cv integer null) using memory');
+				await db.exec('create view rnpv2 as select c.cc as cc, c.cv as cv, p.pv as pv from rnp2_parent p right join rnp2_child c on p.pp = c.pr');
+				await expectMutationReject('update rnpv2 set pv = 9 where cc = 1', 'null-extended-create-conflict');
+
+				// Composite join key: the materialization insert threads a single join column, so
+				// a non-preserved side equated on >1 column cannot be re-joined — reject at plan time.
+				await db.exec('drop view if exists rnpvk');
+				await db.exec('drop table if exists rnpk_child');
+				await db.exec('drop table if exists rnpk_parent');
+				await db.exec('create table rnpk_parent (pp integer primary key, k2 integer null, pv integer null) using memory');
+				await db.exec('create table rnpk_child (cc integer primary key, x integer null, y integer null) using memory');
+				await db.exec('create view rnpvk as select c.cc as cc, p.pv as pv from rnpk_parent p right join rnpk_child c on p.pp = c.x and p.k2 = c.y');
+				await db.exec('insert into rnpk_child values (1, 99, 7)'); // null-extended, dangling composite key
+				await expectMutationReject('update rnpvk set pv = 5 where cc = 1', 'unsupported-outer-join-update');
+
+				// RETURNING through a non-preserved-side update is not recoverable (parity with LEFT).
+				await expectMutationReject('update rnpv set pv = 7 where cc = 1 returning cc, pv', 'returning-through-view');
+			});
+
 			// ----- Outer (LEFT) join: existence-column WRITE (flag-flip ⇒ insert/delete) -----
 			// `rj_ex` = ex_child LEFT JOIN ex_parent on parent.pp = child.pr, with the match
 			// existence reified as `exists right as hasP`. WRITING hasP drives the non-preserved

@@ -1172,14 +1172,13 @@ function collectJoinSources(view: MutableViewLike, from: readonly AST.FromClause
 				return;
 			case 'join': {
 				const hasPredicate = !!fc.condition || (!!fc.columns && fc.columns.length > 0);
-				// RIGHT is **excluded** even though its preserved/non-preserved classification
-				// is the mirror of LEFT and the runtime can now read a RIGHT join: write-through
-				// re-admission is the separate dependent ticket (`view-write-right-join-readmit`),
-				// so until that lands, admitting RIGHT here would make the static surfaces
-				// advertise a RIGHT-join view as writable before the per-side routing exists.
-				// FULL is accepted only to carry through to its precise conservative diagnostics
-				// (it has no preserved side, so it never falsely advertises). Re-admit RIGHT for
-				// write-through in `view-write-right-join-readmit`.
+				// RIGHT is **admitted** (`view-write-right-join-readmit`): the runtime reads a
+				// RIGHT join and its preserved/non-preserved classification is the exact mirror of
+				// LEFT (the right operand of a `right` is preserved, the left null-extended — see
+				// the per-side recursion below), so the substrate routes it symmetrically (it keys
+				// off `JoinSide.preserved`, not source order). FULL is accepted only to carry
+				// through to its precise conservative diagnostics (it has no preserved side, so it
+				// never falsely advertises); FULL write-through is a separable future concern.
 				const acceptedType = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'right' || fc.joinType === 'full';
 				if (!acceptedType || !hasPredicate) {
 					raiseMutationDiagnostic({
