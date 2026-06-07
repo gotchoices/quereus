@@ -17,6 +17,8 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { proveLens, type ConstraintObligation, type LensDeployReport } from '../src/schema/lens-prover.js';
 import type { LensSlot } from '../src/schema/lens.js';
+import { Parser } from '../src/parser/parser.js';
+import { astToString } from '../src/emit/ast-stringify.js';
 
 async function expectThrows(fn: () => Promise<unknown>, matcher?: RegExp): Promise<void> {
 	let threw = false;
@@ -847,6 +849,69 @@ describe('lens prover: round-trip (computed deploy-time predicate)', () => {
 			await db.exec('declare logical schema x { table m (scaled integer primary key with tags ("quereus.lens.writable" = true), speed integer null) }');
 			await db.exec('declare lens for x over y { view m as select speed * speed as scaled, speed from y.src }');
 			await expectThrows(() => db.exec('apply schema x'), /lens\.non-invertible|writable|invertible/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('survives schema export round-trip: the re-emitted writable tag still blocks on re-apply', async () => {
+		// docs/lens.md § Computed and Generated Columns claims the signal "survives schema
+		// export/round-trip". Export the declared logical schema AND the lens through the AST
+		// stringifier (the export path: formatColumnDef → columnDefToString → tagsClauseToString
+		// → tagValueToString) and re-apply the round-tripped text into a fresh DB: it must still
+		// throw lens.non-invertible.
+		const parser = new Parser();
+		const exportedLogical = astToString(parser.parse(
+			'declare logical schema x { table m (id integer primary key, who text null, label text null with tags ("quereus.lens.writable" = true)) }',
+		));
+		// The boolean tag re-emits faithfully (not coerced to 1/0 or a string).
+		expect(exportedLogical, 're-emitted logical schema carries the boolean writable tag')
+			.to.match(/quereus\.lens\.writable["'\s]*=\s*true/i);
+		const exportedLens = astToString(parser.parse(
+			'declare lens for x over y { view m as select id, who, upper(who) as label from y.src }',
+		));
+
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, who text null) }');
+			await db.exec('apply schema y');
+			// Re-apply the EXPORTED (serialized → re-parsed) forms, not the original literals.
+			await db.exec(exportedLogical);
+			await db.exec(exportedLens);
+			await expectThrows(() => db.exec('apply schema x'), /lens\.non-invertible|writable|invertible/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('case-insensitive: a mixed-case writable-intent column still blocks (intentWritable lowercases)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, who text null) }');
+			await db.exec('apply schema y');
+			// `Label` is declared (and projected) mixed-case; `intentWritable` resolves it via the
+			// lowercased `logicalColIndex`, so the intent must still fire. A regression that drops
+			// the `.toLowerCase()` would miss the tag and silently admit the column read-only.
+			await db.exec('declare logical schema x { table m (id integer primary key, who text null, "Label" text null with tags ("quereus.lens.writable" = true)) }');
+			await db.exec('declare lens for x over y { view m as select id, who, upper(who) as "Label" from y.src }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.non-invertible|writable|invertible/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('multiple opaque writable-intent columns each produce a deploy error (one per column)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, a text null, b text null) }');
+			await db.exec('apply schema y');
+			// Two opaque columns, each declared writable ⇒ the per-verdict forEach emits one error
+			// per column, aggregated into a single atomic deploy failure ("blocked by 2 error(s)").
+			await db.exec('declare logical schema x { table m (id integer primary key, ua text null with tags ("quereus.lens.writable" = true), ub text null with tags ("quereus.lens.writable" = true)) }');
+			await db.exec('declare lens for x over y { view m as select id, upper(a) as ua, upper(b) as ub from y.src }');
+			await expectThrows(() => db.exec('apply schema x'), /blocked by 2 error\(s\)/);
+			// Atomicity: a blocked deploy leaves no report behind.
+			expect(db.declaredSchemaManager.getDeployedLensReport('x'), 'no report after a blocked deploy').to.be.undefined;
 		} finally {
 			await db.close();
 		}
