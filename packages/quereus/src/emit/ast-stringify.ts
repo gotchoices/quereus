@@ -417,6 +417,105 @@ function windowFrameBoundToString(bound: AST.WindowFrameBound): string {
 	}
 }
 
+/**
+ * Returns a structural clone of an expression with every bare column / identifier
+ * reference case-folded — `column` and `identifier` node `name` / `table` / `schema`
+ * lowercased — and everything else left byte-exact. This is the expression-level
+ * analogue of {@link lowercaseTableConstraintColumnNames}'s column-list fold: it makes
+ * the canonical body of a CHECK expression / partial-index WHERE predicate
+ * case-insensitive, matching Quereus's uniformly case-folding column resolution (the
+ * AST never records identifier quoting; every resolver folds via `.toLowerCase()`), so
+ * a reference whose case diverges from the column definition (or across re-declares)
+ * renders identically on both diff sides instead of churning a spurious drop+recreate.
+ *
+ * Folds ONLY identifier references. Left byte-exact: string / blob / number / JSON /
+ * NULL literals (`value` / `lexeme`), parameters, `cast.targetType`, `function.name`
+ * (already lowercased at render), and `collate.collation` (already lowercased at
+ * render — folding it here would double-handle). The full {@link expressionToString}
+ * node set is mirrored so every nested shape recurses and folds its inner refs.
+ *
+ * Bounded limitation: subquery bodies (`subquery` / `exists` / `in (select …)`) pass
+ * through structurally — the inner query is NOT descended into. This is symmetric on
+ * both diff sides (no NEW churn versus today), and CHECK / partial-WHERE subqueries
+ * are rare; full coverage is intentionally NOT implied.
+ *
+ * MUST NOT mutate the input: every folded node is rebuilt as a fresh object
+ * (`{ ...node, ...recursed }`) and only `name` / `table` / `schema` are overridden on
+ * a leaf ref. A `literal`'s `value` (a possibly-shared Uint8Array / JSON object /
+ * Promise) is passed through by reference, never recursed into or copied. Used ONLY by
+ * the canonical renderers ({@link constraintBodyToCanonicalString} via
+ * {@link lowercaseTableConstraintColumnNames}, {@link createIndexBodyToCanonicalString});
+ * the persistence renderers keep original case.
+ */
+function lowerExprIdentifiers(expr: AST.Expression): AST.Expression {
+	switch (expr.type) {
+		case 'column':
+			return { ...expr, name: expr.name.toLowerCase(), table: expr.table?.toLowerCase(), schema: expr.schema?.toLowerCase() };
+		case 'identifier':
+			return { ...expr, name: expr.name.toLowerCase(), schema: expr.schema?.toLowerCase() };
+		case 'binary':
+			return { ...expr, left: lowerExprIdentifiers(expr.left), right: lowerExprIdentifiers(expr.right) };
+		case 'unary':
+			return { ...expr, expr: lowerExprIdentifiers(expr.expr) };
+		case 'function':
+			return { ...expr, args: expr.args.map(arg => lowerExprIdentifiers(arg)) };
+		case 'cast':
+			return { ...expr, expr: lowerExprIdentifiers(expr.expr) };
+		case 'collate':
+			// `collation` is left alone — the render lowercases it (`quoteIdentifier(collation.toLowerCase())`).
+			return { ...expr, expr: lowerExprIdentifiers(expr.expr) };
+		case 'case':
+			return {
+				...expr,
+				baseExpr: expr.baseExpr ? lowerExprIdentifiers(expr.baseExpr) : undefined,
+				whenThenClauses: expr.whenThenClauses.map(c => ({ when: lowerExprIdentifiers(c.when), then: lowerExprIdentifiers(c.then) })),
+				elseExpr: expr.elseExpr ? lowerExprIdentifiers(expr.elseExpr) : undefined,
+			};
+		case 'between':
+			return { ...expr, expr: lowerExprIdentifiers(expr.expr), lower: lowerExprIdentifiers(expr.lower), upper: lowerExprIdentifiers(expr.upper) };
+		case 'in':
+			// `subquery` (when present) passes through structurally — bounded limitation, see doc.
+			return { ...expr, expr: lowerExprIdentifiers(expr.expr), values: expr.values?.map(v => lowerExprIdentifiers(v)) };
+		case 'windowFunction':
+			return { ...expr, function: lowerExprIdentifiers(expr.function) as AST.FunctionExpr, window: expr.window ? lowerWindowDefinitionIdentifiers(expr.window) : undefined };
+		case 'literal':
+		case 'parameter':
+		case 'subquery':
+		case 'exists':
+		default:
+			// Identifier-free or pass-through-structurally (subquery / exists) nodes: returned
+			// as-is. Never mutated, so aliasing the input subtree back into the output is safe
+			// (read-only at render); a literal's `value` is therefore never touched.
+			return expr;
+	}
+}
+
+/** Window-definition analogue of {@link lowerExprIdentifiers} — folds identifier refs in
+ *  PARTITION BY / ORDER BY exprs and frame bounds. Window functions never appear in a CHECK /
+ *  partial-WHERE today, but the fold mirrors {@link windowDefinitionToString} for symmetry. */
+function lowerWindowDefinitionIdentifiers(win: AST.WindowDefinition): AST.WindowDefinition {
+	return {
+		...win,
+		partitionBy: win.partitionBy?.map(e => lowerExprIdentifiers(e)),
+		orderBy: win.orderBy?.map(o => ({ ...o, expr: lowerExprIdentifiers(o.expr) })),
+		frame: win.frame ? lowerWindowFrameIdentifiers(win.frame) : undefined,
+	};
+}
+
+function lowerWindowFrameIdentifiers(frame: AST.WindowFrame): AST.WindowFrame {
+	return {
+		...frame,
+		start: lowerWindowFrameBoundIdentifiers(frame.start),
+		end: frame.end ? lowerWindowFrameBoundIdentifiers(frame.end) : frame.end,
+	};
+}
+
+function lowerWindowFrameBoundIdentifiers(bound: AST.WindowFrameBound): AST.WindowFrameBound {
+	return (bound.type === 'preceding' || bound.type === 'following')
+		? { ...bound, value: lowerExprIdentifiers(bound.value) }
+		: bound;
+}
+
 // Statement stringify functions
 export function selectToString(stmt: AST.SelectStmt): string {
 	const parts: string[] = [];
@@ -884,13 +983,18 @@ function canonicalIndexedColumnsToString(cols: readonly AST.IndexedColumn[]): st
  * including it would churn false positives. Both the declared-AST side
  * (`schema-differ`) and the actual-catalog side (`ddl-generator`'s
  * `indexToCanonicalDDL`) funnel through here so their fragments are byte-comparable.
+ *
+ * The partial-index WHERE predicate's bare column references are case-folded
+ * ({@link lowerExprIdentifiers}) so a reference whose case diverges between schema
+ * versions (the stored predicate keeps the as-written case; a re-declare may differ)
+ * renders identically on both sides — literals are preserved byte-exact.
  */
 export function createIndexBodyToCanonicalString(stmt: AST.CreateIndexStmt): string {
 	const parts: string[] = [];
 	if (stmt.isUnique) parts.push('unique');
 	parts.push('index');
 	parts.push(`(${canonicalIndexedColumnsToString(stmt.columns)})`);
-	if (stmt.where) parts.push('where', expressionToString(stmt.where));
+	if (stmt.where) parts.push('where', expressionToString(lowerExprIdentifiers(stmt.where)));
 	return parts.join(' ');
 }
 
@@ -1354,16 +1458,22 @@ function canonicalCheckOperations(ops: RowOp[] | undefined): RowOp[] | undefined
 }
 
 /**
- * Normalizes a foreign-key clause for body comparison: the default `restrict`
+ * Normalizes a foreign-key clause for body comparison: the referenced (parent)
+ * TABLE name is case-folded (the catalog stores it as-written — see
+ * `constraint-builder`'s `referencedTable: fk.table` — so a parent-name case change
+ * between versions would otherwise churn a spurious drop+add); the default `restrict`
  * action on DELETE / UPDATE renders the same whether written explicitly or
  * omitted, so it collapses to `undefined` (no `on delete/update` clause); an
  * empty referenced-column list collapses to `undefined` (bare `references t`);
  * and the deferrable clause is dropped entirely (it is not a body-change
- * channel the declarative differ tracks).
+ * channel the declarative differ tracks). `quoteIdentifier` still runs after the
+ * lowercase at render, so a reserved-word parent name re-quotes correctly on both
+ * sides. (The referenced COLUMN list is folded upstream by
+ * {@link lowercaseTableConstraintColumnNames}.)
  */
 function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClause {
 	return {
-		table: fk.table,
+		table: fk.table.toLowerCase(),
 		columns: fk.columns && fk.columns.length > 0 ? fk.columns : undefined,
 		onDelete: fk.onDelete && fk.onDelete !== 'restrict' ? fk.onDelete : undefined,
 		onUpdate: fk.onUpdate && fk.onUpdate !== 'restrict' ? fk.onUpdate : undefined,
@@ -1380,16 +1490,16 @@ function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClau
  * {@link tableConstraintsToString} keeps the original case so a stored CREATE TABLE
  * round-trips its declared casing.
  *
- * Covers the UNIQUE / PRIMARY KEY column list, the FK local (child) column list, and
- * the FK referenced (parent) column list. CHECK carries no column list (its refs live
- * in the expression — out of scope, see the canonical-body-identifier-case-beyond-
- * column-lists backlog ticket), so it passes through unchanged.
+ * Covers the UNIQUE / PRIMARY KEY column list, the FK local (child) column list, the
+ * FK referenced (parent) column list, AND the bare column references embedded in a
+ * CHECK expression — the last via {@link lowerExprIdentifiers} (a structural clone),
+ * since CHECK carries no column list and its refs live in the expression.
  *
  * MUST NOT mutate the input: the declared side passes `DeclaredNamedConstraint.bodyAst`,
- * which backs the differ's `ddl` / `definition` — so the column arrays are cloned
- * before rewriting. `quoteIdentifier` still runs *after* the lowercase, so a
- * reserved-word column name (`Order` → `order`) re-quotes to `"order"` on both sides
- * (keyword detection is already case-insensitive).
+ * which backs the differ's `ddl` / `definition` — so the column arrays (and the CHECK
+ * expression tree) are cloned before rewriting. `quoteIdentifier` still runs *after*
+ * the lowercase, so a reserved-word column name (`Order` → `order`) re-quotes to
+ * `"order"` on both sides (keyword detection is already case-insensitive).
  */
 function lowercaseTableConstraintColumnNames(tc: AST.TableConstraint): AST.TableConstraint {
 	switch (tc.type) {
@@ -1406,8 +1516,11 @@ function lowercaseTableConstraintColumnNames(tc: AST.TableConstraint): AST.Table
 					? { ...tc.foreignKey, columns: tc.foreignKey.columns?.map(n => n.toLowerCase()) }
 					: tc.foreignKey,
 			};
-		default:
-			return tc; // 'check' — no column list (refs live in the expr, parked)
+		case 'check':
+			// No column list — bare column refs live in the expression; fold them via a
+			// structural clone. String / blob / numeric / JSON literals, parameters,
+			// collation and cast/function names pass through byte-exact (see lowerExprIdentifiers).
+			return tc.expr ? { ...tc, expr: lowerExprIdentifiers(tc.expr) } : tc;
 	}
 }
 

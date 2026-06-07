@@ -428,6 +428,16 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
 	});
 
+	it('a partial WHERE whose column-ref case changes across re-declares does not churn', async () => {
+		// The stored predicate keeps the as-written ref case; baseline WHERE references the
+		// column as `Active`, the modified re-declare as `active` (the column is `active`).
+		// Equal only after folding the column ref in the canonical index body — and the
+		// literal `1` is preserved byte-exact (the genuine-edit case above proves it differs).
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (name) where Active = 1`, `${TABLE}\nindex ix_active on t (name) where active = 1`);
+		expect(diff.indexesToDrop, 'no drop from a WHERE column-ref case change').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate from a WHERE column-ref case change').to.deep.equal([]);
+	});
+
 	it('reordering index columns recreates the index', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, active)`, `${TABLE}\nindex ix_comp on t (active, name)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_comp']);

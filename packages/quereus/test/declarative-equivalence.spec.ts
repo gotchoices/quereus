@@ -2205,6 +2205,163 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 			await db.close();
 		}
 	});
+
+	// --- Identifier-case folding BEYOND column lists: column refs inside CHECK
+	// expressions / partial-index WHERE predicates, and the FK referenced-table name.
+	// Unlike UNIQUE/PK/FK column lists (where the actual side lifts the column
+	// DEFINITION case), the CHECK expr and FK referenced-table are stored AS WRITTEN,
+	// so the fold-exercising divergence is a BETWEEN-VERSIONS case change. ---
+
+	it('a CHECK whose embedded column-ref case changes across re-declares does not churn', async function () {
+		const db = new Database();
+		try {
+			// Stored CHECK expr keeps the as-written ref case (`QTY`); re-declare references
+			// it as `qty`. Equal only after folding the column ref in the canonical CHECK body.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (QTY > 0) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (qty > 0) }
+			}`);
+			const alter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter, 'no constraint churn from a CHECK column-ref case change').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK column-ref divergent from its definition, re-declared verbatim, does not churn', async function () {
+		const db = new Database();
+		try {
+			// Column declared `Qty`; CHECK references `qty`. A verbatim re-declare must not
+			// churn (sanity probe — both sides carry the same as-written expr regardless of fold).
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, Qty INTEGER, constraint chk check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+			const alter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter, 'no constraint churn from a verbatim re-declare').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK string literal is compared byte-exact — verbatim no-churn, but a literal-value edit recreates', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, status TEXT, constraint chk check (status = 'Active') }
+			}`);
+			await db.exec('apply schema main');
+
+			// Verbatim re-declare: the literal is preserved, so no churn.
+			const alter0 = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter0, 'verbatim CHECK re-declare does not churn (literal preserved)').to.be.undefined;
+
+			// Genuine literal-VALUE edit ('Active' → 'active'): this IS a body change — the fold
+			// collapses identifier case only, never a literal value — so it drops+recreates.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, status TEXT, constraint chk check (status = 'active') }
+			}`);
+			const alter1 = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter1?.constraintsToDrop ?? [], 'literal-value edit drops old CHECK').to.deep.equal(['chk']);
+			expect(alter1?.constraintsToAdd?.length ?? 0, 'literal-value edit adds new CHECK').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a reserved-word column ref in a CHECK re-quotes identically and does not churn on a case change', async function () {
+		const db = new Database();
+		try {
+			// `"Order"` is a reserved word; folded → `order` → quoteIdentifier → `"order"` on
+			// both sides. A between-versions case change of the ref must not churn.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, "Order" INTEGER, constraint chk check ("Order" > 0) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, "Order" INTEGER, constraint chk check ("order" > 0) }
+			}`);
+			const alter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter, 'no churn from a reserved-word CHECK ref case change').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK whose REFERENCED (parent) TABLE case changes across re-declares does not churn', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// referencedTable is stored AS WRITTEN; apply with `references Parent`, re-declare
+			// with `references parent`. The actual renders `Parent`, the new declaration `parent`
+			// — equal only after folding the FK referenced-table name in the canonical FK body.
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references Parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			const childAlter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop ?? [], 'no spurious FK drop from a referenced-table case change').to.deep.equal([]);
+			expect(childAlter?.constraintsToAdd ?? [], 'no spurious FK add from a referenced-table case change').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK retargeted to a genuinely different parent table still drops+recreates', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table other { oid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			// Retarget the FK parent: parent → other (a real different table, not just case).
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table other { oid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references other(oid) }
+			}`);
+			const childAlter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop ?? [], 'retarget drops old FK').to.deep.equal(['fk']);
+			expect(childAlter?.constraintsToAdd?.length ?? 0, 'retarget adds new FK').to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK with a case-divergent column ref applies once, enforces, and converges with no migration DDL', async function () {
+		const db = new Database();
+		try {
+			// Column `Qty`; CHECK references `qty`. Apply, then a verbatim re-declare must
+			// yield neither a diff nor any migration DDL — and the CHECK must really enforce.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, Qty INTEGER, constraint chk check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter, 'converged: no alter on re-diff').to.deep.equal([]);
+			expect(generateMigrationDDL(diff, 'main'), 'converged: no migration DDL').to.deep.equal([]);
+
+			// The CHECK genuinely enforces (it was applied, not silently skipped).
+			await db.exec('insert into t values (1, 5)');
+			let rejected = false;
+			try { await db.exec('insert into t values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'CHECK enforces under the case-divergent ref').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================
