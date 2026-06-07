@@ -448,7 +448,14 @@ describe('IND propagation through FanOutLookupJoin', () => {
 // every materialized row's `cols` projection (excluding NULL-rejected rows) is
 // actually present in the target table's `targetCols` projection. An over-claim
 // reds the test. Soundness, not completeness: a missing IND is fine.
-describe('IND soundness (no over-claim)', () => {
+describe('IND soundness (no over-claim)', function () {
+	// The over-claim property below drives 40 fast-check runs that each reseed
+	// four tables, plan a query, and materialize every relational node in the
+	// optimized tree in isolation. In isolation it lands ~2.4s — just past the
+	// default 2000ms mocha timeout — so give the suite a generous budget rather
+	// than letting a wall-clock slip red the soundness check.
+	this.timeout(30_000);
+
 	let db: Database;
 
 	beforeEach(async () => {
