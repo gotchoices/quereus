@@ -955,6 +955,44 @@ describe('declarative idempotency — exposed implicit covering index', () => {
 			}
 		});
 	}
+
+	// Belt-and-suspenders: the create+drop *coincidence* shape. Pre-fix, an
+	// exposed implicit index was scheduled for a spurious DROP; pairing it with a
+	// genuine index CREATE produced a 1-create/1-drop diff that `require-hint`
+	// hard-errors as an ambiguous unhinted rename (it only throws when creates>0
+	// AND drops>0). The filter removes the implicit drop, leaving a clean
+	// 1-create/0-drop that passes the guard — so `computeSchemaDiff` must NOT
+	// throw and must not touch the exposed implicit index.
+	it('a genuine index create alongside the exposed implicit index does not trip require-hint', async () => {
+		const db = new Database();
+		try {
+			await db.exec(DECL);
+			await db.exec('apply schema main');
+
+			// Re-declare: converged table + a genuine standalone index. The exposed
+			// implicit `uq_expo_vin` is still present in the actual catalog.
+			await db.exec(`declare schema main {
+				table ExpoTbl {
+					id INTEGER PRIMARY KEY,
+					vin TEXT,
+					constraint uq_expo_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)
+				}
+				index idx_expo_extra on ExpoTbl(vin)
+			}`);
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+
+			// Must NOT throw under require-hint (pre-fix this raised an unhinted-rename
+			// error), and the only index op is the genuine create.
+			const diff = computeSchemaDiff(declared, catalog, 'require-hint');
+			expect(diff.indexesToDrop, 'exposed implicit index not dropped').to.deep.equal([]);
+			expect(diff.indexesToCreate.length, 'exactly the one genuine index create').to.equal(1);
+			expect(diff.indexesToCreate[0], 'the genuine index, not the implicit one').to.contain('idx_expo_extra');
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 /**
