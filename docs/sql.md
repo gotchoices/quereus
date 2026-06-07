@@ -2904,6 +2904,12 @@ create index idx_orders_customer_date on orders(customer_id, order_date);
 
 -- Unique index
 create unique index idx_products_sku on products(sku);
+
+-- Per-column COLLATE (and direction): the index orders/compares this column
+-- under the given collation, overriding the table column's collation. A bare
+-- `col COLLATE x` is a per-column collation, not an expression index; a genuine
+-- expression operand (e.g. `lower(name)`) is still rejected.
+create index idx_users_email_ci on users(email collate nocase desc);
 ```
 
 ## 7. Constraints and Indexes

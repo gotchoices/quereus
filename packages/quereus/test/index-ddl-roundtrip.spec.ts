@@ -645,6 +645,32 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		}
 	});
 
+	it('a descending explicit-COLLATE index applies and the catalog carries both DESC and the collation', async () => {
+		// The collate-folded DESC form (`email collate nocase desc`) must survive the
+		// live create path AND round-trip its direction: buildIndexSchema reads the
+		// direction off col.direction (not the folded expr), and the persistence
+		// emitter re-appends the trailing `desc` for that form. End-to-end apply-level
+		// guard for the DESC half (the canonical-body no-churn case is covered below).
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix on t (email collate nocase desc)\n}`);
+			await db.exec('apply schema main');
+
+			const info = await rows(db, "select column_name, collation, \"desc\" from index_info('t')");
+			expect(info, 'applied index column carries NOCASE and DESC').to.deep.equal([{ column_name: 'email', collation: 'NOCASE', desc: 1 }]);
+
+			// Re-declaring the identical descending index is a no-op (zero churn on re-diff).
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix on t (email collate nocase desc)\n}`);
+			const actual = collectSchemaCatalog(db, 'main');
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToCreate, 'no creates on verbatim re-declare').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'no drops on verbatim re-declare').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('an index inheriting a non-BINARY column collation, re-declared verbatim, does not churn', async () => {
 		// `email text collate nocase`, index has no explicit COLLATE: both sides resolve
 		// NOCASE from the TABLE column. Guards that the declared side reads the
