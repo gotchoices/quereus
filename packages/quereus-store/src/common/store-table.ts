@@ -23,6 +23,7 @@ import {
 	type DatabaseInternal,
 	type MaterializedViewSchema,
 	type TableSchema,
+	type TableIndexSchema,
 	type UniqueConstraintSchema,
 	type CompiledPredicate,
 	type Row,
@@ -149,6 +150,12 @@ export class StoreTable extends VirtualTable {
 	// the WeakMap lets the GC reclaim entries for retired constraints.
 	private readonly predicateCache: WeakMap<UniqueConstraintSchema, CompiledPredicate> = new WeakMap();
 
+	// Lazy cache of compiled partial-index predicates, keyed on the IndexSchema
+	// object identity (frozen; a CREATE/DROP INDEX or reopen produces a fresh
+	// object, so the WeakMap reclaims retired entries). Mirrors predicateCache but
+	// for secondary-index maintenance rather than UNIQUE enforcement.
+	private readonly indexPredicateCache: WeakMap<TableIndexSchema, CompiledPredicate> = new WeakMap();
+
 	constructor(
 		db: Database,
 		storeModule: StoreTableModule,
@@ -182,6 +189,16 @@ export class StoreTable extends VirtualTable {
 	updateSchema(newSchema: TableSchema): void {
 		this.tableSchema = newSchema;
 		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
+	}
+
+	/**
+	 * Mark the table's DDL as already persisted to the catalog, so the lazy
+	 * first-store-access save in {@link initializeStore} is skipped. Called by
+	 * `StoreModule.createIndex` / `dropIndex` after they eagerly write the catalog
+	 * bundle, so a subsequent INSERT does not redundantly re-persist identical DDL.
+	 */
+	markDdlSaved(): void {
+		this.ddlSaved = true;
 	}
 
 	/** Close and forget a cached index-store handle, if any. */
@@ -938,8 +955,16 @@ export class StoreTable extends VirtualTable {
 			const indexCols = index.columns.map(c => c.index);
 			const indexDirections = index.columns.map(c => !!c.desc);
 
-			// Remove old index entry
-			if (oldRow) {
+			// Partial index: only rows the predicate unambiguously accepts are
+			// indexed (mirrors buildIndexEntries' build-time filtering). Guarding both
+			// halves keeps a row that transitions across the predicate scope on UPDATE
+			// correct — an in-scope→out-of-scope edit removes the old entry and adds
+			// none; the reverse adds without a stale delete. A full index (no
+			// predicate) always maintains its entry.
+			const predicate = this.compileIndexFor(index);
+
+			// Remove old index entry (only if the old row was within scope).
+			if (oldRow && (!predicate || predicate.evaluate(oldRow) === true)) {
 				const oldIndexValues = indexCols.map(i => oldRow[i]);
 				const oldIndexKey = buildIndexKey(
 					oldIndexValues,
@@ -956,8 +981,8 @@ export class StoreTable extends VirtualTable {
 				}
 			}
 
-			// Add new index entry
-			if (newRow) {
+			// Add new index entry (only if the new row is within scope).
+			if (newRow && (!predicate || predicate.evaluate(newRow) === true)) {
 				const newIndexValues = indexCols.map(i => newRow[i]);
 				const newIndexKey = buildIndexKey(
 					newIndexValues,
@@ -989,6 +1014,21 @@ export class StoreTable extends VirtualTable {
 		if (!compiled) {
 			compiled = compilePredicate(uc.predicate, this.tableSchema!.columns);
 			this.predicateCache.set(uc, compiled);
+		}
+		return compiled;
+	}
+
+	/**
+	 * Returns the compiled predicate for a partial secondary index, or undefined
+	 * for a full index. Compilation is memoized per IndexSchema instance so the hot
+	 * DML index-maintenance path doesn't recompile.
+	 */
+	private compileIndexFor(index: TableIndexSchema): CompiledPredicate | undefined {
+		if (!index.predicate) return undefined;
+		let compiled = this.indexPredicateCache.get(index);
+		if (!compiled) {
+			compiled = compilePredicate(index.predicate, this.tableSchema!.columns);
+			this.indexPredicateCache.set(index, compiled);
 		}
 		return compiled;
 	}

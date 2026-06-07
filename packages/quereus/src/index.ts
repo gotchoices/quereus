@@ -140,6 +140,7 @@ export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSche
 export type { ColumnSchema } from './schema/column.js';
 export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';
 export { generateTableDDL, generateIndexDDL } from './schema/ddl-generator.js';
+export { isHiddenImplicitIndex } from './schema/catalog.js';
 
 // Partial-index predicate compilation (used by store modules to honor partial UNIQUE)
 export { compilePredicate } from './vtab/memory/utils/predicate.js';

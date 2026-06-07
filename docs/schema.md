@@ -204,6 +204,59 @@ A **synthesized all-columns key** (a table with no declared PRIMARY KEY) emits *
 import { generateTableDDL } from '@quereus/store';
 ```
 
+### Store catalog persistence (bundled index DDL)
+
+`@quereus/store` persists each table's secondary indexes **inside the same
+catalog entry as the table**, keyed `{schema}.{table}` (no per-index key
+namespace). The entry is a newline-joined bundle — the `CREATE TABLE` statement
+first, then one `CREATE [UNIQUE] INDEX` line per persistable index:
+
+```
+CREATE TABLE "main"."t" (...) USING store
+CREATE INDEX "ix_b" ON "main"."t" ("b")
+CREATE UNIQUE INDEX "uq_email" ON "main"."t" ("email" COLLATE NOCASE) WHERE "email" IS NOT NULL
+```
+
+`StoreModule.buildCatalogEntry` produces the bundle (table DDL + every index DDL,
+both in the persistence-safe no-`db` form). Hidden implicit covering indexes (the
+auto-built BTree backing a declared inline `UNIQUE`) are excluded — they
+round-trip via the table's `UNIQUE` constraint, not as a standalone
+`CREATE INDEX`. On reopen, `rehydrateCatalog` feeds each bundle to
+`importCatalog`, whose `parser.parseAll` splits it by AST (never on `\n`, so a
+newline inside a `DEFAULT` / `CHECK` / partial-predicate string literal is safe)
+and imports table-before-indexes.
+
+**Why bundle rather than a separate per-index key:** every existing re-persist
+path carries the indexes for free —
+
+- `CREATE INDEX` / `DROP INDEX` rewrite the bundle (`StoreModule.createIndex` /
+  `dropIndex` call `saveTableDDL` after updating the connected table's schema).
+- `DROP TABLE` deletes the single key, so the indexes vanish with it (no orphan
+  catalog entries).
+- `RENAME TABLE` regenerates the bundle under the new name (index DDL references
+  the renamed table automatically).
+- `ALTER INDEX … SET/ADD/DROP TAGS` fires `table_modified` on the *owning* table;
+  the store's catalog listener regenerates the bundle (index tags live in
+  `tableSchema.indexes`) with no index-specific plumbing.
+- Structural ALTERs that reindex columns already re-persist the table, so the
+  bundle's index lines track the reindexed columns.
+
+**Reattach, not rebuild.** The physical index KV store survives a logical close,
+so rehydrate does **not** scan rows to rebuild it. After the import loop,
+`rehydrateCatalog` refreshes each connected `StoreTable`'s cached schema from the
+now-current registry (import updates the registry but not the live table
+instance), so DML maintains the rehydrated index and the derived `UNIQUE`
+enforces. The backing store is reattached lazily on first access via
+`provider.getIndexStore`. Partial indexes are maintained on DML too: the store's
+index-update path honors the index `WHERE` predicate (only in-scope rows are
+indexed), matching the build-time filtering.
+
+**Best-effort durability.** Persistence follows the store's existing best-effort
+contract: if the catalog write fails after a `CREATE INDEX` built the physical
+index store, the in-memory schema has the index but the catalog does not, so on
+reopen the index is missing and its store is orphaned. There is no two-phase
+protocol here.
+
 ## Schema Path
 
 The schema path controls the search order when resolving unqualified table names. These are `Database`-level methods:

@@ -46,7 +46,7 @@ import {
 	buildStatsKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
-import { generateTableDDL } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, isHiddenImplicitIndex } from '@quereus/quereus';
 
 /**
  * Result of catalog rehydration.
@@ -369,6 +369,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const updatedSchema = appendIndexToTableSchema(tableSchema, indexSchema);
 		table.updateSchema(updatedSchema);
 
+		// Authoritative catalog write: persist the table's bundle now (including the
+		// new index), so the index survives close → reopen even when the table has
+		// no rows yet and was never lazily persisted. `markDdlSaved` suppresses the
+		// later lazy table-only write on first store access (StoreTable.ddlSaved), so
+		// this is the only catalog write the createIndex produces. SchemaManager fires
+		// a follow-up `table_modified` whose listener regenerates the SAME bundle and
+		// skips (identical) — see persistCatalogIfChanged.
+		await this.saveTableDDL(updatedSchema);
+		table.markDdlSaved();
+
 		// Emit schema change event
 		this.eventEmitter?.emitSchemaChange({
 			type: 'create',
@@ -428,6 +438,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// failure of the physical drop doesn't leave the schema enforcing an
 		// index whose backing store has already been mutated.
 		table.updateSchema(updatedSchema);
+
+		// Rewrite the catalog bundle without the dropped index, before the physical
+		// teardown — so on reopen the index does not resurrect even if the store
+		// delete below fails. `markDdlSaved` keeps the lazy first-access save from
+		// re-writing the same bundle. SchemaManager's follow-up `table_modified`
+		// regenerates an identical bundle and skips.
+		await this.saveTableDDL(updatedSchema);
+		table.markDdlSaved();
 
 		// Drop the cached handle on the table side and tear down the
 		// underlying KVStore. `deleteIndexStore` (if the provider implements
@@ -1386,10 +1404,42 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Save table DDL to the catalog store.
+	 * Build the catalog entry for a table: its CREATE TABLE DDL followed by one
+	 * `CREATE [UNIQUE] INDEX` statement per persistable secondary index, newline-
+	 * joined into a single multi-statement bundle keyed by `{schema}.{table}`.
+	 *
+	 * Bundling the indexes into the table's own entry means every existing
+	 * re-persist path — `saveTableDDL` (each `alterTable` arm, `renameTable`) and
+	 * the `table_modified` listener (`persistCatalogIfChanged`) — carries the
+	 * indexes along for free, and `removeTableDDL` drops them with the table. The
+	 * bundle is consumed on reopen by `rehydrateCatalog` → `importCatalog`, whose
+	 * `parser.parseAll` splits it AST-by-AST (never on `\n`) and imports each
+	 * statement in document order, so the table registers before its indexes.
+	 *
+	 * Both the table DDL and the index DDL are emitted without a `db` arg, keeping
+	 * the persistence-safe fully-qualified form. Hidden implicit covering indexes
+	 * (the auto-built BTree backing a declared UNIQUE constraint) are excluded —
+	 * they are a backing detail that round-trips via the table's UNIQUE constraint,
+	 * not as a standalone CREATE INDEX. For store tables `buildTableSchemaFromAST`
+	 * synthesizes none of those, so in practice every index is included; the guard
+	 * is defensive. A `CREATE UNIQUE INDEX`'s derived UNIQUE constraint is already
+	 * excluded from the table DDL by the generator, so it round-trips solely via
+	 * its own `CREATE UNIQUE INDEX` line — no doubling.
+	 */
+	private buildCatalogEntry(tableSchema: TableSchema): string {
+		const parts: string[] = [generateTableDDL(tableSchema)];
+		for (const idx of tableSchema.indexes ?? []) {
+			if (isHiddenImplicitIndex(tableSchema, idx.name)) continue;
+			parts.push(generateIndexDDL(idx, tableSchema));
+		}
+		return parts.join('\n');
+	}
+
+	/**
+	 * Save table DDL (bundled with its secondary index DDL) to the catalog store.
 	 */
 	async saveTableDDL(tableSchema: TableSchema): Promise<void> {
-		const ddl = generateTableDDL(tableSchema);
+		const ddl = this.buildCatalogEntry(tableSchema);
 		const catalogKey = buildCatalogKey(tableSchema.schemaName, tableSchema.name);
 		const encoder = new TextEncoder();
 		const encodedDDL = encoder.encode(ddl);
@@ -1447,6 +1497,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				);
 				result.errors.push({ ddl, error });
 			}
+		}
+
+		// Refresh each connected StoreTable from the now-current registry. During
+		// import, `importTable` connects a StoreTable holding the table-only schema,
+		// then `importIndex` appends the index (and its derived UNIQUE constraint) to
+		// the SchemaManager's registered schema but NOT to that live StoreTable
+		// instance — `importCatalog` deliberately skips module hooks to stay generic,
+		// so the store module reconciles here. Without this, DML on a rehydrated table
+		// would not maintain its indexes and the derived UNIQUE would not enforce.
+		for (const table of this.tables.values()) {
+			const current = table.getSchema();
+			const fresh = db.schemaManager.getTable(current.schemaName, current.name);
+			if (fresh) table.updateSchema(fresh);
 		}
 
 		return result;
@@ -1551,7 +1614,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const existing = await catalogStore.get(key);
 		if (existing === undefined) return; // not store-backed in this catalog — skip
 
-		const newDDL = generateTableDDL(newObject);
+		// Regenerate the full bundle (table DDL + its index DDL): a SET TAGS on an
+		// index fires `table_modified` on the OWNING table with the updated index in
+		// `tableSchema.indexes`, so the changed index DDL re-persists here with no
+		// index-specific plumbing. An identical bundle is what makes a structural
+		// ALTER (and the createIndex follow-up event) a no-op — no double-write.
+		const newDDL = this.buildCatalogEntry(newObject);
 		const existingDDL = new TextDecoder().decode(existing);
 		if (existingDDL === newDDL) return; // identical — no redundant write
 
