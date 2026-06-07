@@ -121,7 +121,19 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 		// null-extended) in a trailing pass.
 		async function* driveFromRight(): AsyncIterable<Row> {
 			const leftRows: Row[] = [];
-			for await (const r of leftSource) leftRows.push(r);
+			// Copy each buffered row (same rationale as the shared cache's
+			// `cache.push([...row])`): this is the only driver that retains source
+			// rows beyond a single iteration, so a source that reuses its row array
+			// across yields would otherwise alias every buffered entry.
+			for await (const r of leftSource) leftRows.push([...r] as Row);
+			// The left child has been fully drained. Reclaim our leftSlot's descriptor
+			// so downstream attribute-index lookups for the left attr ids resolve
+			// through *our* slot, not the drained child's cursor (the
+			// child-shadows-operator direction of the "source-attr contexts and child
+			// pulls" invariant — see emit/asof-scan.ts and docs/runtime.md). Without
+			// this, correctness would depend on the child closing its slot on
+			// exhaustion to trigger the attribute-index rebuild.
+			leftSlot.reactivate();
 			const leftMatched = joinType === 'full'
 				? new Array<boolean>(leftRows.length).fill(false)
 				: undefined;
@@ -153,6 +165,11 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 			if (leftMatched) {
 				const nullRight = new Array(rightAttributes.length).fill(null) as Row;
 				rightSlot.set(nullRight);
+				// The right child has been fully drained too; reclaim our rightSlot so
+				// the null padding (not the drained right cursor) wins the
+				// attribute-index race for the right attr ids (see the leftSlot
+				// reactivate above and emit/asof-scan.ts).
+				rightSlot.reactivate();
 				for (let i = 0; i < leftRows.length; i++) {
 					if (!leftMatched[i]) {
 						leftSlot.set(leftRows[i]);
