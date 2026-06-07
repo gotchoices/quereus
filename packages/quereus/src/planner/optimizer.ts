@@ -503,7 +503,7 @@ export class Optimizer {
 		});
 
 		// Aggregate variant of join-elimination: when an Aggregate sits over an
-		// FK-covered inner join and only references the FK side (or `count(*)`),
+		// FK-covered left/right/inner join and only references the FK side (or `count(*)`),
 		// drop the join. Shares chain-walking + FK-PK alignment with
 		// ruleJoinElimination via the same module.
 		this.passManager.addRuleToPass(PassId.Structural, {
@@ -512,8 +512,8 @@ export class Optimizer {
 			phase: 'rewrite',
 			fn: ruleJoinEliminationUnderAggregate,
 			priority: 26,
-			// Drops the non-preserved side of an inner join sitting under an
-			// Aggregate — same guard as ruleJoinElimination.
+			// Drops the non-preserved side of a left/right/inner join sitting under
+			// an Aggregate — same guard as ruleJoinElimination.
 			sideEffectMode: 'aware',
 		});
 

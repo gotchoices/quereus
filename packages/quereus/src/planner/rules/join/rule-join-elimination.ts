@@ -288,24 +288,46 @@ export function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: Relationa
 
 /**
  * Aggregate counterpart of `ruleJoinElimination`: when an Aggregate sits over
- * a chain ending in an FK-covered inner join and the aggregate's payload only
- * depends on the FK (left) side, drop the join.
+ * a chain ending in an FK-covered `left`/`right`/`inner` join and the
+ * aggregate's payload only depends on the preserved (FK) side, drop the join.
+ * Structurally identical to the Project entrypoint apart from the demand
+ * prologue (group-by + aggregate exprs) and the rebuild epilogue (reconstruct
+ * the `AggregateNode`).
  *
- * Why correct for `count(*)` and similar cardinality-only aggregates: a
- * non-null FK with the IND `L.fk ⊆ R.pk` and an unfiltered R guarantees
- * `|L ⋈ R| == |L|`, so `count(*)` over the join equals `count(*)` over L.
- * More generally, when no aggregate argument or group key references R, the
- * inner join's only effect is to gate L by `fk IS NOT NULL`, which the
- * NOT-NULL precondition already rules out.
+ * Why correct for `count(*)` and similar cardinality-only aggregates:
+ *
+ *  - INNER: a non-null FK with the IND `L.fk ⊆ R.pk` and an unfiltered R
+ *    guarantees `|L ⋈ R| == |L|`, so `count(*)` over the join equals `count(*)`
+ *    over L. More generally, when no aggregate argument or group key references
+ *    R, the inner join's only effect is to gate L by `fk IS NOT NULL`, which the
+ *    NOT-NULL precondition (checked in `tryEliminate`) already rules out.
+ *  - LEFT: `L LEFT JOIN R` preserves every L row (matched → 1 row; unmatched →
+ *    1 null-padded row) and FK→PK alignment guarantees ≤1 match, so
+ *    `|L LEFT JOIN R| == |L|` *unconditionally* — needing **neither** a NOT-NULL
+ *    FK **nor** a row-preserving path to R's base table (a null FK or a filtered
+ *    R simply null-pads the L row rather than dropping it). `tryEliminate` gates
+ *    those two extra checks behind `joinType === 'inner'`, so the outer-join path
+ *    performs exactly the FK→PK alignment + side-effect checks — the correct gate.
+ *  - RIGHT: the mirror of LEFT.
+ *
+ * `full` joins are out of scope (both sides preserved); the `usesRight` /
+ * `usesLeft` demand gate already retains a side the aggregate reads.
+ *
+ * The `hasExistenceColumns` guard is **load-bearing** once outer joins are
+ * eligible: a live `exists … as` flag's attribute id is not a column of either
+ * side, so the `usesRight`/`usesLeft` demand scan cannot see the aggregate's
+ * dependency on the non-preserved side — eliminating the join out from under the
+ * flag would be unsound. (The inner-only gate used to make this guard implicit,
+ * since flags only exist on outer joins.) The `join-existence-pruning-aggregate`
+ * rule (priority 22) strips *undemanded* flags before this rule (priority 26)
+ * sees the node, so all-undemanded → flag gone → eliminate; any demanded → flag
+ * retained → guard abstains.
  *
  * Implementation mirrors the Project entrypoint: collect attribute IDs the
  * Aggregate demands (group-key expressions + every aggregate expression),
  * walk the wrapper chain to find the Join, run the same FK-PK alignment +
- * row-preserving checks as the inner-join case, then rebuild the chain on
- * the preserved side.
- *
- * Only `inner` joins are eligible here — outer joins reduce to inner in this
- * context only when both sides demand attrs, which we'd have rejected already.
+ * (inner-only) row-preserving checks, then rebuild the chain on the preserved
+ * side.
  */
 export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptContext): PlanNode | null {
 	if (!(node instanceof AggregateNode)) return null;
@@ -322,8 +344,13 @@ export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptC
 	if (!walk) return null;
 
 	const { join, chain } = walk;
-	// Only inner-eliminable shapes — see `ruleJoinElimination` notes.
-	if (join.joinType !== 'inner') return null;
+	// A live `exists … as` flag's attr id is not a column of either side, so the
+	// usesRight/usesLeft demand scan cannot see its dependency on the
+	// non-preserved side — eliminating out from under it would be unsound. (The
+	// inner-only gate used to make this guard implicit, since flags only exist on
+	// outer joins.) See `ruleJoinElimination` for the same guard.
+	if (join.hasExistenceColumns) return null;
+	if (join.joinType !== 'left' && join.joinType !== 'right' && join.joinType !== 'inner') return null;
 	if (!join.condition) return null;
 
 	const leftAttrs = join.left.getAttributes();
@@ -340,16 +367,28 @@ export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptC
 	const usesRight = setsIntersect(demanded, rightIds);
 
 	let preserved: RelationalPlanNode | null = null;
-	if (!usesRight) {
-		preserved = tryEliminate(join, 'right', pairs);
-	}
-	if (!preserved && !usesLeft) {
-		preserved = tryEliminate(join, 'left', pairs);
+	switch (join.joinType) {
+		case 'left':
+			if (usesRight) return null;
+			preserved = tryEliminate(join, 'right', pairs);
+			break;
+		case 'right':
+			if (usesLeft) return null;
+			preserved = tryEliminate(join, 'left', pairs);
+			break;
+		case 'inner':
+			if (!usesRight) {
+				preserved = tryEliminate(join, 'right', pairs);
+			}
+			if (!preserved && !usesLeft) {
+				preserved = tryEliminate(join, 'left', pairs);
+			}
+			break;
 	}
 	if (!preserved) return null;
 
-	log('Eliminating inner join under Aggregate; preserved side has %d attrs',
-		preserved.getAttributes().length);
+	log('Eliminating %s join under Aggregate; preserved side has %d attrs',
+		join.joinType, preserved.getAttributes().length);
 
 	const newSource = rebuildChain(chain, preserved);
 	if (!isRelationalNode(newSource)) {

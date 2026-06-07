@@ -42,6 +42,20 @@ async function results(db: Database, sql: string): Promise<ResultRow[]> {
 	return rows;
 }
 
+/** Run `sql` with the aggregate-anchored elimination rule disabled (the baseline). */
+async function resultsNoAggElim(db: Database, sql: string): Promise<ResultRow[]> {
+	const base = db.optimizer.tuning;
+	db.optimizer.updateTuning({
+		...base,
+		disabledRules: new Set([...(base.disabledRules ?? []), 'join-elimination-aggregate']),
+	});
+	try {
+		return await results(db, sql);
+	} finally {
+		db.optimizer.updateTuning(base);
+	}
+}
+
 describe('ruleJoinElimination', () => {
 	let db: Database;
 
@@ -258,5 +272,111 @@ describe('ruleJoinElimination', () => {
 		expect(out.map(r => r.order_id)).to.deep.equal([10, 11, 12]);
 
 		await db.exec('DROP VIEW order_view');
+	});
+
+	// `ruleJoinEliminationUnderAggregate` (id `join-elimination-aggregate`): the
+	// Aggregate-anchored sibling of the Project entrypoint. A cardinality-only
+	// aggregate (`count(*)`) over an FK→PK LEFT/RIGHT/INNER join whose
+	// non-preserved side nothing reads collapses to zero join ops. The LEFT case
+	// holds *unconditionally* (`|L LEFT JOIN R| == |L|`) — needing neither a
+	// NOT-NULL FK nor a row-preserving R, the two checks the INNER case requires.
+	describe('aggregate-anchored elimination', () => {
+		it('eliminates the LEFT join under count(*) when no right-side columns are referenced', async () => {
+			await setupCustomersOrders();
+			const q =
+				'SELECT count(*) AS n FROM orders LEFT JOIN customers ON orders.customer_id = customers.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+			// Byte-equal to the rule-disabled baseline — elimination is a pure optimization.
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('eliminates the LEFT join under count(*) even when the FK is nullable (unmatched rows still counted)', async () => {
+			// Distinct from the INNER nullable-FK case below, which KEEPS the join:
+			// LEFT preserves the unmatched (null-FK) row by null-padding it, so
+			// |L LEFT JOIN R| == |L| regardless of FK nullability.
+			await db.exec("CREATE TABLE cust2 (id INTEGER PRIMARY KEY, name TEXT) USING memory");
+			await db.exec(
+				"CREATE TABLE ord2 (order_id INTEGER PRIMARY KEY, customer_id INTEGER NULL REFERENCES cust2(id), total REAL) USING memory",
+			);
+			await db.exec("INSERT INTO cust2 VALUES (1, 'Acme')");
+			// Row 21 has a NULL FK — unmatched in the join, but LEFT keeps it.
+			await db.exec("INSERT INTO ord2 VALUES (20, 1, 99.0), (21, null, 49.5), (22, 1, 12.0)");
+
+			const q =
+				'SELECT count(*) AS n FROM ord2 LEFT JOIN cust2 ON ord2.customer_id = cust2.id';
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('does NOT eliminate when an aggregate argument reads the non-preserved side', async () => {
+			await setupCustomersOrders();
+			const q =
+				'SELECT sum(length(customers.region)) AS s FROM orders LEFT JOIN customers ON orders.customer_id = customers.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			// regions EU(2)/US(2): orders 10,12 → EU, 11 → US ⇒ 2+2+2 = 6.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ s: 6 }]);
+		});
+
+		it('does NOT eliminate when a GROUP BY key reads the non-preserved side', async () => {
+			await setupCustomersOrders();
+			const q =
+				'SELECT customers.region AS region, count(*) AS n FROM orders LEFT JOIN customers ' +
+				'ON orders.customer_id = customers.id GROUP BY customers.region ORDER BY region';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ region: 'EU', n: 2 },
+				{ region: 'US', n: 1 },
+			]);
+		});
+
+		it('does NOT eliminate when a live existence flag is demanded (hasExistenceColumns guard)', async () => {
+			await setupCustomersOrders();
+			// The flag IS demanded (an aggregate arg), so join-existence-pruning keeps
+			// it; the flag's attr id is invisible to the usesRight scan, so the
+			// hasExistenceColumns guard must retain the join.
+			const q =
+				'SELECT sum(case when hasC then 1 else 0 end) AS s FROM orders ' +
+				'LEFT JOIN customers ON orders.customer_id = customers.id exists right as hasC';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			// FK NOT NULL ⇒ every order matches ⇒ hasC always true ⇒ sum = 3.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ s: 3 }]);
+		});
+
+		it('eliminates the join under count(*) once an undemanded existence flag is pruned (cascade)', async () => {
+			await setupCustomersOrders();
+			// The flag is unreferenced: join-existence-pruning-aggregate (priority 22)
+			// strips it, then this rule eliminates the flag-free LEFT join — both in one
+			// applyRules pass. (Also covered in the existence-pruning spec.)
+			const q =
+				'SELECT count(*) AS n FROM orders LEFT JOIN customers ' +
+				'ON orders.customer_id = customers.id exists right as hasC';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+		});
 	});
 });

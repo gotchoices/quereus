@@ -382,12 +382,14 @@ describe('ruleJoinExistencePruning', () => {
 
 	// `ruleJoinExistencePruningUnderAggregate` (id `join-existence-pruning-aggregate`):
 	// the AggregateNode anchor for the same demand-gated prune. An `exists … as`
-	// flag is only valid on an OUTER join (the parser rejects it on inner), and the
-	// aggregate variant of join-elimination is inner-only, so pruning under an
-	// aggregate re-enables PHYSICAL join selection (hash/merge) — it does NOT cascade
-	// to join elimination. See the handoff for that documented limitation.
+	// flag is only valid on an OUTER join (the parser rejects it on inner). Pruning
+	// the unused flag yields a flag-free LEFT join, and the aggregate variant of
+	// join-elimination now eliminates FK→PK left/right joins — so pruning under an
+	// aggregate CASCADES to join elimination (zero join ops), not merely to physical
+	// join selection. The prune (priority 22) and the eliminate (priority 26) fire in
+	// the same `applyRules` pass.
 	describe('aggregate-anchored pruning', () => {
-		it('an unused flag under count(*) is pruned, re-enabling physical join selection', async () => {
+		it('an unused flag under count(*) is pruned, cascading to FK→PK join elimination (zero join ops)', async () => {
 			await setupFkOrders();
 			const q =
 				'select count(*) as n from orders left join customers on orders.customer_id = customers.id exists right as hasC';
@@ -395,11 +397,9 @@ describe('ruleJoinExistencePruning', () => {
 			const rows = await planRows(db, q);
 			// Flag gone from the (now flag-free) join…
 			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
-			// …which lets join-physical-selection turn the pinned nested-loop into a hash join.
-			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(true);
-			// The join is NOT eliminated: existence flags require an outer join and
-			// ruleJoinEliminationUnderAggregate is inner-only — so one physical join remains.
-			expect(joinCount(rows)).to.equal(1);
+			// …and the now flag-free FK→PK LEFT join is eliminated entirely under count(*).
+			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(false);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
 
 			const out = await results(db, q);
 			expect(out).to.deep.equal([{ n: 3 }]);
