@@ -33,6 +33,7 @@ import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js'
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
 import { ruleJoinExistencePruning, ruleJoinExistencePruningUnderAggregate } from './rules/join/rule-join-existence-pruning.js';
 import { ruleSemijoinExistenceRecovery } from './rules/join/rule-semijoin-existence-recovery.js';
+import { ruleInnerJoinExistenceRecovery } from './rules/join/rule-inner-join-existence-recovery.js';
 import { ruleFanOutLookupJoin } from './rules/join/rule-fanout-lookup-join.js';
 import { ruleFanOutBatchedOuter } from './rules/join/rule-fanout-batched-outer.js';
 import { ruleAsyncGatherUnionAll } from './rules/parallel/rule-async-gather-union-all.js';
@@ -420,6 +421,31 @@ export class Optimizer {
 			// Recovers a semi/anti join, which short-circuits the right side's scan at
 			// the first match — changing R's execution count. Refuses when R carries a
 			// write (mirrors subquery-decorrelation's impure-inner refusal).
+			sideEffectMode: 'aware',
+		});
+
+		// Inner-join existence-flag recovery (demand-SHAPE gated): the right-column-
+		// demanded complement of `semijoin-existence-recovery`. When the sole
+		// `exists … as` flag on a `left join` is a POSITIVE top-level probe
+		// (`where flag`) AND ≥1 right-side column is demanded above the join, rewrite
+		// the JoinNode to a plain `inner join` (drop the flag, keep both sides) —
+		// re-opening physical join selection, non-nullable right typing, and the
+		// FK/IND cascade the live flag pinned shut. Registered immediately AFTER
+		// `semijoin-existence-recovery` (so the semi rule wins its no-right-col half;
+		// the two partition the positive-probe space by the right-col predicate and
+		// never both fire) and (in registration order) BEFORE `fanout-lookup-join` /
+		// `join-elimination` (24) / the Join-typed IND folders (26) so the recovered
+		// inner join threads into them in the same applyRules loop.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'inner-join-existence-recovery',
+			nodeType: PlanNodeType.Project,
+			phase: 'rewrite',
+			fn: ruleInnerJoinExistenceRecovery,
+			priority: 23,
+			// Logically scans R the same number of times as the flag-bearing left
+			// join, but dropping the flag re-enables join-physical-selection, which can
+			// pick a hash join that scans R once total — changing an impure R's
+			// execution count. Refuses when R carries a write (mirrors the sibling).
 			sideEffectMode: 'aware',
 		});
 

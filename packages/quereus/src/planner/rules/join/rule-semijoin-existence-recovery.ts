@@ -174,8 +174,15 @@ import {
 
 const log = createLogger('optimizer:rule:semijoin-existence-recovery');
 
-/** The single probe conjunct located across the chain's FilterNodes. */
-interface ProbeMatch {
+/**
+ * The single probe conjunct located across the chain's FilterNodes.
+ *
+ * Exported (with `analyzeChain` / `classifyProbe` / `rebuildChainStrippingProbe`)
+ * for reuse by the sibling `rule-inner-join-existence-recovery`, which shares the
+ * exact same probe machinery — it merely keeps the `'semi'` (positive) polarity
+ * and the right-column-demanded half of the partition this rule abstains on.
+ */
+export interface ProbeMatch {
 	/** Index into `chain` of the FilterNode that holds the probe conjunct. */
 	chainIndex: number;
 	/** That filter. */
@@ -270,7 +277,7 @@ export function ruleSemijoinExistenceRecovery(node: PlanNode, _context: OptConte
  * the flag referenced in more than one conjunct, or the flag inside a non-probe
  * conjunct shape (`f or x`, `f(x)`, …).
  */
-function analyzeChain(
+export function analyzeChain(
 	project: ProjectNode,
 	chain: ReadonlyArray<ChainEntry>,
 	flagId: number,
@@ -347,7 +354,7 @@ function rightMatchesAtMostOne(join: JoinNode): boolean {
  * is normalized first so `not not f` collapses and NOT pushes down. Returns the
  * resulting join polarity, or null when the shape is not a pure probe.
  */
-function classifyProbe(conj: ScalarPlanNode, flagId: number): 'semi' | 'anti' | null {
+export function classifyProbe(conj: ScalarPlanNode, flagId: number): 'semi' | 'anti' | null {
 	const n = normalizePredicate(conj);
 
 	// `f` — bare boolean colref.
@@ -418,21 +425,22 @@ function referencesAttr(node: PlanNode, attrId: number): boolean {
 }
 
 /**
- * Rebuild the pass-through chain on top of the recovered semi/anti join, stripping
- * the sole probe conjunct from its FilterNode (omitting the Filter entirely when
- * no residual conjunct remains). Reuses `rebuildChain` for the entries below and
+ * Rebuild the pass-through chain on top of the recovered join (`recovered` — a
+ * semi/anti join here, an inner join in the sibling rule), stripping the sole
+ * probe conjunct from its FilterNode (omitting the Filter entirely when no
+ * residual conjunct remains). Reuses `rebuildChain` for the entries below and
  * above the probe filter; only the probe filter itself is special-cased.
  */
-function rebuildChainStrippingProbe(
+export function rebuildChainStrippingProbe(
 	chain: ReadonlyArray<ChainEntry>,
 	probe: ProbeMatch,
-	semiAnti: RelationalPlanNode,
+	recovered: RelationalPlanNode,
 ): RelationalPlanNode {
 	// Chain is collected top→bottom; entries AFTER the probe are closer to the join.
 	const below = chain.slice(probe.chainIndex + 1);
 	const above = chain.slice(0, probe.chainIndex);
 
-	let current = rebuildChain(below, semiAnti);
+	let current = rebuildChain(below, recovered);
 
 	const residualPred = combineConjuncts(probe.residualConjuncts);
 	if (residualPred !== null) {

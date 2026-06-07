@@ -383,13 +383,18 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
 		});
 
-		it('right column demanded: `select cc, p.pv … where hasP` keeps the flag (deferred outer→inner case)', async () => {
+		it('right column demanded: `select cc, p.pv … where hasP` recovers an INNER join (handed off to inner-join-existence-recovery)', async () => {
 			await seedExisting();
+			// A demanded right column (p.pv) is the demand-SHAPE complement the semi
+			// rule abstains on; `inner-join-existence-recovery` now picks it up and
+			// rewrites the flag-bearing left join to a plain inner join (flag dropped,
+			// both sides kept). Rows stay byte-identical to the baseline.
 			const q =
 				'select c.cc as cc, p.pv as pv from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP order by c.cc';
 
 			const rows = await planRows(db, q);
-			expect(joinExistence(rows), 'flag retained when a right column is demanded').to.deep.equal(['exists right as hasP']);
+			expect(joinExistence(rows), 'flag dropped — recovered as an inner join').to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
 
 			const out = await results(db, q);
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
