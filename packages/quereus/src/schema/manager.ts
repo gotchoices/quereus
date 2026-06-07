@@ -13,7 +13,7 @@ import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mu
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema } from './constraint-builder.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import { backingTableNameFor } from './view.js';
-import { isHiddenImplicitIndex } from './catalog.js';
+import { isHiddenImplicitIndex, findExposedImplicitConstraintIndex } from './catalog.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
@@ -1018,35 +1018,48 @@ export class SchemaManager {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		const lower = indexName.toLowerCase();
-		let ownerTable: TableSchema | undefined;
-		let matched: IndexSchema | undefined;
+
+		// Primary path: a materialized IndexSchema — every real index, plus the
+		// memory backend's materialized implicit covering index. Tags live on the
+		// matched IndexSchema. A *hidden* implicit index is not user-addressable and
+		// is skipped here; it then fails the exposed-constraint fallback below
+		// (its name is materialized, so it is not "exposed and unmaterialized") and
+		// surfaces as NOTFOUND — preserving Phase 22/37 behavior.
 		for (const table of schema.getAllTables()) {
-			const found = table.indexes?.find(idx => idx.name.toLowerCase() === lower);
-			if (found) {
-				ownerTable = table;
-				matched = found;
-				break;
-			}
+			const matched = table.indexes?.find(idx => idx.name.toLowerCase() === lower);
+			if (!matched || isHiddenImplicitIndex(table, matched.name)) continue;
+			// Compute before rebuilding the index array so a drop-of-absent NOTFOUND
+			// aborts before any swap.
+			const nextTags = compute(matched.tags);
+			const updatedIndexes = table.indexes!.map(idx => (idx.name.toLowerCase() === lower ? { ...idx, tags: nextTags } : idx));
+			this.commitTagUpdate(targetSchemaName, table, { ...table, indexes: Object.freeze(updatedIndexes) });
+			return;
 		}
-		if (!ownerTable || !matched || isHiddenImplicitIndex(ownerTable, matched.name)) {
-			throw new QuereusError(`Index '${indexName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
+
+		// Fallback (store mode): the exposed implicit covering index is not
+		// materialized as an IndexSchema. Route its tags onto the originating UNIQUE
+		// constraint's `exposedIndexTags` — kept separate from `uc.tags`, which holds
+		// the exposure flag, so the flag never leaks into the surfaced index tags.
+		// `findExposedImplicitConstraintIndex` returns -1 for hidden/materialized
+		// implicit indexes, so they fall through to NOTFOUND.
+		for (const table of schema.getAllTables()) {
+			const ucIndex = findExposedImplicitConstraintIndex(table, indexName);
+			if (ucIndex < 0) continue;
+			const constraints = table.uniqueConstraints!;
+			// Compute before swapping so a drop-of-absent NOTFOUND aborts untouched.
+			const nextTags = compute(constraints[ucIndex].exposedIndexTags);
+			const updatedConstraints = constraints.map((uc, i) => {
+				if (i !== ucIndex) return uc;
+				const next = { ...uc };
+				if (nextTags) next.exposedIndexTags = nextTags;
+				else delete next.exposedIndexTags;
+				return next;
+			});
+			this.commitTagUpdate(targetSchemaName, table, { ...table, uniqueConstraints: Object.freeze(updatedConstraints) });
+			return;
 		}
-		// Compute before rebuilding the index array so a drop-of-absent NOTFOUND
-		// aborts before any swap.
-		const nextTags = compute(matched.tags);
-		const updatedIndexes = ownerTable.indexes!.map(idx => (idx.name.toLowerCase() === lower ? { ...idx, tags: nextTags } : idx));
-		const updatedTableSchema: TableSchema = {
-			...ownerTable,
-			indexes: Object.freeze(updatedIndexes),
-		};
-		schema.addTable(updatedTableSchema);
-		this.changeNotifier.notifyChange({
-			type: 'table_modified',
-			schemaName: targetSchemaName,
-			objectName: ownerTable.name,
-			oldObject: ownerTable,
-			newObject: updatedTableSchema,
-		});
+
+		throw new QuereusError(`Index '${indexName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 	}
 
 	/**

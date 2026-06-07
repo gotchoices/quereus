@@ -602,6 +602,16 @@ export interface UniqueConstraintSchema {
 	coveringStructureName?: string;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * User-addressable tags for this constraint's *exposed* implicit covering index
+	 * (the one opted into catalog visibility via `quereus.expose_implicit_index`).
+	 * Kept SEPARATE from `tags` (which holds the exposure flag + constraint tags) so
+	 * the exposure flag never leaks into the surfaced index tags and the differ can
+	 * treat the two independently. Only consulted for backends that do NOT
+	 * materialize the implicit index as an `IndexSchema` (i.e. the store); in memory
+	 * mode the tags live on the materialized `IndexSchema.tags` instead.
+	 */
+	exposedIndexTags?: Readonly<Record<string, SqlValue>>;
 }
 
 export interface PrimaryKeyColumnDefinition {

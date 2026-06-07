@@ -1,5 +1,5 @@
 import type { Database } from '../core/database.js';
-import type { TableSchema, IndexSchema } from './table.js';
+import type { TableSchema, IndexSchema, IndexColumnSchema, UniqueConstraintSchema } from './table.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
@@ -150,6 +150,16 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 					indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db));
 				}
 			}
+
+			// Surface exposed implicit covering indexes the backend did NOT
+			// materialize as `IndexSchema` entries (store mode). In memory mode this
+			// returns [] (the name is already in `tableSchema.indexes` above), so the
+			// catalog shape matches across backends with no double-listing. Tags ride
+			// on the descriptor (from `uc.exposedIndexTags`), kept out of the canonical
+			// `definition` so a tag-only change stays `ALTER INDEX … SET TAGS`.
+			for (const desc of exposedImplicitIndexes(tableSchema)) {
+				indexes.push(indexSchemaToCatalog(desc, tableSchema, db));
+			}
 		}
 	}
 
@@ -290,11 +300,94 @@ function implicitCoveringIndexExposure(tableSchema: TableSchema): Map<string, bo
 	const map = new Map<string, boolean>();
 	for (const uc of tableSchema.uniqueConstraints ?? []) {
 		if (uc.derivedFromIndex) continue;
-		const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i));
-		const name = uc.name ?? `_uc_${colNames.join('_')}`;
-		map.set(name, uc.tags?.[EXPOSE_IMPLICIT_INDEX_TAG] === true);
+		map.set(implicitIndexName(tableSchema, uc), uc.tags?.[EXPOSE_IMPLICIT_INDEX_TAG] === true);
 	}
 	return map;
+}
+
+/**
+ * Deterministic name of the implicit covering structure realizing `uc` —
+ * `uc.name` when the constraint is named, else the auto-name `_uc_<cols>`. This is
+ * the single source of the name shared by the catalog exposure map, the synthetic
+ * descriptor, and `MemoryTableManager.ensureUniqueConstraintIndexes` (which
+ * materializes the identical name).
+ */
+function implicitIndexName(tableSchema: TableSchema, uc: UniqueConstraintSchema): string {
+	const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i));
+	return uc.name ?? `_uc_${colNames.join('_')}`;
+}
+
+/**
+ * A backend-agnostic description of an *exposed* implicit covering index that is
+ * NOT materialized in `tableSchema.indexes` (the store-mode case). Shaped as a
+ * subset of {@link IndexSchema} (no `unique` flag — see below) so the read-path
+ * helpers (`indexSchemaToCatalog`, the `schema()` / `index_info()` TVFs) can
+ * consume it identically to a real index.
+ */
+export interface SyntheticExposedIndex {
+	name: string;
+	/** Mirrors `ensureUniqueConstraintIndexes`: per-column index + declared collation. */
+	columns: ReadonlyArray<IndexColumnSchema>;
+	/** Partial-index predicate from `uc.predicate`, when any. */
+	predicate?: AST.Expression;
+	/** User tags from `uc.exposedIndexTags` (the exposure flag stays on `uc.tags`). */
+	tags?: Readonly<Record<string, SqlValue>>;
+	// NOTE: deliberately NO `unique` flag — mirrors the memory materialized entry
+	// (ensureUniqueConstraintIndexes does not set `unique`; UNIQUE enforcement routes
+	// through uniqueConstraints), so index_info()'s `unique` column matches across
+	// backends.
+}
+
+/**
+ * Exposed implicit covering indexes that are NOT already materialized in
+ * `tableSchema.indexes` — i.e. the store-mode case. For each non-derived UNIQUE
+ * constraint carrying `quereus.expose_implicit_index = true` whose implicit name
+ * (`uc.name ?? '_uc_<cols>'`) is absent from `tableSchema.indexes`, returns a
+ * descriptor the read paths can surface and `updateIndexTags` can target.
+ *
+ * Returns empty for memory-mode tables (the name is already materialized), so
+ * callers can append unconditionally with no risk of double-listing.
+ */
+export function exposedImplicitIndexes(tableSchema: TableSchema): SyntheticExposedIndex[] {
+	const result: SyntheticExposedIndex[] = [];
+	const materialized = new Set((tableSchema.indexes ?? []).map(idx => idx.name.toLowerCase()));
+	for (const uc of tableSchema.uniqueConstraints ?? []) {
+		if (uc.derivedFromIndex) continue;
+		if (uc.tags?.[EXPOSE_IMPLICIT_INDEX_TAG] !== true) continue;
+		const name = implicitIndexName(tableSchema, uc);
+		if (materialized.has(name.toLowerCase())) continue; // memory mode — already surfaced
+		result.push({
+			name,
+			columns: uc.columns.map(colIdx => ({ index: colIdx, collation: tableSchema.columns[colIdx]?.collation })),
+			predicate: uc.predicate,
+			tags: uc.exposedIndexTags,
+		});
+	}
+	return result;
+}
+
+/**
+ * Index of the exposed (non-materialized) implicit-covering UNIQUE constraint
+ * whose implicit name matches `indexName`, or `-1` when none — the write-path
+ * counterpart of {@link exposedImplicitIndexes}. `updateIndexTags` uses this to
+ * route `ALTER INDEX … TAGS` onto the originating constraint's `exposedIndexTags`
+ * when the index is not materialized as an `IndexSchema` (store mode). A *hidden*
+ * implicit index (exposure flag absent/false) and a materialized one both return
+ * `-1`, preserving their `NOTFOUND` behavior.
+ */
+export function findExposedImplicitConstraintIndex(tableSchema: TableSchema, indexName: string): number {
+	const lower = indexName.toLowerCase();
+	const ucs = tableSchema.uniqueConstraints ?? [];
+	const materialized = new Set((tableSchema.indexes ?? []).map(idx => idx.name.toLowerCase()));
+	for (let i = 0; i < ucs.length; i++) {
+		const uc = ucs[i];
+		if (uc.derivedFromIndex) continue;
+		if (uc.tags?.[EXPOSE_IMPLICIT_INDEX_TAG] !== true) continue;
+		const name = implicitIndexName(tableSchema, uc).toLowerCase();
+		if (materialized.has(name)) continue;
+		if (name === lower) return i;
+	}
+	return -1;
 }
 
 /**

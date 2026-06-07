@@ -8,10 +8,11 @@ import type { FunctionSchema } from "../../schema/function.js";
 import { isScalarFunctionSchema, isTableValuedFunctionSchema, isAggregateFunctionSchema } from "../../schema/function.js";
 import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
+import { exposedImplicitIndexes, type SyntheticExposedIndex } from "../../schema/catalog.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
 import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
-import { RowOpFlag } from "../../schema/table.js";
+import { RowOpFlag, type TableSchema } from "../../schema/table.js";
 import { jsonStringify } from "../../util/serialization.js";
 import { expressionToString } from "../../emit/ast-stringify.js";
 import { createLogger } from "../../common/logger.js";
@@ -35,6 +36,34 @@ function tagsToJson(tags: Readonly<Record<string, SqlValue>> | undefined): strin
 	const keys = Object.keys(tags);
 	if (keys.length === 0) return null;
 	return jsonStringify(tags);
+}
+
+/**
+ * Builds the `CREATE INDEX "name" ON "table" (cols)` string a `schema()` row
+ * surfaces. Shared by real `IndexSchema` rows and synthetic exposed-implicit
+ * descriptors (both expose `name` + `columns`). Returns `null` if a referenced
+ * column index is out of range, matching the prior inline behavior.
+ */
+function buildIndexCreateSql(
+	index: { name: string; columns: ReadonlyArray<{ index: number; collation?: string; desc?: boolean }> },
+	tableSchema: TableSchema,
+): string | null {
+	try {
+		const indexColumns = index.columns.map(col => {
+			const column = tableSchema.columns[col.index];
+			let colStr = `"${column.name}"`;
+			if (col.collation) {
+				colStr += ` COLLATE ${col.collation}`;
+			}
+			if (col.desc) {
+				colStr += ' DESC';
+			}
+			return colStr;
+		}).join(', ');
+		return `CREATE INDEX "${index.name}" ON "${tableSchema.name}" (${indexColumns})`;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -113,33 +142,30 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 					// Process Indexes for this table
 					if (tableSchema.indexes) {
 						for (const indexSchema of tableSchema.indexes) {
-							let indexSql: string | null = null;
-							try {
-								const indexColumns = indexSchema.columns.map(col => {
-									const column = tableSchema.columns[col.index];
-									let colStr = `"${column.name}"`;
-									if (col.collation) {
-										colStr += ` COLLATE ${col.collation}`;
-									}
-									if (col.desc) {
-										colStr += ' DESC';
-									}
-									return colStr;
-								}).join(', ');
-								indexSql = `CREATE INDEX "${indexSchema.name}" ON "${tableSchema.name}" (${indexColumns})`;
-							} catch {
-								indexSql = null;
-							}
-
 							yield [
 								schemaName,
 								'index',
 								indexSchema.name,
 								tableSchema.name,
-								indexSql,
+								buildIndexCreateSql(indexSchema, tableSchema),
 								tagsToJson(indexSchema.tags)
 							] as Row;
 						}
+					}
+
+					// Surface exposed implicit covering indexes the backend did NOT
+					// materialize as `IndexSchema` entries (store mode). In memory mode
+					// `exposedImplicitIndexes` returns [] (the name is already in
+					// `tableSchema.indexes` above), so this loop is a no-op there.
+					for (const desc of exposedImplicitIndexes(tableSchema)) {
+						yield [
+							schemaName,
+							'index',
+							desc.name,
+							tableSchema.name,
+							buildIndexCreateSql(desc, tableSchema),
+							tagsToJson(desc.tags)
+						] as Row;
 					}
 				}
 
@@ -367,11 +393,19 @@ export const indexInfoFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
 		}
 
-		if (!table.indexes) return;
+		// Real indexes plus any exposed implicit covering index the backend did NOT
+		// materialize as an `IndexSchema` (store mode). In memory mode the second
+		// list is empty (the name already lives in `table.indexes`), so the row set
+		// matches across backends. Synthetic descriptors carry no `unique` flag —
+		// UNIQUE enforcement routes through `uniqueConstraints` — so they report
+		// `unique = 0`, mirroring the memory materialized entry.
+		const realIndexes = table.indexes ?? [];
+		const synthetic: ReadonlyArray<SyntheticExposedIndex> = exposedImplicitIndexes(table);
+		if (realIndexes.length === 0 && synthetic.length === 0) return;
 
-		for (const idx of table.indexes) {
+		for (const idx of [...realIndexes, ...synthetic]) {
 			const tagJson = tagsToJson(idx.tags);
-			const uniqueFlag = idx.unique ? 1 : 0;
+			const uniqueFlag = ('unique' in idx && idx.unique) ? 1 : 0;
 			const partialFlag = idx.predicate ? 1 : 0;
 			for (let seq = 0; seq < idx.columns.length; seq++) {
 				const col = idx.columns[seq];
