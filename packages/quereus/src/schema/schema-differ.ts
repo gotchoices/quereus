@@ -1,7 +1,7 @@
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, indexedColumnBareName } from '../emit/ast-stringify.js';
 import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
@@ -456,12 +456,17 @@ export function computeSchemaDiff(
 			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
 			continue;
 		}
-		// Body comparison (canonical: name / tags / collation excluded). Schema
-		// qualification does not affect the body render, so compare the raw declared
-		// stmt. The drop targets the actual (pre-rename) name and the recreate carries
-		// the declared (post-rename) name, so a body change on a rename-matched index
-		// resolves to a correct drop+recreate that supersedes the no-op rename op.
-		const declaredBody = createIndexBodyToCanonicalString(declaredIndex.indexStmt);
+		// Body comparison (canonical: name / tags excluded; per-column collation
+		// included via both-sides pre-resolution). Schema qualification does not affect
+		// the body render, so compare the raw declared stmt. The declared side resolves
+		// each column's effective collation against the matched declared table (so an
+		// inherited/BINARY collation that is unchanged does not churn, while a real
+		// collation change recreates). The drop targets the actual (pre-rename) name and
+		// the recreate carries the declared (post-rename) name, so a body change on a
+		// rename-matched index resolves to a correct drop+recreate that supersedes the
+		// no-op rename op.
+		const declaredTableForIndex = declaredTables.get(declaredIndex.indexStmt.table.name.toLowerCase());
+		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex);
 		if (declaredBody !== matchedActual.definition) {
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
@@ -768,6 +773,65 @@ function applyIndexDefaults(
 	}
 
 	return result;
+}
+
+/**
+ * Reads an index column's EXPLICIT per-column collation as-written, covering both
+ * indexed-column forms: the plain `col.collation` and the parser's collate-folded
+ * form (`col COLLATE x`, whose collation lives on `col.expr.collation`). Returns
+ * undefined when the column carries no explicit COLLATE — it then inherits the
+ * table column's collation (see {@link declaredColumnCollation}).
+ */
+function explicitIndexColumnCollation(col: AST.IndexedColumn): string | undefined {
+	if (col.collation) return col.collation;
+	if (col.expr?.type === 'collate') return col.expr.collation;
+	return undefined;
+}
+
+/**
+ * Reads a declared table column's effective collation from its `collate` column
+ * constraint, normalized (uppercase), defaulting to `'BINARY'`. Mirrors the
+ * engine's resolution of a table column's collation ({@link extractDeclaredCollation}).
+ * Returns `'BINARY'` when no declared table is supplied (an index on a non-declared
+ * table — not a coherent name-match) or the column is not found in it.
+ */
+function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, columnName: string): string {
+	if (!declaredTable) return 'BINARY';
+	const lower = columnName.toLowerCase();
+	const col = declaredTable.tableStmt.columns.find(c => c.name.toLowerCase() === lower);
+	return col ? extractDeclaredCollation(col) : 'BINARY';
+}
+
+/**
+ * Renders the canonical body of a DECLARED index, pre-resolving each column's
+ * effective collation the same way the engine does at create/import time
+ * (`buildIndexSchema` / `importIndex`): explicit index COLLATE, else the declared
+ * table column's collation, else BINARY — normalized. The resolved value is placed
+ * on a normalized plain-form {@link AST.IndexedColumn} (`{ name, collation,
+ * direction }`) so {@link createIndexBodyToCanonicalString} reads it off
+ * `col.collation`, matching the actual side's lift (`indexToCanonicalDDL`). Because
+ * both sides feed an identically-resolved collation, an unchanged inherited/BINARY
+ * collation renders identically (no churn) while a genuine collation change diverges
+ * (drop+recreate).
+ *
+ * A genuine expression-index column (no resolvable bare name) is passed through
+ * untouched — there is no column collation to resolve and the renderer falls back to
+ * `expressionToString`. `declaredTable` is the matched declared table (looked up by
+ * the index's table reference); undefined falls back to explicit-or-BINARY.
+ */
+function declaredIndexCanonicalBody(
+	indexStmt: AST.CreateIndexStmt,
+	declaredTable: AST.DeclaredTable | undefined,
+): string {
+	const columns: AST.IndexedColumn[] = indexStmt.columns.map(col => {
+		const bareName = indexedColumnBareName(col);
+		if (!bareName) return col;
+		const effective = normalizeCollationName(
+			explicitIndexColumnCollation(col) || declaredColumnCollation(declaredTable, bareName) || 'BINARY',
+		);
+		return { name: bareName, collation: effective, direction: col.direction };
+	});
+	return createIndexBodyToCanonicalString({ ...indexStmt, columns });
 }
 
 /**

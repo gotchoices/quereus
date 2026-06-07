@@ -318,11 +318,15 @@ describe('CREATE INDEX DDL round-trip: importCatalog multi-statement entries', (
 // Declarative differ: index BODY drift detection.
 //
 // The differ resolves indexes by name, then compares a CANONICAL BODY (UNIQUE-
-// ness, column set/order/direction, partial WHERE — collation and tags excluded)
-// rendered by the same `createIndexBodyToCanonicalString` on both the declared-AST
-// side and the actual-catalog side (lifted via `indexToCanonicalDDL`). A
-// name-matched index whose body drifted drops + recreates (the recreate carries
-// the declared tags); an unchanged body with drifted tags takes in-place SET TAGS.
+// ness, column set/order/direction, partial WHERE, per-column collation — tags
+// excluded) rendered by the same `createIndexBodyToCanonicalString` on both the
+// declared-AST side and the actual-catalog side (lifted via `indexToCanonicalDDL`).
+// Per-column collation is resolved identically on both sides (explicit index
+// COLLATE, else the table column's collation, else BINARY; normalized) so an
+// inherited/default-BINARY collation that is unchanged never churns, while a real
+// collation change drops+recreates. A name-matched index whose body drifted drops +
+// recreates (the recreate carries the declared tags); an unchanged body with drifted
+// tags takes in-place SET TAGS.
 // ============================================================================
 
 describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
@@ -376,7 +380,9 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		}
 	});
 
-	it('an inherited-NOCASE unique index re-declares with no churn (collation excluded from body)', async () => {
+	it('an inherited-NOCASE unique index re-declares with no churn (both sides resolve the same collation)', async () => {
+		// The index has no explicit COLLATE; both sides resolve NOCASE from the table
+		// column, so the canonical bodies match and no recreate churns.
 		const tbl = `table t { id INTEGER PRIMARY KEY, email TEXT collate nocase }`;
 		const diff = await diffIndexEdit(`${tbl}\nunique index uq_email on t (email)`, `${tbl}\nunique index uq_email on t (email)`);
 		expect(diff.indexesToCreate, 'no index creates').to.deep.equal([]);
@@ -563,6 +569,93 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		} finally {
 			await db.close();
 		}
+	});
+
+	// --- Per-column collation in the canonical index body ---
+	// Both sides pre-resolve each column's effective collation (explicit index
+	// COLLATE, else the table column's collation, else BINARY; normalized), so an
+	// inherited/default-BINARY collation that is unchanged renders identically (no
+	// churn) while a genuine collation change diverges (drop+recreate).
+
+	it('an index inheriting BINARY, re-declared verbatim, does not churn', async () => {
+		// The common case the original exclusion protected: no COLLATE anywhere, both
+		// sides resolve BINARY and elide it.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix on t (name)`, `${TABLE}\nindex ix on t (name)`);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+		expect(diff.indexTagsChanges, 'no tag changes').to.deep.equal([]);
+	});
+
+	it('adding an explicit index COLLATE recreates the index', async () => {
+		// Declared resolves NOCASE, actual still BINARY → diverge → drop+recreate.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix on t (email)`, `${TABLE}\nindex ix on t (email collate nocase)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0], 'recreate carries the declared collation').to.match(/collate nocase/i);
+	});
+
+	it('an index inheriting a non-BINARY column collation, re-declared verbatim, does not churn', async () => {
+		// `email text collate nocase`, index has no explicit COLLATE: both sides resolve
+		// NOCASE from the TABLE column. Guards that the declared side reads the
+		// table-column collation, not just the index column's explicit COLLATE.
+		const tbl = `table t { id INTEGER PRIMARY KEY, email TEXT collate nocase }`;
+		const diff = await diffIndexEdit(`${tbl}\nindex ix on t (email)`, `${tbl}\nindex ix on t (email)`);
+		expect(diff.indexesToDrop, 'no drop from inherited NOCASE').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate from inherited NOCASE').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
+	});
+
+	it('changing the column collation under a stable-named index recreates it AND alters the column', async () => {
+		// `name text` → `name text collate nocase` with a same-named index inheriting it.
+		// The index follows the declared column: declared body resolves NOCASE, actual
+		// body (old) is BINARY → drop+recreate. The column itself also emits a SET COLLATE.
+		const baseTbl = `table t { id INTEGER PRIMARY KEY, name TEXT }`;
+		const modTbl = `table t { id INTEGER PRIMARY KEY, name TEXT collate nocase }`;
+		const diff = await diffIndexEdit(`${baseTbl}\nindex ix on t (name)`, `${modTbl}\nindex ix on t (name)`);
+		expect(diff.indexesToDrop, 'index drops').to.deep.equal(['ix']);
+		expect(diff.indexesToCreate, 'index recreates').to.have.length(1);
+		// The column collation change rides the table-alter channel.
+		expect(diff.tablesToAlter, 'one table alter').to.have.length(1);
+		const colChange = diff.tablesToAlter[0].columnsToAlter.find(c => c.columnName.toLowerCase() === 'name');
+		expect(colChange?.collation, 'column SET COLLATE to NOCASE').to.equal('NOCASE');
+	});
+
+	it('an explicit COLLATE BINARY on a BINARY column does not churn', async () => {
+		// Normalization makes `binary` / `BINARY` / absent equivalent — both elide.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix on t (email)`, `${TABLE}\nindex ix on t (email collate binary)`);
+		expect(diff.indexesToDrop, 'no drop from a no-op explicit BINARY').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate from a no-op explicit BINARY').to.deep.equal([]);
+	});
+
+	it('a composite index with all collations unchanged does not churn', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, email)`, `${TABLE}\nindex ix_comp on t (name, email)`);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+	});
+
+	it('a composite index gaining one column COLLATE recreates', async () => {
+		// Only the second column's render differs → recreate.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, email)`, `${TABLE}\nindex ix_comp on t (name, email collate nocase)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_comp']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/collate nocase/i);
+	});
+
+	it('a desc index inheriting a non-BINARY collation, re-declared verbatim, does not churn', async () => {
+		// Guards the name->collate->desc render order on both sides with an inherited
+		// NOCASE collation plus a descending column.
+		const tbl = `table t { id INTEGER PRIMARY KEY, name TEXT collate nocase }`;
+		const diff = await diffIndexEdit(`${tbl}\nindex ix on t (name desc)`, `${tbl}\nindex ix on t (name desc)`);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+	});
+
+	it('a pure collation body-change recreate does not trip require-hint policy', async () => {
+		// A collation-driven recreate is a body change (counts in indexBodyRecreates),
+		// so it is excluded from the unhinted-rename guard, exactly as other body changes.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix on t (email)`, `${TABLE}\nindex ix on t (email collate nocase)`, 'require-hint');
+		expect(diff.indexesToDrop).to.deep.equal(['ix']);
+		expect(diff.indexesToCreate).to.have.length(1);
 	});
 });
 

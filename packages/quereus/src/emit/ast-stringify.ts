@@ -931,23 +931,47 @@ export function createIndexToString(stmt: AST.CreateIndexStmt): string {
  * expression over a column reference, so for that form the name lives on
  * `col.expr.expr.name`. Returns undefined for a genuine expression-index column
  * (no resolvable column name).
+ *
+ * Exported so the declarative differ can resolve a declared index column's
+ * effective collation (it needs the bare name to look up the table column).
  */
-function indexedColumnBareName(col: AST.IndexedColumn): string | undefined {
+export function indexedColumnBareName(col: AST.IndexedColumn): string | undefined {
 	if (col.name) return col.name;
 	if (col.expr?.type === 'collate' && col.expr.expr.type === 'column') return col.expr.expr.name;
 	return undefined;
 }
 
 /**
- * Collation-EXCLUDING canonical renderer for an index's column list, used only by
+ * The effective per-column collation to render in the canonical index body, or
+ * undefined when none / `BINARY` (both elided; comparison is case-insensitive).
+ *
+ * Reads the resolved collation off the plain `IndexedColumn.collation`: the two
+ * callers ({@link createIndexBodyToCanonicalString} via the differ's
+ * `declaredIndexCanonicalBody`, and the actual catalog's `indexToCanonicalDDL`)
+ * BOTH pre-resolve the effective collation onto that field (explicit index
+ * COLLATE, else table-column collation, else BINARY; normalized), so rendering it
+ * here makes an unchanged inherited/BINARY collation render identically on both
+ * diff sides while a genuine collation change diverges. The defensive fallback
+ * reads the parser's collate-folded form (`col.expr.collation`) so a future raw
+ * caller that skips the pre-resolve step does not silently drop the collation.
+ */
+function canonicalIndexColumnCollation(col: AST.IndexedColumn): string | undefined {
+	const c = col.collation ?? (col.expr?.type === 'collate' ? col.expr.collation : undefined);
+	if (!c || c.toUpperCase() === 'BINARY') return undefined;
+	return c;
+}
+
+/**
+ * Canonical renderer for an index's column list, used only by
  * {@link createIndexBodyToCanonicalString} for body-drift comparison — NOT a
- * persistence path (see {@link indexedColumnsToString} for the collation-emitting
- * form). For each column emit the bare column name + ` desc` only when descending.
- * The bare name is extracted from both indexed-column forms (plain `col.name` and
- * the parser's collate-folded form — see {@link indexedColumnBareName}); a genuine
- * expression-index column with no resolvable name falls back to
- * `expressionToString(col.expr)` (such indexes are rejected on import and never
- * name-match a real actual).
+ * persistence path (see {@link indexedColumnsToString} for the persistence form).
+ * For each column emit the bare column name, then an effective `collate <c>` (only
+ * when non-BINARY), then ` desc` when descending — the same name/collate/desc order
+ * the persistence renderer uses. The bare name is extracted from both indexed-column
+ * forms (plain `col.name` and the parser's collate-folded form — see
+ * {@link indexedColumnBareName}); a genuine expression-index column with no
+ * resolvable name falls back to `expressionToString(col.expr)` (such indexes are
+ * rejected on import and never name-match a real actual).
  *
  * The bare name is lowercased before `quoteIdentifier` so the comparison key is
  * case-insensitive — matching Quereus's uniformly case-folding column resolution
@@ -956,13 +980,22 @@ function indexedColumnBareName(col: AST.IndexedColumn): string | undefined {
  * declared side carries the as-written index reference case; folding both makes a
  * case-only divergence (e.g. column `Email` indexed as `email`) render identically
  * instead of churning a spurious drop+recreate.
+ *
+ * Collation is rendered from the pre-resolved effective value
+ * ({@link canonicalIndexColumnCollation}): both diff sides resolve the column's
+ * collation the same way the engine does at create/import time, so an inherited or
+ * default-BINARY collation that is unchanged renders identically (no churn) while a
+ * genuine per-column collation change renders differently (drop+recreate).
  */
 function canonicalIndexedColumnsToString(cols: readonly AST.IndexedColumn[]): string {
 	return cols.map(col => {
 		const name = indexedColumnBareName(col);
 		if (name) {
-			const lower = name.toLowerCase();
-			return col.direction === 'desc' ? `${quoteIdentifier(lower)} desc` : quoteIdentifier(lower);
+			let colStr = quoteIdentifier(name.toLowerCase());
+			const collation = canonicalIndexColumnCollation(col);
+			if (collation) colStr += ` collate ${quoteIdentifier(collation.toLowerCase())}`;
+			if (col.direction === 'desc') colStr += ' desc';
+			return colStr;
 		}
 		return col.expr ? expressionToString(col.expr) : '';
 	}).filter(s => s).join(', ');
@@ -977,12 +1010,15 @@ function canonicalIndexedColumnsToString(cols: readonly AST.IndexedColumn[]): st
  *
  * Excludes the index `name`, the `on <table>` reference, `if not exists`, AND the
  * `with tags (...)` suffix (tags are a separate diff channel — `ALTER INDEX … SET
- * TAGS`). Collation is intentionally EXCLUDED from the column render this pass
- * (see schema-differ's Decision): the actual side stores a resolved per-column
- * collation while the declared side inherits it from the table column, so
- * including it would churn false positives. Both the declared-AST side
- * (`schema-differ`) and the actual-catalog side (`ddl-generator`'s
- * `indexToCanonicalDDL`) funnel through here so their fragments are byte-comparable.
+ * TAGS`). Per-column collation IS included, but only as an already-resolved
+ * effective value: both sides pre-resolve each column's effective collation the
+ * way the engine does at create/import time (explicit index COLLATE, else the
+ * table column's collation, else BINARY; normalized) before calling this renderer
+ * — the actual side in `ddl-generator`'s `indexToCanonicalDDL`, the declared side
+ * in `schema-differ`'s `declaredIndexCanonicalBody`. An unchanged inherited or
+ * default-BINARY collation therefore renders identically (no churn) while a genuine
+ * collation change renders differently (drop+recreate). Both sides funnel through
+ * here so their fragments are byte-comparable.
  *
  * The partial-index WHERE predicate's bare column references are case-folded
  * ({@link lowerExprIdentifiers}) so a reference whose case diverges between schema

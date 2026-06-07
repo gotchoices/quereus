@@ -68,8 +68,12 @@ export interface CatalogIndex {
 	tableName: string;
 	ddl: string;
 	/**
-	 * Canonical body string (UNIQUE-ness, column set/order/direction, partial
-	 * predicate; name / `on <table>` / tags / collation excluded). The differ
+	 * Canonical body string (UNIQUE-ness, column set/order/direction, per-column
+	 * collation, partial predicate; name / `on <table>` / tags excluded). Per-column
+	 * collation is rendered from the resolved effective value (the same value both
+	 * diff sides pre-resolve — see `indexToCanonicalDDL` / the differ's
+	 * `declaredIndexCanonicalBody`), so an inherited/default-BINARY collation that is
+	 * unchanged never churns while a real collation change recreates. The differ
 	 * compares this against a declared index's body — rendered by the same
 	 * `createIndexBodyToCanonicalString` — to detect a name-matched index whose
 	 * body changed (→ drop+recreate), mirroring `CatalogTable.namedConstraints[].

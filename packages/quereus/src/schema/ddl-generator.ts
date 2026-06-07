@@ -149,9 +149,13 @@ export function generateIndexDDL(
  * into the equivalent minimal {@link AST.CreateIndexStmt} (column indices → names,
  * `unique`, `predicate` → `where`), so both sides share one rendering path and
  * stay byte-comparable — exactly as {@link constraintToCanonicalDDL} does via
- * `schemaConstraintToTableConstraint`. Collation is excluded by the shared
- * renderer (see its doc); `index` / `table` are placeholder identifiers the body
- * render never reads (it excludes the name and the `on <table>` reference).
+ * `schemaConstraintToTableConstraint`. Each lifted column carries its resolved
+ * effective collation (stored `IndexColumnSchema.collation`, falling back to the
+ * table column's collation; normalized, default BINARY) so the shared renderer
+ * elides BINARY and emits a non-BINARY collation explicitly — matching the
+ * declared side's pre-resolution (see `createIndexBodyToCanonicalString`).
+ * `index` / `table` are placeholder identifiers the body render never reads (it
+ * excludes the name and the `on <table>` reference).
  */
 export function indexToCanonicalDDL(indexSchema: IndexSchema, tableSchema: TableSchema): string {
 	const stmt: AST.CreateIndexStmt = {
@@ -162,6 +166,7 @@ export function indexToCanonicalDDL(indexSchema: IndexSchema, tableSchema: Table
 		columns: indexSchema.columns.map(col => ({
 			name: tableSchema.columns[col.index].name,
 			direction: col.desc ? 'desc' as const : undefined,
+			collation: normalizeCollationName(col.collation ?? tableSchema.columns[col.index].collation ?? 'BINARY'),
 		})),
 		isUnique: !!indexSchema.unique,
 		where: indexSchema.predicate,
