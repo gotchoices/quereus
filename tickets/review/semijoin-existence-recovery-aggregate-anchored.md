@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-07T09:56:36.345Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\semijoin-existence-recovery-aggregate-anchored.review.2026-06-07T09-56-36-345Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Aggregate-anchored variant of `semijoin-existence-recovery`. Adds `ruleSemijoinExistenceRecoveryUnderAggregate` — a second entrypoint anchored on `AggregateNode` that recovers a semi/anti join from a probe-only `left join … exists right as <flag>` sitting under a bare `count(*)` / `group by` with no enclosing Project (e.g. `select count(*) from child c left join parent p on … exists right as hasP where hasP`). Shares ALL probe-detection + chain-rewrite machinery with the Project entrypoint; only the demand seed (group-by + aggregate exprs) and rebuild epilogue (`AggregateNode` with `preserveAttributeIds`) differ. Mirrors how `ruleJoinExistencePruningUnderAggregate` / `ruleJoinEliminationUnderAggregate` extended their Project siblings.
 files: packages/quereus/src/planner/rules/join/rule-semijoin-existence-recovery.ts, packages/quereus/src/planner/rules/join/rule-inner-join-existence-recovery.ts, packages/quereus/src/planner/optimizer.ts, packages/quereus/test/optimizer/rule-semijoin-existence-recovery.spec.ts, packages/quereus/test/optimizer/rule-join-existence-pruning.spec.ts, packages/quereus/test/logic/08.2-existence-flag-semijoin-recovery.sqllogic, docs/optimizer.md
 ----
