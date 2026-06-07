@@ -2212,9 +2212,28 @@ select null as no_value;
 
 Path shorthand: `expr -> 'name'` is equivalent to `expr -> '$.name'`; `expr -> 0` is equivalent to `expr -> '$[0]'`.
 
+**IS Predicates (postfix boolean tests):**
+
+These are postfix unary predicates on the left operand. They are **total** — they
+never return NULL, even when the operand is NULL — so they route truthiness
+through the engine's `isTruthy` (numeric-string coercion: `'abc'`, `'0'`, blobs ⇒
+false), matching the `where` / `NOT` / logical-operator path.
+
+- `expr is null` / `expr is not null`: NULL test
+- `expr is true` / `expr is not true`: boolean test against truthiness
+- `expr is false` / `expr is not false`: boolean test against falsiness
+
+| operator       | operand NULL | operand non-NULL |
+|----------------|--------------|------------------|
+| `is true`      | `false`      | `isTruthy(v)`    |
+| `is not true`  | `true`       | `not isTruthy(v)`|
+| `is false`     | `false`      | `not isTruthy(v)`|
+| `is not false` | `true`       | `isTruthy(v)`    |
+
+The general binary form `a is b` (identity comparison of two expressions) is **not
+supported** — only the postfix predicates above are recognized.
+
 **Other Operators:**
-- `is`: Tests if values are identical (including NULL)
-- `is not`: Tests if values are not identical
 - `in`: Tests if a value is in a set
 - `not in`: Tests if a value is not in a set
 - `like`: Pattern matching with wildcards
