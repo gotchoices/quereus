@@ -469,41 +469,109 @@ describe('Parser', () => {
 		});
 	});
 
-	describe('ALTER VIEW / MATERIALIZED VIEW / INDEX SET TAGS', () => {
-		it('parses ALTER VIEW ... SET TAGS', () => {
-			const stmt = parse(`alter view v set tags (cacheable = true)`) as import('../src/parser/ast.js').AlterViewStmt;
+	describe('ALTER VIEW / MATERIALIZED VIEW / INDEX SET / ADD / DROP TAGS', () => {
+		type AlterViewStmt = import('../src/parser/ast.js').AlterViewStmt;
+		type AlterMaterializedViewStmt = import('../src/parser/ast.js').AlterMaterializedViewStmt;
+		type AlterIndexStmt = import('../src/parser/ast.js').AlterIndexStmt;
+
+		it('parses ALTER VIEW ... SET TAGS as a replace setTags', () => {
+			const stmt = parse(`alter view v set tags (cacheable = true)`) as AlterViewStmt;
 			expect(stmt.type).to.equal('alterView');
 			expect(stmt.name.name).to.equal('v');
-			expect(stmt.action).to.deep.equal({ type: 'setTags', tags: { cacheable: true } });
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: { cacheable: true } });
 		});
 
-		it('parses ALTER MATERIALIZED VIEW ... SET TAGS', () => {
-			const stmt = parse(`alter materialized view mv set tags (owner = 'analytics')`) as import('../src/parser/ast.js').AlterMaterializedViewStmt;
+		it('parses ALTER MATERIALIZED VIEW ... SET TAGS as a replace setTags', () => {
+			const stmt = parse(`alter materialized view mv set tags (owner = 'analytics')`) as AlterMaterializedViewStmt;
 			expect(stmt.type).to.equal('alterMaterializedView');
 			expect(stmt.name.name).to.equal('mv');
-			expect(stmt.action).to.deep.equal({ type: 'setTags', tags: { owner: 'analytics' } });
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: { owner: 'analytics' } });
 		});
 
-		it('parses ALTER INDEX ... SET TAGS', () => {
-			const stmt = parse(`alter index idx set tags (purpose = 'search')`) as import('../src/parser/ast.js').AlterIndexStmt;
+		it('parses ALTER INDEX ... SET TAGS as a replace setTags', () => {
+			const stmt = parse(`alter index idx set tags (purpose = 'search')`) as AlterIndexStmt;
 			expect(stmt.type).to.equal('alterIndex');
 			expect(stmt.name.name).to.equal('idx');
-			expect(stmt.action).to.deep.equal({ type: 'setTags', tags: { purpose: 'search' } });
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: { purpose: 'search' } });
 		});
 
+		// ── ADD TAGS → merge setTags ──
+		it('parses ALTER VIEW ... ADD TAGS as a merge setTags', () => {
+			const stmt = parse(`alter view v add tags (cacheable = true)`) as AlterViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: { cacheable: true } });
+		});
+
+		it('parses ALTER MATERIALIZED VIEW ... ADD TAGS as a merge setTags', () => {
+			const stmt = parse(`alter materialized view mv add tags (owner = 'team-b')`) as AlterMaterializedViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: { owner: 'team-b' } });
+		});
+
+		it('parses ALTER INDEX ... ADD TAGS as a merge setTags', () => {
+			const stmt = parse(`alter index idx add tags (purpose = 'search')`) as AlterIndexStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: { purpose: 'search' } });
+		});
+
+		// ── DROP TAGS → dropTags ──
+		it('parses ALTER VIEW ... DROP TAGS as a dropTags', () => {
+			const stmt = parse(`alter view v drop tags (purpose)`) as AlterViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'dropTags', keys: ['purpose'] });
+		});
+
+		it('parses ALTER MATERIALIZED VIEW ... DROP TAGS as a dropTags', () => {
+			const stmt = parse(`alter materialized view mv drop tags (legacy, owner)`) as AlterMaterializedViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'dropTags', keys: ['legacy', 'owner'] });
+		});
+
+		it('parses ALTER INDEX ... DROP TAGS as a dropTags', () => {
+			const stmt = parse(`alter index idx drop tags (purpose)`) as AlterIndexStmt;
+			expect(stmt.action).to.deep.equal({ type: 'dropTags', keys: ['purpose'] });
+		});
+
+		// ── empty-list forms ──
 		it('parses an empty SET TAGS () as the clear-all form', () => {
-			const stmt = parse(`alter index idx set tags ()`) as import('../src/parser/ast.js').AlterIndexStmt;
-			expect(stmt.action.tags).to.deep.equal({});
+			const stmt = parse(`alter index idx set tags ()`) as AlterIndexStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: {} });
+		});
+
+		it('parses empty ADD TAGS () / DROP TAGS () as no-op lists', () => {
+			const add = parse(`alter view v add tags ()`) as AlterViewStmt;
+			expect(add.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: {} });
+			const drop = parse(`alter view v drop tags ()`) as AlterViewStmt;
+			expect(drop.action).to.deep.equal({ type: 'dropTags', keys: [] });
 		});
 
 		it('honors a schema-qualified object name', () => {
-			const stmt = parse(`alter view main.v set tags (a = 1)`) as import('../src/parser/ast.js').AlterViewStmt;
+			const stmt = parse(`alter view main.v set tags (a = 1)`) as AlterViewStmt;
 			expect(stmt.name.schema).to.equal('main');
 			expect(stmt.name.name).to.equal('v');
 		});
 
 		it('rejects ALTER on an unsupported object keyword', () => {
 			expect(() => parse(`alter sequence s set tags (a = 1)`)).to.throw();
+		});
+
+		it('rejects a tag verb that is not SET / ADD / DROP', () => {
+			expect(() => parse(`alter view v rename tags (a)`)).to.throw();
+		});
+
+		it('round-trips all nine view / MV / index tag forms through astToString', () => {
+			for (const sql of [
+				`alter view v set tags (cacheable = true)`,
+				`alter view v add tags (cacheable = true)`,
+				`alter view v drop tags (purpose)`,
+				`alter materialized view mv set tags (owner = 'team-b')`,
+				`alter materialized view mv add tags (owner = 'team-b')`,
+				`alter materialized view mv drop tags (legacy)`,
+				`alter index idx set tags (purpose = 'search')`,
+				`alter index idx add tags (purpose = 'search')`,
+				`alter index idx drop tags (purpose)`,
+				// A quoted reserved-looking key proves tagKeysBodyToString quotes keys.
+				`alter view v drop tags ("quereus.id")`,
+			]) {
+				const stmt = parse(sql);
+				const reparsed = parse(astToString(stmt));
+				expect((reparsed as AlterViewStmt).action, sql).to.deep.equal((stmt as AlterViewStmt).action);
+			}
 		});
 	});
 

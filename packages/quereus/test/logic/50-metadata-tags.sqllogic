@@ -880,3 +880,223 @@ ALTER TABLE MixMergeDrop DROP TAGS (scratch);
 SELECT json_extract(tags, '$.keep') AS keep, json_type(tags, '$.scratch') AS scratch_type
     FROM schema() WHERE type = 'table' AND name = 'MixMergeDrop';
 → [{"keep":1,"scratch_type":null}]
+
+-- ===================================================================
+-- Phase 32: ALTER VIEW ... ADD / DROP TAGS (per-key merge + delete)
+-- ===================================================================
+
+CREATE TABLE VBase (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO VBase VALUES (1, 'a'), (2, 'b');
+CREATE VIEW VTagged AS SELECT id, name FROM VBase WITH TAGS (a = 1, b = 2);
+
+-- ADD merges: overwrite b, keep a, add c (merge, not replace).
+ALTER VIEW VTagged ADD TAGS (b = 99, c = 3);
+SELECT json_extract(tags, '$.a') AS a, json_extract(tags, '$.b') AS b, json_extract(tags, '$.c') AS c
+    FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"a":1,"b":99,"c":3}]
+
+-- ADD TAGS () is a no-op (keeps existing) — distinct from SET TAGS ().
+ALTER VIEW VTagged ADD TAGS ();
+SELECT json_extract(tags, '$.a') AS a FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"a":1}]
+
+-- DROP one key, keep the rest.
+ALTER VIEW VTagged DROP TAGS (b);
+SELECT json_type(tags, '$.b') AS b_type, json_extract(tags, '$.a') AS a
+    FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"b_type":null,"a":1}]
+
+-- DROP of an absent key → NOTFOUND, atomic (a, c survive).
+ALTER VIEW VTagged DROP TAGS (a, nope);
+-- error: not found
+
+SELECT json_extract(tags, '$.a') AS a, json_extract(tags, '$.c') AS c
+    FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"a":1,"c":3}]
+
+-- DROP TAGS () is a no-op.
+ALTER VIEW VTagged DROP TAGS ();
+SELECT json_extract(tags, '$.a') AS a FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"a":1}]
+
+-- Drop all remaining keys → tags IS NULL (same end-state as SET TAGS ()).
+ALTER VIEW VTagged DROP TAGS (a, c);
+SELECT tags FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"tags":null}]
+
+-- The view still resolves and returns rows after the tag churn.
+SELECT * FROM VTagged ORDER BY id;
+→ [{"id":1,"name":"a"},{"id":2,"name":"b"}]
+
+-- ===================================================================
+-- Phase 33: ALTER INDEX ... ADD / DROP TAGS (per-key merge + delete)
+-- ===================================================================
+
+CREATE TABLE ITbl (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO ITbl VALUES (1, 'Widget'), (2, 'Gadget');
+CREATE INDEX ix_itbl_name ON ITbl (name) WITH TAGS (purpose = 'search');
+
+-- ADD merges onto the index's live tags.
+ALTER INDEX ix_itbl_name ADD TAGS (owner = 'team', purpose = 'fulltext');
+SELECT json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"owner":"team","purpose":"fulltext"}]
+
+-- The index still answers lookups after the merge.
+SELECT name FROM ITbl WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- DROP one key, keep the rest.
+ALTER INDEX ix_itbl_name DROP TAGS (owner);
+SELECT json_type(tags, '$.owner') AS owner_type, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"owner_type":null,"purpose":"fulltext"}]
+
+-- DROP of an absent key → NOTFOUND (atomic).
+ALTER INDEX ix_itbl_name DROP TAGS (nope);
+-- error: not found
+
+-- Drop the last key → tags IS NULL.
+ALTER INDEX ix_itbl_name DROP TAGS (purpose);
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 34: ALTER MATERIALIZED VIEW ... ADD / DROP TAGS (no re-materialization)
+-- ===================================================================
+
+CREATE TABLE MTbl (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO MTbl VALUES (1, 'M-A'), (2, 'M-B');
+CREATE MATERIALIZED VIEW mv_tagged AS SELECT id, name FROM MTbl WITH TAGS (owner = 'analytics');
+
+SELECT id, name FROM mv_tagged ORDER BY id;
+→ [{"id":1,"name":"M-A"},{"id":2,"name":"M-B"}]
+
+-- ADD merges as a catalog-only change — the backing data is not rebuilt.
+ALTER MATERIALIZED VIEW mv_tagged ADD TAGS (tier = 'gold');
+SELECT id, name FROM mv_tagged ORDER BY id;
+→ [{"id":1,"name":"M-A"},{"id":2,"name":"M-B"}]
+
+-- DROP is catalog-only too — still no rebuild.
+ALTER MATERIALIZED VIEW mv_tagged DROP TAGS (owner);
+SELECT id, name FROM mv_tagged ORDER BY id;
+→ [{"id":1,"name":"M-A"},{"id":2,"name":"M-B"}]
+
+-- DROP of an absent key → NOTFOUND (atomic; tier survives).
+ALTER MATERIALIZED VIEW mv_tagged DROP TAGS (nope);
+-- error: not found
+
+-- Drop the last key → still no rebuild, data intact.
+ALTER MATERIALIZED VIEW mv_tagged DROP TAGS (tier);
+SELECT id, name FROM mv_tagged ORDER BY id;
+→ [{"id":1,"name":"M-A"},{"id":2,"name":"M-B"}]
+
+-- ===================================================================
+-- Phase 35: empty-list distinction for ADD / SET / DROP (view kind)
+-- ===================================================================
+
+CREATE TABLE EBase (id INTEGER PRIMARY KEY);
+CREATE VIEW EView AS SELECT id FROM EBase WITH TAGS (k = 1);
+
+-- ADD TAGS () keeps the existing set.
+ALTER VIEW EView ADD TAGS ();
+SELECT json_extract(tags, '$.k') AS k FROM schema() WHERE type = 'view' AND name = 'EView';
+→ [{"k":1}]
+
+-- DROP TAGS () keeps the existing set.
+ALTER VIEW EView DROP TAGS ();
+SELECT json_extract(tags, '$.k') AS k FROM schema() WHERE type = 'view' AND name = 'EView';
+→ [{"k":1}]
+
+-- SET TAGS () clears — the distinguishing case.
+ALTER VIEW EView SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'view' AND name = 'EView';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 36: ADD validates reserved keys; DROP does not (view + index)
+-- ===================================================================
+
+-- ADD rejects an unknown reserved key at the view-ddl site (same as SET TAGS).
+ALTER VIEW VTagged ADD TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- ADD rejects an unknown reserved key at the physical-index site.
+ALTER INDEX ix_itbl_name ADD TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- A valid reserved key at the right site is stored by ADD (quereus.id is legal at
+-- view-ddl), then DROP removes it without value validation — dropping a reserved
+-- key is legitimate.
+ALTER VIEW VTagged ADD TAGS ("quereus.id" = 'view-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"qid":"view-thing"}]
+ALTER VIEW VTagged DROP TAGS ("quereus.id");
+SELECT tags FROM schema() WHERE type = 'view' AND name = 'VTagged';
+→ [{"tags":null}]
+
+-- Same for an index: quereus.id is legal at physical-index; DROP removes it.
+ALTER INDEX ix_itbl_name ADD TAGS ("quereus.id" = 'idx-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"qid":"idx-thing"}]
+ALTER INDEX ix_itbl_name DROP TAGS ("quereus.id");
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 37: hidden implicit covering index is not addressable for ADD / DROP
+-- ===================================================================
+
+-- Employees (Phase 3) has a named UNIQUE constraint uq_email whose implicit
+-- covering structure is hidden — ADD / DROP TAGS must treat it as NOTFOUND
+-- (its tags live on the constraint), mirroring SET TAGS (Phase 22).
+ALTER INDEX uq_email ADD TAGS (a = 1);
+-- error: not found
+
+ALTER INDEX uq_email DROP TAGS (a);
+-- error: not found
+
+-- ===================================================================
+-- Phase 38: exposed implicit covering index becomes addressable for ADD / DROP
+-- ===================================================================
+
+CREATE TABLE ExpoTbl (
+    id INTEGER PRIMARY KEY,
+    vin TEXT,
+    CONSTRAINT uq_expo_vin UNIQUE (vin) WITH TAGS ("quereus.expose_implicit_index" = true)
+);
+
+-- The exposed implicit index is user-addressable: ADD merges onto its tags.
+ALTER INDEX uq_expo_vin ADD TAGS (purpose = 'lookup');
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'uq_expo_vin';
+→ [{"purpose":"lookup"}]
+
+-- DROP removes the key (visibility is governed by the constraint, so the index
+-- stays addressable).
+ALTER INDEX uq_expo_vin DROP TAGS (purpose);
+SELECT json_type(tags, '$.purpose') AS purpose_type
+    FROM schema() WHERE type = 'index' AND name = 'uq_expo_vin';
+→ [{"purpose_type":null}]
+
+-- ===================================================================
+-- Phase 39: NOTFOUND object for ADD / DROP (view, materialized view, index)
+-- ===================================================================
+
+ALTER VIEW NoSuchV ADD TAGS (a = 1);
+-- error: not found
+
+ALTER VIEW NoSuchV DROP TAGS (a);
+-- error: not found
+
+ALTER MATERIALIZED VIEW NoSuchMv ADD TAGS (a = 1);
+-- error: not found
+
+ALTER MATERIALIZED VIEW NoSuchMv DROP TAGS (a);
+-- error: not found
+
+ALTER INDEX NoSuchIx ADD TAGS (a = 1);
+-- error: not found
+
+ALTER INDEX NoSuchIx DROP TAGS (a);
+-- error: not found

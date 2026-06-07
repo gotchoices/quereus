@@ -869,24 +869,24 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Sets metadata tags on an existing view, replacing any existing tags (empty
-	 * record clears). Catalog-only: swaps the in-memory {@link ViewSchema} and
-	 * re-registers it. Fires `view_modified` so a cached write-through plan that
-	 * recorded a `view` dependency (every view-/MV-mediated write does — see
-	 * `buildViewMutation`) is invalidated when the view's behavioral
-	 * `quereus.update.*` tags change. This event is distinct from the (non-existent)
-	 * plain-view create event, so it triggers no maintenance re-registration.
-	 *
-	 * @throws QuereusError(NOTFOUND) if the view does not exist.
+	 * Shared view-tag read-modify-write: fetches the live view (NOTFOUND if
+	 * absent), computes its next tag record from its current `tags` via `compute`,
+	 * re-registers the swapped {@link ViewSchema}, and fires `view_modified` so a
+	 * cached write-through plan that recorded a `view` dependency (every
+	 * view-/MV-mediated write does — see `buildViewMutation`) is invalidated when
+	 * the view's behavioral `quereus.update.*` tags change. This event is distinct
+	 * from the (non-existent) plain-view create event, so it triggers no maintenance
+	 * re-registration. `compute` decides replace / merge / drop and may throw before
+	 * any mutation (drop-of-absent NOTFOUND), leaving the catalog untouched.
 	 */
-	setViewTags(viewName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+	private updateViewTags(viewName: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		const view = schema.getView(viewName);
 		if (!view) {
 			throw new QuereusError(`View '${viewName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
-		const updated: ViewSchema = { ...view, tags: this.freezeTags(tags) };
+		const updated: ViewSchema = { ...view, tags: compute(view.tags) };
 		schema.addView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'view_modified',
@@ -902,33 +902,65 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Sets metadata tags on an existing materialized view, replacing any existing
-	 * tags (empty record clears). Catalog-only: swaps the in-memory
-	 * {@link MaterializedViewSchema} and re-registers it. The backing table and the
-	 * row-time maintenance plan are untouched (tags do not affect maintenance), so
-	 * this never re-materializes. Fires `materialized_view_modified` so a cached
-	 * write-through plan that recorded a `view` dependency is invalidated when the
-	 * MV's behavioral `quereus.update.*` tags change. This event is deliberately
-	 * distinct from `materialized_view_added` (what create emits) — the MV
-	 * maintenance manager re-registers on `_added` but ignores `_modified`, so a tag
-	 * change does not re-register maintenance or rebuild the backing.
+	 * Sets metadata tags on an existing view, replacing any existing tags (empty
+	 * record clears).
 	 *
-	 * @throws QuereusError(NOTFOUND) if the materialized view does not exist.
+	 * @throws QuereusError(NOTFOUND) if the view does not exist.
 	 */
-	setMaterializedViewTags(name: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+	setViewTags(viewName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateViewTags(viewName, () => this.freezeTags(tags), schemaName);
+	}
+
+	/**
+	 * Merges `tags` into an existing view's tags — set/overwrite the listed keys,
+	 * keep the rest (`ALTER VIEW … ADD TAGS`). Empty `tags` is a no-op (does NOT
+	 * clear). Reads the view's live tags at call time.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the view does not exist.
+	 */
+	mergeViewTags(viewName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateViewTags(viewName, current => this.mutateTagRecord(current, { op: 'merge', tags }), schemaName);
+	}
+
+	/**
+	 * Drops the listed keys from an existing view's tags (`ALTER VIEW … DROP TAGS`).
+	 * Atomic: every key must be present, else `NOTFOUND` names the missing key(s)
+	 * and nothing is dropped. Dropping the last key(s) leaves `tags` undefined. An
+	 * empty `keys` is a no-op.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the view does not exist, or any listed key
+	 *   is absent.
+	 */
+	dropViewTags(viewName: string, keys: readonly string[], schemaName?: string): void {
+		this.updateViewTags(viewName, current => this.mutateTagRecord(current, { op: 'drop', keys }), schemaName);
+	}
+
+	/**
+	 * Shared materialized-view-tag read-modify-write: fetches the live MV (NOTFOUND
+	 * if absent), computes its next tag record via `compute`, re-registers the
+	 * swapped {@link MaterializedViewSchema}, and fires `materialized_view_modified`.
+	 * The backing table and the row-time maintenance plan are untouched (tags do not
+	 * affect maintenance), so this never re-materializes — `_modified` is
+	 * deliberately distinct from `materialized_view_added` (what create emits): the
+	 * MV maintenance manager re-registers on `_added` but ignores `_modified`. The
+	 * event invalidates a cached write-through plan that recorded a `view` dependency
+	 * when the MV's behavioral `quereus.update.*` tags change. `compute` may throw
+	 * before any mutation (drop-of-absent NOTFOUND), leaving the catalog untouched.
+	 */
+	private updateMaterializedViewTags(name: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		const mv = schema.getMaterializedView(name);
 		if (!mv) {
 			throw new QuereusError(`Materialized view '${name}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
-		const updated: MaterializedViewSchema = { ...mv, tags: this.freezeTags(tags) };
+		const updated: MaterializedViewSchema = { ...mv, tags: compute(mv.tags) };
 		schema.addMaterializedView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'materialized_view_modified',
 			schemaName: targetSchemaName,
 			// Canonical stored name (not the raw `name` arg) so the event matches the
-			// `view` plan dependency, which records `view.name` — see `setViewTags`.
+			// `view` plan dependency, which records `view.name` — see `updateViewTags`.
 			objectName: updated.name,
 			oldObject: mv,
 			newObject: updated,
@@ -936,19 +968,53 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Sets metadata tags on an existing index, replacing any existing tags (empty
-	 * record clears). Indexes live on their owning {@link TableSchema}, so this
-	 * resolves the owner by index name, swaps the matching {@link IndexSchema}, and
-	 * re-registers the table — firing `table_modified` (mirroring create/drop index)
-	 * so optimizer caches invalidate.
+	 * Sets metadata tags on an existing materialized view, replacing any existing
+	 * tags (empty record clears). Catalog-only — never re-materializes.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the materialized view does not exist.
+	 */
+	setMaterializedViewTags(name: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateMaterializedViewTags(name, () => this.freezeTags(tags), schemaName);
+	}
+
+	/**
+	 * Merges `tags` into an existing materialized view's tags — set/overwrite the
+	 * listed keys, keep the rest (`ALTER MATERIALIZED VIEW … ADD TAGS`). Empty
+	 * `tags` is a no-op (does NOT clear). Catalog-only — never re-materializes.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the materialized view does not exist.
+	 */
+	mergeMaterializedViewTags(name: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateMaterializedViewTags(name, current => this.mutateTagRecord(current, { op: 'merge', tags }), schemaName);
+	}
+
+	/**
+	 * Drops the listed keys from an existing materialized view's tags (`ALTER
+	 * MATERIALIZED VIEW … DROP TAGS`). Atomic: every key must be present, else
+	 * `NOTFOUND` names the missing key(s) and nothing is dropped. Empty `keys` is a
+	 * no-op. Catalog-only — never re-materializes.
+	 *
+	 * @throws QuereusError(NOTFOUND) if the materialized view does not exist, or any
+	 *   listed key is absent.
+	 */
+	dropMaterializedViewTags(name: string, keys: readonly string[], schemaName?: string): void {
+		this.updateMaterializedViewTags(name, current => this.mutateTagRecord(current, { op: 'drop', keys }), schemaName);
+	}
+
+	/**
+	 * Shared index-tag read-modify-write. Indexes live on their owning
+	 * {@link TableSchema}, so this resolves the owner by index name, computes the
+	 * matching {@link IndexSchema}'s next tag record from its current `tags` via
+	 * `compute`, swaps it, re-registers the table, and fires `table_modified`
+	 * (mirroring create/drop index) so optimizer caches invalidate.
 	 *
 	 * Hidden implicit covering structures (the auto-built BTree backing a UNIQUE
 	 * constraint, not opted into catalog visibility) are not user-addressable and
-	 * surface as NOTFOUND — their tags live on the originating constraint.
-	 *
-	 * @throws QuereusError(NOTFOUND) if no user-visible index matches.
+	 * surface as NOTFOUND — their tags live on the originating constraint. `compute`
+	 * runs before the index array is rebuilt, so a drop-of-absent NOTFOUND aborts
+	 * before any swap.
 	 */
-	setIndexTags(indexName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+	private updateIndexTags(indexName: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		const lower = indexName.toLowerCase();
@@ -965,8 +1031,10 @@ export class SchemaManager {
 		if (!ownerTable || !matched || isHiddenImplicitIndex(ownerTable, matched.name)) {
 			throw new QuereusError(`Index '${indexName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
-		const frozen = this.freezeTags(tags);
-		const updatedIndexes = ownerTable.indexes!.map(idx => (idx.name.toLowerCase() === lower ? { ...idx, tags: frozen } : idx));
+		// Compute before rebuilding the index array so a drop-of-absent NOTFOUND
+		// aborts before any swap.
+		const nextTags = compute(matched.tags);
+		const updatedIndexes = ownerTable.indexes!.map(idx => (idx.name.toLowerCase() === lower ? { ...idx, tags: nextTags } : idx));
 		const updatedTableSchema: TableSchema = {
 			...ownerTable,
 			indexes: Object.freeze(updatedIndexes),
@@ -979,6 +1047,39 @@ export class SchemaManager {
 			oldObject: ownerTable,
 			newObject: updatedTableSchema,
 		});
+	}
+
+	/**
+	 * Sets metadata tags on an existing index, replacing any existing tags (empty
+	 * record clears).
+	 *
+	 * @throws QuereusError(NOTFOUND) if no user-visible index matches.
+	 */
+	setIndexTags(indexName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateIndexTags(indexName, () => this.freezeTags(tags), schemaName);
+	}
+
+	/**
+	 * Merges `tags` into an existing index's tags — set/overwrite the listed keys,
+	 * keep the rest (`ALTER INDEX … ADD TAGS`). Empty `tags` is a no-op (does NOT
+	 * clear).
+	 *
+	 * @throws QuereusError(NOTFOUND) if no user-visible index matches.
+	 */
+	mergeIndexTags(indexName: string, tags: Record<string, SqlValue>, schemaName?: string): void {
+		this.updateIndexTags(indexName, current => this.mutateTagRecord(current, { op: 'merge', tags }), schemaName);
+	}
+
+	/**
+	 * Drops the listed keys from an existing index's tags (`ALTER INDEX … DROP
+	 * TAGS`). Atomic: every key must be present, else `NOTFOUND` names the missing
+	 * key(s) and nothing is dropped. Empty `keys` is a no-op.
+	 *
+	 * @throws QuereusError(NOTFOUND) if no user-visible index matches, or any listed
+	 *   key is absent.
+	 */
+	dropIndexTags(indexName: string, keys: readonly string[], schemaName?: string): void {
+		this.updateIndexTags(indexName, current => this.mutateTagRecord(current, { op: 'drop', keys }), schemaName);
 	}
 
 	/**

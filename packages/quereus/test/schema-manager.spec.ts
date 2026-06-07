@@ -466,6 +466,118 @@ describe('Schema Manager', () => {
 			const idx = db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'uq_email');
 			expect(idx!.tags).to.deep.equal({ purpose: 'lookup' });
 		});
+
+		// ── mergeViewTags / dropViewTags (ALTER VIEW ADD/DROP TAGS) ──
+		it('should merge and drop view tags', async () => {
+			await db.exec('create table base (id integer primary key)');
+			await db.exec("create view v1 as select * from base with tags (a = 1)");
+			db.schemaManager.mergeViewTags('v1', { b: 2, a: 99 });
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.deep.equal({ a: 99, b: 2 });
+			db.schemaManager.dropViewTags('v1', ['a']);
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.deep.equal({ b: 2 });
+			db.schemaManager.dropViewTags('v1', ['b']);
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.be.undefined;
+		});
+
+		it('should treat an empty view merge / drop as a no-op (merge does not clear)', async () => {
+			await db.exec('create table base (id integer primary key)');
+			await db.exec("create view v1 as select * from base with tags (a = 1)");
+			db.schemaManager.mergeViewTags('v1', {});
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.deep.equal({ a: 1 });
+			db.schemaManager.dropViewTags('v1', []);
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should throw NOTFOUND (atomic) on dropViewTags with an absent key', async () => {
+			await db.exec('create table base (id integer primary key)');
+			await db.exec("create view v1 as select * from base with tags (a = 1)");
+			expect(() => db.schemaManager.dropViewTags('v1', ['a', 'nope'])).to.throw(/nope/i);
+			// Atomic: the present key is untouched.
+			expect(db.schemaManager.getView('main', 'v1')!.tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should throw NOTFOUND for merge/drop view tags on an unknown view', () => {
+			expect(() => db.schemaManager.mergeViewTags('nope', { a: 1 })).to.throw(/not found/i);
+			expect(() => db.schemaManager.dropViewTags('nope', ['a'])).to.throw(/not found/i);
+		});
+
+		// ── mergeMaterializedViewTags / dropMaterializedViewTags ──
+		it('should merge and drop materialized-view tags without perturbing the body', async () => {
+			await db.exec('create table t (id integer primary key, x integer not null)');
+			await db.exec("create materialized view mv as select id, x from t with tags (a = 1)");
+			const bodyHashBefore = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			db.schemaManager.mergeMaterializedViewTags('mv', { b: 2 });
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.deep.equal({ a: 1, b: 2 });
+			db.schemaManager.dropMaterializedViewTags('mv', ['a']);
+			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
+			expect(mv.tags).to.deep.equal({ b: 2 });
+			expect(mv.bodyHash, 'body hash unchanged by a tag merge/drop').to.equal(bodyHashBefore);
+		});
+
+		it('should collapse materialized-view tags to undefined when dropping the last key', async () => {
+			await db.exec('create table t (id integer primary key, x integer not null)');
+			await db.exec("create materialized view mv as select id, x from t with tags (a = 1)");
+			db.schemaManager.dropMaterializedViewTags('mv', ['a']);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND (atomic) on dropMaterializedViewTags with an absent key', async () => {
+			await db.exec('create table t (id integer primary key, x integer not null)');
+			await db.exec("create materialized view mv as select id, x from t with tags (a = 1)");
+			expect(() => db.schemaManager.dropMaterializedViewTags('mv', ['nope'])).to.throw(/nope/i);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should throw NOTFOUND for merge/drop MV tags on an unknown materialized view', () => {
+			expect(() => db.schemaManager.mergeMaterializedViewTags('nope', { a: 1 })).to.throw(/not found/i);
+			expect(() => db.schemaManager.dropMaterializedViewTags('nope', ['a'])).to.throw(/not found/i);
+		});
+
+		// ── mergeIndexTags / dropIndexTags ──
+		it('should merge and drop index tags, resolving the owning table', async () => {
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec("create index idx_name on t (name) with tags (a = 1)");
+			const idx = () => db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'idx_name');
+			db.schemaManager.mergeIndexTags('idx_name', { b: 2, a: 99 });
+			expect(idx()!.tags).to.deep.equal({ a: 99, b: 2 });
+			db.schemaManager.dropIndexTags('idx_name', ['a']);
+			expect(idx()!.tags).to.deep.equal({ b: 2 });
+			db.schemaManager.dropIndexTags('idx_name', ['b']);
+			expect(idx()!.tags).to.be.undefined;
+		});
+
+		it('should throw NOTFOUND (atomic) on dropIndexTags with an absent key', async () => {
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec("create index idx_name on t (name) with tags (a = 1)");
+			expect(() => db.schemaManager.dropIndexTags('idx_name', ['a', 'nope'])).to.throw(/nope/i);
+			const idx = db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'idx_name');
+			expect(idx!.tags).to.deep.equal({ a: 1 });
+		});
+
+		it('should throw NOTFOUND for merge/drop index tags on an unknown index', async () => {
+			await db.exec('create table t (id integer primary key)');
+			expect(() => db.schemaManager.mergeIndexTags('nope', { a: 1 })).to.throw(/not found/i);
+			expect(() => db.schemaManager.dropIndexTags('nope', ['a'])).to.throw(/not found/i);
+		});
+
+		it('should throw NOTFOUND for merge/drop on a hidden implicit covering index', async () => {
+			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email))');
+			expect(() => db.schemaManager.mergeIndexTags('uq_email', { a: 1 })).to.throw(/not found/i);
+			expect(() => db.schemaManager.dropIndexTags('uq_email', ['a'])).to.throw(/not found/i);
+		});
+
+		it('should merge and drop tags on an EXPOSED implicit covering index', async () => {
+			await db.exec("create table t (id integer primary key, email text, constraint uq_email unique (email) with tags (\"quereus.expose_implicit_index\" = true))");
+			// The exposed implicit index carries no own tags (the expose hint lives on the
+			// constraint), so merging `purpose` makes it the index's only tag, and dropping
+			// it collapses the set back to undefined — the index stays addressable because
+			// visibility is governed by the constraint, not the index's own tags.
+			db.schemaManager.mergeIndexTags('uq_email', { purpose: 'lookup' });
+			const idx = () => db.schemaManager.findTable('t')!.indexes!.find(i => i.name === 'uq_email');
+			expect(idx()!.tags!.purpose).to.equal('lookup');
+			db.schemaManager.dropIndexTags('uq_email', ['purpose']);
+			expect(idx()!.tags).to.be.undefined;
+		});
 	});
 
 	// ────────────────── Schema hashing: tags excluded ──────────────────

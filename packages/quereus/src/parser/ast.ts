@@ -368,13 +368,25 @@ export interface AlterTableStmt extends AstNode {
 }
 
 /**
- * ALTER VIEW / ALTER MATERIALIZED VIEW / ALTER INDEX … SET TAGS — whole-set
- * metadata-tag replacement on the named object (empty list clears). These are
- * catalog-only mutations (no module / data round-trip); v1 scope is `SET TAGS`
- * only. The `action` envelope keeps `setTags` as its sole member so structural
- * alter follow-ups have a home without reshaping these statements.
+ * ALTER VIEW / ALTER MATERIALIZED VIEW / ALTER INDEX … {SET|ADD|DROP} TAGS —
+ * a metadata-tag mutation on the named object itself (the object is the
+ * statement's own `name`, not a sub-site, so unlike the ALTER TABLE union there
+ * is no `target` field). Mirrors the ALTER TABLE tag-mutation semantics:
+ *   - `setTags` with `mode:'replace'` (SET TAGS): whole-set replacement; `tags`
+ *     is the complete desired set and an empty record clears all tags.
+ *   - `setTags` with `mode:'merge'` (ADD TAGS): per-key merge; set/overwrite the
+ *     listed keys and keep the rest. An empty list is a no-op (it does NOT
+ *     clear — that distinguishes `ADD TAGS ()` from `SET TAGS ()`).
+ *   - `dropTags` (DROP TAGS): per-key deletion. Atomic — every listed key must
+ *     currently be present, else a NOTFOUND error names the missing key(s) and
+ *     nothing is dropped. Dropping the last key(s) leaves `tags IS NULL`. An
+ *     empty list is a no-op. Key matching is verbatim (case-sensitive). DROP
+ *     does NO value validation — dropping a reserved `quereus.*` key is legit.
+ * All forms are catalog-only (no module / data round-trip, no re-materialize).
  */
-export type AlterObjectTagsAction = { type: 'setTags'; tags: Record<string, SqlValue> };
+export type AlterObjectTagsAction =
+	| { type: 'setTags'; mode: 'replace' | 'merge'; tags: Record<string, SqlValue> }
+	| { type: 'dropTags'; keys: string[] };
 
 export interface AlterViewStmt extends AstNode {
 	type: 'alterView';

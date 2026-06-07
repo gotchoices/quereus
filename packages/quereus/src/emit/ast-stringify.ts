@@ -954,16 +954,30 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 	}
 }
 
+/**
+ * Renders the trailing `{set|add|drop} tags (...)` clause shared by ALTER VIEW /
+ * MATERIALIZED VIEW / INDEX: `setTags` is `add tags` when `mode === 'merge'` else
+ * `set tags` (body via `tagsBodyToString`); `dropTags` is `drop tags` (body via
+ * `tagKeysBodyToString`).
+ */
+function objectTagsActionToString(action: AST.AlterObjectTagsAction): string {
+	if (action.type === 'dropTags') {
+		return `drop tags ${tagKeysBodyToString(action.keys)}`;
+	}
+	const verb = action.mode === 'merge' ? 'add tags' : 'set tags';
+	return `${verb} ${tagsBodyToString(action.tags)}`;
+}
+
 function alterViewToString(stmt: AST.AlterViewStmt): string {
-	return `alter view ${expressionToString(stmt.name)} set tags ${tagsBodyToString(stmt.action.tags)}`;
+	return `alter view ${expressionToString(stmt.name)} ${objectTagsActionToString(stmt.action)}`;
 }
 
 function alterMaterializedViewToString(stmt: AST.AlterMaterializedViewStmt): string {
-	return `alter materialized view ${expressionToString(stmt.name)} set tags ${tagsBodyToString(stmt.action.tags)}`;
+	return `alter materialized view ${expressionToString(stmt.name)} ${objectTagsActionToString(stmt.action)}`;
 }
 
 function alterIndexToString(stmt: AST.AlterIndexStmt): string {
-	return `alter index ${expressionToString(stmt.name)} set tags ${tagsBodyToString(stmt.action.tags)}`;
+	return `alter index ${expressionToString(stmt.name)} ${objectTagsActionToString(stmt.action)}`;
 }
 
 function analyzeToString(stmt: AST.AnalyzeStmt): string {

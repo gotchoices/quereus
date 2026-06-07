@@ -7,12 +7,15 @@ import { createLogger } from '../../common/logger.js';
 const log = createLogger('runtime:emit:set-object-tags');
 
 /**
- * Emits `ALTER VIEW / MATERIALIZED VIEW / INDEX … SET TAGS`. Tags touch no
- * stored row and no physical layout, so this is a pure catalog mutation: it
- * delegates to the matching SchemaManager setter (which re-registers the schema
- * object, clearing tags on an empty set, and fires `table_modified` for an index
- * so optimizer caches invalidate). Reserved-tag validation already ran at
- * plan-build time. NOTFOUND on a missing object surfaces from the setter.
+ * Emits `ALTER VIEW / MATERIALIZED VIEW / INDEX … {SET|ADD|DROP} TAGS`. Tags
+ * touch no stored row and no physical layout, so this is a pure catalog
+ * mutation: it dispatches on `objectKind × op` to the matching SchemaManager
+ * setter — `replace` → `set*Tags`, `merge` → `merge*Tags`, `drop` → `drop*Tags`
+ * — each of which re-registers the schema object (clearing tags on an empty set)
+ * and fires the right `*_modified` event so optimizer / write-through caches
+ * invalidate. Reserved-tag validation already ran at plan-build time (SET/ADD
+ * only). NOTFOUND on a missing object — or a drop-of-absent key — surfaces from
+ * the setter.
  */
 export function emitSetObjectTags(plan: SetObjectTagsNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -20,24 +23,33 @@ export function emitSetObjectTags(plan: SetObjectTagsNode, _ctx: EmissionContext
 		await rctx.db._ensureTransaction();
 
 		const sm = rctx.db.schemaManager;
+		const m = plan.mutation;
+		// Test `op === 'drop'` first: it uniquely identifies the keys-bearing union
+		// member, so the `else` branches narrow cleanly to the tags-bearing member.
 		switch (plan.objectKind) {
 			case 'view':
-				sm.setViewTags(plan.name, plan.tags, plan.schemaName);
+				if (m.op === 'drop') sm.dropViewTags(plan.name, m.keys, plan.schemaName);
+				else if (m.op === 'merge') sm.mergeViewTags(plan.name, m.tags, plan.schemaName);
+				else sm.setViewTags(plan.name, m.tags, plan.schemaName);
 				break;
 			case 'materializedView':
-				sm.setMaterializedViewTags(plan.name, plan.tags, plan.schemaName);
+				if (m.op === 'drop') sm.dropMaterializedViewTags(plan.name, m.keys, plan.schemaName);
+				else if (m.op === 'merge') sm.mergeMaterializedViewTags(plan.name, m.tags, plan.schemaName);
+				else sm.setMaterializedViewTags(plan.name, m.tags, plan.schemaName);
 				break;
 			case 'index':
-				sm.setIndexTags(plan.name, plan.tags, plan.schemaName);
+				if (m.op === 'drop') sm.dropIndexTags(plan.name, m.keys, plan.schemaName);
+				else if (m.op === 'merge') sm.mergeIndexTags(plan.name, m.tags, plan.schemaName);
+				else sm.setIndexTags(plan.name, m.tags, plan.schemaName);
 				break;
 		}
-		log('Set tags on %s %s.%s', plan.objectKind, plan.schemaName, plan.name);
+		log('%s tags on %s %s.%s', m.op, plan.objectKind, plan.schemaName, plan.name);
 		return null;
 	}
 
 	return {
 		params: [],
 		run,
-		note: `setObjectTags(${plan.objectKind} ${plan.schemaName}.${plan.name})`,
+		note: `${plan.mutation.op}ObjectTags(${plan.objectKind} ${plan.schemaName}.${plan.name})`,
 	};
 }
