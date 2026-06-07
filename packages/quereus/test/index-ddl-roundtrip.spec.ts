@@ -23,9 +23,10 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { generateTableDDL, generateIndexDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
+import { createIndexToString } from '../src/emit/ast-stringify.js';
 import { computeSchemaDiff } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
-import type { IndexedColumn } from '../src/parser/ast.js';
+import type { CreateIndexStmt, DeclaredIndex, IndexedColumn } from '../src/parser/ast.js';
 
 async function rows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
 	const out: Record<string, unknown>[] = [];
@@ -337,6 +338,94 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 			expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
 		} finally {
 			await db.close();
+		}
+	});
+});
+
+// ============================================================================
+// `declare schema { ... }` index WHERE-clause grammar (partial declared index).
+//
+// `declareIndexItem` must accept an optional WHERE <predicate> between the column
+// list and WITH TAGS, mirroring the standalone `create index` form, so a partial
+// index can be expressed inside a declarative schema. These are parse-level tests:
+// they inspect the `CreateIndexStmt.where` the parser populates on each declared
+// index item.
+// ============================================================================
+
+/** Extract every declared index's `CreateIndexStmt` from a declare-schema body. */
+function declaredIndexes(body: string): CreateIndexStmt[] {
+	const stmt = parse(`declare schema main {\n${body}\n}`);
+	if (stmt.type !== 'declareSchema') throw new Error(`not a declare schema: ${stmt.type}`);
+	return stmt.items
+		.filter((it): it is DeclaredIndex => it.type === 'declaredIndex')
+		.map(it => it.indexStmt);
+}
+
+describe('declare schema: index WHERE-clause grammar', () => {
+	it('a plain partial index populates indexStmt.where', () => {
+		const [ix] = declaredIndexes(
+			`table t { id INTEGER PRIMARY KEY, active INTEGER }
+			 index ix_active on t (active) where active = 1`,
+		);
+		expect(ix.index.name).to.equal('ix_active');
+		expect(ix.where, 'partial declared index carries a WHERE predicate').to.exist;
+		expect(ix.isUnique ?? false, 'plain index is not unique').to.equal(false);
+		expect(ix.tags, 'no tags on a bare partial index').to.be.undefined;
+	});
+
+	it('a unique partial index sets both isUnique and where', () => {
+		const [ix] = declaredIndexes(
+			`table t { id INTEGER PRIMARY KEY, active INTEGER }
+			 unique index uq_active on t (active) where active = 1`,
+		);
+		expect(ix.isUnique, 'unique keyword threads through').to.equal(true);
+		expect(ix.where, 'unique partial index carries a WHERE predicate').to.exist;
+	});
+
+	it('a partial index with WITH TAGS populates both where and tags', () => {
+		const [ix] = declaredIndexes(
+			`table t { id INTEGER PRIMARY KEY, active INTEGER }
+			 unique index uq_a on t (active) where active = 1 with tags (k = 'v')`,
+		);
+		expect(ix.where, 'WHERE before WITH TAGS').to.exist;
+		expect(ix.tags, 'WITH TAGS still parses after WHERE').to.deep.equal({ k: 'v' });
+		expect(ix.isUnique).to.equal(true);
+	});
+
+	it('a non-partial declared index leaves where undefined (no regression)', () => {
+		// Plain, tag-only, and a tag-only index followed by another item all keep
+		// `where` undefined and must not mis-step the WITH/TAGS backtrack.
+		const ixs = declaredIndexes(
+			`table t { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }
+			 index ix_plain on t (name)
+			 index ix_tagged on t (active) with tags (purpose = 'search')
+			 index ix_after on t (id)`,
+		);
+		expect(ixs.map(i => i.index.name)).to.deep.equal(['ix_plain', 'ix_tagged', 'ix_after']);
+		expect(ixs[0].where, 'plain index has no predicate').to.be.undefined;
+		expect(ixs[1].where, 'tag-only index has no predicate').to.be.undefined;
+		expect(ixs[1].tags).to.deep.equal({ purpose: 'search' });
+		// The item after a tag-only index parses cleanly — the WITH backtrack did
+		// not strand the cursor.
+		expect(ixs[2].where).to.be.undefined;
+		expect(indexColumnName(ixs[2].columns[0])).to.equal('id');
+	});
+
+	it('a non-trivial predicate round-trips through createIndexToString re-parseably', () => {
+		const [ix] = declaredIndexes(
+			`table t { id INTEGER PRIMARY KEY, active INTEGER }
+			 index ix_active on t (active) where active = 1 and id > 0`,
+		);
+		const emitted = createIndexToString(ix);
+		expect(emitted, 'emitted DDL carries the full predicate').to.match(/where active = 1 and id > 0/i);
+
+		// Re-parse the emitted standalone DDL and re-emit: createIndexToString is a
+		// fixed point over the declared partial index, so the predicate survives.
+		const reparsed = parse(emitted);
+		expect(reparsed.type).to.equal('createIndex');
+		if (reparsed.type === 'createIndex') {
+			expect(reparsed.where, 're-parsed DDL still carries a WHERE').to.exist;
+			expect(createIndexToString(reparsed)).to.equal(emitted);
 		}
 	});
 });

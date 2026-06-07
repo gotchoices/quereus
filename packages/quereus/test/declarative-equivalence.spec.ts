@@ -611,6 +611,60 @@ describe('declarative-equivalence: indexes', () => {
 			],
 		});
 	});
+
+	it('partial index round-trips its WHERE predicate through declarative apply', async function () {
+		// Exercises the `declare schema` index WHERE-clause grammar end-to-end: the
+		// declared partial index must parse, apply, and land a `predicate` matching
+		// the direct `create index ... where` form. assertTableSchemaEqual compares
+		// the index predicate (eqExpr), so a dropped/garbled WHERE fails the case.
+		await runCase({
+			name: 'index-partial',
+			directDDL: [
+				'create table t (id integer primary key, active integer, name text)',
+				'create index ix_active on t (name) where active = 1',
+			],
+			declarativeBody: `table t {
+				id INTEGER PRIMARY KEY,
+				active INTEGER,
+				name TEXT
+			}
+
+			index ix_active on t (name) where active = 1`,
+			expectTables: ['t'],
+			probes: [
+				{ sql: "insert into t values (1, 1, 'alice'), (2, 0, 'bob')", expect: { rows: [] } },
+				{ sql: "select id from t where name = 'alice'", expect: { rows: [{ id: 1 }] } },
+			],
+		});
+	});
+
+	it('unique partial index round-trips and enforces uniqueness within its predicate', async function () {
+		// `unique index ... where ...` must thread BOTH isUnique and the predicate
+		// through the declarative path. The conflict probe inserts two predicate-
+		// matching duplicates; both paths reject the second identically.
+		await runCase({
+			name: 'index-unique-partial',
+			directDDL: [
+				'create table t (id integer primary key, active integer, name text)',
+				'create unique index uq_active_name on t (name) where active = 1',
+			],
+			declarativeBody: `table t {
+				id INTEGER PRIMARY KEY,
+				active INTEGER,
+				name TEXT
+			}
+
+			unique index uq_active_name on t (name) where active = 1`,
+			expectTables: ['t'],
+			probes: [
+				{ sql: "insert into t values (1, 1, 'dup')", expect: { rows: [] } },
+				{
+					sql: "insert into t values (2, 1, 'dup')",
+					expect: { error: { status: StatusCode.CONSTRAINT } },
+				},
+			],
+		});
+	});
 });
 
 // ============================================================================

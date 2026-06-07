@@ -3490,6 +3490,12 @@ export class Parser {
 		const columns = this.indexedColumnList();
 		this.consume(TokenType.RPAREN, "Expected ')' after index columns.");
 
+		// Parse optional WHERE <predicate> (partial index), before WITH TAGS
+		let where: AST.Expression | undefined;
+		if (this.matchKeyword('WHERE')) {
+			where = this.expression();
+		}
+
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
 		if (this.matchKeyword('WITH')) {
@@ -3506,6 +3512,7 @@ export class Parser {
 			table: { type: 'identifier', name: tableName },
 			ifNotExists: false,
 			columns,
+			where,
 			isUnique,
 			tags
 		};
