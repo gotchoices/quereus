@@ -5206,7 +5206,7 @@ describe('Property-Based Tests', () => {
 
 				await fc.assert(fc.asyncProperty(
 					fc.array(colRowArb, { maxLength: 8 }),
-					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-null', 'delete'),
+					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-anchor', 'update-c-self', 'update-c-null', 'delete'),
 					fc.integer({ min: 1, max: 6 }),    // id predicate
 					fc.integer({ min: 10, max: 20 }),  // NV  (a)
 					fc.integer({ min: 21, max: 30 }),  // NV2 (b)
@@ -5251,6 +5251,17 @@ describe('Property-Based Tests', () => {
 							// materialize it. Either way the post-state is c=NV3 for a matched anchor.
 							await db.exec(`update x.T set c = ${NV3} where id = ${K}`);
 							if (core.has(K)) { cMap.set(K, NV3); mutated++; }
+						} else if (op === 'update-c-anchor') {
+							// Anchor-resolvable optional value: `set c = a + 1` collapses both branches
+							// into one upsert — a matched anchor gets c = a + 1 whether or not it already
+							// had a T_c row (`a` is unchanged, so the post-state is core.get(K) + 1).
+							await db.exec(`update x.T set c = a + 1 where id = ${K}`);
+							if (core.has(K)) { cMap.set(K, core.get(K)! + 1); mutated++; }
+						} else if (op === 'update-c-self') {
+							// Member self-reference: `set c = c + 1` is matched-update-only — a present
+							// T_c increments, an absent one stays absent (no spurious materialization).
+							await db.exec(`update x.T set c = c + 1 where id = ${K}`);
+							if (core.has(K) && cMap.has(K)) { cMap.set(K, cMap.get(K)! + 1); mutated++; }
 						} else if (op === 'update-c-null') {
 							// All of T_c's value columns (just `c`) set null → the component row is
 							// emptied (deleted); an absent T_c stays absent (no-op).
@@ -5933,8 +5944,11 @@ describe('Property-Based Tests', () => {
 				await db.exec('insert into main.T_c values (1, 1000)');
 				await expectMutationReject('delete from x.T where b = 100', 'unsupported-decomposition-predicate'); // non-anchor predicate
 				await expectMutationReject('update x.T set id = 9 where id = 1', 'unsupported-decomposition-update'); // shared key (identity change)
-				// A non-constant optional-member value needs the per-row capture substrate (deferred).
-				await expectMutationReject('update x.T set c = a + 1 where id = 1', 'unsupported-decomposition-update');
+				// An ARBITRARY optional-member value (here a cross-member read of `b`, backed by T_b)
+				// still needs the per-row capture substrate (deferred). Anchor-resolvable (`set c = a + 1`)
+				// and self-reference (`set c = c + 1`) values are now supported — fuzzed by the columnar
+				// PutGet oracle above (the `update-c-anchor` / `update-c-self` arms).
+				await expectMutationReject('update x.T set c = b where id = 1', 'unsupported-decomposition-update');
 			});
 
 			it('reject-do-not-widen: an EAV non-anchor predicate is deferred', async () => {

@@ -12,9 +12,13 @@
  *   identity column or a computed mapping whose basis lives on the anchor).
  * - UPDATE routed to the member backing each column: a mandatory, non-EAV member takes
  *   one base UPDATE; an **optional** columnar member's write is a per-row materialization
- *   transition (matched → base UPDATE, absent → `on conflict do nothing` materialize
- *   INSERT, all value columns null → base DELETE); an **EAV pivot** member's write is the
- *   per-attribute triple analogue (non-null → upsert, null → delete).
+ *   transition routed by the assigned **value shape** — a **constant** (matched → base
+ *   UPDATE, absent → `on conflict do nothing` materialize INSERT, all value columns null →
+ *   base DELETE); an **anchor-resolvable** value (`set c = a + 1`) collapsing both branches
+ *   into one `on conflict do update set c = excluded.c` upsert; a **self-reference**
+ *   (`set c = c + 1`) that is matched-update-only (absent rows stay absent). An **EAV pivot**
+ *   member's write is the per-attribute triple analogue (null → delete, anchor-resolvable →
+ *   `do update` upsert, constant → matched UPDATE + `do nothing` materialize INSERT).
  * - INSERT one per member (anchor first) off the shared-surrogate envelope
  *   (`view-mutation-shared-surrogate-insert`): a surrogate sourced from the anchor key
  *   column's declared `default` (evaluated once per row, with `mutation_ordinal()` in
@@ -24,9 +28,11 @@
  *
  * Still deferred onto absent substrate (asserted to raise a precise diagnostic): a
  * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution), a
- * shared-key (identity) UPDATE, and a non-constant value written to an optional/EAV
- * member (which would need the per-row capture substrate to thread it across both the
- * matched-update and materialize-insert branches).
+ * shared-key (identity) UPDATE, and an **arbitrary** value written to an optional/EAV
+ * member (a subquery, a cross-member column, or a value mixing anchor + self leaves, and
+ * any EAV self-reference) — which would need the per-row capture substrate to thread it
+ * across both the matched-update and materialize-insert branches. The two self-contained
+ * non-constant shapes — anchor-resolvable and member self-reference — are now supported.
  */
 
 import { expect } from 'chai';
@@ -302,13 +308,63 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		}
 	});
 
-	it('defers a non-constant optional-member value (needs the per-row capture substrate)', async () => {
+	it('writes an anchor-resolvable optional-member value via the upsert (present updates, absent materializes)', async () => {
+		// `set c = a + 1` lowers to `T_core.a + 1` — every leaf is an anchor base column, so the
+		// value is computed once over the anchor scan and the matched-update and materialize-insert
+		// branches collapse into one `on conflict (id) do update set c = excluded.c` upsert. A
+		// present row updates; an absent row materializes the anchor-computed value.
 		const db = new Database();
 		try {
 			await setup(db);
-			// A value referencing another column cannot be threaded across the matched-update
-			// (member scope) and materialize-insert (anchor scope) branches without capture.
-			await expectThrows(() => db.exec('update x.T set c = a + 1 where id = 1'), /constant \(or null\) value/i);
+			// present (row 1 has a T_c row, a = 10) → c = a + 1 = 11.
+			await db.exec('update x.T set c = a + 1 where id = 1');
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 11 }]);
+			// absent (row 2 has no T_c, a = 20) → materialize c = a + 1 = 21.
+			await db.exec('update x.T set c = a + 1 where id = 2');
+			expect(await rows(db, 'select id, c from main.T_c order by id')).to.deep.equal([{ id: 1, c: 11 }, { id: 2, c: 21 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 21 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('writes a member self-reference (present increments, absent stays absent — no spurious materialization)', async () => {
+		// `set c = c + 1` lowers to `T_c.c + 1` — the owning member's own column, so an absent row
+		// has no prior value to increment and is matched-update-only by nature (the materialize is
+		// suppressed). The owner qualifier is stripped so the per-member UPDATE targets T_c directly.
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('update x.T set c = c + 1 where id = 1');   // present (c = 1000) → 1001
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1001 }]);
+			await db.exec('update x.T set c = c + 1 where id = 2');   // absent → no-op, no row springs into being
+			expect(await rows(db, 'select id from main.T_c order by id')).to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a cross-member optional-member value (set c = b reads a different member)', async () => {
+		// `set c = b` lowers to `T_b.b` — a column on a *different* member than the optional member
+		// it assigns. Threading that across both branches needs the per-row capture substrate.
+		const db = new Database();
+		try {
+			await setup(db);
+			await expectThrows(() => db.exec('update x.T set c = b where id = 1'), /capture substrate|different member/i);
+			// Atomic: the optional component is untouched.
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1000 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a subquery optional-member value', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			await expectThrows(() => db.exec('update x.T set c = (select max(a) from main.T_core) where id = 1'), /capture substrate|subquery/i);
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1000 }]);
 		} finally {
 			await db.close();
 		}
@@ -410,6 +466,127 @@ describe('lens decomposition put: UPDATE of a multi-value-column optional member
 			await db.close();
 		}
 	});
+
+	it('an anchor-resolvable partial write upserts the assigned value column, landing the other null on an absent row', async () => {
+		// `set c1 = a + 1` is anchor-resolvable → one `on conflict (id) do update set c1 = excluded.c1`
+		// upsert. A present row updates c1 (c2 untouched); an absent row materializes c1 = a + 1 with
+		// the unassigned c2 landing null (the same view-soundness the constant path guarantees).
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = a + 1 where id = 1');   // present (a=10) → c1=11, c2 untouched
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 11, c2: 200 }]);
+			await db.exec('update x.M set c1 = a + 1 where id = 2');   // absent (a=20) → materialize c1=21, c2=null
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 11, c2: 200 }, { id: 2, c1: 21, c2: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the unassigned-value-column non-null-default gate still fires on the anchor upsert path', async () => {
+		// The upsert path reuses the same soundness gate as the constant materialize: e2 carries
+		// `default 7`, so a `set e1 = a + 1` (anchor) upsert that leaves e2 to its non-null default
+		// would silently widen the absent row's image — rejected at plan time, exactly as the
+		// constant `set e1 = 5` is.
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await expectThrows(() => db.exec('update x.M set e1 = a + 1 where id = 2'), /silently widening|base default/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an anchor cell with a null-literal sibling upserts both (not the all-null DELETE path)', async () => {
+		// `set c1 = a + 1, c2 = null`: the group has a non-null anchor cell, so it is the anchor
+		// upsert (projecting null for c2, `do update set c2 = excluded.c2`), NOT the all-null DELETE
+		// (which fires only for a pure-constant group whose every assigned value is null).
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = a + 1, c2 = null where id = 1');   // present → c1=11, c2=null (row survives)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 11, c2: null }]);
+			await db.exec('update x.M set c1 = a + 1, c2 = null where id = 2');   // absent → materialize (2, 21, null)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 11, c2: null }, { id: 2, c1: 21, c2: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a value mixing an anchor-resolvable cell and a self-reference cell in one member', async () => {
+		// `set c1 = a + 1` (anchor) + `set c2 = c2 + 1` (self) on the same optional member: the
+		// matched side would need a per-row capture to thread the anchor value while the self cell
+		// reads the member's own prior value — deferred (the shared-capture follow-up).
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await expectThrows(
+				() => db.exec('update x.M set c1 = a + 1, c2 = c2 + 1 where id = 1'),
+				/mixes an anchor-resolvable value and a member self-reference/i,
+			);
+			// Atomic: the present component is untouched.
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 100, c2: 200 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Anchor-resolvable optional-member value that is itself a **computed anchor mapping**
+ * (`bumped = a + 1` logical column, `set c = bumped + 1`). `substituteViewColumns` lowers
+ * `bumped` to its anchor-qualified basis (`K_core.a + 1`), so `bumped + 1` is `(K_core.a + 1)
+ * + 1` — every leaf anchor-qualified → the anchor upsert branch. The single-value optional
+ * member `K_c(c)` round-trips it (present updates, absent materializes).
+ */
+describe('lens decomposition put: UPDATE optional member with a computed-anchor value', () => {
+	function computedAnchorAd(): MappingAdvertisement {
+		return {
+			id: 'K_core', logicalTable: 'K', role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'K_core',
+				members: [
+					{
+						relationId: 'K_core', relation: { schema: 'main', table: 'K_core' }, presence: 'mandatory',
+						columns: [
+							colMap('id', 'id'), colMap('a', 'a'),
+							{ logicalColumn: 'bumped', basisExpr: { type: 'binary', operator: '+', left: { type: 'column', name: 'a' }, right: { type: 'literal', value: 1 } } },
+						],
+					},
+					{ relationId: 'K_c', relation: { schema: 'main', table: 'K_c' }, presence: 'optional', columns: [colMap('c', 'c')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['K_core', ['id']], ['K_c', ['id']]) },
+			},
+		};
+	}
+
+	async function setupComputedAnchor(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [computedAnchorAd()];
+		db.registerModule('kmod', mod);
+		await db.exec('create table K_core (id integer primary key, a integer) using kmod');
+		await db.exec('create table K_c (id integer primary key, c integer null) using kmod');
+		await db.exec('declare logical schema x { table K { id integer primary key, a integer, bumped integer, c integer null } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.K_core values (1, 10), (2, 20)');
+		await db.exec('insert into main.K_c values (1, 1000)');   // id 1 present, id 2 absent
+	}
+
+	it('set c = bumped + 1 lowers to an anchor-qualified value and upserts (present + absent)', async () => {
+		const db = new Database();
+		try {
+			await setupComputedAnchor(db);
+			// present (id 1, a = 10) → bumped + 1 = (10 + 1) + 1 = 12.
+			await db.exec('update x.K set c = bumped + 1 where id = 1');
+			expect(await rows(db, 'select c from main.K_c where id = 1')).to.deep.equal([{ c: 12 }]);
+			// absent (id 2, a = 20) → materialize bumped + 1 = (20 + 1) + 1 = 22.
+			await db.exec('update x.K set c = bumped + 1 where id = 2');
+			expect(await rows(db, 'select id, c from main.K_c order by id')).to.deep.equal([{ id: 1, c: 12 }, { id: 2, c: 22 }]);
+			expect(await rows(db, 'select c from x.K where id = 2')).to.deep.equal([{ c: 22 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 /** EAV decomposition: anchor main.E_core (id) + a triple store main.E_eav (eid, attr, val). */
@@ -476,6 +653,40 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 			expect(await rows(db, 'select p from x.E where id = 1')).to.deep.equal([{ p: null }]);
 			// An unbacked column is still a plain no-inverse (not an EAV route).
 			await expectThrows(() => db.exec('update x.E set notacol = 1 where id = 1'), /not backed by any decomposition member/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('upserts an anchor-resolvable EAV value via do-update (set p = id * 2, present + absent)', async () => {
+		// `set p = id * 2` lowers to `E_core.id * 2` — anchor-qualified, so the matched UPDATE and
+		// the materialize INSERT collapse into one `on conflict (eid, attr) do update set val =
+		// excluded.val` triple upsert (the value computed once over the anchor scan).
+		const db = new Database();
+		try {
+			await setupEav(db);
+			// matched (entity 1 has a 'p' triple, id = 1) → val = id * 2 = 2.
+			await db.exec('update x.E set p = id * 2 where id = 1');
+			expect(await rows(db, "select val from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 2 }]);
+			// absent (entity 2 has no 'q' triple, id = 2) → materialize (2, 'q', 4).
+			await db.exec('update x.E set q = id * 2 where id = 2');
+			expect(await rows(db, "select val from main.E_eav where eid = 2 and attr = 'q'")).to.deep.equal([{ val: 4 }]);
+			expect(await rows(db, 'select q from x.E where id = 2')).to.deep.equal([{ q: 4 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects an EAV self-reference (set p = p + 1 lowers to a correlated subquery)', async () => {
+		// An EAV value column is projected by the get body as a correlated subquery, so a
+		// self-reference `set p = p + 1` lowers to `(select val …) + 1` — a subquery value, which
+		// lands `arbitrary` (deferred to the shared-capture follow-up), never the `self` branch.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await expectThrows(() => db.exec('update x.E set p = p + 1 where id = 1'), /capture substrate|subquery/i);
+			// Atomic: the matched triple is untouched.
+			expect(await rows(db, "select val from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 11 }]);
 		} finally {
 			await db.close();
 		}

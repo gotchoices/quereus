@@ -40,14 +40,22 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * - **UPDATE** routes each assignment to the member that backs it, keyed off the
  *   anchor the same anchor-last way. A **mandatory, non-EAV** member takes one base
  *   UPDATE. An **optional columnar** member's write is a per-row materialization
- *   transition realized as plain AST base ops over the anchor: **matched** rows take
- *   the base UPDATE, **absent** rows take a null-extended INSERT (anchor-keyed
- *   insert-select `… on conflict (<memberKey>) do nothing`, which cedes the matched
- *   rows to the UPDATE without the insert source scanning its own target), and
- *   when every one of the member's value columns is assigned null the component row is
- *   emptied → a base DELETE instead. An **EAV pivot** member's write is the triple
- *   analogue, per attribute: a non-null value upserts the `(entity, attr, value)`
- *   triple (matched UPDATE + materialize INSERT), a null deletes it.
+ *   transition realized as plain AST base ops over the anchor, routed by the assigned
+ *   **value shape** ({@link lowerMaterializedValue}): a **constant** value takes the
+ *   matched base UPDATE + an absent null-extended INSERT (anchor-keyed insert-select
+ *   `… on conflict (<memberKey>) do nothing`, which cedes the matched rows to the
+ *   UPDATE without the insert source scanning its own target), or — when every value
+ *   column is assigned null — a base DELETE instead; an **anchor-resolvable** value
+ *   (`set c = a + 1`, every leaf lowers to an anchor base column) collapses both
+ *   branches into a single `… on conflict (<memberKey>) do update set c = excluded.c`
+ *   upsert (the value computed once over the anchor scan, matched rows reading it via
+ *   `excluded.<col>`); a **member self-reference** (`set c = c + 1`) is matched-update-
+ *   only (an absent row has no prior value, so the materialize is suppressed). An
+ *   **EAV pivot** member's write is the triple analogue, per attribute: a null deletes
+ *   the triple, an anchor-resolvable value upserts it via `do update`, a constant value
+ *   upserts it via matched UPDATE + `do nothing` materialize INSERT. Any other value —
+ *   a subquery, a cross-member column, or a value mixing anchor + self leaves — stays
+ *   rejected `unsupported-decomposition-update` (the shared-capture follow-up).
  * - **INSERT** fans out to one insert per member, **anchor first** (FK-order root).
  *   It rides the shared-surrogate mutation envelope `view-mutation-shared-surrogate-insert`
  *   ships (`ViewMutationNode.envelope` + `EnvelopeScanNode`): the user source is
@@ -78,6 +86,13 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * - **UPDATE of a shared-key column** — a key write is an identity change, not a
  *   value write. (Optional-member and EAV value writes are **supported** — see
  *   the UPDATE bullet above; only a key/identity write stays rejected.)
+ * - **UPDATE of an optional/EAV member with an arbitrary value** — a value that embeds
+ *   a subquery, reads a *different* member's column, or mixes anchor + self leaves
+ *   (and any EAV self-reference, which lowers to a subquery) needs a per-row capture
+ *   substrate to thread it across the matched-update and materialize-insert branches.
+ *   The two self-contained shapes — anchor-resolvable and member self-reference — are
+ *   *supported* (see the UPDATE bullet); the rest is deferred to the shared-capture
+ *   follow-up (`view-write-decomposition-update-arbitrary-value-capture`).
  * - **composite shared keys** — v1 threads a single-column key (mirrors the
  *   single-column-PK boundary in `multi-source.ts`).
  */
@@ -738,14 +753,14 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 				noteTarget(routed.member.relationId, routed.basisColumn.toLowerCase(), asg.column);
 				let g = optional.get(routed.member.relationId);
 				if (!g) { g = { member: routed.member, cells: [] }; optional.set(routed.member.relationId, g); }
-				g.cells.push({ basisColumn: routed.basisColumn, value: routed.value, isNull: routed.isNull });
+				g.cells.push({ basisColumn: routed.basisColumn, value: routed.value, isNull: routed.isNull, kind: routed.valueKind });
 				break;
 			}
 			case 'eav': {
 				noteTarget(routed.member.relationId, `attr:${routed.attribute.toLowerCase()}`, asg.column);
 				let g = eav.get(routed.member.relationId);
 				if (!g) { g = { member: routed.member, cells: [] }; eav.set(routed.member.relationId, g); }
-				g.cells.push({ attribute: routed.attribute, value: routed.value, isNull: routed.isNull });
+				g.cells.push({ attribute: routed.attribute, value: routed.value, isNull: routed.isNull, kind: routed.valueKind });
 				break;
 			}
 		}
@@ -768,12 +783,34 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 	return ops;
 }
 
+/**
+ * How an optional/EAV-member assigned value is scoped, after lowering to base terms — the
+ * gate on whether a non-constant value is expressible without a new capture substrate.
+ */
+type ValueKind =
+	/** No column ref (a constant, or the null-literal delete / absent-no-op trigger). */
+	| 'constant'
+	/** Every leaf resolves to an **anchor** base column (`set c = a + 1`) — unified via an upsert. */
+	| 'anchor'
+	/** Every leaf is the **owning member's** own column (`set c = c + 1`) — present-rows-only (columnar). */
+	| 'self';
+
+/** A lowered optional/EAV-member value plus its {@link ValueKind} classification. */
+interface LoweredValue {
+	readonly kind: ValueKind;
+	/** Assigned value, lowered to base terms (member-relationId-qualified column refs). */
+	readonly value: AST.Expression;
+	/** True for a syntactic null literal (always `constant`; the all-null delete / no-op trigger). */
+	readonly isNull: boolean;
+}
+
 /** One assigned cell of an optional columnar member's update group. */
 interface OptionalCell {
 	readonly basisColumn: string;
-	/** Assigned value, already lowered to base terms (a constant, or a null literal). */
+	/** Assigned value, already lowered to base terms (a constant, an anchor-resolvable expr, or a self-reference). */
 	readonly value: AST.Expression;
 	readonly isNull: boolean;
+	readonly kind: ValueKind;
 }
 
 /** One assigned cell of an EAV pivot member's update group (per attribute). */
@@ -782,15 +819,17 @@ interface EavCell {
 	readonly attribute: string;
 	readonly value: AST.Expression;
 	readonly isNull: boolean;
+	/** `constant` or `anchor` only — an EAV `self` lowers to a subquery, so it lands `arbitrary` (rejected). */
+	readonly kind: ValueKind;
 }
 
 type RoutedAssignment =
 	/** A mandatory, non-EAV identity member — the legacy single base UPDATE. */
 	| { readonly kind: 'mandatory'; readonly member: DecompositionMember; readonly basisColumn: string; readonly value: AST.Expression }
 	/** An optional (outer-joined) columnar member — a per-row materialization transition. */
-	| { readonly kind: 'optional'; readonly member: DecompositionMember; readonly basisColumn: string; readonly value: AST.Expression; readonly isNull: boolean }
+	| { readonly kind: 'optional'; readonly member: DecompositionMember; readonly basisColumn: string; readonly value: AST.Expression; readonly isNull: boolean; readonly valueKind: ValueKind }
 	/** An EAV pivot member — a per-attribute triple upsert/delete. */
-	| { readonly kind: 'eav'; readonly member: DecompositionMember; readonly attribute: string; readonly value: AST.Expression; readonly isNull: boolean };
+	| { readonly kind: 'eav'; readonly member: DecompositionMember; readonly attribute: string; readonly value: AST.Expression; readonly isNull: boolean; readonly valueKind: ValueKind };
 
 /**
  * Resolve one `set <col> = <value>` to its backing member off the threaded backward
@@ -817,16 +856,16 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
 			// per-row materialization transition (matched → update, absent → insert, all
 			// value columns null → delete), realized as anchor-keyed AST base ops below.
 			if (route.member.presence !== 'mandatory' || route.nullExtended) {
-				const { value, isNull } = lowerMaterializedValue(view, shape, asg);
-				return { kind: 'optional', member: route.member, basisColumn: route.baseColumn, value, isNull };
+				const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg);
+				return { kind: 'optional', member: route.member, basisColumn: route.baseColumn, value, isNull, valueKind: kind };
 			}
 			return { kind: 'mandatory', member: route.member, basisColumn: route.baseColumn, value: rewriteAssignedValue(view, shape, route.member, asg.value) };
 		}
 		case 'eav': {
 			// An EAV pivot backs its logical columns as attribute triples: a non-null value
 			// upserts the triple, a null deletes it (the EAV analogue of the optional case).
-			const { value, isNull } = lowerMaterializedValue(view, shape, asg);
-			return { kind: 'eav', member: route.member, attribute: declaredNames.get(logical) ?? asg.column, value, isNull };
+			const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg);
+			return { kind: 'eav', member: route.member, attribute: declaredNames.get(logical) ?? asg.column, value, isNull, valueKind: kind };
 		}
 		case 'computed-mapping':
 			return raiseMutationDiagnostic({
@@ -846,27 +885,79 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
 }
 
 /**
- * Lower an optional/EAV-member assigned value to base terms and classify it. The
- * matched-UPDATE evaluates the value in the **member's** scope while the materialize
- * INSERT evaluates it over the **anchor** — so a value that survives both scopes must
- * be scope-independent. v1 admits a **constant** (or a null literal, the delete
- * trigger); a value referencing any column (a member self-reference, an anchor column,
- * a cross-member read, a subquery) is rejected — the per-row capture substrate that
- * would thread a non-constant value across both branches is the outer-join path's, not
- * yet wired here.
+ * Lower an optional/EAV-member assigned value to base terms and classify how it is
+ * scoped ({@link LoweredValue}). The matched write evaluates the value in the **member's**
+ * row scope while the materialize INSERT evaluates it over the **anchor** scan — so a
+ * non-constant value is only expressible when both branches can agree on it with **no new
+ * runtime substrate**. Three self-contained shapes qualify:
+ *
+ * - **constant** (no column ref, or a null literal) — survives both scopes trivially.
+ * - **anchor** — every leaf resolves to an anchor base column (`set c = a + 1`). The value
+ *   is computed once over the anchor scan and the two branches are unified by an upsert
+ *   ({@link buildOptionalMemberInsertSelect} `do update`), so the matched side reads the
+ *   identical anchor-computed value via `excluded.<col>`.
+ * - **self** (columnar only) — every leaf is the owning member's own column (`set c = c + 1`).
+ *   An absent row has no prior value to transform, so it is matched-update-only by nature
+ *   (the materialize INSERT is suppressed).
+ *
+ * Anything else — a subquery, a cross-member column, an unqualified ref, or a single value
+ * mixing anchor and self leaves — is `arbitrary` and rejected: threading it across both
+ * branches needs the per-row capture substrate (deferred; backlog
+ * `view-write-decomposition-update-arbitrary-value-capture`). An EAV value column substitutes
+ * to a correlated subquery, so an EAV self-reference lands here too (only `constant` / `anchor`
+ * reach an EAV cell). Classification reads the lowered value's column-ref **relationId
+ * qualifiers** (the synthesized body aliases each member by its relationId — the same qualifier
+ * {@link rewriteAssignedValue} keys cross-member rejection on); the owner is never the anchor
+ * (an optional/EAV member is mandatory-distinct), so `anchor` and `self` never collide.
  */
-function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, asg: AST.UpdateStmt['assignments'][number]): { value: AST.Expression; isNull: boolean } {
+function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, owner: DecompositionMember, asg: AST.UpdateStmt['assignments'][number]): LoweredValue {
 	const lowered = substituteViewColumns(asg.value, shape, view);
 	const isNull = isNullLiteral(lowered);
-	if (!isNull && exprHasColumnRef(lowered)) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-decomposition-update',
-			column: asg.column,
-			table: view.name,
-			message: `cannot update logical table '${view.name}': writing optional/EAV-member column '${asg.column}' supports a constant (or null) value in v1; a value that references other columns needs the per-row capture substrate to thread it across the matched-update and materialize-insert branches (deferred)`,
-		});
+	const { qualifiers, hasUnqualifiedColumn, hasSubquery } = collectValueScopes(lowered);
+
+	if (!hasSubquery && !hasUnqualifiedColumn && qualifiers.size === 0) {
+		return { kind: 'constant', value: lowered, isNull };
 	}
-	return { value: lowered, isNull };
+	if (!hasSubquery && !hasUnqualifiedColumn) {
+		const anchorId = shape.anchor.relationId;
+		if ([...qualifiers].every(q => q === anchorId)) return { kind: 'anchor', value: lowered, isNull };
+		const ownerIsColumnar = owner.attributePivot === undefined;
+		if (ownerIsColumnar && [...qualifiers].every(q => q === owner.relationId)) return { kind: 'self', value: lowered, isNull };
+	}
+	raiseMutationDiagnostic({
+		reason: 'unsupported-decomposition-update',
+		column: asg.column,
+		table: view.name,
+		message: `cannot update logical table '${view.name}': writing optional/EAV-member column '${asg.column}' admits a constant, an anchor-resolvable value (every leaf resolves to an anchor base column, e.g. \`${asg.column} = <anchorCol> + 1\`), or a member self-reference (e.g. \`${asg.column} = ${asg.column} + 1\`); this value embeds a subquery, reads a different member's column, or mixes anchor and self leaves, which needs the per-row capture substrate to thread it across the matched-update and materialize-insert branches (deferred — see backlog view-write-decomposition-update-arbitrary-value-capture)`,
+	});
+}
+
+/**
+ * Walk a lowered (base-term) assigned value, collecting the distinct member-relationId
+ * qualifiers its column refs carry, whether any column ref is **unqualified**, and whether
+ * it embeds a subquery. {@link lowerMaterializedValue} classifies the value by whether every
+ * qualifier is the anchor's (`anchor`) or the owning member's (`self`); an unqualified ref or
+ * a subquery forces `arbitrary` (the user-term analogue of the predicate gate's
+ * {@link collectViewColumnRefs}, but keyed on the base qualifier rather than the logical name).
+ */
+function collectValueScopes(expr: AST.Expression): { qualifiers: Set<string>; hasUnqualifiedColumn: boolean; hasSubquery: boolean } {
+	const qualifiers = new Set<string>();
+	let hasUnqualifiedColumn = false;
+	let hasSubquery = false;
+	const walk = (node: unknown): void => {
+		if (Array.isArray(node)) { node.forEach(walk); return; }
+		if (!node || typeof node !== 'object' || !('type' in (node as object))) return;
+		const n = node as Record<string, unknown> & { type: string };
+		if (n.type === 'column') {
+			if (typeof n.table === 'string') qualifiers.add(n.table);
+			else hasUnqualifiedColumn = true;
+			return;
+		}
+		if (n.type === 'subquery' || n.type === 'select' || n.type === 'exists') { hasSubquery = true; return; }
+		for (const v of Object.values(n)) walk(v);
+	};
+	walk(expr);
+	return { qualifiers, hasUnqualifiedColumn, hasSubquery };
 }
 
 /** `update <member> set <cols> where <memberKey> in (select <anchorKey> from <anchor> where <pred>)`. */
@@ -921,16 +1012,22 @@ function rewriteAssignedValue(view: MutableViewLike, shape: DecompShape, owner: 
 
 /**
  * Emit the per-row base ops for an optional (outer-joined) columnar member's update
- * group. Three branches off the value-null shape:
+ * group, routed by the group's {@link ValueKind} composition (see the table in the file
+ * header):
  *
- * - **all value columns assigned null** → the component row becomes empty, which the
- *   read renders identically to absence, so `delete from <member> where <memberKey> in
- *   (<anchor subquery>)` (the matched rows; absent rows are already empty). No insert.
- * - **otherwise** → the **matched** rows take the legacy member UPDATE; and when ≥1
- *   value is non-null, the **absent** rows take a null-extended materialization INSERT.
- *   (An all-null *partial* assignment — every assigned value null but not every value
- *   column assigned — keeps the matched UPDATE only: an absent row stays all-null, i.e.
- *   absent, so there is nothing to materialize.)
+ * - **mixes `anchor` and `self`** → reject `arbitrary`: the matched side would need a
+ *   per-row correlated capture to thread the anchor value while the self cell reads the
+ *   member's own prior value (deferred — the value-capture follow-up).
+ * - **has an `anchor` cell** (no `self`) → a single **upsert** unifies the matched UPDATE
+ *   and the absent materialize INSERT: the value is computed once over the anchor scan and
+ *   both branches read it (insert directly, matched via `excluded.<col>`). Constant cells
+ *   fold in as literal projections / `do update set col = excluded.col`.
+ * - **has a `self` cell** (no `anchor`) → present rows take a bare matched UPDATE; absent
+ *   rows have no prior value to transform, so they stay absent — the materialize INSERT is
+ *   **suppressed**. Constant cells ride along as bare literals (a self-reference makes the
+ *   whole group present-rows-only).
+ * - **all `constant`** → the legacy fast lane: all-value-columns-null → base DELETE; else the
+ *   matched UPDATE plus, when ≥1 value is non-null, the absent materialize INSERT.
  */
 function emitOptionalMemberUpdate(
 	ctx: PlanningContext,
@@ -942,6 +1039,33 @@ function emitOptionalMemberUpdate(
 	stmt: AST.UpdateStmt,
 	ops: BaseOp[],
 ): void {
+	const hasAnchor = cells.some(c => c.kind === 'anchor');
+	const hasSelf = cells.some(c => c.kind === 'self');
+
+	if (hasAnchor && hasSelf) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-decomposition-update',
+			table: view.name,
+			message: `cannot update logical table '${view.name}': the update of optional member '${member.relationId}' mixes an anchor-resolvable value and a member self-reference in one statement; threading both across the matched-update and materialize branches needs the per-row capture substrate (deferred — see backlog view-write-decomposition-update-arbitrary-value-capture)`,
+		});
+	}
+
+	if (hasAnchor) {
+		// Anchor-resolvable group → one upsert replaces both the matched UPDATE and the
+		// materialize INSERT (the value agrees row-for-row across both branches by construction).
+		ops.push(buildOptionalMemberInsertSelect(ctx, view, shape, member, cells, pred, stmt, 'update'));
+		return;
+	}
+
+	if (hasSelf) {
+		// Self-reference group → matched-update-only over the owner-qualifier-stripped values;
+		// no materialize (an absent row has no prior value to increment).
+		ops.push(memberUpdateOp(ctx, view, shape, member,
+			cells.map(c => ({ column: c.basisColumn, value: stripMemberQualifier(c.value, member) })), pred, stmt));
+		return;
+	}
+
+	// Pure-constant group: the legacy fast lane.
 	const valueBasisCols = optionalValueColumns(view, shape, member);
 	const assignedBasis = new Set(cells.map(c => c.basisColumn.toLowerCase()));
 	const allValueColsAssigned = valueBasisCols.every(bc => assignedBasis.has(bc.toLowerCase()));
@@ -970,47 +1094,54 @@ function emitOptionalMemberUpdate(
 	// Absent rows: materialize only when at least one assigned value is non-null (an
 	// all-null partial assignment leaves the absent row absent — nothing to create).
 	if (cells.some(c => !c.isNull)) {
-		ops.push(buildOptionalMaterializeInsert(ctx, view, shape, member, cells, valueBasisCols, pred, stmt));
+		ops.push(buildOptionalMemberInsertSelect(ctx, view, shape, member, cells, pred, stmt, 'nothing'));
 	}
 }
 
 /**
- * Build the null-extended materialization INSERT for an optional columnar member:
- * `insert into <member> (<memberKey>, <assigned cols…>) select <anchorKey>, <values…>
- * from <anchor> where <pred> on conflict (<memberKey>) do nothing`. The anchor key
- * threads the member key (EC); each assigned value fills its column; unassigned value
- * columns take base defaults. The `on conflict … do nothing` skips the matched anchors
- * (whose member row already exists — the matched UPDATE owns those), so the matched
- * UPDATE and this INSERT partition the affected rows without the insert source having
- * to scan its own target (which the planner cannot assign an access path to).
+ * Build the anchor-keyed insert-select that materializes / unifies an optional columnar
+ * member's update, in one of two `action` flavours sharing the identical select + soundness
+ * gates:
+ *
+ * - **`'nothing'`** (constant group, absent branch) — `insert into <member> (<memberKey>,
+ *   <cols…>) select <anchorKey>, <values…> from <anchor> where <pred> on conflict (<memberKey>)
+ *   do nothing`. The matched anchors (whose member row exists) conflict and are ceded to the
+ *   separate matched UPDATE; only the absent rows materialize. The insert source never scans
+ *   its own target (which the planner cannot assign an access path to).
+ * - **`'update'`** (anchor-resolvable group) — the same select, but `on conflict (<memberKey>)
+ *   do update set <col> = excluded.<col>, …`. This **replaces both** the matched UPDATE and the
+ *   materialize INSERT: the value is computed once over the anchor scan, absent rows insert it,
+ *   and matched rows read the identical proposed-insert value via `excluded.<col>` — so the two
+ *   branches agree row-for-row (the round-trip oracle holds by construction).
  *
  * The conflict target is the member's stitch key, which `validatePrimaryAdvertisement`
  * (lens-compiler.ts) guarantees at deploy time to be a declared PRIMARY KEY / non-partial
- * UNIQUE on the member basis. That deploy guard is what makes this partition sound: the
- * runtime `do nothing` fires only on a declared PK/UNIQUE violation, so a non-unique stitch
- * key would double-insert the matched rows instead of ceding them — and could not deploy.
+ * UNIQUE on the member basis. That deploy guard is what makes the partition sound: the runtime
+ * `on conflict` fires only on a declared PK/UNIQUE violation, so a non-unique stitch key would
+ * double-insert the matched rows instead of ceding/updating them — and could not deploy.
  *
- * Two soundness gates (data-independent, plan-time):
+ * Two soundness gates (data-independent, plan-time), enforced on **both** flavours:
  * - a member **value** column the statement does not assign must materialize as null
  *   (nullable + no declared default), else its base default would silently widen the
  *   absent row's logical image — rejected `unsupported-decomposition-update`;
  * - a NOT NULL base column with no default that no value covers cannot be created —
  *   rejected via {@link assertNoMissingNotNull} (the decomposition create-conflict).
  */
-function buildOptionalMaterializeInsert(
+function buildOptionalMemberInsertSelect(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	shape: DecompShape,
 	member: DecompositionMember,
 	cells: readonly OptionalCell[],
-	valueBasisCols: readonly string[],
 	pred: AST.Expression | undefined,
 	stmt: AST.UpdateStmt,
+	action: 'nothing' | 'update',
 ): BaseOp {
 	const ref = resolveMemberTable(ctx, member);
 	const schema = ref.tableSchema;
 	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
 	const memberKey = singleKeyColumn(view, shape, member);
+	const valueBasisCols = optionalValueColumns(view, shape, member);
 	const assignedBasis = new Set(cells.map(c => c.basisColumn.toLowerCase()));
 
 	// View-soundness: an unassigned value column that would not land null (it is NOT
@@ -1045,12 +1176,15 @@ function buildOptionalMaterializeInsert(
 		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
 		where: pred ? cloneExpr(pred) : undefined,
 	};
+	const upsert: AST.UpsertClause = action === 'nothing'
+		? { type: 'upsert', conflictTarget: [memberKey], action: 'nothing' }
+		: { type: 'upsert', conflictTarget: [memberKey], action: 'update', assignments: cells.map(c => ({ column: c.basisColumn, value: excludedColumn(c.basisColumn) })) };
 	const statement: AST.InsertStmt = {
 		type: 'insert',
 		table: memberIdentifier(member),
 		columns: targetColumns,
 		source: select,
-		upsertClauses: [{ type: 'upsert', conflictTarget: [memberKey], action: 'nothing' }],
+		upsertClauses: [upsert],
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
@@ -1059,10 +1193,18 @@ function buildOptionalMaterializeInsert(
 }
 
 /**
- * Emit the per-attribute base ops for an EAV pivot member's update group. Each
- * attribute is an independent triple: a **null** value deletes its triple for the
- * matched entities; a **non-null** value upserts it — a matched UPDATE of the value
- * column plus a materialization INSERT for entities lacking the triple.
+ * Emit the per-attribute base ops for an EAV pivot member's update group. Each attribute is
+ * an independent triple, routed by the cell's null-ness and {@link ValueKind}:
+ *
+ * - **null** value → delete its triple for the matched entities.
+ * - **`anchor`** value (`set p = id * 2`) → one **upsert** (`do update`) unifies the matched
+ *   UPDATE and the absent materialize INSERT, keyed on `(entity, attribute)` — the value is
+ *   computed once over the anchor scan and matched entities read it via `excluded.<valCol>`.
+ * - **`constant`** value → matched UPDATE of the value column + `on conflict (entity, attr)
+ *   do nothing` materialize INSERT for entities lacking the triple.
+ *
+ * A `self` value cannot occur here: an EAV value column substitutes to a correlated subquery,
+ * so an EAV self-reference lands `arbitrary` and is rejected before reaching a cell.
  */
 function emitEavMemberUpdate(
 	ctx: PlanningContext,
@@ -1078,9 +1220,11 @@ function emitEavMemberUpdate(
 	for (const cell of cells) {
 		if (cell.isNull) {
 			ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'delete'));
+		} else if (cell.kind === 'anchor') {
+			ops.push(buildEavInsertSelect(ctx, view, shape, member, pivot, cell, pred, stmt, 'update'));
 		} else {
 			ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'update'));
-			ops.push(buildEavMaterializeInsert(ctx, view, shape, member, pivot, cell, pred, stmt));
+			ops.push(buildEavInsertSelect(ctx, view, shape, member, pivot, cell, pred, stmt, 'nothing'));
 		}
 	}
 }
@@ -1125,11 +1269,17 @@ function buildEavAttrOp(
 }
 
 /**
- * Build the EAV materialization INSERT for one attribute: `insert into <pivot>
- * (<entity>, <attr>, <val>) select <anchorKey>, '<attribute>', <value> from <anchor>
- * where <pred> on conflict (<entity>, <attr>) do nothing` — one new triple per matched
- * entity that lacks this attribute (the entities whose triple exists conflict on the
- * `(entity, attr)` key and are owned by the matched UPDATE, so they are skipped).
+ * Build the anchor-keyed EAV triple insert-select for one attribute, in one of two `action`
+ * flavours sharing the identical select: `insert into <pivot> (<entity>, <attr>, <val>) select
+ * <anchorKey>, '<attribute>', <value> from <anchor> where <pred>` followed by
+ *
+ * - **`'nothing'`** (constant cell, absent branch) — `on conflict (<entity>, <attr>) do nothing`:
+ *   one new triple per matched entity that lacks this attribute (entities whose triple exists
+ *   conflict and are ceded to the separate matched UPDATE).
+ * - **`'update'`** (anchor-resolvable cell) — `on conflict (<entity>, <attr>) do update set
+ *   <valCol> = excluded.<valCol>`: **replaces both** the matched UPDATE and the materialize
+ *   INSERT, the value computed once over the anchor scan and read by matched entities via
+ *   `excluded.<valCol>`.
  *
  * The conflict target `(entity, attribute)` — NOT the stitch key (`entity` alone, which is
  * intentionally one-to-many) — is guaranteed a declared PRIMARY KEY / non-partial UNIQUE on
@@ -1137,7 +1287,7 @@ function buildEavAttrOp(
  * is what keeps both the matched/materialize partition here and the get-side correlated
  * subquery single-valued; a non-unique `(entity, attr)` could not deploy.
  */
-function buildEavMaterializeInsert(
+function buildEavInsertSelect(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	shape: DecompShape,
@@ -1146,6 +1296,7 @@ function buildEavMaterializeInsert(
 	cell: EavCell,
 	pred: AST.Expression | undefined,
 	stmt: AST.UpdateStmt,
+	action: 'nothing' | 'update',
 ): BaseOp {
 	const ref = resolveMemberTable(ctx, member);
 	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
@@ -1160,12 +1311,15 @@ function buildEavMaterializeInsert(
 		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
 		where: pred ? cloneExpr(pred) : undefined,
 	};
+	const upsert: AST.UpsertClause = action === 'nothing'
+		? { type: 'upsert', conflictTarget: [pivot.entityColumn, pivot.attributeColumn], action: 'nothing' }
+		: { type: 'upsert', conflictTarget: [pivot.entityColumn, pivot.attributeColumn], action: 'update', assignments: [{ column: pivot.valueColumn, value: excludedColumn(pivot.valueColumn) }] };
 	const statement: AST.InsertStmt = {
 		type: 'insert',
 		table: memberIdentifier(member),
 		columns: [pivot.entityColumn, pivot.attributeColumn, pivot.valueColumn],
 		source: select,
-		upsertClauses: [{ type: 'upsert', conflictTarget: [pivot.entityColumn, pivot.attributeColumn], action: 'nothing' }],
+		upsertClauses: [upsert],
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
@@ -1200,19 +1354,25 @@ function isNullLiteral(expr: AST.Expression): boolean {
 	return expr.type === 'literal' && expr.value === null;
 }
 
-/** True when an expression references any column (after lowering to base terms). */
-function exprHasColumnRef(expr: AST.Expression): boolean {
-	let found = false;
-	const walk = (node: unknown): void => {
-		if (found) return;
-		if (Array.isArray(node)) { node.forEach(walk); return; }
-		if (!node || typeof node !== 'object' || !('type' in (node as object))) return;
-		const n = node as Record<string, unknown> & { type: string };
-		if (n.type === 'column') { found = true; return; }
-		for (const v of Object.values(n)) walk(v);
-	};
-	walk(expr);
-	return found;
+/**
+ * `excluded.<col>` — the proposed-insert value of an upsert's `do update set` assignment
+ * (registered in the upsert scope by `building/insert.ts`; `NEW.<col>` is the equivalent
+ * alias). An anchor-resolvable upsert assigns each matched row `<col> = excluded.<col>` so
+ * it reads the identical anchor-computed value the absent rows insert.
+ */
+function excludedColumn(col: string): AST.ColumnExpr {
+	return { type: 'column', name: col, table: 'excluded' };
+}
+
+/**
+ * Strip the owning member's relationId qualifier from a lowered self-reference value, so a
+ * per-member UPDATE over it (`<member>.c + 1`) targets that table directly (`c + 1`). The
+ * classifier proved every column ref is the owner's, so a plain strip suffices (a constant
+ * sibling carries no ref — a no-op). Mirrors {@link rewriteAssignedValue}'s strip without
+ * its cross-member reject (the classifier already excluded a foreign qualifier).
+ */
+function stripMemberQualifier(value: AST.Expression, owner: DecompositionMember): AST.Expression {
+	return transformExpr(value, (col) => (col.table === owner.relationId ? { type: 'column', name: col.name } : undefined));
 }
 
 // --- predicate / subquery construction ------------------------------------
