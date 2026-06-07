@@ -224,6 +224,30 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			expect(out.map(r => r.cc)).to.deep.equal([2, 4]);
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
 		});
+
+		// `IS [NOT] TRUE/FALSE` forms over the never-null flag. The `is not …`
+		// collapses are exact only because the flag is provably non-null.
+		const isTestForms: ReadonlyArray<{ probe: string; polarity: 'semi' | 'anti'; cc: number[] }> = [
+			{ probe: 'hasP is true', polarity: 'semi', cc: [1, 3] },
+			{ probe: 'hasP is not false', polarity: 'semi', cc: [1, 3] },
+			{ probe: 'hasP is false', polarity: 'anti', cc: [2, 4] },
+			{ probe: 'hasP is not true', polarity: 'anti', cc: [2, 4] },
+		];
+		for (const { probe, polarity, cc } of isTestForms) {
+			it(`\`${probe}\` recovers ${polarity === 'semi' ? 'a semi' : 'an anti'} join`, async () => {
+				await seedExisting();
+				const q =
+					`select c.cc as cc from exc c left join exp p on p.pp = c.pr exists right as hasP where ${probe} order by c.cc`;
+
+				const rows = await planRows(db, q);
+				expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+				expect(joinTypeOf(rows)).to.equal(polarity);
+
+				const out = await results(db, q);
+				expect(out.map(r => r.cc)).to.deep.equal(cc);
+				expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+			});
+		}
 	});
 
 	describe('residual AND-conjunct (split, not folded into the join)', () => {
@@ -310,6 +334,36 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			expect(joinExistence(rows), 'flag retained on OR-probe').to.deep.equal(['exists right as hasP']);
 
 			const out = await results(db, q);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+
+		it('`where hasP is not null` keeps the flag (constant true over the never-null flag, not a probe)', async () => {
+			await seedExisting();
+			const q =
+				'select c.cc as cc from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP is not null order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as hasP']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			// Flag is never null ⇒ the filter is a constant true; all left rows survive.
+			const out = await results(db, q);
+			expect(out.map(r => r.cc)).to.deep.equal([1, 2, 3, 4]);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+
+		it('`where hasP is null` keeps the flag (constant false over the never-null flag, not a probe)', async () => {
+			await seedExisting();
+			const q =
+				'select c.cc as cc from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP is null order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as hasP']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			// Flag is never null ⇒ the filter is a constant false; no rows survive.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([]);
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
 		});
 
@@ -401,6 +455,22 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			const out = await results(db, q);
 			// The baseline fans out to three identical [cc=1] rows — the row count that
 			// a (wrongly) recovered semi join would have collapsed to one.
+			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+
+		it('SEMI via `is true` rides the SAME guard and must NOT fire under fan-out', async () => {
+			await setupFanOut();
+			// `is true` is a SEMI probe just like a bare `where flag`; it must not
+			// bypass the fan-out guard. cc=1 still fans out to three rows.
+			const q =
+				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where h is true order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as h']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			const out = await results(db, q);
 			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
 		});

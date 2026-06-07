@@ -30,6 +30,33 @@ select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where has
 select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP = false order by cc;
 → [{"cc":2},{"cc":4}]
 
+-- IS [NOT] TRUE/FALSE probe forms over the non-null flag.
+--   `is true`      → semi  (rows WITH a match)
+--   `is not false` → semi  (≡ = true, exact because the flag is never null)
+--   `is false`     → anti  (rows with NO match)
+--   `is not true`  → anti  (≡ = false, exact because the flag is never null)
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is true order by cc;
+→ [{"cc":1},{"cc":3}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not false order by cc;
+→ [{"cc":1},{"cc":3}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is false order by cc;
+→ [{"cc":2},{"cc":4}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not true order by cc;
+→ [{"cc":2},{"cc":4}]
+
+-- `is not null` over the never-null flag is a constant TRUE — NOT a probe; the rule
+-- abstains and every left row survives (semi/anti recovery must not fire).
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not null order by cc;
+→ [{"cc":1},{"cc":2},{"cc":3},{"cc":4}]
+
+-- `is null` over the never-null flag is a constant FALSE — likewise not a probe; the
+-- rule abstains and the (always-false) filter keeps no rows.
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is null order by cc;
+→ []
+
 -- residual AND-conjunct is retained above the semi join (cv > 150 keeps only cc 3)
 select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP and c.cv > 150 order by cc;
 → [{"cc":3}]
@@ -96,6 +123,11 @@ insert into fp values (10, 1), (11, 1), (12, 1);
 
 -- semi probe: must keep all three fanned-out cc=1 rows (NOT collapse to one)
 select cc from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- `is true` is also a SEMI probe and rides the same fan-out guard — it must abstain
+-- too, keeping all three fanned-out cc=1 rows (not collapsing to one).
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h is true order by cc;
 → [{"cc":1},{"cc":1},{"cc":1}]
 
 -- anti probe: one row per unmatched left row, fan-out irrelevant

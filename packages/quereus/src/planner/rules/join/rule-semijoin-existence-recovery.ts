@@ -62,9 +62,18 @@
  *  | `not f`           | `UnaryOpNode` NOT over that colref                  | anti     |
  *  | `f = true`        | `BinaryOpNode` `=`, flag colref vs boolean `true`   | semi     |
  *  | `f = false`       | `BinaryOpNode` `=`, flag colref vs boolean `false`  | anti     |
+ *  | `f is true`       | `UnaryOpNode` `IS TRUE` over that colref            | semi     |
+ *  | `f is not false`  | `UnaryOpNode` `IS NOT FALSE` over that colref       | semi     |
+ *  | `f is false`      | `UnaryOpNode` `IS FALSE` over that colref           | anti     |
+ *  | `f is not true`   | `UnaryOpNode` `IS NOT TRUE` over that colref        | anti     |
  *
- * `IS [NOT] TRUE/FALSE` and `case`-wrapped forms are deferred to the
- * `existence-probe-richer-forms` backlog ticket.
+ * The `is not false` / `is not true` collapses (≡ `= true` / `= false`) are exact
+ * only because the flag is provably non-null (`EXISTENCE_FLAG_TYPE.nullable ===
+ * false`): with no NULL row there is no third bucket for `is not` to admit. For the
+ * same reason `f is [not] null` is NOT a probe over the non-null flag (`is not null`
+ * is a constant `true`, `is null` a constant `false`) and the matcher abstains.
+ * `case`-wrapped probes are out of scope (file a fresh backlog ticket if a real
+ * workload ever produces them).
  *
  * ## Q3 — left/right/inner → semi/anti mapping (settled by reachability)
  *
@@ -349,6 +358,22 @@ function classifyProbe(conj: ScalarPlanNode, flagId: number): 'semi' | 'anti' | 
 			return 'anti';
 		}
 		return null;
+	}
+
+	// `f is true` / `f is not false` (semi) and `f is false` / `f is not true`
+	// (anti). The `is not …` collapses are EXACT only because the flag is provably
+	// non-null (`EXISTENCE_FLAG_TYPE.nullable === false`): `f is not false` ≡ `f =
+	// true` and `f is not true` ≡ `f = false` solely because no NULL row exists to
+	// land in the `is not` bucket. `is [not] null` is deliberately NOT listed — over
+	// the non-null flag it is a constant (`is not null` ≡ true, `is null` ≡ false),
+	// not a probe — so it falls through to `return null` and the rule abstains.
+	if (n instanceof UnaryOpNode && isFlagColRef(n.operand, flagId)) {
+		switch (n.expression.operator) {
+			case 'IS TRUE':
+			case 'IS NOT FALSE': return 'semi';
+			case 'IS FALSE':
+			case 'IS NOT TRUE': return 'anti';
+		}
 	}
 
 	// `f = true` / `true = f` (semi) and `f = false` / `false = f` (anti).
