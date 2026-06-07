@@ -79,6 +79,16 @@ export interface CatalogIndex {
 	 */
 	definition: string;
 	tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * True when this index is an *exposed implicit covering structure* — the
+	 * secondary BTree backing a UNIQUE constraint tagged
+	 * `quereus.expose_implicit_index`. Surfaced for introspection only; its
+	 * lifecycle is the originating constraint's (the named-constraint diff path),
+	 * so the schema differ MUST exclude it from the standalone-index
+	 * create/drop/rename buckets (see `computeSchemaDiff`'s `actualIndexes`).
+	 * Absent/false ⇒ an ordinary, differ-managed index.
+	 */
+	implicit?: boolean;
 }
 
 export interface CatalogAssertion {
@@ -147,7 +157,10 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 				for (const indexSchema of tableSchema.indexes) {
 					const exposed = implicit.get(indexSchema.name);
 					if (exposed === false) continue; // hidden implicit covering structure
-					indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db));
+					// Mark only the *exposed* implicit covering structure (exposed === true);
+					// an ordinary index (absent from the exposure map ⇒ undefined) stays
+					// unmarked so the differ manages it normally.
+					indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db, exposed === true));
 				}
 			}
 
@@ -158,7 +171,8 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 			// on the descriptor (from `uc.exposedIndexTags`), kept out of the canonical
 			// `definition` so a tag-only change stays `ALTER INDEX … SET TAGS`.
 			for (const desc of exposedImplicitIndexes(tableSchema)) {
-				indexes.push(indexSchemaToCatalog(desc, tableSchema, db));
+				// Every synthetic descriptor is exposed-implicit by construction → mark it.
+				indexes.push(indexSchemaToCatalog(desc, tableSchema, db, true));
 			}
 		}
 	}
@@ -408,14 +422,19 @@ function indexSchemaToCatalog(
 	indexSchema: IndexSchema,
 	tableSchema: TableSchema,
 	db: Database,
+	/** Set true for an exposed implicit covering structure — see `CatalogIndex.implicit`. */
+	implicit = false,
 ): CatalogIndex {
-	return {
+	const entry: CatalogIndex = {
 		name: indexSchema.name,
 		tableName: tableSchema.name,
 		ddl: generateIndexDDL(indexSchema, tableSchema, db),
 		definition: indexToCanonicalDDL(indexSchema, tableSchema),
 		tags: indexSchema.tags,
 	};
+	// Only set the field when true so an ordinary index's catalog shape is unchanged.
+	if (implicit) entry.implicit = true;
+	return entry;
 }
 
 function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): CatalogAssertion {

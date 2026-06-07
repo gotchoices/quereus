@@ -278,7 +278,18 @@ export function computeSchemaDiff(
 	const actualTables = new Map(actualCatalog.tables.map(t => [t.name.toLowerCase(), t]));
 	const actualViews = new Map(actualCatalog.views.map(v => [v.name.toLowerCase(), v]));
 	const actualMaterializedViews = new Map(actualCatalog.materializedViews.map(mv => [mv.name.toLowerCase(), mv]));
-	const actualIndexes = new Map(actualCatalog.indexes.map(i => [i.name.toLowerCase(), i]));
+	// Exclude *exposed implicit covering indexes* (`CatalogIndex.implicit` — the
+	// secondary BTree backing a UNIQUE constraint tagged
+	// `quereus.expose_implicit_index`). The catalog surfaces them for introspection
+	// (`schema()` / `index_info()`), but their lifecycle belongs to the originating
+	// UNIQUE constraint (the named-constraint diff path), NOT to `CREATE/DROP INDEX`.
+	// Filtering here keeps them out of ALL three downstream index consumers in one
+	// place — rename resolution, the create/body loop, and the orphan-drop loop — so a
+	// converged schema with an exposed implicit index diffs empty (no phantom
+	// `DROP INDEX IF EXISTS`). See `catalog.ts` `CatalogIndex.implicit`.
+	const actualIndexes = new Map(
+		actualCatalog.indexes.filter(i => !i.implicit).map(i => [i.name.toLowerCase(), i]),
+	);
 
 	// Resolve renames per-kind. Each call returns:
 	//   - rename ops (oldName -> newName)

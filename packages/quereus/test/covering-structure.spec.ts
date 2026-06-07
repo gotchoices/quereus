@@ -10,6 +10,7 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
+import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { proveCoverage, proveEffectiveKeyUnique, type CoverageResult } from '../src/planner/analysis/coverage-prover.js';
 import type { FunctionalDependency, PhysicalProperties, RelationalPlanNode } from '../src/planner/nodes/plan-node.js';
 import type { ColRef, RelationType } from '../src/common/datatype.js';
@@ -898,10 +899,62 @@ describe('introspection hiding', () => {
 			const catalog = collectSchemaCatalog(db, 'main');
 			const idx = catalog.indexes.find(i => i.tableName === 't' && i.name === 'uq');
 			expect(idx, 'implicit index surfaced under the constraint name').to.not.be.undefined;
+			// The surfaced entry carries the `implicit` marker so the differ excludes it
+			// from its standalone-index buckets (see the idempotency suite below).
+			expect(idx!.implicit, 'exposed implicit index marked for the differ to exclude').to.equal(true);
 		} finally {
 			await db.close();
 		}
 	});
+});
+
+/**
+ * Declarative idempotency for an *exposed* implicit covering index — the secondary
+ * BTree backing a UNIQUE constraint tagged `quereus.expose_implicit_index`. It is
+ * surfaced in `collectSchemaCatalog().indexes` for introspection, but its lifecycle
+ * belongs to the originating UNIQUE constraint (the named-constraint diff path), not
+ * to `CREATE/DROP INDEX`. A converged schema must therefore diff EMPTY across the
+ * index buckets — no phantom `DROP INDEX IF EXISTS <name>` (ticket
+ * declarative-differ-spurious-drop-exposed-implicit-index). Guarded under both
+ * `allow` and `require-hint`: pre-fix the spurious entry was a pure drop, which
+ * `require-hint` silently executed (it only hard-errors when a create AND a drop
+ * coincide), so the assertion is that the diff is empty, not that it throws.
+ */
+describe('declarative idempotency — exposed implicit covering index', () => {
+	const DECL = `declare schema main {
+		table ExpoTbl {
+			id INTEGER PRIMARY KEY,
+			vin TEXT,
+			constraint uq_expo_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)
+		}
+	}`;
+
+	for (const policy of ['allow', 'require-hint'] as const) {
+		it(`converged schema diffs empty under rename_policy = '${policy}' (no spurious DROP INDEX)`, async () => {
+			const db = new Database();
+			try {
+				await db.exec(DECL);
+				await db.exec('apply schema main');
+
+				const catalog = collectSchemaCatalog(db, 'main');
+				// Sanity: the exposed index IS surfaced (marker is additive, not a hide).
+				const idx = catalog.indexes.find(i => i.tableName === 'ExpoTbl' && i.name === 'uq_expo_vin');
+				expect(idx, 'exposed implicit index still surfaced for introspection').to.not.be.undefined;
+				expect(idx!.implicit, 'and carries the implicit marker').to.equal(true);
+
+				// The differ must ignore it: a converged schema diffs empty across the
+				// index buckets, and the whole migration is a no-op.
+				const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+				const diff = computeSchemaDiff(declared, catalog, policy);
+				expect(diff.indexesToCreate, 'no index create').to.deep.equal([]);
+				expect(diff.indexesToDrop, 'no spurious DROP INDEX for the exposed implicit index').to.deep.equal([]);
+				expect(diff.indexTagsChanges, 'no spurious index tag change').to.deep.equal([]);
+				expect(generateMigrationDDL(diff, 'main'), 'converged: no migration DDL').to.deep.equal([]);
+			} finally {
+				await db.close();
+			}
+		});
+	}
 });
 
 /**

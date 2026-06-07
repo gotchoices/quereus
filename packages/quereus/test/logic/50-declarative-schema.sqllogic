@@ -1010,3 +1010,40 @@ insert into decl_check_cmpd.Palette values ('z');
 -- error: CHECK constraint failed: InPalette
 
 drop table decl_check_cmpd.Palette;
+
+-- ===================================================================
+-- Exposed implicit covering index — a UNIQUE constraint tagged
+-- quereus.expose_implicit_index surfaces its secondary BTree for
+-- introspection (schema() / index_info()), but the differ must NOT
+-- manage it as a standalone index. A converged schema diffs EMPTY (no
+-- phantom DROP INDEX IF EXISTS uq_expo_vin) across both the memory and
+-- store backends (ticket
+-- declarative-differ-spurious-drop-exposed-implicit-index).
+-- ===================================================================
+
+declare schema decl_expo_idx
+{
+	table ExpoTbl (
+		id INTEGER PRIMARY KEY,
+		vin TEXT,
+		constraint uq_expo_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)
+	);
+}
+
+-- run
+
+apply schema decl_expo_idx;
+
+-- run
+
+-- Converged: re-diff is empty — no spurious DROP INDEX for the exposed
+-- implicit covering index (was the bug this ticket fixes).
+diff schema decl_expo_idx;
+→ []
+
+-- UNIQUE enforcement still holds (the constraint, not the index, governs it).
+insert into decl_expo_idx.ExpoTbl values (1, 'VIN001');
+insert into decl_expo_idx.ExpoTbl values (2, 'VIN001');
+-- error: UNIQUE
+
+drop table decl_expo_idx.ExpoTbl;
