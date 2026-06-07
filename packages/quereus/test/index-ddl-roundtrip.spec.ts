@@ -441,6 +441,25 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate[0]).to.match(/active desc/i);
 	});
 
+	it('a desc index re-declared unchanged does not churn (actual-side desc lift is symmetric)', async () => {
+		// Guards the `indexToCanonicalDDL` lift: the stored `IndexColumnSchema.desc`
+		// must round-trip to a `desc` direction so a baseline desc index re-declared
+		// verbatim renders the SAME canonical body — no spurious drop+recreate. Every
+		// other desc test starts from an asc baseline, so only this one exercises the
+		// actual side already carrying desc.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, active desc)`, `${TABLE}\nindex ix_comp on t (name, active desc)`);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+		expect(diff.indexTagsChanges, 'no tag changes').to.deep.equal([]);
+	});
+
+	it('changing the indexed column (different column) recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_one on t (name)`, `${TABLE}\nindex ix_one on t (email)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_one']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/\(\s*"?email"?\s*\)/i);
+	});
+
 	it('a tags-only change takes SET TAGS, not a recreate', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_name on t (name) with tags (purpose = 'a')`, `${TABLE}\nindex ix_name on t (name) with tags (purpose = 'b')`);
 		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
