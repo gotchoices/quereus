@@ -5,7 +5,7 @@ import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { generateTableDDL, generateIndexDDL, constraintToCanonicalDDL } from './ddl-generator.js';
+import { generateTableDDL, generateIndexDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
 
 /**
  * Represents a catalog snapshot of the current database schema state
@@ -67,6 +67,17 @@ export interface CatalogIndex {
 	name: string;
 	tableName: string;
 	ddl: string;
+	/**
+	 * Canonical body string (UNIQUE-ness, column set/order/direction, partial
+	 * predicate; name / `on <table>` / tags / collation excluded). The differ
+	 * compares this against a declared index's body — rendered by the same
+	 * `createIndexBodyToCanonicalString` — to detect a name-matched index whose
+	 * body changed (→ drop+recreate), mirroring `CatalogTable.namedConstraints[].
+	 * definition` and `CatalogMaterializedView.bodyHash`. Tags are kept separate
+	 * (and out of `definition`) so a tag-only change takes `ALTER INDEX … SET TAGS`,
+	 * not a needless drop+recreate.
+	 */
+	definition: string;
 	tags?: Readonly<Record<string, SqlValue>>;
 }
 
@@ -309,6 +320,7 @@ function indexSchemaToCatalog(
 		name: indexSchema.name,
 		tableName: tableSchema.name,
 		ddl: generateIndexDDL(indexSchema, tableSchema, db),
+		definition: indexToCanonicalDDL(indexSchema, tableSchema),
 		tags: indexSchema.tags,
 	};
 }

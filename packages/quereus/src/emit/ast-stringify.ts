@@ -826,6 +826,65 @@ export function createIndexToString(stmt: AST.CreateIndexStmt): string {
 	return parts.join(' ');
 }
 
+/**
+ * The bare column name an indexed-column AST node refers to. A plain column
+ * carries it on `col.name`; the parser folds `col COLLATE x` into a `collate`
+ * expression over a column reference, so for that form the name lives on
+ * `col.expr.expr.name`. Returns undefined for a genuine expression-index column
+ * (no resolvable column name).
+ */
+function indexedColumnBareName(col: AST.IndexedColumn): string | undefined {
+	if (col.name) return col.name;
+	if (col.expr?.type === 'collate' && col.expr.expr.type === 'column') return col.expr.expr.name;
+	return undefined;
+}
+
+/**
+ * Collation-EXCLUDING canonical renderer for an index's column list, used only by
+ * {@link createIndexBodyToCanonicalString} for body-drift comparison — NOT a
+ * persistence path (see {@link indexedColumnsToString} for the collation-emitting
+ * form). For each column emit the bare column name + ` desc` only when descending.
+ * The bare name is extracted from both indexed-column forms (plain `col.name` and
+ * the parser's collate-folded form — see {@link indexedColumnBareName}); a genuine
+ * expression-index column with no resolvable name falls back to
+ * `expressionToString(col.expr)` (such indexes are rejected on import and never
+ * name-match a real actual).
+ */
+function canonicalIndexedColumnsToString(cols: readonly AST.IndexedColumn[]): string {
+	return cols.map(col => {
+		const name = indexedColumnBareName(col);
+		if (name) {
+			return col.direction === 'desc' ? `${quoteIdentifier(name)} desc` : quoteIdentifier(name);
+		}
+		return col.expr ? expressionToString(col.expr) : '';
+	}).filter(s => s).join(', ');
+}
+
+/**
+ * Renders the **canonical body** of an index — the comparison key the declarative
+ * differ uses to detect a name-matched index whose body changed (UNIQUE-ness,
+ * column set/order/direction, or partial WHERE predicate). Two semantically-equal
+ * indexes must render identically here or a spurious drop+recreate churns; two
+ * different ones must render differently or a real change silently no-ops.
+ *
+ * Excludes the index `name`, the `on <table>` reference, `if not exists`, AND the
+ * `with tags (...)` suffix (tags are a separate diff channel — `ALTER INDEX … SET
+ * TAGS`). Collation is intentionally EXCLUDED from the column render this pass
+ * (see schema-differ's Decision): the actual side stores a resolved per-column
+ * collation while the declared side inherits it from the table column, so
+ * including it would churn false positives. Both the declared-AST side
+ * (`schema-differ`) and the actual-catalog side (`ddl-generator`'s
+ * `indexToCanonicalDDL`) funnel through here so their fragments are byte-comparable.
+ */
+export function createIndexBodyToCanonicalString(stmt: AST.CreateIndexStmt): string {
+	const parts: string[] = [];
+	if (stmt.isUnique) parts.push('unique');
+	parts.push('index');
+	parts.push(`(${canonicalIndexedColumnsToString(stmt.columns)})`);
+	if (stmt.where) parts.push('where', expressionToString(stmt.where));
+	return parts.join(' ');
+}
+
 export function createViewToString(stmt: AST.CreateViewStmt): string {
 	const parts: string[] = ['create'];
 	parts.push('view');

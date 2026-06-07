@@ -1,7 +1,7 @@
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, astToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString } from '../emit/ast-stringify.js';
 import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
@@ -428,14 +428,38 @@ export function computeSchemaDiff(
 		if (!declaredMaterializedViews.has(name)) diff.materializedViewsToDrop.push(name);
 	}
 
-	// Indexes: creates / drops / in-place tag changes (pure name match only, as
-	// with views — a renamed index drops+recreates and carries its tags then).
+	// Indexes: creates / drops / body-change recreates / in-place tag changes.
+	// A name-matched index whose canonical body drifted (UNIQUE-ness, column
+	// set/order/direction, partial WHERE) drops+recreates — the same drop+recreate
+	// shape MVs use, since an index has no in-place "redefine" primitive. The
+	// recreate carries the declared tags, so a body change SUPPRESSES any separate
+	// SET TAGS for that index (mutually exclusive per object, mirroring the MV
+	// precedence above). A pure name match whose body is unchanged but tags drifted
+	// still takes the in-place `ALTER INDEX … SET TAGS` (as views do — a renamed
+	// index has no in-place primitive, so its tags ride the drop+recreate).
+	let indexBodyRecreates = 0; // pure-create/-drop counts for require-hint exclusion
 	for (const [name, declaredIndex] of declaredIndexes) {
 		const matchedActual = indexRenames.pairs.get(name);
 		if (!matchedActual) {
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
 			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
-		} else if (matchedActual.name.toLowerCase() === name && tagsDrifted(declaredIndex.indexStmt.tags, matchedActual.tags)) {
+			continue;
+		}
+		// Body comparison (canonical: name / tags / collation excluded). Schema
+		// qualification does not affect the body render, so compare the raw declared
+		// stmt. The drop targets the actual (pre-rename) name and the recreate carries
+		// the declared (post-rename) name, so a body change on a rename-matched index
+		// resolves to a correct drop+recreate that supersedes the no-op rename op.
+		const declaredBody = createIndexBodyToCanonicalString(declaredIndex.indexStmt);
+		if (declaredBody !== matchedActual.definition) {
+			diff.indexesToDrop.push(matchedActual.name);
+			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
+			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
+			indexBodyRecreates++;
+			continue;
+		}
+		// Body unchanged → in-place tag change (pure name match only, as before).
+		if (matchedActual.name.toLowerCase() === name && tagsDrifted(declaredIndex.indexStmt.tags, matchedActual.tags)) {
 			diff.indexTagsChanges.push({ name: declaredIndex.indexStmt.index.name, tags: desiredTagSet(declaredIndex.indexStmt.tags) });
 		}
 	}
@@ -445,11 +469,13 @@ export function computeSchemaDiff(
 	}
 
 	// Apply 'require-hint' policy: any unhinted name change is an error rather
-	// than a silent drop+create.
+	// than a silent drop+create. A body-change recreate counts as both a create and
+	// a drop, which would falsely trip the unhinted-rename guard — so exclude those
+	// from the index counts (the constraint path does the same with its pure counts).
 	if (policy === 'require-hint') {
 		enforceRequireHint('table', diff.tablesToCreate.length, diff.tablesToDrop.length);
 		enforceRequireHint('view', diff.viewsToCreate.length, diff.viewsToDrop.length);
-		enforceRequireHint('index', diff.indexesToCreate.length, diff.indexesToDrop.length);
+		enforceRequireHint('index', diff.indexesToCreate.length - indexBodyRecreates, diff.indexesToDrop.length - indexBodyRecreates);
 	}
 
 	// Assertions (no rename support — names are explicitly part of the contract).

@@ -24,9 +24,9 @@ import { Database } from '../src/core/database.js';
 import { generateTableDDL, generateIndexDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
 import { createIndexToString } from '../src/emit/ast-stringify.js';
-import { computeSchemaDiff } from '../src/schema/schema-differ.js';
+import { computeSchemaDiff, type SchemaDiff, type RenamePolicy } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
-import type { CreateIndexStmt, DeclaredIndex, IndexedColumn } from '../src/parser/ast.js';
+import type { CreateIndexStmt, DeclaredIndex, IndexedColumn, DeclareSchemaStmt } from '../src/parser/ast.js';
 
 async function rows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
 	const out: Record<string, unknown>[] = [];
@@ -314,28 +314,189 @@ describe('CREATE INDEX DDL round-trip: importCatalog multi-statement entries', (
 	});
 });
 
+// ============================================================================
+// Declarative differ: index BODY drift detection.
+//
+// The differ resolves indexes by name, then compares a CANONICAL BODY (UNIQUE-
+// ness, column set/order/direction, partial WHERE — collation and tags excluded)
+// rendered by the same `createIndexBodyToCanonicalString` on both the declared-AST
+// side and the actual-catalog side (lifted via `indexToCanonicalDDL`). A
+// name-matched index whose body drifted drops + recreates (the recreate carries
+// the declared tags); an unchanged body with drifted tags takes in-place SET TAGS.
+// ============================================================================
+
 describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
-	it('a declared UNIQUE index diffed against the applied catalog produces no migration', async () => {
+	/** Parse a `declare schema main { … }` body into its DeclareSchemaStmt AST. */
+	function declaredSchemaOf(body: string): DeclareSchemaStmt {
+		const stmt = parse(`declare schema main {\n${body}\n}`);
+		if (stmt.type !== 'declareSchema') throw new Error(`not a declare schema: ${stmt.type}`);
+		return stmt;
+	}
+
+	/**
+	 * Apply `baseline` as schema `main`, then diff a fresh `modified` declaration
+	 * against the resulting actual catalog. The baseline is applied so the actual
+	 * table round-trips with zero churn — only the index edit between `baseline` and
+	 * `modified` drives the returned diff. `policy` defaults to 'allow'.
+	 */
+	async function diffIndexEdit(baseline: string, modified: string, policy?: RenamePolicy): Promise<SchemaDiff> {
 		const db = new Database();
 		try {
-			await db.exec(`declare schema main {
-				table t { id INTEGER PRIMARY KEY, email TEXT NOT NULL }
-				unique index uq_email on t (email)
-			}`);
+			await db.exec(`declare schema main {\n${baseline}\n}`);
 			await db.exec('apply schema main');
-
-			// The actual-side index DDL now carries the UNIQUE keyword (generateIndexDDL).
 			const actual = collectSchemaCatalog(db, 'main');
+			return computeSchemaDiff(declaredSchemaOf(modified), actual, policy);
+		} finally {
+			await db.close();
+		}
+	}
+
+	/** Table shared by every index-edit case (identical in baseline + modified, so no table churn). */
+	const TABLE = `table t { id INTEGER PRIMARY KEY, name TEXT, email TEXT, active INTEGER }`;
+
+	it('an unchanged re-declared index produces no migration, and the actual DDL carries UNIQUE', async () => {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\n${TABLE}\nunique index uq_email on t (email)\n}`);
+			await db.exec('apply schema main');
+			const actual = collectSchemaCatalog(db, 'main');
+			// The actual-side index DDL now carries the UNIQUE keyword (generateIndexDDL).
 			expect(actual.indexes.find(i => i.name.toLowerCase() === 'uq_email')!.ddl)
 				.to.match(/^CREATE UNIQUE INDEX/);
-
-			// Diffing the same declaration against that catalog is a no-op: index
-			// matching is name-based, so the added UNIQUE keyword introduces no churn.
-			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
-			const diff = computeSchemaDiff(declared, actual);
+			// Re-diffing the same declaration is a no-op: the differ compares canonical
+			// bodies, and the declared UNIQUE matches the actual UNIQUE body (collation,
+			// excluded from the body, cannot churn either).
+			const diff = computeSchemaDiff(declaredSchemaOf(`${TABLE}\nunique index uq_email on t (email)`), actual);
 			expect(diff.indexesToCreate, 'no index creates').to.deep.equal([]);
 			expect(diff.indexesToDrop, 'no index drops').to.deep.equal([]);
+			expect(diff.indexTagsChanges, 'no tag changes').to.deep.equal([]);
 			expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an inherited-NOCASE unique index re-declares with no churn (collation excluded from body)', async () => {
+		const tbl = `table t { id INTEGER PRIMARY KEY, email TEXT collate nocase }`;
+		const diff = await diffIndexEdit(`${tbl}\nunique index uq_email on t (email)`, `${tbl}\nunique index uq_email on t (email)`);
+		expect(diff.indexesToCreate, 'no index creates').to.deep.equal([]);
+		expect(diff.indexesToDrop, 'no index drops').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
+	});
+
+	it('plain → UNIQUE drops + recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_email on t (email)`, `${TABLE}\nunique index ix_email on t (email)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_email']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/^create unique index/i);
+		expect(diff.indexTagsChanges, 'no separate SET TAGS').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'no table churn').to.deep.equal([]);
+	});
+
+	it('UNIQUE → plain drops + recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nunique index ix_email on t (email)`, `${TABLE}\nindex ix_email on t (email)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_email']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/^create index/i);
+		expect(diff.indexesToCreate[0], 'recreate drops the UNIQUE keyword').to.not.match(/unique/i);
+	});
+
+	it('adding a partial WHERE predicate recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active)`, `${TABLE}\nindex ix_active on t (active) where active = 1`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_active']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/where active = 1/i);
+	});
+
+	it('removing a partial WHERE predicate recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active) where active = 1`, `${TABLE}\nindex ix_active on t (active)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_active']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0], 'recreate drops the WHERE').to.not.match(/where/i);
+	});
+
+	it('changing a partial WHERE predicate recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active) where active = 1`, `${TABLE}\nindex ix_active on t (active) where active = 0`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_active']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/where active = 0/i);
+	});
+
+	it('a semantically-identical partial predicate does not churn', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active) where active = 1`, `${TABLE}\nindex ix_active on t (active) where active = 1`);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+	});
+
+	it('reordering index columns recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, active)`, `${TABLE}\nindex ix_comp on t (active, name)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_comp']);
+		expect(diff.indexesToCreate).to.have.length(1);
+	});
+
+	it('flipping a column direction (asc → desc) recreates the index', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, active)`, `${TABLE}\nindex ix_comp on t (name, active desc)`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_comp']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/active desc/i);
+	});
+
+	it('a tags-only change takes SET TAGS, not a recreate', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_name on t (name) with tags (purpose = 'a')`, `${TABLE}\nindex ix_name on t (name) with tags (purpose = 'b')`);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+		expect(diff.indexTagsChanges).to.deep.equal([{ name: 'ix_name', tags: { purpose: 'b' } }]);
+	});
+
+	it('a body change with a concurrent tags change is a single recreate, no SET TAGS', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_name on t (name) with tags (purpose = 'a')`, `${TABLE}\nunique index ix_name on t (name) with tags (purpose = 'b')`);
+		expect(diff.indexesToDrop).to.deep.equal(['ix_name']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/^create unique index/i);
+		expect(diff.indexesToCreate[0], 'recreate carries the declared tags').to.match(/purpose = 'b'/i);
+		expect(diff.indexTagsChanges, 'no separate SET TAGS').to.deep.equal([]);
+	});
+
+	it('a body-change recreate does not trip require-hint policy', async () => {
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_email on t (email)`, `${TABLE}\nunique index ix_email on t (email)`, 'require-hint');
+		expect(diff.indexesToDrop).to.deep.equal(['ix_email']);
+		expect(diff.indexesToCreate).to.have.length(1);
+	});
+
+	it('a genuine unhinted create + drop still trips require-hint policy', async () => {
+		let threw = false;
+		try {
+			await diffIndexEdit(`${TABLE}\nindex ix_old on t (email)`, `${TABLE}\nindex ix_new on t (email)`, 'require-hint');
+		} catch (e) {
+			threw = true;
+			expect((e as Error).message).to.match(/require-hint/i);
+		}
+		expect(threw, 'distinct-name create + drop must trip require-hint').to.equal(true);
+	});
+
+	it('applying an index body change converges (the drop + recreate executes, re-diff is empty)', async () => {
+		// End-to-end: exercise the real apply path (generateMigrationDDL → exec the
+		// DROP INDEX + CREATE UNIQUE INDEX pair), not just the diff decision.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix_email on t (email)\n}`);
+			await db.exec('apply schema main');
+
+			// Re-declare the same index as UNIQUE and re-apply — the migration drops
+			// and recreates it.
+			await db.exec(`declare schema main {\n${TABLE}\nunique index ix_email on t (email)\n}`);
+			await db.exec('apply schema main');
+
+			// The applied index is now UNIQUE…
+			const actual = collectSchemaCatalog(db, 'main');
+			expect(actual.indexes.find(i => i.name.toLowerCase() === 'ix_email')!.ddl).to.match(/^CREATE UNIQUE INDEX/);
+
+			// …and the declaration now matches the catalog (the migration converged —
+			// a third diff is empty).
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToCreate, 'converged: no creates').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'converged: no drops').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}

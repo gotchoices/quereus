@@ -23,7 +23,7 @@ import { maskToOps, isSynthesizedAllColumnsKey } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, tableConstraintsToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString } from '../emit/ast-stringify.js';
 import { normalizeCollationName } from '../util/comparison.js';
 
 /**
@@ -138,6 +138,35 @@ export function generateIndexDDL(
 	}
 
 	return parts.join(' ');
+}
+
+/**
+ * Canonical **body** string for a stored index (UNIQUE-ness, column
+ * set/order/direction, partial predicate) — the actual-catalog comparison key the
+ * declarative differ diffs against the declared-AST body (rendered by the same
+ * {@link createIndexBodyToCanonicalString}) to detect a name-matched index whose
+ * body changed (→ drop+recreate). The stored {@link IndexSchema} is first lifted
+ * into the equivalent minimal {@link AST.CreateIndexStmt} (column indices → names,
+ * `unique`, `predicate` → `where`), so both sides share one rendering path and
+ * stay byte-comparable — exactly as {@link constraintToCanonicalDDL} does via
+ * `schemaConstraintToTableConstraint`. Collation is excluded by the shared
+ * renderer (see its doc); `index` / `table` are placeholder identifiers the body
+ * render never reads (it excludes the name and the `on <table>` reference).
+ */
+export function indexToCanonicalDDL(indexSchema: IndexSchema, tableSchema: TableSchema): string {
+	const stmt: AST.CreateIndexStmt = {
+		type: 'createIndex',
+		index: { type: 'identifier', name: indexSchema.name },
+		table: { type: 'identifier', name: tableSchema.name },
+		ifNotExists: false,
+		columns: indexSchema.columns.map(col => ({
+			name: tableSchema.columns[col.index].name,
+			direction: col.desc ? 'desc' as const : undefined,
+		})),
+		isUnique: !!indexSchema.unique,
+		where: indexSchema.predicate,
+	};
+	return createIndexBodyToCanonicalString(stmt);
 }
 
 /**
