@@ -111,9 +111,13 @@ drop table custs;
 -- ===== Fan-out guard: right side NOT unique on the join column =====
 -- A plain `left join … exists right as` yields one row per MATCHING right row,
 -- so `where flag` fans out (K rows per matched left row). Recovery to a semi
--- join (1 row per left) would silently drop the duplicates — the rule must
--- abstain on the semi side. The anti side is immune (unmatched rows never fan
--- out) and still recovers. These assert the fanned-out row counts directly.
+-- join (1 row per left) would silently drop the duplicates — so the SEMI rule
+-- must abstain on the positive side. (The fanned-out positive cases are instead
+-- recovered to a fan-out-safe INNER join by `inner-join-existence-recovery`,
+-- which does NOT collapse K→1; see 08.3. Either way the rows below are identical,
+-- which is exactly what these assertions pin.) The anti side is immune (unmatched
+-- rows never fan out) and still recovers via the semi rule. These assert the
+-- fanned-out row counts directly.
 
 create table fc (cc integer primary key);
 create table fp (id integer primary key, pp integer);
@@ -121,12 +125,13 @@ insert into fc values (1), (2);
 -- cc 1 matches THREE fp rows (pp=1); cc 2 matches none.
 insert into fp values (10, 1), (11, 1), (12, 1);
 
--- semi probe: must keep all three fanned-out cc=1 rows (NOT collapse to one)
+-- semi probe over fan-out: SEMI rule abstains (would collapse to one); the inner
+-- fallback recovers an inner join that keeps all three fanned-out cc=1 rows.
 select cc from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc;
 → [{"cc":1},{"cc":1},{"cc":1}]
 
--- `is true` is also a SEMI probe and rides the same fan-out guard — it must abstain
--- too, keeping all three fanned-out cc=1 rows (not collapsing to one).
+-- `is true` is also a SEMI probe and rides the same fan-out guard — the semi rule
+-- abstains, the inner fallback recovers, keeping all three fanned-out cc=1 rows.
 select cc from fc c left join fp p on p.pp = c.cc exists right as h where h is true order by cc;
 → [{"cc":1},{"cc":1},{"cc":1}]
 
