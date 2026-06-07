@@ -119,7 +119,12 @@
  * must cover a unique key of R (`isUnique`), which holds for FK→PK joins (R's PK
  * covered) and ≤1-row R (the empty key). A non-equi / non-unique condition (where
  * a left row can match several R rows) makes the SEMI shape unsound and the rule
- * abstains. The condition is otherwise carried `J.condition` UNCHANGED: a residual
+ * abstains. **`rule-inner-join-existence-recovery` now picks up that abstention
+ * point:** a positive no-right-col probe over a fan-out (non-unique) R is recovered
+ * to a fan-out-safe **inner** join (which does NOT collapse K→1) — so the two rules
+ * partition the entire positive-probe space (unique-R → semi here; fan-out → inner
+ * fallback), both consulting the SAME `rightMatchesAtMostOne` so the boundary never
+ * drifts. The condition is otherwise carried `J.condition` UNCHANGED: a residual
  * conjunct on top of a covered unique key only narrows the ≤1 match further (still
  * ≤1), so the downstream IND folders may abstain on the residual and leave a plain
  * semi join — still a win.
@@ -344,8 +349,15 @@ export function analyzeChain(
  * ≤1-row right relation (the empty key, when there are no equi-pairs). Reads the
  * right side's full uniqueness surface — declared keys plus FD-derived keys via
  * `physical` — exactly as `JoinNode.computePhysical` does.
+ *
+ * Exported for `rule-inner-join-existence-recovery`, which consults the SAME
+ * predicate to decide its abstention boundary: it defers to this (semi) rule only
+ * where R is unique (≤1 match ⇒ the leaner semi join is sound and strictly
+ * better), and fires the fan-out-safe inner fallback where R is NOT unique (semi
+ * abstains here). Sharing one function makes the two rules agree on the
+ * unique/fan-out boundary by construction — no drift.
  */
-function rightMatchesAtMostOne(join: JoinNode): boolean {
+export function rightMatchesAtMostOne(join: JoinNode): boolean {
 	const leftAttrs = join.left.getAttributes();
 	const rightAttrs = join.right.getAttributes();
 	const pairs = extractEquiPairsFromCondition(join.condition, leftAttrs, rightAttrs);

@@ -79,6 +79,31 @@ async function resultsNoRecovery(db: Database, sql: string): Promise<ResultRow[]
 	}
 }
 
+/**
+ * Stronger baseline: disable BOTH existence-recovery rules so the flag-bearing
+ * nested-loop left join survives. Needed for the no-right-col fan-out cases —
+ * disabling only the inner rule leaves the semi rule live, and although it abstains
+ * on its own fan-out guard (so the default `resultsNoRecovery` would coincidentally
+ * agree), disabling both states the genuine nested-loop+flag baseline explicitly
+ * (mirroring the right-col inner test in the sibling semi spec).
+ */
+async function resultsNoEitherRecovery(db: Database, sql: string): Promise<ResultRow[]> {
+	const base = db.optimizer.tuning;
+	db.optimizer.updateTuning({
+		...base,
+		disabledRules: new Set([
+			...(base.disabledRules ?? []),
+			'semijoin-existence-recovery',
+			'inner-join-existence-recovery',
+		]),
+	});
+	try {
+		return await results(db, sql);
+	} finally {
+		db.optimizer.updateTuning(base);
+	}
+}
+
 describe('ruleInnerJoinExistenceRecovery', () => {
 	let db: Database;
 
@@ -103,11 +128,31 @@ describe('ruleInnerJoinExistenceRecovery', () => {
 	// (pp=1), cc=2 matches none. A plain `left join … where flag` FANS OUT (K rows
 	// per matched left row); a semi rewrite would (wrongly) collapse to one. An
 	// INNER join keeps all K — the headline capability the semi rule cannot do.
+	// Deliberately TINY (2×3): nested-loop cost stays below hash here, so physical
+	// selection leaves a nested-loop inner join — this fixture isolates the
+	// joinType-flip + row-equality, not the physical-join payoff.
 	async function setupFanOut(): Promise<void> {
 		await db.exec('create table fchild (cc integer primary key) using memory');
 		await db.exec('create table fparent (id integer primary key, pp integer) using memory');
 		await db.exec('insert into fchild values (1), (2)');
 		await db.exec('insert into fparent values (10, 1), (11, 1), (12, 1)');
+	}
+
+	// Larger fan-out (no right column demanded): 8 left rows, each matching 3 right
+	// rows (24 right rows), the right side non-unique on the join column. Sized so
+	// hash cost < nested-loop cost ⇒ after the inner fallback drops the flag,
+	// `join-physical-selection` picks a physical join. This is the fan-out payoff the
+	// flag-bearing nested-loop left join pinned shut.
+	async function setupLargeFanOut(): Promise<void> {
+		await db.exec('create table gchild (cc integer primary key) using memory');
+		await db.exec('create table gparent (id integer primary key, pp integer) using memory');
+		await db.exec('insert into gchild values (1), (2), (3), (4), (5), (6), (7), (8)');
+		// each cc in 1..8 matches three gparent rows (ids offset by 0/100/200).
+		const vals: string[] = [];
+		for (let cc = 1; cc <= 8; cc++) {
+			vals.push(`(${cc}, ${cc})`, `(${100 + cc}, ${cc})`, `(${200 + cc}, ${cc})`);
+		}
+		await db.exec(`insert into gparent values ${vals.join(', ')}`);
 	}
 
 	describe('inner recovery (where flag + right column demanded)', () => {
@@ -190,6 +235,77 @@ describe('ruleInnerJoinExistenceRecovery', () => {
 		});
 	});
 
+	describe('fan-out fallback (NO right column demanded — the leftover case the semi rule abstains on)', () => {
+		it('keeps all K fanned-out rows — inner recovery even with no right column demanded', async () => {
+			await setupFanOut();
+			// No right column is selected (only c.cc), but cc=1 matches three fparent
+			// rows. The semi rule abstains on its fan-out guard (a semi join would
+			// collapse the three to one); the inner fallback fires and keeps all three.
+			const q =
+				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where h order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
+
+			const out = await results(db, q);
+			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
+		});
+
+		it('SEMI probe via `is true` over fan-out rides the same inner fallback', async () => {
+			await setupFanOut();
+			const q =
+				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where h is true order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
+
+			const out = await results(db, q);
+			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
+		});
+
+		it('negative probe `where not h` over fan-out stays a left join (anti via the semi rule)', async () => {
+			await setupFanOut();
+			// Anti is fan-out-immune (unmatched rows never duplicate) and the inner
+			// fallback only fires on a positive probe — so this is recovered to an ANTI
+			// join by the semi rule, NOT an inner join, and the flag is dropped there.
+			const q =
+				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where not h order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows), 'anti recovered by the semi rule, not inner').to.equal('anti');
+
+			const out = await results(db, q);
+			expect(out.map(r => r.cc)).to.deep.equal([2]);
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
+		});
+
+		it('re-enables physical join selection on a fan-out sized so hash < nested-loop (the payoff)', async () => {
+			await setupLargeFanOut();
+			// 8 left × 24 right, right non-unique on the join column. Dropping the flag
+			// re-opens join-physical-selection, which picks a physical join (hash/merge)
+			// because nested-loop cost is quadratic on these counts. This is the win the
+			// flag-bearing nested-loop left join pinned shut.
+			const q =
+				'select c.cc as cc from gchild c left join gparent p on p.pp = c.cc exists right as h where h order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
+			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(true);
+
+			const out = await results(db, q);
+			// 8 distinct cc, each fanning out to three rows = 24 rows, byte-identical to
+			// the flag-bearing nested-loop baseline.
+			expect(out.length).to.equal(24);
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
+		});
+	});
+
 	describe('residual AND-conjunct (split, retained above the inner join)', () => {
 		it('`where hasP and cv > 150` recovers an inner join with the residual filter retained', async () => {
 			await seedExisting();
@@ -226,14 +342,18 @@ describe('ruleInnerJoinExistenceRecovery', () => {
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
 		});
 
-		it('no right column demanded ⇒ semijoin-existence-recovery wins (semi, NOT inner)', async () => {
+		it('no right column demanded + UNIQUE right ⇒ semijoin-existence-recovery wins (semi, NOT inner)', async () => {
 			await seedExisting();
+			// exp.pp is the PK, so R is unique on the join column (≤1 match per left
+			// row). The inner fallback's gate (`!rightColDemanded && rightMatchesAtMostOne`)
+			// defers to the leaner semi join here — locking the two rules' disjointness on
+			// the unique-R half (the fan-out half is covered by the fan-out fallback block).
 			const q =
 				'select c.cc as cc from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP order by c.cc';
 
 			const rows = await planRows(db, q);
 			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
-			expect(joinTypeOf(rows), 'semi rule wins the no-right-col half').to.equal('semi');
+			expect(joinTypeOf(rows), 'semi rule wins the unique-R/no-right-col half').to.equal('semi');
 
 			const out = await results(db, q);
 			expect(out.map(r => r.cc)).to.deep.equal([1, 3]);

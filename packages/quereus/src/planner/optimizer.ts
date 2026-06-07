@@ -424,16 +424,18 @@ export class Optimizer {
 			sideEffectMode: 'aware',
 		});
 
-		// Inner-join existence-flag recovery (demand-SHAPE gated): the right-column-
-		// demanded complement of `semijoin-existence-recovery`. When the sole
-		// `exists … as` flag on a `left join` is a POSITIVE top-level probe
-		// (`where flag`) AND ≥1 right-side column is demanded above the join, rewrite
-		// the JoinNode to a plain `inner join` (drop the flag, keep both sides) —
-		// re-opening physical join selection, non-nullable right typing, and the
-		// FK/IND cascade the live flag pinned shut. Registered immediately AFTER
-		// `semijoin-existence-recovery` (so the semi rule wins its no-right-col half;
-		// the two partition the positive-probe space by the right-col predicate and
-		// never both fire) and (in registration order) BEFORE `fanout-lookup-join` /
+		// Inner-join existence-flag recovery (demand-SHAPE gated): the fallback
+		// complement of `semijoin-existence-recovery`. When the sole `exists … as`
+		// flag on a `left join` is a POSITIVE top-level probe (`where flag`) AND
+		// EITHER ≥1 right-side column is demanded above the join OR R fans out
+		// (non-unique on the join column, where a semi join would unsoundly collapse
+		// duplicates), rewrite the JoinNode to a plain `inner join` (drop the flag,
+		// keep both sides) — re-opening physical join selection, non-nullable right
+		// typing, and the FK/IND cascade the live flag pinned shut. The two recovery
+		// rules consult the SAME `rightMatchesAtMostOne` and so are provably disjoint
+		// on the positive-probe space INDEPENDENT of registration order (semi fires
+		// iff !rightColDemanded && unique-R; inner iff rightColDemanded || !unique-R).
+		// Registered (in registration order) BEFORE `fanout-lookup-join` /
 		// `join-elimination` (24) / the Join-typed IND folders (26) so the recovered
 		// inner join threads into them in the same applyRules loop.
 		this.passManager.addRuleToPass(PassId.Structural, {

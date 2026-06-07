@@ -1,18 +1,27 @@
 /**
  * Rule: Inner-Join Existence-Flag Recovery (demand-SHAPE gated)
  *
- * The demand-SHAPE **complement** of `rule-semijoin-existence-recovery`. The semi
- * rule recovers a semi/anti join from a probe-only `exists … as` flag, but
- * abstains the moment a right-side column is demanded above the join (a semi join
- * exposes left columns only, so it would drop the very right columns the caller
- * needs). This rule handles exactly that abstention point: a **positive** probe
- * (`where flag` ⇒ `semi` polarity) **with ≥1 right-side column demanded** rewrites
- * the flag-bearing `left join` to a plain **inner join** — dropping the flag,
- * keeping both sides.
+ * The **fallback complement** of `rule-semijoin-existence-recovery`. The semi rule
+ * recovers a semi/anti join from a probe-only `exists … as` flag, but abstains on
+ * TWO shapes of a POSITIVE probe: (a) a right-side column is demanded above the
+ * join (a semi join exposes left columns only, so it would drop the very right
+ * columns the caller needs), or (b) R **fans out** — a left row matches >1 right
+ * row — where a semi join would (unsoundly) collapse K→1, dropping the duplicate
+ * rows. This rule handles BOTH abstention points: a **positive** probe
+ * (`where flag` ⇒ `semi` polarity) where **a right column is demanded OR R fans
+ * out** rewrites the flag-bearing `left join` to a plain **inner join** — dropping
+ * the flag, keeping both sides, and (unlike a semi join) preserving every
+ * fanned-out match. Together the two rules partition the ENTIRE positive-probe space.
  *
+ *   -- (a) right column demanded → keep R
  *   select c.cc, p.pv
  *     from exc c left join exp p on p.pp = c.pr exists right as hasP
  *     where hasP;        -- ⇒ inner join (matched rows only; p.pv is needed → keep R)
+ *
+ *   -- (b) no right column, but R fans out (cc=1 matches 3 rows) → semi would lose dups
+ *   select c.cc
+ *     from fc c left join fp p on p.pp = c.cc exists right as h
+ *     where h;           -- ⇒ inner join (all K fanned rows kept; semi abstains here)
  *
  * Like the sibling, this is a **pure optimization** — byte-identical rows to the
  * flag-bearing nested-loop baseline — that re-opens inner-join physical selection
@@ -34,9 +43,12 @@
  * rows per matched left row and drops the unmatched. **Identical, row-for-row, for
  * ANY condition.** Three consequences distinguish this rule from the semi rule:
  *
- *  - **No fan-out guard.** The semi rule needs `rightMatchesAtMostOne` because a
- *    semi join collapses K→1; an inner join does not collapse, so K matches stay
- *    K. We do NOT import the uniqueness / `isUnique` machinery.
+ *  - **No fan-out guard needed for soundness.** A semi join collapses K→1, so the
+ *    semi rule needs `rightMatchesAtMostOne`; an inner join does not collapse, so K
+ *    matches stay K and this conversion is sound under ANY fan-out. We DO import
+ *    `rightMatchesAtMostOne`, but only to locate the abstention boundary — defer to
+ *    the leaner semi join exactly where it is sound (unique R, no right col) — never
+ *    as a precondition for our own correctness.
  *  - **No condition-shape restriction.** Unlike `join-elimination` (AND-of-
  *    equalities + FK→PK), the inner conversion replays the flag's exact per-pair
  *    match, so non-equi / residual ON conditions are fine — carry `join.condition`
@@ -69,20 +81,32 @@
  *
  * ## Relationship to `semijoin-existence-recovery` (disjoint by construction)
  *
- *  | Probe              | Right col demanded? | Fires                          | Result        |
- *  |--------------------|---------------------|--------------------------------|---------------|
- *  | `where flag` (semi)| NO                  | `semijoin-existence-recovery`  | `semi(L,R,c)` |
- *  | `where not f` (anti)| NO                 | `semijoin-existence-recovery`  | `anti(L,R,c)` |
- *  | `where flag` (semi)| **YES**             | **this rule**                  | `inner join`  |
- *  | `where not f` (anti)| YES                | *neither*                      | stays `left`  |
+ *  | Probe                | Right col demanded? | R unique? | Fires                         | Result        |
+ *  |----------------------|---------------------|-----------|-------------------------------|---------------|
+ *  | `where flag` (semi)  | NO                  | **yes**   | `semijoin-existence-recovery` | `semi(L,R,c)` |
+ *  | `where flag` (semi)  | NO                  | **no**    | **this rule** (fan-out)       | `inner join`  |
+ *  | `where flag` (semi)  | **YES**             | any       | **this rule**                 | `inner join`  |
+ *  | `where not f` (anti) | NO                  | any       | `semijoin-existence-recovery` | `anti(L,R,c)` |
+ *  | `where not f` (anti) | YES                 | any       | *neither*                     | stays `left`  |
  *
- * The two recovery rules partition the positive-probe space by the
- * right-column-demanded predicate, so they never both fire on one node. The
- * negative-probe + right-col case stays a `left` join: an anti row has the right
+ * On the positive-probe space (anti is excluded by `polarity === 'semi'`) the two
+ * rules are DISJOINT independent of registration order, because both consult the
+ * SAME `rightMatchesAtMostOne`:
+ *
+ *   - semi fires iff:  `!rightColDemanded && unique-R`
+ *   - inner fires iff: `rightColDemanded || !unique-R`
+ *   - intersection = `!rightColDemanded && unique-R && (rightColDemanded || !unique-R)` = ∅
+ *
+ * So correctness-of-optimization no longer leans on "registered after so semi wins"
+ * — the gates are provably non-overlapping, and either registration order yields
+ * the same fixpoint (semi then inner at priority 23 is now merely conventional).
+ * The negative-probe + right-col case stays a `left` join: an anti row has the right
  * side all-NULL, so an inner join would be wrong (guarded by `polarity === 'semi'`).
- * Registered AFTER the semi rule (so semi wins its no-right-col half) and BEFORE
- * `join-elimination` / the IND folders (so the recovered inner join threads into
- * them in the same `applyRules` loop).
+ * Registered BEFORE `join-elimination` / the IND folders so the recovered inner join
+ * threads into them in the same `applyRules` loop. Under the fallback's own domain
+ * (no right col, NON-unique R) `join-elimination` cannot fire on the result anyway —
+ * it requires an at-most-one unique FK→PK alignment, which the fan-out precondition
+ * contradicts — so the win there is hash/merge join only.
  *
  * ## `sideEffectMode: 'aware'` + impure-R guard
  *
@@ -108,7 +132,7 @@ import { ProjectNode } from '../../nodes/project-node.js';
 import { JoinNode } from '../../nodes/join-node.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { walkChain, rebuildProject } from './rule-join-elimination.js';
-import { analyzeChain, rebuildChainStrippingProbe } from './rule-semijoin-existence-recovery.js';
+import { analyzeChain, rebuildChainStrippingProbe, rightMatchesAtMostOne } from './rule-semijoin-existence-recovery.js';
 
 const log = createLogger('optimizer:rule:inner-join-existence-recovery');
 
@@ -150,11 +174,17 @@ export function ruleInnerJoinExistenceRecovery(node: PlanNode, _context: OptCont
 	// selected or sorted on lands in `demanded` via projections / sort keys).
 	if (demanded.has(flagId)) return null;
 
-	// The complement gate: ≥1 right-side column demanded. Without a right column
-	// this defers to `semijoin-existence-recovery` (its semi half), which produces
-	// the leaner semi join. With one, only the inner conversion preserves it.
+	// The gate: fire on a positive probe whenever a right column is demanded OR R
+	// fans out. Defer to `semijoin-existence-recovery` ONLY where it can actually
+	// fire — no right column demanded AND R unique on the join column (≤1 match ⇒
+	// the leaner semi join is sound and strictly better: collapses to L, folds via
+	// the IND cascade). When R fans out (non-unique), the semi rule abstains on its
+	// own fan-out guard and the sound inner join is the only win available here. The
+	// two rules share `rightMatchesAtMostOne`, so they are provably disjoint
+	// independent of registration order (see the header partition table).
 	const rightAttrIds = join.right.getAttributes().map(a => a.id);
-	if (!rightAttrIds.some(id => demanded.has(id))) return null;
+	const rightColDemanded = rightAttrIds.some(id => demanded.has(id));
+	if (!rightColDemanded && rightMatchesAtMostOne(join)) return null;
 
 	// Dropping the flag re-enables `join-physical-selection`, which can pick a hash
 	// join that scans R once total — refuse to change an impure R's execution count.

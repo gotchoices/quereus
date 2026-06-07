@@ -82,6 +82,30 @@ async function resultsNoRecovery(db: Database, sql: string): Promise<ResultRow[]
 	}
 }
 
+/**
+ * Stronger baseline: disable BOTH existence-recovery rules so the flag-bearing
+ * nested-loop left join survives even where the inner fallback would otherwise
+ * fire (a positive probe with a right column demanded, or over a fan-out R). Used
+ * by those cases, where `resultsNoRecovery` (semi-only disabled) would itself be
+ * inner-recovered.
+ */
+async function resultsNoEitherRecovery(db: Database, sql: string): Promise<ResultRow[]> {
+	const base = db.optimizer.tuning;
+	db.optimizer.updateTuning({
+		...base,
+		disabledRules: new Set([
+			...(base.disabledRules ?? []),
+			'semijoin-existence-recovery',
+			'inner-join-existence-recovery',
+		]),
+	});
+	try {
+		return await results(db, sql);
+	} finally {
+		db.optimizer.updateTuning(base);
+	}
+}
+
 describe('ruleSemijoinExistenceRecovery', () => {
 	let db: Database;
 
@@ -401,28 +425,12 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			// the semi rule, leaving the inner rule live — that baseline would itself
 			// be inner-recovered, a near-tautology. The strong baseline lives in
 			// rule-inner-join-existence-recovery.spec.ts; this asserts it too.)
-			const base = db.optimizer.tuning;
-			db.optimizer.updateTuning({
-				...base,
-				disabledRules: new Set([
-					...(base.disabledRules ?? []),
-					'semijoin-existence-recovery',
-					'inner-join-existence-recovery',
-				]),
-			});
-			let baseline: ResultRow[];
-			try {
-				baseline = await results(db, q);
-			} finally {
-				db.optimizer.updateTuning(base);
-			}
-
 			const out = await results(db, q);
 			expect(out).to.deep.equal([
 				{ cc: 1, pv: 10 },
 				{ cc: 3, pv: 20 },
 			]);
-			expect(out).to.deep.equal(baseline);
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
 		});
 
 		it('flag sorted on: `… where hasP order by hasP` keeps the flag', async () => {
@@ -471,38 +479,42 @@ describe('ruleSemijoinExistenceRecovery', () => {
 	});
 
 	describe('fan-out guard (non-unique right join column)', () => {
-		it('SEMI must NOT fire when a left row can match >1 right row (fan-out would lose duplicate rows)', async () => {
+		it('SEMI abstains under fan-out; the inner fallback recovers a fan-out-safe inner join', async () => {
 			await setupFanOut();
 			// cc=1 matches three fparent rows ⇒ the flag-bearing left join yields THREE
-			// rows for cc=1; a semi join would yield one. Recovery must abstain.
+			// rows for cc=1; a semi join would (wrongly) collapse to one, so the SEMI
+			// rule abstains on its fan-out guard. `inner-join-existence-recovery` then
+			// recovers a plain inner join — which does NOT collapse — keeping all three
+			// rows. The result is NOT a `semi` join (joinType is `inner`, flag dropped).
 			const q =
 				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where h order by c.cc';
 
 			const rows = await planRows(db, q);
-			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as h']);
-			expect(joinTypeOf(rows)).to.equal('left');
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
 
 			const out = await results(db, q);
-			// The baseline fans out to three identical [cc=1] rows — the row count that
-			// a (wrongly) recovered semi join would have collapsed to one.
+			// All three fanned-out [cc=1] rows survive — the row count a (wrongly)
+			// recovered semi join would have collapsed to one.
 			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
-			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
 		});
 
-		it('SEMI via `is true` rides the SAME guard and must NOT fire under fan-out', async () => {
+		it('SEMI via `is true` also abstains under fan-out and rides the inner fallback', async () => {
 			await setupFanOut();
-			// `is true` is a SEMI probe just like a bare `where flag`; it must not
-			// bypass the fan-out guard. cc=1 still fans out to three rows.
+			// `is true` is a SEMI probe just like a bare `where flag`; it must not be
+			// (wrongly) collapsed under fan-out either. The SEMI rule abstains and the
+			// inner fallback recovers a fan-out-safe inner join keeping all three rows.
 			const q =
 				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where h is true order by c.cc';
 
 			const rows = await planRows(db, q);
-			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as h']);
-			expect(joinTypeOf(rows)).to.equal('left');
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
 
 			const out = await results(db, q);
 			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
-			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+			expect(out).to.deep.equal(await resultsNoEitherRecovery(db, q));
 		});
 
 		it('ANTI still fires under fan-out (unmatched rows never duplicate)', async () => {

@@ -1,8 +1,10 @@
 -- 08.3-existence-flag-inner-recovery.sqllogic
--- The demand-SHAPE complement of 08.2: a POSITIVE probe-only outer-join
--- `exists … as` flag (`where flag`) WITH a right-side column demanded above the
--- join is recovered to a plain INNER join (flag dropped, both sides kept). Pure
--- optimization — these assert end-to-end result correctness against real data.
+-- The fallback complement of 08.2: a POSITIVE probe-only outer-join `exists … as`
+-- flag (`where flag`) is recovered to a plain INNER join (flag dropped, both sides
+-- kept) whenever a semi join would be wrong or impossible — either a right-side
+-- column is demanded above the join, OR R fans out (non-unique on the join column,
+-- where a semi join would collapse duplicates). Pure optimization — these assert
+-- end-to-end result correctness against real data.
 
 -- ===== No declared FK: positive probe + right column recovers to an inner join =====
 
@@ -51,7 +53,7 @@ select cc, hasP, pv from ec c left join ep p on p.pp = c.pr exists right as hasP
 drop table ec;
 drop table ep;
 
--- ===== Fan-out + right column: the case the semi rule cannot handle =====
+-- ===== Fan-out: the case the semi rule cannot handle =====
 -- A plain `left join … exists right as` yields one row per MATCHING right row, so
 -- a left row with K matches fans out to K rows. An inner join keeps all K (no
 -- collapse), unlike a semi join — this is the headline capability of this rule.
@@ -62,8 +64,23 @@ insert into fc values (1), (2);
 -- cc 1 matches THREE fp rows (pp=1); cc 2 matches none.
 insert into fp values (10, 1), (11, 1), (12, 1);
 
+-- with a right column demanded ⇒ inner join, all three fanned rows kept
 select cc, id from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc, id;
 → [{"cc":1,"id":10},{"cc":1,"id":11},{"cc":1,"id":12}]
+
+-- NO right column demanded, but R fans out (non-unique): the semi rule abstains on
+-- its fan-out guard, so the inner fallback recovers a fan-out-safe inner join that
+-- keeps all three rows (a semi join would have collapsed them to one).
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- `is true` positive probe over the fan-out rides the same fallback
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h is true order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- negative probe stays anti (fan-out-immune; unmatched rows never duplicate)
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where not h order by cc;
+→ [{"cc":2}]
 
 drop table fc;
 drop table fp;
