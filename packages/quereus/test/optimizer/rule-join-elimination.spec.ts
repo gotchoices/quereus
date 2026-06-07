@@ -378,5 +378,78 @@ describe('ruleJoinElimination', () => {
 			const out = await results(db, q);
 			expect(out).to.deep.equal([{ n: 3 }]);
 		});
+
+		it('eliminates the LEFT join under count(*) when a left-side predicate folds through the wrapper chain', async () => {
+			await setupCustomersOrders();
+			// A WHERE over a left-side column (orders.total) lands as a Filter between
+			// the Aggregate and the LEFT join. walkChain folds it into `demanded`; the
+			// referenced attr is left-side, so `usesRight` stays false and the join is
+			// still eliminated. Exercises the wrapper-chain path on the outer anchor
+			// (the bare Aggregate → Join shape is covered above).
+			const q =
+				'SELECT count(*) AS n FROM orders LEFT JOIN customers ' +
+				'ON orders.customer_id = customers.id WHERE orders.total > 20';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			// totals 99.0 / 49.5 / 12.0 ⇒ two rows above 20.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('eliminates a RIGHT join under count(*) — and thereby answers a query RIGHT-emit cannot run', async () => {
+			await setupCustomersOrders();
+			// `customers RIGHT JOIN orders` preserves orders (right) and carries the
+			// FK on the preserved side (orders.customer_id → customers.id), so each
+			// preserved row matches ≤1 eliminated (customers) row: the sound mirror of
+			// the LEFT arm. RIGHT-JOIN execution is unimplemented (emit throws
+			// "RIGHT JOIN is not supported yet"), so eliminating the join is the ONLY
+			// way this query produces a result — disabling the rule re-exposes the
+			// throw, which the contrast below asserts.
+			const q =
+				'SELECT count(*) AS n FROM customers RIGHT JOIN orders ON orders.customer_id = customers.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+
+			// With the rule disabled the RIGHT join survives to emit and throws.
+			let threw: string | undefined;
+			try {
+				await resultsNoAggElim(db, q);
+			} catch (e) {
+				threw = (e as Error).message;
+			}
+			expect(threw, 'RIGHT-emit should throw when the join is not eliminated').to.match(/RIGHT JOIN is not supported/i);
+		});
+
+		it('eliminates the LEFT join under count(*) for an aligned composite FK', async () => {
+			// Multi-column checkFkPkAlignment on the outer anchor: the misaligned
+			// composite abstain is covered for INNER (Project anchor); this confirms
+			// the aligned composite SUCCESS path eliminates under the aggregate-LEFT
+			// anchor too. Composite FK (fa, fb) REFERENCES pcomp(a, b), paired in
+			// declaration order, so checkFkPkAlignment reports alignment.
+			await db.exec(
+				"CREATE TABLE pcomp (a INTEGER NOT NULL, b INTEGER NOT NULL, label TEXT, PRIMARY KEY (a, b)) USING memory",
+			);
+			await db.exec(
+				"CREATE TABLE ccomp (id INTEGER PRIMARY KEY, fa INTEGER NOT NULL, fb INTEGER NOT NULL, FOREIGN KEY (fa, fb) REFERENCES pcomp(a, b)) USING memory",
+			);
+			await db.exec("INSERT INTO pcomp VALUES (1, 10, 'p1'), (2, 20, 'p2')");
+			await db.exec("INSERT INTO ccomp VALUES (100, 1, 10), (101, 2, 20)");
+
+			const q = 'SELECT count(*) AS n FROM ccomp c LEFT JOIN pcomp p ON p.a = c.fa AND p.b = c.fb';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
 	});
 });
