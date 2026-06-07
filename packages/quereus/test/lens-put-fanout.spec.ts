@@ -1655,6 +1655,99 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		}
 	});
 
+	it('enforces a single-member CHECK on INSERT: a violating INSERT ABORTs and persists nothing (atomic)', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// The regression this ticket pins. `length(title) < 5` references only title (→ Doc_core),
+			// so its write-row {title} resolves on the anchor member insert ⇒ it rides that op and
+			// fires on INSERT, exactly as on UPDATE. A too-long title ABORTs the whole fan-out.
+			await expectThrows(
+				() => db.exec("insert into x.Doc (docKey, title, body) values ('kX', 'toolong', 'bX')"),
+				/check|constraint|titlelen/i);
+			// Atomic: the anchor member insert fires first, but the aborted statement rolls the whole
+			// fan-out back — no partial Doc_core (or Doc_body) row survives for the new key.
+			expect(await rows(db, "select doc_key from main.Doc_core where doc_key = 'kX'")).to.deep.equal([]);
+			expect(await rows(db, "select docKey from x.Doc where docKey = 'kX'")).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('passes a valid single-member-CHECK INSERT: a short-title row inserts and round-trips', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// The dual of the ABORT above — guards against over-deferral / a false ABORT. A short
+			// title satisfies `length(title) < 5`, and `title <> note` holds (no note supplied), so
+			// the INSERT succeeds and the logical row round-trips through the view.
+			await db.exec("insert into x.Doc (docKey, title, body) values ('kok', 'ok', 'bok')");
+			expect(await rows(db, "select docKey, title, body from x.Doc where docKey = 'kok'"))
+				.to.deep.equal([{ docKey: 'kok', title: 'ok', body: 'bok' }]);
+			expect(await rows(db, "select doc_key, title from main.Doc_core where doc_key = 'kok'"))
+				.to.deep.equal([{ doc_key: 'kok', title: 'ok' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('INSERT boundary: a single-member CHECK ABORTs even while the cross-member CHECK is deferred', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// The precise gate boundary on INSERT: supplying a too-long title that ALSO equals note
+			// violates BOTH `length(title) < 5` (single-member, write-row {title} ⇒ rides Doc_core)
+			// and `title <> note` (cross-member, write-row {title, note} ⇒ rides nothing ⇒ deferred).
+			// The single-member CHECK still ABORTs the INSERT — the cross-member deferral does not
+			// suppress the enforced one.
+			await expectThrows(
+				() => db.exec("insert into x.Doc (docKey, title, body, note) values ('kB', 'toolong', 'bB', 'toolong')"),
+				/check|constraint|titlelen/i);
+			expect(await rows(db, "select doc_key from main.Doc_core where doc_key = 'kB'")).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('enforces the commit-time set-level key on INSERT: a duplicate logical key ABORTs at commit', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// The fixture's logical PK `docKey` has no basis UNIQUE (Doc_core's PK is the surrogate
+			// `sid`), so it enforces via the commit-time count CHECK over `NEW.doc_key` — which rides
+			// the anchor (Doc_core) member insert and auto-defers to commit. The seed already holds
+			// 'k1' (inserted directly into the basis), so a fresh INSERT of 'k1' through the lens mints
+			// a new surrogate sid (the anchor insert itself succeeds), then at commit the count sees
+			// two rows with doc_key='k1' ⇒ ABORT. (A short title keeps the row-local CHECK happy.)
+			await expectThrows(
+				() => db.exec("insert into x.Doc (docKey, title, body) values ('k1', 'dup', 'bd')"),
+				/check|constraint|unique|primary/i);
+			// Atomic at commit: the speculative anchor row is rolled back, leaving the single seed row.
+			expect(await rows(db, "select count(*) as n from main.Doc_core where doc_key = 'k1'"))
+				.to.deep.equal([{ n: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects insert-or-replace on a commit-time set-level decomposition up front (not a silent commit ABORT)', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// The decomposition INSERT path threads the commit-time set-level count CHECK now, so its
+			// `rejectLensSetLevelConflictResolution` gate must fire here too (it sits below the
+			// decomposition early-return in `buildViewMutation`, so `buildDecompositionInsert` runs it
+			// itself). `docKey` has no basis covering structure ⇒ commit-time only ⇒ `or replace`
+			// cannot be honored row-time, so it is rejected at plan time rather than silently ABORTing
+			// at commit.
+			await expectThrows(
+				() => db.exec("insert or replace into x.Doc (docKey, title, body) values ('k1', 'dup', 'bd')"),
+				/replace|conflict|covering structure|commit-time/i);
+		} finally {
+			await db.close();
+		}
+	});
+
 	// Subquery-bearing row-local CHECK gating (`lens-decomp-row-local-subquery-metadata-gate`).
 	// A logical row-local CHECK may contain a subquery (Quereus supports it — auto-deferred to
 	// commit), e.g. `check (exists (select 1 from Allowed where Allowed.name = title))`. Its

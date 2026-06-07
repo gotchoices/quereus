@@ -565,9 +565,24 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
  * `default`) when the shared key is a surrogate. Every member reads the same
  * materialized envelope, so the default is evaluated once per produced row and the
  * value threads identically across the fan-out.
+ *
+ * Lens constraint obligations (row-local CHECK / child-side FK / set-level uniqueness)
+ * ride the member inserts under the SAME per-op resolvability gate the decomposition
+ * UPDATE path uses (`constraintsForOp`): a single-member-resolvable obligation fires on
+ * the member that owns its write-row columns; a cross-member one resolves on no single
+ * member op and stays deferred. A plain (non-lens) decomposition collects none.
  */
 function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
 	const storage = decompositionStorage(ctx, view)!; // guaranteed by the caller's gate
+
+	// This path early-returns from `buildViewMutation` before its `rejectLensSetLevelConflictResolution`
+	// gate (the decomposition routing sits above it), so run the gate here too. Now that the fan-out
+	// threads the commit-time set-level count CHECK (below), an `insert or replace` / `or ignore` /
+	// upsert through a decomposition with a commit-time set-level key would otherwise silently
+	// ABORT-at-commit instead of getting the documented up-front diagnostic (docs/lens.md
+	// § Enforcement by constraint class). A plain insert / `or abort` is unaffected.
+	rejectLensSetLevelConflictResolution(ctx, view, { op: 'insert', stmt });
+
 	const plan = analyzeDecompositionInsert(ctx, view, storage, stmt);
 
 	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.keyDefault);
@@ -582,8 +597,38 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	// projection keeps them bound while downstream rows are produced.
 	const memberNewRowScope = buildMemberDefaultRowScope(ctx, plan.suppliedColumns, envelopeAttrs);
 
+	// Lens enforcement on the decomposition INSERT fan-out — the dual of the per-op gate the
+	// decomposition UPDATE path runs in `buildViewMutation` (the `extraConstraints` /
+	// `constraintsForOp` seam). Collect the three INSERT-applicable lens constraint classes —
+	// row-local CHECK, child-side FK existence, and commit-time set-level uniqueness —
+	// synthesized in *basis* terms. Parent-side FK is DELETE/UPDATE-only (an INSERT cannot
+	// orphan a logical child), so it is deliberately NOT collected here. Each constraint is
+	// gated per member op by `constraintsForOp`: a single-member-resolvable obligation (every
+	// write-row column it references lives on one member's table) rides that member insert and
+	// fires; a cross-member obligation resolves on no single member op ⇒ rides none ⇒ stays
+	// deferred (the documented, deliberately-weaker contract — the same boundary the UPDATE
+	// fan-out draws). For a plain (non-lens) decomposition all three collectors return `[]`,
+	// so this path pays nothing.
+	const extraConstraints = [
+		...lensRowLocalConstraints(ctx, view),
+		...lensForeignKeyConstraints(ctx, view),
+		...lensSetLevelConstraints(ctx, view),
+	];
+	const riddenConstraints = new Set<RowConstraintSchema>();
+
 	const baseOps = plan.ops.map(op =>
-		buildDecompositionMemberInsert(ctx, stmt, descriptor, envelopeAttrs, envelopeType, op, memberNewRowScope));
+		buildDecompositionMemberInsert(
+			ctx, stmt, descriptor, envelopeAttrs, envelopeType, op, memberNewRowScope,
+			constraintsForOp(op, extraConstraints, riddenConstraints)));
+
+	// A lens constraint that resolves on NO member op of the fan-out (a cross-member CHECK /
+	// FK / set-level key) is silently deferred — trace it so the non-enforcement is visible in
+	// debug logs, mirroring the UPDATE fan-out's trace loop in `buildViewMutation`.
+	for (const c of extraConstraints) {
+		if (!riddenConstraints.has(c)) {
+			log('lens constraint %s references write-row columns no member op of the decomposition insert fan-out carries; not enforced on this write', c.name ?? '<anon>');
+		}
+	}
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
 	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.suppliedColumns);
@@ -698,6 +743,11 @@ function buildDecompositionMemberInsert(
 	/** The produced-row NEW context (`new.<col>` over the supplied envelope columns)
 	 *  threaded into this member's default-build scope (see {@link buildDecompositionInsert}). */
 	memberNewRowScope: RegisteredScope,
+	/** The lens constraints (row-local CHECK / child-FK / set-level) gated onto THIS member op
+	 *  by `constraintsForOp` — the single-member-resolvable subset whose every write-row column
+	 *  resolves on this member's table. `[]` for a non-lens decomposition or a member that
+	 *  resolves no obligation (see {@link buildDecompositionInsert}). */
+	extraConstraints: ReadonlyArray<RowConstraintSchema>,
 ): PlanNode {
 	let source: RelationalPlanNode = new EnvelopeScanNode(ctx.scope, descriptor, envelopeAttrs, envelopeType);
 
@@ -730,16 +780,19 @@ function buildDecompositionMemberInsert(
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
-	// Lens row-local CHECK enforcement on a decomposition insert is deferred (the
-	// logical check cannot be unambiguously routed to a single member's basis terms);
-	// matches the multi-source insert path, which also passes no extra constraints.
-	// Leaves `lensRouted = false` (default) for the same reason as the multi-source
-	// path: a decomposition parent has no single basis spine for the runtime parent-side
-	// cascade reverse-map to match, so the marker is moot here. Do not "fix" this.
-	// `memberNewRowScope` threads the produced row's `new.<col>` context so this
-	// member's defaults resolve against the supplied logical row (not only this
-	// member's own columns).
-	return buildInsertStmt(ctx, memberInsert, [], projectedSource, false, memberNewRowScope);
+	// Lens enforcement rides via `extraConstraints`, the per-op-gated subset
+	// `buildDecompositionInsert` computed for this member (`constraintsForOp`): a
+	// single-member-resolvable obligation (row-local CHECK / child-FK / set-level whose
+	// write-row columns all resolve on this member's table) fires on this member insert; a
+	// cross-member one resolves on no member op and stays deferred. The same threading seam
+	// the single-source insert spine uses (`buildInsertStmt`'s `extraConstraints`), composed
+	// here with the `projectedSource` (the envelope projection) — the two params are
+	// independent. Leaves `lensRouted = false` (default): a decomposition parent has no single
+	// basis spine for the runtime parent-side cascade reverse-map to match, so the marker is
+	// moot here (do not "fix" this) — and parent-side FK is not collected for an INSERT anyway.
+	// `memberNewRowScope` threads the produced row's `new.<col>` context so this member's
+	// defaults resolve against the supplied logical row (not only this member's own columns).
+	return buildInsertStmt(ctx, memberInsert, extraConstraints, projectedSource, false, memberNewRowScope);
 }
 
 /**
@@ -883,9 +936,16 @@ function quoteIdent(name: string): string {
  * `extraConstraints` is exclusively lens-synthesized (the basis table's own checks are
  * added inside `buildConstraintChecks` from `tableSchema.checkConstraints`, never via
  * this seam), so gating every entry is safe.
+ *
+ * `op` is typed structurally on just its `table` so BOTH fan-out op shapes satisfy it: a
+ * `BaseOp` (the single-source spine and the multi-source / decomposition UPDATE + DELETE
+ * fan-out) and a `DecompInsertOp` (the decomposition INSERT fan-out, which routes per
+ * member through {@link buildDecompositionInsert} — not via `buildBaseOp`). Both carry the
+ * member's `TableReferenceNode`, so `op.table.tableSchema.columns` resolves the member's
+ * columns directly for either.
  */
 function constraintsForOp(
-	op: BaseOp,
+	op: Pick<BaseOp, 'table'>,
 	extraConstraints: ReadonlyArray<RowConstraintSchema>,
 	ridden: Set<RowConstraintSchema>,
 ): RowConstraintSchema[] {
@@ -1043,10 +1103,13 @@ function collectFromWriteRowColumns(fc: AST.FromClause, cols: Set<string>): void
  * carries the lens-routed CHECKs (basis terms) to merge into the per-row check
  * pipeline: row-local / child-FK / set-level for insert+update, and the parent-side
  * FK `NOT EXISTS` for update **and delete** (a delete can orphan a logical child, so
- * the delete base op now threads them too). For the single-source spine there is
- * exactly one base op, so the constraints route unambiguously onto it; multi-source
- * put fan-out (which would route per member) is a later phase and is write-rejected
- * upstream, so the constraints never reach an ambiguous fan-out here.
+ * the delete base op now threads them too). The caller (`buildViewMutation`) has already
+ * gated `extraConstraints` per op via {@link constraintsForOp}, so the single-source spine
+ * (one base op carrying all basis columns) receives the full set and a multi-op UPDATE /
+ * DELETE fan-out receives only the obligations that resolve on this op's table. The
+ * decomposition INSERT fan-out also routes per member, but through
+ * {@link buildDecompositionMemberInsert} (which calls `buildInsertStmt` against the shared
+ * envelope) rather than this path — so it runs the same gate independently there.
  */
 function buildBaseOp(
 	ctx: PlanningContext,
