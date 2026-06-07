@@ -674,6 +674,178 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToDrop).to.deep.equal(['ix']);
 		expect(diff.indexesToCreate).to.have.length(1);
 	});
+
+	// --- Concurrent column-rename reconciliation in the canonical index body ---
+	// The actual catalog body renders the PRE-rename column names (the rename has not
+	// landed at diff time) while the declared body renders the NEW names. The differ
+	// inverse-applies the index table's in-diff column renames to the declared body so
+	// a same-named index over a renamed column matches (no churn — the rename rides the
+	// table-alter channel) while a genuine body edit layered on the rename still
+	// recreates. A column rename needs `quereus.previous_name` on the modified column
+	// (baseline under the old name, modified under the new name + hint).
+
+	it('a column rename under a same-named index emits only the column rename (no index churn)', async () => {
+		// Headline case: index ix_email on t(email) with email renamed to email_addr.
+		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_email on t (email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_email on t (email_addr)`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no index drop from a pure column rename').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate from a pure column rename').to.deep.equal([]);
+		expect(diff.indexTagsChanges, 'no index tag change').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'one table alter for the column rename').to.have.length(1);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+	});
+
+	it('a column rename plus an index body edit recreates the index AND emits the column rename', async () => {
+		// Same rename, but the index also flips the column direction asc → desc: the
+		// reconciled body still differs (the edit is not undone by the inverse-rename) →
+		// drop+recreate, while the column rename is also emitted.
+		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_email on t (email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_email on t (email_addr desc)`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'body edit recreates under the rename').to.deep.equal(['ix_email']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0], 'recreate carries the NEW column name + desc').to.match(/email_addr desc/i);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+	});
+
+	it('a composite index with one renamed and one stable column does not churn', async () => {
+		// Only the renamed column is inverse-mapped; the stable column matches as-is.
+		const base = `table t { id INTEGER PRIMARY KEY, name TEXT, email TEXT }\nindex ix_comp on t (name, email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, name TEXT, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_comp on t (name, email_addr)`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no churn — body matches after reconcile').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+	});
+
+	it('a renamed column whose inherited collation is unchanged does not churn (ordering guard)', async () => {
+		// The collation must resolve on the NEW name (the declared ColumnDef is keyed by
+		// it) and only THEN be mapped back to the old name. Reversing the order would
+		// look the collation up under the old name, miss the NOCASE, and churn.
+		const base = `table t { id INTEGER PRIMARY KEY, email TEXT collate nocase }\nindex ix on t (email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT collate nocase with tags ("quereus.previous_name" = 'email') }\nindex ix on t (email_addr)`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no churn — inherited NOCASE resolved on the new name, then mapped back').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+	});
+
+	it('a renamed column whose collation also changed recreates the index', async () => {
+		// Rename email → email_addr AND add an inherited NOCASE on the column: the
+		// reconciled body resolves NOCASE on the new name (mapped back to old) vs the
+		// actual BINARY → genuine collation change still recreates, alongside the column
+		// rename. The recreate DDL carries no explicit COLLATE (the index inherits the
+		// table column's NOCASE rather than declaring its own); the drop+recreate is the
+		// observable effect, plus a column SET COLLATE on the table-alter channel.
+		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix on t (email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT collate nocase with tags ("quereus.previous_name" = 'email') }\nindex ix on t (email_addr)`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'collation change still recreates under a rename').to.deep.equal(['ix']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		const alter = diff.tablesToAlter[0];
+		expect(alter.columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+		const colChange = alter.columnsToAlter.find(c => c.columnName.toLowerCase() === 'email_addr');
+		expect(colChange?.collation, 'column SET COLLATE to NOCASE rides the table-alter channel').to.equal('NOCASE');
+	});
+
+	it('a partial-WHERE index over a renamed column does not churn (WHERE predicate reconciled)', async () => {
+		// The index column list (name) is stable; only the partial predicate references
+		// the renamed column. The declared WHERE (`is_active = 1`) is inverse-rewritten
+		// back to `active = 1` to match the actual (pre-rename) predicate.
+		const base = `table t { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix_active on t (name) where active = 1`;
+		const mod = `table t { id INTEGER PRIMARY KEY, name TEXT, is_active INTEGER with tags ("quereus.previous_name" = 'active') }\nindex ix_active on t (name) where is_active = 1`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no churn — the partial WHERE predicate is reconciled new→old').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'active', newName: 'is_active' }]);
+	});
+
+	it('a partial-WHERE index whose predicate genuinely changed still recreates under a rename', async () => {
+		// Precedence guard for the WHERE reconcile: a real predicate edit (literal 1 → 0)
+		// layered on the column rename survives the inverse-rewrite → drop+recreate.
+		const base = `table t { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix_active on t (name) where active = 1`;
+		const mod = `table t { id INTEGER PRIMARY KEY, name TEXT, is_active INTEGER with tags ("quereus.previous_name" = 'active') }\nindex ix_active on t (name) where is_active = 0`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'genuine predicate edit still recreates').to.deep.equal(['ix_active']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0]).to.match(/where is_active = 0/i);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'active', newName: 'is_active' }]);
+	});
+
+	it('a column-rename-only diff under require-hint does not trip the index guard', async () => {
+		// A reconciled pure column rename produces NO index drop+create, so it must not
+		// trip the unhinted-rename guard (it counts as zero creates / zero drops).
+		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_email on t (email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_email on t (email_addr)`;
+		const diff = await diffIndexEdit(base, mod, 'require-hint');
+		expect(diff.indexesToDrop, 'reconciled rename produces no index churn').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate').to.deep.equal([]);
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+	});
+
+	it('applying a column rename under a same-named index converges (RENAME COLUMN executes, index survives, re-diff empty)', async () => {
+		// End-to-end: exercise the real apply path, not just the diff DECISION. A pure
+		// column rename is a metadata-only RENAME COLUMN (no index drop+recreate), and
+		// the index — which stores its column by ordinal, not name — survives intact.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\ntable t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_email on t (email)\n}`);
+			await db.exec('apply schema main');
+			await db.exec("insert into t values (1, 'a@x')");
+
+			// Re-declare with the column renamed (previous_name hint) and re-apply.
+			await db.exec(`declare schema main {\ntable t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_email on t (email_addr)\n}`);
+			await db.exec('apply schema main');
+
+			// The column is renamed and the index survived (no drop+recreate).
+			const actual = collectSchemaCatalog(db, 'main');
+			expect(actual.tables[0].columns.some(c => c.name.toLowerCase() === 'email_addr'), 'column renamed to email_addr').to.equal(true);
+			expect(actual.indexes.some(i => i.name.toLowerCase() === 'ix_email'), 'index survived the rename').to.equal(true);
+
+			// The declaration now matches the catalog — a third diff is empty (idempotent;
+			// the previous_name hint must not re-trigger after the rename lands).
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToCreate, 'converged: no index creates').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'converged: no index drops').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'converged: no table alters').to.deep.equal([]);
+
+			// The data survived and is queryable under the new column name.
+			const rows: Record<string, unknown>[] = [];
+			for await (const r of db.eval('select email_addr from t where id = 1')) rows.push(r as Record<string, unknown>);
+			expect(rows, 'row survived the rename, readable under email_addr').to.deep.equal([{ email_addr: 'a@x' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a renamed index over a concurrently-renamed column emits the index rename only (no body recreate)', async () => {
+		// The index is matched via its own previous_name hint (ix_old → ix_new) AND its
+		// referenced column is renamed (email → email_addr). The body reconcile still
+		// applies on the rename-matched index, so a pure column rename under a pure index
+		// rename yields just the two rename ops — no drop+recreate.
+		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_old on t (email)`;
+		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_new on t (email_addr) with tags ("quereus.previous_name" = 'ix_old')`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no drop — index rename op handles the name change').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate — reconciled body matches').to.deep.equal([]);
+		expect(diff.renames, 'index rename op emitted').to.deep.include({ kind: 'index', oldName: 'ix_old', newName: 'ix_new' });
+		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
+	});
+
+	it('a table rename with stable columns does not churn the index body', async () => {
+		// The index body excludes the `on <table>` reference, so a *table* rename alone
+		// never churns it; the column-rename lookup keyed by the new table name returns
+		// [] (no column renames), so the reconcile is a no-op. Only the table rename op
+		// is emitted — no index drop+recreate.
+		const base = `table t_old { id INTEGER PRIMARY KEY, email TEXT }\nindex ix on t_old (email)`;
+		const mod = `table t_new { id INTEGER PRIMARY KEY, email TEXT } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (email)`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no index drop from a table rename').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate from a table rename').to.deep.equal([]);
+		expect(diff.renames, 'table rename op emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
+	});
 });
 
 // ============================================================================

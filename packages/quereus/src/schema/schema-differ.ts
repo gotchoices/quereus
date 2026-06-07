@@ -461,12 +461,19 @@ export function computeSchemaDiff(
 		// the body render, so compare the raw declared stmt. The declared side resolves
 		// each column's effective collation against the matched declared table (so an
 		// inherited/BINARY collation that is unchanged does not churn, while a real
-		// collation change recreates). The drop targets the actual (pre-rename) name and
-		// the recreate carries the declared (post-rename) name, so a body change on a
-		// rename-matched index resolves to a correct drop+recreate that supersedes the
-		// no-op rename op.
+		// collation change recreates), then inverse-applies the index table's in-diff
+		// column renames so a same-named index over a column renamed in this same diff
+		// matches the actual (pre-rename) body instead of churning a spurious
+		// drop+recreate (the column rename rides the table-alter channel). The rename
+		// lookup is keyed by the index's *declared* (post-rename) table name — exactly
+		// how `columnRenamesByTable` is keyed — so a table renamed in the same diff still
+		// resolves its column renames. The drop targets the actual (pre-rename) name and
+		// the recreate carries the declared (post-rename) name, so a genuine body change
+		// on a rename-matched index resolves to a correct drop+recreate that supersedes
+		// the no-op rename op.
 		const declaredTableForIndex = declaredTables.get(declaredIndex.indexStmt.table.name.toLowerCase());
-		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex);
+		const indexColRenames = columnRenamesByTable.get(declaredIndex.indexStmt.table.name.toLowerCase()) ?? [];
+		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, targetSchemaName);
 		if (declaredBody !== matchedActual.definition) {
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
@@ -818,20 +825,59 @@ function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, c
  * untouched — there is no column collation to resolve and the renderer falls back to
  * `expressionToString`. `declaredTable` is the matched declared table (looked up by
  * the index's table reference); undefined falls back to explicit-or-BINARY.
+ *
+ * **Column-rename reconciliation.** `colRenames` are the in-diff column renames of
+ * the index's table (keyed by the declared/new table name in `computeSchemaDiff`'s
+ * pre-pass). The actual catalog body still renders the *pre-rename* column names at
+ * diff time, while the declared side renders the *new* names — so a same-named index
+ * over a column renamed in this same diff would otherwise churn a spurious
+ * drop+recreate. To reconcile, each resolved bare name is inverse-mapped from its NEW
+ * name back to its OLD name (case-insensitive) so a pure rename matches the actual
+ * body (no churn) while a genuine body edit layered on the rename still differs
+ * (recreate). The index body excludes the `on <table>` reference, so a *table* rename
+ * alone never churns — only column renames matter (strictly simpler than the
+ * constraint FK case in {@link reconciledDeclaredBody}).
+ *
+ * **Ordering is load-bearing**: the effective collation is resolved from the *new*
+ * (declared) column name FIRST — the declared table's `ColumnDef` is keyed by the new
+ * name — and only THEN is the emitted name inverse-renamed to its old form. Reversing
+ * this would look up the declared column's collation under the old name and miss it.
+ *
+ * The partial-index `where` predicate is reconciled the same way the constraint CHECK
+ * path is: each renamed column is inverse-rewritten NEW→OLD over a cloned predicate
+ * via {@link renameColumnInCheckExpression} (seeded with the index's table so
+ * unqualified refs resolve), keeping a partial index over a renamed column from
+ * churning. `schemaName` is the default schema for that rewriter.
  */
 function declaredIndexCanonicalBody(
 	indexStmt: AST.CreateIndexStmt,
 	declaredTable: AST.DeclaredTable | undefined,
+	colRenames: ReadonlyArray<ColumnRenameOp>,
+	schemaName: string,
 ): string {
 	const columns: AST.IndexedColumn[] = indexStmt.columns.map(col => {
 		const bareName = indexedColumnBareName(col);
 		if (!bareName) return col;
+		// Collation resolves on the DECLARED (new) name — see the ordering note above.
 		const effective = normalizeCollationName(
 			explicitIndexColumnCollation(col) || declaredColumnCollation(declaredTable, bareName) || 'BINARY',
 		);
-		return { name: bareName, collation: effective, direction: col.direction };
+		// THEN inverse-rename the emitted name to its old (actual-catalog) form.
+		const oldName = colRenames.find(r => r.newName.toLowerCase() === bareName.toLowerCase())?.oldName ?? bareName;
+		return { name: oldName, collation: effective, direction: col.direction };
 	});
-	return createIndexBodyToCanonicalString({ ...indexStmt, columns });
+	// Reconcile the partial-WHERE predicate: inverse-rewrite each renamed column from
+	// its NEW name back to OLD over a clone (the rewriter mutates in place; indexStmt
+	// backs the recreate DDL). Skip the clone when nothing can match.
+	let where = indexStmt.where;
+	if (where && colRenames.length > 0) {
+		const clone = cloneExpr(where);
+		for (const r of colRenames) {
+			renameColumnInCheckExpression(clone, indexStmt.table.name, r.newName, r.oldName, schemaName);
+		}
+		where = clone;
+	}
+	return createIndexBodyToCanonicalString({ ...indexStmt, columns, where });
 }
 
 /**
