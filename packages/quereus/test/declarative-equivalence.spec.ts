@@ -2114,6 +2114,72 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 			await db.close();
 		}
 	});
+
+	// --- Column-name case folding: a reference whose case diverges from the column
+	// definition must not churn. The actual side lifts the column DEFINITION case
+	// (tableSchema.columns[i].name) while the declared side carries the as-written
+	// reference case; the canonical body folds both (matching case-insensitive column
+	// resolution), so a case-only divergence renders identically. ---
+
+	it('a UNIQUE constraint referencing a column in a different case than its definition does not churn', async function () {
+		const db = new Database();
+		try {
+			// Column declared `Email`; UNIQUE references `email`. Actual lifts `Email`,
+			// declared body uses `email` — equal only after case folding.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, Email TEXT, constraint uq unique (email) }
+			}`);
+			await db.exec('apply schema main');
+			const alter = diffOf(db).tablesToAlter;
+			expect(alter, 'no constraint churn from a UNIQUE column-case divergence').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK whose LOCAL column case differs from the column definition does not churn', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// Child column declared `PA`; FK local list references `pa`. Actual lifts the
+			// child definition case `PA`; declared body uses `pa`.
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, PA INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			await db.exec('apply schema main');
+			const childAlter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter, 'no constraint churn from an FK local column-case divergence').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an FK whose REFERENCED (parent) column case changes across re-declares does not churn', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// The FK's referenced column names are stored AS WRITTEN (not resolved to the
+			// parent definition case), so the referenced-column divergence is a BETWEEN-
+			// VERSIONS case: apply with `references parent(PID)`, re-declare with the same
+			// referenced column in a different case. The actual catalog renders `PID`; the
+			// new declaration renders `pid` — equal only after case folding the canonical
+			// FK referenced-column list (which renders via foreignKeyClauseTail).
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(PID) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table parent { pid INTEGER PRIMARY KEY }
+				table child { id INTEGER PRIMARY KEY, pa INTEGER, constraint fk foreign key (pa) references parent(pid) }
+			}`);
+			const childAlter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter, 'no constraint churn from an FK referenced column-case change').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================

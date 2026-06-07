@@ -849,12 +849,21 @@ function indexedColumnBareName(col: AST.IndexedColumn): string | undefined {
  * expression-index column with no resolvable name falls back to
  * `expressionToString(col.expr)` (such indexes are rejected on import and never
  * name-match a real actual).
+ *
+ * The bare name is lowercased before `quoteIdentifier` so the comparison key is
+ * case-insensitive — matching Quereus's uniformly case-folding column resolution
+ * (the AST never records identifier quoting; every resolver folds via
+ * `.toLowerCase()`). The actual side lifts the column *definition* case while the
+ * declared side carries the as-written index reference case; folding both makes a
+ * case-only divergence (e.g. column `Email` indexed as `email`) render identically
+ * instead of churning a spurious drop+recreate.
  */
 function canonicalIndexedColumnsToString(cols: readonly AST.IndexedColumn[]): string {
 	return cols.map(col => {
 		const name = indexedColumnBareName(col);
 		if (name) {
-			return col.direction === 'desc' ? `${quoteIdentifier(name)} desc` : quoteIdentifier(name);
+			const lower = name.toLowerCase();
+			return col.direction === 'desc' ? `${quoteIdentifier(lower)} desc` : quoteIdentifier(lower);
 		}
 		return col.expr ? expressionToString(col.expr) : '';
 	}).filter(s => s).join(', ');
@@ -1362,6 +1371,47 @@ function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClau
 }
 
 /**
+ * Returns a clone of a table constraint with every bare column-name identifier in
+ * its column list(s) lowercased — the canonical-body normalization that makes the
+ * comparison key case-insensitive, matching Quereus's uniformly case-folding column
+ * resolution (the AST never records identifier quoting, and every resolver folds via
+ * `.toLowerCase()`). Applied ONLY by {@link constraintBodyToCanonicalString} (the
+ * canonical-comparison entry point); the persistence renderer
+ * {@link tableConstraintsToString} keeps the original case so a stored CREATE TABLE
+ * round-trips its declared casing.
+ *
+ * Covers the UNIQUE / PRIMARY KEY column list, the FK local (child) column list, and
+ * the FK referenced (parent) column list. CHECK carries no column list (its refs live
+ * in the expression — out of scope, see the canonical-body-identifier-case-beyond-
+ * column-lists backlog ticket), so it passes through unchanged.
+ *
+ * MUST NOT mutate the input: the declared side passes `DeclaredNamedConstraint.bodyAst`,
+ * which backs the differ's `ddl` / `definition` — so the column arrays are cloned
+ * before rewriting. `quoteIdentifier` still runs *after* the lowercase, so a
+ * reserved-word column name (`Order` → `order`) re-quotes to `"order"` on both sides
+ * (keyword detection is already case-insensitive).
+ */
+function lowercaseTableConstraintColumnNames(tc: AST.TableConstraint): AST.TableConstraint {
+	switch (tc.type) {
+		case 'primaryKey':
+		case 'unique':
+			return tc.columns
+				? { ...tc, columns: tc.columns.map(c => ({ ...c, name: c.name.toLowerCase() })) }
+				: tc;
+		case 'foreignKey':
+			return {
+				...tc,
+				columns: tc.columns?.map(c => ({ ...c, name: c.name.toLowerCase() })),
+				foreignKey: tc.foreignKey
+					? { ...tc.foreignKey, columns: tc.foreignKey.columns?.map(n => n.toLowerCase()) }
+					: tc.foreignKey,
+			};
+		default:
+			return tc; // 'check' — no column list (refs live in the expr, parked)
+	}
+}
+
+/**
  * Renders the **canonical body fragment** of a named table constraint — the
  * comparison key the declarative differ uses to detect a constraint whose name
  * is unchanged but whose body changed (an edited CHECK expression, a changed FK
@@ -1373,15 +1423,17 @@ function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClau
  * Excludes the `constraint <name>` prefix (constraints are matched by name first,
  * and a rename must not block body comparison) AND the `with tags (...)` suffix
  * (tags are a separate diff channel — `ALTER CONSTRAINT … SET TAGS`, so a
- * tag-only change must NOT masquerade as a body change). Parser-default-
- * equivalent forms are normalized (see {@link canonicalCheckOperations},
- * {@link canonicalForeignKeyClause}). Both the declared-AST side
- * (`schema-differ`) and the actual-catalog side (`ddl-generator`'s
- * `constraintToCanonicalDDL`) funnel through here so their fragments are
- * byte-comparable.
+ * tag-only change must NOT masquerade as a body change). Bare column-name
+ * identifiers are case-folded ({@link lowercaseTableConstraintColumnNames}) BEFORE
+ * the default-form normalization so `canonicalForeignKeyClause` reads the already-
+ * lowercased referenced columns. Parser-default-equivalent forms are normalized
+ * (see {@link canonicalCheckOperations}, {@link canonicalForeignKeyClause}). Both
+ * the declared-AST side (`schema-differ`) and the actual-catalog side
+ * (`ddl-generator`'s `constraintToCanonicalDDL`) funnel through here so their
+ * fragments are byte-comparable.
  */
 export function constraintBodyToCanonicalString(tc: AST.TableConstraint): string {
-	const normalized: AST.TableConstraint = { ...tc, name: undefined, tags: undefined };
+	const normalized: AST.TableConstraint = lowercaseTableConstraintColumnNames({ ...tc, name: undefined, tags: undefined });
 	if (normalized.type === 'check') {
 		normalized.operations = canonicalCheckOperations(normalized.operations);
 	}

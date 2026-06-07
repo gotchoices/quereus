@@ -460,6 +460,29 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate[0]).to.match(/\(\s*"?email"?\s*\)/i);
 	});
 
+	// An index reference whose case diverges from the column DEFINITION case must not
+	// churn: the actual side lifts the definition case (tableSchema.columns[i].name)
+	// while the declared side carries the as-written reference case, and the canonical
+	// body folds both (matching case-insensitive column resolution). Without the fold
+	// these render byte-unequal and drop+recreate on every diff.
+	it('an index column whose case differs from the column definition does not churn', async () => {
+		// Column declared `Email`, index references `email` — same on both apply→declare
+		// sides, so only the definition≠reference case divergence is under test.
+		const tbl = `table t { id INTEGER PRIMARY KEY, Email TEXT, Active INTEGER, Name TEXT }`;
+		const diff = await diffIndexEdit(`${tbl}\nindex ix on t (email)`, `${tbl}\nindex ix on t (email)`);
+		expect(diff.indexesToCreate, 'no index creates').to.deep.equal([]);
+		expect(diff.indexesToDrop, 'no index drops').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
+	});
+
+	it('a composite index with mixed-case column references does not churn', async () => {
+		// Columns `name` / `active` (lowercase definitions) referenced as `Name` / `Active`.
+		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (Name, Active)`, `${TABLE}\nindex ix_comp on t (Name, Active)`);
+		expect(diff.indexesToCreate, 'no index creates').to.deep.equal([]);
+		expect(diff.indexesToDrop, 'no index drops').to.deep.equal([]);
+		expect(diff.tablesToAlter, 'no table alters').to.deep.equal([]);
+	});
+
 	it('a tags-only change takes SET TAGS, not a recreate', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_name on t (name) with tags (purpose = 'a')`, `${TABLE}\nindex ix_name on t (name) with tags (purpose = 'b')`);
 		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
