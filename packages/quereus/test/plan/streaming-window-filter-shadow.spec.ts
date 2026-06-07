@@ -88,6 +88,32 @@ describe('Plan shape: streaming window over a residual-filtered ordered scan', (
 		]);
 	});
 
+	it('streaming Window feeding a downstream Window keeps the residual filter correct', async () => {
+		// Stacked: a streaming inner Window (ROW_NUMBER) over the residual Filter,
+		// feeding a (buffered) outer sliding-SUM Window. The intermediate Project
+		// drops monotonicOn so the outer Window cannot also stream — but the inner
+		// Window still streams and is the direct parent of the Filter, so the
+		// cross-pull shadow hazard is live. This guards the implementer's flagged
+		// "streaming Window feeds another Window" interaction in its producible
+		// form; disabling demote() corrupts it exactly like the standalone case
+		// (id=2/val=5 wrongly admitted).
+		const q = `SELECT id, rn, SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS sw
+			FROM (SELECT id, val, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM t WHERE val > 50) ORDER BY id`;
+		const ops = await planOps(db, q);
+		// Two Window nodes, one of which streams (the inner ROW_NUMBER over Filter).
+		expect(ops.filter(o => o === 'WINDOW').length, 'two stacked Window nodes').to.equal(2);
+		expect(ops, 'residual Filter present below the streaming inner Window').to.include('FILTER');
+
+		const res = await allRows<{ id: number; rn: number; sw: number }>(db, q);
+		// Survivors id 1,3,5 (val=100); rn renumbered over the filtered stream;
+		// sw = 1-preceding running sum over the same filtered stream.
+		expect(res).to.deep.equal([
+			{ id: 1, rn: 1, sw: 100 },
+			{ id: 3, rn: 2, sw: 200 },
+			{ id: 5, rn: 3, sw: 200 },
+		]);
+	});
+
 	it('control: buffered Window (PARTITION BY non-key) drains the child and stays correct', async () => {
 		// PARTITION BY val is not aligned with the (id) source ordering ⇒ buffered
 		// path, which fully materializes before emit ⇒ no cross-pull interleave.
