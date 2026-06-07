@@ -900,7 +900,12 @@ function indexedColumnsToString(cols: readonly AST.IndexedColumn[]): string {
 			if (col.direction === 'desc') colStr += ' desc';
 			return colStr;
 		} else if (col.expr) {
-			return expressionToString(col.expr);
+			// Collate-folded form (`col COLLATE x [desc]`): expressionToString renders
+			// the column + collation, but the direction lives on col.direction and
+			// must be re-appended (asc is the default and stays elided).
+			let colStr = expressionToString(col.expr);
+			if (col.direction === 'desc') colStr += ' desc';
+			return colStr;
 		}
 		return '';
 	}).filter(s => s).join(', ');

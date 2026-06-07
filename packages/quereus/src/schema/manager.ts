@@ -2050,12 +2050,13 @@ export class SchemaManager {
 		indexName: string
 	): IndexSchema {
 		const indexColumns = stmt.columns.map((indexedCol: AST.IndexedColumn) => {
-			if (indexedCol.expr) {
-				throw new QuereusError(`Indices on expressions are not supported yet.`, StatusCode.ERROR, undefined, indexedCol.expr.loc?.start.line, indexedCol.expr.loc?.start.column);
-			}
-			const colName = indexedCol.name;
+			// The parser folds `col COLLATE x` into a collate expression over a bare
+			// column reference; resolveImportedIndexColumn unwraps that form to a
+			// { name, collation } pair, mirroring importIndex. A genuine expression
+			// index (non-column operand) resolves to an unset name and is rejected.
+			const { name: colName, collation } = resolveImportedIndexColumn(indexedCol);
 			if (!colName) {
-				throw new QuereusError(`Indexed column must be a simple column name.`, StatusCode.ERROR);
+				throw new QuereusError(`Indices on expressions are not supported yet.`, StatusCode.ERROR, undefined, indexedCol.expr?.loc?.start.line, indexedCol.expr?.loc?.start.column);
 			}
 			const tableColIndex = tableSchema.columnIndexMap.get(colName.toLowerCase());
 			if (tableColIndex === undefined) {
@@ -2065,7 +2066,7 @@ export class SchemaManager {
 			return {
 				index: tableColIndex,
 				desc: indexedCol.direction === 'desc',
-				collation: normalizeCollationName(indexedCol.collation || tableColSchema.collation || 'BINARY')
+				collation: normalizeCollationName(collation || tableColSchema.collation || 'BINARY')
 			};
 		});
 

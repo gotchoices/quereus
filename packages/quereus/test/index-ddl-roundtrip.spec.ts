@@ -594,6 +594,57 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate[0], 'recreate carries the declared collation').to.match(/collate nocase/i);
 	});
 
+	it('applying an added explicit index COLLATE converges and the catalog index carries the collation', async () => {
+		// End-to-end companion to the diff-only case above: exercise the real apply
+		// path. The recreate's CREATE INDEX … (email collate nocase) flows through the
+		// live buildIndexSchema (a collate-folded column), the path this ticket unblocked.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix on t (email)\n}`);
+			await db.exec('apply schema main');
+
+			// Re-declare with an explicit per-column COLLATE and re-apply — drop+recreate.
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix on t (email collate nocase)\n}`);
+			await db.exec('apply schema main');
+
+			// The applied index now carries NOCASE on its column…
+			const info = await rows(db, "select column_name, collation from index_info('t')");
+			expect(info, 'applied index column resolves NOCASE').to.deep.equal([{ column_name: 'email', collation: 'NOCASE' }]);
+
+			// …and a re-diff is empty (the migration converged).
+			const actual = collectSchemaCatalog(db, 'main');
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToCreate, 'converged: no creates').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'converged: no drops').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an explicit-COLLATE index applies on first declare and re-applies with zero churn', async () => {
+		// The collate-folded form must survive the live create path on the FIRST apply
+		// (not just as a recreate), then re-declaring it verbatim must not churn.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix on t (email collate nocase)\n}`);
+			await db.exec('apply schema main');
+
+			const info = await rows(db, "select column_name, collation from index_info('t')");
+			expect(info, 'first apply built the index with NOCASE').to.deep.equal([{ column_name: 'email', collation: 'NOCASE' }]);
+
+			// Re-declaring the identical index is a no-op (zero churn on re-diff).
+			await db.exec(`declare schema main {\n${TABLE}\nindex ix on t (email collate nocase)\n}`);
+			const actual = collectSchemaCatalog(db, 'main');
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToCreate, 'no creates on verbatim re-declare').to.deep.equal([]);
+			expect(diff.indexesToDrop, 'no drops on verbatim re-declare').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('an index inheriting a non-BINARY column collation, re-declared verbatim, does not churn', async () => {
 		// `email text collate nocase`, index has no explicit COLLATE: both sides resolve
 		// NOCASE from the TABLE column. Guards that the declared side reads the
@@ -650,15 +701,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
 	});
 
-	// PENDING — blocked on `index-explicit-column-collate-apply-path`. The canonical
-	// BODY logic this ticket added already handles the collate-folded form correctly
-	// (`declaredIndexCanonicalBody` resolves the collation off `col.expr` and preserves
-	// `col.direction`). What this test cannot yet do is APPLY the baseline: the live
-	// `CREATE INDEX … (email collate nocase desc)` path (`buildIndexSchema`) rejects any
-	// collate-folded column as an "expression index", and `createIndexToString` also
-	// drops the trailing `desc` for that form. Un-skip once that apply/emit path supports
-	// explicit per-column index COLLATE; the expectation below should then hold (no churn).
-	it.skip('an explicit COLLATE on a descending column (collate-folded form), re-declared verbatim, does not churn', async () => {
+	it('an explicit COLLATE on a descending column (collate-folded form), re-declared verbatim, does not churn', async () => {
 		const diff = await diffIndexEdit(
 			`${TABLE}\nindex ix on t (email collate nocase desc)`,
 			`${TABLE}\nindex ix on t (email collate nocase desc)`,
