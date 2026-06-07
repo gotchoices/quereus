@@ -526,8 +526,9 @@ function deriveSurrogateMemberKeys(
 
 /**
  * PoC wiring for `reserved-tags.ts`: validates the reserved `quereus.*` tag
- * namespace on one lens slot's logical table (`logical-table` site) and each of
- * its attached constraints (`logical-constraint` site).
+ * namespace on one lens slot's logical table (`logical-table` site), each of its
+ * logical columns (`logical-column` site — the home of `quereus.lens.writable`),
+ * and each of its attached constraints (`logical-constraint` site).
  *
  * Severity policy is the registry's; this caller only routes it: a
  * `severity:'error'` diagnostic (unknown key, mis-sited key, malformed enum/CSV
@@ -546,6 +547,12 @@ function validateLensTags(slot: LensSlot): void {
 	const diagnostics: TagDiagnostic[] = [
 		...validateReservedTags(slot.logicalTable.tags, 'logical-table'),
 	];
+	// Each logical column's tags at the `logical-column` site (the home of
+	// `quereus.lens.writable`). This also closes a pre-existing gap: a typo'd /
+	// mis-sited `quereus.*` key on a logical column was previously never validated.
+	for (const col of slot.logicalTable.columns) {
+		if (col.tags) diagnostics.push(...validateReservedTags(col.tags, 'logical-column'));
+	}
 	for (const constraint of slot.attachedConstraints) {
 		const tags = constraint.kind === 'primaryKey' ? undefined : constraint.constraint.tags;
 		if (tags) diagnostics.push(...validateReservedTags(tags, 'logical-constraint'));

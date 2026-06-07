@@ -14,7 +14,7 @@ import { ProjectNode } from '../planner/nodes/project-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { astToString, expressionToString } from '../emit/ast-stringify.js';
 import { PhysicalType } from '../types/logical-type.js';
-import { getReservedTagByTemplate } from './reserved-tags.js';
+import { getReservedTagByTemplate, LENS_WRITABLE_INTENT_TAG } from './reserved-tags.js';
 import type { AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
 import { ConflictResolution } from '../common/constants.js';
@@ -499,19 +499,34 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  *    restriction the column's inverse carries is **entailed** by the residual
  *    predicate.
  *
- * The firing rule: `lens.non-invertible` (error) fires **only** for a column the
- * lens presents as writable (a `base` {@link ResolvedBaseSite}) whose round-trip
- * the analysis cannot prove faithful. A `computed`/opaque output column is *not* a
- * deploy error — it is an intentional read-only/derived column (its write reds
- * `no-inverse` at mutation time, as today), per the prover's soundness-over-
- * completeness principle and the no-over-block requirement (`docs/lens.md`
- * § Computed and Generated Columns).
+ * The firing rule has two branches:
+ *  1. a column the lens presents as writable (a `base` {@link ResolvedBaseSite})
+ *     whose round-trip the analysis cannot prove faithful (`v.writable &&
+ *     !v.faithful`) — the original rule, unchanged.
+ *  2. a `computed`/opaque output column (`!v.writable`) the author *declared*
+ *     writable via the `quereus.lens.writable = true` intent tag
+ *     ({@link intentWritable}): the round-trip law's stronger reading makes this
+ *     an authoring error, not a derived column.
+ *
+ * An opaque column carrying no intent tag (or `= false`) is *not* a deploy error
+ * — it is an intentional read-only/derived column (its write reds `no-inverse` at
+ * mutation time, as today), per the prover's soundness-over-completeness principle
+ * and the no-over-block requirement (`docs/lens.md` § Computed and Generated
+ * Columns). The intent is a deploy-policy input, not a property of the body's
+ * complement, so it lives here in the diagnostic wrapper — `computeRoundTrip` and
+ * `roundTripObstruction` are untouched. The branch keys off the round-trip
+ * verdict's `v.writable` (which admits an invertible *composed* expression like
+ * `(speed + 1) - 2`), NOT `isReconstructibleColumn` (the bare-column test, which
+ * would false-fire on such a chain).
  *
  * Degrade-to-safe: returns `[]` (today's behaviour — the mutation-time and
  * key-reconstructibility nets still govern) whenever the complement cannot
  * characterize the body (out of the single-source projection-and-filter fragment,
- * lineage not threaded, or a non-negation-free residual). The body is planned
- * **logically** ({@link planLogicalBody}, not `ctx.root`) so the
+ * lineage not threaded, or a non-negation-free residual). In that case there are
+ * no per-column verdicts and the writable-intent branch does **not** fire — so an
+ * out-of-fragment opaque column tagged writable does not deploy-block; it still
+ * reds `no-inverse` at mutation time. This completeness gap is intentional. The
+ * body is planned **logically** ({@link planLogicalBody}, not `ctx.root`) so the
  * Project/Filter/TableReference operator tree threading `updateLineage` survives.
  * See `docs/lens.md` § Round-trip and `docs/view-updateability.md`
  * § The predicate-honest complement.
@@ -524,18 +539,48 @@ function proveRoundTrip(ctx: ProveContext): LensDiagnostic[] {
 
 	const errors: LensDiagnostic[] = [];
 	verdicts.forEach((v, i) => {
-		if (!v.writable || v.faithful) return;
 		// Site at the *logical* column (the contract spelling), positionally aligned
 		// with the body output — the same space `column_info` derives writability in.
 		const column = ctx.outputColumns[i] ?? v.name;
-		errors.push({
-			code: 'lens.non-invertible',
-			severity: 'error',
-			site: { table: ctx.table.name, column },
-			message: `lens: writable column '${ctx.table.name}.${column}' is not faithfully invertible at the lens boundary (${v.obstruction}); its GetPut/PutGet round-trip cannot be proved, so the declared write path is unsound`,
-		});
+
+		// (1) A column the lens presents as writable whose round-trip cannot be
+		// proved faithful — the original firing rule, unchanged.
+		if (v.writable && !v.faithful) {
+			errors.push({
+				code: 'lens.non-invertible',
+				severity: 'error',
+				site: { table: ctx.table.name, column },
+				message: `lens: writable column '${ctx.table.name}.${column}' is not faithfully invertible at the lens boundary (${v.obstruction}); its GetPut/PutGet round-trip cannot be proved, so the declared write path is unsound`,
+			});
+			return;
+		}
+
+		// (2) An opaque / read-only column the author declared writable via the
+		// `quereus.lens.writable = true` intent tag. Today it would be silently
+		// admitted read-only; the asserted intent turns that into an authoring error.
+		if (!v.writable && intentWritable(ctx, column)) {
+			errors.push({
+				code: 'lens.non-invertible',
+				severity: 'error',
+				site: { table: ctx.table.name, column },
+				message: `lens: column '${ctx.table.name}.${column}' is declared writable ('${LENS_WRITABLE_INTENT_TAG}' = true) but its lens body is computed/opaque with no invertible write path; the round-trip law cannot be satisfied, so the declared writable intent is unsound (map it to an invertible basis expression, or drop the tag to deploy it read-only)`,
+			});
+		}
 	});
 	return errors;
+}
+
+/**
+ * Whether the logical column named `column` carries the writable-intent signal
+ * (`quereus.lens.writable = true`). Resolves the logical column case-insensitively
+ * via the same `logicalColIndex` the rest of the prover uses, then reads the tag
+ * as a real boolean (`=== true`): `validateReservedTags` has already rejected a
+ * non-boolean value at deploy, so a surviving non-`true` value is `false`/absent.
+ */
+function intentWritable(ctx: ProveContext, column: string): boolean {
+	const li = ctx.logicalColIndex.get(column.toLowerCase());
+	if (li === undefined) return false;
+	return ctx.table.columns[li]?.tags?.[LENS_WRITABLE_INTENT_TAG] === true;
 }
 
 /**

@@ -748,4 +748,107 @@ describe('lens prover: round-trip (computed deploy-time predicate)', () => {
 			await db.close();
 		}
 	});
+
+	// --- writable-intent signal (quereus.lens.writable) ---------------------------
+	// The intent input added by `lens-logical-readonly-intent-signal`: an opaque
+	// column the author *declared* writable becomes a deploy error, distinguishing a
+	// deliberate read-only/derived column (admitted, above) from an authoring mistake.
+
+	it('blocks: an opaque computed column declared writable (quereus.lens.writable = true) is a deploy error', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, who text null) }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.src values (1, 'ada')");
+			// `upper(who) as label` is opaque (read-only) — but the author declared `label`
+			// writable, so the asserted intent turns the silent read-only admit into an error.
+			await db.exec('declare logical schema x { table m (id integer primary key, who text null, label text null with tags ("quereus.lens.writable" = true)) }');
+			await db.exec('declare lens for x over y { view m as select id, who, upper(who) as label from y.src }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.non-invertible|writable|invertible/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('explicit read-only: the same opaque column with quereus.lens.writable = false deploys clean (read-only)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, who text null) }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.src values (1, 'ada')");
+			// `= false` is explicit read-only/derived intent — same behaviour as absent.
+			await db.exec('declare logical schema x { table m (id integer primary key, who text null, label text null with tags ("quereus.lens.writable" = false)) }');
+			await db.exec('declare lens for x over y { view m as select id, who, upper(who) as label from y.src }');
+			await db.exec('apply schema x'); // no over-block
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+			expect(await isUpdatable(db, 'm', 'label'), 'label is read-only').to.equal('NO');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('no false-fire: an invertible chain column declared writable deploys writable and round-trips', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, speed integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.src values (1, 10)');
+			// `(speed + 1) - 2` is an invertible ±k chain ⇒ v.writable && v.faithful: the writable
+			// intent is *satisfied*. The intent branch keys off the round-trip verdict (not the
+			// bare-column reconstructibility test), so it must NOT false-fire on the chain.
+			await db.exec('declare logical schema x { table m (id integer primary key, speed integer null, adjusted integer null with tags ("quereus.lens.writable" = true)) }');
+			await db.exec('declare lens for x over y { view m as select id, speed, (speed + 1) - 2 as adjusted from y.src }');
+			await db.exec('apply schema x'); // no throw — the invertible chain satisfies the intent
+			expect(report(db).errors, 'no blocking errors').to.deep.equal([]);
+			expect(await isUpdatable(db, 'm', 'adjusted'), 'adjusted is writable').to.equal('YES');
+
+			await db.exec('update x.m set adjusted = 5 where id = 1');
+			const out: Record<string, unknown>[] = [];
+			for await (const r of db.eval('select speed, adjusted from x.m where id = 1')) out.push(r as Record<string, unknown>);
+			expect(out[0].adjusted, 'adjusted reads back the written value').to.equal(5);
+			expect(out[0].speed, 'base speed holds the inverted value (adjusted + 1)').to.equal(6);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('degrade-to-safe: an opaque writable-intent column in a two-table join body does not deploy-block', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table a (id integer primary key, av integer null); table b (id integer primary key, bv integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.a values (1, 10)');
+			await db.exec('insert into y.b values (1, 20)');
+			// The join body is out of the single-source fragment ⇒ computeRoundTrip degrades to
+			// safe ⇒ the writable-intent branch never fires (the documented completeness gap).
+			await db.exec('declare logical schema x { table m (id integer primary key, av integer null, label integer null with tags ("quereus.lens.writable" = true)) }');
+			await db.exec('declare lens for x over y { view m as select a.id, a.av, b.bv * b.bv as label from y.a join y.b on b.id = a.id }');
+			await db.exec('apply schema x'); // out of fragment ⇒ no spurious lens.non-invertible
+			expect(report(db), 'deploy succeeded').to.not.be.undefined;
+			// The intent did not deploy-block; the computed column still reds at mutation time.
+			await expectThrows(
+				() => db.exec('update x.m set label = 5 where id = 1'),
+				/no-inverse|read-only|cannot write|not updatable|computed|invertible|unsupported/i,
+			);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('non-reconstructible PK declared writable throws lens.non-invertible (error wins over the read-only warning)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table src (id integer primary key, speed integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.src values (1, 4)');
+			// `speed * speed` is opaque ⇒ the PK is non-reconstructible (the table would otherwise
+			// deploy read-only with a pk-not-reconstructible warning). Declared writable, the
+			// intent block additionally errors lens.non-invertible — the error blocks the deploy.
+			await db.exec('declare logical schema x { table m (scaled integer primary key with tags ("quereus.lens.writable" = true), speed integer null) }');
+			await db.exec('declare lens for x over y { view m as select speed * speed as scaled, speed from y.src }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.non-invertible|writable|invertible/i);
+		} finally {
+			await db.close();
+		}
+	});
 });

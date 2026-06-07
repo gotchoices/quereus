@@ -47,6 +47,11 @@ export type TagSite =
 	| 'dml-stmt'            // INSERT/UPDATE/DELETE ... WITH (...) statement-level tag
 	| 'logical-table'       // tags on a declared logical TableSchema
 	| 'logical-constraint'  // tags on a logical RowConstraint/Unique/ForeignKey schema
+	// A logical column's WITH TAGS position. Distinct from `physical-column` (the
+	// basis / declared-table differ column): `quereus.lens.writable` is meaningful
+	// only on a logical column, so a dedicated site gives correct mis-site
+	// rejection in both directions.
+	| 'logical-column'      // tags on a declared logical ColumnSchema
 	// `physical-table` covers BOTH the basis-table advertisement position
 	// (quereus.lens.decomp.* read by buildAdvertisementsFromTags) AND the physical
 	// declarative-schema table position (the differ validates a declared table's
@@ -62,6 +67,16 @@ export const DECOMP_ROLE_VALUES = ['primary-storage', 'auxiliary-access'] as con
 export const DECOMP_PRESENCE_VALUES = ['mandatory', 'optional'] as const;
 /** Closed value set for `quereus.lens.decomp.keykind.<id>`. */
 export const DECOMP_KEYKIND_VALUES = ['surrogate', 'logical-tuple'] as const;
+
+/**
+ * The per-logical-column writable-intent signal (docs/lens.md § Computed and
+ * Generated Columns). Exported so the lens prover keys off this single constant
+ * rather than re-spelling the literal. `= true` declares the column must have a
+ * faithful write path, turning an opaque / non-invertible body into a deploy
+ * error (`lens.non-invertible`); `= false` / absent preserves the conservative
+ * admit-as-read-only behaviour.
+ */
+export const LENS_WRITABLE_INTENT_TAG = 'quereus.lens.writable';
 
 /**
  * The shape a reserved tag's value must satisfy. Validation here is purely
@@ -187,6 +202,18 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		sites: siteSet('logical-table'),
 		valueSchema: 'string',
 		description: 'Declare an expected lookup/ordering access pattern on a column.',
+	},
+	// --- quereus.lens.writable : per-logical-column writable-intent signal ---
+	// docs/lens.md § Computed and Generated Columns. `= true` asserts the column
+	// must be faithfully writable (an opaque / non-invertible body carrying it is a
+	// deploy error via the round-trip prover); `= false` / absent is the
+	// conservative read-only-derived admit. Boolean (the prover reads `=== true`),
+	// logical-column site only.
+	{
+		key: LENS_WRITABLE_INTENT_TAG,
+		sites: siteSet('logical-column'),
+		valueSchema: 'boolean',
+		description: 'Assert a logical column must have a faithful write path; an opaque/non-invertible body carrying it is a deploy error.',
 	},
 	// --- quereus.lens.policy.* : per-(logical-table) advisory escalation policy ---
 	// A comma-separated list of advisory codes (e.g. `lens.no-backing-index`) the
@@ -515,7 +542,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.update.default_for.<column>, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.update.default_for.<column>, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 
@@ -555,6 +582,7 @@ function siteLabel(site: TagSite): string {
 		case 'dml-stmt': return 'a DML statement';
 		case 'logical-table': return 'a logical table';
 		case 'logical-constraint': return 'a logical constraint';
+		case 'logical-column': return 'a logical column';
 		case 'physical-table': return 'a basis table';
 		case 'physical-column': return 'a physical column';
 		case 'physical-index': return 'a physical index';
