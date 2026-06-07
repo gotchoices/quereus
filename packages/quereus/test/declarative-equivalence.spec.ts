@@ -2291,6 +2291,47 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 		}
 	});
 
+	it('a TABLE-qualified CHECK ref case change (t.QTY → t.qty) folds the qualifier too and does not churn', async function () {
+		const db = new Database();
+		try {
+			// The qualifier (`t`) and column (`QTY`) are BOTH folded; a between-versions case
+			// change of either must not churn. (Qualified CHECK refs are unusual but reachable.)
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (T.QTY > 0) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (t.qty > 0) }
+			}`);
+			const alter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter, 'no churn from a qualified CHECK ref case change').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK with column refs nested in a function + CASE folds through the recursion and does not churn', async function () {
+		const db = new Database();
+		try {
+			// Exercises the fold's `function` / `case` / `binary` recursion branches via the
+			// apply path (the other CHECK tests only reach `binary`). The literal `'x'` stays
+			// byte-exact; only the column-ref case (`Qty` / `Status`) diverges across versions.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, status TEXT,
+					constraint chk check (length(case when Status = 'x' then Qty else 0 end) >= 0) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, status TEXT,
+					constraint chk check (length(case when status = 'x' then qty else 0 end) >= 0) }
+			}`);
+			const alter = diffOf(db).tablesToAlter.find(a => a.tableName.toLowerCase() === 't');
+			expect(alter, 'no churn from a nested-expression CHECK ref case change').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('an FK whose REFERENCED (parent) TABLE case changes across re-declares does not churn', async function () {
 		const db = new Database();
 		try {

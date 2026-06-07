@@ -1540,7 +1540,11 @@ function lowercaseTableConstraintColumnNames(tc: AST.TableConstraint): AST.Table
  * identifiers are case-folded ({@link lowercaseTableConstraintColumnNames}) BEFORE
  * the default-form normalization so `canonicalForeignKeyClause` reads the already-
  * lowercased referenced columns. Parser-default-equivalent forms are normalized
- * (see {@link canonicalCheckOperations}, {@link canonicalForeignKeyClause}). Both
+ * (see {@link canonicalCheckOperations}, {@link canonicalForeignKeyClause}). The fold
+ * reaches every identifier channel: the UNIQUE / PK / FK column lists (here, via
+ * {@link lowercaseTableConstraintColumnNames}), the bare column refs inside a CHECK
+ * expression (also via {@link lowercaseTableConstraintColumnNames} → {@link lowerExprIdentifiers}),
+ * and the FK referenced (parent) table name (via {@link canonicalForeignKeyClause}). Both
  * the declared-AST side (`schema-differ`) and the actual-catalog side
  * (`ddl-generator`'s `constraintToCanonicalDDL`) funnel through here so their
  * fragments are byte-comparable.
