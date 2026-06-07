@@ -131,7 +131,7 @@ import type { OptContext } from '../../framework/context.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { JoinNode } from '../../nodes/join-node.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
-import { walkChain, rebuildProject } from './rule-join-elimination.js';
+import { collectAttrIds, walkChain, rebuildProject } from './rule-join-elimination.js';
 import { analyzeChain, rebuildChainStrippingProbe, rightMatchesAtMostOne } from './rule-semijoin-existence-recovery.js';
 
 const log = createLogger('optimizer:rule:inner-join-existence-recovery');
@@ -159,11 +159,17 @@ export function ruleInnerJoinExistenceRecovery(node: PlanNode, _context: OptCont
 	if (!join.condition) return null;
 	const flagId = spec.attrId;
 
-	// Demand-SHAPE analysis (shared with the semi rule): build `demanded` excluding
-	// the sole probe conjunct, and classify the probe's polarity.
-	const analysis = analyzeChain(node, chain, flagId);
+	// Demand-SHAPE analysis (shared with the semi rule): seed `demanded` from the
+	// Project's projections, then `analyzeChain` folds in the chain's non-probe
+	// conjuncts + sort keys and classifies the sole probe conjunct. The returned
+	// `demanded` is the same set we passed in.
+	const demanded = new Set<number>();
+	for (const proj of node.projections) {
+		collectAttrIds(proj.node, demanded);
+	}
+	const analysis = analyzeChain(demanded, chain, flagId);
 	if (!analysis) return null;
-	const { demanded, probe } = analysis;
+	const { probe } = analysis;
 
 	// POSITIVE probe only. A negative probe (`where not flag`, anti polarity) with a
 	// right column demanded must stay a `left` join: an anti row has the right side

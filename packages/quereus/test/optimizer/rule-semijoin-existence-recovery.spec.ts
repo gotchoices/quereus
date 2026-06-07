@@ -106,6 +106,32 @@ async function resultsNoEitherRecovery(db: Database, sql: string): Promise<Resul
 	}
 }
 
+/**
+ * Strongest baseline: disable ALL THREE existence-recovery rules — both Project
+ * anchors AND the new `semijoin-existence-recovery-aggregate`. Used by the
+ * aggregate-anchor cases, where neither `resultsNoRecovery` nor
+ * `resultsNoEitherRecovery` disables the aggregate rule, so they would themselves
+ * be aggregate-recovered (a near-tautology). This yields the genuine flag-bearing
+ * nested-loop left-join baseline that every recovered aggregate shape must match.
+ */
+async function resultsNoAnyRecovery(db: Database, sql: string): Promise<ResultRow[]> {
+	const base = db.optimizer.tuning;
+	db.optimizer.updateTuning({
+		...base,
+		disabledRules: new Set([
+			...(base.disabledRules ?? []),
+			'semijoin-existence-recovery',
+			'inner-join-existence-recovery',
+			'semijoin-existence-recovery-aggregate',
+		]),
+	});
+	try {
+		return await results(db, sql);
+	} finally {
+		db.optimizer.updateTuning(base);
+	}
+}
+
 describe('ruleSemijoinExistenceRecovery', () => {
 	let db: Database;
 
@@ -545,6 +571,173 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			const rows = await planRows(db, q);
 			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(false);
 			expect(joinExistence(rows)).to.deep.equal(['exists right as hasP']);
+		});
+	});
+
+	// The Aggregate-anchored entrypoint (`ruleSemijoinExistenceRecoveryUnderAggregate`):
+	// the SAME probe-only recovery for the bare `count(*) … where flag` shape that
+	// plans with no enclosing Project. Reuses the outer fixtures (seedExisting /
+	// setupFanOut) and `resultsNoAnyRecovery` (the genuine flag-bearing baseline).
+	describe('aggregate anchor (ruleSemijoinExistenceRecoveryUnderAggregate)', () => {
+		it('`count(*) … where hasP` recovers a semi join; count equals baseline', async () => {
+			await seedExisting();
+			const q =
+				'select count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('semi');
+
+			const out = await results(db, q);
+			expect(out).to.have.lengthOf(1);
+			expect(out[0].n).to.equal(2); // cc 1 and cc 3 match
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		it('`count(*) … where not hasP` recovers an anti join; count equals baseline', async () => {
+			await seedExisting();
+			const q =
+				'select count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where not hasP';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('anti');
+
+			const out = await results(db, q);
+			expect(out[0].n).to.equal(2); // cc 2 and cc 4 do not match
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		it('HAVING above the Aggregate does not block recovery (`having count(*) >= 0`)', async () => {
+			await seedExisting();
+			// `having count(*) >= 0` is a FilterNode ABOVE the Aggregate referencing only
+			// the aggregate output — it never appears in walkChain and must not block.
+			const q =
+				'select count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP having count(*) >= 0';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('semi');
+
+			const out = await results(db, q);
+			expect(out[0].n).to.equal(2);
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		it('flag grouped-on (`… where hasP group by hasP`) retains the flag (stays left)', async () => {
+			await seedExisting();
+			// The flag is seeded into `demanded` via groupBy, so `demanded.has(flagId)`
+			// abstains — the flag is genuinely demanded (grouped on), not a pure probe.
+			const q =
+				'select hasP, count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP group by hasP';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), 'flag retained when grouped on').to.deep.equal(['exists right as hasP']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			const out = await results(db, q);
+			// where hasP keeps the matched rows (all hasP=true) → one group, count 2.
+			expect(out).to.deep.equal([{ hasP: true, n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		it('aggregate over a right column (`count(p.pv) … where hasP`) retains the join (stays left)', async () => {
+			await seedExisting();
+			// p.pv is a right-side column demanded by the aggregate, so a semi join (left
+			// columns only) cannot satisfy it; there is NO aggregate inner fallback in
+			// scope, so the join correctly stays a flag-bearing `left` join.
+			const q =
+				'select count(p.pv) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), 'flag retained when a right column is demanded').to.deep.equal(['exists right as hasP']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			const out = await results(db, q);
+			expect(out[0].n).to.equal(2); // pv 10 (cc1) and pv 20 (cc3)
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		it('sibling-prune-then-recover: undemanded `hasA` pruned, sole `hasB` recovered to a semi', async () => {
+			await seedExisting();
+			// hasA is unused → join-existence-pruning-aggregate drops it, leaving a SOLE
+			// hasB which this rule then recovers to a semi join in a later applyRules pass.
+			const q =
+				'select count(*) as n from exc c left join exp p on p.pp = c.pr ' +
+				'exists right as hasA, exists right as hasB where hasB';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('semi');
+
+			const out = await results(db, q);
+			expect(out[0].n).to.equal(2);
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		it('two genuinely-demanded flags (one grouped-on, one probed): no split, flags retained', async () => {
+			await seedExisting();
+			// hasA is grouped on (demanded) and hasB is probed (demanded) — both kept by
+			// pruning, so existence.length === 2 and the recovery abstains.
+			const q =
+				'select hasA, count(*) as n from exc c left join exp p on p.pp = c.pr ' +
+				'exists right as hasA, exists right as hasB where hasB group by hasA';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows)).to.deep.equal(['exists right as hasA', 'exists right as hasB']);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+		});
+
+		describe('fan-out (non-unique right join column)', () => {
+			it('positive probe abstains (no inner fallback) — stays left; count is the fanned-out count', async () => {
+				await setupFanOut();
+				// cc=1 matches THREE fparent rows; a semi join would collapse K→1 (wrong
+				// count), so the SEMI rule abstains on its fan-out guard. Unlike the
+				// Project anchor there is NO aggregate inner fallback, so the join stays a
+				// flag-bearing `left` join and count(*) reflects the fanned-out 3 rows.
+				const q =
+					'select count(*) as n from fchild c left join fparent p on p.pp = c.cc exists right as h where h';
+
+				const rows = await planRows(db, q);
+				expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as h']);
+				expect(joinTypeOf(rows)).to.equal('left');
+
+				const out = await results(db, q);
+				expect(out[0].n).to.equal(3); // the fanned-out count, NOT the collapsed 1
+				expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+			});
+
+			it('anti probe still fires under fan-out (unmatched rows never duplicate)', async () => {
+				await setupFanOut();
+				const q =
+					'select count(*) as n from fchild c left join fparent p on p.pp = c.cc exists right as h where not h';
+
+				const rows = await planRows(db, q);
+				expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+				expect(joinTypeOf(rows)).to.equal('anti');
+
+				const out = await results(db, q);
+				expect(out[0].n).to.equal(1); // only cc=2 is unmatched
+				expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
+			});
+		});
+
+		it('residual AND-conjunct retained below the Aggregate (`where hasP and cv > 150`)', async () => {
+			await seedExisting();
+			// The probe is split out (semi recovered); the residual `cv > 150` is rebuilt
+			// as a Filter below the Aggregate by rebuildChainStrippingProbe.
+			const q =
+				'select count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP and c.cv > 150';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('semi');
+
+			const out = await results(db, q);
+			expect(out[0].n).to.equal(1); // matched cc 1 (cv 100) / cc 3 (cv 300); cv > 150 keeps cc 3
+			expect(out).to.deep.equal(await resultsNoAnyRecovery(db, q));
 		});
 	});
 });

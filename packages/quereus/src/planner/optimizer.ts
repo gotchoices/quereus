@@ -32,7 +32,7 @@ import { ruleJoinKeyInference } from './rules/join/rule-join-key-inference.js';
 import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js';
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
 import { ruleJoinExistencePruning, ruleJoinExistencePruningUnderAggregate } from './rules/join/rule-join-existence-pruning.js';
-import { ruleSemijoinExistenceRecovery } from './rules/join/rule-semijoin-existence-recovery.js';
+import { ruleSemijoinExistenceRecovery, ruleSemijoinExistenceRecoveryUnderAggregate } from './rules/join/rule-semijoin-existence-recovery.js';
 import { ruleInnerJoinExistenceRecovery } from './rules/join/rule-inner-join-existence-recovery.js';
 import { ruleFanOutLookupJoin } from './rules/join/rule-fanout-lookup-join.js';
 import { ruleFanOutBatchedOuter } from './rules/join/rule-fanout-batched-outer.js';
@@ -448,6 +448,31 @@ export class Optimizer {
 			// join, but dropping the flag re-enables join-physical-selection, which can
 			// pick a hash join that scans R once total — changing an impure R's
 			// execution count. Refuses when R carries a write (mirrors the sibling).
+			sideEffectMode: 'aware',
+		});
+
+		// Aggregate counterpart of `semijoin-existence-recovery`: the same probe-only
+		// flag recovery anchored on an `AggregateNode` for the bare `count(*) … where
+		// flag` / `group by` shape that plans with NO enclosing Project (the probe
+		// Filter + flag-bearing join sit under the Aggregate, so the Project entrypoint
+		// never fires). Registered (in registration order) AFTER
+		// `join-existence-pruning-aggregate` (22, so an undemanded sibling flag is
+		// dropped first, maximizing the sole-spec precondition) and BEFORE the
+		// Join-typed IND folders `anti-join-fk-empty` / `semi-join-fk-trivial` and
+		// `join-elimination-aggregate` (all 26), so the recovered semi/anti threads
+		// into them in the same applyRules loop — the aggregate analogue of the Project
+		// rule's placement. No nodeType collision with the Project `semijoin-existence-
+		// recovery` (Project vs Aggregate). Unlike the Project anchor it has NO inner
+		// fallback: a right-col-demanded / fan-out positive probe stays `left`.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'semijoin-existence-recovery-aggregate',
+			nodeType: PlanNodeType.Aggregate,
+			phase: 'rewrite',
+			fn: ruleSemijoinExistenceRecoveryUnderAggregate,
+			priority: 23,
+			// Recovers a semi/anti join under an Aggregate — short-circuits R's scan at
+			// the first match (semi), changing R's execution count. Same impure-R refusal
+			// as the Project entrypoint.
 			sideEffectMode: 'aware',
 		});
 

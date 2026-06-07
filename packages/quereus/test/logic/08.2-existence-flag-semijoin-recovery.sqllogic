@@ -141,3 +141,57 @@ select cc from fc c left join fp p on p.pp = c.cc exists right as h where not h 
 
 drop table fc;
 drop table fp;
+
+-- ===== Aggregate anchor: bare `count(*) … where flag` (no enclosing Project) =====
+-- A flag-bearing left join under a `count(*)` / `group by` with NO enclosing Project
+-- is recovered by the AggregateNode entrypoint (`semijoin-existence-recovery-aggregate`)
+-- exactly like the Project shape — the probe Filter sits between the Aggregate and the
+-- Join, so the same probe-detection + chain-rewrite machinery applies. These assert the
+-- end-to-end counts against real data.
+
+create table ac (cc integer primary key, pr integer null);
+create table ap (pp integer primary key, pv integer);
+insert into ap values (1, 10), (2, 20);
+-- cc 1 (pr 1) matches; cc 2 (pr 9) no match; cc 3 (pr 2) matches; cc 4 (pr null) no match
+insert into ac values (1, 1), (2, 9), (3, 2), (4, null);
+
+-- semi: count of child rows WITH a matching parent
+select count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP where hasP;
+→ [{"n":2}]
+
+-- anti: count of child rows with NO matching parent
+select count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP where not hasP;
+→ [{"n":2}]
+
+-- HAVING above the aggregate references only the count output — it does not block recovery
+select count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP where hasP having count(*) >= 0;
+→ [{"n":2}]
+
+-- flag grouped on: retained (genuinely demanded), one group per flag value
+select hasP, count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP group by hasP order by hasP;
+→ [{"hasP":false,"n":2},{"hasP":true,"n":2}]
+
+drop table ac;
+drop table ap;
+
+-- ===== Aggregate anchor fan-out: NO inner fallback, so count is the fanned-out value =====
+-- Unlike the Project anchor (which hands the fan-out positive probe to a fan-out-safe
+-- inner join), the aggregate anchor has no inner fallback: the SEMI rule abstains and the
+-- join stays a flag-bearing left join, so `count(*)` reflects the fanned-out rows.
+
+create table afc (cc integer primary key);
+create table afp (id integer primary key, pp integer);
+insert into afc values (1), (2);
+-- cc 1 matches THREE afp rows (pp=1); cc 2 matches none.
+insert into afp values (10, 1), (11, 1), (12, 1);
+
+-- positive probe over fan-out: stays left; count(*) is the fanned-out 3, NOT a collapsed 1
+select count(*) as n from afc c left join afp p on p.pp = c.cc exists right as h where h;
+→ [{"n":3}]
+
+-- anti probe: one row per unmatched left row — fan-out irrelevant, recovers an anti join
+select count(*) as n from afc c left join afp p on p.pp = c.cc exists right as h where not h;
+→ [{"n":1}]
+
+drop table afc;
+drop table afp;

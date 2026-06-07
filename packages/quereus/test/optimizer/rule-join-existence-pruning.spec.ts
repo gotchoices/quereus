@@ -459,11 +459,19 @@ describe('ruleJoinExistencePruning', () => {
 
 		it('retained when the flag is referenced only by a WHERE filter under the aggregate', async () => {
 			await seedExisting();
+			// Isolate the PRUNING rule's demand analysis by disabling the aggregate
+			// recovery rule: walkChain folds the intervening Filter's hasP into the
+			// demanded set, so pruning retains the flag. (With recovery enabled this exact
+			// `count(*) … where hasP` shape is instead recovered to a semi join — that is
+			// the aggregate-anchor case in rule-semijoin-existence-recovery.spec.ts.)
+			db.optimizer.updateTuning({
+				...DEFAULT_TUNING,
+				disabledRules: new Set(['semijoin-existence-recovery-aggregate']),
+			});
 			const q =
 				'select count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP';
 
 			const rows = await planRows(db, q);
-			// walkChain folds the intervening Filter's hasP into the demanded set ⇒ retained.
 			expect(joinExistence(rows), 'flag retained for the WHERE').to.deep.equal(['exists right as hasP']);
 
 			// `where hasP` keeps the matched rows (cc 1, 3) ⇒ count = 2.

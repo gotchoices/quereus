@@ -18,6 +18,25 @@
  * just slower than the semi/anti shape. The deliverable is byte-identical rows
  * plus a re-enabled physical/IND cascade.
  *
+ * ## Two entrypoints (mirrors `join-existence-pruning` / `…UnderAggregate`)
+ *
+ * The rule has two anchors sharing ALL of the probe-detection + chain-rewrite
+ * machinery below. `ruleSemijoinExistenceRecovery` fires on a `ProjectNode` (the
+ * common `select … where flag` shape). `ruleSemijoinExistenceRecoveryUnderAggregate`
+ * fires on an `AggregateNode` for the bare `count(*) … where flag` / `group by`
+ * shape that plans with **no enclosing Project** — the probe Filter and the
+ * flag-bearing join sit *under* the Aggregate, so the Project entrypoint walks
+ * right past them. The two differ only in the demand-seed prologue (projections
+ * vs group-by + aggregate expressions — each anchor's only scalar children) and
+ * the rebuild epilogue (`rebuildProject` vs reconstructing the `AggregateNode`
+ * with `preserveAttributeIds`); the sole-spec / `left` / `side==='right'` gates,
+ * the demand-SHAPE proof (`analyzeChain`, which takes a *pre-seeded* demand set),
+ * the fan-out guard (semi only), the impure-R guard, and the probe-strip rebuild
+ * are identical. NOTE: the Aggregate anchor has **no** inner-join fallback — a
+ * right-column-demanded or fan-out *positive* probe under an aggregate stays a
+ * flag-bearing `left` join (sound, just unoptimized), unlike the Project anchor
+ * which hands those off to `rule-inner-join-existence-recovery`.
+ *
  * ## Q1 — Anchor: `ProjectNode`, not `FilterNode`
  *
  * A `FilterNode` anchor (mirroring `ruleSubqueryDecorrelation`) would be UNSOUND
@@ -163,8 +182,10 @@
 
 import { createLogger } from '../../../common/logger.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
+import { isRelationalNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { ProjectNode } from '../../nodes/project-node.js';
+import { AggregateNode } from '../../nodes/aggregate-node.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { JoinNode, type JoinType, extractEquiPairsFromCondition } from '../../nodes/join-node.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
@@ -223,11 +244,18 @@ export function ruleSemijoinExistenceRecovery(node: PlanNode, _context: OptConte
 	if (!join.condition) return null;
 	const flagId = spec.attrId;
 
-	// Demand-SHAPE analysis: build `demanded` excluding the sole probe conjunct,
-	// and classify the probe's polarity (Q2).
-	const analysis = analyzeChain(node, chain, flagId);
+	// Demand-SHAPE analysis: seed `demanded` from the Project's projections (the
+	// anchor's only scalar children that an ancestor can reference), then
+	// `analyzeChain` folds in the chain's non-probe conjuncts + sort keys and
+	// locates/classifies the sole probe conjunct (Q2). The returned `demanded` is
+	// the same set we passed in.
+	const demanded = new Set<number>();
+	for (const proj of node.projections) {
+		collectAttrIds(proj.node, demanded);
+	}
+	const analysis = analyzeChain(demanded, chain, flagId);
 	if (!analysis) return null;
-	const { demanded, probe } = analysis;
+	const { probe } = analysis;
 
 	// The flag must not be demanded anywhere but the stripped probe (a flag that is
 	// selected or sorted on lands in `demanded` via projections / sort keys).
@@ -279,23 +307,145 @@ export function ruleSemijoinExistenceRecovery(node: PlanNode, _context: OptConte
 }
 
 /**
- * Build the residual demand set (everything any ancestor of the Project can
- * reference EXCEPT the single stripped probe conjunct) and locate the sole probe.
+ * Aggregate counterpart of `ruleSemijoinExistenceRecovery` (see the "Two
+ * entrypoints" note in the file header). When the flag-bearing `left join … exists
+ * right as` sits under a bare aggregate (`select count(*) from … where flag`,
+ * `select flag, count(*) … group by flag`) with **no enclosing Project**, the probe
+ * Filter and the join sit *under* the AggregateNode, so the Project entrypoint never
+ * fires. This anchor walks down from the Aggregate's source through the SAME
+ * whitelisted pass-through chain to the flag-bearing join, runs the SAME demand-SHAPE
+ * proof, fan-out guard (semi only), and impure-R guard, and rebuilds the SAME
+ * probe-stripped chain — differing from the Project entrypoint in only two places:
+ *
+ *  - **Demand-seed prologue.** Seed `demanded` from the Aggregate's group-by
+ *    expressions + every aggregate expression (its only scalar children) instead of
+ *    a Project's projections. A flag *grouped on* (`group by flag`) lands in
+ *    `demanded` and abstains; an aggregate over a right column (`count(p.pv)`) lands
+ *    a right attr id in `demanded` and abstains.
+ *  - **Rebuild epilogue.** Reconstruct the `AggregateNode` with `preserveAttributeIds`
+ *    so its output ids stay stable (mirrors `ruleJoinExistencePruningUnderAggregate`
+ *    / `ruleJoinEliminationUnderAggregate`).
+ *
+ * Unlike the Project anchor there is **no inner-join fallback**: a positive probe
+ * with a right column demanded, or over a fan-out (non-unique) R, simply stays a
+ * flag-bearing `left` join (sound, just unoptimized) — the `count(*) … where flag`
+ * shape is the target, and the inner-only cardinality cascade is out of scope here.
+ *
+ * HAVING does not block: `having count(*) > 0` is a `FilterNode` *above* the
+ * Aggregate that can only reference the Aggregate's outputs (group keys / aggregate
+ * results), never the raw flag — so it never appears in `walkChain` and needs no
+ * handling (mirrors the HAVING note in `ruleJoinExistencePruningUnderAggregate`).
+ */
+export function ruleSemijoinExistenceRecoveryUnderAggregate(node: PlanNode, _context: OptContext): PlanNode | null {
+	if (!(node instanceof AggregateNode)) return null;
+
+	// `walkChain` mutates its `demanded` set; we ignore it (a throwaway) and seed
+	// demand from the Aggregate's scalar children below, so the probe can be excluded.
+	const walk = walkChain(node.source, new Set<number>());
+	if (!walk) return null;
+
+	const { join, chain } = walk;
+
+	// Same reachable flag-bearing shape as the Project entrypoint: a `left join …
+	// exists right as` with a SOLE existence spec. A mixed join cannot be split;
+	// `join-existence-pruning-aggregate` strips an undemanded sibling first.
+	if (join.joinType !== 'left') return null;
+	if (!join.hasExistenceColumns) return null;
+	const existence = join.existence!;
+	if (existence.length !== 1) return null;
+	const spec = existence[0];
+	if (spec.side !== 'right') return null;
+	if (!join.condition) return null;
+	const flagId = spec.attrId;
+
+	// Demand-seed prologue — the ONLY divergence from the Project rule's demand
+	// half. The Aggregate's group-by + aggregate expressions are its only scalar
+	// children, so they bound everything any ancestor can reference.
+	const demanded = new Set<number>();
+	for (const groupExpr of node.groupBy) {
+		collectAttrIds(groupExpr, demanded);
+	}
+	for (const agg of node.aggregates) {
+		collectAttrIds(agg.expression, demanded);
+	}
+
+	const analysis = analyzeChain(demanded, chain, flagId);
+	if (!analysis) return null;
+	const { probe } = analysis;
+
+	// The flag must not be demanded anywhere but the stripped probe (a flag that is
+	// grouped on lands in `demanded` via groupBy and abstains).
+	if (demanded.has(flagId)) return null;
+
+	// The semi/anti output is left columns only — abstain if any right column is
+	// demanded (an aggregate over a right column, e.g. `count(p.pv)`, lands here).
+	// There is no aggregate inner fallback in scope, so the join stays `left`.
+	const rightAttrIds = join.right.getAttributes().map(a => a.id);
+	for (const id of rightAttrIds) {
+		if (demanded.has(id)) return null;
+	}
+
+	// Fan-out guard (SEMI only), identical to the Project rule (Q5): a plain
+	// `left join … exists right as` yields K rows per matched left row, whereas a
+	// semi join keeps one — sound only when every left row matches ≤1 right row.
+	// The ANTI path is immune (one null-extension per unmatched row, any fan-out).
+	if (probe.polarity === 'semi' && !rightMatchesAtMostOne(join)) {
+		log('Aggregate semi recovery skipped: right side may match >1 row per left row (fan-out)');
+		return null;
+	}
+
+	// A semi join short-circuits the R scan at the first match — refuse to change
+	// R's execution count when R carries a write (Q7).
+	if (PlanNodeCharacteristics.subtreeHasSideEffects(join.right)) {
+		log('Aggregate recovery skipped: right side has side effects');
+		return null;
+	}
+
+	const newJoinType: JoinType = probe.polarity;
+	const semiAnti = new JoinNode(
+		join.scope,
+		join.left,
+		join.right,
+		newJoinType,
+		join.condition, // carry the full ON condition verbatim (Q5)
+		// no usingColumns, no existence — the flag column disappears.
+	);
+
+	log('Recovered %s join under Aggregate from probe-only existence flag %s', newJoinType, spec.name);
+
+	const newSource = rebuildChainStrippingProbe(chain, probe, semiAnti);
+	if (!isRelationalNode(newSource)) {
+		throw new Error('rule-semijoin-existence-recovery-aggregate: rebuilt source must be relational');
+	}
+	return new AggregateNode(
+		node.scope,
+		newSource,
+		node.groupBy,
+		node.aggregates,
+		undefined,             // estimatedCostOverride
+		node.getAttributes(),  // preserveAttributeIds — keep the Aggregate's output ids stable
+	);
+}
+
+/**
+ * Fold the chain's residual demand into the caller-supplied `demanded` set and
+ * locate the sole probe conjunct. `demanded` is **pre-seeded by the caller** from
+ * its anchor's scalar children (a Project's projections, or an Aggregate's
+ * group-by + aggregate expressions); this routine adds every chain Filter's
+ * NON-probe conjuncts and every chain Sort's keys (Limit/Distinct/Alias add
+ * nothing). The set is mutated in place and also returned for the caller's
+ * convenience. After the call, `demanded` is everything any ancestor of the
+ * anchor can reference EXCEPT the single stripped probe conjunct.
  *
  * Returns null when the demand SHAPE disqualifies the rewrite: no probe found,
  * the flag referenced in more than one conjunct, or the flag inside a non-probe
  * conjunct shape (`f or x`, `f(x)`, …).
  */
 export function analyzeChain(
-	project: ProjectNode,
+	demanded: Set<number>,
 	chain: ReadonlyArray<ChainEntry>,
 	flagId: number,
 ): { demanded: Set<number>; probe: ProbeMatch } | null {
-	const demanded = new Set<number>();
-	for (const proj of project.projections) {
-		collectAttrIds(proj.node, demanded);
-	}
-
 	let probe: ProbeMatch | null = null;
 
 	for (let i = 0; i < chain.length; i++) {
