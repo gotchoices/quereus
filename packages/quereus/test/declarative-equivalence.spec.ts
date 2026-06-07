@@ -640,8 +640,11 @@ describe('declarative-equivalence: indexes', () => {
 
 	it('unique partial index round-trips and enforces uniqueness within its predicate', async function () {
 		// `unique index ... where ...` must thread BOTH isUnique and the predicate
-		// through the declarative path. The conflict probe inserts two predicate-
-		// matching duplicates; both paths reject the second identically.
+		// through the declarative path. The probes prove the index is genuinely
+		// PARTIAL, not just unique: in-scope duplicates are rejected, but a
+		// duplicate name OUTSIDE the predicate scope (active = 0) is allowed — the
+		// behaviour that distinguishes a partial unique index from a full one and
+		// would be lost if the WHERE were dropped on either path.
 		await runCase({
 			name: 'index-unique-partial',
 			directDDL: [
@@ -658,8 +661,21 @@ describe('declarative-equivalence: indexes', () => {
 			expectTables: ['t'],
 			probes: [
 				{ sql: "insert into t values (1, 1, 'dup')", expect: { rows: [] } },
+				// Second in-scope (active = 1) duplicate is rejected by both paths.
 				{
 					sql: "insert into t values (2, 1, 'dup')",
+					expect: { error: { status: StatusCode.CONSTRAINT } },
+				},
+				// A same-name row OUTSIDE the predicate (active = 0) is admitted —
+				// proof the predicate actually narrows enforcement (a full unique
+				// index would reject this).
+				{ sql: "insert into t values (3, 0, 'dup')", expect: { rows: [] } },
+				// And a second out-of-scope duplicate is likewise admitted.
+				{ sql: "insert into t values (4, 0, 'dup')", expect: { rows: [] } },
+				// The original in-scope key is still enforced afterward — the index
+				// was not silently disabled by the out-of-scope inserts.
+				{
+					sql: "insert into t values (5, 1, 'dup')",
 					expect: { error: { status: StatusCode.CONSTRAINT } },
 				},
 			],

@@ -150,8 +150,9 @@ declare schema schema_name
     constraint fk_role foreign key (role_id) references roles(id)
   );
 
-  -- Indexes
+  -- Indexes (optional `unique`, optional partial `where`, optional `with tags`)
   index users_email on users(email);
+  unique index users_active_email on users(email) where created_at is not null;
 
   -- Views
   view v_user_roles as
