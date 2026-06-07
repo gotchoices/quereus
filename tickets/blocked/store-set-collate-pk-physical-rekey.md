@@ -7,6 +7,8 @@ files:
   - packages/quereus/test/logic.spec.ts                        # MEMORY_ONLY_FILES
 ----
 
+**BLOCKED — design / value call (human sign-off).** This is a large core key-encoder rewrite (per-column key collation + physical PK re-key) whose *necessity* is debatable: the sibling `store-set-collate-existing-row-revalidation` deemed validate-only (Option A) "likely sufficient." *Unblocks when:* a human decides whether to invest in physical PK re-key (Option B) or accept and document the memory/store PK-collation divergence. Not auto-implemented — an unsupervised core-storage encoder rewrite of debatable necessity is too risky/wasteful overnight.
+
 # Store `SET COLLATE` on a PRIMARY KEY column — physical re-key (Option B)
 
 ## Background / why this is separate
