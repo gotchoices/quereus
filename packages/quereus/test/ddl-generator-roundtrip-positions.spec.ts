@@ -317,6 +317,32 @@ describe('Generator: table-column COLLATE default elision + round-trip', () => {
 		expect(lower).to.not.include('COLLATE');
 	});
 
+	it('an inline single-column PK + non-default COLLATE re-parses, keeping both', () => {
+		// The generator places COLLATE before the inline PRIMARY KEY
+		// (`"id" TEXT COLLATE NOCASE PRIMARY KEY`). Column constraints re-parse
+		// order-independently, but pin that the combined spelling round-trips:
+		// both the collation and the PK survive. A second (non-PK) column keeps
+		// this off the synthesized all-columns-key path.
+		const table = makeTableSchema({
+			name: 't',
+			columns: [
+				makeColumn('id', { logicalType: TEXT_TYPE, collation: 'NOCASE', primaryKey: true, pkOrder: 1 }),
+				makeColumn('other', { logicalType: TEXT_TYPE }),
+			],
+			primaryKeyDefinition: [{ index: 0 }],
+		});
+		const ddl = generateTableDDL(table);
+		expect(ddl, 'COLLATE precedes inline PRIMARY KEY').to.include('COLLATE NOCASE PRIMARY KEY');
+
+		const stmt = parse(ddl);
+		expect(stmt.type).to.equal('createTable');
+		if (stmt.type === 'createTable') {
+			const col = stmt.columns.find(c => c.name === 'id')!;
+			expect(columnCollationOf(col)?.toLowerCase(), 'collation survives').to.equal('nocase');
+			expect(col.constraints?.some(c => c.type === 'primaryKey'), 'inline PK survives').to.equal(true);
+		}
+	});
+
 	it('round-trips a non-default collation back to canonical NOCASE via columnDefToSchema', () => {
 		const table = makeTableSchema({
 			name: 't',
