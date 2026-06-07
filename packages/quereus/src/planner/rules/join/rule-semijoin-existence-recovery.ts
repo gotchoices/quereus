@@ -75,19 +75,22 @@
  * `case`-wrapped probes are out of scope (file a fresh backlog ticket if a real
  * workload ever produces them).
  *
- * ## Q3 — left/right/inner → semi/anti mapping (settled by reachability)
+ * ## Q3 — left/right/inner → semi/anti mapping
  *
- * The parser (`resolveExistenceSide`) rejects `exists … as` on inner/cross joins,
- * and the runtime (`emitLoopJoin`) throws on RIGHT/FULL. So the ONLY executable
- * flag-bearing shape is `left join … exists right as`, giving the complete table:
+ * The parser (`resolveExistenceSide`) rejects `exists … as` on inner/cross joins.
+ * RIGHT/FULL flag-bearing joins now execute (`emitLoopJoin` drives them directly),
+ * but this rule deliberately handles only the `left join … exists right as` shape,
+ * giving the complete table:
  *
  *  | Join type | spec.side | probe         | rewrite               | rows kept           |
  *  |-----------|-----------|---------------|-----------------------|---------------------|
  *  | `left`    | `right`   | `where f`     | `semi(L, R, cond)`    | L rows WITH a match |
  *  | `left`    | `right`   | `where not f` | `anti(L, R, cond)`    | L rows with NO match |
  *
- * The rule is guarded by `joinType === 'left' && spec.side === 'right'`; right /
- * full origins and inner flags are unreachable today and explicitly out of scope.
+ * The rule is guarded by `joinType === 'left' && spec.side === 'right'`; a RIGHT /
+ * FULL origin keeps its nested-loop join (abstaining is always sound — it merely
+ * forgoes the semi/anti rewrite), and inner flags are unreachable. Both are
+ * explicitly out of scope.
  * The semi/anti node takes the LEFT side's attributes only (the flag column
  * disappears), which the Q2 checks guarantee the consuming Project tolerates.
  *

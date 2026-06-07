@@ -59,11 +59,12 @@ async function prove(
 }
 
 /**
- * Runs the prover against a body that is *planned but not materialized*. Needed
- * for RIGHT JOIN, which plans correctly but is not executable yet (so it cannot
- * back a real MV — `collectBodyRows` throws "RIGHT JOIN is not supported yet").
- * `proveCoverage` reads only `mv.selectAst`, so a stub carrying the parsed body
- * suffices to exercise the prover's `'right'`-join branch end to end.
+ * Runs the prover against a body that is *planned but not materialized*. The MV
+ * materialization path (`collectBodyRows`) is out of scope here — `proveCoverage`
+ * reads only `mv.selectAst`, so a stub carrying the parsed body suffices to
+ * exercise the prover's `'right'`-join branch end to end in isolation. (RIGHT
+ * JOIN itself now executes at runtime; this helper just keeps the coverage unit
+ * test focused on the prover rather than on materialization.)
  */
 function proveUnmaterialized(
 	db: Database,
@@ -304,8 +305,8 @@ describe('coverage prover — multi-source (join) bodies', () => {
 	});
 
 	it('positive: RIGHT join with the lookup on the left (T on the preserving right side) covers', async () => {
-		// RIGHT JOIN is not executable yet, so the MV cannot be materialized; prove
-		// against the planned body directly (the prover's `'right'`-join branch).
+		// Prove against the planned body directly (the prover's `'right'`-join branch),
+		// keeping this unit test focused on coverage rather than MV materialization.
 		const body = 'select o.customer_id, o.sku, o.id from customers c right join orders o on o.customer_id = c.id order by o.customer_id, o.sku';
 		const db = await freshDb(ORDERS_CUSTOMERS);
 		try {

@@ -252,10 +252,10 @@ update oj_left set bv = 'z' where aid = 1;
 select aid, av, bv from oj_left where aid = 1;
 → [{"aid":1,"av":"z","bv":"z"}]
 
--- RIGHT: not runtime-executable (runtime/emit/join.ts throws `RIGHT JOIN is not
--- supported yet`), so the view is neither readable nor writable — report conservative
--- all-`NO`. The write-through recognition excludes RIGHT for the same reason; re-admit
--- it (and flip this row to the per-side LEFT shape) when the runtime gains RIGHT joins.
+-- RIGHT: the runtime now reads a RIGHT join, but write-through recognition still
+-- excludes it (re-admission is the dependent `view-write-right-join-readmit` ticket),
+-- so the surfaces stay conservative all-`NO`. Flip this row to the per-side LEFT shape
+-- when that ticket lands.
 create view oj_right as
     select a.av as av, b.bid as bid, b.bv as bv
     from oj_a a right join oj_b b on b.bid = a.aid;
@@ -264,7 +264,7 @@ select is_insertable_into, is_updatable, is_deletable, effective_targets
 → [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
 
 -- Surface agrees with propagate(): a write through the RIGHT-join view rejects at plan
--- time (recognition excludes RIGHT — the runtime cannot execute it).
+-- time (recognition still excludes RIGHT — write-through re-admission is deferred).
 update oj_right set bv = 'z' where bid = 1;
 -- error: cannot write through view
 

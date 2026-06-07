@@ -399,15 +399,15 @@ describe('ruleJoinElimination', () => {
 			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
 		});
 
-		it('eliminates a RIGHT join under count(*) — and thereby answers a query RIGHT-emit cannot run', async () => {
+		it('eliminates a RIGHT join under count(*) — matching the un-eliminated RIGHT execution', async () => {
 			await setupCustomersOrders();
 			// `customers RIGHT JOIN orders` preserves orders (right) and carries the
 			// FK on the preserved side (orders.customer_id → customers.id), so each
 			// preserved row matches ≤1 eliminated (customers) row: the sound mirror of
-			// the LEFT arm. RIGHT-JOIN execution is unimplemented (emit throws
-			// "RIGHT JOIN is not supported yet"), so eliminating the join is the ONLY
-			// way this query produces a result — disabling the rule re-exposes the
-			// throw, which the contrast below asserts.
+			// the LEFT arm. RIGHT-JOIN execution is now implemented (the nested-loop
+			// emitter drives from the right side), so elimination is purely an
+			// optimization — the un-eliminated RIGHT join produces the same answer,
+			// which the contrast below asserts.
 			const q =
 				'SELECT count(*) AS n FROM customers RIGHT JOIN orders ON orders.customer_id = customers.id';
 
@@ -417,14 +417,8 @@ describe('ruleJoinElimination', () => {
 			const out = await results(db, q);
 			expect(out).to.deep.equal([{ n: 3 }]);
 
-			// With the rule disabled the RIGHT join survives to emit and throws.
-			let threw: string | undefined;
-			try {
-				await resultsNoAggElim(db, q);
-			} catch (e) {
-				threw = (e as Error).message;
-			}
-			expect(threw, 'RIGHT-emit should throw when the join is not eliminated').to.match(/RIGHT JOIN is not supported/i);
+			// With the rule disabled the RIGHT join survives to emit and runs — same result.
+			expect(await resultsNoAggElim(db, q)).to.deep.equal([{ n: 3 }]);
 		});
 
 		it('eliminates the LEFT join under count(*) for an aligned composite FK', async () => {

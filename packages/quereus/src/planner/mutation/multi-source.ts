@@ -276,13 +276,12 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 				return true;
 			case 'join': {
 				// INNER / LEFT / FULL join with an explicit ON predicate or a USING column
-				// list. RIGHT is **excluded**: the runtime cannot execute a RIGHT join at all
-				// (`runtime/emit/join.ts` throws `RIGHT JOIN is not supported yet`, pinned by
-				// test/logic/90.5), so a RIGHT-join view is neither readable nor writable —
-				// admitting it here would make the static surfaces advertise it `is_updatable`.
-				// FULL is also runtime-unexecutable but has no preserved side, so it
-				// self-conservatizes downstream (no false positive). Re-admit RIGHT when the
-				// runtime gains RIGHT-join support (see `outer-join-right-full-runtime`).
+				// list. RIGHT is **excluded**: although the runtime now reads a RIGHT join,
+				// write-through re-admission is the separate dependent ticket
+				// (`view-write-right-join-readmit`), so admitting it here would make the static
+				// surfaces advertise it `is_updatable` before the per-side routing exists. FULL
+				// is admitted but has no preserved side, so it self-conservatizes downstream (no
+				// false positive). Re-admit RIGHT for write-through in `view-write-right-join-readmit`.
 				const accepted = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'full';
 				if (!accepted || (!fc.condition && !(fc.columns && fc.columns.length > 0))) return false;
 				return visit(fc.left) && visit(fc.right);
@@ -1170,14 +1169,13 @@ function collectJoinSources(view: MutableViewLike, from: readonly AST.FromClause
 			case 'join': {
 				const hasPredicate = !!fc.condition || (!!fc.columns && fc.columns.length > 0);
 				// RIGHT is **excluded** even though its preserved/non-preserved classification
-				// is the mirror of LEFT: the runtime cannot execute a RIGHT join at all
-				// (`runtime/emit/join.ts` throws `RIGHT JOIN is not supported yet`, pinned by
-				// test/logic/90.5), so the body's own identification scan would throw — and
-				// admitting it would make the static surfaces advertise a RIGHT-join view as
-				// writable when not even a SELECT through it succeeds. FULL is accepted only to
-				// carry through to its precise conservative diagnostics (it has no preserved
-				// side, so it never falsely advertises). Re-admit RIGHT once the runtime gains
-				// RIGHT-join support (see ticket `outer-join-right-full-runtime`).
+				// is the mirror of LEFT and the runtime can now read a RIGHT join: write-through
+				// re-admission is the separate dependent ticket (`view-write-right-join-readmit`),
+				// so until that lands, admitting RIGHT here would make the static surfaces
+				// advertise a RIGHT-join view as writable before the per-side routing exists.
+				// FULL is accepted only to carry through to its precise conservative diagnostics
+				// (it has no preserved side, so it never falsely advertises). Re-admit RIGHT for
+				// write-through in `view-write-right-join-readmit`.
 				const acceptedType = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'full';
 				if (!acceptedType || !hasPredicate) {
 					raiseMutationDiagnostic({

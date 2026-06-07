@@ -8,15 +8,21 @@ import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 
 import { createRowSlot } from '../context-helpers.js';
-import { QuereusError } from '../../common/errors.js';
-import { StatusCode } from '../../common/types.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:join');
 
 /**
- * Emits a nested loop join instruction.
- * This is a simple nested loop implementation for inner/left/cross joins.
+ * Emits a nested loop join instruction. Handles every join type the optimizer
+ * leaves as a logical {@link JoinNode}: inner / left / cross / semi / anti drive
+ * from the left side (stream left, re-scan right per left row), while right / full
+ * invert the drive — buffer the left side once and iterate the right side as the
+ * outer loop — so every right (and, for full, every unmatched left) row is emitted.
+ *
+ * Output row order is invariant across the two drivers: a row is always
+ * `[...leftRow, ...rightRow (, ...existenceFlags)]`, matching the JoinNode's
+ * attribute order (left attrs, then right attrs, then flags). Driving from the
+ * right side therefore preserves `select *` column identity by construction.
  */
 export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction {
 	// Create row descriptors for left and right inputs
@@ -40,74 +46,124 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 	// ACTUAL match bit the outer-join null-extension already computes (NOT a
 	// re-evaluation of the ON predicate, which would be unsound on a null-extended
 	// row): a matched row has every side present (all flags true); a null-extended
-	// row's non-preserved side is absent (its flag false; the preserved side stays
-	// true). Pre-compute the two flag rows once at emit time.
+	// row's *dropped* side is absent (its flag false; the surviving side stays
+	// true). Pre-compute the flag rows once at emit time.
 	const existence = plan.existence;
 	const matchedFlags: Row | undefined = existence ? existence.map(() => true) as Row : undefined;
-	const unmatchedFlags: Row | undefined = existence ? existence.map(spec => spec.side === 'left') as Row : undefined;
+	// A flag is true iff its side survives the null-extension — i.e. the `dropped`
+	// (null-extended) side's flag goes false and every other flag stays true. This
+	// generalizes the old LEFT-only `spec.side === 'left'` (LEFT drops the right
+	// side) to either dropped side, so RIGHT/FULL get the mirror values for free.
+	const flagsForDroppedSide = (dropped: 'left' | 'right'): Row | undefined =>
+		existence ? existence.map(spec => spec.side !== dropped) as Row : undefined;
+	// Left row with no right match → right side null-extended (LEFT + FULL trailing pass).
+	const leftUnmatchedFlags = flagsForDroppedSide('right');
+	// Right row with no left match → left side null-extended (RIGHT + FULL driver).
+	const rightUnmatchedFlags = flagsForDroppedSide('left');
 
-	// NOTE: rightSource must be re-startable (optimizer facilitates through cache node)
+	// NOTE: for left/inner/semi/anti the rightSource must be re-startable (optimizer
+	// facilitates through a cache node). The right/full driver iterates each side
+	// exactly once, so it has *weaker* restartability requirements.
 	async function* run(rctx: RuntimeContext, leftSource: AsyncIterable<Row>, rightCallback: (ctx: RuntimeContext) => AsyncIterable<Row>, conditionCallback?: (ctx: RuntimeContext) => OutputValue): AsyncIterable<Row> {
 		const joinType = plan.joinType;
 		const isSemiOrAnti = joinType === 'semi' || joinType === 'anti';
+		const isRightOrFull = joinType === 'right' || joinType === 'full';
 
 		log('Starting %s join between %d left attrs and %d right attrs',
 			joinType.toUpperCase(), leftAttributes.length, rightAttributes.length);
-
-		if (joinType === 'right' || joinType === 'full') {
-			throw new QuereusError(
-				`${joinType.toUpperCase()} JOIN is not supported yet`,
-				StatusCode.UNSUPPORTED
-			);
-		}
 
 		// Create row slots for efficient context management
 		const leftSlot = createRowSlot(rctx, leftRowDescriptor);
 		const rightSlot = createRowSlot(rctx, rightRowDescriptor);
 
-		try {
-			// Process left side and join with right (pure streaming)
+		// The condition-met decision, shared by both loop shapes. Evaluated against
+		// the runtime context after BOTH slots are set, so it is agnostic to which
+		// side drives the iteration: callback (ON) / USING / unconditional (cross or
+		// a bare join with no predicate).
+		const conditionMet = async (leftRow: Row, rightRow: Row): Promise<boolean> => {
+			if (conditionCallback) {
+				return !!(await conditionCallback(rctx));
+			}
+			if (usingResolved) {
+				return evaluateUsingCondition(leftRow, rightRow, usingResolved);
+			}
+			return true;
+		};
+
+		// Left-driven loop: inner / left / cross / semi / anti. Stream the left side
+		// as the outer driver and re-scan the right side for each left row.
+		async function* driveFromLeft(): AsyncIterable<Row> {
 			for await (const leftRow of leftSource) {
-				// Set up left context
 				leftSlot.set(leftRow);
+				let matched = false;
 
-				let leftMatched = false;
-
-				// Stream through right side for each left row
 				for await (const rightRow of rightCallback(rctx)) {
-					// Set up right context
 					rightSlot.set(rightRow);
-
-					// Evaluate join condition
-					let conditionMet = true;
-
-					if (conditionCallback) {
-						// Evaluate the join condition using the callback provided by scheduler
-						const conditionResult = await conditionCallback(rctx);
-						conditionMet = !!conditionResult; // Convert to boolean
-					} else if (usingResolved) {
-						// Handle USING condition with pre-resolved indices and typed comparators
-						conditionMet = evaluateUsingCondition(leftRow, rightRow, usingResolved);
-					} else if (joinType === 'cross') {
-						// Cross join - always true
-						conditionMet = true;
-					}
-
-					if (conditionMet) {
-						leftMatched = true;
+					if (await conditionMet(leftRow, rightRow)) {
+						matched = true;
 						if (isSemiOrAnti) {
-							// Semi: emit left row on first match and stop scanning right side
-							// Anti: just record the match, don't emit yet
+							// Semi: emit left row on first match and stop scanning right.
+							// Anti: just record the match, don't emit yet.
 							break;
 						}
 						yield (matchedFlags ? [...leftRow, ...rightRow, ...matchedFlags] : [...leftRow, ...rightRow]) as Row;
 					}
 				}
 
-				const postRow = joinOutputRow(joinType, leftMatched, isSemiOrAnti, leftRow, rightAttributes.length, rightSlot);
-				if (postRow) yield (unmatchedFlags ? [...postRow, ...unmatchedFlags] : postRow) as Row;
+				const postRow = joinOutputRow(joinType, matched, isSemiOrAnti, leftRow, rightAttributes.length, rightSlot);
+				if (postRow) yield (leftUnmatchedFlags ? [...postRow, ...leftUnmatchedFlags] : postRow) as Row;
+			}
+		}
+
+		// Right-driven loop: right / full. Buffer the left side once, then iterate
+		// the right side as the outer driver and scan the buffered left rows. FULL
+		// additionally tracks which left rows matched and emits the leftovers (right
+		// null-extended) in a trailing pass.
+		async function* driveFromRight(): AsyncIterable<Row> {
+			const leftRows: Row[] = [];
+			for await (const r of leftSource) leftRows.push(r);
+			const leftMatched = joinType === 'full'
+				? new Array<boolean>(leftRows.length).fill(false)
+				: undefined;
+
+			for await (const rightRow of rightCallback(rctx)) {
+				rightSlot.set(rightRow);
+				let rightMatched = false;
+
+				for (let i = 0; i < leftRows.length; i++) {
+					const leftRow = leftRows[i];
+					leftSlot.set(leftRow);
+					if (await conditionMet(leftRow, rightRow)) {
+						rightMatched = true;
+						if (leftMatched) leftMatched[i] = true;
+						yield (matchedFlags ? [...leftRow, ...rightRow, ...matchedFlags] : [...leftRow, ...rightRow]) as Row;
+					}
+				}
+
+				if (!rightMatched) {
+					// No left row matched this right row → null-extend the left side.
+					const nullLeft = new Array(leftAttributes.length).fill(null) as Row;
+					leftSlot.set(nullLeft);
+					yield (rightUnmatchedFlags ? [...nullLeft, ...rightRow, ...rightUnmatchedFlags] : [...nullLeft, ...rightRow]) as Row;
+				}
 			}
 
+			// FULL trailing pass: left rows that never matched any right row, with the
+			// right side null-extended.
+			if (leftMatched) {
+				const nullRight = new Array(rightAttributes.length).fill(null) as Row;
+				rightSlot.set(nullRight);
+				for (let i = 0; i < leftRows.length; i++) {
+					if (!leftMatched[i]) {
+						leftSlot.set(leftRows[i]);
+						yield (leftUnmatchedFlags ? [...leftRows[i], ...nullRight, ...leftUnmatchedFlags] : [...leftRows[i], ...nullRight]) as Row;
+					}
+				}
+			}
+		}
+
+		try {
+			yield* isRightOrFull ? driveFromRight() : driveFromLeft();
 		} finally {
 			leftSlot.close();
 			rightSlot.close();
