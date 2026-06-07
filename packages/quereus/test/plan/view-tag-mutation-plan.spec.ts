@@ -4,14 +4,18 @@ import type { SqlValue } from '../../src/common/types.js';
 
 /**
  * A cached write-through plan must be invalidated when the view's behavioral
- * `quereus.update.*` tags change via `ALTER VIEW … SET TAGS`.
+ * `quereus.update.*` tags change via any of `ALTER VIEW … {SET|ADD|DROP} TAGS`.
  *
  * A view-mediated write routes through `buildViewMutation`, which reads the
  * view-level `quereus.update.*` override tags to steer the lowering (here a
- * `default_for.<col>` that fills a projected-away base column). `SET TAGS`
- * swaps the in-memory `ViewSchema` and fires `view_modified`; every
- * view-mediated write records a `view` schema dependency, so the cached
+ * `default_for.<col>` that fills a projected-away base column). Each verb
+ * (`set*Tags` / `merge*Tags` / `drop*Tags`) swaps the in-memory `ViewSchema` /
+ * `MaterializedViewSchema` and fires `view_modified` / `materialized_view_modified`;
+ * every view-mediated write records a `view` schema dependency, so the cached
  * `Statement` listener matches the event → recompiles → re-reads the new tag.
+ * The `ADD` / `DROP` cases below prove the merge / drop helpers fire the same
+ * invalidation event as `SET` (the implement pass left this structurally
+ * guaranteed but unproven).
  *
  * The `.sqllogic` harness re-prepares every statement and so cannot express
  * prepared-statement reuse across an `ALTER`; hence this focused spec. A fresh
@@ -105,6 +109,83 @@ describe('View tag mutation invalidation of cached write-through plans', () => {
 		await stmt.run([2]);
 		expect(await rows('select created from t where id = 2'))
 			.to.deep.equal([{ created: 200 }], 'case-differing ALTER must still invalidate the cached plan');
+
+		await stmt.finalize();
+	});
+
+	it('re-routes a cached insert after ALTER VIEW … ADD TAGS overwrites a default_for tag', async () => {
+		// ADD TAGS (merge) overwriting the behavioral key must fire `view_modified`
+		// exactly as SET does — the merge helper rides the same event path.
+		await db.exec(`
+			create table t (id integer primary key, created integer);
+			create view v as select id from t
+				with tags ("quereus.update.default_for.created" = '100');
+		`);
+
+		const stmt = db.prepare('insert into v (id) values (?)');
+		await stmt.run([1]);
+		expect(await rows('select created from t where id = 1'))
+			.to.deep.equal([{ created: 100 }], 'precondition: first insert uses the original default');
+
+		// Merge a new value for the same key (overwrite), keeping any other tags.
+		await db.exec(`alter view v add tags ("quereus.update.default_for.created" = '200');`);
+
+		await stmt.run([2]);
+		expect(await rows('select created from t where id = 2'))
+			.to.deep.equal([{ created: 200 }], 'cached plan must re-route to the merged default after ADD TAGS');
+
+		await stmt.finalize();
+	});
+
+	it('re-routes a cached insert after ALTER VIEW … DROP TAGS removes a default_for tag', async () => {
+		// DROP TAGS removing the behavioral key must fire `view_modified` too — and
+		// the routing genuinely changes: with no default override the projected-away
+		// column falls back to NULL (the column is declared nullable so the omitted
+		// insert is legal — a bare `integer` column is NOT NULL in Quereus).
+		await db.exec(`
+			create table t (id integer primary key, created integer null);
+			create view v as select id from t
+				with tags ("quereus.update.default_for.created" = '100');
+		`);
+
+		const stmt = db.prepare('insert into v (id) values (?)');
+		await stmt.run([1]);
+		expect(await rows('select created from t where id = 1'))
+			.to.deep.equal([{ created: 100 }], 'precondition: first insert uses the original default');
+
+		await db.exec(`alter view v drop tags ("quereus.update.default_for.created");`);
+
+		await stmt.run([2]);
+		expect(await rows('select created from t where id = 2'))
+			.to.deep.equal([{ created: null }], 'cached plan must re-route to no-default (NULL) after DROP TAGS');
+
+		await stmt.finalize();
+	});
+
+	it('re-routes a cached MV insert after ALTER MATERIALIZED VIEW … ADD / DROP TAGS', async () => {
+		// The MV merge / drop helpers fire `materialized_view_modified`, which the
+		// `view`-dependency listener also honors — so a cached MV write-through plan
+		// re-routes on both ADD (overwrite) and DROP (remove → NULL).
+		await db.exec(`
+			create table t (id integer primary key, created integer null);
+			create materialized view mv as select id from t
+				with tags ("quereus.update.default_for.created" = '100');
+		`);
+
+		const stmt = db.prepare('insert into mv (id) values (?)');
+		await stmt.run([1]);
+		expect(await rows('select created from t where id = 1'))
+			.to.deep.equal([{ created: 100 }], 'precondition: first MV insert uses the original default');
+
+		await db.exec(`alter materialized view mv add tags ("quereus.update.default_for.created" = '200');`);
+		await stmt.run([2]);
+		expect(await rows('select created from t where id = 2'))
+			.to.deep.equal([{ created: 200 }], 'cached MV plan must re-route after ADD TAGS');
+
+		await db.exec(`alter materialized view mv drop tags ("quereus.update.default_for.created");`);
+		await stmt.run([3]);
+		expect(await rows('select created from t where id = 3'))
+			.to.deep.equal([{ created: null }], 'cached MV plan must re-route to no-default (NULL) after DROP TAGS');
 
 		await stmt.finalize();
 	});
