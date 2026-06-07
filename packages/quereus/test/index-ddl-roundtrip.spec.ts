@@ -846,6 +846,22 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate, 'no index recreate from a table rename').to.deep.equal([]);
 		expect(diff.renames, 'table rename op emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
 	});
+
+	it('a table rename with an UNQUALIFIED partial-WHERE predicate does not churn the index', async () => {
+		// Regression guard: a partial predicate with an *unqualified* column reference
+		// carries no table name, so the body is invariant under a table rename — only the
+		// table rename op is emitted. (A *table-qualified* self-reference, e.g.
+		// `where t_old.active = 1`, DOES embed the table name and is NOT reconciled — it
+		// spuriously recreates; benign churn tracked by the backlog ticket
+		// `schema-differ-predicate-table-qualifier-reconcile`. The unqualified form is the
+		// idiomatic one and is pinned here.)
+		const base = `table t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where active = 1`;
+		const mod = `table t_new { id INTEGER PRIMARY KEY, name TEXT, active INTEGER } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where active = 1`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no index drop from a table rename under an unqualified predicate').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate from a table rename under an unqualified predicate').to.deep.equal([]);
+		expect(diff.renames, 'table rename op emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
+	});
 });
 
 // ============================================================================
