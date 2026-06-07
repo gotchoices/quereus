@@ -27,14 +27,17 @@ import { transformExpr, cloneExpr, mapQueryExprUniform } from './scope-transform
  * Scope: a view body that is an **n-way (≥2) equi-join** of base tables — `inner`,
  * `left`, or `full` — including composite-PK sides and **self-joins** (one base table
  * under two or more distinct aliases) — written through with `update` / `delete` /
- * `insert`. **LEFT** outer joins are admitted for the **statically-expressible** cases:
- * preserved-side update passthrough, delete-to-the-preserved-side, and insert routing
- * (both-side / preserved-only / presence-gated non-preserved member). **RIGHT** is
- * *excluded* — the runtime cannot execute a RIGHT join at all (`runtime/emit/join.ts`,
- * pinned by test/logic/90.5), so a RIGHT-join view is neither readable nor writable;
- * **FULL** is admitted only to carry its precise conservative diagnostics (no preserved
- * side ⇒ all writes reject, surfaces report all-`NO`). The one LEFT-join case that needs
- * new runtime — an UPDATE of a **non-preserved** column (a per-row matched-update /
+ * `insert`. **LEFT** and **RIGHT** outer joins are admitted for the
+ * **statically-expressible** cases: preserved-side update passthrough,
+ * delete-to-the-preserved-side, and insert routing (both-side / preserved-only /
+ * presence-gated non-preserved member). RIGHT is the exact **mirror** of LEFT — the
+ * right operand of a `right` join is preserved, the left operand is null-extended — and
+ * the runtime now executes a RIGHT join (`outer-join-right-full-runtime`), so a
+ * RIGHT-join view is both readable and writable. **FULL** is admitted only to carry its
+ * precise conservative diagnostics (no preserved side, so all writes reject and the
+ * surfaces report all-`NO`; FULL write-through — a preserved anchor for a body that is
+ * null-extended per row — is a separable future concern). The one outer-join case that
+ * needs new runtime — an UPDATE of a **non-preserved** column (a per-row matched-update /
  * null-extended-insert branch) — defers with `unsupported-outer-join-update`
  * (`view-write-optional-member-transitions`). The body is
  * **planned once**
@@ -245,8 +248,9 @@ export function isJoinBody(selectAst: AST.QueryExpr): boolean {
 /**
  * Non-throwing AST shape check — the boolean shadow of {@link collectJoinSources}'s
  * acceptance: `true` iff the body is a single explicit **n-way (≥2) equi-join** — `inner`,
- * `left`, or `full` (RIGHT is excluded — the runtime cannot execute it; see
- * {@link collectJoinSources}) — with an ON (or USING) predicate over plain base tables (the
+ * `left`, `right`, or `full` (RIGHT is the exact mirror of LEFT; FULL has no preserved
+ * side, so it self-conservatizes downstream; see {@link collectJoinSources}) with an ON
+ * (or USING) predicate over plain base tables (the
  * exact multi-source shape `propagate()` decomposes), including **composite-PK sides** and
  * **self-joins** (one base table under two or more distinct aliases). Every other
  * multi-table body — cross / comma (implicit) / subquery- or function-source — returns
@@ -275,14 +279,13 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 				tableCount += 1;
 				return true;
 			case 'join': {
-				// INNER / LEFT / FULL join with an explicit ON predicate or a USING column
-				// list. RIGHT is **excluded**: although the runtime now reads a RIGHT join,
-				// write-through re-admission is the separate dependent ticket
-				// (`view-write-right-join-readmit`), so admitting it here would make the static
-				// surfaces advertise it `is_updatable` before the per-side routing exists. FULL
-				// is admitted but has no preserved side, so it self-conservatizes downstream (no
-				// false positive). Re-admit RIGHT for write-through in `view-write-right-join-readmit`.
-				const accepted = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'full';
+				// INNER / LEFT / RIGHT / FULL join with an explicit ON predicate or a USING column
+				// list. RIGHT is now **admitted**: the runtime reads a RIGHT join and write-through
+				// recognition mirrors LEFT (the right of a `right` is preserved, the left
+				// null-extended; `view-write-right-join-readmit`). FULL is admitted but has no
+				// preserved side, so it self-conservatizes downstream (no false positive); FULL
+				// write-through is a separable future concern.
+				const accepted = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'right' || fc.joinType === 'full';
 				if (!accepted || (!fc.condition && !(fc.columns && fc.columns.length > 0))) return false;
 				return visit(fc.left) && visit(fc.right);
 			}
@@ -1131,9 +1134,10 @@ interface JoinSourceInfo {
 
 /**
  * Collect the join's base-table sources (in AST declaration order), validating the body
- * is an **n-way (≥2) equi-join** over plain base tables — `inner`, `left`, or `full`
- * (RIGHT is excluded — the runtime cannot execute it, see the inline note below; no
- * comma/implicit cross join, no subquery or function sources). A **self-join**
+ * is an **n-way (>=2) equi-join** over plain base tables — `inner`, `left`, `right`, or
+ * `full` (RIGHT is the mirror of LEFT; FULL has no preserved side, so it self-
+ * conservatizes downstream; no comma/implicit cross join, no subquery or function
+ * sources). A **self-join**
  * — the same base table under distinct aliases — is accepted (routing is alias-keyed
  * downstream); USING joins are accepted alongside ON joins. The declaration order is the
  * alias-declaration order the substrate serializes per-side ops in (§ Cycles, Self-Joins).
@@ -1176,12 +1180,12 @@ function collectJoinSources(view: MutableViewLike, from: readonly AST.FromClause
 				// FULL is accepted only to carry through to its precise conservative diagnostics
 				// (it has no preserved side, so it never falsely advertises). Re-admit RIGHT for
 				// write-through in `view-write-right-join-readmit`.
-				const acceptedType = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'full';
+				const acceptedType = fc.joinType === 'inner' || fc.joinType === 'left' || fc.joinType === 'right' || fc.joinType === 'full';
 				if (!acceptedType || !hasPredicate) {
 					raiseMutationDiagnostic({
 						reason: 'unsupported-join',
 						table: view.name,
-						message: `cannot write through view '${view.name}': only INNER/LEFT/FULL joins with an ON/USING predicate are decomposable (got '${fc.joinType}'${hasPredicate ? '' : ' without ON/USING'})`,
+						message: `cannot write through view '${view.name}': only INNER/LEFT/RIGHT/FULL joins with an ON/USING predicate are decomposable (got '${fc.joinType}'${hasPredicate ? '' : ' without ON/USING'})`,
 					});
 				}
 				// USING joins carry no AST `Expression` guard — only an explicit ON predicate
@@ -1195,6 +1199,12 @@ function collectJoinSources(view: MutableViewLike, from: readonly AST.FromClause
 					case 'left':
 						visit(fc.left, nonPreserved, guards);
 						visit(fc.right, true, guardsWith);
+						break;
+					case 'right':
+						// Mirror of `left`: the left operand of a RIGHT join is null-extended
+						// (non-preserved), the right operand is preserved.
+						visit(fc.left, true, guardsWith);
+						visit(fc.right, nonPreserved, guards);
 						break;
 					case 'full':
 						visit(fc.left, true, guardsWith);

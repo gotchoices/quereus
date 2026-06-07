@@ -2253,3 +2253,106 @@ select cc, k, cv, pv from skv where cc = 7;
 select pr from skc where cc = 7;
 → [{"pr":42}]
 pragma foreign_keys = false;
+
+-- ===================================
+-- RIGHT outer join (§ Outer Joins) — the mirror of the LEFT `ojv` block above. In
+-- `A right join B`, B (the right operand) is PRESERVED and A (left) is NON-preserved. With
+-- the child (the FK-key holder) on the right and the parent on the left, the preserved /
+-- non-preserved routing is identical to LEFT with the operands swapped: a preserved-side
+-- update / delete / insert works normally; a non-preserved-side update materializes per
+-- row via the EC join key; a both-side insert mints the shared key from the FK-parent's
+-- high-water default. The substrate keys off JoinSide.preserved, not source order, so the
+-- swap is transparent (view-write-right-join-readmit). FK off so an unmatched parent slot
+-- is fine.
+-- ===================================
+pragma foreign_keys = false;
+create table rojp (pp integer primary key default (coalesce((select max(pp) from rojp), 0) + mutation_ordinal()), pv integer null);
+create table rojc (cc integer primary key, pr integer null references rojp(pp), cv integer null);
+create view rojv as select p.pv as pv, c.cc as cc, c.cv as cv from rojp p right join rojc c on p.pp = c.pr;
+
+insert into rojp values (1, 10);
+insert into rojc values (1, 1, 100);     -- joined row
+insert into rojc values (2, null, 200);  -- null-extended row (no parent)
+insert into rojc values (5, 5, 500);     -- null-extended row with a CONCRETE dangling key
+
+-- The view null-extends every preserved (child) row whose parent is absent.
+select cc, cv, pv from rojv order by cc;
+→ [{"cc":1,"cv":100,"pv":10},{"cc":2,"cv":200,"pv":null},{"cc":5,"cv":500,"pv":null}]
+
+-- Preserved-side (child) update propagates to rojc — including the null-extended rows,
+-- which stay null-extended (the parent side is untouched).
+update rojv set cv = 111 where cc = 1;
+update rojv set cv = 222 where cc = 2;
+select cc, cv, pv from rojv order by cc;
+→ [{"cc":1,"cv":111,"pv":10},{"cc":2,"cv":222,"pv":null},{"cc":5,"cv":500,"pv":null}]
+
+-- Non-preserved-side (parent) update, MATCHED row: cc=1 has parent pp=1, so this updates
+-- the parent in place (no new parent row).
+update rojv set pv = 99 where cc = 1;
+select cc, pv from rojv where cc = 1;
+→ [{"cc":1,"pv":99}]
+
+-- Non-preserved-side update, NULL-EXTENDED row with a concrete dangling key (cc=5, pr=5,
+-- no parent yet): materializes rojp(pp=5, pv=555) via the EC join key (pp = pr = 5), so the
+-- child now joins it and the row reads back joined.
+update rojv set pv = 555 where cc = 5;
+select cc, pv from rojv where cc = 5;
+→ [{"cc":5,"pv":555}]
+
+-- Both-side insert: child + (presence-gated) parent under the minted shared key.
+insert into rojv (cc, cv, pv) values (3, 33, 333);
+select cc, cv, pv from rojv where cc = 3;
+→ [{"cc":3,"cv":33,"pv":333}]
+
+-- Preserved-only insert: a single child insert; the row reads back null-extended.
+insert into rojv (cc, cv) values (4, 44);
+select cc, cv, pv from rojv where cc = 4;
+→ [{"cc":4,"cv":44,"pv":null}]
+
+-- A non-preserved-only insert has no preserved anchor row to attach to — rejected.
+insert into rojv (pv) values (999);
+-- error: only non-preserved-side columns
+
+-- Delete routes to the preserved (child) side: the joined row disappears.
+delete from rojv where cc = 1;
+delete from rojv where cc = 2;
+select cc, cv, pv from rojv order by cc;
+→ [{"cc":3,"cv":33,"pv":333},{"cc":4,"cv":44,"pv":null},{"cc":5,"cv":500,"pv":555}]
+pragma foreign_keys = false;
+
+-- ===================================
+-- RIGHT join, PRESERVED-side PK HIDDEN by the projection: the preserved side is the right
+-- operand and its PK (hp_b.bid) is not projected, yet a preserved-side update reconstructs
+-- the row identity from the planned join body (the capture pins base PKs regardless of
+-- projection — the mirror of the inner-join tj2.id hidden-PK case).
+-- ===================================
+create table hp_a (aid integer primary key, av text);
+create table hp_b (bid integer primary key, bv text);
+insert into hp_b values (1, 'x');
+create view hpv as select a.av as av, b.bv as bv from hp_a a right join hp_b b on a.aid = b.bid;
+-- hp_b(1) is preserved with no hp_a match → av null-extends.
+select av, bv from hpv;
+→ [{"av":null,"bv":"x"}]
+-- Preserved-side update with the PK hidden: identity reconstructed from the body.
+update hpv set bv = 'y' where bv = 'x';
+select av, bv from hpv;
+→ [{"av":null,"bv":"y"}]
+
+-- ===================================
+-- Self-join RIGHT (alias-keyed preserved/non-preserved split): `rsj l right join rsj r`
+-- makes the RIGHT alias `r` preserved and the LEFT alias `l` non-preserved — routing is by
+-- alias, not table name. A read-back guards the right self-join variant; a preserved-side
+-- (right-alias) update routes by that alias's identity.
+-- ===================================
+create table rsj (id integer primary key, fk integer null, x text);
+insert into rsj values (1, null, 'r1');
+insert into rsj values (2, 1, 'r2');
+create view rsjv as select l.x as lx, r.id as rid, r.x as rx from rsj l right join rsj r on l.id = r.fk;
+-- Every r row is preserved; l matches where l.id = r.fk. r1(fk null) null-extends l; r2(fk 1)
+-- matches l = r1.
+select lx, rid, rx from rsjv order by rid;
+→ [{"lx":null,"rid":1,"rx":"r1"},{"lx":"r1","rid":2,"rx":"r2"}]
+-- Preserved-side (right-alias) update routes to rsj by the right alias's identity.
+update rsjv set rx = 'r2b' where rid = 2;
+select lx, rid, rx from rsjv order by rid;
+→ [{"lx":null,"rid":1,"rx":"r1"},{"lx":"r1","rid":2,"rx":"r2b"}]

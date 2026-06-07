@@ -4679,7 +4679,7 @@ describe('Property-Based Tests', () => {
 				expect(updByCol.get('cv'), 'cv updatable').to.equal('YES');
 				// pv (non-preserved) is now updatable through the matched-update / null-extended-
 				// insert materialization (a preserved anchor pins identity); the round-trip is
-				// pinned in the dedicated non-preserved-update test below.
+				// covered by the LEFT dedicated non-preserved-update test + the 93.4 RIGHT block.
 				expect(updByCol.get('pv'), 'pv (non-preserved) now updatable via materialization').to.equal('YES');
 
 				// A non-preserved-only insert still defers (no preserved anchor to attach to);
@@ -4751,6 +4751,119 @@ describe('Property-Based Tests', () => {
 						assertRowsEqual('oj delete view', await readRows('select cc, cv, pv from ojv'),
 							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc, cv: r.cv, pv: r.joined ? r.pv : null })), ['cc', 'cv', 'pv']);
 						assertRowsEqual('oj delete child base', await readRows('select cc from oj_child'),
+							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc })), ['cc']);
+					},
+				), { numRuns: 50 });
+			});
+
+			// ----- Outer (RIGHT) join: preserved write-through + presence-gated optional member -----
+			// The exact mirror of the LEFT rjv case with the operands swapped: rj_parent p RIGHT JOIN
+			// rj_child c makes rj_child (the right operand) PRESERVED and rj_parent (left) the
+			// non-preserved optional member (null-extended when the child has no matching parent).
+			// The preserved / non-preserved classification — hence every round-trip law — is the
+			// same as LEFT; this guards that the substrate keys off JoinSide.preserved, not source
+			// order (view-write-right-join-readmit). Same surfaces, same accepts, same rejects.
+			it('outer (right) join: preserved write-through + presence-gated optional member round-trips', async () => {
+				await db.exec('pragma foreign_keys = false');
+				await db.exec('drop view if exists rjv');
+				await db.exec('drop table if exists rj_child');
+				await db.exec('drop table if exists rj_parent');
+				// The preserved anchor's partner (parent) declares the high-water-mark allocator
+				// default — the source the both-side insert mints the shared key from.
+				await db.exec('create table rj_parent (pp integer primary key default (coalesce((select max(pp) from rj_parent), 0) + mutation_ordinal()), pv integer null) using memory');
+				await db.exec('create table rj_child (cc integer primary key, pr integer null references rj_parent(pp), cv integer null) using memory');
+				await db.exec('create view rjv as select c.cc as cc, c.cv as cv, p.pv as pv from rj_parent p right join rj_child c on p.pp = c.pr');
+
+				// Static plan-lineage: cc/cv are preserved base sites; pv is non-preserved null-extended.
+				const node = planLogicalBody('select c.cc as cc, c.cv as cv, p.pv as pv from rj_parent p right join rj_child c on p.pp = c.pr');
+				const attrs = node.getAttributes?.() ?? [];
+				expect(attrs.length, 'rjv exposes cc,cv,pv').to.equal(3);
+				const kindByName = new Map(attrs.map(a => [a.name.toLowerCase(), node.physical.updateLineage?.get(a.id)?.kind]));
+				expect(kindByName.get('cc'), 'cc preserved base').to.equal('base');
+				expect(kindByName.get('cv'), 'cv preserved base').to.equal('base');
+				expect(kindByName.get('pv'), 'pv non-preserved null-extended').to.equal('null-extended');
+
+				// Static surfaces agree with the dynamic per-side truth.
+				const vinfo = await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('rjv')");
+				expect(vinfo[0], 'rjv view_info per-side').to.deep.equal({ is_insertable_into: 'YES', is_updatable: 'YES', is_deletable: 'YES' });
+				const cinfo = await readRows("select column_name, is_updatable from column_info('rjv')");
+				const updByCol = new Map(cinfo.map(r => [String(r.column_name).toLowerCase(), r.is_updatable]));
+				expect(updByCol.get('cc'), 'cc updatable').to.equal('YES');
+				expect(updByCol.get('cv'), 'cv updatable').to.equal('YES');
+				// pv (non-preserved) is now updatable through the matched-update / null-extended-
+				// insert materialization (a preserved anchor pins identity); the round-trip is
+				// covered by the LEFT dedicated non-preserved-update test + the 93.4 RIGHT block.
+				expect(updByCol.get('pv'), 'pv (non-preserved) now updatable via materialization').to.equal('YES');
+
+				// A non-preserved-only insert still defers (no preserved anchor to attach to);
+				// the non-preserved-side UPDATE is now supported (the 93.4 RIGHT block pins
+				// it), so only the insert rejects here.
+				await db.exec('insert into rj_parent values (1, 10)');
+				await db.exec('insert into rj_child values (1, 1, 100)');     // joined row
+				await db.exec('insert into rj_child values (2, null, 200)');  // null-extended row
+				await expectMutationReject('insert into rjv (pv) values (999)', 'null-extended-create-conflict');
+
+				// Delete-to-preserved: deleting the null-extended row removes it from the view
+				// but leaves every parent untouched (the delete routes to the preserved child).
+				await db.exec('delete from rjv where cc = 2');
+				assertRowsEqual('rj delete null-extended view', await readRows('select cc, cv, pv from rjv'),
+					[{ cc: 1, cv: 100, pv: 10 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('rj delete leaves parent', await readRows('select pp, pv from rj_parent'),
+					[{ pp: 1, pv: 10 }], ['pp', 'pv']);
+
+				// Property: both-side / preserved-only insert, preserved-side update (incl
+				// null-extended rows), delete-to-preserved (incl null-extended rows) round-trip.
+				const rowsArb = fc.array(fc.record({
+					cc: fc.integer({ min: 1, max: 6 }),
+					joined: fc.boolean(),                    // joined → both-side insert; else preserved-only
+					cv: fc.integer({ min: 1, max: 9 }),
+					pv: fc.integer({ min: 10, max: 19 }),
+				}), { maxLength: 6 });
+
+				await fc.assert(fc.asyncProperty(
+					rowsArb,
+					fc.integer({ min: 1, max: 6 }),    // target cc for update + delete
+					fc.integer({ min: 20, max: 29 }),  // new cv (disjoint from seeds)
+					async (rows, K, NCV) => {
+						await db.exec('delete from rj_child');
+						await db.exec('delete from rj_parent');
+						const byCc = new Map<number, { cc: number; joined: boolean; cv: number; pv: number }>();
+						for (const r of rows) {
+							if (byCc.has(r.cc)) continue;
+							byCc.set(r.cc, r);
+							if (r.joined) {
+								await db.exec(`insert into rjv (cc, cv, pv) values (${r.cc}, ${r.cv}, ${r.pv})`);  // both-side
+							} else {
+								await db.exec(`insert into rjv (cc, cv) values (${r.cc}, ${r.cv})`);                // preserved-only
+							}
+						}
+						const kept = [...byCc.values()];
+						const imageWith = (cv: (r: typeof kept[number]) => number) =>
+							kept.map(r => ({ cc: r.cc, cv: cv(r), pv: r.joined ? r.pv : null }));
+
+						// PutGet (insert): each child reads back, pv present iff joined.
+						assertRowsEqual('rj insert view', await readRows('select cc, cv, pv from rjv'),
+							imageWith(r => r.cv), ['cc', 'cv', 'pv']);
+
+						// GetPut (update): writing a row's own cv back leaves the image unchanged.
+						const hitRow = byCc.get(K);
+						if (hitRow) {
+							await db.exec(`update rjv set cv = ${hitRow.cv} where cc = ${K}`);
+							assertRowsEqual('rj GetPut update', await readRows('select cc, cv, pv from rjv'),
+								imageWith(r => r.cv), ['cc', 'cv', 'pv']);
+						}
+
+						// PutGet (preserved update): set cv on the target — works for joined AND
+						// null-extended rows; a null-extended row stays null-extended.
+						await db.exec(`update rjv set cv = ${NCV} where cc = ${K}`);
+						assertRowsEqual('rj update view', await readRows('select cc, cv, pv from rjv'),
+							imageWith(r => r.cc === K ? NCV : r.cv), ['cc', 'cv', 'pv']);
+
+						// PutGet (delete-to-preserved): deleting the target removes the joined row.
+						await db.exec(`delete from rjv where cc = ${K}`);
+						assertRowsEqual('rj delete view', await readRows('select cc, cv, pv from rjv'),
+							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc, cv: r.cv, pv: r.joined ? r.pv : null })), ['cc', 'cv', 'pv']);
+						assertRowsEqual('rj delete child base', await readRows('select cc from rj_child'),
 							kept.filter(r => r.cc !== K).map(r => ({ cc: r.cc })), ['cc']);
 					},
 				), { numRuns: 50 });

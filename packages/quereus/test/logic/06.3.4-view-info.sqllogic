@@ -217,15 +217,15 @@ select is_insertable_into from view_info('dfi_v_typo');
 
 -- ===================================================================
 -- Divergence 2 — outer-join bodies report PER-SIDE and agree with propagate().
--- A LEFT outer join is partially writable: the preserved side's columns are
+-- A LEFT (or RIGHT) outer join is partially writable: the preserved side's columns are
 -- base-updatable, the view is insertable (preserved-only / both-side routing) and
--- deletable (delete-to-preserved). The non-preserved (`null-extended`) side's columns
--- are now ALSO updatable (the matched-update / null-extended-insert materialization keyed
--- off the preserved anchor — `view-write-optional-member-transitions`), so the view-level
--- is_updatable stays YES. RIGHT and FULL stay conservative all-`NO`: the runtime cannot execute a
--- RIGHT or FULL join at all (runtime/emit/join.ts, pinned by 90.5-unsupported-join-types),
--- so a RIGHT-join view is neither readable nor writable and must NOT advertise as such;
--- FULL additionally has no preserved side. (Re-admit RIGHT once the runtime supports it.)
+-- deletable (delete-to-preserved). The non-preserved (`null-extended`) side's columns are
+-- now ALSO updatable (the matched-update / null-extended-insert materialization keyed off
+-- the preserved anchor — `view-write-optional-member-transitions`), so the view-level
+-- is_updatable stays YES. RIGHT is the exact mirror of LEFT (the right operand is the
+-- preserved side) and the runtime now executes it (outer-join-right-full-runtime), so it
+-- is re-admitted (view-write-right-join-readmit). FULL stays conservative all-`NO`: it has
+-- no preserved side, hence no anchor to materialize off, so every write rejects.
 -- ===================================================================
 
 create table oj_a (aid integer primary key, av text);
@@ -252,23 +252,34 @@ update oj_left set bv = 'z' where aid = 1;
 select aid, av, bv from oj_left where aid = 1;
 → [{"aid":1,"av":"z","bv":"z"}]
 
--- RIGHT: the runtime now reads a RIGHT join, but write-through recognition still
--- excludes it (re-admission is the dependent `view-write-right-join-readmit` ticket),
--- so the surfaces stay conservative all-`NO`. Flip this row to the per-side LEFT shape
--- when that ticket lands.
+-- RIGHT: oj_b is preserved (the right operand of a `right` join), oj_a is non-preserved
+-- (null-extended) — the exact mirror of oj_left above. bid/bv (oj_b) are base-updatable;
+-- the preserved PK `bid` is projected, so the view is insertable (preserved-only /
+-- both-side routing) and deletable (delete routes to oj_b). The non-preserved `av` (oj_a)
+-- is updatable too (matched-update / null-extended-insert materialization keyed off the
+-- preserved oj_b anchor). Both bases are effective targets (a both-side insert reaches
+-- oj_a). The runtime now executes a RIGHT join (outer-join-right-full-runtime) and
+-- write-through recognition admits it (view-write-right-join-readmit).
 create view oj_right as
     select a.av as av, b.bid as bid, b.bv as bv
     from oj_a a right join oj_b b on b.bid = a.aid;
 select is_insertable_into, is_updatable, is_deletable, effective_targets
     from view_info('oj_right');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
 
--- Surface agrees with propagate(): a write through the RIGHT-join view rejects at plan
--- time (recognition still excludes RIGHT — write-through re-admission is deferred).
-update oj_right set bv = 'z' where bid = 1;
--- error: cannot write through view
+-- Surface agrees with propagate(): both a preserved-side (oj_b) update and a
+-- non-preserved-side (oj_a) update are accepted. Seed a preserved oj_b row whose bid has
+-- no matching oj_a (bid=2; oj_a only has aid=1), so updating the preserved `bv` writes
+-- oj_b directly, while updating the non-preserved `av` materializes oj_a(aid=2, av='zz')
+-- via the EC join key (aid = bid) — the exact mirror of oj_left's `set bv` above.
+insert into oj_b values (2, 'b2');
+update oj_right set bv = 'zz' where bid = 2;
+update oj_right set av = 'zz' where bid = 2;
+select av, bid, bv from oj_right where bid = 2;
+→ [{"av":"zz","bid":2,"bv":"zz"}]
 
--- FULL: every side null-extended ⇒ no preserved anchor ⇒ conservative all-`NO`.
+-- FULL: every side null-extended ⇒ no preserved anchor ⇒ conservative all-`NO`. FULL is
+-- still gated (no preserved anchor); RIGHT is now admitted (view-write-right-join-readmit).
 create view oj_full as
     select a.aid as aid, a.av as av, b.bid as bid, b.bv as bv
     from oj_a a full join oj_b b on b.bid = a.aid;
