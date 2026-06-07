@@ -1567,4 +1567,91 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 			await db.close();
 		}
 	});
+
+	// The CHECK arm of the per-op resolvability gate (`constraintsForOp` /
+	// view-mutation-builder.ts). The gate threads each lens-synthesized row-local CHECK onto
+	// the member fan-out ops whose target table resolves EVERY write-row column the CHECK
+	// references. Pinned here against the same surrogate decomposition (`title` on Doc_core,
+	// `note` on Doc_meta — a genuine cross-member pair):
+	//  - a CHECK spanning columns on MORE THAN ONE member (`title <> note`, write-row
+	//    {title, note}) resolves on no single member op ⇒ rides none ⇒ silently DEFERRED
+	//    (matching the decomposition INSERT path, which defers all lens row-local checks);
+	//  - a SINGLE-member-resolvable CHECK (`length(title) < 5`, write-row {title}) rides the
+	//    Doc_core member op and still FIRES (ABORTs on violation).
+	// This is the documented (docs/lens.md § Enforcement by constraint class) but otherwise
+	// test-unpinned arm of the gate (the set-level key-routing arm is pinned by the docKey
+	// re-key test above). The cross-member deferral is a deliberately weaker contract — these
+	// assertions nail the boundary in place so a future change to the gate cannot silently
+	// flip which side a CHECK lands on.
+	async function setupSurrogateWithChecks(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [surrogateOptionalAd()];
+		db.registerModule('docchkmod', mod);
+		await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text) using docchkmod');
+		await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docchkmod');
+		await db.exec('create table Doc_meta (meta_sid integer primary key, note text) using docchkmod');
+		// `title <> note` spans Doc_core (title) + Doc_meta (note) ⇒ write-row {title, note},
+		// resolvable on no single member op ⇒ deferred. `length(title) < 5` references only
+		// title (Doc_core) ⇒ write-row {title} ⇒ rides the Doc_core member op ⇒ fires.
+		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text, constraint xmember check (title <> note), constraint titlelen check (length(title) < 5) } }');
+		await db.exec('apply schema x');
+		// Seed satisfies both CHECKs (titles len 3 < 5; title <> note): k1 carries the optional
+		// Doc_meta note, k2 does not. Direct basis inserts bypass the lens, so the seed itself
+		// is not gated by the logical CHECKs.
+		await db.exec("insert into main.Doc_core (sid, doc_key, title) values (100, 'k1', 'aaa'), (101, 'k2', 'bbb')");
+		await db.exec("insert into main.Doc_body values (100, 'b1'), (101, 'b2')");
+		await db.exec("insert into main.Doc_meta values (100, 'm1')");
+	}
+
+	it('defers a cross-member CHECK (title <> note): a violating UPDATE passes and persists the violation', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// Assign BOTH title (→ Doc_core) and note (→ Doc_meta) to the same value so the
+			// violation genuinely spans the two members — the fan-out emits a Doc_core op AND a
+			// Doc_meta op, yet the `title <> note` CHECK's write-row {title, note} resolves on
+			// NEITHER (each op carries only one of the pair) ⇒ it rides no op ⇒ deferred. The
+			// sibling `length(title) < 5` CHECK rides Doc_core and passes ('z' is short), so the
+			// UPDATE succeeds despite the cross-member violation.
+			await db.exec("update x.Doc set title = 'z', note = 'z' where docKey = 'k1'");
+			// The violating row is persisted across both members and surfaced by the view —
+			// documenting the (deliberate) non-enforcement of the cross-member CHECK.
+			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'z' }]);
+			expect(await rows(db, 'select note from main.Doc_meta where meta_sid = 100')).to.deep.equal([{ note: 'z' }]);
+			expect(await rows(db, "select title, note from x.Doc where docKey = 'k1'")).to.deep.equal([{ title: 'z', note: 'z' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('enforces a single-member CHECK (length(title) < N): a violating UPDATE ABORTs and leaves the row unmutated', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// `length(title) < 5` references only title ⇒ write-row {title} resolves on the
+			// Doc_core member op ⇒ it rides that op and fires. A too-long title ABORTs (the dual
+			// of the deferral above: a single-member CHECK is enforced, a cross-member one is not).
+			await expectThrows(() => db.exec("update x.Doc set title = 'toolong' where docKey = 'k1'"), /check|constraint|titlelen/i);
+			// The aborted UPDATE rolled back: the Doc_core title is unchanged at both layers.
+			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'aaa' }]);
+			expect(await rows(db, "select title from x.Doc where docKey = 'k1'")).to.deep.equal([{ title: 'aaa' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('decomposition INSERT parity: the cross-member CHECK is deferred on INSERT too', async () => {
+		const db = new Database();
+		try {
+			await setupSurrogateWithChecks(db);
+			// A decomposition INSERT fans out one op per member off the shared envelope; the
+			// cross-member `title <> note` CHECK rides none ⇒ deferred, exactly as on the UPDATE.
+			// A brand-new logical row with title == note persists — anchoring the UPDATE deferral
+			// against the established INSERT baseline. (`length(title)` passes; 'q' is short.)
+			await db.exec("insert into x.Doc (docKey, title, body, note) values ('k9', 'q', 'b9', 'q')");
+			expect(await rows(db, "select title, note from x.Doc where docKey = 'k9'")).to.deep.equal([{ title: 'q', note: 'q' }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
