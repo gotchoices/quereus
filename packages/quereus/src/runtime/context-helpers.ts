@@ -36,7 +36,13 @@ function* descriptorEntries(descriptor: RowDescriptor): Generator<[number, numbe
 export class RowContextMap {
 	private map = new Map<RowDescriptor, RowGetter>();
 
-	/** Direct attribute-ID → resolver for O(1) column lookup. */
+	/**
+	 * Direct attribute-ID → resolver for O(1) column lookup. Last-`set`-wins:
+	 * `slot.set(row)` does NOT update this; only `set`/`delete` on this map do.
+	 * See the "source-attr contexts and child pulls" invariant in docs/runtime.md
+	 * for why a streaming operator must release its source-attr context before
+	 * pulling its child.
+	 */
 	readonly attributeIndex: Array<IndexEntry | undefined> = [];
 
 	set(descriptor: RowDescriptor, rowGetter: RowGetter): this {
@@ -101,6 +107,12 @@ export interface RowSlot {
 	 * IDs in between this slot's `set` calls — without re-claiming, downstream
 	 * lookups would resolve through the child's slot whose row is the iterator's
 	 * cursor position, not this slot's matched row.
+	 *
+	 * This is the *child-shadows-operator* resolution of the "source-attr
+	 * contexts and child pulls" invariant (docs/runtime.md); call it before
+	 * yielding (see emit/asof-scan.ts). The mirror direction —
+	 * operator-shadows-child — is resolved by tear-down-before-pull instead
+	 * (see emit/aggregate.ts and emit/window.ts).
 	 */
 	reactivate(): void;
 	/** Tear down (removes descriptor from context) */

@@ -345,14 +345,66 @@ const result = await withAsyncRowContext(rctx, rowDescriptor, () => row, async (
 ```
 
 ### Column Reference Resolution
-Column references are resolved automatically using attribute IDs.  The runtime now searches the context **from newest → oldest**, so the most recently-pushed scope wins:
+Column references are resolved automatically using attribute IDs.  Resolution has
+two tiers (see `resolveAttribute` in `context-helpers.ts`):
+
+1. **Fast path — `attributeIndex` (authoritative).** `RowContextMap` keeps a flat
+   `attributeIndex[attrId] → { rowGetter, columnIndex }`. The winner for a given
+   attribute ID is whichever context called `context.set(descriptor, …)` **most
+   recently** for that ID — i.e. *last-`set`-wins*, **not** insertion-order
+   "newest scope wins". Note `slot.set(row)` is a cheap field write that does
+   **not** touch the index; only slot creation, `RowSlot.reactivate()`, or a
+   direct `context.set` re-claims an attribute ID.
+2. **Fallback — newest → oldest scan.** Used only when the indexed entry's row is
+   not yet populated (e.g. a slot created but not yet `set`). `resolveAttribute`
+   then walks the remaining contexts newest → oldest and returns the first whose
+   row is a populated array.
+
 ```typescript
 // In emitColumnReference (built-in):
 function run(ctx: RuntimeContext): SqlValue {
-	// Deterministic lookup: newest (innermost) scope wins
+	// O(1) attributeIndex fast path; newest→oldest scan only as a fallback
 	return resolveAttribute(ctx, plan.attributeId, plan.expression.name);
 }
 ```
+
+#### Invariant: source-attr contexts and child pulls
+
+> **A streaming operator must not leave a row context built from its source's
+> attribute IDs winning the `attributeIndex` while it pulls its child for the
+> next input row.**
+
+Because `slot.set(row)` does not reclaim the index, a child that updates its own
+slot per row (e.g. a residual `Filter` directly below the operator) cannot win
+back the shared attribute IDs if the parent's context is still the most-recent
+`set`. The parent's stale row then silently **shadows** the child's current-row
+reads — the child evaluates against the parent's previous output instead of its
+own current row.
+
+The mirror case is equally real: an operator whose source-attr context is
+shadowed *by* a still-running child cursor (a look-ahead peek) must re-win the
+index *before yielding* so downstream resolves through the operator's intended
+row, not the child cursor's position.
+
+There are two tools, picked by which side must win at the moment of the next pull:
+
+- **Tear-down-before-pull (`delete`)** — for the *operator-shadows-child*
+  direction. The operator drops its source-attr context after yielding and before
+  pulling the next child row, letting the deepest child reclaim the index; it
+  re-establishes the context when the next row arrives. Worked examples:
+  - `emit/aggregate.ts` (streaming GROUP BY) tears the just-yielded group's
+    representative-row context down before pulling the next source row.
+  - `emit/window.ts` (streaming variant) `demote()`s its `myDesc` at the end of
+    each iteration, then `promote()`s again on the next row. This is also the
+    canonical *stacked same-attr operator* case: a `set(row)` alone is
+    insufficient because it does not re-insert, so `promote()` does delete+set to
+    win for its own callbacks and at the yield, while `demote()` releases the
+    index across the pull.
+- **`reactivate()` before yield** — for the *child-shadows-operator* direction.
+  The operator re-`set`s its descriptor (re-winning the index) just before it
+  yields. Worked example: `emit/asof-scan.ts` (merge variant) calls
+  `rightSlot.reactivate()` before yielding the matched / null-padded row, so
+  downstream reads the matched row rather than the right scan's look-ahead cursor.
 
 ## Scheduler Execution Model
 

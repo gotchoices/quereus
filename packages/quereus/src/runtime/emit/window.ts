@@ -951,11 +951,23 @@ async function* runStreaming(
 
 	// We register our own source-attribute getter directly in the rctx context.
 	// This bypasses the slot abstraction so we can fully control insertion
-	// order: each iteration we delete-then-re-set the entry, pushing it to
-	// the *end* of the map's insertion order. This matters when streaming
-	// Windows are stacked — without re-promotion, an outer Window's slot
-	// (registered later) would shadow ours during our iterations, and our
-	// attribute resolutions would read the outer Window's stale row.
+	// order. `promote()` delete-then-re-sets the entry, pushing it to the *end*
+	// of the map's insertion order so it wins the `attributeIndex` for the
+	// source attribute IDs at two moments: (a) while we evaluate our own
+	// partition/order-by/arg callbacks against the current row, and (b) at the
+	// instant we yield, so a downstream consumer (an outer Window, or a Project)
+	// resolves source columns through the *yielded* row.
+	//
+	// But we must NOT leave that context winning while we pull the *next* source
+	// row — see the "source-attr contexts and child pulls" invariant in
+	// docs/runtime.md. Our `myDesc` shares the source's attribute IDs, and a
+	// streaming child below us (e.g. a residual Filter) updates its own slot by
+	// `set(row)` alone, which does not reclaim the index. If we stayed promoted
+	// across the pull, the child would read *our* last-yielded row instead of
+	// its current row (the same shadowing defect fixed in aggregate.ts). So we
+	// `demote()` at the end of each iteration — tear-down-before-pull — letting
+	// the deepest child win the index during the pull, then `promote()` again
+	// when the next row arrives.
 	//
 	// Use a fresh descriptor reference (NOT `sourceRowDescriptor`) so we
 	// occupy our own map slot rather than co-tenanting Window's outer
@@ -980,6 +992,15 @@ async function* runStreaming(
 		}
 		rctx.context.set(myDesc, myGetter);
 		myRegistered = true;
+	};
+
+	// Release our source-attr context so the child below reclaims the
+	// attributeIndex during the next pull (tear-down-before-pull).
+	const demote = (): void => {
+		if (myRegistered) {
+			rctx.context.delete(myDesc);
+			myRegistered = false;
+		}
 	};
 
 	try {
@@ -1113,6 +1134,11 @@ async function* runStreaming(
 			promote(yieldedRow);
 			yield yieldedRow;
 		}
+
+		// Tear down our source-attr context before pulling the next source row
+		// so a streaming child (e.g. a residual Filter) reclaims the index and
+		// reads its current row, not our last-yielded one.
+		demote();
 	}
 
 	// Source exhausted: flush trailing partition (if any).
