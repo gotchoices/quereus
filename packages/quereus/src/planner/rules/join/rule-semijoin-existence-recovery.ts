@@ -49,9 +49,13 @@
  *     and every chain Sort's keys (Limit/Distinct/Alias contribute nothing).
  *     Require `!demanded.has(flagId)` — this catches a flag selected or sorted on.
  *  3. **No right-side column demanded.** The semi/anti output is left columns
- *     only, so `demanded ∩ {J.right attr ids} === ∅`. (`select *` / `select c.*,
- *     p.col … where f` land here and abstain — that is the deferred
- *     outer→inner-conversion case, NOT a semi-join shape.)
+ *     only, so `demanded ∩ {J.right attr ids} === ∅`. `select c.*, p.col … where
+ *     f` lands here and abstains — `rule-inner-join-existence-recovery` then picks
+ *     it up and rewrites to an inner join (NOT a semi-join shape). Unqualified
+ *     `select * … where f` is different: `*` expands the join-appended flag too, so
+ *     the flag itself is demanded — this rule abstains on (2), and the inner rule
+ *     abstains on `!demanded.has(flagId)`; the flag is correctly retained (the
+ *     caller selected it).
  *
  * **Accepted probe normal forms** (each conjunct normalized with
  * `normalizePredicate` first — collapses `not not f`, pushes NOT down):

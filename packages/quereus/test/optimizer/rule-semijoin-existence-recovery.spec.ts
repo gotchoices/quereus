@@ -396,8 +396,33 @@ describe('ruleSemijoinExistenceRecovery', () => {
 			expect(joinExistence(rows), 'flag dropped — recovered as an inner join').to.equal(undefined);
 			expect(joinTypeOf(rows)).to.equal('inner');
 
+			// Genuine baseline: disable BOTH recovery rules so the flag-bearing
+			// nested-loop left join survives. (`resultsNoRecovery` here disables only
+			// the semi rule, leaving the inner rule live — that baseline would itself
+			// be inner-recovered, a near-tautology. The strong baseline lives in
+			// rule-inner-join-existence-recovery.spec.ts; this asserts it too.)
+			const base = db.optimizer.tuning;
+			db.optimizer.updateTuning({
+				...base,
+				disabledRules: new Set([
+					...(base.disabledRules ?? []),
+					'semijoin-existence-recovery',
+					'inner-join-existence-recovery',
+				]),
+			});
+			let baseline: ResultRow[];
+			try {
+				baseline = await results(db, q);
+			} finally {
+				db.optimizer.updateTuning(base);
+			}
+
 			const out = await results(db, q);
-			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+			expect(out).to.deep.equal([
+				{ cc: 1, pv: 10 },
+				{ cc: 3, pv: 20 },
+			]);
+			expect(out).to.deep.equal(baseline);
 		});
 
 		it('flag sorted on: `… where hasP order by hasP` keeps the flag', async () => {

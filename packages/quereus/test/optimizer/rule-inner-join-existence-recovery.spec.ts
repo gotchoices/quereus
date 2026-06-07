@@ -297,6 +297,46 @@ describe('ruleInnerJoinExistenceRecovery', () => {
 		});
 	});
 
+	describe('star expansion', () => {
+		it('`select c.*, p.pv … where hasP` recovers an inner join (qualified c.* omits the appended flag, p.pv demands a right col)', async () => {
+			await seedExisting();
+			const q =
+				'select c.*, p.pv as pv from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('inner');
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ cc: 1, pr: 1, cv: 100, pv: 10 },
+				{ cc: 3, pr: 2, cv: 300, pv: 20 },
+			]);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+
+		it('unqualified `select * … where hasP` keeps the flag (`*` expands the join-appended flag, so it is demanded — and the user is selecting it)', async () => {
+			await seedExisting();
+			// `buildStarProjections` expands `source.getAttributes()`, which for a
+			// flag-bearing join INCLUDES the appended existence flag. So `*` demands the
+			// flag, `!demanded.has(flagId)` fails, and the rule correctly abstains —
+			// the flag must survive because the user asked for it via `*`.
+			const q =
+				'select * from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as hasP']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ cc: 1, pr: 1, cv: 100, pp: 1, pv: 10, hasP: true },
+				{ cc: 3, pr: 2, cv: 300, pp: 2, pv: 20, hasP: true },
+			]);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+	});
+
 	describe('cascade with join-existence-pruning', () => {
 		it('undemanded sibling flag is pruned first, THEN the sole survivor + right col recovers an inner join', async () => {
 			await seedExisting();
