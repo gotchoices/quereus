@@ -36,6 +36,38 @@ import type { Database as DatabaseType } from '../src/core/database.js';
 import type { Schema } from '../src/schema/schema.js';
 import type { MappingAdvertisement, LogicalColumnMapping } from '../src/vtab/mapping-advertisement.js';
 import type * as AST from '../src/parser/ast.js';
+import { astToString } from '../src/emit/ast-stringify.js';
+import { collectLensRowLocalConstraints } from '../src/planner/mutation/lens-enforcement.js';
+import { BuildTimeDependencyTracker, type PlanningContext } from '../src/planner/planning-context.js';
+import { GlobalScope } from '../src/planner/scopes/global.js';
+import { ParameterScope } from '../src/planner/scopes/param.js';
+import type { LensSlot } from '../src/schema/lens.js';
+
+/**
+ * A minimal {@link PlanningContext} for the direct `collectLensRowLocalConstraints`
+ * unit calls in the subquery-CHECK rewrite tests — the scope-aware rewrite needs a
+ * context to resolve subquery FROM column names.
+ */
+function makeCtx(db: Database): PlanningContext {
+	return {
+		db,
+		schemaManager: db.schemaManager,
+		parameters: {},
+		scope: new ParameterScope(new GlobalScope(db.schemaManager)),
+		cteNodes: new Map(),
+		schemaDependencies: new BuildTimeDependencyTracker(),
+		schemaCache: new Map(),
+		cteReferenceCache: new Map(),
+		outputScopes: new Map(),
+	};
+}
+
+/** The lens slot for logical table `x.<table>` (asserts it exists). */
+function slotX(db: Database, table: string): LensSlot {
+	const s = db.schemaManager.getSchema('x')!.getLensSlot(table);
+	expect(s, `lens slot for x.${table}`).to.not.be.undefined;
+	return s!;
+}
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
 	const out: Array<Record<string, unknown>> = [];
@@ -1829,6 +1861,96 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'zzz' }]);
 			expect(await rows(db, 'select note from main.Doc_meta where meta_sid = 100')).to.deep.equal([{ note: 'zzz' }]);
 			expect(await rows(db, "select title, note from x.Doc where docKey = 'k1'")).to.deep.equal([{ title: 'zzz', note: 'zzz' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// The rename twist (`lens-rowlocal-subquery-correlated-rename-rewrite`): the prior gate fix
+	// used same-named `title`/`note` correlations, where the un-descended `rewriteToBasisTerms`
+	// left the bare subquery-internal ref intact and it happened to still resolve (logical ==
+	// basis). When the correlated write-row column is RENAMED (`docKey` logical → `doc_key`
+	// basis), the un-descended rewrite left `docKey` verbatim and the built constraint crashed
+	// with `Column not found: docKey`. The scope-aware rewrite spells the correlated ref `doc_key`
+	// while leaving the foreign `Allowed.name` ref and any subquery-LOCAL ref untouched.
+	it('decomposition: a subquery CHECK correlating the renamed key column (docKey→doc_key) builds and enforces', async () => {
+		const db = new Database();
+		try {
+			// `docKey` (logical PK) maps to basis `doc_key` on the Doc_core anchor and appears
+			// ONLY inside the subquery. Pre-fix the un-descended rewrite left it verbatim ⇒ build
+			// crash; post-fix it spells `doc_key`, gates onto Doc_core (which owns doc_key), and
+			// fires at commit.
+			await setupSubqueryCheck(db, 'constraint keyallow check (exists (select 1 from Allowed where Allowed.name = docKey))');
+			// Admit only k1 on the doc-key allow-list (k2 stays unlisted). A title-only UPDATE
+			// leaves docKey unchanged, so NEW.doc_key is the row's key.
+			await db.exec("insert into main.Allowed (name, kind) values ('k1', 'g')");
+
+			// k1 IS allow-listed ⇒ the deferred subquery CHECK passes; the title-only fan-out
+			// (Doc_core only) builds with `doc_key` resolvable and commits.
+			await db.exec("update x.Doc set title = 'ok' where docKey = 'k1'");
+			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'ok' }]);
+
+			// k2 is NOT allow-listed ⇒ the same CHECK ABORTs at commit; the row rolls back.
+			await expectThrows(() => db.exec("update x.Doc set title = 'nope' where docKey = 'k2'"), /check|constraint|keyallow/i);
+			expect(await rows(db, 'select title from main.Doc_core where sid = 101')).to.deep.equal([{ title: 'bbb' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('decomposition rename: the rewrite spells the correlated key in basis terms, the foreign ref intact, metadata consistent', async () => {
+		const db = new Database();
+		try {
+			await setupSubqueryCheck(db, 'constraint keyallow check (exists (select 1 from Allowed where Allowed.name = docKey))');
+			const constraints = collectLensRowLocalConstraints(makeCtx(db), slotX(db, 'Doc'));
+			const c = constraints.find(rc => rc.name === 'lens:keyallow');
+			expect(c, 'the routed subquery CHECK is present').to.not.be.undefined;
+			const exprSql = astToString(c!.expr);
+			// The correlated write-row ref `docKey` is rewritten to the basis `doc_key`...
+			expect(exprSql, 'correlated docKey rewritten to basis doc_key').to.match(/doc_key/);
+			expect(exprSql, 'no leftover logical docKey spelling').to.not.match(/docKey/);
+			// ...while the foreign subquery ref `Allowed.name` (qualifier ≠ logical table) is left
+			// untouched (it resolves against the subquery FROM, not the write row).
+			expect(exprSql, 'foreign Allowed ref left intact').to.match(/allowed/i);
+			// The gate metadata over-collects the source CHECK's mapped logical columns: only the
+			// write-row `docKey`→`doc_key` (the foreign `Allowed.name` is not a logical column).
+			expect(c!.referencedWriteRowColumns, 'metadata stays consistent with the rewrite').to.deep.equal(['doc_key']);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('decomposition rename: a subquery-LOCAL ref sharing a logical name is NOT rewritten (the shadow guard)', async () => {
+		const db = new Database();
+		try {
+			// The subquery FROM aliases a source column to `docKey`, so a *bare* `docKey` inside
+			// the subquery is subquery-local (shadowed) — it resolves against `src`, NOT the write
+			// row. The scope-aware rewrite must leave it spelled `docKey`; only a genuinely
+			// correlated ref would be rewritten to `doc_key`. A naive deep rewrite (no shadow
+			// tracking) would over-rewrite it to `doc_key` and break the subquery's own binding.
+			await setupSubqueryCheck(db, "constraint shadowok check (exists (select 1 from (select name as docKey from Allowed) src where docKey = 'k1'))");
+			const constraints = collectLensRowLocalConstraints(makeCtx(db), slotX(db, 'Doc'));
+			const exprSql = astToString(constraints.find(rc => rc.name === 'lens:shadowok')!.expr);
+			// The shadowed (subquery-local) `docKey` is preserved; nothing is rewritten to basis
+			// terms (there is no genuine correlated write-row ref in this CHECK).
+			expect(exprSql, 'subquery-local docKey preserved').to.match(/docKey/);
+			expect(exprSql, 'no spurious basis rewrite of the shadowed ref').to.not.match(/doc_key/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('decomposition rename: a tainted (select *) subquery correlating a write-row column is rejected, not mis-rewritten', async () => {
+		const db = new Database();
+		try {
+			// The subquery FROM is a `select *` source, so its columns are not statically
+			// resolvable ⇒ the scope is TAINTED: a bare `docKey` inside cannot be proven
+			// subquery-local-vs-correlated. Rather than mis-rewrite it (or fall through to a
+			// cryptic build crash), the rewrite rejects with a clear `unsupported-subquery-
+			// correlation` diagnostic — mirroring the single-source view-column descent's policy.
+			await setupSubqueryCheck(db, 'constraint taintchk check (exists (select 1 from (select * from Allowed) sub where docKey = sub.name))');
+			expect(() => collectLensRowLocalConstraints(makeCtx(db), slotX(db, 'Doc')))
+				.to.throw(/correlat|statically resolvable|select \*/i);
 		} finally {
 			await db.close();
 		}

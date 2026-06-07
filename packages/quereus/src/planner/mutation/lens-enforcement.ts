@@ -11,7 +11,9 @@ import {
 	matchingBasisFks,
 	findLogicalParentFkRefs,
 } from '../../schema/lens-fk-discovery.js';
-import { transformExpr } from './scope-transform.js';
+import { transformScopedExpr, type ScopeContext } from './scope-transform.js';
+import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
+import type { PlanningContext } from '../planning-context.js';
 import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
 import { createLogger } from '../../common/logger.js';
 
@@ -68,20 +70,88 @@ const log = createLogger('planner:lens-enforcement');
 export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
 
 /**
- * Rewrites a logical-column expression into basis-column terms: a column that
- * maps to a basis column is replaced by an unqualified reference to it; any other
- * column reference has its table/schema qualifier stripped so it resolves against
- * the single basis source after the rewrite. (The prover already errored at deploy
- * on a check over a non-reconstructible column, so every referenced logical column
- * maps cleanly here.)
+ * The {@link ScopeContext} for the logical→basis row-local CHECK rewrite — the
+ * scope-aware dual of the single-source view-column descent ({@link import('./single-source.js').makeViewScope}).
+ * It rewrites a **correlated write-row** logical column to its bare basis spelling
+ * while leaving a **subquery-local** ref (one a nested FROM introduces) untouched, so
+ * a CHECK whose subquery correlates a write-row column with a logical≠basis name spells
+ * that ref in basis terms at the constraint-build boundary instead of crashing on a
+ * column the basis write row does not carry (`docs/lens.md` § Constraint Attachment).
+ * The descent itself owns shadow accumulation / taint propagation; this object decides
+ * per column:
+ *
+ * - **Qualified by the logical table name** and mapped ⇒ a qualified write-row ref ⇒
+ *   replace with the bare basis column (qualifier dropped so it resolves against the
+ *   single basis source). Any other qualifier (`Allowed.name`, a subquery FROM source)
+ *   ⇒ left untouched — it resolves against the subquery FROM. This is the negative-case
+ *   guard against over-rewriting a foreign ref whose name happens to equal a logical column.
+ * - **Bare**, shadowed by a (this-or-enclosing) subquery FROM ⇒ left untouched
+ *   (subquery-local); else, name maps ⇒ replace with the bare basis column (a correlated
+ *   write-row ref); else ⇒ left untouched.
+ *
+ * The old top-level behavior — strip the qualifier of an *unmapped* qualified column — is
+ * intentionally dropped: the prover errors at deploy on a CHECK over a non-reconstructible
+ * column, so every referenced logical column maps cleanly, and a top-level CHECK qualifier
+ * can only name the logical table (a CHECK reaches other tables only via a subquery).
+ *
+ * `unresolvableScope: 'taint'` (mirroring the view-column descent): when a subquery's FROM
+ * columns are not statically resolvable (`select *` / TVF / CTE), a bare logical-column-named
+ * ref inside it cannot be proven correlated — reject it from the tainted scope with a clear
+ * diagnostic rather than mis-rewrite or fall through to a cryptic build crash. A foreign /
+ * qualified ref in a tainted scope is still left untouched (its name is not a logical column).
  */
-function rewriteToBasisTerms(expr: AST.Expression, map: ReadonlyMap<string, string>): AST.Expression {
-	return transformExpr(expr, (col) => {
-		const basisColumn = map.get(col.name.toLowerCase());
-		if (basisColumn !== undefined) return { type: 'column', name: basisColumn };
-		if (col.table || col.schema) return { type: 'column', name: col.name };
-		return undefined;
-	});
+function makeLensRewriteScope(map: ReadonlyMap<string, string>, logicalTableName: string): ScopeContext {
+	const lcTable = logicalTableName.toLowerCase();
+	const resolve = (name: string): AST.Expression | undefined => {
+		const basisColumn = map.get(name);
+		return basisColumn !== undefined ? { type: 'column', name: basisColumn } : undefined;
+	};
+	return {
+		makeSubstitute: (shadowed, tainted) => (col) => {
+			const name = col.name.toLowerCase();
+			if (col.table) {
+				// Only a ref qualified by the logical table is a (qualified) write-row ref;
+				// any other qualifier resolves against the subquery FROM.
+				return col.table.toLowerCase() === lcTable ? resolve(name) : undefined;
+			}
+			if (shadowed.has(name)) return undefined;
+			if (!map.has(name)) return undefined;
+			if (tainted) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-subquery-correlation',
+					table: logicalTableName,
+					column: col.name,
+					message: `cannot enforce the logical CHECK on '${logicalTableName}': the reference '${col.name}' inside a subquery cannot be proven correlated to the write row because the subquery's source columns are not statically resolvable (a 'select *' / table-valued function / unresolved source); qualify the reference with the logical table, or restructure the CHECK`,
+				});
+			}
+			return resolve(name);
+		},
+		unresolvableScope: 'taint',
+		rejectDmlSubquery: () => raiseMutationDiagnostic({
+			reason: 'unsupported-subquery-correlation',
+			table: logicalTableName,
+			message: `cannot enforce the logical CHECK on '${logicalTableName}': a data-modifying subquery (INSERT/UPDATE/DELETE) within it cannot be analysed for write-row correlation`,
+		}),
+	};
+}
+
+/**
+ * Rewrites a logical-column CHECK expression into basis-column terms, scope-aware:
+ * a top-level (or correlated) write-row logical column maps to its bare basis column,
+ * while a subquery-local column the nested FROM introduces is left untouched. Rides the
+ * shared {@link transformScopedExpr} descent over {@link makeLensRewriteScope}, entered at
+ * the outermost scope — so a top-level bare logical column still maps to basis exactly as
+ * the prior top-level-only rewrite did, and a correlated bare write-row ref inside a subquery
+ * (e.g. `exists (select 1 from Allowed where Allowed.name = docKey)`, `docKey`→`doc_key`) is
+ * now also rewritten rather than passing through verbatim and crashing at constraint build.
+ */
+function rewriteToBasisTerms(
+	ctx: PlanningContext,
+	expr: AST.Expression,
+	map: ReadonlyMap<string, string>,
+	logicalTableName: string,
+): AST.Expression {
+	return transformScopedExpr(ctx, makeLensRewriteScope(map, logicalTableName), expr);
 }
 
 /**
@@ -130,9 +200,10 @@ function rowLocalReferencedBasisColumns(expr: AST.Expression, map: ReadonlyMap<s
  * Returns `[]` when the slot is un-proved (`obligations` undefined) or carries no
  * row-local checks — the common case, so a non-lens / check-free write pays nothing.
  */
-export function collectLensRowLocalConstraints(slot: LensSlot): RowConstraintSchema[] {
+export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensSlot): RowConstraintSchema[] {
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
+	const logicalTableName = slot.logicalTable.name;
 	const constraints: RowConstraintSchema[] = [];
 	for (const obligation of slot.obligations) {
 		if (obligation.kind !== 'enforced-row-local') continue;
@@ -140,7 +211,7 @@ export function collectLensRowLocalConstraints(slot: LensSlot): RowConstraintSch
 		const source = obligation.constraint.constraint;
 		constraints.push({
 			name: source.name ? `lens:${source.name}` : 'lens:check',
-			expr: rewriteToBasisTerms(source.expr, map),
+			expr: rewriteToBasisTerms(ctx, source.expr, map, logicalTableName),
 			// A logical CHECK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			// Prover-supplied write-row dependency set for the per-op decomposition gate.

@@ -342,7 +342,7 @@ function buildMultiSourceReturning(
  */
 function lensRowLocalConstraints(ctx: PlanningContext, view: MutableViewLike): RowConstraintSchema[] {
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
-	return slot ? collectLensRowLocalConstraints(slot) : [];
+	return slot ? collectLensRowLocalConstraints(ctx, slot) : [];
 }
 
 /**

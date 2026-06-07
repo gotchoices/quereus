@@ -64,6 +64,26 @@ function slot(db: Database, table: string): LensSlot {
 }
 
 /**
+ * A minimal {@link PlanningContext} for the direct `collectLensRowLocalConstraints`
+ * unit calls below — the scope-aware rewrite needs a context to resolve subquery FROM
+ * column names (`collectFromColumnNames`). Mirrors the fuller ctx built at the
+ * plan-node regression near the end of this file.
+ */
+function makeCtx(db: Database): PlanningContext {
+	return {
+		db,
+		schemaManager: db.schemaManager,
+		parameters: {},
+		scope: new ParameterScope(new GlobalScope(db.schemaManager)),
+		cteNodes: new Map(),
+		schemaDependencies: new BuildTimeDependencyTracker(),
+		schemaCache: new Map(),
+		cteReferenceCache: new Map(),
+		outputScopes: new Map(),
+	};
+}
+
+/**
  * The `mode` of every `enforced-set-level` obligation on a slot. Lets a test pin
  * the prover's *classification* — `row-time` vs `commit-time` — rather than only
  * the collector's output, which is `[]` for `row-time`, `proved`, AND `vacuous`
@@ -127,11 +147,48 @@ describe('lens enforcement: row-local CHECK at the write boundary', () => {
 			expect(await rows(db, 'select id, maxSpeed from x.t where id = 2')).to.deep.equal([{ id: 2, maxSpeed: 5 }]);
 
 			// The rewrite is visible on the synthesized basis-term constraint.
-			const basisConstraints = collectLensRowLocalConstraints(slot(db, 't'));
+			const basisConstraints = collectLensRowLocalConstraints(makeCtx(db), slot(db, 't'));
 			expect(basisConstraints.length, 'one routed row-local check').to.equal(1);
 			const exprSql = astToString(basisConstraints[0].expr);
 			expect(exprSql, 'rewritten to the basis column').to.match(/\bspeed\b/i);
 			expect(exprSql, 'no longer references the logical column').to.not.match(/maxspeed/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('enforces a subquery CHECK correlating a renamed logical column on a single-source lens', async () => {
+		const db = new Database();
+		try {
+			// A single-source (non-decomposition) lens with a rename (`speed as maxSpeed`) and a
+			// row-local CHECK whose subquery *correlates* the renamed write-row column `maxSpeed`.
+			// `maxSpeed` appears ONLY inside the subquery, so pre-fix the un-descended rewrite left
+			// it verbatim and the constraint crashed at build (`Column not found: maxSpeed`). The
+			// scope-aware rewrite spells the correlated ref `speed` while leaving the foreign
+			// `y.Allowed.cap` ref alone. Proves the fix is independent of decomposition.
+			await db.exec('declare schema y { table t (id integer primary key, speed integer); table Allowed (cap integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, maxSpeed integer, constraint capok check (exists (select 1 from y.Allowed where Allowed.cap = maxSpeed))) }');
+			await db.exec('declare lens for x over y { view t as select id, speed as maxSpeed from y.t }');
+			await db.exec('apply schema x');
+
+			// The allow-list (basis-direct seed, bypassing the lens): 5 and 10 are admitted.
+			await db.exec('insert into y.Allowed (cap) values (5), (10)');
+
+			// An allow-listed value inserts (the deferred subquery CHECK passes at commit)...
+			await db.exec('insert into x.t (id, maxSpeed) values (1, 5)');
+			expect(await rows(db, 'select id, maxSpeed from x.t where id = 1')).to.deep.equal([{ id: 1, maxSpeed: 5 }]);
+			// ...and a non-listed one ABORTs — the CHECK is genuinely enforced, not merely build-safe.
+			await expectThrows(() => db.exec('insert into x.t (id, maxSpeed) values (2, 7)'), /capok|constraint|check/i);
+			expect(await rows(db, 'select count(*) as n from x.t where id = 2')).to.deep.equal([{ n: 0 }]);
+
+			// The rewrite spelled the correlated ref in basis terms; the foreign ref is untouched.
+			const constraints = collectLensRowLocalConstraints(makeCtx(db), slot(db, 't'));
+			expect(constraints.length, 'one routed row-local check').to.equal(1);
+			const exprSql = astToString(constraints[0].expr);
+			expect(exprSql, 'correlated maxSpeed rewritten to basis speed').to.match(/\bspeed\b/i);
+			expect(exprSql, 'no leftover logical spelling').to.not.match(/maxspeed/i);
+			expect(exprSql, 'foreign Allowed ref left intact').to.match(/allowed/i);
 		} finally {
 			await db.close();
 		}
@@ -145,7 +202,7 @@ describe('lens enforcement: row-local CHECK at the write boundary', () => {
 			await db.exec('declare logical schema x { table t (id integer primary key, val integer, constraint nonneg check (val >= 0)) }');
 			await db.exec('apply schema x');
 
-			const routed = collectLensRowLocalConstraints(slot(db, 't'));
+			const routed = collectLensRowLocalConstraints(makeCtx(db), slot(db, 't'));
 			expect(routed.length).to.equal(1);
 			expect(routed[0].tags?.[LENS_BOUNDARY_ATTACHED_TAG], 'marker present').to.equal(true);
 			expect(routed[0].name).to.equal('lens:nonneg');
@@ -163,7 +220,7 @@ describe('lens enforcement: row-local CHECK at the write boundary', () => {
 			await db.exec('declare logical schema x { table t (id integer primary key, val integer) }');
 			await db.exec('apply schema x');
 
-			expect(collectLensRowLocalConstraints(slot(db, 't'))).to.deep.equal([]);
+			expect(collectLensRowLocalConstraints(makeCtx(db), slot(db, 't'))).to.deep.equal([]);
 
 			// And a plain physical table's write is unaffected: a normal insert works.
 			await db.exec('insert into x.t (id, val) values (1, -5)');
