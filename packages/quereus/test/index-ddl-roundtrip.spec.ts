@@ -650,6 +650,23 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
 	});
 
+	// PENDING — blocked on `index-explicit-column-collate-apply-path`. The canonical
+	// BODY logic this ticket added already handles the collate-folded form correctly
+	// (`declaredIndexCanonicalBody` resolves the collation off `col.expr` and preserves
+	// `col.direction`). What this test cannot yet do is APPLY the baseline: the live
+	// `CREATE INDEX … (email collate nocase desc)` path (`buildIndexSchema`) rejects any
+	// collate-folded column as an "expression index", and `createIndexToString` also
+	// drops the trailing `desc` for that form. Un-skip once that apply/emit path supports
+	// explicit per-column index COLLATE; the expectation below should then hold (no churn).
+	it.skip('an explicit COLLATE on a descending column (collate-folded form), re-declared verbatim, does not churn', async () => {
+		const diff = await diffIndexEdit(
+			`${TABLE}\nindex ix on t (email collate nocase desc)`,
+			`${TABLE}\nindex ix on t (email collate nocase desc)`,
+		);
+		expect(diff.indexesToDrop, 'no drop').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no recreate').to.deep.equal([]);
+	});
+
 	it('a pure collation body-change recreate does not trip require-hint policy', async () => {
 		// A collation-driven recreate is a body change (counts in indexBodyRecreates),
 		// so it is excluded from the unhinted-rename guard, exactly as other body changes.
