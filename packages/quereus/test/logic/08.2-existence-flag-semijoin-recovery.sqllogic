@@ -80,3 +80,27 @@ select oid from ords left join custs on ords.cust = custs.id exists right as has
 
 drop table ords;
 drop table custs;
+
+-- ===== Fan-out guard: right side NOT unique on the join column =====
+-- A plain `left join … exists right as` yields one row per MATCHING right row,
+-- so `where flag` fans out (K rows per matched left row). Recovery to a semi
+-- join (1 row per left) would silently drop the duplicates — the rule must
+-- abstain on the semi side. The anti side is immune (unmatched rows never fan
+-- out) and still recovers. These assert the fanned-out row counts directly.
+
+create table fc (cc integer primary key);
+create table fp (id integer primary key, pp integer);
+insert into fc values (1), (2);
+-- cc 1 matches THREE fp rows (pp=1); cc 2 matches none.
+insert into fp values (10, 1), (11, 1), (12, 1);
+
+-- semi probe: must keep all three fanned-out cc=1 rows (NOT collapse to one)
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- anti probe: one row per unmatched left row, fan-out irrelevant
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where not h order by cc;
+→ [{"cc":2}]
+
+drop table fc;
+drop table fp;

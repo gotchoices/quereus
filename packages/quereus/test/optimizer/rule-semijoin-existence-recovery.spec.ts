@@ -116,6 +116,16 @@ describe('ruleSemijoinExistenceRecovery', () => {
 		await db.exec('insert into child values (10, 1, 100), (20, null, 200), (30, 2, 300), (40, null, 400)');
 	}
 
+	// Right side NOT unique on the join column: cc=1 matches THREE fparent rows
+	// (pp=1), cc=2 matches none. A plain `left join … where flag` FANS OUT (K rows
+	// per matched left row), so a semi rewrite (1 row per left) would be UNSOUND.
+	async function setupFanOut(): Promise<void> {
+		await db.exec('create table fchild (cc integer primary key) using memory');
+		await db.exec('create table fparent (id integer primary key, pp integer) using memory');
+		await db.exec('insert into fchild values (1), (2)');
+		await db.exec('insert into fparent values (10, 1), (11, 1), (12, 1)');
+	}
+
 	// exc→exp with NO declared FK; a known match pattern so flag values are pinned.
 	//   cc=1 (pr=1) matches; cc=2 (pr=9) no match; cc=3 (pr=2) matches; cc=4 (pr=null) no match
 	async function seedExisting(): Promise<void> {
@@ -372,6 +382,40 @@ describe('ruleSemijoinExistenceRecovery', () => {
 
 			const out = await results(db, q);
 			expect(out.map(r => r.cc)).to.deep.equal([1, 3]);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+	});
+
+	describe('fan-out guard (non-unique right join column)', () => {
+		it('SEMI must NOT fire when a left row can match >1 right row (fan-out would lose duplicate rows)', async () => {
+			await setupFanOut();
+			// cc=1 matches three fparent rows ⇒ the flag-bearing left join yields THREE
+			// rows for cc=1; a semi join would yield one. Recovery must abstain.
+			const q =
+				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where h order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.deep.equal(['exists right as h']);
+			expect(joinTypeOf(rows)).to.equal('left');
+
+			const out = await results(db, q);
+			// The baseline fans out to three identical [cc=1] rows — the row count that
+			// a (wrongly) recovered semi join would have collapsed to one.
+			expect(out.map(r => r.cc)).to.deep.equal([1, 1, 1]);
+			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
+		});
+
+		it('ANTI still fires under fan-out (unmatched rows never duplicate)', async () => {
+			await setupFanOut();
+			const q =
+				'select c.cc as cc from fchild c left join fparent p on p.pp = c.cc exists right as h where not h order by c.cc';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			expect(joinTypeOf(rows)).to.equal('anti');
+
+			const out = await results(db, q);
+			expect(out.map(r => r.cc)).to.deep.equal([2]);
 			expect(out).to.deep.equal(await resultsNoRecovery(db, q));
 		});
 	});

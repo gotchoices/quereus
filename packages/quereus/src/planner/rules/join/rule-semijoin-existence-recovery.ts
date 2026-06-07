@@ -91,22 +91,37 @@
  * rule then recovers in a later `applyRules` iteration. The genuinely-mixed case
  * (≥2 demanded flags) is left unoptimized.
  *
- * ## Q5 — Residual ON-condition + non-equi predicates (sound; carry verbatim)
+ * ## Q5 — Fan-out guard (SEMI only) + residual ON-condition
  *
- * `left join … where f` keeps exactly the L rows for which ∃ an R row satisfying
- * the FULL join condition — precisely `semi(L, R, condition)` for an arbitrary
- * `condition` (equi + residual + non-equi). So the constructed join carries
- * `J.condition` UNCHANGED. The downstream IND folders gate on
- * `isAndOfColumnEqualities(normalizePredicate(condition))` and abstain on any
- * residual, leaving a plain semi/anti join (hash semi-join still beats
- * nested-loop+flag). This rule does NOT itself require AND-of-equalities.
+ * **A plain `left join … exists right as` does NOT collapse to one row per left
+ * row.** `emitLoopJoin` yields one output row per MATCHING right row, each
+ * carrying flag=true (it is a normal left join with an extra computed bit, not an
+ * existence-semantics join). So `where f` keeps **K rows** for a left row with K
+ * matches, while `semi(L,R,cond)` keeps exactly **one**. The two are row-equal
+ * iff every left row matches AT MOST ONE right row. We therefore gate the SEMI
+ * rewrite on `rightMatchesAtMostOne(J)` — the equi-join columns of `J.condition`
+ * must cover a unique key of R (`isUnique`), which holds for FK→PK joins (R's PK
+ * covered) and ≤1-row R (the empty key). A non-equi / non-unique condition (where
+ * a left row can match several R rows) makes the SEMI shape unsound and the rule
+ * abstains. The condition is otherwise carried `J.condition` UNCHANGED: a residual
+ * conjunct on top of a covered unique key only narrows the ≤1 match further (still
+ * ≤1), so the downstream IND folders may abstain on the residual and leave a plain
+ * semi join — still a win.
  *
- * ## Q6 — Outer-side preservation / NULL semantics (clean partition)
+ * The **ANTI** path needs no such guard (and `rightMatchesAtMostOne` is not
+ * consulted for it): see Q6.
+ *
+ * ## Q6 — Outer-side preservation / NULL semantics + anti fan-out immunity
  *
  * The flag is `{true,false}` and never NULL (`EXISTENCE_FLAG_TYPE.nullable ===
  * false`; `emitLoopJoin` pre-computes matched=`true` / unmatched=`false` for an
- * `exists right as` spec). So `where f` and `where not f` partition the L rows
- * into exact complements — the textbook semi / anti split, no NULL edge.
+ * `exists right as` spec). For the ANTI rewrite this makes the split exact under
+ * arbitrary fan-out: an UNMATCHED left row yields exactly one null-extended row
+ * (flag=false) — one per left row, never K — and every MATCHED row carries
+ * flag=true and is dropped by `where not f`. So `where not f` keeps exactly the
+ * unmatched left rows, one each = `anti(L,R,cond)` for any `cond`, no fan-out
+ * hazard. (The SEMI side keeps matched rows, where the K-vs-1 divergence lives —
+ * hence the Q5 guard.)
  *
  * ## Q7 — Write-half safety (excluded by construction) + impure-R guard
  *
@@ -130,12 +145,13 @@ import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../nodes/p
 import type { OptContext } from '../../framework/context.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { FilterNode } from '../../nodes/filter.js';
-import { JoinNode, type JoinType } from '../../nodes/join-node.js';
+import { JoinNode, type JoinType, extractEquiPairsFromCondition } from '../../nodes/join-node.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { UnaryOpNode, BinaryOpNode, LiteralNode } from '../../nodes/scalar.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { isUnique, type KeyRel } from '../../util/fd-utils.js';
 import {
 	collectAttrIds,
 	walkChain,
@@ -194,6 +210,21 @@ export function ruleSemijoinExistenceRecovery(node: PlanNode, _context: OptConte
 	const rightAttrIds = join.right.getAttributes().map(a => a.id);
 	for (const id of rightAttrIds) {
 		if (demanded.has(id)) return null;
+	}
+
+	// SOUNDNESS — fan-out guard (SEMI only). A plain `left join … exists right as`
+	// does NOT collapse to one row per left row: the nested-loop emitter yields one
+	// output row per MATCHING right row, each carrying flag=true (see
+	// `emitLoopJoin`). So `where flag` keeps K rows for a left row with K matches,
+	// whereas a semi join keeps exactly one — the two diverge whenever a left row
+	// can match more than one right row. They agree iff every left row matches AT
+	// MOST ONE right row, i.e. the equi-join columns cover a unique key of the right
+	// side. The ANTI path is immune: an unmatched left row yields exactly one
+	// null-extension regardless of fan-out, and matched rows are filtered out, so
+	// `anti(L,R,cond)` equals `left join … where not flag` for arbitrary `cond`.
+	if (probe.polarity === 'semi' && !rightMatchesAtMostOne(join)) {
+		log('Semi recovery skipped: right side may match >1 row per left row (fan-out)');
+		return null;
 	}
 
 	// A semi join short-circuits the R scan at the first match — refuse to change
@@ -280,6 +311,23 @@ function analyzeChain(
 
 	if (!probe) return null;
 	return { demanded, probe };
+}
+
+/**
+ * True iff every left row matches AT MOST ONE right row under `join.condition` —
+ * the precondition for a sound SEMI rewrite (see the fan-out guard at the call
+ * site). Holds when the equi-join columns cover a unique key of the right side
+ * (`isUnique`), which subsumes both the FK→PK case (right PK covered) and a
+ * ≤1-row right relation (the empty key, when there are no equi-pairs). Reads the
+ * right side's full uniqueness surface — declared keys plus FD-derived keys via
+ * `physical` — exactly as `JoinNode.computePhysical` does.
+ */
+function rightMatchesAtMostOne(join: JoinNode): boolean {
+	const leftAttrs = join.left.getAttributes();
+	const rightAttrs = join.right.getAttributes();
+	const pairs = extractEquiPairsFromCondition(join.condition, leftAttrs, rightAttrs);
+	const rightRel: KeyRel = { getType: () => join.right.getType(), physical: join.right.physical };
+	return isUnique(pairs.map(p => p.right), rightRel);
 }
 
 /**
