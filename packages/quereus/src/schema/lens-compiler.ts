@@ -12,7 +12,7 @@ import { buildLogicalConstraints, type LensSlot, type LensColumnProvenance,
 import { computeSchemaHash } from './schema-hasher.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { proveLens, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
+import { proveLens, collectColumnRefNames, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
 import { applyAckGovernance, resolveEscalationPolicy, type AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
 import type { MappingAdvertisement, DecompositionMember, StorageShape } from '../vtab/mapping-advertisement.js';
@@ -1848,30 +1848,3 @@ function validateOverrideAdvertisementConflict(
 	}
 }
 
-/**
- * Collects the names of every `column` reference in a basis expression (a
- * best-effort reflective walk). Used to validate that an advertisement's
- * `basisExpr` references columns that actually exist on its member relation.
- */
-function collectColumnRefNames(expr: AST.Expression): string[] {
-	const names: string[] = [];
-	const stack: AST.AstNode[] = [expr as AST.AstNode];
-	while (stack.length > 0) {
-		const node = stack.pop()!;
-		if (node.type === 'column' && typeof (node as AST.ColumnExpr).name === 'string') {
-			names.push((node as AST.ColumnExpr).name);
-		}
-		for (const key of Object.keys(node)) {
-			const value = (node as unknown as Record<string, unknown>)[key];
-			if (!value) continue;
-			if (Array.isArray(value)) {
-				for (const item of value) {
-					if (item && typeof item === 'object' && 'type' in item) stack.push(item as AST.AstNode);
-				}
-			} else if (typeof value === 'object' && 'type' in (value as object)) {
-				stack.push(value as AST.AstNode);
-			}
-		}
-	}
-	return names;
-}

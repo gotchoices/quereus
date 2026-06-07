@@ -867,11 +867,18 @@ function quoteIdent(name: string): string {
 
 /**
  * Filter the lens-synthesized `extraConstraints` to those a base op can build: a
- * constraint rides `op` iff every write-row column it references
- * ({@link writeRowColumns}) resolves on the op's target-table columns
- * (case-insensitive). Each constraint that rides ≥1 op is recorded in `ridden` so the
- * caller can trace any that rode none (a silently-deferred cross-member CHECK/FK, or a
- * dropped uniqueness scan on a key-unchanged UPDATE).
+ * constraint rides `op` iff every write-row column it references resolves on the op's
+ * target-table columns (case-insensitive). Each constraint that rides ≥1 op is recorded
+ * in `ridden` so the caller can trace any that rode none (a silently-deferred cross-member
+ * CHECK/FK, or a dropped uniqueness scan on a key-unchanged UPDATE).
+ *
+ * The write-row column set comes from one of two sources. A lens-synthesized **row-local
+ * CHECK** carries `referencedWriteRowColumns` — prover-supplied lowercased basis names
+ * (`collectLensRowLocalConstraints`) — which is preferred because the AST walk
+ * ({@link writeRowColumns}) under-collects a correlated bare write-row ref that appears
+ * only inside a subquery (a subquery-bearing row-local CHECK, which the prover still
+ * classifies `enforced-row-local`). The FK / set-level classes leave it undefined and fall
+ * back to the walk, which collects their `NEW.*` / `OLD.*` refs unambiguously anywhere.
  *
  * `extraConstraints` is exclusively lens-synthesized (the basis table's own checks are
  * added inside `buildConstraintChecks` from `tableSchema.checkConstraints`, never via
@@ -886,7 +893,9 @@ function constraintsForOp(
 	const opCols = new Set(op.table.tableSchema.columns.map(c => c.name.toLowerCase()));
 	const kept: RowConstraintSchema[] = [];
 	for (const c of extraConstraints) {
-		const refs = writeRowColumns(c.expr);
+		// Prefer the prover-supplied row-local metadata (already lowercased basis names);
+		// fall back to the AST walk for FK / set-level constraints (which leave it undefined).
+		const refs = c.referencedWriteRowColumns ?? writeRowColumns(c.expr);
 		let resolvable = true;
 		for (const col of refs) {
 			if (!opCols.has(col)) { resolvable = false; break; }
@@ -907,12 +916,19 @@ function constraintsForOp(
  *    subquery): the correlated write-row side of a set-level count subquery, a child-FK
  *    `EXISTS`, or a parent-FK `NOT EXISTS` (+ its UPDATE short-circuit guard);
  *  - any **bare** (unqualified) column **not** inside a subquery: a row-local CHECK
- *    rewritten to bare basis terms (`rewriteToBasisTerms`), whose `enforced-row-local`
- *    class is subquery-free by the prover's definition, so a bare top-level ref is a
+ *    rewritten to bare basis terms (`rewriteToBasisTerms`), whose bare top-level ref is a
  *    write-row ref.
  * Subquery-internal bare / alias-qualified refs (the count subquery's `_u.docKey`, an FK
- * child/parent alias) resolve against the subquery's own FROM, not the write row, so they
- * are ignored.
+ * child/parent alias) are assumed to resolve against the subquery's own FROM, not the
+ * write row, so they are ignored.
+ *
+ * That subquery-free assumption is now only ever applied to the FK / set-level classes,
+ * whose bare-in-subquery refs are genuinely FROM-resolved aliases. The **row-local CHECK**
+ * class no longer reaches this walk: a subquery-bearing row-local CHECK could carry a
+ * *correlated* bare write-row ref inside its subquery (the prover does not forbid a
+ * subquery in a row-local CHECK), which this walk would under-collect, so the gate prefers
+ * the prover-supplied `referencedWriteRowColumns` metadata for that class (see
+ * {@link constraintsForOp} and `collectLensRowLocalConstraints`).
  */
 function writeRowColumns(expr: AST.Expression): Set<string> {
 	const cols = new Set<string>();

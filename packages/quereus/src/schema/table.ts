@@ -453,6 +453,19 @@ export interface RowConstraintSchema {
 	defaultConflict?: ConflictResolution;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * Lens-synthesized **row-local CHECK only**: the lowercased basis-column names this
+	 * constraint depends on, supplied by the prover (`collectLensRowLocalConstraints`)
+	 * rather than re-derived from the AST. The per-op decomposition gate (`constraintsForOp`
+	 * in `view-mutation-builder`) prefers this over its `writeRowColumns` walk, so a
+	 * subquery-bearing row-local CHECK whose correlated write-row column the walker would
+	 * miss *inside* the subquery still gates onto the member op that owns it. Transient —
+	 * set only on a write-plan-time constraint, never persisted to the catalog and never
+	 * compared by the declarative differ. Undefined on FK / set-level lens constraints
+	 * (they keep the AST walk, whose `NEW.*` / `OLD.*` refs it collects unambiguously) and
+	 * on every basis-declared CHECK.
+	 */
+	referencedWriteRowColumns?: readonly string[];
 }
 
 /**

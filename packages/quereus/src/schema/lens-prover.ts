@@ -1418,8 +1418,16 @@ function cardinalityBand(rows: number | undefined): string {
 // Shared utility
 // ---------------------------------------------------------------------------
 
-/** Collects every `column` reference name in an expression (best-effort reflective walk). */
-function collectColumnRefNames(expr: AST.Expression): string[] {
+/**
+ * Collects every `column` reference name in an expression (best-effort reflective walk,
+ * qualifier-stripped — returns each `column` node's `.name`). Shared with the lens write
+ * side (`planner/mutation/lens-enforcement.ts`), which maps these refs through the slot's
+ * logical→basis projection to derive a row-local CHECK's `referencedWriteRowColumns`
+ * metadata — keeping the gate's notion of "write-row column" consistent with the prover's
+ * notion of "row-local" (both use this walk + logical-column membership; see
+ * {@link classifyCheckConstraint}).
+ */
+export function collectColumnRefNames(expr: AST.Expression): string[] {
 	const names: string[] = [];
 	const stack: AST.AstNode[] = [expr as AST.AstNode];
 	while (stack.length > 0) {

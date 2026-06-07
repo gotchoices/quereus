@@ -3,7 +3,7 @@ import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
 import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
-import { resolveSlotBasisSource } from '../../schema/lens-prover.js';
+import { resolveSlotBasisSource, collectColumnRefNames } from '../../schema/lens-prover.js';
 import {
 	logicalToBasisColumnMap,
 	resolveLogicalReferencedColumns,
@@ -85,10 +85,47 @@ function rewriteToBasisTerms(expr: AST.Expression, map: ReadonlyMap<string, stri
 }
 
 /**
+ * The lowercased **basis**-column names a row-local logical CHECK depends on — the
+ * prover-supplied metadata the per-op decomposition gate (`constraintsForOp` in
+ * `view-mutation-builder`) prefers over its own AST walk. Mirrors the prover's
+ * {@link import('../../schema/lens-prover.js').classifyCheckConstraint}: enumerate every
+ * `column` ref in the source CHECK (qualifier-stripped, via {@link collectColumnRefNames})
+ * and keep only those that map to a basis column — i.e. that are logical columns of *this*
+ * table. Two consequences make this exactly the right set:
+ *
+ *  - a **correlated bare write-row ref** (`somecol`) that appears only *inside* a subquery
+ *    IS a logical column ⇒ mapped ⇒ included. This is the ref the AST walker under-collects
+ *    (it assumes a bare subquery-internal ref resolves against the subquery's own FROM), and
+ *    the hardening this metadata exists to deliver;
+ *  - a **foreign ref** (`peer.k`, whose name is not a logical column of this table) maps to
+ *    nothing ⇒ excluded — correct, it resolves against the subquery FROM, not the write row.
+ *
+ * Over-collection is the safe direction: a subquery ref qualified to another table whose
+ * name happens to equal a logical column (`peer.title`) is qualifier-stripped here and
+ * falsely mapped, adding an extra basis name. That only ever makes the gate *defer* a
+ * constraint it might have threaded — conservative, the same bias the gate already carries.
+ * Deduped because a CHECK may reference a column more than once.
+ */
+function rowLocalReferencedBasisColumns(expr: AST.Expression, map: ReadonlyMap<string, string>): string[] {
+	const cols = new Set<string>();
+	for (const name of collectColumnRefNames(expr)) {
+		const basis = map.get(name.toLowerCase());
+		if (basis !== undefined) cols.add(basis.toLowerCase());
+	}
+	return [...cols];
+}
+
+/**
  * Builds the basis-term row-local CHECK constraints a lens write must enforce.
  * Reads the slot's `enforced-row-local` obligations, rewrites each to basis terms,
  * and tags it with {@link LENS_BOUNDARY_ATTACHED_TAG}. The result is merged into
  * the basis INSERT/UPDATE's constraint-check pipeline by the base-table builder.
+ *
+ * Each constraint also carries {@link rowLocalReferencedBasisColumns} as
+ * `referencedWriteRowColumns` — prover-supplied metadata the per-op decomposition gate
+ * uses instead of an AST walk, so a subquery-bearing row-local CHECK (which the prover
+ * still classifies `enforced-row-local`) gates onto the member op that owns its correlated
+ * write-row column rather than crashing on a member that cannot resolve it.
  *
  * Returns `[]` when the slot is un-proved (`obligations` undefined) or carries no
  * row-local checks — the common case, so a non-lens / check-free write pays nothing.
@@ -106,6 +143,8 @@ export function collectLensRowLocalConstraints(slot: LensSlot): RowConstraintSch
 			expr: rewriteToBasisTerms(source.expr, map),
 			// A logical CHECK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
+			// Prover-supplied write-row dependency set for the per-op decomposition gate.
+			referencedWriteRowColumns: rowLocalReferencedBasisColumns(source.expr, map),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}

@@ -1654,4 +1654,89 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 			await db.close();
 		}
 	});
+
+	// Subquery-bearing row-local CHECK gating (`lens-decomp-row-local-subquery-metadata-gate`).
+	// A logical row-local CHECK may contain a subquery (Quereus supports it — auto-deferred to
+	// commit), e.g. `check (exists (select 1 from Allowed where Allowed.name = title))`. Its
+	// correlated write-row column (`title`) appears ONLY inside the subquery, so the AST walker
+	// (`writeRowColumns`) under-collects it (it assumes a bare subquery-internal ref resolves
+	// against the subquery's own FROM). On a decomposition that under-collection let the per-op
+	// gate thread the CHECK onto a member op whose target lacks `title`, where the build crashed
+	// with `title isn't a column`. The fix carries the write-row dependency as prover-supplied
+	// `referencedWriteRowColumns` metadata (the source CHECK's referenced logical columns mapped
+	// to basis columns); `constraintsForOp` prefers it over the walk for the row-local class, so
+	// the CHECK gates onto the member that owns the column (single-member ⇒ enforced) or rides no
+	// member (cross-member ⇒ deferred) — never onto a member it cannot build.
+	async function setupSubqueryCheck(db: Database, checkSql: string): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [surrogateOptionalAd()];
+		db.registerModule('docsubqmod', mod);
+		await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text) using docsubqmod');
+		await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docsubqmod');
+		await db.exec('create table Doc_meta (meta_sid integer primary key, note text) using docsubqmod');
+		// The allow-list the subquery CHECK probes — a plain basis table the correlated
+		// write-row column is matched against (`title` / `note` share their logical and basis
+		// spellings, so the un-descended `rewriteToBasisTerms` leaves the correlated ref intact).
+		await db.exec('create table Allowed (name text, kind text) using docsubqmod');
+		await db.exec(`declare logical schema x { table Doc { docKey text primary key, title text, body text, note text, ${checkSql} } }`);
+		await db.exec('apply schema x');
+		// Direct basis inserts bypass the lens, so the seed is not gated by the logical CHECK.
+		await db.exec("insert into main.Allowed (name, kind) values ('ok', 'g'), ('aaa', 'g'), ('bbb', 'g')");
+		await db.exec("insert into main.Doc_core (sid, doc_key, title) values (100, 'k1', 'aaa'), (101, 'k2', 'bbb')");
+		await db.exec("insert into main.Doc_body values (100, 'b1'), (101, 'b2')");
+		await db.exec("insert into main.Doc_meta values (100, 'm1')");   // only k1 has the optional component
+	}
+
+	it('single-member subquery CHECK: an UPDATE touching another member builds and runs (no "isn\'t a column" crash)', async () => {
+		const db = new Database();
+		try {
+			// `title` is the only referenced write-row column (it lives on Doc_core); `Allowed.name`
+			// is a foreign ref excluded from the metadata. The UPDATE assigns title (→ Doc_core) AND
+			// note (→ Doc_meta), so the fan-out emits a Doc_meta op too. Pre-fix the walker under-
+			// collected `title` ⇒ the CHECK (empty write-row set) rode EVERY op ⇒ it was threaded onto
+			// the Doc_meta op, which lacks `title`, and the build crashed. Post-fix the metadata
+			// {title} gates it onto Doc_core only ⇒ it builds, runs, and passes ('ok' is allowed).
+			await setupSubqueryCheck(db, 'constraint titleallow check (exists (select 1 from Allowed where Allowed.name = title))');
+			await db.exec("update x.Doc set title = 'ok', note = 'n1' where docKey = 'k1'");
+			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'ok' }]);
+			expect(await rows(db, 'select note from main.Doc_meta where meta_sid = 100')).to.deep.equal([{ note: 'n1' }]);
+			expect(await rows(db, "select title, note from x.Doc where docKey = 'k1'")).to.deep.equal([{ title: 'ok', note: 'n1' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('single-member subquery CHECK rides the column-owning member and ABORTs a violating UPDATE', async () => {
+		const db = new Database();
+		try {
+			// The dual of the build-and-pass case: the metadata gates the CHECK onto Doc_core (which
+			// owns title), so a title NOT in the allow-list makes the deferred subquery CHECK ABORT at
+			// commit — the CHECK is genuinely ENFORCED, not merely build-safe.
+			await setupSubqueryCheck(db, 'constraint titleallow check (exists (select 1 from Allowed where Allowed.name = title))');
+			await expectThrows(() => db.exec("update x.Doc set title = 'nope', note = 'n2' where docKey = 'k1'"), /check|constraint|titleallow/i);
+			// The aborted UPDATE rolled back across both members: title and note are unchanged.
+			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'aaa' }]);
+			expect(await rows(db, 'select note from main.Doc_meta where meta_sid = 100')).to.deep.equal([{ note: 'm1' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('cross-member subquery CHECK resolves on no single member op ⇒ deferred (no crash, violation persists)', async () => {
+		const db = new Database();
+		try {
+			// The subquery correlates BOTH `title` (Doc_core) and `note` (Doc_meta) — a genuine
+			// cross-member pair. Metadata {title, note} resolves on neither member op, so the CHECK
+			// rides none and is deferred (matching the decomposition INSERT path). Pre-fix the empty
+			// write-row set would have ridden every op and crashed on the member lacking the other
+			// column; post-fix it builds cleanly and the cross-member violation persists unenforced.
+			await setupSubqueryCheck(db, 'constraint xallow check (exists (select 1 from Allowed where Allowed.name = title and Allowed.kind = note))');
+			await db.exec("update x.Doc set title = 'zzz', note = 'zzz' where docKey = 'k1'");
+			expect(await rows(db, 'select title from main.Doc_core where sid = 100')).to.deep.equal([{ title: 'zzz' }]);
+			expect(await rows(db, 'select note from main.Doc_meta where meta_sid = 100')).to.deep.equal([{ note: 'zzz' }]);
+			expect(await rows(db, "select title, note from x.Doc where docKey = 'k1'")).to.deep.equal([{ title: 'zzz', note: 'zzz' }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
