@@ -31,7 +31,7 @@ import { ruleSargableRangeRewrite } from './rules/predicate/rule-sargable-range-
 import { ruleJoinKeyInference } from './rules/join/rule-join-key-inference.js';
 import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js';
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
-import { ruleJoinExistencePruning } from './rules/join/rule-join-existence-pruning.js';
+import { ruleJoinExistencePruning, ruleJoinExistencePruningUnderAggregate } from './rules/join/rule-join-existence-pruning.js';
 import { ruleFanOutLookupJoin } from './rules/join/rule-fanout-lookup-join.js';
 import { ruleFanOutBatchedOuter } from './rules/join/rule-fanout-batched-outer.js';
 import { ruleAsyncGatherUnionAll } from './rules/parallel/rule-async-gather-union-all.js';
@@ -372,6 +372,27 @@ export class Optimizer {
 			priority: 22,
 			// Drops only a derived, read-only `{true,false}` boolean column; both
 			// join sides survive verbatim, so no write can be skipped or reordered.
+			sideEffectMode: 'safe',
+		});
+
+		// Aggregate variant of existence-flag pruning: drop an `exists … as` match
+		// flag from a JoinNode reachable through a pass-through chain under an
+		// AggregateNode (the Project entrypoint never sees this shape). Priority 22
+		// mirrors the Project entrypoint and places it BEFORE
+		// join-elimination-aggregate (priority 26), so a freshly-pruned Aggregate
+		// threads into that rule in the same applyRules loop — the aggregate-side
+		// analogue of why join-existence-pruning (22) runs before
+		// join-elimination (24).
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'join-existence-pruning-aggregate',
+			nodeType: PlanNodeType.Aggregate,
+			phase: 'rewrite',
+			fn: ruleJoinExistencePruningUnderAggregate,
+			priority: 22,
+			// Same as the Project entrypoint: drops only a derived, read-only
+			// `{true,false}` boolean column; both join sides survive verbatim and
+			// the Aggregate is reconstructed with identical groupBy / aggregates /
+			// output attrs (a pure source swap), so no write can be skipped.
 			sideEffectMode: 'safe',
 		});
 

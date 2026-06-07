@@ -71,6 +71,28 @@ async function resultsNoPrune(db: Database, sql: string): Promise<ResultRow[]> {
 	}
 }
 
+/**
+ * Unpruned baseline for the aggregate anchor: disable BOTH the aggregate and the
+ * Project entrypoints so the flag survives and the join stays the nested-loop
+ * shape, regardless of which anchor would have fired.
+ */
+async function resultsNoPruneAgg(db: Database, sql: string): Promise<ResultRow[]> {
+	const base = db.optimizer.tuning;
+	db.optimizer.updateTuning({
+		...base,
+		disabledRules: new Set([
+			...(base.disabledRules ?? []),
+			'join-existence-pruning-aggregate',
+			'join-existence-pruning',
+		]),
+	});
+	try {
+		return await results(db, sql);
+	} finally {
+		db.optimizer.updateTuning(base);
+	}
+}
+
 describe('ruleJoinExistencePruning', () => {
 	let db: Database;
 
@@ -350,6 +372,160 @@ describe('ruleJoinExistencePruning', () => {
 			// Disabled ⇒ flag survives ⇒ join pinned to the logical nested-loop shape.
 			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(false);
 			expect(joinExistence(rows)).to.deep.equal(['exists right as m']);
+		});
+	});
+
+	// `ruleJoinExistencePruningUnderAggregate` (id `join-existence-pruning-aggregate`):
+	// the AggregateNode anchor for the same demand-gated prune. An `exists … as`
+	// flag is only valid on an OUTER join (the parser rejects it on inner), and the
+	// aggregate variant of join-elimination is inner-only, so pruning under an
+	// aggregate re-enables PHYSICAL join selection (hash/merge) — it does NOT cascade
+	// to join elimination. See the handoff for that documented limitation.
+	describe('aggregate-anchored pruning', () => {
+		it('an unused flag under count(*) is pruned, re-enabling physical join selection', async () => {
+			await setupFkOrders();
+			const q =
+				'select count(*) as n from orders left join customers on orders.customer_id = customers.id exists right as hasC';
+
+			const rows = await planRows(db, q);
+			// Flag gone from the (now flag-free) join…
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+			// …which lets join-physical-selection turn the pinned nested-loop into a hash join.
+			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(true);
+			// The join is NOT eliminated: existence flags require an outer join and
+			// ruleJoinEliminationUnderAggregate is inner-only — so one physical join remains.
+			expect(joinCount(rows)).to.equal(1);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+		});
+
+		it('contrast: with the aggregate rule disabled the flag survives on a nested-loop join', async () => {
+			await setupFkOrders();
+			db.optimizer.updateTuning({
+				...DEFAULT_TUNING,
+				disabledRules: new Set(['join-existence-pruning-aggregate']),
+			});
+			const q =
+				'select count(*) as n from orders left join customers on orders.customer_id = customers.id exists right as hasC';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows)).to.deep.equal(['exists right as hasC']);
+			expect(hasPhysicalJoin(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(false);
+		});
+
+		it('result equality: pruned count(*) matches the unpruned baseline', async () => {
+			await setupFkOrders();
+			const q =
+				'select count(*) as n from orders left join customers on orders.customer_id = customers.id exists right as hasC';
+			const pruned = await results(db, q);
+			const baseline = await resultsNoPruneAgg(db, q);
+			expect(pruned).to.deep.equal(baseline);
+		});
+
+		it('retained when the flag is referenced by an aggregate argument (reads correctly)', async () => {
+			await seedExisting();
+			const q =
+				'select sum(case when hasP then 1 else 0 end) as s from exc c left join exp p on p.pp = c.pr exists right as hasP';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), 'flag retained for the aggregate arg').to.deep.equal(['exists right as hasP']);
+
+			// cc 1 (pr 1) and cc 3 (pr 2) match ⇒ hasP true twice ⇒ sum = 2.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ s: 2 }]);
+		});
+
+		it('retained when the flag is a GROUP BY key (grouping reads the correct boolean)', async () => {
+			await seedExisting();
+			const q =
+				'select hasP, count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP group by hasP order by hasP';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), 'flag retained for the group key').to.deep.equal(['exists right as hasP']);
+
+			// false (cc 2,4) groups ahead of true (cc 1,3); two rows in each group.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ hasP: false, n: 2 },
+				{ hasP: true, n: 2 },
+			]);
+		});
+
+		it('retained when the flag is referenced only by a WHERE filter under the aggregate', async () => {
+			await seedExisting();
+			const q =
+				'select count(*) as n from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP';
+
+			const rows = await planRows(db, q);
+			// walkChain folds the intervening Filter's hasP into the demanded set ⇒ retained.
+			expect(joinExistence(rows), 'flag retained for the WHERE').to.deep.equal(['exists right as hasP']);
+
+			// `where hasP` keeps the matched rows (cc 1, 3) ⇒ count = 2.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('HAVING-bearing query still prunes an otherwise-unused flag', async () => {
+			await setupFkOrders();
+			// HAVING references count(*) (an Aggregate output), never the raw flag, so
+			// hasC is unreferenced and pruned even with the HAVING Filter above.
+			const q =
+				'select count(*) as n from orders left join customers on orders.customer_id = customers.id exists right as hasC having count(*) > 0';
+
+			const rows = await planRows(db, q);
+			expect(joinExistence(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(undefined);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+		});
+
+		describe('mixed multi-flag under an aggregate', () => {
+			it('drops the unused earlier flag; the later flag still reads correctly in an aggregate arg', async () => {
+				await seedExisting();
+				// Two right-side flags; only the LATER (hasB) is used (in an aggregate arg).
+				// The kept flag's runtime slot shifts forward — pins attr-id resolution.
+				const q =
+					'select sum(case when hasB then 1 else 0 end) as s from exc c left join exp p on p.pp = c.pr exists right as hasA, exists right as hasB';
+
+				const rows = await planRows(db, q);
+				expect(joinExistence(rows)).to.deep.equal(['exists right as hasB']);
+
+				const out = await results(db, q);
+				expect(out).to.deep.equal([{ s: 2 }]);
+			});
+
+			it('three flags, only the MIDDLE used: both ends pruned, middle reads correctly', async () => {
+				await seedExisting();
+				const q =
+					'select sum(case when hasB then 1 else 0 end) as s from exc c left join exp p on p.pp = c.pr ' +
+					'exists right as hasA, exists right as hasB, exists right as hasC';
+
+				const rows = await planRows(db, q);
+				expect(joinExistence(rows)).to.deep.equal(['exists right as hasB']);
+
+				const out = await results(db, q);
+				expect(out).to.deep.equal([{ s: 2 }]);
+			});
+
+			it('result equality vs the unpruned baseline for the mixed case', async () => {
+				await seedExisting();
+				const q =
+					'select sum(case when hasB then 1 else 0 end) as s from exc c left join exp p on p.pp = c.pr exists right as hasA, exists right as hasB';
+				const pruned = await results(db, q);
+				const baseline = await resultsNoPruneAgg(db, q);
+				expect(pruned).to.deep.equal(baseline);
+			});
+		});
+
+		it('clean no-op when the aggregate sits directly over a base table (no join)', async () => {
+			await setupFkOrders();
+			const q = 'select count(*) as n from orders';
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
 		});
 	});
 });

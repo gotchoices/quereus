@@ -223,15 +223,18 @@ fanout / elimination rules bail on it) so the appended flag column is never
 dropped by a physical rewrite — the limitation (existence joins forgo hash/merge
 selection, and a flag-bearing join cannot be eliminated) applies only **while the
 flag is demanded**. An **unused** flag — one no ancestor reads — is removed by the
-demand-gated `join-existence-pruning` rule (Structural / Project / priority 22):
-it anchors on the nearest enclosing Project, walks the pass-through chain to the
-join (the same demand analysis `join-elimination` uses), and rebuilds the
-`JoinNode` without that `ExistenceColumnSpec`. Once the last spec is dropped the
-join is flag-free, `hasExistenceColumns` flips `false`, and the five guarded
-rules re-enable automatically — the join can then be eliminated or pick a
-hash/merge variant like any other (a pure optimization; the write half is
+demand-gated existence-pruning rule (Structural / priority 22), which has two
+anchors: `join-existence-pruning` on the nearest enclosing Project, and
+`join-existence-pruning-aggregate` on an enclosing Aggregate (for a flag-bearing
+join under a `count(*)` / `group by` with no Project). Either anchor walks the
+pass-through chain to the join (the same demand analysis `join-elimination` uses)
+and rebuilds the `JoinNode` without that `ExistenceColumnSpec`. Once the last spec
+is dropped the join is flag-free, `hasExistenceColumns` flips `false`, and the
+five guarded rules re-enable automatically — the join can then be eliminated or
+pick a hash/merge variant like any other (a pure optimization; the write half is
 unaffected because a writable flag is always SELECTed by its view's projection,
-which keeps it demanded and retained).
+which keeps it demanded and retained — and a routing Project, never an Aggregate,
+is what carries a view's write-side flag reference).
 
 **Writing the flag (the write half).** The existence column is the explicit, per-row
 control surface for the non-preserved side's existence — *writing* the flag **is** the
