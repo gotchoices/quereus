@@ -51,6 +51,13 @@ function indexCollationOf(col: IndexedColumn): string | undefined {
 	return undefined;
 }
 
+/** The index name a CREATE INDEX DDL string declares (via the real parser). */
+function parseIndexName(ddl: string): string {
+	const stmt = parse(ddl);
+	if (stmt.type !== 'createIndex') throw new Error(`not a CREATE INDEX: ${ddl}`);
+	return stmt.index.name;
+}
+
 /**
  * Builds a source DB with a table and a representative spread of secondary
  * indexes (unique, partial, composite/desc, tagged, unique-partial). Returns the
@@ -211,6 +218,46 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 				expect((e as Error).message).to.match(/Expression-based index columns are not supported/);
 			}
 			expect(threw, 'expression index import should throw').to.equal(true);
+		} finally {
+			await dst.close();
+		}
+	});
+
+	it('re-generating DDL from the imported schema is a fixed point (predicate / collation / desc survive textually)', async () => {
+		// index_info() exposes the partial flag but NOT the predicate text, so the
+		// deep-equal above cannot catch predicate drift (WHERE active = 1 degrading
+		// to a different/empty body). Re-emitting the imported index as DDL and
+		// comparing it to the original generated DDL closes that gap: it asserts the
+		// whole clause shape — UNIQUE, column collation, DESC, WHERE body, tags —
+		// round-trips, making generateIndexDDL a fixed point over import.
+		const { db: src, indexDDLs } = await buildSource();
+		try {
+			const dst = new Database();
+			try {
+				await dst.exec('create table t (id integer primary key, email text collate nocase, active integer, name text)');
+				await dst.schemaManager.importCatalog([indexDDLs.join(';\n')]);
+
+				const dstTable = dst.schemaManager.getTable('main', 't')!;
+				const byName = new Map(indexDDLs.map(ddl => [parseIndexName(ddl), ddl]));
+				for (const ix of dstTable.indexes!) {
+					const regenerated = generateIndexDDL(ix, dstTable);
+					expect(regenerated, `index ${ix.name} re-emits identically`).to.equal(byName.get(ix.name));
+				}
+			} finally {
+				await dst.close();
+			}
+		} finally {
+			await src.close();
+		}
+	});
+
+	it('a composite UNIQUE index synthesizes a derived constraint over all its columns', async () => {
+		const dst = new Database();
+		try {
+			await dst.exec('create table t (id integer primary key, a integer, b integer)');
+			await dst.schemaManager.importCatalog(['CREATE UNIQUE INDEX uq_ab ON t (a, b DESC)']);
+			const uc = await rows(dst, "select name, column_name, seq from unique_constraint_info('t') where name = 'uq_ab' order by seq");
+			expect(uc.map(r => r.column_name)).to.deep.equal(['a', 'b']);
 		} finally {
 			await dst.close();
 		}
