@@ -31,7 +31,7 @@ import type {
 	MappingAdvertisement,
 	SchemaChangeEvent as EngineSchemaChangeEvent,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -490,6 +490,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			: undefined;
 		const seen: Set<string> | undefined = indexSchema.unique ? new Set() : undefined;
 
+		// Per-column normalizers for the in-pass UNIQUE dup check, drawing each
+		// column's collation from the index column (if it carries one) else the
+		// underlying table column — so the dedup signature honors a per-column
+		// NOCASE/RTRIM collation, matching write-time enforcement.
+		const indexColIndices = indexSchema.columns.map(col => col.index);
+		const indexNormalizers = seen
+			? indexSchema.columns.map(col =>
+				resolveKeyNormalizer(col.collation ?? tableSchema.columns[col.index].collation))
+			: undefined;
+
 		// Scan all data rows
 		const bounds = buildFullScanBounds();
 		const batch = indexStore.batch();
@@ -507,11 +517,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			const indexValues = indexSchema.columns.map(col => row[col.index]);
 
 			if (seen) {
-				// SQL UNIQUE allows multiple NULLs: skip dup detection when any
-				// indexed column is NULL for this row.
-				const hasNull = indexValues.some(v => v === null);
-				if (!hasNull) {
-					const keySig = JSON.stringify(indexValues);
+				// serializeRowKey returns null when any indexed column is NULL —
+				// SQL UNIQUE allows multiple NULLs, so those rows never collide.
+				const keySig = serializeRowKey(row, indexColIndices, indexNormalizers!);
+				if (keySig !== null) {
 					if (seen.has(keySig)) {
 						const colNames = indexSchema.columns
 							.map(c => tableSchema.columns[c.index]?.name ?? String(c.index))
@@ -540,17 +549,23 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Validates the existing rows in `dataStore` against a newly-added UNIQUE
-	 * constraint, throwing `CONSTRAINT` on the first duplicate before any schema
-	 * mutation. Mirrors the duplicate detection in {@link buildIndexEntries}: a
-	 * `seen` Set keyed on a JSON signature of the constrained values, with SQL
-	 * NULL semantics (a row with any NULL constrained value never counts as a
-	 * duplicate) and the partial `predicate` honored.
+	 * Validates the existing rows in `dataStore` against a UNIQUE constraint,
+	 * throwing `CONSTRAINT` on the first duplicate before any schema mutation.
+	 * Used by `ADD CONSTRAINT UNIQUE` (validate against the current collation) and
+	 * by `SET COLLATE` (pass an `updatedSchema` whose altered column carries the
+	 * NEW collation, so the dedup is performed under it). Mirrors the duplicate
+	 * detection in {@link buildIndexEntries}: a `seen` Set keyed on a per-column
+	 * collation-aware signature of the constrained values, with SQL NULL semantics
+	 * (a row with any NULL constrained value never counts as a duplicate) and the
+	 * partial `predicate` honored.
 	 *
 	 * No index store is written — store UNIQUE enforcement is a full-scan over
-	 * `uniqueConstraints` at write time. The signature is value-exact (BINARY),
-	 * matching the store's `CREATE UNIQUE INDEX` path; it does not honor a
-	 * per-column NOCASE collation (see docs/schema.md store-collation note).
+	 * `uniqueConstraints` at write time. The signature is built by
+	 * {@link serializeRowKey} with one normalizer per constrained column drawn from
+	 * `tableSchema.columns[idx].collation`, so a per-column NOCASE/RTRIM collation
+	 * is honored (matching write-time `compareSqlValues` enforcement). Residual: a
+	 * custom comparator-only collation has no string normalizer and falls back to
+	 * BINARY for the dedup (see docs/schema.md store-collation note).
 	 */
 	private async validateUniqueOverExistingRows(
 		dataStore: KVStore,
@@ -560,6 +575,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const predicate: CompiledPredicate | undefined = uc.predicate
 			? compilePredicate(uc.predicate, tableSchema.columns)
 			: undefined;
+		const normalizers = uc.columns.map(idx => resolveKeyNormalizer(tableSchema.columns[idx].collation));
 		const seen = new Set<string>();
 
 		for await (const entry of dataStore.iterate(buildFullScanBounds())) {
@@ -568,11 +584,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// Partial constraint: only rows the predicate unambiguously accepts count.
 			if (predicate && predicate.evaluate(row) !== true) continue;
 
-			const values = uc.columns.map(idx => row[idx]);
-			// SQL UNIQUE allows multiple NULLs: skip rows with any NULL constrained value.
-			if (values.some(v => v === null)) continue;
+			// serializeRowKey returns null when any constrained column is NULL —
+			// SQL UNIQUE allows multiple NULLs, so those rows never collide.
+			const keySig = serializeRowKey(row, uc.columns, normalizers);
+			if (keySig === null) continue;
 
-			const keySig = JSON.stringify(values);
 			if (seen.has(keySig)) {
 				const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i)).join(', ');
 				throw new QuereusError(
@@ -1008,6 +1024,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				}
 				const oldCol = oldSchema.columns[colIndex];
 				let newCol: ColumnSchema = oldCol;
+				// A collation change needs existing-row UNIQUE re-validation below
+				// (non-PK, Option A); the other attribute changes do not.
+				let collationChanged = false;
 
 				// Pull exactly one of the three attributes from the change.
 				if (change.setNotNull !== undefined) {
@@ -1061,13 +1080,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				} else if (change.setDefault !== undefined) {
 					newCol = { ...oldCol, defaultValue: change.setDefault };
 				} else if (change.setCollation !== undefined) {
-					// Schema-only collation update. The store's physical key encoding uses a
-					// fixed table-level collation (`encodeOptions`), so per-column physical
-					// re-keying / store-level uniqueness re-validation under the new collation
-					// is out of scope (see store-module limitation note in the ticket handoff).
+					// Per-column collation update. Physical key encoding still uses the
+					// fixed table-level collation (`encodeOptions`), so PRIMARY KEY columns
+					// are NOT re-keyed or re-validated here (the PK is enforced physically;
+					// deferred to store-set-collate-pk-physical-rekey). For non-PK UNIQUE
+					// constraints we DO re-validate existing rows under the new collation
+					// below (Option A) — write-time UNIQUE enforcement is already
+					// collation-aware, so this reaches end-to-end parity with memory.
 					// Query-layer ORDER BY / `=` / `table_info().collation` pick the new
 					// collation up from the column schema once this updated schema re-registers.
-					newCol = { ...oldCol, collation: validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName) };
+					const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
+					if (normalized === (oldCol.collation || 'BINARY')) {
+						return oldSchema; // already in desired state — no scan, no re-persist
+					}
+					newCol = { ...oldCol, collation: normalized };
+					collationChanged = true;
 				} else {
 					throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
 				}
@@ -1078,6 +1105,24 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					columns: Object.freeze(updatedColumns),
 					columnIndexMap: buildColumnIndexMap(updatedColumns),
 				};
+
+				// SET COLLATE existing-row re-validation (Option A, non-PK UNIQUE): a new
+				// per-column collation can make rows that were distinct under the old
+				// collation collide. Re-scan every UNIQUE constraint covering the altered
+				// column under the NEW collation (`updatedSchema` carries it). The first
+				// collision throws CONSTRAINT BEFORE any mutation/persist, so the table is
+				// left unchanged and writable (matches the ADD CONSTRAINT rollback shape).
+				// The PK is intentionally excluded — it never appears in `uniqueConstraints`.
+				if (collationChanged) {
+					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
+						.filter(uc => uc.columns.includes(colIndex));
+					if (coveringConstraints.length > 0) {
+						const dataStore = await this.getStore(tableKey, table.getConfig());
+						for (const uc of coveringConstraints) {
+							await this.validateUniqueOverExistingRows(dataStore, updatedSchema, uc);
+						}
+					}
+				}
 
 				table.updateSchema(updatedSchema);
 				await this.saveTableDDL(updatedSchema);

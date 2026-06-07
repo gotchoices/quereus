@@ -178,6 +178,10 @@ export {
 // Utility functions
 export { Latches } from './util/latches.js';
 
+// Collation-aware key serialization (used by store modules for existing-row
+// UNIQUE re-validation that honors a per-column NOCASE/RTRIM/BINARY collation).
+export { resolveKeyNormalizer, serializeRowKey } from './util/key-serializer.js';
+
 // Plugin helper for static loading (React Native, etc.)
 export { registerPlugin } from './util/plugin-helper.js';
 export type { PluginFunction } from './util/plugin-helper.js';

@@ -40,7 +40,7 @@ const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
-  '41.7.1-alter-column-collate-unique.sqllogic',  // Memory re-keys/re-validates PK+UNIQUE under a collation change; store applies SET COLLATE schema-only
+  '41.7.1-alter-column-collate-unique.sqllogic',  // PK-only: memory re-keys/re-validates the PK under a collation change; store PK key bytes use a fixed table collation (re-key deferred to store-set-collate-pk-physical-rekey). Non-PK UNIQUE/index cases run cross-module in 41.7.2-alter-column-collate-unique-store.sqllogic
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'

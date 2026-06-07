@@ -1,0 +1,119 @@
+-- ALTER COLUMN ... SET COLLATE — non-PK UNIQUE / index existing-row re-validation.
+--
+-- CROSS-MODULE (NOT in MEMORY_ONLY_FILES): runs in both memory and store modes.
+-- A per-column collation change is re-validated against existing rows for every
+-- non-PK UNIQUE constraint (inline UNIQUE and CREATE UNIQUE INDEX-derived) covering
+-- the altered column: a value set distinct under BINARY but colliding under NOCASE
+-- rejects the ALTER with CONSTRAINT (schema unchanged), and a distinct set succeeds
+-- and then enforces under the new collation. The store reaches end-to-end parity
+-- with memory here because the constrained column is row DATA keyed by the integer
+-- PK, so the store's fixed-table-collation KEY encoding is irrelevant — both modules
+-- behave identically. The PK-column cases (where the store's fixed key collation DOES
+-- matter) stay memory-only in 41.7.1, deferred to store-set-collate-pk-physical-rekey.
+-- The cross-module query-layer behavior lives in 41.7-alter-column-collate.sqllogic.
+
+-- ===================================
+-- 1. UNIQUE column, values distinct under BOTH collations → ALTER succeeds, and a
+--    subsequent NOCASE-colliding insert is then rejected under the new collation.
+-- ===================================
+
+create table us (id integer primary key, email text unique);
+insert into us values (1, 'a@x'), (2, 'b@x');
+
+alter table us alter column email set collate nocase;
+-- run
+
+-- the change took effect: a case-only duplicate now collides under NOCASE
+insert into us values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+select id, email from us order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"}]
+
+-- a genuinely distinct value still inserts
+insert into us values (4, 'c@x');
+select id, email from us order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"},{"id":4,"email":"c@x"}]
+
+drop table us;
+
+-- ===================================
+-- 2. UNIQUE column, values distinct under BINARY but COLLIDING under NOCASE →
+--    the ALTER is rejected with CONSTRAINT and the table is left unchanged.
+-- ===================================
+
+create table uc (id integer primary key, email text unique);
+insert into uc values (1, 'a@x'), (2, 'A@x');
+-- run
+
+alter table uc alter column email set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- the rejected ALTER rolled back: both rows survive and the column is still BINARY,
+-- so the two case-distinct values remain valid
+select id, email from uc order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"A@x"}]
+
+select name, collation from table_info('uc') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"email","collation":"BINARY"}]
+
+-- and the table is still writable after the failed ALTER
+insert into uc values (3, 'B@x');
+select count(*) as n from uc;
+→ [{"n":3}]
+
+drop table uc;
+
+-- ===================================
+-- 3. EXPLICIT `create unique index` (not an inline UNIQUE) is re-validated by the
+--    same existing-row scan. A value set distinct under BINARY but colliding under
+--    NOCASE rejects the ALTER and rolls back; the table stays writable and the index
+--    keeps enforcing under the original collation.
+-- ===================================
+
+create table xi (id integer primary key, email text);
+create unique index xi_email on xi(email);
+insert into xi values (1, 'a@x'), (2, 'A@x');
+-- run
+
+alter table xi alter column email set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- rollback: both rows survive, column still BINARY
+select id, email from xi order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"A@x"}]
+
+select name, collation from table_info('xi') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"email","collation":"BINARY"}]
+
+-- the explicit unique index still enforces (under the original BINARY collation):
+-- a case-distinct value is still allowed, an exact duplicate is rejected.
+insert into xi values (3, 'B@x');
+select count(*) as n from xi;
+→ [{"n":3}]
+
+insert into xi values (4, 'a@x');
+-- error: UNIQUE constraint failed
+
+drop table xi;
+
+-- ===================================
+-- 4. EXPLICIT `create unique index`, distinct under BOTH collations → ALTER
+--    succeeds and the index then enforces under the NEW collation.
+-- ===================================
+
+create table xj (id integer primary key, email text);
+create unique index xj_email on xj(email);
+insert into xj values (1, 'a@x'), (2, 'b@x');
+
+alter table xj alter column email set collate nocase;
+-- run
+
+-- the index now enforces under NOCASE: a case-only duplicate collides
+insert into xj values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+select id, email from xj order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"}]
+
+drop table xj;
