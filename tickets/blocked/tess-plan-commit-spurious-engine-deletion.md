@@ -4,6 +4,8 @@ files:
   - packages/quereus                               # the package that was deleted and restored (affected area; no code change needed here)
 ----
 
+**BLOCKED — human sign-off (infrastructure).** The tess-runner transition commit step (likely `git add -A`) can capture spurious whole-tree deletions — it deleted the entire engine package once (recovered at HEAD). The body notes "runner internals are outside this repo," so a human must decide whether/where to fix it and which of the three suggested directions. *Not auto-worked:* unsupervised self-modification of the runner's own commit machinery is too high blast-radius.
+
 # Plan-stage runner produced a 250k-line deletion of the engine package
 
 ## Symptom (as originally observed)
