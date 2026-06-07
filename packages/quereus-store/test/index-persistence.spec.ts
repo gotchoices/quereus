@@ -212,6 +212,47 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(indexStoreSize('t', 'ix_pos'), 'in-scope INSERT adds an entry').to.equal(3);
 	});
 
+	it('UPDATE relocates a full-index entry on the rehydrated index (no stale key leak)', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10)`);
+		await mod.closeAll();
+
+		const { db: db2 } = await reopen();
+
+		// Mutating the indexed column re-keys the single backing entry: the count
+		// stays 1 only if the old (b=10) key was removed before the new (b=99) key
+		// was written. A leak would leave two entries.
+		await db2.exec(`update t set b = 99 where id = 1`);
+		expect(indexStoreSize('t', 'ix_b'), 'UPDATE re-keys without leaking the old entry').to.equal(1);
+		expect(await rows(db2, `select id from t where b = 99`)).to.deep.equal([{ id: 1 }]);
+		expect(await rows(db2, `select id from t where b = 10`), 'old value no longer present').to.deep.equal([]);
+	});
+
+	it('UPDATE across a partial-index predicate scope maintains the rehydrated backing store both ways', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_pos on t (b) where b > 0`);
+		await db.exec(`insert into t values (1, 10)`);
+		expect(indexStoreSize('t', 'ix_pos')).to.equal(1);
+		await mod.closeAll();
+
+		const { db: db2 } = await reopen();
+
+		// in-scope → out-of-scope: the old entry is removed and none is added.
+		await db2.exec(`update t set b = -5 where id = 1`);
+		expect(indexStoreSize('t', 'ix_pos'), 'edit out of scope drops the entry').to.equal(0);
+
+		// out-of-scope → in-scope: an entry is added with no stale delete to undo it.
+		await db2.exec(`update t set b = 7 where id = 1`);
+		expect(indexStoreSize('t', 'ix_pos'), 'edit back into scope re-adds the entry').to.equal(1);
+
+		// in-scope → in-scope: the entry is re-keyed in place, count unchanged.
+		await db2.exec(`update t set b = 8 where id = 1`);
+		expect(indexStoreSize('t', 'ix_pos'), 'in-scope→in-scope stays a single entry').to.equal(1);
+	});
+
 	it('DESC + COLLATE index columns round-trip across reopen', async () => {
 		const { db, mod } = open();
 		// Collation flows into the index by inheriting the column's COLLATE (the live
