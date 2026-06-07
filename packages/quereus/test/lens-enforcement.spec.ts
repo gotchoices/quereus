@@ -194,6 +194,41 @@ describe('lens enforcement: row-local CHECK at the write boundary', () => {
 		}
 	});
 
+	it('a correlated ref whose basis name collides with a subquery-FROM column binds the write row (NEW-qualified), not the subquery source', async () => {
+		const db = new Database();
+		try {
+			// The collision corner the `NEW.` qualifier guards: logical `maxSpeed` renames to basis
+			// `speed`, and the CHECK subquery's FROM (`y.Allowed`) ALSO has a `speed` column. A *bare*
+			// rewrite would spell the correlated ref `speed`, which then re-binds to `Allowed.speed`
+			// (innermost SQL scoping) — turning the CHECK into "does any Allowed row have cap = speed?",
+			// independent of the write value. The `NEW.speed` qualifier makes it correlate to the write
+			// row. The two regimes give DIFFERENT verdicts, so this distinguishes the fix behaviorally.
+			await db.exec('declare schema y { table t (id integer primary key, speed integer); table Allowed (cap integer, speed integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, maxSpeed integer, constraint capok check (exists (select 1 from y.Allowed where Allowed.cap = maxSpeed))) }');
+			await db.exec('declare lens for x over y { view t as select id, speed as maxSpeed from y.t }');
+			await db.exec('apply schema x');
+
+			// Row (99, 99) has cap == speed, so the BUGGY `Allowed.cap = Allowed.speed` reading would be
+			// satisfied for EVERY write. The allow-list of `cap` values is {5, 99}.
+			await db.exec('insert into y.Allowed (cap, speed) values (5, 7), (99, 99)');
+
+			// maxSpeed = 5 is on the cap allow-list ⇒ passes under the correct (NEW) reading.
+			await db.exec('insert into x.t (id, maxSpeed) values (1, 5)');
+			expect(await rows(db, 'select maxSpeed from x.t where id = 1')).to.deep.equal([{ maxSpeed: 5 }]);
+			// maxSpeed = 8 is NOT a cap ⇒ must ABORT under the correct reading. The buggy bare reading
+			// would WRONGLY admit it (some Allowed row has cap == speed), so this assertion fails pre-fix.
+			await expectThrows(() => db.exec('insert into x.t (id, maxSpeed) values (2, 8)'), /capok|constraint|check/i);
+			expect(await rows(db, 'select count(*) as n from x.t where id = 2')).to.deep.equal([{ n: 0 }]);
+
+			// The correlated ref is NEW-qualified; the foreign `Allowed.cap` ref is untouched.
+			const exprSql = astToString(collectLensRowLocalConstraints(makeCtx(db), slot(db, 't'))[0].expr);
+			expect(exprSql, 'correlated write-row ref qualified NEW.speed').to.match(/new\.speed/i);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('stamps the boundary-attached marker on each routed constraint', async () => {
 		const db = new Database();
 		try {

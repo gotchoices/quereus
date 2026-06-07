@@ -81,13 +81,19 @@ export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
  * per column:
  *
  * - **Qualified by the logical table name** and mapped ⇒ a qualified write-row ref ⇒
- *   replace with the bare basis column (qualifier dropped so it resolves against the
- *   single basis source). Any other qualifier (`Allowed.name`, a subquery FROM source)
- *   ⇒ left untouched — it resolves against the subquery FROM. This is the negative-case
- *   guard against over-rewriting a foreign ref whose name happens to equal a logical column.
+ *   replace with the basis column qualified `NEW.<basis>` (the write-row correlation name).
+ *   Any other qualifier (`Allowed.name`, a subquery FROM source) ⇒ left untouched — it
+ *   resolves against the subquery FROM. This is the negative-case guard against
+ *   over-rewriting a foreign ref whose name happens to equal a logical column.
  * - **Bare**, shadowed by a (this-or-enclosing) subquery FROM ⇒ left untouched
- *   (subquery-local); else, name maps ⇒ replace with the bare basis column (a correlated
+ *   (subquery-local); else, name maps ⇒ replace with `NEW.<basis>` (a correlated
  *   write-row ref); else ⇒ left untouched.
+ *
+ * The replacement is qualified `NEW.<basis>` rather than left bare so a ref emitted
+ * inside a correlated subquery cannot be captured by a same-named column the subquery's
+ * own FROM introduces (the lens analogue of the single-source descent's
+ * {@link import('./single-source.js').makeBaseQualifier}); see {@link makeLensRewriteScope}'s
+ * `resolve`. At the top level it resolves to the write row identically to a bare ref.
  *
  * The old top-level behavior — strip the qualifier of an *unmapped* qualified column — is
  * intentionally dropped: the prover errors at deploy on a CHECK over a non-reconstructible
@@ -102,9 +108,22 @@ export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
  */
 function makeLensRewriteScope(map: ReadonlyMap<string, string>, logicalTableName: string): ScopeContext {
 	const lcTable = logicalTableName.toLowerCase();
+	// A rewritten write-row ref is qualified `NEW.<basis>` — the write-row correlation
+	// name the constraint scope registers (`building/constraint-builder.ts` registers
+	// `new.<col>` for every basis column on an INSERT/UPDATE check; row-local lens
+	// checks are INSERT|UPDATE only). The qualifier is load-bearing for a ref emitted
+	// INSIDE a correlated subquery: a *bare* basis column there would re-bind to a
+	// same-named column the subquery's own FROM introduces (innermost SQL scoping)
+	// instead of the write row — silently changing the CHECK's meaning when a renamed
+	// logical column's basis spelling collides with a subquery-source column. This is
+	// the lens analogue of the single-source descent's `makeBaseQualifier` (which
+	// qualifies with the lowered target's alias for the same reason). At the top level
+	// `NEW.<basis>` resolves to the write row identically to the prior bare form, so the
+	// behavior is unchanged except in the collision corner. Mirrors the FK / set-level
+	// synthesizers, which likewise qualify their write-row side `NEW.*`.
 	const resolve = (name: string): AST.Expression | undefined => {
 		const basisColumn = map.get(name);
-		return basisColumn !== undefined ? { type: 'column', name: basisColumn } : undefined;
+		return basisColumn !== undefined ? { type: 'column', name: basisColumn, table: 'NEW' } : undefined;
 	};
 	return {
 		makeSubstitute: (shadowed, tainted) => (col) => {
@@ -137,13 +156,14 @@ function makeLensRewriteScope(map: ReadonlyMap<string, string>, logicalTableName
 
 /**
  * Rewrites a logical-column CHECK expression into basis-column terms, scope-aware:
- * a top-level (or correlated) write-row logical column maps to its bare basis column,
+ * a top-level (or correlated) write-row logical column maps to its `NEW.<basis>` column,
  * while a subquery-local column the nested FROM introduces is left untouched. Rides the
  * shared {@link transformScopedExpr} descent over {@link makeLensRewriteScope}, entered at
- * the outermost scope — so a top-level bare logical column still maps to basis exactly as
- * the prior top-level-only rewrite did, and a correlated bare write-row ref inside a subquery
+ * the outermost scope — so a top-level logical column still maps to the write row exactly as
+ * the prior top-level-only rewrite did, and a correlated write-row ref inside a subquery
  * (e.g. `exists (select 1 from Allowed where Allowed.name = docKey)`, `docKey`→`doc_key`) is
- * now also rewritten rather than passing through verbatim and crashing at constraint build.
+ * now also rewritten (to `NEW.doc_key`) rather than passing through verbatim and crashing at
+ * constraint build.
  */
 function rewriteToBasisTerms(
 	ctx: PlanningContext,
