@@ -49,8 +49,13 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   (`set c = a + 1`, every leaf lowers to an anchor base column) collapses both
  *   branches into a single `… on conflict (<memberKey>) do update set c = excluded.c`
  *   upsert (the value computed once over the anchor scan, matched rows reading it via
- *   `excluded.<col>`); a **member self-reference** (`set c = c + 1`) is matched-update-
- *   only (an absent row has no prior value, so the materialize is suppressed). An
+ *   `excluded.<col>`); a **member self-reference** (`set c = c + 1`, `set c = coalesce(c, 0)
+ *   + 1`) keeps the matched UPDATE for present rows **and** adds a materialize INSERT for absent
+ *   rows that projects the self-expression with the owner's own columns substituted to NULL,
+ *   gated by a runtime non-empty filter (so a null-propagating expression materializes nothing
+ *   while a null→non-null one does) and `on conflict (<memberKey>) do nothing` to cede matched
+ *   rows — the two ops stay distinct because the matched and materialize values are computed over
+ *   different scans. An
  *   **EAV pivot** member's write is the triple analogue, per attribute: a null deletes
  *   the triple, an anchor-resolvable value upserts it via `do update`, a constant value
  *   upserts it via matched UPDATE + `do nothing` materialize INSERT. Any other value —
@@ -792,7 +797,8 @@ type ValueKind =
 	| 'constant'
 	/** Every leaf resolves to an **anchor** base column (`set c = a + 1`) — unified via an upsert. */
 	| 'anchor'
-	/** Every leaf is the **owning member's** own column (`set c = c + 1`) — present-rows-only (columnar). */
+	/** Every leaf is the **owning member's** own column (`set c = c + 1`) — matched UPDATE for present
+	 *  rows plus a null-substituted, non-empty-filtered materialize INSERT for absent rows (columnar). */
 	| 'self';
 
 /** A lowered optional/EAV-member value plus its {@link ValueKind} classification. */
@@ -896,9 +902,12 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
  *   is computed once over the anchor scan and the two branches are unified by an upsert
  *   ({@link buildOptionalMemberInsertSelect} `do update`), so the matched side reads the
  *   identical anchor-computed value via `excluded.<col>`.
- * - **self** (columnar only) — every leaf is the owning member's own column (`set c = c + 1`).
- *   An absent row has no prior value to transform, so it is matched-update-only by nature
- *   (the materialize INSERT is suppressed).
+ * - **self** (columnar only) — every leaf is the owning member's own column (`set c = c + 1`,
+ *   `set c = coalesce(c, 0) + 1`). Present rows take the matched UPDATE (their real prior value);
+ *   absent rows take a materialize INSERT computing the self-expression with the owner's columns
+ *   substituted to NULL, gated by a runtime non-empty filter. The matched and materialize branches
+ *   read different scans (member vs null-substituted anchor), so they stay two distinct ops — not
+ *   an upsert (see {@link emitOptionalMemberUpdate} / {@link buildSelfMaterializeInsertSelect}).
  *
  * Anything else — a subquery, a cross-member column, an unqualified ref, or a single value
  * mixing anchor and self leaves — is `arbitrary` and rejected: threading it across both
@@ -1022,10 +1031,18 @@ function rewriteAssignedValue(view: MutableViewLike, shape: DecompShape, owner: 
  *   and the absent materialize INSERT: the value is computed once over the anchor scan and
  *   both branches read it (insert directly, matched via `excluded.<col>`). Constant cells
  *   fold in as literal projections / `do update set col = excluded.col`.
- * - **has a `self` cell** (no `anchor`) → present rows take a bare matched UPDATE; absent
- *   rows have no prior value to transform, so they stay absent — the materialize INSERT is
- *   **suppressed**. Constant cells ride along as bare literals (a self-reference makes the
- *   whole group present-rows-only).
+ * - **has a `self` cell** (no `anchor`) → present rows take the matched UPDATE (their real
+ *   prior member value, owner qualifier stripped); absent rows take a materialize INSERT
+ *   ({@link buildSelfMaterializeInsertSelect}) that evaluates the self-expression with the
+ *   owner's own columns substituted to NULL — an absent row's prior value is null. A runtime
+ *   non-empty filter gates it: a **null-propagating** self-expression (`c + 1` → null) is
+ *   constant-false and materializes no phantom row, while one that maps null → non-null
+ *   (`coalesce(c, 0) + 1`) is constant-true and materializes the new value. The two ops stay
+ *   distinct (they **cannot** collapse into an upsert: the matched value is computed over the
+ *   member scan, the materialize value over the null-substituted anchor scan — they disagree
+ *   row-for-row by construction), and `on conflict (<memberKey>) do nothing` cedes matched
+ *   rows to the UPDATE. Constant cells ride along in both branches (the matched UPDATE applies
+ *   them; the materialize INSERT projects them, and a non-null constant makes the filter true).
  * - **all `constant`** → the legacy fast lane: all-value-columns-null → base DELETE; else the
  *   matched UPDATE plus, when ≥1 value is non-null, the absent materialize INSERT.
  */
@@ -1058,10 +1075,17 @@ function emitOptionalMemberUpdate(
 	}
 
 	if (hasSelf) {
-		// Self-reference group → matched-update-only over the owner-qualifier-stripped values;
-		// no materialize (an absent row has no prior value to increment).
+		// Self-reference group → two distinct ops. Present rows take the matched UPDATE over the
+		// owner-qualifier-stripped values (their real prior member value). Absent rows take a
+		// materialize INSERT that evaluates the self-expression with the owner's own columns
+		// substituted to NULL (an absent row's prior value is null), gated by a runtime non-empty
+		// filter: a null-propagating self-expression (`c + 1` → null) materializes nothing, while a
+		// null→non-null one (`coalesce(c, 0) + 1`) does. The UPDATE must precede the INSERT so the
+		// matched rows are settled before the `do nothing` materialize cedes them (see the doc above
+		// for why these cannot collapse into a single upsert).
 		ops.push(memberUpdateOp(ctx, view, shape, member,
 			cells.map(c => ({ column: c.basisColumn, value: stripMemberQualifier(c.value, member) })), pred, stmt));
+		ops.push(buildSelfMaterializeInsertSelect(ctx, view, shape, member, cells, pred, stmt));
 		return;
 	}
 
@@ -1141,24 +1165,8 @@ function buildOptionalMemberInsertSelect(
 	const schema = ref.tableSchema;
 	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
 	const memberKey = singleKeyColumn(view, shape, member);
-	const valueBasisCols = optionalValueColumns(view, shape, member);
-	const assignedBasis = new Set(cells.map(c => c.basisColumn.toLowerCase()));
 
-	// View-soundness: an unassigned value column that would not land null (it is NOT
-	// NULL, or carries a declared default) cannot be materialized without changing the
-	// absent row's image. Reject conservatively rather than silently widen the view.
-	for (const bc of valueBasisCols) {
-		if (assignedBasis.has(bc.toLowerCase())) continue;
-		const col = columnByName(view, schema, bc);
-		if (col.notNull || col.defaultValue !== null) {
-			raiseMutationDiagnostic({
-				reason: 'unsupported-decomposition-update',
-				column: bc,
-				table: view.name,
-				message: `cannot update logical table '${view.name}': materializing an absent row of optional member '${member.relationId}' would leave value column '${bc}' to a base default (it is NOT NULL or declares a default), silently widening the row; assign every value column of the member in this statement, or restrict the update to present rows`,
-			});
-		}
-	}
+	assertNoUnassignedValueColumnWiden(view, shape, member, schema, cells);
 
 	const targetColumns: string[] = [memberKey];
 	const projections: AST.ResultColumn[] = [
@@ -1190,6 +1198,111 @@ function buildOptionalMemberInsertSelect(
 		loc: stmt.loc,
 	};
 	return { table: ref, op: 'insert', statement };
+}
+
+/**
+ * Build the absent-row materialize INSERT for a **member self-reference** update group
+ * (`set c = c + 1`, `set c = coalesce(c, 0) + 1`). Modeled on {@link buildOptionalMemberInsertSelect}
+ * (`'nothing'` flavour) and sharing its two soundness gates, but the projected value is the
+ * self-expression with the owner's own column refs **substituted to NULL** — an absent row's
+ * prior member value is null ({@link substituteOwnerColumnsWithNull}). Every leaf of a `self`
+ * cell is the owner's own column (the classifier proved it), so after substitution the value is a
+ * constant expression evaluable over the anchor scan; a constant sibling cell passes through.
+ *
+ * The select is additionally **filtered to a non-empty materialized image**:
+ * `… where <pred> and (<v1> is not null or <v2> is not null or …)` over the null-substituted
+ * values. This is what makes the always-emit sound: a **null-propagating** self-expression
+ * (`c + 1` → `null + 1` → null) yields a constant-false filter and materializes **no** phantom
+ * row, while one that maps null → non-null (`coalesce(c, 0) + 1` → `1`) is constant-true and
+ * materializes. `on conflict (<memberKey>) do nothing` cedes present rows to the matched UPDATE
+ * (which runs first), so only genuinely-absent rows are created — never an upsert (the matched and
+ * materialize values are computed over different scans and disagree row-for-row by construction).
+ */
+function buildSelfMaterializeInsertSelect(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	cells: readonly OptionalCell[],
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+): BaseOp {
+	const ref = resolveMemberTable(ctx, member);
+	const schema = ref.tableSchema;
+	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	const memberKey = singleKeyColumn(view, shape, member);
+
+	assertNoUnassignedValueColumnWiden(view, shape, member, schema, cells);
+
+	// An absent row's prior member value is null, so the materialized image is the self-expression
+	// with the owner's own columns nulled out (a self cell collapses to a constant; a constant cell
+	// is unchanged).
+	const nulled = cells.map(c => ({ basisColumn: c.basisColumn, value: substituteOwnerColumnsWithNull(c.value, member) }));
+
+	const targetColumns: string[] = [memberKey];
+	const projections: AST.ResultColumn[] = [
+		{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } },
+	];
+	for (const n of nulled) {
+		targetColumns.push(n.basisColumn);
+		projections.push({ type: 'column', expr: cloneExpr(n.value) });
+	}
+	assertNoMissingNotNull(view, schema, targetColumns.map((baseColumn): DecompInsertColumn => ({ baseColumn })));
+
+	// Non-empty image filter: OR-chain `<nulledValue> is not null` so a null-propagating
+	// self-expression creates no phantom row (constant-false), conjoined with the user predicate.
+	const nonEmpty = nulled
+		.map((n): AST.Expression => ({ type: 'unary', operator: 'IS NOT NULL', expr: cloneExpr(n.value) }))
+		.reduce((acc, e): AST.Expression => acc ? { type: 'binary', operator: 'OR', left: acc, right: e } : e);
+	const where = combineAnd(pred ? cloneExpr(pred) : undefined, nonEmpty);
+
+	const select: AST.SelectStmt = {
+		type: 'select',
+		columns: projections,
+		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
+		where,
+	};
+	const statement: AST.InsertStmt = {
+		type: 'insert',
+		table: memberIdentifier(member),
+		columns: targetColumns,
+		source: select,
+		upsertClauses: [{ type: 'upsert', conflictTarget: [memberKey], action: 'nothing' }],
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	return { table: ref, op: 'insert', statement };
+}
+
+/**
+ * View-soundness gate shared by every optional-member materialize insert-select
+ * ({@link buildOptionalMemberInsertSelect} and {@link buildSelfMaterializeInsertSelect}): an
+ * unassigned member **value** column that would not land null (it is NOT NULL, or carries a
+ * declared default) cannot be materialized without changing the absent row's logical image.
+ * Reject conservatively rather than silently widen the view. (The companion gate —
+ * {@link assertNoMissingNotNull} — is called at each builder's target-column site.)
+ */
+function assertNoUnassignedValueColumnWiden(
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	schema: TableSchema,
+	cells: readonly OptionalCell[],
+): void {
+	const assignedBasis = new Set(cells.map(c => c.basisColumn.toLowerCase()));
+	for (const bc of optionalValueColumns(view, shape, member)) {
+		if (assignedBasis.has(bc.toLowerCase())) continue;
+		const col = columnByName(view, schema, bc);
+		if (col.notNull || col.defaultValue !== null) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-decomposition-update',
+				column: bc,
+				table: view.name,
+				message: `cannot update logical table '${view.name}': materializing an absent row of optional member '${member.relationId}' would leave value column '${bc}' to a base default (it is NOT NULL or declares a default), silently widening the row; assign every value column of the member in this statement, or restrict the update to present rows`,
+			});
+		}
+	}
 }
 
 /**
@@ -1373,6 +1486,19 @@ function excludedColumn(col: string): AST.ColumnExpr {
  */
 function stripMemberQualifier(value: AST.Expression, owner: DecompositionMember): AST.Expression {
 	return transformExpr(value, (col) => (col.table === owner.relationId ? { type: 'column', name: col.name } : undefined));
+}
+
+/**
+ * Substitute the owning member's own column refs in a lowered self-reference value with a NULL
+ * literal — an absent row has no member row, so its prior value is null. So `c + 1` lowers to
+ * `null + 1` (→ null, filtered out as a phantom row) and `coalesce(c, 0) + 1` to `coalesce(null, 0)
+ * + 1` (→ 1, materializes). The classifier proved every column ref of a `self` cell is the owner's,
+ * so substituting only the owner qualifier suffices; a constant sibling carries no owner ref and is
+ * left unchanged. Mirrors {@link stripMemberQualifier} but maps the owner's columns to NULL rather
+ * than to a bare member-scoped reference (the materialize evaluates over the anchor, not the member).
+ */
+function substituteOwnerColumnsWithNull(value: AST.Expression, owner: DecompositionMember): AST.Expression {
+	return transformExpr(value, (col) => (col.table === owner.relationId ? { type: 'literal', value: null } : undefined));
 }
 
 // --- predicate / subquery construction ------------------------------------

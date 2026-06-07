@@ -5206,7 +5206,7 @@ describe('Property-Based Tests', () => {
 
 				await fc.assert(fc.asyncProperty(
 					fc.array(colRowArb, { maxLength: 8 }),
-					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-anchor', 'update-c-self', 'update-c-null', 'delete'),
+					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-anchor', 'update-c-self', 'update-c-coalesce-self', 'update-c-null', 'delete'),
 					fc.integer({ min: 1, max: 6 }),    // id predicate
 					fc.integer({ min: 10, max: 20 }),  // NV  (a)
 					fc.integer({ min: 21, max: 30 }),  // NV2 (b)
@@ -5258,10 +5258,19 @@ describe('Property-Based Tests', () => {
 							await db.exec(`update x.T set c = a + 1 where id = ${K}`);
 							if (core.has(K)) { cMap.set(K, core.get(K)! + 1); mutated++; }
 						} else if (op === 'update-c-self') {
-							// Member self-reference: `set c = c + 1` is matched-update-only — a present
-							// T_c increments, an absent one stays absent (no spurious materialization).
+							// Null-propagating member self-reference: `set c = c + 1` increments a present
+							// T_c; an absent one stays absent (its null-substituted image `null + 1` = null is
+							// filtered out, so the materialize creates no row).
 							await db.exec(`update x.T set c = c + 1 where id = ${K}`);
 							if (core.has(K) && cMap.has(K)) { cMap.set(K, cMap.get(K)! + 1); mutated++; }
+						} else if (op === 'update-c-coalesce-self') {
+							// Non-null-propagating member self-reference: `set c = coalesce(c, 0) + 1` increments
+							// a present T_c AND materializes an absent one (its null-substituted image
+							// coalesce(null, 0) + 1 = 1 is non-null, so the filter admits it). A matched anchor
+							// ends at (present ? c + 1 : 1) — the absent-materialize transition the `c + 1` arm
+							// cannot reach.
+							await db.exec(`update x.T set c = coalesce(c, 0) + 1 where id = ${K}`);
+							if (core.has(K)) { cMap.set(K, (cMap.has(K) ? cMap.get(K)! : 0) + 1); mutated++; }
 						} else if (op === 'update-c-null') {
 							// All of T_c's value columns (just `c`) set null → the component row is
 							// emptied (deleted); an absent T_c stays absent (no-op).
@@ -5946,8 +5955,9 @@ describe('Property-Based Tests', () => {
 				await expectMutationReject('update x.T set id = 9 where id = 1', 'unsupported-decomposition-update'); // shared key (identity change)
 				// An ARBITRARY optional-member value (here a cross-member read of `b`, backed by T_b)
 				// still needs the per-row capture substrate (deferred). Anchor-resolvable (`set c = a + 1`)
-				// and self-reference (`set c = c + 1`) values are now supported — fuzzed by the columnar
-				// PutGet oracle above (the `update-c-anchor` / `update-c-self` arms).
+				// and self-reference values are now supported — fuzzed by the columnar PutGet oracle above
+				// (the `update-c-anchor`, null-propagating `update-c-self`, and non-null-propagating
+				// `update-c-coalesce-self` arms — the last covering the absent-materialize transition).
 				await expectMutationReject('update x.T set c = b where id = 1', 'unsupported-decomposition-update');
 			});
 

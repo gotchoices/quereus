@@ -16,7 +16,9 @@
  *   UPDATE, absent → `on conflict do nothing` materialize INSERT, all value columns null →
  *   base DELETE); an **anchor-resolvable** value (`set c = a + 1`) collapsing both branches
  *   into one `on conflict do update set c = excluded.c` upsert; a **self-reference**
- *   (`set c = c + 1`) that is matched-update-only (absent rows stay absent). An **EAV pivot**
+ *   (`set c = c + 1`, `set c = coalesce(c, 0) + 1`) keeping the matched UPDATE for present rows
+ *   and adding a null-substituted, non-empty-filtered materialize INSERT for absent rows (a
+ *   null-propagating expression materializes nothing; one that maps null → non-null does). An **EAV pivot**
  *   member's write is the per-attribute triple analogue (null → delete, anchor-resolvable →
  *   `do update` upsert, constant → matched UPDATE + `do nothing` materialize INSERT).
  * - INSERT one per member (anchor first) off the shared-surrogate envelope
@@ -32,7 +34,9 @@
  * member (a subquery, a cross-member column, or a value mixing anchor + self leaves, and
  * any EAV self-reference) — which would need the per-row capture substrate to thread it
  * across both the matched-update and materialize-insert branches. The two self-contained
- * non-constant shapes — anchor-resolvable and member self-reference — are now supported.
+ * non-constant shapes — anchor-resolvable and member self-reference — are now supported; a
+ * self-reference materializes an absent row whenever its null-substituted image is non-null
+ * (`coalesce(c, 0) + 1`), and stays absent when null-propagating (`c + 1`).
  */
 
 import { expect } from 'chai';
@@ -328,18 +332,58 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		}
 	});
 
-	it('writes a member self-reference (present increments, absent stays absent — no spurious materialization)', async () => {
-		// `set c = c + 1` lowers to `T_c.c + 1` — the owning member's own column, so an absent row
-		// has no prior value to increment and is matched-update-only by nature (the materialize is
-		// suppressed). The owner qualifier is stripped so the per-member UPDATE targets T_c directly.
+	it('writes a null-propagating member self-reference (present increments, absent stays absent — the filtered materialize creates no row)', async () => {
+		// `set c = c + 1` lowers to `T_c.c + 1` — the owning member's own column. Present rows take the
+		// matched UPDATE; absent rows take a materialize INSERT whose null-substituted image is
+		// `null + 1` = null, so the runtime non-empty filter is constant-false and no row springs into
+		// being. The owner qualifier is stripped so the matched UPDATE targets T_c directly.
 		const db = new Database();
 		try {
 			await setup(db);
 			await db.exec('update x.T set c = c + 1 where id = 1');   // present (c = 1000) → 1001
 			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1001 }]);
-			await db.exec('update x.T set c = c + 1 where id = 2');   // absent → no-op, no row springs into being
+			await db.exec('update x.T set c = c + 1 where id = 2');   // absent → filtered out, no row materializes
 			expect(await rows(db, 'select id from main.T_c order by id')).to.deep.equal([{ id: 1 }]);
 			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('materializes a non-null-propagating self-reference on an absent row (coalesce maps null → non-null)', async () => {
+		// `set c = coalesce(c, 0) + 1` is a self-reference whose image on an absent row is non-null
+		// (coalesce(null, 0) + 1 = 1), so — unlike the null-propagating `c + 1` — it MUST materialize
+		// the absent row. Present rows still take the matched UPDATE over their real prior c (no
+		// double-apply: the matched UPDATE runs first, and the `do nothing` materialize cedes the
+		// present row on conflict). (T_c.c is NOT NULL here, which the materialized value satisfies; the
+		// present-but-null matched arm rides the nullable M_opt fixture below.)
+		const db = new Database();
+		try {
+			await setup(db);
+			// absent (row 2 has no T_c) → materialize c = coalesce(null, 0) + 1 = 1.
+			await db.exec('update x.T set c = coalesce(c, 0) + 1 where id = 2');
+			expect(await rows(db, 'select id, c from main.T_c order by id')).to.deep.equal([{ id: 1, c: 1000 }, { id: 2, c: 1 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 1 }]);
+			// present (row 1, c = 1000) → matched UPDATE to 1001 (the materialize does not double-apply).
+			await db.exec('update x.T set c = coalesce(c, 0) + 1 where id = 1');
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1001 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('materializes an iif / case else-non-null self-reference on an absent row', async () => {
+		// `iif(c is null, 0, c) + 1` and `case when c is null then 0 else c end + 1` are self-references
+		// whose null-substituted image is non-null (0 + 1 = 1), so an absent row materializes — exactly
+		// like coalesce. (`ifnull` is not a registered function in this engine; coalesce/iif/case are.)
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('update x.T set c = iif(c is null, 0, c) + 1 where id = 2');   // absent → 1
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 1 }]);
+			await db.exec('delete from main.T_c where id = 2');                          // back to absent
+			await db.exec('update x.T set c = case when c is null then 0 else c end + 1 where id = 2'); // absent → 1
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 1 }]);
 		} finally {
 			await db.close();
 		}
@@ -526,6 +570,85 @@ describe('lens decomposition put: UPDATE of a multi-value-column optional member
 			);
 			// Atomic: the present component is untouched.
 			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 100, c2: 200 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a self cell with a non-null-constant sibling materializes the absent row (self lands null, constant lands its value)', async () => {
+		// `set c1 = c1 + 1, c2 = 5`: c1 is a null-propagating self cell, c2 a non-null constant. The
+		// group is `hasSelf`, so on an absent row the materialized image is (c1 = null + 1 = null, c2 = 5)
+		// — non-empty because the constant c2 is non-null — so the row materializes (the constant cell is
+		// no longer dropped when a self cell is present). On a present row the matched UPDATE applies both.
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = c1 + 1, c2 = 5 where id = 2');   // absent → materialize (c1=null, c2=5)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 100, c2: 200 }, { id: 2, c1: null, c2: 5 },
+			]);
+			await db.exec('update x.M set c1 = c1 + 1, c2 = 5 where id = 1');   // present → c1 = 101, c2 = 5
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 101, c2: 5 }, { id: 2, c1: null, c2: 5 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('two self cells with mixed null-propagation materialize per-cell (one stays null, one lands non-null)', async () => {
+		// `set c1 = c1 + 1, c2 = coalesce(c2, 0) + 1`: both cells are self-references, but c1 is
+		// null-propagating and c2 is not. On an absent row the materialized image is (c1 = null + 1 = null,
+		// c2 = coalesce(null, 0) + 1 = 1) — non-empty because c2 is non-null — so the row materializes with
+		// the per-cell null-substituted values. On a present row the matched UPDATE applies both transforms.
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = c1 + 1, c2 = coalesce(c2, 0) + 1 where id = 2');   // absent → (null, 1)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 100, c2: 200 }, { id: 2, c1: null, c2: 1 },
+			]);
+			await db.exec('update x.M set c1 = c1 + 1, c2 = coalesce(c2, 0) + 1 where id = 1');   // present → (101, 201)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 101, c2: 201 }, { id: 2, c1: null, c2: 1 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a coalesce self-reference updates a present-but-null row to a non-null value', async () => {
+		// The matched UPDATE branch over a present row whose member value is null: `set c1 = coalesce(c1, 0)
+		// + 1` on a present M_opt row with c1 = null → coalesce(null, 0) + 1 = 1 (the materialize cedes the
+		// present row on conflict). M_opt.c1 is `integer null`, so it can actually hold the null prior value.
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = null where id = 1');   // present row, c1 now null (c2 = 200 keeps the row)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: null, c2: 200 }]);
+			await db.exec('update x.M set c1 = coalesce(c1, 0) + 1 where id = 1');   // present-but-null → 1
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 1, c2: 200 }]);
+			// absent row 2 → materialize (c1 = coalesce(null, 0) + 1 = 1, c2 left null).
+			await db.exec('update x.M set c1 = coalesce(c1, 0) + 1 where id = 2');
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 1, c2: 200 }, { id: 2, c1: 1, c2: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a partial self-update that leaves a non-null-defaulted sibling value column unassigned', async () => {
+		// `set e1 = e1 + 1` on M_def (e2 carries `default 7`) is a self-reference, but its materialize
+		// INSERT for an absent row would leave e2 to its non-null default — silently widening the absent
+		// row's image. We cannot statically tell `e1 + 1` (null-propagating, never materializes) from
+		// `coalesce(e1, 0) + 1` (materializes), so the same widen gate the constant/anchor paths enforce
+		// rejects it. This is an intentional surface change: the old matched-update-only self path
+		// silently accepted this partial write.
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await expectThrows(() => db.exec('update x.M set e1 = e1 + 1 where id = 2'), /silently widening|base default/i);
+			// Atomic: nothing materialized.
+			expect(await rows(db, 'select count(*) as n from main.M_def where id = 2')).to.deep.equal([{ n: 0 }]);
 		} finally {
 			await db.close();
 		}
