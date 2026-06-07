@@ -158,6 +158,26 @@ function compileUnary(
 			return (row) => operand(row) === null;
 		case 'IS NOT NULL':
 			return (row) => operand(row) !== null;
+		case 'IS TRUE':
+			return (row) => {
+				const t = predicateTruthy(operand(row));
+				return t === null ? false : t;
+			};
+		case 'IS NOT TRUE':
+			return (row) => {
+				const t = predicateTruthy(operand(row));
+				return t === null ? true : !t;
+			};
+		case 'IS FALSE':
+			return (row) => {
+				const t = predicateTruthy(operand(row));
+				return t === null ? false : !t;
+			};
+		case 'IS NOT FALSE':
+			return (row) => {
+				const t = predicateTruthy(operand(row));
+				return t === null ? true : t;
+			};
 		case 'NOT':
 			return (row) => {
 				const t = predicateTruthy(operand(row));

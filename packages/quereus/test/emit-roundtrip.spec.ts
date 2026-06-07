@@ -535,6 +535,22 @@ describe('Emit: expression round-trips', () => {
 		it('expr IS NOT NULL', () => {
 			roundTripExpr('a is not null');
 		});
+
+		it('expr IS TRUE', () => {
+			roundTripExpr('a is true');
+		});
+
+		it('expr IS NOT TRUE', () => {
+			roundTripExpr('a is not true');
+		});
+
+		it('expr IS FALSE', () => {
+			roundTripExpr('a is false');
+		});
+
+		it('expr IS NOT FALSE', () => {
+			roundTripExpr('a is not false');
+		});
 	});
 
 	describe('Function calls', () => {

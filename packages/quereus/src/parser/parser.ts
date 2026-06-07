@@ -1327,13 +1327,17 @@ export class Parser {
 			const right = this.notExpression();
 			return { type: 'unary', operator: 'NOT', expr: right, loc: _createLoc(operatorToken, this.previous()) };
 		}
-		return this.isNull();
+		return this.isPredicate();
 	}
 
 	/**
-	 * Parse IS NULL / IS NOT NULL expressions
+	 * Parse the postfix IS predicates, each a unary postfix operator on the
+	 * operand: `IS [NOT] NULL`, `IS [NOT] TRUE`, `IS [NOT] FALSE`. A general
+	 * `IS <expr>` (anything other than NULL/TRUE/FALSE) is unsupported — we
+	 * backtrack the consumed `IS [NOT]` so the caller surfaces the same error
+	 * as before.
 	 */
-	private isNull(): AST.Expression {
+	private isPredicate(): AST.Expression {
 		const startToken = this.peek();
 		const expr = this.equality();
 
@@ -1343,7 +1347,15 @@ export class Parser {
 				const operator = isNot ? 'IS NOT NULL' : 'IS NULL';
 				return { type: 'unary', operator, expr, loc: _createLoc(startToken, this.previous()) };
 			}
-			// IS [NOT] not followed by NULL — backtrack
+			if (this.match(TokenType.TRUE)) {
+				const operator = isNot ? 'IS NOT TRUE' : 'IS TRUE';
+				return { type: 'unary', operator, expr, loc: _createLoc(startToken, this.previous()) };
+			}
+			if (this.match(TokenType.FALSE)) {
+				const operator = isNot ? 'IS NOT FALSE' : 'IS FALSE';
+				return { type: 'unary', operator, expr, loc: _createLoc(startToken, this.previous()) };
+			}
+			// IS [NOT] not followed by NULL/TRUE/FALSE — backtrack the IS [NOT].
 			if (isNot) this.current--;
 			this.current--;
 		}

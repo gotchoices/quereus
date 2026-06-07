@@ -37,8 +37,12 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 				break;
 			case 'IS NULL':
 			case 'IS NOT NULL':
+			case 'IS TRUE':
+			case 'IS NOT TRUE':
+			case 'IS FALSE':
+			case 'IS NOT FALSE':
 				logicalType = BOOLEAN_TYPE;
-				nullable = false; // IS NULL/IS NOT NULL never return null
+				nullable = false; // IS [NOT] NULL/TRUE/FALSE are total — never return null
 				break;
 			case '-':
 			case '+':

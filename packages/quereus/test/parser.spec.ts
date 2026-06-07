@@ -179,6 +179,40 @@ describe('Parser', () => {
 		});
 	});
 
+	describe('IS [NOT] TRUE / FALSE', () => {
+		it('should parse IS TRUE', () => {
+			const un = expectUnary(parseExpr('1 IS TRUE'), 'IS TRUE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('should parse IS NOT TRUE', () => {
+			const un = expectUnary(parseExpr('1 IS NOT TRUE'), 'IS NOT TRUE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('should parse IS FALSE', () => {
+			const un = expectUnary(parseExpr('1 IS FALSE'), 'IS FALSE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('should parse IS NOT FALSE', () => {
+			const un = expectUnary(parseExpr('1 IS NOT FALSE'), 'IS NOT FALSE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('binds tighter than prefix NOT: not 1 is true → NOT(1 IS TRUE)', () => {
+			const outer = expectUnary(parseExpr('not 1 is true'), 'NOT');
+			const inner = expectUnary(outer.expr, 'IS TRUE');
+			expectLiteral(inner.expr, 1);
+		});
+
+		it('still rejects a general IS <expr> (non-NULL/TRUE/FALSE)', () => {
+			// The TRUE/FALSE additions must not consume tokens for the generic
+			// `IS` path: `1 is x` backtracks the IS and leaves it dangling → parse error.
+			expect(() => parse('select 1 is x')).to.throw();
+		});
+	});
+
 	describe('Location Tracking', () => {
 		it('should track locations on expression nodes', () => {
 			const expr = parseExpr('1 + 2');

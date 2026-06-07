@@ -18,7 +18,7 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 
 	switch (operator) {
 		case 'NOT':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				// SQL NOT: NULL -> NULL, false -> true, true -> false
 				if (operand === null) return null;
 				return !isTruthy(operand);
@@ -27,21 +27,53 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 			break;
 
 		case 'IS NULL':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				return operand === null;
 			};
 			note = 'IS NULL';
 			break;
 
 		case 'IS NOT NULL':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				return operand !== null;
 			};
 			note = 'IS NOT NULL';
 			break;
 
+		case 'IS TRUE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// Total predicate: NULL operand is not true; otherwise SQL truthiness.
+				return operand === null ? false : isTruthy(operand);
+			};
+			note = 'IS TRUE';
+			break;
+
+		case 'IS NOT TRUE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// ≡ NOT (x IS TRUE): the NULL row flips into the true bucket.
+				return operand === null ? true : !isTruthy(operand);
+			};
+			note = 'IS NOT TRUE';
+			break;
+
+		case 'IS FALSE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// Total predicate: NULL operand is not false; otherwise not-truthy.
+				return operand === null ? false : !isTruthy(operand);
+			};
+			note = 'IS FALSE';
+			break;
+
+		case 'IS NOT FALSE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// ≡ NOT (x IS FALSE): the NULL row flips into the true bucket.
+				return operand === null ? true : isTruthy(operand);
+			};
+			note = 'IS NOT FALSE';
+			break;
+
 		case '-':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				if (operand === null) return null;
 
 				// Check if it's a timespan (ISO 8601 duration string)
@@ -65,7 +97,7 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 			break;
 
 		case '+':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				// Unary plus - convert to number if possible
 				if (operand === null) return null;
 				if (typeof operand === 'number' || typeof operand === 'bigint') return operand;
@@ -76,7 +108,7 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 			break;
 
 		case '~':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				if (operand === null) return null;
 				if (typeof operand === 'bigint') return ~operand;
 				// Convert to integer and apply bitwise NOT

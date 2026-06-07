@@ -229,10 +229,11 @@ export function expressionToString(expr: AST.Expression): string {
 			const exprStr = unaryBodyNeedsParens(expr)
 				? `(${expressionToString(expr.expr)})`
 				: expressionToString(expr.expr);
-			// Handle postfix operators like IS NULL, IS NOT NULL
-			if (expr.operator === 'IS NULL' || expr.operator === 'IS NOT NULL') {
+			// Handle postfix operators: IS [NOT] NULL/TRUE/FALSE
+			const upperOp = expr.operator.toUpperCase();
+			if (POSTFIX_IS_OPERATORS.has(upperOp)) {
 				return `${exprStr} ${expr.operator.toLowerCase()}`;
-			} else if (expr.operator.toUpperCase() === 'NOT') {
+			} else if (upperOp === 'NOT') {
 				return `not ${exprStr}`;
 			}
 			return `${expr.operator.toLowerCase()}${exprStr}`;
@@ -318,6 +319,14 @@ export function expressionToString(expr: AST.Expression): string {
 			return '[unknown_expr]';
 	}
 }
+
+// Unary operators rendered as postfix `<expr> <op>` (e.g. `a is null`,
+// `a is not true`) rather than the default prefix form.
+const POSTFIX_IS_OPERATORS = new Set([
+	'IS NULL', 'IS NOT NULL',
+	'IS TRUE', 'IS NOT TRUE',
+	'IS FALSE', 'IS NOT FALSE',
+]);
 
 // Determines whether the body of a unary expression must be parenthesised so
 // the emitted SQL re-parses to the same AST. With prefix NOT bound above all
