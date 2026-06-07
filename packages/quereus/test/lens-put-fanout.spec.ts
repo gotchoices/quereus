@@ -1575,7 +1575,8 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 	// `note` on Doc_meta — a genuine cross-member pair):
 	//  - a CHECK spanning columns on MORE THAN ONE member (`title <> note`, write-row
 	//    {title, note}) resolves on no single member op ⇒ rides none ⇒ silently DEFERRED
-	//    (matching the decomposition INSERT path, which defers all lens row-local checks);
+	//    (matching the decomposition INSERT path, which runs the same per-op gate and so
+	//    likewise defers only cross-member checks while enforcing single-member ones);
 	//  - a SINGLE-member-resolvable CHECK (`length(title) < 5`, write-row {title}) rides the
 	//    Doc_core member op and still FIRES (ABORTs on violation).
 	// This is the documented (docs/lens.md § Enforcement by constraint class) but otherwise
