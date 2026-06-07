@@ -236,6 +236,20 @@ unaffected because a writable flag is always SELECTed by its view's projection,
 which keeps it demanded and retained — and a routing Project, never an Aggregate,
 is what carries a view's write-side flag reference).
 
+A **probe-only** flag — one demanded *solely* as a top-level boolean test in a
+`where` clause (`where <flag>` / `where not <flag>`) and nowhere else — is the
+demand-SHAPE complement of the unused case: the demand-PRESENCE gate retains it
+(it *is* read), but the `semijoin-existence-recovery` rule (Structural / priority
+23) recognizes that the only use is an existence probe and rewrites the
+`left join … exists right as` to the equivalent **semi** (`where flag`) or
+**anti** (`where not flag`) join — re-opening hash/merge selection and the FK
+IND-folding cascade the live flag otherwise forfeits. This is **write-safe by the
+same construction**: a flag writable through a view is always SELECTed by its
+routing Project, so it is demanded outside the probe and recovery abstains (the
+rewrite drops the right columns and the flag, so it requires the consuming
+Project to reference neither). The write path therefore never reaches the
+rewrite. See `docs/optimizer.md` § `ruleSemijoinExistenceRecovery`.
+
 **Writing the flag (the write half).** The existence column is the explicit, per-row
 control surface for the non-preserved side's existence — *writing* the flag **is** the
 guard. It reuses the non-preserved-side UPDATE substrate (the up-front `__vmupd_keys`

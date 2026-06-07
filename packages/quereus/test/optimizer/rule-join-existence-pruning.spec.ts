@@ -227,15 +227,20 @@ describe('ruleJoinExistencePruning', () => {
 
 		it('retained when referenced only in a WHERE filter above the join', async () => {
 			await seedExisting();
+			// `walkChain` folds the intervening Filter's flag reference into the demand
+			// set, so the flag is retained. The reference is a NON-probe shape (an OR)
+			// on purpose: a *pure* top-level probe (`where hasP`) is now rewritten to a
+			// semi join by `semijoin-existence-recovery` — see that rule's spec — so an
+			// OR keeps this case squarely about the pruning rule's WHERE-demand folding.
 			const q =
-				'select c.cc as cc from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP order by c.cc';
+				'select c.cc as cc from exc c left join exp p on p.pp = c.pr exists right as hasP where hasP or c.cv > 150 order by c.cc';
 
 			const rows = await planRows(db, q);
 			expect(joinExistence(rows), 'flag retained for the filter').to.deep.equal(['exists right as hasP']);
 
-			// `where hasP` keeps only the matched rows (cc 1, 3).
+			// hasP (cc 1,3) OR cv > 150 (cc 2,4) ⇒ every row qualifies.
 			const out = await results(db, q);
-			expect(out.map(r => r.cc)).to.deep.equal([1, 3]);
+			expect(out.map(r => r.cc)).to.deep.equal([1, 2, 3, 4]);
 		});
 
 		it('retained when referenced only in an ORDER BY above the join', async () => {

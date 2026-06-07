@@ -32,6 +32,7 @@ import { ruleJoinKeyInference } from './rules/join/rule-join-key-inference.js';
 import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js';
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
 import { ruleJoinExistencePruning, ruleJoinExistencePruningUnderAggregate } from './rules/join/rule-join-existence-pruning.js';
+import { ruleSemijoinExistenceRecovery } from './rules/join/rule-semijoin-existence-recovery.js';
 import { ruleFanOutLookupJoin } from './rules/join/rule-fanout-lookup-join.js';
 import { ruleFanOutBatchedOuter } from './rules/join/rule-fanout-batched-outer.js';
 import { ruleAsyncGatherUnionAll } from './rules/parallel/rule-async-gather-union-all.js';
@@ -394,6 +395,32 @@ export class Optimizer {
 			// the Aggregate is reconstructed with identical groupBy / aggregates /
 			// output attrs (a pure source swap), so no write can be skipped.
 			sideEffectMode: 'safe',
+		});
+
+		// Semi/anti-join existence-flag recovery (demand-SHAPE gated): the complement
+		// of `join-existence-pruning`. When the sole `exists … as` flag on a
+		// `left join` is demanded ONLY as a top-level boolean probe
+		// (`where flag` ⇒ semi, `where not flag` ⇒ anti), rewrite the JoinNode to the
+		// equivalent semi/anti join — the same shape `subquery-decorrelation` emits —
+		// re-opening physical join selection and the IND-folding cascade. Registered
+		// AFTER `join-existence-pruning` (so an undemanded sibling flag is dropped
+		// first, maximizing the sole-spec precondition) and BEFORE
+		// `fanout-lookup-join` / `join-elimination` and the IND folders
+		// `anti-join-fk-empty` / `semi-join-fk-trivial` (Join, registered below) so
+		// the recovered semi/anti threads into them in the same applyRules loop —
+		// exactly why `subquery-decorrelation` precedes those folders. Pass rules fire
+		// in REGISTRATION order, so this placement (22 < priority 23 < 26) is what
+		// realizes the ordering; the priority value is documentation.
+		this.passManager.addRuleToPass(PassId.Structural, {
+			id: 'semijoin-existence-recovery',
+			nodeType: PlanNodeType.Project,
+			phase: 'rewrite',
+			fn: ruleSemijoinExistenceRecovery,
+			priority: 23,
+			// Recovers a semi/anti join, which short-circuits the right side's scan at
+			// the first match — changing R's execution count. Refuses when R carries a
+			// write (mirrors subquery-decorrelation's impure-inner refusal).
+			sideEffectMode: 'aware',
 		});
 
 		// Fan-out lookup join (FK→PK): cluster N LEFT/INNER nested-loop joins from
