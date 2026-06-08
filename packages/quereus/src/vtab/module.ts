@@ -257,13 +257,17 @@ export interface VirtualTableModule<
 
 	/**
 	 * Alter an existing table's structure. Called by ALTER TABLE for
-	 * data-affecting changes (ADD COLUMN, DROP COLUMN, RENAME COLUMN).
-	 * RENAME TABLE is schema-only and does not call this method.
+	 * data-affecting changes — every `SchemaChangeInfo` arm: ADD / DROP /
+	 * RENAME COLUMN, ADD / DROP / RENAME CONSTRAINT, ALTER COLUMN, ALTER
+	 * PRIMARY KEY. RENAME TABLE is schema-only and routes through `renameTable`,
+	 * not this method. See docs/module-authoring.md § "Schema Changes
+	 * (`SchemaChangeInfo`)" for the per-arm mandate each arm carries.
 	 *
 	 * Returns the updated TableSchema after the operation. The engine
 	 * registers this in the schema catalog.
 	 *
-	 * If not implemented, the engine rejects data-affecting ALTER operations.
+	 * If not implemented, the engine rejects data-affecting ALTER operations
+	 * (`renameColumn` degrades to an engine-side schema-only rename instead).
 	 */
 	alterTable?(
 		db: Database,

@@ -1106,7 +1106,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// Per-column collation update. Physical key encoding still uses the
 					// fixed table-level collation (`encodeOptions`), so PRIMARY KEY columns
 					// are NOT re-keyed or re-validated here (the PK is enforced physically;
-					// deferred to store-set-collate-pk-physical-rekey). For non-PK UNIQUE
+					// deferred to store-pk-collate-module-capability). For non-PK UNIQUE
 					// constraints we DO re-validate existing rows under the new collation
 					// below (Option A) — write-time UNIQUE enforcement is already
 					// collation-aware, so this reaches end-to-end parity with memory.
