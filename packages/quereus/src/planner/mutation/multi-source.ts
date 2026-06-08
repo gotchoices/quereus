@@ -1432,23 +1432,14 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 					message: `cannot write through view '${view.name}': column '${asg.column}' is backed by the non-preserved side of an outer join (base table '${analysis.sides[out.sideIndex].schema.name}'); the per-row matched-update / null-extended-insert materialization needs the capture carrier`,
 				});
 			}
-			// RETURNING is not recoverable through a non-preserved-side update: the
-			// post-mutation re-query (`buildMultiSourceUpdateReturning`) identifies rows by
-			// EVERY side's CAPTURED PK, but a null-extended row's non-preserved PK was
-			// captured NULL while the materialized row now carries a real one — the `NULL = pk`
-			// identity match never holds, so the row is silently dropped from the RETURNING
-			// image (the matched rows would still surface, but the result would be a silent
-			// partial set). Reject at plan time (data-independent — we cannot know which rows
-			// null-extend) until the re-query keys off the stable preserved-side identity
-			// (`view-write-outer-join-nonpreserved-returning`).
-			if (stmt.returning && stmt.returning.length > 0) {
-				raiseMutationDiagnostic({
-					reason: 'returning-through-view',
-					column: asg.column,
-					table: view.name,
-					message: `cannot write through view '${view.name}': RETURNING is not supported on an update of non-preserved (outer-join null-extended) column '${asg.column}' — a materialized null-extended row is not recoverable by the captured-identity re-query`,
-				});
-			}
+			// RETURNING through a non-preserved-side update IS supported: the post-mutation
+			// re-query (`buildMultiSourceUpdateReturning`) re-keys its identity EXISTS off the
+			// stable preserved-side PK (a per-non-preserved-side matched-OR-null disjunction),
+			// so a freshly-materialized null-extended row — whose non-preserved PK was captured
+			// NULL — surfaces via its preserved-side equalities instead of being dropped by a
+			// `NULL = <minted pk>` match (`view-write-outer-join-nonpreserved-returning`). The
+			// existence-flag RETURNING reject above stays — `set hasB = false` deletes the
+			// matched partition, which neither disjunction branch recovers.
 			// The assigned value's top-level references must name view columns (parity with
 			// the preserved path); the value is then lowered to base terms over the join body
 			// and captured pre-mutation, so a same- or cross-side read resolves uniformly.
@@ -1950,12 +1941,21 @@ export function buildMultiSourceKeyCapture(
  * predicate* cannot recapture a row whose predicate column the update itself
  * rewrote (the changed row no longer matches), so this matches by the captured
  * **identity** instead: project the view-spelled, base-term RETURNING columns over
- * the post-mutation join body, restricted to the captured identities by `exists
- * (select 1 from __vmupd_keys k where k.k0_0 = s0.pk0 [and k.k0_1 = s0.pk1] and k.k1_0
- * = s1.pk0 …)` (every side × PK column) — so a row the update pushed *out* of the
- * view's filter (or whose predicate column it rewrote) is still returned (single-source
- * NEW semantics). It keeps only the structural join ON-condition; the body/user WHERE is
- * intentionally NOT re-applied.
+ * the post-mutation join body, restricted to the captured identities by a correlated
+ * `exists (select 1 from __vmupd_keys k where <per-side identity>)` — so a row the
+ * update pushed *out* of the view's filter (or whose predicate column it rewrote) is
+ * still returned (single-source NEW semantics). It keeps only the structural join
+ * ON-condition; the body/user WHERE is intentionally NOT re-applied.
+ *
+ * The per-side identity is **preserved-keyed**: a preserved side matches by exact
+ * per-PK-column equality (`k.k<p>_<j> = s<p>.pk<j>`), while a non-preserved (outer-join
+ * null-extended) side uses a matched-OR-null disjunction `(AND_j k.k<np>_<j> =
+ * s<np>.pk<j>) OR (AND_j k.k<np>_<j> is null)`. This re-keys the re-query off the
+ * **stable preserved-side identity** so a freshly-materialized null-extended row (whose
+ * non-preserved PK was captured NULL) surfaces via its preserved-side equalities alone,
+ * rather than being silently dropped by a `NULL = <minted pk>` match. For an all-
+ * preserved (inner) join every side is exact equality — byte-identical to the prior
+ * behavior, so inner-join RETURNING is unchanged.
  *
  * Reads the shared {@link MultiSourceKeyCapture} the builder materializes
  * before the base ops fire (via its own freshly-minted key ref over the same
@@ -1976,17 +1976,39 @@ export function buildMultiSourceUpdateReturning(
 	// the body/user WHERE is intentionally NOT re-applied) — no AST re-plan of the
 	// body. The EXISTS subquery resolves `__vmupd_keys` via `cteNodes` to a fresh key
 	// ref over the shared capture descriptor; `s<side>.pk<j>` correlate to the outer
-	// join row through `joinScope`. Conjoin one equality per side per PK column.
-	const conds: AST.Expression[] = [];
-	analysis.sides.forEach((side, sideIndex) => {
-		requireKeyColumns(view, side).forEach((pk, j) => {
-			conds.push({
-				type: 'binary',
-				operator: '=',
-				left: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
-				right: { type: 'column', name: pk, table: side.alias },
-			});
-		});
+	// join row through `joinScope`.
+	//
+	// The per-side identity predicate is AND'd over all sides:
+	//  - a **preserved** side keys by exact per-PK-column equality (`AND_j k.k<side>_<j>
+	//    = s<side>.pk<j>`) — its PK is stable across the mutation and uniquely identifies
+	//    the view row (the premise that makes a non-preserved column updatable at all);
+	//  - a **non-preserved** (outer-join null-extended) side keys by a matched-OR-null
+	//    disjunction `(AND_j k.k<np>_<j> = s<np>.pk<j>) OR (AND_j k.k<np>_<j> is null)`.
+	//
+	// A *matched* capture row (np PK non-null) takes the matched branch and finds the
+	// stable np row; the null branch is false (the np PK is non-null). A *materialized
+	// null-extended* capture row (np PK captured NULL — it had no pre-mutation partner)
+	// fails the matched branch (`null = …` is not-true) and takes the null branch, so it
+	// is identified by the preserved-side equalities ALONE — surfacing the freshly-minted
+	// partner row (and a preserved-side update touching a still-null-extended row, the
+	// latent partial-set bug #2). SQL three-valued comparison keeps the two branches
+	// disjoint, so no explicit `is not null` guard is needed.
+	const sideConds = analysis.sides.map((side, sideIndex): AST.Expression => {
+		const pkCols = requireKeyColumns(view, side);
+		const exact = pkCols.map((pk, j): AST.Expression => ({
+			type: 'binary',
+			operator: '=',
+			left: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
+			right: { type: 'column', name: pk, table: side.alias },
+		})).reduce((acc, c) => combineAnd(acc, c)!);
+		if (side.preserved) return exact;
+		// Null-extended branch: every captured PK column of this non-preserved side is null
+		// (no pre-mutation join partner), so the row is identified by the preserved sides'
+		// exact equalities alone.
+		const allNull = pkCols.map((_pk, j): AST.Expression =>
+			({ type: 'unary', operator: 'IS NULL', expr: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' } } as AST.UnaryExpr))
+			.reduce((acc, c) => combineAnd(acc, c)!);
+		return { type: 'binary', operator: 'OR', left: exact, right: allNull } as AST.BinaryExpr;
 	});
 	const keyRef = makeMultiSourceKeyRef(ctx.scope, capture);
 	const existsPredicateAst: AST.Expression = {
@@ -1995,7 +2017,7 @@ export function buildMultiSourceUpdateReturning(
 			type: 'select',
 			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
 			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
-			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
+			where: sideConds.reduce((acc, c) => combineAnd(acc, c)!),
 		},
 	};
 	const cteNodes = new Map(ctx.cteNodes ?? []);

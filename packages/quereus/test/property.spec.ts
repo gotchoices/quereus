@@ -4985,11 +4985,91 @@ describe('Property-Based Tests', () => {
 				await db.exec('insert into npk_child values (1, 99, 7)'); // null-extended, dangling composite key
 				await expectMutationReject('update npvk set pv = 5 where cc = 1', 'unsupported-outer-join-update');
 
-				// RETURNING through a non-preserved-side update is not recoverable: the
-				// post-mutation re-query identifies by the captured non-preserved PK, which a
-				// materialized null-extended row no longer matches (captured NULL vs the real
-				// minted key). Reject at plan time rather than return a silent partial set.
-				await expectMutationReject('update npv set pv = 7 where cc = 1 returning cc, pv', 'returning-through-view');
+				// RETURNING through a non-preserved-side update IS supported: the post-mutation
+				// re-query re-keys its identity EXISTS off the stable PRESERVED-side (child) PK
+				// with a matched-OR-null disjunction, so a matched row, a freshly-materialized
+				// null-extended row (captured np PK null → identified by the child PK alone), and
+				// a null-key no-op row all surface with their correct post-mutation NEW image
+				// (view-write-outer-join-nonpreserved-returning).
+				const resetNp = async (): Promise<void> => {
+					await db.exec('delete from np_parent');
+					await db.exec('delete from np_child');
+					await db.exec('insert into np_parent values (10, 100)');
+					await db.exec('insert into np_child values (1, 10, 1000)');   // matched
+					await db.exec('insert into np_child values (2, 99, 2000)');   // null-extended, dangling key
+					await db.exec('insert into np_child values (3, null, 3000)'); // null-extended, NULL key
+				};
+
+				// Matched-only: child PK exact-equality + the parent's matched disjunction branch.
+				await resetNp();
+				assertRowsEqual('np matched RETURNING', await readRows('update npv set pv = 444 where cc = 1 returning cc, pv'),
+					[{ cc: 1, pv: 444 }], ['cc', 'pv']);
+
+				// Null-extended materialization: the parent PK was captured NULL, so the null
+				// disjunction branch identifies the row by the child PK alone — the freshly minted
+				// parent (pp = 99, pv = 555) surfaces rather than being dropped.
+				await resetNp();
+				assertRowsEqual('np null-extended materialization RETURNING', await readRows('update npv set pv = 555 where cc = 2 returning cc, cv, pv'),
+					[{ cc: 2, cv: 2000, pv: 555 }], ['cc', 'cv', 'pv']);
+
+				// Null-key no-op: nothing materializes (no joinable key), but the affected child
+				// row still returns its unchanged post-mutation image (pv null).
+				await resetNp();
+				assertRowsEqual('np null-key no-op RETURNING', await readRows('update npv set pv = 666 where cc = 3 returning cc, pv'),
+					[{ cc: 3, pv: null }], ['cc', 'pv']);
+
+				// Mixed batch spanning matched (cc=1) + null-extended materialization (cc=2) +
+				// null-key no-op (cc=3): each affected view row returns its correct post-mutation
+				// image exactly once (order-insensitive).
+				await resetNp();
+				assertRowsEqual('np mixed-batch RETURNING', await readRows('update npv set pv = 777 where cc in (1, 2, 3) returning cc, pv'),
+					[{ cc: 1, pv: 777 }, { cc: 2, pv: 777 }, { cc: 3, pv: null }], ['cc', 'pv']);
+
+				// `returning *` expands to every view output column's base term, recomputed over
+				// the re-keyed filter.
+				await resetNp();
+				assertRowsEqual('np mixed-batch RETURNING *', await readRows('update npv set pv = 888 where cc in (1, 2, 3) returning *'),
+					[{ cc: 1, cv: 1000, pv: 888 }, { cc: 2, cv: 2000, pv: 888 }, { cc: 3, cv: 3000, pv: null }], ['cc', 'cv', 'pv']);
+
+				// GetPut idempotence: the RETURNING'd pv is the actual stored NEW image, so writing
+				// each returned pv back leaves the whole view image unchanged.
+				await resetNp();
+				const npRet = await readRows('update npv set pv = 909 where cc in (1, 2, 3) returning cc, pv');
+				for (const r of npRet) await db.exec(`update npv set pv = ${r.pv === null ? 'null' : r.pv} where cc = ${r.cc}`);
+				assertRowsEqual('np GetPut idempotent via RETURNING', await readRows('select cc, cv, pv from npv order by cc'),
+					[{ cc: 1, cv: 1000, pv: 909 }, { cc: 2, cv: 2000, pv: 909 }, { cc: 3, cv: 3000, pv: null }], ['cc', 'cv', 'pv']);
+
+				// Preserved-side update touching a null-extended row + RETURNING (the latent
+				// partial-set bug #2): updating a PRESERVED column (cv) over a batch including the
+				// null-extended cc=3 row must still return cc=3 — its captured-null parent PK is
+				// recovered by the null disjunction branch, so the row is not dropped.
+				await resetNp();
+				assertRowsEqual('np preserved-side update + null-extended row RETURNING',
+					await readRows('update npv set cv = 99 where cc in (1, 3) returning cc, cv, pv'),
+					[{ cc: 1, cv: 99, pv: 100 }, { cc: 3, cv: 99, pv: null }], ['cc', 'cv', 'pv']);
+
+				// Fan-out: a parent (pp = 10) shared by three children, updating the PRESERVED
+				// column (cv) over two of them (cc in (1, 4)) with RETURNING. All sides are captured
+				// for a RETURNING update, so the shared parent PK (10) is in the capture for both
+				// cc=1 and cc=4; the re-query must return exactly those two view rows once each and
+				// NOT leak the unselected sibling cc=5 — which shares the same parent PK but whose
+				// child PK is absent from the capture, so neither disjunction branch matches its join
+				// row. (Updating the NON-preserved column across a shared parent is a separate,
+				// pre-existing limitation of the matched-update captured-value read — out of scope
+				// for this ticket, which is about the RETURNING identity re-query.)
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_parent values (10, 100)');
+				await db.exec('insert into np_child values (1, 10, 1000)');
+				await db.exec('insert into np_child values (4, 10, 4000)');
+				await db.exec('insert into np_child values (5, 10, 5000)');
+				assertRowsEqual('np fan-out RETURNING (no unaffected sibling leaked)',
+					await readRows('update npv set cv = 7 where cc in (1, 4) returning cc, cv, pv'),
+					[{ cc: 1, cv: 7, pv: 100 }, { cc: 4, cv: 7, pv: 100 }], ['cc', 'cv', 'pv']);
+				// The unselected sibling cc=5 is neither returned above nor modified here.
+				assertRowsEqual('np fan-out view image (unaffected sibling cc=5 untouched)',
+					await readRows('select cc, cv, pv from npv order by cc'),
+					[{ cc: 1, cv: 7, pv: 100 }, { cc: 4, cv: 7, pv: 100 }, { cc: 5, cv: 5000, pv: 100 }], ['cc', 'cv', 'pv']);
 			});
 
 			// ----- Outer (RIGHT) join: non-preserved-side UPDATE (matched + null-extended) -----
@@ -5000,7 +5080,7 @@ describe('Property-Based Tests', () => {
 			// source order, so every branch and boundary must hold identically — this pins the
 			// matched update, the null-extended dangling-key materialization, the NULL-key no-op,
 			// the NOT NULL `null-extended-create-conflict`, the composite-key
-			// `unsupported-outer-join-update`, and the RETURNING `returning-through-view` rejects
+			// `unsupported-outer-join-update` rejects, and the preserved-keyed RETURNING re-query (matched + materialized + null-key + fan-out)
 			// for RIGHT directly (view-write-right-join-readmit).
 			it('outer (right) join: non-preserved-side update materializes matched + null-extended rows', async () => {
 				await db.exec('pragma foreign_keys = false');
@@ -5064,8 +5144,74 @@ describe('Property-Based Tests', () => {
 				await db.exec('insert into rnpk_child values (1, 99, 7)'); // null-extended, dangling composite key
 				await expectMutationReject('update rnpvk set pv = 5 where cc = 1', 'unsupported-outer-join-update');
 
-				// RETURNING through a non-preserved-side update is not recoverable (parity with LEFT).
-				await expectMutationReject('update rnpv set pv = 7 where cc = 1 returning cc, pv', 'returning-through-view');
+				// RETURNING through a non-preserved-side update IS supported — the exact mirror of
+				// the LEFT `npv` assertions. The substrate keys off the per-row
+				// `nullExtended`/`sideIndex`, not source order, so the preserved-keyed disjunction
+				// re-query surfaces matched + materialized + null-key rows identically for RIGHT.
+				const resetRnp = async (): Promise<void> => {
+					await db.exec('delete from rnp_parent');
+					await db.exec('delete from rnp_child');
+					await db.exec('insert into rnp_parent values (10, 100)');
+					await db.exec('insert into rnp_child values (1, 10, 1000)');   // matched
+					await db.exec('insert into rnp_child values (2, 99, 2000)');   // null-extended, dangling key
+					await db.exec('insert into rnp_child values (3, null, 3000)'); // null-extended, NULL key
+				};
+
+				// Matched-only.
+				await resetRnp();
+				assertRowsEqual('rnp matched RETURNING', await readRows('update rnpv set pv = 444 where cc = 1 returning cc, pv'),
+					[{ cc: 1, pv: 444 }], ['cc', 'pv']);
+
+				// Null-extended materialization.
+				await resetRnp();
+				assertRowsEqual('rnp null-extended materialization RETURNING', await readRows('update rnpv set pv = 555 where cc = 2 returning cc, cv, pv'),
+					[{ cc: 2, cv: 2000, pv: 555 }], ['cc', 'cv', 'pv']);
+
+				// Null-key no-op.
+				await resetRnp();
+				assertRowsEqual('rnp null-key no-op RETURNING', await readRows('update rnpv set pv = 666 where cc = 3 returning cc, pv'),
+					[{ cc: 3, pv: null }], ['cc', 'pv']);
+
+				// Mixed batch (matched + null-extended materialization + null-key no-op).
+				await resetRnp();
+				assertRowsEqual('rnp mixed-batch RETURNING', await readRows('update rnpv set pv = 777 where cc in (1, 2, 3) returning cc, pv'),
+					[{ cc: 1, pv: 777 }, { cc: 2, pv: 777 }, { cc: 3, pv: null }], ['cc', 'pv']);
+
+				// `returning *`.
+				await resetRnp();
+				assertRowsEqual('rnp mixed-batch RETURNING *', await readRows('update rnpv set pv = 888 where cc in (1, 2, 3) returning *'),
+					[{ cc: 1, cv: 1000, pv: 888 }, { cc: 2, cv: 2000, pv: 888 }, { cc: 3, cv: 3000, pv: null }], ['cc', 'cv', 'pv']);
+
+				// GetPut idempotence via the returned pv.
+				await resetRnp();
+				const rnpRet = await readRows('update rnpv set pv = 909 where cc in (1, 2, 3) returning cc, pv');
+				for (const r of rnpRet) await db.exec(`update rnpv set pv = ${r.pv === null ? 'null' : r.pv} where cc = ${r.cc}`);
+				assertRowsEqual('rnp GetPut idempotent via RETURNING', await readRows('select cc, cv, pv from rnpv order by cc'),
+					[{ cc: 1, cv: 1000, pv: 909 }, { cc: 2, cv: 2000, pv: 909 }, { cc: 3, cv: 3000, pv: null }], ['cc', 'cv', 'pv']);
+
+				// Preserved-side (child cv) update touching the null-extended cc=3 row + RETURNING
+				// (the latent partial-set bug #2, RIGHT mirror).
+				await resetRnp();
+				assertRowsEqual('rnp preserved-side update + null-extended row RETURNING',
+					await readRows('update rnpv set cv = 99 where cc in (1, 3) returning cc, cv, pv'),
+					[{ cc: 1, cv: 99, pv: 100 }, { cc: 3, cv: 99, pv: null }], ['cc', 'cv', 'pv']);
+
+				// Fan-out (RIGHT mirror): a parent shared by three children; a PRESERVED-column (cv)
+				// update over two of them returns each once and does not leak the unselected sibling
+				// cc=5 (which shares the captured parent PK but whose child PK is absent from the
+				// capture). The non-preserved-column shared-parent fan-out is out of scope (see LEFT).
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_parent values (10, 100)');
+				await db.exec('insert into rnp_child values (1, 10, 1000)');
+				await db.exec('insert into rnp_child values (4, 10, 4000)');
+				await db.exec('insert into rnp_child values (5, 10, 5000)');
+				assertRowsEqual('rnp fan-out RETURNING (no unaffected sibling leaked)',
+					await readRows('update rnpv set cv = 7 where cc in (1, 4) returning cc, cv, pv'),
+					[{ cc: 1, cv: 7, pv: 100 }, { cc: 4, cv: 7, pv: 100 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('rnp fan-out view image (unaffected sibling cc=5 untouched)',
+					await readRows('select cc, cv, pv from rnpv order by cc'),
+					[{ cc: 1, cv: 7, pv: 100 }, { cc: 4, cv: 7, pv: 100 }, { cc: 5, cv: 5000, pv: 100 }], ['cc', 'cv', 'pv']);
 			});
 
 			// ----- Outer (LEFT) join: existence-column WRITE (flag-flip ⇒ insert/delete) -----

@@ -2200,6 +2200,49 @@ select pv from ojp order by pv;
 → [{"pv":99},{"pv":333}]
 
 -- ===================================
+-- Outer (LEFT) join NON-PRESERVED-side UPDATE … RETURNING. The post-mutation re-query
+-- re-keys its identity off the stable PRESERVED-side (child) PK via a matched-OR-null
+-- disjunction (preserved side = exact PK equality; non-preserved side = matched OR
+-- captured-null), so a MATCHED row (parent updated in place), a freshly-MATERIALIZED
+-- null-extended row (parent minted), and a NULL-key no-op row all surface with their
+-- correct post-mutation NEW image. See docs/view-updateability.md § `returning` Clauses.
+-- ===================================
+pragma foreign_keys = false;
+create table ojrp (pp integer primary key, pv integer null);
+create table ojrc (cc integer primary key, pr integer null, cv integer null);
+create view ojrv as select c.cc as cc, c.cv as cv, p.pv as pv from ojrc c left join ojrp p on p.pp = c.pr;
+
+insert into ojrp values (10, 100);
+insert into ojrc values (1, 10, 1000);    -- matched
+insert into ojrc values (2, 99, 2000);    -- null-extended, dangling key (materializes)
+insert into ojrc values (3, null, 3000);  -- null-extended, NULL key (no-op)
+
+-- Matched-only: parent pp=10 updated in place; the matched disjunction branch identifies it.
+update ojrv set pv = 444 where cc = 1 returning cc, pv;
+→ [{"cc":1,"pv":444}]
+
+-- Null-extended materialization: the non-preserved PK was captured NULL, so the row is
+-- identified by the child PK alone (the null branch) and the freshly minted parent surfaces.
+update ojrv set pv = 555 where cc = 2 returning cc, cv, pv;
+→ [{"cc":2,"cv":2000,"pv":555}]
+
+-- Null-key no-op: nothing materializes, but the affected child row still returns its
+-- unchanged post-mutation image (pv null).
+update ojrv set pv = 666 where cc = 3 returning cc, pv;
+→ [{"cc":3,"pv":null}]
+
+-- Mixed batch over the (now all-joined cc=1,2 + null-key cc=3) view; `returning *` expands
+-- to the view's columns. Ascending child-PK scan order is deterministic.
+update ojrv set pv = 777 where cc in (1, 2, 3) returning *;
+→ [{"cc":1,"cv":1000,"pv":777},{"cc":2,"cv":2000,"pv":777},{"cc":3,"cv":3000,"pv":null}]
+
+-- Preserved-side (child cv) update over a batch including the null-extended cc=3 row +
+-- RETURNING: the captured-null parent PK is recovered by the null branch, so cc=3 is NOT
+-- dropped (the latent partial-set bug this fix closes).
+update ojrv set cv = 99 where cc in (1, 3) returning cc, cv, pv;
+→ [{"cc":1,"cv":99,"pv":777},{"cc":3,"cv":99,"pv":null}]
+
+-- ===================================
 -- Outer-join INSERT with FK ENFORCEMENT ON (the per-row conditional key thread).
 -- The preserved (FK-child) side threads the minted shared key into its join column
 -- only for rows whose non-preserved (FK-parent) partner is present that row; for a row
