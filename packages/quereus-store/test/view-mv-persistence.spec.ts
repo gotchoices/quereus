@@ -282,6 +282,30 @@ describe('StoreModule view / materialized-view persistence', () => {
 			.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
 	});
 
+	it('a 3-deep MV chain rehydrates through multiple fixpoint rounds (each level sorts before its source)', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10), (2, 20)`);
+		// Chain: a_top → m_mid → z_base (each reads the next). By catalog key order they
+		// sort a_top < m_mid < z_base — the exact REVERSE of build order — so a naive
+		// in-order replay fails the two dependents every pass. The fixpoint must take
+		// three rounds: round 1 builds only z_base, round 2 builds m_mid, round 3 a_top.
+		await db.exec(`create materialized view z_base as select id, v from base`);
+		await db.exec(`create materialized view m_mid as select id, v from z_base`);
+		await db.exec(`create materialized view a_top as select id, v from m_mid`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'deep MV chain rehydrates without error').to.have.lengthOf(0);
+		expect(result.materializedViews).to.have.members(['main.a_top', 'main.m_mid', 'main.z_base']);
+		expect(await rows(db2, 'select id, v from a_top order by id'))
+			.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		// Maintenance survives all the way up the rehydrated chain.
+		await db2.exec(`insert into base values (3, 30)`);
+		expect(await rows(db2, 'select id, v from a_top order by id'))
+			.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+	});
+
 	// ── Persist-queue drain & idempotency ────────────────────────────
 
 	it('view/MV writes enqueue on the persist queue (drained by whenCatalogPersisted)', async () => {
