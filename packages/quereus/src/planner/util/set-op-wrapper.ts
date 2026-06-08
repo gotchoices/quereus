@@ -27,8 +27,11 @@ import type * as AST from '../../parser/ast.js';
  * one call. A wrapper whose inner carries its own `compound` stops there (that inner is NOT
  * a pure wrapper — it re-compounds), so the inner compound is preserved verbatim.
  *
- * Shared by the read/plan path (`planner/building/select-compound.ts`) and the write path
- * (`planner/mutation/set-op.ts`), so neither can drift on what a pure wrapper is.
+ * Used today by the read/plan path (`planner/building/select-compound.ts`). The write path
+ * (`planner/mutation/set-op.ts` `leftBranchSelect`) does NOT yet unwrap — a write through a
+ * left-wrapped compound view is currently rejected cleanly (it sees the synthetic `select *`);
+ * `set-op-leftwrap-write` will reuse this same predicate there so neither path can drift on
+ * what a pure wrapper is.
  */
 export function unwrapPassthroughSubquery(sel: AST.SelectStmt): AST.QueryExpr | undefined {
 	if (!isPassthroughWrapper(sel)) return undefined;
@@ -52,7 +55,11 @@ function isPassthroughWrapper(sel: AST.SelectStmt): boolean {
 	// An `as v(a, b)` column-rename list renames the surface — not a pure passthrough.
 	if (src.columns && src.columns.length > 0) return false;
 	// Any of these clauses make the wrapper narrow / filter / re-order / re-compound the
-	// inner rows, so it is a real projection rather than a pure regrouping.
+	// inner rows, so it is a real projection rather than a pure regrouping. The legacy
+	// `union` / `unionAll` fields are dead in current parser output (compounds ride the
+	// `compound` slot), but are guarded for parity with the rest of the engine
+	// (`isNonRowReducingProjection`) so a hand-built or resurrected legacy AST cannot
+	// smuggle a re-compounding wrapper past this predicate.
 	return sel.where === undefined
 		&& sel.groupBy === undefined
 		&& sel.having === undefined
@@ -62,6 +69,8 @@ function isPassthroughWrapper(sel: AST.SelectStmt): boolean {
 		&& sel.limit === undefined
 		&& sel.offset === undefined
 		&& sel.compound === undefined
+		&& sel.union === undefined
+		&& !sel.unionAll
 		&& sel.schemaPath === undefined
 		&& sel.withClause === undefined;
 }
