@@ -14,6 +14,7 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
 import { MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
+import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
 /**
  * Set-operation membership-column write decomposition — the **first set-op view
@@ -63,6 +64,17 @@ import { cloneExpr, transformExpr } from './scope-transform.js';
  * surfaced-inner-flag write, and insert-through routing into a subtree side — have no single
  * deterministic target leaf (product-coordinate addressing) and are rejected, pointing at
  * `set-op-membership-nested`.
+ *
+ * **A LEFT operand can be a subtree too** (`set-op-leftwrap-write`). A parenthesized LEFT
+ * compound operand — `(A∪B) union[…] (C∪D)`, a *parallel-sibling* shape — is lifted by the parser
+ * into a `select * from (A∪B) as values_N` passthrough wrapper so the SELECT-level `compound` slot
+ * can host the outer operator. {@link buildBranch} **unwraps** that wrapper (via
+ * {@link unwrapBranchSelect}, the same {@link unwrapPassthroughSubquery} predicate the read/plan
+ * path uses) so the wrapped left operand is a first-class subtree operand — its data cols,
+ * `isNested`, and fan-out recursion all derive from the inner compound, exactly as the
+ * (always-direct) right compound operand. So the unambiguous fan-out (data UPDATE / DELETE /
+ * `set <subtreeFlag> = false`) reaches the LEFT subtree's leaves, while the ambiguous inserts
+ * into it stay deferred (`set-op-membership-nested`). The static surfaces walk both operands too.
  *
  * **Per-branch correlation.** A fan-out / membership-delete op identifies the branch's
  * affected rows by a correlated `exists (select 1 from __vmupd_keys k where <k matches
@@ -158,12 +170,16 @@ function isSetOpBodyWritable(selectAst: AST.SelectStmt): boolean {
  */
 function isOperandWritable(operand: AST.QueryExpr, hasGatingFlag: boolean): boolean {
 	if (operand.type !== 'select') return false;
-	if (operand.compound && operand.compound.op !== 'diff') {
+	// Unwrap a parenthesized LEFT compound operand's `select * from (compound)` wrapper so it is
+	// classified as the subtree it is, mirroring the dynamic `buildBranch` unwrap — a no-op on a
+	// direct operand (`set-op-leftwrap-write`).
+	const effective = unwrapBranchSelect(operand);
+	if (effective.compound && effective.compound.op !== 'diff') {
 		// An except / intersect subtree needs a boundary flag to gate the membership fan on.
-		if (!isUnionLikeSubtree(operand.compound.op) && !hasGatingFlag) return false;
-		return isSetOpBodyWritable(operand);
+		if (!isUnionLikeSubtree(effective.compound.op) && !hasGatingFlag) return false;
+		return isSetOpBodyWritable(effective);
 	}
-	return tryBranchColumnNames(operand) !== null;
+	return tryBranchColumnNames(effective) !== null;
 }
 
 /**
@@ -181,17 +197,22 @@ function isUnionLikeSubtree(op: 'union' | 'unionAll' | 'intersect' | 'except' | 
 
 /**
  * True iff a membership body has a **subtree (compound) operand** — an inner
- * `SetOperationNode` operand. Insert-through into a multi-leaf subtree has no single
- * deterministic target leaf (product-coordinate addressing — `set-op-membership-nested`),
+ * `SetOperationNode` operand on EITHER side. Insert-through into a multi-leaf subtree has no
+ * single deterministic target leaf (product-coordinate addressing — `set-op-membership-nested`),
  * so the static `is_insertable_into` surface gates to `NO` when this holds, while
- * data/delete fan-out (which touches every member leaf) stays writable. The left operand is
- * never a compound in SQL (a parenthesized left compound flattens to a subquery), so only
- * the right operand is probed.
+ * data/delete fan-out (which touches every member leaf) stays writable. A parenthesized LEFT
+ * compound operand is lifted into a `select * from (compound)` wrapper, so the left is unwrapped
+ * before probing — a parallel-sibling view (`set-op-leftwrap-write`) also reports NO.
  */
 export function setOpHasSubtreeOperand(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.compound) return false;
-	const right = selectAst.compound.select;
-	return right.type === 'select' && !!right.compound && right.compound.op !== 'diff';
+	const left = unwrapBranchSelect(leftBranchSelect(selectAst));
+	return isSubtreeOperand(left) || isSubtreeOperand(selectAst.compound.select);
+}
+
+/** True iff an operand SELECT is itself a (non-diff) set-op subtree. */
+function isSubtreeOperand(operand: AST.QueryExpr): boolean {
+	return operand.type === 'select' && !!operand.compound && operand.compound.op !== 'diff';
 }
 
 /**
@@ -205,7 +226,11 @@ export function setOpHasSubtreeOperand(selectAst: AST.QueryExpr): boolean {
 export function surfacedInnerFlagNames(selectAst: AST.QueryExpr): string[] {
 	const out: string[] = [];
 	if (selectAst.type === 'select' && selectAst.compound) {
-		// The left operand is never a compound in SQL; only the right operand can be a subtree.
+		// Walk BOTH operands in layout order (`[L flags] ++ [R flags]`). A parenthesized LEFT
+		// compound operand is lifted into a `select * from (compound)` wrapper, so unwrap it first —
+		// its inner flags surface too (`set-op-leftwrap-write`), and a write to one rejects with the
+		// clean `set-op-membership-nested` diagnostic rather than `unknown-view-column`.
+		collectSubtreeFlagNames(unwrapBranchSelect(leftBranchSelect(selectAst)), out);
 		collectSubtreeFlagNames(selectAst.compound.select, out);
 	}
 	return out;
@@ -431,6 +456,44 @@ function leftBranchSelect(sel: AST.SelectStmt): AST.SelectStmt {
 	return leftCore as AST.SelectStmt;
 }
 
+/**
+ * The **effective** operand SELECT of a (possibly parenthesized-compound) operand: the inner
+ * compound when `branchSelect` is a pure `select * from (<compound>) as values_N` passthrough
+ * wrapper (the shape the parser lifts a parenthesized LEFT compound operand into,
+ * `set-op-leftwrap-arity`), else `branchSelect` unchanged. Shared with the read/plan path
+ * (`select-compound.ts`'s `unwrapToSelect`, via the same {@link unwrapPassthroughSubquery}
+ * predicate) so neither path drifts on what a pure wrapper is.
+ *
+ * Threading it through {@link buildBranch} makes the wrapped LEFT operand a first-class subtree
+ * operand for the write path's unambiguous fan-out (data UPDATE / DELETE / `set <flag> = false`),
+ * exactly as the (always-direct) right compound operand already is (`set-op-leftwrap-write`). The
+ * unwrap is a no-op on a direct operand (a leaf SELECT, or the right side's direct compound), so
+ * applying it uniformly to both sides is safe. A non-SELECT inner (a `select * from (values…)`)
+ * stays the wrapper and is rejected downstream as a `select *` leg.
+ */
+function unwrapBranchSelect(branchSelect: AST.SelectStmt): AST.SelectStmt {
+	const inner = unwrapPassthroughSubquery(branchSelect);
+	return inner && inner.type === 'select' ? inner : branchSelect;
+}
+
+/**
+ * The **left-most leaf** SELECT of a (possibly nested, possibly wrapped) operand — the leg whose
+ * projection positionally aligns to the set operation's data columns (a `SetOperationNode`
+ * preserves its left child's column ids verbatim at every depth). A direct operand IS its own
+ * leaf; a nested compound descends its left leg, unwrapping each `select * from (compound)`
+ * wrapper. This is what {@link branchColumnNames} reads its data-column names from: a right-spine
+ * nested operand's left leg is a direct leaf (so `branchSelect.columns` already named it), but a
+ * LEFT-spine nested operand's left leg is itself wrapped (`set-op-leftwrap-write`), so a single
+ * `.columns` read there would see the wrapper's `*` — the descent reaches the real leaf instead.
+ */
+function leftmostLeafSelect(branchSelect: AST.SelectStmt): AST.SelectStmt {
+	let cur = unwrapBranchSelect(branchSelect);
+	while (cur.compound && cur.compound.op !== 'diff') {
+		cur = unwrapBranchSelect(leftBranchSelect(cur));
+	}
+	return cur;
+}
+
 /** The right operand's SELECT, stripped of any leg-local ORDER BY / LIMIT / OFFSET. */
 function rightBranchSelect(view: MutableViewLike, right: AST.QueryExpr): AST.SelectStmt {
 	if (right.type !== 'select') {
@@ -452,7 +515,12 @@ function buildBranch(
 	dataColCount: number,
 	flags: readonly MembershipFlag[],
 ): SetOpBranch {
-	const dataColNames = branchColumnNames(view, side, branchSelect);
+	// Unwrap a parenthesized LEFT compound operand's `select * from (<compound>)` wrapper to its
+	// inner compound, so a wrapped left operand is a first-class subtree operand (its data cols,
+	// `isNested`, and recursion all derive from the inner) — `set-op-leftwrap-write`. A no-op on a
+	// direct operand.
+	const effectiveSelect = unwrapBranchSelect(branchSelect);
+	const dataColNames = branchColumnNames(view, side, effectiveSelect);
 	if (dataColNames.length !== dataColCount) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-set-op',
@@ -463,11 +531,11 @@ function buildBranch(
 	const branchView: MutableViewLike = {
 		name: `__setop_${side}`,
 		schemaName: view.schemaName,
-		selectAst: branchSelect,
+		selectAst: effectiveSelect,
 	};
 	const flag = flags.find(f => f.side === side);
 	// A subtree operand carries its own (non-diff) compound; its fan-out recurses to leaves.
-	const isNested = !!branchSelect.compound && branchSelect.compound.op !== 'diff';
+	const isNested = !!effectiveSelect.compound && effectiveSelect.compound.op !== 'diff';
 	return { side, view: branchView, dataColNames, isNested, ...(flag ? { flag } : {}) };
 }
 
@@ -480,12 +548,16 @@ function buildBranch(
  * write a fanned-out value into.
  */
 function branchColumnNames(view: MutableViewLike, side: 'left' | 'right', branchSelect: AST.SelectStmt): string[] {
-	const names = tryBranchColumnNames(branchSelect);
+	// The data-column names are the left-most leaf's projection (a set op preserves its left
+	// child's column ids at every depth) — descend through a nested / left-wrapped operand so a
+	// LEFT-spine compound branch derives names from its real leaf, not a wrapper's `*`.
+	const leaf = leftmostLeafSelect(branchSelect);
+	const names = tryBranchColumnNames(leaf);
 	if (names) return names;
 	// `tryBranchColumnNames` returned `null` ⇒ a `*` or computed leg; re-derive the
 	// specific reason for the per-side diagnostic (the shared probe only yields the
 	// boolean, so the static surface and this path cannot drift on what counts as writable).
-	for (const rc of branchSelect.columns) {
+	for (const rc of leaf.columns) {
 		if (rc.type === 'all') {
 			raiseMutationDiagnostic({
 				reason: 'unsupported-set-op',

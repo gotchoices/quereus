@@ -403,7 +403,9 @@ relation. This is the **sum** surface (distinct flag names → distinct columns)
 **reuse** the same flag names (the **product** model — reused names merging into shared coordinate
 columns) are out of scope and currently rejected at create (the duplicate names collide in the set-op
 output scope); that merge is the deferred `set-op-product-coordinate-model`. Writes through the left
-wrapper are the separate `set-op-leftwrap-write`.
+wrapper landed as `set-op-leftwrap-write` (see § Set-operation membership writes → Parenthesized LEFT
+subtree operand): the write path unwraps the same pure wrapper, so the LEFT subtree fans out for the
+unambiguous operations exactly as the right subtree does.
 
 ### Set-operation membership writes
 
@@ -414,7 +416,8 @@ existence — the explicit, per-row control surface that replaces the never-buil
 removed by `remove-update-routing-tag-surface`). Scope is `union` / `union all` /
 `except` / `intersect` membership writes, with data-column UPDATE fan-out, DELETE fan-out,
 and `set <subtreeFlag> = false` recursing through a **nested / subtree operand** at any
-depth (`nestable-flagged-set-ops`). A **union / union all** subtree fans freely; a **flagged
+depth (`nestable-flagged-set-ops`) — on **either** side, including a parenthesized LEFT
+compound operand (`set-op-leftwrap-write`). A **union / union all** subtree fans freely; a **flagged
 `except` / `intersect`** subtree fans **membership-gated** on its captured boundary flag
 (`set-op-membership-nested-except`), and only a **flag-less** non-union boundary stays deferred.
 The genuinely ambiguous inserts into a multi-leaf
@@ -529,6 +532,28 @@ Each diagnostic names `set-op-membership-nested` and is neither the misleading
 `SetOperation … not updateable` message nor `unknown-view-column` (a surfaced inner flag IS a
 view column).
 
+**Parenthesized LEFT subtree operand** (`set-op-leftwrap-write`). A subtree operand can sit on the
+**left**, where SQL spells it as a parenthesized compound — `(A∪B) union[…] (C∪D)`, the
+*parallel-sibling* shape — which the parser lifts into a `select * from (A∪B) as values_N`
+passthrough wrapper so the SELECT-level `compound` slot can host the outer operator (§ Parenthesized
+LEFT-compound operand). The write path **unwraps** that pure wrapper (`buildBranch` →
+`unwrapPassthroughSubquery`, the same predicate the read/plan path uses) so the wrapped left operand
+is a first-class subtree operand — its data-column names, `isNested`, and fan-out recursion all derive
+from the inner compound, exactly as the (always-direct) right compound operand. The result is full
+symmetry: the unambiguous fan-out (data UPDATE / DELETE / `set <subtreeFlag> = false`) reaches the
+LEFT subtree's leaves at any depth — a `delete from P1 where id = 2` over `(A∪B) union[inL,inR] (C∪D)`
+fans into A and B, and `set inL = false` drops the row from the left subtree's resident leaves only
+(the right subtree keeps it). A union LEFT subtree fans freely; a flagged `except` / `intersect` LEFT
+subtree fans **membership-gated** on the boundary flag the outer compound declares for the left side
+(`set-op-membership-nested-except`), a flag-less non-union one stays deferred. The branch's data-column
+names come from its **left-most leaf** (a left-spine nest's own left leg is itself wrapped, so a single
+projection read would see the wrapper's `*`; the write path descends to the real leaf). The ambiguous
+inserts into the LEFT subtree (`set <subtreeFlag> = true`, a surfaced left-subtree inner-flag write,
+insert-through routing into the left subtree side) stay deferred to `set-op-membership-nested`, and the
+static surfaces walk **both** operands so `is_insertable_into` reports `NO` and the surfaced left-inner
+flags report `is_updatable = NO`. The orthogonal **product** model (two siblings *reusing* flag names,
+merging into shared coordinate columns) remains the blocked `set-op-product-coordinate-model`.
+
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of
 that tuple (the count variant is deferred). A data-fan-out value that *references* a data
@@ -559,11 +584,14 @@ branch-writable** (`set-op-membership-nested-except`): the probe threads each op
 that side) and admits a non-union subtree IFF its side carries a boundary flag to gate the fan
 on — so a flagged except/intersect view reports `is_updatable` / `is_deletable` = `YES`, while a
 **flag-less** non-union boundary stays non-writable (the conservative all-`NO` shape), agreeing
-with the dynamic reject. `is_insertable_into` is gated **off** to `NO` whenever any operand is a subtree
-(`setOpHasSubtreeOperand`) — a conservative, honest under-claim, since inserting into a
-multi-leaf subtree is deferred to `set-op-membership-nested`. Per-column, a **surfaced inner
-flag** reports `is_updatable = 'NO'` (writing it is deferred), while data columns and own
-flags report `YES`.
+with the dynamic reject. The probe **unwraps a parenthesized LEFT compound operand** before
+classifying it (`set-op-leftwrap-write`), so a parallel-sibling view reports its left subtree's
+writability identically to the right. `is_insertable_into` is gated **off** to `NO` whenever **either**
+operand is a subtree (`setOpHasSubtreeOperand`, which now walks the unwrapped left too) — a
+conservative, honest under-claim, since inserting into a multi-leaf subtree is deferred to
+`set-op-membership-nested`. Per-column, a **surfaced inner flag** — on either side, since
+`surfacedInnerFlagNames` walks both operands — reports `is_updatable = 'NO'` (writing it is deferred),
+while data columns and own flags report `YES`.
 
 > **Implemented surface vs. the design below.** Binary set-op write-through is realized
 > through the **membership columns** above (`set-op-membership-write`): the explicit

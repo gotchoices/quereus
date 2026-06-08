@@ -3617,6 +3617,302 @@ describe('Property-Based Tests', () => {
 		});
 	});
 
+	// --- Parenthesized LEFT-compound operand WRITES (set-op-leftwrap-write) ---
+	// A parenthesized LEFT compound operand — `(A∪B) union[…] (C∪D)`, the *parallel-sibling*
+	// shape — is lifted by the parser into a `select * from (A∪B) as values_N` passthrough wrapper.
+	// The write path now UNWRAPS that wrapper (`buildBranch`), making the wrapped left operand a
+	// first-class subtree operand: data UPDATE / DELETE / `set <subtreeFlag> = false` fan out
+	// through the LEFT subtree's leaves exactly as they already do through the (direct) right
+	// subtree. The ambiguous inserts into it (`set <flag> = true`, surfaced-inner-flag writes,
+	// insert-through into a subtree side) stay deferred to `set-op-membership-nested`. This closes
+	// the 6.0 backlog gap (`set-op-membership-nested` left write branch over a `select *` wrapper).
+	describe('Parenthesized LEFT-compound operand writes', () => {
+		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
+			return out;
+		}
+		async function ids(sql: string): Promise<SqlValue[]> {
+			return (await readRows(sql)).map(r => Object.values(r)[0]);
+		}
+		async function writeError(sql: string): Promise<string> {
+			try { await db.exec(sql); return ''; }
+			catch (e) { return e instanceof Error ? e.message : String(e); }
+		}
+		/** First SetOperationNode in a logically-planned body. */
+		function findSetOp(sql: string): RelationalPlanNode {
+			const ast = new Parser().parse(sql) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			const root = (plan as unknown as { getRelations(): readonly RelationalPlanNode[] }).getRelations()[0];
+			let found: RelationalPlanNode | undefined;
+			const visit = (n: PlanNode): void => {
+				if (found) return;
+				if (n.nodeType === PlanNodeType.SetOperation) { found = n as RelationalPlanNode; return; }
+				for (const c of n.getChildren()) visit(c);
+			};
+			visit(root);
+			if (!found) throw new Error('no SetOperationNode in planned body');
+			return found;
+		}
+		// A∪B = {1,2,3}; C∪D = {3,4,5}; outer = {1..5}. id 1=A, 2=A&B, 3=B&C, 4=C&D, 5=D.
+		async function seedPS(): Promise<void> {
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (1, 10), (2, 20)');
+			await db.exec('insert into B values (2, 20), (3, 30)');
+			await db.exec('insert into C values (3, 30), (4, 40)');
+			await db.exec('insert into D values (4, 40), (5, 50)');
+		}
+		// P1: flag-less inner siblings, outer boundary flags inL / inR. The shape that previously
+		// REJECTED on write (`the left branch uses 'select *'`).
+		const P1 = '(select id, x from A union select id, x from B)'
+			+ ' union exists left as inL, exists right as inR '
+			+ '(select id, x from C union select id, x from D)';
+		// P2: distinct-name flagged inner siblings — surfaces inA,inB (left) + inC,inD (right).
+		const P2 = '(select id, x from A union exists left as inA, exists right as inB select id, x from B)'
+			+ ' union exists left as inLsub, exists right as inRsub '
+			+ '(select id, x from C union exists left as inC, exists right as inD select id, x from D)';
+
+		it('P1 data fan-out: an update reaches every member leaf of the LEFT subtree (PutGet)', async () => {
+			await seedPS();
+			await db.exec(`create view P1 as ${P1}`);
+			// id=2 ∈ A AND B (both left-subtree leaves); ∉ C,D.
+			await db.exec('update P1 set x = 99 where id = 2');
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(99);
+			expect((await readRows('select x from B where id = 2'))[0].x).to.equal(99);
+			expect(await readRows('select id from C where id = 2'), 'right subtree never had id=2').to.deep.equal([]);
+			// id=3 ∈ B (left) AND C (right) → fans to BOTH subtrees.
+			await db.exec('update P1 set x = 93 where id = 3');
+			expect((await readRows('select x from B where id = 3'))[0].x).to.equal(93);
+			expect((await readRows('select x from C where id = 3'))[0].x).to.equal(93);
+			// PutGet: the view re-reads the new values, none escaping the predicate.
+			expect((await readRows('select x from P1 where id = 2'))[0].x).to.equal(99);
+			expect((await readRows('select x from P1 where id = 3'))[0].x).to.equal(93);
+		});
+
+		it('P1 data fan-out value referencing a data column recurses through the left wrapper (set x = x + 1)', async () => {
+			await seedPS();
+			await db.exec(`create view P1 as ${P1}`);
+			// id=2 ∈ A AND B (both left-subtree leaves). The value is cloned fresh at each leaf and
+			// resolves against that leaf's columns (the v1 matching-leg-names path), at depth.
+			await db.exec('update P1 set x = x + 1 where id = 2');
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(21);
+			expect((await readRows('select x from B where id = 2'))[0].x).to.equal(21);
+		});
+
+		it('P1 delete fan-out: a delete removes the row from the LEFT subtree leaves', async () => {
+			await seedPS();
+			await db.exec(`create view P1 as ${P1}`);
+			await db.exec('delete from P1 where id = 2'); // A & B (both left-subtree leaves)
+			expect(await ids('select id from A order by id')).to.deep.equal([1]);
+			expect(await ids('select id from B order by id')).to.deep.equal([3]);
+			expect(await readRows('select id from P1 where id = 2')).to.deep.equal([]);
+			// id=3 spans both subtrees → delete fans to B (left) and C (right).
+			await db.exec('delete from P1 where id = 3');
+			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
+			expect(await readRows('select id from C where id = 3')).to.deep.equal([]);
+			expect(await ids('select id from D order by id'), 'D untouched').to.deep.equal([4, 5]);
+		});
+
+		it('set <leftSubtreeFlag> = false drops the row from the LEFT subtree leaves only', async () => {
+			await seedPS();
+			await db.exec(`create view P1 as ${P1}`);
+			// id=3 ∈ B (left subtree) AND C (right subtree). `set inL = false` drops it from the
+			// left subtree leaves only; the right subtree keeps it, so the row stays visible.
+			await db.exec('update P1 set inL = false where id = 3');
+			expect(await readRows('select id from B where id = 3'), 'dropped from left leaf B').to.deep.equal([]);
+			expect((await readRows('select x from C where id = 3'))[0].x, 'right leaf C kept').to.equal(30);
+			// Still visible via the right subtree (inR=true), now a non-member of the left.
+			expect((await readRows('select inL, inR from P1 where id = 3'))[0]).to.deep.equal({ inL: false, inR: true });
+		});
+
+		it('set <leftSubtreeFlag> = true is rejected (insert into a multi-leaf subtree — product addressing)', async () => {
+			await seedPS();
+			await db.exec(`create view P1 as ${P1}`);
+			const msg = await writeError('update P1 set inL = true where id = 4'); // id=4 ∉ the left subtree
+			expect(msg, 'rejects').to.not.equal('');
+			expect(msg).to.match(/set-op-membership-nested/);
+			expect(msg, 'not unknown-view-column').to.not.match(/not a data or membership column/);
+		});
+
+		it('writing a surfaced LEFT-subtree inner flag rejects cleanly (named, not unknown-view-column)', async () => {
+			await seedPS();
+			await db.exec(`create view P2 as ${P2}`);
+			// inA is the LEFT subtree's inner leaf flag — surfaced as a readable column, but writing
+			// it addresses a branch INSIDE a subtree operand (product addressing).
+			const msg = await writeError('update P2 set inA = true where id = 1');
+			expect(msg, 'rejects').to.not.equal('');
+			expect(msg, 'inA IS a (surfaced) view column').to.match(/set-op-membership-nested/);
+			expect(msg, 'not unknown-view-column').to.not.match(/not a data or membership column/);
+		});
+
+		it('P2 data + left-subtree-drop fan-out works alongside the surfaced inner flags', async () => {
+			await seedPS();
+			await db.exec(`create view P2 as ${P2}`);
+			await db.exec('update P2 set x = 22 where id = 2'); // A & B (left subtree)
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(22);
+			expect((await readRows('select x from B where id = 2'))[0].x).to.equal(22);
+			await db.exec('update P2 set inLsub = false where id = 3'); // drop from left subtree (B)
+			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
+			expect((await readRows('select x from C where id = 3'))[0].x, 'right subtree kept').to.equal(30);
+		});
+
+		it('static surfaces agree with the dynamic write (P2 parallel-sibling)', async () => {
+			await seedPS();
+			await db.exec(`create view P2 as ${P2}`);
+			const info = (await readRows("select is_updatable, is_deletable, is_insertable_into from view_info('P2')"))[0];
+			expect(info.is_updatable, 'updatable (data + both-subtree fan-out)').to.equal('YES');
+			expect(info.is_deletable, 'deletable (delete fan-out)').to.equal('YES');
+			expect(info.is_insertable_into, 'insert into a subtree is deferred').to.equal('NO');
+			// column_info: data cols + own subtree flags = YES; surfaced inner flags (both sides) = NO.
+			const cols = new Map((await readRows("select column_name, is_updatable from column_info('P2')")).map(r => [r.column_name, r.is_updatable]));
+			expect(cols.get('id')).to.equal('YES');
+			expect(cols.get('x')).to.equal('YES');
+			expect(cols.get('inLsub'), 'own left subtree flag').to.equal('YES');
+			expect(cols.get('inRsub'), 'own right subtree flag').to.equal('YES');
+			for (const inner of ['inA', 'inB', 'inC', 'inD']) {
+				expect(cols.get(inner), `surfaced inner flag ${inner}`).to.equal('NO');
+			}
+			// Cross-check: the YES forms succeed dynamically and the deferred form rejects.
+			await db.exec('update P2 set x = 100 where id = 2');
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(100);
+			await db.exec('delete from P2 where id = 5');
+			expect(await readRows('select id from P2 where id = 5')).to.deep.equal([]);
+			expect(await writeError('update P2 set inA = true where id = 1'), 'surfaced inner deferred').to.match(/set-op-membership-nested/);
+		});
+
+		it('contradiction guard fires for the LEFT subtree (set x and inL = false)', async () => {
+			await seedPS();
+			await db.exec(`create view P1 as ${P1}`);
+			const msg = await writeError('update P1 set x = 5, inL = false where id = 2');
+			expect(msg, 'a data write + left-subtree removal of the same branch contradict').to.not.equal('');
+			expect(msg).to.match(/contradict|conflicting/i);
+		});
+
+		it('flagged EXCEPT left subtree (gated): a non-member visible via the right is NOT touched', async () => {
+			// Left subtree `A except B` carries the outer boundary flag inLsub; the gated fan AND-s
+			// k.inLsub into each leaf member-exists. id=7 ∈ A, B AND C ⇒ excluded from `A except B`
+			// (inLsub=false) but visible via the right subtree (inRsub=true).
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (1, 10), (7, 70)');
+			await db.exec('insert into B values (7, 70)');
+			await db.exec('insert into C values (7, 70)'); // D empty
+			const body = '(select id, x from A except exists left as inAx, exists right as inBx select id, x from B)'
+				+ ' union exists left as inLsub, exists right as inRsub '
+				+ '(select id, x from C union select id, x from D)';
+			await db.exec(`create view Vex as ${body}`);
+			expect((await readRows('select inLsub, inRsub from Vex where id = 7'))[0]).to.deep.equal({ inLsub: false, inRsub: true });
+			// update id=7 → right subtree (C) only; the LEFT except subtree is gated out (non-member).
+			await db.exec('update Vex set x = 99 where id = 7');
+			expect((await readRows('select x from C where id = 7'))[0].x, 'right leaf updated').to.equal(99);
+			expect((await readRows('select x from A where id = 7'))[0].x, 'left leaf A untouched').to.equal(70);
+			expect((await readRows('select x from B where id = 7'))[0].x, 'left leaf B untouched').to.equal(70);
+			// A genuine left member (id=1, ∈ A only ⇒ ∈ A except B) fans to the left subtree leaf A.
+			await db.exec('update Vex set x = 11 where id = 1');
+			expect((await readRows('select x from A where id = 1'))[0].x).to.equal(11);
+			// Static surfaces: a flagged except left ⇒ updatable / deletable (gated), not insertable.
+			const info = (await readRows("select is_updatable, is_deletable, is_insertable_into from view_info('Vex')"))[0];
+			expect(info.is_updatable).to.equal('YES');
+			expect(info.is_deletable).to.equal('YES');
+			expect(info.is_insertable_into).to.equal('NO');
+		});
+
+		it('flagged INTERSECT left subtree (gated): a non-member visible via the right is NOT touched', async () => {
+			// Left subtree `A intersect B` with boundary flag inLsub. id=2 ∈ A but ∉ B ⇒ non-member of
+			// A∩B (inLsub=false), visible via the right subtree; id=3 ∈ A and B ⇒ a genuine member.
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (2, 20), (3, 30)');
+			await db.exec('insert into B values (3, 30)');
+			await db.exec('insert into C values (2, 20)'); // D empty
+			const body = '(select id, x from A intersect exists left as inAx, exists right as inBx select id, x from B)'
+				+ ' union exists left as inLsub, exists right as inRsub '
+				+ '(select id, x from C union select id, x from D)';
+			await db.exec(`create view Vint as ${body}`);
+			expect((await readRows('select inLsub, inRsub from Vint where id = 2'))[0]).to.deep.equal({ inLsub: false, inRsub: true });
+			// delete id=2 → right subtree (C) only; left intersect leaves A,B untouched (non-member).
+			await db.exec('delete from Vint where id = 2');
+			expect(await readRows('select id from C where id = 2')).to.deep.equal([]);
+			expect((await readRows('select x from A where id = 2'))[0].x, 'A untouched').to.equal(20);
+			// id=3 is a genuine member (∈ A and B) → delete fans to both intersect leaves.
+			await db.exec('delete from Vint where id = 3');
+			expect(await readRows('select id from A where id = 3')).to.deep.equal([]);
+			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
+		});
+
+		it('flag-less non-union LEFT subtree stays deferred (set-op-membership-nested-except)', async () => {
+			// `(A except B) union exists right as inRsub (C∪D)` — the left except declares no boundary
+			// flag, so there is no captured probe to gate the fan on. Policy: deferred (reject + static all-NO).
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (1, 10), (7, 70)');
+			await db.exec('insert into B values (7, 70)');
+			await db.exec('insert into C values (7, 70)'); // D empty
+			const body = '(select id, x from A except select id, x from B)'
+				+ ' union exists right as inRsub '
+				+ '(select id, x from C union select id, x from D)';
+			await db.exec(`create view Vdef as ${body}`);
+			for (const sql of ['delete from Vdef where id = 1', 'update Vdef set x = 99 where id = 1']) {
+				const msg = await writeError(sql);
+				expect(msg, `${sql} must reject`).to.not.equal('');
+				expect(msg, sql).to.match(/set-op-membership-nested-except/);
+			}
+			expect((await readRows('select x from A where id = 1'))[0].x, 'base rows untouched').to.equal(10);
+			// Static surfaces all-NO (no boundary flag to gate the left except fan).
+			const info = (await readRows("select is_updatable, is_deletable, is_insertable_into from view_info('Vdef')"))[0];
+			expect(info.is_updatable).to.equal('NO');
+			expect(info.is_deletable).to.equal('NO');
+			expect(info.is_insertable_into).to.equal('NO');
+		});
+
+		it('depth-3 LEFT nest: data + delete fan out to the deepest left-most leaf', async () => {
+			// `((A∪B) ∪ (C∪D)) union[inL,inR] (E∪F)` — the left operand is itself a left-nested
+			// compound (its own left `(A∪B)` is again wrapped). The unwrap recursion peels every
+			// layer; a write to id=1 (A-only, the deepest left-most leaf) reaches A.
+			for (const t of ['A', 'B', 'C', 'D', 'E', 'F']) {
+				await db.exec(`create table ${t} (id integer primary key, x integer) using memory`);
+			}
+			await db.exec('insert into A values (1, 10)');
+			await db.exec('insert into B values (2, 20)');
+			await db.exec('insert into C values (3, 30)');
+			await db.exec('insert into D values (4, 40)');
+			await db.exec('insert into E values (5, 50)');
+			await db.exec('insert into F values (6, 60)');
+			const body = '(select id, x from A union select id, x from B)'
+				+ ' union (select id, x from C union select id, x from D)'
+				+ ' union exists left as inL, exists right as inR '
+				+ '(select id, x from E union select id, x from F)';
+			await db.exec(`create view V3 as ${body}`);
+			await db.exec('update V3 set x = 11 where id = 1'); // deepest left-most leaf A
+			expect((await readRows('select x from A where id = 1'))[0].x).to.equal(11);
+			await db.exec('delete from V3 where id = 1');
+			expect(await readRows('select id from A where id = 1')).to.deep.equal([]);
+			expect(await readRows('select id from V3 where id = 1')).to.deep.equal([]);
+		});
+
+		it('Key Soundness under write: the parallel-sibling view stays keyed on data columns (no flag in a key)', async () => {
+			await seedPS();
+			await db.exec(`create view P2 as ${P2}`);
+			await db.exec('update P2 set x = 99 where id = 3'); // a fan-out write through the left wrapper
+			const outer = findSetOp(P2);
+			// Sum layout [id, x, inA, inB, inC, inD, inLsub, inRsub]; keys stay on the data cols [0,1].
+			expect(outer.getType().columns.map(c => c.name)).to.deep.equal(
+				['id', 'x', 'inA', 'inB', 'inC', 'inD', 'inLsub', 'inRsub']);
+			for (const key of keysOf(outer)) {
+				for (const idx of key) expect(idx, 'a key references only data columns, never a flag').to.be.lessThan(2);
+			}
+		});
+	});
+
 	// --- 16. View Round-Trip Laws ---
 	// The backward-direction dual of Key Soundness. Key Soundness keeps the
 	// FORWARD relational walk honest (claimed keys / isSet never over-claim on
