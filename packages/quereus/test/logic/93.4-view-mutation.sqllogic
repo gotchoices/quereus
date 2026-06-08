@@ -2274,6 +2274,11 @@ select count(*) as n from mpc;
 → [{"n":0}]
 pragma foreign_keys = false;
 
+-- The reject is shape-based (driven by the FK *schema*, via sideDeclaresFkOnto), not by
+-- runtime enforcement, so it still fires with foreign_keys OFF — pragma-independent.
+insert into mpv (c, cv, pv, qv) values (4, 400, 30, 40);
+-- error: single shared key
+
 -- ===================================
 -- SUPPLIED shared key (the join key is a writable view column, not minted): the per-row
 -- key gate must NOT fire. The user's explicit key may reference a PRE-EXISTING parent the
