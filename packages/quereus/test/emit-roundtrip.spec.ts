@@ -113,6 +113,22 @@ describe('Emit: statement round-trips', () => {
 			it('membership on the outer op of a parenthesized compound round-trips stably', () => {
 				roundTripStmt('(select id, x from a union select id, x from b) union exists left as inL, exists right as inR (select id, x from a union select id, x from b)');
 			});
+
+			// A leg's OWN order by / limit binds inside the parens at parse; the
+			// stringifier must re-emit the grouping parens or re-parse would rebind
+			// them to the outer compound (parenthesized-compound-set-op-legs gap #1).
+			it('a leg with its own order by / limit re-emits its grouping parens', () => {
+				expect(roundTripStmt('select 1 union (select 2 order by 1 limit 1)'))
+					.to.equal('select 1 union (select 2 order by 1 limit 1)');
+			});
+
+			// Regression: an OUTER order by / limit on a compound applies to the whole
+			// compound, so it must be emitted AFTER the compound chain — not in its
+			// normal (left-leg) position, which produced un-reparseable SQL.
+			it('regression: an outer order by / limit emits after the compound', () => {
+				expect(roundTripStmt('select val from c_left union select val from c_right order by val limit 3'))
+					.to.equal('select val from c_left union select val from c_right order by val limit 3');
+			});
 		});
 
 		it('subquery in FROM', () => {

@@ -556,6 +556,12 @@ export function selectToString(stmt: AST.SelectStmt): string {
 		parts.push('having', expressionToString(stmt.having));
 	}
 
+	// Trailing ORDER BY / LIMIT / OFFSET. On a COMPOUND select these apply to the
+	// whole compound result and so are emitted AFTER the compound chain below —
+	// rendering them in their normal position would re-bind them to the LEFT leg on
+	// re-parse (and produce un-reparseable `… order by … union …` SQL). Built once
+	// here and appended last in both the compound and non-compound cases.
+	const trailing: string[] = [];
 	if (stmt.orderBy && stmt.orderBy.length > 0) {
 		const orderParts = stmt.orderBy.map(clause => {
 			let orderStr = expressionToString(clause.expr);
@@ -563,15 +569,13 @@ export function selectToString(stmt: AST.SelectStmt): string {
 			if (clause.nulls) orderStr += ` nulls ${clause.nulls.toLowerCase()}`;
 			return orderStr;
 		});
-		parts.push('order by', orderParts.join(', '));
+		trailing.push('order by', orderParts.join(', '));
 	}
-
 	if (stmt.limit) {
-		parts.push('limit', expressionToString(stmt.limit));
+		trailing.push('limit', expressionToString(stmt.limit));
 	}
-
 	if (stmt.offset) {
-		parts.push('offset', expressionToString(stmt.offset));
+		trailing.push('offset', expressionToString(stmt.offset));
 	}
 
 	let result = parts.join(' ');
@@ -585,11 +589,30 @@ export function selectToString(stmt: AST.SelectStmt): string {
 				.map(e => `exists ${e.branch} as ${quoteIdentifier(e.name)}`)
 				.join(', ') + ' ';
 		}
-		// Compound leg is a QueryExpr; astToString dispatches on the discriminator.
-		result += astToString(stmt.compound.select);
+		result += compoundLegToString(stmt.compound.select);
+	}
+
+	if (trailing.length > 0) {
+		result += ' ' + trailing.join(' ');
 	}
 
 	return result;
+}
+
+/**
+ * Renders one compound set-operation leg. A SELECT leg that carries its OWN
+ * trailing ORDER BY / LIMIT / OFFSET is wrapped in parentheses so those clauses
+ * re-bind INSIDE the leg on re-parse; without the parens they would attach to the
+ * enclosing compound and change the parse. Every other leg — a bare SELECT, a
+ * VALUES leg, or a nested compound (whose right-leaning re-parse is identical) —
+ * renders without parens, so existing round-trips are unchanged.
+ */
+function compoundLegToString(leg: AST.QueryExpr): string {
+	const s = astToString(leg);
+	if (leg.type === 'select' && ((leg.orderBy && leg.orderBy.length > 0) || leg.limit || leg.offset)) {
+		return `(${s})`;
+	}
+	return s;
 }
 
 function compoundOpToKeyword(op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'): string {
