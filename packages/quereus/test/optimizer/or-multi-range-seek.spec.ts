@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('OR multi-range seek', () => {
 	let db: Database;
@@ -37,7 +40,7 @@ describe('OR multi-range seek', () => {
 	it('disjoint ranges: price > 1000 OR price < 10', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price > 1000 OR price < 10 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Budget', 'Cheap', 'Free', 'Luxury', 'UltraLux']);
 	});
@@ -45,7 +48,7 @@ describe('OR multi-range seek', () => {
 	it('bounded ranges: score BETWEEN 90 AND 100 OR score BETWEEN 0 AND 10', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE (score >= 90 AND score <= 100) OR (score >= 0 AND score <= 10) ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Free', 'Luxury', 'UltraLux']);
 	});
@@ -53,7 +56,7 @@ describe('OR multi-range seek', () => {
 	it('mixed equality + range: price = 50 OR price > 1000', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price = 50 OR price > 1000 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Luxury', 'Mid', 'UltraLux']);
 	});
@@ -61,7 +64,7 @@ describe('OR multi-range seek', () => {
 	it('three branches: price > 2000 OR price < 1 OR price = 100', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price > 2000 OR price < 1 OR price = 100 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Free', 'Moderate', 'UltraLux']);
 	});
@@ -71,7 +74,7 @@ describe('OR multi-range seek', () => {
 	it('uses IndexSeek (not SeqScan) for OR-range on indexed column', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price > 1000 OR price < 10";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -85,7 +88,7 @@ describe('OR multi-range seek', () => {
 	it('OR-range on primary key column', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE id > 6 OR id < 3 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Budget', 'Cheap', 'Free', 'Moderate']);
 	});
@@ -95,7 +98,7 @@ describe('OR multi-range seek', () => {
 	it('no matching rows in any range', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price > 5000 OR price < -1 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(0);
 	});
@@ -103,7 +106,7 @@ describe('OR multi-range seek', () => {
 	it('single row matches in each range', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price > 2500 OR price < 1 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Free', 'UltraLux']);
 	});
@@ -113,7 +116,7 @@ describe('OR multi-range seek', () => {
 	it('single range scan still works (regression)', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price > 100 ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Luxury', 'Premium', 'UltraLux']);
 	});
@@ -121,7 +124,7 @@ describe('OR multi-range seek', () => {
 	it('IN-list multi-seek still works (regression)', async () => {
 		await setupProducts();
 		const q = "SELECT name FROM products WHERE price IN (5.0, 50.0, 1500.0) ORDER BY name";
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results.map(r => r.name)).to.deep.equal(['Cheap', 'Luxury', 'Mid']);
 	});

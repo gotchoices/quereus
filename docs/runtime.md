@@ -778,7 +778,7 @@ Mutation context is captured and preserved for deferred constraints:
 rctx.db._queueDeferredConstraintRow(
   baseTable,
   constraintName,
-  row.slice() as Row,
+  coerceNewSection(row, tableSchema),  // NEW section coerced to column logical types
   flatRowDescriptor,
   evaluator,
   connectionId,
@@ -786,6 +786,18 @@ rctx.db._queueDeferredConstraintRow(
   contextDescriptor  // Context row descriptor
 );
 ```
+
+The NEW section of the snapshotted row (indices `n..2n-1`) is coerced to the
+declared column logical types via `validateAndParse` before queueing. The insert
+pipeline otherwise defers type conversion to the storage layer's `performInsert`,
+so the row reaching the ConstraintCheck node still holds *raw* NEW values. Deferred
+CHECK subqueries compare those values against rows already stored (and therefore
+coerced) in other tables, so without this step a logical type that rewrites its
+value on parse (e.g. `datetime`) would spuriously fail equality at COMMIT (GitHub
+#25). OLD values are left untouched — they are NULL on INSERT or read from
+already-coerced stored rows on UPDATE — and a per-cell parse failure falls back to
+the raw value so the row's own `performInsert` remains the authoritative source of
+the MISMATCH error.
 
 **Evaluation at COMMIT:**
 ```typescript
@@ -854,22 +866,65 @@ const value = await entry.evaluator(runtimeCtx);
 
 ## Determinism Validation
 
-Quereus enforces that all expressions in CHECK constraints and DEFAULT values must be deterministic. This ensures that captured statements at the VTable update boundary are fully deterministic and replayable.
+The real invariant Quereus needs in DEFAULT / CHECK / GENERATED clauses is not
+"the source expression is deterministic" — it is "the captured artifact at the
+`vtab.update()` frontier is fully resolved and replayable." That invariant is
+satisfied by construction: defaults and stored generated columns are evaluated
+per row before reaching the module, immediate row CHECKs fire at write time so
+only passing rows reach `vtab.update()`, and deferred CHECKs evaluate once at
+commit (their outcome decides commit-vs-rollback for the entire transaction,
+so replay-via-module-layer cannot disagree with the commit outcome).
 
-### Why Determinism Matters
+Because of this, the prohibition on non-deterministic expressions in DDL is a
+**stricter-than-necessary proxy** for the actual replay contract, not a
+correctness requirement. Quereus therefore defaults to strict rejection for
+backward compatibility but exposes a single opt-in to lift the gate when you
+want it.
 
-Non-deterministic expressions (like `random()`, `datetime('now')`) produce different values on each execution. If these were allowed in constraints or defaults:
-- Replaying captured statements would produce different results
-- Constraint validation could be inconsistent
-- Audit logs would not be reproducible
+### The `nondeterministic_schema` option
 
-### Validation Rules
+| Option | Type | Default | Aliases |
+| --- | --- | --- | --- |
+| `nondeterministic_schema` | boolean | `false` | `allow_nondeterministic_schema_expressions` |
+
+Set programmatically or via PRAGMA:
+
+```sql
+pragma nondeterministic_schema = true;
+pragma nondeterministic_schema;
+-- → [{"name":"nondeterministic_schema","value":true}]
+```
+
+```typescript
+db.setOption('nondeterministic_schema', true);
+```
+
+When `true`, Quereus permits non-deterministic expressions in DEFAULT, CHECK,
+and `GENERATED ALWAYS AS` clauses. Capture still happens at the resolved-row
+frontier: the row stored in the table (and the literal SQL produced by
+`buildInsertStatement` / `buildUpdateStatement` / `buildDeleteStatement` in
+`util/mutation-statement.ts`) contains the concrete value the engine
+evaluated for that row.
+
+The option is not baked into any persisted schema; toggling it affects
+validation of *subsequent* DDL/DML only — already-created tables keep
+whatever expressions they were created with.
+
+### Strict-mode behaviour (default)
+
+The default `nondeterministic_schema = false` preserves the historical
+rejection paths.
 
 **Rejected in Constraints and Defaults:**
 - `random()`, `randomblob()` - Random value generation
 - `date('now')`, `time('now')`, `datetime('now')`, `julianday('now')` - Current time functions
 - User-defined functions marked as non-deterministic
 - Any expression containing non-deterministic sub-expressions
+- DML in expression position (`(insert/update/delete … returning …)` inside
+  a CHECK / DEFAULT / assertion expression). DML is non-deterministic via
+  the side-effect axis — the `DmlExecutorNode` sets `deterministic: false`,
+  which propagates through the AND-of-children physical-properties chain
+  and is rejected by the determinism enforcer.
 
 **Allowed in Constraints and Defaults:**
 - Constant literals: `42`, `'hello'`, `true`
@@ -939,13 +994,34 @@ db.createScalarFunction("my_upper",
 
 ### Validation Timing
 
+All determinism rejection sites described below are skipped when
+`nondeterministic_schema = true`. The bind-parameter / column-reference
+pre-walks remain active in both modes (those are scope checks, not
+determinism checks).
+
 **CREATE TABLE:**
-- DEFAULT expressions validated if they don't reference table columns
-- CHECK constraints NOT validated (columns don't exist yet in scope)
+- DEFAULT expressions are rejected if they reference bind parameters
+  (`?`, `:name`) or table columns; both are detected via an AST pre-walk
+  before expression building.
+- DEFAULT expressions are then built and rejected if their physical
+  `deterministic` property is false (e.g. `random()`).
+- CHECK constraints are walked at DDL time: any function call is looked up
+  against the registry and rejected unless it has the `DETERMINISTIC` flag.
+  Bind parameters (`?`, `:name`) are also rejected at DDL time. Column
+  references inside CHECK predicates are validated later, at INSERT/UPDATE
+  time, when the row scope is established.
+
+These DDL-time guards currently fire only on `CREATE TABLE`. The `ALTER
+TABLE` paths (`ADD COLUMN`, `ADD CONSTRAINT`, `ALTER COLUMN ... SET
+DEFAULT`) do not yet route through the same validators — extending them is
+a known follow-up.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion
-- CHECK constraints validated when building constraint checks
+- CHECK constraints validated when building constraint checks (full
+  column-scope resolution happens here)
+- `GENERATED ALWAYS AS` expressions validated when building the generated
+  column projection (INSERT) or assignment chain (UPDATE)
 
 **ALTER TABLE ADD CONSTRAINT:**
 - Validation deferred to first INSERT/UPDATE (constraints may reference NEW/OLD)
@@ -988,6 +1064,36 @@ async function run(rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<und
 	return undefined;
 }
 ```
+
+### Impure subquery emitters: full-drain + run-once
+
+Scalar, `IN`, and `EXISTS` subquery emitters detect a side-effecting inner via
+`PlanNodeCharacteristics.subtreeHasSideEffects(plan.subquery)` and switch to
+an impure-path implementation that applies two contracts:
+
+- **Full drain.** The emitter iterates every row of the inner. The pure path's
+  short-circuits (scalar's "first row only" / `IN`'s "first match" / `EXISTS`'s
+  "first row") would skip writes past row 1, so they are dropped for impure
+  inners. Loss of the short-circuit is acceptable because (a) it only fires for
+  DML-bearing inners and (b) correctness trumps the optimization there.
+- **Run-once per statement execution.** A correlated outer expression or a
+  per-row scan would re-invoke the scalar subquery's `run` function once per
+  outer row. The emitter memoizes the materialized result and the
+  scalar/`EXISTS`/`IN` answer on first call, and replays the memoized answer
+  on subsequent calls without re-driving the iterator. Closure state is
+  per-emission and `Statement` re-emits per execution, so the memoization
+  resets between prepared-statement runs.
+
+Both contracts are gated by `physical.readonly === false` on the inner — pure
+subqueries take the unchanged short-circuit fast path. See
+`src/runtime/emit/subquery.ts` for the emitter source.
+
+DML in expression position is rejected as a view body at view-creation time
+(see `src/planner/building/create-view.ts`). A view body re-evaluates on
+every reference; a DML body would re-drive writes per read, which the
+run-once fence cannot rescue (views compose, the cache lives at one emission
+site, and a downstream consumer would observe stale state). The check is
+permanent, not pending.
 
 ## Query Optimizer Integration
 
@@ -1039,6 +1145,113 @@ The runtime's column reference resolution relies on the optimizer's attribute ID
 - This enables robust resolution across arbitrary plan transformations
 
 For comprehensive optimizer details, see the [Optimizer Documentation](../optimizer.md).
+
+## ParallelDriver (Runtime Primitive)
+
+`src/runtime/parallel-driver.ts` exposes a `ParallelDriver` class with two operations:
+
+- `fork(rctx, n)` — returns `n` independent `RuntimeContext` views. Each fork has its own `RowContextMap` (seeded with a snapshot of the parent's entries) and its own `tableContexts` `Map` (seeded with a shallow copy). Writes via `createRowSlot`, `withRowContext`, or direct `tableContexts.set/delete` in one fork do not leak to siblings or to the parent. The fork's view of `context` and `tableContexts` is **snapshot-at-fork**, not read-through: parent mutations made *after* the fork is created are not visible inside the fork. Callers must therefore treat the parent's `context` and `tableContexts` as immutable for the lifetime of the forks. Read-mostly fields (`db`, `stmt`, `params`, `enableMetrics`, `tracer`, `activeConnection`, `contextTracker`, `planStack`) are shared by reference; concurrent mutation of those by branch code is the caller's responsibility (the driver makes no concurrency guarantee about them).
+- `drive(factories, forks, opts?)` — runs N `(ctx) => AsyncIterable<T>` factories concurrently with optional `concurrency` cap and `AbortSignal` cancellation, yielding `{ branch, value }` pairs in arrival order. On any branch error or signal abort, all sibling iterators are best-effort `return()`-closed before the error propagates; the same close-all path runs when a consumer breaks out of the `for-await` early.
+
+The driver is intentionally combinator-agnostic — it does not gather, zip, merge, or otherwise combine branch outputs. It has no plan-node or emitter consumers yet; it exists as the foundation primitive for the broader `parallel-*` track. Parallel use of virtual-table connections is governed by the module's declared `concurrencyMode` (see [Module Authoring § Concurrency Mode](module-authoring.md#3-concurrency-mode-parallel-runtime)); consumers call `getModuleConcurrencyMode(module)` and `acquireConnectionLock(connection)` (from `vtab/concurrency.ts`) to fall back to serial behavior when a `'serial'` module's connection is shared across sibling branches. The driver itself does not enforce the lock — enforcement belongs in the consumer that owns the vtab interaction (e.g. fan-out lookup join).
+
+### Parallel runtime fork contract
+
+Three invariants govern what code may do with a `RuntimeContext` once it has been forked. They are enforced by the test harness in `packages/quereus/test/runtime/fork-contract.spec.ts`.
+
+**1. Fork policy per RuntimeContext field.** Every field has a declared policy:
+
+| Field | Policy | Meaning |
+| --- | --- | --- |
+| `db` | `shared-frozen` | Shared by reference, immutable for fork lifetime. |
+| `stmt` | `shared-frozen` | Shared by reference. |
+| `params` | `shared-frozen` | Shared by reference (bound args). |
+| `context` | `forked` | Independent per branch (snapshot-at-fork). |
+| `tableContexts` | `forked` | Independent per branch (snapshot-at-fork). |
+| `tracer` | `shared-sink` | Shared write-only instrumentation. |
+| `activeConnection` | `shared-cooperative` | Vtab's `concurrencyMode` declares concurrent-use safety; `'serial'` (the default) requires `acquireConnectionLock`. |
+| `enableMetrics` | `shared-frozen` | Boolean flag. |
+| `contextTracker` | `shared-sink` | Diagnostics sink. |
+| `planStack` | `shared-sink` | Tracing-only stack. |
+
+Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
+
+**2. Parent immutability during fork lifetime.** A `RuntimeContext` whose `tableContexts` or `context` has been forked must not be mutated by the parent until every fork has finished being driven. The fork snapshots are taken at `fork()` time, not read-through, so parent mutations made afterward would silently diverge between parent and forks.
+
+**3. Mutation-site allowlist.** Direct `tableContexts.set/delete` and `context.set/delete` on a `RuntimeContext` are restricted to an audited set of files (`TABLE_CONTEXTS_MUTATION_ALLOWLIST` and `ROW_CONTEXT_MUTATION_ALLOWLIST` in the spec). Prefer `createRowSlot` / `withRowContext` / `withAsyncRowContext` over direct mutation. New direct-mutation sites must be added to the allowlist deliberately after weighing the fork-contract implications.
+
+### Connection-lock contract under impure subtrees
+
+`acquireConnectionLock` (in `vtab/concurrency.ts`) serializes sibling branches that share a `'serial'` (or `'reentrant-reads'`) module connection. It governs concurrent **reads** of the same connection — write operations are *not* a supported usage of the lock; the per-connection write protocol (transactions, savepoints, statement-bumps) is not reentrant under any of the currently-defined `concurrencyMode` values. A DML subtree on a branch driven concurrently with a sibling read would interleave the write with the sibling's cursor under the same connection, violating both the lock contract and the write protocol.
+
+Because of this, the parallel-track recognition rules in the optimizer (`AsyncGather` union-all / zip-by-key, `EagerPrefetch` probe, `FanOutLookupJoin`, `FanOutBatchedOuter`) **refuse to fold** when any participating branch reports `hasSideEffects = true`. The serial plan stays in place; writes execute exactly once, in textual order, under the connection lock. See `docs/optimizer.md` § "Parallel-track side-effect refusal" for the optimizer-side discipline and the shared `PlanNodeCharacteristics.isConcurrencySafe` predicate. Once a module advertises `'fully-reentrant'`, this restriction can be relaxed for that module — at which point both the optimizer predicate and the lock policy refine in tandem.
+
+### Strict-fork test mode
+
+Set `QUEREUS_FORK_STRICT=1` (or run `yarn test:fork-strict` from `packages/quereus`, which the root `yarn check` gate also runs) to enable a Node-only proxy/subclass that wraps every `RuntimeContext.tableContexts` and `RuntimeContext.context` constructed at the five production sites (`Statement`, `Database._executeSingleStatement`, `DatabaseAssertions.executeResidualPerTuple`, `DeferredConstraintQueue.runDeferredRows`, `const-evaluator`) plus every fork's own maps. The wrapper throws a `strict-fork: parent context mutated ...` error if any `set` / `delete` / `clear` is invoked on a parent map while one of its forks is currently being driven by `ParallelDriver.drive()`.
+
+State is tracked per parent map (not globally) so concurrent unrelated drivers don't interfere and forks may freely mutate their own (fresh) maps. When the env flag is unset every helper is a no-op pass-through — production paths see vanilla `new RowContextMap()` / `new Map()`.
+
+### EagerPrefetchNode (first ParallelDriver.fork consumer)
+
+`EagerPrefetchNode` is the first physical relational node that consumes `ParallelDriver.fork()` directly. It is a pass-through whose only effect is timing: **on `run()`** (emit / scheduler arg-assembly, *not* first iteration), its emitter forks the runtime context once, immediately starts a detached "pump" that drains the child sub-tree into a bounded ring buffer, and serves the consumer from that buffer. Rows, order, attribute IDs, keys, FDs, equivalence classes, orderings, and monotonicity all pass through verbatim — only `deterministic` / `idempotent` / `readonly` / `concurrencySafe` propagate via the default child-merge.
+
+Eager-on-`run()` is the point: inside a `BloomJoinNode`, the scheduler invokes the prefetch's `run()` during arg-assembly — before the join's generator body drains the build (`right`) side — so the probe's first fetch is already in flight while the build materializes. `prefetchAsyncIterable` returns a manual `AsyncIterable<Row>` (not an async generator) whose iterator owns teardown via `next()`/`return()`/`throw()`.
+
+**Iterate-or-close contract.** Because the fork (and its strict-fork counter) is live from `run()`, any consumer of an EagerPrefetch MUST either iterate the stream to completion or call its iterator's `return()` — otherwise the pump leaks (fills the buffer, then blocks on back-pressure forever) and the fork counter stays bumped. `emitBloomJoin` honors this by acquiring the left iterator up front and closing it in a `finally` that wraps both the build and probe phases (covering the build-error-before-probe path).
+
+Because the emitter uses `ParallelDriver.fork()` without going through `drive()`, it is responsible for the strict-fork bookkeeping that `drive()` normally handles internally. `parallel-driver.ts` re-exports `bumpParentForkCounter` / `dropParentForkCounter` for this purpose: any caller using `fork()` manually must `bump` once per parent map after forking and `drop` the returned state in cleanup once the fork's iteration is complete. Don't import these from `strict-fork.ts` directly — that module is internal.
+
+**Strict-fork interaction (eager-start).** Holding the fork live from `run()` means it is active for the entire statement, so any slot-creating ancestor (a `Project` or `Sort` above the join) mutates the same parent `rctx` while the fork is counted — tripping the strict-fork contract (invariant 2). This is the same known interaction as Sort-above-`AsyncGather`, and is a **strict-harness false-positive only**: `bumpParentForkCounter` is a no-op in production, and the probe is a self-contained relation scan whose detached snapshot never observes the parent's later mutations. Strict-mode tests over executed eager-prefetched plans are skipped accordingly; the non-strict path validates correctness.
+
+### AsyncGatherNode (N-ary parallel relational combinator)
+
+`AsyncGatherNode` is a physical N-ary relational node that drives ≥ 2 independent (uncorrelated) child relations concurrently via `ParallelDriver.drive()` and combines their outputs with a per-node `AsyncGatherCombinator`. Three combinators ship:
+
+- `unionAll` — yield every row from every branch in **arrival order** (multiset union, no dedup). All children must share a column count. Attribute IDs mirror `children[0]` so downstream `ORDER BY` references keep resolving (same convention as `SetOperationNode.buildAttributes`). Ordering, FDs, equivalence classes, constant bindings, and domain constraints are all dropped — arrival-order interleave is non-deterministic, so downstream consumers requiring a total order must wrap the gather in `Sort`. `isSet` is `false`; per-column nullability is the OR across children.
+
+- `crossProduct` — drain every branch fully, then yield the full N-ary Cartesian product. Output attributes are the verbatim concatenation of children's attributes; FDs / ECs / constant bindings / domain constraints are the pairwise N-ary fold of children's properties (the same fold `JoinNode(cross)` does, applied repeatedly). Cartesian-product order is deterministic-but-unspecified — it depends on the per-branch arrival order. **Memory caveat: the runtime buffers every branch in memory before yielding the first row.** This matches the materialization profile a fully-materialized `JoinNode(cross)` would have, but it is a real cost on wide products — callers should not use `crossProduct` when any branch is large. No streaming variant exists in v1.
+
+- `zipByKey({ branchKeyAttrs, outputKeyAttrs })` — full N-way **outer join** on the key columns named **per branch** by `branchKeyAttrs`. `branchKeyAttrs[b]` lists the attribute IDs of branch *b*'s K key columns in key-position order (distinct per branch — each branch originates its own key id); `outputKeyAttrs` lists the K attribute IDs the gather **mints** for the merged key columns (one per key position, pairwise distinct and disjoint from every child id). For each distinct key value present in any branch, emit exactly one composed row: the K merged key columns once (carrying the `outputKeyAttrs` ids, in key-position order), then each branch's non-key columns (NULL when that branch has no row for that key). Implemented as an **eager hash-merge** over a `BTree` keyed by the key tuple — *not* a chained binary full-outer-join lowering. Output key is `[[0..K-1]]`; `isSet` is `false`; key nullability is the OR across branches (a NULL-keyed standalone row can surface) and non-key columns are forced nullable. **Provenance:** the gather genuinely *originates* the K merged key columns ("branch0's key, or branch1's key, …, whichever row is present" — `outputKeyAttrs` appear in no child) and *forwards* each branch's non-key id (each appears in exactly one child), so `validatePhysicalTree` passes by construction — no id is output by two branches. Relational invariants (FDs/ECs/bindings/domains/ordering) are dropped, same conservatism as `unionAll` (conditional non-key FDs are future work). **Memory caveat: every branch is drained before the first row is yielded.** NULL keys never merge (SQL `NULL = NULL` is unknown) — each NULL-keyed row emits standalone. Within-branch duplicate keys are unspecified in v1 (branches assumed key-unique). Manual construction only — the recognition rule is the backlog ticket `parallel-async-gather-zip-by-key-rule`.
+
+All three combinators inherit `ParallelDriver.drive()`'s cancellation, error propagation (one branch's throw is re-raised after a best-effort `return()`-close of in-flight siblings), strict-fork bookkeeping, and consumer-break cleanup. Concurrency is capped at the node's `concurrencyCap` field, which the recognition rule (see `5.5-parallel-async-gather-union-all-rule`) initialises from `tuning.parallel.concurrency`.
+
+`expectedLatencyMs` and `concurrencySafe` are now defined on `PhysicalProperties`. The merge default the `PlanNode.physical` getter applies is `max` across children for `expectedLatencyMs` and `AND` across children for `concurrencySafe`. `TableReferenceNode` populates the leaf values: `concurrencySafe` from `getModuleConcurrencyMode(vtabModule) !== 'serial'`, and `expectedLatencyMs` from an optional `VirtualTableModule.expectedLatencyMs` hint (omit-implies-0 — local-only paths stay at 0 and the fan-out cost gate is inert by design until a remote plugin declares non-zero latency).
+
+**Recognition rule (unionAll).** `rule-async-gather-union-all.ts` (`PassId.PostOptimization` priority 17, after physical selection and before `materialization-advisory`) folds a chain of `SetOperationNode(unionAll)` into one `AsyncGatherNode({ kind: 'unionAll' })`. The rule fires only when every flattened child clears `physical.concurrencySafe === true` AND the slowest child meets `tuning.parallel.gatherThresholdMs` (default 25 ms). Memory-vtab leaves declare `expectedLatencyMs = 0`, so the rule is inert by design in local-only configurations and the `test/plan/` golden sweep is unaffected. The flatten step absorbs unionAll-`AsyncGatherNode` children as well as nested `SetOperationNode(unionAll)` — necessary because bottom-up traversal fires the rule on inner sub-chains first, so the outer firing must collapse the inner gather into the new one rather than nesting them. See `docs/optimizer.md` § "Async gather UNION ALL" for the full rule contract, gates, and tuning knobs. `crossProduct` recognition is opt-in only and is not on the optimizer roadmap. The `zipByKey` combinator (full N-way outer join, eager hash-merge) is implemented as a manual-construction node; its recognition rule is deferred to the backlog ticket `parallel-async-gather-zip-by-key-rule`.
+
+### FanOutLookupJoinNode (per-row fan-out lookup join)
+
+`FanOutLookupJoinNode` is a physical relational node that replaces a chain of N nested-loop LEFT/INNER joins where each branch is a key-aligned (FK→PK) lookup against an independent table — or, for `cross` branches, an unconstrained 1:n inner nested-loop join. For one outer row, the emitter forks the runtime context N times, drives the N parameterized branch sub-plans concurrently via `ParallelDriver.drive()`, collects each branch's result rows, and assembles the wide result rows (outer ++ branch[0] ++ … ++ branch[N-1] — the n-ary Cartesian product across branches).
+
+**Branch modes.** Each branch declares a `mode`:
+
+- `atMostOne-left` — like LEFT JOIN: a zero-row branch yields NULL-padded columns for that slice; the outer row is kept.
+- `atMostOne-inner` — like INNER JOIN: a zero-row branch drops the outer row entirely.
+- `cross` — like an inner nested-loop join: the branch yields *n* rows per outer row (data-driven cardinality) and the node emits one wide row per `(outer, branch-row)` combination — the Cartesian product. A zero-row branch drops the outer row (inner-drop). All product rows of one outer row are emitted contiguously, in outer order, with the right-most branch varying fastest (matching the nested-loop chain it replaces).
+- `cross-left` — like a LEFT nested-loop join with a data-driven 1:n match: same Cartesian product as `cross` when the branch matches, but a zero-row branch emits one NULL-padded factor row so the outer row is preserved (LEFT semantics). Its output columns are nullable-widened, like `atMostOne-left`.
+
+The left-preserving modes (`atMostOne-left` / `cross-left`) and the 1:n cross modes (`cross` / `cross-left`) are distinguished by the `isLeftBranchMode` / `isCrossBranchMode` predicates exported from `fanout-lookup-join-node.ts`, shared by the node's attribute/type widening, the recognition rule, and the emit composer. The `atMostOne-*` modes share an `atMostOne` invariant the runtime enforces defensively (scoped to those modes only — `cross` / `cross-left` are exempt): any such branch that yields more than one row for a single outer row throws `QuereusError(StatusCode.CONSTRAINT, "FanOutLookupJoin: branch i produced more than one row …")`. The recognition rule guarantees FK→PK alignment so this is unreachable in practice; it remains a defense against manually-constructed plans. The `array` (per-row N rows preserved) mode is deferred to a follow-up backlog ticket.
+
+**Lock policy.** Each branch declares a `concurrencySafe: boolean` (the node constructor / rule layer computes it from `getModuleConcurrencyMode` on the branch's table reference, plus a read-only-subtree check). When the flag is `true` the branch is invoked raw on its forked context; when `false`, the emitter wraps the branch in `acquireConnectionLock(target)` so sibling branches sharing the same lock target serialize. The lock target is the branch's `connectionKey` hint when present, otherwise `rctx.activeConnection`. Distinct connections never contend; sibling branches sharing a `'serial'` module connection serialize through the per-connection promise chain. When `concurrencySafe` is `false` but neither a `connectionKey` nor `rctx.activeConnection` is available (e.g. for CTE-materialization or const-evaluation paths that run without an established connection), the branch falls through raw — there is no identity to key the lock by, so serialization cannot be enforced and callers must ensure the situation is safe. v1 always reuses the outer's connection (`rctx.activeConnection`) when no explicit hint is set — opening a fresh connection per branch is deferred until a `'reentrant-reads'` plugin needs per-connection isolation.
+
+**Outer-row binding propagation.** The emitter installs the outer row's `RowSlot` on the parent `rctx.context` *before* forking, so each fork's snapshot (per `ParallelDriver.fork()`'s parent-snapshot semantics) already carries the binding. The branch sub-plan can read the outer columns from `rctx.context` inside its own emit code without further wiring.
+
+**Ordering / FDs.** Outer ordering passes through; v1 emits rows in outer order. Functional-dependency propagation is conservative: it folds the branches in left-to-right `propagateJoinFds` calls with **empty equi-pair lists** — the node does not currently carry per-branch FK→PK alignment, so it cannot derive the cross-branch FDs that the recognition rule (4.5) would otherwise see. Once a per-branch equi-pair surface is added to `FanOutBranchSpec`, the node's `computePhysical` can tighten without changing the emitter. `concurrencyCap` bounds the number of concurrently-active branches via `ParallelDriver.drive()`; the recognition rule (`rule-fanout-lookup-join.ts`) sources it from `min(tuning.parallel.concurrency, branches.length)`.
+
+**Recognition + cost gate.** The `rule-fanout-lookup-join` Structural-pass rule (priority 23, ahead of `join-elimination` at 24) clusters a Project-rooted chain of N FK→PK-aligned LEFT/INNER joins into one `FanOutLookupJoinNode`. Eligibility mirrors `ruleJoinElimination`'s checks (AND-of-column-equalities ON-clause, FK→PK alignment via `lookupCoveringFK` + `checkFkPkAlignment`, NOT-NULL FK + row-preserving path for INNER branches). The cost gate fires only when `(N − concurrencyCap) × expectedLatencyMs > N × branchSetupCost`; the formula clamps to 0 savings when `cap ≥ N` — fan-out wins only when concurrency-bound. The gate is intentionally inert for local-only chains (`expectedLatencyMs = 0`) — see `docs/optimizer.md` for the full rule contract.
+
+**Outer execution modes (`outerMode`).** The node carries `outerMode: 'serial' | 'batched'` (default `'serial'`). The serial path above overlaps the N branches of *one* outer row, then blocks on the next row — so a small per-row `branchCount` can never saturate a larger budget, and latency hiding is bounded to a single row. The `'batched'` path (run by `runFanOutLookupJoinBatched` in `runtime/emit/fanout-lookup-join.ts`) pipelines lookups *across* outer rows. `'serial'` remains the default; `rule-fanout-batched-outer` (`PassId.PostOptimization` priority 16 — see `docs/optimizer.md` § "Fan-out batched outer") flips a node to `'batched'` only when the per-row branch count under-saturates the global budget, the slowest branch is high-latency, and the outer cardinality is large — gates that are all inert on memory-vtab plans, so the golden-plan sweep stays byte-for-byte unchanged. When it flips, the rule also wraps the outer in an `EagerPrefetchNode` so the outer sub-plan runs against an isolated forked context (the batched pump then drains a pure buffer, never mutating the shared `rctx.context` the per-row forks bump — this is what makes the cross-row outer pump safe under strict-fork and against torn non-outer reads). Both modes emit rows in identical outer order, so `computePhysical`'s ordering pass-through holds for both.
+
+The batched driver:
+
+- **Global in-flight budget.** A single `AsyncSemaphore` (`runtime/async-semaphore.ts`, FIFO, single-shot idempotent release) over `tuning.parallel.outerBatchConcurrency` (default 16) caps concurrent branch lookups across *all* in-flight outer rows — distinct from `concurrency` (the per-row serial cap, default 8). A small `branchCount` saturates the budget by admitting more outer rows rather than more branches per row.
+- **Bounded outer read-ahead.** The outer pump admits at most `R = clamp(ceil(globalCap / max(1, branchCount)), 1, maxOuterReadAhead)` rows *ahead of the emit frontier* (the lowest not-yet-emitted row). `tuning.parallel.maxOuterReadAhead` (default 64) is the hard clamp so `branchCount = 1` cannot fork an unbounded number of contexts. Backpressure is measured from the consumer: a slow head-of-line row holds back at most `R` rows.
+- **Per-outer-row context isolation (load-bearing correctness point).** Each admitted row forks its own `rowCtx` from `rctx` and installs its own `RowSlot` (its own boxed `ref`), then forks the branches from `rowCtx`. The branch forks snapshot *this row's* getter — a closure over a ref that is never mutated again — so concurrently in-flight rows never share an outer binding. (The serial single-slot-on-parent approach mutates one shared `ref` per row and is unsafe under cross-row concurrency.) This is nested forking (`rctx → rowCtx → branch forks`); strict-fork counters are bumped on admit and dropped on row completion, mirroring `prefetchAsyncIterable`.
+- **Permit-before-lock ordering.** Each branch task acquires its global permit *before* the wrapped factory's first pull (where `acquireConnectionLock` is taken). A lock-holder therefore always also holds a permit, so a permit-holder blocked on a lock is always waiting on another permit-holder that will release — no deadlock. A shared `'serial'` connection still serializes across branches of *different* outer rows through the per-connection promise chain (more rows in flight just raises contention on that one connection).
+- **Order-preserving reorder buffer.** Each completed row lands in a `seq`-keyed map as the (possibly empty) list of wide rows it produced; the generator emits all of `seq = emitFrontier`'s rows contiguously as soon as they land, then advances the frontier (an empty list is a dropped outer row — an `atMostOne-inner` miss or an empty `cross` branch). Window accounting advances per `seq`, independent of product fan-out. Out-of-order completion, in-order emit. Consumer `return()`, downstream `throw`, or any branch error aborts the pump, `return()`-closes all live branch iterators, drains all per-row jobs to their teardown (drop fork counters, close slots), and re-raises the first branch error.
+
+The `composeOuterRows(outerRow, branchBuf, descriptors, padLengths) → Row[]` helper (NULL-pad + inner-drop + Cartesian-product composition) is shared by both drivers so they compose identically; an empty array signals a dropped outer row.
 
 ## Incremental Delta Runtime (Design)
 

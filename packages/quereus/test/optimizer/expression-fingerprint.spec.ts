@@ -14,8 +14,7 @@ import type { ScalarType } from '../../src/common/datatype.js';
 import { WindowFunctionCallNode } from '../../src/planner/nodes/window-function.js';
 import { ArrayIndexNode } from '../../src/planner/nodes/array-index-node.js';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const scope = EmptyScope.instance as any;
+const scope = EmptyScope.instance;
 
 const textType: ScalarType = { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: false };
 const intType: ScalarType = { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: false };
@@ -30,12 +29,12 @@ function lit(value: unknown): LiteralNode {
 }
 
 function binOp(op: string, left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-	const ast = { type: 'binary', operator: op, left: (left as any).expression, right: (right as any).expression } as AST.BinaryExpr;
+	const ast = { type: 'binary', operator: op, left: left.expression, right: right.expression } as AST.BinaryExpr;
 	return new BinaryOpNode(scope, ast, left, right);
 }
 
 function unaryOp(op: string, operand: ScalarPlanNode): UnaryOpNode {
-	const ast = { type: 'unary', operator: op, operand: (operand as any).expression } as unknown as AST.UnaryExpr;
+	const ast = { type: 'unary', operator: op, operand: operand.expression } as unknown as AST.UnaryExpr;
 	return new UnaryOpNode(scope, ast, operand);
 }
 
@@ -50,12 +49,12 @@ function makeFunctionSchema(name: string, deterministic: boolean): ScalarFunctio
 }
 
 function fnCall(name: string, args: ScalarPlanNode[], deterministic = true): ScalarFunctionCallNode {
-	const expr = { type: 'function', name, args: args.map(a => (a as any).expression) } as unknown as AST.FunctionExpr;
+	const expr = { type: 'function', name, args: args.map(a => a.expression) } as unknown as AST.FunctionExpr;
 	return new ScalarFunctionCallNode(scope, expr, makeFunctionSchema(name, deterministic), args);
 }
 
 function aggCall(name: string, args: ScalarPlanNode[], distinct = false): AggregateFunctionCallNode {
-	const expr = { type: 'function', name, args: args.map(a => (a as any).expression) } as unknown as AST.FunctionExpr;
+	const expr = { type: 'function', name, args: args.map(a => a.expression) } as unknown as AST.FunctionExpr;
 	const schema: AggregateFunctionSchema = {
 		name,
 		numArgs: args.length,

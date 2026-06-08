@@ -1,5 +1,5 @@
 import type { RelationType } from '../../common/datatype.js';
-import { PlanNode, type RelationalPlanNode, type Attribute, type UnaryRelationalNode, ScalarPlanNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type UnaryRelationalNode, ScalarPlanNode, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type { TableReferenceNode } from './reference.js';
@@ -55,6 +55,27 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	/**
+	 * Pass-through propagation of the source pipeline's physical properties.
+	 * Retrieve is a marker for the module/Quereus execution boundary — its
+	 * output is bit-for-bit the source's output, so FDs/ECs/bindings/keys/
+	 * ordering all carry through unchanged. Without this override the default
+	 * physical accessor drops them at the boundary.
+	 */
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const src = childrenPhysical[0];
+		if (!src) return {};
+		return {
+			estimatedRows: this.source.estimatedRows,
+			ordering: src.ordering,
+			monotonicOn: src.monotonicOn,
+			fds: src.fds,
+			equivClasses: src.equivClasses,
+			constantBindings: src.constantBindings,
+			domainConstraints: src.domainConstraints,
+		};
 	}
 
 	/** Get the virtual table module for this retrieve node */

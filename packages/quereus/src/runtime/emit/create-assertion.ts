@@ -36,7 +36,8 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			violationSql,
 			deferrable: true, // Auto-deferred for multi-table constraints
 			initiallyDeferred: true,
-			dependentTables: []
+			dependentTables: [],
+			checkExpression: plan.checkExpression,
 		};
 
 		// Discover dependent base tables (best-effort; conservative if any failure)
@@ -44,13 +45,17 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			const planNode = rctx.db.getPlan(violationSql);
 			const deps = new Map<string, AssertionDependentTable>();
 			(function collect(node: unknown) {
-				const anyNode = node as any;
-				if (anyNode && typeof anyNode.getRelations === 'function') {
-					for (const child of anyNode.getRelations()) collect(child);
+				const candidate = node as {
+					getRelations?: () => Iterable<unknown>;
+					tableSchema?: { name?: string; schemaName?: string };
+					id?: unknown;
+				};
+				if (candidate && typeof candidate.getRelations === 'function') {
+					for (const child of candidate.getRelations()) collect(child);
 				}
-				if (anyNode?.tableSchema?.name && anyNode?.id !== undefined) {
-					const base = `${anyNode.tableSchema.schemaName}.${anyNode.tableSchema.name}`.toLowerCase();
-					const relationKey = `${base}#${anyNode.id}`;
+				if (candidate?.tableSchema?.name && candidate?.id !== undefined) {
+					const base = `${candidate.tableSchema.schemaName}.${candidate.tableSchema.name}`.toLowerCase();
+					const relationKey = `${base}#${String(candidate.id)}`;
 					if (!deps.has(relationKey)) deps.set(relationKey, { relationKey, base });
 				}
 			})(planNode);
@@ -73,7 +78,7 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			);
 		}
 
-		schema.addAssertion(assertionSchema);
+		schemaManager.addAssertion(schema.name, assertionSchema);
 
 		log('Created assertion %s with violationSql: %s', plan.name, violationSql);
 		return null;

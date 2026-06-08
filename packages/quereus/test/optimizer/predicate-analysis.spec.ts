@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { EmptyScope } from '../../src/planner/scopes/empty.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { BinaryOpNode, LiteralNode, BetweenNode, UnaryOpNode } from '../../src/planner/nodes/scalar.js';
+import { InNode } from '../../src/planner/nodes/subquery.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
@@ -10,10 +11,10 @@ import { extractConstraints, type TableInfo } from '../../src/planner/analysis/c
 import { TEXT_TYPE } from '../../src/types/builtin-types.js';
 
 describe('Predicate analysis', () => {
-	const scope = EmptyScope.instance as unknown as any;
+	const scope = EmptyScope.instance;
 
 	function colRef(attrId: number, name: string, index: number): ColumnReferenceNode {
-		const expr: AST.ColumnExpr = { type: 'column', schema: undefined as any, table: undefined as any, name } as unknown as AST.ColumnExpr;
+		const expr: AST.ColumnExpr = { type: 'column', name };
 		const columnType = {
 			typeClass: 'scalar' as const,
 			logicalType: TEXT_TYPE,
@@ -29,27 +30,27 @@ describe('Predicate analysis', () => {
 	}
 
 	function andNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (left as any).expression, right: (right as any).expression };
+		const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: left.expression, right: right.expression };
 		return new BinaryOpNode(scope, ast, left, right);
 	}
 
 	function orNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: 'OR', left: (left as any).expression, right: (right as any).expression };
+		const ast: AST.BinaryExpr = { type: 'binary', operator: 'OR', left: left.expression, right: right.expression };
 		return new BinaryOpNode(scope, ast, left, right);
 	}
 
 	function eqNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: '=', left: (left as any).expression, right: (right as any).expression };
+		const ast: AST.BinaryExpr = { type: 'binary', operator: '=', left: left.expression, right: right.expression };
 		return new BinaryOpNode(scope, ast, left, right);
 	}
 
 	function notNode(operand: ScalarPlanNode): UnaryOpNode {
-		const ast: AST.UnaryExpr = { type: 'unary', operator: 'NOT', expr: (operand as any).expression };
+		const ast: AST.UnaryExpr = { type: 'unary', operator: 'NOT', expr: operand.expression };
 		return new UnaryOpNode(scope, ast, operand);
 	}
 
 	function minusNode(operand: ScalarPlanNode): UnaryOpNode {
-		const ast: AST.UnaryExpr = { type: 'unary', operator: '-', expr: (operand as any).expression };
+		const ast: AST.UnaryExpr = { type: 'unary', operator: '-', expr: operand.expression };
 		return new UnaryOpNode(scope, ast, operand);
 	}
 
@@ -67,11 +68,10 @@ describe('Predicate analysis', () => {
     let totalValues = 0;
     while (stack.length) {
       const n = stack.pop()!;
-      const exprOp = (n as any).expression?.operator;
+      const exprOp = (n as { expression?: { operator?: string } }).expression?.operator;
       if (exprOp === 'OR') {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const b = n as any;
-        stack.push(b.left as ScalarPlanNode, b.right as ScalarPlanNode);
+        const b = n as BinaryOpNode;
+        stack.push(b.left, b.right);
         continue;
       }
       if (n.nodeType === PlanNodeType.BinaryOp && exprOp === '=') {
@@ -79,8 +79,7 @@ describe('Predicate analysis', () => {
         continue;
       }
       if (n.nodeType === PlanNodeType.In) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const values = ((n as any).values as unknown[] | undefined) ?? [];
+        const values = (n as { values?: unknown[] }).values ?? [];
         totalValues += values.length;
         continue;
       }
@@ -158,12 +157,12 @@ describe('Predicate analysis', () => {
 		};
 
 		function gtNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-			const ast: AST.BinaryExpr = { type: 'binary', operator: '>', left: (left as any).expression, right: (right as any).expression };
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '>', left: left.expression, right: right.expression };
 			return new BinaryOpNode(scope, ast, left, right);
 		}
 
 		function ltNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-			const ast: AST.BinaryExpr = { type: 'binary', operator: '<', left: (left as any).expression, right: (right as any).expression };
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '<', left: left.expression, right: right.expression };
 			return new BinaryOpNode(scope, ast, left, right);
 		}
 
@@ -237,6 +236,137 @@ describe('Predicate analysis', () => {
 			const ops = res.allConstraints.map(cn => cn.op).sort();
 			expect(ops).to.deep.equal(['=', 'IN']);
 			expect(res.residualPredicate).to.be.undefined;
+		});
+	});
+
+	// ---- Canonical-form audit for monotonic-range-scan recognition ----
+	//
+	// Each shape below must produce the canonical constraint set that
+	// rule-monotonic-range-access (and the access-path lowering that feeds it)
+	// relies on. If any of these regress, the range-scan rule will silently
+	// stop firing on that shape.
+
+	describe('Canonical-form audit (monotonic range patterns)', () => {
+		const tableInfo: TableInfo = {
+			relationName: 'main.t',
+			relationKey: 'main.t#test',
+			attributes: [{ id: 700, name: 'x' }],
+			columnIndexMap: new Map([[700, 0]]),
+			uniqueKeys: [[0]],
+		};
+
+		function gtNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '>', left: left.expression, right: right.expression };
+			return new BinaryOpNode(scope, ast, left, right);
+		}
+		function geNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '>=', left: left.expression, right: right.expression };
+			return new BinaryOpNode(scope, ast, left, right);
+		}
+		function ltNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '<', left: left.expression, right: right.expression };
+			return new BinaryOpNode(scope, ast, left, right);
+		}
+		function leNode(left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
+			const ast: AST.BinaryExpr = { type: 'binary', operator: '<=', left: left.expression, right: right.expression };
+			return new BinaryOpNode(scope, ast, left, right);
+		}
+		function inNode(condition: ScalarPlanNode, values: ScalarPlanNode[]): InNode {
+			const ast: AST.InExpr = {
+				type: 'in',
+				expr: condition.expression,
+				values: values.map(v => v.expression),
+			};
+			return new InNode(scope, ast, condition, undefined, values);
+		}
+		function constraintsFor(pred: ScalarPlanNode) {
+			const all = extractConstraints(pred, [tableInfo]).allConstraints;
+			return all.map(c => ({ op: c.op, value: c.value, columnIndex: c.columnIndex, usable: c.usable, targetRelation: c.targetRelation }));
+		}
+
+		it('x BETWEEN a AND b → [>= a, <= b] both usable', () => {
+			const c = colRef(700, 'x', 0);
+			const ast: AST.BetweenExpr = { type: 'between', expr: c.expression, lower: lit(1).expression, upper: lit(4).expression };
+			const between = new BetweenNode(scope, ast, c, lit(1), lit(4));
+			const cs = constraintsFor(between);
+			expect(cs).to.have.lengthOf(2);
+			const lower = cs.find(c => c.op === '>=')!;
+			const upper = cs.find(c => c.op === '<=')!;
+			expect(lower).to.deep.include({ op: '>=', value: 1, columnIndex: 0, usable: true, targetRelation: 'main.t#test' });
+			expect(upper).to.deep.include({ op: '<=', value: 4, columnIndex: 0, usable: true, targetRelation: 'main.t#test' });
+		});
+
+		it('x >= a AND x <= b → [>= a, <= b]', () => {
+			const c = colRef(700, 'x', 0);
+			const pred = andNode(geNode(c, lit(1)), leNode(c, lit(4)));
+			const cs = constraintsFor(pred);
+			expect(cs).to.have.lengthOf(2);
+			expect(cs.map(c => c.op).sort()).to.deep.equal(['<=', '>=']);
+		});
+
+		it('x >= a AND x < b → [>= a, < b]', () => {
+			const c = colRef(700, 'x', 0);
+			const pred = andNode(geNode(c, lit(1)), ltNode(c, lit(4)));
+			const cs = constraintsFor(pred);
+			expect(cs).to.have.lengthOf(2);
+			expect(cs.map(c => c.op).sort()).to.deep.equal(['<', '>=']);
+		});
+
+		it('x > a AND x <= b → [> a, <= b]', () => {
+			const c = colRef(700, 'x', 0);
+			const pred = andNode(gtNode(c, lit(1)), leNode(c, lit(4)));
+			const cs = constraintsFor(pred);
+			expect(cs).to.have.lengthOf(2);
+			expect(cs.map(c => c.op).sort()).to.deep.equal(['<=', '>']);
+		});
+
+		it('x > a AND x < b → [> a, < b]', () => {
+			const c = colRef(700, 'x', 0);
+			const pred = andNode(gtNode(c, lit(1)), ltNode(c, lit(4)));
+			const cs = constraintsFor(pred);
+			expect(cs).to.have.lengthOf(2);
+			expect(cs.map(c => c.op).sort()).to.deep.equal(['<', '>']);
+		});
+
+		it('x = c → single = constraint (not internally rewritten to >=/<=)', () => {
+			const c = colRef(700, 'x', 0);
+			const cs = constraintsFor(eqNode(c, lit(3)));
+			expect(cs).to.have.lengthOf(1);
+			expect(cs[0]).to.deep.include({ op: '=', value: 3, columnIndex: 0, usable: true });
+		});
+
+		it('x >= a alone → single >= constraint (open upper bound)', () => {
+			const c = colRef(700, 'x', 0);
+			const cs = constraintsFor(geNode(c, lit(5)));
+			expect(cs).to.have.lengthOf(1);
+			expect(cs[0]).to.deep.include({ op: '>=', value: 5, columnIndex: 0, usable: true });
+		});
+
+		it('x < b alone → single < constraint (open lower bound)', () => {
+			const c = colRef(700, 'x', 0);
+			const cs = constraintsFor(ltNode(c, lit(5)));
+			expect(cs).to.have.lengthOf(1);
+			expect(cs[0]).to.deep.include({ op: '<', value: 5, columnIndex: 0, usable: true });
+		});
+
+		it('x IN (c1, c2) → single IN constraint with array value', () => {
+			const c = colRef(700, 'x', 0);
+			const node = inNode(c, [lit(1), lit(2)]);
+			const cs = extractConstraints(node, [tableInfo]).allConstraints;
+			expect(cs).to.have.lengthOf(1);
+			expect(cs[0].op).to.equal('IN');
+			expect(cs[0].value).to.deep.equal([1, 2]);
+			expect(cs[0].columnIndex).to.equal(0);
+			expect(cs[0].usable).to.equal(true);
+		});
+
+		it('reversed comparison c >= x → flipped to x <= c', () => {
+			const c = colRef(700, 'x', 0);
+			// Constant on the LEFT — extractor flips operator
+			const cs = constraintsFor(geNode(lit(4), c));
+			expect(cs).to.have.lengthOf(1);
+			expect(cs[0].op).to.equal('<=');
+			expect(cs[0].value).to.equal(4);
 		});
 	});
 });

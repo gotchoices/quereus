@@ -14,12 +14,79 @@ import type { ModuleCapabilities } from '../capabilities.js';
 
 const logger = createMemoryTableLoggers('module');
 
+const EMPTY_COLUMN_SET: ReadonlySet<number> = new Set<number>();
+
+/**
+ * Cost per pairwise comparison used to estimate an external sort. Tuned to be
+ * commensurate with the access-plan cost units emitted by `AccessPlanBuilder`
+ * (e.g. fullscan = rows * 1.0, range scan ≈ rows * 0.5 + 0.3). For 1000 rows
+ * a sort costs ≈ 1000 * log2(1000) * 0.1 ≈ 1000 — i.e. comparable to a full
+ * scan, which matches the rough heuristic that sorting N rows is on the same
+ * order as scanning them once when N is moderate.
+ */
+const SORT_COST_PER_COMPARISON = 0.1;
+
+/**
+ * Per-row cost charged for each unhandled filter when an ordering-only access
+ * pattern leaves filters as residual predicates. Mirrors the global
+ * FILTER_PER_ROW constant used elsewhere in the cost model.
+ */
+const RESIDUAL_FILTER_COST_PER_ROW = 0.2;
+
+/**
+ * Estimate the cost of an external O(n log n) sort over `rows` rows. Returns
+ * 0 for ≤1 rows where no sort is required.
+ */
+function estimateSortCost(rows: number): number {
+	if (rows <= 1) return 0;
+	return rows * Math.log2(rows) * SORT_COST_PER_COMPARISON;
+}
+
+/**
+ * Collect column indexes bound by an equality predicate (`=` or single-value `IN`).
+ * These columns are constants for the access plan and don't contribute ordering.
+ */
+function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): ReadonlySet<number> {
+	const cols = new Set<number>();
+	for (const f of filters) {
+		if (!f.usable) continue;
+		if (f.op === '=') {
+			cols.add(f.columnIndex);
+		} else if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length === 1) {
+			cols.add(f.columnIndex);
+		}
+	}
+	return cols.size === 0 ? EMPTY_COLUMN_SET : cols;
+}
+
 /**
  * A module that provides in-memory table functionality using BTree (inheritree).
  * Tables created with this module persist only for the lifetime of the
  * database connection.
  */
 export class MemoryTableModule implements VirtualTableModule<MemoryTable, MemoryTableConfig> {
+	/**
+	 * Memory tables snapshot the connection's read layer once at `query()` entry
+	 * (`startLayer = pendingTransactionLayer ?? readLayer`) and iterate the
+	 * captured layer's BTree. Concurrent `query()` calls on a single connection
+	 * therefore see consistent, non-mutating snapshots so long as no writer is
+	 * in flight — safe for `'reentrant-reads'`.
+	 *
+	 * Writes are NOT safe to interleave with reads on the same connection:
+	 * `ensureTransactionLayer` only allocates a fresh `TransactionLayer` when
+	 * `pendingTransactionLayer` is null. Once a transaction is open, subsequent
+	 * writes call `recordUpsert` on the SAME `primaryModifications` BTree that
+	 * an in-flight `query()` may be iterating, which would tear the iterator's
+	 * tree-walk path. `'fully-reentrant'` would require either fresh-per-write
+	 * layers or an in-place-mutation-safe iterator; neither is implemented yet.
+	 *
+	 * If a future change either (a) makes writes always allocate a fresh layer
+	 * (autocommit-only path) or (b) audits that mid-iteration BTree mutation
+	 * is iterator-safe, this can be upgraded to `'fully-reentrant'`. Likewise,
+	 * an in-place layer collapser would force this back to `'serial'`.
+	 */
+	readonly concurrencyMode = 'reentrant-reads' as const;
+
 	public readonly tables: Map<string, MemoryTableManager> = new Map();
 	private eventEmitter?: VTableEventEmitter;
 
@@ -178,7 +245,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		// Check if we can satisfy ordering requirements
 		if (request.requiredOrdering && request.requiredOrdering.length > 0) {
-			bestPlan = this.adjustPlanForOrdering(bestPlan, request, availableIndexes);
+			bestPlan = this.adjustPlanForOrdering(bestPlan, request, availableIndexes, estimatedTableSize);
 		}
 
 		// B-tree scans inherently produce rows in PK order.  Advertise this
@@ -226,7 +293,73 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			bestPlan = { ...bestPlan, handledFilters: mergedHandled };
 		}
 
+		// Advertise monotonicOn / supportsAsofRight when the chosen path is
+		// index-style and walks a sorted index. Downstream optimizer rules use
+		// these to license rewrites that depend on total-order emit, not just
+		// per-row ordering.
+		// TODO: supportsOrdinalSeek is deferred for memory-table — the layered
+		// store's scan does not cheaply support O(log N) seek to the kth row.
+		const advertisement = this.buildMonotonicAdvertisement(bestPlan, request, availableIndexes);
+		if (advertisement.monotonicOn) {
+			bestPlan = { ...bestPlan, ...advertisement };
+		}
+
 		return bestPlan;
+	}
+
+	/**
+	 * Compute the monotonic-ordering advertisement for a chosen access plan.
+	 * Returns an empty object when the path is non-monotonic (multi-IN multi-seek,
+	 * OR_RANGE multi-range, or a single-row equality seek).
+	 */
+	private buildMonotonicAdvertisement(
+		bestPlan: BestAccessPlanResult,
+		request: BestAccessPlanRequest,
+		availableIndexes: IndexSchema[],
+	): Pick<BestAccessPlanResult, 'monotonicOn' | 'supportsAsofRight'> {
+		// Multi-value IN multi-seek visits values in IN-list order; OR_RANGE
+		// concatenates disjoint ranges. Neither emits in monotonic order.
+		for (let i = 0; i < bestPlan.handledFilters.length; i++) {
+			if (!bestPlan.handledFilters[i]) continue;
+			const f = request.filters[i];
+			if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length > 1) return {};
+			if (f.op === 'OR_RANGE') return {};
+		}
+
+		// Locate the index being walked. Prefer a filter-side index, else the
+		// orderingIndexName (set by adjustPlanForOrdering / the PK-ordering post-pass).
+		const indexName = bestPlan.indexName ?? bestPlan.orderingIndexName;
+		if (!indexName) return {};
+		const usedIndex = availableIndexes.find(idx => idx.name === indexName);
+		if (!usedIndex || usedIndex.columns.length === 0) return {};
+
+		// Find the leading non-equality-bound column. Equality-bound columns are
+		// constants over the scan and don't contribute to monotonic ordering.
+		const equalityBound = collectEqualityBoundColumns(request.filters);
+		const trailingNonBound = usedIndex.columns.filter(c => !equalityBound.has(c.index));
+		if (trailingNonBound.length === 0) return {}; // single-row equality seek
+
+		const leadingCol = trailingNonBound[0];
+
+		// Strict iff the leading non-bound column alone determines uniqueness within
+		// the path: a unique index (PK or declared unique) where the leading column
+		// is the sole remaining unbound key. (For composite PK with a free leading
+		// column, the leading column may have duplicate values across rows.)
+		const isUnique = indexName === '_primary_' || (usedIndex.unique ?? false);
+		const strict = isUnique && trailingNonBound.length === 1;
+
+		// Direction follows the index's natural sort order, but if the planner
+		// produced an explicit providesOrdering covering this column, honor that
+		// (adjustPlanForOrdering may have selected a descending ORDER BY against
+		// an asc index — for that we'd need to reverse-walk the index, which the
+		// memory-table scan-plan supports). For now, the index's own desc flag
+		// is the single source of truth.
+		const direction: 'asc' | 'desc' = leadingCol.desc ? 'desc' : 'asc';
+
+		return {
+			monotonicOn: { columnIndex: leadingCol.index, direction, strict },
+			supportsAsofRight: true,
+		};
 	}
 
 	/**
@@ -409,52 +542,211 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	}
 
 	/**
-	 * Adjust plan to account for ordering requirements
+	 * Adjust plan to account for ordering requirements.
+	 *
+	 * Compares two competing strategies and returns the cheaper:
+	 *
+	 *   Plan A: keep the chosen filtering plan. If its index also satisfies the
+	 *           required ordering (and the access pattern walks it monotonically),
+	 *           claim ordering directly. Otherwise charge an estimated external
+	 *           sort cost — the plan is returned unchanged and a `SortNode` will
+	 *           be inserted above it by the planner.
+	 *
+	 *   Plan B: scan an alternative index in its natural order, applying any
+	 *           filters that don't seek into it as residuals. Useful when the
+	 *           filter index doesn't cover ordering and the table is small or
+	 *           the filter is unselective enough that scan-and-filter beats
+	 *           seek-and-sort.
+	 *
+	 * `validateAccessPlan` enforces that whenever a plan claims `providesOrdering`,
+	 * its `indexName` (if any) matches `orderingIndexName` — the cross-index
+	 * correctness bug is caught at the boundary regardless of which module
+	 * emits the plan.
 	 */
 	private adjustPlanForOrdering(
 		plan: BestAccessPlanResult,
 		request: BestAccessPlanRequest,
-		availableIndexes: IndexSchema[]
+		availableIndexes: IndexSchema[],
+		estimatedTableSize: number
 	): BestAccessPlanResult {
-		// Check if any index can provide the required ordering
-		for (const index of availableIndexes) {
-			if (this.indexSatisfiesOrdering(index, request.requiredOrdering!)) {
-				// This index can provide ordering - prefer it even if slightly more expensive
-				const adjustedCost = plan.cost * 0.9; // 10% discount for avoiding sort
+		// Columns bound by an equality predicate are constants for this scan and
+		// therefore contribute no ordering information — they can be skipped when
+		// aligning an index against the required ordering.
+		const equalityCols = collectEqualityBoundColumns(request.filters);
 
-				return {
-					...plan,
-					cost: adjustedCost,
-					providesOrdering: request.requiredOrdering,
-					orderingIndexName: index.name,
-					explains: `${plan.explains} with ordering from ${index.name}`
-				};
-			}
+		// Determine whether plan A's existing access pattern can claim the
+		// required ordering. It can iff the chosen filter index satisfies the
+		// ordering AND the access pattern walks the index monotonically — i.e.,
+		// not OR_RANGE (concatenated ranges) and not multi-value IN on an
+		// ordering column (visits values in IN-list order).
+		const filterIndex = plan.indexName
+			? availableIndexes.find(idx => idx.name === plan.indexName)
+			: undefined;
+		const filterSatisfies = filterIndex
+			? this.indexSatisfiesOrdering(filterIndex, request.requiredOrdering!, equalityCols)
+			: false;
+
+		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
+		const usesOrRange = request.filters.some(
+			(f, i) => plan.handledFilters[i] && f.op === 'OR_RANGE'
+		);
+		const usesMultiInOnOrderedCol = request.filters.some(
+			(f, i) => plan.handledFilters[i]
+				&& f.op === 'IN'
+				&& Array.isArray(f.value)
+				&& (f.value as unknown[]).length > 1
+				&& orderingColumns.has(f.columnIndex)
+		);
+		const planACanClaimOrdering = filterSatisfies && !usesOrRange && !usesMultiInOnOrderedCol;
+
+		let planA: BestAccessPlanResult;
+		let planACost: number;
+		if (planACanClaimOrdering) {
+			planA = {
+				...plan,
+				providesOrdering: request.requiredOrdering,
+				orderingIndexName: filterIndex!.name,
+				explains: `${plan.explains} with ordering from ${filterIndex!.name}`,
+			};
+			planACost = plan.cost;
+		} else {
+			planA = plan;
+			planACost = plan.cost + estimateSortCost(plan.rows ?? estimatedTableSize);
 		}
 
-		// No index can provide ordering - plan will need external sort
-		return plan;
+		// Plan B: cheapest competing plan that walks an ordering-providing
+		// index in its natural order (with any unpushable filters becoming
+		// residuals). Returns undefined when no such index exists.
+		const planB = this.evaluateOrderingOnlyPlans(
+			request, availableIndexes, equalityCols, estimatedTableSize
+		);
+
+		if (planB && planB.cost < planACost) {
+			return planB;
+		}
+		return planA;
 	}
 
 	/**
-	 * Check if an index can satisfy ordering requirements
+	 * Evaluate alternative access paths that walk an ordering-providing index
+	 * directly. Returns the cheapest such plan, or undefined when no index
+	 * satisfies the required ordering.
+	 *
+	 * For each candidate index whose key suffix satisfies `requiredOrdering`,
+	 * we first ask `evaluateIndexAccess` whether the index can also push any
+	 * filters as a seek/range. If yes (and the resulting access pattern still
+	 * walks monotonically), use that plan; otherwise fall back to a pure
+	 * ordering scan over the index. Either way we add residual-filter cost
+	 * for filters left unhandled.
+	 */
+	private evaluateOrderingOnlyPlans(
+		request: BestAccessPlanRequest,
+		availableIndexes: IndexSchema[],
+		equalityCols: ReadonlySet<number>,
+		estimatedTableSize: number
+	): BestAccessPlanResult | undefined {
+		let best: BestAccessPlanResult | undefined;
+		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
+
+		for (const index of availableIndexes) {
+			if (!this.indexSatisfiesOrdering(index, request.requiredOrdering!, equalityCols)) {
+				continue;
+			}
+
+			// See whether this index can also serve as a filter seek/range.
+			const candidate = this.evaluateIndexAccess(index, request, estimatedTableSize);
+
+			// A useful filter pattern that breaks ordering (multi-IN multi-seek
+			// on an ordering column or OR_RANGE) cannot claim ordering — fall
+			// back to a pure scan that doesn't push those filters.
+			const breaksOrdering = request.filters.some(
+				(f, i) => candidate.handledFilters[i]
+					&& (
+						f.op === 'OR_RANGE'
+						|| (f.op === 'IN'
+							&& Array.isArray(f.value)
+							&& (f.value as unknown[]).length > 1
+							&& orderingColumns.has(f.columnIndex))
+					)
+			);
+
+			let basePlan: BestAccessPlanResult;
+			if (candidate.indexName === index.name && !breaksOrdering) {
+				basePlan = candidate;
+			} else {
+				// Pure ordering scan over the index — no filters pushed.
+				basePlan = AccessPlanBuilder
+					.rangeScan(estimatedTableSize)
+					.setHandledFilters(new Array(request.filters.length).fill(false))
+					.setIndexName(index.name)
+					.setExplanation(`Index ordering scan on ${index.name}`)
+					.build();
+			}
+
+			// Charge per-row residual-filter cost for filters not handled by
+			// the chosen access pattern; these remain as a Filter above the leaf.
+			const rows = basePlan.rows ?? estimatedTableSize;
+			const unhandledCount = basePlan.handledFilters.reduce((n, h) => n + (h ? 0 : 1), 0);
+			const residualCost = rows * unhandledCount * RESIDUAL_FILTER_COST_PER_ROW;
+
+			const ordered: BestAccessPlanResult = {
+				...basePlan,
+				cost: basePlan.cost + residualCost,
+				providesOrdering: request.requiredOrdering,
+				orderingIndexName: index.name,
+				indexName: index.name,
+				explains: `${basePlan.explains} with ordering from ${index.name}`,
+			};
+
+			if (!best || ordered.cost < best.cost) {
+				best = ordered;
+			}
+		}
+
+		return best;
+	}
+
+	/**
+	 * Check if an index can satisfy ordering requirements.
+	 *
+	 * Leading index columns that are bound by equality (and therefore constant
+	 * for this scan) are skipped before aligning against the required ordering
+	 * keys. The per-column direction comparison still applies to the remaining
+	 * (unbound) suffix.
 	 */
 	private indexSatisfiesOrdering(
 		index: IndexSchema,
-		requiredOrdering: readonly OrderingSpec[]
+		requiredOrdering: readonly OrderingSpec[],
+		equalityCols: ReadonlySet<number> = EMPTY_COLUMN_SET
 	): boolean {
-		if (requiredOrdering.length > index.columns.length) {
-			return false;
+		let i = 0; // pointer into index.columns
+		let j = 0; // pointer into requiredOrdering
+
+		// Skip leading equality-bound index columns; they contribute no ordering.
+		while (i < index.columns.length && equalityCols.has(index.columns[i].index)) {
+			i++;
 		}
 
-		for (let i = 0; i < requiredOrdering.length; i++) {
-			const required = requiredOrdering[i];
+		while (j < requiredOrdering.length) {
+			if (i >= index.columns.length) return false;
+			const required = requiredOrdering[j];
 			const indexCol = index.columns[i];
 
-			if (required.columnIndex !== indexCol.index ||
-				required.desc !== (indexCol.desc ?? false)) {
-				return false;
+			if (required.columnIndex === indexCol.index &&
+				required.desc === (indexCol.desc ?? false)) {
+				i++;
+				j++;
+				continue;
 			}
+
+			// Allow equality-bound columns interleaved after the matched prefix:
+			// they don't break ordering on later columns.
+			if (equalityCols.has(indexCol.index)) {
+				i++;
+				continue;
+			}
+
+			return false;
 		}
 
 		return true;
@@ -470,8 +762,15 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		};
 		availableIndexes.push(pkIndexSchema);
 
-		// Add secondary indexes
-		availableIndexes.push(...(tableInfo.indexes ?? []));
+		// Add secondary indexes — but exclude partial indexes (those with a WHERE
+		// predicate). The planner does not yet check that the query's WHERE
+		// implies the partial predicate, so using a partial index for a query
+		// it doesn't cover would silently drop matching rows. Treat partial
+		// indexes purely as uniqueness enforcers.
+		for (const idx of tableInfo.indexes ?? []) {
+			if (idx.predicate) continue;
+			availableIndexes.push(idx);
+		}
 
 		return availableIndexes;
 	}
@@ -542,6 +841,11 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			case 'alterPrimaryKey':
 				throw new QuereusError(
 					'MemoryTable does not support in-place primary key alteration',
+					StatusCode.UNSUPPORTED,
+				);
+			case 'addConstraint':
+				throw new QuereusError(
+					`MemoryTable does not support ADD CONSTRAINT ${change.constraint.type}`,
 					StatusCode.UNSUPPORTED,
 				);
 			case 'alterColumn':

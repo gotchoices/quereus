@@ -1,6 +1,6 @@
 ---
 description: Completed documentation review — fixed broken links, added doc validation tests, assessed quality
-dependencies: none
+prereq: none
 
 ---
 
@@ -52,5 +52,5 @@ All 6 tests passing. Full test suite (45 tests) passing.
 ## Follow-up Tasks
 
 - `tasks/fix/3-documentation-gaps.md` — prioritized list of documentation gaps to fill
-- `tasks/fix/2-update-bnf-docs.md` — already existed; BNF grammar update in sql.md
+- `tasks/fix/update-bnf-docs.md` — already existed; BNF grammar update in sql.md
 

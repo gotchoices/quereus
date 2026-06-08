@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-loader",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "Plugin loading system for Quereus - supports dynamic imports for Node.js and browsers",
   "publisher": "Got Choices Foundation",
@@ -31,13 +31,13 @@
     "@quereus/quereus": "workspace:^"
   },
   "devDependencies": {
-    "@quereus/quereus": "*",
     "@types/debug": "^4.1.12",
     "@types/node": "^25.0.9",
     "rimraf": "^6.1.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "@quereus/quereus": "workspace:^",
     "debug": "^4.4.3"
   }
 }

@@ -28,7 +28,7 @@ export function emitDropAssertion(plan: DropAssertionNode, _ctx: EmissionContext
 			);
 		}
 
-		const removed = schema.removeAssertion(plan.name);
+		const removed = schemaManager.removeAssertion(schema.name, plan.name);
 		if (!removed && !plan.ifExists) {
 			throw new QuereusError(
 				`Failed to remove assertion ${plan.name}`,

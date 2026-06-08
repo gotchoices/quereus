@@ -1,0 +1,39 @@
+-- random-extras.sqllogic - randomblob() observable surface and arity validation.
+-- random() determinism rejection lives in 44-determinism-validation / 45-udf-determinism;
+-- this file pins the value-shape contract for SELECTs that *do* use random*.
+-- (Most of SQLite's test/random.test is statistical / reseed and n/a for Quereus.)
+
+-- randomblob(N) returns a BLOB of length N
+select typeof(randomblob(8));
+→ [{"typeof(randomblob(8))":"blob"}]
+
+select length(randomblob(16));
+→ [{"length(randomblob(16))":16}]
+
+-- randomblob(1) returns a one-byte BLOB
+select length(randomblob(1));
+→ [{"length(randomblob(1))":1}]
+
+-- randomblob(0): empty BLOB
+select length(randomblob(0));
+→ [{"length(randomblob(0))":0}]
+
+-- randomblob(-N): SQLite returns an empty (or null) blob; pin observable behavior
+select length(randomblob(-5));
+→ [{"length(randomblob(-5))":0}]
+
+-- random() returns an integer in a plain SELECT
+select typeof(random());
+→ [{"typeof(random())":"integer"}]
+
+-- Two consecutive random() calls — assert only the type contract
+select typeof(random()) as t1, typeof(random()) as t2;
+→ [{"t1":"integer","t2":"integer"}]
+
+-- Arity: random() takes no arguments
+select random(1);
+-- error: random
+
+-- Arity: randomblob() requires exactly one argument
+select randomblob();
+-- error: randomblob

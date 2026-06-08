@@ -541,6 +541,12 @@ SELECT filename FROM files ORDER BY filename COLLATE NUMERIC;
 SELECT * FROM files WHERE filename = 'file10.txt' COLLATE NUMERIC;
 ```
 
+> **Note** — to use a custom collation as the key for a compound index, supply
+> a `normalizer` alongside `func` (see [Key Normalizers and Index
+> Participation](#key-normalizers-and-index-participation) below). Comparator-only
+> registrations work for `ORDER BY` and standalone comparisons but index
+> creation referencing them is rejected.
+
 ## Configuration
 
 ### Plugin Settings
@@ -1073,7 +1079,7 @@ if (registrations.functions) {
 
 if (registrations.collations) {
   for (const collation of registrations.collations) {
-    db.registerCollation(collation.name, collation.func);
+    db.registerCollation(collation.name, collation.func, collation.normalizer);
   }
 }
 
@@ -1231,6 +1237,10 @@ interface BaseModuleConfig {}
 interface VirtualTableConnection {
   readonly connectionId: string;
   readonly tableName: string;
+  // Optional: when multiple connections are registered for the same table
+  // (e.g. an isolation wrapper plus its underlying storage connection), set
+  // this on the wrapper so the deferred-constraint queue can disambiguate.
+  readonly isCovering?: boolean;
   begin(): MaybePromise<void>;
   commit(): MaybePromise<void>;
   rollback(): MaybePromise<void>;
@@ -1271,6 +1281,13 @@ interface BestAccessPlanResult {
   providesOrdering?: readonly OrderingSpec[];
   isSet?: boolean;
   explains?: string;
+
+  // Optional monotonic-storage advertisements. The optimizer lifts these onto
+  // the physical leaf node so downstream rules (streaming asof, monotonic merge
+  // join, ordinal-seek pushdown) can rely on storage-level total-order emit.
+  monotonicOn?: { columnIndex: number; direction: 'asc' | 'desc'; strict: boolean };
+  supportsOrdinalSeek?: boolean; // implies monotonicOn
+  supportsAsofRight?: boolean;   // implies monotonicOn
 }
 
 // Helper class for building access plans
@@ -1403,6 +1420,10 @@ interface FunctionPluginInfo {
 interface CollationPluginInfo {
   name: string;
   func: CollationFunction;
+  /** Optional key normalizer; required to use this collation as the key
+   *  in a compound index. Without it, the collation works for ORDER BY
+   *  and standalone comparisons but index creation referencing it fails. */
+  normalizer?: (s: string) => string;
 }
 ```
 
@@ -1417,16 +1438,33 @@ The function should return:
 - `0` if `a === b`
 - `1` if `a > b`
 
+### Key Normalizers and Index Participation
+
+A collation defines an equivalence relation on strings (the set of pairs where
+the comparator returns `0`). For a collation to back a compound index key, the
+engine needs a *normalizer* — a function whose output equality partitions
+strings into the same equivalence classes as the comparator. For example,
+`NOCASE`'s normalizer is `s => s.toLowerCase()`, and `RTRIM`'s strips only
+trailing ASCII spaces (matching its comparator — note that `s.trimEnd()` would
+*disagree* by also stripping tabs/NBSP).
+
+Normalizer-and-comparator agreement is a hard contract. If they diverge, index
+lookups silently miss rows.
+
 ### Built-in Collations
 
 ```typescript
 // Available collation functions
 const BINARY_COLLATION: CollationFunction;    // Byte-by-byte comparison
-const NOCASE_COLLATION: CollationFunction;    // Case-insensitive comparison  
+const NOCASE_COLLATION: CollationFunction;    // Case-insensitive comparison
 const RTRIM_COLLATION: CollationFunction;     // Right-trim before comparison
 
 // Collation management
-function registerCollation(name: string, func: CollationFunction): void;
+function registerCollation(
+  name: string,
+  func: CollationFunction,
+  normalizer?: (s: string) => string,
+): void;
 function getCollation(name: string): CollationFunction | undefined;
 function resolveCollation(collationName: string): CollationFunction;
 ```

@@ -1,3 +1,5 @@
+import type * as AST from '../parser/ast.js';
+
 export interface AssertionDependentTable {
   /** Instance-unique table reference key, e.g. schema.table#nodeId */
   relationKey: string;
@@ -16,6 +18,13 @@ export interface IntegrityAssertionSchema {
   initiallyDeferred: boolean;
   /** Base tables referenced; filled during assertion preparation/creation. */
   dependentTables?: AssertionDependentTable[];
+  /**
+   * Original CHECK expression AST. Populated when the assertion is created
+   * via CREATE ASSERTION; absent for assertions reconstructed from persisted
+   * `violationSql` alone. Consumed by the optimizer's assertion-hoist analysis
+   * — assertions without it fall through to commit-time enforcement only.
+   */
+  checkExpression?: AST.Expression;
 }
 
 

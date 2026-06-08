@@ -1,6 +1,6 @@
 ---
 description: Extract repeated transaction finalization pattern into helper
-dependencies: none
+prereq: none
 
 ---
 

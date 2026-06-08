@@ -1,6 +1,6 @@
 ---
 description: Core API lifecycle and cleanup tests for Database and Statement
-dependencies: none
+prereq: none
 ---
 
 # Core API Lifecycle Tests

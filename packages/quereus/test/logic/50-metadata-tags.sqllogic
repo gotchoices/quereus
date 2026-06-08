@@ -15,6 +15,12 @@ INSERT INTO Orders VALUES (1, 'Order A'), (2, 'Order B');
 SELECT * FROM Orders ORDER BY id;
 → [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
 
+-- Round-trip: tags surface through schema() introspection
+SELECT json_extract(tags, '$.display_name') AS display_name,
+       json_extract(tags, '$.audit') AS audit
+    FROM schema() WHERE type = 'table' AND name = 'Orders';
+→ [{"display_name":"Customer Orders","audit":true}]
+
 -- ===================================================================
 -- Phase 2: Column-level tags
 -- ===================================================================
@@ -28,6 +34,12 @@ CREATE TABLE Products (
 INSERT INTO Products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99);
 SELECT name, price FROM Products ORDER BY name;
 → [{"name":"Gadget","price":19.99},{"name":"Widget","price":9.99}]
+
+-- Round-trip: column tags via table_info()
+SELECT name, json_extract(tags, '$.display_name') AS display_name,
+       json_extract(tags, '$.searchable') AS searchable
+    FROM table_info('Products') WHERE cid IN (0, 1) ORDER BY cid;
+→ [{"name":"id","display_name":"Product ID","searchable":null},{"name":"name","display_name":"Product Name","searchable":true}]
 
 -- ===================================================================
 -- Phase 3: Constraint-level tags
@@ -58,6 +70,11 @@ INSERT INTO Employees VALUES (1, 'alice@test.com'), (2, 'bob@test.com');
 SELECT * FROM Employees ORDER BY id;
 → [{"id":1,"email":"alice@test.com"},{"id":2,"email":"bob@test.com"}]
 
+-- Round-trip: named UNIQUE constraint tags via unique_constraint_info()
+SELECT name, json_extract(tags, '$.error_message') AS msg
+    FROM unique_constraint_info('Employees') WHERE name = 'uq_email';
+→ [{"name":"uq_email","msg":"Email must be unique"}]
+
 -- ===================================================================
 -- Phase 4: View-level tags
 -- ===================================================================
@@ -67,6 +84,12 @@ CREATE VIEW ActiveOrders AS SELECT * FROM Orders WHERE id > 0
 
 SELECT * FROM ActiveOrders ORDER BY id;
 → [{"id":1,"name":"Order A"},{"id":2,"name":"Order B"}]
+
+-- Round-trip: view tags via schema()
+SELECT json_extract(tags, '$.cacheable') AS cacheable,
+       json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
+→ [{"cacheable":true,"purpose":"active orders filter"}]
 
 -- ===================================================================
 -- Phase 5: Index-level tags
@@ -78,6 +101,15 @@ CREATE INDEX idx_product_name ON Products (name)
 -- Verify index works
 SELECT name FROM Products WHERE name = 'Widget';
 → [{"name":"Widget"}]
+
+-- Round-trip: index tags via schema() and index_info()
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"purpose":"search optimization"}]
+
+SELECT index_name, column_name, json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('Products') WHERE index_name = 'idx_product_name';
+→ [{"index_name":"idx_product_name","column_name":"name","purpose":"search optimization"}]
 
 -- ===================================================================
 -- Phase 6: Tag value types

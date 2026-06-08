@@ -1,5 +1,5 @@
 description: LevelDB provider now physically removes table/index directories on DROP so re-creating a table with the same name starts empty; fixes `apply schema … with seed` UNIQUE-PK violation in store mode.
-dependencies: none
+prereq: none
 files:
   packages/quereus-plugin-leveldb/src/provider.ts
   packages/quereus/test/logic/50-declarative-schema.sqllogic

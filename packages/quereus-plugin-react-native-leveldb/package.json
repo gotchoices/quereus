@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-react-native-leveldb",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "React Native LevelDB storage plugin for Quereus - mobile persistent storage",
   "keywords": [
@@ -85,10 +85,12 @@
     "typecheck": "tsc --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-plugin-react-native-leveldb/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-plugin-react-native-leveldb/test/**/*.spec.ts\" --reporter min --colors"
   },
+  "dependencies": {
+    "@quereus/quereus": "workspace:^",
+    "@quereus/store": "workspace:^"
+  },
   "devDependencies": {
     "@quereus/isolation": "*",
-    "@quereus/quereus": "*",
-    "@quereus/store": "*",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.0.9",

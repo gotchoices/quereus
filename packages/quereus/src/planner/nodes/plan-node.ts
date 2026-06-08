@@ -2,8 +2,176 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type { BaseType, RelationType, ScalarType } from '../../common/datatype.js';
 import type { Expression } from '../../parser/ast.js';
-import type { OutputValue, Row } from '../../common/types.js';
+import type { OutputValue, Row, SqlValue } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
+
+/**
+ * Information about an attribute the relation is monotonically ordered on.
+ * Stronger than `ordering`: meaningful only for total-order-preserving sources
+ * (vtab access plans that advertise it; sort nodes; certain merge operators)
+ * and survives only the propagation rules documented in characteristics.ts.
+ */
+export interface MonotonicOnInfo {
+  /** Attribute over which the relation is ordered. Stable across plan transformations. */
+  readonly attrId: number;
+  /** True iff the relation guarantees no two rows share the value of attrId. */
+  readonly strict: boolean;
+  /** Direction; default 'asc'. */
+  readonly direction: 'asc' | 'desc';
+}
+
+/**
+ * A functional dependency on a relational node's output columns: when the
+ * values of `determinants` are fixed, the values of `dependents` are also
+ * fixed for every row.
+ *
+ * Column indices are output-column indices.
+ *
+ * - `determinants` empty means "constant": the dependents take a single value
+ *   for every row in the relation. An FD `∅ → all_cols` is the canonical
+ *   marker for an "at-most-one-row" relation.
+ * - A unique key `K` is encoded as the FD `K → (all_cols \ K)`. Consumers ask
+ *   "is K a superkey?" via `isSuperkey(K, fds, columnCount)` from
+ *   `planner/util/fd-utils.ts`.
+ * - The set is non-canonical — only the FDs each operator can prove are
+ *   stored. Use `computeClosure` to derive what a set of attributes implies.
+ * - The full-relation case (`K = all_cols`, i.e. set semantics with no smaller
+ *   discoverable key) is communicated via `RelationType.isSet`, not an FD.
+ * - `guard`, when present, restricts the FD to predicates that entail every
+ *   clause in the conjunction. A guarded FD never participates in closure;
+ *   `FilterNode` activates it (strips the guard) when its predicate implies
+ *   the guard, after which it propagates as an ordinary unconditional FD.
+ */
+export interface FunctionalDependency {
+  /** Determinant column indices in the node's output. Empty array means "constant" (no row variation). */
+  readonly determinants: readonly number[];
+  /** Dependent column indices in the node's output. Non-empty. */
+  readonly dependents: readonly number[];
+  /** When defined, the FD only activates if a surrounding predicate entails every clause. */
+  readonly guard?: GuardPredicate;
+  /** Optional provenance tag — informational for diagnostics, ignored by dedup. */
+  readonly source?: ConstraintProvenance;
+}
+
+/**
+ * Origin of an inferred constraint (FD / binding / domain). Optional and
+ * informational — dedup helpers in `fd-utils.ts` compare structural fields
+ * only, so identical constraints from different sources collapse to one and
+ * the kept entry's provenance is whichever was merged first. When a declared
+ * CHECK and a hoisted assertion produce structurally-identical contributions,
+ * the table reference merges declared-check facts first, so `declared-check`
+ * wins.
+ */
+export interface ConstraintProvenance {
+  readonly kind: 'declared-check' | 'assertion';
+  /** Lowercased assertion name when kind === 'assertion'. */
+  readonly name?: string;
+}
+
+/**
+ * Predicate guarding a conditional functional dependency. All clauses must be
+ * entailed by the surrounding predicate (conjunctively) before the guarded FD
+ * activates.
+ */
+export interface GuardPredicate {
+  readonly clauses: readonly GuardClause[];
+}
+
+/**
+ * Narrow guard-clause vocabulary recognized by predicate-implies-guard
+ * checking. Each shape is something `extractEqualityFds` / EC / binding layers
+ * can already reason about, so activation is a structural check.
+ *
+ * Shapes:
+ * - `eq-literal` / `eq-column` / `is-null` — equality and null-test atoms.
+ * - `range` — open or closed interval on one column, matching `DomainConstraint`
+ *   range shape. Inclusivity flags for absent bounds are unobservable but
+ *   stored conservatively as `false`. Discharge subsumption ("filter ⊆ guard")
+ *   is via per-side bound comparison.
+ * - `or-of` — flat disjunction of the other shapes; recognizers flatten nested
+ *   `or-of` clauses at construction time so a sub-clause is never itself an
+ *   `or-of`.
+ *
+ * `IN (lit, ...)` and `NOT col` shapes are pre-normalized at recognition time
+ * into the same vocabulary (IN-list → `or-of [eq-literal]`, `NOT col` →
+ * `eq-literal { col, value: 0 }`).
+ */
+export type GuardClause =
+  | { readonly kind: 'eq-literal'; readonly column: number; readonly value: SqlValue }
+  | { readonly kind: 'eq-column'; readonly left: number; readonly right: number }
+  | { readonly kind: 'is-null'; readonly column: number; readonly negated: boolean }
+  | {
+      readonly kind: 'range';
+      readonly column: number;
+      readonly min?: SqlValue;
+      readonly max?: SqlValue;
+      readonly minInclusive: boolean;
+      readonly maxInclusive: boolean;
+    }
+  | { readonly kind: 'or-of'; readonly clauses: readonly GuardClause[] };
+
+/**
+ * A pinned-constant value associated with a `ConstantBinding`. Either a
+ * compile-time literal `SqlValue`, or a bound parameter identified by
+ * `paramRef` (numeric 1-based index for `?`, string name for `:foo`-style).
+ */
+export type ConstantValue =
+  | { readonly kind: 'literal'; readonly value: SqlValue }
+  | { readonly kind: 'parameter'; readonly paramRef: string | number };
+
+/**
+ * Output columns pinned to a single value across every row of one execution.
+ * Companion to `∅ → col` FDs: that FD records *that* a column is constant,
+ * while a `ConstantBinding` additionally records *what value* it is pinned
+ * to. Downstream rules (predicate inference through ECs, ordering pruning)
+ * consume bindings directly instead of re-walking predicate ASTs.
+ */
+export interface ConstantBinding {
+  /** Output column indices pinned to `value`. */
+  readonly attrs: readonly number[];
+  readonly value: ConstantValue;
+  /** Optional provenance tag — informational, ignored by dedup. */
+  readonly source?: ConstraintProvenance;
+}
+
+/**
+ * A bound on the values a single output column can take across every row of one
+ * execution. Sourced from declared CHECK constraints at the table reference and
+ * propagated like FDs/ECs/bindings — see `planner/util/fd-utils.ts` for the
+ * merge/project/shift helpers.
+ *
+ * - `range`: an open or closed interval. `min`/`max` are absent for unbounded
+ *   sides; `minInclusive`/`maxInclusive` are ignored when the corresponding
+ *   bound is absent.
+ * - `enum`: a finite set of allowed values.
+ *
+ * Multiple constraints may exist on the same column (and even on the same kind)
+ * — intersection is deferred to the predicate-contradiction-detection ticket.
+ */
+export type DomainConstraint =
+	| {
+		readonly kind: 'range';
+		/** Output column index. */
+		readonly column: number;
+		/** Lower bound, when known. */
+		readonly min?: SqlValue;
+		/** Upper bound, when known. */
+		readonly max?: SqlValue;
+		/** Lower bound is inclusive. Ignored when `min` is absent. */
+		readonly minInclusive: boolean;
+		/** Upper bound is inclusive. Ignored when `max` is absent. */
+		readonly maxInclusive: boolean;
+		/** Optional provenance tag — informational, ignored by dedup. */
+		readonly source?: ConstraintProvenance;
+	}
+	| {
+		readonly kind: 'enum';
+		/** Output column index. */
+		readonly column: number;
+		readonly values: ReadonlyArray<SqlValue>;
+		/** Optional provenance tag — informational, ignored by dedup. */
+		readonly source?: ConstraintProvenance;
+	};
 
 /**
  * Physical properties that execution nodes can provide or require
@@ -16,11 +184,83 @@ export interface PhysicalProperties {
   estimatedRows?: number;
 
   /**
-   * Column sets that are guaranteed unique in the output.
-   * Unlike logical keys which are schema-defined, these are derived from
-   * the operation (e.g., DISTINCT creates a unique key on all columns)
+   * Functional dependencies that hold over the output stream. The canonical
+   * representation of "what determines what" — unique keys are encoded as
+   * FDs `K → (all_cols \ K)`, and `∅ → all_cols` encodes "at-most-one-row".
+   * Use `computeClosure` / `isSuperkey` / `hasAnyKey` / `hasSingletonFd`
+   * from `planner/util/fd-utils.ts` to query them.
    */
-  uniqueKeys?: number[][];
+  fds?: ReadonlyArray<FunctionalDependency>;
+
+  /**
+   * Equivalence classes over the node's output columns. Each class is a set
+   * of column indices known to hold equal values for every row. Derived from
+   * equality predicates and equi-join conditions.
+   */
+  equivClasses?: ReadonlyArray<ReadonlyArray<number>>;
+
+  /**
+   * Output columns pinned to a known constant value within a single execution.
+   * Mirrors `∅ → col` FDs but carries the *value* so downstream rules
+   * (predicate inference, ordering pruning) can rewrite predicates without
+   * re-walking the source predicate AST. Parameters (`?` / `:foo`) count as
+   * constants here because they are bound once before iteration.
+   */
+  constantBindings?: ReadonlyArray<ConstantBinding>;
+
+  /**
+   * Per-column value bounds (range or enum) provable for every row in the
+   * stream. Sourced from declared CHECK constraints at the table reference and
+   * propagated through unary/binary operators using the same projection rules
+   * as FDs/ECs/bindings. Multiple constraints on the same column may coexist;
+   * intersection across constraints is deferred to a follow-up ticket.
+   */
+  domainConstraints?: ReadonlyArray<DomainConstraint>;
+
+  /**
+   * Attributes the relation is monotonically ordered on. Stronger than `ordering`:
+   * meaningful only for total-order-preserving sources (vtab access plans that
+   * advertise it; sort nodes; certain merge operators) and survives only the
+   * propagation rules documented in characteristics.ts.
+   *
+   * `monotonicOn` strictly implies `ordering` on the same attribute in the same
+   * direction; nodes are permitted (not required) to populate one from the other.
+   */
+  monotonicOn?: readonly MonotonicOnInfo[];
+
+  /**
+   * Capability flags advertised by the underlying access path. Unlike
+   * `monotonicOn`, these are not relational characteristics — they describe
+   * what the access path's iterator can be driven to do (ordinal seek for
+   * pushed-down LIMIT/OFFSET, forward-only repositioning for asof joins).
+   *
+   * These survive only on the physical leaf node where the access plan was
+   * resolved. Single-input pass-through nodes (Filter, LimitOffset, Alias,
+   * etc.) MUST NOT propagate these — once another operator sits between the
+   * vtab leaf and the consumer, the leaf's iterator is no longer the
+   * consumer's iterator.
+   */
+  accessCapabilities?: {
+    /** Path supports O(log N) seek to the kth monotonic row. Implies monotonicOn. */
+    ordinalSeek?: boolean;
+    /** Path can be driven as the right side of a streaming asof join. Implies monotonicOn. */
+    asofRight?: boolean;
+  };
+
+  /**
+   * Symbolic range bound that downstream rules / EXPLAIN can read off. Set by
+   * rule-monotonic-range-access on physical leaves whose access plan walks a
+   * MonotonicOn(x) path bounded by a recognized range predicate on x. The
+   * lower/upper fields are absent for unbounded sides (half-open ranges).
+   *
+   * Non-relational: lives on the physical leaf where the access plan was
+   * resolved. Pass-through nodes do NOT propagate it.
+   */
+  rangeBoundedOn?: {
+    attrId: number;
+    lower?: { op: '>=' | '>'; valueLiteral?: SqlValue };
+    upper?: { op: '<=' | '<'; valueLiteral?: SqlValue };
+  };
 
   /**
    * Whether this node is read-only (does not mutate external state).
@@ -46,6 +286,33 @@ export interface PhysicalProperties {
 	 * If this is true, the node should implement getValue() to return the constant value.
    */
   constant?: boolean;
+
+  /**
+   * Expected first-row latency in milliseconds for this subtree's iterator.
+   * 0 (default) for local-only paths (memory vtab, in-process compute).
+   * Non-zero for remote vtabs and any operator whose cost model declares it.
+   * Consumed by rule-fanout-lookup-join's cost gate; consumers must not rely
+   * on it for correctness (only as a fan-out savings hint).
+   *
+   * Propagation: unary/multi-input nodes inherit the max of children. Leaves
+   * declare their own value via `computePhysical`. Remote-vtab leaves should
+   * source this from their access plan; the in-tree default is 0 and the
+   * fan-out cost gate is intentionally inert until a remote plugin populates it.
+   */
+  expectedLatencyMs?: number;
+
+  /**
+   * True when the subtree is safe to execute concurrently with siblings sharing
+   * the same vtab connection. Defaults to true for read-only subtrees over
+   * modules with `concurrencyMode !== 'serial'`. False when the subtree mutates
+   * state, holds a non-reentrant cursor, or sits over a `'serial'` module that
+   * does not have a per-branch connection available.
+   *
+   * Propagation: multi-input nodes inherit the AND of children — any non-safe
+   * child poisons the parent. Leaves derive their own value from the
+   * underlying module's concurrency mode and the subtree's readonly status.
+   */
+  concurrencySafe?: boolean;
 }
 
 // Derived properties (computed, not stored):
@@ -61,6 +328,67 @@ export const DEFAULT_PHYSICAL: PhysicalProperties = {
 	idempotent: true, // Default true for readonly nodes
 	constant: false,
 } as const;
+
+/**
+ * Monotonicity of a scalar expression with respect to a given input attribute.
+ * Direction is "as the attribute's value increases, what happens to the expression":
+ *   - 'increasing'    — strictly non-decreasing (compatible with `asc` ordering)
+ *   - 'decreasing'    — strictly non-increasing
+ *   - 'constant'      — does not depend on the attribute (flat in attrId)
+ *   - 'non_monotone'  — depends on the attribute but provably not monotone
+ *   - 'unknown'       — cannot prove a property; safe default
+ *
+ * Other inputs are held constant when reasoning about monotonicity in attrId.
+ */
+export type Monotonicity = 'increasing' | 'decreasing' | 'constant' | 'non_monotone' | 'unknown';
+
+export interface InjectivityResult {
+  /** True iff distinct values of the input attribute always produce distinct expression values
+   *  (with all other inputs held constant). */
+  readonly injective: boolean;
+  /** Optional explanation for diagnostics. */
+  readonly reason?: string;
+}
+
+export interface MonotonicityResult {
+  readonly monotonicity: Monotonicity;
+  readonly reason?: string;
+}
+
+/**
+ * Equivalent half-open range on input x for a predicate `f(x) op c` where f is
+ * monotone but lossy (e.g. `f(x) = date(x); f(x) = D` corresponds to a
+ * one-day half-open range on x). `lowerInclusive ≤ x < upperExclusive`.
+ *
+ * The boundary computation is type-driven; see LogicalType.bucketBounds.
+ */
+export interface RangeRewrite {
+  readonly lowerInclusive: SqlValue;
+  readonly upperExclusive: SqlValue;
+}
+
+/** Conservative defaults for the scalar property surface. Exposed for tests / consumers. */
+export const DEFAULT_INJECTIVITY: InjectivityResult = { injective: false } as const;
+export const DEFAULT_MONOTONICITY: MonotonicityResult = { monotonicity: 'unknown' } as const;
+
+/** Negate (flip) a monotonicity direction; constant/non_monotone/unknown pass through unchanged. */
+export function negateMonotonicity(m: Monotonicity): Monotonicity {
+	switch (m) {
+		case 'increasing': return 'decreasing';
+		case 'decreasing': return 'increasing';
+		default: return m;
+	}
+}
+
+/** Combine monotonicities for `a + b` (addition rules). */
+export function addMonotonicity(a: Monotonicity, b: Monotonicity): Monotonicity {
+	if (a === 'unknown' || b === 'unknown') return 'unknown';
+	if (a === 'non_monotone' || b === 'non_monotone') return 'non_monotone';
+	if (a === 'constant') return b;
+	if (b === 'constant') return a;
+	if (a === b) return a; // both increasing or both decreasing
+	return 'unknown'; // mixed directions
+}
 
 /**
  * Represents a column with a unique identifier that persists across plan transformations
@@ -154,6 +482,27 @@ export abstract class PlanNode {
    */
   getAttributes?(): readonly Attribute[];
 
+  /** Cached attrId → index map; see getAttributeIndex(). */
+  private _attributeIndexCache?: ReadonlyMap<number, number>;
+
+  /**
+   * Map from attribute id to its index in `getAttributes()`. Replaces the
+   * ad-hoc `attrs.findIndex(a => a.id === …)` scans scattered across the
+   * planner. Cached per instance; because PlanNodes are immutable, `withChildren`
+   * mints a fresh instance and the cache rebuilds automatically.
+   */
+  getAttributeIndex(): ReadonlyMap<number, number> {
+    if (!this._attributeIndexCache) {
+      const map = new Map<number, number>();
+      const attrs = this.getAttributes?.() ?? [];
+      for (let i = 0; i < attrs.length; i++) {
+        map.set(attrs[i].id, i);
+      }
+      this._attributeIndexCache = map;
+    }
+    return this._attributeIndexCache;
+  }
+
   /**
    * Get map of attribute ID to producing scalar expression (for constant folding)
    * Only relational nodes that synthesize columns from expressions need implement this
@@ -181,6 +530,33 @@ export abstract class PlanNode {
     return {};
   }
 
+  /**
+   * Is this scalar expression injective in the given input attribute?
+   * Default is the conservative "no" — only meaningful for ScalarPlanNode subclasses
+   * that override. Other inputs are assumed held constant when reasoning.
+   */
+  isInjectiveIn(_inputAttrId: number): InjectivityResult {
+    return DEFAULT_INJECTIVITY;
+  }
+
+  /**
+   * Monotonicity of this scalar expression in the given input attribute, with
+   * other inputs held constant. Default is the conservative 'unknown'.
+   */
+  monotonicityIn(_inputAttrId: number): MonotonicityResult {
+    return DEFAULT_MONOTONICITY;
+  }
+
+  /**
+   * For monotone-but-lossy scalar transforms only: given a constant `c` from a
+   * predicate `f(x) op c`, return the equivalent half-open range on x. Return
+   * undefined when not applicable / unsafe. Implementations must be consistent
+   * with `monotonicityIn`.
+   */
+  rangeRewriteIn(_inputAttrId: number, _constant: SqlValue): RangeRewrite | undefined {
+    return undefined;
+  }
+
 	/** Infer and cache the physical properties of this node */
 	get physical(): PhysicalProperties {
 		if (!this._physical) {
@@ -196,6 +572,16 @@ export abstract class PlanNode {
 					idempotent: childrenPhysical.every(child => child.idempotent),
 					readonly: childrenPhysical.every(child => child.readonly),
 					// constant: DON'T INHERIT - only ValueNodes can be directly constant
+					// expectedLatencyMs: max of children — slowest child gates first-row
+					// latency. 0 default for local-only paths.
+					expectedLatencyMs: childrenPhysical.reduce(
+						(acc, child) => Math.max(acc, child.expectedLatencyMs ?? 0),
+						0,
+					),
+					// concurrencySafe: AND of children — any non-safe child poisons the
+					// parent. Default true so missing values do not spuriously disable
+					// parallelism; leaves that need stricter behavior set false.
+					concurrencySafe: childrenPhysical.every(child => child.concurrencySafe !== false),
 				}
 				: DEFAULT_PHYSICAL;
 
@@ -267,6 +653,9 @@ export interface RelationalPlanNode extends PlanNode {
    * Each attribute has a unique ID that persists across plan transformations
    */
   getAttributes(): readonly Attribute[];
+
+  /** Map from attribute id to its index in getAttributes(). Cached on PlanNode. */
+  getAttributeIndex(): ReadonlyMap<number, number>;
 }
 
 /**
@@ -279,10 +668,18 @@ export function isRelationalNode(node: PlanNode): node is RelationalPlanNode {
 /**
  * Base interface for PlanNodes that produce a scalar value (Expression Nodes).
  * Note: this is an interface that concrete ScalarNode classes will implement.
+ *
+ * The injectivity / monotonicity / rangeRewrite methods all have safe defaults
+ * on `PlanNode`, so concrete classes opt in by overriding only the cases they
+ * can prove. Conservatively defaulting to "unknown / not injective" is critical:
+ * downstream optimizer rules treat these as load-bearing correctness claims.
  */
 export interface ScalarPlanNode extends PlanNode {
 	readonly expression: Expression;
   getType(): ScalarType;
+  isInjectiveIn(inputAttrId: number): InjectivityResult;
+  monotonicityIn(inputAttrId: number): MonotonicityResult;
+  rangeRewriteIn(inputAttrId: number, constant: SqlValue): RangeRewrite | undefined;
 }
 
 /**

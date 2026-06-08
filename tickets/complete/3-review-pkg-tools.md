@@ -1,6 +1,6 @@
 ---
 description: Review of tooling packages under packages/tools (planviz)
-dependencies: 3-review-core-api
+prereq: review-core-api
 
 ---
 

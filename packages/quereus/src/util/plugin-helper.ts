@@ -94,7 +94,7 @@ export async function registerPlugin(
 
 	registerItems(
 		registrations.collations,
-		(collation) => db.registerCollation(collation.name, collation.func),
+		(collation) => db.registerCollation(collation.name, collation.func, collation.normalizer),
 		(collation) => `Failed to register collation '${collation.name}'`
 	);
 

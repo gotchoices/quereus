@@ -252,3 +252,90 @@ SELECT amount FROM ledger WHERE id = 1;
 DROP ASSERTION ledger_no_deletes;
 DROP TABLE ledger;
 -- run
+
+-- ===================================
+-- Deferred CHECK across tables with datetime coercion (GitHub #25)
+-- The deferred subquery compares new.* against an already-coerced stored row.
+-- A datetime column rewrites its value on parse, so the comparison must run
+-- coerced-vs-coerced or it spuriously fails.
+-- ===================================
+
+CREATE TABLE Parent (Id TEXT, TS datetime, PRIMARY KEY (Id, TS)) USING memory;
+CREATE TABLE Child (
+  Id TEXT PRIMARY KEY,
+  ParentTS datetime,
+  CONSTRAINT ParentExists CHECK (
+    EXISTS (SELECT 1 FROM Parent P WHERE P.TS = new.ParentTS)
+  )
+) USING memory;
+
+-- Parent.TS coerced from numeric literal to the datetime logical representation
+INSERT INTO Parent VALUES ('p1', 1700000000000);
+COMMIT;
+
+-- Positive: matching parent (numeric literal coerces to the same value) → OK
+BEGIN;
+INSERT INTO Child VALUES ('c1', 1700000000000);
+COMMIT;
+-- run
+
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 1 }]
+
+-- Negative: no matching parent → deferred CHECK still fires at commit
+BEGIN;
+INSERT INTO Child VALUES ('c2', 1800000000000);
+COMMIT;
+-- error: CHECK constraint failed: ParentExists
+
+-- Verify the failed row did not land
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 1 }]
+
+-- Alternate textual representation on both sides — Z-suffixed input now
+-- canonicalizes through the column-type parse, so this exercises that path.
+INSERT INTO Parent VALUES ('p2', '2023-11-14T22:13:20Z');
+COMMIT;
+
+BEGIN;
+INSERT INTO Child VALUES ('c3', '2023-11-14T22:13:20Z');
+COMMIT;
+-- run
+
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 2 }]
+
+-- UPDATE shares the deferred-queue call site, so NEW is coerced there too.
+-- p3 stored from a numeric literal; the matching deferred-CHECK UPDATE below
+-- uses a textual representation of the same instant. Since datetime coercion
+-- is now canonical across input representations, the numeric-stored value
+-- and the textual NEW compare equal.
+INSERT INTO Parent VALUES ('p3', 1500000000000);
+COMMIT;
+
+BEGIN;
+UPDATE Child SET ParentTS = 1500000000000 WHERE Id = 'c1';
+COMMIT;
+-- run
+
+-- Textual-NEW vs numeric-stored UPDATE: 1600000000000 ms = 2020-09-13T12:26:40Z.
+INSERT INTO Parent VALUES ('p4', 1600000000000);
+COMMIT;
+
+BEGIN;
+UPDATE Child SET ParentTS = '2020-09-13T12:26:40Z' WHERE Id = 'c3';
+COMMIT;
+-- run
+
+-- Negative UPDATE: no matching parent → deferred CHECK still fires at commit
+BEGIN;
+UPDATE Child SET ParentTS = 1900000000000 WHERE Id = 'c1';
+COMMIT;
+-- error: CHECK constraint failed: ParentExists
+
+SELECT count(*) FROM Child;
+→ [{ "count(*)": 2 }]
+
+DROP TABLE Child;
+DROP TABLE Parent;
+-- run

@@ -878,6 +878,80 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			);
 			expect(result).to.deep.equal([[0]]);
 		});
+
+		// Regression: a correlated binding (`col = <outer-ref>`) is not a
+		// unique-key cover for delta-binding purposes — the RHS varies per
+		// outer row. The cover guard skips on the orthogonal `correlated` flag
+		// (computed at extraction time), so the relation is classified
+		// `'global'` (not `'row'`), preventing false-positive NOT-EXISTS
+		// violations downstream. Tracked via
+		// `lamina-quereus-assertion-residual-correlated-binding` and its
+		// follow-up `quereus-binding-extractor-correlated-expression-and-in`.
+		it('correlated equality (correlated: true) does NOT cover', () => {
+			const c = makeConstraint('=', 0);
+			c.bindingKind = 'correlated';
+			c.correlated = true;
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([]);
+		});
+
+		it('literal equality still covers (bindingKind: "literal")', () => {
+			const c = makeConstraint('=', 0);
+			c.bindingKind = 'literal';
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([[0]]);
+		});
+
+		it('parameter equality still covers (bindingKind: "parameter")', () => {
+			const c = makeConstraint('=', 0);
+			c.bindingKind = 'parameter';
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([[0]]);
+		});
+
+		it('mixed-key composite: literal on one column + correlated on the other does NOT cover', () => {
+			const c0 = makeConstraint('=', 0);
+			c0.bindingKind = 'literal';
+			const c1 = makeConstraint('=', 1);
+			c1.bindingKind = 'correlated';
+			c1.correlated = true;
+			const result = computeCoveredKeysForConstraints([c0, c1], [[0, 1]]);
+			expect(result).to.deep.equal([]);
+		});
+
+		// Follow-up gaps: the cover guard keys on the orthogonal `correlated`
+		// flag rather than `bindingKind`, so wrapped-correlated (`'expression'`)
+		// and singleton-IN-correlated bindings are skipped uniformly.
+		it('correlated singleton IN (correlated: true) does NOT cover', () => {
+			const c = makeConstraint('IN', 0);
+			c.value = [undefined];
+			c.bindingKind = 'mixed';
+			c.correlated = true;
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([]);
+		});
+
+		it('non-correlated singleton IN (correlated: false) still covers', () => {
+			const c = makeConstraint('IN', 0);
+			c.value = [1];
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([[0]]);
+		});
+
+		it('correlated wrapped-expression equality (bindingKind: "expression") does NOT cover', () => {
+			const c = makeConstraint('=', 0);
+			c.bindingKind = 'expression';
+			c.correlated = true;
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([]);
+		});
+
+		it('same-table expression equality (correlated: false) still covers', () => {
+			const c = makeConstraint('=', 0);
+			c.bindingKind = 'expression';
+			const result = computeCoveredKeysForConstraints([c], [[0]]);
+			expect(result).to.deep.equal([[0]]);
+		});
 	});
 
 	// ===================================================================
@@ -927,6 +1001,143 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('>');
 			expect(result.allConstraints[0].bindingKind).to.equal('parameter');
+		});
+	});
+
+	// ===================================================================
+	// correlated flag — row-scope escape, orthogonal to bindingKind
+	// (follow-up: quereus-binding-extractor-correlated-expression-and-in)
+	// ===================================================================
+	describe('correlated flag (row-scope escape)', () => {
+		it('p.id = outer.id (bare other-table ref) → correlated true', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = binOp('=', id, other);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].bindingKind).to.equal('correlated');
+			expect(result.allConstraints[0].correlated).to.equal(true);
+		});
+
+		// The free-reference walk reaches refs nested under a CAST. `cast(outer.id)`
+		// unwraps (via isDynamicValue) to a bare column ref, so it IS extracted —
+		// inner is an other-table column → bindingKind 'correlated', and the walk
+		// flags it. This is the reachable "wrapped correlated" extraction case.
+		it('p.id = cast(outer.id) (cast-wrapped other-table ref) → correlated true', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = binOp('=', id, castNode(other));
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].bindingKind).to.equal('correlated');
+			expect(result.allConstraints[0].correlated).to.equal(true);
+		});
+
+		// Same-table cast-wrapped ref reaches the 'expression' bindingKind branch
+		// (inner is a same-table column ref) and the walk correctly returns false —
+		// a legitimate same-table filter must not be de-classified.
+		it('p.id = cast(p.b) (cast-wrapped same-table ref) → correlated false, bindingKind expression', () => {
+			const id = colRef(100, 'id', 0);
+			const b = colRef(102, 'b', 2);
+			const expr = binOp('=', id, castNode(b));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].bindingKind).to.equal('expression');
+			expect(result.allConstraints[0].correlated).to.equal(false);
+		});
+
+		// Documents the extractor limitation: a general-expression value side
+		// (BinaryOp, coalesce, cast-over-expr) does NOT pass the column-constant
+		// pattern guard, so `p.id = outer.id + 1` stays residual and never reaches
+		// the cover guard — already safe, no false cover possible via this path.
+		it('p.id = outer.id + 1 (general expression) → not extracted (residual)', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = binOp('=', id, binOp('+', other, lit(1)));
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('p.id = p.b (bare same-table ref) → correlated false', () => {
+			const id = colRef(100, 'id', 0);
+			const b = colRef(102, 'b', 2);
+			const expr = binOp('=', id, b);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].bindingKind).to.equal('expression');
+			expect(result.allConstraints[0].correlated).to.equal(false);
+		});
+
+		it('p.id = :param → correlated false (parameter does not escape row scope)', () => {
+			const id = colRef(100, 'id', 0);
+			const param = paramRef(':p1');
+			const expr = binOp('=', id, param);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].correlated).to.equal(false);
+		});
+
+		it('p.id = 5 (literal) → correlated unset/falsy', () => {
+			const id = colRef(100, 'id', 0);
+			const expr = binOp('=', id, lit(5));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].correlated).to.not.equal(true);
+		});
+
+		it('p.id IN (outer.id) (correlated singleton) → correlated true, bindingKind mixed', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = inNode(id, [other]);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].bindingKind).to.equal('mixed');
+			expect(result.allConstraints[0].correlated).to.equal(true);
+		});
+
+		it('p.id IN (:p1) (parameter singleton) → correlated false', () => {
+			const id = colRef(100, 'id', 0);
+			const param = paramRef(':p1');
+			const expr = inNode(id, [param]);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].correlated).to.equal(false);
+		});
+
+		// Cast-wrapped IN element: `cast(outer.id)` passes isDynamicValue (single
+		// unwrapCast exposes a column ref) so it IS extracted, and the free-ref
+		// walk reaches the outer ref through the cast → correlated true. Mirrors
+		// the equality cast case for the IN path.
+		it('p.id IN (cast(outer.id)) (cast-wrapped correlated singleton) → correlated true', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = inNode(id, [castNode(other)]);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].correlated).to.equal(true);
+			expect(result.coveredKeysByTable!.get('t')!).to.have.length(0);
+		});
+
+		// Cover integration: a correlated singleton IN must not be treated as a
+		// covering key (the latent gap this ticket closes).
+		it('p.id IN (outer.id) does NOT cover the PK (coveredKeysByTable)', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = inNode(id, [other]);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.coveredKeysByTable!.get('t')!).to.have.length(0);
+		});
+
+		it('p.id = cast(outer.id) does NOT cover the PK (coveredKeysByTable)', () => {
+			const id = colRef(100, 'id', 0);
+			const other = colRef(200, 'x', 0);
+			const expr = binOp('=', id, castNode(other));
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.coveredKeysByTable!.get('t')!).to.have.length(0);
 		});
 	});
 

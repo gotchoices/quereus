@@ -4,11 +4,12 @@ import type {
 	AlterTableStmt,
 	AnalyzeStmt,
 	CreateAssertionStmt,
-	MutatingSubquerySource,
+	SubquerySource,
 	IdentifierExpr,
 	ColumnDef,
 	TableConstraint,
 	DeleteStmt,
+	FromClause,
 } from '../src/parser/ast.js';
 
 // Helper to build an IdentifierExpr
@@ -119,6 +120,16 @@ describe('Emit: missing statement types', () => {
 			expect(result).to.include('main');
 			expect(result).to.include('users');
 		});
+
+		it('should stringify schema-only analyze as schema.* (round-trippable)', () => {
+			const node: AnalyzeStmt = { type: 'analyze', schemaName: 'main' };
+			const result = astToString(node);
+			// Emits `analyze main.*` — the `.*` surface is what re-parses to the
+			// schema-only shape (not `analyze main`, which would parse as a table).
+			expect(result).to.not.equal('[analyze]');
+			expect(result).to.include('main');
+			expect(result).to.include('.*');
+		});
 	});
 
 	describe('createAssertion', () => {
@@ -141,30 +152,31 @@ describe('Emit: missing statement types', () => {
 		});
 	});
 
-	describe('mutatingSubquerySource in fromClauseToString', () => {
-		it('should stringify mutating subquery source via select', () => {
-			// Build a SELECT that uses a mutating subquery in FROM
+	describe('mutating DML in subquerySource via fromClauseToString', () => {
+		it('should stringify a DML body (DELETE w/ RETURNING) as a FROM subquery', () => {
+			// The folded SubquerySource carries any QueryExpr in `subquery`,
+			// including a DML statement with RETURNING. The emitter dispatches
+			// on the inner discriminator so the body emits correctly.
 			const deleteStmt: DeleteStmt = {
 				type: 'delete',
 				table: ident('old_logs'),
 				returning: [{ type: 'all' }],
 			};
-			const mutSource: MutatingSubquerySource = {
-				type: 'mutatingSubquerySource',
-				stmt: deleteStmt,
+			const mutSource: SubquerySource = {
+				type: 'subquerySource',
+				subquery: deleteStmt,
 				alias: 'deleted',
 			};
-			// We can't call fromClauseToString directly (not exported),
-			// so build a select that uses it as a FROM source
 			const selectNode = {
 				type: 'select' as const,
 				columns: [{ type: 'all' as const }],
-				from: [mutSource as any],
+				from: [mutSource as unknown as FromClause],
 			};
 			const result = astToString(selectNode);
-			// Currently the from clause falls through to [unknown_from]
 			expect(result).to.not.include('[unknown_from]');
 			expect(result).to.include('deleted');
+			expect(result).to.include('delete from');
+			expect(result).to.include('returning');
 		});
 	});
 });

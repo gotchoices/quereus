@@ -134,27 +134,36 @@ export function buildChildSideFKChecks(
 	const checks: ConstraintCheck[] = [];
 
 	for (const fk of tableSchema.foreignKeys) {
-		// Skip entirely-ignored FKs (both actions are 'ignore' = no enforcement)
-		if (fk.onDelete === 'ignore' && fk.onUpdate === 'ignore') continue;
-
-		// Resolve parent table
+		// Resolve parent table. If absent, MATCH SIMPLE still allows the row when any
+		// FK column is NULL — but otherwise no parent row can match, so the check must
+		// fail. Build a null-guard chain terminated by a falsy literal in that case.
 		const parentSchema = ctx.schemaManager.findTable(
 			fk.referencedTable,
 			fk.referencedSchema,
 		);
+
+		let existsExpr: AST.Expression;
 		if (!parentSchema) {
-			log(`FK check skipped: parent table '${fk.referencedTable}' not found`);
-			continue;
-		}
+			log(`FK '${fk.name}': parent table '${fk.referencedTable}' not found; emitting null-guards-only check`);
+			const nullGuards: AST.UnaryExpr[] = fk.columns.map((childColIdx) => ({
+				type: 'unary',
+				operator: 'IS NULL',
+				expr: { type: 'column', name: tableSchema.columns[childColIdx].name, table: 'NEW' } as AST.ColumnExpr,
+			}));
+			existsExpr = nullGuards.reduceRight<AST.Expression>(
+				(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
+				{ type: 'literal', value: 0 } as AST.LiteralExpr,
+			);
+		} else {
+			const parentColIndices = resolveReferencedColumns(fk, parentSchema);
+			if (parentColIndices.length !== fk.columns.length) {
+				log(`FK check skipped: column count mismatch for FK '${fk.name}'`);
+				continue;
+			}
 
-		const parentColIndices = resolveReferencedColumns(fk, parentSchema);
-		if (parentColIndices.length !== fk.columns.length) {
-			log(`FK check skipped: column count mismatch for FK '${fk.name}'`);
-			continue;
+			// Synthesize EXISTS(SELECT 1 FROM parent WHERE parent.ref = NEW.fk)
+			existsExpr = synthesizeExistsCheck(fk, tableSchema, parentSchema, parentColIndices, 'new');
 		}
-
-		// Synthesize EXISTS(SELECT 1 FROM parent WHERE parent.ref = NEW.fk)
-		const existsExpr = synthesizeExistsCheck(fk, tableSchema, parentSchema, parentColIndices, 'new');
 
 		// Build as a RowConstraintSchema so it integrates with existing infrastructure
 		const syntheticConstraint: RowConstraintSchema = {
@@ -231,6 +240,7 @@ export function buildChildSideFKChecks(
 				deferrable: true,
 				initiallyDeferred: true,
 				needsDeferred: true,
+				kind: 'fk-child',
 			});
 		} finally {
 			if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);
@@ -270,16 +280,16 @@ export function buildParentSideFKChecks(
 
 				const action = operation === RowOpFlag.DELETE ? fk.onDelete : fk.onUpdate;
 
-				// Only RESTRICT generates parent-side checks
-				// CASCADE, SET NULL, SET DEFAULT are handled by cascading actions
-				// IGNORE means no enforcement at all
+				// Only RESTRICT generates parent-side checks. CASCADE, SET NULL,
+				// and SET DEFAULT are handled by cascading actions in
+				// runtime/foreign-key-actions.
 				if (action !== 'restrict') continue;
 
 				const parentColIndices = resolveReferencedColumns(fk, tableSchema);
 				if (parentColIndices.length !== fk.columns.length) continue;
 
-				// For UPDATE, only check if the referenced columns are being modified
-				// (this optimization can be added later; for now check always)
+				// For UPDATE, the runtime skips this check when none of `parentColIndices`
+				// changed (see emit/constraint-check.ts).
 
 				// Synthesize NOT EXISTS(SELECT 1 FROM child WHERE child.fk = OLD.pk)
 				const notExistsExpr = synthesizeNotExistsCheck(fk, childTable, tableSchema, parentColIndices);
@@ -362,6 +372,8 @@ export function buildParentSideFKChecks(
 						deferrable: !isRestrict,
 						initiallyDeferred: !isRestrict,
 						needsDeferred: !isRestrict, // RESTRICT must be immediate, not deferred
+						kind: 'fk-parent',
+						referencedColumnIndices: parentColIndices,
 					});
 				} finally {
 					if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);

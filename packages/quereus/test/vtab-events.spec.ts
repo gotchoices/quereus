@@ -307,8 +307,7 @@ describe('VTable Event Hooks', () => {
 		});
 	});
 
-describe.skip('getEventEmitter API', () => {
-	// Note: Database.getTable() API is not yet implemented
+describe('getEventEmitter API', () => {
 	it('should expose event emitter from table', async () => {
 		await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY)');
 
@@ -334,6 +333,46 @@ describe.skip('getEventEmitter API', () => {
 
 		assert.equal(localEvents.length, 1);
 		assert.equal(localEvents[0].type, 'insert');
+	});
+
+	it('returns undefined for unknown tables', () => {
+		assert.equal(db.getTable('main', 'no_such_table'), undefined);
+		assert.equal(db.getTable('main', 'NoSuchTable'), undefined);
+	});
+
+	it('resolves via default schema when schemaName is undefined', async () => {
+		await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY)');
+		const handle = db.getTable(undefined, 'users');
+		assert.ok(handle);
+		assert.equal(handle!.tableName, 'users');
+		assert.equal(handle!.schemaName, 'main');
+	});
+
+	it('unsubscribe stops further events', async () => {
+		await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+		const handle = db.getTable('main', 'users');
+		const seen: VTableDataChangeEvent[] = [];
+		const off = handle!.getEventEmitter()!.onDataChange!((e) => seen.push(e));
+		await db.exec("INSERT INTO users VALUES (1, 'Alice')");
+		off();
+		await db.exec("INSERT INTO users VALUES (2, 'Bob')");
+		assert.equal(seen.length, 1);
+	});
+
+	it('post-DROP: handle keeps emitter, no events fire after table is gone', async () => {
+		await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+		const handle = db.getTable('main', 'users')!;
+		const seen: VTableDataChangeEvent[] = [];
+		handle.getEventEmitter()!.onDataChange!((e) => {
+			if (e.tableName === 'users') seen.push(e);
+		});
+		await db.exec("INSERT INTO users VALUES (1, 'Alice')");
+		assert.equal(seen.length, 1);
+		await db.exec('DROP TABLE users');
+		// Handle should now resolve undefined from db.getTable, but the
+		// previously-captured handle's emitter still works (no throw).
+		assert.equal(db.getTable('main', 'users'), undefined);
+		assert.notEqual(handle.getEventEmitter(), undefined);
 	});
 });
 

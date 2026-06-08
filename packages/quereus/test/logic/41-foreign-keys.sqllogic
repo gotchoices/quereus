@@ -111,7 +111,7 @@ SELECT id FROM departments;
 DROP TABLE employees;
 DROP TABLE departments;
 
--- --- NO ACTION (alias for IGNORE — no enforcement) ---
+-- --- NO ACTION (treated as RESTRICT) ---
 
 CREATE TABLE categories (
     id INTEGER PRIMARY KEY,
@@ -131,13 +131,19 @@ INSERT INTO products VALUES (1, 'Laptop', 1);
 SELECT count(*) FROM products;
 → [{"count(*)":1}]
 
--- NO ACTION = IGNORE: deleting parent with existing children should succeed
+-- NO ACTION → RESTRICT: deleting parent with existing children fails
 DELETE FROM categories WHERE id = 1;
+-- error: CHECK constraint failed: _fk_products_cat_id
 
+-- Nothing changed
 SELECT count(*) FROM categories WHERE id = 1;
-→ [{"count(*)":0}]
--- Child row still exists (orphaned — no enforcement)
+→ [{"count(*)":1}]
 SELECT count(*) FROM products WHERE cat_id = 1;
+→ [{"count(*)":1}]
+
+-- Deleting an unreferenced parent succeeds
+DELETE FROM categories WHERE id = 2;
+SELECT count(*) FROM categories;
 → [{"count(*)":1}]
 
 DROP TABLE products;
@@ -717,4 +723,70 @@ SELECT id, parent_id FROM repl_sn_child ORDER BY id;
 
 DROP TABLE repl_sn_child;
 DROP TABLE repl_sn_parent;
+
+-- ===================================================================
+-- Phase: Parent-side FK UPDATE column-mask (regression for fix-fk-parent-update-column-mask)
+-- ===================================================================
+-- Updates that don't touch any FK-referenced parent column must NOT trip
+-- the synthesised parent-side NOT EXISTS check.
+
+CREATE TABLE pmask_parent (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE pmask_child (parent_id TEXT PRIMARY KEY REFERENCES pmask_parent(id));
+
+INSERT INTO pmask_parent VALUES ('a', 'x');
+INSERT INTO pmask_child VALUES ('a');
+
+-- UPDATE on a non-referenced column succeeds even with referencing child rows
+UPDATE pmask_parent SET name = 'y' WHERE id = 'a';
+
+SELECT id, name FROM pmask_parent;
+→ [{"id":"a","name":"y"}]
+
+-- UPDATE that touches the referenced PK still trips RESTRICT
+UPDATE pmask_parent SET id = 'b' WHERE id = 'a';
+-- error: CHECK constraint failed:
+
+DROP TABLE pmask_child;
+DROP TABLE pmask_parent;
+
+-- Two FKs referencing different parent columns: updating only one must
+-- skip the other parent-side check.
+
+CREATE TABLE pmask2_parent (
+    id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL UNIQUE,
+    extra TEXT NULL
+);
+CREATE TABLE pmask2_child_code (
+    cid INTEGER PRIMARY KEY,
+    parent_code TEXT REFERENCES pmask2_parent(code)
+);
+CREATE TABLE pmask2_child_label (
+    cid INTEGER PRIMARY KEY,
+    parent_label TEXT REFERENCES pmask2_parent(label)
+);
+
+INSERT INTO pmask2_parent VALUES (1, 'C1', 'L1', NULL);
+INSERT INTO pmask2_child_code VALUES (10, 'C1');
+INSERT INTO pmask2_child_label VALUES (20, 'L1');
+
+-- Updating `label` only: pmask2_child_code's parent-side check (on `code`) must skip;
+-- pmask2_child_label's check fires on `label` change → RESTRICT.
+UPDATE pmask2_parent SET label = 'L2' WHERE id = 1;
+-- error: CHECK constraint failed:
+
+-- Updating `code` only: symmetric — pmask2_child_code's check fires.
+UPDATE pmask2_parent SET code = 'C2' WHERE id = 1;
+-- error: CHECK constraint failed:
+
+-- Updating neither referenced column: both checks must skip.
+UPDATE pmask2_parent SET extra = 'ok' WHERE id = 1;
+
+SELECT id, code, label, extra FROM pmask2_parent;
+→ [{"id":1,"code":"C1","label":"L1","extra":"ok"}]
+
+DROP TABLE pmask2_child_label;
+DROP TABLE pmask2_child_code;
+DROP TABLE pmask2_parent;
 

@@ -1,5 +1,7 @@
-import type { RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
+import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
+import type { RelationType } from '../../common/datatype.js';
+import type { Scope } from '../scopes/scope.js';
 import { WindowNode, type WindowSpec } from '../nodes/window-node.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
@@ -168,27 +170,24 @@ function buildWindowProjections(
 			const builtExpr = buildExpression(selectContext, column.expr, true);
 
 			if (isWindowExpression(builtExpr)) {
-				// For window functions, use ArrayIndexNode to access the value by direct index
-				const windowColumnIndex = findWindowFunctionIndex(
+				// Rewrite each window-function descendant into an ArrayIndexNode pointing
+				// at its computed window-output column, preserving any surrounding
+				// arithmetic / scalar wrapper (e.g. `1000 - row_number() over (...)`).
+				// The top-level case (`row_number() over (...) as rn`) falls out naturally:
+				// the whole tree is the window node, so the rewrite returns a bare
+				// ArrayIndexNode, matching the prior behavior.
+				const rewritten = rewriteWindowFunctions(
 					builtExpr,
 					windowFunctions,
-					sourceColumnCount
+					sourceColumnCount,
+					windowType,
+					selectContext.scope
 				);
 
-				if (windowColumnIndex >= 0) {
-					const windowColumnType = windowType.columns[windowColumnIndex].type;
-
-					const arrayIndexNode = new ArrayIndexNode(
-						selectContext.scope,
-						windowColumnIndex,
-						windowColumnType
-					);
-
-					windowProjections.push({
-						node: arrayIndexNode,
-						alias: column.alias
-					});
-				}
+				windowProjections.push({
+					node: rewritten,
+					alias: column.alias
+				});
 			} else {
 				// For regular columns, use the already-built expression
 				windowProjections.push({
@@ -203,28 +202,73 @@ function buildWindowProjections(
 }
 
 /**
- * Finds the index of a window function in the window output
+ * Recursively rewrites every WindowFunctionCallNode descendant of a scalar
+ * expression into an ArrayIndexNode referencing that function's window-output
+ * column, leaving the surrounding expression structure intact.
+ *
+ * Mirrors the aggregate path (collectInnerAggregates): the whole outer
+ * expression is preserved and the inner window results are substituted back in.
+ * Does NOT recurse into a window function's own arguments — its result is a
+ * single output column already materialized by the WindowNode.
  */
-function findWindowFunctionIndex(
-	originalExpr: ScalarPlanNode,
+function rewriteWindowFunctions(
+	node: ScalarPlanNode,
+	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
+	sourceColumnCount: number,
+	windowType: RelationType,
+	scope: Scope
+): ScalarPlanNode {
+	if (CapabilityDetectors.isWindowFunction(node)) {
+		const index = findWindowColumnIndex(node as WindowFunctionCallNode, windowFunctions, sourceColumnCount);
+		if (index >= 0) {
+			return new ArrayIndexNode(scope, index, windowType.columns[index].type);
+		}
+		// No match (shouldn't happen for a window node we collected) — leave as-is.
+		return node;
+	}
+
+	const children = node.getChildren();
+	const newChildren: PlanNode[] = [];
+	let changed = false;
+
+	for (const child of children) {
+		// Only scalar children participate in window rewriting; pass others through.
+		if ('expression' in child) {
+			const rewrittenChild = rewriteWindowFunctions(
+				child as ScalarPlanNode,
+				windowFunctions,
+				sourceColumnCount,
+				windowType,
+				scope
+			);
+			if (rewrittenChild !== child) {
+				changed = true;
+			}
+			newChildren.push(rewrittenChild);
+		} else {
+			newChildren.push(child as PlanNode);
+		}
+	}
+
+	return changed ? (node.withChildren(newChildren) as ScalarPlanNode) : node;
+}
+
+/**
+ * Finds the window-output column index for a single window-function node by
+ * matching it (name + window spec) against the collected window functions.
+ */
+function findWindowColumnIndex(
+	windowNode: WindowFunctionCallNode,
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
 	sourceColumnCount: number
 ): number {
 	const matchingWindowFuncIndex = windowFunctions.findIndex(({ func }) => {
-		// Match based on function name, parameters, and window specification
-		if (!CapabilityDetectors.isWindowFunction(originalExpr) ||
-			func.functionName.toLowerCase() !== originalExpr.functionName.toLowerCase()) {
+		// Match based on function name and window specification
+		if (func.functionName.toLowerCase() !== windowNode.functionName.toLowerCase()) {
 			return false;
 		}
 
-		// Cast to WindowFunctionCallNode to access expression property
-		const windowFunc = originalExpr as WindowFunctionCallNode;
-
-		// Also compare window specifications to distinguish between functions with same name
-		const originalWindow = windowFunc.expression.window;
-		const funcWindow = func.expression.window;
-
-		return compareWindowSpecs(originalWindow, funcWindow);
+		return compareWindowSpecs(windowNode.expression.window, func.expression.window);
 	});
 
 	return matchingWindowFuncIndex >= 0 ? sourceColumnCount + matchingWindowFuncIndex : -1;

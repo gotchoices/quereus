@@ -44,7 +44,7 @@ export class GlobalScope extends BaseScope {
 		if (!vtabModule) {
 			return undefined;
 		}
-		return new TableReferenceNode(this, tableSchema, vtabModule.module, vtabModule.auxData);
+		return new TableReferenceNode(this, tableSchema, vtabModule.module, vtabModule.auxData, undefined, false, this.manager);
 	}
 
 	findUnqualifiedName(name: string): PlanNode | typeof Ambiguous | undefined {
@@ -62,7 +62,7 @@ export class GlobalScope extends BaseScope {
 			if (!vtabModule) {
 				return undefined;
 			}
-			return new TableReferenceNode(this, table, vtabModule.module, vtabModule.auxData);
+			return new TableReferenceNode(this, table, vtabModule.module, vtabModule.auxData, undefined, false, this.manager);
 		}
 		return undefined;
 	}

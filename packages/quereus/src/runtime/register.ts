@@ -31,6 +31,7 @@ import { emitFilter } from './emit/filter.js';
 import { emitDistinct } from './emit/distinct.js';
 import { emitScalarFunctionCall } from './emit/scalar-function.js';
 import { emitLimitOffset } from './emit/limit-offset.js';
+import { emitOrdinalSlice } from './emit/ordinal-slice.js';
 import { emitStreamAggregate } from './emit/aggregate.js';
 import { emitHashAggregate } from './emit/hash-aggregate.js';
 import { emitCaseExpr } from './emit/case.js';
@@ -51,13 +52,18 @@ import { emitAlterTable } from './emit/alter-table.js';
 import { emitLoopJoin } from './emit/join.js';
 import { emitBloomJoin } from './emit/bloom-join.js';
 import { emitMergeJoin } from './emit/merge-join.js';
+import { emitAsofScan } from './emit/asof-scan.js';
 import { emitCache } from './emit/cache.js';
+import { emitEagerPrefetch } from './emit/eager-prefetch.js';
+import { emitAsyncGather } from './emit/async-gather.js';
+import { emitFanOutLookupJoin } from './emit/fanout-lookup-join.js';
 import { emitReturning } from './emit/returning.js';
 import { emitSink } from './emit/sink.js';
 import { emitBetween } from './emit/between.js';
 import { emitRetrieve } from './emit/retrieve.js';
 import { emitRemoteQuery } from './emit/remote-query.js';
 import { emitEmptyResult } from './emit/empty-result.js';
+import { emitEmptyRelation } from './emit/empty-relation.js';
 import { emitDeclareSchema, emitDiffSchema, emitApplySchema, emitExplainSchema } from './emit/schema-declarative.js';
 
 let registered = false;
@@ -95,6 +101,7 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.IndexScan, emitSeqScan as EmitterFunc); // Reuse for now
 	registerEmitter(PlanNodeType.IndexSeek, emitSeqScan as EmitterFunc); // Reuse for now
 	registerEmitter(PlanNodeType.EmptyResult, emitEmptyResult as EmitterFunc);
+	registerEmitter(PlanNodeType.EmptyRelation, emitEmptyRelation as EmitterFunc);
 	registerEmitter(PlanNodeType.RemoteQuery, emitRemoteQuery as EmitterFunc);
 
 	registerEmitter(PlanNodeType.Values, emitValues as EmitterFunc);
@@ -105,6 +112,7 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.Distinct, emitDistinct as EmitterFunc);
 	registerEmitter(PlanNodeType.Sort, emitSort as EmitterFunc);
 	registerEmitter(PlanNodeType.LimitOffset, emitLimitOffset as EmitterFunc);
+	registerEmitter(PlanNodeType.OrdinalSlice, emitOrdinalSlice as EmitterFunc);
 	registerEmitter(PlanNodeType.TableFunctionCall, emitTableValuedFunctionCall as EmitterFunc);
 	registerEmitter(PlanNodeType.In, emitIn as EmitterFunc);
 	registerEmitter(PlanNodeType.Window, emitWindow as EmitterFunc);
@@ -154,9 +162,19 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.Join, emitLoopJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.HashJoin, emitBloomJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.MergeJoin, emitMergeJoin as EmitterFunc);
+	registerEmitter(PlanNodeType.AsofScan, emitAsofScan as EmitterFunc);
 
 	// Cache emitter
 	registerEmitter(PlanNodeType.Cache, emitCache as EmitterFunc);
+
+	// Eager prefetch emitter
+	registerEmitter(PlanNodeType.EagerPrefetch, emitEagerPrefetch as EmitterFunc);
+
+	// Async gather emitter (N-ary parallel relational combinator)
+	registerEmitter(PlanNodeType.AsyncGather, emitAsyncGather as EmitterFunc);
+
+	// Fan-out lookup join emitter (per outer row → N concurrent at-most-one lookups)
+	registerEmitter(PlanNodeType.FanOutLookupJoin, emitFanOutLookupJoin as EmitterFunc);
 
 	// Sink emitter
 	registerEmitter(PlanNodeType.Sink, emitSink as EmitterFunc);

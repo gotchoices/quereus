@@ -86,14 +86,25 @@ export class MemoryTable extends VirtualTable {
 					: null;
 				if (existingMemConn && existingMemConn.tableManager === this.manager) {
 					this.connection = existingMemConn;
-					// Sync readLayer with the manager's current committed state.
+					// Sync readLayer with the manager's current committed state
+					// when the connection has no in-flight transactional state.
 					// The connection may have been disconnected from the manager
 					// (removed from its connections map by a previous scan's finally
 					// block) while remaining in the DB's connection registry.  After
 					// schema changes like ALTER TABLE ADD COLUMN,
 					// ensureSchemaChangeSafety only updates connections still in the
 					// manager's map, so this connection may point to an outdated layer.
-					this.connection.readLayer = this.manager.currentCommittedLayer;
+					//
+					// Skip the reset during an active transaction: readLayer may be
+					// a savepoint snapshot (eager-swap) holding in-transaction writes
+					// that aren't yet in currentCommittedLayer; resetting would lose
+					// those writes. Schema changes can't happen during a transaction
+					// (ensureSchemaChangeSafety throws on active transactions), so
+					// staleness is not a concern here.
+					if (!this.connection.explicitTransaction
+						&& !this.connection.pendingTransactionLayer) {
+						this.connection.readLayer = this.manager.currentCommittedLayer;
+					}
 					logger.debugLog(`ensureConnection: Reused existing connection ${this.connection.connectionId} for table ${this.tableName}`);
 				} else {
 					// Establish connection state with the manager upon first use
@@ -324,6 +335,11 @@ export class MemoryTable extends VirtualTable {
 				case 'alterPrimaryKey':
 					throw new QuereusError(
 						'MemoryTable does not support in-place primary key alteration',
+						StatusCode.UNSUPPORTED,
+					);
+				case 'addConstraint':
+					throw new QuereusError(
+						`MemoryTable does not support ADD CONSTRAINT ${changeInfo.constraint.type}`,
 						StatusCode.UNSUPPORTED,
 					);
 				case 'alterColumn':

@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Retrieve growth with index-style fallback (memory vtab)', () => {
 	let db: Database;
@@ -19,7 +22,7 @@ describe('Retrieve growth with index-style fallback (memory vtab)', () => {
 
 	it('grows Filter(id = :id) and selects IndexSeek on PK', async () => {
 		await setup();
-		const res: any[] = [];
+		const res: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan('SELECT name FROM mt WHERE id = :id')")) {
 			res.push(r);
 		}
@@ -30,7 +33,7 @@ describe('Retrieve growth with index-style fallback (memory vtab)', () => {
 
 	it('range + ORDER BY selects index access (scan or seek) with ordering', async () => {
 		await setup();
-		const res: any[] = [];
+		const res: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan('SELECT id FROM mt WHERE id >= 1 AND id <= 3 ORDER BY id')")) {
 			res.push(r);
 		}
@@ -41,7 +44,7 @@ describe('Retrieve growth with index-style fallback (memory vtab)', () => {
 
 	it('constant LIMIT is considered during growth (still produces correct result)', async () => {
 		await setup();
-		const rows: any[] = [];
+		const rows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT id FROM mt ORDER BY id LIMIT 1")) rows.push(r);
 		expect(rows).to.deep.equal([{ id: 1 }]);
 	});

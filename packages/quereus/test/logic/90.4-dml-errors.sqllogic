@@ -41,7 +41,7 @@ INSERT INTO t_mut_src VALUES (1, 10);
 -- run
 
 INSERT INTO t_mut_dst SELECT * FROM (DELETE FROM t_mut_src WHERE id = 1);
--- error: Mutating subqueries must have a RETURNING clause
+-- error: must have a RETURNING clause
 
 DROP TABLE t_mut_src;
 DROP TABLE t_mut_dst;

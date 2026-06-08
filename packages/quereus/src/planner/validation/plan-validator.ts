@@ -9,6 +9,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { validateLog } from '../debug/logger-utils.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
+import { computeAttributeProvenance, type ProvenanceEntry } from '../analysis/attribute-provenance.js';
 
 const log = validateLog();
 
@@ -41,6 +42,15 @@ export function validatePhysicalTree(root: PlanNode, options: ValidationOptions 
 	log('Starting plan validation for tree rooted at %s', root.nodeType);
 
 	const context = new ValidationContext(opts);
+
+	// Derive the attribute-provenance surface once. This both (a) detects
+	// duplicate origins (throws) and (b) yields the complete attrId → origin map
+	// regardless of traversal order, so the in-scope check below is order-free
+	// and forwarding (Set/Join/EagerPrefetch/AsyncGather/Project) never trips it.
+	if (opts.validateAttributes) {
+		context.provenance = computeAttributeProvenance(root);
+	}
+
 	validateNode(root, context, []);
 
 	log('Plan validation completed successfully');
@@ -50,35 +60,17 @@ export function validatePhysicalTree(root: PlanNode, options: ValidationOptions 
  * Validation context for tracking state during traversal
  */
 class ValidationContext {
-	/** All attribute IDs seen so far */
-	private attributeIds = new Set<number>();
-
-	/** Map of attribute ID to node path for debugging */
-	private attributeLocations = new Map<number, string>();
+	/** attrId → originating node, precomputed once when validateAttributes is on. */
+	provenance?: Map<number, ProvenanceEntry>;
 
 	constructor(public readonly options: ValidationOptions) {}
 
 	/**
-	 * Register an attribute ID and check for duplicates
-	 */
-	registerAttribute(attrId: number, nodePath: string): void {
-		if (this.attributeIds.has(attrId)) {
-			const existingLocation = this.attributeLocations.get(attrId);
-			throw new QuereusError(
-				`Duplicate attribute ID ${attrId} found at ${nodePath} (previously seen at ${existingLocation})`,
-				StatusCode.INTERNAL
-			);
-		}
-
-		this.attributeIds.add(attrId);
-		this.attributeLocations.set(attrId, nodePath);
-	}
-
-	/**
-	 * Check if an attribute ID exists
+	 * Check if an attribute ID is in scope anywhere in the tree (originated or
+	 * forwarded). Matches the prior global-set scoping semantics.
 	 */
 	hasAttribute(attrId: number): boolean {
-		return this.attributeIds.has(attrId);
+		return this.provenance?.has(attrId) ?? false;
 	}
 }
 
@@ -214,7 +206,10 @@ function validateRelationalNode(node: RelationalPlanNode, context: ValidationCon
 		log('Warning: Relational node %s has no attributes at %s', node.nodeType, nodePath);
 	}
 
-	// Register all attribute IDs and check for duplicates within this node
+	// Per-attribute shape checks. Duplicate-origin detection lives in the
+	// precomputed provenance surface (computeAttributeProvenance), not here —
+	// attribute-preserving parents (Set/Join/EagerPrefetch/AsyncGather) forward
+	// child ids verbatim and must not be flagged as duplicates.
 	for (const attr of attributes) {
 		if (typeof attr.id !== 'number') {
 			throw new QuereusError(
@@ -222,8 +217,6 @@ function validateRelationalNode(node: RelationalPlanNode, context: ValidationCon
 				StatusCode.INTERNAL
 			);
 		}
-
-		context.registerAttribute(attr.id, nodePath);
 
 		// Validate attribute properties
 		if (!attr.name || typeof attr.name !== 'string') {

@@ -7,9 +7,8 @@ Tags use the `v` prefix (e.g. `v1.0.0`).
 
 ## Prerequisites
 
-- All CI checks pass on `main`
 - `yarn build` succeeds
-- `yarn test` passes
+- `yarn check` passes
 - Clean working tree (`git status` shows no uncommitted changes)
 
 ## Quick Release

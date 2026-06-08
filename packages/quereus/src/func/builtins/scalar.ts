@@ -2,7 +2,7 @@ import type { SqlValue, DeepReadonly } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { compareSqlValues, getSqlDataTypeName } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE } from '../../types/builtin-types.js';
+import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 
 /**
  * Find the common type among multiple logical types.
@@ -69,39 +69,47 @@ export const absFunc = createScalarFunction(
 );
 
 // --- round(X, Y?) ---
-export const roundFunc = createScalarFunction(
-	{
-		name: 'round',
-		numArgs: -1,
-		deterministic: true,
-		// Type inference: return the same type as the input for numeric types
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: false,
-			isReadOnly: true
-		}),
-		validateArgTypes: (argTypes) => argTypes[0].isNumeric === true
-	},
-	(numVal: SqlValue, placesVal?: SqlValue): SqlValue => {
-		if (numVal === null) return null;
-		const x = Number(numVal);
-		if (isNaN(x)) return null;
+const roundImpl = (numVal: SqlValue, placesVal?: SqlValue): SqlValue => {
+	if (numVal === null) return null;
+	const x = Number(numVal);
+	if (isNaN(x)) return null;
 
-		let y = 0;
-		if (placesVal !== undefined && placesVal !== null) {
-			const numY = Number(placesVal);
-			if (isNaN(numY)) return null;
-			y = Math.trunc(numY);
-		}
-
-		try {
-			const factor = Math.pow(10, y);
-			return Math.round(x * factor) / factor;
-		} catch {
-			return null;
-		}
+	let y = 0;
+	if (placesVal !== undefined && placesVal !== null) {
+		const numY = Number(placesVal);
+		if (isNaN(numY)) return null;
+		y = Math.trunc(numY);
 	}
+
+	try {
+		const factor = Math.pow(10, y);
+		return Math.round(x * factor) / factor;
+	} catch {
+		return null;
+	}
+};
+
+const roundSchemaBase = {
+	name: 'round',
+	deterministic: true,
+	// Type inference: return the same type as the input for numeric types
+	inferReturnType: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ({
+		typeClass: 'scalar' as const,
+		logicalType: argTypes[0],
+		nullable: false,
+		isReadOnly: true
+	}),
+	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => argTypes[0].isNumeric === true
+};
+
+export const roundFunc1 = createScalarFunction(
+	{ ...roundSchemaBase, numArgs: 1 },
+	roundImpl
+);
+
+export const roundFunc2 = createScalarFunction(
+	{ ...roundSchemaBase, numArgs: 2 },
+	roundImpl
 );
 
 // --- coalesce(...) ---
@@ -149,8 +157,23 @@ export const nullifFunc = createScalarFunction(
 );
 
 // --- typeof(X) ---
+// Pin the return type to TEXT so the planner does not insert an implicit
+// cast on the right-hand side of comparisons like `typeof(x) = 'integer'`.
+// Without this, the default REAL return type makes the comparator coerce
+// the literal 'integer' to REAL (=> 0), which then constant-folds and the
+// CHECK predicate always fails.
 export const typeofFunc = createScalarFunction(
-	{ name: 'typeof', numArgs: 1, deterministic: true },
+	{
+		name: 'typeof',
+		numArgs: 1,
+		deterministic: true,
+		returnType: {
+			typeClass: 'scalar',
+			logicalType: TEXT_TYPE,
+			nullable: false,
+			isReadOnly: true
+		}
+	},
 	(arg: SqlValue): SqlValue => {
 		return getSqlDataTypeName(arg);
 	}

@@ -1,0 +1,120 @@
+-- where-null-comparisons.sqllogic - WHERE-clause three-valued logic for NULL operands
+-- Distilled from SQLite test/where5.test and test/null.test
+
+create table wn (id integer primary key, val integer null, txt text null);
+insert into wn values (1, 10, 'a'), (2, null, 'b'), (3, 30, null), (4, null, null);
+
+-- =============================================================================
+-- col <op> NULL is unknown -> WHERE filters out all rows
+-- =============================================================================
+
+select id from wn where val = null order by id;
+→ []
+
+select id from wn where val != null order by id;
+→ []
+
+select id from wn where val <> null order by id;
+→ []
+
+select id from wn where val < null order by id;
+→ []
+
+select id from wn where val <= null order by id;
+→ []
+
+select id from wn where val > null order by id;
+→ []
+
+select id from wn where val >= null order by id;
+→ []
+
+select id from wn where txt = null order by id;
+→ []
+
+-- =============================================================================
+-- NULL <op> col / NULL <op> NULL is unknown -> no rows
+-- =============================================================================
+
+select id from wn where null = val order by id;
+→ []
+
+select id from wn where null < val order by id;
+→ []
+
+select id from wn where null = null order by id;
+→ []
+
+select id from wn where null != null order by id;
+→ []
+
+-- Bare NULL in WHERE is falsy
+select id from wn where null order by id;
+→ []
+
+-- NOT NULL in WHERE is also unknown -> no rows
+select id from wn where not null order by id;
+→ []
+
+-- =============================================================================
+-- Arithmetic propagating NULL into a comparison
+-- =============================================================================
+
+select id from wn where val + null > 5 order by id;
+→ []
+
+select id from wn where val + null is null order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+select id from wn where (val * 0) = null order by id;
+→ []
+
+-- =============================================================================
+-- NOT around a NULL-producing comparison stays unknown
+-- =============================================================================
+
+select id from wn where not (val = null) order by id;
+→ []
+
+select id from wn where not (val < null) order by id;
+→ []
+
+select id from wn where not (val + null > 5) order by id;
+→ []
+
+-- =============================================================================
+-- IS / IS NOT are null-safe and produce TRUE/FALSE, never NULL
+-- =============================================================================
+
+select id from wn where val is null order by id;
+→ [{"id":2},{"id":4}]
+
+select id from wn where val is not null order by id;
+→ [{"id":1},{"id":3}]
+
+-- (Quereus parser restricts IS to IS NULL / IS NOT NULL — null-safe equality form not supported)
+
+-- IS NULL inside a NOT is still TRUE/FALSE
+select id from wn where not (val is null) order by id;
+→ [{"id":1},{"id":3}]
+
+select id from wn where not (val is not null) order by id;
+→ [{"id":2},{"id":4}]
+
+-- =============================================================================
+-- Compound with AND/OR: unknown short-circuits AND but not OR-with-true
+-- =============================================================================
+
+-- val > 5 AND val = NULL: AND of (true|null) and unknown -> all unknown
+select id from wn where val > 5 and val = null order by id;
+→ []
+
+-- val > 5 OR val = NULL: OR of (true|null) and unknown -> id=1,3 keep true; id=2,4 stay null
+select id from wn where val > 5 or val = null order by id;
+→ [{"id":1},{"id":3}]
+
+-- TRUE OR unknown -> TRUE: id=1 wins via val=10; rest stay unknown
+select id from wn where val = 10 or val = null order by id;
+→ [{"id":1}]
+
+drop table wn;

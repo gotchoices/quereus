@@ -1,5 +1,5 @@
 import { PlanNodeType } from './plan-node-type.js';
-import { PlanNode, type Attribute, type RelationalPlanNode, type UnaryRelationalNode, type ScalarPlanNode } from './plan-node.js';
+import { PlanNode, type Attribute, type RelationalPlanNode, type UnaryRelationalNode, type ScalarPlanNode, type PhysicalProperties, type MonotonicOnInfo } from './plan-node.js';
 import type { WindowFunctionCallNode } from './window-function.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
@@ -7,11 +7,58 @@ import { Cached } from '../../util/cached.js';
 import type * as AST from '../../parser/ast.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { ColumnReferenceNode } from './reference.js';
+import { isAssertedKey } from '../util/fd-utils.js';
 
 export interface WindowSpec {
 	partitionBy: AST.Expression[];
 	orderBy: AST.OrderByClause[];
 	frame?: AST.WindowFrame;
+}
+
+/**
+ * Per-function streaming mode chosen by `rule-monotonic-window`. Indexed
+ * parallel to `WindowNode.functions`.
+ *
+ *   - rowNumber / rank / denseRank — single counter + last-key state.
+ *   - lag / lead — ring/read-ahead buffer with a literal offset and default value.
+ *   - firstValue — caches the first row's expression for the partition.
+ *   - lastValue — under the streaming default frame (`UNBOUNDED PRECEDING TO
+ *     CURRENT ROW`) `LAST_VALUE(expr)` is `expr` evaluated on the current row.
+ *   - runningAgg — fold via the registered step/final hooks (default frame only).
+ *   - slidingAgg — `SUM/COUNT/AVG/MIN/MAX/FIRST_VALUE/LAST_VALUE` over a sliding
+ *     frame of the form `ROWS BETWEEN n PRECEDING AND m FOLLOWING` (literal `n`,
+ *     `m`, both ≥ 0) or `RANGE BETWEEN <num> PRECEDING AND <num> FOLLOWING`
+ *     (single numeric ORDER BY, literal non-negative offsets).
+ */
+export type StreamingWindowFunctionMode =
+	| { kind: 'rowNumber' }
+	| { kind: 'rank' }
+	| { kind: 'denseRank' }
+	| { kind: 'lag'; offset: number }
+	| { kind: 'lead'; offset: number }
+	| { kind: 'firstValue' }
+	| { kind: 'lastValue' }
+	| { kind: 'runningAgg' }
+	| {
+		kind: 'slidingAgg';
+		/** Underlying aggregate / value function name (lower-case). */
+		name: 'sum' | 'count' | 'avg' | 'min' | 'max' | 'first_value' | 'last_value';
+		frameMode: 'rows' | 'range';
+		/** Non-negative integer literal for ROWS; non-negative numeric literal for RANGE. */
+		preceding: number;
+		/** Same constraints as preceding. */
+		following: number;
+	};
+
+/**
+ * Marker added to a `WindowNode` by `rule-monotonic-window` when the source's
+ * emit order already covers `[PARTITION BY..., ORDER BY[0]]`. Drives the
+ * runtime's streaming emitter and signals to `computePhysical()` that the
+ * window output preserves the source's `monotonicOn` unchanged.
+ */
+export interface StreamingWindowConfig {
+	readonly modes: ReadonlyArray<StreamingWindowFunctionMode>;
 }
 
 /**
@@ -34,7 +81,9 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		public readonly functionArguments: ScalarPlanNode[][],
 		estimatedCostOverride?: number,
 		/** Optional predefined attributes for preserving IDs during optimization */
-		public readonly predefinedAttributes?: Attribute[]
+		public readonly predefinedAttributes?: Attribute[],
+		/** Set by `rule-monotonic-window` when the source streams in window order. */
+		public readonly streaming?: StreamingWindowConfig,
 	) {
 		super(scope, estimatedCostOverride);
 
@@ -156,12 +205,82 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 			// Preserve attributes only when the source is unchanged so that column IDs
 			// stay consistent. If the source relation changed, let the WindowNode rebuild
 			// its attribute list so that descriptors match the new underlying schema.
-			sourceChanged ? undefined : originalAttributes
+			sourceChanged ? undefined : originalAttributes,
+			this.streaming,
+		);
+	}
+
+	/** Return a new WindowNode with the given streaming config attached. */
+	withStreaming(config: StreamingWindowConfig): WindowNode {
+		return new WindowNode(
+			this.scope,
+			this.source,
+			this.windowSpec,
+			this.functions,
+			this.partitionExpressions,
+			this.orderByExpressions,
+			this.functionArguments,
+			undefined,
+			this.getAttributes() as Attribute[],
+			config,
 		);
 	}
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const sourcePhysical = childrenPhysical[0];
+
+		// Window output ordering is determined by [PARTITION BY, ORDER BY]:
+		//   - streaming set: the runtime walks the source in source order and emits
+		//     in source order — windowing is row-pass-through. Source's monotonicOn
+		//     survives unchanged.
+		//   - PARTITION BY non-empty (buffered): the runtime groups rows by partition
+		//     key in insertion order then sorts within each partition, so a
+		//     single-attribute monotonicOn does not survive at the relation level.
+		//   - PARTITION BY empty, ORDER BY present (buffered): output is sorted by
+		//     the window's ORDER BY — derive monotonicOn from the leading key
+		//     (mirrors SortNode).
+		//   - PARTITION BY empty, ORDER BY empty: rows pass through in source order;
+		//     preserve source's monotonicOn unchanged.
+		// TODO: the partitioned case can be tightened (e.g. when the partition keys
+		// themselves are functionally determined by the candidate attribute) — out
+		// of scope for the carrier ticket.
+		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
+		if (this.streaming) {
+			monotonicOn = sourcePhysical?.monotonicOn;
+		} else if (this.partitionExpressions.length === 0) {
+			if (this.orderByExpressions.length === 0) {
+				monotonicOn = sourcePhysical?.monotonicOn;
+			} else {
+				const leadExpr = this.orderByExpressions[0];
+				if (leadExpr instanceof ColumnReferenceNode) {
+					const sourceAttrs = this.source.getAttributes();
+					const leadAttrId = leadExpr.attributeId;
+					const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
+					if (leadIdx >= 0) {
+						const direction = this.windowSpec.orderBy[0]?.direction === 'desc' ? 'desc' : 'asc';
+						const strict = isAssertedKey(new Set([leadIdx]), sourcePhysical?.fds, sourceAttrs.length);
+						monotonicOn = [{ attrId: leadAttrId, direction, strict }];
+					}
+				}
+			}
+		}
+
+		return {
+			estimatedRows: this.estimatedRows,
+			ordering: sourcePhysical?.ordering,
+			monotonicOn,
+			// Window functions append columns but don't change the source row stream;
+			// FDs, equivalence classes, and constant bindings pass through on the
+			// source columns. (Window output columns are not in any new FDs — deferred.)
+			fds: sourcePhysical?.fds,
+			equivClasses: sourcePhysical?.equivClasses,
+			constantBindings: sourcePhysical?.constantBindings,
+			domainConstraints: sourcePhysical?.domainConstraints,
+		};
 	}
 
 	get estimatedRows(): number | undefined {
@@ -182,7 +301,7 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
-		return {
+		const attrs: Record<string, unknown> = {
 			windowSpec: {
 				partitionBy: this.windowSpec.partitionBy.length,
 				orderBy: this.windowSpec.orderBy.length,
@@ -194,5 +313,11 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 				distinct: f.isDistinct
 			}))
 		};
+		if (this.streaming) {
+			attrs.streaming = {
+				modes: this.streaming.modes.map(m => m.kind),
+			};
+		}
+		return attrs;
 	}
 }

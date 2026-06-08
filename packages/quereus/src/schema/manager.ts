@@ -8,11 +8,13 @@ import { StatusCode, type SqlValue } from '../common/types.js';
 import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js';
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
-import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema } from './table.js';
+import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns } from './table.js';
 import type { ViewSchema } from './view.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
+import { traverseAst } from '../parser/visitor.js';
+import { FunctionFlags } from '../common/constants.js';
 import { SchemaChangeNotifier } from './change-events.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { buildExpression } from '../planner/building/expression.js';
@@ -23,6 +25,7 @@ import { ParameterScope } from '../planner/scopes/param.js';
 import type { ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { hasNativeEventSupport } from '../util/event-support.js';
 import type { VTableSchemaChangeEvent } from '../vtab/events.js';
+import { quoteIdentifier } from '../emit/ast-stringify.js';
 
 const log = createLogger('schema:manager');
 const warnLog = log.extend('warn');
@@ -51,6 +54,15 @@ export class SchemaManager {
 	private defaultVTabModuleArgs: Record<string, SqlValue> = {};
 	private db: Database;
 	private changeNotifier = new SchemaChangeNotifier();
+	/**
+	 * Re-entrancy guard: when truthy, optimizer-side assertion hoisting is
+	 * suppressed. Set by `AssertionEvaluator` while compiling an assertion's
+	 * own violation query — without this guard, the hoist would make the
+	 * violation query plan to empty (the optimizer would trust the assertion
+	 * to prove its own non-violation), defeating commit-time enforcement.
+	 * See `assertion-hoist-cache.ts` and `core/database-assertions.ts`.
+	 */
+	private assertionHoistSuppressed: number = 0;
 
 	/**
 	 * Creates a new schema manager
@@ -110,6 +122,17 @@ export class SchemaManager {
 	 */
 	getModule(name: string): { module: AnyVirtualTableModule, auxData?: unknown } | undefined {
 		return this.modules.get(name.toLowerCase());
+	}
+
+	/**
+	 * Iterates registered virtual table modules in registration order.
+	 * Each entry yields the registered (lowercased) name, the module, and
+	 * any auxData supplied at registration time.
+	 */
+	*allModules(): IterableIterator<{ name: string; module: AnyVirtualTableModule; auxData?: unknown }> {
+		for (const [name, reg] of this.modules) {
+			yield { name, module: reg.module, auxData: reg.auxData };
+		}
 	}
 
 	/**
@@ -226,10 +249,85 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Adds (or replaces) an assertion in the named schema, firing
+	 * `assertion_added` or `assertion_modified` events as appropriate.
+	 * The Schema object itself does not hold a notifier; this wrapper exists
+	 * so optimizer caches (e.g. assertion-hoist) can invalidate on change.
+	 */
+	addAssertion(schemaName: string, assertion: IntegrityAssertionSchema): void {
+		const schema = this.schemas.get(schemaName.toLowerCase());
+		if (!schema) {
+			throw new QuereusError(`Schema not found: ${schemaName}`, StatusCode.ERROR);
+		}
+		const existing = schema.getAssertion(assertion.name);
+		schema.addAssertion(assertion);
+		if (existing) {
+			this.changeNotifier.notifyChange({
+				type: 'assertion_modified',
+				schemaName: schemaName,
+				objectName: assertion.name,
+				oldObject: existing,
+				newObject: assertion,
+			});
+		} else {
+			this.changeNotifier.notifyChange({
+				type: 'assertion_added',
+				schemaName: schemaName,
+				objectName: assertion.name,
+				newObject: assertion,
+			});
+		}
+	}
+
+	/**
+	 * Removes an assertion from the named schema, firing `assertion_removed`
+	 * on success. Returns true iff the assertion existed and was removed.
+	 */
+	removeAssertion(schemaName: string, name: string): boolean {
+		const schema = this.schemas.get(schemaName.toLowerCase());
+		if (!schema) return false;
+		const existing = schema.getAssertion(name);
+		if (!existing) return false;
+		const removed = schema.removeAssertion(name);
+		if (removed) {
+			this.changeNotifier.notifyChange({
+				type: 'assertion_removed',
+				schemaName: schemaName,
+				objectName: name,
+				oldObject: existing,
+			});
+		}
+		return removed;
+	}
+
+	/**
 	 * Gets the schema change notifier for listening to schema changes
 	 */
 	getChangeNotifier(): SchemaChangeNotifier {
 		return this.changeNotifier;
+	}
+
+	/**
+	 * True when assertion-hoisting must be suppressed (the caller is currently
+	 * planning an assertion's own violation query). Read by
+	 * `getAssertionHoistedConstraints`.
+	 */
+	isAssertionHoistSuppressed(): boolean {
+		return this.assertionHoistSuppressed > 0;
+	}
+
+	/**
+	 * Run `fn` with assertion-hoisting suppressed. Re-entrant via a depth
+	 * counter so nested suppressions compose. Always restores the previous
+	 * state, even when `fn` throws.
+	 */
+	withSuppressedAssertionHoist<T>(fn: () => T): T {
+		this.assertionHoistSuppressed++;
+		try {
+			return fn();
+		} finally {
+			this.assertionHoistSuppressed--;
+		}
 	}
 
 	/**
@@ -420,6 +518,58 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Asserts that no other table has FK rows referencing the table being dropped.
+	 * Self-referential FKs are skipped — those rows go away with the table.
+	 * No-op when foreign_keys is off.
+	 */
+	private async assertNoReferencingChildrenForDrop(parentSchemaName: string, parentTableName: string): Promise<void> {
+		if (!this.db.options.getBooleanOption('foreign_keys')) return;
+
+		const parentSchemaLower = parentSchemaName.toLowerCase();
+		const parentTableLower = parentTableName.toLowerCase();
+
+		for (const schema of this._getAllSchemas()) {
+			for (const childTable of schema.getAllTables()) {
+				if (!childTable.foreignKeys) continue;
+				// Skip the table being dropped itself — self-FK rows are going away with it.
+				if (childTable.schemaName.toLowerCase() === parentSchemaLower &&
+					childTable.name.toLowerCase() === parentTableLower) continue;
+
+				for (const fk of childTable.foreignKeys) {
+					if (fk.referencedTable.toLowerCase() !== parentTableLower) continue;
+					const targetSchema = fk.referencedSchema ?? childTable.schemaName;
+					if (targetSchema.toLowerCase() !== parentSchemaLower) continue;
+
+					// MATCH SIMPLE: row is referencing iff every FK column is non-NULL.
+					const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
+					const whereClause = childColNames.map(c => `${c} IS NOT NULL`).join(' AND ');
+					const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+						? `${quoteIdentifier(childTable.schemaName)}.`
+						: '';
+					const sql = `select 1 from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause} limit 1`;
+
+					const stmt = this.db.prepare(sql);
+					try {
+						let referenced = false;
+						for await (const _row of stmt._iterateRowsRaw()) {
+							referenced = true;
+							break;
+						}
+						if (referenced) {
+							throw new QuereusError(
+								`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
+								StatusCode.CONSTRAINT,
+							);
+						}
+					} finally {
+						await stmt.finalize();
+					}
+				}
+			}
+		}
+	}
+
+	/**
 	 * Drops a table from the specified schema
 	 *
 	 * @param schemaName The name of the schema
@@ -443,6 +593,12 @@ export class SchemaManager {
 			}
 			throw new QuereusError(`Table ${tableName} not found in schema ${schemaName}`, StatusCode.NOTFOUND);
 		}
+
+		// FK guard: when foreign_keys is on, refuse to drop a parent that still has
+		// non-NULL FK rows in any child table (excluding self-FK; those rows go away
+		// with the table). MATCH SIMPLE: a row is "referencing" iff every FK column
+		// is non-NULL.
+		await this.assertNoReferencingChildrenForDrop(schemaName, tableName);
 
 		// Remove any active connections for this table before destroying the module.
 		// Connections become stale once the table is dropped and must not be reused
@@ -603,9 +759,10 @@ export class SchemaManager {
 	): {
 		columns: ColumnSchema[];
 		pkDefinition: ReadonlyArray<import('./table.js').PrimaryKeyColumnDefinition>;
+		pkDefaultConflict: import('../common/constants.js').ConflictResolution | undefined;
 	} {
 		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull));
-		const pkDefinition = findPKDefinition(preliminaryColumnSchemas, astConstraints);
+		const { pkDef: pkDefinition, defaultConflict: pkDefaultConflict } = findPKDefinition(preliminaryColumnSchemas, astConstraints);
 
 		const columns = preliminaryColumnSchemas.map((col, idx) => {
 			const isPkColumn = pkDefinition.some(pkCol => pkCol.index === idx);
@@ -620,7 +777,7 @@ export class SchemaManager {
 			};
 		});
 
-		return { columns, pkDefinition };
+		return { columns, pkDefinition, pkDefaultConflict };
 	}
 
 	/**
@@ -639,8 +796,7 @@ export class SchemaManager {
 						name: con.name ?? `_check_${colDef.name}`,
 						expr: con.expr,
 						operations: opsToMask(con.operations),
-						deferrable: con.deferrable,
-						initiallyDeferred: con.initiallyDeferred,
+						defaultConflict: con.onConflict,
 						tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 					});
 				}
@@ -653,8 +809,7 @@ export class SchemaManager {
 					name: con.name,
 					expr: con.expr,
 					operations: opsToMask(con.operations),
-					deferrable: con.deferrable,
-					initiallyDeferred: con.initiallyDeferred,
+					defaultConflict: con.onConflict,
 					tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 				});
 			}
@@ -689,6 +844,12 @@ export class SchemaManager {
 
 					// Parent column resolution is deferred — store names for now
 					// We need the parent table schema to resolve indices, but it may not exist yet
+					if (fk.columns && fk.columns.length !== 1) {
+						throw new QuereusError(
+							`FK constraint '${con.name ?? `_fk_${tableName}_${colDef.name}`}' on table '${tableName}': child column count (1) does not match parent column count (${fk.columns.length})`,
+							StatusCode.ERROR,
+						);
+					}
 					result.push({
 						name: con.name ?? `_fk_${tableName}_${colDef.name}`,
 						columns: Object.freeze([childColIndex]),
@@ -696,8 +857,8 @@ export class SchemaManager {
 						referencedSchema: schemaName,
 						referencedColumns: Object.freeze([]), // resolved at enforcement time
 						referencedColumnNames: fk.columns, // deferred resolution via resolveReferencedColumns
-						onDelete: fk.onDelete ?? 'ignore',
-						onUpdate: fk.onUpdate ?? 'ignore',
+						onDelete: fk.onDelete ?? 'restrict',
+						onUpdate: fk.onUpdate ?? 'restrict',
 						deferred: fk.initiallyDeferred ?? false,
 						tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 					});
@@ -717,6 +878,12 @@ export class SchemaManager {
 					return idx;
 				});
 
+				if (fk.columns && fk.columns.length !== childColIndices.length) {
+					throw new QuereusError(
+						`FK constraint '${con.name ?? `_fk_${tableName}_${con.columns.map(c => c.name).join('_')}`}' on table '${tableName}': child column count (${childColIndices.length}) does not match parent column count (${fk.columns.length})`,
+						StatusCode.ERROR,
+					);
+				}
 				result.push({
 					name: con.name ?? `_fk_${tableName}_${con.columns.map(c => c.name).join('_')}`,
 					columns: Object.freeze(childColIndices),
@@ -724,8 +891,8 @@ export class SchemaManager {
 					referencedSchema: schemaName,
 					referencedColumns: Object.freeze([]), // resolved at enforcement time
 					referencedColumnNames: fk.columns, // deferred resolution via resolveReferencedColumns
-					onDelete: fk.onDelete ?? 'ignore',
-					onUpdate: fk.onUpdate ?? 'ignore',
+					onDelete: fk.onDelete ?? 'restrict',
+					onUpdate: fk.onUpdate ?? 'restrict',
 					deferred: fk.initiallyDeferred ?? false,
 					tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 				});
@@ -755,6 +922,7 @@ export class SchemaManager {
 						result.push({
 							name: con.name,
 							columns: Object.freeze([colIndex]),
+							defaultConflict: con.onConflict,
 							tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 						});
 					}
@@ -775,6 +943,7 @@ export class SchemaManager {
 				result.push({
 					name: con.name,
 					columns: Object.freeze(colIndices),
+					defaultConflict: con.onConflict,
 					tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 				});
 			}
@@ -800,7 +969,7 @@ export class SchemaManager {
 		const defaultNotNull = defaultNullability === 'not_null';
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull);
+		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull);
 		const checkConstraints = this.extractCheckConstraints(astColumns, stmt.constraints);
 		const columnIndexMap = buildColumnIndexMap(columns);
 		const foreignKeys = this.extractForeignKeys(astColumns, stmt.constraints, columnIndexMap, tableName, targetSchemaName);
@@ -810,12 +979,28 @@ export class SchemaManager {
 			? stmt.contextDefinitions.map(varDef => mutationContextVarToSchema(varDef, defaultNotNull))
 			: undefined;
 
+		// Extract generated-column dependencies and validate that they form a DAG.
+		// Cycle detection runs before module.create so an invalid schema never
+		// reaches storage.
+		const rawGenDeps = extractGeneratedColumnDependencies(columns, tableName);
+		const genTopoOrder = rawGenDeps.size > 0
+			? topoSortGeneratedColumns(columns, rawGenDeps)
+			: undefined;
+		const generatedColumnDependencies = rawGenDeps.size > 0
+			? Object.freeze(new Map(
+				Array.from(rawGenDeps.entries()).map(
+					([k, v]) => [k, Object.freeze(v)] as const,
+				),
+			))
+			: undefined;
+
 		return {
 			name: tableName,
 			schemaName: targetSchemaName,
 			columns: Object.freeze(columns),
 			columnIndexMap,
 			primaryKeyDefinition: pkDefinition,
+			primaryKeyDefaultConflict: pkDefaultConflict,
 			checkConstraints: Object.freeze(checkConstraints),
 			foreignKeys: foreignKeys.length > 0 ? Object.freeze(foreignKeys) : undefined,
 			uniqueConstraints: uniqueConstraints.length > 0 ? Object.freeze(uniqueConstraints) : undefined,
@@ -827,15 +1012,70 @@ export class SchemaManager {
 			vtabAuxData: moduleInfo.auxData,
 			estimatedRows: 0,
 			mutationContext: mutationContextSchemas ? Object.freeze(mutationContextSchemas) : undefined,
+			generatedColumnDependencies,
+			generatedColumnTopoOrder: genTopoOrder ? Object.freeze(genTopoOrder) : undefined,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 	}
 
 	/**
-	 * Validates that all DEFAULT expressions in the column schemas are deterministic.
-	 * Skips expressions that reference columns (validated at INSERT time instead).
+	 * Walks an expression AST and rejects bind-parameter and (optionally)
+	 * column-reference nodes. Used by DDL-time DEFAULT/CHECK validators where
+	 * such references are illegal even though they may otherwise build cleanly.
+	 *
+	 * Throws a QuereusError on the first offending node, with a message
+	 * produced by the supplied formatters.
 	 */
-	private validateDefaultDeterminism(columns: ReadonlyArray<ColumnSchema>, tableName: string): void {
+	private rejectIllegalReferences(
+		expr: AST.AstNode,
+		options: {
+			rejectColumns: boolean;
+			formatParamError: () => string;
+			formatColumnError?: () => string;
+		}
+	): void {
+		let offendingType: 'parameter' | 'column' | undefined;
+		traverseAst(expr, {
+			enterNode: (node: AST.AstNode) => {
+				if (offendingType) return false;
+				if (node.type === 'parameter') {
+					offendingType = 'parameter';
+					return false;
+				}
+				if (options.rejectColumns && node.type === 'column') {
+					offendingType = 'column';
+					return false;
+				}
+			},
+		});
+		if (offendingType === 'parameter') {
+			throw new QuereusError(options.formatParamError(), StatusCode.ERROR);
+		}
+		if (offendingType === 'column') {
+			throw new QuereusError(options.formatColumnError!(), StatusCode.ERROR);
+		}
+	}
+
+	/**
+	 * Validates that all DEFAULT expressions in the column schemas are
+	 * deterministic and free of bind parameters or (when no mutation
+	 * context is defined) column references. Bind parameters and column
+	 * references are rejected up-front via an AST pre-walk so the error
+	 * messages stay specific (rather than degrading into "column not
+	 * found" during expression building).
+	 *
+	 * When `hasMutationContext` is true, column-style identifiers are
+	 * preserved because they may resolve to mutation-context variables at
+	 * INSERT time (the AST cannot distinguish a real column from a
+	 * context variable, and the build attempt is permitted to fail —
+	 * scope resolution is deferred to row-time).
+	 */
+	private validateDefaultDeterminism(
+		columns: ReadonlyArray<ColumnSchema>,
+		tableName: string,
+		hasMutationContext: boolean,
+		allowNonDeterministic: boolean = false
+	): void {
 		const globalScope = new GlobalScope(this.db.schemaManager);
 		const parameterScope = new ParameterScope(globalScope);
 		const planningCtx: PlanningContext = {
@@ -855,24 +1095,98 @@ export class SchemaManager {
 				continue;
 			}
 
+			this.rejectIllegalReferences(col.defaultValue as AST.AstNode, {
+				rejectColumns: !hasMutationContext,
+				formatParamError: () =>
+					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference bind parameters.`,
+				formatColumnError: () =>
+					`DEFAULT for column '${col.name}' in table '${tableName}' may not reference columns; use a generated column instead.`,
+			});
+
 			let defaultExpr: ScalarPlanNode | undefined;
 			try {
 				defaultExpr = buildExpression(planningCtx, col.defaultValue as AST.Expression) as ScalarPlanNode;
-			} catch (_e) {
-				log('Skipping determinism validation for default on column %s.%s at CREATE TABLE time (will validate at INSERT time): %s',
-					tableName, col.name, (_e as Error).message);
-			}
-
-			if (defaultExpr) {
-				const result = checkDeterministic(defaultExpr);
-				if (!result.valid) {
+			} catch (e) {
+				if (hasMutationContext) {
+					// Column-style identifiers in DEFAULT may resolve to mutation
+					// context variables at INSERT time; the row scope isn't
+					// available here, so a build failure isn't necessarily a bug.
+					// Determinism is re-checked at INSERT time.
+					log('Skipping determinism validation for default on column %s.%s at CREATE TABLE time (deferred to INSERT, mutation context present): %s',
+						tableName, col.name, (e as Error).message);
+				} else {
+					const message = e instanceof Error ? e.message : String(e);
+					const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
 					throw new QuereusError(
-						`Non-deterministic expression not allowed in DEFAULT for column '${col.name}' in table '${tableName}'. ` +
-						`Expression: ${result.expression}. ` +
-						`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
-						StatusCode.ERROR
+						`DEFAULT for column '${col.name}' in table '${tableName}' is invalid: ${message}`,
+						code,
+						e instanceof Error ? e : undefined
 					);
 				}
+			}
+
+			if (!defaultExpr) continue;
+
+			if (allowNonDeterministic) continue;
+
+			const result = checkDeterministic(defaultExpr);
+			if (!result.valid) {
+				throw new QuereusError(
+					`Non-deterministic expression not allowed in DEFAULT for column '${col.name}' in table '${tableName}'. ` +
+					`Expression: ${result.expression}. ` +
+					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
+					StatusCode.ERROR
+				);
+			}
+		}
+	}
+
+	/**
+	 * Validates that CHECK constraint expressions don't call non-deterministic
+	 * functions and don't reference bind parameters. Walks the AST and looks
+	 * up each function call against the registry; raises if any function
+	 * lacks the DETERMINISTIC flag. Avoids the full planning pipeline because
+	 * CHECK expressions reference table columns whose scope is not yet
+	 * established at CREATE TABLE time.
+	 */
+	private validateCheckConstraintDeterminism(
+		checkConstraints: ReadonlyArray<RowConstraintSchema>,
+		tableName: string,
+		allowNonDeterministic: boolean = false
+	): void {
+		for (const cc of checkConstraints) {
+			const constraintName = cc.name ?? `_check_${tableName}`;
+
+			this.rejectIllegalReferences(cc.expr as AST.AstNode, {
+				rejectColumns: false,
+				formatParamError: () =>
+					`CHECK constraint '${constraintName}' on table '${tableName}' may not reference bind parameters.`,
+			});
+
+			if (allowNonDeterministic) continue;
+
+			let offendingExpr: AST.FunctionExpr | undefined;
+			traverseAst(cc.expr as AST.AstNode, {
+				enterNode: (node: AST.AstNode) => {
+					if (offendingExpr) return false;
+					if (node.type !== 'function') return;
+					const fnNode = node as AST.FunctionExpr;
+					const argCount = fnNode.args?.length ?? 0;
+					const funcSchema = this.findFunction(fnNode.name, argCount)
+						?? this.findFunction(fnNode.name, -1);
+					if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
+						offendingExpr = fnNode;
+						return false;
+					}
+				},
+			});
+			if (offendingExpr) {
+				throw new QuereusError(
+					`Non-deterministic expression not allowed in CHECK constraint '${constraintName}' on table '${tableName}'. ` +
+					`Function '${offendingExpr.name}' is not deterministic. ` +
+					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
+					StatusCode.ERROR
+				);
 			}
 		}
 	}
@@ -1008,19 +1322,34 @@ export class SchemaManager {
 		return {
 			name: indexName,
 			columns: Object.freeze(indexColumns),
+			unique: stmt.isUnique || undefined,
+			predicate: stmt.where,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 	}
 
 	/**
-	 * Returns a new TableSchema with the given index appended.
+	 * Returns a new TableSchema with the given index appended. If the index is
+	 * unique, also adds a matching uniqueConstraint so the mutation manager
+	 * enforces uniqueness on insert/update through its existing checks.
 	 */
 	private addIndexToTableSchema(tableSchema: TableSchema, indexSchema: IndexSchema): TableSchema {
 		const updatedIndexes = [...(tableSchema.indexes || []), indexSchema];
-		return {
+		const result: TableSchema = {
 			...tableSchema,
 			indexes: Object.freeze(updatedIndexes),
 		};
+		if (indexSchema.unique) {
+			const newConstraint: UniqueConstraintSchema = {
+				name: indexSchema.name,
+				columns: Object.freeze(indexSchema.columns.map(c => c.index)),
+				predicate: indexSchema.predicate,
+				derivedFromIndex: indexSchema.name,
+			};
+			const updatedConstraints = [...(tableSchema.uniqueConstraints ?? []), newConstraint];
+			result.uniqueConstraints = Object.freeze(updatedConstraints);
+		}
+		return result;
 	}
 
 	/**
@@ -1071,13 +1400,20 @@ export class SchemaManager {
 			}
 		}
 
-		// Remove the index from the table schema
+		// Remove the index from the table schema, along with any uniqueConstraint
+		// that was synthesized from this index (see addIndexToTableSchema).
 		const updatedIndexes = (ownerTable.indexes || []).filter(
 			idx => idx.name.toLowerCase() !== lowerIndexName
+		);
+		const updatedUniqueConstraints = (ownerTable.uniqueConstraints ?? []).filter(
+			uc => uc.derivedFromIndex?.toLowerCase() !== lowerIndexName
 		);
 		const updatedTableSchema: TableSchema = {
 			...ownerTable,
 			indexes: Object.freeze(updatedIndexes),
+			uniqueConstraints: updatedUniqueConstraints.length > 0
+				? Object.freeze(updatedUniqueConstraints)
+				: undefined,
 		};
 		schema.addTable(updatedTableSchema);
 
@@ -1130,6 +1466,15 @@ export class SchemaManager {
 			throw new QuereusError(`Internal error: Schema '${targetSchemaName}' not found.`, StatusCode.INTERNAL);
 		}
 
+		const seenColumnNames = new Set<string>();
+		for (const col of stmt.columns) {
+			const lower = col.name.toLowerCase();
+			if (seenColumnNames.has(lower)) {
+				throw new QuereusError(`Duplicate column name: ${col.name}`, StatusCode.ERROR, undefined, stmt.table.loc?.start.line, stmt.table.loc?.start.column);
+			}
+			seenColumnNames.add(lower);
+		}
+
 		const existingTable = schema.getTable(tableName);
 		const existingView = schema.getView(tableName);
 
@@ -1146,7 +1491,16 @@ export class SchemaManager {
 		const { moduleName, effectiveModuleArgs, moduleInfo } = this.resolveModuleInfo(stmt);
 		const baseTableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo);
 
-		this.validateDefaultDeterminism(baseTableSchema.columns, tableName);
+		const hasMutationContext = !!baseTableSchema.mutationContext && baseTableSchema.mutationContext.length > 0;
+		// `nondeterministic_schema = true` lifts the strict-rejection gate at CREATE TABLE.
+		// The captured artifact at the vtab.update() frontier is fully resolved per row, so
+		// defaults / CHECKs / generated columns containing non-determinism remain replay-safe
+		// (see docs/architecture.md § Constraints and docs/module-authoring.md § Mutation Statements).
+		// The bind-parameter / column-reference pre-walks inside the validators still run
+		// in both modes — those are scope checks, not determinism checks.
+		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
+		this.validateDefaultDeterminism(baseTableSchema.columns, tableName, hasMutationContext, allowNonDet);
+		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName, allowNonDet);
 
 		let tableInstance: VirtualTable;
 		try {

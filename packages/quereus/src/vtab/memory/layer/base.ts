@@ -3,11 +3,12 @@ import type { TableSchema } from '../../../schema/table.js';
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
 import type { Layer } from './interface.js';
 import { MemoryIndex } from '../index.js';
-import type { Row, SqlValue } from '../../../common/types.js';
+import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
 import { type ColumnSchema } from '../../../schema/column.js';
 import type { IndexSchema } from '../../../schema/table.js';
 import { createPrimaryKeyFunctions, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
+import { QuereusError } from '../../../common/errors.js';
 
 let baseLayerCounter = 0;
 const logger = createMemoryTableLoggers('layer:base');
@@ -97,6 +98,7 @@ export class BaseLayer implements Layer {
 
 		indexes.forEach(index => {
 			try {
+				if (!index.rowMatchesPredicate(row)) return;
 				const indexKey = index.keyFromRow(row);
 				index.addEntry(indexKey, primaryKey);
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -217,15 +219,51 @@ export class BaseLayer implements Layer {
 		});
 
 		const newMemoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns);
-		this.populateNewIndex(newMemoryIndex);
+		this.populateNewIndex(newMemoryIndex, indexSchema);
 		this.secondaryIndexes.set(indexSchema.name, newMemoryIndex);
 	}
 
-	private populateNewIndex(newIndex: MemoryIndex): void {
+	/**
+	 * Populates a freshly-created secondary index from the primary tree,
+	 * honoring the index's partial-WHERE predicate (rows for which the
+	 * predicate is not TRUE are skipped). For UNIQUE indexes, raises a
+	 * CONSTRAINT error on the first duplicate index key among in-scope rows;
+	 * the caller is expected to roll back the schema change in that case.
+	 */
+	private populateNewIndex(newIndex: MemoryIndex, indexSchema: IndexSchema): void {
+		// Track index keys we've already inserted so we can detect duplicates
+		// without doing a get() per row (the BTree merges duplicates by primaryKey
+		// set; we want the first duplicate to surface as a CONSTRAINT error).
+		const seen = indexSchema.unique
+			? new Map<string, boolean>()
+			: undefined;
+
 		for (const path of this.primaryTree.ascending(this.primaryTree.first())) {
 			const currentRow = this.primaryTree.at(path)!;
+			if (!newIndex.rowMatchesPredicate(currentRow)) continue;
+
 			const indexKey = newIndex.keyFromRow(currentRow);
 			const primaryKey = this.primaryKeyFunctions.extractFromRow(currentRow);
+
+			if (seen) {
+				const cols = newIndex.specColumns.map(c => currentRow[c.index]);
+				// SQL UNIQUE allows multiple NULLs: skip dup detection if any key value is NULL.
+				const hasNull = cols.some(v => v === null);
+				if (!hasNull) {
+					const keySig = JSON.stringify(cols);
+					if (seen.has(keySig)) {
+						const colNames = newIndex.specColumns
+							.map(c => this.tableSchema.columns[c.index]?.name ?? String(c.index))
+							.join(', ');
+						throw new QuereusError(
+							`UNIQUE constraint failed: ${this.tableSchema.name} (${colNames})`,
+							StatusCode.CONSTRAINT,
+						);
+					}
+					seen.set(keySig, true);
+				}
+			}
+
 			newIndex.addEntry(indexKey, primaryKey);
 		}
 	}

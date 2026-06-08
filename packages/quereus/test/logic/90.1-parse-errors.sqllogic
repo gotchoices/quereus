@@ -61,3 +61,17 @@ SELECT * FROM t_parse_where WHERE;
 -- error: Expected expression
 
 DROP TABLE t_parse_where;
+-- run
+
+-- @-prefixed parameter form (not supported in Quereus; lexer rejects)
+SELECT 1 WHERE 1 = @x;
+-- error: Unexpected character
+
+-- ?-followed-by-digit (sqlite ?N form not supported; ? is consumed
+-- as positional placeholder, leaving the digit as a stray token)
+SELECT 1 WHERE 1 = ?1;
+-- error:
+
+-- Named parameter prefix with neither identifier nor integer
+SELECT :;
+-- error: Expected identifier or number after parameter prefix

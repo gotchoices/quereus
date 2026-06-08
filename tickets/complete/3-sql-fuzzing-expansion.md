@@ -1,5 +1,5 @@
 description: Expanded property-based testing with SQL fuzzing and parser robustness
-dependencies: fast-check (devDependency)
+prereq: fast-check (devDependency)
 files:
   - packages/quereus/test/property.spec.ts
   - packages/quereus/README.md

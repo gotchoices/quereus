@@ -1,6 +1,7 @@
 import type { Expression } from '../parser/ast.js';
 import type { LogicalType } from '../types/logical-type.js';
 import type { SqlValue } from '../common/types.js';
+import type { ConflictResolution } from '../common/constants.js';
 import { TEXT_TYPE } from '../types/builtin-types.js';
 
 /**
@@ -29,6 +30,12 @@ export interface ColumnSchema {
 	generatedStored?: boolean;
 	/** Sort direction for primary key ('asc' | 'desc') */
 	pkDirection?: 'asc' | 'desc';
+	/**
+	 * Default conflict resolution declared at the column level for this column's
+	 * NOT NULL / PK constraint (e.g., `name TEXT NOT NULL ON CONFLICT IGNORE`).
+	 * Statement-level OR clauses override this; if both are absent the action is ABORT.
+	 */
+	defaultConflict?: ConflictResolution;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }

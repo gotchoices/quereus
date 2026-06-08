@@ -7,10 +7,11 @@
  * optimization rules.
  */
 
-import type { PlanNode, RelationalPlanNode, ScalarPlanNode, ConstantNode, TableDescriptor } from '../nodes/plan-node.js';
+import type { PlanNode, RelationalPlanNode, ScalarPlanNode, ConstantNode, TableDescriptor, MonotonicOnInfo } from '../nodes/plan-node.js';
 import { isRelationalNode } from '../nodes/plan-node.js';
 import type * as AST from '../../parser/ast.js';
 import type { TableSchema } from '../../schema/table.js';
+import { hasAnyKey, hasSingletonFd } from '../util/fd-utils.js';
 
 // Default row estimate when not available
 const DEFAULT_ROW_ESTIMATE = 1000;
@@ -22,6 +23,50 @@ export class PlanNodeCharacteristics {
 	// Physical property shortcuts
 	static hasSideEffects(node: PlanNode): boolean {
 		return node.physical.readonly === false;
+	}
+
+	/**
+	 * True iff this node OR any descendant in its subtree has side effects.
+	 *
+	 * `PlanNode.physical.readonly` propagates as AND-of-children, so for any
+	 * well-formed plan tree `hasSideEffects(node) ⇔ subtreeHasSideEffects(node)`.
+	 * This helper exists for rules that want to express the audit intent
+	 * explicitly ("refuse if any subtree I am about to move / drop / dedup
+	 * carries a write") — and as a defensive belt against a node that fails to
+	 * forward the property through its own `computePhysical` override.
+	 */
+	static subtreeHasSideEffects(node: PlanNode): boolean {
+		if (this.hasSideEffects(node)) return true;
+		for (const child of node.getChildren()) {
+			if (this.subtreeHasSideEffects(child)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * True iff the subtree rooted at `node` is safe to drive concurrently with a
+	 * sibling subtree under a parallel-track operator (`EagerPrefetchNode`,
+	 * `AsyncGatherNode`, `FanOutLookupJoinNode`).
+	 *
+	 * For now, the only gate is **side-effect freedom**: a subtree carrying a
+	 * write violates the per-connection lock contract under every module
+	 * concurrency mode except `'fully-reentrant'`, and no module currently
+	 * advertises that level. The module-level concurrency contract
+	 * (`'serial'` / `'reentrant-reads'` / `'fully-reentrant'`) is enforced
+	 * separately via `PhysicalProperties.concurrencySafe`, which the parallel-
+	 * track rules already consult; this predicate is the **side-effect** gate
+	 * that pairs with it. Once a `'fully-reentrant'` module ships, this
+	 * predicate can be refined to allow concurrent impure execution on it.
+	 *
+	 * Pairs with the parallel-track recognition rules' refusal discipline: any
+	 * rule that introduces an `EagerPrefetchNode` / `AsyncGatherNode` /
+	 * `FanOutLookupJoinNode` consults this predicate on every participating
+	 * branch and refuses (leaves the serial plan in place) when any branch
+	 * reports unsafe. See `docs/optimizer.md` § "Parallel-track side-effect
+	 * refusal" for the cross-rule discipline.
+	 */
+	static isConcurrencySafe(node: PlanNode): boolean {
+		return !this.subtreeHasSideEffects(node);
 	}
 
 	static isReadOnly(node: PlanNode): boolean {
@@ -59,21 +104,45 @@ export class PlanNodeCharacteristics {
 		return node.physical.ordering;
 	}
 
+	// MonotonicOn capabilities
+	static getMonotonicOn(node: PlanNode): readonly MonotonicOnInfo[] {
+		return node.physical.monotonicOn ?? [];
+	}
+
+	static isMonotonicOn(node: PlanNode, attrId: number): MonotonicOnInfo | undefined {
+		return node.physical.monotonicOn?.find(m => m.attrId === attrId);
+	}
+
 	// Cardinality analysis
 	static estimatesRows(node: PlanNode): number {
 		return node.physical.estimatedRows ?? DEFAULT_ROW_ESTIMATE;
 	}
 
+	/**
+	 * True iff the relation is guaranteed to produce at most one row — i.e.,
+	 * the singleton FD `∅ → all_cols` holds. (Replaces the legacy `[[]]`
+	 * uniqueKeys marker.)
+	 */
 	static guaranteesUniqueRows(node: PlanNode): boolean {
-		return node.physical.uniqueKeys?.some(key => key.length === 0) === true;
+		if (!isRelationalNode(node)) return false;
+		const colCount = node.getAttributes().length;
+		if (colCount === 0) {
+			// Zero-column relation: at-most-one-row claim comes via estimatedRows
+			// since the singleton FD isn't representable.
+			return node.physical.estimatedRows === 1;
+		}
+		return hasSingletonFd(node.physical.fds, colCount);
 	}
 
+	/**
+	 * True iff the relation has at least one non-trivial unique key — i.e., an
+	 * FD whose determinants form a superkey of all output columns, with the
+	 * determinant set strictly smaller than the full column list.
+	 */
 	static hasUniqueKeys(node: PlanNode): boolean {
-		return node.physical.uniqueKeys !== undefined && node.physical.uniqueKeys.length > 0;
-	}
-
-	static getUniqueKeys(node: PlanNode): number[][] | undefined {
-		return node.physical.uniqueKeys;
+		if (!isRelationalNode(node)) return false;
+		const colCount = node.getAttributes().length;
+		return hasAnyKey(node.physical.fds, colCount);
 	}
 
 	// Relational capabilities

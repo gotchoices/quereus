@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of isolation package (MVCC, transactions)
-dependencies: 3-review-core-vtab
+prereq: review-core-vtab
 
 ---
 
@@ -43,7 +43,7 @@ Added 15 interface-driven tests to `isolation-layer.spec.ts` (57 total, up from 
 
 ## Bugs Found (3)
 
-All three have failing tests (marked `.skip`) and follow-up task: `tasks/fix/3-isolation-overlay-bugs.md`
+All three have failing tests (marked `.skip`) and follow-up task: `tasks/fix/isolation-overlay-bugs.md`
 
 1. **Savepoint rollback loses prior overlay state** — `ROLLBACK TO SAVEPOINT sp_inner` discards changes from before the inner savepoint, not just after it.
 2. **Savepoint rollback doesn't restore tombstoned/updated rows** — Delete then rollback-to-savepoint doesn't restore the deleted row.
@@ -51,7 +51,7 @@ All three have failing tests (marked `.skip`) and follow-up task: `tasks/fix/3-i
 
 ## Code Quality Findings
 
-Follow-up task: `tasks/fix/3-isolation-perf-and-dry.md`
+Follow-up task: `tasks/fix/isolation-perf-and-dry.md`
 
 ### Performance
 - **`getOverlayRow()`**: O(n) full table scan to find a row by PK (should be PK point lookup)
@@ -90,8 +90,8 @@ The overlay-based isolation architecture is sound:
 
 ## Follow-Up Tasks Created
 
-- `tasks/fix/3-isolation-overlay-bugs.md` — Three bugs with failing tests
-- `tasks/fix/3-isolation-perf-and-dry.md` — O(n) scans, DRY violations, clearOverlay optimization
+- `tasks/fix/isolation-overlay-bugs.md` — Three bugs with failing tests
+- `tasks/fix/isolation-perf-and-dry.md` — O(n) scans, DRY violations, clearOverlay optimization
 
 ## Test Validation
 

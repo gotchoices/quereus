@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Retrieve.bindings propagation (params and correlations)', () => {
   let db: Database;
@@ -20,14 +23,14 @@ describe('Retrieve.bindings propagation (params and correlations)', () => {
   it('captures parameter binding into Retrieve and executes correctly', async () => {
     await setup();
     const sql = "SELECT name FROM bt WHERE id = :id";
-    const rows: any[] = [];
+    const rows: ResultRow[] = [];
     for await (const r of db.eval(sql, { id: 2 })) {
       rows.push(r);
     }
     expect(rows).to.deep.equal([{ name: 'Bob' }]);
 
     // Verify plan contains a ParameterReference (binding in logical plan)
-    const params: any[] = [];
+    const params: ResultRow[] = [];
     for await (const r of db.eval("SELECT COUNT(*) AS params FROM query_plan(?) WHERE node_type = 'ParameterReference'", [sql])) {
       params.push(r);
     }
@@ -38,7 +41,7 @@ describe('Retrieve.bindings propagation (params and correlations)', () => {
   it('captures correlation binding across a correlated subquery (EXISTS)', async () => {
     await setup();
     const sql = "SELECT b1.name FROM bt b1 WHERE EXISTS (SELECT 1 FROM bt b2 WHERE b2.id = b1.id) ORDER BY b1.id";
-    const rows: any[] = [];
+    const rows: ResultRow[] = [];
     for await (const r of db.eval(sql)) {
       rows.push(r);
     }

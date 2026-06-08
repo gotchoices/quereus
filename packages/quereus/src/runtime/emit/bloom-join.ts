@@ -29,9 +29,11 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 	const leftIndices: number[] = [];
 	const rightIndices: number[] = [];
 	const keyNormalizers: ((s: string) => string)[] = [];
+	const leftIndex = plan.left.getAttributeIndex();
+	const rightIndex = plan.right.getAttributeIndex();
 	for (const pair of plan.equiPairs) {
-		const li = leftAttributes.findIndex(a => a.id === pair.leftAttrId);
-		const ri = rightAttributes.findIndex(a => a.id === pair.rightAttrId);
+		const li = leftIndex.get(pair.leftAttrId) ?? -1;
+		const ri = rightIndex.get(pair.rightAttrId) ?? -1;
 		if (li === -1 || ri === -1) {
 			throw new Error(`BloomJoin: could not resolve equi-pair attr IDs ${pair.leftAttrId}=${pair.rightAttrId}`);
 		}
@@ -53,28 +55,40 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		log('Starting %s hash join: %d equi-pairs, %d left attrs, %d right attrs',
 			plan.joinType.toUpperCase(), plan.equiPairs.length, leftAttributes.length, rightAttributes.length);
 
-		// === Build phase: materialize right side into hash map ===
-		const hashMap = new Map<string, Row[]>();
-		for await (const rightRow of rightSource) {
-			const key = serializeRowKey(rightRow, rightIndices, keyNormalizers);
-			if (key === null) continue; // null keys can't match
-			const bucket = hashMap.get(key);
-			if (bucket) {
-				bucket.push(rightRow);
-			} else {
-				hashMap.set(key, [rightRow]);
-			}
-		}
+		// Acquire the left (probe) iterator up front. When `left` is an
+		// EagerPrefetchNode its pump is already running (it forks `rctx` and
+		// starts on run()), so we MUST guarantee the iterator is closed even if
+		// the build phase throws before the probe loop begins — otherwise the
+		// eager pump leaks (fills its buffer then blocks forever) and its
+		// strict-fork counter stays bumped. The `finally` below covers both
+		// phases for exactly that reason.
+		const leftIter = leftSource[Symbol.asyncIterator]();
 
-		log('Build phase complete: %d buckets, right side materialized', hashMap.size);
-
-		// === Probe phase: stream left side, probe hash map ===
 		const isSemiOrAnti = plan.joinType === 'semi' || plan.joinType === 'anti';
 		const leftSlot = createRowSlot(rctx, leftRowDescriptor);
 		const rightSlot = createRowSlot(rctx, rightRowDescriptor);
 
 		try {
-			for await (const leftRow of leftSource) {
+			// === Build phase: materialize right side into hash map ===
+			const hashMap = new Map<string, Row[]>();
+			for await (const rightRow of rightSource) {
+				const key = serializeRowKey(rightRow, rightIndices, keyNormalizers);
+				if (key === null) continue; // null keys can't match
+				const bucket = hashMap.get(key);
+				if (bucket) {
+					bucket.push(rightRow);
+				} else {
+					hashMap.set(key, [rightRow]);
+				}
+			}
+
+			log('Build phase complete: %d buckets, right side materialized', hashMap.size);
+
+			// === Probe phase: stream left side, probe hash map ===
+			while (true) {
+				const next = await leftIter.next();
+				if (next.done) break;
+				const leftRow = next.value;
 				leftSlot.set(leftRow);
 
 				const key = serializeRowKey(leftRow, leftIndices, keyNormalizers);
@@ -108,6 +122,14 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		} finally {
 			leftSlot.close();
 			rightSlot.close();
+			// Close the probe iterator on every exit path (normal completion,
+			// consumer break, throw, or build-phase error) so an eager prefetch
+			// pump is always torn down.
+			try {
+				await leftIter.return?.(undefined);
+			} catch {
+				// Swallow — already in cleanup.
+			}
 		}
 	}
 

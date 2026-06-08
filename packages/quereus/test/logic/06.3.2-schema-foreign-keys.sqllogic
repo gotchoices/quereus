@@ -27,7 +27,7 @@ CREATE TABLE books (
 
 SELECT id, "table", "from", referenced_table, "to", on_update, on_delete, "deferred", seq
 FROM foreign_key_info('books');
-→ [{"id":0,"table":"books","from":"author_id","referenced_table":"authors","to":"id","on_update":"ignore","on_delete":"ignore","deferred":0,"seq":0}]
+→ [{"id":0,"table":"books","from":"author_id","referenced_table":"authors","to":"id","on_update":"restrict","on_delete":"restrict","deferred":0,"seq":0}]
 
 -- ===================================================================
 -- Test 2: Table with no FKs returns empty result

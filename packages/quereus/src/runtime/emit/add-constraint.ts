@@ -13,61 +13,18 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 	const tableSchema = plan.table.tableSchema;
 
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
-		// Convert the AST constraint to a schema constraint object
+		// Ensure we're in a transaction before DDL (lazy/JIT transaction start).
+		await rctx.db._ensureTransaction();
+
 		const constraint = plan.constraint;
-
-		if (constraint.type !== 'check') {
-			throw new QuereusError(
-				`ADD CONSTRAINT ${constraint.type} is not yet implemented`,
-				StatusCode.UNSUPPORTED
-			);
-		}
-
-		if (!constraint.expr) {
-			throw new QuereusError(
-				'CHECK constraint requires an expression',
-				StatusCode.ERROR
-			);
-		}
-
-		// Create the constraint schema object
-		// Note: We don't validate determinism here because constraints may reference NEW/OLD
-		// which require special scoping. Determinism is validated at INSERT/UPDATE plan time
-		// in constraint-builder.ts when the constraint is actually checked.
-		const constraintSchema: RowConstraintSchema = {
-			name: constraint.name || `check_${tableSchema.checkConstraints.length}`,
-			expr: constraint.expr,
-			operations: opsToMask(constraint.operations), // Convert operations array to bitmask
-			deferrable: constraint.deferrable ?? false,
-			initiallyDeferred: constraint.initiallyDeferred,
-		};
-
-		// Create a new table schema with the additional constraint (honor immutability)
-		const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
-		const updatedTableSchema: TableSchema = {
-			...tableSchema,
-			checkConstraints: Object.freeze(updatedConstraints),
-		};
-
-		// Replace the table schema in the database
 		const schemaManager = rctx.db.schemaManager;
 		const schema = schemaManager.getSchemaOrFail(tableSchema.schemaName);
 
-		// Replace the table schema (addTable overwrites existing)
-		schema.addTable(updatedTableSchema);
+		if (constraint.type === 'check') {
+			return runAddCheck(rctx, tableSchema, schema, constraint);
+		}
 
-		// Notify schema change listeners that the table was modified
-		schemaManager.getChangeNotifier().notifyChange({
-			type: 'table_modified',
-			schemaName: tableSchema.schemaName,
-			objectName: tableSchema.name,
-			oldObject: tableSchema,
-			newObject: updatedTableSchema
-		});
-
-		log('Added constraint %s to table %s.%s', constraintSchema.name, tableSchema.schemaName, tableSchema.name);
-
-		return null;
+		return runAddConstraintViaModule(rctx, tableSchema, schema, constraint);
 	}
 
 	return {
@@ -75,4 +32,84 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		run: run as InstructionRun,
 		note: `addConstraint(${plan.table.tableSchema.name}, ${plan.constraint.name || 'unnamed'})`
 	};
+}
+
+async function runAddCheck(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+	constraint: AddConstraintNode['constraint'],
+): Promise<SqlValue> {
+	if (!constraint.expr) {
+		throw new QuereusError(
+			'CHECK constraint requires an expression',
+			StatusCode.ERROR
+		);
+	}
+
+	// Note: We don't validate determinism here because constraints may reference NEW/OLD
+	// which require special scoping. Determinism is validated at INSERT/UPDATE plan time
+	// in constraint-builder.ts when the constraint is actually checked.
+	const constraintSchema: RowConstraintSchema = {
+		name: constraint.name || `check_${tableSchema.checkConstraints.length}`,
+		expr: constraint.expr,
+		operations: opsToMask(constraint.operations),
+	};
+
+	const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
+	const updatedTableSchema: TableSchema = {
+		...tableSchema,
+		checkConstraints: Object.freeze(updatedConstraints),
+	};
+
+	schema.addTable(updatedTableSchema);
+
+	rctx.db.schemaManager.getChangeNotifier().notifyChange({
+		type: 'table_modified',
+		schemaName: tableSchema.schemaName,
+		objectName: tableSchema.name,
+		oldObject: tableSchema,
+		newObject: updatedTableSchema
+	});
+
+	log('Added CHECK constraint %s to table %s.%s', constraintSchema.name, tableSchema.schemaName, tableSchema.name);
+
+	return null;
+}
+
+async function runAddConstraintViaModule(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+	constraint: AddConstraintNode['constraint'],
+): Promise<SqlValue> {
+	const module = tableSchema.vtabModule;
+	if (!module.alterTable) {
+		throw new QuereusError(
+			`Module for table '${tableSchema.name}' does not support ADD CONSTRAINT`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+
+	const updatedTableSchema = await module.alterTable(
+		rctx.db,
+		tableSchema.schemaName,
+		tableSchema.name,
+		{ type: 'addConstraint', constraint },
+	);
+
+	schema.addTable(updatedTableSchema);
+
+	rctx.db.schemaManager.getChangeNotifier().notifyChange({
+		type: 'table_modified',
+		schemaName: tableSchema.schemaName,
+		objectName: tableSchema.name,
+		oldObject: tableSchema,
+		newObject: updatedTableSchema,
+	});
+
+	log('Added %s constraint %s to table %s.%s',
+		constraint.type, constraint.name || 'unnamed', tableSchema.schemaName, tableSchema.name);
+
+	return null;
 }

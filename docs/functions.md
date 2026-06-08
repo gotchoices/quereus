@@ -457,15 +457,32 @@ select fullkey, type from json_tree('{"a": [1, 2]}');
 | `table_info(table_name)` | 1 | Column details for a specific table |
 | `function_info(name?)` | 0-1 | All registered functions, or only those matching `name` (case-insensitive) |
 | `foreign_key_info(table_name)` | 1 | Foreign key constraints for a specific table |
+| `index_info(table_name)` | 1 | One row per (index, indexed-column) on a table |
+| `check_constraint_info(table_name)` | 1 | CHECK constraints on a table |
+| `unique_constraint_info(table_name)` | 1 | UNIQUE constraints on a table (excludes the primary key) |
+| `assertion_info()` | 0 | All `CREATE ASSERTION` objects |
+
+### Tags column
+
+Schema objects can carry arbitrary `WITH TAGS (key = value, ...)` metadata. Introspection TVFs expose this as a `tags` column containing a JSON object (TEXT), or `NULL` when the object has no tags. Query individual keys with `json_extract`:
+
+```sql
+select name, json_extract(tags, '$.audit') as audit
+  from schema() where type = 'table';
+select name, json_extract(tags, '$.error_message') as msg
+  from check_constraint_info('orders') where name is not null;
+```
 
 ### `schema()` columns
 
 | Column | Type | Description |
 |---|---|---|
+| `schema` | TEXT | Schema name (`'main'`, `'temp'`, attached) |
 | `type` | TEXT | `'table'`, `'view'`, `'index'`, `'function'` |
 | `name` | TEXT | Object name |
 | `tbl_name` | TEXT | Associated table name |
 | `sql` | TEXT? | SQL definition |
+| `tags` | TEXT? | Tag bag as JSON object (`NULL` if no tags; always `NULL` for functions) |
 
 ### `table_info(table_name)` columns
 
@@ -477,6 +494,9 @@ select fullkey, type from json_tree('{"a": [1, 2]}');
 | `notnull` | INTEGER | 1 if NOT NULL |
 | `dflt_value` | TEXT? | Default value |
 | `pk` | INTEGER | 1 if primary key |
+| `tags` | TEXT? | Column tags as JSON object (`NULL` if no tags) |
+| `collation` | TEXT | Declared collation (defaults to `'BINARY'`) |
+| `generated` | INTEGER | 0 = not generated, 1 = virtual generated, 2 = stored generated |
 
 ### `function_info()` columns
 
@@ -500,17 +520,74 @@ select fullkey, type from json_tree('{"a": [1, 2]}');
 | `referenced_table` | TEXT | Parent table name |
 | `referenced_schema` | TEXT? | Parent schema (null if same schema) |
 | `to` | TEXT | Parent column name |
-| `on_update` | TEXT | Update action (`cascade`, `restrict`, `setNull`, `setDefault`, `ignore`) |
-| `on_delete` | TEXT | Delete action (`cascade`, `restrict`, `setNull`, `setDefault`, `ignore`) |
+| `on_update` | TEXT | Update action (`cascade`, `restrict`, `setNull`, `setDefault`) |
+| `on_delete` | TEXT | Delete action (`cascade`, `restrict`, `setNull`, `setDefault`) |
 | `deferred` | INTEGER | 1 if enforcement is deferred to COMMIT |
 | `seq` | INTEGER | Column sequence within FK (0-based) |
+| `tags` | TEXT? | FK tags as JSON object (repeated across `seq` rows) |
+
+### `index_info(table_name)` columns
+
+One row per (index, indexed-column) pair, ordered by column position within the index.
+
+| Column | Type | Description |
+|---|---|---|
+| `index_name` | TEXT | Index name |
+| `seq` | INTEGER | 0-based position within the index |
+| `column_name` | TEXT | Column name |
+| `desc` | INTEGER | 1 if column is sorted descending |
+| `collation` | TEXT? | Collation for the column in this index (NULL if not specified) |
+| `unique` | INTEGER | 1 if the index enforces uniqueness (repeated per row) |
+| `partial` | INTEGER | 1 if the index has a `WHERE` predicate |
+| `tags` | TEXT? | Index tags as JSON object (repeated per row) |
+
+### `check_constraint_info(table_name)` columns
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER | Constraint index (0-based) |
+| `name` | TEXT? | Constraint name (NULL for unnamed) |
+| `expr` | TEXT | CHECK expression as SQL text |
+| `operations` | TEXT | Comma-joined subset of `insert,update,delete` |
+| `deferrable` | INTEGER | 0/1 |
+| `initially_deferred` | INTEGER | 0/1 |
+| `tags` | TEXT? | Constraint tags as JSON object |
+
+### `unique_constraint_info(table_name)` columns
+
+One row per (UNIQUE constraint, column) pair. The primary key is excluded — query `table_info().pk` for that. UNIQUE constraints synthesized from `CREATE UNIQUE INDEX` appear here too.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER | Constraint index (0-based) |
+| `name` | TEXT? | Constraint name (NULL for unnamed) |
+| `seq` | INTEGER | 0-based column position within the constraint |
+| `column_name` | TEXT | Column name |
+| `partial` | INTEGER | 1 if the backing index has a `WHERE` predicate |
+| `tags` | TEXT? | Constraint tags as JSON object (repeated per row) |
+
+### `assertion_info()` columns
+
+| Column | Type | Description |
+|---|---|---|
+| `name` | TEXT | Assertion name |
+| `violation_sql` | TEXT | The query that should return zero rows when the assertion holds |
+| `deferrable` | INTEGER | 0/1 |
+| `initially_deferred` | INTEGER | 0/1 |
+| `dependent_tables` | TEXT | JSON array of `{relationKey, base}` |
 
 ```sql
 select type, name from schema() where type = 'table';
-select name, type, notnull from table_info('users');
+select name, type, notnull, collation, generated from table_info('users');
 select name, type from function_info() where type = 'scalar';
 select * from function_info('abs');
 select "from", "to", on_delete from foreign_key_info('orders');
+select index_name, column_name, "desc" from index_info('orders') order by index_name, seq;
+select name, expr from check_constraint_info('orders');
+select name, column_name from unique_constraint_info('orders') order by id, seq;
+select name from assertion_info();
+select name, json_extract(tags, '$.audit') as audit
+  from schema() where type = 'table';
 ```
 
 ---

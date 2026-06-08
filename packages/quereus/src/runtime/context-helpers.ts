@@ -94,6 +94,15 @@ export class RowContextMap {
 export interface RowSlot {
 	/** Replace the current row (cheap field write) */
 	set(row: Row): void;
+	/**
+	 * Re-claim this slot's descriptor in the context map so its `attributeIndex`
+	 * entries point back at this slot. Useful when a child iterator (e.g. an
+	 * underlying scan) creates and `set`s its own slot for the same attribute
+	 * IDs in between this slot's `set` calls — without re-claiming, downstream
+	 * lookups would resolve through the child's slot whose row is the iterator's
+	 * cursor position, not this slot's matched row.
+	 */
+	reactivate(): void;
 	/** Tear down (removes descriptor from context) */
 	close(): void;
 }
@@ -124,6 +133,11 @@ export function createRowSlot(
 	return {
 		set(row: Row) {
 			ref.current = row;
+		},
+		reactivate() {
+			// Re-call set() on the context map so attributeIndex points back at
+			// this slot's getter for all attribute IDs in `descriptor`.
+			rctx.context.set(descriptor, getter);
 		},
 		close() {
 			rctx.context.delete(descriptor);

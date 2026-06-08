@@ -12,12 +12,24 @@ import type { ColumnReferenceNode } from '../nodes/reference.js';
  * that are not defined within its own scope.
  */
 export function isCorrelatedSubquery(subqueryNode: RelationalPlanNode): boolean {
-	// Collect all attributes defined within the subquery
+	// Short-circuit: stop at the first external reference rather than collecting all.
 	const definedAttributes = new Set<number>();
 	collectDefinedAttributes(subqueryNode, definedAttributes);
-
-	// Check if any column references use attributes not defined within the subquery
 	return hasExternalReferences(subqueryNode, definedAttributes);
+}
+
+/**
+ * Collect the attribute IDs the subquery references from *outer* scopes (i.e.
+ * not defined within its own subtree). An empty set means the subquery is not
+ * correlated. Used by rules that need to know *which* outer attributes a
+ * correlation depends on, not merely that it is correlated.
+ */
+export function collectExternalReferences(subqueryNode: RelationalPlanNode): Set<number> {
+	const definedAttributes = new Set<number>();
+	collectDefinedAttributes(subqueryNode, definedAttributes);
+	const external = new Set<number>();
+	collectExternalAttributeIds(subqueryNode, definedAttributes, external);
+	return external;
 }
 
 /**
@@ -80,4 +92,31 @@ function hasExternalReferences(node: PlanNode, definedAttributes: Set<number>): 
 	}
 
 	return false;
+}
+
+/**
+ * Like {@link hasExternalReferences}, but accumulates every external attribute
+ * ID into `external` instead of short-circuiting at the first one.
+ */
+function collectExternalAttributeIds(
+	node: PlanNode,
+	definedAttributes: Set<number>,
+	external: Set<number>,
+): void {
+	if (node.nodeType === PlanNodeType.ColumnReference) {
+		const colRef = node as ColumnReferenceNode;
+		if (!definedAttributes.has(colRef.attributeId)) {
+			external.add(colRef.attributeId);
+		}
+	}
+
+	for (const child of node.getChildren()) {
+		collectExternalAttributeIds(child, definedAttributes, external);
+	}
+
+	if (isRelationalNode(node)) {
+		for (const relation of node.getRelations()) {
+			collectExternalAttributeIds(relation, definedAttributes, external);
+		}
+	}
 }

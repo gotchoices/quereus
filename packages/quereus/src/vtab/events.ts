@@ -1,8 +1,26 @@
 import type { Row, SqlValue } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
+import type { AnyVirtualTableModule } from './module.js';
 
 const log = createLogger('vtab:events');
 const errorLog = log.extend('error');
+
+/**
+ * Attempt to extract a {@link VTableEventEmitter} from a virtual-table module.
+ * Returns `undefined` when the module does not expose `getEventEmitter()` or
+ * the returned object does not provide at least one of `onDataChange` /
+ * `onSchemaChange`. Used by both the database-level event hooking path and
+ * the public {@link Table} handle.
+ */
+export function tryGetEventEmitter(module: AnyVirtualTableModule): VTableEventEmitter | undefined {
+	const asSource = module as { getEventEmitter?: () => unknown };
+	if (typeof asSource.getEventEmitter !== 'function') return undefined;
+	const emitter = asSource.getEventEmitter();
+	if (!emitter || typeof emitter !== 'object') return undefined;
+	const typed = emitter as { onDataChange?: unknown; onSchemaChange?: unknown };
+	if (typeof typed.onDataChange !== 'function' && typeof typed.onSchemaChange !== 'function') return undefined;
+	return emitter as VTableEventEmitter;
+}
 
 /**
  * Data change event emitted when mutations are committed.

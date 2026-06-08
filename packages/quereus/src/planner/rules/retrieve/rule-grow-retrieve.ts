@@ -22,13 +22,15 @@ import type { OptContext } from '../../framework/context.js';
 import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { FilterNode } from '../../nodes/filter.js';
 import type { TableReferenceNode } from '../../nodes/reference.js';
+import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { PlanNodeType } from '../../nodes/plan-node-type.js';
 import type { SupportAssessment } from '../../../vtab/module.js';
-import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
-import { extractConstraints, createTableInfoFromNode, type TableInfo, type PredicateConstraint } from '../../analysis/constraint-extractor.js';
+import type { BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec } from '../../../vtab/best-access-plan.js';
+import { extractConstraints, createTableInfoFromNode, extractConstraintsForTable, type TableInfo, type PredicateConstraint } from '../../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { seqScanCost } from '../../cost/index.js';
 import { SortNode } from '../../nodes/sort.js';
+import { ProjectNode } from '../../nodes/project-node.js';
 import { extractOrderingFromSortKeys } from '../../framework/physical-utils.js';
 import { LimitOffsetNode } from '../../nodes/limit-offset.js';
 import { PlanNode as _PlanNode } from '../../nodes/plan-node.js';
@@ -52,7 +54,7 @@ interface IndexStyleContext {
 }
 
 function isIndexStyleContext(ctx: unknown): ctx is IndexStyleContext {
-	return !!ctx && typeof ctx === 'object' && (ctx as any).kind === 'index-style';
+	return !!ctx && typeof ctx === 'object' && (ctx as { kind?: string }).kind === 'index-style';
 }
 
 export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode | null {
@@ -67,6 +69,13 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 	// Find the RetrieveNode child (if any)
 	const retrieveChild = findRetrieveChild(node);
 	if (!retrieveChild) {
+		// Special case: Sort can absorb its ordering into a Retrieve reachable
+		// through commuting unary operators (Project, Filter), provided the
+		// access plan can satisfy the requested ordering. See
+		// trySortAbsorbViaIndexOrdering for details.
+		if (node instanceof SortNode) {
+			return trySortAbsorbViaIndexOrdering(node, context);
+		}
 		return null;
 	}
 
@@ -294,20 +303,40 @@ function fallbackIndexSupports(
 		log('Extracted ordering requirement of length %d', request.requiredOrdering.length);
 
 	} else if (node.nodeType === PlanNodeType.LimitOffset) {
-		// Extract limit from LimitOffset node when constant
+		// Extract limit + offset from LimitOffset when both are constants. We
+		// surface OFFSET to the module via `request.offset` so modules pushing
+		// LIMIT into the scan can stamp `scan-side limit = limit + offset` and
+		// avoid underproducing the runtime LimitOffsetNode (which still applies
+		// the OFFSET skip above whatever the scan emits).
 		const lim = node as unknown as LimitOffsetNode;
+		let limitVal: number | undefined;
+		let offsetVal = 0;
 		if (lim.limit && lim.limit.nodeType === _PlanNodeType.Literal) {
-			const limitVal = (lim.limit as unknown as LiteralNode).expression.value;
-			if (typeof limitVal === 'number') {
-				request.limit = Math.max(0, Math.floor(limitVal));
-				log('Extracted limit value: %d', request.limit);
+			const v = (lim.limit as unknown as LiteralNode).expression.value;
+			if (typeof v === 'number') limitVal = Math.max(0, Math.floor(v));
+		}
+		if (lim.offset) {
+			if (lim.offset.nodeType === _PlanNodeType.Literal) {
+				const v = (lim.offset as unknown as LiteralNode).expression.value;
+				if (typeof v === 'number') {
+					offsetVal = Math.max(0, Math.floor(v));
+				} else {
+					// Non-numeric literal OFFSET — refuse to push the LIMIT,
+					// because we cannot soundly compute `limit + offset`.
+					limitVal = undefined;
+				}
+			} else {
+				// Non-literal OFFSET (e.g. parameter) — refuse to push the LIMIT.
+				limitVal = undefined;
 			}
 		}
-		// We ignore OFFSET for now (modules can implement it internally if desired)
-		if (!request.limit) {
-			log('No usable constant LIMIT found');
+		if (limitVal === undefined) {
+			log('No usable constant LIMIT (or non-literal OFFSET present)');
 			return undefined;
 		}
+		request.limit = limitVal;
+		request.offset = offsetVal;
+		log('Extracted limit=%d offset=%d', limitVal, offsetVal);
 
 	} else {
 		log('Node type %s not supported by index-style fallback', node.nodeType);
@@ -384,6 +413,136 @@ function fallbackIndexSupports(
 		cost: accessPlan.cost,
 		ctx: indexCtx
 	};
+}
+
+/**
+ * Attempt to absorb a Sort whose Retrieve is reachable through a chain of
+ * commuting unary operators (Project, Filter). When the table's access plan
+ * can satisfy the required ordering — e.g., a composite index where leading
+ * columns are equality-bound by an upstream Filter and trailing columns
+ * provide the ORDER BY direction — the Sort can be elided entirely:
+ * Retrieve produces rows in the requested order, and Project/Filter preserve
+ * row order on the way back up.
+ */
+function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): PlanNode | null {
+	// Walk down through commuting unary operators to find the RetrieveNode.
+	const chain: (ProjectNode | FilterNode)[] = [];
+	let current: PlanNode = sort.source;
+	while (true) {
+		if (current instanceof RetrieveNode) break;
+		if (current instanceof ProjectNode || current instanceof FilterNode) {
+			chain.push(current);
+			current = current.source;
+			continue;
+		}
+		log('Sort source chain interrupted by unsupported node type %s', current.nodeType);
+		return null;
+	}
+	const retrieveNode = current as RetrieveNode;
+	const tableRef = retrieveNode.tableRef;
+	if (!tableRef?.tableSchema) return null;
+	const vtabModule = tableRef.vtabModule;
+	if (!vtabModule?.getBestAccessPlan) return null;
+
+	// Translate sort keys to table-column ordering using attribute IDs.
+	const tableAttrIndex = tableRef.getAttributeIndex();
+	const requiredOrdering: OrderingSpec[] = [];
+	for (const key of sort.getSortKeys()) {
+		// Explicit NULLS FIRST/LAST is not currently propagated to the access
+		// plan — refuse to absorb so the Sort runtime can honor the request.
+		if (key.nulls) {
+			log('Sort key has explicit NULLS %s; cannot absorb', key.nulls);
+			return null;
+		}
+		if (key.expression.nodeType !== PlanNodeType.ColumnReference) {
+			log('Non-trivial sort expression; cannot absorb');
+			return null;
+		}
+		const colRef = key.expression as ColumnReferenceNode;
+		const tableColIdx = tableAttrIndex.get(colRef.attributeId) ?? -1;
+		if (tableColIdx < 0) {
+			log('Sort key not directly mappable to table column; cannot absorb');
+			return null;
+		}
+		requiredOrdering.push({ columnIndex: tableColIdx, desc: key.direction === 'desc' });
+	}
+
+	// Collect filters anywhere in the subtree below Sort (chain Filters or
+	// Filters already pushed into Retrieve.source). The relation key here must
+	// match what createTableInfosFromPlan emits for this table reference —
+	// schema-qualified name plus the TableReferenceNode id.
+	const tInfo: TableInfo = createTableInfoFromNode(
+		tableRef,
+		`${tableRef.tableSchema.schemaName}.${tableRef.tableSchema.name}`
+	);
+	const constraints = extractConstraintsForTable(sort.source as RelationalPlanNode, tInfo.relationKey);
+
+	const tableSchema = tableRef.tableSchema;
+	const request: BestAccessPlanRequest = {
+		columns: tableSchema.columns.map((col, index) => ({
+			index,
+			name: col.name,
+			type: col.logicalType,
+			isPrimaryKey: col.primaryKey || false,
+			isUnique: col.primaryKey || false,
+		})),
+		filters: constraints,
+		requiredOrdering,
+		estimatedRows: tableRef.estimatedRows || context.stats.tableRows(tableSchema) || 1000,
+	};
+
+	const accessPlan = vtabModule.getBestAccessPlan(context.db, tableSchema, request) as BestAccessPlanResult;
+
+	// Only proceed if the plan actually satisfies the ordering.
+	if (!accessPlan.providesOrdering || accessPlan.providesOrdering.length < requiredOrdering.length) {
+		log('Access plan does not satisfy required ordering; leaving Sort in place');
+		return null;
+	}
+
+	// Build residual predicate from any constraints the access plan didn't handle.
+	// rule-select-access-path's index-style branch trusts moduleCtx.residualPredicate
+	// rather than rebuilding from retrieveNode.source, so this must be set.
+	let residualPredicate: ScalarPlanNode | undefined;
+	if (constraints.length > 0) {
+		const unhandledExprs: ScalarPlanNode[] = [];
+		for (let i = 0; i < constraints.length; i++) {
+			if (!accessPlan.handledFilters[i] && constraints[i].sourceExpression) {
+				unhandledExprs.push(constraints[i].sourceExpression);
+			}
+		}
+		if (unhandledExprs.length > 0) {
+			let acc: ScalarPlanNode = unhandledExprs[0];
+			for (let i = 1; i < unhandledExprs.length; i++) {
+				const right = unhandledExprs[i];
+				const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+				acc = new BinaryOpNode(acc.scope, ast, acc, right);
+			}
+			residualPredicate = acc;
+		}
+	}
+
+	// Equip the Retrieve with index-style context so rule-select-access-path
+	// uses this plan. Existing source pipeline (which may already contain
+	// pushed-down filters) is preserved.
+	const indexCtx = {
+		kind: 'index-style' as const,
+		accessPlan,
+		residualPredicate,
+		originalConstraints: [...constraints],
+	};
+	const newRetrieve = retrieveNode.withPipeline(retrieveNode.source, indexCtx, retrieveNode.bindings);
+
+	// Rebuild the chain on top of the equipped Retrieve, dropping the Sort.
+	let result: RelationalPlanNode = newRetrieve;
+	for (let i = chain.length - 1; i >= 0; i--) {
+		const chainNode = chain[i];
+		const oldChildren = chainNode.getChildren();
+		const newChildren = oldChildren.map((c, idx) => idx === 0 ? result : c);
+		result = chainNode.withChildren(newChildren) as RelationalPlanNode;
+	}
+
+	log('Absorbed Sort into Retrieve via index ordering for %s', tableSchema.name);
+	return result;
 }
 
 /**

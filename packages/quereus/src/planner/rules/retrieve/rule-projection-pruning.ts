@@ -17,6 +17,7 @@ import type { PlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
+import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:projection-pruning');
 
@@ -62,6 +63,19 @@ export function ruleProjectionPruning(node: PlanNode, _context: OptContext): Pla
 
 	// Don't prune to zero projections — keep at least one
 	if (keptIndices.length === 0) return null;
+
+	// Refuse to drop any projection whose scalar expression carries a write —
+	// pruning a side-effect-bearing computed column would silently skip the
+	// write the user wrote into the projection list. (Detected at the projection
+	// node level; the projection's scalar may be a relational subquery whose
+	// readonly flag propagates up the AND-of-children.)
+	for (let i = 0; i < inner.projections.length; i++) {
+		if (keptIndices.includes(i)) continue;
+		if (PlanNodeCharacteristics.subtreeHasSideEffects(inner.projections[i].node)) {
+			log('projection-pruning skipped: dropped projection %s has side effects', inner.projections[i].alias);
+			return null;
+		}
+	}
 
 	log(
 		'Pruning inner project from %d to %d projections',

@@ -27,7 +27,8 @@ import {
 	MisuseError,
 	unwrapError,
 } from '../src/common/errors.js';
-import { StatusCode } from '../src/common/types.js';
+import { StatusCode, type SqlValue } from '../src/common/types.js';
+import { type LogicalType, PhysicalType } from '../src/types/logical-type.js';
 
 describe('Utility Edge Cases', () => {
 
@@ -479,39 +480,41 @@ describe('Utility Edge Cases', () => {
 
 	describe('compareTypedValues', () => {
 		it('should handle NULL comparisons', () => {
-			const type = { name: 'INTEGER' } as any;
+			const type: LogicalType = { name: 'INTEGER', physicalType: PhysicalType.INTEGER };
 			expect(compareTypedValues(null, null, type, type)).to.equal(0);
 			expect(compareTypedValues(null, 1, type, type)).to.be.lessThan(0);
 			expect(compareTypedValues(1, null, type, type)).to.be.greaterThan(0);
 		});
 
 		it('should throw on type mismatch', () => {
-			const typeA = { name: 'INTEGER' } as any;
-			const typeB = { name: 'TEXT' } as any;
+			const typeA: LogicalType = { name: 'INTEGER', physicalType: PhysicalType.INTEGER };
+			const typeB: LogicalType = { name: 'TEXT', physicalType: PhysicalType.TEXT };
 			expect(() => compareTypedValues(1, 'a', typeA, typeB)).to.throw(QuereusError);
 		});
 
 		it('should use type-specific compare when available', () => {
-			const type = {
+			const type: LogicalType = {
 				name: 'CUSTOM',
-				compare: (a: any, b: any) => (a as number) - (b as number),
-			} as any;
+				physicalType: PhysicalType.INTEGER,
+				compare: (a: SqlValue, b: SqlValue) => (a as number) - (b as number),
+			};
 			expect(compareTypedValues(1, 2, type, type)).to.be.lessThan(0);
 			expect(compareTypedValues(2, 1, type, type)).to.be.greaterThan(0);
 		});
 
 		it('should fall back to compareSqlValuesFast without type.compare', () => {
-			const type = { name: 'INTEGER' } as any;
+			const type: LogicalType = { name: 'INTEGER', physicalType: PhysicalType.INTEGER };
 			expect(compareTypedValues(1, 2, type, type)).to.be.lessThan(0);
 		});
 	});
 
 	describe('createTypedComparator', () => {
 		it('should return a comparator using type.compare', () => {
-			const type = {
+			const type: LogicalType = {
 				name: 'INTEGER',
-				compare: (a: any, b: any) => (a as number) - (b as number),
-			} as any;
+				physicalType: PhysicalType.INTEGER,
+				compare: (a: SqlValue, b: SqlValue) => (a as number) - (b as number),
+			};
 			const cmp = createTypedComparator(type);
 			expect(cmp(1, 2)).to.be.lessThan(0);
 			expect(cmp(null, 1)).to.be.lessThan(0);
@@ -519,7 +522,7 @@ describe('Utility Edge Cases', () => {
 		});
 
 		it('should fall back to compareSqlValuesFast without type.compare', () => {
-			const type = { name: 'TEXT' } as any;
+			const type: LogicalType = { name: 'TEXT', physicalType: PhysicalType.TEXT };
 			const cmp = createTypedComparator(type);
 			expect(cmp('a', 'b')).to.be.lessThan(0);
 			expect(cmp('b', 'a')).to.be.greaterThan(0);

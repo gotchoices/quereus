@@ -1,5 +1,5 @@
 description: Remove unsafe `as any` cast for ranges in MemoryTableModule.findOrRangeMatch
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/vtab/best-access-plan.ts
   packages/quereus/src/planner/analysis/constraint-extractor.ts

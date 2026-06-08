@@ -1,6 +1,6 @@
 ---
 description: Review of quoomb-web package — tests, code quality, architecture docs
-dependencies: all core reviews
+prereq: all core reviews
 ---
 
 # Quoomb Web Package Review — Summary
@@ -50,6 +50,6 @@ Early return at line 20–22 (`if (storageModule !== 'sync') return null`) occur
 
 ## Follow-up Tasks Created
 
-- `tasks/fix/3-quoomb-web-bugs.md` — Three bugs: resetToDefaults inconsistency, SyncEventsPanel hook ordering, configStore array validation
-- `tasks/fix/3-quoomb-web-dry-refactor.md` — DRY consolidation: file save, CSV formatting, download utility, EnhancedErrorDisplay coupling, large file decomposition
+- `tasks/fix/quoomb-web-bugs.md` — Three bugs: resetToDefaults inconsistency, SyncEventsPanel hook ordering, configStore array validation
+- `tasks/fix/quoomb-web-dry-refactor.md` — DRY consolidation: file save, CSV formatting, download utility, EnhancedErrorDisplay coupling, large file decomposition
 

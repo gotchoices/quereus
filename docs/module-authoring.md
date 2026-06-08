@@ -143,8 +143,22 @@ interface BestAccessPlanResult {
   isSet?: boolean;                     // If result is guaranteed unique
   explains?: string;                   // Free-text explanation for debugging
   residualFilter?: (row: any) => boolean; // Optional JS filter for residual predicates
+
+  // Optional monotonic-storage advertisements. The optimizer lifts these onto
+  // the physical leaf node's `physical.monotonicOn` / `physical.accessCapabilities`
+  // and downstream rules use them to license rewrites that depend on
+  // total-order emit (streaming asof, monotonic merge join, ordinal-seek
+  // pushdown). Not propagated through pass-through nodes.
+  monotonicOn?: { columnIndex: number; direction: 'asc' | 'desc'; strict: boolean };
+  supportsOrdinalSeek?: boolean;       // Implies monotonicOn; O(log N) seek to kth row
+  supportsAsofRight?: boolean;         // Implies monotonicOn; forward-only repositioning
 }
 ```
+
+**Capability contracts**:
+- `monotonicOn` is the leaf's natural emit order (storage property, not request-dependent). Stronger than `providesOrdering` — implies a total order with no gaps in coverage.
+- `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
+- `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.
 
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 
@@ -180,6 +194,71 @@ getBestAccessPlan(
 }
 ```
 
+### 3. Concurrency Mode (Parallel Runtime)
+
+When a parallel-runtime consumer (e.g. fan-out lookup join) wants to issue
+multiple vtab calls in flight on a single connection, it consults the
+module's declared `concurrencyMode`. By default, modules opt out of
+parallelism — the runtime acquires a per-connection lock so calls are
+serialized.
+
+```typescript
+interface VirtualTableModule {
+  readonly concurrencyMode?: 'serial' | 'reentrant-reads' | 'fully-reentrant';
+}
+```
+
+| Mode | Per-connection guarantee from the module |
+| --- | --- |
+| `'serial'` (default) | Nothing. Runtime serializes via `acquireConnectionLock`. |
+| `'reentrant-reads'` | Concurrent `query()` is safe; writes still serialize. |
+| `'fully-reentrant'` | All operations are safe to interleave on one connection. |
+
+**Default is `'serial'`** — the safe choice for any module that hasn't
+been audited. The cost is that parallel consumers fall back to lock
+serialization on shared connections, defeating parallelism for that
+module. The declaration is the knob that actually buys parallelism;
+nothing else needs to change.
+
+**Upgrading a module:**
+
+1. Identify the connection-level state mutated by `query()`, `update()`,
+   savepoints, etc. If `query()` snapshots its working set at call entry
+   and never touches state another call writes, `'reentrant-reads'` is
+   safe.
+2. Walk through the worst-case interleavings under
+   single-threaded JS: torn reads can only happen if a write publishes
+   state in more than one statement step. Atomic single-statement
+   pointer swaps are safe; multi-step state machines aren't.
+3. For `'fully-reentrant'`, the same holds for writes. This is a much
+   higher bar and is usually not worth it — `'reentrant-reads'` is the
+   common upgrade target.
+
+The runtime helpers live at `vtab/concurrency.ts`:
+
+```typescript
+import { getModuleConcurrencyMode, acquireConnectionLock } from '@quereus/quereus';
+
+const mode = getModuleConcurrencyMode(module);
+if (mode === 'serial') {
+  const release = await acquireConnectionLock(connection);
+  try {
+    for await (const row of vtab.query(filterInfo)) yield row;
+  } finally {
+    release();
+  }
+}
+```
+
+Memory vtab declares `'reentrant-reads'`: `query()` captures the
+connection's read or pending layer at call entry and iterates that
+captured BTree, so concurrent reads on one connection see consistent,
+non-mutating snapshots. Writes serialize because, once a transaction is
+open, subsequent writes mutate the existing pending layer's BTree in
+place — `'fully-reentrant'` would require either fresh-per-write layers
+or an iterator-safe mutation path. Layered stores, isolation wrappers,
+and persistent plugins stay default until their owners audit them.
+
 ## Runtime Execution Modes
 
 ### Query-Based Execution
@@ -210,10 +289,14 @@ interface VirtualTable {
 interface FilterInfo {
   args: SqlValue[];           // Constraint values
   argIndices: number[];       // Which constraints are provided
+  limit?: number;             // Optional row cap (LIMIT pushdown)
+  offset?: number;            // Optional kth-row seek (only valid when supportsOrdinalSeek was advertised)
 }
 ```
 
 The module receives individual constraints and returns matching rows.
+
+**Pushdown directives**: `FilterInfo.limit` is a soft row cap — modules may stop emitting once `limit` rows have been yielded. `FilterInfo.offset` is a seek-to-kth-row directive and is only set when the access plan advertised `supportsOrdinalSeek` for this query — modules without ordinal-seek support can ignore both fields safely (a streaming guard above the leaf still enforces correctness).
 
 ## Optimization Integration Points
 
@@ -285,7 +368,7 @@ class MyTable extends VirtualTable {
 
 | Method | Description |
 |--------|-------------|
-| `registerConnection(conn)` | Registers a connection for transaction management. If a transaction is already active, `begin()` is called on the connection. |
+| `registerConnection(conn)` | Registers a connection for transaction management. If a transaction is already active, `begin()` is called on the connection and the active savepoint stack is replayed by calling `createSavepoint(depth)` for each open depth, so subsequent `releaseSavepoint` / `rollbackToSavepoint` broadcasts targeting earlier depths are in-range on the new connection. |
 | `unregisterConnection(id)` | Unregisters a connection. May be deferred during implicit transactions. |
 | `getConnection(id)` | Gets a connection by ID. |
 | `getConnectionsForTable(name)` | Gets all connections for a table. Useful for connection reuse. |
@@ -489,10 +572,9 @@ Virtual table modules can opt-in to receive deterministic mutation statements fo
 When a module sets `wantStatements: true`, Quereus provides a `mutationStatement` string with each `update()` call. This statement:
 
 - Represents the **bottom-level mutation** at the VirtualTable.update() level (not the top-level DML statement)
-- Contains all values as **literals** (no parameters or non-deterministic expressions)
+- Contains all values as **literals** (no parameters; non-deterministic source expressions like `random()` or `datetime('now')` are already resolved to the concrete per-row values the engine evaluated)
 - Includes **resolved mutation context** values as literals in the WITH CONTEXT clause
-- Can be replayed on another Quereus instance to produce identical results
-- Preserves determinism by eliminating all non-deterministic expressions
+- Is the **audit / transport encoding** of the resolved per-row primitive that hit the module; replay is the act of applying that primitive at the same module boundary on another instance — not re-parsing the captured SQL through the full DML pipeline (re-execution would re-fire CHECKs, default evaluation, and generated-column computation, which is explicitly not the supported replay path)
 
 ### Module Opt-In
 
@@ -563,10 +645,10 @@ The mutation statement system ensures determinism by:
 
 1. **Resolving Execution Parameters**: All `:name` and `?` parameters are replaced with their literal values
 2. **Resolving Mutation Context**: All context variables are evaluated once per statement and emitted as literals
-3. **Resolving Defaults**: Default expressions are evaluated and emitted as literal values
+3. **Resolving Defaults / Generated Columns**: DEFAULT and `GENERATED ALWAYS AS` expressions are evaluated per row and emitted as literal values — this is true even when the source expressions contain non-deterministic functions (allowed under `pragma nondeterministic_schema = true`; see [Determinism Validation](runtime.md#determinism-validation))
 4. **Preserving Order**: Mutations are logged in the order they're applied to the virtual table
 
-This means that a sequence of logged mutation statements can be replayed to fully replicate a database, with no chance of non-determinism (assuming the same code and schema version).
+Replay then means: take the captured primitive and re-apply it at the module boundary (e.g. feed `mutationStatement` rows back through `vtab.update()` on the replica), not re-execute the SQL through the full DML pipeline. The atomicity of the original commit — including deferred CHECKs that were evaluated once at commit time — is preserved by replaying the transaction's writes as a unit.
 
 ### Use Cases
 

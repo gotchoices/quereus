@@ -4,7 +4,9 @@
 -- Implicit Transaction Tests
 -- ===================================
 -- When not in an explicit transaction (autocommit mode), each statement
--- or batch of statements is automatically wrapped in an implicit transaction
+-- is its own implicit-transaction boundary — matching SQLite's autocommit
+-- semantics. A later statement's failure does NOT roll back prior
+-- statements that already committed in the same `exec` batch.
 
 CREATE TABLE implicit_tx (id INTEGER PRIMARY KEY, val TEXT);
 
@@ -13,29 +15,30 @@ INSERT INTO implicit_tx VALUES (1, 'auto-committed');
 SELECT val FROM implicit_tx WHERE id = 1;
 → [{ "val": "auto-committed" }]
 
--- Multiple statements in one exec should be atomic (all or nothing)
+-- Multiple statements in one exec each auto-commit on success.
 INSERT INTO implicit_tx VALUES (2, 'batch-a');
 INSERT INTO implicit_tx VALUES (3, 'batch-b');
 INSERT INTO implicit_tx VALUES (4, 'batch-c');
 SELECT count(*) as cnt FROM implicit_tx;
 → [{ "cnt": 4 }]
 
--- Error in batch should rollback entire batch
--- This should fail on duplicate key and rollback both inserts
+-- Error in batch: each statement is its own commit boundary. The first
+-- statement commits, the second statement's duplicate-key failure rolls
+-- back ONLY that statement, and the third statement never runs.
 INSERT INTO implicit_tx VALUES (10, 'new1');
 INSERT INTO implicit_tx VALUES (1, 'duplicate');
 INSERT INTO implicit_tx VALUES (11, 'new2');
 -- error: UNIQUE constraint failed
 
--- Verify the failed batch was rolled back (row 10 should not exist)
+-- Verify per-statement commit boundary: row 10 (committed) survives, row 11 (never ran) does not.
 SELECT count(*) as cnt FROM implicit_tx WHERE id = 10;
-→ [{ "cnt": 0 }]
+→ [{ "cnt": 1 }]
 SELECT count(*) as cnt FROM implicit_tx WHERE id = 11;
 → [{ "cnt": 0 }]
 
--- Original data should be intact
+-- Original data still intact plus the surviving (10, 'new1') row.
 SELECT count(*) as cnt FROM implicit_tx;
-→ [{ "cnt": 4 }]
+→ [{ "cnt": 5 }]
 
 DROP TABLE implicit_tx;
 

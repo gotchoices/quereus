@@ -1,0 +1,171 @@
+-- query-expr-dml.sqllogic — exercises DML with RETURNING in every relation
+-- position that the dml-in-expression-position ticket unlocked: scalar / IN /
+-- EXISTS / compound-leg / CTE-body / FROM-source / INSERT-source.
+--
+-- Two contracts the emitters apply on impure (DML-bearing) inners:
+--   - full-drain: every row of the inner is consumed, so every write fires
+--     (no short-circuit on first row, on match, or on EXISTS=true).
+--   - run-once: when an outer expression is re-evaluated (correlated
+--     subquery / per-row scan), the inner DML executes exactly once per
+--     statement execution. The memoized result is replayed thereafter.
+
+-- ===================================
+-- 1. EXISTS over a DML inner: fully drains (no short-circuit on first row)
+-- ===================================
+
+create table log_e (v integer);
+select exists (insert into log_e values (1), (2), (3) returning v);
+→ [{"exists (insert into log_e values (1), (2), (3) returning v)":true}]
+select count(*) as c from log_e;
+→ [{"c":3}]
+drop table log_e;
+
+-- ===================================
+-- 2. IN over a DML inner: fully drains (no short-circuit on first match)
+-- ===================================
+
+create table log_i (v integer);
+select 1 in (insert into log_i values (1), (2), (3) returning v) as found;
+→ [{"found":true}]
+select count(*) as c from log_i;
+→ [{"c":3}]
+drop table log_i;
+
+-- ===================================
+-- 3. Scalar subquery over a DML inner: drains every row, scalar = first
+-- ===================================
+
+create table log_s (v integer);
+select (insert into log_s values (10), (20), (30) returning v) as first_v;
+→ [{"first_v":10}]
+select count(*) as c, sum(v) as total from log_s;
+→ [{"c":3,"total":60}]
+drop table log_s;
+
+-- ===================================
+-- 4. Run-once fence: correlated outer evaluating per row fires DML once
+-- ===================================
+-- Without the run-once fence the EXISTS inner would re-fire per outer row.
+-- With it, the inner DML runs exactly once regardless of outer cardinality.
+
+create table outer_t (o integer);
+insert into outer_t values (1), (2), (3), (4), (5);
+create table log_o (v integer);
+
+select o, exists (insert into log_o values (100) returning v) as ex
+from outer_t order by o;
+→ [{"o":1,"ex":true},{"o":2,"ex":true},{"o":3,"ex":true},{"o":4,"ex":true},{"o":5,"ex":true}]
+select count(*) as c from log_o;
+→ [{"c":1}]
+drop table outer_t;
+drop table log_o;
+
+-- ===================================
+-- 5. DML in a compound-set leg: VALUES UNION ALL (insert … returning …)
+-- ===================================
+
+create table log_c (v integer);
+values (1) union all (insert into log_c values (2) returning v);
+→ [{"column_0":1},{"column_0":2}]
+select v from log_c;
+→ [{"v":2}]
+drop table log_c;
+
+-- ===================================
+-- 6. DML in a CTE body
+-- ===================================
+
+create table log_cte (v integer);
+with x(v) as (insert into log_cte values (1), (2) returning v)
+select v from x order by v;
+→ [{"v":1},{"v":2}]
+select count(*) as c from log_cte;
+→ [{"c":2}]
+drop table log_cte;
+
+-- ===================================
+-- 7. DML as INSERT source (outer insert consumes inner RETURNING rows)
+-- ===================================
+
+create table src_t (v integer);
+create table dst_t (v integer);
+insert into src_t values (10), (20), (30);
+insert into dst_t insert into src_t values (1), (2) returning v;
+select v from dst_t order by v;
+→ [{"v":1},{"v":2}]
+select v from src_t order by v;
+→ [{"v":1},{"v":2},{"v":10},{"v":20},{"v":30}]
+drop table src_t;
+drop table dst_t;
+
+-- ===================================
+-- 8. Conflict-resolution scoping: outer OR REPLACE does NOT propagate inward
+-- ===================================
+-- The outer INSERT's OR REPLACE applies only to the outer's conflicts. The
+-- inner INSERT carries its own (default) conflict resolution. We pin this by
+-- running an inner INSERT whose values would conflict with a pre-existing row
+-- in the inner table; the inner must error with its own default (ABORT),
+-- regardless of the outer OR REPLACE.
+
+create table inner_pk (id integer primary key, v text);
+create table outer_pk (id integer primary key, v text);
+insert into inner_pk values (1, 'pre');
+
+insert or replace into outer_pk
+  insert into inner_pk values (1, 'dup') returning id, v;
+-- error: constraint
+
+select v from inner_pk where id = 1;
+→ [{"v":"pre"}]
+drop table inner_pk;
+drop table outer_pk;
+
+-- ===================================
+-- 8b. UPDATE in EXISTS position fires its writes (parallel to case 1)
+-- ===================================
+
+create table upd_e (id integer primary key, v integer);
+insert into upd_e values (1, 10), (2, 20), (3, 30);
+select exists (update upd_e set v = v + 1 returning v) as ex;
+→ [{"ex":true}]
+select v from upd_e order by id;
+→ [{"v":11},{"v":21},{"v":31}]
+drop table upd_e;
+
+-- ===================================
+-- 8c. DELETE as scalar subquery returns the deleted row's value
+-- ===================================
+-- Single-row DELETE keeps the scalar deterministic without relying on order
+-- of returned rows for multi-row DML in scalar position.
+
+create table del_s (id integer primary key, v integer);
+insert into del_s values (1, 100), (2, 200), (3, 300);
+select (delete from del_s where id = 2 returning v) as deleted;
+→ [{"deleted":200}]
+select v from del_s order by id;
+→ [{"v":100},{"v":300}]
+drop table del_s;
+
+-- ===================================
+-- 9. View bodied as VALUES is unupdateable (FD-driven path)
+-- ===================================
+
+create view v_vals as values (1, 'a'), (2, 'b');
+select * from v_vals order by column_0;
+→ [{"column_0":1,"column_1":"a"},{"column_0":2,"column_1":"b"}]
+insert into v_vals values (3, 'c');
+-- error:
+drop view v_vals;
+
+-- ===================================
+-- 10. DML in CHECK constraint is rejected by the determinism enforcer
+-- ===================================
+-- Constraint validation is lazy (built on first INSERT planning), so the
+-- CREATE TABLE itself succeeds; the INSERT triggers the determinism check.
+
+create table src_d (v integer);
+create table t_check (id integer primary key, x integer check ((select v from (insert into src_d values (1) returning v)) is not null));
+insert into t_check values (1, 1);
+-- error: non-deterministic
+drop table t_check;
+drop table src_d;

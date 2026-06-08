@@ -12,6 +12,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
+import { resolveOrdinalReference } from './select-ordinal.js';
 
 /**
  * Creates final output projections and applies result column aliases
@@ -22,7 +23,8 @@ export function buildFinalProjections(
 	selectScope: Scope,
 	stmt: AST.SelectStmt,
 	selectContext: PlanningContext,
-	preserveInputColumns: boolean = true
+	preserveInputColumns: boolean = true,
+	selectListAsts: AST.Expression[] = []
 ): {
 	output: RelationalPlanNode;
 	finalContext: PlanningContext;
@@ -48,7 +50,8 @@ export function buildFinalProjections(
 	// Apply ORDER BY before projection if needed (compile expressions against input scope)
 	if (needsPreProjectionSort && stmt.orderBy && stmt.orderBy.length > 0) {
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const expression = buildExpression(selectContext, orderByClause.expr);
+			const resolved = resolveOrdinalReference(orderByClause.expr, selectListAsts, 'ORDER BY');
+			const expression = buildExpression(selectContext, resolved ?? orderByClause.expr);
 			return {
 				expression,
 				direction: orderByClause.direction,
@@ -96,7 +99,9 @@ export function applyOrderBy(
 	stmt: AST.SelectStmt,
 	selectContext: PlanningContext,
 	preAggregateSort: boolean,
-	projectionScope?: RegisteredScope
+	projectionScope?: RegisteredScope,
+	allowAggregates: boolean = false,
+	selectListAsts: AST.Expression[] = []
 ): RelationalPlanNode {
 	if (stmt.orderBy && stmt.orderBy.length > 0 && !preAggregateSort) {
 		// Merge projection scope if available so ORDER BY can reference output column aliases
@@ -107,7 +112,8 @@ export function applyOrderBy(
 		}
 
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const expression = buildExpression(orderByContext, orderByClause.expr);
+			const resolved = resolveOrdinalReference(orderByClause.expr, selectListAsts, 'ORDER BY');
+			const expression = buildExpression(orderByContext, resolved ?? orderByClause.expr, allowAggregates);
 			return {
 				expression,
 				direction: orderByClause.direction,
@@ -177,7 +183,7 @@ function shouldApplyOrderByBeforeProjection(
 /**
  * Creates a scope for projection output columns
  */
-function createProjectionOutputScope(projectionNode: RelationalPlanNode): RegisteredScope {
+export function createProjectionOutputScope(projectionNode: RelationalPlanNode): RegisteredScope {
 	const projectionOutputScope = new RegisteredScope();
 	const projectionAttributes = projectionNode.getAttributes();
 
@@ -202,6 +208,19 @@ function isIdentityProjection(projections: Projection[], source: RelationalPlanN
 	// Must have same number of projections as source attributes
 	if (projections.length !== sourceAttrs.length) {
 		return false;
+	}
+
+	// If the source exposes duplicate column names (e.g., a JOIN with same-named
+	// columns on each side), a ProjectNode is required to disambiguate via
+	// `name:N` suffixes — otherwise downstream row→object conversion would
+	// collapse duplicate keys and silently drop columns.
+	const seenNames = new Set<string>();
+	for (const attr of sourceAttrs) {
+		const lower = attr.name.toLowerCase();
+		if (seenNames.has(lower)) {
+			return false;
+		}
+		seenNames.add(lower);
 	}
 
 	for (let i = 0; i < projections.length; i++) {

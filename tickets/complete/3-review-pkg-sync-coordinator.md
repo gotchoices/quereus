@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of sync-coordinator package (coordinator service, transports, store management, S3 integration)
-dependencies: 3-review-pkg-sync
+prereq: review-pkg-sync
 
 ---
 
@@ -58,7 +58,7 @@ Extended from 55 to 86 tests across 7 test files:
 
 ## Bug Found
 
-**BigInt serialization in snapshot endpoints**: Both WS `handleGetSnapshot()` and HTTP `GET /:databaseId/snapshot` send raw `SnapshotChunk` objects containing `HLC` (BigInt `wallTime`) and `SiteId` (Uint8Array) through `JSON.stringify()`, which throws. The `get_changes` handler correctly uses `serializeChangeSet()` but no equivalent exists for snapshots. Tracked in `tasks/fix/3-sync-coordinator-snapshot-serialization-bug.md`.
+**BigInt serialization in snapshot endpoints**: Both WS `handleGetSnapshot()` and HTTP `GET /:databaseId/snapshot` send raw `SnapshotChunk` objects containing `HLC` (BigInt `wallTime`) and `SiteId` (Uint8Array) through `JSON.stringify()`, which throws. The `get_changes` handler correctly uses `serializeChangeSet()` but no equivalent exists for snapshots. Tracked in `tasks/fix/sync-coordinator-snapshot-serialization-bug.md`.
 
 ## Code Quality Findings
 
@@ -93,10 +93,10 @@ Extended from 55 to 86 tests across 7 test files:
 
 ## Follow-up Tasks Created
 
-- `tasks/fix/3-sync-coordinator-snapshot-serialization-bug.md` — BigInt serialization bug
-- `tasks/fix/3-sync-coordinator-resource-leaks.md` — Eviction race, socket close leaks
-- `tasks/fix/3-sync-coordinator-error-handling.md` — Error handling gaps + missing resume_snapshot
-- `tasks/fix/3-sync-coordinator-dry-violations.md` — Duplicated code, hasSnapshot stub
+- `tasks/fix/sync-coordinator-snapshot-serialization-bug.md` — BigInt serialization bug
+- `tasks/fix/sync-coordinator-resource-leaks.md` — Eviction race, socket close leaks
+- `tasks/fix/sync-coordinator-error-handling.md` — Error handling gaps + missing resume_snapshot
+- `tasks/fix/sync-coordinator-dry-violations.md` — Duplicated code, hasSnapshot stub
 
 ## Test Validation
 

@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sample-plugins",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "description": "Sample plugins demonstrating the Quereus plugin architecture",
   "main": "index.js",
   "type": "module",
@@ -29,13 +29,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/quereus/quereus2.git",
+    "url": "https://github.com/gotchoices/quereus.git",
     "directory": "packages/sample-plugins"
   },
   "engines": {
     "node": ">=18.0.0"
   },
+  "dependencies": {
+    "@quereus/quereus": "workspace:^"
+  },
   "devDependencies": {
-    "rimraf": "^6.1.2"
+    "rimraf": "^6.1.2",
+    "typescript": "^5.9.3"
   }
 }

@@ -1,5 +1,5 @@
 description: Fixed CTENode.buildAttributes() to use positional mapping instead of name-based lookup for explicit CTE column names
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/planner/nodes/cte-node.ts
   packages/quereus/test/logic/13-cte.sqllogic

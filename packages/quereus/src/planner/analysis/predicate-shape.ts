@@ -1,0 +1,126 @@
+/**
+ * Shape recognizers for declared-predicate AST trees (CHECK constraints,
+ * partial-index WHERE clauses). Shared by `check-extraction.ts` and
+ * `partial-unique-extraction.ts`; both pull `col`-style references, literal
+ * values, and "which columns are mentioned anywhere" out of small AST shapes.
+ *
+ * These helpers are intentionally syntactic — they do not interpret types,
+ * collations, or coercions. Callers wanting semantic equivalence should layer
+ * that on top.
+ */
+
+import type * as AST from '../../parser/ast.js';
+import type { SqlValue } from '../../common/types.js';
+
+/**
+ * Return the column index for an `AST.ColumnExpr` or unqualified
+ * `AST.IdentifierExpr` that names a column in `columnIndexMap`; undefined
+ * otherwise. Schema-qualified identifiers (`other.foo`) are rejected.
+ */
+export function columnIndexFromExpr(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+): number | undefined {
+	if (expr.type === 'column') {
+		const ref = expr as AST.ColumnExpr;
+		return columnIndexMap.get(ref.name.toLowerCase());
+	}
+	if (expr.type === 'identifier') {
+		const ref = expr as AST.IdentifierExpr;
+		if (ref.schema) return undefined;
+		return columnIndexMap.get(ref.name.toLowerCase());
+	}
+	return undefined;
+}
+
+/**
+ * Return the literal `SqlValue` for an `AST.LiteralExpr`, or undefined for any
+ * other expression shape (functions, casts, casts-of-literals, etc.). Only
+ * compile-time literals count for binding/domain purposes.
+ */
+export function literalValue(expr: AST.Expression): SqlValue | undefined {
+	if (expr.type !== 'literal') return undefined;
+	const lit = expr as AST.LiteralExpr;
+	const v = lit.value;
+	if (v instanceof Promise) return undefined;
+	return v;
+}
+
+/**
+ * Flip a comparison operator across its operands: if you rewrite `b op a` as
+ * `a flipComparison(op) b`, the truth value is preserved. Unrecognized
+ * operators (including `=`/`==`) round-trip unchanged.
+ *
+ * Used by `partial-unique-extraction.ts`, `check-extraction.ts`, and
+ * `fd-utils.ts` to normalize `lit op col` into `col flipped lit`. Distinct
+ * from predicate negation (the same-named `flipComparison` in
+ * `predicate-normalizer.ts` returns `NOT op` instead of `swap-operands op`).
+ */
+export function flipComparison(op: string): string {
+	switch (op) {
+		case '<': return '>';
+		case '<=': return '>=';
+		case '>': return '<';
+		case '>=': return '<=';
+		default: return op;
+	}
+}
+
+/**
+ * Flatten a top-level `OR` chain into an array of disjunct expressions.
+ * Non-OR roots return as a single-element array. Textual order is preserved.
+ *
+ * Shared by `check-extraction.ts` (implication-form CHECK recognition) and
+ * `partial-unique-extraction.ts` (top-level OR guard recognition).
+ */
+export function flattenDisjunction(expr: AST.Expression): AST.Expression[] {
+	const out: AST.Expression[] = [];
+	const stack: AST.Expression[] = [expr];
+	while (stack.length > 0) {
+		const cur = stack.pop()!;
+		if (cur.type === 'binary' && (cur as AST.BinaryExpr).operator === 'OR') {
+			const b = cur as AST.BinaryExpr;
+			// Preserve textual order: push right then left so left is popped first.
+			stack.push(b.right, b.left);
+			continue;
+		}
+		out.push(cur);
+	}
+	return out;
+}
+
+/**
+ * Collect the set of column indices referenced by `expr`. Only column /
+ * identifier nodes naming columns in `columnIndexMap` count. Returns an empty
+ * set when the expression references zero recognized columns; the caller can
+ * distinguish "no columns" (constant expression) from "exactly one column"
+ * by inspecting the size.
+ */
+export function collectColumnNames(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+): Set<number> {
+	const out = new Set<number>();
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		const idx = node.type === 'column' || node.type === 'identifier'
+			? columnIndexFromExpr(node as AST.Expression, columnIndexMap)
+			: undefined;
+		if (idx !== undefined) out.add(idx);
+		for (const key of Object.keys(node)) {
+			const v = (node as unknown as Record<string, unknown>)[key];
+			if (!v) continue;
+			if (Array.isArray(v)) {
+				for (const item of v) {
+					if (item && typeof item === 'object' && 'type' in item) {
+						stack.push(item as AST.AstNode);
+					}
+				}
+			} else if (typeof v === 'object' && 'type' in (v as object)) {
+				stack.push(v as AST.AstNode);
+			}
+		}
+	}
+	return out;
+}

@@ -6,8 +6,9 @@ import type { RelationType } from '../../common/datatype.js';
 import { ColumnReferenceNode } from './reference.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { Cached } from '../../util/cached.js';
-import { projectKeys } from '../util/key-utils.js';
+import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
 import { projectOrdering } from '../framework/physical-utils.js';
+import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, superkeyToFd } from '../util/fd-utils.js';
 
 export interface ReturningProjection {
   node: ScalarPlanNode;
@@ -53,22 +54,16 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     const nameCount = new Map<string, number>();
 
     const columns = this.projections.map((proj) => {
-      // Determine base column name
+      // Determine base column name; preserve the spelling supplied by the user
+      // (matches ProjectNode behaviour for SELECT — case-insensitive matching is
+      // a resolution concern, not an output-name concern).
       let baseName: string;
       if (proj.alias) {
-        baseName = proj.alias.toLowerCase();
+        baseName = proj.alias;
       } else if (proj.node instanceof ColumnReferenceNode) {
-        // For column references, check if there's a table qualifier (like NEW or OLD)
         const expr = proj.node.expression;
-        if (expr.table) {
-          // Use qualified name for NEW.id, OLD.id, etc., normalized to lowercase
-          baseName = `${expr.table.toLowerCase()}.${expr.name.toLowerCase()}`;
-        } else {
-          // Use the unqualified column name, normalized to lowercase
-          baseName = expr.name.toLowerCase();
-        }
+        baseName = expr.table ? `${expr.table}.${expr.name}` : expr.name;
       } else {
-        // For expressions, use the string representation
         baseName = expressionToString(proj.node.expression);
       }
 
@@ -92,16 +87,13 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
       };
     });
 
-    // Logical key propagation via simple column references
+    // Logical key propagation via the shared projection-mapping helper (covers
+    // both bare column references and injective unary projections).
     const execType = this.executor.getType();
-    const execAttrs = this.executor.getAttributes();
-    const srcToOut = new Map<number, number>();
-    this.projections.forEach((proj, outIdx) => {
-      if (proj.node instanceof ColumnReferenceNode) {
-        const srcIndex = execAttrs.findIndex(a => a.id === (proj.node as ColumnReferenceNode).attributeId);
-        if (srcIndex >= 0) srcToOut.set(srcIndex, outIdx);
-      }
-    });
+    const { map: srcToOut } = deriveProjectionColumnMap(
+      this.executor.getAttributes(),
+      this.projections.map((p, outIndex) => ({ expr: p.node, outIndex })),
+    );
 
     return {
       typeClass: 'relation',
@@ -222,31 +214,71 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     const sourcePhysical = childrenPhysical[0];
-    const execAttrs = this.executor.getAttributes();
-    const map = new Map<number, number>();
-    this.projections.forEach((proj, outIdx) => {
-      if (proj.node instanceof ColumnReferenceNode) {
-        const srcIndex = execAttrs.findIndex(a => a.id === (proj.node as ColumnReferenceNode).attributeId);
-        if (srcIndex >= 0 && !map.has(srcIndex)) map.set(srcIndex, outIdx);
-      }
-    });
+    const outputColCount = this.projections.length;
+    const { map, injectivePairs } = deriveProjectionColumnMap(
+      this.executor.getAttributes(),
+      this.projections.map((p, outIndex) => ({ expr: p.node, outIndex })),
+    );
 
-    const uniqueKeys = (sourcePhysical?.uniqueKeys || [])
-      .map(key => {
-        const projected: number[] = [];
-        for (const col of key) {
-          const outIdx = map.get(col);
-          if (outIdx === undefined) return null;
-          projected.push(outIdx);
+    // Project the executor's logical unique keys through the column map; each
+    // surviving key K' becomes the FD `K' → (all_other_out_cols)` on the output.
+    const executorLogicalKeys = this.executor.getType().keys.map(k => k.map(ref => ref.index));
+    const projectedKeys: number[][] = [];
+    for (const key of executorLogicalKeys) {
+      const projected: number[] = [];
+      let miss = false;
+      for (const col of key) {
+        const outIdx = map.get(col);
+        if (outIdx === undefined) { miss = true; break; }
+        projected.push(outIdx);
+      }
+      if (!miss) projectedKeys.push(projected);
+    }
+
+    // Substitute injectively-derived columns into existing keys (`SELECT id, id+1`
+    // contributes both [col0] and [col1] as unique keys).
+    for (const [srcIdx, outIdx] of injectivePairs) {
+      const bareOut = map.get(srcIdx);
+      if (bareOut === undefined || bareOut === outIdx) continue;
+      const variants: number[][] = [];
+      for (const key of projectedKeys) {
+        if (key.includes(bareOut) && !key.includes(outIdx)) {
+          variants.push(key.map(c => (c === bareOut ? outIdx : c)));
         }
-        return projected;
-      })
-      .filter((k): k is number[] => k !== null);
+      }
+      projectedKeys.push(...variants);
+    }
+
+    let fds = projectFds(sourcePhysical?.fds ?? [], map);
+    for (const key of projectedKeys) {
+      const keyFd = superkeyToFd(key, outputColCount);
+      if (keyFd) fds = addFd(fds, keyFd, { keyHints: projectedKeys });
+    }
+    for (const [srcIdx, outIdx] of injectivePairs) {
+      const bareOut = map.get(srcIdx);
+      if (bareOut === undefined || bareOut === outIdx) continue;
+      fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx] }, { keyHints: projectedKeys });
+      fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut] }, { keyHints: projectedKeys });
+    }
+    const projectedEquiv: number[][] = [];
+    for (const cls of sourcePhysical?.equivClasses ?? []) {
+      const mapped: number[] = [];
+      for (const c of cls) {
+        const out = map.get(c);
+        if (out !== undefined && !mapped.includes(out)) mapped.push(out);
+      }
+      if (mapped.length >= 2) projectedEquiv.push(mapped.sort((a, b) => a - b));
+    }
+    const projectedBindings = projectConstantBindings(sourcePhysical?.constantBindings ?? [], map);
+    const projectedDomains = projectDomainConstraints(sourcePhysical?.domainConstraints ?? [], map);
 
     return {
       estimatedRows: this.estimatedRows,
       ordering: projectOrdering(sourcePhysical?.ordering, map),
-      uniqueKeys,
+      fds: fds.length > 0 ? fds : undefined,
+      equivClasses: projectedEquiv.length > 0 ? projectedEquiv : undefined,
+      constantBindings: projectedBindings.length > 0 ? projectedBindings : undefined,
+      domainConstraints: projectedDomains.length > 0 ? projectedDomains : undefined,
     };
   }
 

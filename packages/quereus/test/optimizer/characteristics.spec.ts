@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-expressions */
 /**
  * Tests for characteristics-based plan node analysis
  */

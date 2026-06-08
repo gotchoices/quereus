@@ -70,6 +70,16 @@ export interface LogicalType {
   isNumeric?: boolean;
   isTextual?: boolean;
   isTemporal?: boolean;
+
+  // Sargable-range support (optional)
+  // For monotone-but-lossy transforms (e.g. `date(ts) = D`), compute the
+  // half-open range `[lowerInclusive, upperExclusive)` on the input value.
+  // `kind` is named by the function schema's `rangeRewriteOnArg` trait;
+  // see docs/optimizer.md § "Sargable range rewrites".
+  bucketBounds?(
+    kind: string,
+    value: SqlValue,
+  ): { lowerInclusive: SqlValue; upperExclusive: SqlValue } | undefined;
 }
 ```
 
@@ -150,23 +160,26 @@ This ensures type information flows through the entire planning and execution pi
 **DATE**
 - Physical: `PhysicalType.TEXT` (ISO 8601 string: "YYYY-MM-DD")
 - Values: ISO date strings
-- Validation: Must parse as valid Temporal.PlainDate
+- Validation: Must parse as a valid bare PlainDate, or as a datetime string (bare, offset, `Z`, or `[zone]`) from which a date can be extracted
 - Comparison: Lexicographic (ISO strings sort correctly)
 - Collations: None
+- Canonicalization: A datetime-shaped input is first converted to UTC (offset / `Z` / `[zone]` annotations honored), then the UTC date is stored. Numeric inputs (Unix milliseconds) are likewise canonicalized through UTC.
 
 **TIME**
 - Physical: `PhysicalType.TEXT` (ISO 8601 string: "HH:MM:SS.sss")
 - Values: ISO time strings
-- Validation: Must parse as valid Temporal.PlainTime
+- Validation: Must parse as a valid bare PlainTime, or as a datetime string (bare, offset, `Z`, or `[zone]`) from which a time can be extracted
 - Comparison: Lexicographic
 - Collations: None
+- Canonicalization: A datetime-shaped input is first converted to UTC, then the UTC wall-clock time is stored — `'2024-01-15T10:30:00+02:00'` stores as `'08:30:00'`, not `'10:30:00'`.
 
 **DATETIME**
 - Physical: `PhysicalType.TEXT` (ISO 8601 string: "YYYY-MM-DDTHH:MM:SS.sss")
 - Values: ISO datetime strings
-- Validation: Must parse as valid Temporal.PlainDateTime
-- Comparison: Lexicographic
+- Validation: Must parse as valid Temporal.PlainDateTime, Temporal.ZonedDateTime, or Temporal.Instant
+- Comparison: Lexicographic (by UTC wall-clock — see canonicalization below)
 - Collations: None
+- Canonicalization: Inputs with an offset (`+HH:MM` / `Z`) or `[zone]` annotation are converted to UTC, and numeric inputs (Unix milliseconds) are canonicalized through UTC, before being stored as the bare PlainDateTime form. Equal instants compare equal regardless of input shape.
 
 **TIMESPAN**
 - Physical: `PhysicalType.TEXT` (ISO 8601 duration string: "PT1H30M", "P1DT2H")

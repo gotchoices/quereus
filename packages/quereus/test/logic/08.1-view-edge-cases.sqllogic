@@ -1,0 +1,118 @@
+-- adapted from SQLite test/view.test
+-- View-feature scenarios beyond basic 08-views.sqllogic.
+
+-- ===================================
+-- 1. Multi-level views (view referencing another view)
+-- ===================================
+
+create table base_v (id integer primary key, cat text, val integer);
+insert into base_v values (1, 'a', 10), (2, 'b', 20), (3, 'a', 30), (4, 'b', 40);
+
+-- v1 filters; v2 aggregates over v1
+create view v1 as select id, cat, val from base_v where val > 15;
+create view v2 as select cat, count(*) as n, sum(val) as s from v1 group by cat;
+
+select * from v2 order by cat;
+→ [{"cat":"a","n":1,"s":30},{"cat":"b","n":2,"s":60}]
+
+-- three-level chain
+create view v3 as select cat from v2 where n > 1;
+
+select * from v3;
+→ [{"cat":"b"}]
+
+drop view v3;
+drop view v2;
+drop view v1;
+drop table base_v;
+
+-- ===================================
+-- 2. View with explicit column-list rename
+-- ===================================
+
+create table cr_base (id integer primary key, name text, val integer);
+insert into cr_base values (1, 'x', 5), (2, 'y', 7);
+
+create view cr_v (k, label, amount) as select id, name, val from cr_base;
+
+select k, label, amount from cr_v order by k;
+→ [{"k":1,"label":"x","amount":5},{"k":2,"label":"y","amount":7}]
+
+drop view cr_v;
+
+create view cr_bad (a, b) as select id, name, val from cr_base;
+-- error: declared columns
+drop view if exists cr_bad;
+
+drop table cr_base;
+
+-- ===================================
+-- 3. TEMP VIEW lifecycle
+-- ===================================
+
+create table tv_base (id integer primary key, val integer);
+insert into tv_base values (1, 10), (2, 20);
+
+create temp view tv_t as select id, val from tv_base where val > 10;
+
+select * from tv_t;
+→ [{"id":2,"val":20}]
+
+drop view tv_t;
+drop table tv_base;
+
+-- ===================================
+-- 4. View over UNION ALL / compound select
+-- ===================================
+
+create table cs_a (id integer primary key, label text);
+create table cs_b (id integer primary key, label text);
+insert into cs_a values (1, 'a1'), (2, 'a2');
+insert into cs_b values (3, 'b1'), (4, 'b2');
+
+create view cs_v as
+	select id, label from cs_a
+	union all
+	select id, label from cs_b;
+
+select * from cs_v order by id;
+→ [{"id":1,"label":"a1"},{"id":2,"label":"a2"},{"id":3,"label":"b1"},{"id":4,"label":"b2"}]
+
+drop view cs_v;
+drop table cs_a;
+drop table cs_b;
+
+-- ===================================
+-- 5. Schema-qualified view (main / temp)
+-- ===================================
+
+create table sq_base (id integer primary key, val integer);
+insert into sq_base values (1, 10), (2, 20);
+
+create view main.sq_v as select id, val from sq_base where val > 10;
+
+select * from main.sq_v;
+→ [{"id":2,"val":20}]
+
+create temp view temp.sq_tv as select id from sq_base;
+
+drop view temp.sq_tv;
+drop view main.sq_v;
+drop table sq_base;
+
+-- ===================================
+-- 6. View aliases / self-join in view body
+-- ===================================
+
+create table tsj (id integer primary key, parent_id integer null);
+insert into tsj values (1, null), (2, 1), (3, 1);
+
+create view v_sj as
+	select c.id as child, p.id as parent
+	from tsj c left join tsj p on c.parent_id = p.id;
+
+select * from v_sj order by child;
+→ [{"child":1,"parent":null},{"child":2,"parent":1},{"child":3,"parent":1}]
+
+drop view v_sj;
+drop table tsj;

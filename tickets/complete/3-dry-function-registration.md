@@ -1,6 +1,6 @@
 ---
 description: Extract repeated function registration error handling into a shared helper
-dependencies: none
+prereq: none
 
 ---
 

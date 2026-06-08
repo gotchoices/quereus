@@ -77,6 +77,18 @@ export interface BestAccessPlanRequest {
 	requiredOrdering?: readonly OrderingSpec[];
 	/** LIMIT value known at plan time */
 	limit?: number | null;
+	/**
+	 * OFFSET value known at plan time. Modules pushing LIMIT into the scan
+	 * must read this and stamp `scan-side limit = limit + offset`, because the
+	 * runtime LimitOffsetNode still applies the OFFSET skip above whatever the
+	 * scan emits — pushing only `limit` would underproduce by `offset` rows.
+	 *
+	 * If the module advertises `supportsOrdinalSeek` on its result, the runtime
+	 * may instead consume this `offset` directly as a seek-to-kth-row directive
+	 * (no buffer-and-discard); in that case the scan emits exactly `limit` rows
+	 * starting at the `offset`-th monotonic position.
+	 */
+	offset?: number | null;
 	/** Estimated rows hint from planner (may be unknown) */
 	estimatedRows?: number;
 }
@@ -105,6 +117,45 @@ export interface BestAccessPlanResult {
 	isSet?: boolean;
 	/** Free-text explanation for debugging */
 	explains?: string;
+
+	/**
+	 * The access path emits rows in monotonic non-decreasing (or non-increasing,
+	 * for `direction: 'desc'`) order on the named column. Stronger than
+	 * `providesOrdering` because:
+	 *   - it is a property of the underlying storage (not just a sort),
+	 *   - the column's values are total-ordered with no gaps in coverage,
+	 *   - downstream rules may rely on `between(a,b)` semantics.
+	 *
+	 * `strict = true` additionally guarantees no two rows share a value.
+	 *
+	 * `columnIndex` is the table-relative column index (0-based, into
+	 * `request.columns`). The optimizer translates this into an attribute id
+	 * when lifting onto the physical leaf node.
+	 */
+	monotonicOn?: {
+		columnIndex: number;
+		direction: 'asc' | 'desc';
+		strict: boolean;
+	};
+
+	/**
+	 * The access path supports O(log N) seek to the kth row in monotonic
+	 * order — i.e., LIMIT n OFFSET k can be pushed into the scan instead
+	 * of buffer-and-discard. Implies `monotonicOn` is set.
+	 *
+	 * The vtab's query()/scan() implementation must accept an offset
+	 * directive in its access-plan request when this is advertised.
+	 */
+	supportsOrdinalSeek?: boolean;
+
+	/**
+	 * The access path can serve as the right input to a streaming asof
+	 * scan: given a left row and its match key, the vtab can position
+	 * its cursor at the largest row ≤ that key in O(log avg-gap), and
+	 * advance forward without re-seeking for monotonically increasing
+	 * left keys. Implies `monotonicOn` is set.
+	 */
+	supportsAsofRight?: boolean;
 }
 
 /**
@@ -270,6 +321,27 @@ export function validateAccessPlan(
 		}
 	}
 
+	// Whenever a plan claims `providesOrdering`, it must identify the index that
+	// produces that order via `orderingIndexName`. When the same plan also drives
+	// iteration via `indexName` (i.e., a seek/range plan), the two MUST refer to
+	// the same index — claiming ordering from one index while iterating via
+	// another silently emits rows in the wrong order. This invariant catches
+	// the bug at the boundary regardless of which module emits the plan.
+	if (result.providesOrdering && result.providesOrdering.length > 0) {
+		if (!result.orderingIndexName) {
+			quereusError(
+				'providesOrdering requires orderingIndexName to identify the source index',
+				StatusCode.FORMAT
+			);
+		}
+		if (result.indexName && result.indexName !== result.orderingIndexName) {
+			quereusError(
+				`providesOrdering claims ordering from '${result.orderingIndexName}' but plan iterates via '${result.indexName}'; ordering can only be claimed from the same index that drives iteration`,
+				StatusCode.FORMAT
+			);
+		}
+	}
+
 	// Validate seek column indexes
 	if (result.seekColumnIndexes) {
 		for (const colIdx of result.seekColumnIndexes) {
@@ -280,6 +352,33 @@ export function validateAccessPlan(
 				);
 			}
 		}
+	}
+
+	// Validate monotonicOn column index is in range
+	if (result.monotonicOn) {
+		const colIdx = result.monotonicOn.columnIndex;
+		if (colIdx < 0 || colIdx >= request.columns.length) {
+			quereusError(
+				`Invalid monotonicOn column index ${colIdx}, must be 0-${request.columns.length - 1}`,
+				StatusCode.FORMAT
+			);
+		}
+	}
+
+	// Validate supportsOrdinalSeek implies monotonicOn is set
+	if (result.supportsOrdinalSeek && !result.monotonicOn) {
+		quereusError(
+			'supportsOrdinalSeek requires monotonicOn to be set',
+			StatusCode.FORMAT
+		);
+	}
+
+	// Validate supportsAsofRight implies monotonicOn is set
+	if (result.supportsAsofRight && !result.monotonicOn) {
+		quereusError(
+			'supportsAsofRight requires monotonicOn to be set',
+			StatusCode.FORMAT
+		);
 	}
 }
 

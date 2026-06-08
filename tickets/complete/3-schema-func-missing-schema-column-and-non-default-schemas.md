@@ -1,5 +1,5 @@
 description: Schema() TVF now has schema column and enumerates all schemas; function_info() also enumerates all schemas
-dependencies: none
+prereq: none
 files: packages/quereus/src/func/builtins/schema.ts, packages/quereus/src/schema/manager.ts, packages/quereus/test/logic/06.3.1-schema-all-schemas.sqllogic, docs/sql.md
 ----
 

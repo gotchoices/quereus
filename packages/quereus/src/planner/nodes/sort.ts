@@ -1,5 +1,5 @@
 import { PlanNodeType } from './plan-node-type.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type UnaryRelationalNode, type PhysicalProperties, type Attribute, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type UnaryRelationalNode, type PhysicalProperties, type Attribute, type MonotonicOnInfo, isRelationalNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { formatSortKey } from '../../util/plan-formatter.js';
@@ -7,6 +7,8 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { extractOrderingFromSortKeys } from '../framework/physical-utils.js';
 import { SortCapable } from '../framework/characteristics.js';
+import { ColumnReferenceNode } from './reference.js';
+import { isAssertedKey } from '../util/fd-utils.js';
 
 /**
  * Represents a sort key for ordering results
@@ -75,10 +77,36 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		// Extract ordering from sort keys if they are trivial column references
 		const ordering = extractOrderingFromSortKeys(this.sortKeys, sourceAttributes);
 
+		// Establish monotonicOn from the leading sort key when it is a trivial
+		// column reference. Strict iff the input was unique on that single column —
+		// equivalent to `{leadIdx}` being a superkey of the source's columns.
+		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
+		if (this.sortKeys.length > 0) {
+			const leadingKey = this.sortKeys[0];
+			if (leadingKey.expression instanceof ColumnReferenceNode) {
+				const leadAttrId = leadingKey.expression.attributeId;
+				const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
+				if (leadIdx >= 0) {
+					const strict = isAssertedKey(new Set([leadIdx]), sourcePhysical?.fds, sourceAttributes.length);
+					monotonicOn = [{
+						attrId: leadAttrId,
+						direction: leadingKey.direction,
+						strict,
+					}];
+				}
+			}
+		}
+
 		return {
 			estimatedRows: this.estimatedRows,
 			ordering,
-			uniqueKeys: sourcePhysical?.uniqueKeys,
+			// Sort doesn't change which rows are in the relation — FDs/ECs/bindings
+			// propagate unchanged.
+			fds: sourcePhysical?.fds,
+			equivClasses: sourcePhysical?.equivClasses,
+			constantBindings: sourcePhysical?.constantBindings,
+			domainConstraints: sourcePhysical?.domainConstraints,
+			monotonicOn,
 		};
 	}
 

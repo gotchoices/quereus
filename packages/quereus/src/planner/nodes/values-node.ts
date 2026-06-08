@@ -1,10 +1,11 @@
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
-import { PlanNode, type ScalarPlanNode, type ZeroAryRelationalNode, type Attribute } from './plan-node.js';
+import { PlanNode, type ScalarPlanNode, type ZeroAryRelationalNode, type Attribute, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import { Cached } from '../../util/cached.js';
 import { formatScalarType } from '../../util/plan-formatter.js';
 import { Row } from '../../common/types.js';
+import { singletonFd } from '../util/fd-utils.js';
 
 /**
  * Represents a VALUES clause, producing a relation from literal rows.
@@ -98,6 +99,22 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
 
   getRelations(): readonly [] {
     return [];
+  }
+
+  computePhysical(_children: readonly PhysicalProperties[]): Partial<PhysicalProperties> {
+    // A VALUES clause with ≤1 row is provably ≤1-row, so emit the canonical
+    // singleton `∅ → all_cols` FD. Multi-row VALUES remains a bag with no FDs.
+    if (this.rows.length > 1) {
+      return { estimatedRows: this.rows.length };
+    }
+    const singleton = singletonFd(this.getAttributes().length);
+    if (singleton === undefined) {
+      return { estimatedRows: this.rows.length };
+    }
+    return {
+      estimatedRows: this.rows.length,
+      fds: [singleton],
+    };
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {

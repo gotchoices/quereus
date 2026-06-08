@@ -174,6 +174,57 @@ DROP TABLE mj_mc_pk1;
 DROP TABLE mj_mc_pk2;
 DROP TABLE mj_pk_empty;
 
+-- ===== Monotonic-merge recognition tests =====
+-- These cover the broader "MonotonicOn on equi-pair" recognition (rule:
+-- monotonic-merge-join). The headline case is a three-way join where the
+-- middle MergeJoin's output advertises MonotonicOn on both equi-pair
+-- attributes (left and right ids), but `physical.ordering` only reflects
+-- the left side; the parent join on the right side's id therefore depends
+-- on the MonotonicOn-aware rule rather than ordering-prefix matching.
+
+CREATE TABLE mm_t1 (id INTEGER PRIMARY KEY, x TEXT);
+CREATE TABLE mm_t2 (id INTEGER PRIMARY KEY, y TEXT);
+CREATE TABLE mm_t3 (id INTEGER PRIMARY KEY, z TEXT);
+INSERT INTO mm_t1 VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d');
+INSERT INTO mm_t2 VALUES (1,'x'),(2,'y'),(3,'z');
+INSERT INTO mm_t3 VALUES (1,'p'),(3,'r'),(4,'s');
+
+-- Plan shape: three-way join must use MergeJoin at both join levels.
+SELECT count(*) AS cnt FROM query_plan('SELECT * FROM mm_t1 JOIN mm_t2 ON mm_t1.id = mm_t2.id JOIN mm_t3 ON mm_t2.id = mm_t3.id') WHERE node_type = 'MergeJoin';
+→ [{"cnt":2}]
+
+-- Three-way INNER JOIN correctness
+SELECT mm_t1.id, x, y, z FROM mm_t1 JOIN mm_t2 ON mm_t1.id = mm_t2.id JOIN mm_t3 ON mm_t2.id = mm_t3.id ORDER BY mm_t1.id;
+→ [{"id":1,"x":"a","y":"x","z":"p"},{"id":3,"x":"c","y":"z","z":"r"}]
+
+-- Multi-conjunct ON where only id is monotonic on both sides; the second
+-- conjunct (l.code = r.code) is evaluated as residual without breaking
+-- correctness.
+CREATE TABLE mm_a (id INTEGER PRIMARY KEY, code INTEGER, label TEXT);
+CREATE TABLE mm_b (id INTEGER PRIMARY KEY, code INTEGER, info TEXT);
+INSERT INTO mm_a VALUES (1,100,'a'),(2,200,'b'),(3,200,'c');
+INSERT INTO mm_b VALUES (1,100,'x'),(2,250,'y'),(3,200,'z');
+
+SELECT a.id, label, info FROM mm_a a JOIN mm_b b ON a.id = b.id AND a.code = b.code ORDER BY a.id;
+→ [{"id":1,"label":"a","info":"x"},{"id":3,"label":"c","info":"z"}]
+
+-- LEFT JOIN with the monotonic-merge rule firing
+SELECT mm_t1.id, x, y FROM mm_t1 LEFT JOIN mm_t2 ON mm_t1.id = mm_t2.id ORDER BY mm_t1.id;
+→ [{"id":1,"x":"a","y":"x"},{"id":2,"x":"b","y":"y"},{"id":3,"x":"c","y":"z"},{"id":4,"x":"d","y":null}]
+
+-- SEMI / ANTI join via EXISTS / NOT EXISTS over monotonic equi-pair
+SELECT mm_t1.id FROM mm_t1 WHERE EXISTS (SELECT 1 FROM mm_t2 WHERE mm_t2.id = mm_t1.id) ORDER BY mm_t1.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT mm_t1.id FROM mm_t1 WHERE NOT EXISTS (SELECT 1 FROM mm_t2 WHERE mm_t2.id = mm_t1.id) ORDER BY mm_t1.id;
+→ [{"id":4}]
+
+DROP TABLE mm_t1;
+DROP TABLE mm_t2;
+DROP TABLE mm_t3;
+DROP TABLE mm_a;
+DROP TABLE mm_b;
+
 -- Cleanup
 DROP TABLE mj_left;
 DROP TABLE mj_right;

@@ -1,6 +1,6 @@
 {
 	"name": "@quereus/isolation",
-	"version": "2.6.0",
+	"version": "3.3.0",
 	"type": "module",
 	"description": "Generic transaction isolation layer for Quereus virtual table modules",
 	"keywords": [
@@ -42,8 +42,10 @@
 	"peerDependencies": {
 		"@quereus/quereus": "workspace:^"
 	},
+	"dependencies": {
+		"@quereus/quereus": "workspace:^"
+	},
 	"devDependencies": {
-		"@quereus/quereus": "*",
 		"@types/mocha": "^10.0.10",
 		"@types/node": "^25.0.9",
 		"chai": "^6.2.2",

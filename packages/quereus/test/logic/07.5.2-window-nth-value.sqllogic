@@ -1,0 +1,13 @@
+-- adapted from SQLite test/window1.test, test/window3.test, test/window6.test
+-- nth_value(expr, n) is not currently implemented as a window function in
+-- Quereus. Document the rejection.
+
+create table nv (id integer primary key, val integer, grp text);
+insert into nv values (1, 10, 'A'), (2, 20, 'A');
+
+select id, val, grp,
+       nth_value(val, 1) over (partition by grp order by id) as nth1
+from nv order by id;
+-- error: Unknown window function: nth_value
+
+drop table nv;

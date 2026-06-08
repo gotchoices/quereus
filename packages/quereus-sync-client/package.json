@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sync-client",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "WebSocket sync client for Quereus - handles connection, reconnection, and change synchronization",
   "keywords": [
@@ -44,7 +44,6 @@
     "@quereus/sync": "workspace:^"
   },
   "devDependencies": {
-    "@quereus/sync": "*",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.0.9",
     "chai": "^6.2.2",
@@ -54,7 +53,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@quereus/quereus": "workspace:^"
+    "@quereus/quereus": "workspace:^",
+    "@quereus/sync": "workspace:^"
   },
   "quereus": {
     "provides": {

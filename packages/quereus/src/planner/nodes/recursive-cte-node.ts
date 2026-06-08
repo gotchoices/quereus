@@ -1,4 +1,4 @@
-import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor, isRelationalNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
@@ -27,7 +27,9 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		public readonly isUnionAll: boolean,
 		public readonly materializationHint: 'materialized' | 'not_materialized' | undefined = 'materialized',
 		public readonly maxRecursion?: number,
-		tableDescriptor?: TableDescriptor
+		tableDescriptor?: TableDescriptor,
+		public readonly limitExpr?: ScalarPlanNode,
+		public readonly offsetExpr?: ScalarPlanNode
 	) {
 		super(scope, baseCaseQuery.getTotalCost() + recursiveCaseQuery.getTotalCost() + 50); // Higher cost for recursion
 		this._recursiveCaseQuery = recursiveCaseQuery;
@@ -89,8 +91,11 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		return this.typeCache.value;
 	}
 
-	getChildren(): readonly [RelationalPlanNode, RelationalPlanNode] {
-		return [this.baseCaseQuery, this.recursiveCaseQuery];
+	getChildren(): readonly PlanNode[] {
+		const children: PlanNode[] = [this.baseCaseQuery, this.recursiveCaseQuery];
+		if (this.limitExpr) children.push(this.limitExpr);
+		if (this.offsetExpr) children.push(this.offsetExpr);
+		return children;
 	}
 
 	// For recursive CTEs, we consider the base case as the primary source
@@ -103,19 +108,29 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
-		if (newChildren.length !== 2) {
-			throw new Error(`RecursiveCTENode expects 2 children, got ${newChildren.length}`);
+		const expectedLength = 2 + (this.limitExpr ? 1 : 0) + (this.offsetExpr ? 1 : 0);
+		if (newChildren.length !== expectedLength) {
+			throw new Error(`RecursiveCTENode expects ${expectedLength} children, got ${newChildren.length}`);
 		}
 
-		const [newBaseCaseQuery, newRecursiveCaseQuery] = newChildren;
+		const [newBaseCaseQuery, newRecursiveCaseQuery, ...rest] = newChildren;
 
 		// Type check
 		if (!isRelationalNode(newBaseCaseQuery) || !isRelationalNode(newRecursiveCaseQuery)) {
-			throw new Error('RecursiveCTENode: children must be RelationalPlanNodes');
+			throw new Error('RecursiveCTENode: first two children must be RelationalPlanNodes');
 		}
 
+		let restIndex = 0;
+		const newLimitExpr = this.limitExpr ? rest[restIndex++] as ScalarPlanNode : undefined;
+		const newOffsetExpr = this.offsetExpr ? rest[restIndex++] as ScalarPlanNode : undefined;
+
 		// Return same instance if nothing changed
-		if (newBaseCaseQuery === this.baseCaseQuery && newRecursiveCaseQuery === this.recursiveCaseQuery) {
+		if (
+			newBaseCaseQuery === this.baseCaseQuery
+			&& newRecursiveCaseQuery === this.recursiveCaseQuery
+			&& newLimitExpr === this.limitExpr
+			&& newOffsetExpr === this.offsetExpr
+		) {
 			return this;
 		}
 
@@ -129,7 +144,9 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 			this.isUnionAll,
 			this.materializationHint,
 			this.maxRecursion,
-			this.tableDescriptor
+			this.tableDescriptor,
+			newLimitExpr,
+			newOffsetExpr
 		);
 
 		return newNode;

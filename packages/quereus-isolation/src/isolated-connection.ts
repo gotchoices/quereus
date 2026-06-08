@@ -22,6 +22,7 @@ export interface IsolatedTableCallback {
 export class IsolatedConnection implements VirtualTableConnection {
 	readonly connectionId: string;
 	readonly tableName: string;
+	readonly isCovering = true;
 
 	private readonly underlyingConnection: VirtualTableConnection | undefined;
 	private readonly overlayConnection: VirtualTableConnection | undefined;

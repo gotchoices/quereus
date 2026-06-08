@@ -1,0 +1,50 @@
+-- adapted from SQLite test/gencol1.test
+-- Generated-column error / rejection paths.
+
+-- ===================================
+-- 1. Self-referencing generated column rejected
+-- ===================================
+
+create table t_self (
+	id integer primary key,
+	a integer generated always as (a + 1) stored
+);
+-- error:
+drop table if exists t_self;
+
+-- ===================================
+-- 2. Mutually-recursive generated columns rejected
+-- ===================================
+
+create table t_cycle (
+	id integer primary key,
+	c0 integer not null,
+	c1 integer generated always as (c0 + c2) stored,
+	c2 integer generated always as (c1) stored
+);
+-- error:
+drop table if exists t_cycle;
+
+-- ===================================
+-- 3. DROP COLUMN of a column referenced by a GENERATED expression rejected
+-- ===================================
+
+create table t_drop (
+	id integer primary key,
+	a integer not null,
+	b integer generated always as (a * 2) stored
+);
+
+insert into t_drop (id, a) values (1, 5);
+
+-- 'a' is referenced by generated column 'b'
+alter table t_drop drop column a;
+-- error:
+
+-- dropping the generated column itself should succeed
+alter table t_drop drop column b;
+
+select id, a from t_drop where id = 1;
+→ [{"id":1,"a":5}]
+
+drop table t_drop;

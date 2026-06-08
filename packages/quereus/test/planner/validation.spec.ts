@@ -6,6 +6,10 @@ import type { BaseType, RelationType, ScalarType } from '../../src/common/dataty
 import type { Scope } from '../../src/planner/scopes/scope.js';
 import { QuereusError } from '../../src/common/errors.js';
 import { validatePhysicalTree, quickValidate } from '../../src/planner/validation/plan-validator.js';
+import { JoinNode } from '../../src/planner/nodes/join-node.js';
+import { SetOperationNode } from '../../src/planner/nodes/set-operation-node.js';
+import { EagerPrefetchNode } from '../../src/planner/nodes/eager-prefetch-node.js';
+import { AsyncGatherNode } from '../../src/planner/nodes/async-gather-node.js';
 import {
 	checkDeterministic,
 	validateDeterministicExpression,
@@ -115,7 +119,7 @@ function mockScalar(deterministic: boolean, label = 'expr'): any {
 
 describe('plan-validator', () => {
 
-	describe('attribute ID uniqueness', () => {
+	describe('attribute provenance (origination vs forwarding)', () => {
 		it('accepts unique attribute IDs across nodes', () => {
 			const child = relNode({
 				nodeType: PlanNodeType.SeqScan,
@@ -131,20 +135,45 @@ describe('plan-validator', () => {
 			expect(() => validatePhysicalTree(parent)).not.to.throw();
 		});
 
-		it('rejects duplicate attribute IDs across nodes', () => {
+		it('accepts a parent that forwards a child\'s attribute IDs', () => {
+			// A parent re-publishing its child's IDs is *forwarding*, not a
+			// duplicate origin — this is the whole point of stable IDs (Set/Join/
+			// EagerPrefetch/AsyncGather all do this). The old tree-global
+			// uniqueness check rejected it; the provenance surface allows it.
 			const child = relNode({
 				nodeType: PlanNodeType.SeqScan,
 				attributes: [makeAttr(10), makeAttr(11)],
 				physical: { deterministic: true, readonly: true },
 			});
-			// Parent reuses attribute ID 10
 			const parent = relNode({
 				nodeType: PlanNodeType.Filter,
 				children: [child],
+				attributes: [makeAttr(10), makeAttr(11)],
+				physical: { deterministic: true, readonly: true },
+			});
+			expect(() => validatePhysicalTree(parent)).not.to.throw();
+		});
+
+		it('rejects the same attribute ID originated by two distinct nodes', () => {
+			// Two sibling leaves each *mint* ID 10 — a genuine bug. Provenance
+			// detects the origin collision even though the parent forwards the ID.
+			const leftLeaf = relNode({
+				nodeType: PlanNodeType.SeqScan,
 				attributes: [makeAttr(10)],
 				physical: { deterministic: true, readonly: true },
 			});
-			expect(() => validatePhysicalTree(parent)).to.throw(QuereusError, /Duplicate attribute ID 10/);
+			const rightLeaf = relNode({
+				nodeType: PlanNodeType.SeqScan,
+				attributes: [makeAttr(10)],
+				physical: { deterministic: true, readonly: true },
+			});
+			const parent = relNode({
+				nodeType: PlanNodeType.Join,
+				children: [leftLeaf, rightLeaf],
+				attributes: [makeAttr(10)],
+				physical: { deterministic: true, readonly: true },
+			});
+			expect(() => validatePhysicalTree(parent)).to.throw(QuereusError, /originated at two distinct nodes/);
 		});
 
 		it('rejects duplicate attribute IDs within the same node', () => {
@@ -450,23 +479,57 @@ describe('plan-validator', () => {
 	});
 
 	describe('shared child / DAG references', () => {
-		it('does not crash when a child is referenced from two parents', () => {
+		it('does not crash (or false-positive) when a child instance is referenced twice', () => {
 			const shared = relNode({
 				nodeType: PlanNodeType.SeqScan,
 				attributes: [makeAttr(90)],
 				physical: { deterministic: true, readonly: true },
 			});
-			// Build a parent that references `shared` twice — attribute 90 will be
-			// registered on the first visit and found as a duplicate on the second.
-			// The key thing we test: no infinite loop or stack overflow.
+			// `shared` is referenced twice. The provenance walk dedupes by node
+			// identity, so its single origin of ID 90 is not mistaken for a
+			// two-node origin collision. The key things we test: no infinite loop
+			// or stack overflow, and no false-positive duplicate.
 			const parent = relNode({
 				nodeType: PlanNodeType.Filter,
 				children: [shared, shared],
 				attributes: [makeAttr(91)],
 				physical: { deterministic: true, readonly: true },
 			});
-			// We expect a duplicate attribute error, but definitely not a hang
-			expect(() => validatePhysicalTree(parent)).to.throw(QuereusError, /Duplicate attribute ID 90/);
+			expect(() => validatePhysicalTree(parent)).not.to.throw();
+		});
+	});
+
+	describe('attribute-preserving node families (default options)', () => {
+		const phys = { deterministic: true, readonly: true, estimatedRows: 10 };
+
+		it('accepts Join / SetOperation / EagerPrefetch / AsyncGather forwarding subtrees', () => {
+			const scanA = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1000), makeAttr(1001)], physical: phys });
+			const scanB = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1002), makeAttr(1003)], physical: phys });
+			// Inner join concatenates left+right attribute IDs verbatim.
+			const join = new JoinNode(mockScope, scanA as any, scanB as any, 'inner');
+			// EagerPrefetch forwards its source list unchanged.
+			const prefetch = new EagerPrefetchNode(mockScope, join);
+			// SetOperation mirrors the left child's attributes (same 4 IDs).
+			const scanC = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1004), makeAttr(1005), makeAttr(1006), makeAttr(1007)], physical: phys });
+			const setop = new SetOperationNode(mockScope, prefetch, scanC as any, 'unionAll');
+			// AsyncGather(unionAll) mirrors children[0] (the setop) attributes.
+			const scanD = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1008), makeAttr(1009), makeAttr(1010), makeAttr(1011)], physical: phys });
+			const gather = new AsyncGatherNode(mockScope, [setop, scanD], { kind: 'unionAll' }, 4);
+			expect(() => validatePhysicalTree(gather)).not.to.throw();
+		});
+
+		it('accepts a right join (verbatim concatenation with re-published IDs)', () => {
+			const scanA = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1100), makeAttr(1101)], physical: phys });
+			const scanB = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1102)], physical: phys });
+			const join = new JoinNode(mockScope, scanA as any, scanB as any, 'right');
+			expect(() => validatePhysicalTree(join)).not.to.throw();
+		});
+
+		it('accepts a cross join (verbatim concatenation)', () => {
+			const scanA = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1200)], physical: phys });
+			const scanB = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1201)], physical: phys });
+			const join = new JoinNode(mockScope, scanA as any, scanB as any, 'cross');
+			expect(() => validatePhysicalTree(join)).not.to.throw();
 		});
 	});
 
@@ -606,6 +669,28 @@ describe('determinism-validator', () => {
 			const result = checkDeterministic(mockScalar(false, 'random()'));
 			expect(result.valid).to.equal(false);
 			expect(result.expression).to.equal('random()');
+		});
+	});
+
+	// The `nondeterministic_schema` option lifts the *invocation* of these
+	// validators at the four call sites (CREATE TABLE DEFAULT/CHECK and
+	// INSERT/UPDATE generated/default build sites); the validators themselves
+	// remain strict so any future call site that wants strict checking can
+	// keep relying on them. Lock that contract here.
+	describe('validators remain strict when called directly', () => {
+		it('validateDeterministicDefault still throws on non-det input', () => {
+			expect(() => validateDeterministicDefault(mockScalar(false, 'random()'), 'a', 't'))
+				.to.throw(QuereusError, /Non-deterministic expression not allowed/);
+		});
+
+		it('validateDeterministicGenerated still throws on non-det input', () => {
+			expect(() => validateDeterministicGenerated(mockScalar(false, 'random()'), 'g', 't'))
+				.to.throw(QuereusError, /Non-deterministic expression not allowed/);
+		});
+
+		it('validateDeterministicConstraint still throws on non-det input', () => {
+			expect(() => validateDeterministicConstraint(mockScalar(false, 'random()'), 'c', 't'))
+				.to.throw(QuereusError, /Non-deterministic expression not allowed/);
 		});
 	});
 });

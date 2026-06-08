@@ -71,15 +71,14 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			(stmt.orderBy ?? []).forEach(o => traverseAst(o.expr, callbacks));
 			traverseAst(stmt.limit, callbacks);
 			traverseAst(stmt.offset, callbacks);
-			traverseAst(stmt.union, callbacks);
+			traverseAst(stmt.compound?.select, callbacks);
 			break;
 		}
 		case 'insert': {
 			const stmt = node as AST.InsertStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
 			traverseAst(stmt.table, callbacks);
-			(stmt.values ?? []).forEach(row => row.forEach(v => traverseAst(v, callbacks)));
-			traverseAst(stmt.select, callbacks);
+			traverseAst(stmt.source, callbacks);
 			break;
 		}
 		case 'update': {
@@ -185,11 +184,6 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			traverseAst(betweenExpr.expr, callbacks);
 			traverseAst(betweenExpr.lower, callbacks);
 			traverseAst(betweenExpr.upper, callbacks);
-			break;
-		}
-		case 'mutatingSubquerySource': {
-			const mutSrc = node as AST.MutatingSubquerySource;
-			traverseAst(mutSrc.stmt, callbacks);
 			break;
 		}
 		// Leaf nodes (literal, identifier, column, parameter) are handled by specific visitors or enterNode

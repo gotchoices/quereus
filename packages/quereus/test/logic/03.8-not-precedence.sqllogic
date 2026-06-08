@@ -1,0 +1,255 @@
+-- 03.8-not-precedence.sqllogic — Prefix-NOT precedence matrix.
+--
+-- Regression lock for github.com/gotchoices/quereus/issues/22: prefix `not`
+-- must bind above every predicate (comparison, IN, BETWEEN, LIKE,
+-- IS [NOT] NULL, EXISTS) but below AND/OR. Each block asserts that
+--   A. `not v <predicate>` (prefix form, parser must group correctly),
+--   B. `v not <predicate>` (postfix form, where SQL exposes one), and
+--   C. `not (v <predicate>)` (explicit parenthesisation)
+-- are semantically identical. If a new predicate is added to the grammar
+-- without recursing under prefix-NOT, the corresponding A row diverges
+-- from B/C and fails loudly.
+--
+-- Probe relation seeds NULL once, so every block also exercises the
+-- three-valued-logic rules: `not (NULL = x)` is NULL (not false),
+-- `not NULL in (...)` is NULL, `not NULL is null` is false.
+
+-- Quereus requires an explicit primary key; `id` is incidental and not
+-- referenced in any predicate below.
+create table p (id integer primary key, v any null);
+insert into p values (1, 5), (2, 10), (3, null);
+
+-- ---------------------------------------------------------------------------
+-- Comparison operators (=, ==, <>, !=, <, <=, >, >=).
+-- No postfix form exists for these. Two assertions per operator (A vs C).
+-- The null row is always excluded — `not (null op 5)` is `not null` = null,
+-- which the WHERE filter treats as not-true.
+-- ---------------------------------------------------------------------------
+
+-- = 5: only v=10 survives `not (v = 5)`.
+select v from p where not v = 5 order by v;
+→ [{"v":10}]
+
+select v from p where not (v = 5) order by v;
+→ [{"v":10}]
+
+-- == 5: synonym of =.
+select v from p where not v == 5 order by v;
+→ [{"v":10}]
+
+select v from p where not (v == 5) order by v;
+→ [{"v":10}]
+
+-- <> 5: only v=5 survives `not (v <> 5)`.
+select v from p where not v <> 5 order by v;
+→ [{"v":5}]
+
+select v from p where not (v <> 5) order by v;
+→ [{"v":5}]
+
+-- != 5: synonym of <>.
+select v from p where not v != 5 order by v;
+→ [{"v":5}]
+
+select v from p where not (v != 5) order by v;
+→ [{"v":5}]
+
+-- < 5: both non-null rows fail v<5, so `not (v<5)` keeps both.
+select v from p where not v < 5 order by v;
+→ [{"v":5},{"v":10}]
+
+select v from p where not (v < 5) order by v;
+→ [{"v":5},{"v":10}]
+
+-- <= 5: v=5 satisfies v<=5 (excluded); v=10 does not (included).
+select v from p where not v <= 5 order by v;
+→ [{"v":10}]
+
+select v from p where not (v <= 5) order by v;
+→ [{"v":10}]
+
+-- > 5: v=10 satisfies v>5 (excluded); v=5 does not (included).
+select v from p where not v > 5 order by v;
+→ [{"v":5}]
+
+select v from p where not (v > 5) order by v;
+→ [{"v":5}]
+
+-- >= 5: both v=5 and v=10 satisfy v>=5 (both excluded); null is excluded.
+select v from p where not v >= 5 order by v;
+→ []
+
+select v from p where not (v >= 5) order by v;
+→ []
+
+-- ---------------------------------------------------------------------------
+-- IN value list.
+-- ---------------------------------------------------------------------------
+
+-- not v in (5,7) — without the precedence fix this would parse as
+-- (not v) in (5,7), which evaluates `not 5`=false / `not 10`=false /
+-- `not null`=null and returns []. Correct: only v=10 survives.
+select v from p where not v in (5, 7) order by v;
+→ [{"v":10}]
+
+select v from p where v not in (5, 7) order by v;
+→ [{"v":10}]
+
+select v from p where not (v in (5, 7)) order by v;
+→ [{"v":10}]
+
+-- ---------------------------------------------------------------------------
+-- IN subquery.
+-- ---------------------------------------------------------------------------
+
+select v from p where not v in (select 5 union all select 7) order by v;
+→ [{"v":10}]
+
+select v from p where v not in (select 5 union all select 7) order by v;
+→ [{"v":10}]
+
+select v from p where not (v in (select 5 union all select 7)) order by v;
+→ [{"v":10}]
+
+-- ---------------------------------------------------------------------------
+-- BETWEEN.
+-- ---------------------------------------------------------------------------
+
+-- v=5 is inside [3,7] (excluded); v=10 outside (included); null excluded.
+select v from p where not v between 3 and 7 order by v;
+→ [{"v":10}]
+
+select v from p where v not between 3 and 7 order by v;
+→ [{"v":10}]
+
+select v from p where not (v between 3 and 7) order by v;
+→ [{"v":10}]
+
+-- ---------------------------------------------------------------------------
+-- LIKE — cast(v as text) so the probe relation stays homogeneous. The cast
+-- of null yields null, and `null like '5'` is null, so the null row is still
+-- excluded by `not`.
+-- ---------------------------------------------------------------------------
+
+select v from p where not cast(v as text) like '5' order by v;
+→ [{"v":10}]
+
+select v from p where cast(v as text) not like '5' order by v;
+→ [{"v":10}]
+
+select v from p where not (cast(v as text) like '5') order by v;
+→ [{"v":10}]
+
+-- ---------------------------------------------------------------------------
+-- GLOB / REGEXP — not currently exposed by the parser (no GLOB/REGEXP
+-- token in lexer.ts; comparison() in parser.ts only matches LIKE among
+-- pattern operators). If/when added, mirror the LIKE block above with the
+-- same three-form pattern.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- IS NULL.
+-- ---------------------------------------------------------------------------
+
+-- not v is null: both non-null rows pass, null row fails.
+select v from p where not v is null order by v;
+→ [{"v":5},{"v":10}]
+
+select v from p where v is not null order by v;
+→ [{"v":5},{"v":10}]
+
+select v from p where not (v is null) order by v;
+→ [{"v":5},{"v":10}]
+
+-- ---------------------------------------------------------------------------
+-- IS NOT NULL.
+-- The postfix-equivalent of `not v is not null` is `v is null`
+-- (double-negation). Unlike the other predicates, the null row IS the
+-- surviving row here because IS NULL returns true/false (never unknown).
+-- ---------------------------------------------------------------------------
+
+select v from p where not v is not null order by v;
+→ [{"v":null}]
+
+select v from p where v is null order by v;
+→ [{"v":null}]
+
+select v from p where not (v is not null) order by v;
+→ [{"v":null}]
+
+-- ---------------------------------------------------------------------------
+-- EXISTS — no postfix form. The fix matters for `not exists ... and X`
+-- style scoping rather than EXISTS itself, but include the two forms for
+-- completeness.
+-- ---------------------------------------------------------------------------
+
+-- inner select hits v=5 → exists=true → not=false.
+select (not exists (select 1 from p where v = 5)) as r;
+→ [{"r":false}]
+
+select (not (exists (select 1 from p where v = 5))) as r;
+→ [{"r":false}]
+
+-- inner select hits nothing → exists=false → not=true.
+select (not exists (select 1 from p where v = 99)) as r;
+→ [{"r":true}]
+
+select (not (exists (select 1 from p where v = 99))) as r;
+→ [{"r":true}]
+
+-- ---------------------------------------------------------------------------
+-- Stacked NOT — `not not p` must reduce to `p`. Smoke for the two predicate
+-- shapes most affected by the fix (comparison and IN-list).
+-- ---------------------------------------------------------------------------
+
+select v from p where not not v = 5 order by v;
+→ [{"v":5}]
+
+select v from p where v = 5 order by v;
+→ [{"v":5}]
+
+select v from p where not not v in (5, 7) order by v;
+→ [{"v":5}]
+
+select v from p where v in (5, 7) order by v;
+→ [{"v":5}]
+
+-- ---------------------------------------------------------------------------
+-- NOT bound by AND — the fix puts prefix-NOT below AND, so
+-- `not v = 5 and v < 5` must parse as `(not v = 5) and (v < 5)`, NOT as
+-- `not (v = 5 and v < 5)`. The two parses disagree on v=10:
+--   correct: not(false) AND false = true AND false = false → excluded
+--   wrong:   not(false AND false) = not(false) = true → included
+-- Choosing `v < 5` as the second conjunct makes the discriminator sharp:
+-- correct parse keeps nothing, wrong parse would keep two rows.
+-- ---------------------------------------------------------------------------
+
+-- Correct precedence: `(not v = 5) AND (v < 5)`. v=5 fails left, v=10 fails
+-- right, null fails (three-valued AND of nulls). Count = 0.
+select count(*) as c from p where not v = 5 and v < 5;
+→ [{"c":0}]
+
+-- Explicit parenthesised form must match.
+select count(*) as c from p where (not v = 5) and v < 5;
+→ [{"c":0}]
+
+-- Wrong parse equivalent (kept here to prove the discriminator has bite):
+-- `not (v = 5 AND v < 5)` includes v=5 and v=10 (both make the inner AND
+-- false, NOT flips to true). Null row excluded. Count = 2.
+select count(*) as c from p where not (v = 5 and v < 5);
+→ [{"c":2}]
+
+-- ---------------------------------------------------------------------------
+-- De Morgan — `not (A or B)` ≡ `(not A) and (not B)`. Using bare prefix
+-- forms on the right exercises the fix on both A and B in one assertion.
+-- Every non-null row hits one branch (v=5 hits the IN, v=10 hits the =10),
+-- so both forms return []. The null row is null on both sides → excluded.
+-- ---------------------------------------------------------------------------
+
+select v from p where not (v in (5, 7) or v = 10) order by v;
+→ []
+
+select v from p where (not v in (5, 7)) and not v = 10 order by v;
+→ []
+
+drop table p;

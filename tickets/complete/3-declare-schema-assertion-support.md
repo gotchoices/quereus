@@ -1,5 +1,5 @@
 description: Add assertion support to DECLARE SCHEMA (parse, diff, DDL generation)
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/parser/ast.ts              # DeclaredAssertion type, DeclareItem union
   packages/quereus/src/parser/parser.ts            # declareSchemaStatement, declareAssertionItem

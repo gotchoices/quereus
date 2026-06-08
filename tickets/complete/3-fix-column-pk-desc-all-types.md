@@ -1,5 +1,5 @@
 description: Fixed findColumnPKDefinition ignoring DESC direction for non-INTEGER column-level PKs
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/schema/table.ts
   packages/quereus/test/logic/40.1-pk-desc-direction.sqllogic

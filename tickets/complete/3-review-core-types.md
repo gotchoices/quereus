@@ -1,6 +1,6 @@
 ---
 description: Completed review of type system (logical types, physical types, coercion, comparison)
-dependencies: none
+prereq: none
 
 ---
 

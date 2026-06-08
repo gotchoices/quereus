@@ -7,6 +7,7 @@ import type { Layer } from './interface.js';
 import { createLogger } from '../../../common/logger.js';
 import { createPrimaryKeyFunctions } from '../utils/primary-key.js';
 import { QuereusError } from '../../../common/errors.js';
+import { StatusCode } from '../../../common/types.js';
 
 const log = createLogger('vtab:memory:layer:transaction');
 const warnLog = log.extend('warn');
@@ -48,7 +49,15 @@ export class TransactionLayer implements Layer {
 	constructor(parent: Layer) {
 		this.layerId = transactionLayerCounter++;
 		this.parentLayer = parent;
-		this.tableSchemaAtCreation = parent.getSchema(); // Schema is fixed at creation
+		const schema = parent.getSchema();
+		if (!schema) {
+			throw new QuereusError(
+				`TransactionLayer: parent layer ${parent.getLayerId()} has no schema. ` +
+				'This usually means a savepoint snapshot was created before the overlay was initialised.',
+				StatusCode.INTERNAL
+			);
+		}
+		this.tableSchemaAtCreation = schema; // Schema is fixed at creation
 
 		// Initialize primary modifications BTree with parent's primary tree as base
 		const { primaryKeyExtractorFromRow, primaryKeyComparator } = this.getPkExtractorsAndComparators(this.tableSchemaAtCreation);
@@ -122,27 +131,10 @@ export class TransactionLayer implements Layer {
 	}
 
 	/**
-	 * Check if change tracking is enabled.
-	 */
-	isTrackingChanges(): boolean {
-		return this.pendingChanges !== null;
-	}
-
-	/**
 	 * Get pending changes for event emission.
 	 */
 	getPendingChanges(): readonly PendingChange[] {
 		return this.pendingChanges ?? [];
-	}
-
-	/**
-	 * Copy change tracking state from another layer (for savepoint snapshots).
-	 */
-	copyChangeTrackingFrom(source: TransactionLayer): void {
-		if (source.pendingChanges) {
-			this.pendingChanges = [...source.pendingChanges];
-		}
-		this._hasModifications = source._hasModifications;
 	}
 
 	public getPkExtractorsAndComparators(schema: TableSchema): {
@@ -192,14 +184,33 @@ export class TransactionLayer implements Layer {
 			});
 		}
 
-		// Update secondary indexes
+		// Update secondary indexes (honoring partial-index predicates)
 		const schema = this.getSchema();
 		if (schema.indexes) {
 			for (const indexSchema of schema.indexes) {
 				const memoryIndex = this.secondaryIndexes.get(indexSchema.name);
 				if (!memoryIndex) continue;
 
+				const newInScope = memoryIndex.rowMatchesPredicate(newRowData);
+
 				if (oldRowDataIfUpdate) { // UPDATE
+					const oldInScope = memoryIndex.rowMatchesPredicate(oldRowDataIfUpdate);
+
+					if (!oldInScope && !newInScope) continue;
+
+					if (oldInScope && !newInScope) {
+						const oldIndexKey = memoryIndex.keyFromRow(oldRowDataIfUpdate);
+						memoryIndex.removeEntry(oldIndexKey, primaryKey);
+						continue;
+					}
+
+					if (!oldInScope && newInScope) {
+						const newIndexKey = memoryIndex.keyFromRow(newRowData);
+						memoryIndex.addEntry(newIndexKey, primaryKey);
+						continue;
+					}
+
+					// Both in scope
 					const oldIndexKey = memoryIndex.keyFromRow(oldRowDataIfUpdate);
 					const newIndexKey = memoryIndex.keyFromRow(newRowData);
 
@@ -213,6 +224,7 @@ export class TransactionLayer implements Layer {
 						memoryIndex.addEntry(newIndexKey, primaryKey);
 					}
 				} else { // INSERT
+					if (!newInScope) continue;
 					const newIndexKey = memoryIndex.keyFromRow(newRowData);
 					memoryIndex.addEntry(newIndexKey, primaryKey);
 				}
@@ -243,12 +255,14 @@ export class TransactionLayer implements Layer {
 			});
 		}
 
-		// Update secondary indexes to remove entries
+		// Update secondary indexes to remove entries (only if the deleted row was in scope)
 		const schema = this.getSchema();
 		if (schema.indexes) {
 			for (const indexSchema of schema.indexes) {
 				const memoryIndex = this.secondaryIndexes.get(indexSchema.name);
 				if (!memoryIndex) continue;
+
+				if (!memoryIndex.rowMatchesPredicate(oldRowDataForIndexes)) continue;
 
 				const oldIndexKey = memoryIndex.keyFromRow(oldRowDataForIndexes);
 				memoryIndex.removeEntry(oldIndexKey, primaryKey);

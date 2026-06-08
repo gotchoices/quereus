@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of virtual table subsystem (VTab interface, Memory table, cursors)
-dependencies: none
+prereq: none
 
 ---
 
@@ -62,7 +62,7 @@ Several potential issues were investigated and resolved or ruled out:
 
 ### Remaining Opportunities (Deferred)
 
-- [ ] **Extended constraint pushdown**: `getBestAccessPlan` only handles `=` and range operators. `IS NULL`, `IS NOT NULL`, `IN` could benefit from index-aware planning. See `tasks/plan/3-vtab-extended-constraint-pushdown.md`.
+- [ ] **Extended constraint pushdown**: `getBestAccessPlan` only handles `=` and range operators. `IS NULL`, `IS NOT NULL`, `IN` could benefit from index-aware planning. See `tasks/plan/vtab-extended-constraint-pushdown.md`.
 - [ ] **Cost model sanity**: Cost estimates in `evaluateIndexAccess` use fixed heuristics (e.g., `estimatedTableSize / 4` for range rows). Could benefit from actual statistics.
 - [ ] **Layer collapse completeness**: The `cleanupUnreferencedLayers` method is a no-op relying on GC. For long-running systems with many transactions, explicit layer tracking could prevent memory pressure.
 - [ ] **VTab interface tests**: No dedicated interface contract tests exist (though integration coverage via sqllogic tests is good).

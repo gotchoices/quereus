@@ -1,6 +1,6 @@
 ---
 description: Completed review of integration boundaries between subsystems
-dependencies: none
+prereq: none
 
 ---
 
@@ -27,7 +27,7 @@ Comprehensive adversarial review of all six integration boundaries in the Quereu
 
 ### Bug Found
 
-**schema() TVF does not include views** — `src/func/builtins/schema.ts` line 50 iterates `getAllTables()` which only returns tables. Views live in a separate `Schema.views` map. The `getAllViews()` method exists but is never called. Filed as `tasks/fix/3-schema-tvf-missing-views.md`.
+**schema() TVF does not include views** — `src/func/builtins/schema.ts` line 50 iterates `getAllTables()` which only returns tables. Views live in a separate `Schema.views` map. The `getAllViews()` method exists but is never called. Filed as `tasks/fix/schema-tvf-missing-views.md`.
 
 ### SPP Violations
 
@@ -65,5 +65,5 @@ Comprehensive adversarial review of all six integration boundaries in the Quereu
 
 ## Follow-up Tasks Created
 
-- `tasks/fix/3-schema-tvf-missing-views.md` — Bug: schema() TVF omits views from output
+- `tasks/fix/schema-tvf-missing-views.md` — Bug: schema() TVF omits views from output
 

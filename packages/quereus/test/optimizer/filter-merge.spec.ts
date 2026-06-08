@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Filter merge', () => {
 	let db: Database;
@@ -23,7 +26,7 @@ describe('Filter merge', () => {
 		const q = "select * FROM cat_a WHERE value > 100";
 
 		// Verify correctness: only Gamma matches (category='A' AND value>100)
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) {
 			results.push(r);
 		}
@@ -31,7 +34,7 @@ describe('Filter merge', () => {
 		expect(results[0].name).to.equal('Gamma');
 
 		// Verify plan: at most one FILTER node (merged)
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("select count(*) as filters FROM query_plan(?) WHERE op = 'FILTER'", [q])) {
 			planRows.push(r);
 		}
@@ -48,7 +51,7 @@ describe('Filter merge', () => {
 		const q = "select * FROM v2 WHERE name != 'Alpha'";
 
 		// Verify correctness: Gamma (category='A', value>50, name!='Alpha')
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) {
 			results.push(r);
 		}
@@ -57,7 +60,7 @@ describe('Filter merge', () => {
 
 		// Nested views with Retrieve boundaries may not produce fully adjacent filters,
 		// but at least the adjacent pair should be merged (< 3 filters from 3 source predicates)
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("select count(*) as filters FROM query_plan(?) WHERE op = 'FILTER'", [q])) {
 			planRows.push(r);
 		}
@@ -73,7 +76,7 @@ describe('Filter merge', () => {
 		await db.exec("CREATE VIEW high_val AS select * FROM items WHERE value >= 150");
 		const q = "select name FROM high_val WHERE category = 'B' order by name";
 
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) {
 			results.push(r);
 		}

@@ -1,6 +1,9 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
 import { TestQueryModule } from '../vtab/test-query-module.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Retrieve growth with supports() (remote query)', () => {
   let db: Database;
@@ -21,7 +24,7 @@ describe('Retrieve growth with supports() (remote query)', () => {
 
   it('slides Filter into Retrieve and selects RemoteQuery', async () => {
     await createTable();
-    const rows: any[] = [];
+    const rows: ResultRow[] = [];
     for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan('SELECT id FROM qt WHERE id = 1')")) {
       rows.push(r);
     }
@@ -32,7 +35,7 @@ describe('Retrieve growth with supports() (remote query)', () => {
 
   it('slides Sort/Limit into Retrieve boundary when supports() accepts', async () => {
     await createTable();
-    const rows: any[] = [];
+    const rows: ResultRow[] = [];
     for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan('SELECT id FROM qt WHERE id = 1 ORDER BY id LIMIT 1')")) {
       rows.push(r);
     }

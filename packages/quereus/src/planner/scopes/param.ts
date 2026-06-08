@@ -39,23 +39,25 @@ export class ParameterScope extends BaseScope {
 		let resolvedType = DEFAULT_PARAMETER_TYPE;
 
 		if (symbolKey === '?') {
-			// Use the current _nextAnonymousIndex as the potential identifier for this '?'
-			const currentAnonymousId = this._nextAnonymousIndex;
+			// Positional '?' parameters bind in SOURCE-TEXT order. The parser stamps each '?'
+			// with a left-to-right, 1-based `index` (parser.ts: this.parameterPosition++), and the
+			// rest of the pipeline keys positional args by array position (database.ts/statement.ts
+			// boundArgs[index+1], core/param.ts type hints). So we MUST honour the parser's text-order
+			// index here rather than re-deriving order from when the planner happens to resolve nodes
+			// (FROM/WHERE resolve before SELECT-projection), which would mis-order a projection '?'
+			// relative to later WHERE/FROM '?'s and also mis-assign type hints.
+			//
+			// Fall back to the running counter only for synthetic parameter nodes that lack an index.
+			const currentAnonymousId = parameterExpression.index ?? this._nextAnonymousIndex;
 
-			// Check if this specific anonymous parameter (by its future index) has a declared type
+			// Check if this specific anonymous parameter (by its text-order index) has a declared type
 			if (this._parameterTypes.has(currentAnonymousId)) {
 				resolvedType = this._parameterTypes.get(currentAnonymousId)!;
 			}
-			// Note: We don't check _parameters here for '?' because each '?' AST node should resolve,
-			// potentially creating a new ParameterReferenceNode if it's a new '?' instance in the query,
-			// even if it gets the same numeric index as a previous one *if* they were different AST nodes.
-			// The _parameters map is more for caching resolved nodes per unique AST node or name.
-			// For '?', the ParameterReferenceNode constructor expects the numeric index.
-			// We use currentAnonymousId as the identifier and increment after creation.
 			identifier = currentAnonymousId;
 			parameterNode = new ParameterReferenceNode(this, parameterExpression, identifier, resolvedType);
-			this._parameters.set(identifier, parameterNode); // Cache it by its assigned numeric ID
-			this._nextAnonymousIndex++; // Increment for the *next* '?'
+			this._parameters.set(identifier, parameterNode); // Cache it by its text-order numeric ID
+			this._nextAnonymousIndex++; // Advance the fallback counter for any index-less synthetic '?'
 		} else if (symbolKey.startsWith(':')) {
 			const nameOrIndex = symbolKey.substring(1);
 			const numIndex = parseInt(nameOrIndex, 10);

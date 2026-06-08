@@ -1,9 +1,10 @@
 import type { Database } from '../core/database.js';
-import type { TableSchema } from './table.js';
+import type { TableSchema, IndexSchema } from './table.js';
 import type { ViewSchema } from './view.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createIndexToString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
+import type { SqlValue } from '../common/types.js';
 import { generateTableDDL, generateIndexDDL } from './ddl-generator.js';
 
 /**
@@ -26,19 +27,27 @@ export interface CatalogTable {
 		notNull: boolean;
 		primaryKey: boolean;
 		defaultValue: AST.Expression | null;
+		tags?: Readonly<Record<string, SqlValue>>;
 	}>;
 	primaryKey: Array<{ columnName: string; desc: boolean }>;
+	/** Lowercased names of tables this table FK-references (within the same schema). */
+	referencedTables: string[];
+	tags?: Readonly<Record<string, SqlValue>>;
+	/** Named constraints (CHECK / UNIQUE / FOREIGN KEY) carrying their tags. Constraints without a name are excluded. */
+	namedConstraints: Array<{ name: string; tags?: Readonly<Record<string, SqlValue>> }>;
 }
 
 export interface CatalogView {
 	name: string;
 	ddl: string;
+	tags?: Readonly<Record<string, SqlValue>>;
 }
 
 export interface CatalogIndex {
 	name: string;
 	tableName: string;
 	ddl: string;
+	tags?: Readonly<Record<string, SqlValue>>;
 }
 
 export interface CatalogAssertion {
@@ -74,11 +83,7 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 			// Collect indexes for this table
 			if (tableSchema.indexes && tableSchema.indexes.length > 0) {
 				for (const indexSchema of tableSchema.indexes) {
-					indexes.push({
-						name: indexSchema.name,
-						tableName: tableSchema.name,
-						ddl: generateIndexDDL(indexSchema, tableSchema, db)
-					});
+					indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db));
 				}
 			}
 		}
@@ -113,6 +118,7 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		notNull: col.notNull,
 		primaryKey: col.primaryKey,
 		defaultValue: col.defaultValue ?? null,
+		tags: col.tags,
 	}));
 
 	const primaryKey = tableSchema.primaryKeyDefinition.map(pk => ({
@@ -120,18 +126,63 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		desc: pk.desc ?? false,
 	}));
 
+	// FK references within the same schema (cross-schema FKs are excluded — drop
+	// ordering only matters for tables whose lifetimes are tied to this schema).
+	const ownSchemaLower = tableSchema.schemaName.toLowerCase();
+	const referencedTables: string[] = [];
+	const seen = new Set<string>();
+	for (const fk of tableSchema.foreignKeys ?? []) {
+		const refSchema = (fk.referencedSchema ?? tableSchema.schemaName).toLowerCase();
+		if (refSchema !== ownSchemaLower) continue;
+		const refName = fk.referencedTable.toLowerCase();
+		if (refName === tableSchema.name.toLowerCase()) continue; // self-FK
+		if (seen.has(refName)) continue;
+		seen.add(refName);
+		referencedTables.push(refName);
+	}
+
+	// Surface named constraints with their tags so the differ can detect renames
+	// of named CHECK / UNIQUE / FOREIGN KEY constraints.
+	const namedConstraints: CatalogTable['namedConstraints'] = [];
+	for (const c of tableSchema.checkConstraints ?? []) {
+		if (c.name) namedConstraints.push({ name: c.name, tags: c.tags });
+	}
+	for (const c of tableSchema.uniqueConstraints ?? []) {
+		if (c.name) namedConstraints.push({ name: c.name, tags: c.tags });
+	}
+	for (const c of tableSchema.foreignKeys ?? []) {
+		if (c.name) namedConstraints.push({ name: c.name, tags: c.tags });
+	}
+
 	return {
 		name: tableSchema.name,
 		ddl,
 		columns,
 		primaryKey,
+		referencedTables,
+		tags: tableSchema.tags,
+		namedConstraints,
 	};
 }
 
 function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 	return {
 		name: viewSchema.name,
-		ddl: viewSchema.sql
+		ddl: viewSchema.sql,
+		tags: viewSchema.tags,
+	};
+}
+
+function indexSchemaToCatalog(
+	indexSchema: IndexSchema,
+	tableSchema: TableSchema,
+	db: Database,
+): CatalogIndex {
+	return {
+		name: indexSchema.name,
+		tableName: tableSchema.name,
+		ddl: generateIndexDDL(indexSchema, tableSchema, db),
+		tags: indexSchema.tags,
 	};
 }
 

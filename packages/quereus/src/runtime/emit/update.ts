@@ -38,22 +38,25 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 		emitCallFromPlan(assign.value, ctx)
 	);
 
-	async function* run(rctx: RuntimeContext, sourceRowsIterable: AsyncIterable<Row>, ...assignmentEvaluators: Array<(ctx: RuntimeContext) => SqlValue>): AsyncIterable<Row> {
+	async function* run(rctx: RuntimeContext, sourceRowsIterable: AsyncIterable<Row>, ...assignmentEvaluators: Array<(ctx: RuntimeContext) => SqlValue | Promise<SqlValue>>): AsyncIterable<Row> {
 		const slot = createRowSlot(rctx, sourceRowDescriptor);
 		try {
 			for await (const sourceRow of sourceRowsIterable) {
 				slot.set(sourceRow);
 
-				// Phase 1: Evaluate regular (non-generated) assignment expressions
+				// Phase 1: Evaluate regular (non-generated) assignment expressions.
+				// Await to support async evaluators (e.g. scalar subqueries) — non-async
+				// callbacks return values directly and `await` is a no-op for them.
 				const updatedRow = [...sourceRow]; // Copy the original row
 				for (const i of regularIndices) {
-					const value = assignmentEvaluators[i](rctx) as SqlValue;
+					const value = await assignmentEvaluators[i](rctx) as SqlValue;
 					updatedRow[assignmentTargetIndices[i]] = value;
 				}
 
-				// Phase 2: Evaluate generated column expressions against the updated row
-				// Use withRowContext to temporarily override the row context so generated
-				// expressions see post-SET values (the scan's slot may shadow our slot)
+				// Phase 2: Evaluate generated column expressions against the updated row.
+				// Generated expressions are validated as deterministic (see
+				// validateDeterministicGenerated in update.ts builder), so they cannot
+				// contain scalar subqueries and always return synchronously.
 				if (generatedIndices.length > 0) {
 					withRowContext(rctx, sourceRowDescriptor, () => updatedRow as Row, () => {
 						for (const i of generatedIndices) {

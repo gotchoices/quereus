@@ -1,0 +1,124 @@
+-- adapted from SQLite test/groupby.test
+-- GROUP BY ordinal positions, expression grouping, alias resolution, and
+-- combined with HAVING / ORDER BY in non-trivial shapes.
+
+create table gx (id integer primary key, grp text, sub text, val integer);
+insert into gx values
+  (1, 'a', 'x', 10),
+  (2, 'a', 'y', 20),
+  (3, 'b', 'x', 30),
+  (4, 'b', 'y', 40),
+  (5, 'a', 'x', 50);
+
+-- GROUP BY / ORDER BY positional ordinal references the Nth SELECT-list output
+select grp, count(*) as cnt from gx group by 1 order by 1;
+→ [{"grp":"a","cnt":3},{"grp":"b","cnt":2}]
+
+-- Multiple ordinals in GROUP BY and ORDER BY
+select grp, sub, sum(val) as total from gx group by 1, 2 order by 1, 2;
+→ [{"grp":"a","sub":"x","total":60},{"grp":"a","sub":"y","total":20},{"grp":"b","sub":"x","total":30},{"grp":"b","sub":"y","total":40}]
+
+-- Equivalent using explicit expressions
+select grp, count(*) as cnt from gx group by grp order by grp;
+→ [{"grp":"a","cnt":3},{"grp":"b","cnt":2}]
+
+-- GROUP BY mixed expression
+select grp || sub as combined, sum(val) as total
+from gx group by grp || sub order by grp || sub;
+→ [{"combined":"ax","total":60},{"combined":"ay","total":20},{"combined":"bx","total":30},{"combined":"by","total":40}]
+
+-- GROUP BY with arithmetic expression
+select val % 20 as bucket, count(*) as cnt
+from gx group by val % 20 order by val % 20;
+→ [{"bucket":0,"cnt":2},{"bucket":10,"cnt":3}]
+
+-- GROUP BY ordinal combined with HAVING — the resolved expression is the same
+-- plan node as the GROUP BY key, so HAVING still validates against that key.
+select grp, count(*) as cnt from gx group by 1 having count(*) > 2 order by 1;
+→ [{"grp":"a","cnt":3}]
+
+-- GROUP BY ordinal combined with ORDER BY ordinal on an aggregate output column
+select grp, sum(val) as total from gx group by 1 order by 2 desc;
+→ [{"grp":"a","total":80},{"grp":"b","total":70}]
+
+-- Equivalent using named columns
+select grp, count(*) as cnt from gx group by grp having count(*) > 2 order by grp;
+→ [{"grp":"a","cnt":3}]
+
+-- SELECT-list alias on a grouped column reference survives to the output and
+-- is available to ORDER BY.
+select grp as g, count(*) as cnt from gx group by grp order by g;
+→ [{"g":"a","cnt":3},{"g":"b","cnt":2}]
+
+-- Same with HAVING — alias still survives.
+select grp as g, count(*) as cnt from gx group by grp having count(*) > 0 order by g;
+→ [{"g":"a","cnt":3},{"g":"b","cnt":2}]
+
+-- Minimal repro: alias-only on a grouped column ref with no aggregates.
+select grp as g from gx group by grp order by g;
+→ [{"g":"a"},{"g":"b"}]
+
+drop table gx;
+
+-- GROUP BY with COLLATE NOCASE on a TEXT column is not supported by Quereus
+-- (engine emits a clear rejection at table creation time).
+create table gn (id integer primary key, name text collate nocase, val integer);
+-- error: Collation 'nocase' is not supported
+
+-- GROUP BY a CASE expression
+create table gc (id integer primary key, val integer);
+insert into gc values (1, 5), (2, 15), (3, 25), (4, 35), (5, 45);
+
+-- ORDER BY referencing an aggregate (count(*)) is allowed when the query has a GROUP BY.
+select case when val < 20 then 'low' when val < 40 then 'mid' else 'high' end as bucket,
+       count(*) as cnt
+from gc group by case when val < 20 then 'low' when val < 40 then 'mid' else 'high' end
+order by count(*) desc, case when val < 20 then 'low' when val < 40 then 'mid' else 'high' end;
+→ [{"bucket":"low","cnt":2},{"bucket":"mid","cnt":2},{"bucket":"high","cnt":1}]
+
+-- Equivalent without aggregate in ORDER BY: sort by the GROUP BY expression
+select case when val < 20 then 'low' when val < 40 then 'mid' else 'high' end as bucket,
+       count(*) as cnt
+from gc group by case when val < 20 then 'low' when val < 40 then 'mid' else 'high' end
+order by case when val < 20 then 'low' when val < 40 then 'mid' else 'high' end;
+→ [{"bucket":"high","cnt":1},{"bucket":"low","cnt":2},{"bucket":"mid","cnt":2}]
+
+drop table gc;
+
+-- ORDER BY aggregate function — additional coverage
+create table aob (id integer primary key, grp text, val integer);
+insert into aob values
+  (1, 'a', 10), (2, 'a', 20), (3, 'a', 30),
+  (4, 'b', 40), (5, 'b', 50),
+  (6, 'c', 70);
+
+-- Scalar aggregate sorted by itself: single-row result.
+select count(*) as c from aob order by count(*);
+→ [{"c":6}]
+
+-- Baseline: ORDER BY alias of an aggregate in SELECT.
+select grp, sum(val) as s from aob group by grp order by s desc;
+→ [{"grp":"b","s":90},{"grp":"c","s":70},{"grp":"a","s":60}]
+
+-- Same result via explicit aggregate expression in ORDER BY.
+select grp, sum(val) as s from aob group by grp order by sum(val) desc;
+→ [{"grp":"b","s":90},{"grp":"c","s":70},{"grp":"a","s":60}]
+
+-- Aggregate referenced in ORDER BY only (not in SELECT).
+select grp from aob group by grp order by max(val) desc;
+→ [{"grp":"c"},{"grp":"b"},{"grp":"a"}]
+
+-- Negative: ORDER BY aggregate in a non-aggregate query is still rejected.
+select id from aob order by sum(val);
+-- error: Aggregate function sum not allowed in this context
+
+drop table aob;
+
+-- GROUP BY everything filtered out: no rows
+create table gf (id integer primary key, grp text, val integer);
+insert into gf values (1, 'a', 10), (2, 'b', 20);
+
+select grp, count(*) from gf where 1 = 0 group by grp;
+→ []
+
+drop table gf;

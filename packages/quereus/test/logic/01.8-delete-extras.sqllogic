@@ -1,0 +1,122 @@
+-- adapted from SQLite test/delete.test, test/delete4.test
+-- DELETE feature variants beyond the simple form covered in 01-basic / 02-smoke.
+-- Quereus has no rowids and no DELETE LIMIT/ORDER BY; the rowid-bound DELETE
+-- variants from SQLite are n/a — the multi-row delete via PK is the surface here.
+
+-- ===================================
+-- 1. DELETE with EXISTS subquery
+-- ===================================
+
+create table del_parent (id integer primary key, val text);
+create table del_child (id integer primary key, parent_id integer);
+insert into del_parent values (1, 'a'), (2, 'b'), (3, 'c');
+insert into del_child values (10, 1), (20, 2);
+
+delete from del_parent where exists (select 1 from del_child where del_child.parent_id = del_parent.id);
+select id, val from del_parent order by id;
+→ [{"id":3,"val":"c"}]
+
+drop table del_child;
+drop table del_parent;
+
+-- ===================================
+-- 2. DELETE with NOT EXISTS subquery
+-- ===================================
+
+create table orders (id integer primary key, customer_id integer);
+create table customers (id integer primary key, active integer);
+insert into customers values (1, 1), (2, 0);
+insert into orders values (10, 1), (20, 1), (30, 2);
+
+delete from orders where not exists (select 1 from customers where customers.id = orders.customer_id and customers.active = 1);
+select id, customer_id from orders order by id;
+→ [{"id":10,"customer_id":1},{"id":20,"customer_id":1}]
+
+drop table orders;
+drop table customers;
+
+-- ===================================
+-- 3. DELETE with NOT condition in WHERE
+-- ===================================
+
+create table del_neg (vkey integer primary key, c1 integer);
+insert into del_neg values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+delete from del_neg where not (vkey <= 3);
+
+select vkey from del_neg order by vkey;
+→ [{"vkey":1},{"vkey":2},{"vkey":3}]
+
+drop table del_neg;
+
+-- ===================================
+-- 4. DELETE with OR conditions across columns
+-- ===================================
+
+create table del_or (id integer primary key, a text, b text);
+insert into del_or values (1, 'one', 'i'), (2, 'two', 'ii'), (3, 'three', 'iii'), (4, 'four', 'iv');
+
+delete from del_or where a = 'two' or b = 'iv';
+
+select id from del_or order by id;
+→ [{"id":1},{"id":3}]
+
+drop table del_or;
+
+-- ===================================
+-- 5. DELETE with multi-column AND on non-PK columns
+-- ===================================
+
+create table inventory (id integer primary key, loc text not null, sku text not null, qty integer);
+insert into inventory values (1, 'W1', 'A1', 10), (2, 'W1', 'A2', 20), (3, 'W2', 'A1', 30);
+
+delete from inventory where loc = 'W1' and sku = 'A1';
+
+select id from inventory order by id;
+→ [{"id":2},{"id":3}]
+
+drop table inventory;
+
+-- ===================================
+-- 6. DELETE with self-referential EXISTS (delete rows that have a "next" sibling)
+-- ===================================
+
+create table seq (x integer primary key);
+insert into seq values (1), (2), (3), (4), (5);
+
+delete from seq where exists (select 1 from seq as s2 where s2.x = seq.x + 1);
+select x from seq order by x;
+→ [{"x":5}]
+
+drop table seq;
+
+-- ===================================
+-- 7. DELETE all rows from a composite-PK table
+-- ===================================
+
+create table comp_pk (a integer, b integer, val text, primary key (a, b));
+insert into comp_pk values (1, 2, 'p'), (1, 3, 'q'), (2, 4, 'r'), (3, 5, 's');
+
+delete from comp_pk;
+
+select count(*) as cnt from comp_pk;
+→ [{"cnt":0}]
+
+drop table comp_pk;
+
+-- ===================================
+-- 8. DELETE with subquery driving the IN list
+-- ===================================
+
+create table flag_table (id integer primary key, flag integer);
+create table data_table (id integer primary key, val text);
+insert into flag_table values (1, 0), (2, 1), (3, 0), (4, 1);
+insert into data_table values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+delete from data_table where id in (select id from flag_table where flag = 1);
+
+select id, val from data_table order by id;
+→ [{"id":1,"val":"a"},{"id":3,"val":"c"}]
+
+drop table flag_table;
+drop table data_table;

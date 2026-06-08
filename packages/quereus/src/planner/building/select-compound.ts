@@ -10,7 +10,10 @@ import { LiteralNode } from '../nodes/scalar.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
-// Import will be added after refactoring select.ts
+import { buildValuesStmt } from './select.js';
+import { buildInsertStmt } from './insert.js';
+import { buildUpdateStmt } from './update.js';
+import { buildDeleteStmt } from './delete.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 
@@ -30,11 +33,33 @@ export function buildCompoundSelect(
 	// Build left side by cloning the statement without compound and stripping ORDER BY/LIMIT/OFFSET that belong to outer query
 	const { compound: _outerCompound, orderBy: outerOrderBy, limit: outerLimit, offset: outerOffset, ...leftCore } = stmt;
 
-	// Also strip ORDER BY/LIMIT/OFFSET from the right side - they should only apply to the final compound result
-	const { orderBy: _rightOrderBy, limit: _rightLimit, offset: _rightOffset, ...rightCore } = stmt.compound.select;
-
 	const leftPlan = buildSelectStmt(contextWithCTEs, leftCore as AST.SelectStmt, cteNodes) as RelationalPlanNode;
-	const rightPlan = buildSelectStmt(contextWithCTEs, rightCore as AST.SelectStmt, cteNodes) as RelationalPlanNode;
+
+	// Right side: any QueryExpr. SELECT legs strip ORDER BY/LIMIT/OFFSET (those
+	// belong to the outer compound). VALUES legs build directly. DML legs
+	// (RETURNING enforced by the parser) build through the standard DML
+	// builders; their RETURNING projection supplies the compound-leg arity.
+	const rightStmt = stmt.compound.select;
+	let rightPlan: RelationalPlanNode;
+	switch (rightStmt.type) {
+		case 'select': {
+			const { orderBy: _rightOrderBy, limit: _rightLimit, offset: _rightOffset, ...rightCore } = rightStmt;
+			rightPlan = buildSelectStmt(contextWithCTEs, rightCore as AST.SelectStmt, cteNodes) as RelationalPlanNode;
+			break;
+		}
+		case 'values':
+			rightPlan = buildValuesStmt(contextWithCTEs, rightStmt);
+			break;
+		case 'insert':
+			rightPlan = buildInsertStmt(contextWithCTEs, rightStmt) as RelationalPlanNode;
+			break;
+		case 'update':
+			rightPlan = buildUpdateStmt(contextWithCTEs, rightStmt) as RelationalPlanNode;
+			break;
+		case 'delete':
+			rightPlan = buildDeleteStmt(contextWithCTEs, rightStmt) as RelationalPlanNode;
+			break;
+	}
 
 	// Expand DIFF as (A EXCEPT B) UNION (B EXCEPT A)
 	let setNode: RelationalPlanNode;

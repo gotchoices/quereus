@@ -2,7 +2,7 @@ import type { RecursiveCTENode } from '../../planner/nodes/recursive-cte-node.js
 import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row } from '../../common/types.js';
+import type { MaybePromise, Row, SqlValue } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import { BTree } from 'inheritree';
 import { compareRows } from '../../util/comparison.js';
@@ -15,9 +15,32 @@ const log = createLogger('runtime:emit:recursive-cte');
 export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): Instruction {
 	// Use the plan's table descriptor for table context coordination
 	const { tableDescriptor } = plan;
+	const hasLimit = !!plan.limitExpr;
+	const hasOffset = !!plan.offsetExpr;
 
-	async function* run(rctx: RuntimeContext, baseCaseResult: AsyncIterable<Row>, recursiveCaseCallback: (ctx: RuntimeContext) => AsyncIterable<Row>): AsyncIterable<Row> {
+	async function* run(
+		rctx: RuntimeContext,
+		baseCaseResult: AsyncIterable<Row>,
+		recursiveCaseCallback: (ctx: RuntimeContext) => AsyncIterable<Row>,
+		...rest: Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>
+	): AsyncIterable<Row> {
 		log('Starting recursive CTE execution for %s (union=%s, algorithm=semi-naive)', plan.cteName, plan.isUnionAll ? 'ALL' : 'DISTINCT');
+
+		// Resolve LIMIT/OFFSET if present
+		let argIndex = 0;
+		const limitFn = hasLimit ? rest[argIndex++] : undefined;
+		const offsetFn = hasOffset ? rest[argIndex++] : undefined;
+
+		const limitValue = limitFn ? await limitFn(rctx) : null;
+		const offsetValue = offsetFn ? await offsetFn(rctx) : null;
+
+		let limit = limitValue !== null ? Number(limitValue) : Infinity;
+		let offset = offsetValue !== null ? Number(offsetValue) : 0;
+		if (limit < 0 || !Number.isFinite(limit)) limit = limit < 0 ? 0 : Infinity;
+		if (offset < 0 || !Number.isFinite(offset)) offset = 0;
+
+		// Total rows that need to be generated before limit is satisfied
+		const totalNeeded = limit === Infinity ? Infinity : offset + limit;
 
 		// Get configuration - use plan node limit if specified, otherwise use default tuning
 		const maxIterations = plan.maxRecursion ?? DEFAULT_TUNING.recursiveCte.maxIterations;
@@ -29,25 +52,49 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 		);
 		let deltaRows: Row[] = [];
 
+		// Counters for global LIMIT/OFFSET enforcement
+		let yieldedCount = 0;	// rows actually yielded downstream (post-offset, pre-limit)
+		let producedCount = 0;	// rows produced by the recursion (pre-offset)
+
+		// Yields a row through the global offset/limit gate. Returns true if the consumer
+		// has not yet hit the limit (i.e., recursion should continue).
+		const tryYield = function* (row: Row): Generator<Row, boolean, unknown> {
+			producedCount++;
+			if (producedCount <= offset) {
+				return producedCount < totalNeeded;
+			}
+			if (yieldedCount >= limit) return false;
+			yield row;
+			yieldedCount++;
+			return yieldedCount < limit;
+		};
+
 		// Step 2: Execute base case and populate initial delta
-		// Stream base case results immediately while building delta for next iteration
+		let continueRecursion = true;
 		for await (const row of baseCaseResult) {
 			// Yield if we're union all or if the row is new
 			const shouldYield = !allRowsTree || allRowsTree.insert(row).on;
 
 			if (shouldYield) {
-				// Yield immediately — context is managed by the downstream cte_ref's slot
-				yield row;
+				const gate = tryYield(row);
+				let gateResult = gate.next();
+				while (!gateResult.done) {
+					yield gateResult.value;
+					gateResult = gate.next();
+				}
+				continueRecursion = gateResult.value;
 
 				// Add to delta for recursive processing (deep copy to avoid reference issues)
 				deltaRows.push([...row] as Row);
+
+				if (!continueRecursion) break;
 			}
 		}
 
 		// Step 3: Semi-naïve iterative recursive execution
 		let iterationCount = 0;
 
-		while (deltaRows.length > 0 && (maxIterations === 0 || iterationCount < maxIterations)) {
+		while (continueRecursion && deltaRows.length > 0 && (maxIterations === 0 || iterationCount < maxIterations)) {
 			++iterationCount;
 			log('Recursive CTE %s iteration %d, delta size: %d', plan.cteName, iterationCount, deltaRows.length);
 
@@ -64,11 +111,18 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 					const shouldYield = !allRowsTree || allRowsTree.insert(row).on;
 
 					if (shouldYield) {
-						// Stream the row immediately — context is managed by the downstream cte_ref's slot
-						yield row;
+						const gate = tryYield(row);
+						let gateResult = gate.next();
+						while (!gateResult.done) {
+							yield gateResult.value;
+							gateResult = gate.next();
+						}
+						continueRecursion = gateResult.value;
 
 						// Add to next iteration's delta (deep copy to avoid reference issues)
 						newDeltaRows.push([...row] as Row);
+
+						if (!continueRecursion) break;
 					}
 				}
 			} finally {
@@ -80,8 +134,8 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 		}
 
 		// Safety check for infinite recursion — only error if we hit the limit
-		// while there was still work to do (deltaRows not empty)
-		if (maxIterations > 0 && iterationCount >= maxIterations && deltaRows.length > 0) {
+		// while there was still work to do (deltaRows not empty) AND we didn't already satisfy LIMIT
+		if (maxIterations > 0 && iterationCount >= maxIterations && deltaRows.length > 0 && continueRecursion) {
 			quereusError(
 				`Recursive CTE '${plan.cteName}' exceeded maximum iteration limit (${maxIterations})`,
 				StatusCode.ERROR
@@ -95,8 +149,12 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 	const baseCaseInstruction = emitPlanNode(plan.baseCaseQuery, ctx);
 	const recursiveCaseInstruction = emitCallFromPlan(plan.recursiveCaseQuery, ctx);
 
+	const params: Instruction[] = [baseCaseInstruction, recursiveCaseInstruction];
+	if (plan.limitExpr) params.push(emitCallFromPlan(plan.limitExpr, ctx));
+	if (plan.offsetExpr) params.push(emitCallFromPlan(plan.offsetExpr, ctx));
+
 	return {
-		params: [baseCaseInstruction, recursiveCaseInstruction],
+		params,
 		run: run as InstructionRun,
 		note: `recursiveCTE(${plan.cteName})`
 	};

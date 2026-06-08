@@ -9,7 +9,7 @@ import type { BlockNode } from '../planner/nodes/block.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
-import { RowContextMap } from '../runtime/context-helpers.js';
+import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { Cached } from '../util/cached.js';
 import { isAsyncIterable } from '../runtime/utils.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
@@ -19,6 +19,7 @@ import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
+import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
@@ -298,8 +299,8 @@ export class Statement {
 				db: this.db,
 				stmt: this,
 				params: this.boundArgs,
-				context: new RowContextMap(),
-				tableContexts: new Map(),
+				context: createStrictRowContextMap(),
+				tableContexts: wrapTableContextsStrict(new Map()),
 				tracer,
 				enableMetrics,
 			};
@@ -335,8 +336,8 @@ export class Statement {
 	 * implicit transactions on successful completion, rolls back on error.
 	 */
 	iterateRows(params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Row> {
-		return wrapAsyncIterator(this._iterateRowsRaw(params), (commit) =>
-			this.db._finalizeImplicitTransaction(commit)
+		return wrapAsyncIterator(this._iterateRowsRaw(params), (commit, error) =>
+			this.db._finalizeImplicitTransaction(commit, error)
 		);
 	}
 
@@ -347,7 +348,7 @@ export class Statement {
 	iterateRowsWithTrace(params: SqlParameters | SqlValue[] | undefined, tracer: InstructionTracer): AsyncIterableIterator<Row> {
 		return wrapAsyncIterator(
 			this._iterateRowsRawInternal(params, { tracer, enableMetrics: false }),
-			(commit) => this.db._finalizeImplicitTransaction(commit)
+			(commit, error) => this.db._finalizeImplicitTransaction(commit, error)
 		);
 	}
 
@@ -414,13 +415,17 @@ export class Statement {
 
 		await this.db._runWithMutex(async () => {
 			let success = false;
+			let runError: unknown;
 			try {
 				for await (const _ of this._iterateRowsRaw(params)) {
 					/* Consume all rows */
 				}
 				success = true;
+			} catch (e) {
+				runError = e;
+				throw e;
 			} finally {
-				await this.db._finalizeImplicitTransaction(success);
+				await this.db._finalizeImplicitTransaction(success, runError);
 			}
 		});
 	}
@@ -435,6 +440,7 @@ export class Statement {
 		return this.db._runWithMutex(async () => {
 			let result: Record<string, SqlValue> | undefined;
 			let success = false;
+			let getError: unknown;
 
 			try {
 				const names = this.getColumnNames();
@@ -444,8 +450,11 @@ export class Statement {
 				}
 				success = true;
 				return result;
+			} catch (e) {
+				getError = e;
+				throw e;
 			} finally {
-				await this.db._finalizeImplicitTransaction(success);
+				await this.db._finalizeImplicitTransaction(success, getError);
 			}
 		});
 	}
@@ -458,8 +467,8 @@ export class Statement {
 	all(params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Record<string, SqlValue>> {
 		this.validateStatement("get all rows for");
 
-		return wrapAsyncIterator(this._allGenerator(params), (commit) =>
-			this.db._finalizeImplicitTransaction(commit)
+		return wrapAsyncIterator(this._allGenerator(params), (commit, error) =>
+			this.db._finalizeImplicitTransaction(commit, error)
 		);
 	}
 
@@ -590,6 +599,36 @@ export class Statement {
 				);
 			}
 		}
+	}
+
+	/**
+	 * Analyzes which base-table state and external inputs the statement may
+	 * read from, returning a serializable `ChangeScope`. Bound parameters
+	 * provided via `params` (or already bound to the statement) are
+	 * substituted into the scope's row-binding placeholders; remaining
+	 * placeholders surface under `unboundParameters`.
+	 */
+	getChangeScope(params?: SqlParameters | SqlValue[]): ChangeScope {
+		this.validateStatement("get change scope for");
+		const plan = this.getAnalysisPlan();
+		const effectiveParams = params ?? (Object.keys(this.boundArgs).length > 0 ? this.boundArgs : undefined);
+		return analyzeChangeScope(plan, effectiveParams !== undefined ? { params: effectiveParams } : undefined);
+	}
+
+	/**
+	 * @internal Build (or re-build) a pre-physical analysis plan for the
+	 * current AST statement. Analysis-only callers (change-scope, future
+	 * binding-aware tools) need a plan whose TableReferenceNodes still
+	 * sit in plain logical structure, not wrapped by physical access
+	 * operators. This path is independent of the execution plan cache.
+	 */
+	private getAnalysisPlan(): BlockNode {
+		const currentAst = this.getAstStatement();
+		if (this.parameterTypes === undefined) {
+			this.parameterTypes = getParameterTypes(this.boundArgs);
+		}
+		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.parameterTypes);
+		return this.db.optimizer.optimizeForAnalysis(rawPlan, this.db) as BlockNode;
 	}
 
 	/**

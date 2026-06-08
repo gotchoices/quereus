@@ -29,7 +29,7 @@ import { DistinctNode } from '../../nodes/distinct-node.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { AliasNode } from '../../nodes/alias-node.js';
-import { CapabilityDetectors } from '../../framework/characteristics.js';
+import { CapabilityDetectors, PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import type { ScalarPlanNode } from '../../nodes/plan-node.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { collectBindingsInExpr } from '../../analysis/binding-collector.js';
@@ -54,6 +54,14 @@ export function rulePredicatePushdown(node: PlanNode, _context: OptContext): Pla
 }
 
 function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope: Scope): PlanNode | null {
+	// Refuse to push past any child whose own subtree carries a write — moving
+	// the Filter below it changes which input rows reach the side-effect
+	// subtree (rejecting fewer rows above means more side-effect executions).
+	if (PlanNodeCharacteristics.subtreeHasSideEffects(child)) {
+		log('predicate-pushdown skipped: child subtree has side effects');
+		return null;
+	}
+
 	// Reach a Retrieve boundary: insert only the supported portion inside pipeline
 	if (child instanceof RetrieveNode) {
 		log('Pushing predicate into Retrieve pipeline (supported-only)');
@@ -134,7 +142,7 @@ function collectReferencedAttributeIds(expr: ScalarPlanNode): Set<number> {
 	const ids = new Set<number>();
 	walkExpr(expr, node => {
 		if (CapabilityDetectors.isColumnReference(node)) {
-			ids.add((node as any).attributeId as number);
+			ids.add(node.attributeId);
 		}
 	});
 	return ids;

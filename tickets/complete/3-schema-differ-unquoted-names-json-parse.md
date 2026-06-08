@@ -1,5 +1,5 @@
 description: schema-differ now quotes identifiers in DDL and guards JSON.parse
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/schema/schema-differ.ts
   packages/quereus/test/schema-differ.spec.ts

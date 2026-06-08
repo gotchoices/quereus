@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-nativescript-sqlite",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "NativeScript SQLite storage plugin for Quereus - mobile persistent storage",
   "keywords": [
@@ -85,10 +85,12 @@
     "typecheck": "tsc --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-plugin-nativescript-sqlite/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-plugin-nativescript-sqlite/test/**/*.spec.ts\" --reporter min --colors"
   },
+  "dependencies": {
+    "@quereus/quereus": "workspace:^",
+    "@quereus/store": "workspace:^"
+  },
   "devDependencies": {
     "@quereus/isolation": "*",
-    "@quereus/quereus": "*",
-    "@quereus/store": "*",
     "@types/better-sqlite3": "^7.6.13",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",

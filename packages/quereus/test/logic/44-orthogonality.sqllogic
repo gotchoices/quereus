@@ -139,7 +139,7 @@ SELECT * FROM (
     INSERT INTO users (id, name, email)
     VALUES (8, 'Invalid', 'invalid@example.com')
 ) AS invalid_subquery;
--- error: Mutating subqueries must have a RETURNING clause to be used as table sources
+-- error: must have a RETURNING clause
 
 -- Cleanup
 DROP TABLE audit_log;

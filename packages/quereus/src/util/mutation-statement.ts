@@ -17,7 +17,10 @@ export function buildInsertStatement(
 		type: 'insert',
 		table: { type: 'identifier', name: tableSchema.name },
 		columns: tableSchema.columns.map(col => col.name),
-		values: [newRow.map(sqlValueToLiteralExpr)],
+		source: {
+			type: 'values',
+			values: [newRow.map(sqlValueToLiteralExpr)],
+		} satisfies AST.ValuesStmt,
 		contextValues: buildContextAssignments(tableSchema, contextRow)
 	};
 

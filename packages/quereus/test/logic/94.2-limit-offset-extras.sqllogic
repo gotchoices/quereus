@@ -1,0 +1,98 @@
+-- adapted from SQLite test/limit.test, test/limit2.test, test/select8.test,
+-- test/e_select.test
+-- LIMIT / OFFSET combinations that 94.1 doesn't already cover: expression
+-- operands, OFFSET without LIMIT, interaction with DISTINCT and GROUP BY.
+
+create table le (id integer primary key, val text);
+insert into le values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+-- LIMIT with arithmetic expression
+select * from le order by id limit 1 + 1;
+→ [{"id":1,"val":"a"},{"id":2,"val":"b"}]
+
+-- OFFSET with arithmetic expression
+select * from le order by id limit 10 offset 4 - 2;
+→ [{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]
+
+-- LIMIT and OFFSET both expression-valued
+select * from le order by id limit 4 / 2 offset 1 + 1;
+→ [{"id":3,"val":"c"},{"id":4,"val":"d"}]
+
+-- OFFSET without LIMIT — Quereus parser requires explicit LIMIT before OFFSET
+select * from le order by id offset 2;
+-- error: offset
+
+-- Equivalent expressed with explicit large LIMIT
+select * from le order by id limit 1000 offset 2;
+→ [{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]
+
+-- OFFSET equal to row count returns empty
+select * from le order by id limit 1000 offset 5;
+→ []
+
+drop table le;
+
+-- =============================================================================
+-- LIMIT after DISTINCT — DISTINCT runs first, then LIMIT trims
+-- =============================================================================
+
+create table dl (id integer primary key, category text, val integer);
+insert into dl values
+  (1, 'A', 10),
+  (2, 'A', 20),
+  (3, 'B', 10),
+  (4, 'B', 30),
+  (5, 'A', 20),
+  (6, 'C', 50);
+
+select distinct category from dl order by category limit 2;
+→ [{"category":"A"},{"category":"B"}]
+
+select distinct category from dl order by category limit 1 offset 1;
+→ [{"category":"B"}]
+
+-- DISTINCT on multiple columns, then LIMIT
+select distinct category, val from dl order by category, val limit 3;
+→ [{"category":"A","val":10},{"category":"A","val":20},{"category":"B","val":10}]
+
+drop table dl;
+
+-- =============================================================================
+-- LIMIT after GROUP BY aggregate — group reduction first, then LIMIT
+-- =============================================================================
+
+create table gp (id integer primary key, artist text, plays integer);
+insert into gp values
+  (1, 'one',   1),
+  (2, 'one',   2),
+  (3, 'two',   3),
+  (4, 'three', 5),
+  (5, 'one',   7),
+  (6, 'two',  11);
+
+-- Sorted group keys, take first
+select artist, sum(plays) as total
+from gp group by artist
+order by artist limit 1;
+→ [{"artist":"one","total":10}]
+
+-- LIMIT 1 OFFSET 1 — second group in alphabetical order
+select artist, sum(plays) as total
+from gp group by artist
+order by artist limit 1 offset 1;
+→ [{"artist":"three","total":5}]
+
+-- ORDER BY the aggregate, then LIMIT — top-N by aggregate
+select artist, sum(plays) as total
+from gp group by artist
+order by total desc limit 2;
+→ [{"artist":"two","total":14},{"artist":"one","total":10}]
+
+-- HAVING reduces groups, then LIMIT trims further
+select artist, sum(plays) as total
+from gp group by artist
+having sum(plays) > 5
+order by artist limit 1;
+→ [{"artist":"one","total":10}]
+
+drop table gp;

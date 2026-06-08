@@ -36,7 +36,8 @@ export function buildTableReference(fromClause: AST.FromClause, context: Plannin
 		vtabModuleInfo.module,
 		vtabModuleInfo.auxData,
 		undefined,
-		readCommitted
+		readCommitted,
+		context.schemaManager,
 	);
 
 	// Wrap in RetrieveNode to establish vtab/Quereus boundary

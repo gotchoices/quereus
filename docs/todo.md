@@ -179,7 +179,7 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
 ## Declarative Schema - Remaining Work (Future Enhancements)
 
 **Planned:**
-- [ ] Rename detection with `old name` hints and stable `id` matching
+- [x] Rename detection with `old name` hints and stable `id` matching (tables, columns, named constraints; views/indexes drop+recreate when hinted — see `docs/sql.md` §"Rename detection")
 - [ ] Destructive change gating with `allow_destructive` option
 - [ ] `validate_only` and `dry_run` modes for safety
 - [ ] Import support: `import schema <alias> from '<url>' cache '<key>' version '<semver>'`
@@ -189,7 +189,8 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
 - [ ] Helper TVFs: `schema_diff()`, `schema_objects()`, `schema_hash()`
 - [ ] CLI integration in quoomb
 - [ ] View and index DDL generation in diff engine
-- [ ] Advanced rename policies (`require-hint` vs `infer-id`)
+- [x] Advanced rename policies (`rename_policy = 'allow' | 'require-hint' | 'deny'`)
+- [ ] Engine-level RENAME primitives for views, indexes, and named constraints (today: drop+recreate)
 
 ### Architecture Notes
 

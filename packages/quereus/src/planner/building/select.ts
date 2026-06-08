@@ -30,8 +30,9 @@ import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
 import { buildAggregatePhase, buildFinalAggregateProjections } from './select-aggregates.js';
 import { buildWindowPhase } from './select-window.js';
-import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset } from './select-modifiers.js';
+import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset, createProjectionOutputScope } from './select-modifiers.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
+import { buildSelectListAsts, resolveOrdinalReference } from './select-ordinal.js';
 
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -110,10 +111,14 @@ export function buildSelectStmt(
 		projections: columnProjections,
 		aggregates,
 		windowFunctions,
-		hasAggregates,
+		hasAggregates: hasAggregatesInSelect,
 		hasWindowFunctions,
 		hasWrappedAggregates
 	} = analyzeSelectColumns(stmt.columns, selectContext);
+	// `hasAggregates` may grow as buildAggregatePhase collects HAVING-only or
+	// ORDER-BY-only aggregates; track it locally so the post-aggregate branch
+	// is taken when those promote a non-aggregate query into an aggregate one.
+	let hasAggregates = hasAggregatesInSelect;
 
 	// Handle SELECT * separately
 	for (const column of stmt.columns) {
@@ -126,14 +131,45 @@ export function buildSelectStmt(
 	// Add non-star projections
 	projections.push(...columnProjections);
 
+	// Build the source-order AST list of SELECT-list output columns (with stars expanded)
+	// for resolving GROUP BY / ORDER BY positional ordinals.
+	const selectListAsts = buildSelectListAsts(stmt.columns, input);
+
 	// Process aggregates if present
-	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates);
+	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListAsts);
 	input = aggregateResult.output;
 	let preAggregateSort = aggregateResult.preAggregateSort;
+	let orderByAppliedEarly = false;
+	let aggregateProjectionScope: RegisteredScope | undefined;
 
 	// Update context if we have aggregates
 	if (aggregateResult.aggregateScope) {
-		selectContext = { ...selectContext, scope: aggregateResult.aggregateScope };
+		// HAVING-only or ORDER-BY-only aggregates may have promoted this into an
+		// aggregate query even if SELECT had none — reflect that locally.
+		if (aggregateResult.hasHavingOnlyAggregates || aggregateResult.hasOrderByOnlyAggregates) {
+			hasAggregates = true;
+		}
+
+		selectContext = {
+			...selectContext,
+			scope: aggregateResult.aggregateScope,
+			aggregates: aggregateResult.aggregatesContext,
+		};
+
+		// When ORDER BY references aggregate functions, apply it now — *before*
+		// any stripping final projection — so it can resolve against the full
+		// AggregateNode output (which still includes ORDER-BY-only aggregates).
+		// Skipped when window functions are present (window output isn't
+		// available yet) or when pre-aggregate sort already handled ordering.
+		if (
+			aggregateResult.orderByHasAggregates &&
+			!preAggregateSort &&
+			!hasWindowFunctions &&
+			stmt.orderBy && stmt.orderBy.length > 0
+		) {
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, undefined, true, selectListAsts);
+			orderByAppliedEarly = true;
+		}
 
 		// Build final projections if needed
 		if (aggregateResult.needsFinalProjection && aggregateResult.aggregateNode && aggregateResult.groupByExpressions) {
@@ -145,10 +181,17 @@ export function buildSelectStmt(
 				aggregates,
 				aggregateResult.groupByExpressions
 			);
-			// When HAVING-only aggregates were added, don't preserve input columns
-			// so they are stripped from the output (they exist only for the filter).
-			const preserveForAggregate = preserveInputColumns && !aggregateResult.hasHavingOnlyAggregates;
+			// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
+			// input columns so they are stripped from the output (they exist only for
+			// those clauses).
+			const preserveForAggregate =
+				preserveInputColumns &&
+				!aggregateResult.hasHavingOnlyAggregates &&
+				!aggregateResult.hasOrderByOnlyAggregates;
 			input = new ProjectNode(selectScope, input, finalProjections, undefined, undefined, preserveForAggregate);
+			// Expose final-projection output column names (including SELECT-list aliases)
+			// so subsequent ORDER BY can reference aliases like the non-aggregate path.
+			aggregateProjectionScope = createProjectionOutputScope(input);
 		}
 	}
 
@@ -173,11 +216,14 @@ export function buildSelectStmt(
 					const orderColumn = orderByClause.expr.name.toLowerCase();
 					if (!selectedColumns.has(orderColumn)) {
 						// Apply ORDER BY before window projections
-						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => ({
-							expression: buildExpression(selectContext, orderBy.expr),
-							direction: orderBy.direction,
-							nulls: orderBy.nulls
-						}));
+						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => {
+							const resolved = resolveOrdinalReference(orderBy.expr, selectListAsts, 'ORDER BY');
+							return {
+								expression: buildExpression(selectContext, resolved ?? orderBy.expr),
+								direction: orderBy.direction,
+								nulls: orderBy.nulls
+							};
+						});
 						input = new SortNode(selectContext.scope, input, sortKeys);
 						preWindowSort = true;
 						break;
@@ -209,20 +255,27 @@ export function buildSelectStmt(
 
 	// Handle final projections for non-aggregate, non-window cases
 	if (!hasAggregates && !hasWindowFunctions) {
-		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns);
+		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns, selectListAsts);
 		input = finalResult.output;
 		selectContext = finalResult.finalContext;
 		preAggregateSort = finalResult.preAggregateSort;
 
 		// Apply final modifiers with projection scope for column alias resolution
 		input = applyDistinct(input, stmt, selectScope);
-		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope);
+		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope, false, selectListAsts);
 		input = applyLimitOffset(input, stmt, selectContext, finalResult.projectionScope);
 	} else {
-		// Apply final modifiers without projection scope for aggregate/window cases
+		// Apply final modifiers. For the aggregate path, expose the final-projection
+		// output scope so ORDER BY can resolve SELECT-list aliases (the non-aggregate
+		// path already does this via finalResult.projectionScope). The window path
+		// keeps its existing scope handling.
 		input = applyDistinct(input, stmt, selectScope);
-		input = applyOrderBy(input, stmt, selectContext, preAggregateSort);
-		input = applyLimitOffset(input, stmt, selectContext);
+		if (!orderByAppliedEarly) {
+			// In the aggregate path, ORDER BY may legally reference aggregates; in the
+			// window path it may reference window outputs. Both are now in selectContext.
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListAsts);
+		}
+		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
 	}
 
 	return input;
@@ -336,8 +389,20 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 			const viewSchema = parentContext.db.schemaManager.getView(schemaName, fromClause.table.name);
 
 			if (viewSchema) {
-				// Build the view's SELECT statement
-				let viewSelectNode = buildSelectStmt(parentContext, viewSchema.selectAst, cteNodes) as RelationalPlanNode;
+				// Build the view's body. The body is a QueryExpr — today only
+				// SELECT and VALUES bodies plan; DML bodies are rejected at
+				// CREATE VIEW plan time so we never get here with one.
+				let viewSelectNode: RelationalPlanNode;
+				if (viewSchema.selectAst.type === 'select') {
+					viewSelectNode = buildSelectStmt(parentContext, viewSchema.selectAst, cteNodes) as RelationalPlanNode;
+				} else if (viewSchema.selectAst.type === 'values') {
+					viewSelectNode = buildValuesStmt(parentContext, viewSchema.selectAst);
+				} else {
+					throw new QuereusError(
+						`View '${viewSchema.name}' has a ${viewSchema.selectAst.type.toUpperCase()} body, which is not yet supported.`,
+						StatusCode.UNSUPPORTED,
+					);
+				}
 
 				// If the view has explicit column names, wrap with a projection to rename columns
 				if (viewSchema.columns && viewSchema.columns.length > 0) {
@@ -400,16 +465,33 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 		columnScope = registerColumnScope(parentContext.scope, fromTable, '', fromClause.alias?.toLowerCase() ?? fromClause.name.name.toLowerCase());
 
 	} else if (fromClause.type === 'subquerySource') {
-		// Build the subquery
+		// Build the subquery body. SubquerySource now carries any QueryExpr;
+		// the SELECT/VALUES legs return a pure relation, the DML legs (with
+		// RETURNING — enforced by the parser) materialize via the DML
+		// builders. The builder dispatch mirrors the legacy MutatingSubquerySource
+		// branch and the legacy SubquerySource branch in one place.
 		let subqueryNode: RelationalPlanNode;
-		if (fromClause.subquery.type === 'select') {
-			subqueryNode = buildSelectStmt(parentContext, fromClause.subquery, cteNodes) as RelationalPlanNode;
-		} else if (fromClause.subquery.type === 'values') {
-			subqueryNode = buildValuesStmt(parentContext, fromClause.subquery);
-		} else {
-			const exhaustiveCheck: never = fromClause.subquery;
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			throw new QuereusError(`Unsupported subquery type: ${(exhaustiveCheck as any).type}`, StatusCode.INTERNAL);
+		switch (fromClause.subquery.type) {
+			case 'select':
+				subqueryNode = buildSelectStmt(parentContext, fromClause.subquery, cteNodes) as RelationalPlanNode;
+				break;
+			case 'values':
+				subqueryNode = buildValuesStmt(parentContext, fromClause.subquery);
+				break;
+			case 'insert':
+				subqueryNode = buildInsertStmt(parentContext, fromClause.subquery) as RelationalPlanNode;
+				break;
+			case 'update':
+				subqueryNode = buildUpdateStmt(parentContext, fromClause.subquery) as RelationalPlanNode;
+				break;
+			case 'delete':
+				subqueryNode = buildDeleteStmt(parentContext, fromClause.subquery) as RelationalPlanNode;
+				break;
+			default: {
+				const exhaustiveCheck: never = fromClause.subquery;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				throw new QuereusError(`Unsupported subquery type: ${(exhaustiveCheck as any).type}`, StatusCode.INTERNAL);
+			}
 		}
 
 		const alias = fromClause.alias?.toLowerCase();
@@ -439,52 +521,6 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 			? new AliasedScope(subqueryScope, '', alias)
 			: subqueryScope;
 
-	} else if (fromClause.type === 'mutatingSubquerySource') {
-		// Build the mutating subquery (DML with RETURNING)
-		let dmlNode: RelationalPlanNode;
-
-		if (fromClause.stmt.type === 'insert') {
-			// Build INSERT without SinkNode wrapper since we need the RETURNING results
-			dmlNode = buildInsertStmt(parentContext, fromClause.stmt) as RelationalPlanNode;
-		} else if (fromClause.stmt.type === 'update') {
-			// Build UPDATE without SinkNode wrapper since we need the RETURNING results
-			dmlNode = buildUpdateStmt(parentContext, fromClause.stmt) as RelationalPlanNode;
-		} else if (fromClause.stmt.type === 'delete') {
-			// Build DELETE without SinkNode wrapper since we need the RETURNING results
-			dmlNode = buildDeleteStmt(parentContext, fromClause.stmt) as RelationalPlanNode;
-		} else {
-			const exhaustiveCheck: never = fromClause.stmt;
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			throw new QuereusError(`Unsupported mutating subquery type: ${(exhaustiveCheck as any).type}`, StatusCode.INTERNAL);
-		}
-
-		const alias = fromClause.alias?.toLowerCase();
-
-		// Wrap with AliasNode to update relationName on attributes
-		fromTable = alias
-			? new AliasNode(parentContext.scope, dmlNode, alias)
-			: dmlNode;
-
-		// Create scope for mutating subquery columns
-		const mutatingScope = new RegisteredScope(parentContext.scope);
-		const mutatingAttributes = fromTable.getAttributes();
-
-		// Use provided column names or infer from RETURNING clause
-		const columnNames = fromClause.columns || fromTable.getType().columns.map(c => c.name);
-
-		columnNames.forEach((colName, i) => {
-			if (i < mutatingAttributes.length) {
-				const attr = mutatingAttributes[i];
-				const columnType = fromTable.getType().columns[i]?.type || { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: false };
-				mutatingScope.registerSymbol(colName.toLowerCase(), (exp, s) =>
-					new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, attr.id, i));
-			}
-		});
-
-		columnScope = alias
-			? new AliasedScope(mutatingScope, '', alias)
-			: mutatingScope;
-
 	} else if (fromClause.type === 'join') {
 		// Handle JOIN clauses
 		return buildJoin(fromClause, parentContext, cteNodes);
@@ -503,9 +539,21 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
  * Builds a join plan node from an AST join clause
  */
 function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, cteNodes: Map<string, CTEScopeNode>): JoinNode {
-	// Build left and right sides recursively
+	// Build left and right sides recursively. For LATERAL joins, expose the
+	// left's output scope to the right's build context so the inner subquery
+	// can reference outer columns (this is what makes LATERAL correlated).
 	const leftNode = buildFrom(joinClause.left, parentContext, cteNodes);
-	const rightNode = buildFrom(joinClause.right, parentContext, cteNodes);
+	let rightContext = parentContext;
+	if (joinClause.isLateral) {
+		const leftOutputScope = parentContext.outputScopes.get(leftNode);
+		if (leftOutputScope) {
+			rightContext = {
+				...parentContext,
+				scope: new ShadowScope([leftOutputScope, parentContext.scope]),
+			};
+		}
+	}
+	const rightNode = buildFrom(joinClause.right, rightContext, cteNodes);
 
 	// Create a combined scope for join expressions
 	const leftScope = parentContext.outputScopes.get(leftNode);

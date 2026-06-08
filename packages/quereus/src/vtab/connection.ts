@@ -12,6 +12,14 @@ export interface VirtualTableConnection {
 	/** Name of the table this connection is associated with */
 	readonly tableName: string;
 
+	/**
+	 * When true, this connection is the primary/covering connection for the table —
+	 * it coordinates all transaction semantics (including over underlying sub-connections).
+	 * Used by DeferredConstraintQueue to prefer this connection when multiple connections
+	 * match the same table name.
+	 */
+	readonly isCovering?: boolean;
+
 	// Transaction methods
 	/** Begins a transaction on this connection */
 	begin(): MaybePromise<void>;

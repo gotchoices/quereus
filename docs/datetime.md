@@ -40,6 +40,17 @@ The functions attempt to parse the initial time string argument (`timestring`) l
 
 If parsing fails for any reason, the function generally returns `NULL`.
 
+**Canonicalization for stored column values** (separate from the lenient
+SQL-function parsing above): when a value is written into a `DATE`, `TIME`, or
+`DATETIME` column, the column's logical type normalizes the input to a single
+canonical shape so that equal instants compare equal regardless of how they
+were written. For `DATETIME` the canonical form is the bare PlainDateTime
+string (`YYYY-MM-DDTHH:MM:SS[.sss]`) in **UTC** — an input with `Z`, a `±HH:MM`
+offset, a `[zone]` annotation, or a numeric Unix-millisecond value is
+converted to UTC before the zone information is discarded. The SQL functions
+listed above retain their existing lenient behavior; only the column-type
+`parse` performs this canonicalization.
+
 ### Strict Parsing (Epoch Functions)
 
 The `epoch_s`, `epoch_ms`, and `epoch_s_frac` functions use **strict parsing** to avoid the ambiguity inherent in lenient numeric parsing. They accept only:

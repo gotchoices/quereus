@@ -1,6 +1,6 @@
 ---
 description: Review + hardening of planner scope resolution, ambiguity handling, and window typing
-dependencies: none
+prereq: none
 
 ---
 

@@ -1,6 +1,6 @@
 ---
 description: GENERATED ALWAYS AS computed columns (STORED and VIRTUAL) — reviewed and complete
-dependencies: none
+prereq: none
 files:
   - packages/quereus/src/schema/column.ts
   - packages/quereus/src/schema/table.ts

@@ -23,7 +23,7 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 		functionSchema = ctx.findFunction(functionName, -1); // Try variable argument function
 	}
 	if (!functionSchema) {
-		throw new QuereusError(`Unknown function: ${functionName}/${numArgs}`, StatusCode.ERROR);
+		throw new QuereusError(`Function not found: ${functionName}/${numArgs}`, StatusCode.ERROR);
 	}
 	if (!isTableValuedFunctionSchema(functionSchema)) {
 		throw new QuereusError(`Function ${functionName}/${numArgs} is not a table-valued function`, StatusCode.ERROR);
@@ -59,8 +59,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			} finally {
 				slot.close();
 			}
-		} catch (error: any) {
-			throw new QuereusError(`Table-valued function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
 	}
 
@@ -80,7 +81,7 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			// Special validation for known variable argument functions
 			if (functionName === 'json_each' || functionName === 'json_tree') {
 				if (args.length < 1 || args.length > 2) {
-					throw new QuereusError(`${functionName} requires 1 or 2 arguments (jsonSource, [rootPath])`, StatusCode.ERROR);
+					throw new QuereusError(`Error: ${functionName} requires 1 or 2 arguments (jsonSource, [rootPath])`, StatusCode.ERROR);
 				}
 			}
 		}
@@ -101,8 +102,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			} finally {
 				slot.close();
 			}
-		} catch (error: any) {
-			throw new QuereusError(`Table-valued function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
 	}
 

@@ -5,6 +5,8 @@ import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { RowOpFlag } from '../../schema/table.js';
 import type { RowConstraintSchema } from '../../schema/table.js';
+import type { ConflictResolution } from '../../common/constants.js';
+import type { Expression } from '../../parser/ast.js';
 
 export interface ConstraintCheck {
   constraint: RowConstraintSchema;  // The constraint metadata
@@ -12,6 +14,25 @@ export interface ConstraintCheck {
   deferrable?: boolean;
   initiallyDeferred?: boolean;
   needsDeferred: boolean;            // Whether this constraint must be deferred (subquery, committed ref, etc.)
+  /** Constraint class for conflict-resolution dispatch at runtime. */
+  kind?: 'check' | 'fk-child' | 'fk-parent';
+  /** For 'fk-parent' UPDATE checks: parent-table column indices the FK references.
+   *  When set, the runtime can skip the check when none of these indices changed. */
+  referencedColumnIndices?: ReadonlyArray<number>;
+}
+
+/**
+ * Pre-built default-value evaluator for a NOT NULL column with a DEFAULT clause.
+ * Used by REPLACE-on-NOT-NULL substitution to fill the NEW slot when the user
+ * supplied NULL for a NOT NULL column.
+ */
+export interface NotNullDefaultPlan {
+  /** Index of the column in the table schema. */
+  columnIndex: number;
+  /** AST default expression (used as a fallback if the planned node is missing). */
+  defaultExpr: Expression;
+  /** Pre-built scalar node that evaluates the default in the current row context. */
+  defaultNode: ScalarPlanNode;
 }
 
 /**
@@ -33,6 +54,8 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
     public readonly mutationContextValues?: Map<string, ScalarPlanNode>, // Mutation context value expressions
     public readonly contextAttributes?: Attribute[], // Mutation context attributes
     public readonly contextDescriptor?: RowDescriptor, // Mutation context row descriptor
+    public readonly onConflict?: ConflictResolution, // Statement-level OR clause; resolves IGNORE/REPLACE/FAIL/ROLLBACK
+    public readonly notNullDefaults?: ReadonlyArray<NotNullDefaultPlan>, // Pre-built DEFAULT evaluators for NOT NULL columns (used by REPLACE substitution)
   ) {
     super(scope);
   }
@@ -56,16 +79,24 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
     this.constraintChecks.forEach(check => {
       children.push(check.expression);
     });
+    // Add NOT NULL DEFAULT evaluators so they participate in optimization too.
+    if (this.notNullDefaults) {
+      this.notNullDefaults.forEach(d => children.push(d.defaultNode));
+    }
     return children;
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
-    const expectedChildren = 1 + this.constraintChecks.length;
+    const constraintCount = this.constraintChecks.length;
+    const defaultCount = this.notNullDefaults?.length ?? 0;
+    const expectedChildren = 1 + constraintCount + defaultCount;
     if (newChildren.length !== expectedChildren) {
       throw new Error(`ConstraintCheckNode expects ${expectedChildren} children, got ${newChildren.length}`);
     }
 
-    const [newSource, ...newConstraintExprs] = newChildren;
+    const newSource = newChildren[0];
+    const newConstraintExprs = newChildren.slice(1, 1 + constraintCount);
+    const newDefaultExprs = newChildren.slice(1 + constraintCount);
 
     // Type check the source
     if (!isRelationalNode(newSource)) {
@@ -79,10 +110,18 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
         throw new Error(`ConstraintCheckNode: constraint child ${i + 1} must be a ScalarPlanNode`);
       }
     }
+    for (let i = 0; i < newDefaultExprs.length; i++) {
+      const expr = newDefaultExprs[i];
+      if (!isScalarNode(expr)) {
+        throw new Error(`ConstraintCheckNode: default child ${i + 1} must be a ScalarPlanNode`);
+      }
+    }
 
     // Return same instance if nothing changed
-    if (newSource === this.source &&
-        newConstraintExprs.every((expr, i) => expr === this.constraintChecks[i].expression)) {
+    const constraintsUnchanged = newConstraintExprs.every((expr, i) => expr === this.constraintChecks[i].expression);
+    const defaultsUnchanged = !this.notNullDefaults
+      || newDefaultExprs.every((expr, i) => expr === this.notNullDefaults![i].defaultNode);
+    if (newSource === this.source && constraintsUnchanged && defaultsUnchanged) {
       return this;
     }
 
@@ -91,6 +130,13 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
       ...check,
       expression: newConstraintExprs[i] as ScalarPlanNode
     }));
+
+    const newNotNullDefaults = this.notNullDefaults
+      ? this.notNullDefaults.map((d, i) => ({
+          ...d,
+          defaultNode: newDefaultExprs[i] as ScalarPlanNode,
+        }))
+      : undefined;
 
     // Create new instance
     return new ConstraintCheckNode(
@@ -104,7 +150,9 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
       newConstraintChecks,
       this.mutationContextValues,
       this.contextAttributes,
-      this.contextDescriptor
+      this.contextDescriptor,
+      this.onConflict,
+      newNotNullDefaults
     );
   }
 
@@ -133,6 +181,8 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
       constraintNames: this.constraintChecks.map(c => c.constraint.name || '_unnamed'),
       hasOldDescriptor: !!this.oldRowDescriptor,
       hasNewDescriptor: !!this.newRowDescriptor,
+      onConflict: this.onConflict,
+      notNullDefaults: this.notNullDefaults?.length ?? 0,
     };
   }
 }

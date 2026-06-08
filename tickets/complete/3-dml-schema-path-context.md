@@ -1,5 +1,5 @@
 description: Fixed DML builders to propagate contextWithSchemaPath consistently
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/planner/building/update.ts
   packages/quereus/src/planner/building/delete.ts

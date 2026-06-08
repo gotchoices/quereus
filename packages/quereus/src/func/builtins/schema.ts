@@ -11,6 +11,35 @@ import { Schema } from "../../schema/schema.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
 import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
+import { RowOpFlag } from "../../schema/table.js";
+import { jsonStringify } from "../../util/serialization.js";
+import { expressionToString } from "../../emit/ast-stringify.js";
+
+/**
+ * Encodes a tag bag as a JSON object string. Returns null when there are no
+ * tags so callers can use `WHERE tags IS NULL` to filter untagged objects.
+ * BigInt values are coerced to JSON-safe numbers/strings via `jsonStringify`.
+ */
+function tagsToJson(tags: Readonly<Record<string, SqlValue>> | undefined): string | null {
+	if (!tags) return null;
+	const keys = Object.keys(tags);
+	if (keys.length === 0) return null;
+	return jsonStringify(tags);
+}
+
+/**
+ * Converts a RowOpMask bitmask to a comma-joined operations list.
+ * An empty/default mask returns the canonical default-all string so the
+ * value round-trips cleanly.
+ */
+function rowOpMaskToString(mask: number): string {
+	const parts: string[] = [];
+	if (mask & RowOpFlag.INSERT) parts.push('insert');
+	if (mask & RowOpFlag.UPDATE) parts.push('update');
+	if (mask & RowOpFlag.DELETE) parts.push('delete');
+	if (parts.length === 0) return 'insert,update,delete';
+	return parts.join(',');
+}
 
 /**
  * Generates a function signature string for display
@@ -37,7 +66,8 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 				{ name: 'type', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'tbl_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
-				{ name: 'sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true }
+				{ name: 'sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'tags', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true }
 			],
 			keys: [],
 			rowConstraints: []
@@ -66,7 +96,8 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 						tableSchema.isView ? 'view' : 'table',
 						tableSchema.name,
 						tableSchema.name,
-						createSql
+						createSql,
+						tagsToJson(tableSchema.tags)
 					] as Row;
 
 					// Process Indexes for this table
@@ -95,7 +126,8 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 								'index',
 								indexSchema.name,
 								tableSchema.name,
-								indexSql
+								indexSql,
+								tagsToJson(indexSchema.tags)
 							] as Row;
 						}
 					}
@@ -108,7 +140,8 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 						'view',
 						viewSchema.name,
 						viewSchema.name,
-						viewSchema.sql
+						viewSchema.sql,
+						tagsToJson(viewSchema.tags)
 					] as Row;
 				}
 
@@ -119,7 +152,8 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 						'function',
 						funcSchema.name,
 						funcSchema.name,
-						stringifyCreateFunction(funcSchema)
+						stringifyCreateFunction(funcSchema),
+						null
 					] as Row;
 				}
 			};
@@ -132,7 +166,7 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		} catch (error: any) {
 			// If schema introspection fails, yield an error row
-			yield ['', 'error', 'schema_error', 'schema_error', `Failed to introspect schema: ${error.message}`];
+			yield ['', 'error', 'schema_error', 'schema_error', `Failed to introspect schema: ${error.message}`, null];
 		}
 	}
 );
@@ -153,40 +187,49 @@ export const tableInfoFunc = createIntegratedTableValuedFunction(
 				{ name: 'type', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'notnull', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'dflt_value', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
-				{ name: 'pk', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true }
+				{ name: 'pk', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'tags', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'collation', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'generated', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true }
 			],
 			keys: [],
 			rowConstraints: []
-		}
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// `cid` (column 0) is the column ordinal — unique per row.
+			keys: [[{ index: 0 }]],
+		},
 	},
 	async function* (db: Database, tableName: SqlValue): AsyncIterable<Row> {
 		if (typeof tableName !== 'string') {
 			throw new QuereusError('table_info() requires a table name string argument', StatusCode.ERROR);
 		}
 
-		try {
-			const table = db._findTable(tableName);
-			if (!table) {
-				throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
-			}
+		const table = db._findTable(tableName);
+		if (!table) {
+			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
+		}
 
-			for (let i = 0; i < table.columns.length; i++) {
-				const column = table.columns[i];
-				const isPrimaryKey = table.primaryKeyDefinition.some(pk => pk.index === i);
+		for (let i = 0; i < table.columns.length; i++) {
+			const column = table.columns[i];
+			const isPrimaryKey = table.primaryKeyDefinition.some(pk => pk.index === i);
+			// 0 = not generated, 1 = virtual generated, 2 = stored generated
+			const generatedFlag = column.generated
+				? (column.generatedStored ? 2 : 1)
+				: 0;
 
-				yield [
-					i,                                    // cid
-					column.name,                         // name
-					column.logicalType.name,             // type
-					column.notNull ? 1 : 0,             // notnull
-					column.defaultValue?.toString() || null, // dflt_value
-					isPrimaryKey ? 1 : 0                // pk
-				];
-			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
-			// If table info fails, yield an error row
-			yield [0, 'error', 'error', 1, `Failed to get table info: ${error.message}`, 0];
+			yield [
+				i,                                    // cid
+				column.name,                         // name
+				column.logicalType.name,             // type
+				column.notNull ? 1 : 0,             // notnull
+				column.defaultValue?.toString() || null, // dflt_value
+				isPrimaryKey ? 1 : 0,               // pk
+				tagsToJson(column.tags),            // tags
+				column.collation || 'BINARY',       // collation
+				generatedFlag                       // generated
+			];
 		}
 	}
 );
@@ -213,10 +256,16 @@ export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 				{ name: 'on_delete', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'deferred', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'seq', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'tags', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
 			],
 			keys: [],
 			rowConstraints: []
-		}
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// Composite key (id, seq): each FK has one row per referenced column.
+			keys: [[{ index: 0 }, { index: 10 }]],
+		},
 	},
 	async function* (db: Database, tableName: SqlValue): AsyncIterable<Row> {
 		if (typeof tableName !== 'string') {
@@ -233,6 +282,7 @@ export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 
 		for (let fkIdx = 0; fkIdx < foreignKeys.length; fkIdx++) {
 			const fk = foreignKeys[fkIdx];
+			const fkTagJson = tagsToJson(fk.tags);
 			for (let seq = 0; seq < fk.columns.length; seq++) {
 				const fromCol = table.columns[fk.columns[seq]];
 
@@ -260,9 +310,225 @@ export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 					fk.onUpdate,                        // on_update
 					fk.onDelete,                        // on_delete
 					fk.deferred ? 1 : 0,                // deferred
-					seq,                                 // seq
+					seq,                                // seq
+					fkTagJson,                          // tags
 				];
 			}
+		}
+	}
+);
+
+// Index information function (table-valued function)
+export const indexInfoFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'index_info',
+		numArgs: 1,
+		deterministic: false,
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'index_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'seq', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'column_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'desc', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'collation', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'unique', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'partial', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'tags', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// Composite key (index_name, seq): each index has one row per indexed column position.
+			keys: [[{ index: 0 }, { index: 1 }]],
+		},
+	},
+	async function* (db: Database, tableName: SqlValue): AsyncIterable<Row> {
+		if (typeof tableName !== 'string') {
+			throw new QuereusError('index_info() requires a table name string argument', StatusCode.ERROR);
+		}
+
+		const table = db._findTable(tableName);
+		if (!table) {
+			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
+		}
+
+		if (!table.indexes) return;
+
+		for (const idx of table.indexes) {
+			const tagJson = tagsToJson(idx.tags);
+			const uniqueFlag = idx.unique ? 1 : 0;
+			const partialFlag = idx.predicate ? 1 : 0;
+			for (let seq = 0; seq < idx.columns.length; seq++) {
+				const col = idx.columns[seq];
+				const tableCol = table.columns[col.index];
+				yield [
+					idx.name,                       // index_name
+					seq,                            // seq
+					tableCol.name,                  // column_name
+					col.desc ? 1 : 0,               // desc
+					col.collation ?? null,          // collation
+					uniqueFlag,                     // unique
+					partialFlag,                    // partial
+					tagJson,                        // tags
+				];
+			}
+		}
+	}
+);
+
+// CHECK constraint information function (table-valued function)
+export const checkConstraintInfoFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'check_constraint_info',
+		numArgs: 1,
+		deterministic: false,
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'id', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'expr', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'operations', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'deferrable', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'initially_deferred', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'tags', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// `id` (column 0) is the constraint ordinal — unique per emitted row.
+			keys: [[{ index: 0 }]],
+		},
+	},
+	async function* (db: Database, tableName: SqlValue): AsyncIterable<Row> {
+		if (typeof tableName !== 'string') {
+			throw new QuereusError('check_constraint_info() requires a table name string argument', StatusCode.ERROR);
+		}
+
+		const table = db._findTable(tableName);
+		if (!table) {
+			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
+		}
+
+		const checks = table.checkConstraints;
+		for (let i = 0; i < checks.length; i++) {
+			const cc = checks[i];
+			yield [
+				i,                                  // id
+				cc.name ?? null,                    // name
+				expressionToString(cc.expr),        // expr
+				rowOpMaskToString(cc.operations),   // operations
+				cc.deferrable ? 1 : 0,              // deferrable
+				cc.initiallyDeferred ? 1 : 0,       // initially_deferred
+				tagsToJson(cc.tags),                // tags
+			];
+		}
+	}
+);
+
+// UNIQUE constraint information function (table-valued function)
+export const uniqueConstraintInfoFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'unique_constraint_info',
+		numArgs: 1,
+		deterministic: false,
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'id', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'seq', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'column_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'partial', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'tags', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// Composite (id, seq): one row per (constraint, column position).
+			keys: [[{ index: 0 }, { index: 2 }]],
+		},
+	},
+	async function* (db: Database, tableName: SqlValue): AsyncIterable<Row> {
+		if (typeof tableName !== 'string') {
+			throw new QuereusError('unique_constraint_info() requires a table name string argument', StatusCode.ERROR);
+		}
+
+		const table = db._findTable(tableName);
+		if (!table) {
+			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
+		}
+
+		const uniques = table.uniqueConstraints;
+		if (!uniques) return;
+
+		for (let i = 0; i < uniques.length; i++) {
+			const uc = uniques[i];
+			const tagJson = tagsToJson(uc.tags);
+			const partialFlag = uc.predicate ? 1 : 0;
+			for (let seq = 0; seq < uc.columns.length; seq++) {
+				const tableCol = table.columns[uc.columns[seq]];
+				yield [
+					i,                          // id
+					uc.name ?? null,            // name
+					seq,                        // seq
+					tableCol.name,              // column_name
+					partialFlag,                // partial
+					tagJson,                    // tags
+				];
+			}
+		}
+	}
+);
+
+// Assertion information function (table-valued function)
+export const assertionInfoFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'assertion_info',
+		numArgs: 0,
+		deterministic: false,
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'violation_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'deferrable', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'initially_deferred', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'dependent_tables', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			keys: [[{ index: 0 }]],
+		},
+	},
+	async function* (db: Database): AsyncIterable<Row> {
+		for (const assertion of db.schemaManager.getAllAssertions()) {
+			const deps = assertion.dependentTables ?? [];
+			yield [
+				assertion.name,
+				assertion.violationSql,
+				assertion.deferrable ? 1 : 0,
+				assertion.initiallyDeferred ? 1 : 0,
+				jsonStringify(deps),
+			];
 		}
 	}
 );
@@ -307,7 +573,12 @@ export const functionInfoFunc = createIntegratedTableValuedFunction(
 			],
 			keys: [],
 			rowConstraints: []
-		}
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// Composite (name, num_args): function-key matches the (name, numArgs) registration key.
+			keys: [[{ index: 0 }, { index: 1 }]],
+		},
 	},
 	async function* (db: Database, filterName?: SqlValue): AsyncIterable<Row> {
 		const nameFilter = (typeof filterName === 'string') ? filterName.toLowerCase() : null;

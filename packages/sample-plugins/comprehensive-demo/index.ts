@@ -85,34 +85,41 @@ class KeyValueTable extends VirtualTable {
 	}
 }
 
-const stores = new Map<string, Map<string, string>>();
+const storesByDb = new WeakMap<Database, Map<string, Map<string, string>>>();
 
-function getOrCreateStore(schemaName: string, tableName: string): Map<string, string> {
+function getOrCreateStore(db: Database, schemaName: string, tableName: string): Map<string, string> {
+	let dbStores = storesByDb.get(db);
+	if (!dbStores) {
+		dbStores = new Map();
+		storesByDb.set(db, dbStores);
+	}
 	const key = `${schemaName}.${tableName}`.toLowerCase();
-	let store = stores.get(key);
+	let store = dbStores.get(key);
 	if (!store) {
 		store = new Map();
-		stores.set(key, store);
+		dbStores.set(key, store);
 	}
 	return store;
 }
 
 const keyValueModule: VirtualTableModule<KeyValueTable> = {
 	async create(db: Database, tableSchema: TableSchema): Promise<KeyValueTable> {
-		const store = getOrCreateStore(tableSchema.schemaName, tableSchema.name);
+		const store = getOrCreateStore(db, tableSchema.schemaName, tableSchema.name);
 		const table = new KeyValueTable(db, keyValueModule, tableSchema.schemaName, tableSchema.name, store);
 		table.tableSchema = tableSchema;
 		return table;
 	},
 
 	async connect(db: Database, _pAux: unknown, _moduleName: string, schemaName: string, tableName: string): Promise<KeyValueTable> {
-		const store = getOrCreateStore(schemaName, tableName);
+		const store = getOrCreateStore(db, schemaName, tableName);
 		return new KeyValueTable(db, keyValueModule, schemaName, tableName, store);
 	},
 
-	async destroy(_db: Database, _pAux: unknown, _moduleName: string, schemaName: string, tableName: string): Promise<void> {
-		const key = `${schemaName}.${tableName}`.toLowerCase();
-		stores.delete(key);
+	async destroy(db: Database, _pAux: unknown, _moduleName: string, schemaName: string, tableName: string): Promise<void> {
+		const dbStores = storesByDb.get(db);
+		if (dbStores) {
+			dbStores.delete(`${schemaName}.${tableName}`.toLowerCase());
+		}
 	}
 };
 

@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sync",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "Fully opaque CRDT sync for Quereus - write normal SQL, get automatic multi-master replication with conflict resolution",
   "keywords": [
@@ -50,9 +50,11 @@
     "@quereus/quereus": "workspace:^",
     "@quereus/store": "workspace:^"
   },
+  "dependencies": {
+    "@quereus/quereus": "workspace:^",
+    "@quereus/store": "workspace:^"
+  },
   "devDependencies": {
-    "@quereus/quereus": "*",
-    "@quereus/store": "*",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.0.9",
     "chai": "^6.2.2",

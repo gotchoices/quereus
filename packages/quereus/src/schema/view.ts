@@ -12,8 +12,14 @@ export interface ViewSchema {
 	schemaName: string;
 	/** The original SQL text used to create the view */
 	sql: string;
-	/** The parsed SELECT statement AST that defines the view's logic */
-	selectAst: AST.SelectStmt;
+	/**
+	 * The parsed body AST that defines the view's logic. Any relation-producing
+	 * QueryExpr (SELECT / VALUES). DML bodies (INSERT/UPDATE/DELETE with
+	 * RETURNING) are rejected at view-creation time because a view body
+	 * re-evaluates on every reference — replaying a write per read is incoherent
+	 * with view semantics.
+	 */
+	selectAst: AST.QueryExpr;
 	/** Columns explicitly defined in CREATE VIEW (e.g., CREATE VIEW v(a,b) AS...) */
 	columns?: ReadonlyArray<string>; // Optional list of explicitly named columns
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */

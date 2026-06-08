@@ -67,7 +67,7 @@ INSERT INTO test_constrained (id, positive_value, name) VALUES (201, 10, 'valid'
 
 -- Failed INSERT due to constraint - should not return anything
 INSERT INTO test_constrained (id, positive_value, name) VALUES (202, -5, 'invalid') RETURNING id, positive_value;
--- error: CHECK constraint failed: check_0
+-- error: CHECK constraint failed: _check_positive_value
 
 -- Failed INSERT due to NOT NULL - should not return anything
 INSERT INTO test_constrained (id, positive_value, name) VALUES (203, 15, NULL) RETURNING id, name;
@@ -83,7 +83,7 @@ UPDATE test_constrained SET positive_value = 20 WHERE id = 201 RETURNING id, pos
 
 -- Failed UPDATE due to constraint - should not return anything
 UPDATE test_constrained SET positive_value = -1 WHERE id = 201 RETURNING id, positive_value;
--- error: CHECK constraint failed: check_0
+-- error: CHECK constraint failed: _check_positive_value
 
 -- Verify failed update didn't change anything
 SELECT positive_value FROM test_constrained WHERE id = 201;
@@ -133,27 +133,27 @@ SELECT * FROM test_table;
 
 -- Test UPDATE RETURNING with OLD qualifier (should show original value)
 UPDATE test_table SET value = 'updated' WHERE id = 1 RETURNING OLD.value;
-→ [{"old.value":"original"}]
+→ [{"OLD.value":"original"}]
 
 -- Verify the update actually happened
 SELECT * FROM test_table;
 → [{"id":1,"value":"updated"}]
 
--- Test case normalization with various patterns
+-- RETURNING preserves the user's spelling for output column names
 INSERT INTO test_table VALUES (2, 'second');
 UPDATE test_table SET value = 'modified' WHERE id = 2 RETURNING NEW.value, OLD.value;
-→ [{"new.value":"modified","old.value":"second"}]
+→ [{"NEW.value":"modified","OLD.value":"second"}]
 
--- Test with aliases to ensure column names are normalized
+-- Aliases are emitted with the case as written
 UPDATE test_table SET value = 'final' WHERE id = 2 RETURNING NEW.value AS NewValue, OLD.value AS OldValue;
-→ [{"newvalue":"final","oldvalue":"modified"}]
+→ [{"NewValue":"final","OldValue":"modified"}]
 
--- Test INSERT with NEW qualifier and case normalization
+-- INSERT with NEW qualifier — qualifier case preserved
 INSERT INTO test_table VALUES (3, 'third') RETURNING NEW.id, NEW.value;
-→ [{"new.id":3,"new.value":"third"}]
+→ [{"NEW.id":3,"NEW.value":"third"}]
 
--- Test DELETE with OLD qualifier and case normalization
+-- DELETE with OLD qualifier — qualifier case preserved
 DELETE FROM test_table WHERE id = 3 RETURNING OLD.id, OLD.value;
-→ [{"old.id":3,"old.value":"third"}]
+→ [{"OLD.id":3,"OLD.value":"third"}]
 
 DROP TABLE test_table;

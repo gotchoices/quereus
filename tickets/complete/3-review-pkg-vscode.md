@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of quereus-vscode VS Code extension package
-dependencies: [3-review-core-api]
+prereq: [review-core-api]
 
 ---
 
@@ -46,12 +46,12 @@ No functional bugs in the tested surface. `snapshotSchema` correctly reflects sc
 
 ### Issues Noted (follow-up tasks created)
 
-#### DRY & Type Safety (`tasks/fix/3-vscode-dry-type-safety.md`)
+#### DRY & Type Safety (`tasks/fix/vscode-dry-type-safety.md`)
 - **SchemaSnapshot x3**: `SchemaSnapshot`/`SchemaSnapshotTable` identically defined in `schema-sync.ts`, `commands.ts`, and `schema-bridge.ts`
 - **Double cast**: `connection as unknown as any` in `server.ts:59` — masks type mismatch between `vscode-languageserver/node` and `vscode-languageserver` Connection types
 - **Hardcoded keywords**: `DEFAULT_KEYWORDS` array duplicates `KEYWORDS` export from `@quereus/quereus`
 
-#### Server Quality (`tasks/fix/3-vscode-server-quality.md`)
+#### Server Quality (`tasks/fix/vscode-server-quality.md`)
 - **O(n²) span lookup**: `isInsideComment`/`isInsideSpans` do linear scan per regex match
 - **Repeated split**: `pushMultiline` calls `doc.getText().split('\n')` per line
 - **Re-implemented utility**: custom `positionAt()` duplicates `TextDocument.positionAt()`
@@ -78,8 +78,8 @@ No functional bugs in the tested surface. `snapshotSchema` correctly reflects sc
 
 ## Follow-Up Tasks Created
 
-- `tasks/fix/3-vscode-dry-type-safety.md` — SchemaSnapshot DRY, double-cast, hardcoded keywords
-- `tasks/fix/3-vscode-server-quality.md` — Performance, error handling, testability, completions
+- `tasks/fix/vscode-dry-type-safety.md` — SchemaSnapshot DRY, double-cast, hardcoded keywords
+- `tasks/fix/vscode-server-quality.md` — Performance, error handling, testability, completions
 
 ## Files Modified
 

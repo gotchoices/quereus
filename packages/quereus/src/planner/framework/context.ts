@@ -7,8 +7,6 @@ import type { Optimizer } from '../optimizer.js';
 import type { StatsProvider } from '../stats/index.js';
 import type { OptimizerTuning } from '../optimizer-tuning.js';
 import { createLogger } from '../../common/logger.js';
-import { StatusCode } from '../../common/types.js';
-import { quereusError } from '../../common/errors.js';
 import { Database } from '../../core/database.js';
 import type { PlanNode } from '../nodes/plan-node.js';
 
@@ -30,9 +28,6 @@ export interface OptContext {
 
 	/** Current optimization phase */
 	readonly phase: 'rewrite' | 'impl';
-
-	/** Rule application depth (for detecting infinite recursion) */
-	readonly depth: number;
 
 	/** Additional context data that rules can use */
 	readonly context: Map<string, unknown>;
@@ -77,9 +72,8 @@ export class OptimizationContext implements OptContext {
 		public readonly tuning: OptimizerTuning,
 		public readonly phase: 'rewrite' | 'impl' = 'rewrite',
 		public readonly db: Database,
-		public readonly depth: number = 0,
 	) {
-		log('Created optimization context (phase: %s, depth: %d)', phase, depth);
+		log('Created optimization context (phase: %s)', phase);
 	}
 
 	/**
@@ -92,29 +86,6 @@ export class OptimizationContext implements OptContext {
 			this.tuning,
 			phase,
 			this.db,
-			this.depth,
-		);
-
-		// Copy visited tracking state
-		this.copyTrackingState(newContext);
-		return newContext;
-	}
-
-	/**
-	 * Create a new context with incremented depth
-	 */
-	withIncrementedDepth(): OptimizationContext {
-		if (this.depth >= this.tuning.maxOptimizationDepth) {
-			quereusError(`Maximum optimization depth exceeded: ${this.depth}`, StatusCode.ERROR);
-		}
-
-		const newContext = new OptimizationContext(
-			this.optimizer,
-			this.stats,
-			this.tuning,
-			this.phase,
-			this.db,
-			this.depth + 1,
 		);
 
 		// Copy visited tracking state
@@ -132,7 +103,6 @@ export class OptimizationContext implements OptContext {
 			this.tuning,
 			this.phase,
 			this.db,
-			this.depth,
 		);
 
 		// Copy existing context
@@ -234,6 +204,5 @@ export function isOptContext(obj: any): obj is OptContext {
 		'stats' in obj &&
 		'tuning' in obj &&
 		'phase' in obj &&
-		'depth' in obj &&
 		'context' in obj;
 }

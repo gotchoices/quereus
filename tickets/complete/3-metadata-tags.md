@@ -12,7 +12,7 @@ files:
   - packages/quereus/src/planner/nodes/create-view-node.ts
   - packages/quereus/src/planner/building/create-view.ts
   - packages/quereus/src/runtime/emit/create-view.ts
-  - packages/quereus/test/logic/50-metadata-tags.sqllogic
+  - packages/quereus/test/logic/metadata-tags.sqllogic
   - packages/quereus/test/emit-roundtrip.spec.ts
   - packages/quereus/test/schema-manager.spec.ts
   - docs/sql.md

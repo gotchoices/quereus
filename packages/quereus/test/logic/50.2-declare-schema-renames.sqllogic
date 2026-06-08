@@ -1,0 +1,283 @@
+-- Declarative schema: rename detection via quereus.id / quereus.previous_name hints
+
+-- ===================================
+-- 1. Table rename via quereus.previous_name
+-- ===================================
+
+create table client (client_id integer primary key, name text not null);
+insert into client values (1, 'Alice'), (2, 'Bob');
+
+declare schema main {
+	table customer {
+		client_id integer primary key,
+		name text not null
+	} with tags ("quereus.previous_name" = 'client')
+}
+
+-- run
+
+-- Diff should be a single RENAME, no drops or creates
+diff schema main;
+→ [{"ddl": "ALTER TABLE client RENAME TO customer"}]
+
+apply schema main;
+
+-- run
+
+-- Data preserved under the new name
+select count(*) as cnt from customer;
+→ [{"cnt": 2}]
+
+select * from customer order by client_id;
+→ [{"client_id": 1, "name": "Alice"}, {"client_id": 2, "name": "Bob"}]
+
+-- Round-trip: re-diffing should now be empty
+diff schema main;
+→ []
+
+drop table customer;
+
+-- ===================================
+-- 2. Table rename via quereus.id (id wins over previous_name)
+-- ===================================
+
+create table widget (id integer primary key, label text) with tags ("quereus.id" = 'tbl-thing');
+insert into widget values (1, 'A'), (2, 'B');
+
+-- Declare with same id but a previous_name pointing nowhere; id should still win.
+declare schema main {
+	table thing {
+		id integer primary key,
+		label text
+	} with tags (
+		"quereus.id" = 'tbl-thing',
+		"quereus.previous_name" = 'does_not_exist'
+	)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE widget RENAME TO thing"}]
+
+apply schema main;
+
+-- run
+
+select * from thing order by id;
+→ [{"id": 1, "label": "A"}, {"id": 2, "label": "B"}]
+
+drop table thing;
+
+-- ===================================
+-- 3. Column rename inside an otherwise-unchanged table
+-- ===================================
+
+create table employees (emp_id integer primary key, fullname text not null);
+insert into employees values (10, 'Carol'), (20, 'Dan');
+
+declare schema main {
+	table employees {
+		emp_id integer primary key,
+		full_name text not null with tags ("quereus.previous_name" = 'fullname')
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE employees RENAME COLUMN fullname TO full_name"}]
+
+apply schema main;
+
+-- run
+
+select * from employees order by emp_id;
+→ [{"emp_id": 10, "full_name": "Carol"}, {"emp_id": 20, "full_name": "Dan"}]
+
+diff schema main;
+→ []
+
+drop table employees;
+
+-- ===================================
+-- 4. Multi-step history: comma-separated previous_name list
+-- ===================================
+
+-- Start from a table named 'a'; declared previous_name is 'a, b'.
+create table a (id integer primary key, val text);
+insert into a values (1, 'one'), (2, 'two');
+
+declare schema main {
+	table c {
+		id integer primary key,
+		val text
+	} with tags ("quereus.previous_name" = 'a, b')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE a RENAME TO c"}]
+
+apply schema main;
+
+-- run
+
+select * from c order by id;
+→ [{"id": 1, "val": "one"}, {"id": 2, "val": "two"}]
+
+drop table c;
+
+-- Now do the same starting from 'b' — same declared schema should match either.
+create table b (id integer primary key, val text);
+insert into b values (3, 'three');
+
+declare schema main {
+	table c {
+		id integer primary key,
+		val text
+	} with tags ("quereus.previous_name" = 'a, b')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE b RENAME TO c"}]
+
+apply schema main;
+
+-- run
+
+select * from c order by id;
+→ [{"id": 3, "val": "three"}]
+
+drop table c;
+
+-- ===================================
+-- 5. Conflict: declared name and previous_name both resolve to existing actuals
+-- ===================================
+
+create table foo (id integer primary key, x text);
+create table bar (id integer primary key, x text);
+
+declare schema main {
+	table foo {
+		id integer primary key,
+		x text
+	} with tags ("quereus.previous_name" = 'bar')
+}
+
+-- run
+
+-- Both 'foo' and 'bar' exist in actual; the rename hint conflicts with the name match.
+diff schema main;
+-- error: Rename conflict for table 'foo'
+
+drop table foo;
+drop table bar;
+
+-- ===================================
+-- 6. rename_policy = 'require-hint' rejects unhinted name change
+-- ===================================
+
+create table old_table (id integer primary key, x text);
+
+declare schema main {
+	table new_table {
+		id integer primary key,
+		x text
+	}
+}
+
+-- run
+
+apply schema main options (rename_policy = 'require-hint');
+-- error: rename_policy = 'require-hint'
+
+drop table old_table;
+
+-- ===================================
+-- 7. rename_policy = 'deny' produces drop+create even with hints present
+-- ===================================
+
+create table src_table (id integer primary key, val text);
+insert into src_table values (1, 'keep');
+
+declare schema main {
+	table dst_table {
+		id integer primary key,
+		val text
+	} with tags ("quereus.previous_name" = 'src_table')
+}
+
+-- run
+
+-- Under deny, the hint is ignored. Drop + create wipes data.
+apply schema main options (rename_policy = 'deny');
+
+-- run
+
+-- src_table is gone, dst_table is fresh and empty.
+select count(*) as cnt from dst_table;
+→ [{"cnt": 0}]
+
+drop table dst_table;
+
+-- (Schema-hash stability with/without rename-hint tags is covered by the unit
+-- tests for stripTagsFromDeclaredSchema in test/schema/catalog.spec.ts. Tags
+-- are stripped before canonical DDL is generated, so this property is verified
+-- without depending on the test runner's ability to capture and compare
+-- explain-schema rows.)
+
+-- ===================================
+-- 8. Combined: table rename + column rename + new column add in one apply
+-- ===================================
+
+create table orig_t (a_id integer primary key, b text not null);
+insert into orig_t values (1, 'hello'), (2, 'world');
+
+-- A child table referencing orig_t to verify the FK survives the rename.
+create table child_t (
+	id integer primary key,
+	parent_a integer not null,
+	constraint fk_parent foreign key (parent_a) references orig_t (a_id)
+);
+insert into child_t values (10, 1), (20, 2);
+
+declare schema main {
+	table renamed_t {
+		a_id integer primary key,
+		b_renamed text not null with tags ("quereus.previous_name" = 'b'),
+		new_col text null default ''
+	} with tags ("quereus.previous_name" = 'orig_t')
+
+	table child_t {
+		id integer primary key,
+		parent_a integer not null,
+		constraint fk_parent foreign key (parent_a) references renamed_t (a_id)
+	}
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+-- Both parent's data and child's FK survive
+select count(*) as cnt from renamed_t;
+→ [{"cnt": 2}]
+
+select * from renamed_t order by a_id;
+→ [{"a_id": 1, "b_renamed": "hello", "new_col": ""}, {"a_id": 2, "b_renamed": "world", "new_col": ""}]
+
+select * from child_t order by id;
+→ [{"id": 10, "parent_a": 1}, {"id": 20, "parent_a": 2}]
+
+-- FK still enforced post-rename (Quereus surfaces FK violations as CHECK constraint failures by name)
+insert into child_t values (30, 999);
+-- error: fk_parent
+
+drop table child_t;
+drop table renamed_t;

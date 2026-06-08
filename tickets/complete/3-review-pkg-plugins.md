@@ -1,6 +1,6 @@
 ---
 description: Review of plugins package architecture - registration, contracts, and loader
-dependencies: 3-review-pkg-plugin-loader
+prereq: review-pkg-plugin-loader
 ---
 
 # Plugins Package Review Summary

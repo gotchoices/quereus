@@ -1,0 +1,111 @@
+-- query-expr-values.sqllogic — exercises the unified QueryExpr surface for
+-- VALUES bodies at every relation site. These cases parse + execute under
+-- the pure-VALUES portion of the orthogonality work; DML-as-relation cases
+-- are gated until the follow-up dml-in-expression-position ticket lifts them.
+
+-- ===================================
+-- 1. VALUES as a CTE body (was a parser TODO; now first-class)
+-- ===================================
+
+with t(a, b) as (values (1, 'x'), (2, 'y'))
+select a, b from t order by a;
+→ [{"a":1,"b":"x"},{"a":2,"b":"y"}]
+
+-- ===================================
+-- 2. VALUES as a compound-set leg (UNION ALL with another VALUES)
+-- ===================================
+
+values (1) union all values (2);
+→ [{"column_0":1},{"column_0":2}]
+
+-- ===================================
+-- 3. Mixed compound: SELECT against a subquery VALUES, then UNION ALL with VALUES
+-- ===================================
+-- Output column names follow the union output naming convention used by the
+-- planner today; what we're pinning here is that the rows survive
+-- end-to-end through the unified compound-leg parser.
+
+select * from (values (1, 'x'), (2, 'y')) as t(a, b)
+union all
+values (3, 'z');
+→ [{"column_0":1,"column_1":"x"},{"column_0":2,"column_1":"y"},{"column_0":3,"column_1":"z"}]
+
+-- ===================================
+-- 4. VALUES as a CREATE VIEW body — names synthesized from the body
+-- ===================================
+
+create view v_unnamed as values (1, 'a'), (2, 'b');
+select * from v_unnamed order by column_0;
+→ [{"column_0":1,"column_1":"a"},{"column_0":2,"column_1":"b"}]
+drop view v_unnamed;
+
+-- ===================================
+-- 5. VALUES as a CREATE VIEW body — binding-site column names win
+-- ===================================
+
+create view v_named(a, b) as values (1, 'x'), (2, 'y');
+select * from v_named order by a;
+→ [{"a":1,"b":"x"},{"a":2,"b":"y"}]
+drop view v_named;
+
+-- ===================================
+-- 6. VALUES inside IN (already worked via Project(Values…); pinned here)
+-- ===================================
+
+select 2 in (values (1), (2), (3)) as found;
+→ [{"found":true}]
+
+-- ===================================
+-- 7. VALUES inside EXISTS
+-- ===================================
+
+select exists (values (1)) as ex;
+→ [{"ex":true}]
+
+-- ===================================
+-- 8. Scalar / row subquery with VALUES body
+-- ===================================
+
+select (values (42)) as v;
+→ [{"v":42}]
+
+-- ===================================
+-- 9. Three-leg compound chain of bare VALUES
+-- ===================================
+-- The right leg of a compound recurses through the VALUES wrapper so chains
+-- longer than two legs work, not just `VALUES … UNION VALUES …`.
+
+values (1) union all values (2) union all values (3);
+→ [{"column_0":1},{"column_0":2},{"column_0":3}]
+
+-- ===================================
+-- 10. Bare VALUES + ORDER BY at top level (no compound)
+-- ===================================
+-- The wrapper synthesizes whenever ORDER BY / LIMIT / OFFSET follow VALUES,
+-- not just on compound. Result column names come from the inner VALUES
+-- (synthetic `column_0`).
+
+values (3), (1), (2) order by column_0;
+→ [{"column_0":1},{"column_0":2},{"column_0":3}]
+
+-- ===================================
+-- 11. Bare VALUES + LIMIT/OFFSET at top level
+-- ===================================
+
+values (1), (2), (3), (4) limit 2 offset 1;
+→ [{"column_0":2},{"column_0":3}]
+
+-- ===================================
+-- 12. Bare VALUES + ORDER BY/LIMIT inside a parenthesized subquery source
+-- ===================================
+
+select * from (values (3), (1), (2) order by column_0 limit 2) as v;
+→ [{"column_0":1},{"column_0":2}]
+
+-- ===================================
+-- 13. Bare VALUES + ORDER BY in a CTE body
+-- ===================================
+
+with c(a) as (values (3), (1), (2) order by column_0)
+select a from c;
+→ [{"a":1},{"a":2},{"a":3}]

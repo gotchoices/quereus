@@ -9,13 +9,14 @@ import { FilterNode } from '../nodes/filter.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { RegisteredScope } from '../scopes/registered.js';
+import { AliasedScope } from '../scopes/aliased.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag } from '../../schema/table.js';
 import { ReturningNode } from '../nodes/returning-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
-import { buildConstraintChecks } from './constraint-builder.js';
+import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
@@ -67,14 +68,18 @@ export function buildUpdateStmt(
   // Plan the source of rows to update. This is typically the table itself, potentially filtered.
   let sourceNode: RelationalPlanNode = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
 
-  // Create a new scope with the table columns registered for column resolution
-  const tableScope = new RegisteredScope(ctx.scope);
+  // Create a new scope with the table columns registered for column resolution.
+  // Wrap with AliasedScope so correlated subqueries inside SET / WHERE / RETURNING
+  // can reference the outer DML target via qualified `table.column` form.
+  const tableColumnScope = new RegisteredScope(ctx.scope);
   const sourceAttributes = sourceNode.getAttributes();
   sourceNode.getType().columns.forEach((c, i) => {
     const attr = sourceAttributes[i];
-    tableScope.registerSymbol(c.name.toLowerCase(), (exp, s) =>
+    tableColumnScope.registerSymbol(c.name.toLowerCase(), (exp, s) =>
       new ColumnReferenceNode(s, exp as AST.ColumnExpr, c.type, attr.id, i));
   });
+  const tableName = tableReference.tableSchema.name.toLowerCase();
+  const tableScope = new AliasedScope(tableColumnScope, tableName, tableName);
 
   // Create a new planning context with the updated scope for WHERE clause resolution
   const updateCtx = { ...contextWithSchemaPath, scope: tableScope };
@@ -98,15 +103,20 @@ export function buildUpdateStmt(
     };
   });
 
-  // Add implicit assignments for generated STORED columns (recompute after user assignments)
-  for (const col of tableReference.tableSchema.columns) {
-    if (col.generated && col.generatedExpr) {
-      // Build generated expression in the table scope so it can reference columns
-      const genNode = buildExpression(updateCtx, col.generatedExpr) as ScalarPlanNode;
+  // Add implicit assignments for generated columns in topological order so
+  // that a generated column referencing another generated column sees the
+  // freshly-computed value when the runtime evaluates each in turn against
+  // the in-place updated row.
+  const genTopoOrder = tableReference.tableSchema.generatedColumnTopoOrder ?? [];
+  for (const colIdx of genTopoOrder) {
+    const col = tableReference.tableSchema.columns[colIdx];
+    if (!col.generated || !col.generatedExpr) continue;
+    const genNode = buildExpression(updateCtx, col.generatedExpr) as ScalarPlanNode;
+    if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
       validateDeterministicGenerated(genNode, col.name, tableReference.tableSchema.name);
-      const targetColumn: AST.ColumnExpr = { type: 'column', name: col.name, table: stmt.table.name, schema: stmt.table.schema };
-      assignments.push({ targetColumn, value: genNode, isGenerated: true });
     }
+    const targetColumn: AST.ColumnExpr = { type: 'column', name: col.name, table: stmt.table.name, schema: stmt.table.schema };
+    assignments.push({ targetColumn, value: genNode, isGenerated: true });
   }
 
   // Now build the WHERE filter (parameters here get indices after SET clause parameters)
@@ -143,7 +153,7 @@ export function buildUpdateStmt(
   const { oldRowDescriptor, newRowDescriptor, flatRowDescriptor } = buildOldNewRowDescriptors(oldAttributes, newAttributes);
 
   // Build context descriptor if we have context attributes
-  const contextDescriptor: RowDescriptor = contextAttributes.length > 0 ? [] : undefined as any;
+  const contextDescriptor: RowDescriptor | undefined = contextAttributes.length > 0 ? [] : undefined;
   if (contextDescriptor) {
     contextAttributes.forEach((attr, index) => {
       contextDescriptor[attr.id] = index;
@@ -175,6 +185,11 @@ export function buildUpdateStmt(
     );
     constraintChecks.push(...childFKChecks, ...parentFKChecks);
   }
+
+  // Pre-build DEFAULT evaluators for NOT NULL columns (used by REPLACE substitution).
+  const notNullDefaults = buildNotNullDefaults(
+    updateCtx, tableReference.tableSchema, newAttributes, contextAttributes
+  );
 
   if (stmt.returning && stmt.returning.length > 0) {
     // For RETURNING, create coordinated attribute IDs like we do for INSERT
@@ -260,15 +275,14 @@ export function buildUpdateStmt(
       // TODO: Support RETURNING *
       if (rc.type === 'all') throw new QuereusError('RETURNING * not yet supported', StatusCode.UNSUPPORTED);
 
-      // Infer alias from column name if not explicitly provided
+      // Infer alias from column name if not explicitly provided.
+      // Preserve the spelling the user wrote so quoted identifiers like
+      // [Name] / "Name" round-trip to the result column name unchanged.
       let alias = rc.alias;
       if (!alias && rc.expr.type === 'column') {
-        // For qualified column references like NEW.id or OLD.id, normalize to lowercase
-        if (rc.expr.table) {
-          alias = `${rc.expr.table.toLowerCase()}.${rc.expr.name.toLowerCase()}`;
-        } else {
-          alias = rc.expr.name.toLowerCase();
-        }
+        alias = rc.expr.table
+          ? `${rc.expr.table}.${rc.expr.name}`
+          : rc.expr.name;
       }
 
       const columnIndex = tableReference.tableSchema.columns.findIndex(col => col.name.toLowerCase() === (rc.expr.type === 'column' ? rc.expr.name.toLowerCase() : ''));
@@ -287,7 +301,6 @@ export function buildUpdateStmt(
       tableReference,
       assignments,
       sourceNode,
-      stmt.onConflict,
       oldRowDescriptor,
       newRowDescriptor,
       flatRowDescriptor,
@@ -309,7 +322,9 @@ export function buildUpdateStmt(
       constraintChecks,
       mutationContextValues.size > 0 ? mutationContextValues : undefined,
       contextAttributes.length > 0 ? contextAttributes : undefined,
-      contextDescriptor
+      contextDescriptor,
+      undefined, // onConflict — UPDATE has no statement-level OR clause; per-constraint defaults apply
+      notNullDefaults.length > 0 ? notNullDefaults : undefined
     );
 
     const updateExecutorNode = new DmlExecutorNode(
@@ -317,7 +332,7 @@ export function buildUpdateStmt(
       constraintCheckNode,
       tableReference,
       'update',
-      undefined, // onConflict not used for UPDATE
+      undefined, // onConflict — UPDATE has no statement-level OR clause
       mutationContextValues.size > 0 ? mutationContextValues : undefined,
       contextAttributes.length > 0 ? contextAttributes : undefined,
       contextDescriptor
@@ -334,7 +349,6 @@ export function buildUpdateStmt(
     tableReference,
     assignments,
     sourceNode,
-    stmt.onConflict,
     oldRowDescriptor,
     newRowDescriptor,
     flatRowDescriptor,
@@ -355,7 +369,9 @@ export function buildUpdateStmt(
     constraintChecks,
     mutationContextValues.size > 0 ? mutationContextValues : undefined,
     contextAttributes.length > 0 ? contextAttributes : undefined,
-    contextDescriptor
+    contextDescriptor,
+    undefined, // onConflict — UPDATE has no statement-level OR clause; per-constraint defaults apply
+    notNullDefaults.length > 0 ? notNullDefaults : undefined
   );
 
   const updateExecutorNode = new DmlExecutorNode(
@@ -363,7 +379,7 @@ export function buildUpdateStmt(
     constraintCheckNode,
     tableReference,
     'update',
-    undefined, // onConflict not used for UPDATE
+    undefined, // onConflict — UPDATE has no statement-level OR clause
     mutationContextValues.size > 0 ? mutationContextValues : undefined,
     contextAttributes.length > 0 ? contextAttributes : undefined,
     contextDescriptor

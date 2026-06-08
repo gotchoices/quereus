@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review plan for schema management subsystem
-dependencies: none
+prereq: none
 
 ---
 

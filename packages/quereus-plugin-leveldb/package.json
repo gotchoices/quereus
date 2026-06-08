@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-leveldb",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "LevelDB storage plugin for Quereus - Node.js persistent storage",
   "keywords": [
@@ -88,12 +88,12 @@
     "test": "cd ../.. && node --import ./packages/quereus-plugin-leveldb/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-plugin-leveldb/test/**/*.spec.ts\" --reporter min --colors"
   },
   "dependencies": {
+    "@quereus/quereus": "workspace:^",
+    "@quereus/store": "workspace:^",
     "classic-level": "^3.0.0"
   },
   "devDependencies": {
     "@quereus/isolation": "*",
-    "@quereus/quereus": "*",
-    "@quereus/store": "*",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.0.9",
     "chai": "^6.2.2",

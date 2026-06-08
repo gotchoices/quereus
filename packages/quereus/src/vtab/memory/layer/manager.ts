@@ -9,18 +9,19 @@ import { MemoryTableConnection } from './connection.js';
 import { Latches } from '../../../util/latches.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
-import type { ColumnDef as ASTColumnDef, LiteralExpr } from '../../../parser/ast.js';
+import type { ColumnDef as ASTColumnDef } from '../../../parser/ast.js';
 import { compareSqlValues } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
 import { scanLayer as scanLayerImpl } from './scan-layer.js';
 import { createPrimaryKeyFunctions, buildPrimaryKeyFromValues, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
-import { getSyncLiteral } from '../../../parser/utils.js';
+import { tryFoldLiteral } from '../../../parser/utils.js';
 import { validateAndParse } from '../../../types/validation.js';
 import type { VTableEventEmitter } from '../../events.js';
 import { inferType } from '../../../types/registry.js';
 import type { Expression } from '../../../parser/ast.js';
+import { compilePredicate } from '../utils/predicate.js';
 
 let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
@@ -96,6 +97,7 @@ export class MemoryTableManager {
 				newIndexes.push({
 					name: indexName,
 					columns: uc.columns.map(colIdx => ({ index: colIdx })),
+					predicate: uc.predicate,
 				});
 				added = true;
 			}
@@ -231,11 +233,68 @@ export class MemoryTableManager {
 			connection.clearSavepoints();
 			return;
 		}
-		const pendingLayer = connection.pendingTransactionLayer;
-		if (!pendingLayer) return;
 
-		// Capture changes before marking committed
-		const changes = pendingLayer.getPendingChanges();
+		// If pending is null but readLayer is a swapped savepoint snapshot
+		// AHEAD of the committed chain, wrap an empty pending around it so
+		// the snapshot's data lands in the committed chain. "Ahead" means
+		// readLayer's parent chain leads back to `_currentCommittedLayer`
+		// (i.e., the snapshot was forked off the current committed head).
+		// If readLayer is instead a stale ancestor (e.g., the connection was
+		// last seeing a TransactionLayer that has since been consolidated into
+		// `baseLayer` by ALTER TABLE) or carries an out-of-date schema, leave
+		// it alone — committing such a layer would supplant the schema-aware
+		// committed head with stale data.
+		if (!connection.pendingTransactionLayer
+			&& connection.readLayer !== this._currentCommittedLayer
+			&& connection.readLayer instanceof TransactionLayer
+			&& connection.readLayer.getSchema() === this.tableSchema) {
+			let walker: Layer | null = connection.readLayer.getParent();
+			let isAhead = false;
+			while (walker) {
+				if (walker === this._currentCommittedLayer) {
+					isAhead = true;
+					break;
+				}
+				walker = walker.getParent();
+			}
+			if (isAhead) {
+				connection.pendingTransactionLayer = new TransactionLayer(connection.readLayer);
+				if (this.eventEmitter?.hasDataListeners?.()) {
+					connection.pendingTransactionLayer.enableChangeTracking();
+				}
+			}
+		}
+
+		const pendingLayer = connection.pendingTransactionLayer;
+		if (!pendingLayer) {
+			// No pending — refresh readLayer to the current committed head so a
+			// stale ancestor (post-schema-change) doesn't leak into the next
+			// statement's view.
+			connection.readLayer = this._currentCommittedLayer;
+			return;
+		}
+
+		// Capture changes from pendingLayer and any ancestor TransactionLayers
+		// up to (but not including) the currentCommittedLayer. Ancestor layers
+		// in the chain are typically savepoint-promoted in-transaction layers
+		// whose pendingChanges were never emitted (they were never directly
+		// committed). Walking the chain ensures events from earlier writes
+		// in the same transaction aren't dropped just because a SAVEPOINT
+		// promotion swapped the pending layer mid-transaction.
+		const eventChunks: ReturnType<TransactionLayer['getPendingChanges']>[] = [];
+		{
+			let layer: Layer | null = pendingLayer;
+			while (layer && layer !== this._currentCommittedLayer) {
+				if (layer instanceof TransactionLayer) {
+					const events = layer.getPendingChanges();
+					if (events.length > 0) eventChunks.push(events);
+				}
+				layer = layer.getParent();
+			}
+		}
+		// Chunks are newest-layer-first; reverse to chronological order while
+		// preserving intra-layer event order.
+		const changes = eventChunks.reverse().flat();
 
 		const lockKey = `MemoryTable.Commit:${this.schemaName}.${this._tableName}`;
 		const release = await Latches.acquire(lockKey);
@@ -472,7 +531,7 @@ export class MemoryTableManager {
 		operation: 'insert' | 'update' | 'delete',
 		values: Row | undefined,
 		oldKeyValues?: Row,
-		onConflict: ConflictResolution = ConflictResolution.ABORT
+		onConflict?: ConflictResolution
 	): Promise<UpdateResult> {
 		this.validateMutationPermissions(operation);
 
@@ -516,8 +575,15 @@ export class MemoryTableManager {
 
 	private ensureTransactionLayer(connection: MemoryTableConnection): void {
 		if (!connection.pendingTransactionLayer) {
-			// Lazily create a new TransactionLayer based on the current committed layer
-			connection.pendingTransactionLayer = new TransactionLayer(this._currentCommittedLayer);
+			// Lazily create a new TransactionLayer parented on the connection's
+			// current readLayer (not the manager's _currentCommittedLayer).
+			// In the clean autocommit case the two are identical. After an
+			// eager-snapshot savepoint, readLayer is the immutable snapshot
+			// containing all in-transaction writes up to that point, so the
+			// new pending inherits those rows and reads-your-own-writes still
+			// works, while SELECTs iterating the snapshot don't see the new
+			// pending's mutations.
+			connection.pendingTransactionLayer = new TransactionLayer(connection.readLayer);
 
 			// Enable change tracking if there are data listeners
 			if (this.eventEmitter?.hasDataListeners?.()) {
@@ -532,7 +598,7 @@ export class MemoryTableManager {
 	private async performInsert(
 		targetLayer: TransactionLayer,
 		values: Row | undefined,
-		onConflict: ConflictResolution
+		onConflict: ConflictResolution | undefined
 	): Promise<UpdateResult> {
 		if (!values) {
 			throw new QuereusError("INSERT requires values.", StatusCode.MISUSE);
@@ -556,10 +622,12 @@ export class MemoryTableManager {
 		const existingRow = this.lookupEffectiveRow(primaryKey, targetLayer);
 
 		if (existingRow !== null) {
-			if (onConflict === ConflictResolution.IGNORE) {
+			// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
+			const pkAction = onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
+			if (pkAction === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
 			}
-			if (onConflict === ConflictResolution.REPLACE) {
+			if (pkAction === ConflictResolution.REPLACE) {
 				targetLayer.recordUpsert(primaryKey, newRowData, existingRow);
 				return { status: 'ok', row: newRowData, replacedRow: existingRow };
 			}
@@ -583,7 +651,7 @@ export class MemoryTableManager {
 		targetLayer: TransactionLayer,
 		values: Row | undefined,
 		oldKeyValues: Row | undefined,
-		onConflict: ConflictResolution
+		onConflict: ConflictResolution | undefined
 	): Promise<UpdateResult> {
 		if (!values || !oldKeyValues) {
 			throw new QuereusError("UPDATE requires new values and old key values.", StatusCode.MISUSE);
@@ -639,13 +707,21 @@ export class MemoryTableManager {
 		newPrimaryKey: BTreeKeyForPrimary,
 		oldRowData: Row,
 		newRowData: Row,
-		onConflict: ConflictResolution
+		onConflict: ConflictResolution | undefined
 	): UpdateResult {
 		const existingRowAtNewKey = this.lookupEffectiveRow(newPrimaryKey, targetLayer);
 
 		if (existingRowAtNewKey !== null) {
-			if (onConflict === ConflictResolution.IGNORE) {
+			const pkAction = onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
+			if (pkAction === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
+			}
+			if (pkAction === ConflictResolution.REPLACE) {
+				// Evict the row currently at the new PK, then move the updated row.
+				targetLayer.recordDelete(newPrimaryKey, existingRowAtNewKey);
+				targetLayer.recordDelete(oldPrimaryKey, oldRowData);
+				targetLayer.recordUpsert(newPrimaryKey, newRowData, null);
+				return { status: 'ok', row: newRowData, replacedRow: existingRowAtNewKey };
 			}
 			// Return constraint violation with existing row
 			return {
@@ -690,12 +766,25 @@ export class MemoryTableManager {
 		return { status: 'ok', row: oldRowData };
 	}
 
-	/** Returns true if any column covered by a UNIQUE constraint changed between old and new rows. */
+	/**
+	 * Returns true if any column covered by a UNIQUE constraint changed between
+	 * old and new rows, or if any column referenced by a partial-UNIQUE predicate
+	 * changed (which may transition the row into or out of the predicate's scope).
+	 */
 	private uniqueColumnsChanged(schema: TableSchema, oldRow: Row, newRow: Row): boolean {
 		if (!schema.uniqueConstraints) return false;
 		for (const uc of schema.uniqueConstraints) {
 			for (const colIdx of uc.columns) {
 				if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
+			}
+			if (uc.predicate) {
+				const idx = this.findIndexForConstraint(this._currentCommittedLayer, uc);
+				const referenced = idx?.predicate?.referencedColumns;
+				if (referenced) {
+					for (const colIdx of referenced) {
+						if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
+					}
+				}
 			}
 		}
 		return false;
@@ -711,7 +800,7 @@ export class MemoryTableManager {
 		schema: TableSchema,
 		newRowData: Row,
 		newPrimaryKey: BTreeKeyForPrimary,
-		onConflict: ConflictResolution
+		onConflict: ConflictResolution | undefined
 	): UpdateResult | null {
 		if (!schema.uniqueConstraints) return null;
 
@@ -731,19 +820,29 @@ export class MemoryTableManager {
 		uc: UniqueConstraintSchema,
 		newRowData: Row,
 		newPrimaryKey: BTreeKeyForPrimary,
-		onConflict: ConflictResolution
+		onConflict: ConflictResolution | undefined
 	): UpdateResult | null {
 		// SQL semantics: UNIQUE allows multiple NULLs — skip if any constrained column is NULL
 		if (uc.columns.some(colIdx => newRowData[colIdx] === null)) return null;
 
 		// Find the matching secondary index for this constraint
 		const index = this.findIndexForConstraint(targetLayer, uc);
+
+		// Partial UNIQUE: a row whose predicate is not unambiguously TRUE is
+		// outside the index's scope and contributes nothing to uniqueness.
+		if (index?.predicate && !index.rowMatchesPredicate(newRowData)) {
+			return null;
+		}
+
+		// Resolve effective action: statement OR > constraint default > ABORT.
+		const effective = onConflict ?? uc.defaultConflict ?? ConflictResolution.ABORT;
+
 		if (index) {
-			return this.checkUniqueViaIndex(targetLayer, schema, uc, index, newRowData, newPrimaryKey, onConflict);
+			return this.checkUniqueViaIndex(targetLayer, schema, uc, index, newRowData, newPrimaryKey, effective);
 		}
 
 		// Fallback: scan primary tree
-		return this.checkUniqueByScanning(targetLayer, schema, uc, newRowData, newPrimaryKey, onConflict);
+		return this.checkUniqueByScanning(targetLayer, schema, uc, newRowData, newPrimaryKey, effective);
 	}
 
 	private findIndexForConstraint(
@@ -812,10 +911,18 @@ export class MemoryTableManager {
 		const primaryTree = targetLayer.getModificationTree('primary');
 		if (!primaryTree) return null;
 
+		// Compile partial-UNIQUE predicate ad-hoc (cold path: an auto-index normally
+		// services this check, so this branch fires only for pathological schemas).
+		const predicate = uc.predicate
+			? compilePredicate(uc.predicate, schema.columns)
+			: undefined;
+
 		for (const path of primaryTree.ascending(primaryTree.first())) {
 			const existingRow = primaryTree.at(path)!;
 			const existingPK = this.primaryKeyFromRow(existingRow);
 			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
+
+			if (predicate && predicate.evaluate(existingRow) !== true) continue;
 
 			const allMatch = uc.columns.every(
 				colIdx => compareSqlValues(newRowData[colIdx], existingRow[colIdx]) === 0
@@ -900,10 +1007,13 @@ export class MemoryTableManager {
 				throw new QuereusError(`Duplicate column name: ${newColumnSchema.name}`, StatusCode.ERROR);
 			}
 			let defaultValue: SqlValue = null;
+			let defaultIsLiteral = false;
 			const defaultConstraint = columnDefAst.constraints.find(c => c.type === 'default');
 			if (defaultConstraint && defaultConstraint.expr) {
-				if (defaultConstraint.expr.type === 'literal') {
-					defaultValue = getSyncLiteral(defaultConstraint.expr as LiteralExpr);
+				const folded = tryFoldLiteral(defaultConstraint.expr);
+				if (folded !== undefined) {
+					defaultValue = folded;
+					defaultIsLiteral = true;
 				} else {
 					logger.warn('Add Column', this._tableName, 'Default for new col is expr; existing rows get NULL.', { columnName: newColumnSchema.name });
 				}
@@ -911,7 +1021,7 @@ export class MemoryTableManager {
 			// Check for NOT NULL constraint (could be explicit or from default behavior)
 			// Allow NOT NULL without DEFAULT if table is empty (SQLite-compatible)
 			const tableHasRows = this.baseLayer.primaryTree.at(this.baseLayer.primaryTree.first()) !== undefined;
-			if (newColumnSchema.notNull && defaultValue === null && !(defaultConstraint?.expr?.type ==='literal') && tableHasRows) {
+			if (newColumnSchema.notNull && defaultValue === null && !defaultIsLiteral && tableHasRows) {
 				throw new QuereusError(
 					`Cannot add NOT NULL column '${newColumnSchema.name}' to non-empty table `
 						+ `'${this.schemaName}.${this._tableName}' without a DEFAULT value`,
@@ -939,7 +1049,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Add Column', this._tableName, { columnName: newColumnSchema.name });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1001,7 +1111,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Drop Column', this._tableName, { columnName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1065,7 +1175,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Rename Column', this._tableName, { oldName, newName: newColumnName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1107,8 +1217,8 @@ export class MemoryTableManager {
 					// Tightening: scan for NULLs. If DEFAULT present, backfill first.
 					const defaultExpr = oldCol.defaultValue;
 					let defaultLiteral: SqlValue | undefined;
-					if (defaultExpr && defaultExpr.type === 'literal') {
-						defaultLiteral = getSyncLiteral(defaultExpr as LiteralExpr);
+					if (defaultExpr) {
+						defaultLiteral = tryFoldLiteral(defaultExpr);
 					}
 
 					const tree = this.baseLayer.primaryTree;
@@ -1202,7 +1312,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -1236,9 +1346,24 @@ export class MemoryTableManager {
 				}
 			}
 
+			const updatedIndexes = Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry]);
+			let updatedUniqueConstraints = this.tableSchema.uniqueConstraints;
+			if (newIndexSchemaEntry.unique) {
+				const newConstraint: UniqueConstraintSchema = {
+					name: newIndexSchemaEntry.name,
+					columns: Object.freeze(newIndexSchemaEntry.columns.map(c => c.index)),
+					predicate: newIndexSchemaEntry.predicate,
+					derivedFromIndex: newIndexSchemaEntry.name,
+				};
+				updatedUniqueConstraints = Object.freeze([
+					...(this.tableSchema.uniqueConstraints ?? []),
+					newConstraint
+				]);
+			}
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
-				indexes: Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry])
+				indexes: updatedIndexes,
+				uniqueConstraints: updatedUniqueConstraints,
 			});
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
@@ -1255,7 +1380,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Create Index', this._tableName, { indexName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			logger.error('Create Index', this._tableName, e);
@@ -1281,9 +1406,18 @@ export class MemoryTableManager {
 				}
 				throw new QuereusError(`Index '${indexName}' not on table '${this._tableName}'.`, StatusCode.ERROR);
 			}
+			// Strip any UNIQUE constraint synthesized from this index alongside
+			// the index itself (mirrors SchemaManager.dropIndex). Without this,
+			// checkUniqueConstraints would keep enforcing it after DROP INDEX.
+			const remainingUniqueConstraints = (this.tableSchema.uniqueConstraints ?? []).filter(
+				uc => uc.derivedFromIndex?.toLowerCase() !== indexNameLower
+			);
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
-				indexes: Object.freeze((this.tableSchema.indexes || []).filter(idx => idx.name.toLowerCase() !== indexNameLower))
+				indexes: Object.freeze((this.tableSchema.indexes || []).filter(idx => idx.name.toLowerCase() !== indexNameLower)),
+				uniqueConstraints: remainingUniqueConstraints.length > 0
+					? Object.freeze(remainingUniqueConstraints)
+					: undefined,
 			});
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			await this.baseLayer.dropIndexFromBase(indexName);
@@ -1298,7 +1432,7 @@ export class MemoryTableManager {
 			});
 
 			logger.operation('Drop Index', this._tableName, { indexName });
-		} catch (e: any) {
+		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			logger.error('Drop Index', this._tableName, e);
@@ -1428,4 +1562,20 @@ export class MemoryTableManager {
 	public async* scanLayer(layer: Layer, plan: ScanPlan): AsyncIterable<Row> {
 		yield* scanLayerImpl(layer, plan);
 	}
+}
+
+/**
+ * Resolves the per-constraint default conflict action for PK conflicts.
+ * Prefers the table-level `PRIMARY KEY (...) ON CONFLICT <action>` clause
+ * (the constraint's own declaration) over any column-level `defaultConflict`
+ * declared on a PK column (which primarily targets that column's own
+ * constraints and only acts as a fallback for PK conflicts).
+ */
+function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | undefined {
+	if (schema.primaryKeyDefaultConflict !== undefined) return schema.primaryKeyDefaultConflict;
+	for (const def of schema.primaryKeyDefinition) {
+		const col = schema.columns[def.index];
+		if (col && col.defaultConflict !== undefined) return col.defaultConflict;
+	}
+	return undefined;
 }

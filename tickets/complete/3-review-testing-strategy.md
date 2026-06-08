@@ -1,6 +1,6 @@
 ---
 description: Completed review of testing strategy and test coverage across the Quereus project
-dependencies: none
+prereq: none
 
 ---
 

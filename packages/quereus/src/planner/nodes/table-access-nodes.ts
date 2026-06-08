@@ -4,7 +4,7 @@
  */
 
 import { PlanNodeType } from './plan-node-type.js';
-import { PlanNode, type UnaryRelationalNode, type PhysicalProperties, type Attribute } from './plan-node.js';
+import { PlanNode, type UnaryRelationalNode, type PhysicalProperties, type Attribute, type MonotonicOnInfo } from './plan-node.js';
 import { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
@@ -12,6 +12,52 @@ import { Cached } from '../../util/cached.js';
 import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import { TableAccessCapable } from '../framework/characteristics.js';
+import { addFd, singletonFd } from '../util/fd-utils.js';
+
+/**
+ * Advertisement lifted from a `BestAccessPlanResult` onto a physical leaf node:
+ * the monotonicOn property keyed by table-relative column index (translated to
+ * attrId at lift time), plus access-path capability flags.
+ */
+export interface AccessPathAdvertisement {
+	/** Monotonic ordering provided by the underlying storage. */
+	monotonicOn?: { columnIndex: number; direction: 'asc' | 'desc'; strict: boolean };
+	/** Whether the path supports O(log N) seek to the kth monotonic row. */
+	supportsOrdinalSeek?: boolean;
+	/** Whether the path can serve as the right side of a streaming asof join. */
+	supportsAsofRight?: boolean;
+}
+
+/**
+ * Lift an `AccessPathAdvertisement` onto `PhysicalProperties` overrides.
+ * Translates `monotonicOn.columnIndex` to an attrId via the table reference's
+ * attributes and emits a single-element `monotonicOn` array on the result.
+ */
+function liftAdvertisement(
+	source: TableReferenceNode,
+	advertisement: AccessPathAdvertisement | undefined,
+): { monotonicOn?: readonly MonotonicOnInfo[]; accessCapabilities?: PhysicalProperties['accessCapabilities'] } {
+	if (!advertisement) return {};
+	const out: { monotonicOn?: readonly MonotonicOnInfo[]; accessCapabilities?: PhysicalProperties['accessCapabilities'] } = {};
+	if (advertisement.monotonicOn) {
+		const attrs = source.getAttributes();
+		const colIdx = advertisement.monotonicOn.columnIndex;
+		if (colIdx >= 0 && colIdx < attrs.length) {
+			out.monotonicOn = [{
+				attrId: attrs[colIdx].id,
+				direction: advertisement.monotonicOn.direction,
+				strict: advertisement.monotonicOn.strict,
+			}];
+		}
+	}
+	if (advertisement.supportsOrdinalSeek || advertisement.supportsAsofRight) {
+		const caps: { ordinalSeek?: boolean; asofRight?: boolean } = {};
+		if (advertisement.supportsOrdinalSeek) caps.ordinalSeek = true;
+		if (advertisement.supportsAsofRight) caps.asofRight = true;
+		out.accessCapabilities = caps;
+	}
+	return out;
+}
 
 /**
  * Base class for physical table access operations
@@ -99,17 +145,36 @@ export abstract class TableAccessNode extends PlanNode implements UnaryRelationa
 export class SeqScanNode extends TableAccessNode {
 	override readonly nodeType = PlanNodeType.SeqScan;
 
+	constructor(
+		scope: Scope,
+		source: TableReferenceNode,
+		filterInfo: FilterInfo,
+		estimatedCostOverride?: number,
+		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
+		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
+		public readonly suppressMonotonic: boolean = false,
+	) {
+		super(scope, source, filterInfo, estimatedCostOverride);
+	}
+
 	getAccessMethod(): 'sequential' {
 		return 'sequential';
 	}
 
-	computePhysical(): Partial<PhysicalProperties> {
-		return {
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const sourcePhysical = childrenPhysical[0];
+		// Keys come through from the TableReferenceNode as FDs (`{key} → other-cols`).
+		const out: Partial<PhysicalProperties> = {
 			estimatedRows: this.source.estimatedRows,
-			uniqueKeys: this.source.getType().keys.map(key => key.map(colRef => colRef.index)),
 			// Sequential scans don't provide any specific ordering
-			ordering: undefined
+			ordering: undefined,
+			fds: sourcePhysical?.fds,
+			equivClasses: sourcePhysical?.equivClasses,
+			constantBindings: sourcePhysical?.constantBindings,
+			domainConstraints: sourcePhysical?.domainConstraints,
 		};
+		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
+		return out;
 	}
 
 	override toString(): string {
@@ -137,7 +202,10 @@ export class SeqScanNode extends TableAccessNode {
 		return new SeqScanNode(
 			this.scope,
 			newSource,
-			this.filterInfo
+			this.filterInfo,
+			undefined,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
 		);
 	}
 }
@@ -155,7 +223,11 @@ export class IndexScanNode extends TableAccessNode {
 		filterInfo: FilterInfo,
 		public readonly indexName: string,
 		public readonly providesOrdering?: { column: number; desc: boolean }[],
-		estimatedCostOverride?: number
+		estimatedCostOverride?: number,
+		public readonly advertisement?: AccessPathAdvertisement,
+		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
+		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
+		public readonly suppressMonotonic: boolean = false,
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 	}
@@ -164,13 +236,26 @@ export class IndexScanNode extends TableAccessNode {
 		return 'index-scan';
 	}
 
-	computePhysical(): Partial<PhysicalProperties> {
-		return {
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const sourcePhysical = childrenPhysical[0];
+		const lifted = liftAdvertisement(this.source, this.advertisement);
+		if (this.suppressMonotonic) {
+			delete lifted.monotonicOn;
+			// Capabilities below all imply monotonicOn — drop them too.
+			delete lifted.accessCapabilities;
+		}
+		const out: Partial<PhysicalProperties> = {
 			estimatedRows: this.source.estimatedRows,
-			uniqueKeys: this.source.getType().keys.map(key => key.map(colRef => colRef.index)),
 			// Index scans can provide ordering
-			ordering: this.providesOrdering
+			ordering: this.providesOrdering,
+			fds: sourcePhysical?.fds,
+			equivClasses: sourcePhysical?.equivClasses,
+			constantBindings: sourcePhysical?.constantBindings,
+			domainConstraints: sourcePhysical?.domainConstraints,
+			...lifted,
 		};
+		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
+		return out;
 	}
 
 	override toString(): string {
@@ -211,7 +296,11 @@ export class IndexScanNode extends TableAccessNode {
 			newSource,
 			this.filterInfo,
 			this.indexName,
-			this.providesOrdering
+			this.providesOrdering,
+			undefined,
+			this.advertisement,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
 		);
 	}
 }
@@ -230,7 +319,6 @@ export class EmptyResultNode extends TableAccessNode {
 	computePhysical(): Partial<PhysicalProperties> {
 		return {
 			estimatedRows: 0,
-			uniqueKeys: [],
 			ordering: undefined
 		};
 	}
@@ -267,7 +355,11 @@ export class IndexSeekNode extends TableAccessNode {
 		public readonly seekKeys: ScalarPlanNode[],
 		public readonly isRange: boolean = false,
 		public readonly providesOrdering?: { column: number; desc: boolean }[],
-		estimatedCostOverride?: number
+		estimatedCostOverride?: number,
+		public readonly advertisement?: AccessPathAdvertisement,
+		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
+		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
+		public readonly suppressMonotonic: boolean = false,
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 	}
@@ -276,16 +368,33 @@ export class IndexSeekNode extends TableAccessNode {
 		return 'index-seek';
 	}
 
-	computePhysical(): Partial<PhysicalProperties> {
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const sourcePhysical = childrenPhysical[0];
+		const lifted = liftAdvertisement(this.source, this.advertisement);
+		if (this.suppressMonotonic) {
+			delete lifted.monotonicOn;
+			// Capabilities below all imply monotonicOn — drop them too.
+			delete lifted.accessCapabilities;
+		}
 		const base = {
-			uniqueKeys: this.source.getType().keys.map(key => key.map(colRef => colRef.index)),
 			ordering: this.providesOrdering,
-			estimatedRows: Math.min(this.source.estimatedRows || 1000, 100)
+			estimatedRows: Math.min(this.source.estimatedRows || 1000, 100),
+			fds: sourcePhysical?.fds,
+			equivClasses: sourcePhysical?.equivClasses,
+			constantBindings: sourcePhysical?.constantBindings,
+			domainConstraints: sourcePhysical?.domainConstraints,
+			...lifted,
 		} as Partial<PhysicalProperties>;
+		if (this.rangeBoundedOn) base.rangeBoundedOn = this.rangeBoundedOn;
 		if (!this.isRange && this.indexName === 'primary') {
 			const pk = this.source.tableSchema.primaryKeyDefinition ?? [];
 			if (pk.length > 0 && this.seekKeys.length >= pk.length) {
-				return { ...base, estimatedRows: 1, uniqueKeys: [[]] } as Partial<PhysicalProperties>;
+				// Full PK equality seek — at most one row. Encode via the singleton
+				// FD `∅ → all_cols`.
+				const colCount = this.source.getType().columns.length;
+				const singleton = singletonFd(colCount);
+				const fds = singleton ? addFd(base.fds ?? [], singleton) : base.fds;
+				return { ...base, estimatedRows: 1, fds } as Partial<PhysicalProperties>;
 			}
 		}
 		return base;
@@ -353,7 +462,11 @@ export class IndexSeekNode extends TableAccessNode {
 			this.indexName,
 			newSeekKeys as ScalarPlanNode[],
 			this.isRange,
-			this.providesOrdering
+			this.providesOrdering,
+			undefined,
+			this.advertisement,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
 		);
 	}
 }

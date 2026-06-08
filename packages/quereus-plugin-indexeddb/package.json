@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-indexeddb",
-  "version": "2.6.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "IndexedDB storage plugin for Quereus - browser persistent storage",
   "keywords": [
@@ -81,10 +81,12 @@
     "typecheck": "tsc --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-plugin-indexeddb/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-plugin-indexeddb/test/**/*.spec.ts\" --reporter min --colors"
   },
+  "dependencies": {
+    "@quereus/quereus": "workspace:^",
+    "@quereus/store": "workspace:^"
+  },
   "devDependencies": {
     "@quereus/isolation": "*",
-    "@quereus/quereus": "*",
-    "@quereus/store": "*",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
     "chai": "^6.2.2",

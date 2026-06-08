@@ -13,7 +13,7 @@ import { emitPlanNode } from '../../runtime/emitters.js';
 import { EmissionContext } from '../../runtime/emission-context.js';
 import { Scheduler } from '../../runtime/scheduler.js';
 import type { RuntimeContext } from '../../runtime/types.js';
-import { RowContextMap } from '../../runtime/context-helpers.js';
+import { createStrictRowContextMap, wrapTableContextsStrict } from '../../runtime/strict-fork.js';
 import { isAsyncIterable } from '../../runtime/utils.js';
 import { createLogger } from '../../common/logger.js';
 import { PlanNode, type Attribute } from '../nodes/plan-node.js';
@@ -45,8 +45,8 @@ export function createRuntimeExpressionEvaluator(db: Database): (expr: PlanNode)
 				db,
 				stmt: undefined,
 				params: {}, // No parameters needed for constants
-				context: new RowContextMap(), // No row context needed
-				tableContexts: new Map(), // No table contexts needed for constants
+				context: createStrictRowContextMap(), // No row context needed
+				tableContexts: wrapTableContextsStrict(new Map()), // No table contexts needed for constants
 				enableMetrics: false
 			};
 
@@ -161,8 +161,8 @@ export function createRuntimeRelationalEvaluator(db: Database): (node: PlanNode)
 					db,
 					stmt: undefined,
 					params: {},
-					context: new RowContextMap(),
-					tableContexts: new Map(),
+					context: createStrictRowContextMap(),
+					tableContexts: wrapTableContextsStrict(new Map()),
 					enableMetrics: false
 				};
 				return scheduler.run(runtimeCtx);

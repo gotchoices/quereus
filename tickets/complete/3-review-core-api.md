@@ -1,6 +1,6 @@
 ---
 description: Completed review of core API (Database, Statement, Events, Transactions)
-dependencies: none
+prereq: none
 
 ---
 

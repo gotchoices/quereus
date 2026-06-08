@@ -40,7 +40,8 @@ registerRule(createRule(
   PlanNodeType.Aggregate,
   'impl',
   ruleAggregateStreaming,
-  10 // priority
+  'safe', // sideEffectMode — see docs/optimizer.md § Audit discipline
+  10      // priority
 ));
 ```
 

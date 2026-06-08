@@ -1,6 +1,8 @@
 import { PlanNodeType } from './plan-node-type.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type UnaryRelationalNode, type Attribute, isRelationalNode, type PhysicalProperties } from './plan-node.js';
 import { ColumnReferenceNode } from './reference.js';
+import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, singletonFd, superkeyToFd } from '../util/fd-utils.js';
+import type { ConstantBinding, DomainConstraint, FunctionalDependency } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
@@ -12,6 +14,91 @@ import type { AggregationCapable } from '../framework/characteristics.js';
 export interface AggregateExpression {
   expression: ScalarPlanNode;
   alias: string;
+}
+
+/**
+ * Shared FD/EC propagation for aggregate nodes.
+ *
+ * Output columns 0..groupCount-1 correspond to the GROUP BY expressions.
+ * Only bare column references map back to a source column index; other
+ * expressions drop out of the mapping (and any FD/EC referencing them).
+ *
+ * A source FD `X → Y` survives only if every column in `X ∪ Y` maps to a
+ * group-by output column. Equivalence classes project the same way.
+ *
+ * In addition, the aggregate emits the key-encoding FD:
+ *   - GROUP BY non-empty: `{0..groupCount-1} → (all_other_output_cols)`.
+ *   - GROUP BY empty:     `∅ → all_output_cols` (singleton: one row total).
+ *
+ * `outputColumnCount` is the aggregate node's total output-column count. It is
+ * always exactly `groupCount + aggregateCount`: aggregate nodes advertise (and
+ * emit) only their GROUP BY + aggregate columns. Source columns needed for
+ * HAVING / correlated access flow through the runtime row-descriptor context,
+ * never as output columns, so they do not appear here.
+ */
+export function propagateAggregateFds(
+  sourceAttrIndex: ReadonlyMap<number, number>,
+  groupBy: readonly ScalarPlanNode[],
+  sourcePhysical: PhysicalProperties | undefined,
+  outputColumnCount: number,
+): {
+  fds?: ReadonlyArray<FunctionalDependency>;
+  equivClasses?: ReadonlyArray<ReadonlyArray<number>>;
+  constantBindings?: ReadonlyArray<ConstantBinding>;
+  domainConstraints?: ReadonlyArray<DomainConstraint>;
+} {
+  const groupCount = groupBy.length;
+
+  if (groupCount === 0) {
+    // Single-group aggregate: emit the singleton FD if there is at least one
+    // output column. Source-side FDs do not survive — every source row collapses
+    // into one output row, so per-row source determinations no longer apply.
+    const singleton = singletonFd(outputColumnCount);
+    return {
+      fds: singleton ? [singleton] : undefined,
+    };
+  }
+
+  const map = new Map<number, number>();
+  groupBy.forEach((expr, outIdx) => {
+    if (expr instanceof ColumnReferenceNode) {
+      const srcIdx = sourceAttrIndex.get(expr.attributeId) ?? -1;
+      if (srcIdx >= 0 && !map.has(srcIdx)) map.set(srcIdx, outIdx);
+    }
+  });
+
+  let fds = projectFds(sourcePhysical?.fds ?? [], map);
+
+  // Emit the group-key FD `{0..groupCount-1} → (all_other_output_cols)`. The
+  // group-by columns are a unique key on the aggregate output (one row per
+  // distinct group), so they functionally determine every other output column.
+  const groupKey = Array.from({ length: groupCount }, (_, i) => i);
+  const keyFd = superkeyToFd(groupKey, outputColumnCount);
+  if (keyFd) {
+    fds = addFd(fds, keyFd, { keyHints: [groupKey] });
+  }
+
+  const projectedEquiv: number[][] = [];
+  for (const cls of sourcePhysical?.equivClasses ?? []) {
+    const mapped: number[] = [];
+    for (const c of cls) {
+      const out = map.get(c);
+      if (out !== undefined && !mapped.includes(out)) mapped.push(out);
+    }
+    if (mapped.length >= 2) projectedEquiv.push(mapped.sort((a, b) => a - b));
+  }
+
+  // Constant bindings on GROUP BY columns survive; aggregate-output columns get
+  // none (they are computed expressions, not in the column-mapping).
+  const projectedBindings = projectConstantBindings(sourcePhysical?.constantBindings ?? [], map);
+  const projectedDomains = projectDomainConstraints(sourcePhysical?.domainConstraints ?? [], map);
+
+  return {
+    fds: fds.length > 0 ? fds : undefined,
+    equivClasses: projectedEquiv.length > 0 ? projectedEquiv : undefined,
+    constantBindings: projectedBindings.length > 0 ? projectedBindings : undefined,
+    domainConstraints: projectedDomains.length > 0 ? projectedDomains : undefined,
+  };
 }
 
 /**
@@ -189,14 +276,20 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     const sourcePhysical = childrenPhysical[0];
-    const groupCount = this.groupBy.length;
-    // If there is a GROUP BY, the group-by columns form a unique key on the output
-    // Output attribute indices for group-by are 0..groupCount-1 per buildAttributes
-    const uniqueKeys = groupCount > 0 ? [Array.from({ length: groupCount }, (_, i) => i)] : [[]];
+    const { fds, equivClasses, constantBindings, domainConstraints } = propagateAggregateFds(
+      this.source.getAttributeIndex(),
+      this.groupBy,
+      sourcePhysical,
+      this.getAttributes().length,
+    );
+
     return {
-      uniqueKeys,
       estimatedRows: this.estimatedRows,
       ordering: sourcePhysical?.ordering,
+      fds,
+      equivClasses,
+      constantBindings,
+      domainConstraints,
     };
   }
 
@@ -231,9 +324,6 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
       }));
     }
 
-    // Expose logical unique keys: group-by columns (0..groupCount-1) or [[]] for global aggregate
-    const groupCount = this.groupBy.length;
-    props.uniqueKeys = groupCount > 0 ? [Array.from({ length: groupCount }, (_, i) => i)] : [[]];
     return props;
   }
 

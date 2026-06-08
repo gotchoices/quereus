@@ -6,8 +6,9 @@
  * Cleanup handler called when an async iterator is terminated.
  * @param commit - true if iterator completed normally or early exit via break,
  *                 false if error was thrown into the iterator
+ * @param error - the error that terminated the iterator (only set when commit=false)
  */
-export type CleanupHandler = (commit: boolean) => Promise<void> | void;
+export type CleanupHandler = (commit: boolean, error?: unknown) => Promise<void> | void;
 
 /**
  * Wraps an async iterable to ensure cleanup handlers are called on termination.
@@ -35,10 +36,10 @@ export function wrapAsyncIterator<T>(
 	const iterator = source[Symbol.asyncIterator]();
 	let cleanupCalled = false;
 
-	const runCleanup = async (commit: boolean): Promise<void> => {
+	const runCleanup = async (commit: boolean, error?: unknown): Promise<void> => {
 		if (cleanupCalled) return;
 		cleanupCalled = true;
-		await cleanup(commit);
+		await cleanup(commit, error);
 	};
 
 	return {
@@ -56,7 +57,7 @@ export function wrapAsyncIterator<T>(
 			} catch (error) {
 				// Run cleanup but prefer the original iterator error
 				try {
-					await runCleanup(false);
+					await runCleanup(false, error);
 				} catch {
 					// Discard cleanup error; the iterator error is more relevant
 				}
@@ -93,7 +94,7 @@ export function wrapAsyncIterator<T>(
 			// Error thrown into iterator - rollback the logical resource
 			let cleanupError: unknown;
 			try {
-				await runCleanup(false);
+				await runCleanup(false, error);
 			} catch (err) {
 				cleanupError = err;
 			}

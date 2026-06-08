@@ -23,7 +23,7 @@ describe('Ordering propagation', () => {
 		const sql = "SELECT v, id FROM (SELECT id, v FROM t ORDER BY id) s";
 		const rows: Array<{ physical: string | null; detail: string }> = [];
 		for await (const r of db.eval("SELECT physical, detail FROM query_plan(?) WHERE op = 'PROJECT'", [sql])) {
-			rows.push(r as any);
+			rows.push(r as unknown as { physical: string | null; detail: string });
 		}
 
 		const outer = rows.find(r => String(r.detail).includes('SELECT v, id'));
@@ -43,7 +43,7 @@ describe('Ordering propagation', () => {
 		const sql = "SELECT v FROM tn ORDER BY v NULLS LAST";
 		const sortDetails: string[] = [];
 		for await (const r of db.eval("SELECT detail FROM query_plan(?) WHERE op = 'SORT'", [sql])) {
-			sortDetails.push(String((r as any).detail));
+			sortDetails.push(String((r as { detail?: unknown }).detail));
 		}
 		expect(sortDetails).to.have.lengthOf(1);
 		expect(sortDetails[0]).to.include('NULLS LAST');
@@ -51,7 +51,7 @@ describe('Ordering propagation', () => {
 		// Verify results: non-null sorted ASC, then NULLs at end
 		const rows: Array<{ v: number | null }> = [];
 		for await (const r of db.eval(sql)) {
-			rows.push(r as any);
+			rows.push(r as unknown as { v: number | null });
 		}
 		expect(rows.map(r => r.v)).to.deep.equal([1, 2, 3, null, null]);
 	});
@@ -62,7 +62,7 @@ describe('Ordering propagation', () => {
 		const sql = "SELECT v FROM tn2 ORDER BY v DESC NULLS FIRST";
 		const props: string[] = [];
 		for await (const r of db.eval("SELECT properties FROM query_plan(?) WHERE op = 'SORT'", [sql])) {
-			props.push(String((r as any).properties));
+			props.push(String((r as { properties?: unknown }).properties));
 		}
 		expect(props).to.have.lengthOf(1);
 		const logical = JSON.parse(props[0]);
@@ -77,12 +77,12 @@ describe('Ordering propagation', () => {
 		const sql = "SELECT id, count(*) AS c FROM (SELECT * FROM t ORDER BY id LIMIT ?) s GROUP BY id";
 		const sorts: Array<{ c: number }> = [];
 		for await (const r of db.eval("SELECT COUNT(*) AS c FROM query_plan(?) WHERE op = 'SORT'", [sql])) {
-			sorts.push(r as any);
+			sorts.push(r as unknown as { c: number });
 		}
 
 		const streamAggs: Array<{ c: number }> = [];
 		for await (const r of db.eval("SELECT COUNT(*) AS c FROM query_plan(?) WHERE op = 'STREAMAGGREGATE'", [sql])) {
-			streamAggs.push(r as any);
+			streamAggs.push(r as unknown as { c: number });
 		}
 
 		expect(streamAggs).to.have.lengthOf(1);

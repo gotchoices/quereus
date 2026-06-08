@@ -7,6 +7,7 @@ import { formatExpressionList } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
+import { propagateAggregateFds } from './aggregate-node.js';
 
 /**
  * Physical node representing a streaming aggregate operation.
@@ -36,8 +37,8 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
   }
 
   private buildAttributes(): Attribute[] {
-    // If we have preserved attribute IDs, use them directly
-    // The optimizer rule now passes both aggregate AND source attributes
+    // If we have preserved attribute IDs, use them directly. The optimizer rule
+    // passes exactly the logical AggregateNode's GROUP BY + aggregate attributes.
     if (this.preserveAttributeIds) {
       return this.preserveAttributeIds.slice();
     }
@@ -66,18 +67,9 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
       });
     });
 
-    // Add source attributes to support HAVING clauses
-    const sourceAttributes = this.source.getAttributes();
-    const existingAttrNames = new Set(attributes.map(attr => attr.name));
-
-    for (const sourceAttr of sourceAttributes) {
-      // Only add if not already present by name (avoid duplicates for GROUP BY columns)
-      if (!existingAttrNames.has(sourceAttr.name)) {
-        attributes.push(sourceAttr);
-        existingAttrNames.add(sourceAttr.name);
-      }
-    }
-
+    // Advertise only GROUP BY + aggregate columns — exactly what the emitter yields.
+    // Source values for HAVING / correlated reads flow through the runtime row-descriptor
+    // context, not through extra output attributes.
     return attributes;
   }
 
@@ -113,23 +105,13 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
         generated: false
       })));
 
-      // Then aggregate columns
+      // Then aggregate columns. Only GROUP BY + aggregate columns are advertised
+      // (consistent with getAttributes()); source columns are not emitted as output.
       columns.push(...this.aggregates.map(agg => ({
         name: agg.alias,
         type: agg.expression.getType(),
         generated: true
       })));
-
-      // Add all source columns to support HAVING clauses (consistent with getAttributes())
-      const sourceType = this.source.getType();
-      const existingNames = new Set(columns.map(col => col.name));
-
-      for (const sourceCol of sourceType.columns) {
-        // Only add if not already present (avoid duplicates for GROUP BY columns)
-        if (!existingNames.has(sourceCol.name)) {
-          columns.push(sourceCol);
-        }
-      }
     }
 
     return {
@@ -194,17 +176,27 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
     }
   }
 
-  computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+    const sourcePhysical = childrenPhysical[0];
+    const { fds, equivClasses, constantBindings, domainConstraints } = propagateAggregateFds(
+      this.source.getAttributeIndex(),
+      this.groupBy,
+      sourcePhysical,
+      this.getAttributes().length,
+    );
+
     return {
       estimatedRows: this.estimatedRows,
       // Stream aggregate preserves ordering on GROUP BY columns
       ordering: this.groupBy.length > 0 ?
         this.groupBy.map((_, idx) => ({ column: idx, desc: false })) :
         undefined,
-      // Aggregation creates unique keys on GROUP BY columns
-      uniqueKeys: this.groupBy.length > 0 ?
-        [this.groupBy.map((_, idx) => idx)] :
-        [[]], // Single row if no GROUP BY
+      // Aggregation boundary: drop monotonicOn (the grouped relation is a set).
+      monotonicOn: undefined,
+      fds,
+      equivClasses,
+      constantBindings,
+      domainConstraints,
     };
   }
 
@@ -242,9 +234,6 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
       }));
     }
 
-    // Expose logical unique keys: group-by columns (0..groupCount-1) or [[]] for global aggregate
-    const groupCount = this.groupBy.length;
-    props.uniqueKeys = groupCount > 0 ? [Array.from({ length: groupCount }, (_, i) => i)] : [[]];
     return props;
   }
 

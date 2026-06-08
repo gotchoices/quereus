@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-expressions */
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it } from 'mocha';
 import { expect } from 'chai';
 import { buildHistogram, selectivityFromHistogram } from '../../src/planner/stats/histogram.js';

@@ -45,7 +45,9 @@ const substrImpl = (str: SqlValue, start: SqlValue, len?: SqlValue): SqlValue =>
 	y = Math.trunc(y);
 	z = z === undefined ? undefined : Math.trunc(z);
 
-	const strLen = s.length;
+	// Index by Unicode code point, not UTF-16 code unit, so non-BMP chars (e.g. 😀) aren't split.
+	const cps = Array.from(s);
+	const strLen = cps.length;
 	let begin: number;
 
 	if (y > 0) {
@@ -66,7 +68,7 @@ const substrImpl = (str: SqlValue, start: SqlValue, len?: SqlValue): SqlValue =>
 		end = begin;
 	}
 
-	return s.substring(begin, end);
+	return cps.slice(begin, end).join('');
 };
 
 const substrTypeInference = {

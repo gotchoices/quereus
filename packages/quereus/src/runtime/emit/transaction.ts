@@ -39,16 +39,7 @@ export function emitTransaction(plan: TransactionNode, _ctx: EmissionContext): I
 				const savepointName = plan.savepoint;
 				run = async (rctx: RuntimeContext) => {
 					log(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-
-					// TransactionManager validates the name and rolls back change/event layers.
-					// Returns the depth index that connections should roll back to.
-					const targetDepth = rctx.db._rollbackToSavepoint(savepointName);
-
-					// Roll back each connection to the target savepoint depth
-					const connections = rctx.db.getAllConnections();
-					for (const connection of connections) {
-						await connection.rollbackToSavepoint(targetDepth);
-					}
+					await rctx.db._rollbackToSavepointBroadcast(savepointName);
 					return null;
 				};
 				note = `ROLLBACK TO SAVEPOINT ${plan.savepoint}`;
@@ -76,15 +67,8 @@ export function emitTransaction(plan: TransactionNode, _ctx: EmissionContext): I
 				// wants transaction control, so we shouldn't auto-commit
 				rctx.db._upgradeToExplicitTransaction();
 
-				// TransactionManager tracks the name and creates change/event layers
-				const depth = rctx.db._createSavepoint(savepointName);
-
-				const connections = rctx.db.getAllConnections();
-				log(`SAVEPOINT ${savepointName} (depth ${depth}): ${connections.length} connections`);
-
-				for (const connection of connections) {
-					await connection.createSavepoint(depth);
-				}
+				const depth = await rctx.db._createSavepointBroadcast(savepointName);
+				log(`SAVEPOINT ${savepointName} (depth ${depth})`);
 				return null;
 			};
 			note = `SAVEPOINT ${plan.savepoint}`;
@@ -98,15 +82,7 @@ export function emitTransaction(plan: TransactionNode, _ctx: EmissionContext): I
 			const savepointName = plan.savepoint;
 			run = async (rctx: RuntimeContext) => {
 				log(`RELEASE SAVEPOINT ${savepointName}`);
-
-				// TransactionManager validates the name and releases change/event layers
-				const targetDepth = rctx.db._releaseSavepoint(savepointName);
-
-				// Release each connection's savepoint at the target depth
-				const connections = rctx.db.getAllConnections();
-				for (const connection of connections) {
-					await connection.releaseSavepoint(targetDepth);
-				}
+				await rctx.db._releaseSavepointBroadcast(savepointName);
 				return null;
 			};
 			note = `RELEASE SAVEPOINT ${plan.savepoint}`;

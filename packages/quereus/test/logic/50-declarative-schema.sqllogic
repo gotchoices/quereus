@@ -122,8 +122,9 @@ declare schema main {
 -- run
 
 -- Step 15: Diff should show DROP statements for posts and comments
+-- (comments must be dropped before posts because it FK-references posts)
 diff schema main;
-→ [{"ddl": "DROP TABLE IF EXISTS posts"}, {"ddl": "DROP TABLE IF EXISTS comments"}]
+→ [{"ddl": "DROP TABLE IF EXISTS comments"}, {"ddl": "DROP TABLE IF EXISTS posts"}]
 
 -- Step 16: Apply to drop extra tables
 apply schema main;
@@ -750,3 +751,262 @@ commit;
 select * from assert_items;
 → [{"id": 1, "qty": 5, "price": 10}]
 
+-- ===================================================================
+-- Declarative `unique index` — parser admits the UNIQUE qualifier and
+-- the diff stringifies it back as `create unique index` so that the
+-- apply path enforces uniqueness the same way a top-level
+-- `CREATE UNIQUE INDEX` does.
+-- ===================================================================
+
+declare schema decl_uniq {
+	table T (
+		id INTEGER PRIMARY KEY,
+		email TEXT NOT NULL,
+		a TEXT,
+		b TEXT
+	)
+
+	unique index ix_T_email on T(email)
+	unique index ix_T_a_b on T(a, b)
+}
+
+-- run
+
+-- Diff stringifies the declared indexes with the `unique` qualifier.
+diff schema decl_uniq;
+→ [{"ddl": "create table decl_uniq.T (id INTEGER primary key, email TEXT not null, a TEXT, b TEXT)"}, {"ddl": "create unique index decl_uniq.ix_T_email on decl_uniq.T (email)"}, {"ddl": "create unique index decl_uniq.ix_T_a_b on decl_uniq.T (a, b)"}]
+
+apply schema decl_uniq;
+
+-- run
+
+-- Apply was idempotent; re-diff is empty.
+diff schema decl_uniq;
+→ []
+
+-- Single-column unique enforcement.
+insert into decl_uniq.T values (1, 'x@y', 'p', 'q');
+insert into decl_uniq.T values (2, 'x@y', 'r', 's');
+-- error: UNIQUE
+
+-- Multi-column unique enforcement (compound key collides on (p,q)).
+insert into decl_uniq.T values (3, 'a@y', 'p', 'q');
+-- error: UNIQUE
+
+-- Distinct compound key is accepted.
+insert into decl_uniq.T values (4, 'b@y', 'p', 'r');
+
+select count(*) as cnt from decl_uniq.T;
+→ [{"cnt": 2}]
+
+-- Regression for github.com/gotchoices/quereus/issues/22 — prefix NOT against
+-- a subquery predicate inside CHECK, through the declare/apply round-trip.
+-- This exercises stringify → re-parse and must produce a semantically
+-- equivalent CHECK constraint (not one that rejects every row).
+declare schema decl_not_in
+{
+	table Block (Code text primary key);
+	table TIn (
+		Id int, Color text,
+		primary key (Id),
+		constraint NoBlocked check (Color not in (select Code from Block))
+	);
+}
+
+-- run
+
+apply schema decl_not_in;
+
+-- run
+
+insert into decl_not_in.Block (Code) values ('r');
+insert into decl_not_in.Block (Code) values ('y');
+insert into decl_not_in.TIn (Id, Color) values (1, 'g');
+select Color from decl_not_in.TIn;
+→ [{"Color":"g"}]
+
+insert into decl_not_in.TIn (Id, Color) values (2, 'r');
+-- error: CHECK constraint failed: NoBlocked
+
+drop table decl_not_in.TIn;
+drop table decl_not_in.Block;
+
+-- ===================================================================
+-- Regression for github.com/gotchoices/quereus/issues/23 — CHECK
+-- `on delete` operations clause survives the declare/apply round-trip.
+-- The stringifier used to drop the `operations` list, so the constraint
+-- defaulted to the all-ops mask (INSERT+UPDATE+DELETE) and fired on
+-- INSERT instead of only on DELETE.
+-- ===================================================================
+
+declare schema decl_check_ops
+{
+	table NoDelete (
+		Id int,
+		primary key (Id),
+		constraint NoDeleteEver check on delete (false)
+	);
+}
+
+-- run
+
+apply schema decl_check_ops;
+
+-- run
+
+-- INSERT must succeed (operations list excludes insert).
+insert into decl_check_ops.NoDelete (Id) values (1);
+select Id from decl_check_ops.NoDelete;
+→ [{"Id":1}]
+
+-- DELETE must fail.
+delete from decl_check_ops.NoDelete where Id = 1;
+-- error: CHECK constraint failed: NoDeleteEver
+
+drop table decl_check_ops.NoDelete;
+
+-- CHECK `on update` (the other half of the default-mask, distinct from
+-- the on-delete case so a mistakenly-defaulted mask still surfaces).
+declare schema decl_check_upd
+{
+	table OnUpdOnly (
+		Id int,
+		Val int,
+		primary key (Id),
+		constraint NoNegOnUpdate check on update (new.Val >= 0)
+	);
+}
+
+-- run
+
+apply schema decl_check_upd;
+
+-- run
+
+-- INSERT must succeed regardless of the bad value (constraint excludes insert).
+insert into decl_check_upd.OnUpdOnly (Id, Val) values (1, -5);
+select Val from decl_check_upd.OnUpdOnly;
+→ [{"Val":-5}]
+
+-- UPDATE must fail when the new value violates the constraint.
+update decl_check_upd.OnUpdOnly set Val = -1 where Id = 1;
+-- error: CHECK constraint failed: NoNegOnUpdate
+
+-- UPDATE that satisfies the constraint succeeds.
+update decl_check_upd.OnUpdOnly set Val = 7 where Id = 1;
+select Val from decl_check_upd.OnUpdOnly;
+→ [{"Val":7}]
+
+drop table decl_check_upd.OnUpdOnly;
+
+-- ===================================================================
+-- Regression for github.com/gotchoices/quereus/issues/21 — compound
+-- SELECT tail survives the declare/apply round-trip. The stringifier
+-- read `stmt.union` / `stmt.unionAll` (dead fields the parser never
+-- populates) instead of `stmt.compound`, silently dropping every leg
+-- beyond the first. Views are declared in `main` since declarative
+-- views in non-main schemas are emitted without a schema prefix (a
+-- separate concern outside this fix).
+-- ===================================================================
+
+declare schema main {
+	view rgb_codes as
+		select 'r' as Code, 'Red' as Name
+		union all select 'g' as Code, 'Green' as Name
+		union all select 'b' as Code, 'Blue' as Name
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+-- All three legs must be present; previously only 'r' survived.
+select Code from rgb_codes order by Code;
+→ [{"Code":"b"}, {"Code":"g"}, {"Code":"r"}]
+
+drop view rgb_codes;
+
+-- UNION (DISTINCT) — duplicate row collapses.
+declare schema main {
+	view distinct_union as
+		select 1 as N union select 2 as N union select 1 as N
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select N from distinct_union order by N;
+→ [{"N": 1}, {"N": 2}]
+
+drop view distinct_union;
+
+-- INTERSECT — only common row survives. (Compound operators are
+-- right-associative in this parser, so the test uses single-leg sides
+-- to keep the test focused on the stringifier emitting `intersect`.)
+declare schema main {
+	view two_only as
+		select 2 as N intersect select 2 as N
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select N from two_only;
+→ [{"N": 2}]
+
+drop view two_only;
+
+-- EXCEPT — left minus right.
+declare schema main {
+	view one_only as
+		select 1 as N except select 2 as N
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+select N from one_only;
+→ [{"N": 1}]
+
+drop view one_only;
+
+-- Cross-fix smoke: CHECK whose expression is a compound subquery. Both
+-- the operations list and the compound tail must survive the round-trip
+-- for the constraint to evaluate as written.
+declare schema decl_check_cmpd
+{
+	table Palette (
+		Color text primary key,
+		constraint InPalette check (Color in (
+			select 'r' as c union all
+			select 'g'      union all
+			select 'b'
+		))
+	);
+}
+
+-- run
+
+apply schema decl_check_cmpd;
+
+-- run
+
+insert into decl_check_cmpd.Palette values ('g');
+select Color from decl_check_cmpd.Palette;
+→ [{"Color":"g"}]
+
+insert into decl_check_cmpd.Palette values ('z');
+-- error: CHECK constraint failed: InPalette
+
+drop table decl_check_cmpd.Palette;

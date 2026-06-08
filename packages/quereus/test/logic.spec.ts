@@ -37,24 +37,11 @@ const USE_STORE_MODULE = process.env.QUEREUS_TEST_STORE === 'true' || process.en
 
 // Files that are explicitly memory-module-specific and should be skipped in store mode
 const MEMORY_ONLY_FILES = new Set([
-  '04-transactions.sqllogic',  // UNIQUE constraint across overlay and underlying is not detected (isolation-layer limitation)
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
-  '10.1-ddl-lifecycle.sqllogic',  // DROP+CREATE reuse of table name races with underlyingTables state (unrelated to transaction isolation)
-  '29-constraint-edge-cases.sqllogic',  // CASCADE FK delete across overlay/underlying does not cascade in isolation layer
-  '40-constraints.sqllogic',  // Deferred constraint queue finds ambiguity between IsolatedConnection and overlay MemoryVirtualTableConnection
-  '40.1-pk-desc-direction.sqllogic',  // PK DESC iteration order not preserved when merging overlay with underlying
-  '41-alter-table.sqllogic',  // ALTER TABLE RENAME through isolation layer does not propagate to overlay schema
-  '41-fk-cross-schema.sqllogic',  // UPDATE with PK change does not tombstone old PK in overlay (isolation-layer limitation)
-  '41-foreign-keys.sqllogic',  // Deferred constraint queue finds ambiguity between IsolatedConnection and overlay MemoryVirtualTableConnection
-  '41.2-alter-column.sqllogic',  // ALTER COLUMN through isolation layer loses data on overlay re-creation
-  '42-returning.sqllogic',  // RETURNING with DELETE does not include rows already in overlay (isolation-layer limitation)
-  '43-transition-constraints.sqllogic',  // Transition constraint row counts diverge across overlay/underlying merge
-  '44-orthogonality.sqllogic',  // DELETE-returning-subquery does not observe overlay writes when merged
-  '47-upsert.sqllogic',  // ON CONFLICT does not detect cross-layer conflicts (isolation-layer UNIQUE limitation)
+  // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
+  // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
-  '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
-  '102-unique-constraints.sqllogic',  // INSERT OR REPLACE conflict resolution does not flow across isolation overlay; underlying StoreTable enforces UNIQUE correctly (see store-table unique.spec.ts)
-  '102-schema-catalog-edge-cases.sqllogic',  // DROP+CREATE reuse races with isolation-layer underlyingTables state (unrelated to transaction isolation)
+  // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'
   '105-vtab-memory-mutation-kills.sqllogic',  // White-box mutation tests targeting src/vtab/memory/ internals
 ]);
@@ -578,24 +565,49 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 						console.log(`Executing block (expect error "${errorSubstring}"):\n${sqlBlock}`);
 					}
 
+					// Split into setup statements and final query so that SELECT-iteration
+					// errors (e.g. row-generator throws) are actually surfaced. db.exec on a
+					// SELECT does not consume the result iterator, so errors thrown inside
+					// the generator body would otherwise stay latent. Setup statements run
+					// in a single db.exec so multi-statement DML batches retain atomicity.
+					const statements = sqlBlock.split(';').map(s => s.trim()).filter(s => s.length > 0);
+					const setupStatements = statements.slice(0, -1);
+					const finalStatement = statements[statements.length - 1] ?? '';
+
+					let actualError: Error | undefined;
 					try {
-						await db.exec(sqlBlock);
+						if (setupStatements.length > 0) {
+							await db.exec(setupStatements.join(';\n') + ';');
+						}
+						if (finalStatement) {
+							const prepared = db.prepare(finalStatement);
+							try {
+								// Drain rows so iteration-time errors are raised
+								for await (const _row of prepared.iterateRows()) { /* drain */ }
+							} finally {
+								await prepared.finalize();
+							}
+						}
+					} catch (e: any) {
+						actualError = e instanceof Error ? e : new Error(String(e));
+					}
+
+					if (actualError === undefined) {
 						const baseError = new Error(`[${file}:${lineNum}] Expected error matching "${errorSubstring}" but SQL block executed successfully.\nBlock: ${sqlBlock}`);
 						const diagnostics = generateDiagnostics(db, sqlBlock, baseError);
 						throw new Error(`${baseError.message}${diagnostics}`);
-					} catch (actualError: any) {
-						expect(actualError.message.toLowerCase()).to.include(errorSubstring.toLowerCase(),
-							`[${file}:${lineNum}] Block: ${sqlBlock}\nExpected error containing: "${errorSubstring}"\nActual error: "${actualError.message}"`
-						);
+					}
 
-						// Show location information if available
-						const locationInfo = formatLocationInfo(actualError, sqlBlock);
-						if (TEST_OPTIONS.verbose && locationInfo) {
-							console.log(`   -> Error location: ${locationInfo}`);
-						}
-						if (TEST_OPTIONS.verbose) {
-							console.log(`   -> Caught expected error: ${actualError.message}`);
-						}
+					expect(actualError.message.toLowerCase()).to.include(errorSubstring.toLowerCase(),
+						`[${file}:${lineNum}] Block: ${sqlBlock}\nExpected error containing: "${errorSubstring}"\nActual error: "${actualError.message}"`
+					);
+
+					const locationInfo = formatLocationInfo(actualError, sqlBlock);
+					if (TEST_OPTIONS.verbose && locationInfo) {
+						console.log(`   -> Error location: ${locationInfo}`);
+					}
+					if (TEST_OPTIONS.verbose) {
+						console.log(`   -> Caught expected error: ${actualError.message}`);
 					}
 				};
 

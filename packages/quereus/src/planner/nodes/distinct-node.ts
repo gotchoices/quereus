@@ -63,21 +63,34 @@ export class DistinctNode extends PlanNode implements UnaryRelationalNode {
   }
 
   override getLogicalAttributes(): Record<string, unknown> {
-    const colCount = this.source.getAttributes().length;
-    const allColsKey = [Array.from({ length: colCount }, (_, i) => i)];
     return {
-      uniqueKeys: allColsKey
+      // The "set semantics" claim lives on `RelationType.isSet`, which `getType()`
+      // already sets to true. No separate logical-attribute key is needed.
+      isSet: true,
     };
   }
 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     const sourcePhysical = childrenPhysical[0];
-    const colCount = this.source.getAttributes().length;
-    const allColsKey = [Array.from({ length: colCount }, (_, i) => i)];
+
+    // Distinct strengthens an already-monotonic input from non-strict to strict.
+    // It does not establish ordering on its own.
+    const sourceMonotonic = sourcePhysical?.monotonicOn;
+    const monotonicOn = sourceMonotonic && sourceMonotonic.length > 0
+      ? sourceMonotonic.map(m => ({ ...m, strict: true }))
+      : undefined;
+
+    // Distinct's "all-columns is a key" claim is communicated via
+    // `RelationType.isSet` (set in getType()). FDs that the source proved on
+    // proper subsets of the output (e.g., a PK FD) carry through unchanged.
     return {
-      uniqueKeys: allColsKey,
       estimatedRows: this.estimatedRows,
       ordering: sourcePhysical?.ordering,
+      monotonicOn,
+      fds: sourcePhysical?.fds,
+      equivClasses: sourcePhysical?.equivClasses,
+      constantBindings: sourcePhysical?.constantBindings,
+      domainConstraints: sourcePhysical?.domainConstraints,
     };
   }
 

@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-expressions */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
@@ -487,6 +486,23 @@ describe('ANALYZE command', () => {
 			rows.push(r);
 		}
 		expect(rows).to.have.lengthOf(0);
+	});
+
+	it('ANALYZE main.* analyzes every table in the schema', async () => {
+		await setupTable();
+		await db.exec(`
+			CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT) USING memory
+		`);
+		await db.exec("INSERT INTO widgets VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+
+		const rows: any[] = [];
+		for await (const r of db.eval('ANALYZE main.*')) {
+			rows.push(r);
+		}
+
+		const byTable = new Map(rows.map(r => [r.table, r.rows]));
+		expect(byTable.get('products')).to.equal(100);
+		expect(byTable.get('widgets')).to.equal(3);
 	});
 
 	it('collects per-column distinct counts', async () => {

@@ -40,6 +40,37 @@ export class ConstraintError extends QuereusError {
 }
 
 /**
+ * Constraint violation that resolved to OR FAIL.
+ *
+ * Per SQLite OR FAIL semantics: rows successfully processed before the
+ * violation must remain inserted/updated even though the statement aborts.
+ * The iterator-level cleanup recognizes this subclass and commits prior
+ * rows (in autocommit mode) instead of rolling back.
+ */
+export class FailConflictError extends ConstraintError {
+	constructor(message: string, code: number = StatusCode.CONSTRAINT, cause?: Error) {
+		super(message, code, cause);
+		this.name = 'FailConflictError';
+		Object.setPrototypeOf(this, FailConflictError.prototype);
+	}
+}
+
+/**
+ * Constraint violation that resolved to OR ROLLBACK.
+ *
+ * Per SQLite OR ROLLBACK semantics: the violation aborts the entire
+ * enclosing transaction (explicit or implicit). The iterator-level cleanup
+ * recognizes this subclass and unconditionally rolls back the transaction.
+ */
+export class RollbackConflictError extends ConstraintError {
+	constructor(message: string, code: number = StatusCode.CONSTRAINT, cause?: Error) {
+		super(message, code, cause);
+		this.name = 'RollbackConflictError';
+		Object.setPrototypeOf(this, RollbackConflictError.prototype);
+	}
+}
+
+/**
  * Error thrown when the API is used incorrectly
  */
 export class MisuseError extends QuereusError {

@@ -1,5 +1,5 @@
 description: Fixed FNV-1a carry loss in 64-bit multiplication
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/util/hash.ts
   packages/quereus/test/util/hash.spec.ts

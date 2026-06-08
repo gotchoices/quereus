@@ -1,0 +1,128 @@
+-- adapted from SQLite test/alter3.test, test/alter4.test, test/alter.test
+-- ADD COLUMN with various constraints. Existing 41-alter-table covers
+-- NULL backfill, text DEFAULT, NOT NULL+DEFAULT — this fills in CHECK,
+-- REFERENCES, COLLATE, UNIQUE rejection, and various default literal types.
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- 1. ADD COLUMN with CHECK constraint
+-- ===================================
+
+create table t_chk (id integer primary key, a integer not null);
+insert into t_chk values (1, 10);
+
+alter table t_chk add column b integer null check (b is null or b > 0);
+
+-- existing rows backfilled with NULL (allowed by CHECK)
+select b from t_chk where id = 1;
+→ [{"b":null}]
+
+-- valid insert
+insert into t_chk values (2, 20, 5);
+
+-- CHECK violation
+insert into t_chk values (3, 30, -1);
+-- error: CHECK
+
+drop table t_chk;
+
+-- ===================================
+-- 2. ADD COLUMN with REFERENCES (column-level FK)
+-- ===================================
+
+create table t_parent (pid integer primary key);
+insert into t_parent values (1), (2);
+
+create table t_child (id integer primary key, name text);
+insert into t_child values (1, 'x');
+
+alter table t_child add column parent integer null references t_parent(pid);
+
+-- backfilled NULL is allowed (MATCH SIMPLE)
+select parent from t_child where id = 1;
+→ [{"parent":null}]
+
+-- valid FK insert
+insert into t_child values (2, 'y', 1);
+
+-- FK violation
+insert into t_child values (3, 'z', 99);
+-- error:
+
+drop table t_child;
+drop table t_parent;
+
+-- ===================================
+-- 3. ADD COLUMN with COLLATE clause — Quereus rejects NOCASE on TEXT
+-- ===================================
+
+create table t_col (id integer primary key, name text);
+insert into t_col values (1, 'Alice'), (2, 'BOB');
+
+alter table t_col add column nick text null collate nocase;
+-- error: not supported
+
+drop table t_col;
+
+-- ===================================
+-- 4. ADD COLUMN UNIQUE rejected on populated table
+-- ===================================
+
+create table t_addunq (id integer primary key, a integer not null);
+insert into t_addunq values (1, 10), (2, 20);
+
+alter table t_addunq add column u integer unique;
+-- error:
+
+drop table t_addunq;
+
+-- ===================================
+-- 5. ADD COLUMN default value backfilled to existing rows
+-- ===================================
+
+-- integer default
+create table t_int (id integer primary key);
+insert into t_int values (1), (2);
+
+alter table t_int add column n integer default 7;
+
+select n from t_int order by id;
+→ [{"n":7},{"n":7}]
+
+drop table t_int;
+
+create table t_real_t (id integer primary key);
+insert into t_real_t values (1), (2);
+
+alter table t_real_t add column r real default -123.0;
+
+select r from t_real_t where id = 1;
+→ [{"r":-123}]
+
+drop table t_real_t;
+
+-- positive real default works
+create table t_real_p (id integer primary key);
+insert into t_real_p values (1), (2);
+
+alter table t_real_p add column r real default 123.0;
+
+select r from t_real_p where id = 1;
+→ [{"r":123}]
+
+drop table t_real_p;
+
+-- ===================================
+-- 6. Default backfill participates in aggregates over pre-existing rows
+-- ===================================
+
+create table t_agg (id integer primary key);
+insert into t_agg values (1), (2), (3);
+
+alter table t_agg add column score integer default 7;
+
+select sum(score) as s, count(score) as c from t_agg;
+→ [{"s":21,"c":3}]
+
+drop table t_agg;

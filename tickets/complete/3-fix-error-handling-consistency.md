@@ -1,6 +1,6 @@
 ---
 description: Fix error handling inconsistencies (ParseError, inline require, logging)
-dependencies: none
+prereq: none
 
 ---
 

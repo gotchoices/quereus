@@ -4,9 +4,18 @@ import * as fc from 'fast-check';
 import { Database } from '../src/core/database.js';
 import { compareSqlValues } from '../src/util/comparison.js';
 import { safeJsonStringify } from '../src/util/serialization.js';
-import type { SqlValue } from '../src/common/types.js';
+import type { Row, SqlValue } from '../src/common/types.js';
 import { Parser } from '../src/parser/parser.js';
 import { QuereusError } from '../src/common/errors.js';
+import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
+import { keysOf } from '../src/planner/util/fd-utils.js';
+import { type PlanNode, type RelationalPlanNode, isRelationalNode } from '../src/planner/nodes/plan-node.js';
+import { EmissionContext } from '../src/runtime/emission-context.js';
+import { emitPlanNode } from '../src/runtime/emitters.js';
+import { Scheduler } from '../src/runtime/scheduler.js';
+import { createStrictRowContextMap, wrapTableContextsStrict } from '../src/runtime/strict-fork.js';
+import { isAsyncIterable } from '../src/runtime/utils.js';
+import type { RuntimeContext } from '../src/runtime/types.js';
 
 describe('Property-Based Tests', () => {
 	let db: Database;
@@ -1365,4 +1374,455 @@ describe('Property-Based Tests', () => {
 		});
 	});
 
+	// --- 14. Declarative-schema equivalence ---
+	// Generates a small constrained table shape, builds two DBs in parallel
+	// (canonical `create table` vs `declare schema {...} apply schema`), and
+	// asserts the two end up indistinguishable at the catalog level AND under
+	// the same DML probes. Acts as the dragnet behind the curated
+	// `declarative-equivalence.spec.ts` corpus.
+	//
+	// Gated to `numRuns: 50` by default; set `PROPERTY_LONG=1` for `numRuns: 200`.
+	describe('Declarative-schema equivalence (property)', () => {
+		const NUM_RUNS = process.env.PROPERTY_LONG ? 200 : 50;
+
+		const identArb = fc.stringMatching(/^[a-z][a-z0-9_]{2,7}$/).filter(s => !RESERVED.has(s));
+		const colTypeArb = fc.constantFrom('integer', 'text');
+		const literalArb: fc.Arbitrary<{ sql: string; jsValue: unknown }> = fc.oneof(
+			fc.integer({ min: 0, max: 1000 }).map(n => ({ sql: String(n), jsValue: n })),
+			fc.stringMatching(/^[a-z0-9 ]{1,8}$/).map(s => ({ sql: `'${s}'`, jsValue: s })),
+		);
+
+		/** A simple CHECK predicate against a single column. */
+		function checkExprArb(colName: string, type: 'integer' | 'text'): fc.Arbitrary<string> {
+			if (type === 'integer') {
+				return fc.oneof(
+					fc.integer({ min: 0, max: 100 }).map(n => `${colName} >= ${n}`),
+					fc.integer({ min: 1, max: 100 }).map(n => `${colName} < ${n}`),
+				);
+			}
+			return fc.oneof(
+				fc.constant(`${colName} is not null`),
+				fc.stringMatching(/^[a-z]{1,4}$/).map(s => `${colName} <> '${s}'`),
+			);
+		}
+
+		interface ColumnShape {
+			name: string;
+			type: 'integer' | 'text';
+			notNull: boolean;
+			default?: { sql: string; jsValue: unknown };
+		}
+
+		interface TableShape {
+			tableName: string;
+			columns: ColumnShape[];
+			pkColumn: string;
+			checks: Array<{ name: string; sql: string }>;
+		}
+
+		function tableShapeArb(): fc.Arbitrary<TableShape> {
+			return fc.tuple(
+				identArb,
+				fc.uniqueArray(identArb, { minLength: 2, maxLength: 3 }),
+			).chain(([tableName, colNames]) => {
+				const colShapeArbs = colNames.map((name, i) => {
+					// First column is always integer PK to keep the shape valid for FK
+					// experiments and to give probes a deterministic id to insert.
+					if (i === 0) {
+						return fc.constant<ColumnShape>({ name, type: 'integer', notNull: true });
+					}
+					return fc.record({
+						type: colTypeArb,
+						notNull: fc.boolean(),
+						defaultOpt: fc.option(literalArb, { nil: undefined }),
+					}).map(({ type, notNull, defaultOpt }): ColumnShape => ({
+						name,
+						type,
+						notNull,
+						default: defaultOpt,
+					}));
+				});
+				return fc.tuple(...colShapeArbs).chain(columns => {
+					const cols = columns as ColumnShape[];
+					// Pick at most 1 CHECK over a single non-PK column to keep arbitrary inside the parser's accepted region.
+					const checkableCol = cols.find(c => c.name !== cols[0].name);
+					const checksArb: fc.Arbitrary<Array<{ name: string; sql: string }>> =
+						checkableCol
+							? fc.option(
+								checkExprArb(checkableCol.name, checkableCol.type).map((sql, idx) => [{ name: `chk_${idx}`, sql }]),
+								{ nil: [] as Array<{ name: string; sql: string }> },
+							)
+							: fc.constant([] as Array<{ name: string; sql: string }>);
+					return checksArb.map(checks => ({
+						tableName,
+						columns: cols,
+						pkColumn: cols[0].name,
+						checks,
+					}));
+				});
+			});
+		}
+
+		function renderCanonicalDDL(shape: TableShape): string {
+			const colSqls = shape.columns.map(c => {
+				const parts = [c.name, c.type.toUpperCase()];
+				if (c.name === shape.pkColumn) parts.push('primary key');
+				if (c.notNull && c.name !== shape.pkColumn) parts.push('not null');
+				if (c.default) parts.push(`default ${c.default.sql}`);
+				return parts.join(' ');
+			});
+			const checkSqls = shape.checks.map(c => `constraint ${c.name} check (${c.sql})`);
+			return `create table ${shape.tableName} (${[...colSqls, ...checkSqls].join(', ')})`;
+		}
+
+		function renderDeclarativeBody(shape: TableShape): string {
+			const colLines = shape.columns.map(c => {
+				const parts = [c.name, c.type.toUpperCase()];
+				if (c.name === shape.pkColumn) parts.push('PRIMARY KEY');
+				if (c.notNull && c.name !== shape.pkColumn) parts.push('NOT NULL');
+				if (c.default) parts.push(`DEFAULT ${c.default.sql}`);
+				return '\t' + parts.join(' ');
+			});
+			const checkLines = shape.checks.map(c => `\tconstraint ${c.name} check (${c.sql})`);
+			return `table ${shape.tableName} {\n${[...colLines, ...checkLines].join(',\n')}\n}`;
+		}
+
+		it('canonical DDL ≡ declarative body at the catalog + probe level', async function () {
+			await fc.assert(fc.asyncProperty(tableShapeArb(), async (shape) => {
+				const canonicalDDL = renderCanonicalDDL(shape);
+				const declarativeBody = renderDeclarativeBody(shape);
+
+				const directDb = new Database();
+				const appliedDb = new Database();
+				try {
+					await directDb.exec(canonicalDDL);
+					await appliedDb.exec(`declare schema main {\n${declarativeBody}\n}`);
+					await appliedDb.exec('apply schema main');
+
+					const directTbl = directDb.schemaManager.getTable('main', shape.tableName);
+					const appliedTbl = appliedDb.schemaManager.getTable('main', shape.tableName);
+					if (!directTbl || !appliedTbl) {
+						throw new Error(`table missing  canonicalDDL: ${canonicalDDL}\n  declarativeBody: ${declarativeBody}`);
+					}
+					try {
+						assertTableSchemaEqual(directTbl, appliedTbl, shape.tableName);
+					} catch (e) {
+						const msg = e instanceof Error ? e.message : String(e);
+						throw new Error(`${msg}\n  canonicalDDL:    ${canonicalDDL}\n  declarativeBody: ${declarativeBody}`);
+					}
+
+					// One simple count probe (cheap; catalog compare is the strong oracle here).
+					await assertProbeEquivalent(directDb, appliedDb, {
+						sql: `select count(*) as n from ${shape.tableName}`,
+						expect: { rows: [{ n: 0 }] },
+					}, shape.tableName);
+				} finally {
+					await directDb.close();
+					await appliedDb.close();
+				}
+			}), { numRuns: NUM_RUNS });
+		});
+	});
+
+	// --- 15. Key soundness ---
+	// The empirical backstop for the unified uniqueness surface: for a spread of
+	// query shapes (the node zoo) over randomly-seeded small tables, read the
+	// claimed keys (`keysOf`) and set-ness (`isSet`) off the top relational
+	// result node and assert the *materialized* rows never contradict them. A
+	// claimed key must be all-distinct; `isSet` must mean the full rows are
+	// distinct. An over-claim (a key that does not actually hold) reds the test.
+	//
+	// Soundness, not completeness: a *missing* key is fine; a *false* key is not.
+	//
+	// Tier 1 asserts at the top result node for every shape. Tier 2 walks every
+	// relational node in the *optimized* plan tree, materializes each node in
+	// isolation (emit + Scheduler.run), and runs the same assertions on that
+	// node's own rows — pinning the soundness of each operator's getType() /
+	// computePhysical independent of whether a shape surfaces it at the top.
+	// Tier 2 is best-effort: correlated / parameterized inner nodes cannot emit
+	// standalone, so emission/run failures *skip* rather than fail the test.
+	describe('Key Soundness', () => {
+		/** Stable, type-aware signature for a tuple of SqlValues. */
+		function tupleSig(values: SqlValue[]): string {
+			return values.map(v => {
+				if (v === null || v === undefined) return 'N';
+				if (v instanceof Uint8Array) return 'B:' + Array.from(v).join('.');
+				return typeof v + ':' + String(v);
+			}).join('|');
+		}
+
+		/**
+		 * Positional core of the soundness check: throws on the first
+		 * contradiction between the claimed uniqueness facts and the actual rows,
+		 * where each row is a tuple of values ordered to match the node's columns
+		 * and each key is a list of column indices. Shared by Tier 1 (result node,
+		 * via the record adapter below) and Tier 2 (isolated per-node rows).
+		 */
+		function checkKeysAndSet(
+			label: string,
+			keys: readonly (readonly number[])[],
+			isSet: boolean,
+			rows: readonly SqlValue[][],
+		): void {
+			for (const key of keys) {
+				if (key.length === 0) {
+					// The empty key claims at-most-one-row.
+					if (rows.length > 1) {
+						throw new Error(`over-claim: empty key claims ≤1 row but ${label} returned ${rows.length}`);
+					}
+					continue;
+				}
+				const seen = new Set<string>();
+				for (const row of rows) {
+					const sig = tupleSig(key.map(i => row[i]));
+					if (seen.has(sig)) {
+						throw new Error(`over-claim: key [${key}] is not unique on ${label} (duplicate ${sig})`);
+					}
+					seen.add(sig);
+				}
+			}
+			if (isSet) {
+				const seen = new Set<string>();
+				for (const row of rows) {
+					const sig = tupleSig(row);
+					if (seen.has(sig)) {
+						throw new Error(`over-claim: isSet=true but full rows are not distinct on ${label}`);
+					}
+					seen.add(sig);
+				}
+			}
+		}
+
+		/**
+		 * Record adapter over {@link checkKeysAndSet}: projects each row-object to
+		 * a positional tuple in `cols` order. Shared by the Tier-1 property below
+		 * and the negative self-test that proves the check fails loudly.
+		 */
+		function checkNoOverClaim(
+			q: string,
+			keys: readonly (readonly number[])[],
+			isSet: boolean,
+			cols: readonly string[],
+			rows: readonly Record<string, SqlValue>[],
+		): void {
+			const positional = rows.map(row => cols.map(c => row[c]));
+			checkKeysAndSet(`\`${q}\``, keys, isSet, positional);
+		}
+
+		// Query shapes spanning the node zoo, shared by both tiers. Output column
+		// names are kept distinct so the row-object lookup by name is unambiguous.
+		const queries = [
+			'select a, b, c from ta',                                            // bare scan (set on [a])
+			'select b, c from ta',                                               // projection drops the key (bag)
+			'select b from ta',                                                  // single-column key-dropping projection
+			'select distinct b, c from ta',                                      // DISTINCT (set on all cols)
+			'select distinct b from ta',
+			'select b, count(*) as n from ta group by b',                        // GROUP BY (key on group col)
+			'select a, b, c from ta group by a, b, c',                           // all-columns GROUP BY
+			'select b, c from ta group by b, c',
+			'select a, b, c from ta order by b',                                 // ORDER BY
+			'select a, b, c from ta order by b limit 3',                         // LIMIT
+			'select a, b, c from ta union all select d, e, e from tb',           // UNION ALL (bag)
+			'select a, b, c from ta union select d, e, e from tb',               // UNION (set)
+			'select b, c from ta intersect select e, e from tb',                 // INTERSECT (set)
+			'select b, c from ta except select e, e from tb',                    // EXCEPT (set)
+			'select ta.a as ja, tb.d as jd, ta.b as jb from ta join tb on ta.b = tb.d', // inner join
+			'select ta.a as la, tb.d as ld from ta left join tb on ta.b = tb.d', // left join
+			'select ta.a as xa, tb.d as xd, ta.c as xc from ta cross join tb',   // cross join
+			'select x, y from (select distinct b as x, c as y from ta)',         // projection over inner DISTINCT
+			'select distinct x, y from (select distinct b as x, c as y from ta)',// nested DISTINCT
+		];
+
+		const rowArbA = fc.record({
+			a: fc.integer({ min: 1, max: 8 }),
+			b: fc.integer({ min: 1, max: 3 }),
+			c: fc.integer({ min: 1, max: 3 }),
+		});
+		const rowArbB = fc.record({
+			d: fc.integer({ min: 1, max: 8 }),
+			e: fc.integer({ min: 1, max: 3 }),
+		});
+
+		/** Create the two source tables (fresh `db` per `beforeEach`). */
+		async function createTables(): Promise<void> {
+			await db.exec('create table ta (a integer primary key, b integer, c integer) using memory');
+			await db.exec('create table tb (d integer primary key, e integer) using memory');
+		}
+
+		/** Replace table contents with the generated rows, deduped by PK. */
+		async function seedTables(rowsA: { a: number; b: number; c: number }[], rowsB: { d: number; e: number }[]): Promise<void> {
+			await db.exec('delete from ta');
+			await db.exec('delete from tb');
+			const seenA = new Set<number>();
+			for (const r of rowsA) {
+				if (seenA.has(r.a)) continue;
+				seenA.add(r.a);
+				await db.exec(`insert into ta values (${r.a}, ${r.b}, ${r.c})`);
+			}
+			const seenB = new Set<number>();
+			for (const r of rowsB) {
+				if (seenB.has(r.d)) continue;
+				seenB.add(r.d);
+				await db.exec(`insert into tb values (${r.d}, ${r.e})`);
+			}
+		}
+
+		/** Collect every relational node in a plan tree, deduped by node id. */
+		function collectRelationalNodes(rootNode: PlanNode): RelationalPlanNode[] {
+			const out: RelationalPlanNode[] = [];
+			const seen = new Set<string>();
+			const stack: PlanNode[] = [rootNode];
+			while (stack.length > 0) {
+				const n = stack.pop()!;
+				if (seen.has(n.id)) continue;
+				seen.add(n.id);
+				if (isRelationalNode(n)) out.push(n);
+				for (const child of n.getChildren()) stack.push(child);
+			}
+			return out;
+		}
+
+		/**
+		 * Emit + run a single relational node in isolation and collect its rows as
+		 * positional tuples (column order matches `node.getType().columns`). Mirrors
+		 * `scheduler_program` (func/builtins/explain.ts) and the runtime-context
+		 * construction in `Database._executeSingleStatement`. Throws if the node
+		 * cannot emit/run standalone (e.g. correlated / parameterized) — Tier 2
+		 * treats that as a skip.
+		 */
+		async function materializeNode(node: RelationalPlanNode): Promise<SqlValue[][]> {
+			const emissionContext = new EmissionContext(db);
+			const rootInstruction = emitPlanNode(node, emissionContext);
+			const scheduler = new Scheduler(rootInstruction);
+			const runtimeCtx: RuntimeContext = {
+				db,
+				stmt: undefined,
+				params: {},
+				context: createStrictRowContextMap(),
+				tableContexts: wrapTableContextsStrict(new Map()),
+				tracer: undefined,
+				enableMetrics: false,
+			};
+			const output = scheduler.run(runtimeCtx);
+			const resolved = output instanceof Promise ? await output : output;
+			if (!isAsyncIterable(resolved)) {
+				throw new Error('node did not produce a row stream');
+			}
+			const rows: SqlValue[][] = [];
+			for await (const row of resolved as AsyncIterable<Row>) {
+				rows.push(row as SqlValue[]);
+			}
+			return rows;
+		}
+
+		it('the soundness check fails loudly on an injected over-claim', () => {
+			const cols = ['x', 'y'];
+			// `x` repeats across rows, so claiming [0] (x) is a key is an over-claim.
+			const rows = [{ x: 1 as SqlValue, y: 1 as SqlValue }, { x: 1 as SqlValue, y: 2 as SqlValue }];
+			expect(() => checkNoOverClaim('injected', [[0]], false, cols, rows)).to.throw(/over-claim/);
+			// Duplicate full rows contradict an injected isSet=true.
+			const dupRows = [{ x: 1 as SqlValue, y: 1 as SqlValue }, { x: 1 as SqlValue, y: 1 as SqlValue }];
+			expect(() => checkNoOverClaim('injected', [], true, cols, dupRows)).to.throw(/over-claim/);
+			// The honest case does not throw.
+			expect(() => checkNoOverClaim('honest', [[0]], false, cols, [{ x: 1, y: 1 }, { x: 2, y: 9 }])).to.not.throw();
+		});
+
+		it('keysOf / isSet never over-claim on materialized result rows', async () => {
+			await createTables();
+
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
+				fc.constantFrom(...queries),
+				async (rowsA, rowsB, q) => {
+					await seedTables(rowsA, rowsB);
+
+					const block = db.getPlan(q) as any;
+					const root = block.getRelations?.()[0];
+					if (!root) return;
+					const cols: string[] = root.getType().columns.map((c: any) => c.name);
+					const keys = keysOf(root);
+					const isSet: boolean = root.getType().isSet;
+
+					const rows: Record<string, SqlValue>[] = [];
+					for await (const row of db.eval(q)) rows.push(row as Record<string, SqlValue>);
+
+					checkNoOverClaim(q, keys, isSet, cols, rows);
+				},
+			), { numRuns: 50 });
+		});
+
+		// Tier 2: walk every relational node in the optimized tree and assert the
+		// invariants on each node's own materialized rows. Best-effort — nodes that
+		// cannot emit/run standalone (correlated / parameterized inner nodes) are
+		// skipped. A skip never fails the test; only an actual over-claim does.
+		it('keysOf / isSet never over-claim on any isolated inner node (Tier 2)', async () => {
+			await createTables();
+
+			let checkedNodes = 0;
+			let skippedNodes = 0;
+
+			await fc.assert(fc.asyncProperty(
+				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
+				fc.constantFrom(...queries),
+				async (rowsA, rowsB, q) => {
+					await seedTables(rowsA, rowsB);
+
+					const block = db.getPlan(q) as unknown as PlanNode;
+					const nodes = collectRelationalNodes(block);
+
+					for (const node of nodes) {
+						const type = node.getType();
+						const keys = keysOf(node);
+						const isSet = type.isSet;
+						// Nothing claimed ⇒ nothing to contradict; skip the isolated run.
+						if (keys.length === 0 && !isSet) continue;
+
+						let rows: SqlValue[][];
+						try {
+							rows = await materializeNode(node);
+						} catch {
+							// Correlated / parameterized inner nodes won't emit/run
+							// standalone — this tier is a bonus, not a gate.
+							skippedNodes++;
+							continue;
+						}
+
+						checkedNodes++;
+						checkKeysAndSet(`${node.nodeType}[${node.id}] of \`${q}\``, keys, isSet, rows);
+					}
+				},
+			), { numRuns: 50 });
+
+			// Sanity: across the shape zoo at least some inner nodes must have
+			// materialized, or the tier is silently a no-op.
+			expect(checkedNodes, `Tier 2 checked no inner nodes (skipped ${skippedNodes})`).to.be.greaterThan(0);
+		});
+	});
+
 });
+
+// Identifier denylist for the declarative-equivalence property arbitrary.
+// Kept lightweight (only the lexer keywords the small arbitrary can collide with).
+const RESERVED = new Set<string>([
+	'select', 'from', 'where', 'and', 'or', 'not', 'null', 'true', 'false',
+	'table', 'index', 'view', 'create', 'drop', 'alter', 'rename', 'column',
+	'add', 'set', 'primary', 'key', 'unique', 'check', 'default', 'collate',
+	'references', 'foreign', 'cascade', 'restrict', 'on', 'delete', 'update',
+	'insert', 'into', 'values', 'using', 'with', 'as', 'asc', 'desc',
+	'between', 'in', 'exists', 'case', 'when', 'then', 'else', 'end',
+	'group', 'by', 'having', 'order', 'limit', 'offset', 'distinct', 'all',
+	'inner', 'left', 'right', 'full', 'outer', 'cross', 'join', 'union',
+	'intersect', 'except', 'diff', 'cast', 'is', 'like', 'glob', 'match',
+	'regexp', 'begin', 'commit', 'rollback', 'savepoint', 'release',
+	'pragma', 'analyze', 'temp', 'temporary', 'if', 'integer', 'real', 'text',
+	'blob', 'numeric', 'declare', 'schema', 'version', 'apply', 'explain',
+	'seed', 'assertion', 'constraint', 'generated', 'always', 'stored', 'virtual',
+	'context', 'tags', 'nulls', 'first', 'last', 'rows', 'range', 'over',
+	'partition', 'preceding', 'following', 'unbounded', 'current', 'row',
+	'returning', 'option', 'maxrecursion', 'lateral', 'recursive', 'no', 'action',
+	'conflict', 'abort', 'fail', 'ignore', 'replace', 'deferrable',
+	'initially', 'deferred', 'immediate',
+	'count', 'sum', 'avg', 'min', 'max', 'length', 'substr', 'abs',
+]);

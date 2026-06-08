@@ -128,7 +128,7 @@ insert into t_notnull values (1), (2);
 -- run
 
 -- NOT NULL without DEFAULT should fail (table has rows)
-alter table t_notnull add column required text;
+alter table t_notnull add column required text not null;
 -- error: NOT NULL
 
 -- Error message should name the column and qualified table

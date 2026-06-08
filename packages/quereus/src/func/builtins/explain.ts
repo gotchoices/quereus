@@ -20,20 +20,25 @@ import type { PlanningContext } from "../../planner/planning-context.js";
 import { BuildTimeDependencyTracker } from "../../planner/planning-context.js";
 import { buildBlock } from "../../planner/building/block.js";
 
+interface NamedSchemaLike {
+	name: string;
+	schemaName?: string;
+}
+
 // Helper function to safely get function name from nodes that have it
 function getFunctionName(node: PlanNode): string | null {
-	// Check for nodes that have functionName property
-	if ('functionName' in node && typeof (node as any).functionName === 'string') {
-		return (node as any).functionName;
+	const candidate = (node as { functionName?: unknown }).functionName;
+	if (typeof candidate === 'string') {
+		return candidate;
 	}
 	return null;
 }
 
 // Helper function to safely get alias from nodes that have it
 function getAlias(node: PlanNode): string | null {
-	// Check for nodes that have alias property
-	if ('alias' in node && typeof (node as any).alias === 'string') {
-		return (node as any).alias;
+	const candidate = (node as { alias?: unknown }).alias;
+	if (typeof candidate === 'string') {
+		return candidate;
 	}
 	return null;
 }
@@ -47,24 +52,21 @@ function getObjectName(node: PlanNode): string | null {
 	}
 
 	// Check for table schema in table reference nodes
-	if ('tableSchema' in node) {
-		const tableSchema = (node as any).tableSchema;
-		if (tableSchema && typeof tableSchema.name === 'string') {
-			return tableSchema.schemaName ? `${tableSchema.schemaName}.${tableSchema.name}` : tableSchema.name;
-		}
+	const tableSchema = (node as { tableSchema?: NamedSchemaLike }).tableSchema;
+	if (tableSchema && typeof tableSchema.name === 'string') {
+		return tableSchema.schemaName ? `${tableSchema.schemaName}.${tableSchema.name}` : tableSchema.name;
 	}
 
 	// Check for CTE name
-	if ('cteName' in node && typeof (node as any).cteName === 'string') {
-		return (node as any).cteName;
+	const cteName = (node as { cteName?: unknown }).cteName;
+	if (typeof cteName === 'string') {
+		return cteName;
 	}
 
 	// Check for view schema in view reference nodes
-	if ('viewSchema' in node) {
-		const viewSchema = (node as any).viewSchema;
-		if (viewSchema && typeof viewSchema.name === 'string') {
-			return viewSchema.schemaName ? `${viewSchema.schemaName}.${viewSchema.name}` : viewSchema.name;
-		}
+	const viewSchema = (node as { viewSchema?: NamedSchemaLike }).viewSchema;
+	if (viewSchema && typeof viewSchema.name === 'string') {
+		return viewSchema.schemaName ? `${viewSchema.schemaName}.${viewSchema.name}` : viewSchema.name;
 	}
 
 	return null;
@@ -96,7 +98,13 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 			],
 			keys: [],
 			rowConstraints: []
-		}
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// `id` (column 0) is the assigned nodeId and is unique per plan node.
+			keys: [[{ index: 0 }]],
+			deterministic: true,
+		},
 	},
 	async function* (db: Database, sql: SqlValue): AsyncIterable<Row> {
 		if (typeof sql !== 'string') {
@@ -148,7 +156,7 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 					// Attach minimal QuickPick diagnostics from optimizer if available
 					const diag = db.optimizer.getLastDiagnostics?.();
 					if (diag?.quickpick) {
-						(logicalAttributes as any).quickpick = diag.quickpick;
+						(logicalAttributes as Record<string, unknown>).quickpick = diag.quickpick;
 					}
 					properties = safeJsonStringify(logicalAttributes);
 				}
@@ -181,10 +189,10 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 					nodeStack.push({ node: children[i], parentId: currentId, level });
 				}
 			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If planning fails, yield an error row
-			yield [1, null, 0, 'ERROR', 'ERROR', `Failed to plan SQL: ${error.message}`, null, null, null, null, null, null];
+			const message = error instanceof Error ? error.message : String(error);
+			yield [1, null, 0, 'ERROR', 'ERROR', `Failed to plan SQL: ${message}`, null, null, null, null, null, null];
 		}
 	}
 );
@@ -273,10 +281,10 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 					}
 				}
 			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If compilation fails, yield an error instruction
-			yield [0, '[]', `Failed to compile SQL: ${error.message}`, null, 0, null];
+			const message = error instanceof Error ? error.message : String(error);
+			yield [0, '[]', `Failed to compile SQL: ${message}`, null, 0, null];
 		}
 	}
 );
@@ -315,7 +323,7 @@ export const stackTraceFunc = createIntegratedTableValuedFunction(
 
 			// Simulate a call stack based on the plan structure
 			let frameId = 0;
-			const stack: Array<{ name: string; location: string; vars: any }> = [];
+			const stack: Array<{ name: string; location: string; vars: Record<string, unknown> }> = [];
 
 			// Add main execution frame
 			stack.push({
@@ -336,27 +344,33 @@ export const stackTraceFunc = createIntegratedTableValuedFunction(
 				if (!node || depth > 10) return; // Prevent infinite recursion
 
 				switch (node.nodeType) {
-					case 'Block':
+					case 'Block': {
+						const statements = (node as { statements?: ReadonlyArray<unknown> }).statements;
 						stack.push({
 							name: 'buildBlock',
 							location: 'building/block.ts:buildBlock',
-							vars: { statementCount: ('statements' in node) ? (node as any).statements?.length || 0 : 0 }
+							vars: { statementCount: statements?.length ?? 0 }
 						});
 						break;
-					case 'Filter':
+					}
+					case 'Filter': {
+						const condition = (node as { condition?: { toString(): string } }).condition;
 						stack.push({
 							name: 'buildFilter',
 							location: 'building/select.ts:buildSelectStmt',
-							vars: { condition: ('condition' in node) ? (node as any).condition?.toString() || 'unknown' : 'unknown' }
+							vars: { condition: condition?.toString() ?? 'unknown' }
 						});
 						break;
-					case 'Project':
+					}
+					case 'Project': {
+						const projections = (node as { projections?: ReadonlyArray<unknown> }).projections;
 						stack.push({
 							name: 'buildProject',
 							location: 'building/select.ts:buildSelectStmt',
-							vars: { projectionCount: ('projections' in node) ? (node as any).projections?.length || 0 : 0 }
+							vars: { projectionCount: projections?.length ?? 0 }
 						});
 						break;
+					}
 				}
 
 				// Recursively add frames for children
@@ -380,10 +394,10 @@ export const stackTraceFunc = createIntegratedTableValuedFunction(
 					0                            // is_virtual
 				];
 			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If analysis fails, yield an error frame
-			yield [0, 0, 'error', 'stack_trace', `Failed to analyze: ${error.message}`, null, 0];
+			const message = error instanceof Error ? error.message : String(error);
+			yield [0, 0, 'error', 'stack_trace', `Failed to analyze: ${message}`, null, 0];
 		}
 	}
 );
@@ -433,21 +447,21 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 					instructionDependencies.set(addr, dependencies);
 					instructionOperations.set(addr, description);
 				}
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			} catch (schedulerError: any) {
-				console.warn('Could not get scheduler program info:', schedulerError.message);
+			} catch (schedulerError: unknown) {
+				const message = schedulerError instanceof Error ? schedulerError.message : String(schedulerError);
+				console.warn('Could not get scheduler program info:', message);
 			}
 
 			// Import the CollectingInstructionTracer
 			const tracer = new CollectingInstructionTracer();
 
 			// Parse the query and execute with tracing
-			let stmt: any;
+			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
 
 				// Execute the query with tracing to collect actual instruction events
-				const results: any[] = [];
+				const results: Row[] = [];
 				for await (const row of stmt.iterateRowsWithTrace(undefined, tracer)) {
 					results.push(row); // We don't yield the results, just the trace events
 				}
@@ -491,7 +505,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				}
 
 				// Build enhanced sub-program information
-				let subProgramsInfo: any = null;
+				let subProgramsInfo: unknown = null;
 				if (inputEvent?.subPrograms && inputEvent.subPrograms.length > 0) {
 					// Enhance sub-program info with details from the tracer
 					subProgramsInfo = inputEvent.subPrograms.map(sp => {
@@ -504,10 +518,10 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 
 						if (subProgramDetail) {
 							// Add instruction details from the sub-program
-							const instructions = subProgramDetail.scheduler.instructions.map((instr: any, idx: number) => ({
+							const instructions = subProgramDetail.scheduler.instructions.map((instr: Instruction, idx: number) => ({
 								index: idx,
 								operation: instr.note || `instruction_${idx}`,
-								dependencies: instr.params.map((_: any, paramIdx: number) => paramIdx).filter((paramIdx: number) => paramIdx < idx)
+								dependencies: instr.params.map((_, paramIdx) => paramIdx).filter((paramIdx) => paramIdx < idx)
 							}));
 							return { ...baseInfo, instructions };
 						}
@@ -546,9 +560,9 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				];
 			}
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If tracing setup fails, yield an error event
+			const message = error instanceof Error ? error.message : String(error);
 			yield [
 				0,                                                        // instruction_index
 				'TRACE_SETUP',                                           // operation
@@ -557,7 +571,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				null,                                                     // output_value
 				null,                                                     // duration_ms
 				null,                                                     // sub_programs
-				`Failed to setup execution trace: ${error.message}`,     // error_message
+				`Failed to setup execution trace: ${message}`,           // error_message
 				Date.now()                                                // timestamp_ms
 			];
 		}
@@ -596,21 +610,21 @@ export const rowTraceFunc = createIntegratedTableValuedFunction(
 			const tracer = new CollectingInstructionTracer();
 
 			// Parse the query and execute with tracing
-			let stmt: any;
+			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
 
 				// Execute the query with tracing to collect row-level events
-				const results: any[] = [];
+				const results: Row[] = [];
 				for await (const row of stmt.iterateRowsWithTrace(undefined, tracer)) {
 					results.push(row); // We don't yield the results, just the trace events
 				}
 
 				await stmt.finalize();
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			} catch (executionError: any) {
+			} catch (executionError: unknown) {
 				// If execution fails, we might still have some trace events
-				console.warn('Query execution failed during row tracing:', executionError.message);
+				const message = executionError instanceof Error ? executionError.message : String(executionError);
+				console.warn('Query execution failed during row tracing:', message);
 			}
 
 			// Get the collected trace events and filter for row events
@@ -761,20 +775,27 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 		const plan = buildBlock(ctx, [ast]);
 		const analyzed = db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
 
-		// Classify row/global per relationKey
-		const classifications = analyzeRowSpecific(analyzed);
+		// Classify each table reference as row/group/global.
+		const { classifications, groupKeys } = analyzeRowSpecific(analyzed);
 
 		for (const [relationKey, cls] of classifications) {
 			const base = `${relationKey.split('#')[0]}`;
 			let prepared: string | null = null;
-			if (cls === 'row' && base) {
-				// Prepared parameters are PK-based: ["pk0", "pk1", ...]
+			if (base) {
 				const [schemaName, tableName] = base.split('.');
 				const table = db._findTable(tableName, schemaName);
 				if (table) {
-					const pkCount = table.primaryKeyDefinition.length;
-					const names = Array.from({ length: pkCount }, (_, i) => `pk${i}`);
-					prepared = JSON.stringify(names);
+					if (cls === 'row') {
+						// Prepared parameters are PK-based: ["pk0", "pk1", ...]
+						const pkCount = table.primaryKeyDefinition.length;
+						const names = Array.from({ length: pkCount }, (_, i) => `pk${i}`);
+						prepared = JSON.stringify(names);
+					} else if (cls === 'group') {
+						// Prepared parameters are the group key column names on this table.
+						const cols = groupKeys.get(relationKey) ?? [];
+						const names = cols.map(idx => table.columns[idx]?.name ?? `col${idx}`);
+						prepared = JSON.stringify(names);
+					}
 				}
 			}
 

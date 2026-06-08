@@ -1,5 +1,5 @@
 description: Replace Node-only process.hrtime.bigint() in scheduler with cross-platform hrtimeNs() utility
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/util/hrtime.ts                      (new — cross-platform timer)
   packages/quereus/src/runtime/scheduler.ts                (8 call sites replaced)

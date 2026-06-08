@@ -56,6 +56,18 @@ export interface LogicalType {
 	isTextual?: boolean;
 	/** Is this a temporal type? */
 	isTemporal?: boolean;
+
+	/**
+	 * For monotone-but-lossy scalar transforms (e.g. date(ts) = D), compute the
+	 * equivalent half-open range `[lowerInclusive, upperExclusive)` on the
+	 * underlying input value. The `kind` is named by the function schema's
+	 * `rangeRewriteOnArg` trait. Returns undefined when the kind is unsupported
+	 * or the value is not bucketable for this type.
+	 */
+	bucketBounds?(
+		kind: string,
+		value: SqlValue,
+	): { lowerInclusive: SqlValue; upperExclusive: SqlValue } | undefined;
 }
 
 /**

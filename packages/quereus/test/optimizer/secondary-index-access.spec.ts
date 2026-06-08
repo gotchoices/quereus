@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Secondary index access path selection', () => {
 	let db: Database;
@@ -21,7 +24,7 @@ describe('Secondary index access path selection', () => {
 	it('selects IndexSeek on secondary index for equality predicate', async () => {
 		await setup();
 		const q = "SELECT name FROM items WHERE age = 25";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -30,7 +33,7 @@ describe('Secondary index access path selection', () => {
 		expect(ops).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 
 		// Verify correct results
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(2);
 		const names = results.map(r => r.name).sort();
@@ -40,7 +43,7 @@ describe('Secondary index access path selection', () => {
 	it('selects index access for range predicate on secondary index', async () => {
 		await setup();
 		const q = "SELECT name FROM items WHERE age > 30";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -49,7 +52,7 @@ describe('Secondary index access path selection', () => {
 		expect(ops).to.match(/INDEX(SEEK|SCAN| SEEK| SCAN)|IndexSeek|IndexScan/i);
 
 		// Verify correct results
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		const names = results.map(r => r.name).sort();
 		expect(names).to.deep.equal(['Charlie', 'Eve']);
@@ -58,7 +61,7 @@ describe('Secondary index access path selection', () => {
 	it('selects index access for range scan with both bounds', async () => {
 		await setup();
 		const q = "SELECT name FROM items WHERE age >= 25 AND age <= 35";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -67,7 +70,7 @@ describe('Secondary index access path selection', () => {
 		expect(ops).to.match(/INDEX(SEEK|SCAN| SEEK| SCAN)|IndexSeek|IndexScan/i);
 
 		// Verify correct results
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(4);
 		const names = results.map(r => r.name).sort();
@@ -78,7 +81,7 @@ describe('Secondary index access path selection', () => {
 		await setup();
 		// Combined filter + ordering via the same secondary index
 		const q = "SELECT name, age FROM items WHERE age >= 25 ORDER BY age";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -88,18 +91,18 @@ describe('Secondary index access path selection', () => {
 		expect(ops).to.match(/INDEX(SEEK|SCAN| SEEK| SCAN)|IndexSeek|IndexScan/i);
 
 		// Verify correct ordering
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
-		const ages = results.map(r => r.age);
+		const ages = results.map(r => r.age as number);
 		// Ordering may not be guaranteed by range seek alone; verify results are correct
-		expect(ages.sort((a: number, b: number) => a - b)).to.deep.equal([25, 25, 30, 35, 40]);
+		expect(ages.sort((a, b) => a - b)).to.deep.equal([25, 25, 30, 35, 40]);
 	});
 
 	it('prefers secondary index over full table scan for equality', async () => {
 		await setup();
 		// Without an index on 'score', equality on age should use idx_age
 		const q = "SELECT name FROM items WHERE age = 30";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -117,7 +120,7 @@ describe('Secondary index access path selection', () => {
 		const q = "SELECT title FROM events WHERE category = 'tech' AND year = 2024";
 
 		// Verify correct results
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.have.lengthOf(1);
 		expect(results[0].title).to.equal('DevCon');
@@ -139,7 +142,7 @@ describe('Secondary index access path selection', () => {
 		it('IN on first column with equality on second: a IN (1,2) AND b = 5', async () => {
 			await setupEvents();
 			const q = "SELECT title FROM events WHERE category in ('tech', 'music') AND year = 2024 ORDER BY title";
-			const results: any[] = [];
+			const results: ResultRow[] = [];
 			for await (const r of db.eval(q)) results.push(r);
 			expect(results.map(r => r.title)).to.deep.equal(['DevCon', 'SoundWave']);
 		});
@@ -147,7 +150,7 @@ describe('Secondary index access path selection', () => {
 		it('equality on first column with IN on second: a = 1 AND b IN (3,4,5)', async () => {
 			await setupEvents();
 			const q = "SELECT title FROM events WHERE category = 'tech' AND year in (2024, 2025) ORDER BY title";
-			const results: any[] = [];
+			const results: ResultRow[] = [];
 			for await (const r of db.eval(q)) results.push(r);
 			expect(results.map(r => r.title)).to.deep.equal(['CodeFest', 'DevCon']);
 		});
@@ -155,7 +158,7 @@ describe('Secondary index access path selection', () => {
 		it('IN on both columns: cross-product', async () => {
 			await setupEvents();
 			const q = "SELECT title FROM events WHERE category in ('tech', 'music') AND year in (2024, 2025) ORDER BY title";
-			const results: any[] = [];
+			const results: ResultRow[] = [];
 			for await (const r of db.eval(q)) results.push(r);
 			expect(results.map(r => r.title)).to.deep.equal(['BeatDrop', 'CodeFest', 'DevCon', 'SoundWave']);
 		});
@@ -163,7 +166,7 @@ describe('Secondary index access path selection', () => {
 		it('explain shows IndexSeek for composite IN', async () => {
 			await setupEvents();
 			const q = "SELECT title FROM events WHERE category in ('tech', 'music') AND year = 2024";
-			const planRows: any[] = [];
+			const planRows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 				planRows.push(r);
 			}
@@ -175,7 +178,7 @@ describe('Secondary index access path selection', () => {
 		it('single-column IN still works (regression)', async () => {
 			await setup();
 			const q = "SELECT name FROM items WHERE age in (25, 35) ORDER BY name";
-			const results: any[] = [];
+			const results: ResultRow[] = [];
 			for await (const r of db.eval(q)) results.push(r);
 			expect(results.map(r => r.name)).to.deep.equal(['Bob', 'Charlie', 'Diana']);
 		});
@@ -184,7 +187,7 @@ describe('Secondary index access path selection', () => {
 	it('still uses PK seek when filtering on primary key', async () => {
 		await setup();
 		const q = "SELECT name FROM items WHERE id = 3";
-		const planRows: any[] = [];
+		const planRows: ResultRow[] = [];
 		for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
 			planRows.push(r);
 		}
@@ -192,7 +195,7 @@ describe('Secondary index access path selection', () => {
 		const ops = planRows[0].ops as string;
 		expect(ops).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 
-		const results: any[] = [];
+		const results: ResultRow[] = [];
 		for await (const r of db.eval(q)) results.push(r);
 		expect(results).to.deep.equal([{ name: 'Charlie' }]);
 	});

@@ -71,9 +71,13 @@ SELECT 1 AS ok FROM query_plan('SELECT b, a, count(*) FROM aps_comp GROUP BY b, 
 WHERE op = 'HASHAGGREGATE' LIMIT 1;
 → [{"ok":1}]
 
--- More grouping keys than PK columns → HashAggregate
+-- More grouping keys than PK columns: GROUP-BY FD simplification drops the
+-- PK-determined column (`c` is functionally determined by the PK `(a, b)`)
+-- and rewrites the aggregate over `GROUP BY a, b` with a MIN(c) picker.
+-- The resulting GROUP BY is a prefix of the source ordering, so we land on
+-- StreamAggregate (no Sort needed).
 SELECT 1 AS ok FROM query_plan('SELECT a, b, c, count(*) FROM aps_comp GROUP BY a, b, c')
-WHERE op = 'HASHAGGREGATE' LIMIT 1;
+WHERE op = 'STREAMAGGREGATE' LIMIT 1;
 → [{"ok":1}]
 
 -- Second key only (not prefix) → HashAggregate

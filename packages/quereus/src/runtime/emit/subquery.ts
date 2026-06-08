@@ -8,8 +8,49 @@ import { StatusCode } from '../../common/types.js';
 import { BTree } from 'inheritree';
 import { compareSqlValuesFast } from '../../util/comparison.js';
 import { ConstantNode } from '../../planner/nodes/plan-node.js';
+import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 
 export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContext): Instruction {
+	const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.subquery);
+
+	if (isImpure) {
+		// Impure inner (DML w/ RETURNING in scalar position):
+		// - Fully drain the iterator so every write happens, not just the first.
+		// - Memoize across re-evaluations (correlated outer, per-row scan) so
+		//   the DML fires exactly once per statement execution. Closure state
+		//   is per-emission and the Statement re-emits per execution, so this
+		//   resets between prepared-statement runs.
+		let memoized: { value: SqlValue } | null = null;
+
+		async function runImpure(_rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
+			if (memoized) return memoized.value;
+
+			let result: SqlValue = null;
+			let seen = false;
+
+			for await (const row of input) {
+				if (!seen) {
+					if (row.length > 1) {
+						throw new QuereusError('Subquery should return at most one column', StatusCode.ERROR);
+					}
+					result = row.length === 0 ? null : row[0];
+					seen = true;
+				}
+				// Continue iterating to drive every write, even past the first row.
+			}
+
+			memoized = { value: result };
+			return result;
+		}
+
+		const innerInstruction = emitPlanNode(plan.subquery, ctx);
+
+		return {
+			params: [innerInstruction],
+			run: runImpure as InstructionRun,
+			note: 'SCALAR_SUBQUERY(impure)'
+		};
+	}
 
 	async function run(_rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
 		let result: SqlValue = null;
@@ -45,8 +86,56 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 	const collation = ctx.resolveCollation(collationName);
 
 	if (plan.source) {
-		// IN subquery: expr IN (SELECT ...)
-		// Use streaming approach - check each row as we read it, return early on match
+		const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.source);
+
+		if (isImpure) {
+			// Impure inner: fully drain (no short-circuit on match) so every
+			// write fires, and memoize so re-evaluation does not re-drive the DML.
+			let memoized: { value: SqlValue } | null = null;
+
+			async function runImpure(_rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
+				if (memoized) return memoized.value;
+
+				let matched = false;
+				let hasNull = false;
+				const shouldCompare = condition !== null;
+
+				for await (const row of input) {
+					if (row.length > 0) {
+						const rowValue = row[0];
+						if (rowValue === null) {
+							hasNull = true;
+						} else if (shouldCompare && !matched && compareSqlValuesFast(condition, rowValue, collation) === 0) {
+							matched = true;
+						}
+					}
+					// Continue iterating to drive every write past the first match.
+				}
+
+				let result: SqlValue;
+				if (!shouldCompare) {
+					result = null;
+				} else if (matched) {
+					result = true;
+				} else {
+					result = hasNull ? null : false;
+				}
+
+				memoized = { value: result };
+				return result;
+			}
+
+			const sourceInstruction = emitPlanNode(plan.source, ctx);
+			const conditionExpr = emitPlanNode(plan.condition, ctx);
+
+			return {
+				params: [sourceInstruction, conditionExpr],
+				run: runImpure as InstructionRun,
+				note: 'IN(impure)'
+			};
+		}
+
+		// Pure subquery: streaming + early exit on match.
 		async function runSubqueryStreaming(_rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
 			// If condition is NULL, result is NULL
 			if (condition === null) {
@@ -186,6 +275,36 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 }
 
 export function emitExists(plan: ExistsNode, ctx: EmissionContext): Instruction {
+	const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.subquery);
+
+	if (isImpure) {
+		// Impure inner: fully drain (no short-circuit) so every write fires,
+		// and memoize so re-evaluation does not re-drive the DML.
+		let memoized: { value: SqlValue } | null = null;
+
+		async function runImpure(_rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
+			if (memoized) return memoized.value;
+
+			let any = false;
+			for await (const _row of input) {
+				any = true;
+				// Continue iterating to drive every write past the first row.
+			}
+
+			const result: SqlValue = any;
+			memoized = { value: result };
+			return result;
+		}
+
+		const innerInstruction = emitPlanNode(plan.subquery, ctx);
+
+		return {
+			params: [innerInstruction],
+			run: runImpure as InstructionRun,
+			note: 'EXISTS(impure)'
+		};
+	}
+
 	async function run(_rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
 		for await (const _row of input) {
 			return true; // First row => TRUE

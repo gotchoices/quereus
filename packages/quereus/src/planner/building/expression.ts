@@ -9,10 +9,43 @@ import { StatusCode } from '../../common/types.js';
 import type { RelationType } from '../../common/datatype.js';
 import { resolveColumn, resolveParameter } from '../resolve.js';
 import { Ambiguous } from '../scopes/scope.js';
-import { buildSelectStmt } from './select.js';
+import { buildSelectStmt, buildValuesStmt } from './select.js';
+import { buildInsertStmt } from './insert.js';
+import { buildUpdateStmt } from './update.js';
+import { buildDeleteStmt } from './delete.js';
 import { resolveWindowFunction } from '../../schema/window-function.js';
 import { buildFunctionCall } from './function-call.js';
 import { createLogger } from '../../common/logger.js';
+
+/**
+ * Plans a `QueryExpr` in scalar / IN / EXISTS expression position.
+ *
+ * SELECT and VALUES legs lower to their normal relational builders. DML
+ * legs (INSERT/UPDATE/DELETE with RETURNING — the parser requires RETURNING
+ * in this position) build through the standard DML builders and yield a
+ * `ReturningNode`. The runtime emitters for scalar / IN / EXISTS detect a
+ * side-effecting inner via `subtreeHasSideEffects` and apply full-drain +
+ * run-once semantics (see `docs/runtime.md`).
+ */
+function buildExpressionPositionQueryExpr(
+	ctx: PlanningContext,
+	query: AST.QueryExpr,
+	preserveInputColumns: boolean,
+	_siteLabel: 'scalar subquery' | 'IN subquery' | 'EXISTS subquery',
+): RelationalPlanNode {
+	switch (query.type) {
+		case 'select':
+			return buildSelectStmt(ctx, query, ctx.cteNodes, preserveInputColumns) as RelationalPlanNode;
+		case 'values':
+			return buildValuesStmt(ctx, query);
+		case 'insert':
+			return buildInsertStmt(ctx, query) as RelationalPlanNode;
+		case 'update':
+			return buildUpdateStmt(ctx, query) as RelationalPlanNode;
+		case 'delete':
+			return buildDeleteStmt(ctx, query) as RelationalPlanNode;
+	}
+}
 
 const logger = createLogger('planner:expression');
 
@@ -164,17 +197,14 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        };
        // Preserve input columns in scalar subqueries to ensure correlated predicates
        // have access to all underlying attributes.
-       const subqueryPlan = buildSelectStmt(subqueryContext, expr.query, ctx.cteNodes, true);
+       const subqueryPlan = buildExpressionPositionQueryExpr(subqueryContext, expr.query, true, 'scalar subquery');
        logger(`Building scalar subquery with preserveInputColumns=true`);
-       if (subqueryPlan.getType().typeClass !== 'relation') {
-         throw new QuereusError('Subquery must produce a relation', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
-       }
        // Validate that scalar subquery returns exactly one column
        const scalarSubqueryType = subqueryPlan.getType();
        if (scalarSubqueryType.typeClass === 'relation' && (scalarSubqueryType as RelationType).columns.length !== 1) {
          throw new QuereusError('Scalar subquery must return exactly one column', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
        }
-       return new ScalarSubqueryNode(ctx.scope, expr, subqueryPlan as RelationalPlanNode);
+       return new ScalarSubqueryNode(ctx.scope, expr, subqueryPlan);
 		}
 
 		case 'windowFunction': {
@@ -209,21 +239,18 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        const leftExpr = buildExpression(ctx, expr.expr, allowAggregates);
 
        if (expr.subquery) {
-         // IN subquery: expr IN (SELECT ...)
+         // IN subquery: expr IN (<QueryExpr>)
          const inSubqueryContext = {
            ...ctx,
            cteReferenceCache: ctx.cteReferenceCache || new Map()
          };
-         const inSubqueryPlan = buildSelectStmt(inSubqueryContext, expr.subquery, ctx.cteNodes, true);
-         if (inSubqueryPlan.getType().typeClass !== 'relation') {
-           throw new QuereusError('IN subquery must produce a relation', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
-         }
+         const inSubqueryPlan = buildExpressionPositionQueryExpr(inSubqueryContext, expr.subquery, true, 'IN subquery');
          // Validate that subquery returns exactly one column
          const subqueryType = inSubqueryPlan.getType();
          if (subqueryType.typeClass === 'relation' && (subqueryType as RelationType).columns.length !== 1) {
            throw new QuereusError('IN subquery must return exactly one column', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
          }
-                   return new InNode(ctx.scope, expr, leftExpr, inSubqueryPlan as RelationalPlanNode);
+                   return new InNode(ctx.scope, expr, leftExpr, inSubqueryPlan);
                } else if (expr.values) {
           // IN value list: expr IN (value1, value2, ...)
           const valueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
@@ -241,11 +268,8 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
          ...ctx,
          cteReferenceCache: ctx.cteReferenceCache || new Map()
        };
-       const existsSubqueryPlan = buildSelectStmt(existsSubqueryContext, expr.subquery, ctx.cteNodes, true);
-       if (existsSubqueryPlan.getType().typeClass !== 'relation') {
-         throw new QuereusError('EXISTS subquery must produce a relation', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
-       }
-       return new ExistsNode(ctx.scope, expr, existsSubqueryPlan as RelationalPlanNode);
+       const existsSubqueryPlan = buildExpressionPositionQueryExpr(existsSubqueryContext, expr.subquery, true, 'EXISTS subquery');
+       return new ExistsNode(ctx.scope, expr, existsSubqueryPlan);
 		}
 
     case 'between': {

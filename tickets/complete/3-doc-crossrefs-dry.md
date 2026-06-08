@@ -7,7 +7,7 @@ files:
   - docs/schema.md
   - docs/plugins.md
   - docs/errors.md
-  - packages/quereus/README.md
+  - docs/architecture.md
 ---
 
 ## Summary

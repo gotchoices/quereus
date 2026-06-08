@@ -164,20 +164,25 @@ describe('Schema Manager', () => {
 			expect(table!.columns[1].tags).to.deep.equal({ display_name: 'Name' });
 		});
 
-		it('should distinguish column tags from constraint tags', async () => {
-			// WITH TAGS after PRIMARY KEY attaches to the constraint, not the column
+		it('should attach unnamed-constraint trailing WITH TAGS to the column', async () => {
+			// `WITH TAGS` after an unnamed inline constraint (PK) attaches to the
+			// column itself — this matches the natural reading of the syntax and
+			// is what the rename-detection differ relies on (`quereus.previous_name`
+			// hints have to land on the column).
 			await db.exec("create table t1 (id integer primary key with tags (pk_info = 'auto'), name text)");
 			const table = db.schemaManager.findTable('t1');
 			expect(table).to.exist;
-			// Tags are on the PK constraint, not the column
-			expect(table!.columns[0].tags).to.be.undefined;
+			expect(table!.columns[0].tags).to.deep.equal({ pk_info: 'auto' });
 		});
 
-		it('should preserve constraint-level tags on CHECK', async () => {
-			await db.exec("create table t1 (id integer primary key, qty integer not null check (qty > 0) with tags (msg = 'positive'))");
+		it('should preserve constraint-level tags on a NAMED CHECK constraint', async () => {
+			// To anchor tags on a constraint instead of the column, the constraint
+			// must be named — otherwise the tags fall through to the column.
+			await db.exec("create table t1 (id integer primary key, qty integer not null constraint chk_qty check (qty > 0) with tags (msg = 'positive'))");
 			const table = db.schemaManager.findTable('t1');
 			expect(table).to.exist;
 			expect(table!.checkConstraints.length).to.equal(1);
+			expect(table!.checkConstraints[0].name).to.equal('chk_qty');
 			expect(table!.checkConstraints[0].tags).to.deep.equal({ msg: 'positive' });
 		});
 

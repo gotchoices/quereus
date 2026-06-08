@@ -1,0 +1,44 @@
+-- adapted from SQLite test/joinE.test
+-- ON IS NULL / IS NOT NULL on nullable columns in INNER and LEFT joins.
+-- Companion to 26.1-left-join-isnull-on-notnull.sqllogic which covers the
+-- NOT-NULL-column case.
+
+create table jn_a (id integer primary key, k integer null, v text);
+create table jn_b (id integer primary key, k integer null, v text);
+
+insert into jn_a values (1, 10, 'a1'), (2, null, 'a2'), (3, null, 'a3');
+insert into jn_b values (10, 10, 'b1'), (20, null, 'b2'), (30, null, 'b3'), (40, 99, 'b4');
+
+-- INNER JOIN ON a.k IS NULL: matches only left rows whose key is null,
+-- crossed with every right row (the predicate is independent of right side)
+select jn_a.id as aid, jn_b.id as bid
+  from jn_a join jn_b on jn_a.k is null
+  order by aid, bid;
+→ [{"aid":2,"bid":10},{"aid":2,"bid":20},{"aid":2,"bid":30},{"aid":2,"bid":40},{"aid":3,"bid":10},{"aid":3,"bid":20},{"aid":3,"bid":30},{"aid":3,"bid":40}]
+
+-- INNER JOIN ON a.k IS NULL AND b.k IS NULL: only null-key rows from both sides
+select jn_a.id as aid, jn_b.id as bid
+  from jn_a join jn_b on jn_a.k is null and jn_b.k is null
+  order by aid, bid;
+→ [{"aid":2,"bid":20},{"aid":2,"bid":30},{"aid":3,"bid":20},{"aid":3,"bid":30}]
+
+-- LEFT JOIN ON a.k IS NULL: non-null-keyed left rows get padded
+select jn_a.id as aid, jn_b.id as bid
+  from jn_a left join jn_b on jn_a.k is null and jn_b.k = 10
+  order by aid, bid;
+→ [{"aid":1,"bid":null},{"aid":2,"bid":10},{"aid":3,"bid":10}]
+
+-- INNER JOIN ON regular equality with explicit IS NULL fallback
+select jn_a.id as aid, jn_b.id as bid
+  from jn_a join jn_b on jn_a.k = jn_b.k or (jn_a.k is null and jn_b.k is null)
+  order by aid, bid;
+→ [{"aid":1,"bid":10},{"aid":2,"bid":20},{"aid":2,"bid":30},{"aid":3,"bid":20},{"aid":3,"bid":30}]
+
+-- LEFT JOIN ON IS NOT NULL on right key
+select jn_a.id as aid, jn_b.id as bid
+  from jn_a left join jn_b on jn_a.id = jn_b.id - 9 and jn_b.k is not null
+  order by aid, bid;
+→ [{"aid":1,"bid":10},{"aid":2,"bid":null},{"aid":3,"bid":null}]
+
+drop table jn_a;
+drop table jn_b;

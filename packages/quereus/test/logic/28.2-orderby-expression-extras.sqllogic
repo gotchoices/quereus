@@ -1,0 +1,83 @@
+-- adapted from SQLite test/select1.test, test/orderby1.test, test/orderby5.test,
+-- test/orderby8.test, test/orderby9.test, test/e_select.test
+-- ORDER BY targets that aren't bare column names: positional references,
+-- arithmetic / function expressions, mixed CASE, multi-column COLLATE, and
+-- expression-derived ORDER BY in the absence of GROUP BY.
+
+create table ob (id integer primary key, a integer, b integer null, c text);
+insert into ob values
+  (1, 10, null,  'p'),
+  (2, 20,    5,  'q'),
+  (3,  5,    3,  'r'),
+  (4, 15, null,  'p'),
+  (5, 30,   10,  'q'),
+  (6,  1,    7,  's');
+
+-- ORDER BY positional reference (1 → first SELECT column)
+select a from ob order by 1;
+→ [{"a":1},{"a":5},{"a":10},{"a":15},{"a":20},{"a":30}]
+
+-- ORDER BY positional, multi-column, mixed direction
+select c, a from ob order by 1, 2 desc;
+→ [{"c":"p","a":15},{"c":"p","a":10},{"c":"q","a":30},{"c":"q","a":20},{"c":"r","a":5},{"c":"s","a":1}]
+
+-- ORDER BY with DESC on the first key, and an expression alias second
+select a, b * 2 as bx from ob where b is not null order by a desc, bx;
+→ [{"a":30,"bx":20},{"a":20,"bx":10},{"a":5,"bx":6},{"a":1,"bx":14}]
+
+-- ORDER BY arithmetic expression on a non-projected column
+select id from ob where b is not null order by abs(b - 6), id;
+→ [{"id":2},{"id":6},{"id":3},{"id":5}]
+
+-- ORDER BY a CASE expression — null bucketed past real values
+select id, b from ob order by case when b is null then 999 else b end, id;
+→ [{"id":3,"b":3},{"id":2,"b":5},{"id":6,"b":7},{"id":5,"b":10},{"id":1,"b":null},{"id":4,"b":null}]
+
+-- ORDER BY a + b with null propagation; nulls land last via NULLS LAST
+select id, b from ob order by a + b nulls last, id;
+→ [{"id":3,"b":3},{"id":6,"b":7},{"id":2,"b":5},{"id":5,"b":10},{"id":1,"b":null},{"id":4,"b":null}]
+
+drop table ob;
+
+-- =============================================================================
+-- ORDER BY with per-column COLLATE directives in a multi-key sort
+-- =============================================================================
+
+create table cm (id integer primary key, a text, b text);
+insert into cm values
+  (1, 'Alice', 'bob'),
+  (2, 'bob',   'ALICE'),
+  (3, 'alice', 'Bob');
+
+-- a COLLATE binary, b COLLATE nocase: 'A'<'a' under binary
+select id from cm order by a collate binary, b collate nocase;
+→ [{"id":1},{"id":3},{"id":2}]
+
+-- Reverse roles: a NOCASE then b BINARY
+-- Under nocase, 'Alice'~'alice', tie broken by b binary: 'bob' (id=1) vs 'Bob' (id=3) → 'Bob' first.
+select id from cm order by a collate nocase, b collate binary;
+→ [{"id":3},{"id":1},{"id":2}]
+
+drop table cm;
+
+-- =============================================================================
+-- ORDER BY many computed columns — sort key precedence remains correct
+-- =============================================================================
+
+create table many (x integer);
+insert into many values (1), (5), (9), (7), (3), (2), (4), (6), (8);
+
+-- Several computed result columns alongside the sort key
+select x, x + 1 as p1, x + 2 as p2, x + 10 as p10, x + 100 as p100
+from many order by x;
+→ [{"x":1,"p1":2,"p2":3,"p10":11,"p100":101},{"x":2,"p1":3,"p2":4,"p10":12,"p100":102},{"x":3,"p1":4,"p2":5,"p10":13,"p100":103},{"x":4,"p1":5,"p2":6,"p10":14,"p100":104},{"x":5,"p1":6,"p2":7,"p10":15,"p100":105},{"x":6,"p1":7,"p2":8,"p10":16,"p100":106},{"x":7,"p1":8,"p2":9,"p10":17,"p100":107},{"x":8,"p1":9,"p2":10,"p10":18,"p100":108},{"x":9,"p1":10,"p2":11,"p10":19,"p100":109}]
+
+-- Alias and positional references resolve to the same expression
+select abs(x - 5) as dist from many order by dist;
+→ [{"dist":0},{"dist":1},{"dist":1},{"dist":2},{"dist":2},{"dist":3},{"dist":3},{"dist":4},{"dist":4}]
+
+-- ORDER BY positional ordinal resolves to the SELECT-list expression
+select abs(x - 5) as dist from many order by 1;
+→ [{"dist":0},{"dist":1},{"dist":1},{"dist":2},{"dist":2},{"dist":3},{"dist":3},{"dist":4},{"dist":4}]
+
+drop table many;

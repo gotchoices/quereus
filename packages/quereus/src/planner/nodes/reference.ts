@@ -1,5 +1,10 @@
 import type { BaseType, ScalarType, RelationType } from '../../common/datatype.js';
-import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute } from './plan-node.js';
+import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint } from './plan-node.js';
+import { addFd, closeConstantBindingsOverEcs, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
+import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
+import { getPartialUniqueGuardedFds } from '../analysis/partial-unique-extraction.js';
+import { getAssertionHoistedConstraints } from '../analysis/assertion-hoist-cache.js';
+import type { SchemaManager } from '../../schema/manager.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { Scope } from '../scopes/scope.js';
@@ -12,8 +17,19 @@ import { formatScalarType } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
+import { getModuleConcurrencyMode } from '../../vtab/concurrency.js';
 import type { ColumnBindingProvider } from '../framework/characteristics.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
+
+/** Shared empty `CheckExtraction` instance used when a vtab module's
+ *  `permitsGrandfatheredCheckViolators` capability suppresses the CHECK
+ *  contribution lift in `TableReferenceNode.computePhysical`. */
+const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
+	fds: [],
+	equivPairs: [],
+	constantBindings: [],
+	domainConstraints: [],
+};
 
 /** Represents a reference to a table in the global schema. */
 export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNode, TableAccessCapable, ColumnBindingProvider {
@@ -28,7 +44,17 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		public readonly vtabModule: AnyVirtualTableModule,
 		public readonly vtabAuxData?: unknown,
 		estimatedCostOverride?: number,
-		public readonly readCommitted: boolean = false
+		public readonly readCommitted: boolean = false,
+		/**
+		 * Optional reference to the schema manager that owns `tableSchema`.
+		 * Threaded through so `computePhysical` can hoist qualifying CREATE
+		 * ASSERTION predicates into FD / EC / binding / domain contributions
+		 * via `assertion-hoist-cache`. When undefined (e.g. tests that
+		 * construct a TableReferenceNode in isolation), assertion-hoisting is
+		 * skipped — declared CHECK / partial-unique contributions are
+		 * unaffected.
+		 */
+		public readonly schemaManager?: SchemaManager,
 	) {
 		super(scope, estimatedCostOverride ?? 1);
 		this.typeCache = new Cached(() => relationTypeFromTableSchema(tableSchema));
@@ -77,6 +103,113 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		return this.tableSchema.estimatedRows;
 	}
 
+	computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		// Seed FDs from declared keys: each declared key (PK + UNIQUE) becomes
+		// `key → other-columns`. This is the canonical encoding of "K is a unique
+		// key" — downstream consumers query `physical.fds` (via `isSuperkey` /
+		// `hasAnyKey`) without special-casing keys.
+		const relType = this.getType();
+		const colCount = relType.columns.length;
+		let fds: ReadonlyArray<FunctionalDependency> = [];
+		for (const key of relType.keys) {
+			if (key.length === 0) continue;
+			const det = key.map(k => k.index);
+			const detSet = new Set(det);
+			const dep: number[] = [];
+			for (let i = 0; i < colCount; i++) {
+				if (!detSet.has(i)) dep.push(i);
+			}
+			if (dep.length === 0) continue;
+			fds = addFd(fds, { determinants: det, dependents: dep });
+		}
+
+		// Merge in CHECK-derived FDs/ECs/bindings/domains. Cached per-schema.
+		//
+		// Skipped wholesale when the owning vtab module declares the
+		// `permitsGrandfatheredCheckViolators` capability: under that contract
+		// `ALTER TABLE … ADD CHECK` against non-conforming rows succeeds and
+		// grandfathers the violators, so a declared CHECK is no longer a
+		// universal invariant over the current row set and lifting it into
+		// physical properties would let consumers (e.g. the filter-contradiction
+		// rule) fold WHERE predicates that would have matched the violators.
+		// Assertion-hoist and partial-UNIQUE contributions are independent
+		// paths and are NOT gated by this flag.
+		const permitsCheckViolators =
+			this.vtabModule.getCapabilities?.().permitsGrandfatheredCheckViolators === true;
+		const checkExt: CheckExtraction = permitsCheckViolators
+			? EMPTY_CHECK_EXTRACTION
+			: getCheckExtraction(this.tableSchema);
+		for (const fd of checkExt.fds) {
+			fds = addFd(fds, fd);
+		}
+
+		// Guarded FDs from partial UNIQUE constraints (`CREATE UNIQUE INDEX (K)
+		// WHERE P`). The unconditional UC path in relationTypeFromTableSchema
+		// skips these (uniqueness only holds within P's scope); here we emit
+		// `K → others [guard=P]` so Filter activation can discharge the guard
+		// for queries whose WHERE clause entails P.
+		for (const fd of getPartialUniqueGuardedFds(this.tableSchema)) {
+			fds = addFd(fds, fd);
+		}
+
+		// Assertion-hoist contributions. CREATE ASSERTION predicates in canonical
+		// `not exists (select 1 from T [where P])` shape are folded onto T as
+		// if they were per-row CHECKs — see `assertion-hoist-cache.ts`. Merged
+		// AFTER declared-check / partial-unique so structurally-identical
+		// dedup'd entries keep the declared-check provenance.
+		const hoisted = this.schemaManager !== undefined
+			? getAssertionHoistedConstraints(this.schemaManager, this.tableSchema)
+			: undefined;
+		if (hoisted) {
+			for (const fd of hoisted.fds) fds = addFd(fds, fd);
+		}
+
+		let equivClasses: ReadonlyArray<ReadonlyArray<number>> = [];
+		const allEquivPairs: Array<[number, number]> = [];
+		for (const p of checkExt.equivPairs) allEquivPairs.push([p[0], p[1]]);
+		if (hoisted) for (const p of hoisted.equivPairs) allEquivPairs.push([p[0], p[1]]);
+		if (allEquivPairs.length > 0) {
+			equivClasses = mergeEquivClasses([], allEquivPairs);
+		}
+
+		let constantBindings: ReadonlyArray<ConstantBinding> = [];
+		const hasBindings = checkExt.constantBindings.length > 0
+			|| (hoisted?.constantBindings.length ?? 0) > 0;
+		if (hasBindings) {
+			constantBindings = mergeConstantBindings([], checkExt.constantBindings);
+			if (hoisted && hoisted.constantBindings.length > 0) {
+				constantBindings = mergeConstantBindings(constantBindings, hoisted.constantBindings);
+			}
+			if (equivClasses.length > 0) {
+				constantBindings = closeConstantBindingsOverEcs(constantBindings, equivClasses);
+			}
+		}
+
+		let domainConstraints: ReadonlyArray<DomainConstraint> = checkExt.domainConstraints;
+		if (hoisted && hoisted.domainConstraints.length > 0) {
+			domainConstraints = mergeDomainConstraints(domainConstraints, hoisted.domainConstraints);
+		}
+
+		const out: Partial<PhysicalProperties> = {};
+		if (fds.length > 0) out.fds = fds;
+		if (equivClasses.length > 0) out.equivClasses = equivClasses;
+		if (constantBindings.length > 0) out.constantBindings = constantBindings;
+		if (domainConstraints.length > 0) out.domainConstraints = domainConstraints;
+		// Concurrency safety: read-only subtree over a module that tolerates
+		// concurrent calls. The base PlanNode `physical` getter ANDs children's
+		// `concurrencySafe` automatically; here we set the leaf value.
+		out.concurrencySafe = getModuleConcurrencyMode(this.vtabModule) !== 'serial';
+		// expectedLatencyMs: pick up the module's declared hint. Local in-process
+		// modules omit it (0). Remote modules declare a non-zero value so the
+		// parallel fan-out rule can amortize per-branch latency. With no remote
+		// plugin in tree this stays 0 and the cost gate is inert by design.
+		const moduleLatency = this.vtabModule.expectedLatencyMs;
+		if (typeof moduleLatency === 'number' && moduleLatency > 0) {
+			out.expectedLatencyMs = moduleLatency;
+		}
+		return out;
+	}
+
 	override toString(): string {
 		const prefix = this.readCommitted ? 'committed.' : '';
 		return `${prefix}${this.tableSchema.schemaName}.${this.tableSchema.name}`;
@@ -97,9 +230,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	}
 
 	getColumnIndexForAttribute(attributeId: number): number | undefined {
-		const attrs = this.getAttributes();
-		const idx = attrs.findIndex(a => a.id === attributeId);
-		return idx >= 0 ? idx : undefined;
+		return this.getAttributeIndex().get(attributeId);
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
@@ -243,6 +374,19 @@ export class ColumnReferenceNode extends PlanNode implements ZeroAryScalarNode {
 			resultType: formatScalarType(this.columnType)
 		};
 	}
+
+	override isInjectiveIn(inputAttrId: number): InjectivityResult {
+		// f(x) = x is injective; references to other attributes are not (they don't depend on x).
+		return inputAttrId === this.attributeId
+			? { injective: true }
+			: { injective: false };
+	}
+
+	override monotonicityIn(inputAttrId: number): MonotonicityResult {
+		return inputAttrId === this.attributeId
+			? { monotonicity: 'increasing' }
+			: { monotonicity: 'constant' };
+	}
 }
 
 /**
@@ -289,6 +433,12 @@ export class ParameterReferenceNode extends PlanNode implements ZeroAryScalarNod
 			parameter: this.nameOrIndex,
 			resultType: formatScalarType(this.targetType)
 		};
+	}
+
+	override monotonicityIn(_inputAttrId: number): MonotonicityResult {
+		// A parameter does not depend on any input attribute; its value is fixed
+		// for the duration of one execution.
+		return { monotonicity: 'constant' };
 	}
 }
 

@@ -24,6 +24,30 @@ export type RuleFn = (node: PlanNode, context: OptContext) => PlanNode | null;
 export type RulePhase = 'rewrite' | 'impl';
 
 /**
+ * Required side-effect awareness declaration for every registered rule.
+ *
+ * - `'safe'` — the rule never moves, duplicates, drops, or merges any
+ *   subtree it does not separately verify pure. Reordering scalar properties
+ *   on an existing node, replacing a logical node with a physical one whose
+ *   children survive in the same positions, and annotation-only transforms
+ *   all qualify. The rule does not need to consult
+ *   `PlanNodeCharacteristics.hasSideEffects` because its own structural shape
+ *   guarantees side-effect preservation.
+ *
+ * - `'aware'` — the rule DOES move, duplicate, drop, or merge subtrees, and
+ *   explicitly consults `PlanNodeCharacteristics.hasSideEffects` (or
+ *   `subtreeHasSideEffects`) to refuse / weaken when any participating
+ *   subtree carries a write. Includes rules that *intentionally* preserve
+ *   side effects through run-once memoization (e.g. mutating-subquery-cache).
+ *
+ * This field is intentionally not optional: every future rule author has to
+ * actively pick one. The registry validates the choice at registration time
+ * and rejects rules that fail to declare. See `docs/optimizer.md` § Audit
+ * discipline.
+ */
+export type SideEffectMode = 'safe' | 'aware';
+
+/**
  * Handle for registered optimization rules
  */
 export interface RuleHandle {
@@ -37,6 +61,12 @@ export interface RuleHandle {
 	fn: RuleFn;
 	/** Optional priority (lower numbers run first) */
 	priority?: number;
+	/**
+	 * Side-effect awareness declaration — see {@link SideEffectMode}. Required:
+	 * registration fails when omitted, so every rule author has to make an
+	 * active choice rather than silently dropping a write.
+	 */
+	sideEffectMode: SideEffectMode;
 }
 
 /**
@@ -49,6 +79,8 @@ class RuleRegistry {
 	 * Register a new optimization rule
 	 */
 	registerRule(handle: RuleHandle): void {
+		validateSideEffectMode(handle);
+
 		if (!this.rules.has(handle.nodeType)) {
 			this.rules.set(handle.nodeType, []);
 		}
@@ -257,7 +289,27 @@ export function createRule(
 	nodeType: PlanNodeType,
 	phase: RulePhase,
 	fn: RuleFn,
+	sideEffectMode: SideEffectMode,
 	priority?: number
 ): RuleHandle {
-	return { id, nodeType, phase, fn, priority };
+	return { id, nodeType, phase, fn, sideEffectMode, priority };
+}
+
+/**
+ * Reject any rule registration that fails to declare `sideEffectMode`. The
+ * field is typed as required, but plenty of call sites build rule handles
+ * dynamically (object spreads, generated registries) where TypeScript can't
+ * see through — this runtime check is the load-bearing audit gate. Exported
+ * so the PassManager can apply the same validation when rules are pushed
+ * directly into a pass's `rules` array (bypassing the global registry).
+ */
+export function validateSideEffectMode(handle: RuleHandle): void {
+	const mode = (handle as { sideEffectMode?: unknown }).sideEffectMode;
+	if (mode !== 'safe' && mode !== 'aware') {
+		quereusError(
+			`Optimization rule '${handle.id}' is missing or has invalid sideEffectMode (got ${JSON.stringify(mode)}); ` +
+			`every rule must declare 'safe' or 'aware'. See docs/optimizer.md § Audit discipline.`,
+			StatusCode.INTERNAL,
+		);
+	}
 }

@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of quereus-store package (KVStore, StoreModule, encoding, serialization, events)
-dependencies: [3-review-core-api, 3-review-core-vtab]
+prereq: [review-core-api, review-core-vtab]
 
 ---
 
@@ -62,14 +62,14 @@ Upper-bound `break` logic in `iterate()` fires on the first (highest) entry in r
 
 **Location**: `memory-store.ts` lines 82–96
 **Test**: `memory-store.spec.ts` → `'supports reverse with bounds'` (`.skip`)
-**Follow-up**: `tasks/fix/3-store-memory-reverse-iter-bug.md`
+**Follow-up**: `tasks/fix/store-memory-reverse-iter-bug.md`
 
 ### Bug 2: Secondary index updates bypass TransactionCoordinator
 
 `StoreTable.updateSecondaryIndexes()` applies index writes directly even when in a transaction, so index mutations are not rolled back on transaction rollback. Both `if/else` branches are identical (DRY violation).
 
 **Location**: `store-table.ts` lines 589–611
-**Follow-up**: `tasks/fix/3-store-index-transaction-bypass.md`
+**Follow-up**: `tasks/fix/store-index-transaction-bypass.md`
 
 ## Code Quality Observations
 
@@ -77,7 +77,7 @@ Upper-bound `break` logic in `iterate()` fires on the first (highest) entry in r
 
 - **scanPKRange full scan**: `store-table.ts` lines 368–377 does full scan with TODO to refine bounds. The `_access: PKAccessPattern` parameter is unused.
 - **Deprecated key-builder exports**: `key-builder.ts` lines 187–243 has legacy exports awaiting consumer migration.
-- **Global collation encoder registry**: `encoding.ts` uses a module-level singleton Map. Already tracked in `tasks/plan/3-collation-registry-per-database.md`.
+- **Global collation encoder registry**: `encoding.ts` uses a module-level singleton Map. Already tracked in `tasks/plan/collation-registry-per-database.md`.
 
 ### Positive Findings
 
@@ -96,8 +96,8 @@ Upper-bound `break` logic in `iterate()` fires on the first (highest) entry in r
 
 ## Follow-Up Tasks Created
 
-- `tasks/fix/3-store-memory-reverse-iter-bug.md` — Reverse iteration bounds bug with failing test
-- `tasks/fix/3-store-index-transaction-bypass.md` — Index ops bypass coordinator + DRY violation
+- `tasks/fix/store-memory-reverse-iter-bug.md` — Reverse iteration bounds bug with failing test
+- `tasks/fix/store-index-transaction-bypass.md` — Index ops bypass coordinator + DRY violation
 
 ## Files Modified
 

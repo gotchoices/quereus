@@ -22,6 +22,82 @@ Key features:
 - **Third Manifesto Aligned:** Embraces principles like default NOT NULL columns and key-based addressing.
 
 ## 2. SQL Statement Reference
+
+### Query expressions
+
+A **query expression** is anything that produces a relation. Quereus accepts
+the same five forms at every relation-producing site:
+
+| Form                                 | Notes                                                         |
+| ------------------------------------ | ------------------------------------------------------------- |
+| `SELECT …`                           | The canonical relational query.                               |
+| `VALUES (…), …`                      | A literal row set. Body-supplied / binding-site names apply.  |
+| `INSERT … RETURNING …`               | DML re-projected through `RETURNING`.                         |
+| `UPDATE … RETURNING …`               | DML re-projected through `RETURNING`.                         |
+| `DELETE … RETURNING …`               | DML re-projected through `RETURNING`.                         |
+
+Each of these may appear at any **relation site**:
+
+- Top-level statement
+- FROM-clause subquery source (`… FROM (<query-expr>) AS t [(cols)]`)
+- Scalar / row subquery (`(<query-expr>)`)
+- `IN (<query-expr>)` and `NOT IN (<query-expr>)`
+- `EXISTS (<query-expr>)`
+- Compound legs (`… UNION [ALL] | INTERSECT | EXCEPT | DIFF <query-expr>`)
+- CTE body (`WITH cte(cols) AS (<query-expr>) …`)
+- View body (`CREATE VIEW v[(cols)] AS <query-expr>`)
+
+**RETURNING is required for DML at non-top-level positions.** The outer
+position consumes a relation, so a `RETURNING`-less DML is rejected at parse
+time outside top-level.
+
+**All five forms run at every relation site**, with one exception: DML
+(`INSERT/UPDATE/DELETE … RETURNING`) is rejected as a view body. A view
+re-evaluates on every reference, and replaying a write per read is incoherent
+with view semantics; the mutation belongs in the statement that references
+the view, not in the view body. The rejection fires at view-creation time.
+
+**Run-once + full-drain contract for impure subqueries.** When a DML appears
+in scalar / `IN` / `EXISTS` position, the runtime applies two contracts that
+do not apply to pure inners:
+
+- **Full drain.** The emitter consumes every row of the inner iterator —
+  no short-circuit on first row (`scalar`), on match (`IN`), or on
+  `EXISTS = true`. The pure-inner optimization survives unchanged.
+- **Run once per statement execution.** If the outer expression is
+  re-evaluated (correlated subquery, per-row scan), the inner DML executes
+  exactly once and subsequent evaluations replay the memoized result.
+
+Both contracts are gated by `physical.readonly === false` on the inner
+subtree, so pure inners are unaffected. See `docs/runtime.md` for the
+emitter-level mechanics.
+
+**Conflict resolution does not propagate inward.** An outer
+`INSERT OR REPLACE … (insert into inner … returning …)` does not flow its
+`OR REPLACE` into the inner DML — each DML carries its own
+`onConflict` from its own AST.
+
+**Limitation: per-row DML in an outer DML is not supported.** Expressions
+of the form `update outer set x = (insert into inner … returning y)` where
+the scalar subquery is evaluated *per row of an outer DML* are not yet
+supported. The ordering semantics (does the inner see the outer's mid-flight
+writes?) are subtle and the engine errs on the side of refusing rather than
+guessing. Use a CTE pre-pass or a two-statement form instead.
+
+**Column naming for unnamed bodies.** When a `VALUES` (or any other form
+without explicit projection aliases) appears at a site that binds columns,
+the precedence is:
+
+1. Binding-site column list — `(VALUES (…)) AS t(a, b)`, `WITH t(a, b) AS …`,
+   `CREATE VIEW v(a, b) AS …` — wins absolutely.
+2. Body-supplied names — SELECT/RETURNING aliases or column refs. `VALUES`
+   has none.
+3. Synthesized fallback — `column_0`, `column_1`, … (today's default).
+
+Persistent named relations (top-level CTE bodies, view bodies) with neither
+binding-site nor body-supplied names silently fall back to the synthesized
+form; they do **not** error.
+
 ### 2.0 Declarative Schema (Optional, Order-Independent)
 
 Quereus keeps traditional DDL fully intact. Declarative schema is an optional alternative for describing the desired end‑state in a single, order‑independent block. Modules continue to use DDL‑based interfaces; declarative workflows operate entirely in the engine and produce DDL.
@@ -169,7 +245,21 @@ apply schema main to version '1.0.0' options (
 **Safety:**
 - Seed data application is destructive (clears table before inserting).
 - Future enhancements will add `allow_destructive` gating for schema changes.
-- Rename hints and stable IDs (planned) will prevent accidental drops during renames.
+- Rename hints prevent accidental drops during renames — see "Rename detection" below.
+
+**Rename detection (`rename_policy`):**
+
+`apply schema` understands rename hints carried via the reserved `quereus.id` and `quereus.previous_name` tags (see §2.6.3). The `rename_policy` option in `OPTIONS (...)` controls how strictly the differ behaves when names change:
+
+| Value | Behavior |
+|-------|----------|
+| `'allow'` (default) | Use hints when present; without hints, fall through to drop+create. |
+| `'require-hint'` | Reject any name change that lacks a hint — if drops *and* creates of the same kind both remain after rename matching, error rather than executing destructive DDL. |
+| `'deny'` | Ignore hints entirely. Any name mismatch becomes drop+create. Escape hatch for opting back into the legacy behavior. |
+
+A rename detected via `quereus.id` is authoritative: when both `id` and `previous_name` would resolve, `id` wins. A *conflict* — declared name and the hint resolving to two distinct existing actuals — is always an error regardless of policy.
+
+Renames apply to tables, views, indexes, named constraints (table-level `CONSTRAINT <name> ...`), and columns. Tables and columns rename via the `ALTER TABLE ... RENAME` primitives, which propagate references through dependent CHECK expressions, FK targets, and view bodies. View, index, and named-constraint renames currently fall back to drop+recreate when no rename primitive exists.
 
 **Notes:**
 - Keywords `schema`, `version`, and `seed` are contextual and don't conflict with column names or function calls like `schema()`.
@@ -397,15 +487,30 @@ assignment:
 
 **Conflict Resolution (OR clause):**
 
-When inserting a row that would violate a UNIQUE constraint (including PRIMARY KEY), the `OR` clause specifies how to handle the conflict:
+When inserting a row that would violate a `UNIQUE`, `PRIMARY KEY`, `NOT NULL`, `CHECK`, or `FOREIGN KEY` constraint, the `OR` clause specifies how to handle the conflict:
 
-- **`OR ROLLBACK`**: Abort the current transaction and rollback all changes
-- **`OR ABORT`**: Abort the current statement and rollback changes (default behavior)
-- **`OR FAIL`**: Abort the current statement but do not rollback prior changes in the transaction
-- **`OR IGNORE`**: Silently skip the row that would cause a conflict
-- **`OR REPLACE`**: Delete the existing row that conflicts and insert the new row (destructive—loses unspecified column values)
+- **`OR ROLLBACK`**: Abort the current statement *and* automatically roll back the enclosing transaction (implicit or explicit). Any prior writes inside the transaction are discarded.
+- **`OR ABORT`**: Abort the current statement (default behavior). In autocommit mode the implicit transaction rolls back; inside an explicit transaction the prior writes are preserved (you must `ROLLBACK` manually if you want them undone).
+- **`OR FAIL`**: Abort the current statement but commit prior rows of the same statement that succeeded before the violation. Inside an explicit transaction those rows simply remain in the pending transaction.
+- **`OR IGNORE`**: Silently skip the row that would cause a conflict and continue with the next row.
+- **`OR REPLACE`**: For `UNIQUE`/`PRIMARY KEY` conflicts, delete the existing row and insert the new one (destructive—loses unspecified column values). For `NOT NULL` conflicts, substitute the column's `DEFAULT` value if one is declared (otherwise behaves like `ABORT`). `CHECK` and foreign-key constraints are *not* relaxed by `REPLACE` — those still abort.
 
-**Note:** The `OR` clause and `ON CONFLICT` clause are mutually exclusive. Use `OR REPLACE` for simple full-row replacement, and `ON CONFLICT DO UPDATE` for surgical column-level updates.
+**Per-constraint defaults.** A column- or table-level constraint may carry its own `ON CONFLICT <action>` clause:
+
+```sql
+create table products (
+  sku text primary key on conflict ignore,           -- duplicate INSERTs silently skipped
+  name text not null on conflict ignore,             -- NULL name → row skipped
+  price real check (price > 0) on conflict ignore,   -- non-positive price → row skipped
+  email text unique on conflict replace              -- duplicate email → existing row replaced
+);
+```
+
+The action precedence is: **statement-level OR clause > per-constraint default > ABORT**. So `INSERT OR ABORT INTO products ...` overrides every column-level directive above.
+
+**Note:** The `OR` clause and `ON CONFLICT DO ...` clause are mutually exclusive. Use `OR REPLACE` for simple full-row replacement, and `ON CONFLICT DO UPDATE` for surgical column-level updates.
+
+**INSERT only.** The `OR <action>` clause is **only accepted on `INSERT`**. Quereus does not support SQLite's `UPDATE OR <action>` (or `DELETE OR <action>`) per-statement override — that syntax has no precedent outside SQLite (Postgres, SQL Server, MySQL, Oracle, and ANSI SQL all lack it). For UPDATE conflict handling, use the schema-level `ON CONFLICT <action>` declared on the constraint, or rewrite the UPDATE with `WHERE NOT EXISTS (...)` / explicit `DELETE` + `UPDATE` inside a transaction.
 
 #### UPSERT (ON CONFLICT clause)
 
@@ -869,9 +974,10 @@ Generated columns are computed from an expression over other columns in the same
 - `STORED`: The value is computed at INSERT/UPDATE time and persisted. Reads return the stored value directly.
 - `VIRTUAL`: Semantically computed on read (currently stored identically to STORED; storage optimization is planned).
 - If neither `STORED` nor `VIRTUAL` is specified, `VIRTUAL` is the default.
-- Generated column expressions must be deterministic and may only reference non-generated columns of the same table.
+- Generated column expressions must be deterministic. They may reference any column of the same table, including other generated columns; their dependency graph must be acyclic and self-references are rejected at `CREATE TABLE` / `ALTER TABLE ADD COLUMN` time.
 - Cannot have both `DEFAULT` and `GENERATED ALWAYS AS` on the same column.
 - Cannot INSERT into or UPDATE a generated column directly.
+- `ALTER TABLE ... DROP COLUMN` of a column referenced by another generated column's expression is rejected; drop the referencing generated column first.
 
 ### 2.6.1 CREATE/DROP ASSERTION (Global Integrity Constraints)
 
@@ -1056,6 +1162,31 @@ Tag values can be strings, numbers, booleans (`true`/`false`), or `null`. Tag ke
 
 Tags are available on the schema interfaces (`TableSchema.tags`, `ColumnSchema.tags`, etc.) and via the programmatic API (`SchemaManager.getTableTags()`, `SchemaManager.setTableTags()`).
 
+**Reserved namespace `quereus.*`:** keys whose name starts with `quereus.` are reserved for the engine. Tag keys with dots must use the quoted-identifier form (`"quereus.id"`). Currently recognized keys:
+
+| Key | Used by | Effect |
+|-----|---------|--------|
+| `"quereus.id"` | `apply schema` / `diff schema` | Stable identifier — when a declared and actual object share the same `quereus.id` but have different names, the differ emits a rename instead of a drop+create. Authoritative; wins over `previous_name`. |
+| `"quereus.previous_name"` | `apply schema` / `diff schema` | One or more comma-separated old names. The differ matches a declared object whose name is missing in the catalog against an actual object whose name appears in this list. |
+
+Unrecognized `quereus.*` keys are accepted with a soft warning so future versions may add new keys without breaking older parsers.
+
+Example — declaring a renamed table and column:
+
+```sql
+declare schema main {
+  table customer with tags (
+    "quereus.id" = 'tbl-customer',
+    "quereus.previous_name" = 'client'
+  ) {
+    customer_id integer primary key with tags ("quereus.previous_name" = 'client_id'),
+    full_name text not null with tags ("quereus.previous_name" = 'name')
+  }
+}
+```
+
+Against an existing `client(client_id, name)`, this diffs to `ALTER TABLE client RENAME TO customer` plus two `ALTER TABLE customer RENAME COLUMN ...` rather than dropping and recreating.
+
 ### 2.7 ALTER TABLE Statement
 
 Modifies an existing table's structure or name.
@@ -1066,7 +1197,7 @@ Modifies an existing table's structure or name.
 ALTER TABLE old_name RENAME TO new_name;
 ```
 
-Renames a table. The old name becomes invalid immediately. Fails if the new name already exists.
+Renames a table. The old name becomes invalid immediately. Fails if the new name already exists. References to the old name in dependent objects are rewritten in place: CHECK expressions on every table in the schema, FOREIGN KEY `referencedTable` entries (across all schemas), and view bodies (`selectAst` and the cached `sql` text). The rewrite is best-effort AST replacement — a CTE that intentionally shadowed the old name is not preserved.
 
 **RENAME COLUMN**
 
@@ -1074,7 +1205,7 @@ Renames a table. The old name becomes invalid immediately. Fails if the new name
 ALTER TABLE table_name RENAME COLUMN old_col TO new_col;
 ```
 
-Renames a column. Data is preserved. Fails if the new name conflicts with an existing column or the old name doesn't exist.
+Renames a column. Data is preserved. Fails if the new name conflicts with an existing column or the old name doesn't exist. As with `RENAME TABLE`, references in CHECK expressions, FOREIGN KEY `referencedColumnNames`, and view bodies are propagated. Inside dependent SELECTs the rewrite follows scope: unqualified column references resolve when the renamed table (or a CTE that re-exposes the renamed column under the same name) is in the unaliased FROM scope; qualified references resolve via the alias map. A CTE re-exposes the renamed column when it has no explicit column list (`with c as ...` not `with c(x) as ...`) and at least one result column is a passthrough of the renamed column (an unaliased `select k`, `t.k`, or `select *` from the renamed table).
 
 **ADD COLUMN**
 
@@ -1085,7 +1216,7 @@ ALTER TABLE table_name ADD COLUMN col_name type [constraints];
 Adds a new column to the table. Existing rows are backfilled with the column's DEFAULT value (or NULL if no default). Restrictions:
 
 - Cannot add a PRIMARY KEY column.
-- Cannot add a NOT NULL column without a DEFAULT if the table has existing rows.
+- Cannot add a NOT NULL column without a DEFAULT if the table has existing rows — unless the table's module advertises the `delegatesNotNullBackfill` capability, in which case the engine skips this pre-check and the module's `alterTable` owns the decision (intended for structurally-total modules that carry pre-existing rows forward and enforce NOT NULL at write time going forward). Native modules (memory, store) leave the capability off, so this restriction applies to them.
 
 **DROP COLUMN**
 
@@ -1325,7 +1456,7 @@ The having clause filters groups based on a condition.
 having condition
 ```
 
-The condition is applied after grouping, allowing filtering on aggregate values.
+The condition is applied after grouping, allowing filtering on aggregate values. References to columns are restricted: only columns that appear in `group by` and aggregate expressions are valid; bare references to ungrouped columns raise an error. The same restriction applies to the implicit single group when the query has aggregates but no `group by`.
 
 **Examples:**
 ```sql
@@ -1364,7 +1495,8 @@ order by expression [asc | desc] [nulls first | nulls last]
 - `desc`: Descending order
 - `nulls first`: NULL values sort before non-NULL values
 - `nulls last`: NULL values sort after non-NULL values
-- Expression can be a column name, alias, or expression
+- Expression can be a column name, alias, expression, or a positive integer representing a position in the select list (1-based; out-of-range raises an error)
+- Aggregate functions are permitted when the query is itself an aggregate query (has aggregates in `select`/`having`, or has `group by`)
 
 **Examples:**
 ```sql
@@ -1383,6 +1515,12 @@ order by total desc;
 -- Ordering with NULLS FIRST/LAST
 select * from users
 order by last_login desc nulls last;
+
+-- Aggregate function in ORDER BY (legal with GROUP BY or other aggregates)
+select grp, count(*) as cnt from t group by grp order by count(*) desc;
+
+-- Aggregate referenced only in ORDER BY (not in SELECT)
+select grp from t group by grp order by max(val) desc;
 ```
 
 ### 3.6 LIMIT and OFFSET Clauses
@@ -1631,6 +1769,17 @@ with recursive counter(n) as (
 )
 option (maxrecursion 10000)  -- Limit to 10,000 iterations
 select count(*) from counter;
+```
+
+A `limit`/`offset` written on the outer compound is also honored as an early-termination bound on the entire recursive output, applied after deduplication for `union`. Iteration stops as soon as the consumer has been served `limit` rows, so it can be used to cap an otherwise unbounded recursion:
+```sql
+with recursive counter(n) as (
+  select 1
+  union all
+  select n + 1 from counter
+  limit 5
+)
+select n from counter;  -- 1, 2, 3, 4, 5
 ```
 
 **Performance Characteristics:**
@@ -2626,7 +2775,7 @@ pragma foreign_keys = on;   -- enable FK enforcement (default)
 pragma foreign_keys = off;  -- parse but don't enforce
 ```
 
-When no `ON DELETE` or `ON UPDATE` clause is specified, the default action is `IGNORE` (no enforcement). This means FKs are only enforced when you explicitly specify an action like `CASCADE`, `RESTRICT`, `SET NULL`, or `SET DEFAULT`.
+When no `ON DELETE` or `ON UPDATE` clause is specified, the default action is `RESTRICT`. `NO ACTION` is currently treated as a synonym for `RESTRICT`.
 
 **Syntax - Column Constraint:**
 ```sql
@@ -2647,16 +2796,15 @@ Where `action` can be:
 - `set null` — set child FK columns to NULL when parent row is deleted/updated
 - `set default` — set child FK columns to their default values
 - `cascade` — delete/update child rows when parent row is deleted/updated
-- `restrict` — immediately reject delete/update if child rows exist
-- `no action` / `ignore` (default) — no enforcement; the FK is informational only
+- `restrict` (default) — immediately reject delete/update if child rows exist
+- `no action` — currently treated as a synonym for `restrict`
 
 **Enforcement Semantics:**
 
 When `pragma foreign_keys = on` (the default):
 
-- **IGNORE / NO ACTION (default):** No enforcement. The FK is stored in the schema for metadata/introspection but does not generate any constraint checks or cascading actions.
-- **Child-side (INSERT/UPDATE):** For FKs with at least one non-ignore action, validates that referenced parent rows exist. These checks are deferred to commit time (they use cross-table subqueries). Uses MATCH SIMPLE semantics (SQL default): if any FK column is NULL, the constraint is satisfied without checking the parent table.
-- **Parent-side DELETE/UPDATE with RESTRICT:** Immediately rejects the operation if child rows reference the parent row being modified.
+- **Child-side (INSERT/UPDATE):** Validates that referenced parent rows exist. These checks are deferred to commit time (they use cross-table subqueries). Uses MATCH SIMPLE semantics (SQL default): if any FK column is NULL, the constraint is satisfied without checking the parent table. If the referenced parent table does not exist, non-NULL FK rows are rejected.
+- **Parent-side DELETE/UPDATE with RESTRICT:** Immediately rejects the operation if child rows reference the parent row being modified. Two layers of enforcement run: a plan-time `NOT EXISTS` synthesized into the DML's constraint-check node, and a runtime `select 1 from <child> where <fk> = ? limit 1` pre-check fired by the DML executor before the vtab `xUpdate` call. The runtime pass is defense-in-depth so any vtab module — including those whose subquery evaluation diverges from a plain row scan — sees a consistent enforcement path. The check honours MATCH SIMPLE (NULL parent values cannot be referenced) and, on UPDATE, skips when no referenced parent column actually changed.
 - **Parent-side DELETE/UPDATE with CASCADE:** Automatically deletes or updates matching child rows.
 - **Parent-side DELETE/UPDATE with SET NULL:** Sets child FK columns to NULL.
 - **Parent-side DELETE/UPDATE with SET DEFAULT:** Sets child FK columns to their default values.
@@ -2665,14 +2813,14 @@ Cascade cycle detection prevents infinite recursion when cascading actions chain
 
 **Examples:**
 ```sql
--- Column-level foreign key (no action clause = informational only)
+-- Column-level foreign key (no action clause = RESTRICT default)
 create table posts (
   id integer primary key,
   user_id integer references users(id),
   title text not null
 );
 
--- Table-level foreign key with explicit actions (enforced)
+-- Table-level foreign key with explicit actions
 create table comments (
   id integer primary key,
   post_id integer,
@@ -2925,7 +3073,51 @@ create table users (
 
 **Note:** Primary key columns are always NOT NULL regardless of this setting.
 
-#### 9.2.4 schema_path
+#### 9.2.4 nondeterministic_schema
+
+Allows non-deterministic expressions (`random()`, `datetime('now')`, user-defined functions
+marked non-deterministic, etc.) inside DEFAULT, CHECK, and `GENERATED ALWAYS AS` clauses.
+Defaults to `false` (strict rejection) for backward compatibility.
+
+**Aliases:** `allow_nondeterministic_schema_expressions`
+
+**Values:**
+- `false` (default) — strict rejection: a CREATE TABLE / INSERT / UPDATE that compiles a
+  non-deterministic expression in a DEFAULT, CHECK, or generated-column clause raises
+  `Non-deterministic expression not allowed in …`.
+- `true` — permit non-deterministic expressions. Per-row evaluation still produces a
+  concrete literal at the `vtab.update()` frontier (captured in `args.values` and in the
+  literal SQL produced by `buildInsertStatement` / `buildUpdateStatement` /
+  `buildDeleteStatement`), so the replay contract — "apply primitives at the module-layer
+  boundary" — is preserved.
+
+```sql
+-- Default: strict rejection
+create table t (id integer primary key, ts text default datetime('now'));
+-- error: Non-deterministic expression not allowed in DEFAULT
+
+-- Relax the gate
+pragma nondeterministic_schema = true;
+
+create table audit (
+  id integer primary key,
+  ts text default datetime('now'),         -- now permitted
+  tag integer generated always as (random()) stored
+);
+
+insert into audit (id) values (1);
+-- The row stored carries a concrete ts string and concrete tag integer.
+```
+
+**Scope:** The option is read at validation time. Toggling it affects validation of
+*subsequent* DDL / DML only; tables already created retain whatever expressions they
+were created with. The option is not baked into any persisted schema.
+
+**See also:** [Determinism Validation](runtime.md#determinism-validation) for the full
+replay-contract discussion, and [Mutation Statements](module-authoring.md#mutation-statements)
+for how the captured artifact is structured.
+
+#### 9.2.5 schema_path
 
 Sets or queries the default schema search path used when resolving unqualified table names. The value is a comma-separated list of schema names.
 
@@ -3012,6 +3204,9 @@ analyze products;
 
 -- Analyze a table in a specific schema
 analyze main.products;
+
+-- Analyze every table in a specific schema
+analyze main.*;
 ```
 
 `ANALYZE` returns one row per table with columns `table` (text) and `rows` (integer).
@@ -3150,11 +3345,11 @@ While Quereus supports similar SQL syntax, it has evolved into a distinct system
 **Quereus:**
 - All tables are virtual tables
 - No built-in file storage
-- In-memory focused with `memory` module as primary storage
+- In-memory default with `memory` module
 - Async/await API design for JavaScript
 
 **SQLite:**
-- Physical disk-based tables with optional virtual tables
+- Physical disk-based tables by default with optional virtual tables
 - Built around persistent file storage
 - Synchronous C API
 
@@ -3163,7 +3358,7 @@ While Quereus supports similar SQL syntax, it has evolved into a distinct system
 | Feature | Quereus | SQLite |
 |---------|---------|--------|
 | **Type System** | Logical/physical separation, temporal types, JSON | Type affinity model |
-| **File Storage** | No built-in support; VTab modules could implement | Primary feature |
+| **File Storage** | Supported via modules | Built-in |
 | **Virtual Tables** | Central to design; all tables are virtual | Additional feature |
 | **Triggers** | Not supported | Supported |
 | **Views** | Basic support | Full support |
@@ -3171,8 +3366,9 @@ While Quereus supports similar SQL syntax, it has evolved into a distinct system
 | **Window Functions** | Phase 1 Complete (ranking, aggregates, partitioning) | Full support |
 | **Recursive CTEs** | Basic support | Full support |
 | **JSON Functions** | Extensive support with native JSON type | Available as extension |
-| **Indexes** | Supported by some VTab modules | Full support |
+| **Indexes** | Depends on VTab module | Full support |
 | **BLOB I/O** | Basic support | Advanced support |
+| **`OR <action>` modifier** | `INSERT OR <action>` only; UPDATE/DELETE deliberately omitted (use schema-level `ON CONFLICT` or rewrite) | `INSERT/UPDATE/DELETE OR <action>` (SQLite-specific extension) |
 
 #### 11.2.4 Syntax Extensions
 
@@ -3188,7 +3384,7 @@ create table events (
   event_date date,
   event_time time,
   created_at datetime,
-  metadata json
+  metadata json,  -- Extra commas are OK
 );
 
 -- Quereus: Conversion functions instead of CAST
@@ -3202,7 +3398,23 @@ create table products (
   price real check on insert (price >= 0),
   stock integer check on update (stock >= 0)
 );
+
+-- Quereus: Empty keys = singleton table (0-1 rows)
+create table settings (
+  knob integer,
+  primary key ()
+);
+
+-- Quereus: Declarative DDL
+declare schema Movies {
+  table movie (id integer primary key,
+    -- ...
+  )
+}
+apply schema Movies;
 ```
+
+Quereus also has row contraints with old/new context, mutation contexts, `with tags` metadata, and many more features.
 
 #### 11.2.5 Performance Characteristics
 
@@ -3214,7 +3426,7 @@ create table products (
 When migrating from SQLite to Quereus:
 
 1. **Type System**: Update date/time columns to use DATE, TIME, DATETIME types. Consider using JSON type for structured data. Replace CAST with conversion functions.
-2. **Storage Strategy**: Determine how to handle persistence (custom VTab, export/import, etc.)
+2. **Storage Strategy**: Determine how to handle persistence (quereus-plugin-indexeddb, quereus-plugin-leveldb, etc.)
 3. **Async Handling**: Convert synchronous SQLite code to async/await with Quereus
 4. **Feature Check**: Review use of triggers, advanced views, enforced foreign keys
 5. **Transaction Model**: Similar, but understand Quereus's virtual table transaction model
@@ -3226,9 +3438,6 @@ Quereus is actively developed with plans to add:
 - Advanced window function features (navigation functions, window frames)
 - Enhanced recursive CTE capabilities  
 - More query planning enhancements
-- Additional virtual table modules
-
-See [todo.md] for the current development plans.
 
 ## 12. EBNF Grammar
 
@@ -3486,7 +3695,7 @@ release_stmt       = "release" [ "savepoint" ] savepoint_name ;
 pragma_stmt        = "pragma" pragma_name [ "=" pragma_value ] ;
 
 /* ANALYZE statement */
-analyze_stmt       = "analyze" [ [ schema_name "." ] table_name ] ;
+analyze_stmt       = "analyze" [ ( [ schema_name "." ] table_name ) | ( schema_name "." "*" ) ] ;
 
 pragma_value       = signed_number | name | string_literal ;
 

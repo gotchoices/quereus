@@ -345,3 +345,251 @@ DROP ASSERTION multi_a_pos;
 DROP ASSERTION multi_b_pos;
 DROP TABLE multi;
 -- run
+
+-- ===================================
+-- Group-Classified Assertion: Parameterized Delta Execution
+-- ===================================
+-- A subquery that aggregates by PK should be classified as 'group' so the
+-- delta executor parameterizes per changed group key instead of running the
+-- full violation query globally.
+
+CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, qty INTEGER);
+-- run
+
+-- The inner aggregate (GROUP BY id) is row-unique per group key. The outer
+-- predicate asserts every per-id total is non-negative.
+CREATE ASSERTION orders_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM (SELECT id, SUM(qty) AS s FROM orders GROUP BY id) WHERE s < 0
+));
+-- run
+
+-- Valid inserts: pass the assertion.
+INSERT INTO orders VALUES (1, 10, 5);
+INSERT INTO orders VALUES (2, 11, 7);
+INSERT INTO orders VALUES (3, 10, 3);
+COMMIT;
+SELECT COUNT(*) FROM orders;
+→ [{ "count(*)": 3 }]
+
+-- Invalid insert at commit: qty negative trips the per-group check.
+BEGIN;
+INSERT INTO orders VALUES (4, 10, -100);
+COMMIT;
+-- error: Integrity assertion failed: orders_nonneg
+
+-- Verify rollback.
+SELECT COUNT(*) FROM orders;
+→ [{ "count(*)": 3 }]
+
+DROP ASSERTION orders_nonneg;
+DROP TABLE orders;
+-- run
+
+-- ===================================
+-- Group Assertion: NULL Group Key (repro for delta-null-group-key)
+-- ===================================
+-- The per-group residual binds the changed group key into the inner scan.
+-- When the group-key column is NULL, the residual's `col = :gk` would
+-- evaluate UNKNOWN under naive equality and silently skip the NULL group.
+-- These cases verify that NULL groups are re-evaluated correctly.
+
+CREATE TABLE orders_nullable (id INTEGER PRIMARY KEY, customer_id INTEGER NULL, qty INTEGER);
+CREATE ASSERTION onn_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM (SELECT customer_id, SUM(qty) AS s FROM orders_nullable GROUP BY customer_id) WHERE s < 0
+));
+-- run
+
+-- Seed: NULL group has positive sum, commits cleanly.
+INSERT INTO orders_nullable VALUES (1, NULL, 5);
+COMMIT;
+SELECT COUNT(*) FROM orders_nullable;
+→ [{ "count(*)": 1 }]
+
+-- Violation in the NULL group: per-group residual must re-evaluate the NULL
+-- group and flag the negative sum.
+BEGIN;
+INSERT INTO orders_nullable VALUES (2, NULL, -100);
+COMMIT;
+-- error: Integrity assertion failed: onn_nonneg
+
+-- Verify rollback.
+SELECT COUNT(*) FROM orders_nullable;
+→ [{ "count(*)": 1 }]
+
+DROP ASSERTION onn_nonneg;
+DROP TABLE orders_nullable;
+-- run
+
+-- ===================================
+-- Group Assertion: Cross-Group Isolation with NULL Group Present
+-- ===================================
+-- A passing NULL group must not mask a violation in a separate non-NULL
+-- group, and a passing non-NULL group must not mask a NULL-group violation.
+
+CREATE TABLE orders_iso (id INTEGER PRIMARY KEY, customer_id INTEGER NULL, qty INTEGER);
+CREATE ASSERTION oiso_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM (SELECT customer_id, SUM(qty) AS s FROM orders_iso GROUP BY customer_id) WHERE s < 0
+));
+-- run
+
+INSERT INTO orders_iso VALUES (1, NULL, 5);
+INSERT INTO orders_iso VALUES (2, 100, 10);
+COMMIT;
+SELECT COUNT(*) FROM orders_iso;
+→ [{ "count(*)": 2 }]
+
+-- Violation in non-NULL group while NULL group still positive.
+BEGIN;
+INSERT INTO orders_iso VALUES (3, 100, -50);
+COMMIT;
+-- error: Integrity assertion failed: oiso_nonneg
+
+SELECT COUNT(*) FROM orders_iso;
+→ [{ "count(*)": 2 }]
+
+-- Violation in NULL group while non-NULL group still positive.
+BEGIN;
+INSERT INTO orders_iso VALUES (4, NULL, -50);
+COMMIT;
+-- error: Integrity assertion failed: oiso_nonneg
+
+SELECT COUNT(*) FROM orders_iso;
+→ [{ "count(*)": 2 }]
+
+DROP ASSERTION oiso_nonneg;
+DROP TABLE orders_iso;
+-- run
+
+-- ===================================
+-- Group Assertion: UPDATE Moves Row Across NULL/non-NULL Groups
+-- ===================================
+-- UPDATE projects both OLD and NEW tuples; when one side has NULL in the
+-- group key, the residual must still re-check that group.
+
+CREATE TABLE orders_mv (id INTEGER PRIMARY KEY, customer_id INTEGER NULL, qty INTEGER);
+CREATE ASSERTION omv_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM (SELECT customer_id, SUM(qty) AS s FROM orders_mv GROUP BY customer_id) WHERE s < 0
+));
+-- run
+
+-- Seed: NULL group sum=150, group 100 sum=50.
+INSERT INTO orders_mv VALUES (1, NULL, 50);
+INSERT INTO orders_mv VALUES (2, NULL, 100);
+INSERT INTO orders_mv VALUES (3, 100, 50);
+COMMIT;
+
+-- Move row 1 from NULL group to group 100, switching qty to a value that
+-- drives group 100 negative. NULL group is unaffected (100, ok); group 100
+-- becomes 50 + (-200) = -150 and must trip the assertion.
+BEGIN;
+UPDATE orders_mv SET customer_id = 100, qty = -200 WHERE id = 1;
+COMMIT;
+-- error: Integrity assertion failed: omv_nonneg
+
+-- Verify rollback.
+SELECT customer_id, qty FROM orders_mv WHERE id = 1;
+→ [{ "customer_id": null, "qty": 50 }]
+
+-- Move row 3 from group 100 into the NULL group with a value that drives
+-- the NULL group negative. Group 100 becomes empty/positive; NULL group
+-- becomes 50 + 100 + (-500) = -350 and must trip the assertion.
+BEGIN;
+UPDATE orders_mv SET customer_id = NULL, qty = -500 WHERE id = 3;
+COMMIT;
+-- error: Integrity assertion failed: omv_nonneg
+
+SELECT customer_id, qty FROM orders_mv WHERE id = 3;
+→ [{ "customer_id": 100, "qty": 50 }]
+
+DROP ASSERTION omv_nonneg;
+DROP TABLE orders_mv;
+-- run
+
+-- ===================================
+-- Group Assertion: Multi-Column Group Key with Mixed NULLs
+-- ===================================
+-- Per-conjunct NULL handling must compose: GROUP BY a, b where one of
+-- a/b is NULL on some rows.
+
+CREATE TABLE orders_mc (id INTEGER PRIMARY KEY, a INTEGER NULL, b INTEGER NULL, qty INTEGER);
+CREATE ASSERTION omc_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM (SELECT a, b, SUM(qty) AS s FROM orders_mc GROUP BY a, b) WHERE s < 0
+));
+-- run
+
+-- Seed: groups (NULL,1)=15, (1,NULL)=10, (1,1)=20.
+INSERT INTO orders_mc VALUES (1, NULL, 1, 10);
+INSERT INTO orders_mc VALUES (2, NULL, 1, 5);
+INSERT INTO orders_mc VALUES (3, 1, NULL, 10);
+INSERT INTO orders_mc VALUES (4, 1, 1, 20);
+COMMIT;
+
+-- Violation in (NULL, 1) group.
+BEGIN;
+INSERT INTO orders_mc VALUES (5, NULL, 1, -100);
+COMMIT;
+-- error: Integrity assertion failed: omc_nonneg
+
+-- Violation in (1, NULL) group.
+BEGIN;
+INSERT INTO orders_mc VALUES (6, 1, NULL, -100);
+COMMIT;
+-- error: Integrity assertion failed: omc_nonneg
+
+-- Passing insert into (NULL, NULL) group does not flag the existing
+-- non-violating mixed-NULL groups.
+INSERT INTO orders_mc VALUES (7, NULL, NULL, 1);
+COMMIT;
+SELECT COUNT(*) FROM orders_mc;
+→ [{ "count(*)": 5 }]
+
+DROP ASSERTION omc_nonneg;
+DROP TABLE orders_mc;
+-- run
+
+-- ===================================
+-- Row Assertion: Nullable UNIQUE Column Present (repro for delta-null-row-key)
+-- ===================================
+-- A row-classified assertion's residual is `col = :pk_i` per chosen key column.
+-- When `chooseRowKey` lands on a nullable UNIQUE column instead of the PK, a
+-- change tuple with NULL in that column would silently bypass the residual
+-- under naive equality. In practice the optimizer's FD/EC closure propagates
+-- the UNIQUE equality to PK so the binding is PK; this block guards against
+-- regressions in (a) the binding picker preferring PK and (b) the residual
+-- builder handling nullable key columns NULL-safely if the picker ever lands
+-- on one. Pattern after `onn_nonneg`.
+
+CREATE TABLE accounts (id INTEGER PRIMARY KEY, ext_id TEXT NULL UNIQUE, balance INTEGER);
+CREATE ASSERTION rnn_balance CHECK (NOT EXISTS (
+  SELECT 1 FROM accounts WHERE id = 1 AND balance < 0
+));
+-- run
+
+-- Verify the binding lands on PK via FD closure (regression guard for
+-- chooseRowKey's PK-preferred behaviour).
+SELECT COALESCE(prepared_pk_params, '[]') AS prepared_pk_params
+  FROM explain_assertion('rnn_balance') WHERE classification = 'row' LIMIT 1;
+→ [{ "prepared_pk_params": "[\"pk0\"]" }]
+
+-- Seed a row whose nullable UNIQUE column is NULL. Per SQL standard NULLs are
+-- distinct, so this commits cleanly.
+INSERT INTO accounts VALUES (1, NULL, 100);
+COMMIT;
+SELECT COUNT(*) FROM accounts;
+→ [{ "count(*)": 1 }]
+
+-- Update the NULL-keyed row to violate the assertion: the row residual must
+-- re-evaluate this tuple even though its UNIQUE column is NULL. The PK
+-- binding makes this trivial today, but the per-column-nullable residual
+-- shape keeps it correct if `chooseRowKey` ever lands on `ext_id`.
+BEGIN;
+UPDATE accounts SET balance = -50 WHERE id = 1;
+COMMIT;
+-- error: Integrity assertion failed: rnn_balance
+
+SELECT balance FROM accounts WHERE id = 1;
+→ [{ "balance": 100 }]
+
+DROP ASSERTION rnn_balance;
+DROP TABLE accounts;
+-- run

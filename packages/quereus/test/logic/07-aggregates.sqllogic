@@ -23,6 +23,15 @@ SELECT grp, sum(val) as total FROM agg_t GROUP BY grp HAVING total > 40 ORDER BY
 SELECT grp, sum(val) as total FROM agg_t GROUP BY grp HAVING total > 40 ORDER BY grp;
 → [{"grp":"b","total":60},{"grp":"c","total":50}]
 
+-- HAVING on a GROUP BY column is pushed below the aggregate (rule-aggregate-predicate-pushdown).
+-- Result rows must be unchanged by the rewrite.
+SELECT grp, sum(val) as total FROM agg_t GROUP BY grp HAVING grp > 'a' ORDER BY grp;
+→ [{"grp":"b","total":60},{"grp":"c","total":50}]
+
+-- Mixed HAVING: GROUP-BY-column conjunct is pushed below, aggregate-output conjunct stays above.
+SELECT grp, sum(val) as total FROM agg_t GROUP BY grp HAVING grp >= 'b' AND sum(val) > 40 ORDER BY grp;
+→ [{"grp":"b","total":60},{"grp":"c","total":50}]
+
 -- HAVING without GROUP BY
 SELECT sum(val) FROM agg_t HAVING sum(val) > 100;
 → [{"sum(val)":150}]
@@ -130,3 +139,30 @@ SELECT SUM(val), AVG(val), COUNT(val), COUNT(*) FROM agg_order_test;
 → [{"sum(val)":6,"avg(val)":1.5,"count(val)":4,"count(*)":6}]
 
 DROP TABLE agg_order_test;
+
+-- GROUP BY FD simplification — PK-driven
+-- `id` is the PK, so `id → name` and `id → email` hold. The optimizer drops
+-- `name` and `email` from GROUP BY and re-emits them as MIN() picker
+-- aggregates. Result rows must be unchanged by the rewrite.
+CREATE TABLE agg_fd_pk (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
+INSERT INTO agg_fd_pk VALUES
+	(1, 'a', 'a@x'),
+	(2, 'b', 'b@x'),
+	(3, 'b', 'b@y');
+
+SELECT id, name, email FROM agg_fd_pk GROUP BY id, name, email ORDER BY id;
+→ [{"id":1,"name":"a","email":"a@x"},{"id":2,"name":"b","email":"b@x"},{"id":3,"name":"b","email":"b@y"}]
+
+DROP TABLE agg_fd_pk;
+
+-- GROUP BY FD simplification — EC-driven
+-- `WHERE a = b` makes a ≡ b under the filter, so the optimizer drops one of
+-- the two from GROUP BY and re-emits it as a MIN() picker. Result rows must
+-- match the un-simplified semantics.
+CREATE TABLE agg_fd_ec (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+INSERT INTO agg_fd_ec VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 1, 1);
+
+SELECT a, b FROM agg_fd_ec WHERE a = b GROUP BY a, b ORDER BY a;
+→ [{"a":1,"b":1},{"a":2,"b":2},{"a":3,"b":3}]
+
+DROP TABLE agg_fd_ec;

@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of sync-client package (WebSocket sync, serialization, reconnection, type safety)
-dependencies: 3-review-pkg-sync
+prereq: review-pkg-sync
 
 ---
 

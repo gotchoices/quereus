@@ -17,7 +17,7 @@ export class CreateViewNode extends VoidNode {
 		public readonly schemaName: string,
 		public readonly ifNotExists: boolean,
 		public readonly columns: string[] | undefined,
-		public readonly selectStmt: AST.SelectStmt,
+		public readonly selectStmt: AST.QueryExpr,
 		public readonly sql: string,
 		public readonly tags?: Readonly<Record<string, SqlValue>>
 	) {

@@ -4,7 +4,6 @@ import { PlanNode, type RelationalPlanNode, type Attribute, type RowDescriptor, 
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { ScalarPlanNode } from './plan-node.js';
-import type { ConflictResolution } from '../../common/constants.js';
 import type { RelationType } from '../../common/datatype.js';
 import { formatExpression } from '../../util/plan-formatter.js';
 import { buildAttributesFromFlatDescriptor } from '../../util/row-descriptor.js';
@@ -27,8 +26,7 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
     scope: Scope,
     public readonly table: TableReferenceNode,
     public readonly assignments: ReadonlyArray<UpdateAssignment>,
-    		public readonly source: RelationalPlanNode, // Typically a FilterNode wrapping a TableReferenceNode
-		public readonly onConflict: ConflictResolution | undefined,
+    public readonly source: RelationalPlanNode, // Typically a FilterNode wrapping a TableReferenceNode
     public readonly oldRowDescriptor: RowDescriptor, // For constraint checking
     public readonly newRowDescriptor: RowDescriptor, // For constraint checking
     public readonly flatRowDescriptor: RowDescriptor, // For flat OLD/NEW row attributes
@@ -98,7 +96,6 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
       this.table,
       newAssignments,
       newSource,
-      this.onConflict,
       this.oldRowDescriptor,
       this.newRowDescriptor,
       this.flatRowDescriptor,
@@ -123,7 +120,7 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
   }
 
   override getLogicalAttributes(): Record<string, unknown> {
-    const props: Record<string, unknown> = {
+    return {
       table: this.table.tableSchema.name,
       schema: this.table.tableSchema.schemaName,
       assignments: this.assignments.map(assign => ({
@@ -131,11 +128,5 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
         value: formatExpression(assign.value)
       }))
     };
-
-    if (this.onConflict) {
-      props.onConflict = this.onConflict;
-    }
-
-    return props;
   }
 }

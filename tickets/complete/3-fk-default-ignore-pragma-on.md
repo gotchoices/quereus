@@ -1,5 +1,5 @@
 description: Enable foreign_keys pragma by default; make 'ignore' action skip all enforcement
-dependencies: none
+prereq: none
 files:
   - packages/quereus/src/core/database.ts (foreign_keys option registration ~line 250)
   - packages/quereus/src/planner/building/foreign-key-builder.ts (child-side & parent-side FK checks)

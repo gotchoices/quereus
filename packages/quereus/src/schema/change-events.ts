@@ -1,5 +1,6 @@
 import type { TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
+import type { IntegrityAssertionSchema } from './assertion.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:change-events');
@@ -40,6 +41,12 @@ export type FunctionAddedEvent = SchemaObjectAdded<'function_added', FunctionSch
 export type FunctionRemovedEvent = SchemaObjectRemoved<'function_removed', FunctionSchema>;
 export type FunctionModifiedEvent = SchemaObjectModified<'function_modified', FunctionSchema>;
 
+// ── Assertion events ───────────────────────────────────────────────
+
+export type AssertionAddedEvent = SchemaObjectAdded<'assertion_added', IntegrityAssertionSchema>;
+export type AssertionRemovedEvent = SchemaObjectRemoved<'assertion_removed', IntegrityAssertionSchema>;
+export type AssertionModifiedEvent = SchemaObjectModified<'assertion_modified', IntegrityAssertionSchema>;
+
 // ── Module / collation events (name-only payload) ──────────────────
 
 interface SchemaNameEvent<Type extends string> {
@@ -62,6 +69,9 @@ export type SchemaChangeEvent =
 	| FunctionAddedEvent
 	| FunctionRemovedEvent
 	| FunctionModifiedEvent
+	| AssertionAddedEvent
+	| AssertionRemovedEvent
+	| AssertionModifiedEvent
 	| ModuleAddedEvent
 	| ModuleRemovedEvent
 	| CollationAddedEvent

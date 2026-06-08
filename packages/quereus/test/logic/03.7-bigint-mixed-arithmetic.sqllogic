@@ -43,3 +43,23 @@ SELECT typeof(9007199254740993 + 1.5);
 
 SELECT typeof(9007199254740993 + 1);
 → [{"typeof(9007199254740993 + 1)":"integer"}]
+
+-- bigint + numeric string: text coerced through arithmetic affinity, then BigInt-promoted
+SELECT 9007199254740993 + '3';
+→ [{"9007199254740993 + '3'":9007199254740996}]
+
+-- numeric string + bigint (reversed order)
+SELECT '3' + 9007199254740993;
+→ [{"'3' + 9007199254740993":9007199254740996}]
+
+-- bigint + non-numeric string: string coerces to 0, stays in BigInt domain
+SELECT 9007199254740993 + 'abc';
+→ [{"9007199254740993 + 'abc'":9007199254740993}]
+
+-- bigint + boolean: boolean coerces to 0/1, BigInt-promoted
+SELECT 9007199254740993 + true;
+→ [{"9007199254740993 + true":9007199254740994}]
+
+-- bigint + fractional numeric string: float path
+SELECT 9007199254740993 + '0.5';
+→ [{"9007199254740993 + '0.5'":9007199254740992}]

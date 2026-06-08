@@ -1,6 +1,6 @@
 ---
 description: Utilities subsystem review - comparison, coercion, affinity, errors, cross-platform
-dependencies: none
+prereq: none
 
 ---
 

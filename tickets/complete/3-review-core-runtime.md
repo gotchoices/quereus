@@ -1,6 +1,6 @@
 ---
 description: Runtime subsystem review (scheduler, emitters, context, deferred constraints)
-dependencies: none
+prereq: none
 
 ---
 

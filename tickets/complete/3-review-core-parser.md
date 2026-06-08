@@ -1,6 +1,6 @@
 ---
 description: Completed review of parser subsystem (lexer, parser, AST, visitor)
-dependencies: none
+prereq: none
 
 ---
 

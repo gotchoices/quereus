@@ -43,12 +43,15 @@ export enum PlanNodeType {
   IndexScan = 'IndexScan',          // Physical index scan
   IndexSeek = 'IndexSeek',          // Physical index seek
   EmptyResult = 'EmptyResult',      // Physical empty result (impossible predicate)
+  EmptyRelation = 'EmptyRelation',  // Schema-polymorphic zero-row relation (const-fold result)
   RemoteQuery = 'RemoteQuery',      // Physical remote query execution
   StreamAggregate = 'StreamAggregate',  // Physical ordered aggregate
   HashAggregate = 'HashAggregate',      // Physical hash aggregate
   NestedLoopJoin = 'NestedLoopJoin',
   HashJoin = 'HashJoin',
   MergeJoin = 'MergeJoin',
+  AsofScan = 'AsofScan',            // Streaming asof join: per left row, latest right with key ≤ left's
+  OrdinalSlice = 'OrdinalSlice',    // O(log N) seek to kth row over a monotonic, ordinal-seek-capable leaf
   Materialize = 'Materialize',      // Materialize intermediate results
 
   // Scalar expression nodes
@@ -92,6 +95,9 @@ export enum PlanNodeType {
 
   // Query execution
   Cache = 'Cache',
+  EagerPrefetch = 'EagerPrefetch',
+  AsyncGather = 'AsyncGather',
+  FanOutLookupJoin = 'FanOutLookupJoin',
   Sink = 'Sink',
 
   // RETURNING support

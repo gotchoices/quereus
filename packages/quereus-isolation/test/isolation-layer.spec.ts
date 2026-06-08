@@ -736,6 +736,81 @@ describe('IsolationModule', () => {
 
 			await db.exec('COMMIT');
 		});
+
+		it('pre-overlay savepoint: rollback to savepoint created before first write clears overlay', async () => {
+			// sp1 is created before any write in this transaction (so before the overlay exists).
+			// After the INSERT creates the overlay, ROLLBACK TO sp1 must wipe the overlay entirely.
+			await db.exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await db.exec(`INSERT INTO test VALUES (1, 'committed')`);
+
+			await db.exec('BEGIN');
+			await db.exec('SAVEPOINT sp1');      // sp1 pre-dates the overlay
+			await db.exec(`INSERT INTO test VALUES (2, 'will-vanish')`); // creates overlay
+			await db.exec('ROLLBACK TO SAVEPOINT sp1');
+
+			// Overlay should be wiped — only the pre-transaction committed row is visible
+			const rows = await asyncIterableToArray(db.eval('SELECT * FROM test ORDER BY id'));
+			expect(rows.length).to.equal(1);
+			expect(rows[0].id).to.equal(1);
+
+			await db.exec('ROLLBACK');
+
+			// Underlying unchanged
+			const afterRollback = await asyncIterableToArray(db.eval('SELECT * FROM test'));
+			expect(afterRollback.length).to.equal(1);
+			expect(afterRollback[0].id).to.equal(1);
+		});
+
+		it('savepoint before any access: rollback to savepoint undoes lazy-registered connection writes', async () => {
+			// IsolatedConnection is registered lazily on first read/write. When
+			// SAVEPOINT runs before any access to the table, the connection does
+			// not yet exist, so the DB's savepoint broadcast skips it. The first
+			// INSERT then registers the connection — which must inherit the
+			// active savepoint stack so a subsequent ROLLBACK TO targets a real
+			// entry, not an out-of-range index.
+			await db.exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+
+			await db.exec('BEGIN');
+			await db.exec('SAVEPOINT sp');                                // no IsolatedConnection registered yet
+			await db.exec(`INSERT INTO test VALUES (1, 'will-vanish')`); // registers connection NOW
+			await db.exec('ROLLBACK TO SAVEPOINT sp');
+
+			const rows = await asyncIterableToArray(db.eval('SELECT * FROM test'));
+			expect(rows.length).to.equal(0);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('mixed pre/post-overlay savepoints: rollback to post-overlay sp2 keeps first write, rollback to pre-overlay sp1 wipes all', async () => {
+			// sp1 is pre-overlay, sp2 is post-overlay (created after first INSERT).
+			// ROLLBACK TO sp2 should keep the INSERT before sp2.
+			// ROLLBACK TO sp1 should then wipe everything from the transaction.
+			await db.exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await db.exec(`INSERT INTO test VALUES (1, 'committed')`);
+
+			await db.exec('BEGIN');
+			await db.exec('SAVEPOINT sp1');                               // sp1 pre-overlay
+			await db.exec(`INSERT INTO test VALUES (2, 'after-sp1')`);   // creates overlay
+			await db.exec('SAVEPOINT sp2');                               // sp2 post-overlay
+			await db.exec(`INSERT INTO test VALUES (3, 'after-sp2')`);
+
+			// ROLLBACK TO sp2: undo INSERT (3), keep INSERT (2)
+			await db.exec('ROLLBACK TO SAVEPOINT sp2');
+			let rows = await asyncIterableToArray(db.eval('SELECT * FROM test ORDER BY id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
+
+			// ROLLBACK TO sp1: wipe entire overlay (sp1 pre-dates the overlay)
+			await db.exec('ROLLBACK TO SAVEPOINT sp1');
+			rows = await asyncIterableToArray(db.eval('SELECT * FROM test ORDER BY id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1]);
+
+			await db.exec('COMMIT');
+
+			// Only the pre-transaction row survives
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT * FROM test'));
+			expect(afterCommit.length).to.equal(1);
+			expect(afterCommit[0].id).to.equal(1);
+		});
 	});
 
 	describe('compound primary keys', () => {
@@ -959,6 +1034,118 @@ describe('IsolationModule', () => {
 
 			const committed = await db.get('SELECT * FROM test WHERE id = 1');
 			expect(committed?.name).to.equal('modified');
+		});
+	});
+
+	describe('rename table', () => {
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			const memoryModule = new MemoryTableModule();
+			isolatedModule = new IsolationModule({
+				underlying: memoryModule,
+			});
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('preserves row data through ALTER TABLE RENAME TO', async () => {
+			// Regression: IsolationModule did not forward renameTable to the
+			// underlying module, so rows committed under the old name were lost
+			// when subsequent queries hit a fresh underlying state for the new name.
+			await db.exec(`CREATE TABLE t_rename (id INTEGER PRIMARY KEY, val TEXT) USING isolated`);
+			await db.exec(`INSERT INTO t_rename VALUES (1, 'a'), (2, 'b')`);
+			await db.exec(`ALTER TABLE t_rename RENAME TO t_renamed`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t_renamed ORDER BY id`));
+			expect(rows.length).to.equal(2);
+			expect(rows.map((r: any) => [r.id, r.val])).to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('allows writes against the renamed table', async () => {
+			await db.exec(`CREATE TABLE t_rename (id INTEGER PRIMARY KEY, val TEXT) USING isolated`);
+			await db.exec(`INSERT INTO t_rename VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE t_rename RENAME TO t_renamed`);
+			await db.exec(`INSERT INTO t_renamed VALUES (2, 'b')`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t_renamed ORDER BY id`));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
+		});
+	});
+
+	describe('DROP INDEX forwards through the isolation layer', () => {
+		// Regression: SchemaManager.dropIndex only invokes the registered module's
+		// dropIndex hook. Without IsolationModule.dropIndex, the underlying
+		// module never sees the drop and any synthesized UNIQUE constraint on
+		// the IsolatedTable's cached schema keeps firing on subsequent inserts.
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({
+				underlying: new MemoryTableModule(),
+			});
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('clears the synthesized UNIQUE constraint after DROP UNIQUE INDEX', async () => {
+			await db.exec(`CREATE TABLE iso_du (a INTEGER PRIMARY KEY, b INTEGER) USING isolated`);
+			await db.exec(`CREATE UNIQUE INDEX iso_du_b ON iso_du (b)`);
+			await db.exec(`INSERT INTO iso_du VALUES (1, 100)`);
+
+			let threwBeforeDrop = false;
+			try {
+				await db.exec(`INSERT INTO iso_du VALUES (2, 100)`);
+			} catch (e) {
+				threwBeforeDrop = true;
+				expect(String(e)).to.match(/unique/i);
+			}
+			expect(threwBeforeDrop, 'duplicate must violate UNIQUE while the index exists').to.equal(true);
+
+			await db.exec(`DROP INDEX iso_du_b`);
+			// After drop the duplicate is allowed — the synthesized UC is gone.
+			await db.exec(`INSERT INTO iso_du VALUES (2, 100)`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT a, b FROM iso_du ORDER BY a`));
+			expect(rows.map((r: any) => [r.a, r.b])).to.deep.equal([[1, 100], [2, 100]]);
+		});
+
+		it('clears the synthesized UNIQUE constraint after DROP INDEX inside an active transaction', async () => {
+			// Regression: with an open overlay (a write inside BEGIN..COMMIT), the
+			// overlay's MemoryTable holds a pending TransactionLayer whose
+			// tableSchemaAtCreation captured the synthesized UC. A bare
+			// overlay.dropIndex() forward refreshes the manager but not that frozen
+			// per-layer schema, so the next overlay write still fires UNIQUE inside
+			// MemoryTable.update against `_overlay_<table>_<id>`. The fix rebuilds
+			// the overlay against the post-drop schema.
+			await db.exec(`CREATE TABLE iso_dut (a INTEGER PRIMARY KEY, b INTEGER) USING isolated`);
+			await db.exec(`CREATE UNIQUE INDEX iso_dut_b ON iso_dut (b)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO iso_dut VALUES (1, 100)`);
+			await db.exec(`DROP INDEX iso_dut_b`);
+			// Should succeed now — the UC is gone from both the underlying schema
+			// and the overlay's effective schema.
+			await db.exec(`INSERT INTO iso_dut VALUES (2, 100)`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT a, b FROM iso_dut ORDER BY a`));
+			expect(rows.map((r: any) => [r.a, r.b])).to.deep.equal([[1, 100], [2, 100]]);
+		});
+
+		it('preserves staged tombstones across DROP INDEX inside an active transaction', async () => {
+			// Verifies the overlay rebuild copies tombstone rows verbatim, so a
+			// DELETE staged before DROP INDEX still results in the row being
+			// removed at COMMIT.
+			await db.exec(`CREATE TABLE iso_dtb (a INTEGER PRIMARY KEY, b INTEGER) USING isolated`);
+			await db.exec(`INSERT INTO iso_dtb VALUES (1, 100), (2, 200)`);
+			await db.exec(`CREATE UNIQUE INDEX iso_dtb_b ON iso_dtb (b)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM iso_dtb WHERE a = 1`);
+			await db.exec(`DROP INDEX iso_dtb_b`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT a, b FROM iso_dtb ORDER BY a`));
+			expect(rows.map((r: any) => [r.a, r.b])).to.deep.equal([[2, 200]]);
 		});
 	});
 });

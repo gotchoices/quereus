@@ -491,33 +491,14 @@ export class Lexer {
 	}
 
 	private string(quote: string): void {
+		// SQL standard: characters between the quotes are preserved verbatim,
+		// with one exception — a doubled quote ('') represents a single literal
+		// quote. Backslash has no special meaning.
 		let value = '';
-		let escaping = false;
 
 		while (true) {
-			// Parse characters until we hit a quote or EOF
-			while ((!this.isAtEnd() && this.peek() !== quote) || escaping) {
-				if (escaping) {
-					// Handle escape sequences
-					const c = this.peek();
-					switch (c) {
-						case 'n': value += '\n'; break;
-						case 'r': value += '\r'; break;
-						case 't': value += '\t'; break;
-						case '\\': value += '\\'; break;
-						case '\'': value += '\''; break;
-						case '"': value += '"'; break;
-						case '0': value += '\0'; break;
-						default: value += c; break;
-					}
-					escaping = false;
-				} else if (this.peek() === '\\') {
-					escaping = true;
-				} else {
-					value += this.peek();
-				}
-
-				this.advance();
+			while (!this.isAtEnd() && this.peek() !== quote) {
+				value += this.advance();
 			}
 
 			if (this.isAtEnd()) {
@@ -525,18 +506,14 @@ export class Lexer {
 				return;
 			}
 
-			// We've hit a quote - consume it
+			// Consume the closing quote
 			this.advance();
 
-			// SQL standard: doubled quotes ('') within a string literal represent a single quote
-			// Check if the next character is the same quote - if so, it's an escaped quote
+			// Doubled quote: append a literal quote and keep scanning.
 			if (this.peek() === quote) {
-				// Add the escaped quote to the value and continue parsing the string
 				value += quote;
-				this.advance(); // Consume the second quote
-				// Continue the loop to keep parsing the string
+				this.advance();
 			} else {
-				// String is complete
 				break;
 			}
 		}

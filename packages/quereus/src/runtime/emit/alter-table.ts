@@ -4,13 +4,23 @@ import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
-import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
-import { buildColumnIndexMap } from '../../schema/table.js';
+import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
+import { buildColumnIndexMap, opsToMask, withGeneratedColumnGraph } from '../../schema/table.js';
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
-import { quoteIdentifier, expressionToString } from '../../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
+import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
+import type { Schema } from '../../schema/schema.js';
+import { tryFoldLiteral } from '../../parser/utils.js';
 
 const log = createLogger('runtime:emit:alter-table');
+
+function qualifyTableName(schemaName: string | undefined, tableName: string): string {
+	const prefix = (schemaName && schemaName.toLowerCase() !== 'main')
+		? `${quoteIdentifier(schemaName)}.`
+		: '';
+	return `${prefix}${quoteIdentifier(tableName)}`;
+}
 
 export function emitAlterTable(plan: AlterTableNode, _ctx: EmissionContext): Instruction {
 	const tableSchema = plan.table.tableSchema;
@@ -98,6 +108,11 @@ async function runRenameTable(
 		newObject: updatedTableSchema,
 	});
 
+	// Propagate the rename into dependent objects (CHECK / FK in this and other
+	// tables, view bodies). Best-effort AST rewrite — there is no global
+	// dependency tracker yet, so we walk the catalog and patch in-place.
+	propagateTableRename(rctx, tableSchema.schemaName, oldName, newName);
+
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
 	return null;
 }
@@ -162,6 +177,10 @@ async function runRenameColumn(
 		newObject: updatedTableSchema,
 	});
 
+	// Propagate the rename into dependent objects (CHECK / FK in this and other
+	// tables, view bodies).
+	propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName);
+
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
 	return null;
 }
@@ -182,6 +201,19 @@ async function runAddColumn(
 		throw new QuereusError(`Cannot add a PRIMARY KEY column via ALTER TABLE`, StatusCode.ERROR);
 	}
 
+	// Reject non-foldable DEFAULT expressions at DDL time. ADD COLUMN backfills
+	// existing rows with the DEFAULT value, so the expression must evaluate to a
+	// concrete literal at ALTER time. Column references, bind parameters, and
+	// non-deterministic function calls don't fold and are rejected per the
+	// determinism rule (consistent with CREATE TABLE's DEFAULT validation).
+	const defaultConstraint = columnDef.constraints?.find(c => c.type === 'default');
+	if (defaultConstraint && defaultConstraint.expr && tryFoldLiteral(defaultConstraint.expr) === undefined) {
+		throw new QuereusError(
+			`ALTER TABLE ADD COLUMN DEFAULT for '${columnDef.name}' must fold to a literal — column references, bind parameters, and non-deterministic expressions are not allowed`,
+			StatusCode.ERROR,
+		);
+	}
+
 	// Call module.alterTable for data + schema update
 	const module = tableSchema.vtabModule;
 	if (!module.alterTable) {
@@ -191,24 +223,198 @@ async function runAddColumn(
 		);
 	}
 
+	// NOT NULL without a usable DEFAULT cannot backfill existing rows. A DEFAULT whose
+	// folded value is NULL is equivalent to "no DEFAULT" for this purpose. If the table
+	// is non-empty, reject before mutating any schema or data.
+	//
+	// A module may opt out of this engine-generic rejection via the
+	// `delegatesNotNullBackfill` capability (structurally-total modules that
+	// carry pre-existing rows forward and enforce NOT NULL at write time). When
+	// it declares the capability, the decision is left entirely to its
+	// `alterTable`. Native modules leave it off, so this still fires for them.
+	const delegatesBackfill = module.getCapabilities?.().delegatesNotNullBackfill === true;
+	const hasNotNull = columnDef.constraints?.some(c => c.type === 'notNull') ?? false;
+	if (hasNotNull && !delegatesBackfill) {
+		const folded = defaultConstraint?.expr ? tryFoldLiteral(defaultConstraint.expr) : undefined;
+		const defaultIsNullish = !defaultConstraint || folded === undefined || folded === null;
+		if (defaultIsNullish) {
+			await validateNotNullBackfill(rctx, tableSchema, columnDef.name);
+		}
+	}
+
+	// Extract column-level CHECK / FK constraints. Column-level UNIQUE is not enforced via
+	// table-level constraints; the existing rejection path in the manager handles it.
+	const newCheckConstraints = extractColumnLevelCheckConstraints(columnDef);
+	const newForeignKeys = extractColumnLevelForeignKeys(columnDef, tableSchema.schemaName);
+
 	const updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 		type: 'addColumn',
 		columnDef,
 	});
 
-	// Update the schema catalog
-	schema.addTable(updatedTableSchema);
+	// Resolve the new child column index in the freshly returned schema for any FK constraints.
+	const newColIdx = updatedTableSchema.columnIndexMap.get(columnDef.name.toLowerCase());
+	const resolvedForeignKeys = newColIdx !== undefined
+		? newForeignKeys.map(fk => ({ ...fk, columns: Object.freeze([newColIdx]) }))
+		: newForeignKeys;
+
+	// Merge new column-level CHECK / FK into the table-level constraint sets so the
+	// existing constraint-builder picks them up for INSERT/UPDATE enforcement.
+	const mergedChecks = newCheckConstraints.length > 0
+		? Object.freeze([...updatedTableSchema.checkConstraints, ...newCheckConstraints])
+		: updatedTableSchema.checkConstraints;
+	const mergedForeignKeys = resolvedForeignKeys.length > 0
+		? Object.freeze([...(updatedTableSchema.foreignKeys ?? []), ...resolvedForeignKeys])
+		: updatedTableSchema.foreignKeys;
+
+	const enhancedBase: TableSchema = {
+		...updatedTableSchema,
+		checkConstraints: mergedChecks,
+		foreignKeys: mergedForeignKeys,
+	};
+
+	// Recompute the generated-column dependency graph. If the added column is
+	// generated and its expression references an unknown column, or any new
+	// generated-column edges form a cycle, this throws before we register the
+	// new schema in the catalog.
+	const enhancedTableSchema = withGeneratedColumnGraph(enhancedBase);
+
+	// Register the enhanced schema BEFORE backfill validation so that SQL bound
+	// during validation can resolve the new column.
+	schema.addTable(enhancedTableSchema);
+
+	if (newCheckConstraints.length > 0) {
+		try {
+			await validateBackfillAgainstChecks(rctx, enhancedTableSchema, newCheckConstraints);
+		} catch (err) {
+			// Revert: drop the column and restore the original catalog entry.
+			try {
+				await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+					type: 'dropColumn',
+					columnName: columnDef.name,
+				});
+			} catch (revertErr) {
+				log('Failed to revert ADD COLUMN after CHECK violation: %s', (revertErr as Error).message);
+			}
+			schema.addTable(tableSchema);
+			throw err;
+		}
+	}
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: enhancedTableSchema,
 	});
 
 	log('Added column %s to table %s.%s', columnDef.name, tableSchema.schemaName, tableSchema.name);
 	return null;
+}
+
+function extractColumnLevelCheckConstraints(columnDef: ColumnDef): RowConstraintSchema[] {
+	const result: RowConstraintSchema[] = [];
+	for (const con of columnDef.constraints ?? []) {
+		if (con.type !== 'check' || !con.expr) continue;
+		result.push({
+			name: con.name ?? `_check_${columnDef.name}`,
+			expr: con.expr,
+			operations: opsToMask(con.operations),
+			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+		});
+	}
+	return result;
+}
+
+function extractColumnLevelForeignKeys(
+	columnDef: ColumnDef,
+	defaultSchemaName: string,
+): ForeignKeyConstraintSchema[] {
+	const result: ForeignKeyConstraintSchema[] = [];
+	for (const con of columnDef.constraints ?? []) {
+		if (con.type !== 'foreignKey' || !con.foreignKey) continue;
+		const fk = con.foreignKey;
+		// child column index gets resolved by caller after module.alterTable returns
+		// the updated schema with the new column appended.
+		if (fk.columns && fk.columns.length !== 1) {
+			throw new QuereusError(
+				`FK constraint '${con.name ?? `_fk_${columnDef.name}`}' on ADD COLUMN '${columnDef.name}': child column count (1) does not match parent column count (${fk.columns.length})`,
+				StatusCode.ERROR,
+			);
+		}
+		result.push({
+			name: con.name ?? `_fk_${columnDef.name}`,
+			columns: Object.freeze([]),
+			referencedTable: fk.table,
+			referencedSchema: defaultSchemaName,
+			referencedColumns: Object.freeze([]),
+			referencedColumnNames: fk.columns,
+			onDelete: fk.onDelete ?? 'restrict',
+			onUpdate: fk.onUpdate ?? 'restrict',
+			deferred: fk.initiallyDeferred ?? false,
+			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+		});
+	}
+	return result;
+}
+
+/**
+ * Runs each new CHECK against existing rows. We rely on the just-registered
+ * enhanced schema so SQL can resolve the new column. Any row matching
+ * `not (<check_expr>)` is a violation and aborts the ALTER.
+ */
+async function validateBackfillAgainstChecks(
+	rctx: RuntimeContext,
+	enhancedTableSchema: TableSchema,
+	newCheckConstraints: RowConstraintSchema[],
+): Promise<void> {
+	const qualifiedTable = qualifyTableName(enhancedTableSchema.schemaName, enhancedTableSchema.name);
+
+	for (const cc of newCheckConstraints) {
+		const checkSql = expressionToString(cc.expr);
+		const sql = `select 1 from ${qualifiedTable} where not (${checkSql}) limit 1`;
+		const stmt = rctx.db.prepare(sql);
+		try {
+			let violated = false;
+			for await (const _row of stmt._iterateRowsRaw()) {
+				violated = true;
+				break;
+			}
+			if (violated) {
+				throw new QuereusError(
+					`CHECK constraint ${cc.name ? `'${cc.name}' ` : ''}violated by backfilled rows in ALTER TABLE ADD COLUMN on '${enhancedTableSchema.name}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		} finally {
+			await stmt.finalize();
+		}
+	}
+}
+
+/**
+ * Rejects ADD COLUMN ... NOT NULL when no usable DEFAULT is supplied and the
+ * table already has rows. The pre-mutation form means no rollback is needed —
+ * the schema and module state are still untouched at this point.
+ */
+async function validateNotNullBackfill(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	newColumnName: string,
+): Promise<void> {
+	const qualifiedTable = qualifyTableName(tableSchema.schemaName, tableSchema.name);
+	const stmt = rctx.db.prepare(`select 1 from ${qualifiedTable} limit 1`);
+	try {
+		for await (const _row of stmt._iterateRowsRaw()) {
+			throw new QuereusError(
+				`NOT NULL constraint failed for column '${newColumnName}' added to ${tableSchema.schemaName}.${tableSchema.name} — column has no DEFAULT and existing rows cannot be backfilled`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	} finally {
+		await stmt.finalize();
+	}
 }
 
 async function runDropColumn(
@@ -232,6 +438,20 @@ async function runDropColumn(
 		throw new QuereusError(`Cannot drop the last column of table '${tableSchema.name}'`, StatusCode.ERROR);
 	}
 
+	// Validate: can't drop a column that any generated column's expression depends on
+	if (tableSchema.generatedColumnDependencies) {
+		for (const [genIdx, depIndices] of tableSchema.generatedColumnDependencies) {
+			if (genIdx === colIndex) continue; // Dropping the gen column itself is allowed
+			if (depIndices.includes(colIndex)) {
+				const genName = tableSchema.columns[genIdx].name;
+				throw new QuereusError(
+					`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by generated column '${genName}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+	}
+
 	// Call module.alterTable for data + schema update
 	const module = tableSchema.vtabModule;
 	if (!module.alterTable) {
@@ -246,15 +466,19 @@ async function runDropColumn(
 		columnName,
 	});
 
+	// Recompute the generated-column dependency graph against the post-drop
+	// column array — old indices in the previous map are invalid.
+	const finalSchema = withGeneratedColumnGraph(updatedTableSchema);
+
 	// Update the schema catalog
-	schema.addTable(updatedTableSchema);
+	schema.addTable(finalSchema);
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: finalSchema,
 	});
 
 	log('Dropped column %s from table %s.%s', columnName, tableSchema.schemaName, tableSchema.name);
@@ -525,11 +749,6 @@ export function buildShadowTableDdl(
 	survivingColumns: string[],
 	newPkDef: PrimaryKeyColumnDefinition[],
 ): string {
-	const schemaName = tableSchema.schemaName;
-	const schemaPrefix = (schemaName && schemaName.toLowerCase() !== 'main')
-		? `${quoteIdentifier(schemaName)}.`
-		: '';
-
 	const colDefs: string[] = [];
 	for (const colName of survivingColumns) {
 		const idx = tableSchema.columnIndexMap.get(colName.toLowerCase());
@@ -552,7 +771,7 @@ export function buildShadowTableDdl(
 		pkColNames.push(entry);
 	}
 
-	let createDdl = `create table ${schemaPrefix}${quoteIdentifier(shadowName)} (${colDefs.join(', ')}`;
+	let createDdl = `create table ${qualifyTableName(tableSchema.schemaName, shadowName)} (${colDefs.join(', ')}`;
 	createDdl += pkColNames.length > 0
 		? `, primary key (${pkColNames.join(', ')}))`
 		: `)`;
@@ -582,10 +801,9 @@ async function rebuildViaShadowTable(
 ): Promise<void> {
 	const tableName = tableSchema.name;
 	const schemaName = tableSchema.schemaName;
-	const schemaPrefix = (schemaName && schemaName.toLowerCase() !== 'main')
-		? `${quoteIdentifier(schemaName)}.`
-		: '';
 	const shadowName = `${tableName}__rekey_${Date.now()}`;
+	const qualifiedShadow = qualifyTableName(schemaName, shadowName);
+	const qualifiedTable = qualifyTableName(schemaName, tableName);
 
 	const createDdl = buildShadowTableDdl(tableSchema, shadowName, survivingColumns, newPkDef);
 	const projection = survivingColumns.map(c => quoteIdentifier(c)).join(', ');
@@ -593,22 +811,217 @@ async function rebuildViaShadowTable(
 	try {
 		await rctx.db._execWithinTransaction(createDdl);
 		await rctx.db._execWithinTransaction(
-			`insert into ${schemaPrefix}${quoteIdentifier(shadowName)} (${projection}) select ${projection} from ${schemaPrefix}${quoteIdentifier(tableName)}`
+			`insert into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
 		);
 		await rctx.db._execWithinTransaction(
-			`drop table ${schemaPrefix}${quoteIdentifier(tableName)}`
+			`drop table ${qualifiedTable}`
 		);
 		await rctx.db._execWithinTransaction(
-			`alter table ${schemaPrefix}${quoteIdentifier(shadowName)} rename to ${quoteIdentifier(tableName)}`
+			`alter table ${qualifiedShadow} rename to ${quoteIdentifier(tableName)}`
 		);
 	} catch (e) {
 		try {
 			await rctx.db._execWithinTransaction(
-				`drop table if exists ${schemaPrefix}${quoteIdentifier(shadowName)}`
+				`drop table if exists ${qualifiedShadow}`
 			);
 		} catch { /* ignore */ }
 		throw e;
 	}
+}
+
+/**
+ * Propagates a table rename into every dependent schema object the catalog
+ * knows about: CHECK expressions, FK references, and view bodies. Walks every
+ * schema (not just the renamed table's home schema) so cross-schema FK
+ * references are picked up. View `selectAst` is mutated in place because the
+ * planner re-walks it on every reference.
+ */
+function propagateTableRename(
+	rctx: RuntimeContext,
+	renamedSchemaName: string,
+	oldName: string,
+	newName: string,
+): void {
+	const notifier = rctx.db.schemaManager.getChangeNotifier();
+	for (const schema of rctx.db.schemaManager._getAllSchemas()) {
+		propagateTableRenameInSchema(schema, renamedSchemaName, oldName, newName, notifier);
+	}
+}
+
+function propagateTableRenameInSchema(
+	schema: Schema,
+	renamedSchemaName: string,
+	oldName: string,
+	newName: string,
+	notifier: import('../../schema/change-events.js').SchemaChangeNotifier,
+): void {
+	const renamedSchemaLower = renamedSchemaName.toLowerCase();
+
+	for (const table of Array.from(schema.getAllTables())) {
+		// Skip the just-renamed table when iterating the home schema; the FK
+		// `referencedTable` field on its own FKs (if any self-reference) is
+		// still pointing at the old name and needs rewriting too.
+		const updated = rewriteTableForTableRename(table, renamedSchemaLower, oldName, newName);
+		if (updated !== table) {
+			schema.addTable(updated);
+			notifier.notifyChange({
+				type: 'table_modified',
+				schemaName: schema.name,
+				objectName: updated.name,
+				oldObject: table,
+				newObject: updated,
+			});
+		}
+	}
+
+	if (schema.name.toLowerCase() === renamedSchemaLower) {
+		for (const view of Array.from(schema.getAllViews())) {
+			const changed = renameTableInAst(view.selectAst, oldName, newName, renamedSchemaName);
+			if (changed) {
+				const updatedView = { ...view, sql: astToString(view.selectAst) };
+				schema.addView(updatedView);
+			}
+		}
+	}
+}
+
+function rewriteTableForTableRename(
+	table: TableSchema,
+	renamedSchemaLower: string,
+	oldName: string,
+	newName: string,
+): TableSchema {
+	const oldLower = oldName.toLowerCase();
+	let changed = false;
+
+	const newChecks = table.checkConstraints.map(cc => {
+		const rewrote = renameTableInAst(cc.expr, oldName, newName, renamedSchemaLower);
+		if (!rewrote) return cc;
+		changed = true;
+		return { ...cc };
+	});
+
+	const newFks = (table.foreignKeys ?? []).map(fk => {
+		const fkSchemaLower = (fk.referencedSchema ?? table.schemaName).toLowerCase();
+		if (fkSchemaLower !== renamedSchemaLower) return fk;
+		if (fk.referencedTable.toLowerCase() !== oldLower) return fk;
+		changed = true;
+		return { ...fk, referencedTable: newName };
+	});
+
+	if (!changed) return table;
+
+	return Object.freeze({
+		...table,
+		checkConstraints: Object.freeze(newChecks),
+		foreignKeys: table.foreignKeys ? Object.freeze(newFks) : table.foreignKeys,
+	});
+}
+
+function propagateColumnRename(
+	rctx: RuntimeContext,
+	renamedSchemaName: string,
+	tableName: string,
+	oldCol: string,
+	newCol: string,
+): void {
+	const schemaManager = rctx.db.schemaManager;
+	const notifier = schemaManager.getChangeNotifier();
+	const resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource = (s, t, col) => {
+		const targetSchema = schemaManager.getSchema(s);
+		const targetTable = targetSchema?.getTable(t);
+		return targetTable?.columnIndexMap.has(col.toLowerCase()) ?? false;
+	};
+	for (const schema of schemaManager._getAllSchemas()) {
+		propagateColumnRenameInSchema(schema, renamedSchemaName, tableName, oldCol, newCol, notifier, resolveColumnInSource);
+	}
+}
+
+function propagateColumnRenameInSchema(
+	schema: Schema,
+	renamedSchemaName: string,
+	tableName: string,
+	oldCol: string,
+	newCol: string,
+	notifier: import('../../schema/change-events.js').SchemaChangeNotifier,
+	resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource,
+): void {
+	const renamedSchemaLower = renamedSchemaName.toLowerCase();
+
+	for (const table of Array.from(schema.getAllTables())) {
+		const updated = rewriteTableForColumnRename(table, renamedSchemaLower, tableName, oldCol, newCol, resolveColumnInSource);
+		if (updated !== table) {
+			schema.addTable(updated);
+			notifier.notifyChange({
+				type: 'table_modified',
+				schemaName: schema.name,
+				objectName: updated.name,
+				oldObject: table,
+				newObject: updated,
+			});
+		}
+	}
+
+	if (schema.name.toLowerCase() === renamedSchemaLower) {
+		for (const view of Array.from(schema.getAllViews())) {
+			const changed = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, renamedSchemaName);
+			if (changed) {
+				const updatedView = { ...view, sql: astToString(view.selectAst) };
+				schema.addView(updatedView);
+			}
+		}
+	}
+}
+
+function rewriteTableForColumnRename(
+	table: TableSchema,
+	renamedSchemaLower: string,
+	tableName: string,
+	oldCol: string,
+	newCol: string,
+	resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource,
+): TableSchema {
+	const oldColLower = oldCol.toLowerCase();
+	const tableLower = tableName.toLowerCase();
+	const isRenamedTable =
+		table.schemaName.toLowerCase() === renamedSchemaLower &&
+		table.name.toLowerCase() === tableLower;
+	let changed = false;
+
+	const newChecks = table.checkConstraints.map(cc => {
+		const rewrote = isRenamedTable
+			? renameColumnInCheckExpression(cc.expr, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)
+			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, renamedSchemaLower);
+		if (!rewrote) return cc;
+		changed = true;
+		return { ...cc };
+	});
+
+	const newFks = (table.foreignKeys ?? []).map(fk => {
+		const fkSchemaLower = (fk.referencedSchema ?? table.schemaName).toLowerCase();
+		if (fkSchemaLower !== renamedSchemaLower) return fk;
+		if (fk.referencedTable.toLowerCase() !== tableLower) return fk;
+		if (!fk.referencedColumnNames || fk.referencedColumnNames.length === 0) return fk;
+		let touched = false;
+		const newRefNames = fk.referencedColumnNames.map(n => {
+			if (n.toLowerCase() === oldColLower) {
+				touched = true;
+				return newCol;
+			}
+			return n;
+		});
+		if (!touched) return fk;
+		changed = true;
+		return { ...fk, referencedColumnNames: Object.freeze(newRefNames) };
+	});
+
+	if (!changed) return table;
+
+	return Object.freeze({
+		...table,
+		checkConstraints: Object.freeze(newChecks),
+		foreignKeys: table.foreignKeys ? Object.freeze(newFks) : table.foreignKeys,
+	});
 }
 
 /**

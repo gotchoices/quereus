@@ -5,11 +5,22 @@ import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 
 export function emitDelete(plan: DeleteNode, ctx: EmissionContext): Instruction {
-	// DELETE node now only handles data transformations and passes flat rows through.
-	// The actual database delete operations are handled by DmlExecutorNode.
-	async function* run(_rctx: RuntimeContext, flatRowsIterable: AsyncIterable<Row>): AsyncIterable<Row> {
-		// Simply yield all flat rows from the source (which has already applied filtering, etc.)
-		for await (const flatRow of flatRowsIterable) {
+	// Expand the N-column source row into a flat 2N OLD/NEW row so the downstream
+	// ConstraintCheckNode (which is wired after this node) sees the same row layout
+	// it does for INSERT/UPDATE. For DELETE the OLD section holds the actual values
+	// being removed and the NEW section is all NULL.
+	async function* run(_rctx: RuntimeContext, sourceRows: AsyncIterable<Row>): AsyncIterable<Row> {
+		const tableSchema = plan.table.tableSchema;
+		const colCount = tableSchema.columns.length;
+
+		for await (const sourceRow of sourceRows) {
+			const flatRow: Row = new Array(colCount * 2);
+			for (let i = 0; i < colCount; i++) {
+				flatRow[i] = sourceRow[i] ?? null;
+			}
+			for (let i = 0; i < colCount; i++) {
+				flatRow[colCount + i] = null;
+			}
 			yield flatRow;
 		}
 	}

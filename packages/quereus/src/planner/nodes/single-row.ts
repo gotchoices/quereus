@@ -72,9 +72,11 @@ export class SingleRowNode extends PlanNode implements ZeroAryRelationalNode, Co
   }
 
 	override computePhysical(): Partial<PhysicalProperties> {
+		// SingleRow has zero columns, so the singleton FD `∅ → all_cols` has no
+		// dependents and isn't representable as an FD. The at-most-one-row
+		// guarantee is communicated via `estimatedRows: 1` and `RelationType.isSet`.
 		return {
 			estimatedRows: 1,
-			uniqueKeys: [[]],
 			constant: true,
 		};
 	}

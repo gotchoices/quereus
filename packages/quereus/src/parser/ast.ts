@@ -13,7 +13,7 @@ export interface AstNode {
 		| 'rollback' | 'table' | 'join' | 'savepoint' | 'release' | 'functionSource' | 'with' | 'commonTableExpr' | 'pragma'
 		| 'collate' | 'primaryKey' | 'notNull' | 'null' | 'unique' | 'check' | 'default' | 'foreignKey' | 'generated' | 'windowFunction'
 		| 'windowDefinition' | 'windowFrame' | 'currentRow' | 'unboundedPreceding' | 'unboundedFollowing' | 'preceding' | 'following'
-		| 'subquerySource' | 'mutatingSubquerySource' | 'case' | 'in' | 'exists' | 'values' | 'between'
+		| 'subquerySource' | 'case' | 'in' | 'exists' | 'values' | 'between'
 		| 'declareSchema' | 'diffSchema' | 'applySchema' | 'explainSchema'
 		| 'declaredTable' | 'declaredIndex' | 'declaredView' | 'declaredSeed' | 'declaredAssertion' | 'declareIgnored' | 'upsert'
 		| 'analyze';
@@ -129,7 +129,7 @@ export interface ParameterExpr extends AstNode {
 // Subquery expression
 export interface SubqueryExpr extends AstNode {
 	type: 'subquery';
-	query: SelectStmt;
+	query: QueryExpr;
 }
 
 // BETWEEN expression
@@ -146,13 +146,13 @@ export interface InExpr extends AstNode {
 	type: 'in';
 	expr: Expression;  // Left side of IN
 	values?: Expression[];  // For IN (value1, value2, ...)
-	subquery?: SelectStmt;  // For IN (SELECT ...)
+	subquery?: QueryExpr;  // For IN (SELECT/VALUES/INSERT/UPDATE/DELETE …)
 }
 
 // EXISTS expression
 export interface ExistsExpr extends AstNode {
 	type: 'exists';
-	subquery: SelectStmt;  // EXISTS (SELECT ...)
+	subquery: QueryExpr;  // EXISTS (SELECT/VALUES/INSERT/UPDATE/DELETE …)
 }
 
 // --- Statement Types ---
@@ -182,7 +182,7 @@ export interface SelectStmt extends AstNode {
 	all?: boolean;
 	union?: SelectStmt;
 	unionAll?: boolean;
-	compound?: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: SelectStmt };
+	compound?: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: QueryExpr };
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
 }
 
@@ -212,8 +212,12 @@ export interface InsertStmt extends AstNode {
 	withClause?: WithClause;
 	table: IdentifierExpr;
 	columns?: string[];
-	values?: Expression[][];  // For VALUES (...), (...), ...
-	select?: SelectStmt;      // For INSERT ... SELECT
+	/**
+	 * Source rows for the insert — a SELECT, a VALUES, or another DML with
+	 * RETURNING. Replaces the legacy `values` / `select` pair: bare
+	 * `INSERT … VALUES (…), (…)` parses as a `ValuesStmt` here.
+	 */
+	source: QueryExpr;
 	/** Legacy conflict resolution (INSERT OR REPLACE, etc.) - mutually exclusive with upsertClauses */
 	onConflict?: ConflictResolution;
 	/** UPSERT clauses (ON CONFLICT DO ...) - mutually exclusive with onConflict */
@@ -230,7 +234,6 @@ export interface UpdateStmt extends AstNode {
 	table: IdentifierExpr;
 	assignments: { column: string; value: Expression }[];
 	where?: Expression;
-	onConflict?: ConflictResolution;
 	returning?: ResultColumn[];
 	contextValues?: ContextAssignment[]; // Optional mutation context assignments
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
@@ -252,6 +255,27 @@ export interface ValuesStmt extends AstNode {
 	type: 'values';
 	values: Expression[][]; // Array of value lists: VALUES (1, 'a'), (2, 'b'), ...
 }
+
+/**
+ * Query expression — anything that produces a relation. The orthogonal shape
+ * accepted everywhere a relation is allowed (top-level statement, FROM
+ * subquery source, scalar / IN / EXISTS subquery, compound-set legs, CTE
+ * body, view body).
+ *
+ * DML forms (INSERT/UPDATE/DELETE) qualify only when they carry a RETURNING
+ * clause; the parser enforces this at non-top-level positions. DML in
+ * scalar / IN / EXISTS / compound-leg / CTE-body / FROM-source positions
+ * executes with full-drain + run-once semantics (see `docs/runtime.md`).
+ * DML as a view body is rejected at view-creation time — a view body
+ * re-evaluates on every reference and re-driving the write per read is
+ * incoherent.
+ */
+export type QueryExpr =
+	| SelectStmt
+	| ValuesStmt
+	| InsertStmt
+	| UpdateStmt
+	| DeleteStmt;
 
 // CREATE TABLE statement
 export interface CreateTableStmt extends AstNode {
@@ -292,7 +316,8 @@ export interface CreateViewStmt extends AstNode {
 	view: IdentifierExpr;
 	ifNotExists: boolean;
 	columns?: string[];
-	select: SelectStmt;
+	/** View body — any relation-producing form. Bare `VALUES (...)` is permitted. */
+	select: QueryExpr;
 	isTemporary?: boolean;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
@@ -351,7 +376,7 @@ export type ResultColumn =
 	| ResultColumnExpr;
 
 // FROM clause item (table, join, function call, or subquery)
-export type FromClause = TableSource | JoinClause | FunctionSource | SubquerySource | MutatingSubquerySource;
+export type FromClause = TableSource | JoinClause | FunctionSource | SubquerySource;
 
 // Table source in FROM clause
 export interface TableSource extends AstNode {
@@ -360,18 +385,15 @@ export interface TableSource extends AstNode {
 	alias?: string;
 }
 
-// Subquery source in FROM clause: (SELECT ...) AS alias
+/**
+ * Subquery source in FROM clause: `(SELECT/VALUES/INSERT/UPDATE/DELETE …) AS alias`.
+ * The body is any `QueryExpr`. When the body is a DML statement it must carry
+ * RETURNING (enforced at parse time outside top-level position). The planner
+ * dispatches on `subquery.type` to choose the read vs mutating pipeline.
+ */
 export interface SubquerySource extends AstNode {
 	type: 'subquerySource';
-	subquery: SelectStmt | ValuesStmt;
-	alias: string;
-	columns?: string[]; // Optional column list: AS alias(col1, col2, ...)
-}
-
-// Mutating subquery source in FROM clause: (INSERT/UPDATE/DELETE ... RETURNING ...) AS alias
-export interface MutatingSubquerySource extends AstNode {
-	type: 'mutatingSubquerySource';
-	stmt: InsertStmt | UpdateStmt | DeleteStmt; // Must have RETURNING clause
+	subquery: QueryExpr;
 	alias: string;
 	columns?: string[]; // Optional column list: AS alias(col1, col2, ...)
 }
@@ -384,6 +406,8 @@ export interface JoinClause extends AstNode {
 	right: FromClause;
 	condition?: Expression; // For ON clause
 	columns?: string[];     // For USING clause
+	/** Right side is a LATERAL (correlated) subquery — the left's columns are visible inside. */
+	isLateral?: boolean;
 }
 
 // ORDER BY clause
@@ -428,8 +452,6 @@ export interface ColumnConstraint extends AstNode {
 		expr: Expression;
 		stored: boolean;          // STORED or VIRTUAL
 	};
-	deferrable?: boolean;
-	initiallyDeferred?: boolean;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 
@@ -442,8 +464,6 @@ export interface TableConstraint extends AstNode {
 	operations?: RowOp[];       // ADDED: For CHECK ON (...)
 	onConflict?: ConflictResolution;
 	foreignKey?: ForeignKeyClause;
-	deferrable?: boolean;
-	initiallyDeferred?: boolean;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 
@@ -458,7 +478,7 @@ export interface ForeignKeyClause {
 }
 
 // Foreign key action
-export type ForeignKeyAction = 'setNull' | 'setDefault' | 'cascade' | 'restrict' | 'ignore';
+export type ForeignKeyAction = 'setNull' | 'setDefault' | 'cascade' | 'restrict';
 
 // Column in index definition
 export interface IndexedColumn {
@@ -518,7 +538,8 @@ export interface CommonTableExpr extends AstNode {
 	type: 'commonTableExpr';
 	name: string;
 	columns?: string[];
-	query: SelectStmt | InsertStmt | UpdateStmt | DeleteStmt; // CTE body
+	/** CTE body — any relation-producing form. DML bodies must carry RETURNING. */
+	query: QueryExpr;
 	materializationHint?: 'materialized' | 'not_materialized';
 }
 
@@ -629,7 +650,7 @@ export interface ApplySchemaStmt extends AstNode {
 		dryRun?: boolean;
 		validateOnly?: boolean;
 		allowDestructive?: boolean;
-		renamePolicy?: 'require-hint' | 'infer-id';
+		renamePolicy?: 'allow' | 'require-hint' | 'deny';
 	};
 }
 

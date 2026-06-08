@@ -9,6 +9,7 @@
 export { Database } from './core/database.js';
 export type { DatabaseInternal } from './core/database-internal.js';
 export { Statement } from './core/statement.js';
+export { Table } from './core/table-handle.js';
 
 // Common data types and constants
 export { StatusCode, SqlDataType } from './common/types.js';
@@ -26,7 +27,8 @@ export { MemoryTableModule } from './vtab/memory/module.js';
 export type { IndexInfo, IndexConstraint, IndexConstraintUsage, IndexOrderBy } from './vtab/index-info.js';
 export { IndexScanFlags } from './vtab/index-info.js';
 export type { FilterInfo } from './vtab/filter-info.js';
-export type { BaseModuleConfig, SchemaChangeInfo } from './vtab/module.js';
+export type { BaseModuleConfig, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
+export { getModuleConcurrencyMode, acquireConnectionLock } from './vtab/concurrency.js';
 
 // Virtual Table Event Hooks
 export type {
@@ -126,14 +128,19 @@ export {
 export { Parser } from './parser/parser.js';
 export { Lexer, TokenType, KEYWORDS } from './parser/lexer.js';
 export { ParseError } from './parser/parser.js';
+export { tryFoldLiteral } from './parser/utils.js';
 export { quoteIdentifier } from './emit/ast-stringify.js';
 
 // Schema management
 export { SchemaManager } from './schema/manager.js';
 export { buildColumnIndexMap, columnDefToSchema } from './schema/table.js';
-export type { TableSchema, IndexSchema as TableIndexSchema } from './schema/table.js';
+export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
 export { generateTableDDL, generateIndexDDL } from './schema/ddl-generator.js';
+
+// Partial-index predicate compilation (used by store modules to honor partial UNIQUE)
+export { compilePredicate } from './vtab/memory/utils/predicate.js';
+export type { CompiledPredicate } from './vtab/memory/utils/predicate.js';
 
 // Runtime utilities
 export { isAsyncIterable, getAsyncIterator, asyncIterableToArray } from './runtime/utils.js';
@@ -189,6 +196,34 @@ export type {
 	TypePluginInfo,
 	PluginRegistrations
 } from './vtab/manifest.js';
+
+// Change-scope introspection
+export type {
+	ChangeScope,
+	TableWatch,
+	WatchScope,
+	ScopeValue,
+	ParamScopeValue,
+	PortableScalarType,
+	NonDetSource,
+	QualifiedName,
+	SerializedChangeScope,
+	Subscription,
+	WatchEvent,
+	MatchedWatch,
+	WatchHandler,
+} from './planner/analysis/change-scope.js';
+export {
+	analyzeChangeScope,
+	unionScopes,
+	intersectScopes,
+	bindParameters,
+	isEmpty,
+	describesEverything,
+	serializeChangeScope,
+	deserializeChangeScope,
+	scalarTypeFromPortable,
+} from './planner/analysis/change-scope.js';
 
 // Debug and development utilities
 export { serializePlanTree, formatPlanTree, formatPlanSummary, serializePlanTreeWithOptions } from './planner/debug.js';

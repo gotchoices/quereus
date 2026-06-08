@@ -323,6 +323,31 @@ The `DatabaseSchemaChangeEvent` interface:
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
 
+### Per-Table Subscription via `db.getTable(...)`
+
+`Database.getTable(schemaName, tableName)` returns a public `Table` handle (or `undefined` if the table does not exist). The handle exposes the underlying module's event emitter:
+
+```typescript
+const table = db.getTable('main', 'users');
+const tableEmitter = table?.getEventEmitter();
+
+const off = tableEmitter?.onDataChange?.((event) => {
+  // event.tableName is the source table — filter when you only care about one
+  if (event.tableName === 'users') {
+    console.log('users changed:', event);
+  }
+});
+
+// Later
+off?.();
+```
+
+Notes:
+
+- The emitter is **module-scoped**: it is the same instance shared by every table that lives under the same virtual table module. Callbacks fire for changes to any table in that module, so consumers must filter by `schemaName`/`tableName` if they only care about a single table.
+- When the module does not provide an event emitter, `getEventEmitter()` returns `undefined`. Fall back to the database-level `db.onDataChange()` / `db.onSchemaChange()` listeners — the engine populates those automatically for modules without native event support.
+- The handle is a snapshot taken at `db.getTable()` time. If the table is dropped or replaced, the emitter reference remains valid (the module outlives individual tables) but no further events for that specific table will be produced. Re-acquire the handle after schema changes if you need a fresh view.
+
 ### Transaction Batching
 
 Events are batched within transactions and delivered only after a successful commit. On rollback, batched events are discarded. This ensures listeners see a consistent view of committed data.
@@ -382,7 +407,7 @@ pragma default_column_nullability;
 | `default_column_nullability` | string | `'not_null'` | Default nullability for columns: `'not_null'` (Third Manifesto) or `'nullable'` (SQL standard). Aliases: `column_nullability_default`, `nullable_default` |
 | `default_vtab_module` | string | `'memory'` | Default virtual table module used for `create table` without `using` clause |
 | `default_vtab_args` | object | `{}` | Default arguments passed to the default virtual table module |
-| `foreign_keys` | boolean | `true` | Enable foreign key constraint enforcement. FKs default to IGNORE actions; explicit action clauses required for enforcement. Alias: `fk_enforcement` |
+| `foreign_keys` | boolean | `true` | Enable foreign key constraint enforcement. When omitted, ON DELETE / ON UPDATE default to RESTRICT. Alias: `fk_enforcement` |
 | `runtime_stats` | boolean | `false` | Enable runtime execution statistics collection. Alias: `runtime_metrics` |
 | `validate_plan` | boolean | `false` | Enable plan validation before execution. Alias: `plan_validation` |
 | `trace_plan_stack` | boolean | `false` | Enable plan stack tracing for debugging |
@@ -423,6 +448,9 @@ A high-level async generator for executing a query and iterating over its result
 
 ### `db.beginTransaction()`, `db.commit()`, `db.rollback()`
 Standard transaction control methods.
+
+### `db.getTable(schemaName: string | undefined, tableName: string): Table | undefined`
+Returns a public handle to a table for inspection and per-table event subscription, or `undefined` if the table does not exist or its owning module is not registered. The handle exposes `schemaName`, `tableName`, `schema`, `moduleName`, and `getEventEmitter()`. See the [Event System / Per-Table Subscription](#per-table-subscription-via-dbgettable) section for details and lifecycle caveats.
 
 ### `db.registerModule(...)`, `db.createScalarFunction(...)`, `db.createAggregateFunction(...)`, `db.registerCollation(...)`
 Methods for extending database functionality.
@@ -570,6 +598,117 @@ Resets the statement to its initial state, ready to be re-executed with new para
 #### `stmt.finalize(): Promise<void>`
 
 Releases all resources associated with the statement. The statement cannot be used after finalizing.
+
+## Change-scope introspection
+
+`Statement.getChangeScope(params?)` returns a JSON-serializable `ChangeScope`
+describing what base-table state and external inputs the statement reads
+from. The result is a static analysis — sound but conservative — and is
+the public projection of the binding analysis used by assertions and
+incremental view maintenance. See [Change-scope Documentation](change-scope.md)
+for the full data contract.
+
+### Analyzer-only
+
+```typescript
+import {
+    analyzeChangeScope,
+    serializeChangeScope,
+    unionScopes,
+    bindParameters,
+} from '@quereus/quereus';
+
+// Per-prepared-statement.
+await db.exec('create table orders (id integer primary key, total integer)');
+const stmt = db.prepare('select total from orders where id = ?');
+const scope = stmt.getChangeScope();
+// scope.watches[0] === { table: { schema: 'main', table: 'orders' },
+//                        columns: Set{'total'},
+//                        scope: { kind: 'rows', key: ['id'],
+//                                 values: [[{ kind: 'param', index: 1, type: {...} }]] } }
+// scope.unboundParameters === [1]
+
+// Substitute the parameter and clear the placeholder.
+const bound = stmt.getChangeScope([42]);
+// bound.watches[0].scope.values === [[42]]
+// bound.unboundParameters === []
+```
+
+### Composition
+
+```typescript
+const sA = db.prepare('select * from t where id = 1').getChangeScope();
+const sB = db.prepare('select * from t where id = 2').getChangeScope();
+const merged = unionScopes(sA, sB);
+// merged.watches[0].scope.values === [[1], [2]]
+
+const wire = JSON.stringify(serializeChangeScope(merged));
+// ...ship `wire` somewhere...
+```
+
+### Reactive subscriptions (`Database.watch`)
+
+`Database.watch(scope, handler)` registers a post-commit callback
+driven by any `ChangeScope` value — analyzed, deserialized, or
+hand-built. The watcher is plan-independent: nothing in its design
+ties to a particular `Statement`.
+
+```typescript
+import { Database, type ChangeScope, type WatchEvent } from '@quereus/quereus';
+
+const db = new Database();
+await db.exec('create table t (id integer primary key, v text)');
+
+// Hand-built scope: "watch row id=7 on table t." No Statement needed.
+const scope: ChangeScope = {
+    watches: [{
+        table: { schema: 'main', table: 't' },
+        columns: new Set(['id', 'v']),
+        scope: { kind: 'rows', key: ['id'], values: [[7]] },
+    }],
+    nonDeterministicSources: [],
+    unboundParameters: [],
+};
+
+const sub = db.watch(scope, (event: WatchEvent) => {
+    console.log(`watch ${sub.id} fired in ${event.txnId}`);
+    for (const m of event.matched) {
+        console.log(`  ${m.watch.table.schema}.${m.watch.table.table} hits=${JSON.stringify(m.hits)}`);
+    }
+});
+
+await db.exec("insert into t values (7, 'seven')");
+// → watch fired with hits=[[7]]
+
+sub.unsubscribe();
+```
+
+End-to-end with the analyzer:
+
+```typescript
+import { Database } from '@quereus/quereus';
+
+const db = new Database();
+await db.exec('create table orders (id integer primary key, total integer)');
+const stmt = db.prepare('select total from orders where id = ?');
+
+// Statement.getChangeScope() returns a parameter-aware ChangeScope; passing
+// values resolves placeholders so `db.watch` accepts it without further
+// `bindParameters` calls.
+const scope = stmt.getChangeScope([42]);
+const sub = db.watch(scope, (event) => {
+    console.log(`order #42 changed in ${event.txnId}`);
+});
+await stmt.finalize();
+// later... await db.exec('update orders set total = 100 where id = 42'); // fires
+```
+
+The handler fires once per successful commit and receives every
+`MatchedWatch` for that transaction in a single event. Handler
+errors are logged but do not roll the commit back (assertions enforce;
+watchers observe). See [change-scope.md](change-scope.md) for the
+full firing semantics, schema-change invalidation policy, and the
+list of v1 limitations.
 
 ## Virtual Tables
 

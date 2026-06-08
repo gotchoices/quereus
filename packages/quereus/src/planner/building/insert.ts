@@ -4,9 +4,10 @@ import { InsertNode } from '../nodes/insert-node.js';
 import { buildTableReference } from './table.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { buildSelectStmt } from './select.js';
+import { buildSelectStmt, buildValuesStmt } from './select.js';
+import { buildUpdateStmt } from './update.js';
+import { buildDeleteStmt } from './delete.js';
 import { buildWithClause } from './with.js';
-import { ValuesNode } from '../nodes/values-node.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
 import { buildExpression } from './expression.js';
 import { checkColumnsAssignable, columnSchemaToDef } from '../type-utils.js';
@@ -21,9 +22,10 @@ import { ReturningNode } from '../nodes/returning-node.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode, type UpsertClausePlan } from '../nodes/dml-executor-node.js';
-import { buildConstraintChecks } from './constraint-builder.js';
+import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { buildChildSideFKChecks } from './foreign-key-builder.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
+import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 
 /**
@@ -125,8 +127,11 @@ function createRowExpansionProjection(
 					// It's an AST.Expression - build it into a plan node with context scope
 					defaultNode = buildExpression(defaultCtx, tableColumn.defaultValue as AST.Expression) as ScalarPlanNode;
 
-					// Validate that the default expression is deterministic
-					validateDeterministicDefault(defaultNode, tableColumn.name, tableSchema.name);
+					// Validate that the default expression is deterministic — skip when the
+					// `nondeterministic_schema` option permits non-deterministic defaults.
+					if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+						validateDeterministicDefault(defaultNode, tableColumn.name, tableSchema.name);
+					}
 				} else {
 					// Literal default value
 					defaultNode = buildExpression(defaultCtx, { type: 'literal', value: tableColumn.defaultValue }) as ScalarPlanNode;
@@ -154,56 +159,68 @@ function createRowExpansionProjection(
 }
 
 /**
- * Creates a projection that computes generated column values from an expanded row.
- * Non-generated columns pass through; generated columns are computed from their expressions.
+ * Creates a chain of projections that compute generated column values in
+ * dependency order. One projection per generated column: it passes every
+ * column through and recomputes exactly one generated column whose expression
+ * resolves names against the prior projection's attributes (so a generated
+ * column referencing another generated column sees the freshly-computed value
+ * rather than the NULL placeholder from the initial expansion).
+ *
+ * Topological order is taken from `tableSchema.generatedColumnTopoOrder`,
+ * which the schema manager validates for cycles at CREATE/ALTER time.
  */
 function createGeneratedColumnProjection(
 	ctx: PlanningContext,
 	sourceNode: RelationalPlanNode,
 	tableSchema: TableSchema
 ): RelationalPlanNode {
-	const sourceAttributes = sourceNode.getAttributes();
-	const genProjections: Projection[] = [];
+	const topoOrder = tableSchema.generatedColumnTopoOrder ?? [];
+	let currentNode: RelationalPlanNode = sourceNode;
 
-	// Create a scope where column names resolve to the source (expanded) row attributes
-	const genScope = new RegisteredScope(ctx.scope);
-	tableSchema.columns.forEach((col, colIndex) => {
-		if (col.generated) return; // Generated columns can't be referenced by other generated columns
-		const attr = sourceAttributes[colIndex];
-		genScope.registerSymbol(col.name.toLowerCase(), (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, colIndex)
-		);
-	});
+	for (const genColIdx of topoOrder) {
+		const genColumn = tableSchema.columns[genColIdx];
+		if (!genColumn.generated || !genColumn.generatedExpr) continue;
 
-	const genCtx = { ...ctx, scope: genScope };
+		const inputAttributes = currentNode.getAttributes();
 
-	tableSchema.columns.forEach((tableColumn, colIndex) => {
-		if (tableColumn.generated && tableColumn.generatedExpr) {
-			// Build the generated expression in the scope with access to non-generated columns
-			const genNode = buildExpression(genCtx, tableColumn.generatedExpr) as ScalarPlanNode;
-			validateDeterministicGenerated(genNode, tableColumn.name, tableSchema.name);
+		// Scope: every column resolves to the corresponding attribute in the
+		// current source. This includes generated columns processed in earlier
+		// iterations — their attribute carries the freshly-computed value.
+		const genScope = new RegisteredScope(ctx.scope);
+		tableSchema.columns.forEach((col, colIndex) => {
+			const attr = inputAttributes[colIndex];
+			genScope.registerSymbol(col.name.toLowerCase(), (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, colIndex)
+			);
+		});
 
-			genProjections.push({
-				node: genNode,
-				alias: tableColumn.name
-			});
-		} else {
-			// Pass through non-generated column from source
-			const attr = sourceAttributes[colIndex];
-			genProjections.push({
+		const genCtx = { ...ctx, scope: genScope };
+
+		const genProjections: Projection[] = tableSchema.columns.map((col, colIdx) => {
+			if (colIdx === genColIdx) {
+				const genNode = buildExpression(genCtx, genColumn.generatedExpr!) as ScalarPlanNode;
+				if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+					validateDeterministicGenerated(genNode, genColumn.name, tableSchema.name);
+				}
+				return { node: genNode, alias: col.name };
+			}
+			const attr = inputAttributes[colIdx];
+			return {
 				node: new ColumnReferenceNode(
 					ctx.scope,
 					{ type: 'column', name: attr.name } satisfies AST.ColumnExpr,
 					attr.type,
 					attr.id,
-					colIndex
+					colIdx,
 				),
-				alias: tableColumn.name
-			});
-		}
-	});
+				alias: col.name,
+			};
+		});
 
-	return new ProjectNode(ctx.scope, sourceNode, genProjections);
+		currentNode = new ProjectNode(ctx.scope, currentNode, genProjections);
+	}
+
+	return currentNode;
 }
 
 /**
@@ -343,61 +360,6 @@ function buildUpsertClausePlans(
 	});
 }
 
-/**
- * Validates that RETURNING expressions use appropriate NEW/OLD qualifiers for the operation type
- */
-function validateReturningExpression(expr: AST.Expression, operationType: 'INSERT' | 'UPDATE' | 'DELETE'): void {
-	function checkExpression(e: AST.Expression): void {
-		if (e.type === 'column') {
-			if (e.table?.toLowerCase() === 'old' && operationType === 'INSERT') {
-				throw new QuereusError(
-					'OLD qualifier cannot be used in INSERT RETURNING clause',
-					StatusCode.ERROR
-				);
-			}
-			if (e.table?.toLowerCase() === 'new' && operationType === 'DELETE') {
-				throw new QuereusError(
-					'NEW qualifier cannot be used in DELETE RETURNING clause',
-					StatusCode.ERROR
-				);
-			}
-		} else if (e.type === 'binary') {
-			checkExpression(e.left);
-			checkExpression(e.right);
-		} else if (e.type === 'unary') {
-			checkExpression(e.expr);
-		} else if (e.type === 'function') {
-			e.args.forEach(checkExpression);
-		} else if (e.type === 'case') {
-			if (e.baseExpr) checkExpression(e.baseExpr);
-			e.whenThenClauses.forEach(clause => {
-				checkExpression(clause.when);
-				checkExpression(clause.then);
-			});
-			if (e.elseExpr) checkExpression(e.elseExpr);
-		} else if (e.type === 'cast') {
-			checkExpression(e.expr);
-		} else if (e.type === 'collate') {
-			checkExpression(e.expr);
-		} else if (e.type === 'subquery') {
-			// Subqueries in RETURNING are complex - for now, we'll skip validation
-			// A full implementation would need to traverse the subquery's AST
-		} else if (e.type === 'in') {
-			checkExpression(e.expr);
-			if (e.values) {
-				e.values.forEach(checkExpression);
-			}
-		} else if (e.type === 'exists') {
-			// EXISTS subqueries are complex - skip validation for now
-		} else if (e.type === 'windowFunction') {
-			checkExpression(e.function);
-		}
-		// Other expression types (literal, parameter) don't need validation
-	}
-
-	checkExpression(expr);
-}
-
 export function buildInsertStmt(
 	ctx: PlanningContext,
 	stmt: AST.InsertStmt,
@@ -488,40 +450,55 @@ export function buildInsertStmt(
 			.map(col => columnSchemaToDef(col.name, col));
 	}
 
+	// Build the INSERT source — a unified QueryExpr (SELECT/VALUES/DML w/ RETURNING).
+	// Each branch produces a relational plan that the row-expansion projection
+	// then aligns to the target table columns. CTEs declared on the INSERT
+	// flow into the inner build via `parentCtes`.
+	let parentCtes: Map<string, CTEScopeNode> = new Map();
+	if (stmt.withClause) {
+		parentCtes = buildWithClause(contextWithSchemaPath, stmt.withClause);
+	}
+
 	let sourceNode: RelationalPlanNode;
-
-	if (stmt.values) {
-		// VALUES clause - build the VALUES node
-		const rows = stmt.values.map(rowExprs =>
-			rowExprs.map(expr => buildExpression(contextWithSchemaPath, expr) as PlanNode as ScalarPlanNode)
-		);
-
-		// Check that there are the right number of columns in each row
-		rows.forEach(row => {
-			if (row.length !== targetColumns.length) {
-				throw new QuereusError(`Column count mismatch in VALUES clause. Expected ${targetColumns.length} columns, got ${row.length}.`, StatusCode.ERROR, undefined, stmt.loc?.start.line, stmt.loc?.start.column);
+	switch (stmt.source.type) {
+		case 'values': {
+			// Bare VALUES — no source-side column type-check; the row-expansion
+			// projection handles column-count and per-column type coercion.
+			sourceNode = buildValuesStmt(contextWithSchemaPath, stmt.source);
+			const sourceCols = sourceNode.getType().columns;
+			if (sourceCols.length !== targetColumns.length) {
+				throw new QuereusError(`Column count mismatch in VALUES clause. Expected ${targetColumns.length} columns, got ${sourceCols.length}.`, StatusCode.ERROR, undefined, stmt.loc?.start.line, stmt.loc?.start.column);
 			}
-		});
-
-		// Create VALUES node with target column names
-		const targetColumnNames = targetColumns.map(col => col.name);
-		sourceNode = new ValuesNode(contextWithSchemaPath.scope, rows, targetColumnNames);
-
-	} else if (stmt.select) {
-		// SELECT clause - build the SELECT statement
-		let parentCtes: Map<string, CTEScopeNode> = new Map();
-		if (stmt.withClause) {
-			parentCtes = buildWithClause(contextWithSchemaPath, stmt.withClause);
+			break;
 		}
-		const selectPlan = buildSelectStmt(contextWithSchemaPath, stmt.select, parentCtes);
-		if (selectPlan.getType().typeClass !== 'relation') {
-			throw new QuereusError('SELECT statement in INSERT did not produce a relational plan.', StatusCode.INTERNAL, undefined, stmt.loc?.start.line, stmt.loc?.start.column);
+		case 'select': {
+			const selectPlan = buildSelectStmt(contextWithSchemaPath, stmt.source, parentCtes);
+			if (selectPlan.getType().typeClass !== 'relation') {
+				throw new QuereusError('SELECT statement in INSERT did not produce a relational plan.', StatusCode.INTERNAL, undefined, stmt.loc?.start.line, stmt.loc?.start.column);
+			}
+			sourceNode = selectPlan as RelationalPlanNode;
+			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
+			break;
 		}
-		sourceNode = selectPlan as RelationalPlanNode;
-		checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
-
-	} else {
-		throw new QuereusError('INSERT statement must have a VALUES clause or a SELECT query.', StatusCode.ERROR);
+		case 'insert': {
+			// DML-as-source: the inner DML's RETURNING clause produces the rows
+			// consumed by the outer INSERT. The inner is built through its
+			// standard builder; the outer's row-expansion projection aligns the
+			// RETURNING columns to the outer target columns.
+			sourceNode = buildInsertStmt(contextWithSchemaPath, stmt.source) as RelationalPlanNode;
+			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
+			break;
+		}
+		case 'update': {
+			sourceNode = buildUpdateStmt(contextWithSchemaPath, stmt.source) as RelationalPlanNode;
+			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
+			break;
+		}
+		case 'delete': {
+			sourceNode = buildDeleteStmt(contextWithSchemaPath, stmt.source) as RelationalPlanNode;
+			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
+			break;
+		}
 	}
 
 	// ORTHOGONAL ROW EXPANSION: Apply uniform row expansion to map any source to table structure with defaults
@@ -558,7 +535,7 @@ export function buildInsertStmt(
 	const { oldRowDescriptor, newRowDescriptor, flatRowDescriptor } = buildOldNewRowDescriptors(oldAttributes, newAttributes);
 
 	// Build context descriptor if we have context attributes
-	const contextDescriptor: RowDescriptor = contextAttributes.length > 0 ? [] : undefined as any;
+	const contextDescriptor: RowDescriptor | undefined = contextAttributes.length > 0 ? [] : undefined;
 	if (contextDescriptor) {
 		contextAttributes.forEach((attr, index) => {
 			contextDescriptor[attr.id] = index;
@@ -585,6 +562,12 @@ export function buildInsertStmt(
 		constraintChecks.push(...fkChecks);
 	}
 
+	// Pre-build DEFAULT evaluators for NOT NULL columns. Used by REPLACE to
+	// substitute the default when the user supplied NULL.
+	const notNullDefaults = buildNotNullDefaults(
+		ctx, tableReference.tableSchema, newAttributes, contextAttributes
+	);
+
 	const insertNode = new InsertNode(
 		ctx.scope,
 		tableReference,
@@ -607,7 +590,9 @@ export function buildInsertStmt(
 		constraintChecks,
 		mutationContextValues.size > 0 ? mutationContextValues : undefined,
 		contextAttributes.length > 0 ? contextAttributes : undefined,
-		contextDescriptor
+		contextDescriptor,
+		stmt.onConflict,
+		notNullDefaults.length > 0 ? notNullDefaults : undefined
 	);
 
 	// Build UPSERT clause plans if present
@@ -674,19 +659,19 @@ export function buildInsertStmt(
 			// TODO: Support RETURNING *
 			if (rc.type === 'all') throw new QuereusError('RETURNING * not yet supported', StatusCode.UNSUPPORTED);
 
-			// Infer alias from column name if not explicitly provided
+			// Infer alias from column name if not explicitly provided.
+			// Preserve the spelling the user wrote so quoted identifiers like
+			// [Name] / "Name" round-trip to the result column name unchanged.
 			let alias = rc.alias;
 			if (!alias && rc.expr.type === 'column') {
-				// For qualified column references like NEW.id, normalize to lowercase
-				if (rc.expr.table) {
-					alias = `${rc.expr.table.toLowerCase()}.${rc.expr.name.toLowerCase()}`;
-				} else {
-					alias = rc.expr.name.toLowerCase();
-				}
+				alias = rc.expr.table
+					? `${rc.expr.table}.${rc.expr.name}`
+					: rc.expr.name;
 			}
 
-			// Validate that OLD references are not used in INSERT RETURNING
-			validateReturningExpression(rc.expr, 'INSERT');
+			// Validate qualifier usage on the AST before column resolution so the
+			// OLD-in-INSERT guard fires before any "column not found" error.
+			validateReturningQualifiers(rc.expr, 'INSERT');
 
 			return {
 				node: buildExpression({ ...ctx, scope: returningScope }, rc.expr) as ScalarPlanNode,

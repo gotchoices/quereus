@@ -1,6 +1,6 @@
 ---
 description: Error handling standardization - audit and fixes across the Quereus codebase
-dependencies: none
+prereq: none
 
 ---
 

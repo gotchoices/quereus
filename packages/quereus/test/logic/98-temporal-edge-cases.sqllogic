@@ -357,3 +357,88 @@ SELECT dur FROM ts_val ORDER BY id;
 → [{"dur":"PT1H"},{"dur":null}]
 
 DROP TABLE ts_val;
+
+-- ============================================================
+-- DATETIME: cross-representation canonicalization
+-- All six shapes for the same instant must store identical canonical text.
+-- 1500000000000 ms = 2017-07-14T02:40:00Z = 04:40 in +02:00 = bare 02:40:00 in UTC.
+-- ============================================================
+
+CREATE TABLE dt_canon (id INTEGER PRIMARY KEY, ts DATETIME);
+INSERT INTO dt_canon VALUES (1, 1500000000000);
+INSERT INTO dt_canon VALUES (2, '2017-07-14T02:40:00');
+INSERT INTO dt_canon VALUES (3, '2017-07-14T02:40:00Z');
+INSERT INTO dt_canon VALUES (4, '2017-07-14T02:40:00+00:00');
+INSERT INTO dt_canon VALUES (5, '2017-07-14T02:40:00+00:00[UTC]');
+INSERT INTO dt_canon VALUES (6, '2017-07-14T04:40:00+02:00');
+-- run
+
+-- All six rows must canonicalize to the same bare PlainDateTime string.
+SELECT count(distinct ts) as c FROM dt_canon;
+→ [{"c":1}]
+
+-- And they all equal the canonical form.
+SELECT count(*) as c FROM dt_canon WHERE ts = '2017-07-14T02:40:00';
+→ [{"c":6}]
+
+DROP TABLE dt_canon;
+
+-- ============================================================
+-- DATE: Z-suffix, offset, zoned, and numeric inputs all → canonical date
+-- ============================================================
+
+CREATE TABLE d_canon (id INTEGER PRIMARY KEY, d DATE);
+-- 1705320600000 ms = 2024-01-15T13:30:00Z → date = 2024-01-15
+INSERT INTO d_canon VALUES (1, '2024-01-15');
+INSERT INTO d_canon VALUES (2, '2024-01-15T10:30:00Z');
+INSERT INTO d_canon VALUES (3, '2024-01-15T10:30:00+00:00');
+INSERT INTO d_canon VALUES (4, '2024-01-15T10:30:00+00:00[UTC]');
+INSERT INTO d_canon VALUES (5, 1705320600000);
+-- run
+
+SELECT count(distinct d) as c FROM d_canon;
+→ [{"c":1}]
+
+SELECT count(*) as c FROM d_canon WHERE d = '2024-01-15';
+→ [{"c":5}]
+
+DROP TABLE d_canon;
+
+-- ============================================================
+-- TIME: Z-suffix / ISO datetime inputs degrade to canonical UTC time
+-- ============================================================
+
+CREATE TABLE t_canon (id INTEGER PRIMARY KEY, t TIME);
+INSERT INTO t_canon VALUES (1, '10:30:00');
+INSERT INTO t_canon VALUES (2, '2024-01-15T10:30:00Z');
+INSERT INTO t_canon VALUES (3, '2024-01-15T10:30:00+00:00');
+INSERT INTO t_canon VALUES (4, '2024-01-15T10:30:00+00:00[UTC]');
+-- run
+
+SELECT count(distinct t) as c FROM t_canon;
+→ [{"c":1}]
+
+SELECT count(*) as c FROM t_canon WHERE t = '10:30:00';
+→ [{"c":4}]
+
+DROP TABLE t_canon;
+
+-- ============================================================
+-- DATE / TIME: non-zero offset must shift to UTC, not be silently
+-- stripped as wall-clock. Without canonicalization-first these would
+-- return the local wall-clock date/time instead of the UTC equivalent.
+-- '2024-01-15T01:30:00+02:00' = '2024-01-14T23:30:00Z'  (date crosses)
+-- '2024-01-15T10:30:00+02:00' = '2024-01-15T08:30:00Z'  (time shifts)
+-- '2024-01-15T23:30:00-05:00' = '2024-01-16T04:30:00Z'  (date crosses)
+-- ============================================================
+
+CREATE TABLE dt_offset (id INTEGER PRIMARY KEY, d DATE, t TIME);
+INSERT INTO dt_offset VALUES (1, '2024-01-15T01:30:00+02:00', '2024-01-15T01:30:00+02:00');
+INSERT INTO dt_offset VALUES (2, '2024-01-15T10:30:00+02:00', '2024-01-15T10:30:00+02:00');
+INSERT INTO dt_offset VALUES (3, '2024-01-15T23:30:00-05:00', '2024-01-15T23:30:00-05:00');
+-- run
+
+SELECT id, d, t FROM dt_offset ORDER BY id;
+→ [{"id":1,"d":"2024-01-14","t":"23:30:00"},{"id":2,"d":"2024-01-15","t":"08:30:00"},{"id":3,"d":"2024-01-16","t":"04:30:00"}]
+
+DROP TABLE dt_offset;

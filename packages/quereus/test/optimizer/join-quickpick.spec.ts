@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('QuickPick Join Enumeration', () => {
   let db: Database;
@@ -23,7 +26,7 @@ describe('QuickPick Join Enumeration', () => {
 
   it('exposes quickpick diagnostics in query_plan()', async () => {
     await setupChain();
-    const rows: any[] = [];
+    const rows: ResultRow[] = [];
     for await (const r of db.eval("SELECT properties FROM query_plan('SELECT * FROM a JOIN b ON a.id=b.a_id JOIN c ON b.id=c.b_id')")) rows.push(r);
     const props = String(rows.map(r => r.properties).join(' '));
     // Should include a quickpick diagnostic block somewhere
@@ -33,7 +36,7 @@ describe('QuickPick Join Enumeration', () => {
   it('improves or maintains estimated cost for chain joins', async () => {
     await setupChain();
     // Baseline: just get plan; quickpick runs automatically but we can still assert that estimated rows are reasonable
-    const rows: any[] = [];
+    const rows: ResultRow[] = [];
     for await (const r of db.eval("SELECT physical FROM query_plan('SELECT a.id FROM a JOIN b ON a.id=b.a_id JOIN c ON b.id=c.b_id')")) rows.push(r);
     const physicals = rows.map(r => String(r.physical || ''));
     // Expect at least one JOIN node to have estimatedRows close to base table sizes (not full cross product)

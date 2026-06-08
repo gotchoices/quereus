@@ -106,7 +106,7 @@ describe('Store ALTER TABLE', () => {
 			await db.exec(`INSERT INTO items VALUES (1, 'Widget')`);
 			await db.exec(`INSERT INTO items VALUES (2, 'Gadget')`);
 
-			await db.exec(`ALTER TABLE items ADD COLUMN price REAL`);
+			await db.exec(`ALTER TABLE items ADD COLUMN price REAL NULL`);
 
 			const rows = await asyncIterableToArray(db.eval('select id, name, price from items order by id'));
 			expect(rows).to.have.lengthOf(2);
@@ -138,7 +138,7 @@ describe('Store ALTER TABLE', () => {
 			`);
 			await db.exec(`INSERT INTO items VALUES (1, 'Old')`);
 
-			await db.exec(`ALTER TABLE items ADD COLUMN color TEXT`);
+			await db.exec(`ALTER TABLE items ADD COLUMN color TEXT NULL`);
 			await db.exec(`INSERT INTO items VALUES (2, 'New', 'red')`);
 
 			const rows = await asyncIterableToArray(db.eval('select * from items order by id'));
@@ -429,7 +429,7 @@ describe('Store ALTER TABLE', () => {
 			await db.exec(`INSERT INTO items VALUES (1, 'Widget')`);
 
 			// Add a column
-			await db.exec(`ALTER TABLE items ADD COLUMN color TEXT`);
+			await db.exec(`ALTER TABLE items ADD COLUMN color TEXT NULL`);
 			let row = await db.get('select * from items where id = 1');
 			expect(row).to.deep.equal({ id: 1, name: 'Widget', color: null });
 
@@ -452,9 +452,9 @@ describe('Store ALTER TABLE', () => {
 			`);
 			await db.exec(`INSERT INTO items VALUES (1)`);
 
-			await db.exec(`ALTER TABLE items ADD COLUMN a TEXT`);
+			await db.exec(`ALTER TABLE items ADD COLUMN a TEXT NULL`);
 			await db.exec(`ALTER TABLE items ADD COLUMN b INTEGER DEFAULT 42`);
-			await db.exec(`ALTER TABLE items ADD COLUMN c TEXT`);
+			await db.exec(`ALTER TABLE items ADD COLUMN c TEXT NULL`);
 
 			const row = await db.get('select * from items where id = 1');
 			expect(row).to.deep.equal({ id: 1, a: null, b: 42, c: null });
@@ -469,7 +469,7 @@ describe('Store ALTER TABLE', () => {
 			`);
 			await db.exec(`INSERT INTO items VALUES (1, 'Widget')`);
 
-			await db.exec(`ALTER TABLE items ADD COLUMN scratch TEXT`);
+			await db.exec(`ALTER TABLE items ADD COLUMN scratch TEXT NULL`);
 			await db.exec(`ALTER TABLE items DROP COLUMN scratch`);
 
 			const row = await db.get('select * from items where id = 1');
@@ -575,7 +575,7 @@ describe('Store ALTER TABLE', () => {
 				) USING store2
 			`);
 			await db.exec(`INSERT INTO items2 VALUES (1, 'Widget')`);
-			await db.exec(`ALTER TABLE items2 ADD COLUMN color TEXT`);
+			await db.exec(`ALTER TABLE items2 ADD COLUMN color TEXT NULL`);
 
 			// Load DDL and verify it reflects the new schema
 			const ddlStatements = await storeModule.loadAllDDL();

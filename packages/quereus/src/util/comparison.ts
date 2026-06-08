@@ -510,6 +510,7 @@ export function createTypedComparator(
 ): (a: SqlValue, b: SqlValue) => number {
 	// Pre-resolve the comparison function
 	const compareFunc = type.compare;
+	const collationFunc = collation ?? BINARY_COLLATION;
 
 	if (compareFunc) {
 		// Type has custom comparison
@@ -517,12 +518,20 @@ export function createTypedComparator(
 			if (a === null && b === null) return 0;
 			if (a === null) return -1;
 			if (b === null) return 1;
+			// Per-type compare assumes both args share the declared logical type.
+			// When a caller probes with a different storage class (e.g., an IN-list
+			// multi-seek with integer literals against a BLOB index), the per-type
+			// compare can silently treat unrelated values as equal, causing index
+			// seeks to surface false matches. Fall back to SQLite cross-type
+			// ordering on storage-class mismatch.
+			const classA = getStorageClass(a);
+			const classB = getStorageClass(b);
+			if (classA !== classB) return classA - classB;
 			return compareFunc(a, b, collation);
 		};
 	}
 
 	// Fallback to default comparison
-	const collationFunc = collation ?? BINARY_COLLATION;
 	return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collationFunc);
 }
 

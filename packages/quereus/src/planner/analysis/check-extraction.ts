@@ -1,0 +1,475 @@
+/**
+ * Extract FDs, equivalence classes, constant bindings, and column-domain bounds
+ * from declared CHECK constraints. The recognized AST shapes are syntactic and
+ * decompose across `AND` conjunctions; disjunctions, NOT, subqueries, and any
+ * call to a function the supplied `isDeterministic` predicate rejects are
+ * conservatively skipped.
+ *
+ * See ticket `1-optimizer-check-derived-fds-and-domains` for the recognized
+ * shape table; consumers wire the result into a TableReferenceNode's physical
+ * properties via `fd-utils` helpers.
+ */
+
+import type { ConstantBinding, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
+import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
+import type * as AST from '../../parser/ast.js';
+import type { SqlValue } from '../../common/types.js';
+import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison } from './predicate-shape.js';
+
+export interface CheckExtraction {
+	readonly fds: ReadonlyArray<FunctionalDependency>;
+	readonly equivPairs: ReadonlyArray<readonly [number, number]>;
+	readonly constantBindings: ReadonlyArray<ConstantBinding>;
+	readonly domainConstraints: ReadonlyArray<DomainConstraint>;
+}
+
+/**
+ * Walk each CHECK constraint and emit FD/EC/binding/domain contributions.
+ * `columnIndexMap` is the table's name → index map (lowercase keys).
+ * `isDeterministic` returns true when the named function with `argc` arguments
+ * is registered as deterministic. Constraints invoking any non-deterministic
+ * function are skipped wholesale.
+ */
+/**
+ * Cached schema-keyed view: schema validation already rejects non-deterministic
+ * functions in CHECK expressions, so we use `() => true` here. Replaced when
+ * the schema manager swaps the schema instance (ALTER TABLE), since the cache
+ * is keyed by reference.
+ */
+const cache = new WeakMap<TableSchema, CheckExtraction>();
+
+const allDeterministic = (): boolean => true;
+
+export function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
+	let cached = cache.get(tableSchema);
+	if (!cached) {
+		cached = extractCheckConstraints(
+			tableSchema.checkConstraints,
+			tableSchema.columnIndexMap,
+			allDeterministic,
+		);
+		cache.set(tableSchema, cached);
+	}
+	return cached;
+}
+
+export function extractCheckConstraints(
+	checks: ReadonlyArray<RowConstraintSchema>,
+	columnIndexMap: ReadonlyMap<string, number>,
+	isDeterministic: (fnName: string, argc: number) => boolean,
+): CheckExtraction {
+	const fds: FunctionalDependency[] = [];
+	const equivPairs: Array<readonly [number, number]> = [];
+	const constantBindings: ConstantBinding[] = [];
+	const domainConstraints: DomainConstraint[] = [];
+
+	for (const check of checks) {
+		if (!check.expr) continue;
+		if (containsNonDeterministicCall(check.expr, isDeterministic)) continue;
+		walkConjunction(check.expr, columnIndexMap, fds, equivPairs, constantBindings, domainConstraints);
+	}
+
+	return { fds, equivPairs, constantBindings, domainConstraints };
+}
+
+function walkConjunction(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+	fds: FunctionalDependency[],
+	equivPairs: Array<readonly [number, number]>,
+	constantBindings: ConstantBinding[],
+	domainConstraints: DomainConstraint[],
+): void {
+	const stack: AST.Expression[] = [expr];
+	while (stack.length > 0) {
+		const cur = stack.pop()!;
+		if (cur.type === 'binary' && (cur as AST.BinaryExpr).operator === 'AND') {
+			const b = cur as AST.BinaryExpr;
+			stack.push(b.left, b.right);
+			continue;
+		}
+		recognize(cur, columnIndexMap, fds, equivPairs, constantBindings, domainConstraints);
+	}
+}
+
+function recognize(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+	fds: FunctionalDependency[],
+	equivPairs: Array<readonly [number, number]>,
+	constantBindings: ConstantBinding[],
+	domainConstraints: DomainConstraint[],
+): void {
+	if (expr.type === 'binary') {
+		const b = expr as AST.BinaryExpr;
+		switch (b.operator) {
+			case '=':
+			case '==': {
+				handleEquality(b.left, b.right, columnIndexMap, fds, equivPairs, constantBindings);
+				return;
+			}
+			case '<':
+			case '<=':
+			case '>':
+			case '>=': {
+				handleInequality(b, columnIndexMap, domainConstraints);
+				return;
+			}
+			case 'OR': {
+				handleImplication(b, columnIndexMap, fds);
+				return;
+			}
+			default:
+				return;
+		}
+	}
+	if (expr.type === 'between') {
+		const bt = expr as AST.BetweenExpr;
+		if (bt.not) return;
+		const colIdx = columnIndexFromExpr(bt.expr, columnIndexMap);
+		if (colIdx === undefined) return;
+		const lo = literalValue(bt.lower);
+		const hi = literalValue(bt.upper);
+		if (lo === undefined || hi === undefined) return;
+		domainConstraints.push({
+			kind: 'range',
+			column: colIdx,
+			min: lo,
+			max: hi,
+			minInclusive: true,
+			maxInclusive: true,
+		});
+		return;
+	}
+	if (expr.type === 'in') {
+		const inExpr = expr as AST.InExpr;
+		if (!inExpr.values || inExpr.subquery) return;
+		const colIdx = columnIndexFromExpr(inExpr.expr, columnIndexMap);
+		if (colIdx === undefined) return;
+		const values: SqlValue[] = [];
+		for (const v of inExpr.values) {
+			const lit = literalValue(v);
+			if (lit === undefined) return;
+			values.push(lit);
+		}
+		if (values.length === 0) return;
+		domainConstraints.push({ kind: 'enum', column: colIdx, values });
+		return;
+	}
+}
+
+function handleEquality(
+	left: AST.Expression,
+	right: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+	fds: FunctionalDependency[],
+	equivPairs: Array<readonly [number, number]>,
+	constantBindings: ConstantBinding[],
+): void {
+	const lIdx = columnIndexFromExpr(left, columnIndexMap);
+	const rIdx = columnIndexFromExpr(right, columnIndexMap);
+
+	if (lIdx !== undefined && rIdx !== undefined) {
+		if (lIdx === rIdx) return;
+		fds.push({ determinants: [lIdx], dependents: [rIdx] });
+		fds.push({ determinants: [rIdx], dependents: [lIdx] });
+		equivPairs.push([lIdx, rIdx]);
+		return;
+	}
+
+	if (lIdx !== undefined) {
+		const lit = literalValue(right);
+		if (lit !== undefined) {
+			fds.push({ determinants: [], dependents: [lIdx] });
+			constantBindings.push({ attrs: [lIdx], value: { kind: 'literal', value: lit } });
+			return;
+		}
+		const cols = collectColumnNames(right, columnIndexMap);
+		if (cols.size === 1) {
+			const [singleCol] = cols;
+			if (singleCol !== lIdx) {
+				fds.push({ determinants: [singleCol], dependents: [lIdx] });
+			}
+		}
+		return;
+	}
+
+	if (rIdx !== undefined) {
+		const lit = literalValue(left);
+		if (lit !== undefined) {
+			fds.push({ determinants: [], dependents: [rIdx] });
+			constantBindings.push({ attrs: [rIdx], value: { kind: 'literal', value: lit } });
+			return;
+		}
+		const cols = collectColumnNames(left, columnIndexMap);
+		if (cols.size === 1) {
+			const [singleCol] = cols;
+			if (singleCol !== rIdx) {
+				fds.push({ determinants: [singleCol], dependents: [rIdx] });
+			}
+		}
+	}
+}
+
+function handleInequality(
+	b: AST.BinaryExpr,
+	columnIndexMap: ReadonlyMap<string, number>,
+	domainConstraints: DomainConstraint[],
+): void {
+	// Normalize so the column is on the left.
+	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
+	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
+
+	let colIdx: number | undefined;
+	let lit: SqlValue | undefined;
+	let op: string;
+
+	if (lIdx !== undefined) {
+		lit = literalValue(b.right);
+		colIdx = lIdx;
+		op = b.operator;
+	} else if (rIdx !== undefined) {
+		lit = literalValue(b.left);
+		colIdx = rIdx;
+		op = flipComparison(b.operator);
+	} else {
+		return;
+	}
+
+	if (lit === undefined || colIdx === undefined) return;
+
+	switch (op) {
+		case '>=':
+			domainConstraints.push({ kind: 'range', column: colIdx, min: lit, minInclusive: true, maxInclusive: false });
+			return;
+		case '>':
+			domainConstraints.push({ kind: 'range', column: colIdx, min: lit, minInclusive: false, maxInclusive: false });
+			return;
+		case '<=':
+			domainConstraints.push({ kind: 'range', column: colIdx, max: lit, minInclusive: false, maxInclusive: true });
+			return;
+		case '<':
+			domainConstraints.push({ kind: 'range', column: colIdx, max: lit, minInclusive: false, maxInclusive: false });
+			return;
+	}
+}
+
+/**
+ * Recognize an implication-form CHECK: `(¬g_1) OR (¬g_2) OR ... OR (body)`.
+ *
+ * All but the last disjunct must parse as a negated equality / is-null clause
+ * (e.g. `status <> 'active'`, `a is not null`); the last is the implied body,
+ * recognized as a guarded equality only. Bails out (skipping the whole CHECK)
+ * if any preceding disjunct is not a recognized guard-negation shape.
+ *
+ * Domain contributions are NOT lifted from implication-form CHECKs — a range
+ * or enum that holds only under a guard isn't safely consumable until the
+ * guard activation path also threads through domains.
+ */
+function handleImplication(
+	root: AST.BinaryExpr,
+	columnIndexMap: ReadonlyMap<string, number>,
+	fds: FunctionalDependency[],
+): void {
+	const disjuncts = flattenDisjunction(root);
+	if (disjuncts.length < 2) return;
+
+	const guardClauses: GuardClause[] = [];
+	for (let i = 0; i < disjuncts.length - 1; i++) {
+		const clause = recognizeNegatedGuard(disjuncts[i], columnIndexMap);
+		if (!clause) return;
+		guardClauses.push(clause);
+	}
+	if (guardClauses.length === 0) return;
+
+	const body = disjuncts[disjuncts.length - 1];
+	const guard: GuardPredicate = { clauses: guardClauses };
+	recognizeGuardedBody(body, guard, columnIndexMap, fds);
+}
+
+/**
+ * Recognize one disjunct as the negation of an equality, is-null, or range
+ * shape and return the corresponding guard clause. Returns undefined for any
+ * other shape.
+ *
+ * Patterns recognized:
+ *   col <> literal       ⇒ eq-literal {col, literal}
+ *   col1 <> col2         ⇒ eq-column {col1, col2}
+ *   col IS NOT NULL      ⇒ is-null {col, negated: false}
+ *   col IS NULL          ⇒ is-null {col, negated: true}
+ *   col <  literal       ⇒ range {col, min: lit, minInc: true,  maxInc: false} (i.e. col >= lit)
+ *   col <= literal       ⇒ range {col, min: lit, minInc: false, maxInc: false} (i.e. col >  lit)
+ *   col >  literal       ⇒ range {col, max: lit, maxInc: true,  minInc: false} (i.e. col <= lit)
+ *   col >= literal       ⇒ range {col, max: lit, maxInc: false, minInc: false} (i.e. col <  lit)
+ *
+ * `lit op col` shapes are flipped via `flipComparison` so the column ends up
+ * on the left before the negation table above is applied. NULL literal
+ * bounds are rejected (NULL is not a meaningful comparison anchor).
+ */
+function recognizeNegatedGuard(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+): GuardClause | undefined {
+	if (expr.type === 'unary') {
+		const u = expr as AST.UnaryExpr;
+		if (u.operator === 'IS NULL' || u.operator === 'IS NOT NULL') {
+			const col = columnIndexFromExpr(u.expr, columnIndexMap);
+			if (col === undefined) return undefined;
+			// `col is not null` disjunct ⇒ guard is `col is null` (negated of "is null" is false).
+			// Negating `c is not null` gives `c is null`, so the implied guard is `c is null`.
+			// In our scheme: { kind: 'is-null', column: c, negated: false } means "guard: c is null".
+			return u.operator === 'IS NOT NULL'
+				? { kind: 'is-null', column: col, negated: false }
+				: { kind: 'is-null', column: col, negated: true };
+		}
+		return undefined;
+	}
+	if (expr.type !== 'binary') return undefined;
+	const b = expr as AST.BinaryExpr;
+	const op = b.operator;
+	if (op === '<>' || op === '!=') {
+		const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
+		const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
+		if (lIdx !== undefined && rIdx !== undefined) {
+			if (lIdx === rIdx) return undefined;
+			return { kind: 'eq-column', left: lIdx, right: rIdx };
+		}
+		if (lIdx !== undefined) {
+			const lit = literalValue(b.right);
+			if (lit === undefined) return undefined;
+			return { kind: 'eq-literal', column: lIdx, value: lit };
+		}
+		if (rIdx !== undefined) {
+			const lit = literalValue(b.left);
+			if (lit === undefined) return undefined;
+			return { kind: 'eq-literal', column: rIdx, value: lit };
+		}
+		return undefined;
+	}
+	if (op === '<' || op === '<=' || op === '>' || op === '>=') {
+		// Normalize so the column is on the left.
+		const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
+		const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
+		let colIdx: number | undefined;
+		let lit: SqlValue | undefined;
+		let normOp: string;
+		if (lIdx !== undefined) {
+			lit = literalValue(b.right);
+			colIdx = lIdx;
+			normOp = op;
+		} else if (rIdx !== undefined) {
+			lit = literalValue(b.left);
+			colIdx = rIdx;
+			normOp = flipComparison(op);
+		} else {
+			return undefined;
+		}
+		if (lit === undefined || lit === null || colIdx === undefined) return undefined;
+		switch (normOp) {
+			case '<':
+				return { kind: 'range', column: colIdx, min: lit, minInclusive: true, maxInclusive: false };
+			case '<=':
+				return { kind: 'range', column: colIdx, min: lit, minInclusive: false, maxInclusive: false };
+			case '>':
+				return { kind: 'range', column: colIdx, max: lit, maxInclusive: true, minInclusive: false };
+			case '>=':
+				return { kind: 'range', column: colIdx, max: lit, maxInclusive: false, minInclusive: false };
+		}
+		return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Recognize the body of an implication-form CHECK as a guarded equality. We
+ * accept the equality shapes that `handleEquality` accepts, but emit the
+ * resulting FDs with the supplied `guard` attached and do NOT contribute
+ * equivalence pairs or constant bindings — equivalences/bindings are
+ * unconditional facts.
+ */
+function recognizeGuardedBody(
+	body: AST.Expression,
+	guard: GuardPredicate,
+	columnIndexMap: ReadonlyMap<string, number>,
+	fds: FunctionalDependency[],
+): void {
+	if (body.type !== 'binary') return;
+	const b = body as AST.BinaryExpr;
+	if (b.operator !== '=' && b.operator !== '==') return;
+
+	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
+	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
+
+	if (lIdx !== undefined && rIdx !== undefined) {
+		if (lIdx === rIdx) return;
+		fds.push({ determinants: [lIdx], dependents: [rIdx], guard });
+		fds.push({ determinants: [rIdx], dependents: [lIdx], guard });
+		return;
+	}
+
+	if (lIdx !== undefined) {
+		const lit = literalValue(b.right);
+		if (lit !== undefined) {
+			fds.push({ determinants: [], dependents: [lIdx], guard });
+			return;
+		}
+		const cols = collectColumnNames(b.right, columnIndexMap);
+		if (cols.size === 1) {
+			const [singleCol] = cols;
+			if (singleCol !== lIdx) {
+				fds.push({ determinants: [singleCol], dependents: [lIdx], guard });
+			}
+		}
+		return;
+	}
+
+	if (rIdx !== undefined) {
+		const lit = literalValue(b.left);
+		if (lit !== undefined) {
+			fds.push({ determinants: [], dependents: [rIdx], guard });
+			return;
+		}
+		const cols = collectColumnNames(b.left, columnIndexMap);
+		if (cols.size === 1) {
+			const [singleCol] = cols;
+			if (singleCol !== rIdx) {
+				fds.push({ determinants: [singleCol], dependents: [rIdx], guard });
+			}
+		}
+	}
+}
+
+/**
+ * True when `expr` calls any function for which `isDeterministic(name, argc)`
+ * returns false, or contains a subquery. Used to skip whole CHECK expressions
+ * that we cannot reason about safely.
+ */
+export function containsNonDeterministicCall(
+	expr: AST.Expression,
+	isDeterministic: (fnName: string, argc: number) => boolean,
+): boolean {
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.type === 'subquery' || node.type === 'exists') return true;
+		if (node.type === 'function') {
+			const fn = node as AST.FunctionExpr;
+			const argc = fn.args?.length ?? 0;
+			if (!isDeterministic(fn.name, argc)) return true;
+		}
+		for (const key of Object.keys(node)) {
+			const v = (node as unknown as Record<string, unknown>)[key];
+			if (!v) continue;
+			if (Array.isArray(v)) {
+				for (const item of v) {
+					if (item && typeof item === 'object' && 'type' in item) {
+						stack.push(item as AST.AstNode);
+					}
+				}
+			} else if (typeof v === 'object' && 'type' in (v as object)) {
+				stack.push(v as AST.AstNode);
+			}
+		}
+	}
+	return false;
+}

@@ -2,7 +2,7 @@ description: JSON path operators -> and ->> as syntactic sugar over json_extract
 files:
   - packages/quereus/src/parser/lexer.ts (DARROW token, ARROW token, - handler branching)
   - packages/quereus/src/parser/parser.ts (jsonPath(), jsonPathRhs() methods in expression precedence chain)
-  - packages/quereus/test/logic/06.8-json-path-operators.sqllogic (comprehensive test coverage)
+  - packages/quereus/test/logic/json-path-operators.sqllogic (comprehensive test coverage)
   - docs/sql.md (JSON Path Operators section, grammar update)
   - docs/functions.md (cross-reference with json_extract)
 ----
@@ -31,5 +31,5 @@ Added `->` and `->>` binary operators for JSON path access, following SQLite 3.3
 - Aliased results
 
 ### Notes
-- Full JSON type distinction between `->` and `->>` depends on ticket 4-json-native-object-storage
+- Full JSON type distinction between `->` and `->>` depends on ticket json-native-object-storage
 - `->>` with arrays serializes as `"1,2"` not `"[1,2]"` due to current cast behavior

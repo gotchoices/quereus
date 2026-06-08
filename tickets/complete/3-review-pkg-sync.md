@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review of quereus-sync package (CRDT replication, HLC, metadata stores, sync protocol)
-dependencies: [3-review-pkg-store]
+prereq: [review-pkg-store]
 
 ---
 
@@ -92,10 +92,10 @@ Added 9 interface-driven tests to `packages/quereus-sync/test/sync/sync-protocol
 
 ## Follow-Up Tasks Created
 
-- `tasks/fix/3-sync-manager-dry-violations.md` — HLC serialization duplication, snapshot stream duplication, type duplication
-- `tasks/fix/3-sync-manager-error-handling.md` — Silent failures, unhandled async, missing error boundaries, inconsistent conflict events
-- `tasks/fix/3-sync-snapshot-stream-perf.md` — O(N*M) performance bug in snapshot entry counting
-- `tasks/plan/3-sync-manager-decomposition.md` — Decompose 1,676-line implementation into focused modules
+- `tasks/fix/sync-manager-dry-violations.md` — HLC serialization duplication, snapshot stream duplication, type duplication
+- `tasks/fix/sync-manager-error-handling.md` — Silent failures, unhandled async, missing error boundaries, inconsistent conflict events
+- `tasks/fix/sync-snapshot-stream-perf.md` — O(N*M) performance bug in snapshot entry counting
+- `tasks/plan/sync-manager-decomposition.md` — Decompose 1,676-line implementation into focused modules
 
 ## Files Modified
 

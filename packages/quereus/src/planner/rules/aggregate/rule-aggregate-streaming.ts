@@ -10,7 +10,7 @@
  */
 
 import { createLogger } from '../../../common/logger.js';
-import type { PlanNode, ScalarPlanNode, Attribute } from '../../nodes/plan-node.js';
+import type { PlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { StreamAggregateNode } from '../../nodes/stream-aggregate.js';
 import { HashAggregateNode } from '../../nodes/hash-aggregate.js';
@@ -43,7 +43,11 @@ export function ruleAggregatePhysical(node: PlanNode, _context: OptContext): Pla
 		return null;
 	}
 
-	const finalAttrs = combineAttributes(node.getAttributes(), source.getAttributes());
+	// Advertise exactly the logical AggregateNode's output schema (groupBy + aggregates).
+	// The emitter only ever yields those columns; source values are exposed solely through
+	// the runtime row descriptor context (for HAVING / correlated reads), never as output
+	// attributes. Appending source attributes here would declare columns the node never emits.
+	const finalAttrs = node.getAttributes().slice();
 	const aggregates = aggregateExpressions.map(agg => ({
 		expression: agg.expr,
 		alias: agg.alias
@@ -60,7 +64,7 @@ export function ruleAggregatePhysical(node: PlanNode, _context: OptContext): Pla
 
 	// Check if source already provides the required ordering
 	const sourceOrdering = PlanNodeCharacteristics.getOrdering(source);
-	const alreadySorted = isOrderedForGrouping(sourceOrdering, groupingKeys, source.getAttributes());
+	const alreadySorted = isOrderedForGrouping(sourceOrdering, groupingKeys, source.getAttributeIndex());
 
 	if (alreadySorted) {
 		// Already sorted → always stream aggregate (no sort cost, preserves ordering for downstream)
@@ -111,7 +115,7 @@ export const ruleAggregateStreaming = ruleAggregatePhysical;
 function isOrderedForGrouping(
 	ordering: { column: number; desc: boolean }[] | undefined,
 	groupingKeys: readonly ScalarPlanNode[],
-	sourceAttributes: readonly { id: number }[]
+	sourceAttrIndex: ReadonlyMap<number, number>
 ): boolean {
 	if (!ordering || ordering.length === 0) {
 		return false;
@@ -124,7 +128,7 @@ function isOrderedForGrouping(
 		}
 
 		const colRef = key as unknown as ColumnReferenceNode;
-		const idx = sourceAttributes.findIndex(a => a.id === colRef.attributeId);
+		const idx = sourceAttrIndex.get(colRef.attributeId) ?? -1;
 		if (idx < 0) {
 			return false;
 		}
@@ -143,31 +147,4 @@ function isOrderedForGrouping(
 	}
 
 	return true;
-}
-
-/**
- * Combine attributes from aggregate and source, avoiding duplicates by name
- * This preserves attribute IDs while ensuring unique column names
- */
-function combineAttributes(aggregateAttrs: readonly Attribute[], sourceAttrs: readonly Attribute[]): Attribute[] {
-	const seenNames = new Set<string>();
-	const combinedAttrs: Attribute[] = [];
-
-	// Add aggregate attributes first (GROUP BY + aggregates)
-	for (const attr of aggregateAttrs) {
-		if (!seenNames.has(attr.name)) {
-			combinedAttrs.push(attr);
-			seenNames.add(attr.name);
-		}
-	}
-
-	// Add source attributes that aren't already present by name
-	for (const attr of sourceAttrs) {
-		if (!seenNames.has(attr.name)) {
-			combinedAttrs.push(attr);
-			seenNames.add(attr.name);
-		}
-	}
-
-	return combinedAttrs;
 }

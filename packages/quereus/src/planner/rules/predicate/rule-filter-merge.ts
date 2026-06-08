@@ -33,8 +33,8 @@ export function ruleFilterMerge(node: PlanNode, _context: OptContext): PlanNode 
 		const ast: AST.BinaryExpr = {
 			type: 'binary',
 			operator: 'AND',
-			left: (predicate as any).expression,
-			right: (inner.predicate as any).expression,
+			left: predicate.expression,
+			right: inner.predicate.expression,
 		};
 		predicate = new BinaryOpNode(current.scope, ast, predicate, inner.predicate);
 		current = inner;

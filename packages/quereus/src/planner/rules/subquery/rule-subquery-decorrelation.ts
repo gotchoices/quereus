@@ -30,6 +30,8 @@ import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { PlanNodeType } from '../../nodes/plan-node-type.js';
+import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
+import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:subquery-decorrelation');
 
@@ -40,33 +42,6 @@ interface DecorrelationCandidate {
 	joinType: JoinType;
 	/** The scalar node in the filter predicate that matched (ExistsNode, UnaryOpNode wrapping ExistsNode, or InNode) */
 	predicateNode: ScalarPlanNode;
-}
-
-/**
- * Split an AND-tree into conjuncts.
- */
-function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
-	const result: ScalarPlanNode[] = [];
-	const stack: ScalarPlanNode[] = [pred];
-	while (stack.length) {
-		const n = stack.pop()!;
-		if (n instanceof BinaryOpNode && n.expression.operator === 'AND') {
-			stack.push(n.left, n.right);
-		} else {
-			result.push(n);
-		}
-	}
-	return result;
-}
-
-/**
- * Combine conjuncts back into an AND-tree.
- */
-function combineConjuncts(conjuncts: ScalarPlanNode[]): ScalarPlanNode | null {
-	if (conjuncts.length === 0) return null;
-	return conjuncts.reduce((acc, cur) =>
-		new BinaryOpNode(cur.scope, { type: 'binary', operator: 'AND' } as any, acc, cur)
-	);
 }
 
 /**
@@ -120,6 +95,21 @@ function collectDefinedAttrIds(node: PlanNode): Set<number> {
 	}
 	walk(node);
 	return ids;
+}
+
+/**
+ * Returns true if the plan tree contains any column reference to an
+ * attribute id in `attrIds`. Used to detect leftover correlation in
+ * residual inner-only predicates (which may include nested subqueries).
+ */
+function referencesAnyAttr(node: PlanNode, attrIds: Set<number>): boolean {
+	if (node instanceof ColumnReferenceNode && attrIds.has(node.attributeId)) {
+		return true;
+	}
+	for (const child of node.getChildren()) {
+		if (referencesAnyAttr(child, attrIds)) return true;
+	}
+	return false;
 }
 
 /**
@@ -180,6 +170,15 @@ function extractExistsCorrelation(
 	if (correlationConjuncts.length === 0) {
 		// No simple equi-correlation found
 		return null;
+	}
+
+	// Safety: residual inner-only conjuncts must not still reference outer
+	// attributes. If they do (e.g. a correlated predicate that didn't match
+	// the strict equi-pattern, such as `outer.x = cast(inner.y as real)` or
+	// `outer.x > inner.y`), decorrelation cannot be safely applied without
+	// preserving the correlation, so abort.
+	for (const conj of innerOnlyConjuncts) {
+		if (referencesAnyAttr(conj, outerAttrIds)) return null;
 	}
 
 	const correlationCondition = combineConjuncts(correlationConjuncts)!;
@@ -256,7 +255,7 @@ function extractInCorrelation(
 
 	const equiCondition = new BinaryOpNode(
 		outerColRef.scope,
-		{ type: 'binary', operator: '=' } as any,
+		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
 		outerColRef,
 		innerColRef
 	);
@@ -285,6 +284,12 @@ function extractInCorrelation(
 			} else {
 				innerOnly.push(conj);
 			}
+		}
+
+		// Safety: residual inner-only conjuncts must not still reference outer
+		// attributes. See note in extractExistsCorrelation.
+		for (const conj of innerOnly) {
+			if (referencesAnyAttr(conj, outerAttrIds)) return null;
 		}
 
 		const allCorrelation = [equiCondition, ...additionalCorrelation];
@@ -328,6 +333,18 @@ export function ruleSubqueryDecorrelation(node: PlanNode, _context: OptContext):
 	}
 
 	if (!candidate || candidateIndex === -1) return null;
+
+	// Decorrelating EXISTS/IN into a semi/anti join changes how many times the
+	// inner subquery's subtree executes (per outer row → once per matching outer
+	// row in the semi-join driver). Refuse on impure inners so DML-bearing
+	// subqueries keep their declared per-row firing.
+	const innerRoot = candidate.subqueryNode instanceof ExistsNode
+		? candidate.subqueryNode.subquery
+		: (candidate.subqueryNode as InNode).source;
+	if (innerRoot && PlanNodeCharacteristics.subtreeHasSideEffects(innerRoot)) {
+		log('Decorrelation skipped: inner subquery has side effects');
+		return null;
+	}
 
 	log('Found %s decorrelation candidate in filter predicate', candidate.joinType);
 

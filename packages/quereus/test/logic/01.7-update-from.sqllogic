@@ -1,0 +1,67 @@
+-- UPDATE ... FROM (PostgreSQL/SQLite-3.33+ syntax) is not supported by Quereus.
+-- The parser rejects the FROM clause after SET. This file pins that rejection.
+
+-- ===================================
+-- 1. UPDATE ... FROM single table (basic equi-join) — not supported
+-- ===================================
+
+create table tgt (id integer primary key, val text);
+create table src (id integer primary key, newval text);
+insert into tgt values (1, 'old1'), (2, 'old2'), (3, 'unchanged');
+insert into src values (1, 'new1'), (2, 'new2');
+
+update tgt set val = src.newval from src where tgt.id = src.id;
+-- error: Expected statement type
+
+drop table src;
+drop table tgt;
+
+-- ===================================
+-- 2. UPDATE ... FROM with subquery in FROM — not supported
+-- ===================================
+
+create table grades (student_id integer primary key, total integer);
+create table scores (id integer primary key, student_id integer, exam integer);
+insert into grades values (1, 0), (2, 0), (3, 0);
+insert into scores values (1, 1, 80), (2, 1, 90), (3, 2, 75), (4, 2, 85), (5, 3, 60);
+
+update grades set total = s.tot
+   from (select student_id, sum(exam) as tot from scores group by student_id) s
+   where grades.student_id = s.student_id;
+-- error: Expected statement type
+
+drop table scores;
+drop table grades;
+
+-- ===================================
+-- 3. UPDATE ... FROM with CTE — not supported
+-- ===================================
+
+create table sales (id integer primary key, amount integer, multiplier real null);
+insert into sales values (1, 100, null), (2, 200, null), (3, 300, null);
+
+with mult(id, m) as (values (1, 1.5), (2, 2.0), (3, 3.0))
+   update sales set multiplier = mult.m from mult where sales.id = mult.id;
+-- error: Expected statement type
+
+drop table sales;
+
+-- ===================================
+-- 4. UPDATE ... FROM with multi-table join in FROM — not supported
+-- ===================================
+
+create table emp (id integer primary key, dept_id integer, salary integer);
+create table dept (id integer primary key, region_id integer);
+create table region (id integer primary key, bonus_pct integer);
+insert into emp values (1, 10, 1000), (2, 10, 2000), (3, 20, 3000);
+insert into dept values (10, 100), (20, 200);
+insert into region values (100, 10), (200, 20);
+
+update emp set salary = salary + (salary * region.bonus_pct / 100)
+   from dept, region
+   where emp.dept_id = dept.id and dept.region_id = region.id;
+-- error: Expected statement type
+
+drop table region;
+drop table dept;
+drop table emp;

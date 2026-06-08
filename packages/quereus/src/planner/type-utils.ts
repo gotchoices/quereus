@@ -38,8 +38,18 @@ export function relationTypeFromTableSchema(tableSchema: TableSchema): RelationT
   // Add unique constraints as additional keys, but only when all constrained
   // columns are NOT NULL. SQL UNIQUE allows multiple NULLs, so a nullable
   // UNIQUE column is not a true key for DISTINCT elimination purposes.
+  // Partial UNIQUE constraints (those with a `predicate`, synthesized from
+  // `CREATE UNIQUE INDEX ... WHERE ...`) only guarantee uniqueness within
+  // the partial scope, so they cannot be promoted to relation-level keys —
+  // doing so would let the FD layer derive `K → all-other-cols` over the
+  // whole table and silently break DISTINCT/GROUP BY/ORDER BY/join-elimination
+  // for rows outside the scope. Partial UCs are instead routed through
+  // `planner/analysis/partial-unique-extraction.ts`, which emits *guarded* FDs
+  // that Filter activation discharges when a surrounding predicate entails
+  // the partial WHERE.
   if (tableSchema.uniqueConstraints) {
     for (const uc of tableSchema.uniqueConstraints) {
+      if (uc.predicate !== undefined) continue;
       const allNotNull = uc.columns.every(idx => tableSchema.columns[idx]?.notNull);
       if (allNotNull) {
         keys.push(uc.columns.map(idx => ({ index: idx })));
@@ -49,7 +59,7 @@ export function relationTypeFromTableSchema(tableSchema: TableSchema): RelationT
 
   return {
     typeClass: 'relation',
-    isReadOnly: !!(tableSchema.isView || tableSchema.isTemporary),
+    isReadOnly: !!(tableSchema.isView || tableSchema.isReadOnly),
     isSet: true, // Base tables are sets by definition (enforced by primary keys)
     columns: columnDefs,
     keys: keys,

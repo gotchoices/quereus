@@ -1,0 +1,73 @@
+-- adapted from SQLite test/view.test
+-- View error / rejection paths.
+
+-- ===================================
+-- 1. View querying a dropped underlying table
+-- ===================================
+
+create table mb_base (id integer primary key, val integer);
+insert into mb_base values (1, 10);
+create view mb_v as select id, val from mb_base;
+
+select * from mb_v;
+→ [{"id":1,"val":10}]
+
+drop table mb_base;
+
+-- Querying view after base table dropped should error
+select * from mb_v;
+-- error: not found
+
+drop view mb_v;
+
+-- ===================================
+-- 2. Mutations through a view rejected (read-only by design)
+-- ===================================
+
+create table rom_base (id integer primary key, val integer);
+insert into rom_base values (1, 10);
+create view rom_v as select id, val from rom_base;
+
+insert into rom_v values (2, 20);
+-- error:
+
+update rom_v set val = 99 where id = 1;
+-- error:
+
+delete from rom_v where id = 1;
+-- error:
+
+drop view rom_v;
+drop table rom_base;
+
+-- ===================================
+-- 3. DROP TABLE on a view / DROP VIEW on a table
+-- ===================================
+
+create table dm_base (id integer primary key);
+create view dm_v as select id from dm_base;
+
+drop table dm_v;
+-- error:
+
+drop view dm_base;
+-- error:
+
+drop view dm_v;
+drop table dm_base;
+
+-- ===================================
+-- 4. ALTER TABLE on a view rejected
+-- ===================================
+
+create table at_base (id integer primary key, x integer);
+create view at_v as select id, x from at_base;
+
+alter table at_v rename to at_v2;
+-- error:
+
+alter table at_v add column y integer null;
+-- error:
+
+drop view at_v;
+drop table at_base;

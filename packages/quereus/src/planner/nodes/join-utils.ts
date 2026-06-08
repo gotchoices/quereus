@@ -1,6 +1,17 @@
-import type { Attribute } from './plan-node.js';
+import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
 import type { JoinType } from './join-node.js';
 import type { RelationType, ColRef } from '../../common/datatype.js';
+import {
+	addEquivalence, addFd,
+	closeConstantBindingsOverEcs,
+	mergeConstantBindings,
+	mergeDomainConstraints,
+	mergeEquivClasses, mergeFds,
+	shiftConstantBindings,
+	shiftDomainConstraints,
+	shiftEquivClasses, shiftFds,
+	superkeyToFd,
+} from '../util/fd-utils.js';
 
 /**
  * An equi-join pair: left attribute = right attribute.
@@ -84,6 +95,176 @@ export function buildJoinRelationType(
 		keys: (keys ?? []) as ColRef[][],
 		rowConstraints: [...leftType.rowConstraints, ...rightType.rowConstraints],
 	};
+}
+
+/**
+ * Propagate `monotonicOn` through a join operator.
+ *
+ * Rules (see `1-monotonic-on-characteristic` ticket):
+ * - cross / full-outer:                drop on both sides.
+ * - semi / anti:                       preserve left's monotonicOn unchanged.
+ * - inner / left / right:              for each equi-pair (l.X, r.X) where both
+ *                                      sides are MonotonicOn on their respective X
+ *                                      with matching direction, the non-null-extended
+ *                                      side(s) propagate their monotonicOn(X) to the
+ *                                      output (strictness = AND of the two inputs).
+ *                                      Other monotonicOn entries (those not coupled
+ *                                      by an equi-pair) are dropped.
+ */
+export function propagateJoinMonotonicOn(
+	joinType: JoinType,
+	leftPhys: PhysicalProperties | undefined,
+	rightPhys: PhysicalProperties | undefined,
+	equiPairs: ReadonlyArray<{ leftAttrId: number; rightAttrId: number }>,
+): readonly MonotonicOnInfo[] | undefined {
+	if (joinType === 'cross' || joinType === 'full') return undefined;
+
+	const leftMon = leftPhys?.monotonicOn;
+	if (joinType === 'semi' || joinType === 'anti') {
+		return leftMon && leftMon.length > 0 ? leftMon : undefined;
+	}
+
+	const rightMon = rightPhys?.monotonicOn;
+	if (!leftMon || !rightMon || leftMon.length === 0 || rightMon.length === 0) return undefined;
+	if (equiPairs.length === 0) return undefined;
+
+	const leftPreserved = joinType === 'inner' || joinType === 'left';
+	const rightPreserved = joinType === 'inner' || joinType === 'right';
+
+	const result: MonotonicOnInfo[] = [];
+	for (const pair of equiPairs) {
+		const l = leftMon.find(m => m.attrId === pair.leftAttrId);
+		if (!l) continue;
+		const r = rightMon.find(m => m.attrId === pair.rightAttrId && m.direction === l.direction);
+		if (!r) continue;
+		const strict = l.strict && r.strict;
+		if (leftPreserved) {
+			result.push({ attrId: pair.leftAttrId, direction: l.direction, strict });
+		}
+		if (rightPreserved) {
+			result.push({ attrId: pair.rightAttrId, direction: l.direction, strict });
+		}
+	}
+	return result.length > 0 ? result : undefined;
+}
+
+/**
+ * Propagate functional dependencies and equivalence classes through a join.
+ *
+ * Rules:
+ * - inner / cross: union of left and right FDs (right's column indices shifted
+ *   by leftColumnCount). For each equi-pair (L, R'), add bi-directional FDs
+ *   `{L} → {R'}` and `{R'} → {L}` and merge `L ≡ R'` into the EC list.
+ * - left outer: keep left's FDs/ECs on left's columns only. Right's FDs/ECs and
+ *   equi-pair FDs/ECs are dropped — NULL-padded rows can violate them.
+ * - right outer: mirror of left outer.
+ * - full outer: drop both sides' FDs/ECs (conservative).
+ * - semi / anti: left's FDs/ECs survive; no right contribution and no equi-pair
+ *   FDs (right columns are not in the output).
+ */
+export function propagateJoinFds(
+	joinType: JoinType,
+	leftPhys: PhysicalProperties | undefined,
+	rightPhys: PhysicalProperties | undefined,
+	equiPairs: ReadonlyArray<{ left: number; right: number }>,
+	leftColumnCount: number,
+	totalColumnCount: number,
+	preservedKeys: ReadonlyArray<ReadonlyArray<number>>,
+): {
+	fds?: ReadonlyArray<FunctionalDependency>;
+	equivClasses?: ReadonlyArray<ReadonlyArray<number>>;
+	constantBindings?: ReadonlyArray<ConstantBinding>;
+	domainConstraints?: ReadonlyArray<DomainConstraint>;
+} {
+	const leftFds = leftPhys?.fds ?? [];
+	const rightFds = rightPhys?.fds ?? [];
+	const leftEC = leftPhys?.equivClasses ?? [];
+	const rightEC = rightPhys?.equivClasses ?? [];
+	const leftBindings = leftPhys?.constantBindings ?? [];
+	const rightBindings = rightPhys?.constantBindings ?? [];
+	const leftDomains = leftPhys?.domainConstraints ?? [];
+	const rightDomains = rightPhys?.domainConstraints ?? [];
+
+	const opts = { keyHints: preservedKeys };
+
+	/**
+	 * Layer `preservedKeys` onto `fds` as `key → all_other_join_cols` FDs. An
+	 * empty key `[]` (a ≤1-row join output) maps to the singleton `∅ → all_cols`
+	 * FD via `superkeyToFd([], totalColumnCount)`, so emitting `[]` in
+	 * `preservedKeys` is sufficient to propagate at-most-one-row. Duplicate keys
+	 * (e.g. two `[]` entries) collapse in `addFd`.
+	 */
+	const withKeyFds = (fds: ReadonlyArray<FunctionalDependency>): ReadonlyArray<FunctionalDependency> => {
+		let out = fds;
+		for (const key of preservedKeys) {
+			const keyFd = superkeyToFd(key, totalColumnCount);
+			if (keyFd) out = addFd(out, keyFd, opts);
+		}
+		return out;
+	};
+
+	const wrap = (
+		fds: ReadonlyArray<FunctionalDependency>,
+		equiv: ReadonlyArray<ReadonlyArray<number>>,
+		bindings: ReadonlyArray<ConstantBinding>,
+		domains: ReadonlyArray<DomainConstraint>,
+	) => ({
+		fds: fds.length > 0 ? fds : undefined,
+		equivClasses: equiv.length > 0 ? equiv : undefined,
+		constantBindings: bindings.length > 0 ? bindings : undefined,
+		domainConstraints: domains.length > 0 ? domains : undefined,
+	});
+
+	switch (joinType) {
+		case 'inner':
+		case 'cross': {
+			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(leftFds, shiftFds(rightFds, leftColumnCount), opts);
+			let equiv: ReadonlyArray<ReadonlyArray<number>> = mergeEquivClasses(leftEC, shiftEquivClasses(rightEC, leftColumnCount));
+			for (const p of equiPairs) {
+				const rShifted = p.right + leftColumnCount;
+				fds = addFd(fds, { determinants: [p.left], dependents: [rShifted] }, opts);
+				fds = addFd(fds, { determinants: [rShifted], dependents: [p.left] }, opts);
+				equiv = addEquivalence(equiv, p.left, rShifted);
+			}
+			fds = withKeyFds(fds);
+			// Bindings: union of both sides, then close over the merged EC list so
+			// a one-sided constant `t.k = 5` plus an equi-pair `t.k = u.k` lands as
+			// a binding covering both `t.k` and `u.k`.
+			const mergedBindings = mergeConstantBindings(
+				leftBindings,
+				shiftConstantBindings(rightBindings, leftColumnCount),
+			);
+			const bindings = closeConstantBindingsOverEcs(mergedBindings, equiv);
+			const domains = mergeDomainConstraints(
+				leftDomains,
+				shiftDomainConstraints(rightDomains, leftColumnCount),
+			);
+			return wrap(fds, equiv, bindings, domains);
+		}
+		case 'left': {
+			// Left's bindings survive on left's columns; right's are dropped (the
+			// NULL-padding from unmatched left rows breaks any right-side pin).
+			const fds = withKeyFds(leftFds.slice());
+			return wrap(fds, leftEC.map(c => c.slice()), leftBindings.map(b => ({ ...b })), leftDomains.slice());
+		}
+		case 'right': {
+			let fds: ReadonlyArray<FunctionalDependency> = shiftFds(rightFds, leftColumnCount);
+			fds = withKeyFds(fds);
+			const equiv = shiftEquivClasses(rightEC, leftColumnCount);
+			const bindings = shiftConstantBindings(rightBindings, leftColumnCount);
+			const domains = shiftDomainConstraints(rightDomains, leftColumnCount);
+			return wrap(fds, equiv, bindings, domains);
+		}
+		case 'full':
+			return {};
+		case 'semi':
+		case 'anti': {
+			const fds = withKeyFds(leftFds.slice());
+			return wrap(fds, leftEC.map(c => c.slice()), leftBindings.map(b => ({ ...b })), leftDomains.slice());
+		}
+		default:
+			return {};
+	}
 }
 
 /**

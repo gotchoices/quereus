@@ -20,7 +20,8 @@ export function simpleLike(pattern: string, text: string): boolean {
 	const regexPattern = escapedPattern.replace(/%/g, '.*').replace(/_/g, '.');
 
 	try {
-		const regex = new RegExp(`^${regexPattern}$`);
+		// 'u' flag: match by Unicode code point so `_` matches one code point (incl. non-BMP)
+		const regex = new RegExp(`^${regexPattern}$`, 'u');
 		return regex.test(text);
 	} catch (e) {
 		errorLog('Invalid LIKE pattern converted to regex: ^%s$, %O', regexPattern, e);
@@ -39,18 +40,47 @@ export function simpleLike(pattern: string, text: string): boolean {
  * @returns true if the text matches the pattern, false otherwise
  */
 export function simpleGlob(pattern: string, text: string): boolean {
-	// Escape regex special characters (including * and ? so we can convert them below)
-	const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	// Convert SQL GLOB wildcards to regex equivalents
-	const regexPattern = escapedPattern
-		.replace(/\\\*/g, '.*')
-		.replace(/\\\?/g, '.');
+	const chars = [...pattern]; // iterate by Unicode code point so non-BMP chars survive intact
+	const regexMeta = '\\^$.|?*+()[]{}';
+	let regex = '';
+	let i = 0;
+
+	while (i < chars.length) {
+		const c = chars[i];
+
+		if (c === '*') { regex += '.*'; i++; continue; }
+		if (c === '?') { regex += '.'; i++; continue; }
+
+		if (c === '[') {
+			// Try to consume a character class. SQLite/glob: `]` immediately after `[` or `[^`
+			// is a literal class member (handled here by emitting an escaped `]`).
+			let j = i + 1;
+			let cls = '[';
+			if (j < chars.length && chars[j] === '^') { cls += '^'; j++; }
+			let first = true;
+			let closed = false;
+			while (j < chars.length) {
+				const cc = chars[j];
+				if (cc === ']' && !first) { closed = true; break; }
+				if (cc === '\\' || cc === ']') cls += '\\' + cc;
+				else cls += cc;
+				first = false;
+				j++;
+			}
+			if (closed) { regex += cls + ']'; i = j + 1; continue; }
+			// Unclosed `[` — fall through and treat as a literal `[`.
+		}
+
+		if (regexMeta.includes(c)) regex += '\\' + c;
+		else regex += c;
+		i++;
+	}
 
 	try {
-		const regex = new RegExp(`^${regexPattern}$`);
-		return regex.test(text);
+		// 'u' flag: code-point ranges like `[😀-😎]` and `?`/`.` matching by code point.
+		return new RegExp(`^${regex}$`, 'u').test(text);
 	} catch (e) {
-		errorLog('Invalid GLOB pattern converted to regex: ^%s$, %O', regexPattern, e);
+		errorLog('Invalid GLOB pattern compiled to regex: ^%s$, %O', regex, e);
 		return false;
 	}
 }

@@ -21,12 +21,14 @@ import type {
 	BaseModuleConfig,
 	BestAccessPlanRequest,
 	BestAccessPlanResult,
+	OrderingSpec,
 	SqlValue,
 	ModuleCapabilities,
 	SchemaChangeInfo,
 	ColumnSchema,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, inferType, validateAndParse } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse } from '@quereus/quereus';
+import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
@@ -329,6 +331,34 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const tableSchema = table.getSchema();
 		await this.buildIndexEntries(dataStore, indexStore, tableSchema, indexSchema);
 
+		// Refresh the connected table's cached schema so subsequent DML
+		// maintains the new index (the engine's schema registry is updated
+		// separately by SchemaManager.createIndex, but the StoreTable instance
+		// holds its own reference captured at connect time). Mirrors
+		// SchemaManager.addIndexToTableSchema, including the UNIQUE → derived
+		// uniqueConstraint entry so checkUniqueConstraints enforces it.
+		const updatedIndexes = Object.freeze([
+			...(tableSchema.indexes ?? []),
+			indexSchema,
+		]);
+		const updatedSchema: TableSchema = { ...tableSchema, indexes: updatedIndexes };
+		if (indexSchema.unique) {
+			// `derivedFromIndex` tags this synthesized constraint so a future
+			// `StoreModule.dropIndex` can filter it out symmetrically (mirrors
+			// SchemaManager.dropIndex / MemoryTableManager.dropIndex). Without that
+			// filter on the drop side, the UNIQUE check would survive the index.
+			updatedSchema.uniqueConstraints = Object.freeze([
+				...(tableSchema.uniqueConstraints ?? []),
+				{
+					name: indexSchema.name,
+					columns: Object.freeze(indexSchema.columns.map(c => c.index)),
+					predicate: indexSchema.predicate,
+					derivedFromIndex: indexSchema.name,
+				},
+			]);
+		}
+		table.updateSchema(updatedSchema);
+
 		// Emit schema change event
 		this.eventEmitter?.emitSchemaChange({
 			type: 'create',
@@ -339,7 +369,83 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Drops an index on a store-backed table.
+	 *
+	 * Mirrors createIndex: refreshes the connected StoreTable's cached
+	 * tableSchema (removing the index entry and any UNIQUE constraint
+	 * synthesized from it, tagged with `derivedFromIndex`), releases the
+	 * cached index-store handle, and tears down the underlying index store.
+	 */
+	async dropIndex(
+		_db: Database,
+		schemaName: string,
+		tableName: string,
+		indexName: string,
+	): Promise<void> {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+		const table = this.tables.get(tableKey);
+
+		if (!table) {
+			throw new QuereusError(
+				`Store table '${tableName}' not found in schema '${schemaName}'`,
+				StatusCode.NOTFOUND,
+			);
+		}
+
+		const tableSchema = table.getSchema();
+		const lowerIndexName = indexName.toLowerCase();
+
+		// Mirror SchemaManager.dropIndex: strip the index AND any UNIQUE
+		// constraint synthesized from it (tagged with `derivedFromIndex` by
+		// StoreModule.createIndex). Collapse uniqueConstraints to undefined
+		// when empty.
+		const updatedIndexes = Object.freeze(
+			(tableSchema.indexes ?? []).filter(
+				idx => idx.name.toLowerCase() !== lowerIndexName,
+			),
+		);
+		const remainingUniqueConstraints = (tableSchema.uniqueConstraints ?? []).filter(
+			uc => uc.derivedFromIndex?.toLowerCase() !== lowerIndexName,
+		);
+		const updatedSchema: TableSchema = {
+			...tableSchema,
+			indexes: updatedIndexes,
+			uniqueConstraints: remainingUniqueConstraints.length > 0
+				? Object.freeze(remainingUniqueConstraints)
+				: undefined,
+		};
+		// Update the cached schema BEFORE tearing down the store so that a
+		// failure of the physical drop doesn't leave the schema enforcing an
+		// index whose backing store has already been mutated.
+		table.updateSchema(updatedSchema);
+
+		// Drop the cached handle on the table side and tear down the
+		// underlying KVStore. `deleteIndexStore` (if the provider implements
+		// it) closes the handle before removing the directory; otherwise we
+		// just close it.
+		await table.releaseIndexStore(indexName);
+		if (this.provider.deleteIndexStore) {
+			await this.provider.deleteIndexStore(schemaName, tableName, indexName);
+		} else {
+			await this.provider.closeIndexStore(schemaName, tableName, indexName);
+		}
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'drop',
+			objectType: 'index',
+			schemaName,
+			objectName: indexName,
+		});
+	}
+
+	/**
 	 * Build index entries for all existing rows in a table.
+	 *
+	 * For UNIQUE indexes, performs an in-pass duplicate check (honoring partial
+	 * predicates and SQL NULL semantics: multiple NULLs are allowed) and throws
+	 * CONSTRAINT before any entries are written. Mirrors the memory module's
+	 * populateNewIndex so `CREATE UNIQUE INDEX` over duplicated data fails
+	 * atomically.
 	 */
 	private async buildIndexEntries(
 		dataStore: KVStore,
@@ -351,6 +457,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		const indexDirections = indexSchema.columns.map(col => !!col.desc);
 
+		const predicate: CompiledPredicate | undefined = indexSchema.predicate
+			? compilePredicate(indexSchema.predicate, tableSchema.columns)
+			: undefined;
+		const seen: Set<string> | undefined = indexSchema.unique ? new Set() : undefined;
+
 		// Scan all data rows
 		const bounds = buildFullScanBounds();
 		const batch = indexStore.batch();
@@ -358,11 +469,33 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		for await (const entry of dataStore.iterate(bounds)) {
 			const row = deserializeRow(entry.value);
 
+			// Partial index: skip rows whose predicate is not unambiguously TRUE.
+			if (predicate && predicate.evaluate(row) !== true) continue;
+
 			// Extract PK values
 			const pkValues = tableSchema.primaryKeyDefinition.map(pk => row[pk.index]);
 
 			// Extract index column values
 			const indexValues = indexSchema.columns.map(col => row[col.index]);
+
+			if (seen) {
+				// SQL UNIQUE allows multiple NULLs: skip dup detection when any
+				// indexed column is NULL for this row.
+				const hasNull = indexValues.some(v => v === null);
+				if (!hasNull) {
+					const keySig = JSON.stringify(indexValues);
+					if (seen.has(keySig)) {
+						const colNames = indexSchema.columns
+							.map(c => tableSchema.columns[c.index]?.name ?? String(c.index))
+							.join(', ');
+						throw new QuereusError(
+							`UNIQUE constraint failed: ${tableSchema.name} (${colNames})`,
+							StatusCode.CONSTRAINT,
+						);
+					}
+					seen.add(keySig);
+				}
+			}
 
 			// Build and store index key
 			const indexKey = buildIndexKey(
@@ -384,13 +517,32 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Returns the updated TableSchema for the engine to register.
 	 */
 	async alterTable(
-		_db: Database,
+		db: Database,
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
 	): Promise<TableSchema> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		const table = this.tables.get(tableKey);
+		// Lazy-connect: `renameTable` evicts the old key from `this.tables` and
+		// expects the next `connect()` to repopulate under the new name, but
+		// `apply schema` can call `alterTable` immediately after a rename without
+		// an intervening connect. Mirror connect()'s schemaManager lookup so the
+		// follow-up ALTER finds the moved table.
+		let table = this.tables.get(tableKey);
+		if (!table) {
+			const registeredSchema = db.schemaManager.getTable(schemaName, tableName);
+			if (registeredSchema) {
+				table = new StoreTable(
+					db,
+					this,
+					registeredSchema,
+					this.parseConfig(registeredSchema.vtabArgs ?? {}),
+					this.eventEmitter,
+					true, // isConnected - DDL already exists in storage
+				);
+				this.tables.set(tableKey, table);
+			}
+		}
 
 		if (!table) {
 			throw new QuereusError(
@@ -400,16 +552,23 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 
 		const oldSchema = table.getSchema();
+		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
 
 		switch (change.type) {
 			case 'addColumn': {
-				const newColSchema = columnDefToSchema(change.columnDef, false);
+				const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull);
 
-				// Extract default value from column def constraints
+				// Extract default value from column def constraints. Use the shared
+				// `tryFoldLiteral` helper so signed numerics like `-123.0`
+				// (a UnaryExpr in the AST) are recognized — matching the
+				// memory-mode path and the engine-level ALTER validation.
 				let defaultValue: SqlValue = null;
 				const defaultConstraint = change.columnDef.constraints?.find(c => c.type === 'default');
-				if (defaultConstraint && defaultConstraint.expr && defaultConstraint.expr.type === 'literal') {
-					defaultValue = (defaultConstraint.expr as { value: SqlValue }).value;
+				if (defaultConstraint?.expr) {
+					const folded = tryFoldLiteral(defaultConstraint.expr);
+					if (folded !== undefined) {
+						defaultValue = folded;
+					}
 				}
 
 				// Refuse NOT NULL without a literal DEFAULT on a non-empty table (SQLite-compatible).
@@ -518,7 +677,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					throw new QuereusError(`Column '${change.oldName}' not found.`, StatusCode.ERROR);
 				}
 
-				const newColSchema = columnDefToSchema(change.newColumnDefAst, false);
+				const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull);
 				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newColSchema : c);
 				const updatedIndexes = (oldSchema.indexes || []).map(idx => ({
 					...idx,
@@ -586,6 +745,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				});
 
 				return updatedSchema;
+			}
+
+			case 'addConstraint': {
+				throw new QuereusError(
+					`Store table does not support ADD CONSTRAINT ${change.constraint.type}`,
+					StatusCode.UNSUPPORTED,
+				);
 			}
 
 			case 'alterColumn': {
@@ -781,7 +947,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		);
 
 		if (pkFilters.length === pkColumns.length && pkColumns.length > 0) {
-			// Full PK match - point lookup
+			// Full PK match - point lookup (single row; no monotonic advertisement)
 			const handledFilters = request.filters.map(f =>
 				pkFilters.some(pf => pf.columnIndex === f.columnIndex && pf.op === f.op)
 			);
@@ -789,6 +955,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				.eqMatch(1, 0.1)
 				.setHandledFilters(handledFilters)
 				.setIsSet(true)
+				.setIndexName('_primary_')
 				.setExplanation('Store primary key lookup')
 				.build();
 		}
@@ -807,16 +974,23 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			: [];
 
 		if (rangeFilters.length > 0) {
-			// Range scan on first PK column
+			// Range scan on first PK column. Iteration is by PK key order (see
+			// StoreTable.scanPKRange), so we can advertise monotonic emission on
+			// the leading PK column. The scan still visits the entire data store
+			// today (TODO in scanPKRange to refine bounds), but the order
+			// guarantee already holds.
 			const handledFilters = request.filters.map(f =>
 				rangeFilters.some(rf => rf.columnIndex === f.columnIndex && rf.op === f.op)
 			);
 			const rangeRows = Math.max(1, Math.floor(estimatedRows * 0.3));
-			return AccessPlanBuilder
+			const plan = AccessPlanBuilder
 				.rangeScan(rangeRows, 0.2)
 				.setHandledFilters(handledFilters)
+				.setIndexName('_primary_')
+				.setSeekColumns([firstPkColumn!])
 				.setExplanation('Store primary key range scan')
 				.build();
+			return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
 		}
 
 		// Check for secondary index usage
@@ -844,12 +1018,88 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			}
 		}
 
-		// Fallback to full scan
-		return AccessPlanBuilder
+		// Fallback to full scan. The store iterates rows in PK key order
+		// (see StoreTable.query / store.iterate over buildFullScanBounds), so
+		// the scan is monotonic on the leading PK column. Advertise that so
+		// downstream rules (merge-join, asof-scan) can fire on store-backed
+		// tables, matching memory-mode behavior.
+		const plan = AccessPlanBuilder
 			.fullScan(estimatedRows)
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation('Store full table scan')
 			.build();
+		return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
+	}
+
+	/**
+	 * Compute the PK-ordering advertisement for a scan-style plan. Returns the
+	 * `providesOrdering` / `monotonicOn` / `supportsAsofRight` fields for a plan
+	 * whose iteration is driven by the primary-key key order (full scan or PK
+	 * range scan).
+	 *
+	 * `providesOrdering` is set only when it actually matches what the caller
+	 * needs:
+	 *   - When the request carries `requiredOrdering`, claim it only if the
+	 *     requested keys form a prefix of the PK with matching directions.
+	 *     Claiming PK order against an `ORDER BY <other column>` would cause
+	 *     the absorb-Sort rule to drop the Sort and yield wrong-order rows.
+	 *   - When no `requiredOrdering` is present, advertise the full PK
+	 *     ordering so downstream rules (merge-join, sort elision after a
+	 *     filter) can opportunistically use it.
+	 *
+	 * `monotonicOn` reflects the access path itself and is independent of any
+	 * `requiredOrdering`; it always advertises the leading PK column. Strict
+	 * monotonicity is claimed iff the PK is single-column — composite PKs can
+	 * repeat values on the leading column.
+	 *
+	 * Returns an empty object when there is no PK (heap-only table) — without a
+	 * leading key column there is no natural emit order.
+	 */
+	private buildPkOrderingAdvertisement(
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName' | 'monotonicOn' | 'supportsAsofRight'> {
+		const pk = tableInfo.primaryKeyDefinition;
+		if (pk.length === 0) return {};
+
+		const leading = pk[0];
+		const monotonicOn = {
+			columnIndex: leading.index,
+			direction: leading.desc ? 'desc' as const : 'asc' as const,
+			strict: pk.length === 1,
+		};
+
+		const pkOrdering: OrderingSpec[] = pk.map(col => ({
+			columnIndex: col.index,
+			desc: !!col.desc,
+		}));
+
+		// Pick the providesOrdering to advertise based on requiredOrdering.
+		const required = request.requiredOrdering;
+		let providesOrdering: readonly OrderingSpec[] | undefined;
+		if (required && required.length > 0) {
+			// Only claim ordering when the requested keys form a prefix of the
+			// PK with matching directions. nullsFirst is intentionally not
+			// matched here — if the request specifies an explicit NULLS
+			// FIRST/LAST, leave the Sort in place rather than assume the PK
+			// scan's natural NULL placement matches.
+			if (required.length > pk.length) return { monotonicOn, supportsAsofRight: true };
+			for (let i = 0; i < required.length; i++) {
+				if (required[i].columnIndex !== pkOrdering[i].columnIndex) return { monotonicOn, supportsAsofRight: true };
+				if (required[i].desc !== pkOrdering[i].desc) return { monotonicOn, supportsAsofRight: true };
+				if (required[i].nullsFirst !== undefined) return { monotonicOn, supportsAsofRight: true };
+			}
+			providesOrdering = required;
+		} else {
+			providesOrdering = pkOrdering;
+		}
+
+		return {
+			providesOrdering,
+			orderingIndexName: '_primary_',
+			monotonicOn,
+			supportsAsofRight: true,
+		};
 	}
 
 	// --- StoreTableModule interface implementation ---

@@ -1,6 +1,6 @@
 ---
 description: Comprehensive review plan for optimizer subsystem (rules, framework, analysis)
-dependencies: none
+prereq: none
 
 ---
 
@@ -19,9 +19,9 @@ Conduct an adversarial review of the query optimizer to identify correctness ris
 
 ## Non-goals
 
-- Runtime execution review (see `3-review-core-runtime.md`)
-- Planner AST-to-plan conversion (see `3-review-core-planner.md`)
-- Virtual table implementation (see `3-review-core-vtab.md`)
+- Runtime execution review (see `review-core-runtime.md`)
+- Planner AST-to-plan conversion (see `review-core-planner.md`)
+- Virtual table implementation (see `review-core-vtab.md`)
 
 ## Checklist
 
@@ -108,7 +108,7 @@ Conduct an adversarial review of the query optimizer to identify correctness ris
 
 ## Notes/Links
 
-- Related: `3-review-core-planner.md` (planner-optimizer integration)
-- Related: `3-review-core-runtime.md` (optimizer-runtime integration)
+- Related: `review-core-planner.md` (planner-optimizer integration)
+- Related: `review-core-runtime.md` (optimizer-runtime integration)
 - Framework docs: `docs/optimizer.md`
 - Rule conventions: `docs/optimizer-conventions.md`

@@ -1,5 +1,5 @@
-import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, isUpdateOk, IndexConstraintOp } from '@quereus/quereus';
+import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, isUpdateOk, IndexConstraintOp, ConflictResolution, compilePredicate } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -35,11 +35,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private registeredConnection: IsolatedConnection | null = null;
 
 	/**
-	 * Tracks savepoint depths that were created before the overlay existed.
-	 * When rolling back to one of these savepoints, the overlay is cleared
-	 * entirely (restoring the "no uncommitted changes" state).
+	 * Lazy cache of compiled partial-UNIQUE predicates. Keyed on the
+	 * UniqueConstraintSchema object identity — a new constraint object
+	 * after CREATE/DROP INDEX produces a fresh compile, and the WeakMap
+	 * lets the GC reclaim entries for retired constraints.
 	 */
-	private savepointsBeforeOverlay: Set<number> = new Set();
+	private readonly predicateCache: WeakMap<UniqueConstraintSchema, CompiledPredicate> = new WeakMap();
+
+	/**
+	 * Returns the connection-scoped set of savepoint depths that pre-date the overlay.
+	 * Stored in IsolationModule (keyed by db+schema+table) so all IsolatedTable instances
+	 * for the same connection see the same set — important because each statement creates
+	 * a fresh IsolatedTable instance via module.connect(), so instance-local state would
+	 * be lost between the createSavepoint callback and the ensureOverlay() call.
+	 */
+	private get savepointsBeforeOverlay(): Set<number> {
+		return this.isolationModule.getPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
+	}
 
 	constructor(
 		db: Database,
@@ -132,6 +144,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// is needed, and calling it would throw a "duplicate index" error.
 		const overlayTable = await this.isolationModule.overlayModule.create(this.db, overlaySchema);
 
+		// If savepoints were taken before the overlay existed, pre-register the
+		// overlay's connection now so MemoryTable.ensureConnection() reuses it
+		// instead of creating a fresh one on the first overlay.update() (which
+		// would skip the savepoint-stack replay done by Database.registerConnection
+		// at this exact call). The replay itself is performed by
+		// Database.registerConnection — see registerConnection in database.ts.
+		if (this.savepointsBeforeOverlay.size > 0 && overlayTable.createConnection) {
+			const preAlignedConn = await overlayTable.createConnection();
+			await (this.db as DatabaseInternal).registerConnection(preAlignedConn);
+		}
+
 		// Store in connection-scoped storage
 		const state: ConnectionOverlayState = {
 			overlayTable,
@@ -145,16 +168,32 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	/**
 	 * Ensures a connection is registered with the database for transaction coordination.
 	 * This is called before any read or write operation.
+	 *
+	 * Multiple IsolatedTable instances may be created per transaction (one per getVTable()
+	 * call in the runtime). Without reuse, each instance would register a fresh
+	 * IsolatedConnection, causing DeferredConstraintQueue.findConnection() to find multiple
+	 * covering candidates and throw. We therefore reuse the first covering connection
+	 * already registered for this table.
 	 */
 	private async ensureConnection(): Promise<IsolatedConnection> {
 		if (!this.registeredConnection) {
+			// Reuse an existing covering (IsolatedConnection) if one is already registered
+			// for this table — avoids accumulating one IsolatedConnection per statement.
+			const qualifiedName = `${this.schemaName}.${this.tableName}`;
+			const existing = (this.db as DatabaseInternal).getConnectionsForTable(qualifiedName);
+			const existingCovering = existing.find((c: VirtualTableConnection) => c.isCovering) as IsolatedConnection | undefined;
+			if (existingCovering) {
+				this.registeredConnection = existingCovering;
+				return this.registeredConnection;
+			}
+
 			// Create connection - overlay connection created lazily if needed
 			const overlayConn = this.overlayTable
 				? await Promise.resolve(this.overlayTable.createConnection?.())
 				: undefined;
 
 			this.registeredConnection = new IsolatedConnection(
-				this.tableName,
+				`${this.schemaName}.${this.tableName}`,
 				undefined,
 				overlayConn,
 				this
@@ -184,7 +223,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 
 		return new IsolatedConnection(
-			this.tableName,
+			`${this.schemaName}.${this.tableName}`,
 			underlyingConn,
 			overlayConn,
 			this  // Include callback for commit/rollback handling
@@ -199,7 +238,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			underlyingConn,
 			overlayConn,
 		]);
-		return new IsolatedConnection(this.tableName, underlying, overlay, this);
+		return new IsolatedConnection(`${this.schemaName}.${this.tableName}`, underlying, overlay, this);
 	}
 
 	// ==================== Query Operations ====================
@@ -585,37 +624,75 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const { operation, values, oldKeyValues } = args;
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 
+		// Resolve the effective PK-level action once so the wrapped overlay vtab
+		// agrees with the overlay's decision. Per-UC defaults are applied inside
+		// checkMergedUniqueConstraints, since each UC may declare its own action.
+		const effectiveOR = args.onConflict ?? resolvePkDefaultConflict(this.tableSchema!);
+		const argsForOverlay: UpdateArgs = effectiveOR !== undefined
+			? { ...args, onConflict: effectiveOR }
+			: args;
+
 		switch (operation) {
 			case 'insert': {
-				// Check if there's an existing tombstone in the overlay for this PK.
-				// This happens when a row is deleted then re-inserted with the same PK.
-				// In that case, convert the tombstone to a regular row (update) instead
-				// of inserting, which would fail with a UNIQUE constraint violation.
 				const pkIndices = this.getPrimaryKeyIndices();
 				const pk = values ? pkIndices.map(i => values[i]) : undefined;
+
+				// Captured when OR REPLACE displaces a row that lives only in the
+				// underlying store — surfaced as `replacedRow` so the DML executor
+				// fires ON DELETE cascades for the displaced parent.
+				let replacedUnderlyingRow: Row | undefined;
 
 				if (pk) {
 					const existingRow = await this.getOverlayRow(overlay, pk);
 					if (existingRow && existingRow[tombstoneIndex] === 1) {
-						// Convert tombstone to regular row
+						// Convert tombstone to regular row (delete then re-insert same PK)
 						const overlayRow = [...(values ?? []), 0];
 						const result = await overlay.update({
 							operation: 'update',
 							values: overlayRow,
 							oldKeyValues: pk,
-							onConflict: args.onConflict,
+							onConflict: effectiveOR,
 						});
 						return this.stripTombstoneFromResult(result, tombstoneIndex);
+					}
+
+					if (existingRow) {
+						// Live row already in overlay for this PK. Resolve against any column-level
+						// PK defaultConflict; ABORT/FAIL/ROLLBACK short-circuit with a table-named
+						// constraint error, IGNORE/REPLACE fall through to overlay.update().
+						const effective = effectiveOR ?? ConflictResolution.ABORT;
+						if (effective === ConflictResolution.ABORT
+							|| effective === ConflictResolution.FAIL
+							|| effective === ConflictResolution.ROLLBACK) {
+							return {
+								status: 'constraint',
+								constraint: 'unique',
+								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
+								existingRow: existingRow.slice(0, tombstoneIndex) as Row,
+							};
+						}
+					}
+
+					if (!existingRow) {
+						// No overlay entry — check underlying for PK conflict
+						const pkOutcome = await this.checkMergedPKConflict(overlay, pk, tombstoneIndex, args.onConflict);
+						if (pkOutcome.terminating) return pkOutcome.terminating;
+						replacedUnderlyingRow = pkOutcome.replacedUnderlyingRow;
+
+						// Check non-PK UNIQUE constraints against merged view
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, [pk], tombstoneIndex, args.onConflict);
+						if (ucResult !== null) return ucResult;
 					}
 				}
 
 				// Normal insert into overlay with tombstone = 0
 				const overlayRow = [...(values ?? []), 0];
 				const result = await overlay.update({
-					...args,
+					...argsForOverlay,
 					values: overlayRow,
 				});
-				return this.stripTombstoneFromResult(result, tombstoneIndex);
+				const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
+				return this.attachReplacedUnderlying(stripped, replacedUnderlyingRow);
 			}
 
 			case 'update': {
@@ -635,21 +712,69 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				const overlayRow = [...values, 0]; // tombstone = 0
 
 				if (existingOverlayRow) {
-					// Update existing overlay row
+					const newPK = pkIndices.map(i => values![i]);
+					const pkChanged = !this.keysEqual(targetPK, newPK);
+
+					if (pkChanged) {
+						// PK is changing: check for conflicts at the new PK, then tombstone the old
+						// overlay slot and insert a fresh row at the new PK so the underlying row
+						// at targetPK is shadowed (tombstoned) after flush.
+						const pkOutcome = await this.checkMergedPKConflict(overlay, newPK, tombstoneIndex, args.onConflict);
+						if (pkOutcome.terminating) return pkOutcome.terminating;
+
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, [targetPK, newPK], tombstoneIndex, args.onConflict);
+						if (ucResult !== null) return ucResult;
+
+						// Remove existing overlay row then insert a tombstone so the underlying
+						// row at targetPK is hidden after flush.  Delete-then-insert avoids a
+						// same-layer upsert that some BTree implementations may not handle
+						// correctly when updating a value inserted in the same transaction.
+						await overlay.update({ operation: 'delete', values: undefined, oldKeyValues: targetPK });
+						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
+						const result = await overlay.update({
+							operation: 'insert',
+							values: overlayRow,
+							onConflict: effectiveOR,
+						});
+						const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
+						return this.attachReplacedUnderlying(stripped, pkOutcome.replacedUnderlyingRow);
+					}
+
+					// Same PK — update the overlay row in place
 					const result = await overlay.update({
-						...args,
+						...argsForOverlay,
 						values: overlayRow,
 						oldKeyValues: targetPK,
 					});
 					return this.stripTombstoneFromResult(result, tombstoneIndex);
 				} else {
-					// Insert new overlay row (shadows underlying)
+					// Insert new overlay row (shadows underlying) — check underlying conflicts first
+					const newPK = pkIndices.map(i => values![i]);
+					const pkChanged = !this.keysEqual(targetPK, newPK);
+
+					let replacedUnderlyingRow: Row | undefined;
+					if (pkChanged) {
+						const pkOutcome = await this.checkMergedPKConflict(overlay, newPK, tombstoneIndex, args.onConflict);
+						if (pkOutcome.terminating) return pkOutcome.terminating;
+						replacedUnderlyingRow = pkOutcome.replacedUnderlyingRow;
+					}
+
+					const selfPks: SqlValue[][] = pkChanged ? [targetPK, newPK] : [targetPK];
+					const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, selfPks, tombstoneIndex, args.onConflict);
+					if (ucResult !== null) return ucResult;
+
+					// For PK-change updates, tombstone the old PK so the underlying row is deleted at flush
+					if (pkChanged) {
+						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
+					}
+
 					const result = await overlay.update({
 						operation: 'insert',
 						values: overlayRow,
-						onConflict: args.onConflict,
+						onConflict: effectiveOR,
 					});
-					return this.stripTombstoneFromResult(result, tombstoneIndex);
+					const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
+					return this.attachReplacedUnderlying(stripped, replacedUnderlyingRow);
 				}
 			}
 
@@ -666,7 +791,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 				if (existingOverlayRow) {
 					if (existingOverlayRow[tombstoneIndex] === 1) {
-						// Already deleted, nothing to do
+						// Already deleted, nothing to do — return ok without row so callers
+						// (e.g. dml-executor auto-event path) know no actual row was removed.
 						return { status: 'ok' };
 					}
 					// Convert to tombstone by updating the tombstone flag
@@ -677,6 +803,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						oldKeyValues: targetPK,
 						onConflict: args.onConflict,
 					});
+					// Return the pre-deletion row so dml-executor emits the auto change event.
+					const deletedRow = existingOverlayRow.slice(0, tombstoneIndex) as SqlValue[];
+					return { status: 'ok', row: deletedRow };
 				} else {
 					// Insert tombstone to shadow underlying row
 					// Build a minimal row with PK values and tombstone = 1
@@ -694,9 +823,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						values: tombstoneRow,
 						onConflict: args.onConflict,
 					});
+					// Return a minimal placeholder row (PK columns only) so dml-executor
+					// recognises the delete as successful and emits the auto change event.
+					const placeholderRow: SqlValue[] = new Array(schema.columns.length).fill(null);
+					pkIndices.forEach((colIdx, i) => {
+						placeholderRow[colIdx] = targetPK[i];
+					});
+					return { status: 'ok', row: placeholderRow };
 				}
-
-				return { status: 'ok' };
 			}
 
 			default:
@@ -709,9 +843,27 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	private stripTombstoneFromResult(result: UpdateResult, tombstoneIndex: number): UpdateResult {
 		if (isUpdateOk(result) && result.row) {
-			return { status: 'ok', row: result.row.slice(0, tombstoneIndex) };
+			// `replacedRow` from the overlay's memory module also carries the trailing
+			// tombstone column (overlay schema appends it).  Slice it off so consumers
+			// see rows that match the user-facing schema.
+			const replacedRow = result.replacedRow
+				? (result.replacedRow.slice(0, tombstoneIndex) as Row)
+				: undefined;
+			return { status: 'ok', row: result.row.slice(0, tombstoneIndex), replacedRow };
 		}
 		return result;
+	}
+
+	/**
+	 * If a REPLACE conflict displaced a row that lives only in the underlying store,
+	 * surface it as `replacedRow` on the success result.  The overlay-only path
+	 * already carries `replacedRow` (the overlay's memory module emits it natively);
+	 * this overrides only when we have a store-side displacement to report.
+	 */
+	private attachReplacedUnderlying(result: UpdateResult, replacedUnderlyingRow: Row | undefined): UpdateResult {
+		if (!replacedUnderlyingRow) return result;
+		if (!isUpdateOk(result) || !result.row) return result;
+		return { status: 'ok', row: result.row, replacedRow: replacedUnderlyingRow };
 	}
 
 	/**
@@ -783,6 +935,172 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				idxFlags: 0,
 			},
 		};
+	}
+
+	// ==================== Merged-View Conflict Detection ====================
+
+	/**
+	 * Returns the compiled predicate for a partial-UNIQUE constraint, or undefined
+	 * when the constraint covers the full table. Compilation is memoized per
+	 * UniqueConstraintSchema instance so the hot UNIQUE-check path doesn't recompile.
+	 */
+	private compileFor(uc: UniqueConstraintSchema): CompiledPredicate | undefined {
+		if (!uc.predicate) return undefined;
+		let compiled = this.predicateCache.get(uc);
+		if (!compiled) {
+			compiled = compilePredicate(uc.predicate, this.tableSchema!.columns);
+			this.predicateCache.set(uc, compiled);
+		}
+		return compiled;
+	}
+
+	private keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
+		if (a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i++) {
+			if (compareSqlValues(a[i], b[i]) !== 0) return false;
+		}
+		return true;
+	}
+
+	private async getUnderlyingRow(pk: SqlValue[]): Promise<Row | undefined> {
+		if (!this.underlyingTable.query) return undefined;
+		for await (const row of this.underlyingTable.query(this.buildPKPointLookupFilter(pk))) {
+			return row;
+		}
+		return undefined;
+	}
+
+	private async insertTombstoneForPK(overlay: VirtualTable, pk: SqlValue[], tombstoneIndex: number): Promise<void> {
+		const schema = this.tableSchema;
+		if (!schema) throw new Error('No table schema');
+		const pkIndices = this.getPrimaryKeyIndices();
+		const tombstoneRow: SqlValue[] = new Array(schema.columns.length + 1).fill(null);
+		pkIndices.forEach((colIdx, i) => { tombstoneRow[colIdx] = pk[i]; });
+		tombstoneRow[tombstoneIndex] = 1;
+		const existing = await this.getOverlayRow(overlay, pk);
+		if (existing) {
+			await overlay.update({ operation: 'update', values: tombstoneRow, oldKeyValues: pk });
+		} else {
+			await overlay.update({ operation: 'insert', values: tombstoneRow });
+		}
+	}
+
+	/**
+	 * Checks if newPK conflicts with an underlying row not already shadowed in the overlay.
+	 *
+	 * Returns a discriminated outcome:
+	 * - `{}` — no conflict (or overlay is authoritative); proceed.
+	 * - `{ terminating }` — short-circuit with this UpdateResult (IGNORE / constraint).
+	 * - `{ replacedUnderlyingRow }` — REPLACE applied against a row that lives only
+	 *   in the underlying store. The caller must surface this row as `replacedRow`
+	 *   in the final UpdateResult so the DML executor fires ON DELETE cascades for
+	 *   the displaced parent. The overlay still inserts normally; at flush time the
+	 *   same-PK collision becomes an UPDATE on the underlying.
+	 */
+	private async checkMergedPKConflict(
+		overlay: VirtualTable,
+		newPK: SqlValue[],
+		tombstoneIndex: number,
+		onConflict?: ConflictResolution,
+	): Promise<{ terminating?: UpdateResult; replacedUnderlyingRow?: Row }> {
+		const overlayRow = await this.getOverlayRow(overlay, newPK);
+		if (overlayRow) return {}; // overlay handles it (tombstone = no conflict; real = overlay enforces)
+
+		const underlyingRow = await this.getUnderlyingRow(newPK);
+		if (!underlyingRow) return {};
+
+		// Statement OR > per-constraint default > ABORT.
+		const effective = resolveEffective(onConflict, resolvePkDefaultConflict(this.tableSchema!));
+		if (effective === ConflictResolution.IGNORE) return { terminating: { status: 'ok', row: undefined } };
+		if (effective === ConflictResolution.REPLACE) return { replacedUnderlyingRow: underlyingRow };
+		return {
+			terminating: {
+				status: 'constraint',
+				constraint: 'unique',
+				message: `UNIQUE constraint failed: ${this.tableName} PK.`,
+				existingRow: underlyingRow,
+			}
+		};
+	}
+
+	/**
+	 * Scans the underlying table for a row conflicting with newRow on `uc.columns`,
+	 * excluding selfPks and rows tombstoned in the overlay. For partial UNIQUE,
+	 * candidates whose row does not satisfy the predicate are skipped.
+	 */
+	private async findMergedUniqueConflict(
+		overlay: VirtualTable,
+		uc: UniqueConstraintSchema,
+		predicate: CompiledPredicate | undefined,
+		newRow: Row,
+		selfPks: SqlValue[][],
+		tombstoneIndex: number,
+	): Promise<{ pk: SqlValue[]; row: Row } | null> {
+		if (!this.underlyingTable.query) return null;
+		const pkIndices = this.getPrimaryKeyIndices();
+		const constrainedCols = uc.columns;
+
+		for await (const underlyingRow of this.underlyingTable.query(this.createFullScanFilterInfo())) {
+			const pk = pkIndices.map(i => underlyingRow[i]);
+			if (selfPks.some(self => this.keysEqual(pk, self))) continue;
+
+			const overlayRow = await this.getOverlayRow(overlay, pk);
+			if (overlayRow && overlayRow[tombstoneIndex] === 1) continue;
+
+			const matches = constrainedCols.every(idx => {
+				if (newRow[idx] === null || underlyingRow[idx] === null) return false;
+				return compareSqlValues(newRow[idx], underlyingRow[idx]) === 0;
+			});
+			if (!matches) continue;
+			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
+			if (predicate && predicate.evaluate(underlyingRow) !== true) continue;
+			return { pk, row: underlyingRow };
+		}
+		return null;
+	}
+
+	/**
+	 * Checks all non-PK UNIQUE constraints against the merged view.
+	 * Returns null when all pass or REPLACE evictions succeed.
+	 */
+	private async checkMergedUniqueConstraints(
+		overlay: VirtualTable,
+		newRow: Row,
+		selfPks: SqlValue[][],
+		tombstoneIndex: number,
+		onConflict?: ConflictResolution,
+	): Promise<UpdateResult | null> {
+		const schema = this.tableSchema;
+		const uniqueConstraints = schema?.uniqueConstraints;
+		if (!uniqueConstraints || uniqueConstraints.length === 0) return null;
+
+		for (const uc of uniqueConstraints) {
+			if (uc.columns.some(idx => newRow[idx] === null)) continue;
+
+			// Partial UNIQUE: a row whose predicate is not unambiguously TRUE is
+			// outside the index's scope and contributes nothing to uniqueness.
+			const predicate = this.compileFor(uc);
+			if (predicate && predicate.evaluate(newRow) !== true) continue;
+
+			const conflict = await this.findMergedUniqueConflict(overlay, uc, predicate, newRow, selfPks, tombstoneIndex);
+			if (!conflict) continue;
+
+			// Statement OR > per-UC defaultConflict > ABORT.
+			const effective = resolveEffective(onConflict, uc.defaultConflict);
+			if (effective === ConflictResolution.IGNORE) return { status: 'ok', row: undefined };
+			if (effective === ConflictResolution.REPLACE) {
+				await this.insertTombstoneForPK(overlay, conflict.pk, tombstoneIndex);
+				continue;
+			}
+			const colNames = uc.columns.map(i => schema!.columns[i].name).join(', ');
+			return {
+				status: 'constraint',
+				constraint: 'unique',
+				message: `UNIQUE constraint failed: ${schema!.name} (${colNames})`,
+				existingRow: conflict.row,
+			};
+		}
+		return null;
 	}
 
 	// ==================== Transaction Lifecycle ====================
@@ -1003,7 +1321,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	async onConnectionCommit(): Promise<void> {
 		await this.flushAndClearOverlay();
-		this.savepointsBeforeOverlay.clear();
+		this.isolationModule.clearPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 
 	/**
@@ -1012,7 +1330,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	async onConnectionRollback(): Promise<void> {
 		this.clearOverlay();
-		this.savepointsBeforeOverlay.clear();
+		this.isolationModule.clearPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 
 	/**
@@ -1062,4 +1380,35 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 		// If overlay's registered connection has this savepoint, it handles rollback
 	}
+}
+
+/**
+ * Resolves the per-constraint default conflict action for PK conflicts.
+ * Prefers the table-level `PRIMARY KEY (...) ON CONFLICT <action>` clause
+ * (the constraint's own declaration) over any column-level `defaultConflict`
+ * declared on a PK column (which primarily targets that column's own
+ * constraints and only acts as a fallback for PK conflicts).
+ *
+ * Mirrors the helper of the same name in `quereus/.../layer/manager.ts` — the
+ * three-tier rule `statement OR > per-constraint default > ABORT` must agree
+ * between the overlay's pre-check and the wrapped vtab's resolver.
+ */
+function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | undefined {
+	if (schema.primaryKeyDefaultConflict !== undefined) return schema.primaryKeyDefaultConflict;
+	for (const def of schema.primaryKeyDefinition) {
+		const col = schema.columns[def.index];
+		if (col?.defaultConflict !== undefined) return col.defaultConflict;
+	}
+	return undefined;
+}
+
+/**
+ * Three-tier conflict-action resolution: statement-level OR > per-constraint
+ * default > ABORT.
+ */
+function resolveEffective(
+	stmt: ConflictResolution | undefined,
+	perConstraint: ConflictResolution | undefined,
+): ConflictResolution {
+	return stmt ?? perConstraint ?? ConflictResolution.ABORT;
 }

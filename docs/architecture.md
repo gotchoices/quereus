@@ -1,0 +1,255 @@
+# Quereus Architecture
+
+This document describes the internal architecture of the Quereus SQL engine: the pipeline from SQL text to result rows, the source layout, the conventions for extending the engine, and the design decisions that shape it. For the user-facing feature overview and quick start, see [`packages/quereus/README.md`](../packages/quereus/README.md).
+
+## Pipeline Overview
+
+Quereus is built on partially immutable `PlanNode`s and an instruction-based runtime with an attribute-based context system.
+
+1. **SQL Input** — a SQL query string.
+2. **Parser (`src/parser`)**
+	* **Lexer (`lexer.ts`)** — tokenizes the raw SQL string.
+	* **Parser (`parser.ts`)** — builds an Abstract Syntax Tree (AST).
+3. **Planner (`src/planner`)**
+	* Traverses the AST to construct a tree of immutable `PlanNode` objects representing the logical query structure.
+	* Handles Common Table Expressions (CTEs) and subqueries by converting them into relational `PlanNode`s.
+	* Resolves table and function references using the Schema Manager.
+	* Performs query planning using each virtual table's `getBestAccessPlan` method and table/column statistics.
+	* **Optimizer (`src/planner/optimizer`)** — transforms logical plans into efficient physical execution plans through a rule-based optimization system. See [Optimizer Documentation](optimizer.md).
+4. **Runtime (`src/runtime`)**
+	* **Emitters (`src/runtime/emitters.ts`, `src/runtime/emit/`)** — translate `PlanNode`s into a graph of `Instruction` objects.
+	* **Scheduler (`src/runtime/scheduler.ts`)** — manages the execution flow of the `Instruction` graph.
+	* **Instructions** — JavaScript functions operating on `RuntimeValue`s (either `SqlValue` or `AsyncIterable<Row>`). Async parameters are awaited.
+	* Invokes virtual table methods (e.g., `query` which returns `AsyncIterable<Row>`, `update`) to interact with data.
+	* Calls User-Defined Functions (UDFs) and aggregate functions.
+	* Handles transaction and savepoint control.
+5. **Virtual Tables (`src/vtab`)** — the core data interface. Modules implement `VirtualTableModule`. `MemoryTable` (`vtab/memory/table.ts`) is the reference implementation, using `digitree`.
+6. **Schema Management (`src/schema`)** — manages schemas, tables, columns, functions.
+7. **User-Defined Functions (`src/func`)** — support for custom JS functions in SQL.
+8. **Core API (`src/core`)** — `Database`, `Statement` classes.
+
+## Source File Layout
+
+```
+src/
+├── core/                     # Database, Statement, transactions
+├── parser/                   # SQL parser → AST
+├── planner/                  # AST → PlanNode tree
+│   ├── building/             # Plan builders (select.ts, expression.ts, ddl.ts, ...)
+│   ├── nodes/                # PlanNode classes (one per node type)
+│   │   └── plan-node-type.ts # PlanNodeType enum — add new node types here
+│   ├── rules/                # Optimizer rules, by category:
+│   │   ├── access/           #   access-path selection
+│   │   ├── aggregate/        #   streaming aggregation
+│   │   ├── cache/            #   CTE, IN-subquery, materialization
+│   │   ├── distinct/         #   distinct elimination
+│   │   ├── join/             #   join commutation, physical selection
+│   │   ├── predicate/        #   predicate pushdown
+│   │   ├── retrieve/         #   retrieve growth
+│   │   └── subquery/         #   subquery decorrelation
+│   ├── framework/            # Optimizer framework (characteristics, passes, registry)
+│   ├── cost/                 # Cost model (index.ts)
+│   ├── analysis/             # Const evaluator, constraint extractor, predicate normalizer
+│   ├── stats/                # Table/column statistics
+│   ├── validation/           # Plan validation passes
+│   ├── scopes/               # Name resolution scopes
+│   └── cache/                # Plan cache
+├── runtime/
+│   ├── emit/                 # Instruction emitters (mirrors planner/nodes/)
+│   ├── cache/                # Runtime caching
+│   └── functions/            # Runtime function dispatch
+├── emit/                     # Top-level emitter entry (plan → instructions)
+├── schema/                   # Catalog, schema manager, table/column/view/assertion defs
+├── types/                    # Type system (logical types, registry, temporal, JSON)
+├── func/builtins/            # Built-in functions (scalar, aggregate, string, datetime, json, ...)
+├── vtab/                     # Virtual table framework
+│   └── memory/               # In-memory VTab implementation (layers, merge iterators)
+├── common/                   # Shared constants, errors, logger, type inference
+└── util/                     # Miscellaneous utilities
+
+test/
+├── logic/                    # SQL logic tests (*.sqllogic) — primary test suite
+├── plan/                     # Plan-shape tests (basic/, joins/, aggregates/)
+├── optimizer/                # Optimizer-specific tests
+├── planner/                  # Planner unit tests
+├── vtab/                     # VTab tests
+└── util/                     # Test utilities
+```
+
+Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `runtime/emit/`. Optimizer rules in `planner/rules/` are registered via `planner/framework/registry.ts`. Tests go in `test/logic/*.sqllogic` (SQL logic tests) or `test/plan/` (plan shape tests).
+
+## Common Implementation Patterns
+
+**Adding a new PlanNode** (follow an existing node as template):
+1. `planner/nodes/my-node.ts` — node class (e.g. copy `bloom-join-node.ts` for joins)
+2. `planner/nodes/plan-node-type.ts` — add enum entry
+3. `runtime/emit/my-node.ts` — matching emitter
+4. `emit/emitter.ts` — register emitter in the visitor
+5. Tests in `test/logic/*.sqllogic` or `test/plan/`
+
+**Adding an optimizer rule:**
+1. `planner/rules/<category>/rule-my-rule.ts` (copy an existing rule in the same category)
+2. Register in `planner/framework/registry.ts`
+3. Cost constants go in `planner/cost/index.ts`
+
+**Adding a built-in function:**
+1. `func/builtins/<category>.ts` (scalar.ts, string.ts, aggregate.ts, json.ts, datetime.ts, ...)
+2. Register via `func/registration.ts`
+
+All paths above are relative to `src/`.
+
+## Key Design Decisions
+
+*   **Federated / VTab-Centric** — all tables are virtual tables. Because remote virtual tables make join cost dominate, the optimizer aggressively eliminates joins whose non-preserved side is unused above the join when FK→PK alignment proves at-most-one-matching, often dropping a remote round-trip entirely. See [Optimizer Documentation §Join](optimizer.md#optimization-rules).
+*   **Async Core** — core operations are asynchronous. Cursors are `AsyncIterable<Row>`.
+*   **Key-Based Addressing** — rows are identified by their defined Primary Key. No separate implicit `rowid`.
+*   **Relational Orthogonality** — any statement that results in a relation can be used anywhere that expects a relation value, including mutating statements with RETURNING clauses.
+*   **Declarative Schema (Optional)** — keep using DDL normally. Optionally use order‑independent `declare schema { ... }` to describe end‑state; the engine computes diffs against current state using module‑reported catalogs and emits canonical DDL. You may auto‑apply via `apply schema` or fetch the DDL and run it yourself (enabling custom backfills). Supports seeds, imports (URL + cache), versioning, and schema hashing. Destructive changes require explicit acknowledgement.
+*   **JavaScript Types** — uses standard JavaScript types (`number`, `string`, `bigint`, `boolean`, `Uint8Array`, `null`) internally.
+*   **Object-Based API** — uses classes (`Database`, `Statement`) to represent resources with lifecycles, rather than handles.
+*   **Transient Schema** — schema information is primarily in-memory; persistence is not a goal. Emission of schema SQL export is supported.
+*   **Multi-Schema Support** — organize tables across multiple schemas with flexible search paths for modular designs.
+*   **Bags vs Sets Distinction** — explicit type-level distinction between relations that guarantee unique rows (sets) and those that allow duplicates (bags), enabling sophisticated optimizations and maintaining algebraic correctness in line with Third Manifesto principles.
+*   **Attribute-Based Context System** — robust column reference resolution using stable attribute IDs eliminates architectural fragilities and provides deterministic context lookup across plan transformations. An attribute ID is *originated* once (at the node that mints it) but may be *forwarded* — re-published verbatim — by any number of ancestors (Set / Join / EagerPrefetch / AsyncGather, simple column-ref projections); the invariant is "originated once", not "appears once". See [Optimizer Documentation §Attribute provenance](optimizer.md#attribute-provenance).
+*   **Functional-Dependency Tracking** — every relational physical node carries optional `fds` and `equivClasses` fields. Unique keys are encoded as `K → (all_cols \ K)` FDs (with `∅ → all_cols` for at-most-one-row claims), so a single surface answers both "what determines what" and "is this column set unique?". Operators propagate per-column FDs (e.g., `col1 = const` ⇒ `∅ → col1`, equi-joins ⇒ bi-directional FDs) and equivalence classes through the plan, giving optimizer rules a first-class signal beyond just superkeys. Declared `CHECK` constraints contribute additional FDs, EC pairs, constant bindings, and per-column `domainConstraints` (range / enum bounds) at the table reference, all propagated through the same per-operator rules. Because a uniqueness fact can live on any of three surfaces (`RelationType.keys`, the FD set, or `RelationType.isSet`), consumers read it through one reconciling pair — `keysOf` / `isUnique` in `planner/util/fd-utils.ts` — which is sound by construction (never claims a key that does not hold) and best-effort complete (the candidate-key enumeration is bounded, not exhaustive). See [Optimizer Documentation §Functional Dependency Tracking](optimizer.md#functional-dependency-tracking).
+*   **Per-Statement Change-Scope Introspection** — `Statement.getChangeScope()` returns a JSON-serializable `ChangeScope` describing what base-table state and external inputs the statement reads from, backed by the FD-aware binding analysis used by assertions and incremental view maintenance. See [Change-scope Documentation](change-scope.md).
+*   **Orthogonal Query Expressions** — `SELECT`, `VALUES`, and DML-with-`RETURNING` are accepted as a single `QueryExpr` shape everywhere a relation is needed (top-level statement, FROM subquery source, scalar / IN / EXISTS subquery, compound legs, CTE bodies). The parser flows every relation site through one `parseQueryExpr` helper; the AST collapses `MutatingSubquerySource` into the standard `SubquerySource` and `InsertStmt.{values, select}` into a single `source: QueryExpr`. All three forms execute at every relation site; DML inners in scalar / `IN` / `EXISTS` position run under full-drain + run-once semantics applied by the runtime emitters (gated on `physical.readonly === false`). DML as a view body is rejected at view-creation time — a view re-evaluates on every reference, and replaying a write per read is incoherent with view semantics. See [SQL Reference § Query expressions](sql.md#query-expressions).
+*   **Predicate-Driven View Updateability** — views, CTEs, and subqueries-in-`from` are uniformly mutable through `insert` / `update` / `delete`. A propagation pass walks the relation tree, fans out to every n-ary branch whose predicate is consistent with the mutation's row-identifying or existence predicate, and emits a per-base operation list executed atomically. Default values for omitted columns are recovered in order from constant FDs derived from selection predicates (`where color = 'green'` defaults `color`), then arbitrary FD/EC reconstruction, then explicit `default_for` tags, then base-column defaults. No `with check option`, no `instead of` triggers, no view-level updateability flag — the FD framework subsumes the dialect-specific rules of other engines. Tags in the `quereus.update.*` namespace override branch routing and supply expression defaults. See [View Updateability Documentation](view-updateability.md).
+*   **Layered Schemas / Lenses** — a database separates into **logical** (embodiment-free design: tables, types, logical constraints, tags — no module, no indexes), **basis** (module-backed relations, possibly federated across modules; covering structures live here as materialized views), and a **mapping** layer of per-logical-table **lenses**. A lens is the bidirectional (`get`/`put`) relational expression realizing a logical table over basis — built on view updateability, so relational algebra is the only operator set in both directions. Lens bodies are authored as **sparse overrides** (rename, hide, compute, …) over a module-pluggable default mapping, merged per-attribute by stable attribute ID and gap-filled by the compiler; the logical spec's constraints are *attached* at the lens boundary (predicates are read-time filters, not invariants), and the lens prover discharges the GetPut/PutGet completeness checks. At deploy the lens compiles to an inline view so the query processor sees an ordinary view; the basis is a generated-then-frozen, hash-coded artifact diffed by the declarative-schema pipeline, with logical removals detaching mappings rather than dropping basis storage. See [Lenses and Layered Schemas](lens.md).
+
+## Design Differences from SQLite
+
+While Quereus supports standard SQL syntax, it has several distinctive design choices:
+
+*   **Modern Type System** — uses logical/physical type separation instead of SQLite's type affinity model. Includes native temporal types (DATE, TIME, DATETIME) and JSON type with deep equality comparison. Conversion functions (`integer()`, `date()`, `json()`) are preferred over CAST syntax. All expressions have known types at plan time, including parameters; cross-category comparisons (e.g., numeric vs text) are handled via explicit conversions rather than implicit runtime coercion. See [Type System Documentation](types.md).
+*   **Virtual Table Centric** — uses `CREATE TABLE ... USING module(...)` syntax. All tables are virtual tables.
+*   **Default NOT NULL Columns** — following Third Manifesto principles, columns default to NOT NULL unless explicitly specified otherwise. This behavior can be controlled via `pragma default_column_nullability = 'nullable'` to restore SQL standard behavior.
+*   **No Rowids** — all tables are addressed by their Primary Key. When no explicit PRIMARY KEY is defined, Quereus includes all columns in the primary key.
+*   **Async API** — core execution is asynchronous with async/await patterns throughout.
+*   **No Triggers or Built-in Persistence** — persistent storage can be implemented as a VTab module.
+
+## Constraints
+
+- Row-level CHECKs that reference only the current row are enforced immediately.
+- Row-level CHECKs that reference other tables (e.g., via subqueries) are automatically deferred and enforced at COMMIT using the same optimized engine as global assertions. No `DEFERRABLE` or `SET CONSTRAINTS` management is required by the user.
+- `CREATE ASSERTION name CHECK (...)` defines database-wide invariants evaluated at COMMIT.
+- **Assertion-as-premise hoisting.** Assertions whose CHECK matches `NOT EXISTS (SELECT 1 FROM T [WHERE P])` over a single base table are also surfaced to the optimizer as if `T` carried a per-row `CHECK (NOT P)`. The negated predicate flows through the standard CHECK-extraction pipeline at `TableReferenceNode.computePhysical`, contributing FDs / equivalence classes / constant bindings / domain constraints tagged with `source: { kind: 'assertion', name }`. Commit-time enforcement remains the source of truth; the hoisted facts are an additive optimizer signal that lets contradicting queries fold to `EmptyRelation`. See [Optimizer Documentation](optimizer.md#assertion-derived-premises).
+- **Assertion delta classification.** Each table reference in an assertion's violation plan is classified as `'row'`, `'group'`, or `'global'`. All three modes are dispatched by a reusable `DeltaExecutor` kernel at COMMIT time: `'row'` runs a parameterized variant per changed PK; `'group'` parameterizes per changed group key (with OLD/NEW projections for group-membership transitions); `'global'` runs the full violation query once. The same kernel is the integration point for materialized views, reactive signals, and triggers — see [Incremental Maintenance](incremental-maintenance.md) and [Optimizer Documentation](optimizer.md#binding-aware-delta-planning-reusable).
+- `FOREIGN KEY ... REFERENCES` with `ON DELETE CASCADE/SET NULL/RESTRICT` and `ON UPDATE CASCADE/SET NULL/RESTRICT`.
+- **`committed.tablename` pseudo-schema** — provides read-only access to the pre-transaction (committed) state of any table. Enables transition constraints that compare current and committed state (e.g., `CREATE ASSERTION no_decrease CHECK (NOT EXISTS (SELECT 1 FROM t JOIN committed.t ct ON t.id = ct.id WHERE t.val < ct.val))`). The committed view is pinned to the transaction-start snapshot and is unaffected by savepoints.
+- **Determinism Enforcement** — by default, CHECK constraints, DEFAULT values, and `GENERATED ALWAYS AS` expressions must use only deterministic expressions; non-deterministic values (like `datetime('now')` or `random()`) are passed via mutation context. The strictness is opt-out: setting `pragma nondeterministic_schema = true` (or `db.setOption('nondeterministic_schema', true)`) lifts the static rejection. The real invariant is that the captured artifact at `vtab.update()` is fully resolved — per-row evaluation already produces concrete values in `args.values` and in the literal SQL emitted by `buildInsertStatement` / `buildUpdateStatement` / `buildDeleteStatement` (see [Module Authoring](module-authoring.md#mutation-statements)). A deferred CHECK with non-deterministic expressions evaluates once at commit; if it passes, the transaction's writes enter the log atomically and replay applies them at the module-layer boundary without re-evaluation, so deferred non-det is replay-safe by transaction atomicity. See [Runtime Documentation](runtime.md#determinism-validation).
+- **Conflict Resolution** — `INSERT OR {IGNORE,REPLACE,FAIL,ABORT,ROLLBACK}` covers every constraint class (NOT NULL, CHECK, FK existence, UNIQUE/PK). Column- and table-level `ON CONFLICT <action>` directives are honored as the per-constraint default; statement-level `OR` clauses always win. A subquery-deferred CHECK is evaluated at row time (not commit) when the active conflict resolution is non-default, so IGNORE/REPLACE can drop or substitute the row in place. UPDATE OR is not yet parsed — see [SQL Reference](sql.md#conflict-resolution-or-clause). NOTE: UPDATE OR support is a separate follow-up.
+
+  Action semantics summary:
+
+  | Class | IGNORE | REPLACE | FAIL | ABORT | ROLLBACK |
+  |---|---|---|---|---|---|
+  | NOT NULL (with DEFAULT) | skip row | substitute DEFAULT | abort stmt | abort stmt | abort stmt + rollback tx |
+  | NOT NULL (no DEFAULT) | skip row | abort stmt | abort stmt | abort stmt | abort stmt + rollback tx |
+  | CHECK | skip row | abort stmt | abort stmt | abort stmt | abort stmt + rollback tx |
+  | FK existence | skip row | abort stmt | abort stmt | abort stmt | abort stmt + rollback tx |
+  | UNIQUE / PK | skip row | replace existing | abort stmt | abort stmt | abort stmt + rollback tx |
+
+  FAIL keeps prior rows of the same statement that already succeeded. ROLLBACK auto-rolls-back the enclosing transaction (implicit or explicit).
+
+## Sequential ID Generation
+
+Quereus has no built-in auto-increment or sequence objects. Instead, batch ID generation composes naturally from existing features: mutation context captures a non-deterministic seed once, a window function provides a deterministic per-row ordinal, and a scalar or table-valued function produces the final ID. For example, inserting with timestamp-derived IDs:
+
+```sql
+insert into orders (id, customer_id, total)
+with context base_ts = epoch_ms('now')
+select
+    base_ts * 1000 + row_number() over (order by c.customer_id),
+    c.customer_id,
+    c.total
+from (select customer_id, sum(price) as total from cart_items group by customer_id) c;
+```
+
+The `WITH CONTEXT` boundary captures `epoch_ms('now')` as a literal, and `row_number() over (order by ...)` assigns a deterministic ordinal over a declared ordering. The entire statement is replayable. For richer formats (ULIDs, UUIDv7), register a deterministic scalar UDF that encodes `(seed, counter)` into the desired format — or use a lateral join to a deterministic TVF when multiple columns are needed per generated row.
+
+## Optimizer
+
+Quereus features a sophisticated rule-based query optimizer that transforms logical plans into efficient physical execution plans. The optimizer uses a single plan node hierarchy with logical-to-physical transformation, generic tree rewriting infrastructure, and comprehensive optimization rules including constant folding, intelligent caching, streaming aggregation, bloom (hash) join selection for equi-joins, and correlated subquery decorrelation (EXISTS/IN → semi/anti joins).
+
+See the [Optimizer Documentation](optimizer.md) for architecture details and [Optimizer Conventions](optimizer-conventions.md) for development guidelines.
+
+### Recent refinements
+
+- Retrieve growth and push-down stabilized: query-based modules slide full nodes via `supports()`; index-style fallback injects supported-only fragments inside `Retrieve`, preserving residuals above.
+- Retrieve logical properties now expose `bindingsCount` and `bindingsNodeTypes` (visible in `query_plan().properties`) to aid verification that parameters/correlations are captured.
+- Table-valued functions can advertise relational and physical characteristics (keys, ordering, monotonicOn, estimated row count, etc.) via an optional `relationalAdvertisement` on `TableValuedFunctionSchema`. `TableFunctionCallNode.computePhysical` consumes the declaration on the standard physical-property path so FD propagation, DISTINCT/sort elimination, and cardinality-aware rules see the same information they get from a real vtab. See [Optimizer Documentation](optimizer.md#tvf-property-declarations).
+- Functional-dependency framework: unique keys, equivalence classes, constant bindings, domain constraints, and guarded (conditional) FDs are now the canonical surface for "what determines what" on a relational node's output. Producers include declared PK/UNIQUE, declared CHECK (including implication-form disjunctions), partial UNIQUE indexes, and statically-classified `CREATE ASSERTION` premises; consumers include DISTINCT elimination, GROUP BY simplification, ORDER BY pruning, predicate-inference-via-EC, sargable range rewrites, predicate contradiction detection, FK→PK join elimination, and FK-driven semi/anti-join folding. See [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking).
+- Change-detection / delta API: every prepared `Statement` exposes a JSON-serializable `ChangeScope` describing what base-table state (full / rows / groups / rowsByGroup) and external inputs it depends on; `Database.watch(scope, handler)` registers post-commit reactive callbacks on the same shape. The internal counterpart is a reusable `DeltaExecutor` that powers transaction-deferred assertions today and is positioned to power materialized views and reactive signals. See [Change-scope Documentation](change-scope.md), [Incremental Maintenance](incremental-maintenance.md), and the [Usage Guide](usage.md#change-scope-introspection).
+- `ParallelDriver` runtime primitive (`src/runtime/parallel-driver.ts`): forks `RuntimeContext` into N independent child views and drives N branch factories concurrently with bounded concurrency and `AbortSignal` cancellation. Foundation for the broader `parallel-*` track; no plan-node consumers yet. See [Runtime § ParallelDriver](runtime.md#paralleldriver-runtime-primitive).
+- `EagerPrefetchNode` (`src/planner/nodes/eager-prefetch-node.ts`): latency-hiding physical pass-through that forks the runtime context on emit and pumps the child sub-tree into a bounded ring buffer immediately, so the consumer's first await finds rows already in flight. First downstream consumer of `ParallelDriver.fork()`; rows/keys/FDs/orderings pass through verbatim. See [Runtime § EagerPrefetchNode](runtime.md#eagerprefetchnode-first-paralleldriverfork-consumer).
+- Module concurrency contract (`src/vtab/module.ts`, `src/vtab/concurrency.ts`): `VirtualTableModule.concurrencyMode` declares `'serial'` (default), `'reentrant-reads'`, or `'fully-reentrant'`. Memory vtab is `'reentrant-reads'` — `query()` captures `pendingTransactionLayer ?? readLayer` at call entry and iterates that captured BTree, so concurrent `query()` calls on a single connection see consistent snapshots. Writes still serialize because once a transaction is open, subsequent writes mutate the existing pending layer's BTree in place; `'fully-reentrant'` would require fresh-per-write layers or an iterator-safe mutation path, neither of which has been audited. Everything else stays default. Parallel runtime consumers call `getModuleConcurrencyMode(module)` and `acquireConnectionLock(connection)` to fall back to serial behavior when sibling branches share a connection. The lock is not enforced by `ParallelDriver` itself — enforcement belongs in the consumer that owns the vtab interaction (e.g. fan-out lookup join).
+- `AsyncGatherNode` (`src/planner/nodes/async-gather-node.ts`): N-ary physical relational combinator that drives ≥ 2 independent children concurrently via `ParallelDriver.drive()`. Three combinators ship — `unionAll` (arrival-order interleave), `crossProduct` (materialized N-ary Cartesian product), and `zipByKey` (full N-way outer join on shared key columns, eager BTree hash-merge). Manual-construction only; recognition of chained `SetOperationNode(op='unionAll')` lands separately in `5.5-parallel-async-gather-union-all-rule`. `crossProduct` recognition is opt-in and not currently on the optimizer roadmap. The `zipByKey` recognition rule has landed (`src/planner/rules/parallel/rule-async-gather-zip-by-key.ts`): it folds a `Project` over a shared-key full-outer `JoinNode` chain, recognizing arbitrary projection order / derived scalars over the merged key (canonical order replaces the `Project` outright; any other order wraps the gather in a thin reordering `Project`). See [Optimizer § Async gather ZIP BY KEY](optimizer.md) and [Runtime § AsyncGatherNode](runtime.md#asyncgathernode-n-ary-parallel-relational-combinator).
+- `FanOutLookupJoinNode` (`src/planner/nodes/fanout-lookup-join-node.ts`): physical relational node that, for one outer row, forks N parameterized child sub-plans, drives them concurrently via `ParallelDriver.drive()` (bounded by `concurrencyCap`), collects each branch's at-most-one lookup row, and composes a wide result. Replaces a chain of N FK→PK LEFT/INNER joins. v1 supports `atMostOne-left` and `atMostOne-inner` branch modes only; `array` / `cross` are deferred. Per-branch `concurrencySafe` plus `acquireConnectionLock` integrates the vtab concurrency contract. Manual-construction / hand-written tests only in this commit; the recognition rule and golden-plan sweep land in ticket `4.5-parallel-fanout-lookup-join-rule`. See [Runtime § FanOutLookupJoinNode](runtime.md#fanoutlookupjoinnode-per-row-fan-out-lookup-join).
+- Side-effect audit discipline: every registered optimization rule declares `sideEffectMode: 'safe' | 'aware'` at registration time, and the registry rejects rules that fail to declare. Rules that move, duplicate, drop, or merge subtrees ('aware') consult `PlanNodeCharacteristics.subtreeHasSideEffects` and refuse / weaken when any participating subtree carries a write — the safety net that `dml-in-expression-position` (parallel ticket) and FROM-position DML write-target propagation in `ChangeScope` stand on. See [Optimizer § Audit discipline](optimizer.md#audit-discipline-sideeffectmode).
+
+## Testing Strategy
+
+The tests are located in `test/*.spec.ts` and are driven by Mocha with ts-node/esm.
+
+```bash
+yarn test
+```
+
+Quereus employs a multi-faceted testing strategy:
+
+1.  **SQL Logic Tests (`test/logic/`)**
+	*   Inspired by SQLite's own testing methodology.
+	*   Uses simple text files (`*.sqllogic`) containing SQL statements and their expected JSON results (using `→` marker) or expected error messages (using `-- error:` directive).
+	*   Driven by a Mocha test runner (`test/logic.spec.ts`) that executes the SQL against a fresh `Database` instance for each file.
+	*   **Configurable Diagnostics** — on unexpected failures, the test runner provides clean error messages by default with optional detailed diagnostics controlled by command line arguments:
+		*   `yarn test --verbose` — show execution progress during tests
+		*   `yarn test --show-plan` — include concise query plan in diagnostics
+		*   `yarn test --plan-full-detail` — include full detailed query plan (JSON format)
+		*   `yarn test --plan-summary` — show one-line execution path summary
+		*   `yarn test --expand-nodes node1,node2...` — expand specific nodes in concise plan
+		*   `yarn test --max-plan-depth N` — limit plan display depth
+		*   `yarn test --show-program` — include instruction program in diagnostics
+		*   `yarn test --show-stack` — include full stack trace in diagnostics
+		*   `yarn test --show-trace` — include execution trace in diagnostics
+		*   `yarn test --trace-plan-stack` — enable plan stack tracing in runtime
+	*   This helps pinpoint failures at the Parser, Planner, or Runtime layer while keeping output manageable.
+	*   Provides comprehensive coverage of SQL features: basic CRUD, complex expressions, all join types, window functions, aggregates, subqueries, CTEs, constraints, transactions, set operations, views, and error handling.
+
+2.  **Property-Based Tests (`test/property.spec.ts`)**
+	*   Uses the `fast-check` library to generate a wide range of inputs for specific, tricky areas.
+	*   Focuses on verifying fundamental properties and invariants that should hold true across many different values.
+	*   Currently includes tests for:
+		*   **Collation Consistency** — ensures `ORDER BY` results match the behavior of the `compareSqlValues` utility for `BINARY`, `NOCASE`, and `RTRIM` collations across various strings.
+		*   **Numeric Affinity** — verifies that comparisons (`=`, `<`) in SQL handle mixed types (numbers, strings, booleans, nulls) consistently with SQLite's affinity rules, using `compareSqlValues` as the reference.
+		*   **JSON Roundtrip** — confirms that arbitrary JSON values survive being processed by `json_quote()` and `json_extract('$')` without data loss or corruption.
+		*   **Mixed Type Arithmetic** — checks that arithmetic on mixed types behaves consistently between SELECT and WHERE contexts.
+		*   **Parser Robustness** — feeds random strings, SQL-like fragment mixtures, and random identifiers to the parser, asserting it either produces a valid AST or throws `QuereusError` — never unhandled exceptions.
+		*   **Expression Evaluation** — compares random arithmetic expression trees and boolean comparisons evaluated in SQL against JS semantics.
+		*   **Comparison Properties** — validates `compareSqlValues` maintains antisymmetry, reflexivity, and transitivity across mixed types.
+		*   **Insert/Select Roundtrip** — tests value preservation through insert+select for INTEGER, REAL, TEXT, BLOB, and ANY column types.
+		*   **ORDER BY Determinism** — verifies repeated ORDER BY queries on data with duplicate sort keys produce identical results.
+		*   **Key Soundness** — over a zoo of query shapes (scans, projections, DISTINCT, GROUP BY, ORDER BY/LIMIT, set operations, joins, nested subqueries) and random table seeds, asserts the optimizer's uniqueness facts (`keysOf()` / `RelationType.isSet`) never *over-claim* against actual rows: a declared key is never duplicated and `isSet` rows are never repeated (soundness, not completeness — a missing key is fine, a false one is not). **Tier 1** checks the top result node of each shape (rows via `db.eval`, matched to keys positionally by column name). **Tier 2** walks *every* relational node in the optimized plan tree, materializes each in isolation (`emitPlanNode` + `Scheduler.run` with a strict, table-context-free runtime), and runs the same positional assertions on that node's own rows — pinning each operator's `getType()` / `computePhysical` independent of whether a shape surfaces it at the top. Tier 2 is best-effort: nodes that cannot emit/run standalone (correlated / parameterized inner nodes, the connection-bound `TableReference`) are *skipped*, and a `checkedNodes > 0` guard keeps the tier from silently degenerating into all-skips.
+		*   **AST Round-Trip (`test/emit-roundtrip-property.spec.ts`)** — generates AST nodes and asserts `parse(stringify(ast)) ≡ ast` via a structural comparator (`test/emit-roundtrip-comparator.ts`) that drops positional metadata and applies documented default-equivalences. Catches stealth field-drops in `emit/ast-stringify.ts` that the string-equality round-trip in `emit-roundtrip.spec.ts` cannot detect.
+		*   **Declarative-Schema Equivalence (`test/declarative-equivalence.spec.ts` + property suite in `test/property.spec.ts`)** — for each shape in a curated corpus and a `fast-check`-generated table arbitrary, builds two databases in parallel — one via direct `create table` / `create view` DDL, one via `declare schema main { ... } apply schema main` — and asserts the resulting `TableSchema` / `ViewSchema` / `IntegrityAssertionSchema` objects compare equal (via `test/util/schema-equivalence.ts`) and that hand-written DML probes return identical row sets / error classes against both. Guards the contract that the declarative pipeline never silently re-shapes a constraint, default, generated column, FK action, partial-index predicate, or view body. Issues #21 (view compound-select first-leg loss), #22 (CHECK `not in` parser dropping the parenthesisation), and #23 (CHECK `on delete` mask drop) are the regression fingerprints this harness is shaped against.
+
+3.  **Performance Sentinels (`test/performance-sentinels.spec.ts`)**
+	*   Micro-benchmarks with generous thresholds to catch severe performance regressions.
+	*   Currently includes sentinels for: parser throughput (simple, wide-SELECT, nested-expression), query execution (full table scan), and self-join (nested-loop baseline).
+	*   Thresholds are intentionally generous to avoid flakiness while still catching order-of-magnitude regressions.
+
+4.  **Unit Tests (`test/*.spec.ts`)**
+	*   Dedicated unit tests for core subsystems: type system (`type-system.spec.ts`), schema manager (`schema-manager.spec.ts`), optimizer rules (`optimizer/*.spec.ts`), memory vtable (`memory-vtable.spec.ts`), utility functions (`utility-edge-cases.spec.ts`).
+	*   Integration boundary tests (`integration-boundaries.spec.ts`) verify all boundary transitions: Parser→Planner, Planner→Optimizer, Optimizer→Runtime, Runtime→VTab.
+	*   Golden plan tests (`plan/golden-plans.spec.ts`) use snapshot testing to detect unintended query plan changes.
+	*   **Parallel-runtime / concurrency tests** guard the `parallel-*` track against timing races, and are **deterministic by construction** — they never assert on wall-clock elapsed time. `test/util/controllable-source.ts` provides gate-driven async sources plus a `ConcurrencyTracker`, so `test/runtime/{parallel-driver,async-gather,eager-prefetch,fanout-lookup-join}.spec.ts` prove parallelism via peak-in-flight counts and forced interleavings rather than `setTimeout` deltas. `test/runtime/fork-contract.spec.ts` pins every `RuntimeContext` field to a fork policy and statically allowlists context-mutation sites; `test/vtab/concurrent-scan.spec.ts` overlaps memory-vtab `query()` iterators at the vtab layer (bypassing the exec mutex) to validate the `reentrant-reads` snapshot contract; `test/vtab/concurrency-mode.spec.ts` covers `acquireConnectionLock` FIFO fairness, mutual exclusion, and batched-outer contention. The **strict-fork** runtime guard (`QUEREUS_FORK_STRICT=1`) throws if a parent context is mutated while a fork is being driven, and runs as part of `yarn check` via `test:fork-strict`. See [Runtime § Parallel runtime fork contract](runtime.md#parallel-runtime-fork-contract).
+
+5.  **Benchmark Suite (`bench/`)**
+	*   Standalone benchmark harness run via `yarn bench`. Measures parser, planner, execution, and mutation throughput across 18 benchmarks.
+	*   Records results to timestamped JSON files in `bench/results/` (gitignored).
+	*   `yarn bench --baseline <file>` compares against a previous result, color-codes regressions (>20% red) and improvements (>10% green), and exits non-zero on regressions.
+
+6.  **CI Integration (Planned)**
+	*   Utilize GitHub Actions (or similar) to run test suites automatically, potentially with different configurations (quick checks, full runs, browser environment).
+
+This layered approach aims for broad coverage via the logic tests, unit tests for individual subsystems, property tests to explore edge cases, performance sentinels to guard against regressions, and a dedicated benchmark suite for tracking performance over time.

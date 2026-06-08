@@ -25,10 +25,15 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 		try {
 			for await (const sourceRow of executorRows) {
 				slot.set(sourceRow);
-				// Evaluate projection expressions in the context of this row
-				const outputs = projectionCallbacks.map(func => func(rctx));
-				const resolved = await Promise.all(outputs);
-				yield resolved as Row;
+				// Sequential evaluation: parallel callbacks that share a plan
+				// subtree (e.g. two scalar subqueries against the same CTE)
+				// would race on the shared inner-scan RowSlot. See ticket
+				// serialize-project-subquery-evaluation for the canonical fix.
+				const outputs: OutputValue[] = [];
+				for (const func of projectionCallbacks) {
+					outputs.push(await func(rctx));
+				}
+				yield outputs as Row;
 			}
 		} finally {
 			slot.close();

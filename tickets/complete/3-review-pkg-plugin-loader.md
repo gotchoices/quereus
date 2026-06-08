@@ -1,6 +1,6 @@
 ---
 description: Review of plugin-loader package improvements — DRY, type safety, logging, security, error handling
-dependencies: 3-review-core-api
+prereq: review-core-api
 ---
 
 # Plugin Loader Package Review — Summary

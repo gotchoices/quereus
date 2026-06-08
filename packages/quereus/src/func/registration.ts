@@ -1,5 +1,5 @@
 import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
-	TableValuedFunctionSchema, AggregateFunctionSchema } from '../schema/function.js';
+	TableValuedFunctionSchema, AggregateFunctionSchema, TVFAdvertisement } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
 import type { ScalarType, RelationType } from '../common/datatype.js';
 import { REAL_TYPE } from '../types/builtin-types.js';
@@ -32,6 +32,16 @@ interface ScalarFuncOptions {
 	 * that the argument types are acceptable for this function.
 	 */
 	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+	/** Argument indices on which this function is injective when all other arguments are held constant. */
+	injectiveOnArgs?: readonly number[];
+	/** Per-argument monotonicity when all other arguments are held constant. */
+	monotoneOnArgs?: { readonly [argIndex: number]: 'increasing' | 'decreasing' };
+	/**
+	 * Per-argument range-rewrite kind for monotone-but-lossy functions. The
+	 * actual boundary computation lives on the argument's logical type
+	 * (`LogicalType.bucketBounds(kind, value)`).
+	 */
+	rangeRewriteOnArg?: { readonly [argIndex: number]: { readonly kind: string } };
 }
 
 /**
@@ -48,6 +58,8 @@ interface TableValuedFuncOptions {
 	deterministic?: boolean;
 	/** Return type (relation) information */
 	returnType?: RelationType;
+	/** Optional relational / physical property advertisement */
+	relationalAdvertisement?: TVFAdvertisement;
 }
 
 /* Interim values for aggregate functions don't have to be SqlValue; they can be anything */
@@ -107,7 +119,10 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		returnType,
 		implementation: jsFunc,
 		inferReturnType: options.inferReturnType,
-		validateArgTypes: options.validateArgTypes
+		validateArgTypes: options.validateArgTypes,
+		injectiveOnArgs: options.injectiveOnArgs,
+		monotoneOnArgs: options.monotoneOnArgs,
+		rangeRewriteOnArg: options.rangeRewriteOnArg,
 	};
 }
 
@@ -134,7 +149,8 @@ export function createTableValuedFunction(options: TableValuedFuncOptions, jsFun
 		numArgs: options.numArgs,
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
 		returnType,
-		implementation: jsFunc
+		implementation: jsFunc,
+		relationalAdvertisement: options.relationalAdvertisement
 	};
 }
 
@@ -162,7 +178,8 @@ export function createIntegratedTableValuedFunction(options: TableValuedFuncOpti
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
 		returnType,
 		implementation: jsFunc,
-		isIntegrated: true
+		isIntegrated: true,
+		relationalAdvertisement: options.relationalAdvertisement
 	};
 }
 

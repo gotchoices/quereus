@@ -6,6 +6,7 @@ import { JoinNode } from '../../nodes/join-node.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
+import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:quickpick');
 
@@ -93,7 +94,12 @@ function extractJoinGraph(node: PlanNode): JoinGraph | null {
     const b = parseInt(bStr, 10);
     // Leave multiple conditions to be AND-combined when consumed
     const combined = conds.length === 1 ? conds[0] : conds.reduce((acc, cur) =>
-      new BinaryOpNode(relations[a].scope, { type: 'binary', operator: 'AND' } as any, acc, cur)
+      new BinaryOpNode(
+        relations[a].scope,
+        { type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+        acc,
+        cur
+      )
     );
     predicates.push({ leftIndex: a, rightIndex: b, condition: combined });
   }
@@ -125,8 +131,15 @@ function buildLeftDeepPlan(order: number[], graph: JoinGraph): RelationalPlanNod
       if (connects) connectors.push(p.condition);
     }
     const cond = connectors.length === 0 ? undefined : connectors.reduce((acc, cur) =>
-      acc ? new BinaryOpNode(current!.scope, { type: 'binary', operator: 'AND' } as any, acc, cur) : cur
-    , undefined as unknown as ScalarPlanNode | undefined);
+      acc
+        ? new BinaryOpNode(
+            current!.scope,
+            { type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+            acc,
+            cur
+          )
+        : cur
+    , undefined as ScalarPlanNode | undefined);
     current = new JoinNode(current.scope, current, next, 'inner', cond);
     chosen.add(idx);
   }
@@ -149,7 +162,16 @@ function buildBushyPlan(graph: JoinGraph): RelationalPlanNode {
       if (crosses) conns.push(p.condition);
     }
     if (conns.length === 0) return undefined;
-    return conns.reduce((acc, cur) => acc ? new BinaryOpNode(graph.relations[0].scope, { type: 'binary', operator: 'AND' } as any, acc, cur) : cur, undefined as unknown as ScalarPlanNode | undefined);
+    return conns.reduce((acc, cur) =>
+      acc
+        ? new BinaryOpNode(
+            graph.relations[0].scope,
+            { type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+            acc,
+            cur
+          )
+        : cur,
+      undefined as ScalarPlanNode | undefined);
   }
 
   while (components.length > 1) {
@@ -194,6 +216,16 @@ export function ruleQuickPickJoinEnumeration(node: PlanNode, context: OptContext
   const graph = extractJoinGraph(node);
   if (!graph) return null;
   if (graph.relations.length < 3) return null; // Only helpful for 3+ relations
+
+  // Refuse to reorder when any participating relation carries a write —
+  // QuickPick enumerates arbitrary join orderings, which would change the
+  // user-visible execution order of side-effect subtrees.
+  for (const rel of graph.relations) {
+    if (PlanNodeCharacteristics.subtreeHasSideEffects(rel)) {
+      log('quickpick skipped: a relation has side effects');
+      return null;
+    }
+  }
 
   const baselineCost = estimatePlanCost(node as unknown as RelationalPlanNode);
   if (baselineCost < (qk.minTriggerCost ?? 0)) return null;

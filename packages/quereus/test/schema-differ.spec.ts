@@ -23,6 +23,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: [],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -42,6 +43,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: [],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -60,6 +62,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: ['index'],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -76,6 +79,7 @@ describe('Schema Differ', () => {
 					columnsToAdd: ['col1 TEXT'],
 					columnsToDrop: ['select'],
 					columnsToAlter: [],
+					columnsToRename: [],
 				}],
 				viewsToCreate: [],
 				viewsToDrop: [],
@@ -83,6 +87,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: [],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -102,6 +107,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: [],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff, 'my schema');
 			expect(ddl).to.deep.equal([
@@ -120,6 +126,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: [],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -138,6 +145,7 @@ describe('Schema Differ', () => {
 				indexesToDrop: [],
 				assertionsToCreate: [],
 				assertionsToDrop: [],
+				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([

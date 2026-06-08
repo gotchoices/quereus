@@ -135,6 +135,10 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     return {
       readonly: false, // DML executor has side effects
       idempotent: false, // DML operations are generally not idempotent
+      // Non-deterministic via the side-effect axis: a write changes
+      // database state, so the executor cannot be folded by determinism-
+      // gated machinery (CHECK / DEFAULT / generated columns / assertions).
+      deterministic: false,
     };
   }
 }

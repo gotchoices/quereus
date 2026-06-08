@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
+
+type ResultRow = Record<string, SqlValue>;
 
 describe('Extended constraint pushdown', () => {
 	let db: Database;
@@ -36,7 +39,7 @@ describe('Extended constraint pushdown', () => {
 	describe('IS NULL on NOT NULL column', () => {
 		it('returns empty result for IS NULL on PK column', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT * FROM items WHERE id IS NULL")) {
 				rows.push(r);
 			}
@@ -45,7 +48,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns empty result for IS NULL on NOT NULL column', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT * FROM items WHERE name IS NULL")) {
 				rows.push(r);
 			}
@@ -56,7 +59,7 @@ describe('Extended constraint pushdown', () => {
 	describe('IS NOT NULL on NOT NULL column', () => {
 		it('returns all rows for IS NOT NULL on PK column', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT * FROM items WHERE id IS NOT NULL")) {
 				rows.push(r);
 			}
@@ -65,7 +68,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns all rows for IS NOT NULL on NOT NULL column', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT * FROM items WHERE name IS NOT NULL")) {
 				rows.push(r);
 			}
@@ -76,7 +79,7 @@ describe('Extended constraint pushdown', () => {
 	describe('IS NULL / IS NOT NULL on nullable column', () => {
 		it('returns rows where nullable column IS NULL', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE category IS NULL ORDER BY id")) {
 				rows.push(r);
 			}
@@ -87,7 +90,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns rows where nullable column IS NOT NULL', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE category IS NOT NULL ORDER BY id")) {
 				rows.push(r);
 			}
@@ -103,7 +106,7 @@ describe('Extended constraint pushdown', () => {
 	describe('IN constraint on PK', () => {
 		it('returns correct rows for IN on PK column', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id, name FROM items WHERE id IN (1, 3, 5) ORDER BY id")) {
 				rows.push(r);
 			}
@@ -118,7 +121,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns correct rows for single-value IN', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id IN (2)")) {
 				rows.push(r);
 			}
@@ -128,7 +131,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns empty result for IN with no matching values', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT * FROM items WHERE id IN (99, 100)")) {
 				rows.push(r);
 			}
@@ -139,7 +142,7 @@ describe('Extended constraint pushdown', () => {
 	describe('IN combined with other constraints', () => {
 		it('combines IN with additional WHERE clause', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id IN (1, 2, 3, 4) AND value > 25 ORDER BY id")) {
 				rows.push(r);
 			}
@@ -154,7 +157,7 @@ describe('Extended constraint pushdown', () => {
 	describe('IS NULL combined with other constraints', () => {
 		it('IS NULL on PK combined with other filter returns empty', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT * FROM items WHERE id IS NULL AND name = 'Alpha'")) {
 				rows.push(r);
 			}
@@ -163,7 +166,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('IS NOT NULL on PK with IN still works', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id IS NOT NULL AND id IN (2, 4) ORDER BY id")) {
 				rows.push(r);
 			}
@@ -177,11 +180,11 @@ describe('Extended constraint pushdown', () => {
 
 	describe('IS NULL index-level optimization', () => {
 		async function getPlanNodeTypes(sql: string): Promise<string[]> {
-			const planRows: any[] = [];
+			const planRows: ResultRow[] = [];
 			for await (const r of db.eval(`SELECT node_type FROM query_plan('${sql.replace(/'/g, "''")}')`)) {
 				planRows.push(r);
 			}
-			return planRows.map(r => r.node_type);
+			return planRows.map(r => String(r.node_type));
 		}
 
 		it('uses EmptyResult node for IS NULL on PK column', async () => {
@@ -221,7 +224,7 @@ describe('Extended constraint pushdown', () => {
 	describe('OR predicates', () => {
 		it('returns correct rows for OR of equalities on PK', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id = 1 OR id = 3 ORDER BY id")) {
 				rows.push(r);
 			}
@@ -232,7 +235,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns correct rows for three-way OR of equalities on PK', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id = 1 OR id = 3 OR id = 5 ORDER BY id")) {
 				rows.push(r);
 			}
@@ -244,7 +247,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns correct rows for OR of equalities on non-PK column', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE category = 'A' OR category = 'B' ORDER BY id")) {
 				rows.push(r);
 			}
@@ -256,7 +259,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns correct rows for OR on different columns (residual filter)', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id = 1 OR name = 'Beta' ORDER BY id")) {
 				rows.push(r);
 			}
@@ -267,7 +270,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('returns correct rows for OR combined with AND', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE (id = 1 OR id = 3 OR id = 5) AND value > 25 ORDER BY id")) {
 				rows.push(r);
 			}
@@ -278,7 +281,7 @@ describe('Extended constraint pushdown', () => {
 
 		it('handles OR with range predicate as residual correctly', async () => {
 			await setupTable();
-			const rows: any[] = [];
+			const rows: ResultRow[] = [];
 			for await (const r of db.eval("SELECT id FROM items WHERE id > 3 OR id < 2 ORDER BY id")) {
 				rows.push(r);
 			}
@@ -293,11 +296,11 @@ describe('Extended constraint pushdown', () => {
 
 	describe('OR plan-level optimization', () => {
 		async function getPlanNodeTypes(sql: string): Promise<string[]> {
-			const planRows: any[] = [];
+			const planRows: ResultRow[] = [];
 			for await (const r of db.eval(`SELECT node_type FROM query_plan('${sql.replace(/'/g, "''")}')`)) {
 				planRows.push(r);
 			}
-			return planRows.map(r => r.node_type);
+			return planRows.map(r => String(r.node_type));
 		}
 
 		it('uses IndexSeek for OR of equalities on PK (normalizer collapses to IN)', async () => {

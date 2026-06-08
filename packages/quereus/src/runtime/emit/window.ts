@@ -14,6 +14,7 @@ import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import type * as AST from '../../parser/ast.js';
 import { createRowSlot, type RowSlot } from '../context-helpers.js';
+import { tryExtractNumericLiteral } from '../../util/ast-literal.js';
 
 const log = createLogger('runtime:emit:window');
 
@@ -89,15 +90,27 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 			argOffset += count;
 		}
 
-		// Collect all rows (window functions require materialization for frame evaluation)
-		const allRows: Row[] = [];
-		for await (const row of source) {
-			allRows.push(row);
-		}
-
 		// Single source slot shared across all partition/sort/ranking/aggregate operations
 		const sourceSlot = createRowSlot(rctx, sourceRowDescriptor);
 		try {
+			if (plan.streaming) {
+				// Streaming fast path: source already arrives in
+				// [PARTITION BY..., ORDER BY] order, so we walk it once and emit
+				// in source order without materializing.
+				yield* runStreaming(
+					plan, functionSchemas, rctx, source, sourceRowDescriptor,
+					partitionCallbackList, orderByCallbackList, funcArgCallbackGroups,
+					partitionKeyNormalizers, orderByEqualityComparators,
+				);
+				return;
+			}
+
+			// Buffered path: materialize then partition/sort.
+			const allRows: Row[] = [];
+			for await (const row of source) {
+				allRows.push(row);
+			}
+
 			if (plan.windowSpec.partitionBy.length === 0) {
 				// No partitioning - process as single partition
 				yield* processPartition(
@@ -153,10 +166,14 @@ async function groupByPartitions(
 
 	for (const row of rows) {
 		sourceSlot.set(row);
-		const partitionValues = await Promise.all(partitionCallbacks.map(callback =>
-			callback(rctx)
-		));
-		const partitionKey = serializeKeyNullGrouping(partitionValues as SqlValue[], keyNormalizers);
+		// Sequential evaluation: parallel callbacks that share a plan subtree
+		// (e.g. PARTITION BY (SELECT ... FROM cte), (SELECT ... FROM cte))
+		// would race on the shared inner-scan RowSlot.
+		const partitionValues: SqlValue[] = [];
+		for (const callback of partitionCallbacks) {
+			partitionValues.push(await callback(rctx) as SqlValue);
+		}
+		const partitionKey = serializeKeyNullGrouping(partitionValues, keyNormalizers);
 
 		if (!partitions.has(partitionKey)) {
 			partitions.set(partitionKey, []);
@@ -273,33 +290,28 @@ async function sortRows(
 		return { rows, orderByValues: rows.map(() => []) };
 	}
 
-	// Pre-evaluate ORDER BY values for all rows to avoid async in sort
-	const rowsWithValues = await Promise.all(rows.map(async (row) => {
+	// Pre-evaluate ORDER BY values for all rows to avoid async in sort.
+	// Sequential outer loop: parallel iterations would race on the shared
+	// sourceSlot. Sequential inner loop: parallel callbacks that share a
+	// plan subtree would race on the shared inner-scan RowSlot.
+	const rowsWithValues: Array<{ row: Row; values: SqlValue[] }> = [];
+	for (const row of rows) {
 		sourceSlot.set(row);
-		const values = await Promise.all(orderByCallbacks.map(async (callback) => {
-			const result = callback(rctx);
-			return await Promise.resolve(result);
-		}));
-		return { row, values };
-	}));
+		const values: SqlValue[] = [];
+		for (const callback of orderByCallbacks) {
+			values.push(await callback(rctx) as SqlValue);
+		}
+		rowsWithValues.push({ row, values });
+	}
 
 	// Now sort using the pre-evaluated values
 	rowsWithValues.sort((a, b) => {
 		// Compare each ORDER BY expression in sequence
 		for (let i = 0; i < orderBy.length; i++) {
-			const comparator = preResolvedComparators[i];
-			const valueA = a.values[i] as SqlValue;
-			const valueB = b.values[i] as SqlValue;
-
-			// Use pre-created optimized comparator
-			const comparison = comparator(valueA, valueB);
-
-			// If not equal, return comparison result
+			const comparison = preResolvedComparators[i](a.values[i], b.values[i]);
 			if (comparison !== 0) {
 				return comparison;
 			}
-
-			// Equal, continue to next ORDER BY expression
 		}
 
 		return 0; // All ORDER BY expressions are equal
@@ -307,7 +319,7 @@ async function sortRows(
 
 	return {
 		rows: rowsWithValues.map(item => item.row),
-		orderByValues: rowsWithValues.map(item => item.values as SqlValue[])
+		orderByValues: rowsWithValues.map(item => item.values)
 	};
 }
 
@@ -734,20 +746,911 @@ function getFrameOffset(expr: AST.Expression): number {
 	return value;
 }
 
-function tryExtractNumericLiteral(expr: AST.Expression): number | undefined {
-	if (expr.type === 'literal') {
-		const v = expr.value;
-		if (typeof v === 'number') return v;
-		if (typeof v === 'bigint') return Number(v);
-		return undefined;
+// ============================================================================
+// Streaming fast-path emitter
+// ============================================================================
+//
+// Activated when `WindowNode.streaming` is set by `rule-monotonic-window`. The
+// source already arrives in `[PARTITION BY..., ORDER BY]` order, so we walk
+// it once with O(P) per-partition state instead of buffering and sorting.
+//
+// Per-row pipeline:
+//   1. Compute partition key + ORDER BY values for the current row.
+//   2. On partition boundary: flush the trailing peer group (assigns the final
+//      RANGE-mode running-aggregate value), flush LEAD's read-ahead buffer
+//      with default values, and yield all queued rows.
+//   3. On peer-group boundary: assign current accumulator to all RANGE-mode
+//      runningAgg slots in the closing peer group.
+//   4. Append a queue entry for the current row, with one slot per function.
+//   5. Update each function's state and fill slots that can be filled now.
+//   6. Yield queue front rows whose slots are all filled.
+
+interface StreamingFunctionContext {
+	/** Index in the WindowNode's `functions` / `functionArguments` arrays. */
+	readonly fi: number;
+	readonly schema: WindowFunctionSchema;
+	readonly args: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>;
+}
+
+/**
+ * Per-row queue entry shared across all functions. `filled[fi]` is true when
+ * function `fi`'s output for this row is finalised. When `pending` reaches 0,
+ * the entry can be yielded.
+ */
+interface StreamingRowEntry {
+	/** Output row: `[...sourceRow, slot0, slot1, ...]`. */
+	row: SqlValue[];
+	/** Per-function fill flags. */
+	filled: boolean[];
+	/** Number of slots still needing fill. When zero, ready to yield. */
+	pending: number;
+	/** Index in `row` where function slots start (== source column count). */
+	funcSlotsStart: number;
+}
+
+/** Per-partition mutable state for the streaming emitter. */
+interface StreamingPartitionState {
+	/** Number of rows seen in this partition (1-based for ranking). */
+	rowCount: number;
+	/** Number of distinct peer groups seen (for DENSE_RANK). */
+	denseRankCounter: number;
+	/** RANK value of the current peer group. */
+	currentRank: number;
+	/** Last row's ORDER BY values, or null at partition start. */
+	lastOrderByValues: SqlValue[] | null;
+	/**
+	 * Queue of pending output rows. Front-of-queue rows are yielded once their
+	 * slots are all filled. Bounded by `peer-group-size + max(LEAD offset)`.
+	 */
+	queue: StreamingRowEntry[];
+	/** Per-function state, indexed by function position. */
+	funcStates: StreamingFuncState[];
+	/** Pending peer group entries needing RANGE-mode runningAgg fill. */
+	pendingPeers: StreamingRowEntry[];
+}
+
+interface StreamingFuncState {
+	mode: import('../../planner/nodes/window-node.js').StreamingWindowFunctionMode;
+	/** Ring buffer for LAG: prior `n+1` evaluated arg-values (newest at end). */
+	lagBuffer?: SqlValue[];
+	/** Pending entries holding back for LEAD. */
+	leadQueue?: StreamingRowEntry[];
+	/** FIRST_VALUE cache: first row's expr value for this partition. */
+	firstValueCached?: { value: SqlValue; cached: boolean };
+	/** Running-aggregate accumulator + row count. */
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	aggAccumulator?: any;
+	aggRowCount?: number;
+	/** RANGE mode running aggs: pending peer group entries waiting for fill. */
+	pendingPeerEntries?: StreamingRowEntry[];
+	/** Sliding-frame ring buffer of {argVal, orderByVal0} for rows currently in scope. */
+	slidingBuffer?: SlidingBufEntry[];
+	/** Partition row index of slidingBuffer[0] (ROWS sliding). */
+	slidingHead?: number;
+	/** Running { sum, count } accumulator for SUM/COUNT/AVG sliding (ROWS step+unstep). */
+	slidingAcc?: { sum: number; count: number };
+	/** Partition row index of next ROWS-sliding entry to finalize. */
+	slidingNextFinalizeIdx?: number;
+	/** ROWS sliding: pending entries awaiting finalization (oldest first). */
+	slidingPending?: StreamingRowEntry[];
+	/** RANGE sliding: pending entries with metadata. */
+	slidingRangePending?: SlidingRangePendingEntry[];
+}
+
+/** Per-row entry in a sliding-frame buffer (ROWS or RANGE). */
+interface SlidingBufEntry {
+	argVal: SqlValue;
+	/** Number(orderByValues[0]) — NaN for null/non-numeric. Used by RANGE only. */
+	orderByVal0: number;
+}
+
+/** Pending entry for a RANGE-sliding function. */
+interface SlidingRangePendingEntry {
+	entry: StreamingRowEntry;
+	/** Numeric ORDER BY value at this entry's row (NaN if non-finite). */
+	v_j: number;
+	/** Pre-computed `Number.isFinite(v_j)`. */
+	isFinite: boolean;
+	/** Right edge has been crossed by a later arrival. */
+	rightClosed: boolean;
+}
+
+function makeFuncState(
+	mode: import('../../planner/nodes/window-node.js').StreamingWindowFunctionMode,
+): StreamingFuncState {
+	const s: StreamingFuncState = { mode };
+	switch (mode.kind) {
+		case 'lag':
+			s.lagBuffer = [];
+			break;
+		case 'lead':
+			s.leadQueue = [];
+			break;
+		case 'firstValue':
+			s.firstValueCached = { value: null, cached: false };
+			break;
+		case 'runningAgg':
+			s.aggAccumulator = null;
+			s.aggRowCount = 0;
+			s.pendingPeerEntries = [];
+			break;
+		case 'slidingAgg':
+			s.slidingBuffer = [];
+			s.slidingHead = 0;
+			s.slidingAcc = { sum: 0, count: 0 };
+			s.slidingNextFinalizeIdx = 0;
+			if (mode.frameMode === 'rows') {
+				s.slidingPending = [];
+			} else {
+				s.slidingRangePending = [];
+			}
+			break;
+		default:
+			break;
+	}
+	return s;
+}
+
+function freshPartitionState(
+	streamingModes: ReadonlyArray<import('../../planner/nodes/window-node.js').StreamingWindowFunctionMode>,
+): StreamingPartitionState {
+	return {
+		rowCount: 0,
+		denseRankCounter: 0,
+		currentRank: 0,
+		lastOrderByValues: null,
+		queue: [],
+		funcStates: streamingModes.map(makeFuncState),
+		pendingPeers: [],
+	};
+}
+
+function arePeers(
+	a: SqlValue[],
+	b: SqlValue[],
+	cmps: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
+): boolean {
+	for (let i = 0; i < cmps.length; i++) {
+		if (cmps[i](a[i], b[i]) !== 0) return false;
+	}
+	return true;
+}
+
+/**
+ * Streaming runner. Processes one row at a time, yielding output rows once
+ * their slot values are all finalised.
+ */
+async function* runStreaming(
+	plan: WindowNode,
+	functionSchemas: ReadonlyArray<WindowFunctionSchema>,
+	rctx: RuntimeContext,
+	source: AsyncIterable<Row>,
+	sourceRowDescriptor: RowDescriptor,
+	partitionCallbacks: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>,
+	orderByCallbacks: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>,
+	funcArgCallbackGroups: ReadonlyArray<ReadonlyArray<(ctx: RuntimeContext) => OutputValue>>,
+	partitionKeyNormalizers: ReadonlyArray<(s: string) => string>,
+	orderByEqualityComparators: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
+): AsyncIterable<Row> {
+	const streaming = plan.streaming!;
+	const funcContexts: StreamingFunctionContext[] = plan.functions.map((_func, fi) => ({
+		fi,
+		schema: functionSchemas[fi],
+		args: funcArgCallbackGroups[fi],
+	}));
+	const funcCount = plan.functions.length;
+
+	// Frame mode for RANGE-vs-ROWS peer handling on running aggregates.
+	// Default frame (with ORDER BY) is RANGE; explicit ROWS UNBOUNDED PRECEDING
+	// suppresses peer-buffering.
+	const frame = plan.windowSpec.frame;
+	const isRangeMode = frame === undefined || frame.type === 'range';
+
+	let curPartitionKey: string | null = null;
+	let state: StreamingPartitionState | null = null;
+
+	// We register our own source-attribute getter directly in the rctx context.
+	// This bypasses the slot abstraction so we can fully control insertion
+	// order: each iteration we delete-then-re-set the entry, pushing it to
+	// the *end* of the map's insertion order. This matters when streaming
+	// Windows are stacked — without re-promotion, an outer Window's slot
+	// (registered later) would shadow ours during our iterations, and our
+	// attribute resolutions would read the outer Window's stale row.
+	//
+	// Use a fresh descriptor reference (NOT `sourceRowDescriptor`) so we
+	// occupy our own map slot rather than co-tenanting Window's outer
+	// `sourceSlot` entry.
+	const myDesc: RowDescriptor = [];
+	for (const k in sourceRowDescriptor) {
+		const idx = sourceRowDescriptor[+k];
+		if (idx !== undefined) myDesc[+k] = idx;
+	}
+	const myRef = { current: undefined as Row | undefined };
+	const myGetter = () => myRef.current!;
+	let myRegistered = false;
+
+	const promote = (row: Row): void => {
+		myRef.current = row;
+		// Move our entry to the end of the context map by deleting and re-adding.
+		// `Map.set` on an existing key only updates the value; it does not move
+		// the key. We need re-insertion to win attribute-index rebuilds
+		// triggered by upstream `withAsyncRowContext` cycles.
+		if (myRegistered) {
+			rctx.context.delete(myDesc);
+		}
+		rctx.context.set(myDesc, myGetter);
+		myRegistered = true;
+	};
+
+	try {
+	for await (const row of source) {
+		promote(row);
+
+		// Resolve partition key. Sequential evaluation: parallel callbacks
+		// that share a plan subtree would race on the shared inner-scan
+		// RowSlot.
+		const partitionValues: SqlValue[] = [];
+		for (const cb of partitionCallbacks) {
+			partitionValues.push(await cb(rctx) as SqlValue);
+		}
+		const partitionKey = serializeKeyNullGrouping(partitionValues, partitionKeyNormalizers);
+
+		// Resolve ORDER BY values (same shared-subtree concern as above).
+		const orderByValues: SqlValue[] = [];
+		for (const cb of orderByCallbacks) {
+			orderByValues.push(await cb(rctx) as SqlValue);
+		}
+
+		// Partition boundary: close out the previous partition.
+		if (state !== null && partitionKey !== curPartitionKey) {
+			yield* finalizePartition(state, funcContexts, isRangeMode, rctx, promote);
+			promote(row);
+			state = null;
+		}
+
+		if (state === null) {
+			state = freshPartitionState(streaming.modes);
+			curPartitionKey = partitionKey;
+		}
+
+		// Peer-group boundary detection (within the current partition).
+		const isPeerOfPrev = state.lastOrderByValues !== null &&
+			arePeers(orderByValues, state.lastOrderByValues, orderByEqualityComparators);
+
+		// Closing the prior peer group fills RANGE-mode running-agg slots.
+		if (state.lastOrderByValues !== null && !isPeerOfPrev) {
+			closePeerGroup(state, funcContexts, isRangeMode);
+		}
+
+		// Update ranking-related counters BEFORE creating the new entry: row_number
+		// and dense_rank are determined at row arrival.
+		const rowIndex0Based = state.rowCount; // 0-based position in partition
+		state.rowCount++;
+		if (!isPeerOfPrev) {
+			state.denseRankCounter++;
+			state.currentRank = rowIndex0Based + 1;
+		}
+
+		// Pre-evaluate args[0] (the value expression) for each function. Done
+		// inline because the source slot is set to the current row right now.
+		const expr0Values: SqlValue[] = new Array(funcCount).fill(null);
+		for (let fi = 0; fi < funcCount; fi++) {
+			const fc = funcContexts[fi];
+			if (fc.args.length >= 1) {
+				expr0Values[fi] = await Promise.resolve(fc.args[0](rctx)) as SqlValue;
+			}
+		}
+
+		// Numeric form of the leading ORDER BY value, used by RANGE-sliding.
+		// SQL NULL must coerce to NaN (not `Number(null) === 0`) so the
+		// non-finite-peer-span branch handles it correctly.
+		const orderByLead = orderByValues.length > 0 ? orderByValues[0] : null;
+		const orderByVal0Num = orderByLead === null ? NaN : Number(orderByLead);
+
+		// Allocate a new queue entry for this row.
+		const sourceColCount = (row as SqlValue[]).length;
+		const outRow: SqlValue[] = new Array(sourceColCount + funcCount);
+		for (let i = 0; i < sourceColCount; i++) outRow[i] = (row as SqlValue[])[i];
+		for (let i = 0; i < funcCount; i++) outRow[sourceColCount + i] = null;
+		const entry: StreamingRowEntry = {
+			row: outRow,
+			filled: new Array(funcCount).fill(false),
+			pending: funcCount,
+			funcSlotsStart: sourceColCount,
+		};
+		state.queue.push(entry);
+
+		// Per-function update: fill what we can, defer the rest.
+		for (let fi = 0; fi < funcCount; fi++) {
+			const fs = state.funcStates[fi];
+			const fc = funcContexts[fi];
+			const argVal = expr0Values[fi];
+
+			switch (fs.mode.kind) {
+				case 'rowNumber':
+					fillSlot(entry, fi, rowIndex0Based + 1);
+					break;
+				case 'rank':
+					fillSlot(entry, fi, state.currentRank);
+					break;
+				case 'denseRank':
+					fillSlot(entry, fi, state.denseRankCounter);
+					break;
+				case 'lag':
+					await fillLag(entry, fi, fs, fc, argVal, rctx);
+					break;
+				case 'lead':
+					handleLead(entry, fi, fs, argVal);
+					break;
+				case 'firstValue':
+					if (!fs.firstValueCached!.cached) {
+						fs.firstValueCached!.value = argVal;
+						fs.firstValueCached!.cached = true;
+					}
+					fillSlot(entry, fi, fs.firstValueCached!.value);
+					break;
+				case 'lastValue':
+					fillSlot(entry, fi, argVal);
+					break;
+				case 'runningAgg':
+					stepRunningAgg(entry, fi, fs, fc, argVal, isRangeMode);
+					break;
+				case 'slidingAgg':
+					handleSlidingArrival(entry, fi, fs, argVal, orderByVal0Num);
+					break;
+			}
+		}
+
+		state.lastOrderByValues = orderByValues;
+
+		// Yield any front-queue entries that are now fully filled.
+		// Promote our slot at the yielded row before yielding so downstream
+		// attribute resolution sees the yielded row, not the row we're
+		// currently processing.
+		while (state.queue.length > 0 && state.queue[0].pending === 0) {
+			const entry = state.queue.shift()!;
+			const yieldedRow = entry.row as Row;
+			promote(yieldedRow);
+			yield yieldedRow;
+		}
 	}
 
-	if (expr.type === 'unary' && (expr.operator === '+' || expr.operator === '-')) {
-		const inner = tryExtractNumericLiteral(expr.expr);
-		if (inner === undefined) return undefined;
-		return expr.operator === '-' ? -inner : inner;
+	// Source exhausted: flush trailing partition (if any).
+	if (state !== null) {
+		yield* finalizePartition(state, funcContexts, isRangeMode, rctx, promote);
+	}
+	} finally {
+		if (myRegistered) rctx.context.delete(myDesc);
+	}
+}
+
+/** Mark slot `fi` of `entry` filled with `value`. Idempotent on already-filled slots. */
+function fillSlot(entry: StreamingRowEntry, fi: number, value: SqlValue): void {
+	if (entry.filled[fi]) return;
+	entry.filled[fi] = true;
+	entry.row[entry.funcSlotsStart + fi] = value;
+	entry.pending--;
+}
+
+async function fillLag(
+	entry: StreamingRowEntry,
+	fi: number,
+	fs: StreamingFuncState,
+	fc: StreamingFunctionContext,
+	currentArgVal: SqlValue,
+	rctx: RuntimeContext,
+): Promise<void> {
+	const offset = (fs.mode as { kind: 'lag'; offset: number }).offset;
+	const buf = fs.lagBuffer!;
+	let lagged: SqlValue;
+	// LAG with offset 0 returns current row's expr value.
+	if (offset === 0) {
+		lagged = currentArgVal;
+	} else if (buf.length >= offset) {
+		// buf holds the last `offset` evaluated arg values prior to this row.
+		lagged = buf[buf.length - offset];
+	} else {
+		// Not enough history: use default if provided, else NULL.
+		lagged = await evalLagLeadDefault(fc, rctx);
+	}
+	fillSlot(entry, fi, lagged);
+	// Push current arg value into ring buffer; trim when oversized.
+	buf.push(currentArgVal);
+	if (buf.length > offset) buf.shift();
+}
+
+/** Evaluate a LAG/LEAD's optional default-value argument (args[2]) in the
+ *  current source-slot context. Mirrors the buffered emitter, which also
+ *  evaluates the default per-row in the current source context. */
+async function evalLagLeadDefault(
+	fc: StreamingFunctionContext,
+	rctx: RuntimeContext,
+): Promise<SqlValue> {
+	if (fc.args.length < 3) return null;
+	return await Promise.resolve(fc.args[2](rctx)) as SqlValue;
+}
+
+function handleLead(
+	entry: StreamingRowEntry,
+	fi: number,
+	fs: StreamingFuncState,
+	currentArgVal: SqlValue,
+): void {
+	const offset = (fs.mode as { kind: 'lead'; offset: number }).offset;
+	if (offset === 0) {
+		fillSlot(entry, fi, currentArgVal);
+		return;
+	}
+	// When this is the offset+1-th entry in the queue, fill the head's lead
+	// slot with the current row's expr value.
+	const leadQ = fs.leadQueue!;
+	if (leadQ.length >= offset) {
+		const target = leadQ[leadQ.length - offset];
+		fillSlot(target, fi, currentArgVal);
+	}
+	leadQ.push(entry);
+	// Bound to offset+1: once we've filled an entry's slot, we no longer need to
+	// keep it referenced.
+	if (leadQ.length > offset) leadQ.shift();
+}
+
+function stepRunningAgg(
+	entry: StreamingRowEntry,
+	fi: number,
+	fs: StreamingFuncState,
+	fc: StreamingFunctionContext,
+	argVal: SqlValue,
+	isRangeMode: boolean,
+): void {
+	const schema = fc.schema;
+	if (schema.step) {
+		fs.aggAccumulator = schema.step(fs.aggAccumulator, argVal);
+		fs.aggRowCount = (fs.aggRowCount ?? 0) + 1;
 	}
 
-	return undefined;
+	if (!isRangeMode) {
+		// ROWS UNBOUNDED PRECEDING TO CURRENT ROW: each row gets its post-step
+		// final value immediately.
+		const finalValue = schema.final
+			? schema.final(fs.aggAccumulator, fs.aggRowCount ?? 0)
+			: (fs.aggAccumulator as SqlValue);
+		fillSlot(entry, fi, finalValue);
+		return;
+	}
+
+	// RANGE mode: defer until peer group closes. Track this entry as part of
+	// the open peer group; we'll backfill at close.
+	fs.pendingPeerEntries!.push(entry);
+}
+
+function closePeerGroup(
+	state: StreamingPartitionState,
+	funcContexts: ReadonlyArray<StreamingFunctionContext>,
+	isRangeMode: boolean,
+): void {
+	if (!isRangeMode) return;
+	for (let fi = 0; fi < funcContexts.length; fi++) {
+		const fs = state.funcStates[fi];
+		if (fs.mode.kind !== 'runningAgg') continue;
+		const schema = funcContexts[fi].schema;
+		const value = schema.final
+			? schema.final(fs.aggAccumulator, fs.aggRowCount ?? 0)
+			: (fs.aggAccumulator as SqlValue);
+		const pending = fs.pendingPeerEntries!;
+		for (const entry of pending) {
+			fillSlot(entry, fi, value);
+		}
+		pending.length = 0;
+	}
+}
+
+async function* finalizePartition(
+	state: StreamingPartitionState,
+	funcContexts: ReadonlyArray<StreamingFunctionContext>,
+	isRangeMode: boolean,
+	rctx: RuntimeContext,
+	promote: (row: Row) => void,
+): AsyncIterable<Row> {
+	// Close trailing peer group (RANGE running aggs).
+	closePeerGroup(state, funcContexts, isRangeMode);
+	// Drain LEAD queues with default values for unfilled trailing entries.
+	for (let fi = 0; fi < funcContexts.length; fi++) {
+		const fs = state.funcStates[fi];
+		if (fs.mode.kind !== 'lead') continue;
+		const fc = funcContexts[fi];
+		const offset = fs.mode.offset;
+		if (offset === 0) continue;
+		const leadQ = fs.leadQueue!;
+		const def = await evalLagLeadDefault(fc, rctx);
+		for (const entry of leadQ) {
+			if (!entry.filled[fi]) {
+				fillSlot(entry, fi, def);
+			}
+		}
+	}
+	// Finalize trailing pending entries for sliding-frame functions. Their
+	// frames clamp at the partition end; values are computed from the
+	// current sliding state.
+	for (let fi = 0; fi < funcContexts.length; fi++) {
+		const fs = state.funcStates[fi];
+		if (fs.mode.kind !== 'slidingAgg') continue;
+		finalizeSlidingTrailing(fi, fs);
+	}
+	// Yield queued entries in order. Promote our slot to each entry's row so
+	// downstream attribute resolution sees the correct row.
+	for (const entry of state.queue) {
+		promote(entry.row as Row);
+		yield entry.row as Row;
+	}
+	state.queue.length = 0;
+}
+
+// ============================================================================
+// Sliding-frame helpers (slidingAgg mode)
+// ============================================================================
+//
+// Activated when `rule-monotonic-window` recognizes
+// `ROWS BETWEEN n PRECEDING AND m FOLLOWING` or
+// `RANGE BETWEEN <num> PRECEDING AND <num> FOLLOWING` (with literal
+// non-negative offsets) over the supported aggregates / value functions.
+//
+// ROWS strategy (per function):
+//   - `slidingBuffer` holds {argVal, orderByVal0} for rows with index in
+//     [slidingHead, currentRow]; entries fall off the front as they age out
+//     of the leftmost-pending entry's frame.
+//   - SUM/COUNT/AVG: maintain a `{ sum, count }` accumulator with step+unstep;
+//     skip null argVals (matches the schema's null-skipping semantics).
+//   - MIN/MAX/FIRST_VALUE/LAST_VALUE: recompute from the buffer slice on each
+//     finalize (acceptable for v1 — windows are typically small).
+//   - Each pending entry is finalized when row `j + following` arrives
+//     (mid-partition) or at partition close (right edge clamps to last row).
+//
+// RANGE strategy (per function):
+//   - Bounds advance by ORDER BY value, not by row offset.
+//   - Each pending entry tracks its `v_j` and a `rightClosed` flag flipped on
+//     by a later arrival whose value strictly exceeds `v_j + following`.
+//   - On finalize: scan the buffer for rows in [v_j - preceding, v_j +
+//     following] (finite v_j) or for the contiguous non-finite peer span
+//     (non-finite v_j); compute the aggregate by direct scan in v1 (no
+//     incremental acc — keeps the code simple and handles non-finite v
+//     entries cleanly).
+
+function slidingStepNum(acc: { sum: number; count: number }, argVal: SqlValue): void {
+	if (argVal === null) return;
+	acc.sum += Number(argVal);
+	acc.count += 1;
+}
+
+function slidingUnstepNum(acc: { sum: number; count: number }, argVal: SqlValue): void {
+	if (argVal === null) return;
+	acc.sum -= Number(argVal);
+	acc.count -= 1;
+}
+
+function slidingFinalAcc(name: string, acc: { sum: number; count: number }): SqlValue {
+	switch (name) {
+		case 'sum': return acc.count === 0 ? null : acc.sum;
+		case 'count': return acc.count;
+		case 'avg': return acc.count === 0 ? null : acc.sum / acc.count;
+		default: return null;
+	}
+}
+
+function slidingScanMin(buf: SlidingBufEntry[], lo: number, hi: number): SqlValue {
+	let best: SqlValue = null;
+	for (let k = lo; k <= hi; k++) {
+		const v = buf[k].argVal;
+		if (v === null) continue;
+		if (best === null || v < best) best = v;
+	}
+	return best;
+}
+
+function slidingScanMax(buf: SlidingBufEntry[], lo: number, hi: number): SqlValue {
+	let best: SqlValue = null;
+	for (let k = lo; k <= hi; k++) {
+		const v = buf[k].argVal;
+		if (v === null) continue;
+		if (best === null || v > best) best = v;
+	}
+	return best;
+}
+
+function slidingScanCountNonNull(buf: SlidingBufEntry[], lo: number, hi: number): number {
+	let n = 0;
+	for (let k = lo; k <= hi; k++) {
+		if (buf[k].argVal !== null) n++;
+	}
+	return n;
+}
+
+function slidingScanSum(buf: SlidingBufEntry[], lo: number, hi: number): { sum: number; count: number } {
+	let sum = 0, count = 0;
+	for (let k = lo; k <= hi; k++) {
+		const v = buf[k].argVal;
+		if (v === null) continue;
+		sum += Number(v);
+		count += 1;
+	}
+	return { sum, count };
+}
+
+/** Per-row dispatch for slidingAgg functions. */
+function handleSlidingArrival(
+	entry: StreamingRowEntry,
+	fi: number,
+	fs: StreamingFuncState,
+	argVal: SqlValue,
+	orderByVal0Num: number,
+): void {
+	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
+	fs.slidingBuffer!.push({ argVal, orderByVal0: orderByVal0Num });
+	if (m.frameMode === 'rows') {
+		handleSlidingRowsArrival(entry, fi, fs, m, argVal);
+	} else {
+		handleSlidingRangeArrival(entry, fi, fs, m, orderByVal0Num);
+	}
+}
+
+// ----- ROWS sliding -----
+
+function handleSlidingRowsArrival(
+	entry: StreamingRowEntry,
+	fi: number,
+	fs: StreamingFuncState,
+	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
+	argVal: SqlValue,
+): void {
+	if (m.name === 'sum' || m.name === 'count' || m.name === 'avg') {
+		slidingStepNum(fs.slidingAcc!, argVal);
+	}
+	fs.slidingPending!.push(entry);
+	while (fs.slidingPending!.length > m.following) {
+		finalizeSlidingRowsEntry(fi, fs, m);
+	}
+}
+
+function finalizeSlidingRowsEntry(
+	fi: number,
+	fs: StreamingFuncState,
+	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
+): void {
+	const j = fs.slidingNextFinalizeIdx!;
+	const targetLeft = Math.max(0, j - m.preceding);
+	// Trim left: rows that have aged out of the next-pending entry's frame.
+	while (fs.slidingHead! < targetLeft) {
+		if (m.name === 'sum' || m.name === 'count' || m.name === 'avg') {
+			slidingUnstepNum(fs.slidingAcc!, fs.slidingBuffer![0].argVal);
+		}
+		fs.slidingBuffer!.shift();
+		fs.slidingHead!++;
+	}
+	const buf = fs.slidingBuffer!;
+	const lo = 0;
+	const hi = buf.length - 1;
+	let value: SqlValue;
+	switch (m.name) {
+		case 'sum':
+		case 'count':
+		case 'avg':
+			value = slidingFinalAcc(m.name, fs.slidingAcc!);
+			break;
+		case 'min':
+			value = slidingScanMin(buf, lo, hi);
+			break;
+		case 'max':
+			value = slidingScanMax(buf, lo, hi);
+			break;
+		case 'first_value':
+			value = lo > hi ? null : buf[lo].argVal;
+			break;
+		case 'last_value':
+			value = lo > hi ? null : buf[hi].argVal;
+			break;
+		default:
+			value = null;
+	}
+	const targetEntry = fs.slidingPending!.shift()!;
+	fillSlot(targetEntry, fi, value);
+	fs.slidingNextFinalizeIdx!++;
+}
+
+// ----- RANGE sliding -----
+
+function handleSlidingRangeArrival(
+	entry: StreamingRowEntry,
+	fi: number,
+	fs: StreamingFuncState,
+	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
+	orderByVal0Num: number,
+): void {
+	const isFinite = Number.isFinite(orderByVal0Num);
+	const pending = fs.slidingRangePending!;
+	pending.push({ entry, v_j: orderByVal0Num, isFinite, rightClosed: false });
+
+	// Mark right-closed for any pending entry whose right edge has now been
+	// strictly exceeded by this arrival. Walking front-to-back: once an
+	// existing entry is right-closed, we can stop (since pending is in
+	// arrival order and v's are sorted).
+	for (const p of pending) {
+		if (p.rightClosed) continue;
+		if (!p.isFinite) {
+			// Non-finite entry: closes once a finite-v row arrives (the
+			// non-finite peer span ends).
+			if (isFinite) p.rightClosed = true;
+		} else {
+			if (isFinite && orderByVal0Num > p.v_j + m.following) p.rightClosed = true;
+			// Finite entry followed by a non-finite arrival doesn't close it
+			// (might still see more finite rows in the same partition — but
+			// since the source is monotonic, finite never follows non-finite
+			// in practice).
+		}
+	}
+
+	while (pending.length > 0 && pending[0].rightClosed) {
+		finalizeSlidingRangeEntry(fi, fs, m);
+	}
+}
+
+/**
+ * Find the buffer index range that constitutes the finite-v window
+ * [v_j - preceding, v_j + following]. Returns lo > hi for an empty range
+ * (shouldn't happen for finite v_j because v_j itself is in scope).
+ */
+function findRangeWindow(
+	buf: SlidingBufEntry[],
+	v_j: number,
+	preceding: number,
+	following: number,
+): { lo: number; hi: number } {
+	const left = v_j - preceding;
+	const right = v_j + following;
+	let lo = -1, hi = -1;
+	for (let k = 0; k < buf.length; k++) {
+		const v = buf[k].orderByVal0;
+		if (!Number.isFinite(v)) continue;
+		if (v < left) continue;
+		if (v > right) break; // buffer is in v-sorted order for finite v
+		if (lo < 0) lo = k;
+		hi = k;
+	}
+	return { lo, hi };
+}
+
+/**
+ * Find the contiguous non-finite peer span around the given pending entry's
+ * row in the buffer. The span is the maximal run of consecutive non-finite-v
+ * rows in `buf` that includes `entryIdx` (or the latest non-finite row, if
+ * the entry has already been shifted out).
+ */
+function findNonFinitePeerSpan(buf: SlidingBufEntry[]): { lo: number; hi: number } {
+	// Find the run that contains the entry. For monotonic input, non-finite
+	// rows cluster at edges. We look for any non-finite run.
+	let lo = -1, hi = -1;
+	for (let k = 0; k < buf.length; k++) {
+		if (!Number.isFinite(buf[k].orderByVal0)) {
+			if (lo < 0) lo = k;
+			hi = k;
+		}
+	}
+	return { lo, hi };
+}
+
+function finalizeSlidingRangeEntry(
+	fi: number,
+	fs: StreamingFuncState,
+	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
+): void {
+	const pending = fs.slidingRangePending!;
+	const head = pending[0];
+	const buf = fs.slidingBuffer!;
+	let lo: number, hi: number;
+	if (head.isFinite) {
+		({ lo, hi } = findRangeWindow(buf, head.v_j, m.preceding, m.following));
+	} else {
+		({ lo, hi } = findNonFinitePeerSpan(buf));
+	}
+
+	let value: SqlValue;
+	if (lo < 0 || hi < 0 || lo > hi) {
+		// Empty frame: SUM/MIN/MAX/FIRST/LAST return NULL, COUNT returns 0.
+		value = m.name === 'count' ? 0 : null;
+	} else {
+		switch (m.name) {
+			case 'sum': {
+				const r = slidingScanSum(buf, lo, hi);
+				value = r.count === 0 ? null : r.sum;
+				break;
+			}
+			case 'count':
+				value = slidingScanCountNonNull(buf, lo, hi);
+				break;
+			case 'avg': {
+				const r = slidingScanSum(buf, lo, hi);
+				value = r.count === 0 ? null : r.sum / r.count;
+				break;
+			}
+			case 'min':
+				value = slidingScanMin(buf, lo, hi);
+				break;
+			case 'max':
+				value = slidingScanMax(buf, lo, hi);
+				break;
+			case 'first_value':
+				value = buf[lo].argVal;
+				break;
+			case 'last_value':
+				value = buf[hi].argVal;
+				break;
+			default:
+				value = null;
+		}
+	}
+	fillSlot(head.entry, fi, value);
+	pending.shift();
+
+	// Trim buffer rows that no remaining pending entry needs.
+	trimSlidingRangeBuffer(fs, m);
+}
+
+function trimSlidingRangeBuffer(
+	fs: StreamingFuncState,
+	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
+): void {
+	const pending = fs.slidingRangePending!;
+	const buf = fs.slidingBuffer!;
+	if (pending.length === 0) {
+		buf.length = 0;
+		return;
+	}
+	// Find the smallest left edge across remaining pending entries. For
+	// finite pending entries, left = v_p - preceding. Pending is in arrival
+	// (v-sorted) order, so the front entry has the smallest left.
+	let minFiniteLeft: number | null = null;
+	let anyNonFinitePending = false;
+	for (const p of pending) {
+		if (p.isFinite) {
+			const left = p.v_j - m.preceding;
+			if (minFiniteLeft === null || left < minFiniteLeft) minFiniteLeft = left;
+		} else {
+			anyNonFinitePending = true;
+		}
+	}
+	// Trim front rows that are outside any pending entry's frame.
+	while (buf.length > 0) {
+		const v0 = buf[0].orderByVal0;
+		if (!Number.isFinite(v0)) {
+			// Drop leading non-finite rows only if no non-finite pending entry
+			// would still need them.
+			if (anyNonFinitePending) break;
+			buf.shift();
+			continue;
+		}
+		// Finite row: drop if smaller than every pending finite entry's left.
+		if (minFiniteLeft === null) {
+			// Only non-finite pending entries remain; finite rows aren't in
+			// any of their frames.
+			buf.shift();
+			continue;
+		}
+		if (v0 < minFiniteLeft) {
+			buf.shift();
+			continue;
+		}
+		break;
+	}
+}
+
+function finalizeSlidingTrailing(fi: number, fs: StreamingFuncState): void {
+	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
+	if (m.frameMode === 'rows') {
+		while (fs.slidingPending!.length > 0) {
+			finalizeSlidingRowsEntry(fi, fs, m);
+		}
+	} else {
+		while (fs.slidingRangePending!.length > 0) {
+			finalizeSlidingRangeEntry(fi, fs, m);
+		}
+	}
 }
 

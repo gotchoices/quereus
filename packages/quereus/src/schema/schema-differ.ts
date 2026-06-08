@@ -1,9 +1,34 @@
-import type { SchemaCatalog } from './catalog.js';
+import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { createTableToString, createViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
+import { createLogger } from '../common/logger.js';
+
+const log = createLogger('schema:differ');
+const warnLog = log.extend('warn');
+
+/** Reserved tag namespace prefix used for differ-recognized hints. */
+const QUEREUS_TAG_PREFIX = 'quereus.';
+
+/** Recognized tag keys under the `quereus.*` namespace. */
+const KNOWN_QUEREUS_KEYS = new Set(['quereus.id', 'quereus.previous_name']);
+
+export type RenamePolicy = 'allow' | 'require-hint' | 'deny';
+
+export type RenameKind = 'table' | 'view' | 'index' | 'constraint';
+
+export interface RenameOp {
+	kind: RenameKind;
+	oldName: string;
+	newName: string;
+}
+
+export interface ColumnRenameOp {
+	oldName: string;
+	newName: string;
+}
 
 /**
  * Represents the difference between a declared schema and actual database state
@@ -18,6 +43,8 @@ export interface SchemaDiff {
 	indexesToDrop: string[];
 	assertionsToCreate: string[];
 	assertionsToDrop: string[];
+	/** Renames detected via `quereus.id` / `quereus.previous_name` hints. */
+	renames: RenameOp[];
 }
 
 export interface ColumnAttributeChange {
@@ -40,6 +67,10 @@ export interface TableAlterDiff {
 	columnsToAdd: string[];
 	columnsToDrop: string[];
 	columnsToAlter: ColumnAttributeChange[];
+	/** Column renames discovered via `quereus.id` / `quereus.previous_name` on declared columns. */
+	columnsToRename: ColumnRenameOp[];
+	/** Constraint renames discovered via tag hints (table-level named constraints only). */
+	constraintsToRename?: ColumnRenameOp[];
 	primaryKeyChange?: {
 		oldPkColumns: string[];
 		newPkColumns: Array<{ name: string; direction?: 'asc' | 'desc' }>;
@@ -51,7 +82,8 @@ export interface TableAlterDiff {
  */
 export function computeSchemaDiff(
 	declaredSchema: AST.DeclareSchemaStmt,
-	actualCatalog: SchemaCatalog
+	actualCatalog: SchemaCatalog,
+	policy: RenamePolicy = 'allow',
 ): SchemaDiff {
 	const diff: SchemaDiff = {
 		tablesToCreate: [],
@@ -62,7 +94,8 @@ export function computeSchemaDiff(
 		indexesToCreate: [],
 		indexesToDrop: [],
 		assertionsToCreate: [],
-		assertionsToDrop: []
+		assertionsToDrop: [],
+		renames: [],
 	};
 
 	const targetSchemaName = actualCatalog.schemaName;
@@ -81,12 +114,21 @@ export function computeSchemaDiff(
 		switch (item.type) {
 			case 'declaredTable':
 				declaredTables.set(item.tableStmt.table.name.toLowerCase(), item);
+				warnUnknownQuereusKeys(item.tableStmt.tags, 'table', item.tableStmt.table.name);
+				for (const col of item.tableStmt.columns) {
+					warnUnknownQuereusKeys(col.tags, 'column', `${item.tableStmt.table.name}.${col.name}`);
+				}
+				for (const c of item.tableStmt.constraints ?? []) {
+					if (c.name) warnUnknownQuereusKeys(c.tags, 'constraint', c.name);
+				}
 				break;
 			case 'declaredView':
 				declaredViews.set(item.viewStmt.view.name.toLowerCase(), item);
+				warnUnknownQuereusKeys(item.viewStmt.tags, 'view', item.viewStmt.view.name);
 				break;
 			case 'declaredIndex':
 				declaredIndexes.set(item.indexStmt.index.name.toLowerCase(), item);
+				warnUnknownQuereusKeys(item.indexStmt.tags, 'index', item.indexStmt.index.name);
 				break;
 			case 'declaredAssertion':
 				declaredAssertions.set(item.assertionStmt.name.toLowerCase(), item);
@@ -99,59 +141,114 @@ export function computeSchemaDiff(
 	const actualViews = new Map(actualCatalog.views.map(v => [v.name.toLowerCase(), v]));
 	const actualIndexes = new Map(actualCatalog.indexes.map(i => [i.name.toLowerCase(), i]));
 
-	// Find tables to create (in declared but not in actual)
+	// Resolve renames per-kind. Each call returns:
+	//   - rename ops (oldName -> newName)
+	//   - matched pairs (declaredKey -> actual): for the alter-diff loop later
+	//   - consumedActuals: actuals that are now spoken-for by a rename and must
+	//     not be dropped
+	const tableRenames = resolveRenames<AST.DeclaredTable, CatalogTable>({
+		kind: 'table',
+		declared: declaredTables,
+		actual: actualTables,
+		getDeclaredName: d => d.tableStmt.table.name,
+		getActualName: a => a.name,
+		getDeclaredTags: d => d.tableStmt.tags,
+		getActualTags: a => a.tags,
+		policy,
+	});
+	diff.renames.push(...tableRenames.renames);
+
+	const viewRenames = resolveRenames<AST.DeclaredView, CatalogView>({
+		kind: 'view',
+		declared: declaredViews,
+		actual: actualViews,
+		getDeclaredName: d => d.viewStmt.view.name,
+		getActualName: a => a.name,
+		getDeclaredTags: d => d.viewStmt.tags,
+		getActualTags: a => a.tags,
+		policy,
+	});
+	diff.renames.push(...viewRenames.renames);
+
+	const indexRenames = resolveRenames<AST.DeclaredIndex, CatalogIndex>({
+		kind: 'index',
+		declared: declaredIndexes,
+		actual: actualIndexes,
+		getDeclaredName: d => d.indexStmt.index.name,
+		getActualName: a => a.name,
+		getDeclaredTags: d => d.indexStmt.tags,
+		getActualTags: a => a.tags,
+		policy,
+	});
+	diff.renames.push(...indexRenames.renames);
+
+	// Tables: creates / alters
 	for (const [name, declaredTable] of declaredTables) {
-		if (!actualTables.has(name)) {
-			// Build the effective table statement, applying schema-level defaults
-			const tableStmt = declaredTable.tableStmt;
-			const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
-			diff.tablesToCreate.push(createTableToString(effectiveStmt));
-		} else {
-			// Table exists - check if it needs alteration
-			const alterDiff = computeTableAlterDiff(declaredTable, actualTables.get(name)!);
-			if (alterDiff.columnsToAdd.length > 0 || alterDiff.columnsToDrop.length > 0 || alterDiff.columnsToAlter.length > 0 || alterDiff.primaryKeyChange) {
+		const tableStmt = declaredTable.tableStmt;
+		const matchedActual = tableRenames.pairs.get(name);
+		if (matchedActual) {
+			// Either a rename match or a name-based match — compute alter diff against the matched actual.
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy);
+			// If this was a rename, set the alter target to the new name (post-rename)
+			if (matchedActual.name.toLowerCase() !== name) {
+				alterDiff.tableName = tableStmt.table.name;
+			}
+			if (
+				alterDiff.columnsToAdd.length > 0
+				|| alterDiff.columnsToDrop.length > 0
+				|| alterDiff.columnsToAlter.length > 0
+				|| alterDiff.columnsToRename.length > 0
+				|| (alterDiff.constraintsToRename?.length ?? 0) > 0
+				|| alterDiff.primaryKeyChange
+			) {
 				diff.tablesToAlter.push(alterDiff);
 			}
+		} else {
+			const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
+			diff.tablesToCreate.push(createTableToString(effectiveStmt));
 		}
 	}
 
-	// Find tables to drop (in actual but not in declared)
+	// Tables: drops (skip those consumed by a rename)
+	const dropSet = new Set<string>();
 	for (const [name] of actualTables) {
-		if (!declaredTables.has(name)) {
-			diff.tablesToDrop.push(name);
-		}
+		if (tableRenames.consumedActuals.has(name)) continue;
+		if (!declaredTables.has(name)) dropSet.add(name);
 	}
+	diff.tablesToDrop = orderDropsByFKDependency(dropSet, actualTables);
 
-	// Find views to create/drop
+	// Views: creates / drops
 	for (const [name, declaredView] of declaredViews) {
-		if (!actualViews.has(name)) {
-			// Generate proper view DDL using AST stringifier
+		if (!viewRenames.pairs.has(name)) {
 			diff.viewsToCreate.push(createViewToString(declaredView.viewStmt));
 		}
 	}
-
 	for (const [name] of actualViews) {
-		if (!declaredViews.has(name)) {
-			diff.viewsToDrop.push(name);
-		}
+		if (viewRenames.consumedActuals.has(name)) continue;
+		if (!declaredViews.has(name)) diff.viewsToDrop.push(name);
 	}
 
-	// Find indexes to create/drop
+	// Indexes: creates / drops
 	for (const [name, declaredIndex] of declaredIndexes) {
-		if (!actualIndexes.has(name)) {
-			// Apply schema name to the index and its table reference
+		if (!indexRenames.pairs.has(name)) {
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
 			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
 		}
 	}
-
 	for (const [name] of actualIndexes) {
-		if (!declaredIndexes.has(name)) {
-			diff.indexesToDrop.push(name);
-		}
+		if (indexRenames.consumedActuals.has(name)) continue;
+		if (!declaredIndexes.has(name)) diff.indexesToDrop.push(name);
 	}
 
-	// Find assertions to create/drop
+	// Apply 'require-hint' policy: any unhinted name change is an error rather
+	// than a silent drop+create.
+	if (policy === 'require-hint') {
+		enforceRequireHint('table', diff.tablesToCreate.length, diff.tablesToDrop.length);
+		enforceRequireHint('view', diff.viewsToCreate.length, diff.viewsToDrop.length);
+		enforceRequireHint('index', diff.indexesToCreate.length, diff.indexesToDrop.length);
+	}
+
+	// Assertions (no rename support — names are explicitly part of the contract).
 	const actualAssertions = new Map(actualCatalog.assertions.map(a => [a.name.toLowerCase(), a]));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
@@ -167,6 +264,170 @@ export function computeSchemaDiff(
 	}
 
 	return diff;
+}
+
+/**
+ * Generic resolver: pair declared and actual objects by name first, then by
+ * `quereus.id` and `quereus.previous_name` tag hints to detect renames.
+ *
+ * Returns:
+ *   - `renames`: ordered RenameOps to perform.
+ *   - `pairs`:  map from lowercased *declared* name to the matched actual,
+ *               for use by alter-diff (covers both name-matched and rename-matched).
+ *   - `consumedActuals`: lowercase actual names that are spoken-for by a rename
+ *                       (so the drop loop skips them).
+ */
+function resolveRenames<D, A>(args: {
+	kind: RenameKind;
+	declared: Map<string, D>;
+	actual: Map<string, A>;
+	getDeclaredName: (d: D) => string;
+	getActualName: (a: A) => string;
+	getDeclaredTags: (d: D) => Readonly<Record<string, SqlValue>> | undefined;
+	getActualTags: (a: A) => Readonly<Record<string, SqlValue>> | undefined;
+	policy: RenamePolicy;
+}): {
+	renames: RenameOp[];
+	pairs: Map<string, A>;
+	consumedActuals: Set<string>;
+} {
+	const { kind, declared, actual, getDeclaredName, getActualName, getDeclaredTags, getActualTags, policy } = args;
+
+	const renames: RenameOp[] = [];
+	const pairs = new Map<string, A>();
+	const consumedActuals = new Set<string>();
+
+	// Under 'deny' policy, skip rename detection entirely — only name matches.
+	if (policy === 'deny') {
+		for (const [dn] of declared) {
+			const nameMatch = actual.get(dn);
+			if (nameMatch) pairs.set(dn, nameMatch);
+		}
+		return { renames, pairs, consumedActuals };
+	}
+
+	// Build (id → actual) index for quick stable-id lookup.
+	const actualById = new Map<string, A>();
+	for (const [, a] of actual) {
+		const id = readQuereusHint(getActualTags(a), 'id');
+		if (id) {
+			if (actualById.has(id)) {
+				throw new QuereusError(
+					`Duplicate quereus.id '${id}' on ${kind}s in actual catalog`,
+					StatusCode.ERROR,
+				);
+			}
+			actualById.set(id, a);
+		}
+	}
+
+	// Iterate declared in insertion order. For each declared:
+	//   - hintMatch: actual resolved by quereus.id (preferred) or previous_name
+	//   - nameMatch: actual sharing the declared's name
+	//   If both exist and refer to *different* actuals → conflict (always error,
+	//   independent of policy beyond 'deny').
+	for (const [dn, d] of declared) {
+		const tags = getDeclaredTags(d);
+		const declaredId = readQuereusHint(tags, 'id');
+		const prevNamesRaw = readQuereusHint(tags, 'previous_name');
+
+		let hintMatch: A | undefined;
+		let hintMatchKey: string | undefined;
+		if (declaredId) {
+			const byId = actualById.get(declaredId);
+			if (byId) {
+				hintMatch = byId;
+				hintMatchKey = getActualName(byId).toLowerCase();
+			}
+		}
+		if (!hintMatch && prevNamesRaw) {
+			const candidates = prevNamesRaw
+				.split(',')
+				.map(s => s.trim().toLowerCase())
+				.filter(s => s.length > 0);
+			for (const cand of candidates) {
+				if (cand === dn) continue; // self-reference is never a rename source
+				const byPrev = actual.get(cand);
+				if (byPrev) {
+					hintMatch = byPrev;
+					hintMatchKey = cand;
+					break;
+				}
+			}
+		}
+
+		const nameMatch = actual.get(dn);
+		const hintIsSelf = hintMatch && hintMatchKey === dn;
+
+		// Conflict: declared name AND hint each resolve to *distinct* existing actuals.
+		if (nameMatch && hintMatch && !hintIsSelf) {
+			throw new QuereusError(
+				`Rename conflict for ${kind} '${getDeclaredName(d)}': declared name and quereus.previous_name/id resolve to different existing objects ('${dn}' vs '${hintMatchKey}')`,
+				StatusCode.ERROR,
+			);
+		}
+
+		if (nameMatch) {
+			pairs.set(dn, nameMatch);
+			continue;
+		}
+		if (hintMatch && !hintIsSelf) {
+			if (consumedActuals.has(hintMatchKey!)) {
+				throw new QuereusError(
+					`Rename conflict for ${kind} '${getDeclaredName(d)}': old object '${hintMatchKey}' already consumed by another rename`,
+					StatusCode.ERROR,
+				);
+			}
+			renames.push({ kind, oldName: getActualName(hintMatch), newName: getDeclaredName(d) });
+			pairs.set(dn, hintMatch);
+			consumedActuals.add(hintMatchKey!);
+		}
+		// Else: create path (caller emits CREATE)
+	}
+
+	return { renames, pairs, consumedActuals };
+}
+
+/**
+ * Read a `quereus.<key>` tag value as a string. Returns undefined if not present
+ * or non-string.
+ */
+function readQuereusHint(
+	tags: Readonly<Record<string, SqlValue>> | undefined,
+	key: 'id' | 'previous_name',
+): string | undefined {
+	if (!tags) return undefined;
+	const fullKey = QUEREUS_TAG_PREFIX + key;
+	const v = tags[fullKey];
+	if (typeof v !== 'string') return undefined;
+	const trimmed = v.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Soft-warn on unrecognized `quereus.*` tag keys so future versions can add
+ * keys without breaking older parsers.
+ */
+function warnUnknownQuereusKeys(
+	tags: Readonly<Record<string, SqlValue>> | undefined,
+	subject: string,
+	subjectName: string,
+): void {
+	if (!tags) return;
+	for (const key of Object.keys(tags)) {
+		if (!key.startsWith(QUEREUS_TAG_PREFIX)) continue;
+		if (KNOWN_QUEREUS_KEYS.has(key)) continue;
+		warnLog('Unknown reserved tag key %s on %s %s', key, subject, subjectName);
+	}
+}
+
+function enforceRequireHint(kind: string, creates: number, drops: number): void {
+	if (creates > 0 && drops > 0) {
+		throw new QuereusError(
+			`rename_policy = 'require-hint': ${kind} drops and creates both present (${drops} drop / ${creates} create); add 'quereus.previous_name' or 'quereus.id' to hint renames, or use 'allow' / 'deny'.`,
+			StatusCode.ERROR,
+		);
+	}
 }
 
 /**
@@ -253,46 +514,98 @@ function applyIndexDefaults(
 
 function computeTableAlterDiff(
 	declaredTable: AST.DeclaredTable,
-	actualTable: import('./catalog.js').CatalogTable,
+	actualTable: CatalogTable,
+	policy: RenamePolicy,
 ): TableAlterDiff {
 	const diff: TableAlterDiff = {
-		tableName: declaredTable.tableStmt.table.name,
+		// Default to actual's name; caller may override to declared name when this is a rename target.
+		tableName: actualTable.name,
 		columnsToAdd: [],
 		columnsToDrop: [],
 		columnsToAlter: [],
+		columnsToRename: [],
 	};
 
-	const declaredColumnsByName = new Map<string, AST.ColumnDef>();
+	// Detect column renames first so subsequent add/drop/alter operate on the
+	// post-rename column set.
+	const declaredColumns = new Map<string, AST.ColumnDef>();
 	for (const col of declaredTable.tableStmt.columns) {
-		declaredColumnsByName.set(col.name.toLowerCase(), col);
+		declaredColumns.set(col.name.toLowerCase(), col);
 	}
-	const actualColumnsByName = new Map<string, import('./catalog.js').CatalogTable['columns'][number]>();
+	const actualColumns = new Map<string, CatalogTable['columns'][number]>();
 	for (const col of actualTable.columns) {
-		actualColumnsByName.set(col.name.toLowerCase(), col);
+		actualColumns.set(col.name.toLowerCase(), col);
+	}
+
+	const colRenames = resolveRenames<AST.ColumnDef, CatalogTable['columns'][number]>({
+		kind: 'constraint', // unused for ColumnRenameOp; kind only flows into RenameOp not surfaced here
+		declared: declaredColumns,
+		actual: actualColumns,
+		getDeclaredName: d => d.name,
+		getActualName: a => a.name,
+		getDeclaredTags: d => d.tags,
+		getActualTags: a => a.tags,
+		policy,
+	});
+	for (const r of colRenames.renames) {
+		diff.columnsToRename.push({ oldName: r.oldName, newName: r.newName });
 	}
 
 	// Find columns to add (store full column definition for DDL generation)
 	for (const col of declaredTable.tableStmt.columns) {
-		if (!actualColumnsByName.has(col.name.toLowerCase())) {
+		if (!colRenames.pairs.has(col.name.toLowerCase())) {
 			diff.columnsToAdd.push(columnDefToString(col));
 		}
 	}
 
-	// Find columns to drop
+	// Find columns to drop (skip those consumed by a rename)
 	for (const col of actualTable.columns) {
-		if (!declaredColumnsByName.has(col.name.toLowerCase())) {
+		const ln = col.name.toLowerCase();
+		if (colRenames.consumedActuals.has(ln)) continue;
+		if (!declaredColumns.has(ln)) {
 			diff.columnsToDrop.push(col.name);
 		}
 	}
 
-	// Detect attribute changes for surviving columns (present in both declared + actual)
+	// Detect attribute changes for surviving columns (matched declared/actual pair)
 	for (const col of declaredTable.tableStmt.columns) {
-		const actual = actualColumnsByName.get(col.name.toLowerCase());
-		if (!actual) continue;
-		const change = computeColumnAttributeChange(col, actual);
+		const matched = colRenames.pairs.get(col.name.toLowerCase());
+		if (!matched) continue;
+		const change = computeColumnAttributeChange(col, matched);
 		if (change) {
 			diff.columnsToAlter.push(change);
 		}
+	}
+
+	// Apply require-hint to columns within this table
+	if (policy === 'require-hint') {
+		enforceRequireHint(`column (${actualTable.name})`, diff.columnsToAdd.length, diff.columnsToDrop.length);
+	}
+
+	// Detect named-constraint renames (table-level only). We do not surface
+	// drops/creates of constraints here — the engine has no ALTER for those
+	// today; the caller would have to manage that out-of-band. For renames,
+	// when a primitive doesn't exist this becomes drop+recreate at DDL emit time.
+	const declaredNamedConstraints = new Map<string, AST.TableConstraint>();
+	for (const c of declaredTable.tableStmt.constraints ?? []) {
+		if (c.name) declaredNamedConstraints.set(c.name.toLowerCase(), c);
+	}
+	const actualNamedConstraints = new Map<string, CatalogTable['namedConstraints'][number]>();
+	for (const c of actualTable.namedConstraints ?? []) {
+		actualNamedConstraints.set(c.name.toLowerCase(), c);
+	}
+	const constraintRenames = resolveRenames<AST.TableConstraint, CatalogTable['namedConstraints'][number]>({
+		kind: 'constraint',
+		declared: declaredNamedConstraints,
+		actual: actualNamedConstraints,
+		getDeclaredName: d => d.name!,
+		getActualName: a => a.name,
+		getDeclaredTags: d => d.tags,
+		getActualTags: a => a.tags,
+		policy,
+	});
+	if (constraintRenames.renames.length > 0) {
+		diff.constraintsToRename = constraintRenames.renames.map(r => ({ oldName: r.oldName, newName: r.newName }));
 	}
 
 	// Detect PK changes
@@ -351,7 +664,7 @@ function stableStringify(v: unknown): string {
 
 function computeColumnAttributeChange(
 	declared: AST.ColumnDef,
-	actual: import('./catalog.js').CatalogTable['columns'][number],
+	actual: CatalogTable['columns'][number],
 ): ColumnAttributeChange | undefined {
 	const change: ColumnAttributeChange = { columnName: declared.name };
 	let any = false;
@@ -440,11 +753,61 @@ export function serializeSchemaDiff(diff: SchemaDiff): string {
 }
 
 /**
+ * Topologically sort the to-be-dropped table set so that, for every edge
+ * "child references parent" within the set, child appears before parent.
+ * Falls back to the input order on a cycle (shouldn't happen for simple FKs,
+ * but self/cyclic FKs would otherwise hang the migration).
+ */
+function orderDropsByFKDependency(
+	dropSet: Set<string>,
+	actualTables: Map<string, CatalogTable>,
+): string[] {
+	const result: string[] = [];
+	const visited = new Set<string>();
+	const visiting = new Set<string>();
+
+	function visit(name: string): void {
+		if (visited.has(name)) return;
+		if (visiting.has(name)) return; // cycle; bail out gracefully
+		visiting.add(name);
+		const table = actualTables.get(name);
+		if (table) {
+			for (const refName of table.referencedTables) {
+				if (dropSet.has(refName) && refName !== name) visit(refName);
+			}
+		}
+		visiting.delete(name);
+		visited.add(name);
+		result.push(name);
+	}
+
+	// DFS post-order along child→parent edges puts parents first; reverse to
+	// drop children before parents.
+	for (const name of dropSet) visit(name);
+	return result.reverse();
+}
+
+/**
  * Generates migration DDL statements from a schema diff
  */
 export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): string[] {
 	const statements: string[] = [];
 	const schemaPrefix = (schemaName && schemaName !== 'main') ? `${quoteIdentifier(schemaName)}.` : '';
+
+	// Renames first — they free old names for subsequent creates and re-target
+	// dependents (handled inside ALTER TABLE ... RENAME by the rename rewriter).
+	// Tables get a primitive ALTER TABLE RENAME; views/indexes/named constraints
+	// have no engine primitive yet — fall back to drop+recreate is left to the
+	// caller (we surface only the rename op here for tables and the alter-diff
+	// pipeline already drops+recreates non-table objects via diff.viewsToDrop /
+	// indexesToDrop when no rename hint is present).
+	for (const r of diff.renames) {
+		if (r.kind === 'table') {
+			statements.push(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.oldName)} RENAME TO ${quoteIdentifier(r.newName)}`);
+		}
+		// View / index / constraint renames have no primitive — caller emits
+		// drop+recreate via the standard buckets.
+	}
 
 	// Drop assertions first (they may reference tables)
 	for (const name of diff.assertionsToDrop) {
@@ -472,13 +835,17 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 
 	// Alter existing tables.
 	// Phase order within one table:
-	//   ADD COLUMN
+	//   RENAME COLUMN (so subsequent phases see post-rename column names)
+	//   → ADD COLUMN
 	//   → ALTER COLUMN (type, then default, then nullability — so SET NOT NULL
 	//     can rely on an already-populated DEFAULT for backfill)
 	//   → ALTER PRIMARY KEY
 	//   → DROP COLUMN (last, so NOT NULL relaxation never blocks subsequent drops)
 	for (const alter of diff.tablesToAlter) {
 		const quotedTable = `${schemaPrefix}${quoteIdentifier(alter.tableName)}`;
+		for (const r of alter.columnsToRename) {
+			statements.push(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
+		}
 		for (const colDef of alter.columnsToAdd) {
 			statements.push(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`);
 		}

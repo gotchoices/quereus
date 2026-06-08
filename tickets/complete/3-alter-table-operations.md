@@ -1,6 +1,6 @@
 ---
 description: ALTER TABLE operations (RENAME TABLE, RENAME COLUMN, ADD COLUMN, DROP COLUMN) — reviewed and complete
-dependencies: none
+prereq: none
 ---
 
 ## Summary

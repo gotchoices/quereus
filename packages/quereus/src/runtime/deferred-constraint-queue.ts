@@ -4,7 +4,8 @@ import type { RuntimeContext } from './types.js';
 import type { Database } from '../core/database.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
-import { createRowSlot, RowContextMap } from './context-helpers.js';
+import { createRowSlot } from './context-helpers.js';
+import { createStrictRowContextMap, wrapTableContextsStrict } from './strict-fork.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { composeCombinedDescriptor } from './descriptor-helpers.js';
 
@@ -70,8 +71,8 @@ export class DeferredConstraintQueue {
 			db: this.db,
 			stmt: undefined,
 			params: {},
-			context: new RowContextMap(),
-			tableContexts: new Map(),
+			context: createStrictRowContextMap(),
+			tableContexts: wrapTableContextsStrict(new Map()),
 			tracer: this.db.getInstructionTracer(),
 			enableMetrics: this.db.options.getBooleanOption('runtime_stats'),
 		};
@@ -174,6 +175,8 @@ export class DeferredConstraintQueue {
 			return connName === normalized || connName === simple;
 		});
 		if (matches.length > 1) {
+			const covering = matches.filter(c => c.isCovering);
+			if (covering.length === 1) return covering[0];
 			throw new QuereusError(
 				`Deferred constraint execution found multiple candidate connections for table ${tableKey}`,
 				StatusCode.INTERNAL

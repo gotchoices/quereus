@@ -1,5 +1,5 @@
 description: Fix pushNotDown dropping NOT wrapper on non-NOT unary ops (e.g. NOT(-x) → -x)
-dependencies: none
+prereq: none
 files:
   packages/quereus/src/planner/analysis/predicate-normalizer.ts
   packages/quereus/test/optimizer/predicate-analysis.spec.ts

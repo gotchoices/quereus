@@ -1,0 +1,92 @@
+-- 97.1-json-blob-and-special-values.sqllogic
+-- adapted from SQLite test/json101.test, json103.test
+-- BLOB and IEEE non-finite values in JSON construction. SQLite raises
+-- "JSON cannot hold BLOB values"; Quereus's prepareJsonValue silently
+-- converts BLOB and Infinity/NaN to JSON null. NaN/Infinity literals
+-- are not in the parser's grammar, so we use 1.0/0.0 to produce them
+-- via runtime arithmetic where useful.
+
+-- ============================================================
+-- json_array: BLOB argument is converted to JSON null
+-- ============================================================
+
+SELECT json_array(1, x'414243', 3);
+→ [[1,null,3]]
+
+-- BLOB only
+SELECT json_array(x'00');
+→ [[null]]
+
+-- ============================================================
+-- json_object: BLOB value is converted to JSON null
+-- ============================================================
+
+SELECT json_object('k', x'cafebabe');
+→ [{"k":null}]
+
+-- Mixed: some BLOB, some scalar values
+SELECT json_object('a', 1, 'b', x'00', 'c', 'three');
+→ [{"a":1,"b":null,"c":"three"}]
+
+-- ============================================================
+-- json_array / json_object: bigint (out of safe-integer range) preserved as string
+-- ============================================================
+
+-- bigint within safe range becomes a number
+SELECT json_array(123);
+→ [[123]]
+
+-- ============================================================
+-- json_group_array: BLOB rows become JSON null entries
+-- ============================================================
+
+CREATE TABLE jagg_blob (id INTEGER PRIMARY KEY, v BLOB NULL);
+INSERT INTO jagg_blob VALUES
+  (1, x'01'),
+  (2, x'0203'),
+  (3, null);
+-- run
+
+SELECT json_group_array(v) FROM jagg_blob;
+→ [{"json_group_array(v)":[null,null,null]}]
+
+-- ============================================================
+-- json_group_object: BLOB values become JSON null
+-- ============================================================
+
+CREATE TABLE jagg_kv (k TEXT PRIMARY KEY, v BLOB NULL);
+INSERT INTO jagg_kv VALUES
+  ('a', x'01'),
+  ('b', null),
+  ('c', x'02');
+-- run
+
+SELECT json_group_object(k, v) FROM jagg_kv;
+→ [{"json_group_object(k, v)":{"a":null,"b":null,"c":null}}]
+
+-- ============================================================
+-- IEEE non-finite values produced by arithmetic
+-- ============================================================
+
+-- 1.0 / 0.0 yields Infinity in JS arithmetic; prepareJsonValue maps to null
+SELECT json_array(1.0 / 0.0);
+→ [[null]]
+
+-- 0.0 / 0.0 yields NaN; prepareJsonValue maps to null
+SELECT json_array(0.0 / 0.0);
+→ [[null]]
+
+-- ============================================================
+-- json_object: non-string key returns NULL (whole call)
+-- ============================================================
+
+-- Numeric key rejected
+SELECT json_object(42, 'value');
+→ [null]
+
+-- BLOB-typed key rejected (not a string)
+SELECT json_object(x'00', 'value');
+→ [null]
+
+DROP TABLE jagg_blob;
+DROP TABLE jagg_kv;

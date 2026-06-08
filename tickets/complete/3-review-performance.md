@@ -1,6 +1,6 @@
 ---
 description: Performance review — sentinel tests, hot-path analysis, and follow-up optimization tasks
-dependencies: None
+prereq: None
 
 ---
 
@@ -23,13 +23,13 @@ The self-join sentinel (50×1000 rows, nested-loop) establishes a baseline of ~3
 
 ### Hot-Path Issues (filed as follow-up tasks)
 
-1. **`resolveAttribute` O(n) per column reference** — allocates `Array.from(...).reverse()` on every call. Filed: `tasks/plan/3-attribute-lookup-optimization.md`
+1. **`resolveAttribute` O(n) per column reference** — allocates `Array.from(...).reverse()` on every call. Filed: `tasks/plan/attribute-lookup-optimization.md`
 
-2. **Per-row context mutations in streaming emitters** — filter.ts, project.ts, distinct.ts use `withRowContextGenerator`/`withAsyncRowContext` (Map.set/delete per row) instead of the efficient `createRowSlot` pattern used by join.ts and scan.ts. Filed: `tasks/plan/3-row-slot-generalization.md`
+2. **Per-row context mutations in streaming emitters** — filter.ts, project.ts, distinct.ts use `withRowContextGenerator`/`withAsyncRowContext` (Map.set/delete per row) instead of the efficient `createRowSlot` pattern used by join.ts and scan.ts. Filed: `tasks/plan/row-slot-generalization.md`
 
 3. **Nested-loop join O(n×m)** — self-join of 50×1000 rows takes ~4 seconds. Updated existing: `tasks/plan/4-join-algorithms.md` with benchmark baseline.
 
-### Minor Inefficiencies (not individually filed — covered by `tasks/plan/2-performance-scalability.md`)
+### Minor Inefficiencies (not individually filed — covered by `tasks/plan/performance-scalability.md`)
 
 - `tryCoerceToNumber` calls `value.trim()` twice (guard + body)
 - `NOCASE_COLLATION` allocates `toLowerCase()` strings per comparison

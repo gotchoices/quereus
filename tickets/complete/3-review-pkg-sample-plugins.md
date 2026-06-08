@@ -1,6 +1,6 @@
 ---
 description: Review of sample plugins - completed implementation
-dependencies: none
+prereq: none
 ---
 
 # Sample Plugins Review - Summary

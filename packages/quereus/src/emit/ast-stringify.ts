@@ -9,7 +9,6 @@
  *   - `ON CONFLICT ABORT`
  *   - `ASC` direction for primary keys
  *   - `VIRTUAL` storage for generated columns
- *   - (TODO: `FOREIGN KEY` default actions and deferrability)
  */
 import type * as AST from '../parser/ast.js';
 import { ConflictResolution } from '../common/constants.js';
@@ -178,14 +177,14 @@ export function expressionToString(expr: AST.Expression): string {
 		}
 
 		case 'unary': {
-			const exprStr = expr.expr.type === 'binary'
+			const exprStr = unaryBodyNeedsParens(expr)
 				? `(${expressionToString(expr.expr)})`
 				: expressionToString(expr.expr);
 			// Handle postfix operators like IS NULL, IS NOT NULL
 			if (expr.operator === 'IS NULL' || expr.operator === 'IS NOT NULL') {
 				return `${exprStr} ${expr.operator.toLowerCase()}`;
 			} else if (expr.operator.toUpperCase() === 'NOT') {
-				return `${expr.operator.toLowerCase()} ${exprStr}`;
+				return `not ${exprStr}`;
 			}
 			return `${expr.operator.toLowerCase()}${exprStr}`;
 		}
@@ -214,10 +213,10 @@ export function expressionToString(expr: AST.Expression): string {
 		}
 
 		case 'subquery':
-			return `(${selectToString(expr.query)})`;
+			return `(${astToString(expr.query)})`;
 
 		case 'exists':
-			return `exists (${selectToString((expr as AST.ExistsExpr).subquery)})`;
+			return `exists (${astToString((expr as AST.ExistsExpr).subquery)})`;
 
 		case 'in': {
 			const inExpr = expr as AST.InExpr;
@@ -225,7 +224,7 @@ export function expressionToString(expr: AST.Expression): string {
 			if (inExpr.values) {
 				result += `(${inExpr.values.map(expressionToString).join(', ')})`;
 			} else if (inExpr.subquery) {
-				result += `(${selectToString(inExpr.subquery)})`;
+				result += `(${astToString(inExpr.subquery)})`;
 			}
 			return result;
 		}
@@ -269,6 +268,15 @@ export function expressionToString(expr: AST.Expression): string {
 		default:
 			return '[unknown_expr]';
 	}
+}
+
+// Determines whether the body of a unary expression must be parenthesised so
+// the emitted SQL re-parses to the same AST. With prefix NOT bound above all
+// predicates (IS [NOT] NULL, IN, BETWEEN, LIKE, comparison), most inner shapes
+// round-trip cleanly without parens — only a `binary` body could re-associate
+// (e.g. `not a and b` would be read as `(not a) and b`).
+function unaryBodyNeedsParens(expr: AST.UnaryExpr): boolean {
+	return expr.expr.type === 'binary';
 }
 
 // Helper to determine if parentheses are needed for binary operations
@@ -411,12 +419,23 @@ export function selectToString(stmt: AST.SelectStmt): string {
 
 	let result = parts.join(' ');
 
-	if (stmt.union) {
-		result += stmt.unionAll ? ' union all ' : ' union ';
-		result += selectToString(stmt.union);
+	if (stmt.compound) {
+		result += ` ${compoundOpToKeyword(stmt.compound.op)} `;
+		// Compound leg is a QueryExpr; astToString dispatches on the discriminator.
+		result += astToString(stmt.compound.select);
 	}
 
 	return result;
+}
+
+function compoundOpToKeyword(op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'): string {
+	switch (op) {
+		case 'union': return 'union';
+		case 'unionAll': return 'union all';
+		case 'intersect': return 'intersect';
+		case 'except': return 'except';
+		case 'diff': return 'diff';
+	}
 }
 
 function withClauseToString(withClause: AST.WithClause): string {
@@ -454,16 +473,9 @@ function fromClauseToString(from: AST.FromClause): string {
 		}
 
 		case 'subquerySource': {
-			let subqueryStr: string;
-			if (from.subquery.type === 'select') {
-				subqueryStr = selectToString(from.subquery);
-			} else if (from.subquery.type === 'values') {
-				subqueryStr = valuesToString(from.subquery);
-			} else {
-				// Handle the case where subquery type is not recognized
-				const exhaustiveCheck: never = from.subquery;
-				subqueryStr = astToString(exhaustiveCheck);
-			}
+			// QueryExpr body: SELECT / VALUES / INSERT|UPDATE|DELETE w/ RETURNING.
+			// astToString dispatches on the inner discriminator.
+			const subqueryStr = astToString(from.subquery);
 
 			let aliasStr = `as ${quoteIdentifier(from.alias)}`;
 			if (from.columns && from.columns.length > 0) {
@@ -501,15 +513,6 @@ function fromClauseToString(from: AST.FromClause): string {
 			return joinStr;
 		}
 
-		case 'mutatingSubquerySource': {
-			const stmtStr = astToString(from.stmt);
-			let aliasStr = `as ${quoteIdentifier(from.alias)}`;
-			if (from.columns && from.columns.length > 0) {
-				aliasStr += ` (${from.columns.map(quoteIdentifier).join(', ')})`;
-			}
-			return `(${stmtStr}) ${aliasStr}`;
-		}
-
 		default:
 			return '[unknown_from]';
 	}
@@ -522,7 +525,11 @@ export function insertToString(stmt: AST.InsertStmt): string {
 		parts.push(withClauseToString(stmt.withClause));
 	}
 
-	parts.push('insert into', expressionToString(stmt.table));
+	parts.push('insert');
+	if (stmt.onConflict && stmt.onConflict !== ConflictResolution.ABORT) {
+		parts.push('or', ConflictResolution[stmt.onConflict].toLowerCase());
+	}
+	parts.push('into', expressionToString(stmt.table));
 
 	if (stmt.columns && stmt.columns.length > 0) {
 		parts.push(`(${stmt.columns.map(quoteIdentifier).join(', ')})`);
@@ -535,18 +542,10 @@ export function insertToString(stmt: AST.InsertStmt): string {
 		parts.push('with context', contextAssignments.join(', '));
 	}
 
-	if (stmt.values) {
-		const valueRows = stmt.values.map(row =>
-			`(${row.map(expressionToString).join(', ')})`
-		);
-		parts.push('values', valueRows.join(', '));
-	} else if (stmt.select) {
-		parts.push(selectToString(stmt.select));
-	}
-
-	if (stmt.onConflict && stmt.onConflict !== ConflictResolution.ABORT) {
-		parts.push(`on conflict ${ConflictResolution[stmt.onConflict].toLowerCase()}`);
-	}
+	// Body is a QueryExpr — bare SELECT/VALUES at top-level of INSERT, or a
+	// nested DML form (must carry RETURNING; outer INSERT is the consumer).
+	// astToString dispatches on the discriminator.
+	parts.push(astToString(stmt.source));
 
 	// UPSERT clauses (ON CONFLICT DO ...)
 	if (stmt.upsertClauses) {
@@ -626,10 +625,6 @@ export function updateToString(stmt: AST.UpdateStmt): string {
 		parts.push('where', expressionToString(stmt.where));
 	}
 
-	if (stmt.onConflict && stmt.onConflict !== ConflictResolution.ABORT) {
-		parts.push(`on conflict ${ConflictResolution[stmt.onConflict].toLowerCase()}`);
-	}
-
 	if (stmt.returning && stmt.returning.length > 0) {
 		const returning = stmt.returning.map(col => {
 			if (col.type === 'all') {
@@ -689,15 +684,8 @@ export function valuesToString(stmt: AST.ValuesStmt): string {
 	return `values ${valueRows.join(', ')}`;
 }
 
-export function createIndexToString(stmt: AST.CreateIndexStmt): string {
-	const parts: string[] = ['create'];
-	if (stmt.isUnique) parts.push('unique');
-	parts.push('index');
-	if (stmt.ifNotExists) parts.push('if not exists');
-
-	parts.push(expressionToString(stmt.index), 'on', expressionToString(stmt.table));
-
-	const columns = stmt.columns.map(col => {
+function indexedColumnsToString(cols: readonly AST.IndexedColumn[]): string {
+	return cols.map(col => {
 		if (col.name) {
 			let colStr = quoteIdentifier(col.name);
 			if (col.collation) colStr += ` collate ${col.collation.toLowerCase()}`;
@@ -707,9 +695,17 @@ export function createIndexToString(stmt: AST.CreateIndexStmt): string {
 			return expressionToString(col.expr);
 		}
 		return '';
-	}).filter(s => s);
+	}).filter(s => s).join(', ');
+}
 
-	parts.push(`(${columns.join(', ')})`);
+export function createIndexToString(stmt: AST.CreateIndexStmt): string {
+	const parts: string[] = ['create'];
+	if (stmt.isUnique) parts.push('unique');
+	parts.push('index');
+	if (stmt.ifNotExists) parts.push('if not exists');
+
+	parts.push(expressionToString(stmt.index), 'on', expressionToString(stmt.table));
+	parts.push(`(${indexedColumnsToString(stmt.columns)})`);
 
 	if (stmt.where) {
 		parts.push('where', expressionToString(stmt.where));
@@ -733,7 +729,8 @@ export function createViewToString(stmt: AST.CreateViewStmt): string {
 		parts.push(`(${stmt.columns.map(quoteIdentifier).join(', ')})`);
 	}
 
-	parts.push('as', selectToString(stmt.select));
+	// View body is a QueryExpr — astToString dispatches on the discriminator.
+	parts.push('as', astToString(stmt.select));
 
 	const viewTagStr = tagsClauseToString(stmt.tags);
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
@@ -792,7 +789,7 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 function analyzeToString(stmt: AST.AnalyzeStmt): string {
 	if (stmt.schemaName && stmt.tableName) return `analyze ${quoteIdentifier(stmt.schemaName)}.${quoteIdentifier(stmt.tableName)}`;
 	if (stmt.tableName) return `analyze ${quoteIdentifier(stmt.tableName)}`;
-	if (stmt.schemaName) return `analyze ${quoteIdentifier(stmt.schemaName)}`;
+	if (stmt.schemaName) return `analyze ${quoteIdentifier(stmt.schemaName)}.*`;
 	return 'analyze';
 }
 
@@ -828,7 +825,7 @@ function releaseToString(stmt: AST.ReleaseStmt): string {
 }
 
 function pragmaToString(stmt: AST.PragmaStmt): string {
-	let result = `pragma ${stmt.name.toLowerCase()}`;
+	let result = `pragma ${quoteIdentifier(stmt.name.toLowerCase())}`;
 	if (stmt.value) {
 		result += ` = ${expressionToString(stmt.value)}`;
 	}
@@ -853,23 +850,93 @@ function declareSchemaToString(stmt: AST.DeclareSchemaStmt): string {
 }
 
 function declareItemToString(it: AST.DeclareItem): string {
-	if (it.type === 'declaredTable') {
-		return `table ${it.tableStmt.table.name} { ... }`;
+	switch (it.type) {
+		case 'declaredTable': return declaredTableToString(it);
+		case 'declaredIndex': return declaredIndexToString(it);
+		case 'declaredView': return declaredViewToString(it);
+		case 'declaredSeed': return declaredSeedToString(it);
+		case 'declaredAssertion': return declaredAssertionToString(it);
+		case 'declareIgnored': return it.text || '-- ignored';
 	}
-	if (it.type === 'declaredIndex') {
-		return `index ${it.indexStmt.index.name} on ${it.indexStmt.table.name} (...)`;
+}
+
+function declaredTableToString(it: AST.DeclaredTable): string {
+	const stmt = it.tableStmt;
+	const parts: string[] = ['table', quoteIdentifier(stmt.table.name)];
+
+	const using = moduleClauseToString(stmt);
+	if (using) parts.push(using);
+
+	parts.push(tableBodyDefsToString(stmt));
+
+	const ctx = contextClauseToString(stmt);
+	if (ctx) parts.push(ctx);
+
+	const tagStr = tagsClauseToString(stmt.tags);
+	if (tagStr) parts.push(tagStr.trimStart());
+
+	return parts.join(' ');
+}
+
+function declaredIndexToString(it: AST.DeclaredIndex): string {
+	const stmt = it.indexStmt;
+	const parts: string[] = [];
+	if (stmt.isUnique) parts.push('unique');
+	parts.push('index', quoteIdentifier(stmt.index.name));
+	parts.push('on', quoteIdentifier(stmt.table.name));
+	parts.push(`(${indexedColumnsToString(stmt.columns)})`);
+
+	const tagStr = tagsClauseToString(stmt.tags);
+	if (tagStr) parts.push(tagStr.trimStart());
+
+	return parts.join(' ');
+}
+
+function declaredViewToString(it: AST.DeclaredView): string {
+	const stmt = it.viewStmt;
+	const parts: string[] = ['view', quoteIdentifier(stmt.view.name)];
+	if (stmt.columns && stmt.columns.length > 0) {
+		parts.push(`(${stmt.columns.map(quoteIdentifier).join(', ')})`);
 	}
-	if (it.type === 'declaredView') {
-		return `view ${it.viewStmt.view.name} as ...`;
+	// View body is a QueryExpr — astToString dispatches on the discriminator.
+	parts.push('as', astToString(stmt.select));
+
+	const tagStr = tagsClauseToString(stmt.tags);
+	if (tagStr) parts.push(tagStr.trimStart());
+
+	return parts.join(' ');
+}
+
+function declaredSeedToString(it: AST.DeclaredSeed): string {
+	let s = `seed ${quoteIdentifier(it.tableName)}`;
+	if (it.columns && it.columns.length > 0) {
+		s += ` values (${it.columns.map(quoteIdentifier).join(', ')}) values`;
 	}
-	if (it.type === 'declaredSeed') {
-		const rowsStr = it.seedData?.map(r => `(${r.map(v => JSON.stringify(v)).join(', ')})`).join(', ') || '';
-		return `seed ${it.tableName} (${rowsStr})`;
+	const rows = it.seedData?.map(r =>
+		`(${r.map(sqlValueToSqlLiteral).join(', ')})`
+	).join(', ') ?? '';
+	s += ` (${rows})`;
+	return s;
+}
+
+function declaredAssertionToString(it: AST.DeclaredAssertion): string {
+	return `assertion ${quoteIdentifier(it.assertionStmt.name)} check (${expressionToString(it.assertionStmt.check)})`;
+}
+
+/** Renders an SqlValue as a SQL literal that re-parses to the same value. */
+function sqlValueToSqlLiteral(value: SqlValue): string {
+	if (value === null) return 'null';
+	if (typeof value === 'boolean') return value ? 'true' : 'false';
+	if (typeof value === 'string') return `'${value.replace(/'/g, "''")}'`;
+	if (typeof value === 'number') return String(value);
+	if (typeof value === 'bigint') return value.toString();
+	if (value instanceof Uint8Array) return `x'${uint8ArrayToHex(value)}'`;
+	// JSON object/array — emit as a quoted JSON string (parser will see a STRING literal)
+	if (typeof value === 'object') {
+		const json = JSON.stringify(value);
+		return `'${json.replace(/'/g, "''")}'`;
 	}
-	if (it.type === 'declaredAssertion') {
-		return `assertion ${quoteIdentifier(it.assertionStmt.name)} check (...)`;
-	}
-	return (it as unknown as AST.DeclareIgnoredItem).text || '-- ignored';
+	return String(value);
 }
 
 // Helper to stringify conflict clauses
@@ -905,7 +972,12 @@ function columnConstraintsToString(constraints: AST.ColumnConstraint[]): string 
 				s += conflictToString(c.onConflict);
 				break;
 			case 'check':
-				s += `check (${expressionToString(c.expr!)})`;
+				s += 'check';
+				if (c.operations && c.operations.length > 0) {
+					s += ` on ${c.operations.join(', ')}`;
+				}
+				s += ` (${expressionToString(c.expr!)})`;
+				s += conflictToString(c.onConflict);
 				break;
 			case 'default':
 				s += `default ${expressionToString(c.expr!)}`;
@@ -915,13 +987,7 @@ function columnConstraintsToString(constraints: AST.ColumnConstraint[]): string 
 				break;
 			case 'foreignKey':
 				if (c.foreignKey) {
-					const fk = c.foreignKey;
-					s += `references ${quoteIdentifier(fk.table)}`;
-					if (fk.columns && fk.columns.length > 0) {
-						s += `(${fk.columns.map(quoteIdentifier).join(', ')})`;
-					}
-					if (fk.onDelete) s += ` on delete ${foreignKeyActionToString(fk.onDelete)}`;
-					if (fk.onUpdate) s += ` on update ${foreignKeyActionToString(fk.onUpdate)}`;
+					s += foreignKeyClauseTail(c.foreignKey);
 				}
 				break;
 			case 'generated':
@@ -951,17 +1017,17 @@ function tableConstraintsToString(constraints: AST.TableConstraint[]): string {
 				s += conflictToString(c.onConflict);
 				break;
 			case 'check':
-				s += `check (${expressionToString(c.expr!)})`;
+				s += 'check';
+				if (c.operations && c.operations.length > 0) {
+					s += ` on ${c.operations.join(', ')}`;
+				}
+				s += ` (${expressionToString(c.expr!)})`;
+				s += conflictToString(c.onConflict);
 				break;
 			case 'foreignKey':
 				if (c.foreignKey) {
-					const fk = c.foreignKey;
-					s += `foreign key (${c.columns!.map(col => quoteIdentifier(col.name)).join(', ')}) references ${quoteIdentifier(fk.table)}`;
-					if (fk.columns && fk.columns.length > 0) {
-						s += `(${fk.columns.map(quoteIdentifier).join(', ')})`;
-					}
-					if (fk.onDelete) s += ` on delete ${foreignKeyActionToString(fk.onDelete)}`;
-					if (fk.onUpdate) s += ` on update ${foreignKeyActionToString(fk.onUpdate)}`;
+					s += `foreign key (${c.columns!.map(col => quoteIdentifier(col.name)).join(', ')}) `;
+					s += foreignKeyClauseTail(c.foreignKey);
 				}
 				break;
 		}
@@ -976,8 +1042,24 @@ function foreignKeyActionToString(action: AST.ForeignKeyAction): string {
 		case 'setDefault': return 'set default';
 		case 'cascade': return 'cascade';
 		case 'restrict': return 'restrict';
-		case 'ignore': return 'no action';
 	}
+}
+
+/** Emits `references TBL(cols) [on delete …] [on update …] [[not] deferrable [initially …]]`. */
+function foreignKeyClauseTail(fk: AST.ForeignKeyClause): string {
+	let s = `references ${quoteIdentifier(fk.table)}`;
+	if (fk.columns && fk.columns.length > 0) {
+		s += `(${fk.columns.map(quoteIdentifier).join(', ')})`;
+	}
+	if (fk.onDelete) s += ` on delete ${foreignKeyActionToString(fk.onDelete)}`;
+	if (fk.onUpdate) s += ` on update ${foreignKeyActionToString(fk.onUpdate)}`;
+	if (fk.deferrable !== undefined) {
+		s += fk.deferrable ? ' deferrable' : ' not deferrable';
+		if (fk.initiallyDeferred !== undefined) {
+			s += fk.initiallyDeferred ? ' initially deferred' : ' initially immediate';
+		}
+	}
+	return s;
 }
 
 /** Formats a tag value as a SQL literal */
@@ -1007,6 +1089,36 @@ export function columnDefToString(col: AST.ColumnDef): string {
 	return colDef;
 }
 
+function tableBodyDefsToString(stmt: AST.CreateTableStmt): string {
+	const definitions: string[] = stmt.columns.map(columnDefToString);
+	const tableConstraints = tableConstraintsToString(stmt.constraints);
+	if (tableConstraints) definitions.push(tableConstraints);
+	return `(${definitions.join(', ')})`;
+}
+
+function moduleClauseToString(stmt: AST.CreateTableStmt): string {
+	if (!stmt.moduleName) return '';
+	let s = `using ${stmt.moduleName}`;
+	if (stmt.moduleArgs && Object.keys(stmt.moduleArgs).length > 0) {
+		const args = Object.entries(stmt.moduleArgs).map(([key, value]) =>
+			`${quoteIdentifier(key)} = ${JSON.stringify(value)}`
+		).join(', ');
+		s += ` (${args})`;
+	}
+	return s;
+}
+
+function contextClauseToString(stmt: AST.CreateTableStmt): string {
+	if (!stmt.contextDefinitions || stmt.contextDefinitions.length === 0) return '';
+	const contextVars = stmt.contextDefinitions.map(varDef => {
+		let def = quoteIdentifier(varDef.name);
+		if (varDef.dataType) def += ` ${varDef.dataType}`;
+		if (varDef.notNull === false) def += ' NULL';
+		return def;
+	}).join(', ');
+	return `with context (${contextVars})`;
+}
+
 export function createTableToString(stmt: AST.CreateTableStmt): string {
 	const parts: string[] = ['create'];
 	if (stmt.isTemporary) parts.push('temp');
@@ -1017,35 +1129,14 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 	const schemaName = stmt.table.schema ? quoteIdentifier(stmt.table.schema) : undefined;
 	parts.push(schemaName ? `${schemaName}.${tableName}` : tableName);
 
-	const definitions: string[] = stmt.columns.map(columnDefToString);
+	parts.push(tableBodyDefsToString(stmt));
 
-	const tableConstraints = tableConstraintsToString(stmt.constraints);
-	if (tableConstraints) definitions.push(tableConstraints);
+	const using = moduleClauseToString(stmt);
+	if (using) parts.push(using);
 
-	parts.push(`(${definitions.join(', ')})`);
+	const ctx = contextClauseToString(stmt);
+	if (ctx) parts.push(ctx);
 
-	if (stmt.moduleName) {
-		parts.push('using', stmt.moduleName);
-		if (stmt.moduleArgs && Object.keys(stmt.moduleArgs).length > 0) {
-			const args = Object.entries(stmt.moduleArgs).map(([key, value]) =>
-				`${quoteIdentifier(key)} = ${JSON.stringify(value)}`
-			).join(', ');
-			parts.push(`(${args})`);
-		}
-	}
-
-	// Add WITH CONTEXT clause if present
-	if (stmt.contextDefinitions && stmt.contextDefinitions.length > 0) {
-		const contextVars = stmt.contextDefinitions.map(varDef => {
-			let def = quoteIdentifier(varDef.name);
-			if (varDef.dataType) def += ` ${varDef.dataType}`;
-			if (varDef.notNull === false) def += ' NULL';
-			return def;
-		}).join(', ');
-		parts.push('with context', `(${contextVars})`);
-	}
-
-	// Add WITH TAGS clause if present
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());
 

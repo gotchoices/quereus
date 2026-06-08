@@ -4,12 +4,15 @@ import { createTypedComparator, resolveCollation } from '../../util/comparison.j
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from './types.js';
 import type { IndexColumnSchema as IndexColumnSpec } from '../../schema/table.js'; // Renamed for clarity
 import type { ColumnSchema } from '../../schema/column.js';
+import type { Expression } from '../../parser/ast.js';
 import { quereusError } from '../../common/errors.js';
+import { compilePredicate, type CompiledPredicate } from './utils/predicate.js';
 
 /** Definition for creating a memory index (matches IndexSchema columns usually) */
 export interface IndexSpec {
 	name?: string;
 	columns: ReadonlyArray<IndexColumnSpec>;
+	predicate?: Expression;
 }
 
 /** Functions for extracting and comparing index keys */
@@ -25,6 +28,9 @@ export class MemoryIndex {
 	public readonly keyFromRow: (row: Row) => BTreeKeyForIndex;
 	public readonly compareKeys: (a: BTreeKeyForIndex, b: BTreeKeyForIndex) => number;
 	public data: BTree<BTreeKeyForIndex, MemoryIndexEntry>;
+	/** Compiled partial-index predicate. When present, only rows for which
+	 *  `evaluate(row) === true` participate in the index. */
+	public readonly predicate: CompiledPredicate | undefined;
 	private readonly allTableColumnsSchema: ReadonlyArray<ColumnSchema>;
 
 	constructor(spec: IndexSpec, allTableColumnsSchema: ReadonlyArray<ColumnSchema>, baseInheritreeTable?: BTree<BTreeKeyForIndex, MemoryIndexEntry>) {
@@ -38,7 +44,15 @@ export class MemoryIndex {
 		this.keyFromRow = keyFunctions.keyFromRow;
 		this.compareKeys = keyFunctions.compareKeys;
 
+		this.predicate = spec.predicate ? compilePredicate(spec.predicate, allTableColumnsSchema) : undefined;
+
 		this.data = this.createBTree(baseInheritreeTable);
+	}
+
+	/** True when the partial-index predicate is satisfied by `row` (or there is no predicate). */
+	rowMatchesPredicate(row: Row): boolean {
+		if (!this.predicate) return true;
+		return this.predicate.evaluate(row) === true;
 	}
 
 	private validateColumnIndexes(allTableColumnsSchema: ReadonlyArray<ColumnSchema>): void {

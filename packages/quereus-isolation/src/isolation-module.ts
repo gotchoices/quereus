@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -62,6 +62,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	private readonly connectionOverlays = new Map<string, ConnectionOverlayState>();
 
+	/**
+	 * Tracks savepoint depths that were created before the overlay existed, per
+	 * connection+table.  Keyed identically to connectionOverlays.
+	 * When the overlay is created lazily after some savepoints already exist,
+	 * its MemoryVirtualTableConnection stack needs to be padded so that
+	 * rollbackToSavepoint(depth) looks up the correct stack index.
+	 */
+	private readonly preOverlaySavepoints = new Map<string, Set<number>>();
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -115,6 +124,27 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	clearConnectionOverlay(db: Database, schemaName: string, tableName: string): void {
 		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		this.connectionOverlays.delete(key);
+	}
+
+	/**
+	 * Returns (creating if absent) the set of savepoint depths that pre-date the overlay
+	 * for this connection+table.  Shared across all IsolatedTable instances in the
+	 * same connection so that ensureOverlay() on any instance sees the correct set.
+	 */
+	getPreOverlaySavepoints(db: Database, schemaName: string, tableName: string): Set<number> {
+		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		let set = this.preOverlaySavepoints.get(key);
+		if (!set) {
+			set = new Set();
+			this.preOverlaySavepoints.set(key, set);
+		}
+		return set;
+	}
+
+	/** Removes the pre-overlay savepoint set for a connection+table. */
+	clearPreOverlaySavepoints(db: Database, schemaName: string, tableName: string): void {
+		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		this.preOverlaySavepoints.delete(key);
 	}
 
 	/**
@@ -255,6 +285,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	async closeAll(): Promise<void> {
 		this.connectionOverlays.clear();
+		this.preOverlaySavepoints.clear();
 		this.underlyingTables.clear();
 		const underlyingWithClose = this.underlying as { closeAll?: () => Promise<void> };
 		if (typeof underlyingWithClose.closeAll === 'function') {
@@ -288,9 +319,85 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Delegates ALTER TABLE to the underlying module. ADD/DROP/RENAME COLUMN
-	 * mutates the underlying TableSchema in place; any per-connection overlays
-	 * derived from the pre-alter schema are invalidated here.
+	 * Drops an index on the underlying table.
+	 *
+	 * Mirrors createIndex: when the underlying VirtualTable exposes an
+	 * instance-level dropIndex (e.g. MemoryTable, which forwards to its manager
+	 * so MemoryTable.tableSchema stays fresh), prefer that. Otherwise fall back
+	 * to the module-level dropIndex (e.g. StoreModule, which refreshes the
+	 * StoreTable's cached tableSchema and tears down the index store).
+	 *
+	 * Any per-connection overlay that already exists for this table is
+	 * rebuilt under the post-drop schema, preserving staged rows. A bare
+	 * forward to `overlay.dropIndex` is insufficient: when the overlay's
+	 * MemoryTable has an active write `TransactionLayer`, its
+	 * `tableSchemaAtCreation` is frozen at layer-creation time, so the
+	 * synthesized UNIQUE constraint keeps firing inside the overlay's
+	 * own UC check on the next write even after the manager's schema is
+	 * refreshed. Rebuilding gives the new MemoryTable a fresh
+	 * transaction layer that captures the post-drop schema. Overlays
+	 * created AFTER this point inherit the post-drop schema from the
+	 * underlying at ensureOverlay time.
+	 */
+	async dropIndex(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		indexName: string
+	): Promise<void> {
+		const state = this.getUnderlyingState(schemaName, tableName);
+		if (state?.underlyingTable.dropIndex) {
+			await state.underlyingTable.dropIndex(indexName);
+		} else if (this.underlying.dropIndex) {
+			await this.underlying.dropIndex(db, schemaName, tableName, indexName);
+		}
+
+		// After the underlying drop, state.underlyingTable.tableSchema reflects the
+		// post-drop schema. Rebuild every affected overlay against that schema so
+		// the synthesized UC is fully gone from the overlay's transaction layer.
+		const updatedSchema = state?.underlyingTable.tableSchema;
+		if (!updatedSchema) return;
+
+		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
+		for (const [key, overlayState] of this.connectionOverlays.entries()) {
+			if (key.endsWith(suffix)) {
+				const newState = await this.migrateOverlayForDropIndex(db, overlayState, updatedSchema);
+				this.connectionOverlays.set(key, newState);
+			}
+		}
+	}
+
+	/**
+	 * Rebuilds an overlay table under the post-drop-index schema, preserving
+	 * staged rows (including tombstones). Column layout is unchanged by
+	 * DROP INDEX, so rows can be copied verbatim.
+	 */
+	private async migrateOverlayForDropIndex(
+		db: Database,
+		oldState: ConnectionOverlayState,
+		updatedSchema: TableSchema,
+	): Promise<ConnectionOverlayState> {
+		const oldOverlay = oldState.overlayTable;
+
+		const newOverlaySchema = this.createOverlaySchema(updatedSchema);
+		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
+
+		if (oldState.hasChanges && oldOverlay.query) {
+			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+				await newOverlayTable.update({ operation: 'insert', values: oldRow as SqlValue[], preCoerced: true });
+			}
+		}
+
+		return { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges };
+	}
+
+	/**
+	 * Delegates ALTER TABLE to the underlying module and migrates any per-connection
+	 * overlays to the post-alter schema without discarding staged rows.
+	 *
+	 * ADD COLUMN  — appends null to each overlay row's data columns.
+	 * DROP COLUMN — removes the dropped column from each overlay row.
+	 * RENAME / ALTER COLUMN — data column indices are unchanged; only schema metadata rotates.
 	 */
 	async alterTable(
 		db: Database,
@@ -305,19 +412,186 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			);
 		}
 
-		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
-
-		// Invalidate any per-connection overlays derived from the pre-alter schema.
-		// Overlay tables carry columns copied from the underlying schema + tombstone,
-		// so their shape is stale after ADD/DROP/RENAME.
+		// Collect affected overlays before the underlying schema is mutated.
 		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
-		for (const key of [...this.connectionOverlays.keys()]) {
+		const affected: [string, ConnectionOverlayState][] = [];
+		for (const [key, state] of this.connectionOverlays.entries()) {
 			if (key.endsWith(suffix)) {
-				this.connectionOverlays.delete(key);
+				affected.push([key, state]);
 			}
 		}
 
+		// For dropColumn we need the pre-alter column index, readable from any overlay schema.
+		let dropColumnIdx: number | undefined;
+		if (change.type === 'dropColumn' && affected.length > 0) {
+			const overlaySchema = affected[0][1].overlayTable.tableSchema;
+			dropColumnIdx = overlaySchema?.columnIndexMap.get(change.columnName.toLowerCase());
+		}
+
+		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
+
+		// Migrate each affected overlay to the new schema, preserving staged rows.
+		for (const [key, oldState] of affected) {
+			const newState = await this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx);
+			this.connectionOverlays.set(key, newState);
+		}
+
 		return updated;
+	}
+
+	/**
+	 * Renames a table through the isolation layer.
+	 *
+	 * Forwards to the underlying module so it can re-key its handles and move
+	 * any physical storage, then re-keys our own tracking maps so subsequent
+	 * connect() calls under the new name find the existing underlying state
+	 * and any in-flight per-connection overlays.
+	 *
+	 * Done in this order so a failure in the underlying rename leaves our
+	 * internal maps untouched (the engine will not update the schema catalog
+	 * if this method throws).
+	 */
+	async renameTable(
+		db: Database,
+		schemaName: string,
+		oldName: string,
+		newName: string,
+	): Promise<void> {
+		if (this.underlying.renameTable) {
+			await this.underlying.renameTable(db, schemaName, oldName, newName);
+		}
+
+		// Drop our cached underlying VirtualTable for the old name. It may have
+		// been disconnected by the underlying module (e.g. StoreModule closes
+		// and re-opens stores during rename), so reusing it would yield "store
+		// is closed" errors. The next connect() under the new name will fetch a
+		// fresh underlying table from the underlying module.
+		this.removeUnderlyingState(schemaName, oldName);
+
+		// Re-key per-connection overlay and savepoint state, preserving the
+		// connection-id prefix so overlays created earlier in an open
+		// transaction remain visible under the new name.
+		this.rekeyConnectionScopedMap(this.connectionOverlays, schemaName, oldName, newName);
+		this.rekeyConnectionScopedMap(this.preOverlaySavepoints, schemaName, oldName, newName);
+	}
+
+	/**
+	 * Re-keys all entries of a connection-scoped map (`<dbId>:<schema>.<table>`)
+	 * from oldName to newName, leaving entries for other tables untouched.
+	 */
+	private rekeyConnectionScopedMap<V>(
+		map: Map<string, V>,
+		schemaName: string,
+		oldName: string,
+		newName: string,
+	): void {
+		const oldSuffix = `:${schemaName}.${oldName}`.toLowerCase();
+		const newSuffix = `:${schemaName}.${newName}`.toLowerCase();
+		const moved: Array<[string, V]> = [];
+		for (const [key, value] of map.entries()) {
+			if (key.endsWith(oldSuffix)) {
+				const prefix = key.substring(0, key.length - oldSuffix.length);
+				moved.push([`${prefix}${newSuffix}`, value]);
+				map.delete(key);
+			}
+		}
+		for (const [newKey, value] of moved) {
+			map.set(newKey, value);
+		}
+	}
+
+	/**
+	 * Rebuilds an overlay table under the post-alter schema, translating each
+	 * staged row to the new column layout.
+	 */
+	private async migrateOverlayForAlter(
+		db: Database,
+		oldState: ConnectionOverlayState,
+		updatedSchema: TableSchema,
+		change: SchemaChangeInfo,
+		dropColumnIdx: number | undefined,
+	): Promise<ConnectionOverlayState> {
+		const oldOverlay = oldState.overlayTable;
+		const oldOverlaySchema = oldOverlay.tableSchema;
+
+		const newOverlaySchema = this.createOverlaySchema(updatedSchema);
+		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
+
+		if (oldState.hasChanges && oldOverlaySchema && oldOverlay.query) {
+			const oldTombstoneIdx = oldOverlaySchema.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
+			if (oldTombstoneIdx === undefined) {
+				throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
+			}
+			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+				const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx);
+				await newOverlayTable.update({ operation: 'insert', values: newRow, preCoerced: true });
+			}
+		}
+
+		return { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges };
+	}
+
+	/**
+	 * Translates a single overlay row from the pre-alter to the post-alter column layout.
+	 * The tombstone value is preserved in the last position.
+	 */
+	private translateOverlayRow(
+		oldRow: Row,
+		oldTombstoneIdx: number,
+		change: SchemaChangeInfo,
+		dropColumnIdx: number | undefined,
+	): SqlValue[] {
+		const tombstoneValue = oldRow[oldTombstoneIdx] as SqlValue;
+		const data = Array.from(oldRow.slice(0, oldTombstoneIdx)) as SqlValue[];
+
+		let newData: SqlValue[];
+		switch (change.type) {
+			case 'addColumn':
+				// New column is always appended after existing data columns.
+				newData = [...data, null];
+				break;
+			case 'dropColumn':
+				newData = dropColumnIdx !== undefined
+					? [...data.slice(0, dropColumnIdx), ...data.slice(dropColumnIdx + 1)]
+					: data;
+				break;
+			case 'renameColumn':
+			case 'alterColumn':
+			case 'alterPrimaryKey':
+			case 'addConstraint':
+				newData = data;
+				break;
+			default: {
+				const _exhaustive: never = change;
+				newData = data;
+			}
+		}
+
+		return [...newData, tombstoneValue];
+	}
+
+	/** Creates a FilterInfo for a full table scan (no constraints). */
+	private makeFullScanFilterInfo(): FilterInfo {
+		return {
+			idxNum: 0,
+			idxStr: null,
+			constraints: [],
+			args: [],
+			indexInfoOutput: {
+				nConstraint: 0,
+				aConstraint: [],
+				nOrderBy: 0,
+				aOrderBy: [],
+				colUsed: 0n,
+				aConstraintUsage: [],
+				idxNum: 0,
+				idxStr: null,
+				orderByConsumed: false,
+				estimatedCost: 1000000,
+				estimatedRows: 1000000n,
+				idxFlags: 0,
+			},
+		};
 	}
 
 	/**

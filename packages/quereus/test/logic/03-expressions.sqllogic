@@ -120,11 +120,12 @@ SELECT id, (a + b * 2) as expr_result FROM expr_context_test WHERE (a + b * 2) =
 SELECT id, (a + b * 2) as expr_result FROM expr_context_test WHERE (a + b * 2) = 2;
 → [{"id":3,"expr_result":2}]
 
--- Same expression in HAVING
-SELECT id, (a + b * 2) as expr_result FROM expr_context_test GROUP BY id HAVING (a + b * 2) = 11;
+-- Same expression in HAVING (a, b in GROUP BY for SQL-92 column coverage; id alone would
+-- need PK-based functional-dependency analysis which Quereus does not implement)
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test GROUP BY id, a, b HAVING (a + b * 2) = 11;
 → [{"id":1,"expr_result":11}]
 
-SELECT id, (a + b * 2) as expr_result FROM expr_context_test GROUP BY id HAVING (a + b * 2) IN (2, 6) ORDER BY id;
+SELECT id, (a + b * 2) as expr_result FROM expr_context_test GROUP BY id, a, b HAVING (a + b * 2) IN (2, 6) ORDER BY id;
 → [{"id":2,"expr_result":6},{"id":3,"expr_result":2}]
 
 -- Test more complex expressions

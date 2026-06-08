@@ -6,114 +6,16 @@ Quereus is a feature-complete SQL query processor specifically designed for effi
 
 ## Project Goals
 
-*   **Virtual Table Centric**: Provide a robust and flexible virtual table API as the primary means of interacting with data sources. All tables are virtual tables.
-*   **In-Memory Default**: Includes a comprehensive in-memory virtual table implementation (`MemoryTable`) with support for transactions and savepoints.
-*   **Modern Type System**: Extensible logical/physical type separation with built-in temporal types (DATE, TIME, DATETIME), native JSON type with deep equality comparison, and plugin support for custom types. See [Type System Documentation](../../docs/types.md).
-*   **TypeScript & Modern JS**: Leverage TypeScript's type system and modern JavaScript features and idioms.
-*   **Async VTab Operations**: Virtual table data operations (reads/writes) are asynchronous. Cursors are implemented as async iterables.
-*   **Cross-Platform**: Target diverse Javascript runtime environments, including Node.js, browser, and React Native. Plugin loading (via `@quereus/plugin-loader`) uses dynamic `import()` and is not compatible with React Native; use static imports for RN.
-*   **Minimal Dependencies**: Avoid heavy external dependencies where possible.
-*   **SQL Compatibility**: Comprehensive support for modern SQL features including joins, window functions, subqueries, CTEs, constraints, views, and advanced DML/DDL operations.
-*   **Key-Based Addressing**: All tables are addressed by their defined Primary Key. The concept of a separate, implicit `rowid` for addressing rows is not used.
-*   **Third Manifesto Friendly**: Embraces some of the principles of the [Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf), such as allowing for empty keys. Utilizes algebraic planning.
-
-## Architecture Overview
-
-Quereus is built on a modern architecture based on partially immutable PlanNodes and an Instruction-based runtime with robust attribute-based context system.
-
-1.  **SQL Input**: The process starts with a SQL query string.
-2.  **Parser (`src/parser`)**:
-    *   **Lexer (`lexer.ts`)**: Tokenizes the raw SQL string.
-    *   **Parser (`parser.ts`)**: Builds an Abstract Syntax Tree (AST).
-3.  **Planner (`src/planner`)**:
-    *   Traverses the AST to construct a tree of immutable `PlanNode` objects representing the logical query structure.
-    *   Handles Common Table Expressions (CTEs) and Subqueries by converting them into relational `PlanNode`s.
-    *   Resolves table and function references using the Schema Manager.
-    *   Performs query planning, incorporating virtual table `getBestAccessPlan` method and table schema statistics.
-    *   **Optimizer (`src/planner/optimizer`)**: Transforms logical plans into efficient physical execution plans through a rule-based optimization system. See [Optimizer Documentation](../../docs/optimizer.md) for details.
-4.  **Runtime (`src/runtime`)**:
-    *   **Emitters (`src/runtime/emitters.ts`, `src/runtime/emit/`)**: Translate `PlanNode`s into a graph of `Instruction` objects.
-    *   **Scheduler (`src/runtime/scheduler.ts`)**: Manages the execution flow of the `Instruction` graph.
-    *   **Instructions**: JavaScript functions that operate on `RuntimeValue`s (which can be `SqlValue` or `AsyncIterable<Row>`). Async parameters are awaited.
-    *   Invokes virtual table methods (e.g., `query` which returns `AsyncIterable<Row>`, `update`) to interact with data.
-    *   Calls User-Defined Functions (UDFs) and aggregate functions.
-    *   Handles transaction and savepoint control.
-5.  **Virtual Tables (`src/vtab`)**:
-    *   The core data interface. Modules implement `VirtualTableModule`.
-    *   `MemoryTable` (`vtab/memory/table.ts`) is a key implementation using `digitree`.
-6.  **Schema Management (`src/schema`)**: Manages schemas, tables, columns, functions.
-7.  **User-Defined Functions (`src/func`)**: Support for custom JS functions in SQL.
-8.  **Core API (`src/core`)**: `Database`, `Statement` classes.
-
-## Source File Layout
-
-```
-src/
-├── core/                     # Database, Statement, transactions
-├── parser/                   # SQL parser → AST
-├── planner/                  # AST → PlanNode tree
-│   ├── building/             # Plan builders (select.ts, expression.ts, ddl.ts, ...)
-│   ├── nodes/                # PlanNode classes (one per node type)
-│   │   └── plan-node-type.ts # PlanNodeType enum — add new node types here
-│   ├── rules/                # Optimizer rules, by category:
-│   │   ├── access/           #   access-path selection
-│   │   ├── aggregate/        #   streaming aggregation
-│   │   ├── cache/            #   CTE, IN-subquery, materialization
-│   │   ├── distinct/         #   distinct elimination
-│   │   ├── join/             #   join commutation, physical selection
-│   │   ├── predicate/        #   predicate pushdown
-│   │   ├── retrieve/         #   retrieve growth
-│   │   └── subquery/         #   subquery decorrelation
-│   ├── framework/            # Optimizer framework (characteristics, passes, registry)
-│   ├── cost/                 # Cost model (index.ts)
-│   ├── analysis/             # Const evaluator, constraint extractor, predicate normalizer
-│   ├── stats/                # Table/column statistics
-│   ├── validation/           # Plan validation passes
-│   ├── scopes/               # Name resolution scopes
-│   └── cache/                # Plan cache
-├── runtime/
-│   ├── emit/                 # Instruction emitters (mirrors planner/nodes/)
-│   ├── cache/                # Runtime caching
-│   └── functions/            # Runtime function dispatch
-├── emit/                     # Top-level emitter entry (plan → instructions)
-├── schema/                   # Catalog, schema manager, table/column/view/assertion defs
-├── types/                    # Type system (logical types, registry, temporal, JSON)
-├── func/builtins/            # Built-in functions (scalar, aggregate, string, datetime, json, ...)
-├── vtab/                     # Virtual table framework
-│   └── memory/               # In-memory VTab implementation (layers, merge iterators)
-├── common/                   # Shared constants, errors, logger, type inference
-└── util/                     # Miscellaneous utilities
-
-test/
-├── logic/                    # SQL logic tests (*.sqllogic) — primary test suite
-├── plan/                     # Plan-shape tests (basic/, joins/, aggregates/)
-├── optimizer/                # Optimizer-specific tests
-├── planner/                  # Planner unit tests
-├── vtab/                     # VTab tests
-└── util/                     # Test utilities
-```
-
-Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `runtime/emit/`. Optimizer rules in `planner/rules/` are registered via `planner/framework/registry.ts`. Tests go in `test/logic/*.sqllogic` (SQL logic tests) or `test/plan/` (plan shape tests).
-
-### Common Implementation Patterns
-
-**Adding a new PlanNode** (follow an existing node as template):
-1. `planner/nodes/my-node.ts` — node class (e.g. copy `bloom-join-node.ts` for joins)
-2. `planner/nodes/plan-node-type.ts` — add enum entry
-3. `runtime/emit/my-node.ts` — matching emitter
-4. `emit/emitter.ts` — register emitter in the visitor
-5. Tests in `test/logic/*.sqllogic` or `test/plan/`
-
-**Adding an optimizer rule:**
-1. `planner/rules/<category>/rule-my-rule.ts` (copy an existing rule in the same category)
-2. Register in `planner/framework/registry.ts`
-3. Cost constants go in `planner/cost/index.ts`
-
-**Adding a built-in function:**
-1. `func/builtins/<category>.ts` (scalar.ts, string.ts, aggregate.ts, json.ts, datetime.ts, ...)
-2. Register via `func/registration.ts`
-
-All paths above are relative to `src/`.
+*   **Virtual Table Centric** — provide a robust and flexible virtual table API as the primary means of interacting with data sources. All tables are virtual tables.
+*   **In-Memory Default** — includes a comprehensive in-memory virtual table implementation (`MemoryTable`) with support for transactions and savepoints.
+*   **Modern Type System** — extensible logical/physical type separation with built-in temporal types (DATE, TIME, DATETIME), native JSON type with deep equality comparison, and plugin support for custom types. See [Type System Documentation](../../docs/types.md).
+*   **TypeScript & Modern JS** — leverage TypeScript's type system and modern JavaScript features and idioms.
+*   **Async VTab Operations** — virtual table data operations (reads/writes) are asynchronous. Cursors are implemented as async iterables.
+*   **Cross-Platform** — target diverse Javascript runtime environments, including Node.js, browser, and React Native. Plugin loading (via `@quereus/plugin-loader`) uses dynamic `import()` and is not compatible with React Native; use static imports for RN.
+*   **Minimal Dependencies** — avoid heavy external dependencies where possible.
+*   **SQL Compatibility** — comprehensive support for modern SQL features including joins, window functions, subqueries, CTEs, constraints, views, and advanced DML/DDL operations.
+*   **Key-Based Addressing** — all tables are addressed by their defined Primary Key. The concept of a separate, implicit `rowid` for addressing rows is not used.
+*   **Third Manifesto Friendly** — embraces some of the principles of the [Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf), such as allowing for empty keys. Utilizes algebraic planning.
 
 ## Quick Start
 
@@ -257,183 +159,66 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 
 ## Documentation
 
-* [Usage Guide](../../docs/usage.md): Complete API reference including:
-  - Type mappings (SQL ↔ JavaScript)
-  - Parameter binding and prepared statements
-  - Logging via `debug` library with namespace control
-  - Instruction tracing for performance analysis
-  - Transaction and savepoint management
-* [SQL Reference Guide](../../docs/sql.md): SQL syntax (includes Declarative Schema)
-* [Schema Management](../../docs/schema.md): SchemaManager API, change events, key types
-* [Type System](../../docs/types.md): Logical/physical types, temporal types, JSON, custom types
-* [Functions](../../docs/functions.md): Built-in scalar, aggregate, window, and JSON functions
-* [Memory Tables](../../docs/memory-table.md): Built-in MemoryTable module
-* [Module Authoring](../../docs/module-authoring.md): Virtual table module development and event system
-* [Date/Time Handling](../../docs/datetime.md): Temporal parsing, functions, and ISO 8601 formats
-* [Runtime](../../docs/runtime.md): Instruction-based execution and opcodes
-* [Error Handling](../../docs/errors.md): Error types and status codes
-* [Plugin System](../../docs/plugins.md): Virtual tables, functions, and collations
-* [TODO List](../../docs/todo.md): Planned features
+**Architecture deep dive:** [Architecture](../../docs/architecture.md) — the pipeline (parser → planner → runtime), source layout, extension patterns, design decisions, constraints model, and testing strategy. Start here if you're working on the engine itself.
+
+**User & operator docs:**
+* [Usage Guide](../../docs/usage.md) — complete API reference (type mappings, parameter binding, logging, tracing, transactions)
+* [SQL Reference Guide](../../docs/sql.md) — SQL syntax (includes Declarative Schema)
+* [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation
+* [Type System](../../docs/types.md) — logical/physical types, temporal types, JSON, custom types
+* [Functions](../../docs/functions.md) — built-in scalar, aggregate, window, and JSON functions
+* [Memory Tables](../../docs/memory-table.md) — built-in MemoryTable module
+* [Module Authoring](../../docs/module-authoring.md) — virtual table module development and event system
+* [Date/Time Handling](../../docs/datetime.md) — temporal parsing, functions, and ISO 8601 formats
+* [Runtime](../../docs/runtime.md) — instruction-based execution and opcodes
+* [Error Handling](../../docs/errors.md) — error types and status codes
+* [Plugin System](../../docs/plugins.md) — virtual tables, functions, and collations
+* [Optimizer](../../docs/optimizer.md) / [Optimizer Conventions](../../docs/optimizer-conventions.md)
+* [Change-scope Introspection](../../docs/change-scope.md) — what a prepared statement reads from
+* [TODO List](../../docs/todo.md) — planned features
 
 ### Plugin Development
 
 Quereus exports all critical utilities needed for plugin and module development:
 
-* **Comparison Functions**: `compareSqlValues`, `compareRows`, `compareTypedValues`, `createTypedComparator` — Match Quereus SQL semantics in custom implementations
-* **Coercion Utilities**: `tryCoerceToNumber`, `coerceForAggregate` — Handle type coercion for aggregates and arithmetic
-* **Collation Support**: `registerCollation`, `getCollation`, built-in collations (`BINARY_COLLATION`, `NOCASE_COLLATION`, `RTRIM_COLLATION`)
-* **Type System**: Full access to logical types, validation, and parsing utilities
-* **Event Hooks**: `VTableEventEmitter` interface for mutation and schema change events — Enable reactive patterns, caching, and replication
-* **DDL Generation**: `generateTableDDL(tableSchema, db?)`, `generateIndexDDL(indexSchema, tableSchema, db?)` — Canonical `CREATE TABLE` / `CREATE INDEX` output from runtime schema objects. With a `Database`, matches session defaults (schema qualification, `default_column_nullability`, `default_vtab_module`/`default_vtab_args`) for readable output; without one, emits fully-qualified, explicitly-annotated DDL safe for cross-session persistence. See [Schema Management — DDL Generation](../../docs/schema.md#ddl-generation).
+* **Comparison Functions** — `compareSqlValues`, `compareRows`, `compareTypedValues`, `createTypedComparator` — match Quereus SQL semantics in custom implementations
+* **Coercion Utilities** — `tryCoerceToNumber`, `coerceForAggregate` — handle type coercion for aggregates and arithmetic
+* **Collation Support** — `registerCollation`, `getCollation`, built-in collations (`BINARY_COLLATION`, `NOCASE_COLLATION`, `RTRIM_COLLATION`)
+* **Type System** — full access to logical types, validation, and parsing utilities
+* **Event Hooks** — `VTableEventEmitter` interface for mutation and schema change events; enable reactive patterns, caching, and replication
+* **DDL Generation** — `generateTableDDL(tableSchema, db?)`, `generateIndexDDL(indexSchema, tableSchema, db?)` — canonical `CREATE TABLE` / `CREATE INDEX` output from runtime schema objects. With a `Database`, matches session defaults (schema qualification, `default_column_nullability`, `default_vtab_module`/`default_vtab_args`) for readable output; without one, emits fully-qualified, explicitly-annotated DDL safe for cross-session persistence. See [Schema Management — DDL Generation](../../docs/schema.md#ddl-generation).
 
 See the [Plugin System documentation](../../docs/plugins.md#comparison-and-coercion-utilities) for complete API reference and examples.
-
-## Key Design Decisions
-
-*   **Federated / VTab-Centric**: All tables are virtual tables.
-*   **Async Core**: Core operations are asynchronous. Cursors are `AsyncIterable<Row>`.
-*   **Key-Based Addressing**: Rows are identified by their defined Primary Key. No separate implicit `rowid`.
-*   **Relational Orthogonality**: Any statement that results in a relation can be used anywhere that expects a relation value, including mutating statements with RETURNING clauses.
-*   **Declarative Schema (Optional)**: Keep using DDL normally. Optionally use order‑independent `declare schema { ... }` to describe end‑state; the engine computes diffs against current state using module‑reported catalogs and emits canonical DDL. You may auto‑apply via `apply schema` or fetch the DDL and run it yourself (enabling custom backfills). Supports seeds, imports (URL + cache), versioning, and schema hashing. Destructive changes require explicit acknowledgement.
-*   **JavaScript Types**: Uses standard JavaScript types (`number`, `string`, `bigint`, `boolean`, `Uint8Array`, `null`) internally.
-*   **Object-Based API**: Uses classes (`Database`, `Statement`) to represent resources with lifecycles, rather than handles.
-*   **Transient Schema**: Schema information is primarily in-memory; persistence is not a goal. Emission of schema SQL export is supported.
-*   **Multi-Schema Support**: Organize tables across multiple schemas with flexible search paths for modular designs.
-*   **Bags vs Sets Distinction**: Explicit type-level distinction between relations that guarantee unique rows (sets) and those that allow duplicates (bags), enabling sophisticated optimizations and maintaining algebraic correctness in line with Third Manifesto principles.
-*   **Attribute-Based Context System**: Robust column reference resolution using stable attribute IDs eliminates architectural fragilities and provides deterministic context lookup across plan transformations.
-
-## Key Design Differences
-
-While Quereus supports standard SQL syntax, it has several distinctive design choices:
-
-*   **Modern Type System**: Uses logical/physical type separation instead of SQLite's type affinity model. Includes native temporal types (DATE, TIME, DATETIME) and JSON type with deep equality comparison. Conversion functions (`integer()`, `date()`, `json()`) are preferred over CAST syntax. All expressions have known types at plan time, including parameters; cross-category comparisons (e.g., numeric vs text) are handled via explicit conversions rather than implicit runtime coercion. See [Type System Documentation](../../docs/types.md).
-*   **Virtual Table Centric**: Uses `CREATE TABLE ... USING module(...)` syntax. All tables are virtual tables.
-*   **Default NOT NULL Columns**: Following Third Manifesto principles, columns default to NOT NULL unless explicitly specified otherwise. This behavior can be controlled via `pragma default_column_nullability = 'nullable'` to restore SQL standard behavior.
-*   **No Rowids**: All tables are addressed by their Primary Key. When no explicit PRIMARY KEY is defined, Quereus includes all columns in the primary key.
-*   **Async API**: Core execution is asynchronous with async/await patterns throughout.
-*   **No Triggers or Built-in Persistence**: Persistent storage can be implemented as a VTab module.
-
-### Constraints
-
-- Row-level CHECKs that reference only the current row are enforced immediately.
-- Row-level CHECKs that reference other tables (e.g., via subqueries) are automatically deferred and enforced at COMMIT using the same optimized engine as global assertions. No `DEFERRABLE` or `SET CONSTRAINTS` management is required by the user.
-- `CREATE ASSERTION name CHECK (...)` defines database-wide invariants evaluated at COMMIT.
-- `FOREIGN KEY ... REFERENCES` with `ON DELETE CASCADE/SET NULL/RESTRICT` and `ON UPDATE CASCADE/SET NULL/RESTRICT`.
-- **`committed.tablename` pseudo-schema**: Provides read-only access to the pre-transaction (committed) state of any table. Enables transition constraints that compare current and committed state (e.g., `CREATE ASSERTION no_decrease CHECK (NOT EXISTS (SELECT 1 FROM t JOIN committed.t ct ON t.id = ct.id WHERE t.val < ct.val))`). The committed view is pinned to the transaction-start snapshot and is unaffected by savepoints.
-- **Determinism Enforcement**: CHECK constraints and DEFAULT values must use only deterministic expressions. Non-deterministic values (like `datetime('now')` or `random()`) must be passed via mutation context to ensure captured statements are replayable. See [Runtime Documentation](../../docs/runtime.md#determinism-validation).
-
-### Sequential ID Generation
-
-Quereus has no built-in auto-increment or sequence objects. Instead, batch ID generation composes naturally from existing features: mutation context captures a non-deterministic seed once, a window function provides a deterministic per-row ordinal, and a scalar or table-valued function produces the final ID. For example, inserting with timestamp-derived IDs:
-
-```sql
-insert into orders (id, customer_id, total)
-with context base_ts = epoch_ms('now')
-select
-    base_ts * 1000 + row_number() over (order by c.customer_id),
-    c.customer_id,
-    c.total
-from (select customer_id, sum(price) as total from cart_items group by customer_id) c;
-```
-
-The `WITH CONTEXT` boundary captures `epoch_ms('now')` as a literal, and `row_number() over (order by ...)` assigns a deterministic ordinal over a declared ordering. The entire statement is replayable. For richer formats (ULIDs, UUIDv7), register a deterministic scalar UDF that encodes `(seed, counter)` into the desired format — or use a lateral join to a deterministic TVF when multiple columns are needed per generated row.
 
 ## Current Status
 
 Quereus is a feature-complete SQL query processor with a modern planner and instruction-based runtime architecture. The engine successfully handles complex SQL workloads including joins, window functions, subqueries, CTEs, constraints, and comprehensive DML/DDL operations.
 
 **Current capabilities include:**
-*   **Modern Type System** - Temporal types (DATE, TIME, DATETIME), JSON with deep equality, plugin-extensible custom types
-*   **Complete JOIN support** - INNER, LEFT, RIGHT, CROSS, SEMI, and ANTI joins with proper NULL padding
-*   **Advanced window functions** - Ranking, aggregates, and frame specifications
-*   **Full constraint system** - NOT NULL, CHECK, FOREIGN KEY, and CREATE ASSERTION. Row-level constraints that reference other tables are automatically deferred to COMMIT. The `committed.tablename` pseudo-schema provides read-only access to pre-transaction state for transition constraints (e.g., "balance may not decrease")
-*   **Comprehensive subqueries** - Scalar, correlated, EXISTS, and IN subqueries
-*   **Relational orthogonality** - INSERT/UPDATE/DELETE with RETURNING can be used as table sources
-*   **Complete set operations** - UNION, INTERSECT, EXCEPT with proper deduplication
-*   **DIFF (symmetric difference)** - `A diff B` equals `(A except B) union (B except A)`, handy for table equality checks via `not exists(A diff B)`
-*   **Robust transaction support** - Multi-level savepoints and rollback. See [Usage Guide](../../docs/usage.md#transactions) for details
-*   **Rich built-in function library** - Scalar, aggregate, window, JSON, and date/time functions
+*   **Modern Type System** — temporal types (DATE, TIME, DATETIME), JSON with deep equality, plugin-extensible custom types
+*   **Complete JOIN support** — INNER, LEFT, RIGHT, CROSS, SEMI, and ANTI joins with proper NULL padding
+*   **Advanced window functions** — ranking, aggregates, and frame specifications
+*   **Full constraint system** — NOT NULL, CHECK, FOREIGN KEY, and CREATE ASSERTION. Row-level constraints that reference other tables are automatically deferred to COMMIT. The `committed.tablename` pseudo-schema provides read-only access to pre-transaction state for transition constraints (e.g., "balance may not decrease"). See [Architecture — Constraints](../../docs/architecture.md#constraints).
+*   **Comprehensive subqueries** — scalar, correlated, EXISTS, and IN subqueries
+*   **Relational orthogonality** — INSERT/UPDATE/DELETE with RETURNING can be used as table sources
+*   **Complete set operations** — UNION, INTERSECT, EXCEPT with proper deduplication
+*   **DIFF (symmetric difference)** — `A diff B` equals `(A except B) union (B except A)`, handy for table equality checks via `not exists(A diff B)`
+*   **Robust transaction support** — multi-level savepoints and rollback. See [Usage Guide](../../docs/usage.md#transactions) for details
+*   **Rich built-in function library** — scalar, aggregate, window, JSON, and date/time functions
+*   **Rule-based optimizer** — constant folding, caching, streaming aggregation, bloom-join selection, and correlated subquery decorrelation. See [Architecture — Optimizer](../../docs/architecture.md#optimizer).
+*   **Change-scope introspection and reactive subscriptions** — `Statement.getChangeScope()` returns a JSON-serializable description of what base-table state and external inputs a prepared statement reads from. The companion `Database.watch(scope, handler)` consumes any `ChangeScope` value (analyzed, deserialized, or hand-built) and fires a post-commit callback whenever matching rows, groups, or tables change. See [Change-scope Documentation](../../docs/change-scope.md).
 
-**Optimizer Status:**
-
-Quereus features a sophisticated rule-based query optimizer that transforms logical plans into efficient physical execution plans. The optimizer uses a single plan node hierarchy with logical-to-physical transformation, generic tree rewriting infrastructure, and comprehensive optimization rules including constant folding, intelligent caching, streaming aggregation, bloom (hash) join selection for equi-joins, and correlated subquery decorrelation (EXISTS/IN → semi/anti joins).
-
-See the [Optimizer Documentation](../../docs/optimizer.md) for architecture details and [Optimizer Conventions](../../docs/optimizer-conventions.md) for development guidelines.
 [TODO List](../../docs/todo.md) has remaining priorities.
-
-Recent changes:
-- Retrieve growth and push-down stabilized: query-based modules slide full nodes via `supports()`; index-style fallback injects supported-only fragments inside `Retrieve`, preserving residuals above.
-- Retrieve logical properties now expose `bindingsCount` and `bindingsNodeTypes` (visible in `query_plan().properties`) to aid verification that parameters/correlations are captured.
-
-## Testing
-
-The tests are located in `test/*.spec.ts` and are driven by Mocha with ts-node/esm.
-
-```bash
-yarn test
-```
-
-Quereus employs a multi-faceted testing strategy:
-
-1.  **SQL Logic Tests (`test/logic/`)**:
-    *   Inspired by SQLite's own testing methodology.
-    *   Uses simple text files (`*.sqllogic`) containing SQL statements and their expected JSON results (using `→` marker) or expected error messages (using `-- error:` directive).
-    *   Driven by a Mocha test runner (`test/logic.spec.ts`) that executes the SQL against a fresh `Database` instance for each file.
-    *   **Configurable Diagnostics**: On unexpected failures, the test runner provides clean error messages by default with optional detailed diagnostics controlled by command line arguments:
-        *   `yarn test --verbose` - Show execution progress during tests
-        *   `yarn test --show-plan` - Include concise query plan in diagnostics
-        *   `yarn test --plan-full-detail` - Include full detailed query plan (JSON format)
-        *   `yarn test --plan-summary` - Show one-line execution path summary
-        *   `yarn test --expand-nodes node1,node2...` - Expand specific nodes in concise plan
-        *   `yarn test --max-plan-depth N` - Limit plan display depth
-        *   `yarn test --show-program` - Include instruction program in diagnostics
-        *   `yarn test --show-stack` - Include full stack trace in diagnostics
-        *   `yarn test --show-trace` - Include execution trace in diagnostics
-        *   `yarn test --trace-plan-stack` - Enable plan stack tracing in runtime
-    *   This helps pinpoint failures at the Parser, Planner, or Runtime layer while keeping output manageable.
-    *   Provides comprehensive coverage of SQL features: basic CRUD, complex expressions, all join types, window functions, aggregates, subqueries, CTEs, constraints, transactions, set operations, views, and error handling.
-
-2.  **Property-Based Tests (`test/property.spec.ts`)**:
-    *   Uses the `fast-check` library to generate a wide range of inputs for specific, tricky areas.
-    *   Focuses on verifying fundamental properties and invariants that should hold true across many different values.
-    *   Currently includes tests for:
-        *   **Collation Consistency**: Ensures `ORDER BY` results match the behavior of the `compareSqlValues` utility for `BINARY`, `NOCASE`, and `RTRIM` collations across various strings.
-        *   **Numeric Affinity**: Verifies that comparisons (`=`, `<`) in SQL handle mixed types (numbers, strings, booleans, nulls) consistently with SQLite's affinity rules, using `compareSqlValues` as the reference.
-        *   **JSON Roundtrip**: Confirms that arbitrary JSON values survive being processed by `json_quote()` and `json_extract('$')` without data loss or corruption.
-        *   **Mixed Type Arithmetic**: Checks that arithmetic on mixed types behaves consistently between SELECT and WHERE contexts.
-        *   **Parser Robustness**: Feeds random strings, SQL-like fragment mixtures, and random identifiers to the parser, asserting it either produces a valid AST or throws `QuereusError` — never unhandled exceptions.
-        *   **Expression Evaluation**: Compares random arithmetic expression trees and boolean comparisons evaluated in SQL against JS semantics.
-        *   **Comparison Properties**: Validates `compareSqlValues` maintains antisymmetry, reflexivity, and transitivity across mixed types.
-        *   **Insert/Select Roundtrip**: Tests value preservation through insert+select for INTEGER, REAL, TEXT, BLOB, and ANY column types.
-        *   **ORDER BY Determinism**: Verifies repeated ORDER BY queries on data with duplicate sort keys produce identical results.
-
-3.  **Performance Sentinels (`test/performance-sentinels.spec.ts`)**:
-    *   Micro-benchmarks with generous thresholds to catch severe performance regressions.
-    *   Currently includes sentinels for: parser throughput (simple, wide-SELECT, nested-expression), query execution (full table scan), and self-join (nested-loop baseline).
-    *   Thresholds are intentionally generous to avoid flakiness while still catching order-of-magnitude regressions.
-
-4.  **Unit Tests (`test/*.spec.ts`)**:
-    *   Dedicated unit tests for core subsystems: type system (`type-system.spec.ts`), schema manager (`schema-manager.spec.ts`), optimizer rules (`optimizer/*.spec.ts`), memory vtable (`memory-vtable.spec.ts`), utility functions (`utility-edge-cases.spec.ts`).
-    *   Integration boundary tests (`integration-boundaries.spec.ts`) verify all boundary transitions: Parser→Planner, Planner→Optimizer, Optimizer→Runtime, Runtime→VTab.
-    *   Golden plan tests (`plan/golden-plans.spec.ts`) use snapshot testing to detect unintended query plan changes.
-
-5.  **Benchmark Suite (`bench/`)**:
-    *   Standalone benchmark harness run via `yarn bench`. Measures parser, planner, execution, and mutation throughput across 18 benchmarks.
-    *   Records results to timestamped JSON files in `bench/results/` (gitignored).
-    *   `yarn bench --baseline <file>` compares against a previous result, color-codes regressions (>20% red) and improvements (>10% green), and exits non-zero on regressions.
-
-6.  **CI Integration (Planned)**:
-    *   Utilize GitHub Actions (or similar) to run test suites automatically, potentially with different configurations (quick checks, full runs, browser environment).
-
-This layered approach aims for broad coverage via the logic tests, unit tests for individual subsystems, property tests to explore edge cases, performance sentinels to guard against regressions, and a dedicated benchmark suite for tracking performance over time.
 
 ## Supported Built-in Functions
 
-*   **Scalar:** `lower`, `upper`, `length`, `substr`/`substring`, `abs`, `round`, `coalesce`, `nullif`, `like`, `glob`, `typeof`
-*   **Aggregate:** `count`, `sum`, `avg`, `min`, `max`, `group_concat`, `json_group_array`, `json_group_object`
-*   **Window Functions:** Complete implementation with `row_number`, `rank`, `dense_rank`, `ntile` (ranking); `count`, `sum`, `avg`, `min`, `max` with OVER clause (aggregates); Full frame specification support (`ROWS BETWEEN`, `UNBOUNDED PRECEDING/FOLLOWING`); `NULLS FIRST/LAST` ordering
-*   **Date/Time:** `date`, `time`, `datetime`, `julianday`, `strftime` (supports common formats and modifiers), `epoch_s`, `epoch_ms`, `epoch_s_frac` (Unix epoch conversions with strict parsing)
-*   **JSON:** `json_valid`, `json_schema`, `json_type`, `json_extract`, `json_quote`, `json_array`, `json_object`, `json_insert`, `json_replace`, `json_set`, `json_remove`, `json_array_length`, `json_patch`
-*   **Query Analysis:** `query_plan`, `scheduler_program`, `execution_trace` (debugging and performance analysis)
+*   **Scalar** — `lower`, `upper`, `length`, `substr`/`substring`, `abs`, `round`, `coalesce`, `nullif`, `like`, `glob`, `typeof`
+*   **Aggregate** — `count`, `sum`, `avg`, `min`, `max`, `group_concat`, `json_group_array`, `json_group_object`
+*   **Window Functions** — complete implementation with `row_number`, `rank`, `dense_rank`, `ntile` (ranking); `count`, `sum`, `avg`, `min`, `max` with OVER clause (aggregates); full frame specification support (`ROWS BETWEEN`, `UNBOUNDED PRECEDING/FOLLOWING`); `NULLS FIRST/LAST` ordering
+*   **Date/Time** — `date`, `time`, `datetime`, `julianday`, `strftime` (supports common formats and modifiers), `epoch_s`, `epoch_ms`, `epoch_s_frac` (Unix epoch conversions with strict parsing)
+*   **JSON** — `json_valid`, `json_schema`, `json_type`, `json_extract`, `json_quote`, `json_array`, `json_object`, `json_insert`, `json_replace`, `json_set`, `json_remove`, `json_array_length`, `json_patch`
+*   **Query Analysis** — `query_plan`, `scheduler_program`, `execution_trace` (debugging and performance analysis)
 
+## Testing
 
+Tests live in `test/*.spec.ts`, driven by Mocha with ts-node/esm. Run with `yarn test`. Quereus uses SQL logic tests (primary), property-based tests, performance sentinels, unit tests, and a benchmark suite — see [Architecture — Testing Strategy](../../docs/architecture.md#testing-strategy) for details.

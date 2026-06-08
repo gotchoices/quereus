@@ -3,8 +3,12 @@ import type { PlanningContext } from '../planning-context.js';
 import { CTENode, type CTEPlanNode, type CTEScopeNode } from '../nodes/cte-node.js';
 import { RecursiveCTENode } from '../nodes/recursive-cte-node.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
-import { buildSelectStmt } from './select.js';
-import type { RelationalPlanNode } from '../nodes/plan-node.js';
+import { buildSelectStmt, buildValuesStmt } from './select.js';
+import { buildInsertStmt } from './insert.js';
+import { buildUpdateStmt } from './update.js';
+import { buildDeleteStmt } from './delete.js';
+import { buildExpression } from './expression.js';
+import type { RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -71,22 +75,46 @@ export function buildCommonTableExpr(
 	}
 	cteContext.scope = cteScope;
 
-	// Check if this is a recursive CTE with UNION structure
+	// Check if this is a recursive CTE with UNION structure. Recursive CTEs
+	// require a SELECT body with a compound (UNION / UNION ALL) leg — VALUES
+	// or DML bodies cannot be recursive and fall through to the normal path
+	// (which will report the right error for non-SELECT recursive bodies).
 	if (isRecursive && cte.query.type === 'select' && cte.query.compound) {
 		return buildRecursiveCTE(cteContext, cte, existingCTEs, options);
 	}
 
-	// For non-recursive CTEs or recursive CTEs without UNION structure
+	// For non-recursive CTEs or recursive CTEs without UNION structure.
+	// CTE bodies are QueryExprs; SELECT and VALUES bodies build straight to a
+	// relation. DML bodies (RETURNING enforced by the parser) lower through
+	// the DML builders — the resulting ReturningNode is the CTE's surface.
 	let query: RelationalPlanNode;
+	switch (cte.query.type) {
+		case 'select':
+			query = buildSelectStmt(cteContext, cte.query, existingCTEs) as RelationalPlanNode;
+			break;
+		case 'values':
+			query = buildValuesStmt(cteContext, cte.query);
+			break;
+		case 'insert':
+			query = buildInsertStmt(cteContext, cte.query) as RelationalPlanNode;
+			break;
+		case 'update':
+			query = buildUpdateStmt(cteContext, cte.query) as RelationalPlanNode;
+			break;
+		case 'delete':
+			query = buildDeleteStmt(cteContext, cte.query) as RelationalPlanNode;
+			break;
+	}
 
-	if (cte.query.type === 'select') {
-		query = buildSelectStmt(cteContext, cte.query, existingCTEs) as RelationalPlanNode;
-	} else {
-		// CTE can also be INSERT, UPDATE, or DELETE statements
-		throw new QuereusError(
-			'Non-SELECT CTEs are not yet supported',
-			StatusCode.UNSUPPORTED
-		);
+	// Validate declared column count matches the SELECT projection arity
+	if (cte.columns && cte.columns.length > 0) {
+		const queryArity = query.getAttributes().length;
+		if (cte.columns.length !== queryArity) {
+			throw new QuereusError(
+				`CTE '${cte.name}' has ${cte.columns.length} declared columns but query produces ${queryArity}`,
+				StatusCode.ERROR
+			);
+		}
 	}
 
 	// Determine materialization strategy
@@ -126,18 +154,51 @@ function buildRecursiveCTE(
 		);
 	}
 
+	// LIMIT/OFFSET on the outer compound apply to the entire recursive output;
+	// strip them from the base case AST and capture them for the RecursiveCTENode.
+	const outerLimit = selectStmt.limit;
+	const outerOffset = selectStmt.offset;
+
 	// Extract base case (the main SELECT) and recursive case (the compound part)
 	const baseCaseStmt: AST.SelectStmt = {
 		...selectStmt,
-		compound: undefined
+		compound: undefined,
+		limit: undefined,
+		offset: undefined
 	};
 
-	const recursiveCaseStmt = selectStmt.compound.select;
+	// Recursive CTE: the recursive leg of the compound must itself be a SELECT
+	// (the only form that can carry self-reference + projection). VALUES /
+	// DML legs would compile but never recurse meaningfully.
+	if (selectStmt.compound.select.type !== 'select') {
+		throw new QuereusError(
+			`Recursive CTE '${cte.name}' recursive leg must be a SELECT (got ${selectStmt.compound.select.type}).`,
+			StatusCode.UNSUPPORTED,
+			undefined,
+			selectStmt.compound.select.loc?.start.line,
+			selectStmt.compound.select.loc?.start.column,
+		);
+	}
+	const recursiveCaseStmt: AST.SelectStmt = selectStmt.compound.select;
 	const isUnionAll = selectStmt.compound.op === 'unionAll';
 
 	// Build the base case query (without CTE self-reference)
 	// Pass existingCTEs so the base case can reference earlier CTEs
 	const baseCaseQuery = buildSelectStmt(ctx, baseCaseStmt, existingCTEs) as RelationalPlanNode;
+
+	const limitExpr: ScalarPlanNode | undefined = outerLimit ? buildExpression(ctx, outerLimit) : undefined;
+	const offsetExpr: ScalarPlanNode | undefined = outerOffset ? buildExpression(ctx, outerOffset) : undefined;
+
+	// Validate declared column count matches the base case projection arity
+	if (cte.columns && cte.columns.length > 0) {
+		const queryArity = baseCaseQuery.getAttributes().length;
+		if (cte.columns.length !== queryArity) {
+			throw new QuereusError(
+				`Recursive CTE '${cte.name}' has ${cte.columns.length} declared columns but query produces ${queryArity}`,
+				StatusCode.ERROR
+			);
+		}
+	}
 
 	// Determine materialization strategy (recursive CTEs should typically be materialized)
 	const materializationHint = cte.materializationHint || 'materialized';
@@ -151,7 +212,10 @@ function buildRecursiveCTE(
 		baseCaseQuery, // Temporary - will be replaced with actual recursive case
 		isUnionAll,
 		materializationHint,
-		options?.maxRecursion
+		options?.maxRecursion,
+		undefined,
+		limitExpr,
+		offsetExpr
 	);
 
 		// For the recursive case, we need to create a special context where the CTE name

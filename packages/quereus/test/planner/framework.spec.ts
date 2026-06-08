@@ -27,9 +27,7 @@ import {
 	mergeOrderings,
 	orderingsEqual,
 	orderingsCompatible,
-	projectUniqueKeys,
 	projectOrdering,
-	uniqueKeysImplyDistinct,
 	type Ordering,
 } from '../../src/planner/framework/physical-utils.js';
 import {
@@ -145,7 +143,7 @@ function makeRule(
 	fn: (node: PlanNode, ctx: OptContext) => PlanNode | null,
 	priority?: number,
 ): RuleHandle {
-	return { id, nodeType, phase: 'rewrite', fn, priority };
+	return { id, nodeType, phase: 'rewrite', fn, priority, sideEffectMode: 'safe' };
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +222,9 @@ describe('Planner Framework', () => {
 
 			const pass = createPass('deep', 'Deep', '', 10, TraversalOrder.BottomUp);
 			const pm = new PassManager([pass]);
-			const ctx = makeContext({ maxOptimizationDepth: 3 });
+			// headroom: 0 keeps the budget capped by maxOptimizationDepth so the
+			// guard fires on this deliberately-too-deep tree.
+			const ctx = makeContext({ maxOptimizationDepth: 3, optimizationDepthHeadroom: 0 });
 
 			expect(() => pm.execute(node, ctx)).to.throw(/Maximum optimization depth/);
 		});
@@ -477,10 +477,20 @@ describe('Planner Framework', () => {
 			expect(PlanNodeCharacteristics.isVoid(node)).to.equal(false);
 		});
 
-		it('hasUniqueKeys and getUniqueKeys', () => {
-			const node = relNode({ physical: { uniqueKeys: [[0, 1]] } });
+		it('hasUniqueKeys via key-encoding FD', () => {
+			// FD encoding: `{0, 1} → {2}` claims that columns 0+1 are a superkey of
+			// a 3-col relation. PlanNodeCharacteristics.hasUniqueKeys should detect
+			// the non-trivial key.
+			const attrs: Attribute[] = [
+				{ id: 1, name: 'a', type: { typeClass: 'scalar' } as any },
+				{ id: 2, name: 'b', type: { typeClass: 'scalar' } as any },
+				{ id: 3, name: 'c', type: { typeClass: 'scalar' } as any },
+			];
+			const node = relNode({
+				attributes: attrs,
+				physical: { fds: [{ determinants: [0, 1], dependents: [2] }] },
+			});
 			expect(PlanNodeCharacteristics.hasUniqueKeys(node)).to.equal(true);
-			expect(PlanNodeCharacteristics.getUniqueKeys(node)).to.deep.equal([[0, 1]]);
 		});
 
 		it('hasOrderedOutput when ordering present', () => {
@@ -766,27 +776,6 @@ describe('Planner Framework', () => {
 			});
 		});
 
-		describe('projectUniqueKeys', () => {
-
-			it('projects keys through mapping', () => {
-				const keys = [[0, 1], [2]];
-				const mapping = new Map([[0, 10], [1, 11], [2, 12]]);
-				expect(projectUniqueKeys(keys, mapping)).to.deep.equal([[10, 11], [12]]);
-			});
-
-			it('drops keys with unmapped columns', () => {
-				const keys = [[0, 1], [2]];
-				const mapping = new Map([[0, 10], [2, 12]]); // column 1 not mapped
-				expect(projectUniqueKeys(keys, mapping)).to.deep.equal([[12]]);
-			});
-
-			it('returns empty when all keys have unmapped columns', () => {
-				const keys = [[0, 1]];
-				const mapping = new Map<number, number>();
-				expect(projectUniqueKeys(keys, mapping)).to.deep.equal([]);
-			});
-		});
-
 		describe('projectOrdering', () => {
 
 			it('projects ordering through mapping', () => {
@@ -812,24 +801,6 @@ describe('Planner Framework', () => {
 			});
 		});
 
-		describe('uniqueKeysImplyDistinct', () => {
-
-			it('unique key subset of projected columns → true', () => {
-				expect(uniqueKeysImplyDistinct([[0, 1]], [0, 1, 2])).to.equal(true);
-			});
-
-			it('unique key not subset → false', () => {
-				expect(uniqueKeysImplyDistinct([[0, 1]], [0, 2])).to.equal(false);
-			});
-
-			it('any key matching is sufficient', () => {
-				expect(uniqueKeysImplyDistinct([[0, 1], [2]], [2, 3])).to.equal(true);
-			});
-
-			it('empty keys → false', () => {
-				expect(uniqueKeysImplyDistinct([], [0, 1])).to.equal(false);
-			});
-		});
 	});
 
 	// ---------------------------------------------------------------------------
@@ -843,6 +814,7 @@ describe('Planner Framework', () => {
 			nodeType: PlanNodeType.Filter,
 			phase: 'rewrite',
 			fn: () => null,
+			sideEffectMode: 'safe',
 		};
 
 		afterEach(() => {

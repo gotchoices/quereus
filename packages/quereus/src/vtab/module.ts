@@ -1,7 +1,7 @@
 import type { Database } from '../core/database.js'; // Assuming Database class exists
 import type { VirtualTable } from './table.js';
 
-import type { ColumnDef, Expression } from '../parser/ast.js'; // <-- Add parser AST import
+import type { ColumnDef, Expression, TableConstraint } from '../parser/ast.js'; // <-- Add parser AST import
 import type { TableSchema, IndexSchema } from '../schema/table.js'; // Add import for TableSchema and IndexSchema
 import type { BestAccessPlanRequest, BestAccessPlanResult } from './best-access-plan.js';
 import type { PlanNode } from '../planner/nodes/plan-node.js';
@@ -15,6 +15,23 @@ export interface BaseModuleConfig {
 	/** When true, the module should provide read-only access to the committed (pre-transaction) state */
 	_readCommitted?: boolean;
 }
+
+/**
+ * Declares whether a virtual table module tolerates concurrent calls on a
+ * single connection. Consulted by parallel runtime consumers (e.g. fan-out
+ * lookup joins) to decide whether sibling branches may share a connection
+ * or must serialize.
+ *
+ * - `'serial'` — runtime must serialize vtab calls per connection. Safe
+ *   default for any module that has not been audited; defeats parallelism
+ *   for that module.
+ * - `'reentrant-reads'` — concurrent `query()` calls on a single
+ *   connection are safe; writes (`update()`, savepoint ops, etc.) still
+ *   serialize.
+ * - `'fully-reentrant'` — no constraint; any operation is safe to
+ *   interleave with any other on the same connection.
+ */
+export type VtabConcurrencyMode = 'serial' | 'reentrant-reads' | 'fully-reentrant';
 
 /**
  * Assessment result from a module's supports() method indicating
@@ -38,6 +55,39 @@ export interface VirtualTableModule<
 	TTable extends VirtualTable,
 	TConfig extends BaseModuleConfig = BaseModuleConfig
 > {
+
+	/**
+	 * Declares whether the runtime may issue concurrent calls (query, update,
+	 * connect, …) against tables owned by this module while another call is
+	 * already in flight on the same connection. Read by `ParallelDriver`
+	 * consumers (e.g. FanOutLookupJoin) to decide whether sibling branches
+	 * may share a connection or must serialize.
+	 *
+	 * - `'serial'` (default) — runtime serializes vtab calls per connection.
+	 *   Safe for any module that has not been audited; defeats parallelism
+	 *   for that module.
+	 * - `'reentrant-reads'` — concurrent `query()` calls on a single
+	 *   connection are safe; writes (`update()`, savepoint ops, etc.)
+	 *   continue to serialize.
+	 * - `'fully-reentrant'` — no constraint; any operation is safe to
+	 *   interleave with any other on the same connection.
+	 *
+	 * Omit to inherit `'serial'`.
+	 */
+	readonly concurrencyMode?: VtabConcurrencyMode;
+
+	/**
+	 * Optional hint: expected first-row latency in milliseconds for an iterator
+	 * opened against tables of this module. Local in-process modules omit this
+	 * (treated as 0). Remote / network-backed modules should declare a non-zero
+	 * value so the parallel fan-out rule can amortize per-branch latency across
+	 * concurrent branches.
+	 *
+	 * Read by `TableReferenceNode.computePhysical` and propagated through the
+	 * subtree via the standard `expectedLatencyMs` max-merge. Consumers must
+	 * treat the value as a heuristic; correctness must never depend on it.
+	 */
+	readonly expectedLatencyMs?: number;
 
 	/**
 	 * Creates the persistent definition of a virtual table.
@@ -210,6 +260,32 @@ export interface VirtualTableModule<
 		oldName: string,
 		newName: string,
 	): Promise<void>;
+
+	/**
+	 * Optional. Called once by APPLY SCHEMA before the migration-DDL loop runs,
+	 * iff there are migration statements to execute. The module may use this to
+	 * open an in-memory overlay/batch that subsequent create/destroy/alter
+	 * callbacks (during the loop) join, so the whole APPLY SCHEMA produces a
+	 * single substrate commit.
+	 *
+	 * The hook runs inside the engine's exec() mutex hold, so the batch lives
+	 * entirely within one engine-level execution scope.
+	 *
+	 * Modules that own no tables in `schemaName` should no-op.
+	 */
+	beginSchemaBatch?(db: Database, schemaName: string): Promise<void>;
+
+	/**
+	 * Optional. Called exactly once per successful `beginSchemaBatch`, on both
+	 * success (`error` undefined) and failure (`error` is the failure that
+	 * aborted the migration loop). On error, the module should discard the
+	 * in-flight overlay; on success, it commits.
+	 *
+	 * Errors thrown from `endSchemaBatch` itself are logged and rethrown only
+	 * if no prior loop error exists — if a loop error is being propagated, the
+	 * end-batch failure is logged and swallowed so the original cause survives.
+	 */
+	endSchemaBatch?(db: Database, schemaName: string, error?: unknown): Promise<void>;
 }
 
 /**
@@ -220,6 +296,7 @@ export type SchemaChangeInfo =
 	| { type: 'dropColumn'; columnName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string; newColumnDefAst?: ColumnDef }
 	| { type: 'alterPrimaryKey'; newPkColumns: ReadonlyArray<{ index: number; desc: boolean }> }
+	| { type: 'addConstraint'; constraint: TableConstraint }
 	| {
 		/**
 		 * ALTER COLUMN with exactly one attribute change.

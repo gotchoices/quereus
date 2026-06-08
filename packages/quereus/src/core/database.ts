@@ -1,5 +1,5 @@
 import { createLogger } from '../common/logger.js';
-import { MisuseError, QuereusError } from '../common/errors.js';
+import { MisuseError, QuereusError, FailConflictError, RollbackConflictError } from '../common/errors.js';
 import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue } from '../common/types.js';
 import type { ScalarType } from '../common/datatype.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
@@ -13,13 +13,14 @@ import { FunctionFlags } from '../common/constants.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { BINARY_COLLATION, NOCASE_COLLATION, RTRIM_COLLATION, type CollationFunction } from '../util/comparison.js';
+import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
 import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
 import { buildBlock } from '../planner/building/block.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { RuntimeContext } from '../runtime/types.js';
-import { RowContextMap } from '../runtime/context-helpers.js';
+import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import type { RowDescriptor } from '../planner/nodes/plan-node.js';
 import { BlockNode } from '../planner/nodes/block.js';
 import type { PlanningContext } from '../planner/planning-context.js';
@@ -52,7 +53,10 @@ import {
 } from './database-events.js';
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
-import type { VTableEventEmitter } from '../vtab/events.js';
+import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
+import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
+import { tryGetEventEmitter } from '../vtab/events.js';
+import { Table } from './table-handle.js';
 
 const log = createLogger('core:database');
 const errorLog = log.extend('error');
@@ -70,22 +74,11 @@ function parseSchemaPath(pathString: string): string[] | undefined {
 	return parts.length > 0 ? parts : undefined;
 }
 
-/** Extract a VTableEventEmitter from a module if it supports one. */
-function tryGetEventEmitter(module: AnyVirtualTableModule): VTableEventEmitter | undefined {
-	const asSource = module as { getEventEmitter?: () => unknown };
-	if (typeof asSource.getEventEmitter !== 'function') return undefined;
-	const emitter = asSource.getEventEmitter();
-	if (!emitter || typeof emitter !== 'object') return undefined;
-	const typed = emitter as { onDataChange?: unknown; onSchemaChange?: unknown };
-	if (typeof typed.onDataChange !== 'function' && typeof typed.onSchemaChange !== 'function') return undefined;
-	return emitter as VTableEventEmitter;
-}
-
 /**
  * Represents a connection to an Quereus database (in-memory in this port).
  * Manages schema, prepared statements, virtual tables, and functions.
  */
-export class Database implements TransactionManagerContext, AssertionEvaluatorContext {
+export class Database implements TransactionManagerContext, AssertionEvaluatorContext, WatcherManagerContext {
 	public readonly schemaManager: SchemaManager;
 	public readonly declaredSchemaManager: DeclaredSchemaManager;
 	private isOpen = true;
@@ -108,8 +101,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly transactionManager: TransactionManager;
 	/** Assertion evaluation */
 	private readonly assertionEvaluator: AssertionEvaluator;
-	/** Per-database collation registry */
-	private readonly collations = new Map<string, CollationFunction>();
+	/** Post-commit watcher dispatch */
+	private readonly watcherManager: WatcherManager;
+	/** Per-database collation registry — comparator + optional key normalizer.
+	 *  The normalizer is required for index participation; comparator-only
+	 *  collations may still be used in ORDER BY but cannot back a compound index. */
+	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string }>();
 
 	constructor() {
 		this.schemaManager = new SchemaManager(this);
@@ -136,6 +133,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// Initialize transaction manager and assertion evaluator
 		this.transactionManager = new TransactionManager(this);
 		this.assertionEvaluator = new AssertionEvaluator(this);
+		this.watcherManager = new WatcherManager(this);
 
 		// Set up option change listeners
 		this.setupOptionListeners();
@@ -167,6 +165,23 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** Get changed PK tuples for a specific base table */
 	getChangedKeyTuples(base: string): SqlValue[][] {
 		return this.transactionManager.getChangedKeyTuples(base);
+	}
+
+	/**
+	 * Get changed value tuples projected onto `columnIndices` for a specific
+	 * base table. The columns must have been registered for capture via
+	 * `registerCaptureSpec` (PK columns are always captured implicitly).
+	 */
+	getChangedTuples(base: string, columnIndices: readonly number[], pkIndices: readonly number[]): SqlValue[][] {
+		return this.transactionManager.getChangedTuples(base, columnIndices, pkIndices);
+	}
+
+	/**
+	 * Register projection capture demand for a base table. Returns a dispose
+	 * handle that removes the spec when called.
+	 */
+	registerCaptureSpec(baseTable: string, spec: { extraColumns: ReadonlySet<number> }): () => void {
+		return this.transactionManager.registerCaptureSpec(baseTable, spec);
 	}
 
 	/** @internal Set up listeners for option changes */
@@ -251,7 +266,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			type: 'boolean',
 			defaultValue: true,
 			aliases: ['fk_enforcement'],
-			description: 'Enable foreign key constraint enforcement. FKs default to ON DELETE IGNORE ON UPDATE IGNORE, so explicit action clauses are required for enforcement.',
+			description: 'Enable foreign key constraint enforcement. When omitted, ON DELETE / ON UPDATE default to RESTRICT.',
+		});
+
+		this.options.registerOption('nondeterministic_schema', {
+			type: 'boolean',
+			defaultValue: false,
+			aliases: ['allow_nondeterministic_schema_expressions'],
+			description: 'When true, permit non-deterministic expressions in DEFAULT, CHECK, and GENERATED ALWAYS AS clauses. ' +
+				'Capture happens at the resolved-row frontier in vtab.update(); replay applies module-layer writes without re-evaluating constraints. ' +
+				'Defaults to false (strict rejection) for backward compatibility.',
+			onChange: (event) => {
+				log('nondeterministic_schema changed to: %s', event.newValue);
+			}
 		});
 	}
 
@@ -270,10 +297,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Registers default collation sequences */
 	private registerDefaultCollations(): void {
-		// Register the built-in collations into per-instance registry
-		this.collations.set('BINARY', BINARY_COLLATION);
-		this.collations.set('NOCASE', NOCASE_COLLATION);
-		this.collations.set('RTRIM', RTRIM_COLLATION);
+		// Register the built-in collations into per-instance registry, paired
+		// with their key normalizers so they can back compound indexes.
+		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY });
+		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE });
+		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM  });
 		log("Default collations registered (BINARY, NOCASE, RTRIM)");
 	}
 
@@ -428,12 +456,27 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * Commits or rolls back an implicit transaction based on success.
-	 * No-op if no implicit transaction is active.
+	 * No-op if no implicit transaction is active — except when `error` is a
+	 * RollbackConflictError (OR ROLLBACK), in which case we unconditionally
+	 * roll back the active transaction (implicit or explicit) per SQLite
+	 * semantics. FailConflictError commits prior rows even though the
+	 * statement aborted (per OR FAIL semantics).
 	 * @internal
 	 */
-	async _finalizeImplicitTransaction(success: boolean): Promise<void> {
+	async _finalizeImplicitTransaction(success: boolean, error?: unknown): Promise<void> {
+		// OR ROLLBACK: roll back any active transaction (implicit or explicit).
+		if (!success && error instanceof RollbackConflictError) {
+			if (this.transactionManager.isInTransaction()) {
+				await this._rollbackTransaction();
+			}
+			return;
+		}
+
+		// OR FAIL: commit prior rows even though the statement aborted.
+		const effectiveSuccess = success || error instanceof FailConflictError;
+
 		if (this.transactionManager.isImplicitTransaction()) {
-			if (success) {
+			if (effectiveSuccess) {
 				await this._commitTransaction();
 			} else {
 				await this._rollbackTransaction();
@@ -476,8 +519,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			db: this,
 			stmt: undefined,
 			params: boundArgs,
-			context: new RowContextMap(),
-			tableContexts: new Map(),
+			context: createStrictRowContextMap(),
+			tableContexts: wrapTableContextsStrict(new Map()),
 			tracer: this.instructionTracer,
 			enableMetrics: this.options.getBooleanOption('runtime_stats'),
 		};
@@ -510,9 +553,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/**
 	 * Executes one or more SQL statements directly.
 	 * Statements are serialized through the execution mutex. Transactions are started
-	 * lazily (just-in-time) when the first DML or DDL operation occurs. If an implicit
-	 * transaction was started during execution, it is committed on success or rolled
-	 * back on error.
+	 * lazily (just-in-time) when the first DML or DDL operation occurs. Each
+	 * statement is its own implicit-transaction boundary — matching SQLite's
+	 * autocommit semantics, where every statement either commits on success or
+	 * rolls back on failure independently of its sibling statements in the same
+	 * `exec` batch. Statements running inside an explicit transaction (user
+	 * `BEGIN`) are NOT auto-committed per-statement; they remain part of the
+	 * surrounding explicit transaction until the user issues `COMMIT` or
+	 * `ROLLBACK`.
 	 *
 	 * @param sql The SQL string(s) to execute.
 	 * @param params Optional parameters to bind.
@@ -527,20 +575,24 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (batch.length === 0) return;
 
 		await this._withMutex(async () => {
-			try {
-				// Execute statements - transactions are started JIT by runtime when needed
-				await this._executeStatementBatch(batch, params);
-
-				// Commit if an implicit transaction was started during execution
-				if (this.transactionManager.isImplicitTransaction()) {
-					await this._commitTransaction();
+			// Per-statement implicit-transaction scope: matches SQLite autocommit
+			// semantics so a later statement's failure (e.g. OR ABORT) does NOT
+			// roll back prior statements that already successfully committed.
+			// The `isImplicitTransaction()` gate skips this for statements
+			// running inside an explicit `BEGIN…COMMIT` block, including
+			// statements that follow a mid-batch `BEGIN`.
+			for (const statementAst of batch) {
+				try {
+					await this._executeSingleStatement(statementAst, params);
+					if (this.transactionManager.isImplicitTransaction()) {
+						await this._commitTransaction();
+					}
+				} catch (err) {
+					if (this.transactionManager.isImplicitTransaction()) {
+						await this._rollbackTransaction();
+					}
+					throw err;
 				}
-			} catch (err) {
-				// Rollback if an implicit transaction was started during execution
-				if (this.transactionManager.isImplicitTransaction()) {
-					await this._rollbackTransaction();
-				}
-				throw err;
 			}
 		});
 	}
@@ -759,6 +811,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// Clean up assertion evaluator (unsubscribe schema change listener, clear plan cache)
 		this.assertionEvaluator.dispose();
 
+		// Clean up watcher manager (dispose all subscriptions + schema listener)
+		this.watcherManager.dispose();
+
 		// Clear schemas, ensuring VTabs are potentially disconnected
 		// This will also call destroy on VTabs via SchemaManager.clearAll -> schema.clearTables -> schemaManager.dropTable
 		this.schemaManager.clearAll();
@@ -902,7 +957,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			if (typeof schema.stepFunction !== 'function') {
 				throw new MisuseError('registerFunction: aggregate schema.stepFunction must be a function');
 			}
-			if (typeof (schema as any).finalizeFunction !== 'function') {
+			if (!('finalizeFunction' in schema) || typeof schema.finalizeFunction !== 'function') {
 				throw new MisuseError('registerFunction: aggregate schema.finalizeFunction must be a function');
 			}
 		} else if ('implementation' in schema) {
@@ -1007,20 +1062,24 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Registers a user-defined collation sequence.
 	 * @param name The name of the collation sequence (case-insensitive).
 	 * @param func The comparison function (a, b) => number (-1, 0, 1).
+	 * @param normalizer Optional key normalizer — a function whose output equality
+	 *   partitions strings into the same equivalence classes as `func` (modulo
+	 *   total ordering). Required to make this collation usable as the key for a
+	 *   compound index; ORDER BY / standalone comparisons work without it.
 	 * @example
 	 * // Example: Create a custom collation for phone numbers
 	 * db.registerCollation('PHONENUMBER', (a, b) => {
-	 *   // Normalize phone numbers by removing non-digit characters
 	 *   const normalize = (phone) => phone.replace(/\D/g, '');
 	 *   const numA = normalize(a);
 	 *   const numB = normalize(b);
 	 *   return numA < numB ? -1 : numA > numB ? 1 : 0;
-	 * });
+	 * }, (s) => s.replace(/\D/g, ''));
 	 *
 	 * // Then use it in SQL:
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
+	 * // CREATE INDEX phone_idx ON contacts(phone COLLATE PHONENUMBER);
 	 */
-	registerCollation(name: string, func: CollationFunction): void {
+	registerCollation(name: string, func: CollationFunction, normalizer?: (s: string) => string): void {
 		this.checkOpen();
 		if (typeof name !== 'string' || !name) {
 			throw new MisuseError('registerCollation: name must be a non-empty string');
@@ -1028,12 +1087,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (typeof func !== 'function') {
 			throw new MisuseError('registerCollation: func must be a function');
 		}
+		if (normalizer !== undefined && typeof normalizer !== 'function') {
+			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
+		}
 		const upperName = name.toUpperCase();
 		if (this.collations.has(upperName)) {
 			log('Overwriting existing collation: %s', upperName);
 		}
-		this.collations.set(upperName, func);
-		log('Registered collation: %s', upperName);
+		this.collations.set(upperName, normalizer !== undefined
+			? { comparator: func, normalizer }
+			: { comparator: func });
+		log('Registered collation: %s%s', upperName, normalizer !== undefined ? ' (with normalizer)' : '');
 	}
 
 	/**
@@ -1107,7 +1171,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Gets a registered collation function */
 	_getCollation(name: string): CollationFunction | undefined {
-		return this.collations.get(name.toUpperCase());
+		return this.collations.get(name.toUpperCase())?.comparator;
+	}
+
+	/** @internal Gets the registered key normalizer for a collation, falling back
+	 *  to the built-in normalizer for `BINARY` / `NOCASE` / `RTRIM` if the
+	 *  collation has no explicit normalizer registered. Returns `undefined` for
+	 *  comparator-only user-defined collations. */
+	_getCollationNormalizer(name: string): ((s: string) => string) | undefined {
+		const upper = name.toUpperCase();
+		const entry = this.collations.get(upper);
+		if (entry?.normalizer !== undefined) return entry.normalizer;
+		// Built-in fallback: even an entry that lost its normalizer (shouldn't
+		// happen for built-ins, but defends against external mutation) still
+		// resolves to the canonical built-in normalizer.
+		return BUILTIN_NORMALIZERS[upper];
 	}
 
 	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {
@@ -1128,32 +1206,106 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this.transactionManager.isInCoordinatedCommit();
 	}
 
-	/** Public API used by DML emitters to record changes */
-	public _recordInsert(baseTable: string, newKey: SqlValue[]): void {
-		this.transactionManager.recordInsert(baseTable, newKey);
+	/** Public API used by DML emitters to record changes. The full row plus
+	 *  PK column indices are passed so the change capture can project the
+	 *  columns that any active DeltaExecutor subscription has registered
+	 *  demand for. */
+	public _recordInsert(baseTable: string, newRow: Row, pkIndices: readonly number[]): void {
+		this.transactionManager.recordInsert(baseTable, newRow, pkIndices);
 	}
 
-	public _recordDelete(baseTable: string, oldKey: SqlValue[]): void {
-		this.transactionManager.recordDelete(baseTable, oldKey);
+	public _recordDelete(baseTable: string, oldRow: Row, pkIndices: readonly number[]): void {
+		this.transactionManager.recordDelete(baseTable, oldRow, pkIndices);
 	}
 
-	public _recordUpdate(baseTable: string, oldKey: SqlValue[], newKey: SqlValue[]): void {
-		this.transactionManager.recordUpdate(baseTable, oldKey, newKey);
+	public _recordUpdate(baseTable: string, oldRow: Row, newRow: Row, pkIndices: readonly number[]): void {
+		this.transactionManager.recordUpdate(baseTable, oldRow, newRow, pkIndices);
 	}
 
-	/** Create a named savepoint, returning its depth index */
+	/**
+	 * Create a named savepoint on the TransactionManager stack, returning
+	 * its depth index. Does NOT broadcast to active connections — call sites
+	 * driving real SAVEPOINT semantics (or statement/row-level placeholders)
+	 * must use `_createSavepointBroadcast` instead, or per-connection
+	 * savepoint stacks will silently desync.
+	 */
 	public _createSavepoint(name: string): number {
 		return this.transactionManager.createSavepoint(name);
 	}
 
-	/** Release a named savepoint (merges layers down to target), returns target depth */
+	/**
+	 * Release a named savepoint on the TransactionManager stack (merges layers
+	 * down to target), returns target depth. See `_createSavepoint` —
+	 * prefer `_releaseSavepointBroadcast` for any real SAVEPOINT semantics.
+	 */
 	public _releaseSavepoint(name: string): number {
 		return this.transactionManager.releaseSavepoint(name);
 	}
 
-	/** Rollback to a named savepoint (discards layers down to target) */
+	/**
+	 * Rollback to a named savepoint on the TransactionManager stack (discards
+	 * layers down to target). See `_createSavepoint` — prefer
+	 * `_rollbackToSavepointBroadcast` for any real SAVEPOINT semantics.
+	 */
 	public _rollbackToSavepoint(name: string): number {
 		return this.transactionManager.rollbackToSavepoint(name);
+	}
+
+	/**
+	 * Create a named savepoint AND broadcast it to every active connection so
+	 * per-connection savepoint stacks stay in lockstep with the
+	 * TransactionManager's stack. Returns the depth index.
+	 *
+	 * Prefer this over the bare `_createSavepoint` for any real SAVEPOINT (or
+	 * statement/row-level placeholder) — `_createSavepoint` alone only
+	 * advances the TxnMgr stack and silently desyncs per-connection stacks,
+	 * a class of bug that has bitten multiple call sites historically.
+	 * @internal
+	 */
+	public async _createSavepointBroadcast(name: string): Promise<number> {
+		const depth = this.transactionManager.createSavepoint(name);
+		for (const connection of this.getAllConnections()) {
+			await connection.createSavepoint(depth);
+		}
+		return depth;
+	}
+
+	/**
+	 * Release a named savepoint AND broadcast the release to every active
+	 * connection. See `_createSavepointBroadcast` for the rationale.
+	 * @internal
+	 */
+	public async _releaseSavepointBroadcast(name: string): Promise<number> {
+		const depth = this.transactionManager.releaseSavepoint(name);
+		for (const connection of this.getAllConnections()) {
+			await connection.releaseSavepoint(depth);
+		}
+		return depth;
+	}
+
+	/**
+	 * Roll back to a named savepoint AND broadcast the rollback to every
+	 * active connection. See `_createSavepointBroadcast` for the rationale.
+	 * @internal
+	 */
+	public async _rollbackToSavepointBroadcast(name: string): Promise<number> {
+		const depth = this.transactionManager.rollbackToSavepoint(name);
+		for (const connection of this.getAllConnections()) {
+			await connection.rollbackToSavepoint(depth);
+		}
+		return depth;
+	}
+
+	/**
+	 * Combo helper for the swallow-and-retry pattern used in DML-executor
+	 * error paths: rollback-to + release, each wrapped in its own try/catch
+	 * so a partial broadcast on rollback doesn't prevent release from running,
+	 * and a missing-name on release doesn't escape.
+	 * @internal
+	 */
+	public async _rollbackAndReleaseSavepointBroadcast(name: string): Promise<void> {
+		try { await this._rollbackToSavepointBroadcast(name); } catch { /* swallow */ }
+		try { await this._releaseSavepointBroadcast(name); } catch { /* swallow */ }
 	}
 
 	public _clearChangeLog(): void {
@@ -1188,8 +1340,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * ```
 	 */
 	eval(sql: string, params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Record<string, SqlValue>> {
-		return wrapAsyncIterator(this._evalGenerator(sql, params), (commit) =>
-			this._finalizeImplicitTransaction(commit)
+		return wrapAsyncIterator(this._evalGenerator(sql, params), (commit, error) =>
+			this._finalizeImplicitTransaction(commit, error)
 		);
 	}
 
@@ -1320,6 +1472,46 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this.schemaManager.findTable(tableName, dbName);
 	}
 
+	/**
+	 * Returns a public handle to a table for inspection and per-table event
+	 * subscription. Returns `undefined` if the table does not exist or its
+	 * owning module is not registered.
+	 *
+	 * The returned {@link Table} is a snapshot: its `schema` reference is
+	 * frozen at acquisition time. If the table is dropped or recreated, the
+	 * handle keeps the original schema, but no further events for that name
+	 * will arrive. Re-acquire after schema changes if you need fresh state.
+	 *
+	 * After {@link Database.close}, the handle's event emitter reference
+	 * remains valid (the module instance outlives the database) but the
+	 * database-level aggregator is unhooked, so local subscriptions on the
+	 * module emitter still fire only as long as the module itself remains
+	 * active.
+	 *
+	 * @param schemaName The schema name ('main', 'temp', or an attached
+	 *   schema). Pass `undefined` to use the current default schema.
+	 * @param tableName  The table name (case-insensitive resolution).
+	 *
+	 * @example
+	 * ```typescript
+	 * const table = db.getTable('main', 'users');
+	 * const tableEmitter = table?.getEventEmitter();
+	 * const off = tableEmitter?.onDataChange?.((event) => {
+	 *   if (event.tableName === 'users') console.log(event);
+	 * });
+	 * ```
+	 */
+	getTable(schemaName: string | undefined, tableName: string): Table | undefined {
+		this.checkOpen();
+		const tableSchema = this.schemaManager.getTable(schemaName, tableName);
+		if (!tableSchema) return undefined;
+		const moduleName = tableSchema.vtabModuleName;
+		if (!moduleName) return undefined;
+		const moduleInfo = this.schemaManager.getModule(moduleName);
+		if (!moduleInfo) return undefined;
+		return new Table(tableSchema, moduleName, moduleInfo.module);
+	}
+
 	/** @internal */
 	_findFunction(funcName: string, nArg: number): FunctionSchema | undefined {
 		return this.schemaManager.findFunction(funcName, nArg);
@@ -1377,6 +1569,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			} catch (error) {
 				errorLog(`Error starting transaction on newly registered connection ${connection.connectionId}: %O`, error);
 				// Don't throw here - just log the error to avoid breaking connection registration
+			}
+
+			// Replay the active savepoint stack onto this connection so subsequent
+			// release/rollback-to broadcasts targeting earlier depths are in-range.
+			// Without this, modules that register connections lazily (memory, isolation,
+			// any vtab whose connection appears on first read/write) see an empty stack
+			// while the DB broadcasts depths > 0 — silently no-op'ing on a real depth.
+			const activeDepth = this.transactionManager.getActiveSavepointDepth();
+			for (let depth = 0; depth < activeDepth; depth++) {
+				try {
+					await connection.createSavepoint(depth);
+				} catch (error) {
+					errorLog(`Error replaying savepoint depth ${depth} on newly registered connection ${connection.connectionId}: %O`, error);
+					// Continue replaying remaining depths — see comment above on registration robustness.
+				}
 			}
 		} else if (this.transactionManager.isEvaluatingDeferredConstraints()) {
 			log(`Skipped transaction begin on connection ${connection.connectionId} (evaluating deferred constraints)`);
@@ -1474,6 +1681,38 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	public async runGlobalAssertions(): Promise<void> {
 		await this.assertionEvaluator.runGlobalAssertions();
+	}
+
+	/**
+	 * Subscribe to changes described by a {@link ChangeScope}.
+	 *
+	 * The watcher fires its handler **after** a transaction commits (mirrors
+	 * assertion COMMIT eval), once per commit, with all matching watches in
+	 * a single {@link WatchEvent}. Handler errors are caught and logged —
+	 * they do not roll the commit back (assertions own that contract).
+	 *
+	 * Validation is synchronous:
+	 * - Throws if `scope.unboundParameters` is non-empty (caller must
+	 *   `bindParameters(scope, params)` first).
+	 * - Throws if any referenced table or column does not exist in the
+	 *   current schema.
+	 *
+	 * If the table or any column the scope mentions is later dropped or
+	 * altered, the subscription is **invalidated and disposed**; re-subscribe
+	 * to continue watching.
+	 *
+	 * @returns A {@link Subscription} handle whose `unsubscribe()` is
+	 *   idempotent and releases capture-spec demand.
+	 */
+	watch(scope: ChangeScope, handler: WatchHandler): Subscription {
+		this.checkOpen();
+		return this.watcherManager.watch(scope, handler);
+	}
+
+	/** @internal Invoked by the TransactionManager after a successful commit
+	 *  and before the change log is cleared. */
+	public async runPostCommitWatchers(): Promise<void> {
+		await this.watcherManager.runPostCommit();
 	}
 
 	/** @internal Invalidate cached assertion plan (called on DROP ASSERTION) */

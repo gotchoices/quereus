@@ -175,6 +175,80 @@ The planner automatically groups window functions with identical specifications:
 - **Partitioned functions**: Buffer only current partition
 - **Frame-bounded aggregates**: Process only necessary frame data
 
+### Streaming fast path over `MonotonicOn`
+
+When the source already arrives in `[PARTITION BY..., ORDER BY[0]]` order — its
+`physical.monotonicOn` covers the leading ORDER BY key and `physical.ordering`
+shows the partition keys as an emit-order prefix — `rule-monotonic-window` tags
+the `WindowNode` with a `streaming` config and the runtime switches from the
+buffer/sort path to a one-pass emitter (`runStreaming` in `runtime/emit/window.ts`).
+
+The streaming emitter:
+
+- Walks the source in source order, emitting in source order.
+- Maintains `O(P)` per-partition state where `P` is the open partition (only one
+  partition is alive at a time since input is partition-sorted), with sub-state
+  per function: ranking counters, LAG ring buffers, LEAD read-ahead queues,
+  FIRST_VALUE caches, and running-aggregate accumulators with peer-group
+  buffering for RANGE-mode frames.
+- Skips the sort entirely — `O(N log N)` per partition saved.
+- Skips materialization — `O(N)` memory saved.
+- Preserves the source's `monotonicOn` on the `WindowNode`'s output so
+  downstream rules (`monotonic-limit-pushdown`, `monotonic-merge-join`,
+  `monotonic-range-access`) compose cleanly above streaming windows.
+
+**Recognized functions** (the rule fires only when *all* functions in a single
+WindowNode are individually recognized):
+
+| Function class | Recognized | Notes |
+| --- | --- | --- |
+| `ROW_NUMBER`, `RANK`, `DENSE_RANK` | yes | per-partition counter + last-key |
+| `LAG`, `LEAD` | yes | offset must be a non-negative integer literal |
+| `FIRST_VALUE`, `LAST_VALUE` | yes | LAST_VALUE only under default frame; both also stream under sliding frames (see below) |
+| Running `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` | yes | default frame (`UNBOUNDED PRECEDING TO CURRENT ROW`, ROWS or RANGE) |
+| Sliding `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE` | yes | `ROWS BETWEEN n PRECEDING AND m FOLLOWING` (literal `n,m ≥ 0`) or `RANGE BETWEEN <num> PRECEDING AND <num> FOLLOWING` (single numeric ORDER BY key, literal non-negative offsets) |
+| `NTILE`, `PERCENT_RANK`, `CUME_DIST` | no | need partition size up-front |
+| Asymmetric sliding (`UNBOUNDED PRECEDING AND m FOLLOWING`, `n PRECEDING AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND m FOLLOWING`) | no | future work |
+| `DISTINCT` aggregates | no | future work |
+
+**Bail conditions** (any one drops to the buffered path):
+
+- The leading ORDER BY key is not a trivial column reference, or doesn't match
+  source's `monotonicOn` direction.
+- Source's `physical.ordering` doesn't cover the full ORDER BY key set.
+- PARTITION BY columns aren't an emit-order prefix of the source ordering.
+- Any partition-by expression is non-trivial (not a column reference).
+- Any function falls outside the recognized set.
+- Frame is anything other than the default (or the explicit equivalent
+  `UNBOUNDED PRECEDING TO CURRENT ROW`), or a supported sliding shape (see
+  the table above).
+- For RANGE-mode sliding frames: more than one ORDER BY key (numeric RANGE
+  offsets require a single sort key per the SQL standard).
+
+### Sliding-frame state machine
+
+Under a sliding frame, `runStreaming` keeps a per-function `slidingBuffer` of
+`{argVal, orderByVal0}` for rows currently in scope plus a list of pending
+entries awaiting finalization. Each pending entry's slot is filled as soon as
+its right edge has been seen.
+
+- **ROWS** — entries finalize when row `j + following` arrives. SUM/COUNT/AVG
+  maintain a `{ sum, count }` accumulator with step+unstep (skipping NULL
+  argVals); MIN/MAX/FIRST_VALUE/LAST_VALUE recompute from the live buffer
+  slice. Memory is `O(preceding + following + 1)` per function per partition.
+- **RANGE** — entries finalize when a later arrival's value strictly exceeds
+  `v_j + following` (right edge has passed). Frame values are computed by
+  scanning the buffer for rows with `v ∈ [v_j - preceding, v_j + following]`
+  (finite `v_j`) or the contiguous non-finite peer span (NULL / non-numeric
+  `v_j`). Buffer is trimmed front-of-line as old rows fall out of every
+  remaining pending entry's frame.
+
+At partition close, all remaining pending entries are flushed with their
+right edges clamped to the last row.
+
+The rule id `monotonic-window` can be disabled via `tuning.disabledRules`. See
+[Monotonic streaming-window recognition](./optimizer.md#monotonic-streaming-window-recognition).
+
 ## Testing
 
 Window functions are comprehensively tested through SQL Logic Tests (`test/logic/07.5-window.sqllogic`):

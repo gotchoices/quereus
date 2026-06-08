@@ -1,6 +1,6 @@
 ---
 description: Standardize parameter binding key types (string vs number)
-dependencies: none
+prereq: none
 
 ---
 

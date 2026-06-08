@@ -2,7 +2,7 @@ import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema, RowConstraintSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
 import type { Attribute, RowDescriptor } from '../nodes/plan-node.js';
-import type { ConstraintCheck } from '../nodes/constraint-check-node.js';
+import type { ConstraintCheck, NotNullDefaultPlan } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { buildExpression } from './expression.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
@@ -145,9 +145,13 @@ export function buildConstraintChecks(
         constraint.expr
       ) as ScalarPlanNode;
 
-      // Validate that the constraint expression is deterministic
+      // Validate that the constraint expression is deterministic — skip when
+      // `nondeterministic_schema` is on; per-row resolution + replay-at-module
+      // boundary keeps the capture safe even with non-det inside CHECKs.
       const constraintName = constraint.name ?? `_check_${tableSchema.name}`;
-      validateDeterministicConstraint(expression, constraintName, tableSchema.name);
+      if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+        validateDeterministicConstraint(expression, constraintName, tableSchema.name);
+      }
 
       // Heuristic: auto-defer if the expression contains a subquery
       // or references committed.* state (which necessarily implies a subquery, but
@@ -160,7 +164,8 @@ export function buildConstraintChecks(
         expression,
         deferrable: needsDeferred,
         initiallyDeferred: needsDeferred,
-        needsDeferred
+        needsDeferred,
+        kind: 'check'
       } satisfies ConstraintCheck;
     } finally {
       // Restore original schema context
@@ -169,6 +174,81 @@ export function buildConstraintChecks(
       }
     }
   });
+}
+
+/**
+ * Pre-builds DEFAULT-value evaluators for every NOT NULL column that has a
+ * DEFAULT clause. The returned plans are consumed by the constraint-check
+ * runtime when REPLACE substitutes a default for an explicitly-NULL value
+ * (per SQLite OR REPLACE semantics on NOT NULL).
+ *
+ * Defaults are evaluated against the same scope used for CHECK constraints:
+ * unqualified column names resolve to NEW attributes (which is fine — defaults
+ * may not reference columns, but we share the scope for consistency).
+ */
+export function buildNotNullDefaults(
+  ctx: PlanningContext,
+  tableSchema: TableSchema,
+  newAttributes: Attribute[],
+  contextAttributes: Attribute[] = [],
+): NotNullDefaultPlan[] {
+  const result: NotNullDefaultPlan[] = [];
+
+  for (let columnIndex = 0; columnIndex < tableSchema.columns.length; columnIndex++) {
+    const column = tableSchema.columns[columnIndex];
+    if (!column.notNull) continue;
+    const defaultExpr = column.defaultValue;
+    if (!defaultExpr || typeof defaultExpr !== 'object' || !('type' in defaultExpr)) continue;
+
+    const scope = new RegisteredScope(ctx.scope);
+    const reservedKeys = new Set<string>();
+
+    // Mutation context variables first so they shadow column names if conflicts exist
+    // (matches createRowExpansionProjection's resolution order).
+    contextAttributes.forEach((attr, contextVarIndex) => {
+      if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
+        const contextVar = tableSchema.mutationContext![contextVarIndex];
+        const varNameLower = contextVar.name.toLowerCase();
+        scope.registerSymbol(varNameLower, (exp, s) =>
+          new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
+        );
+        scope.registerSymbol(`context.${varNameLower}`, (exp, s) =>
+          new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
+        );
+        reservedKeys.add(varNameLower);
+        reservedKeys.add(`context.${varNameLower}`);
+      }
+    });
+
+    // Register NEW columns (DEFAULT can reference siblings as in row-expansion).
+    // Skip the unqualified form when shadowed by a mutation context variable; the
+    // qualified `new.<col>` form remains available.
+    tableSchema.columns.forEach((col, idx) => {
+      const attr = newAttributes[idx];
+      if (!attr) return;
+      const colType = {
+        typeClass: 'scalar' as const,
+        logicalType: col.logicalType,
+        nullable: !col.notNull,
+        isReadOnly: false,
+      };
+      const colKey = col.name.toLowerCase();
+      if (!reservedKeys.has(colKey)) {
+        scope.registerSymbol(colKey, (exp, s) =>
+          new ColumnReferenceNode(s, exp as AST.ColumnExpr, colType, attr.id, idx)
+        );
+      }
+      scope.registerSymbol(`new.${colKey}`, (exp, s) =>
+        new ColumnReferenceNode(s, exp as AST.ColumnExpr, colType, attr.id, idx)
+      );
+    });
+
+    const planningCtx = { ...ctx, scope };
+    const defaultNode = buildExpression(planningCtx, defaultExpr as AST.Expression) as ScalarPlanNode;
+    result.push({ columnIndex, defaultExpr: defaultExpr as AST.Expression, defaultNode });
+  }
+
+  return result;
 }
 
 function containsSubquery(expr: ScalarPlanNode): boolean {

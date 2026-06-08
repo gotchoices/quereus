@@ -90,6 +90,9 @@ export class AnalyzePlanNode extends PlanNode implements RelationalPlanNode {
 		if (this.targetTableName) {
 			return `ANALYZE ${this.targetTableName}`;
 		}
+		if (this.targetSchemaName) {
+			return `ANALYZE ${this.targetSchemaName}.*`;
+		}
 		return 'ANALYZE';
 	}
 

@@ -1,0 +1,82 @@
+-- adapted from SQLite test/select1.test, test/selectD.test, test/e_select.test
+-- SELECT projection corner cases: duplicate wildcard expansion,
+-- qualified column refs across self-join, parenthesized FROM clauses.
+
+create table t1 (a integer primary key, b text);
+insert into t1 values (1, 'one');
+
+-- Single-row sanity check before exercising projection
+select a, b from t1;
+→ [{"a":1,"b":"one"}]
+
+-- Duplicate wildcard in projection — column names disambiguated
+select *, * from t1;
+→ [{"a":1,"b":"one","a:1":1,"b:1":"one"}]
+
+-- Wildcard plus literal expression
+select *, 'lit' as marker from t1;
+→ [{"a":1,"b":"one","marker":"lit"}]
+
+-- Qualified column refs over a self-join (cross join)
+insert into t1 values (2, 'two');
+
+select A.a as la, B.a as ra from t1 as A cross join t1 as B order by la, ra;
+→ [{"la":1,"ra":1},{"la":1,"ra":2},{"la":2,"ra":1},{"la":2,"ra":2}]
+
+select A.*, B.* from t1 as A cross join t1 as B order by A.a, B.a;
+→ [{"a":1,"b":"one","a:1":1,"b:1":"one"},{"a":1,"b":"one","a:1":2,"b:1":"two"},{"a":2,"b":"two","a:1":1,"b:1":"one"},{"a":2,"b":"two","a:1":2,"b:1":"two"}]
+
+drop table t1;
+
+-- =============================================================================
+-- Parenthesized FROM expressions: (a join b) join c
+-- =============================================================================
+
+create table p1 (id integer primary key, val text);
+create table p2 (id integer primary key, p1_id integer);
+create table p3 (id integer primary key, p2_id integer);
+insert into p1 values (1, 'A'), (2, 'B');
+insert into p2 values (10, 1), (20, 2);
+insert into p3 values (100, 10), (200, 20);
+
+-- Inner join wrapped in parentheses, then joined to a third table
+select p1.id as l, p2.id as m, p3.id as r
+from (p1 join p2 on p1.id = p2.p1_id) join p3 on p2.id = p3.p2_id
+order by l;
+-- error: Expected table name
+
+-- Left side scalar table joined to a parenthesized inner-join subexpression
+select p1.id as l, p2.id as m, p3.id as r
+from p1 left join (p2 join p3 on p2.id = p3.p2_id) on p1.id = p2.p1_id
+order by l;
+-- error: Expected table name
+
+drop table p3;
+drop table p2;
+drop table p1;
+
+-- =============================================================================
+-- UNION column-name derivation: names come from the left SELECT
+-- =============================================================================
+
+create table u1 (f1 integer);
+create table u2 (r2 real);
+insert into u1 values (11);
+insert into u2 values (1.5);
+
+-- Result column is named after the left SELECT's expression
+select f1 from u1
+union
+select r2 from u2
+order by f1;
+→ [{"f1":1.5},{"f1":11}]
+
+-- ORDER BY can reference the left-side name even though right side has different name
+select f1 as label from u1
+union all
+select r2 from u2
+order by label;
+→ [{"label":1.5},{"label":11}]
+
+drop table u2;
+drop table u1;

@@ -94,7 +94,18 @@ export const BOOLEAN_FUNC = createScalarFunction(
  * The old date() function will be renamed to date_now() or similar
  */
 export const DATE_FUNC = createScalarFunction(
-	{ name: 'date', numArgs: 1, deterministic: false, returnType: { typeClass: 'scalar', logicalType: DATE_TYPE, nullable: true, isReadOnly: true } },
+	{
+		name: 'date',
+		numArgs: 1,
+		deterministic: false,
+		returnType: { typeClass: 'scalar', logicalType: DATE_TYPE, nullable: true, isReadOnly: true },
+		// `date(x) = D` is equivalent to `x` falling inside the half-open day window
+		// `[D, D+1)`; the boundary computation lives on the argument's logical type
+		// via `bucketBounds('date_bucket', value)`. Only the unary form is annotated —
+		// the variadic `dateFunc` in `datetime.ts` accepts arbitrary modifiers that
+		// can shift / re-bucket the result, so the rewrite would be unsound there.
+		rangeRewriteOnArg: { 0: { kind: 'date_bucket' } },
+	},
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 

@@ -119,6 +119,38 @@ function isAggregating(node: PlanNode): node is AggregationCapable {
 }
 ```
 
+### Functional Dependencies, Equivalence Classes, Bindings
+
+**Problem**: Rules need to reason about "what determines what" — uniqueness, transitive equalities, pinned constants, domain constraints — across many operator shapes without re-implementing the algebra.
+**Solution**: Treat `PhysicalProperties.fds` / `equivClasses` / `constantBindings` / `domainConstraints` as the single source of truth, and route every query through the helpers in `planner/util/fd-utils.ts` rather than walking the lists directly.
+
+```typescript
+// ❌ Fragile: re-implementing closure inline
+const determined = new Set<number>(seedCols);
+for (const fd of node.physical.fds ?? []) {
+  if (fd.determinants.every(d => determined.has(d))) {
+    for (const dep of fd.dependents) determined.add(dep);
+  }
+}
+
+// ✅ Robust: use the shared fixed-point helper (which also handles iteration to convergence)
+import { computeClosure } from '../util/fd-utils.js';
+const determined = computeClosure(seedCols, node.physical.fds ?? []);
+```
+
+**Key conventions for FD-aware rules:**
+
+1. **Reason via `computeClosure` / `determines` / `isSuperkey` / `isAssertedKey` / `hasAnyKey` / `hasSingletonFd`.** Walking `physical.fds` by hand will miss transitive closure and forget the subsumption / cap / guard semantics that `addFd` enforces.
+2. **Guarded FDs are not closure-time facts.** All closure helpers (`computeClosure`, `determines`, `isSuperkey`, `hasAnyKey`, `hasSingletonFd`, `deriveKeysFromFds`) **skip** guarded FDs by design — a conditional uniqueness claim cannot prove a key for an unrelated subtree. If your rule needs to discharge a guard, do it at the producing `Filter`'s `computePhysical` via `predicateImpliesGuard` + `stripGuard`, never at the consumer.
+3. **Column index space.** FDs / ECs / bindings are indexed by **output-column index** on the node carrying them, not by attribute ID. When you cross a Project / Returning / Aggregate / join boundary, translate via `projectFds` / `shiftFds` (and their EC / binding / domain mirrors) instead of hand-mapping. `shiftFds` shifts guard column indices alongside determinants/dependents; `projectFds` drops a guarded FD whose guard references a column missing from the mapping.
+4. **Use `addFd` (not `Array.push`) when accumulating FDs.** `addFd` performs subsumption (drop existing same-determinant FDs whose dependent set is a subset of the new one) and enforces `MAX_FDS_PER_NODE`. Pass `{ keyHints }` listing column-index sets that are known keys so cap eviction prefers to keep them; truncations are logged on the `quereus:planner:fd` debug channel.
+5. **Equivalence-class closure for bindings.** Whenever a rule adds a `ConstantBinding` at the same site as ECs (Filter, inner join), close it with `closeConstantBindingsOverEcs` so downstream consumers see the binding on every EC peer in a single pass. This is what makes `WHERE t.k = u.k AND t.k = 5` land as one binding covering both columns.
+6. **Outer joins drop the null-padded side.** Inheriting "everything from both children" is wrong for LEFT/RIGHT/FULL: NULL padding violates source FDs/ECs/bindings on the padded side, and a guarded FD whose guard references a NULL-padded column would also become activatable for the wrong rows. Follow the per-operator table in [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking) rather than inventing a propagation policy.
+7. **Set semantics is not an FD.** "All output columns together form a key" lives on `RelationType.isSet`, not in `fds`. Consumers asking "is this relation unique?" should check `getType().isSet` *and* `hasAnyKey(fds, columnCount)` / `hasSingletonFd(fds, columnCount)`.
+8. **Provenance is informational.** FD / `ConstantBinding` / `DomainConstraint` entries may carry a `source` tag (`'declared-check'`, `{kind: 'assertion', name}`, etc.). Dedup helpers ignore `source` by design — never branch rule logic on it.
+
+See [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking) for the producer/consumer catalog and the per-operator propagation table, and [Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable) for the `analyzeRowSpecific` / `extractBindings` analysis surface that builds on this layer.
+
 ### Caching Eligibility
 
 **Problem**: Determining what can be cached

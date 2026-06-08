@@ -2,12 +2,14 @@ import type { ColumnSchema } from './column.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { Expression } from '../parser/ast.js';
+import type { ConflictResolution } from '../common/constants.js';
 import { type ColumnDef, type TableConstraint } from '../parser/ast.js';
 import { RowOp, StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
 import { quereusError, QuereusError } from '../common/errors.js';
 import { createLogger } from '../common/logger.js';
 import { inferType } from '../types/registry.js';
+import { traverseAst } from '../parser/visitor.js';
 import type { TableStatistics } from '../planner/stats/catalog-stats.js';
 
 const log = createLogger('schema:table');
@@ -27,6 +29,13 @@ export interface TableSchema {
 	columnIndexMap: ReadonlyMap<string, number>;
 	/** Definition of the primary key, including order and direction */
 	primaryKeyDefinition: ReadonlyArray<PrimaryKeyColumnDefinition>;
+	/**
+	 * Default conflict resolution declared on a table-level
+	 * `PRIMARY KEY (...) ON CONFLICT <action>` clause. Resolution precedence for
+	 * PK conflicts: statement-level OR > this field > column-level
+	 * `defaultConflict` on any PK column > ABORT.
+	 */
+	primaryKeyDefaultConflict?: ConflictResolution;
 	/** CHECK constraints defined on the table or its columns */
 	checkConstraints: ReadonlyArray<RowConstraintSchema>;
 	/** Reference to the registered module */
@@ -61,6 +70,17 @@ export interface TableSchema {
 	foreignKeys?: ReadonlyArray<ForeignKeyConstraintSchema>;
 	/** Unique constraints (beyond primary key) */
 	uniqueConstraints?: ReadonlyArray<UniqueConstraintSchema>;
+	/**
+	 * For each generated column index, the set of column indices in this table its
+	 * expression references. Populated alongside the columns array so INSERT/UPDATE
+	 * planners and DROP COLUMN don't re-walk the AST.
+	 */
+	generatedColumnDependencies?: ReadonlyMap<number, ReadonlyArray<number>>;
+	/**
+	 * Generated column indices ordered so dependencies come before dependents.
+	 * Empty / undefined when no generated columns exist.
+	 */
+	generatedColumnTopoOrder?: ReadonlyArray<number>;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -116,12 +136,21 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 			case 'primaryKey':
 				schema.primaryKey = true;
 				schema.pkDirection = constraint.direction;
+				if (constraint.onConflict !== undefined) {
+					schema.defaultConflict = constraint.onConflict;
+				}
 				break;
 			case 'notNull':
 				schema.notNull = true;
+				if (constraint.onConflict !== undefined) {
+					schema.defaultConflict = constraint.onConflict;
+				}
 				break;
 			case 'null':
 				schema.notNull = false;
+				if (constraint.onConflict !== undefined) {
+					schema.defaultConflict = constraint.onConflict;
+				}
 				break;
 			case 'unique':
 				break;
@@ -219,6 +248,12 @@ export interface IndexSchema {
 	name: string;
 	/** Columns in the index */
 	columns: ReadonlyArray<IndexColumnSchema>;
+	/** Whether the index enforces uniqueness on its key columns */
+	unique?: boolean;
+	/** Optional partial-index predicate (the WHERE clause AST). Rows for which this
+	 *  evaluates to anything other than TRUE are excluded from the index and from
+	 *  any UNIQUE enforcement that the index backs. */
+	predicate?: Expression;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -313,6 +348,11 @@ export interface RowConstraintSchema {
 	deferrable?: boolean;
 	/** Whether the constraint is initially deferred */
 	initiallyDeferred?: boolean;
+	/**
+	 * Default conflict resolution declared at the constraint level (e.g.,
+	 * `CHECK (...) ON CONFLICT IGNORE`). Statement-level OR clauses override.
+	 */
+	defaultConflict?: ConflictResolution;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -338,12 +378,17 @@ export interface ForeignKeyConstraintSchema {
 	 * at enforcement time via {@link resolveReferencedColumns}.
 	 */
 	referencedColumnNames?: ReadonlyArray<string>;
-	/** Action on parent DELETE (default: 'ignore') */
+	/** Action on parent DELETE (default: 'restrict') */
 	onDelete: import('../parser/ast.js').ForeignKeyAction;
-	/** Action on parent UPDATE of referenced columns (default: 'ignore') */
+	/** Action on parent UPDATE of referenced columns (default: 'restrict') */
 	onUpdate: import('../parser/ast.js').ForeignKeyAction;
 	/** Whether enforcement is deferred to COMMIT */
 	deferred: boolean;
+	/**
+	 * Default conflict resolution declared at the FK constraint level. Statement-level
+	 * OR clauses override.
+	 */
+	defaultConflict?: ConflictResolution;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -383,6 +428,21 @@ export interface UniqueConstraintSchema {
 	name?: string;
 	/** Column indices in this table that form the unique constraint */
 	columns: ReadonlyArray<number>;
+	/**
+	 * Default conflict resolution declared at the constraint level (e.g.,
+	 * `email TEXT UNIQUE ON CONFLICT REPLACE`). Statement-level OR clauses override.
+	 */
+	defaultConflict?: ConflictResolution;
+	/** Optional partial-index predicate (the WHERE clause AST). Mirrored from the
+	 *  backing IndexSchema so the runtime can skip uniqueness checks for rows that
+	 *  fall outside the partial scope. Only set when the constraint was synthesized
+	 *  from a `CREATE UNIQUE INDEX ... WHERE ...`. */
+	predicate?: Expression;
+	/** When set, this constraint was synthesized from a UNIQUE index of the
+	 *  given name (see SchemaManager.addIndexToTableSchema). DROP INDEX of that
+	 *  index removes this constraint. Unset for constraints declared at
+	 *  CREATE TABLE time. */
+	derivedFromIndex?: string;
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -397,13 +457,20 @@ export interface PrimaryKeyColumnDefinition {
  * Helper to parse primary key from AST column and table constraints.
  * @param columns Parsed column definitions from AST.
  * @param constraints Parsed table constraints from AST.
- * @returns A ReadonlyArray defining the primary key columns (index and direction), or undefined.
+ * @returns The primary-key column list plus any table-level
+ * `PRIMARY KEY (...) ON CONFLICT <action>` directive. `defaultConflict` is
+ * undefined when the PK was column-declared (column-level `ON CONFLICT`
+ * lives on `ColumnSchema.defaultConflict`) or when no `ON CONFLICT` was
+ * declared on the table-level constraint.
  * @throws QuereusError if multiple primary keys are defined or PK column not found.
  */
 export function findPKDefinition(
 	columns: ReadonlyArray<ColumnSchema>,
 	constraints: ReadonlyArray<AST.TableConstraint> | undefined,
-): ReadonlyArray<PrimaryKeyColumnDefinition> {
+): {
+	pkDef: ReadonlyArray<PrimaryKeyColumnDefinition>;
+	defaultConflict: ConflictResolution | undefined;
+} {
 	const columnPK = findColumnPKDefinition(columns);
 	const constraintPK = findConstraintPKDefinition(columns, constraints);
 
@@ -411,7 +478,8 @@ export function findPKDefinition(
 		throw new QuereusError("Cannot define both table-level and column-level PRIMARY KEYs", StatusCode.CONSTRAINT);
 	}
 
-	let finalPkDef = constraintPK ?? columnPK;
+	let finalPkDef: ReadonlyArray<PrimaryKeyColumnDefinition> | undefined =
+		constraintPK?.pkDef ?? columnPK;
 
 	if (!finalPkDef) {
 		// Quereus-specific behavior: Include all columns in the primary key when no explicit primary key is defined
@@ -429,27 +497,37 @@ export function findPKDefinition(
 
 	// Don't require NOT NULL, we want to be more flexible
 
-	return finalPkDef as ReadonlyArray<PrimaryKeyColumnDefinition>;
+	return {
+		pkDef: finalPkDef,
+		defaultConflict: constraintPK?.defaultConflict,
+	};
 }
 
 function findConstraintPKDefinition(
 	columns: readonly ColumnSchema[],
 	constraints: readonly TableConstraint[] | undefined
-): PrimaryKeyColumnDefinition[] | undefined {
+): {
+	pkDef: PrimaryKeyColumnDefinition[];
+	defaultConflict: ConflictResolution | undefined;
+} | undefined {
 	const colMap = buildColumnIndexMap(columns);
-	let constraintPKs: PrimaryKeyColumnDefinition[] | undefined;
+	let result: {
+		pkDef: PrimaryKeyColumnDefinition[];
+		defaultConflict: ConflictResolution | undefined;
+	} | undefined;
 
 	if (constraints) {
 		for (const constraint of constraints) {
 			if (constraint.type === 'primaryKey') {
-				if (constraintPKs) {
+				if (result) {
 					throw new QuereusError("Multiple table-level PRIMARY KEY constraints defined", StatusCode.CONSTRAINT);
 				}
+				let pkDef: PrimaryKeyColumnDefinition[];
 				if (!constraint.columns || constraint.columns.length === 0) {
 					// An empty column list is fine; means table can have 0-1 rows
-					constraintPKs = [];
+					pkDef = [];
 				} else {
-					constraintPKs = constraint.columns.map(colInfo => {
+					pkDef = constraint.columns.map(colInfo => {
 						const colIndex = colMap.get(colInfo.name.toLowerCase());
 						if (colIndex === undefined) {
 							throw new QuereusError(`PRIMARY KEY column '${colInfo.name}' not found in table definition`, StatusCode.ERROR);
@@ -461,10 +539,11 @@ function findConstraintPKDefinition(
 						};
 					});
 				}
+				result = { pkDef, defaultConflict: constraint.onConflict };
 			}
 		}
 	}
-	return constraintPKs;
+	return result;
 }
 
 function findColumnPKDefinition(columns: ReadonlyArray<ColumnSchema>): ReadonlyArray<PrimaryKeyColumnDefinition> | undefined {
@@ -490,5 +569,153 @@ function findColumnPKDefinition(columns: ReadonlyArray<ColumnSchema>): ReadonlyA
 		desc: col.pkDirection === 'desc',
 		collation: col.collation || 'BINARY'
 	})));
+}
+
+/**
+ * Returns a copy of `tableSchema` with `generatedColumnDependencies` and
+ * `generatedColumnTopoOrder` recomputed from its current column list.
+ * Throws on cycle. The other fields are preserved as-is.
+ */
+export function withGeneratedColumnGraph(tableSchema: TableSchema): TableSchema {
+	const rawDeps = extractGeneratedColumnDependencies(tableSchema.columns, tableSchema.name);
+	if (rawDeps.size === 0) {
+		return Object.freeze({
+			...tableSchema,
+			generatedColumnDependencies: undefined,
+			generatedColumnTopoOrder: undefined,
+		});
+	}
+	const topoOrder = topoSortGeneratedColumns(tableSchema.columns, rawDeps);
+	const frozenDeps = new Map<number, ReadonlyArray<number>>();
+	for (const [k, v] of rawDeps) frozenDeps.set(k, Object.freeze(v));
+	return Object.freeze({
+		...tableSchema,
+		generatedColumnDependencies: frozenDeps,
+		generatedColumnTopoOrder: Object.freeze(topoOrder),
+	});
+}
+
+/**
+ * For each generated column, walks its expression AST and collects the column
+ * indices in this table that the expression references. Unknown column names
+ * referenced unqualified (or qualified to this table) are rejected with a
+ * specific error so typos surface at CREATE TABLE / ALTER TABLE time rather
+ * than at INSERT/UPDATE time.
+ *
+ * References qualified to a different table are skipped — they belong to
+ * an outer scope (e.g. a scalar subquery's source) and don't constitute a
+ * dependency on this table's columns.
+ */
+export function extractGeneratedColumnDependencies(
+	columns: ReadonlyArray<ColumnSchema>,
+	tableName: string,
+): Map<number, number[]> {
+	const columnIndexMap = buildColumnIndexMap(columns);
+	const tableNameLower = tableName.toLowerCase();
+	const result = new Map<number, number[]>();
+
+	columns.forEach((col, colIdx) => {
+		if (!col.generated || !col.generatedExpr) return;
+
+		const deps = new Set<number>();
+		traverseAst(col.generatedExpr as AST.AstNode, {
+			enterNode: (node: AST.AstNode) => {
+				if (node.type === 'column') {
+					const ref = node as AST.ColumnExpr;
+					if (ref.table && ref.table.toLowerCase() !== tableNameLower) return;
+					const refIdx = columnIndexMap.get(ref.name.toLowerCase());
+					if (refIdx === undefined) {
+						throw new QuereusError(
+							`Column '${ref.name}' referenced by generated column '${col.name}' not found in table '${tableName}'`,
+							StatusCode.ERROR,
+						);
+					}
+					deps.add(refIdx);
+				} else if (node.type === 'identifier') {
+					const ref = node as AST.IdentifierExpr;
+					if (ref.schema) return;
+					const refIdx = columnIndexMap.get(ref.name.toLowerCase());
+					if (refIdx !== undefined) deps.add(refIdx);
+				}
+			},
+		});
+
+		result.set(colIdx, Array.from(deps).sort((a, b) => a - b));
+	});
+
+	return result;
+}
+
+/**
+ * Topologically sorts generated columns so a generated column's dependencies
+ * come before it. Throws on any cycle (including self-edges).
+ *
+ * The graph nodes are generated-column indices only — edges from a generated
+ * column to a non-generated column are ignored for topo purposes (only
+ * gen→gen edges can form cycles).
+ */
+export function topoSortGeneratedColumns(
+	columns: ReadonlyArray<ColumnSchema>,
+	deps: ReadonlyMap<number, ReadonlyArray<number>>,
+): number[] {
+	const genIndices = new Set<number>();
+	for (const idx of deps.keys()) genIndices.add(idx);
+
+	// Build in-degree only over gen→gen edges
+	const inDegree = new Map<number, number>();
+	const adjacency = new Map<number, number[]>();
+	for (const idx of genIndices) {
+		inDegree.set(idx, 0);
+		adjacency.set(idx, []);
+	}
+	for (const [genIdx, depList] of deps) {
+		for (const depIdx of depList) {
+			if (!genIndices.has(depIdx)) continue;
+			adjacency.get(depIdx)!.push(genIdx);
+			inDegree.set(genIdx, (inDegree.get(genIdx) ?? 0) + 1);
+		}
+	}
+
+	// Kahn's algorithm
+	const queue: number[] = [];
+	for (const [idx, deg] of inDegree) {
+		if (deg === 0) queue.push(idx);
+	}
+	queue.sort((a, b) => a - b); // Stable ordering: prefer declaration order on ties
+
+	const order: number[] = [];
+	while (queue.length > 0) {
+		const idx = queue.shift()!;
+		order.push(idx);
+		for (const next of adjacency.get(idx) ?? []) {
+			const newDeg = inDegree.get(next)! - 1;
+			inDegree.set(next, newDeg);
+			if (newDeg === 0) {
+				// Insert preserving sorted order so output is deterministic
+				let inserted = false;
+				for (let i = 0; i < queue.length; i++) {
+					if (queue[i] > next) {
+						queue.splice(i, 0, next);
+						inserted = true;
+						break;
+					}
+				}
+				if (!inserted) queue.push(next);
+			}
+		}
+	}
+
+	if (order.length < genIndices.size) {
+		const offending = Array.from(genIndices)
+			.filter(i => !order.includes(i))
+			.map(i => `'${columns[i].name}'`)
+			.join(', ');
+		throw new QuereusError(
+			`Cyclic dependency in generated columns: ${offending}`,
+			StatusCode.ERROR,
+		);
+	}
+
+	return order;
 }
 

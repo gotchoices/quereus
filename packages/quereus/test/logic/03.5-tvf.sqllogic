@@ -36,26 +36,26 @@ SELECT key, value FROM json_each('{"data": [1, 2]}', '$.data');
 -- TVF with root path (json_tree) (just test it runs for now)
 SELECT fullkey, value FROM json_tree('{"a": 1, "nested": {"b": 2}}', '$.nested');
 
--- Error: Invalid JSON
+-- expect error: Invalid JSON
 SELECT * FROM json_each('invalid json');
 -- error: Error: Invalid JSON provided to json_each
 
--- Error: Function not found
+-- expect error: Function not found
 SELECT * FROM non_existent_tvf(1);
 -- error: Function not found: non_existent_tvf/1
 
--- Error: Incorrect number of arguments (json_each - no args)
+-- expect error: Incorrect number of arguments (json_each - no args)
 SELECT * FROM json_each();
 -- error: Error: json_each requires 1 or 2 arguments (jsonSource, [rootPath])
 
--- Error: Incorrect number of arguments (json_each - too many args)
+-- expect error: Incorrect number of arguments (json_each - too many args)
 SELECT * FROM json_each('[]', '$', 'extra');
 -- error: Error: json_each requires 1 or 2 arguments (jsonSource, [rootPath])
 
--- Error: Incorrect number of arguments (json_tree - no args)
+-- expect error: Incorrect number of arguments (json_tree - no args)
 SELECT * FROM json_tree();
 -- error: Error: json_tree requires 1 or 2 arguments (jsonSource, [rootPath])
 
--- Error: Incorrect number of arguments (json_tree - too many args)
+-- expect error: Incorrect number of arguments (json_tree - too many args)
 SELECT * FROM json_tree('{}', '$', 'extra');
 -- error: Error: json_tree requires 1 or 2 arguments (jsonSource, [rootPath])

@@ -18,9 +18,12 @@ import {
 	StatusCode,
 	compareSqlValues,
 	validateAndParse,
+	compilePredicate,
 	type Database,
 	type DatabaseInternal,
 	type TableSchema,
+	type UniqueConstraintSchema,
+	type CompiledPredicate,
 	type Row,
 	type FilterInfo,
 	type SqlValue,
@@ -55,6 +58,34 @@ const STATS_FLUSH_INTERVAL = 100;
 /** Hex-encode a key for use as a Map/Set lookup. */
 function bytesToHex(key: Uint8Array): string {
 	return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Byte-wise equality check for Uint8Arrays. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
+/**
+ * Resolves the per-constraint default conflict action for PK conflicts.
+ * Prefers the table-level `PRIMARY KEY (...) ON CONFLICT <action>` clause
+ * over any column-level `defaultConflict` declared on a PK column.
+ *
+ * Mirrors the helpers in `quereus/.../layer/manager.ts` and
+ * `quereus-isolation/.../isolated-table.ts` — the three-tier precedence
+ * `statement OR > per-constraint default > ABORT` must agree across all
+ * three implementations.
+ */
+function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | undefined {
+	if (schema.primaryKeyDefaultConflict !== undefined) return schema.primaryKeyDefaultConflict;
+	for (const def of schema.primaryKeyDefinition) {
+		const col = schema.columns[def.index];
+		if (col?.defaultConflict !== undefined) return col.defaultConflict;
+	}
+	return undefined;
 }
 
 /**
@@ -111,6 +142,12 @@ export class StoreTable extends VirtualTable {
 	protected mutationCount = 0;
 	protected statsFlushPending = false;
 
+	// Lazy cache of compiled partial-UNIQUE predicates. Keyed on the
+	// UniqueConstraintSchema object identity — UC schemas are frozen and a
+	// new constraint object after CREATE/DROP INDEX produces a fresh compile;
+	// the WeakMap lets the GC reclaim entries for retired constraints.
+	private readonly predicateCache: WeakMap<UniqueConstraintSchema, CompiledPredicate> = new WeakMap();
+
 	constructor(
 		db: Database,
 		storeModule: StoreTableModule,
@@ -144,6 +181,14 @@ export class StoreTable extends VirtualTable {
 	updateSchema(newSchema: TableSchema): void {
 		this.tableSchema = newSchema;
 		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
+	}
+
+	/** Close and forget a cached index-store handle, if any. */
+	async releaseIndexStore(indexName: string): Promise<void> {
+		const cached = this.indexStores.get(indexName);
+		if (!cached) return;
+		this.indexStores.delete(indexName);
+		try { await cached.close(); } catch { /* close is best-effort */ }
 	}
 
 	/**
@@ -234,9 +279,7 @@ export class StoreTable extends VirtualTable {
 
 		const batch = store.batch();
 		for (const { newKey, oldKey, row } of pending.values()) {
-			const oldHex = bytesToHex(oldKey);
-			const newHex = bytesToHex(newKey);
-			if (oldHex !== newHex) {
+			if (!bytesEqual(oldKey, newKey)) {
 				batch.delete(oldKey);
 				batch.put(newKey, serializeRow(row));
 			}
@@ -585,24 +628,28 @@ export class StoreTable extends VirtualTable {
 				const pk = this.extractPK(coerced);
 				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
 
-				// Check for existing row (for conflict handling)
+				// Check for existing row (for conflict handling).
+				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
+				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
 				const existing = await store.get(key);
 				if (existing) {
-					if (args.onConflict === ConflictResolution.IGNORE) {
+					if (pkEffective === ConflictResolution.IGNORE) {
 						return { status: 'ok', row: undefined };
 					}
-					if (args.onConflict !== ConflictResolution.REPLACE) {
+					if (pkEffective !== ConflictResolution.REPLACE) {
 						const existingRow = deserializeRow(existing);
 						return {
 							status: 'constraint',
 							constraint: 'unique',
-							message: 'UNIQUE constraint failed: primary key',
+							message: `UNIQUE constraint failed: ${this.tableName} PK.`,
 							existingRow,
 						};
 					}
 				}
 
-				// Enforce non-PK UNIQUE constraints
+				// Enforce non-PK UNIQUE constraints. Pass the original statement-level
+				// onConflict so checkUniqueConstraints can resolve each UC's own
+				// defaultConflict independently of the PK's default.
 				const ucResult = await this.checkUniqueConstraints(
 					inTransaction,
 					coerced,
@@ -675,21 +722,30 @@ export class StoreTable extends VirtualTable {
 
 				const pkChanged = !this.keysEqual(oldPk, newPk);
 
-				// PK-change UPDATE collides like an INSERT at the new key
+				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
+				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
+
+				// PK-change UPDATE collides like an INSERT at the new key.
+				// Capture the evicted row so it can be reported via `replacedRow`
+				// (consumed by the executor for ON DELETE cascade/SET NULL of the
+				// row at the new PK). Read through the coordinator so an evictee
+				// written earlier in the same transaction is visible.
+				let replacedAtNewPk: Row | null = null;
 				if (pkChanged) {
 					const existingAtNew = await store.get(newKey);
 					if (existingAtNew) {
-						if (args.onConflict === ConflictResolution.IGNORE) {
+						if (pkEffective === ConflictResolution.IGNORE) {
 							return { status: 'ok', row: undefined };
 						}
-						if (args.onConflict !== ConflictResolution.REPLACE) {
+						if (pkEffective !== ConflictResolution.REPLACE) {
 							return {
 								status: 'constraint',
 								constraint: 'unique',
-								message: 'UNIQUE constraint failed: primary key',
+								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
 								existingRow: deserializeRow(existingAtNew),
 							};
 						}
+						replacedAtNewPk = deserializeRow(existingAtNew);
 					}
 				}
 
@@ -697,7 +753,8 @@ export class StoreTable extends VirtualTable {
 				// constraints whose covered columns actually changed; pass [oldPk]
 				// (= newPk) to skip self. For PK-change UPDATE, treat as relocation:
 				// skip both old and new PK so we don't false-conflict against the
-				// row we're moving.
+				// row we're moving. Pass the original statement-level onConflict so
+				// each UC's own defaultConflict can be resolved independently.
 				const selfPks: SqlValue[][] = pkChanged ? [oldPk, newPk] : [oldPk];
 				const shouldCheckUniques = pkChanged
 					|| (oldRow ? this.uniqueColumnsChanged(oldRow, coerced) : true);
@@ -709,6 +766,15 @@ export class StoreTable extends VirtualTable {
 						args.onConflict,
 					);
 					if (ucResult) return ucResult;
+				}
+
+				// When REPLACE evicted a row at the new PK, fully delete it first
+				// (data + secondary indexes + row-count + delete event) so its
+				// state doesn't leak when we then put the moved row at newPk.
+				// Mirrors MemoryTable's `recordDelete(newPK, existingRowAtNewKey)`
+				// step in the PK-change-REPLACE path.
+				if (replacedAtNewPk) {
+					await this.deleteRowAt(inTransaction, newPk, replacedAtNewPk);
 				}
 
 				// Delete old key if PK changed
@@ -727,8 +793,10 @@ export class StoreTable extends VirtualTable {
 					await store.put(newKey, serializedRow);
 				}
 
-				// Update secondary indexes
-				await this.updateSecondaryIndexes(inTransaction, oldRow, coerced, newPk);
+				// Update secondary indexes. For PK-change UPDATE the old entry lives
+				// at oldPk and the new entry must land at newPk; for same-PK UPDATE
+				// both halves use the same key.
+				await this.updateSecondaryIndexes(inTransaction, oldRow, coerced, oldPk, newPk);
 
 				// Queue or emit event
 				const updateEvent = {
@@ -745,7 +813,7 @@ export class StoreTable extends VirtualTable {
 					this.eventEmitter?.emitDataChange(updateEvent);
 				}
 
-				return { status: 'ok', row: coerced };
+				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined };
 			}
 
 			case 'delete': {
@@ -791,12 +859,19 @@ export class StoreTable extends VirtualTable {
 		}
 	}
 
-	/** Update secondary indexes after a row change. */
+	/**
+	 * Update secondary indexes after a row change.
+	 *
+	 * For PK-change UPDATE, `oldPk` (where the existing entry lives) and `newPk`
+	 * (where the relocated entry will live) differ; using a single pk for both
+	 * sides leaks the old entry. Other paths pass the same pk for both.
+	 */
 	protected async updateSecondaryIndexes(
 		inTransaction: boolean,
 		oldRow: Row | null,
 		newRow: Row | null,
-		pk: SqlValue[]
+		oldPk: SqlValue[],
+		newPk: SqlValue[] = oldPk,
 	): Promise<void> {
 		const schema = this.tableSchema!;
 		const indexes = schema.indexes || [];
@@ -811,7 +886,7 @@ export class StoreTable extends VirtualTable {
 				const oldIndexValues = indexCols.map(i => oldRow[i]);
 				const oldIndexKey = buildIndexKey(
 					oldIndexValues,
-					pk,
+					oldPk,
 					this.encodeOptions,
 					indexDirections,
 					this.pkDirections,
@@ -829,7 +904,7 @@ export class StoreTable extends VirtualTable {
 				const newIndexValues = indexCols.map(i => newRow[i]);
 				const newIndexKey = buildIndexKey(
 					newIndexValues,
-					pk,
+					newPk,
 					this.encodeOptions,
 					indexDirections,
 					this.pkDirections,
@@ -846,6 +921,21 @@ export class StoreTable extends VirtualTable {
 		}
 	}
 
+	/**
+	 * Returns the compiled predicate for a partial-UNIQUE constraint, or undefined
+	 * when the constraint covers the full table. Compilation is memoized per
+	 * UniqueConstraintSchema instance so the hot UNIQUE-check path doesn't recompile.
+	 */
+	private compileFor(uc: UniqueConstraintSchema): CompiledPredicate | undefined {
+		if (!uc.predicate) return undefined;
+		let compiled = this.predicateCache.get(uc);
+		if (!compiled) {
+			compiled = compilePredicate(uc.predicate, this.tableSchema!.columns);
+			this.predicateCache.set(uc, compiled);
+		}
+		return compiled;
+	}
+
 	/** Check if two PK arrays are equal. */
 	protected keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
 		if (a.length !== b.length) return false;
@@ -855,13 +945,26 @@ export class StoreTable extends VirtualTable {
 		return true;
 	}
 
-	/** Returns true if any column covered by a UNIQUE constraint differs between oldRow and newRow. */
+	/**
+	 * Returns true if any column covered by a UNIQUE constraint differs between
+	 * oldRow and newRow, or — for partial UNIQUE — any column referenced by the
+	 * partial predicate differs (which can transition the row across the
+	 * predicate scope and re-trigger the uniqueness check).
+	 */
 	protected uniqueColumnsChanged(oldRow: Row, newRow: Row): boolean {
 		const ucs = this.tableSchema?.uniqueConstraints;
 		if (!ucs || ucs.length === 0) return false;
 		for (const uc of ucs) {
 			for (const colIdx of uc.columns) {
 				if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
+			}
+			if (uc.predicate) {
+				const compiled = this.compileFor(uc);
+				if (compiled) {
+					for (const colIdx of compiled.referencedColumns) {
+						if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
+					}
+				}
 			}
 		}
 		return false;
@@ -893,13 +996,20 @@ export class StoreTable extends VirtualTable {
 		for (const uc of uniqueConstraints) {
 			if (uc.columns.some(idx => newRow[idx] === null)) continue;
 
-			const conflict = await this.findUniqueConflict(uc.columns, newRow, selfPks);
+			// Partial UNIQUE: a row whose predicate is not unambiguously TRUE is
+			// outside the index's scope and contributes nothing to uniqueness.
+			const predicate = this.compileFor(uc);
+			if (predicate && predicate.evaluate(newRow) !== true) continue;
+
+			const conflict = await this.findUniqueConflict(uc, predicate, newRow, selfPks);
 			if (!conflict) continue;
 
-			if (onConflict === ConflictResolution.IGNORE) {
+			// Resolve action per-constraint: statement OR > per-UC default > ABORT.
+			const effective = onConflict ?? uc.defaultConflict ?? ConflictResolution.ABORT;
+			if (effective === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
 			}
-			if (onConflict === ConflictResolution.REPLACE) {
+			if (effective === ConflictResolution.REPLACE) {
 				await this.deleteRowAt(inTransaction, conflict.pk, conflict.row);
 				continue;
 			}
@@ -916,11 +1026,13 @@ export class StoreTable extends VirtualTable {
 
 	/**
 	 * Scan committed + pending data rows for a row matching `newRow` on
-	 * `constrainedCols` whose PK is not in `selfPks`. Returns the first match
-	 * or null.
+	 * `uc.columns` whose PK is not in `selfPks`. For partial UNIQUE, candidates
+	 * whose row does not satisfy the predicate are skipped. Returns the first
+	 * match or null.
 	 */
 	private async findUniqueConflict(
-		constrainedCols: ReadonlyArray<number>,
+		uc: UniqueConstraintSchema,
+		predicate: CompiledPredicate | undefined,
 		newRow: Row,
 		selfPks: SqlValue[][],
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
@@ -928,6 +1040,7 @@ export class StoreTable extends VirtualTable {
 		const pending = this.coordinator?.isInTransaction()
 			? this.coordinator.getPendingOpsForStore(store)
 			: null;
+		const constrainedCols = uc.columns;
 
 		const matches = (candidate: Row): { pk: SqlValue[]; row: Row } | null => {
 			const pk = this.extractPK(candidate);
@@ -937,6 +1050,8 @@ export class StoreTable extends VirtualTable {
 			for (const idx of constrainedCols) {
 				if (compareSqlValues(newRow[idx], candidate[idx]) !== 0) return null;
 			}
+			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
+			if (predicate && predicate.evaluate(candidate) !== true) return null;
 			return { pk, row: candidate };
 		};
 

@@ -1,0 +1,32 @@
+-- adapted from SQLite test/index.test, test/index1.test, test/expridx.test ideas
+-- expression indexes: CREATE INDEX ... ON tab(<expr>)
+-- Quereus's parser accepts expressions in indexed-column lists, but the schema
+-- manager rejects them at index-build time. This fixture pins the rejection so
+-- that future support can flip the assertions in one place.
+
+-- =====================================================
+-- 1. Function-call expression in CREATE INDEX is rejected
+-- =====================================================
+create table e_upper (id integer primary key, name text);
+create index ix_e_upper_name on e_upper(upper(name));
+-- error: not supported
+
+drop table e_upper;
+
+-- =====================================================
+-- 2. Arithmetic expression in CREATE INDEX is rejected
+-- =====================================================
+create table e_arith (id integer primary key, a integer, b integer);
+create index ix_e_arith_sum on e_arith(a + b);
+-- error: not supported
+
+drop table e_arith;
+
+-- =====================================================
+-- 3. UNIQUE expression index is rejected at the same point
+-- =====================================================
+create table e_uniq (id integer primary key, name text);
+create unique index ix_e_uniq_lower on e_uniq(lower(name));
+-- error: not supported
+
+drop table e_uniq;

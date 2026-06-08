@@ -96,9 +96,14 @@ describe('ruleAggregatePhysical — branch coverage', () => {
 			expect(ops).to.include('HASHAGGREGATE');
 		});
 
-		it('GROUP BY with extra non-PK column beyond PK picks HashAggregate (more keys than ordering)', async () => {
+		it('GROUP BY a, b, c on composite PK (a, b): groupby-fd-simplification drops `c` and StreamAggregate is picked', async () => {
+			// `c` is functionally determined by the PK `(a, b)`, so the GROUP-BY
+			// FD simplification rule drops it and re-emits it as a MIN(c) picker.
+			// The resulting GROUP BY a, b is a prefix of source ordering, so we
+			// land on StreamAggregate (no Sort needed).
 			const ops = await planOps(db, 'SELECT a, b, c, count(*) FROM comp GROUP BY a, b, c');
-			expect(ops).to.include('HASHAGGREGATE');
+			expect(ops).to.include('STREAMAGGREGATE');
+			expect(ops).to.not.include('HASHAGGREGATE');
 		});
 
 		it('GROUP BY second key only of composite PK picks HashAggregate (not prefix)', async () => {

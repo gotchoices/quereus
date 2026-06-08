@@ -1,6 +1,6 @@
 import type { ScalarType } from "../../common/datatype.js";
 import { OutputValue } from "../../common/types.js";
-import { PlanNode, type ScalarPlanNode, type UnaryScalarNode, type NaryScalarNode, type ZeroAryScalarNode, type BinaryScalarNode, PhysicalProperties, type ConstantNode, type TernaryScalarNode } from "./plan-node.js";
+import { PlanNode, type ScalarPlanNode, type UnaryScalarNode, type NaryScalarNode, type ZeroAryScalarNode, type BinaryScalarNode, PhysicalProperties, type ConstantNode, type TernaryScalarNode, type InjectivityResult, type MonotonicityResult, addMonotonicity, negateMonotonicity } from "./plan-node.js";
 import type * as AST from "../../parser/ast.js";
 import type { Scope } from "../scopes/scope.js";
 import { PlanNodeType } from "./plan-node-type.js";
@@ -108,7 +108,44 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 		};
 	}
 
+	override isInjectiveIn(inputAttrId: number): InjectivityResult {
+		switch (this.expression.operator) {
+			case '+':
+				// Unary plus on a numeric operand is identity; pass through.
+				if (this.operand.getType().logicalType.isNumeric) {
+					return this.operand.isInjectiveIn(inputAttrId);
+				}
+				return { injective: false };
+			case '-':
+				// Negation on numeric operand: -x is injective iff x is.
+				if (this.operand.getType().logicalType.isNumeric) {
+					return this.operand.isInjectiveIn(inputAttrId);
+				}
+				return { injective: false };
+			default:
+				return { injective: false };
+		}
+	}
 
+	override monotonicityIn(inputAttrId: number): MonotonicityResult {
+		switch (this.expression.operator) {
+			case '+': {
+				if (this.operand.getType().logicalType.isNumeric) {
+					return this.operand.monotonicityIn(inputAttrId);
+				}
+				return { monotonicity: 'unknown' };
+			}
+			case '-': {
+				if (this.operand.getType().logicalType.isNumeric) {
+					const childMon = this.operand.monotonicityIn(inputAttrId).monotonicity;
+					return { monotonicity: negateMonotonicity(childMon) };
+				}
+				return { monotonicity: 'unknown' };
+			}
+			default:
+				return { monotonicity: 'unknown' };
+		}
+	}
 }
 
 export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
@@ -242,7 +279,64 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 		};
 	}
 
+	private isNumericArith(): boolean {
+		// Result type is numeric iff both operands are numeric (per generateType above).
+		const lt = this.left.getType().logicalType;
+		const rt = this.right.getType().logicalType;
+		return Boolean(lt.isNumeric && rt.isNumeric);
+	}
 
+	override monotonicityIn(inputAttrId: number): MonotonicityResult {
+		switch (this.expression.operator) {
+			case '+': {
+				if (!this.isNumericArith()) return { monotonicity: 'unknown' };
+				const lm = this.left.monotonicityIn(inputAttrId).monotonicity;
+				const rm = this.right.monotonicityIn(inputAttrId).monotonicity;
+				return { monotonicity: addMonotonicity(lm, rm) };
+			}
+			case '-': {
+				if (!this.isNumericArith()) return { monotonicity: 'unknown' };
+				const lm = this.left.monotonicityIn(inputAttrId).monotonicity;
+				const rm = this.right.monotonicityIn(inputAttrId).monotonicity;
+				// a - b ≡ a + (-b)
+				return { monotonicity: addMonotonicity(lm, negateMonotonicity(rm)) };
+			}
+			default:
+				return { monotonicity: 'unknown' };
+		}
+	}
+
+	override isInjectiveIn(inputAttrId: number): InjectivityResult {
+		switch (this.expression.operator) {
+			case '+':
+			case '-': {
+				if (!this.isNumericArith()) return { injective: false };
+				const lm = this.left.monotonicityIn(inputAttrId).monotonicity;
+				const rm = this.right.monotonicityIn(inputAttrId).monotonicity;
+				// One side flat in attrId → injectivity passes through from the other side.
+				if (lm === 'constant') {
+					const inj = this.right.isInjectiveIn(inputAttrId);
+					// `a - b`: if left is constant, result is `c - b`, still injective when b is.
+					// `a + b`: same.
+					return inj;
+				}
+				if (rm === 'constant') {
+					return this.left.isInjectiveIn(inputAttrId);
+				}
+				// Both depend on attrId. Strict monotonicity (same direction for `+`,
+				// opposite directions for `-`) implies injectivity.
+				const combined = this.expression.operator === '+'
+					? addMonotonicity(lm, rm)
+					: addMonotonicity(lm, negateMonotonicity(rm));
+				if (combined === 'increasing' || combined === 'decreasing') {
+					return { injective: true };
+				}
+				return { injective: false };
+			}
+			default:
+				return { injective: false };
+		}
+	}
 }
 
 export class LiteralNode extends PlanNode implements ZeroAryScalarNode, ConstantNode {
@@ -359,6 +453,10 @@ export class LiteralNode extends PlanNode implements ZeroAryScalarNode, Constant
 		return {
 			constant: true,
 		};
+	}
+
+	override monotonicityIn(_inputAttrId: number): MonotonicityResult {
+		return { monotonicity: 'constant' };
 	}
 }
 
@@ -628,6 +726,19 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 			targetType: this.expression.targetType,
 			resultType: formatScalarType(this.getType())
 		};
+	}
+
+	override isInjectiveIn(inputAttrId: number): InjectivityResult {
+		// Conservative starter rule: only treat the cast as a no-op when the
+		// target logical type exactly matches the operand's. Wider-integer casts
+		// would also be safe but require a "wider with no value collisions"
+		// check from the type system — deferred.
+		const operandType = this.operand.getType().logicalType;
+		const targetType = this.getType().logicalType;
+		if (operandType === targetType) {
+			return this.operand.isInjectiveIn(inputAttrId);
+		}
+		return { injective: false };
 	}
 }
 
