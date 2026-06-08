@@ -11,6 +11,18 @@ files:
 
 # View DDL reserved-tag validation: eager-at-create vs lazy-at-mutation
 
+> **Update (2026-06-07) — reframe under consideration (human, pending).** A third path sits
+> *above* Option A/B: stop carrying this *semantic* behavior as a tag at all. The only
+> behavior-bearing tag at this site is `quereus.update.default_for.<column>` (an omitted-insert
+> default on view write-through); if that moves to a **first-class view insert-default
+> construct**, the eager-vs-lazy *validation-timing* question dissolves (no tag → no tag
+> validation to time). Precedent: the view-mutation **routing** tags were already removed this
+> way in favor of per-row presence/membership columns (`reserved-tags.ts:15-18`,
+> `mutation-tags.ts:22-27`). The human is weighing this de-tagging direction against the A/B
+> options below — decision deferred. A broader "which reserved tags are genuinely metadata vs.
+> semantic behavior" audit is a *separate* concern (the `quereus.lens.decomp.*` mapping,
+> `quereus.id` / `previous_name` rename hints, and lens governance tags likely **stay** tags).
+
 ## Why this is blocked (not an implement ticket)
 
 This is a genuine contract question with two internally-consistent answers, and
