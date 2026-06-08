@@ -265,6 +265,19 @@ index store, the in-memory schema has the index but the catalog does not, so on
 reopen the index is missing and its store is orphaned. There is no two-phase
 protocol here.
 
+**Fixed physical key collation and PK `SET COLLATE`.** The store encodes every
+primary-key key's bytes under a single fixed table-level key collation K
+(`config.collation`, one of `BINARY` / `NOCASE`, default `NOCASE`), and enforces
+PK uniqueness *physically* against those bytes — not under the PK column's declared
+per-column collation. So `ALTER COLUMN … SET COLLATE` on a PK column is negotiated
+**accept-when-consistent / reject-when-divergent**: a target equal to K is applied
+schema-only (forward PK uniqueness is already correct under it), while a divergent
+target throws a sited `UNSUPPORTED` rather than silently applying a schema change the
+key bytes never honor. The reject is data-independent (it fires even on an empty
+table). See [`docs/sql.md` § ALTER COLUMN](sql.md#27-alter-table-statement) for the
+full SET COLLATE contract, including the non-PK UNIQUE re-validation that *does*
+reach memory parity and the custom-comparator dedup residual.
+
 ### View and materialized-view persistence
 
 Views and materialized views are engine-level catalog objects that never pass

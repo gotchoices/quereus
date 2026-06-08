@@ -320,6 +320,44 @@ const ARMS: Arm[] = [
 			} else expect(String(info?.collation).toUpperCase()).to.not.equal('NOCASE');
 		},
 	},
+	{
+		// PK column, CONSISTENT change: target NOCASE == the store's fixed physical key
+		// collation K (default NOCASE). The store applies it schema-only — forward PK
+		// uniqueness is already physically correct under NOCASE. 'abc'/'ABD' are distinct
+		// under NOCASE keys, so both coexist and order under NOCASE.
+		label: 'alterColumn SET COLLATE on PK column (consistent: target == fixed key collation) → honored schema-only',
+		seed: [`create table t (name text primary key) using store`, `insert into t values ('abc'), ('ABD')`],
+		alter: `alter table t alter column name set collate nocase`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'name');
+			if (outcome === 'honored') {
+				expect(String(info?.collation).toUpperCase(), 'collation now NOCASE (matches fixed key collation)').to.equal('NOCASE');
+				const ordered = (await rows(db, `select name from t order by name`)).map(r => String(r.name).toLowerCase());
+				expect(ordered, 'PK rows ordered under NOCASE').to.deep.equal(['abc', 'abd']);
+			} else expect(String(info?.collation).toUpperCase()).to.not.equal('NOCASE');
+		},
+	},
+	{
+		// PK column, DIVERGENT change: target BINARY != K (NOCASE). The store enforces the
+		// PK physically under K and cannot honor a divergent per-column PK collation without
+		// a physical re-key, so it throws a sited UNSUPPORTED — the negotiated rejection that
+		// closes the former silent-divergence gap. Reach it by declaring the column NOCASE
+		// first (so BINARY is a real change, not the BINARY→NOCASE consistent case).
+		label: 'alterColumn SET COLLATE on PK column (divergent from fixed key collation) → UNSUPPORTED',
+		seed: [`create table t (name text collate nocase primary key) using store`, `insert into t values ('abc'), ('xyz')`],
+		alter: `alter table t alter column name set collate binary`,
+		expect: { kind: 'reject', codes: [StatusCode.UNSUPPORTED], site: /name|primary key|collat/i },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'name');
+			if (outcome === 'rejected') {
+				expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
+				// the table is still writable after the failed ALTER
+				await db.exec(`insert into t values ('def')`);
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert succeeded post-reject').to.equal(3);
+			} else expect(String(info?.collation).toUpperCase(), 'unexpected honor of a divergent PK collation').to.equal('NOCASE');
+		},
+	},
 ];
 
 // ── Driver ────────────────────────────────────────────────────────────────────
@@ -365,28 +403,10 @@ describe('ALTER conformance matrix — store module', () => {
 		});
 	}
 
-	// ── Deferred cell: ALTER COLUMN SET COLLATE on a PRIMARY KEY column to a
-	// divergent collation. Today the store updates the column's schema collation
-	// but does NOT re-key the physical primary structure (encodeOptions uses the
-	// fixed table-level collation), so the new collation is silently ignored for
-	// PK ordering / uniqueness — the exact silent-divergence this matrix forbids.
-	// That gap is owned by `store-pk-collate-module-capability`, which will land
-	// the cell as either honored-logical (re-key) or a clean UNSUPPORTED reject.
-	// Kept SKIPPED so the harness stays green and independent until then; remove
-	// `.skip` (and pick the honored/reject branch) when that ticket lands.
-	it.skip('alterColumn SET COLLATE on a PK column → honored (re-key) or clean UNSUPPORTED [store-pk-collate-module-capability]', async () => {
-		await db.exec(`create table t (name text primary key) using store`);
-		await db.exec(`insert into t values ('abc'), ('ABD')`); // distinct under BINARY, would collide under NOCASE
-		const err = await attemptAlter(db, `alter table t alter column name set collate nocase`);
-		if (err === null) {
-			// Honored branch: NOCASE must now govern PK ordering — 'abc' < 'ABD' under NOCASE.
-			expect(String((await columnInfo(db, 'name'))?.collation).toUpperCase()).to.equal('NOCASE');
-			const ordered = (await rows(db, `select name from t order by name`)).map(r => String(r.name).toLowerCase());
-			expect(ordered, 'PK re-keyed under NOCASE ordering').to.deep.equal(['abc', 'abd']);
-		} else {
-			// Clean-reject branch: the engine refused to silently diverge.
-			expect(err.code).to.equal(StatusCode.UNSUPPORTED);
-			expect(err.message.trim().length).to.be.greaterThan(0);
-		}
-	});
+	// The former DEFERRED cell — ALTER COLUMN SET COLLATE on a PRIMARY KEY column —
+	// is now resolved by `store-pk-collate-module-capability` and lives as two live
+	// ARMS above: the CONSISTENT case (target == the store's fixed key collation) is
+	// honored schema-only, and the DIVERGENT case throws a sited UNSUPPORTED. The
+	// store enforces PK uniqueness physically under its fixed table key collation, so
+	// it never silently diverges on a per-column PK collation change.
 });

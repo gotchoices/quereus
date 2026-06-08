@@ -1103,19 +1103,45 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				} else if (change.setDefault !== undefined) {
 					newCol = { ...oldCol, defaultValue: change.setDefault };
 				} else if (change.setCollation !== undefined) {
-					// Per-column collation update. Physical key encoding still uses the
-					// fixed table-level collation (`encodeOptions`), so PRIMARY KEY columns
-					// are NOT re-keyed or re-validated here (the PK is enforced physically;
-					// deferred to store-pk-collate-module-capability). For non-PK UNIQUE
-					// constraints we DO re-validate existing rows under the new collation
-					// below (Option A) — write-time UNIQUE enforcement is already
-					// collation-aware, so this reaches end-to-end parity with memory.
-					// Query-layer ORDER BY / `=` / `table_info().collation` pick the new
-					// collation up from the column schema once this updated schema re-registers.
+					// Per-column collation update. The store enforces PRIMARY KEY uniqueness
+					// PHYSICALLY under a single fixed table-level key collation K
+					// (`encodeOptions`), not the per-column declared collation, so a PK-column
+					// SET COLLATE is negotiated accept-when-consistent / reject-when-divergent by
+					// the guard below: schema-only when the target equals K, else a sited
+					// UNSUPPORTED — never a silent no-op. For non-PK UNIQUE constraints we DO
+					// re-validate existing rows under the new collation further below (Option A)
+					// — write-time UNIQUE enforcement is already collation-aware, so this reaches
+					// end-to-end parity with memory. Query-layer ORDER BY / `=` /
+					// `table_info().collation` pick the new collation up from the column schema
+					// once this updated schema re-registers.
 					const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
 					if (normalized === (oldCol.collation || 'BINARY')) {
 						return oldSchema; // already in desired state — no scan, no re-persist
 					}
+					// PK-column divergence guard (runs BEFORE the non-PK UNIQUE re-validation
+					// block). The store enforces PRIMARY KEY uniqueness PHYSICALLY under a single
+					// fixed table-level key collation K (`StoreTable.encodeOptions`,
+					// = `config.collation || 'NOCASE'`), not the per-column declared collation.
+					// It therefore cannot enforce a PK column's uniqueness/ordering under a
+					// collation that diverges from K without a physical re-key, so reject such a
+					// change cleanly (throw `UNSUPPORTED`) rather than silently applying a
+					// schema-only change the key bytes won't honor. A consistent change
+					// (target == K) falls through and is applied schema-only below — forward PK
+					// uniqueness is already physically correct under it. Data-independent: it
+					// rejects even on an empty table.
+					if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+						const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
+						if (normalized !== keyCollation) {
+							throw new QuereusError(
+								`Cannot SET COLLATE to '${normalized}' on PRIMARY KEY column `
+									+ `'${change.columnName}' of '${schemaName}.${tableName}': this module `
+									+ `enforces PK uniqueness physically under a fixed table key collation `
+									+ `('${keyCollation}'); a divergent per-column PK collation is unsupported.`,
+								StatusCode.UNSUPPORTED,
+							);
+						}
+					}
+
 					newCol = { ...oldCol, collation: normalized };
 					collationChanged = true;
 				} else {

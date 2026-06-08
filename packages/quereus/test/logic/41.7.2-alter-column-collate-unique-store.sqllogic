@@ -1,16 +1,25 @@
--- ALTER COLUMN ... SET COLLATE — non-PK UNIQUE / index existing-row re-validation.
+-- ALTER COLUMN ... SET COLLATE — cross-module existing-row re-validation.
 --
 -- CROSS-MODULE (NOT in MEMORY_ONLY_FILES): runs in both memory and store modes.
--- A per-column collation change is re-validated against existing rows for every
--- non-PK UNIQUE constraint (inline UNIQUE and CREATE UNIQUE INDEX-derived) covering
--- the altered column: a value set distinct under BINARY but colliding under NOCASE
--- rejects the ALTER with CONSTRAINT (schema unchanged), and a distinct set succeeds
--- and then enforces under the new collation. The store reaches end-to-end parity
--- with memory here because the constrained column is row DATA keyed by the integer
--- PK, so the store's fixed-table-collation KEY encoding is irrelevant — both modules
--- behave identically. The PK-column cases (where the store's fixed key collation DOES
--- matter) stay memory-only in 41.7.1, deferred to store-set-collate-pk-physical-rekey.
--- The cross-module query-layer behavior lives in 41.7-alter-column-collate.sqllogic.
+-- Sections 1-8: a per-column collation change is re-validated against existing rows
+-- for every non-PK UNIQUE constraint (inline UNIQUE and CREATE UNIQUE INDEX-derived)
+-- covering the altered column: a value set distinct under BINARY but colliding under
+-- NOCASE rejects the ALTER with CONSTRAINT (schema unchanged), and a distinct set
+-- succeeds and then enforces under the new collation. The store reaches end-to-end
+-- parity with memory here because the constrained column is row DATA keyed by the
+-- integer PK, so the store's fixed-table-collation KEY encoding is irrelevant — both
+-- modules behave identically.
+--
+-- Section 9: a PRIMARY KEY column's CONSISTENT collation change (target == the store's
+-- fixed table key collation, NOCASE) also runs cross-module — memory re-keys its
+-- primary structure, the store applies it schema-only because the target already
+-- matches its physical key encoding, and both then enforce PK uniqueness under NOCASE.
+-- The DIVERGENT PK case (target != the store's fixed key collation) is NOT here: the
+-- store rejects it with UNSUPPORTED (asserted in packages/quereus-store/test/
+-- alter-table-conformance.spec.ts), so it cannot be a cross-module sqllogic assertion.
+-- The physically-impossible memory-only re-key collision fixture ('a'/'A') stays in
+-- 41.7.1-alter-column-collate-unique.sqllogic. The cross-module query-layer behavior
+-- lives in 41.7-alter-column-collate.sqllogic.
 
 -- ===================================
 -- 1. UNIQUE column, values distinct under BOTH collations → ALTER succeeds, and a
@@ -250,3 +259,28 @@ insert into nopg values (3, 'A@X');
 -- error: UNIQUE constraint failed
 
 drop table nopg;
+
+-- ===================================
+-- 9. PRIMARY KEY column, CONSISTENT collation change (target == the store's fixed key
+--    collation, NOCASE) → succeeds on BOTH modules. Memory re-keys its primary
+--    structure under NOCASE; the store applies the change schema-only because the
+--    target already equals its fixed physical key collation. A non-colliding pair
+--    survives the change, then a case-only duplicate of an existing PK collides under
+--    NOCASE and is rejected on both modules. (Migrated from 41.7.1 §2 — it is no longer
+--    memory-only now that the store honors the consistent case.)
+-- ===================================
+
+create table pko (k text primary key);
+insert into pko values ('alpha'), ('Beta');
+
+alter table pko alter column k set collate nocase;
+-- run
+
+-- a case-only duplicate of an existing PK now collides under NOCASE
+insert into pko values ('ALPHA');
+-- error: UNIQUE constraint failed
+
+select k from pko order by k;
+→ [{"k":"alpha"},{"k":"Beta"}]
+
+drop table pko;

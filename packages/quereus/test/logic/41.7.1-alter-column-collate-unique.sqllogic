@@ -1,23 +1,26 @@
--- ALTER COLUMN ... SET COLLATE — PRIMARY KEY existing-row re-validation.
+-- ALTER COLUMN ... SET COLLATE — PRIMARY KEY re-key collision (memory-only).
 --
--- MEMORY-ONLY (registered in MEMORY_ONLY_FILES in logic.spec.ts): exercises the
--- memory module's re-key of the primary tree and re-validation of the PRIMARY KEY
--- under the new collation. The store module CANNOT mirror this without a physical
--- re-key: its PK key bytes are encoded under a single fixed table-level collation
--- (`StoreTable.encodeOptions`, default NOCASE), not the per-column collation, so PK
--- uniqueness is enforced purely physically. Under that default NOCASE table encoding
--- the BINARY-distinct/NOCASE-colliding PK fixtures below (`'a'`,`'A'`) cannot even
--- coexist in the store. The store-PK case is therefore deferred to Option B —
--- store-set-collate-pk-physical-rekey. A PK-only column's SET COLLATE on the store
--- stays schema-only (it never appears in `uniqueConstraints`, the set the store
--- re-validates). The non-PK UNIQUE / CREATE UNIQUE INDEX sections — which behave
--- identically across both modules — live in the cross-module
--- 41.7.2-alter-column-collate-unique-store.sqllogic. The cross-module query-layer
--- behavior lives in 41.7-alter-column-collate.sqllogic.
+-- MEMORY-ONLY (registered in MEMORY_ONLY_FILES in logic.spec.ts): the single fixture
+-- here ('a'/'A') is PHYSICALLY IMPOSSIBLE on the store, so it cannot be cross-module.
+-- The memory module re-keys its primary tree under the new per-column collation and
+-- re-validates the PRIMARY KEY, so a pair distinct under BINARY but colliding under
+-- NOCASE rejects the ALTER with CONSTRAINT. The store encodes PK key bytes under a
+-- single fixed table-level key collation (`StoreTable.encodeOptions`, default NOCASE),
+-- so 'a'/'A' map to the same NOCASE key and cannot even coexist in the store — there
+-- is nothing to re-key, hence this stays memory-only.
+--
+-- The store does NOT silently diverge on a PK SET COLLATE. It rejects a DIVERGENT PK
+-- collation (target != its fixed key collation) with UNSUPPORTED — asserted in
+-- packages/quereus-store/test/alter-table-conformance.spec.ts — and honors a CONSISTENT
+-- one (target == its fixed key collation) schema-only, exercised cross-module in
+-- 41.7.2-alter-column-collate-unique-store.sqllogic §9. The non-PK UNIQUE / CREATE
+-- UNIQUE INDEX sections (identical across both modules) also live in 41.7.2. The
+-- cross-module query-layer behavior lives in 41.7-alter-column-collate.sqllogic.
 
 -- ===================================
 -- 1. PK column collation change re-keys the primary structure; a PK that is
---    unique under BINARY but collides under NOCASE is rejected.
+--    unique under BINARY but collides under NOCASE is rejected. (Memory-only: under
+--    the store's fixed NOCASE key encoding the 'a'/'A' pair cannot coexist at all.)
 -- ===================================
 
 create table pkc (k text primary key);
@@ -32,23 +35,3 @@ select k from pkc order by k;
 → [{"k":"A"},{"k":"a"}]
 
 drop table pkc;
-
--- ===================================
--- 2. PK column collation change that does NOT collide succeeds, and a later
---    NOCASE-colliding PK insert is then rejected under the new collation.
--- ===================================
-
-create table pko (k text primary key);
-insert into pko values ('alpha'), ('Beta');
-
-alter table pko alter column k set collate nocase;
--- run
-
--- a case-only duplicate of an existing PK now collides under NOCASE
-insert into pko values ('ALPHA');
--- error: UNIQUE constraint failed
-
-select k from pko order by k;
-→ [{"k":"alpha"},{"k":"Beta"}]
-
-drop table pko;
