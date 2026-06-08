@@ -281,3 +281,61 @@ describe('view persistence: generateMaterializedViewDDL fixed point', () => {
 		if (cols.type === 'createMaterializedView') expect(cols.columns).to.deep.equal(['x', 'y']);
 	});
 });
+
+// ============================================================================
+// The matrix above feeds the generators parser-derived schemas. These two tests
+// instead exercise them against a LIVE-created schema — the schema a store would
+// actually regenerate. A live MV's `selectAst` is the raw parsed body (the create
+// emitter stores `plan.selectStmt`, NOT the optimized form), so the generators see
+// the same shape; this proves that end-to-end by regenerating DDL from the live
+// schema and rehydrating it into a fresh database.
+// ============================================================================
+
+describe('view persistence: generators over LIVE-created schemas', () => {
+	it('generateViewDDL on a live CREATE VIEW rehydrates faithfully into a fresh database', async () => {
+		const src = new Database();
+		const dst = new Database();
+		try {
+			await src.exec("create view v as select 1 as a, 2 as b with tags (purpose = 'live')");
+			const view = src.schemaManager.getView('main', 'v');
+			expect(view, 'live view registered').to.exist;
+			const ddl = generateViewDDL(view!);
+			expect(parse(ddl).type, 'generated DDL re-parses to createView').to.equal('createView');
+
+			await dst.exec(ddl);
+			const rehydrated = dst.schemaManager.getView('main', 'v');
+			expect(rehydrated?.tags, 'tags survive generate→exec').to.deep.equal({ purpose: 'live' });
+			expect(await rows(dst, 'select a, b from v')).to.deep.equal([{ a: 1, b: 2 }]);
+		} finally {
+			await src.close();
+			await dst.close();
+		}
+	});
+
+	it('generateMaterializedViewDDL on a live CREATE MATERIALIZED VIEW rehydrates faithfully', async () => {
+		const src = new Database();
+		const dst = new Database();
+		try {
+			// A row-time-maintainable body: passthrough projection of a single keyed source.
+			await src.exec('create table base (id integer primary key, v integer)');
+			await src.exec('insert into base values (1, 10), (2, 20)');
+			await src.exec("create materialized view mv as select id, v from base with tags (purpose = 'live')");
+			const mv = src.schemaManager.getMaterializedView('main', 'mv');
+			expect(mv, 'live MV registered').to.exist;
+			const ddl = generateMaterializedViewDDL(mv!);
+			expect(parse(ddl).type, 'generated DDL re-parses to createMaterializedView').to.equal('createMaterializedView');
+			expect(ddl, 'USING omitted (backing rebuilds as memory)').to.not.match(/using/i);
+
+			// The body references `base`, so the destination needs it before the MV DDL.
+			await dst.exec('create table base (id integer primary key, v integer)');
+			await dst.exec('insert into base values (1, 10), (2, 20)');
+			await dst.exec(ddl);
+			const rehydrated = dst.schemaManager.getMaterializedView('main', 'mv');
+			expect(rehydrated?.tags, 'tags survive generate→exec').to.deep.equal({ purpose: 'live' });
+			expect(await rows(dst, 'select id, v from mv')).to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		} finally {
+			await src.close();
+			await dst.close();
+		}
+	});
+});

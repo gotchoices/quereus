@@ -411,6 +411,23 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Returns the named schema, lazily creating an empty (physical) one if absent.
+	 * Used by the catalog-import paths ({@link importTable}/{@link importView}) so an
+	 * object can rehydrate into a schema that holds no tables yet — making import
+	 * order-independent. Unlike {@link addSchema} this never throws on an existing
+	 * schema.
+	 */
+	private getOrCreateSchema(name: string): Schema {
+		const lowerName = name.toLowerCase();
+		let schema = this.schemas.get(lowerName);
+		if (!schema) {
+			schema = new Schema(lowerName);
+			this.schemas.set(lowerName, schema);
+		}
+		return schema;
+	}
+
+	/**
 	 * Removes a schema (e.g., for DETACH)
 	 *
 	 * @param name Name of the schema to remove
@@ -2431,12 +2448,7 @@ export class SchemaManager {
 
 		// Create the schema if absent (mirrors importTable) so a view rehydrates
 		// even into a schema that holds no tables.
-		let schema = this.getSchema(targetSchemaName);
-		if (!schema) {
-			const lowerSchemaName = targetSchemaName.toLowerCase();
-			schema = new Schema(lowerSchemaName);
-			this.schemas.set(lowerSchemaName, schema);
-		}
+		const schema = this.getOrCreateSchema(targetSchemaName);
 
 		schema.addView(viewSchema);
 		log(`Imported view %s.%s`, targetSchemaName, viewName);
@@ -2470,12 +2482,7 @@ export class SchemaManager {
 			throw new QuereusError(`Module '${moduleName}' connect failed during import for table '${tableName}': ${message}`, StatusCode.ERROR);
 		}
 
-		let schema = this.getSchema(targetSchemaName);
-		if (!schema) {
-			const lowerSchemaName = targetSchemaName.toLowerCase();
-			schema = new Schema(lowerSchemaName);
-			this.schemas.set(lowerSchemaName, schema);
-		}
+		const schema = this.getOrCreateSchema(targetSchemaName);
 
 		schema.addTable(tableSchema);
 		log(`Imported table %s.%s using module %s`, targetSchemaName, tableName, moduleName);
