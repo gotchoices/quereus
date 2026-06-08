@@ -164,25 +164,31 @@ Clears all tables, functions, and views from all schemas. Does not call module d
 
 ### Catalog Import
 
-#### `importCatalog(ddlStatements): Promise<{ tables: string[]; indexes: string[] }>`
+#### `importCatalog(ddlStatements): Promise<{ tables: string[]; indexes: string[]; views: string[] }>`
 
 Imports existing schema objects without creating new storage. Used when connecting to a backend that already contains data. For each DDL statement:
 - `CREATE TABLE` calls `module.connect()` instead of `module.create()`
 - `CREATE INDEX` registers the index metadata without calling `module.createIndex()`, reconstructing the index with full fidelity from the re-parsed DDL — the `UNIQUE` flag, the partial `WHERE` predicate, and per-column collation (including the collate-wrapped column form the parser folds `COLLATE` into). A `CREATE UNIQUE INDEX` also re-synthesizes its `derivedFromIndex` UNIQUE constraint, exactly as the live create path does.
+- `CREATE VIEW` registers a plain view **without planning the body** — body validation is deferred to first reference (mirroring how `importTable` defers create-time work via `connect`). This makes view rehydration order-independent: a view over another view, a materialized view, or a not-yet-imported relation registers regardless of phase order, and a broken body surfaces only when the view is queried. The imported view name appears in the `views` result array.
+- `CREATE MATERIALIZED VIEW` is **not** supported here and throws (fail-loud) — an MV's backing must be re-materialized, so the store re-execs its create statement rather than importing it silently.
 - Schema change events are not emitted (these are existing objects)
 
 Each entry in `ddlStatements` may hold **more than one** statement: a table can be bundled with the `CREATE INDEX`es that belong to it in a single string, imported in document order (so the table precedes its indexes). Single-statement entries remain valid. Any unsupported statement type throws (fail-loud), so the store's `rehydrateCatalog` records the failure rather than silently dropping the object.
 
 ### DDL Generation
 
-Canonical `TableSchema` → DDL and `IndexSchema` → DDL generators are exported from the package entry point:
+Canonical schema → DDL generators are exported from the package entry point:
 
 ```typescript
-import { generateTableDDL, generateIndexDDL } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL } from '@quereus/quereus';
 
-const ddl = generateTableDDL(tableSchema, db?);        // CREATE TABLE ...
+const ddl = generateTableDDL(tableSchema, db?);                  // CREATE TABLE ...
 const idxDdl = generateIndexDDL(indexSchema, tableSchema, db?);  // CREATE INDEX ...
+const viewDdl = generateViewDDL(viewSchema);                     // CREATE VIEW main.v ...
+const mvDdl = generateMaterializedViewDDL(mvSchema);             // CREATE MATERIALIZED VIEW main.mv ...
 ```
+
+`generateViewDDL` / `generateMaterializedViewDDL` lift the stored schema back into the equivalent `CreateView` / `CreateMaterializedView` AST and render it through the shared `ast-stringify` emitter (the same schema→AST-lift strategy `generateTableDDL` uses for constraints), so the persistence path and the declarative AST→SQL path cannot drift. They emit a **fully-qualified** (`schema.name`) name so a re-parse registers into the correct schema regardless of the session's current schema, and read the **live** `tags` — so an `ALTER VIEW … SET TAGS` (which swaps the in-memory schema without rewriting the stored `sql`) round-trips. `generateMaterializedViewDDL` deliberately omits the `USING` clause: the backing is always a memory table in v1 and the clause is informational only — on reopen the backing rebuilds as memory regardless, and a re-parse with no `USING` still builds a valid MV. Both are a `parse → generate → parse` fixed point.
 
 Both generators accept an optional `Database` argument that provides session context. Their emission behavior depends on whether `db` is supplied:
 
@@ -331,6 +337,13 @@ The `SchemaChangeEvent` discriminated union includes:
 | `assertion_added` | `newObject: IntegrityAssertionSchema` | After `CREATE ASSERTION` |
 | `assertion_removed` | `oldObject: IntegrityAssertionSchema` | After `DROP ASSERTION` |
 | `assertion_modified` | `oldObject`, `newObject: IntegrityAssertionSchema` | After assertion replacement |
+| `view_added` | `newObject: ViewSchema` | After `CREATE VIEW` (fired from the runtime emitter, not `Schema.addView`) |
+| `view_removed` | `oldObject: ViewSchema` | After `DROP VIEW` |
+| `view_modified` | `oldObject`, `newObject: ViewSchema` | After `ALTER VIEW … SET TAGS` |
+| `materialized_view_added` | `newObject: MaterializedViewSchema` | After `CREATE MATERIALIZED VIEW` |
+| `materialized_view_removed` | `oldObject: MaterializedViewSchema` | After `DROP MATERIALIZED VIEW` |
+| `materialized_view_modified` | `oldObject`, `newObject: MaterializedViewSchema` | After `ALTER MATERIALIZED VIEW … SET TAGS` (catalog-only, no re-materialize) |
+| `materialized_view_refreshed` | `object: MaterializedViewSchema` | After `REFRESH MATERIALIZED VIEW` |
 | `module_added` | _(name only)_ | After module registration |
 | `module_removed` | _(name only)_ | After module removal |
 | `collation_added` | _(name only)_ | After collation registration |

@@ -49,6 +49,18 @@ export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruc
 			);
 		}
 
+		// Fire view_removed so a store-backed catalog can forget this view. Fired
+		// here (not from Schema.removeView) to mirror create-view's emitter-scoped
+		// view_added. Not reached on the IF EXISTS no-op above.
+		if (removed && existingView) {
+			rctx.db.schemaManager.getChangeNotifier().notifyChange({
+				type: 'view_removed',
+				schemaName: plan.schemaName,
+				objectName: existingView.name,
+				oldObject: existingView,
+			});
+		}
+
 		return null; // Explicitly return null for successful void operations
 	}
 

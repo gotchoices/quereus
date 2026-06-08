@@ -45,6 +45,18 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 		}
 
 		schema.addView(viewSchema);
+
+		// Fire view_added so a store-backed catalog can persist this view. Fired
+		// here (not from Schema.addView) so only user/declarative DDL views are
+		// persisted; internal views (lens bodies, etc.) register via schema.addView
+		// directly and are deliberately excluded. Not reached on the IF NOT EXISTS
+		// no-op above.
+		rctx.db.schemaManager.getChangeNotifier().notifyChange({
+			type: 'view_added',
+			schemaName: plan.schemaName,
+			objectName: viewSchema.name,
+			newObject: viewSchema,
+		});
 		return null; // Explicitly return null for successful void operations
 	}
 

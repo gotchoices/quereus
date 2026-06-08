@@ -51,11 +51,23 @@ export type AssertionModifiedEvent = SchemaObjectModified<'assertion_modified', 
 // ── View events ────────────────────────────────────────────────────
 
 /**
+ * Emitted after a plain `CREATE VIEW` / `DROP VIEW` (fired from the runtime
+ * emitters, NOT from `Schema.addView`/`removeView`). Scoping the event to the
+ * DDL emitters deliberately excludes internally-registered views (lens effective
+ * bodies, any other direct `schema.addView` caller) which must NOT be persisted
+ * to a store-backed catalog — they are re-derived, not stored. A store catalog
+ * subscribes to these to persist/forget a view incrementally. Mirrors how the MV
+ * emitters fire `materialized_view_added`/`_removed`.
+ */
+export type ViewAddedEvent = SchemaObjectAdded<'view_added', ViewSchema>;
+export type ViewRemovedEvent = SchemaObjectRemoved<'view_removed', ViewSchema>;
+
+/**
  * Emitted after an in-place change to an existing (non-materialized) view —
- * currently only `ALTER VIEW … SET TAGS`. Distinct from `view_added` (there is
- * none; plain-view create fires no event) so a cached write-through plan that
- * recorded a `view` dependency invalidates when the view's behavioral
- * `quereus.update.*` tags change.
+ * currently only `ALTER VIEW … SET TAGS`. Distinct from `view_added` (which a
+ * fresh create fires) so a cached write-through plan that recorded a `view`
+ * dependency invalidates when the view's behavioral `quereus.update.*` tags
+ * change, without re-triggering a persistence re-create.
  */
 export type ViewModifiedEvent = SchemaObjectModified<'view_modified', ViewSchema>;
 
@@ -107,6 +119,8 @@ export type SchemaChangeEvent =
 	| AssertionAddedEvent
 	| AssertionRemovedEvent
 	| AssertionModifiedEvent
+	| ViewAddedEvent
+	| ViewRemovedEvent
 	| ViewModifiedEvent
 	| MaterializedViewAddedEvent
 	| MaterializedViewRemovedEvent

@@ -29,7 +29,7 @@ import { ParameterScope } from '../planner/scopes/param.js';
 import type { ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { hasNativeEventSupport } from '../util/event-support.js';
 import type { VTableSchemaChangeEvent } from '../vtab/events.js';
-import { quoteIdentifier } from '../emit/ast-stringify.js';
+import { quoteIdentifier, createViewToString } from '../emit/ast-stringify.js';
 
 const log = createLogger('schema:manager');
 const warnLog = log.extend('warn');
@@ -2346,16 +2346,18 @@ export class SchemaManager {
 	 * @param ddlStatements Array of DDL strings (each one or more CREATE TABLE / CREATE INDEX, etc.)
 	 * @returns Array of imported object names
 	 */
-	async importCatalog(ddlStatements: string[]): Promise<{ tables: string[]; indexes: string[] }> {
-		const imported = { tables: [] as string[], indexes: [] as string[] };
+	async importCatalog(ddlStatements: string[]): Promise<{ tables: string[]; indexes: string[]; views: string[] }> {
+		const imported = { tables: [] as string[], indexes: [] as string[], views: [] as string[] };
 
 		for (const ddl of ddlStatements) {
 			try {
 				for (const result of await this.importDDL(ddl)) {
 					if (result.type === 'table') {
 						imported.tables.push(result.name);
-					} else {
+					} else if (result.type === 'index') {
 						imported.indexes.push(result.name);
+					} else {
+						imported.views.push(result.name);
 					}
 				}
 			} catch (e) {
@@ -2365,7 +2367,7 @@ export class SchemaManager {
 			}
 		}
 
-		log('Imported catalog: %d tables, %d indexes', imported.tables.length, imported.indexes.length);
+		log('Imported catalog: %d tables, %d indexes, %d views', imported.tables.length, imported.indexes.length, imported.views.length);
 		return imported;
 	}
 
@@ -2376,21 +2378,70 @@ export class SchemaManager {
 	 * statement type throws — `rehydrateCatalog` relies on this fail-loud contract
 	 * to record import errors rather than silently dropping objects.
 	 */
-	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index'; name: string }>> {
+	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index' | 'view'; name: string }>> {
 		const parser = new Parser();
 		const statements = parser.parseAll(ddl);
 
-		const results: Array<{ type: 'table' | 'index'; name: string }> = [];
+		const results: Array<{ type: 'table' | 'index' | 'view'; name: string }> = [];
 		for (const stmt of statements) {
 			if (stmt.type === 'createTable') {
 				results.push(await this.importTable(stmt as AST.CreateTableStmt));
 			} else if (stmt.type === 'createIndex') {
 				results.push(await this.importIndex(stmt as AST.CreateIndexStmt));
+			} else if (stmt.type === 'createView') {
+				// Plain views import silently (body planning deferred to first
+				// reference). Materialized views deliberately fall through to the
+				// fail-loud error below — MV rehydration re-execs the create
+				// store-side so the backing is re-materialized, not imported here.
+				results.push(this.importView(stmt as AST.CreateViewStmt));
 			} else {
 				throw new QuereusError(`importCatalog does not support statement type: ${stmt.type}`, StatusCode.ERROR);
 			}
 		}
 		return results;
+	}
+
+	/**
+	 * Import a plain view from its parsed DDL **without planning the body**.
+	 * Registration is silent — no `notifyChange` fires, mirroring
+	 * {@link importTable}/{@link importIndex} (a store rehydrating its own catalog
+	 * must not re-emit persistence events). Body validation is deferred to first
+	 * reference, exactly as {@link importTable} defers create-time work via
+	 * `connect`: this makes view rehydration order-independent — a view over
+	 * another view, a materialized view, or a not-yet-imported relation registers
+	 * regardless of phase order, and a broken body surfaces only when queried.
+	 *
+	 * The stored `sql` is the canonical {@link createViewToString} rendering (not
+	 * the raw entry text, which may bundle several statements). Synchronous: unlike
+	 * table/index import there is no module storage to bind, so there is nothing to
+	 * await.
+	 */
+	private importView(stmt: AST.CreateViewStmt): { type: 'view'; name: string } {
+		const targetSchemaName = stmt.view.schema || this.getCurrentSchemaName();
+		const viewName = stmt.view.name;
+
+		const viewSchema: ViewSchema = {
+			name: viewName,
+			schemaName: targetSchemaName,
+			sql: createViewToString(stmt),
+			selectAst: stmt.select,
+			columns: stmt.columns ? Object.freeze([...stmt.columns]) : undefined,
+			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
+		};
+
+		// Create the schema if absent (mirrors importTable) so a view rehydrates
+		// even into a schema that holds no tables.
+		let schema = this.getSchema(targetSchemaName);
+		if (!schema) {
+			const lowerSchemaName = targetSchemaName.toLowerCase();
+			schema = new Schema(lowerSchemaName);
+			this.schemas.set(lowerSchemaName, schema);
+		}
+
+		schema.addView(viewSchema);
+		log(`Imported view %s.%s`, targetSchemaName, viewName);
+
+		return { type: 'view', name: `${targetSchemaName}.${viewName}` };
 	}
 
 	/**

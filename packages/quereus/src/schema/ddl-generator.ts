@@ -21,9 +21,10 @@ import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
 import { maskToOps, isSynthesizedAllColumnsKey } from './table.js';
 import type { ColumnSchema } from './column.js';
+import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, createMaterializedViewToString } from '../emit/ast-stringify.js';
 import { normalizeCollationName } from '../util/comparison.js';
 
 /**
@@ -138,6 +139,54 @@ export function generateIndexDDL(
 	}
 
 	return parts.join(' ');
+}
+
+/**
+ * Generate canonical DDL for a (non-materialized) view from its schema.
+ *
+ * Lifts the stored {@link ViewSchema} back into the equivalent
+ * {@link AST.CreateViewStmt} and renders it via the shared `createViewToString`
+ * emitter (the same schema→AST-lift strategy {@link generateTableDDL} uses for
+ * constraints), so this persistence path and the declarative AST→SQL path cannot
+ * drift. The view name is fully qualified (`schema.name`) so a re-parse registers
+ * into the correct schema regardless of the session's current schema, and the
+ * **current** `tags` are read live — so a `view_modified` (ALTER VIEW … SET TAGS,
+ * which swaps the in-memory schema without rewriting the stored `sql`) round-trips.
+ * The body is already an AST (`selectAst`), so this is a thin, drift-free wrapper.
+ */
+export function generateViewDDL(view: ViewSchema): string {
+	const stmt: AST.CreateViewStmt = {
+		type: 'createView',
+		view: { type: 'identifier', name: view.name, schema: view.schemaName },
+		ifNotExists: false,
+		columns: view.columns ? [...view.columns] : undefined,
+		select: view.selectAst,
+		tags: view.tags ? { ...view.tags } : undefined,
+	};
+	return createViewToString(stmt);
+}
+
+/**
+ * Generate canonical DDL for a materialized view from its schema.
+ *
+ * Mirrors {@link generateViewDDL} via `createMaterializedViewToString`, reading
+ * **current** `tags` so a `materialized_view_modified` (SET TAGS) round-trips.
+ * Deliberately omits `moduleName`/`moduleArgs`: the backing is always a memory
+ * table in v1 and the `using` clause is informational only — on reopen the backing
+ * is rebuilt as a memory table regardless, and a re-parse with no `using` still
+ * builds a valid MV (the build only rejects a *named* unsupported module; absent
+ * module defaults to memory).
+ */
+export function generateMaterializedViewDDL(mv: MaterializedViewSchema): string {
+	const stmt: AST.CreateMaterializedViewStmt = {
+		type: 'createMaterializedView',
+		view: { type: 'identifier', name: mv.name, schema: mv.schemaName },
+		ifNotExists: false,
+		columns: mv.columns ? [...mv.columns] : undefined,
+		select: mv.selectAst,
+		tags: mv.tags ? { ...mv.tags } : undefined,
+	};
+	return createMaterializedViewToString(stmt);
 }
 
 /**

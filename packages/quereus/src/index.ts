@@ -133,13 +133,13 @@ export { quoteIdentifier } from './emit/ast-stringify.js';
 
 // Schema management
 export { SchemaManager } from './schema/manager.js';
-export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent } from './schema/change-events.js';
+export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
 export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType, appendIndexToTableSchema } from './schema/table.js';
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';
-export { generateTableDDL, generateIndexDDL } from './schema/ddl-generator.js';
+export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex } from './schema/catalog.js';
 
 // Partial-index predicate compilation (used by store modules to honor partial UNIQUE)
