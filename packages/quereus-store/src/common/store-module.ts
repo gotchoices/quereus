@@ -695,7 +695,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		switch (change.type) {
 			case 'addColumn': {
-				const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull);
+				// Honor the session `default_collation` for an ADD COLUMN that omits an
+				// explicit COLLATE, matching the CREATE path so an ADD-COLUMN-ed text column
+				// gets the same collation a CREATE-d one would. The persisted DDL re-emits an
+				// explicit COLLATE for any non-BINARY collation, so reopen stays stable.
+				const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'));
 
 				// Extract default value from column def constraints. Use the shared
 				// `tryFoldLiteral` helper so signed numerics like `-123.0`

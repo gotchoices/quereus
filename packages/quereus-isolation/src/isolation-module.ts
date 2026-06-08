@@ -893,7 +893,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// folds to NULL; collapse both to null (the no-usable-literal default).
 		const foldedDefault: SqlValue = defaultExpr ? (tryFoldLiteral(defaultExpr) ?? null) : null;
 		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
-		const newColumn = columnDefToSchema(change.columnDef, defaultNotNull);
+		// Thread the session `default_collation` for symmetry with the underlying memory/store
+		// ADD COLUMN sites. This site only reads `.notNull`/`.name` off the result (the
+		// underlying materializes the real column), so it does not affect collation here — but
+		// keeping the call signature identical avoids drift and is correct for any future reader.
+		const newColumn = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'));
 		return {
 			foldedDefault,
 			evaluator: change.backfillEvaluator,

@@ -84,7 +84,28 @@ select name, collation from table_info('t_rt') order by cid;
 drop table t_rt;
 
 -- ===================================
--- 5. Reset to BINARY restores out-of-box semantics.
+-- 5. ALTER TABLE ADD COLUMN honors default_collation (text → NOCASE, non-text → BINARY).
+-- ===================================
+-- Closes the CREATE-vs-ADD inconsistency: an ADD-COLUMN-ed text column gets NOCASE
+-- like a CREATE-d one, while a non-text added column falls back to BINARY
+-- (resolveDefaultCollation type-gate). Under test:store this also covers the store
+-- addColumn path and a persisted-DDL reopen round-trip.
+
+create table t_add (id integer primary key);
+alter table t_add add column name text;   -- text → NOCASE under the default
+alter table t_add add column qty integer; -- non-text → BINARY
+select name, collation from table_info('t_add') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"NOCASE"},{"name":"qty","collation":"BINARY"}]
+
+-- The added text column compares case-insensitively (NOCASE semantics).
+insert into t_add values (1, 'a', 10);
+select count(*) as n from t_add where name = 'A';
+→ [{"n":1}]
+
+drop table t_add;
+
+-- ===================================
+-- 6. Reset to BINARY restores out-of-box semantics.
 -- ===================================
 
 pragma default_collation='binary';

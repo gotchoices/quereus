@@ -1156,10 +1156,15 @@ function computeTableAlterDiff(
 		diff.columnsToRename.push({ oldName: r.oldName, newName: r.newName });
 	}
 
-	// Find columns to add (store full column definition for DDL generation)
+	// Find columns to add (store full column definition for DDL generation).
+	// Emit an EXPLICIT resolved COLLATE when the declared column omits one and the
+	// session `default_collation` resolves to a non-BINARY collation for its type
+	// (see {@link withResolvedAddColumnCollation}) — keeps the migration both
+	// self-contained (lands the same collation under any executing session default)
+	// and idempotent (matches the catalog column the engine's ADD COLUMN now creates).
 	for (const col of declaredTable.tableStmt.columns) {
 		if (!colRenames.pairs.has(col.name.toLowerCase())) {
-			diff.columnsToAdd.push(columnDefToString(col));
+			diff.columnsToAdd.push(columnDefToString(withResolvedAddColumnCollation(col, defaultCollation)));
 		}
 	}
 
@@ -1375,6 +1380,23 @@ function extractDeclaredCollation(col: AST.ColumnDef, defaultCollation: string):
 	const c = col.constraints?.find(c => c.type === 'collate');
 	if (c) return c.collation ? normalizeCollationName(c.collation) : 'BINARY';
 	return resolveDefaultCollation(inferType(col.dataType), defaultCollation);
+}
+
+/**
+ * Returns `col` unchanged when it already declares an explicit COLLATE, or when the
+ * session `default_collation` resolves to BINARY for its type; otherwise returns a
+ * shallow clone with an explicit `{ type: 'collate', collation: <resolved> }`
+ * constraint appended. Used by the ADD COLUMN emission so generated DDL carries an
+ * explicit non-BINARY collation rather than relying on the executing session's
+ * default — this is what makes `apply schema` idempotent and `diff schema` output
+ * portable across sessions with different defaults. Never mutates the declared AST
+ * (clones the `constraints` array).
+ */
+function withResolvedAddColumnCollation(col: AST.ColumnDef, defaultCollation: string): AST.ColumnDef {
+	if (col.constraints?.some(c => c.type === 'collate')) return col;
+	const resolved = resolveDefaultCollation(inferType(col.dataType), defaultCollation);
+	if (resolved === 'BINARY') return col;
+	return { ...col, constraints: [...(col.constraints ?? []), { type: 'collate', collation: resolved }] };
 }
 
 /**

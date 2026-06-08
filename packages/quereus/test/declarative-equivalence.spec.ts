@@ -3280,4 +3280,74 @@ describe('declarative-equivalence: default_collation', () => {
 			await db.close();
 		}
 	});
+
+	it('an apply that ADDs a text column under nocase lands NOCASE and re-diffs empty', async () => {
+		// The original bug: ADD COLUMN ignored the default, creating `extra` as BINARY
+		// while the declared side resolved to NOCASE — so every re-apply emitted a
+		// spurious SET COLLATE. Approach A (differ emits explicit COLLATE) + Approach B
+		// (execution layer honors the default) both close it; the catalog column lands
+		// NOCASE and the re-diff is empty.
+		const db = new Database();
+		try {
+			db.setOption('default_collation', 'nocase');
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec('declare schema main { table t { id INTEGER PRIMARY KEY, name TEXT, extra TEXT } }');
+			await db.exec('apply schema main'); // adds column `extra`
+
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.find(c => c.name === 'extra')!.collation, 'ADD COLUMN honors default_collation').to.equal('NOCASE');
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-diff after ADD COLUMN — no spurious SET COLLATE').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an apply that ADDs a non-text column under nocase lands BINARY and re-diffs empty', async () => {
+		// resolveDefaultCollation's type-gate: INTEGER does not support NOCASE, so an
+		// ADD-COLUMN-ed integer falls back to BINARY under a nocase default. The differ
+		// emits no explicit COLLATE for it (Approach A's BINARY short-circuit) and the
+		// re-diff stays empty.
+		const db = new Database();
+		try {
+			db.setOption('default_collation', 'nocase');
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec('declare schema main { table t { id INTEGER PRIMARY KEY, name TEXT, extra INTEGER } }');
+			await db.exec('apply schema main'); // adds column `extra`
+
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.find(c => c.name === 'extra')!.collation, 'non-text ADD COLUMN falls back to BINARY').to.equal('BINARY');
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-diff after non-text ADD COLUMN').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('RENAME COLUMN preserves a BINARY column and an explicit NOCASE column under nocase', async () => {
+		// Regression guard for the deliberate carve-out: RENAME COLUMN is a derived-DDL
+		// path (its AST is reconstructed from the live schema via buildConstraintsFromColumn,
+		// which appends an explicit COLLATE only for non-BINARY columns). It must NOT pick
+		// up the session default — a renamed BINARY column stays BINARY (threading the
+		// default here would silently flip it to NOCASE), and a renamed explicit-NOCASE
+		// column stays NOCASE (its reconstructed AST carries the COLLATE).
+		const db = new Database();
+		try {
+			db.setOption('default_collation', 'nocase');
+			await db.exec('create table t (id integer primary key, b text collate binary, c text collate nocase)');
+
+			const before = db.schemaManager.getTable('main', 't')!;
+			expect(before.columns.find(c => c.name === 'b')!.collation).to.equal('BINARY');
+			expect(before.columns.find(c => c.name === 'c')!.collation).to.equal('NOCASE');
+
+			await db.exec('alter table t rename column b to b2');
+			await db.exec('alter table t rename column c to c2');
+
+			const after = db.schemaManager.getTable('main', 't')!;
+			expect(after.columns.find(c => c.name === 'b2')!.collation, 'renamed BINARY column must not pick up the nocase default').to.equal('BINARY');
+			expect(after.columns.find(c => c.name === 'c2')!.collation, 'renamed explicit-NOCASE column stays NOCASE').to.equal('NOCASE');
+		} finally {
+			await db.close();
+		}
+	});
 });
