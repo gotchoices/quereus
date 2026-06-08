@@ -370,7 +370,10 @@ depth, defaulting **false** when the output row is absent from the operand (soun
 row not present in an operand is in none of that operand's nested branches, so every such
 flag probe is false; verified for all four outer operators). The **write** half (writing a
 surfaced inner flag through to its nested branch) is the separate `nestable-flagged-set-ops`
-ticket.
+ticket. Until it lands, the static writability surfaces (`column_info` / `view_info`) over-claim
+a nested flagged body as writable — the same **one-level-deep** over-claim `isSetOpBranchWritable`
+already makes for any set-op operand (a known, out-of-scope deferral; the dynamic write correctly
+rejects nested bodies). Only the metadata is optimistic; reading the data columns is exact.
 
 ### Set-operation membership writes
 

@@ -2681,6 +2681,44 @@ describe('Property-Based Tests', () => {
 					`expected {true,false} domain at shifted idx ${flagIdx}`).to.not.equal(undefined);
 			}
 		});
+
+		it('NULL data tuple at depth: a surfaced inner flag reads NULL = NULL through the nested probe', async () => {
+			// The same `dataComparator` (NULL = NULL) keys the probe set at EVERY depth, so a
+			// NULL-bearing data tuple present in an inner branch reads its surfaced inner flag
+			// true (never NULL-propagated) and default-false when absent — the single-level
+			// NULL-probe invariant, exercised one level down.
+			await db.exec('create table NA (id integer primary key, x integer null) using memory');
+			await db.exec('create table NB (id integer primary key, x integer null) using memory');
+			await db.exec('create table NC (id integer primary key, x integer null) using memory');
+			await db.exec('insert into NA (id, x) values (1, null), (2, 7)');
+			await db.exec('insert into NB (id, x) values (1, null), (2, 8)');
+			await db.exec('insert into NC (id, x) values (1, 8), (2, 9)');
+			// inner (NB ∪ NC) = {null, 8, 9}; outer NA ∪ inner = {null, 7, 8, 9}.
+			const body = 'select x from NA union exists left as inA, exists right as inSub '
+				+ '(select x from NB union exists left as inB, exists right as inC select x from NC)';
+			const rows = await readRows(body);
+			const byX = new Map(rows.map(r => [r.x === null ? 'NULL' : String(r.x), r]));
+			// NULL is in NA, NB and (NB∪NC) — every probe touching it reads through NULL = NULL.
+			expect(byX.get('NULL')).to.deep.equal({ x: null, inB: true, inC: false, inA: true, inSub: true });
+			// 7 is in NA only — absent from the subtree ⇒ inner flags default false, NOT NULL.
+			expect(byX.get('7')).to.deep.equal({ x: 7, inB: false, inC: false, inA: true, inSub: false });
+			expect(byX.get('8')).to.deep.equal({ x: 8, inB: true, inC: true, inA: false, inSub: true });
+			expect(byX.get('9')).to.deep.equal({ x: 9, inB: false, inC: true, inA: false, inSub: true });
+		});
+
+		it('inner EXCEPT surfaced through an outer UNION: the inner node computes its own flags', async () => {
+			await seedNested();
+			// The inner is an EXCEPT (B except C = {(2,20)}), so it computes inB=true / inC=false
+			// for its own visible rows; the outer UNION merely surfaces those columns (it does
+			// not recompute them). Pins the inner-non-union op path the union-only nested tests
+			// leave implicit: a surfaced inner flag rides the stored inner row's slice.
+			await db.exec('create view Vie as select id, x from A union exists left as inA, exists right as inSub '
+				+ '(select id, x from B except exists left as inB, exists right as inC select id, x from C)');
+			expect(await readRows('select id, x, inB, inC, inA, inSub from Vie order by id')).to.deep.equal([
+				{ id: 1, x: 10, inB: false, inC: false, inA: true, inSub: false }, // A-only — absent from inner ⇒ inner flags default false
+				{ id: 2, x: 20, inB: true,  inC: false, inA: true, inSub: true  }, // in A and in (B except C) ⇒ inB from inner's except (true), inC false
+			]);
+		});
 	});
 
 	// --- Parenthesized compound set-operation legs (parenthesized-compound-set-op-legs) ---
