@@ -10525,8 +10525,11 @@ const RAW_RUNTIME_STATE =
           ["chevrotain", "npm:12.0.0"],\
           ["chevrotain-allstar", "virtual:5a98f82a45683240d547aa1396a4daf70cc8e26465a7aaa4bac52ce1b3620d5ca822dce0338776e6e13e6da6fe27324bc59b3f74e81f08d85c24a9b3d608cb23#npm:0.4.1"],\
           ["langium", "npm:4.2.2"],\
+          ["vscode-jsonrpc", "npm:8.2.0"],\
           ["vscode-languageserver", "npm:9.0.1"],\
+          ["vscode-languageserver-protocol", "npm:3.17.5"],\
           ["vscode-languageserver-textdocument", "npm:1.0.12"],\
+          ["vscode-languageserver-types", "npm:3.17.5"],\
           ["vscode-uri", "npm:3.1.0"]\
         ],\
         "linkType": "HARD"\

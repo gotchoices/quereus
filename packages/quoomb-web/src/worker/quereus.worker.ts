@@ -1,5 +1,5 @@
 import * as Comlink from 'comlink';
-import { Database, generateTableDDL, type SqlValue, type DatabaseDataChangeEvent, type DatabaseSchemaChangeEvent } from '@quereus/quereus';
+import { Database, generateTableDDL, type SqlValue } from '@quereus/quereus';
 import { expressionToString } from '@quereus/quereus/emit';
 import type { Expression } from '@quereus/quereus/parser';
 import { StoreEventEmitter, StoreModule, type KVStore } from '@quereus/store';
@@ -14,7 +14,8 @@ import {
 	type SyncState,
 } from '@quereus/sync';
 import { SyncClient, type SyncEvent as SyncClientEvent, type SyncStatus as SyncClientStatus } from '@quereus/sync-client';
-import * as Comlink from 'comlink';
+import { IndexedDBProvider, IndexedDBStore } from '@quereus/plugin-indexeddb';
+import { dynamicLoadModule } from '@quereus/plugin-loader';
 import Papa from 'papaparse';
 import type {
 	ColumnInfo,
