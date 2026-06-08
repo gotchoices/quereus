@@ -5775,9 +5775,9 @@ describe('Property-Based Tests', () => {
 				// cc=1 and cc=4; the re-query must return exactly those two view rows once each and
 				// NOT leak the unselected sibling cc=5 — which shares the same parent PK but whose
 				// child PK is absent from the capture, so neither disjunction branch matches its join
-				// row. (Updating the NON-preserved column across a shared parent is a separate,
-				// pre-existing limitation of the matched-update captured-value read — out of scope
-				// for this ticket, which is about the RETURNING identity re-query.)
+				// row. (Updating the NON-preserved column across a shared parent is covered by the
+				// fan-out assertions below — the matched read-back / materialization INSERT de-dup
+				// per non-preserved partner so the shared-partner write applies once.)
 				await db.exec('delete from np_parent');
 				await db.exec('delete from np_child');
 				await db.exec('insert into np_parent values (10, 100)');
@@ -5791,6 +5791,84 @@ describe('Property-Based Tests', () => {
 				assertRowsEqual('np fan-out view image (unaffected sibling cc=5 untouched)',
 					await readRows('select cc, cv, pv from npv order by cc'),
 					[{ cc: 1, cv: 7, pv: 100 }, { cc: 4, cv: 7, pv: 100 }, { cc: 5, cv: 5000, pv: 100 }], ['cc', 'cv', 'pv']);
+
+				// Matched fan-out on the NON-preserved column (`set pv = …`): two children
+				// (cc in (1, 4)) share ONE existing parent (pp = 10). The shared parent's PK matches
+				// the capture row of each affected child, so a bare scalar read-back would error
+				// `Scalar subquery returned more than one row`; the `min` de-dup collapses the
+				// shared-partner group, so the write applies ONCE to the parent and every child that
+				// joins it (including the unselected sibling cc=5) reads the new pv.
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_parent values (10, 100)');
+				await db.exec('insert into np_child values (1, 10, 1000)');
+				await db.exec('insert into np_child values (4, 10, 4000)');
+				await db.exec('insert into np_child values (5, 10, 5000)');
+				await db.exec('update npv set pv = 5 where cc in (1, 4)');
+				assertRowsEqual('np matched fan-out non-preserved update (single parent updated once)',
+					await readRows('select pp, pv from np_parent order by pp'),
+					[{ pp: 10, pv: 5 }], ['pp', 'pv']);
+				assertRowsEqual('np matched fan-out non-preserved update view image',
+					await readRows('select cc, cv, pv from npv order by cc'),
+					[{ cc: 1, cv: 1000, pv: 5 }, { cc: 4, cv: 4000, pv: 5 }, { cc: 5, cv: 5000, pv: 5 }], ['cc', 'cv', 'pv']);
+
+				// Same matched fan-out with RETURNING: each affected child surfaces its post-mutation
+				// pv once (the shared-partner write is not double-applied or double-returned).
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_parent values (10, 100)');
+				await db.exec('insert into np_child values (1, 10, 1000)');
+				await db.exec('insert into np_child values (4, 10, 4000)');
+				assertRowsEqual('np matched fan-out non-preserved update RETURNING',
+					await readRows('update npv set pv = 5 where cc in (1, 4) returning cc, cv, pv'),
+					[{ cc: 1, cv: 1000, pv: 5 }, { cc: 4, cv: 4000, pv: 5 }], ['cc', 'cv', 'pv']);
+
+				// Materialization fan-out: two children (cc 6, 7) null-extended on the SAME dangling
+				// key (pr = 99, no parent 99 exists). Both project the same join key into the
+				// materialization INSERT, so without the `group by`/`min` de-dup the partner PK (99)
+				// would be inserted twice → `UNIQUE constraint failed`. The materialization now mints
+				// the partner ONCE, and both children join it to read the new pv.
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_child values (6, 99, 6000)');
+				await db.exec('insert into np_child values (7, 99, 7000)');
+				await db.exec('update npv set pv = 7 where cc in (6, 7)');
+				assertRowsEqual('np materialization fan-out (one partner materialized)',
+					await readRows('select pp, pv from np_parent order by pp'),
+					[{ pp: 99, pv: 7 }], ['pp', 'pv']);
+				assertRowsEqual('np materialization fan-out view image (both children read materialized pv)',
+					await readRows('select cc, cv, pv from npv order by cc'),
+					[{ cc: 6, cv: 6000, pv: 7 }, { cc: 7, cv: 7000, pv: 7 }], ['cc', 'cv', 'pv']);
+
+				// Same materialization fan-out with RETURNING: both children surface once, the partner
+				// is minted once.
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_child values (6, 99, 6000)');
+				await db.exec('insert into np_child values (7, 99, 7000)');
+				assertRowsEqual('np materialization fan-out RETURNING',
+					await readRows('update npv set pv = 7 where cc in (6, 7) returning cc, cv, pv'),
+					[{ cc: 6, cv: 6000, pv: 7 }, { cc: 7, cv: 7000, pv: 7 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('np materialization fan-out RETURNING parent base',
+					await readRows('select pp, pv from np_parent order by pp'),
+					[{ pp: 99, pv: 7 }], ['pp', 'pv']);
+
+				// Divergent-value fan-out (`set pv = cv`, a PRESERVED-column read over a shared
+				// partner): the captured value differs per preserved row (child 1 → 1000, child 4 →
+				// 4000), so the shared parent is inherently ambiguous. The `min` de-dup resolves it
+				// DETERMINISTICALLY — `min` of the captured values (1000) — rather than erroring at
+				// runtime; both branches use the same `min`, so the materialization can't PK-conflict
+				// on a divergent value either. (Documented semantics, not a silent corner.)
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_parent values (10, 100)');
+				await db.exec('insert into np_child values (1, 10, 1000)');
+				await db.exec('insert into np_child values (4, 10, 4000)');
+				await db.exec('insert into np_child values (5, 10, 5000)');
+				await db.exec('update npv set pv = cv where cc in (1, 4)');
+				assertRowsEqual('np divergent-value fan-out (min of captured values applied once)',
+					await readRows('select pp, pv from np_parent order by pp'),
+					[{ pp: 10, pv: 1000 }], ['pp', 'pv']);
 			});
 
 			// ----- Outer (RIGHT) join: non-preserved-side UPDATE (matched + null-extended) -----
@@ -5920,7 +5998,7 @@ describe('Property-Based Tests', () => {
 				// Fan-out (RIGHT mirror): a parent shared by three children; a PRESERVED-column (cv)
 				// update over two of them returns each once and does not leak the unselected sibling
 				// cc=5 (which shares the captured parent PK but whose child PK is absent from the
-				// capture). The non-preserved-column shared-parent fan-out is out of scope (see LEFT).
+				// capture). The non-preserved-column shared-parent fan-out is covered below (LEFT mirror).
 				await db.exec('delete from rnp_parent');
 				await db.exec('delete from rnp_child');
 				await db.exec('insert into rnp_parent values (10, 100)');
@@ -5933,6 +6011,58 @@ describe('Property-Based Tests', () => {
 				assertRowsEqual('rnp fan-out view image (unaffected sibling cc=5 untouched)',
 					await readRows('select cc, cv, pv from rnpv order by cc'),
 					[{ cc: 1, cv: 7, pv: 100 }, { cc: 4, cv: 7, pv: 100 }, { cc: 5, cv: 5000, pv: 100 }], ['cc', 'cv', 'pv']);
+
+				// Matched fan-out on the NON-preserved column (RIGHT mirror): two children share one
+				// existing parent (pp = 10); the `min` read-back collapses the shared-partner capture
+				// so `set pv = …` applies ONCE (no `Scalar subquery returned more than one row`).
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_parent values (10, 100)');
+				await db.exec('insert into rnp_child values (1, 10, 1000)');
+				await db.exec('insert into rnp_child values (4, 10, 4000)');
+				await db.exec('insert into rnp_child values (5, 10, 5000)');
+				await db.exec('update rnpv set pv = 5 where cc in (1, 4)');
+				assertRowsEqual('rnp matched fan-out non-preserved update (single parent updated once)',
+					await readRows('select pp, pv from rnp_parent order by pp'),
+					[{ pp: 10, pv: 5 }], ['pp', 'pv']);
+				assertRowsEqual('rnp matched fan-out non-preserved update view image',
+					await readRows('select cc, cv, pv from rnpv order by cc'),
+					[{ cc: 1, cv: 1000, pv: 5 }, { cc: 4, cv: 4000, pv: 5 }, { cc: 5, cv: 5000, pv: 5 }], ['cc', 'cv', 'pv']);
+
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_parent values (10, 100)');
+				await db.exec('insert into rnp_child values (1, 10, 1000)');
+				await db.exec('insert into rnp_child values (4, 10, 4000)');
+				assertRowsEqual('rnp matched fan-out non-preserved update RETURNING',
+					await readRows('update rnpv set pv = 5 where cc in (1, 4) returning cc, cv, pv'),
+					[{ cc: 1, cv: 1000, pv: 5 }, { cc: 4, cv: 4000, pv: 5 }], ['cc', 'cv', 'pv']);
+
+				// Materialization fan-out (RIGHT mirror): two children null-extended on the SAME
+				// dangling key (pr = 99); the `group by`/`min` de-dup mints the partner ONCE (no
+				// `UNIQUE constraint failed`), and both children join it.
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_child values (6, 99, 6000)');
+				await db.exec('insert into rnp_child values (7, 99, 7000)');
+				await db.exec('update rnpv set pv = 7 where cc in (6, 7)');
+				assertRowsEqual('rnp materialization fan-out (one partner materialized)',
+					await readRows('select pp, pv from rnp_parent order by pp'),
+					[{ pp: 99, pv: 7 }], ['pp', 'pv']);
+				assertRowsEqual('rnp materialization fan-out view image (both children read materialized pv)',
+					await readRows('select cc, cv, pv from rnpv order by cc'),
+					[{ cc: 6, cv: 6000, pv: 7 }, { cc: 7, cv: 7000, pv: 7 }], ['cc', 'cv', 'pv']);
+
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_child values (6, 99, 6000)');
+				await db.exec('insert into rnp_child values (7, 99, 7000)');
+				assertRowsEqual('rnp materialization fan-out RETURNING',
+					await readRows('update rnpv set pv = 7 where cc in (6, 7) returning cc, cv, pv'),
+					[{ cc: 6, cv: 6000, pv: 7 }, { cc: 7, cv: 7000, pv: 7 }], ['cc', 'cv', 'pv']);
+				assertRowsEqual('rnp materialization fan-out RETURNING parent base',
+					await readRows('select pp, pv from rnp_parent order by pp'),
+					[{ pp: 99, pv: 7 }], ['pp', 'pv']);
 			});
 
 			// ----- Outer (LEFT) join: existence-column WRITE (flag-flip ⇒ insert/delete) -----

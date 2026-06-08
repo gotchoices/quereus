@@ -1449,8 +1449,12 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			const valAlias = registerCapturedExpr(`neval:${out.sideIndex}:${out.baseColumn.toLowerCase()}`, baseValue);
 			// Matched rows: a per-side UPDATE reading the captured value back, correlated by
 			// the non-preserved side's PK (`buildCapturedKeyPredicate` already filters to
-			// matched rows — a null captured PK never equals a real one).
-			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide)) });
+			// matched rows — a null captured PK never equals a real one). The read-back is
+			// `min`-de-duped per non-preserved partner: when N preserved rows share one
+			// existing partner, that partner's PK matches all N capture rows, so a bare scalar
+			// read would error `Scalar subquery returned more than one row` — `min` collapses
+			// the shared-partner group to one value (a no-op for a constant / np-only SET).
+			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min') });
 			// Null-extended rows: accumulate the (column, captured value) for this side's
 			// single materialization insert, built after the loop.
 			let list = nullExtendedBySide.get(out.sideIndex);
@@ -1622,8 +1626,11 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 
 /**
  * Build the null-extended materialization INSERT for a non-preserved outer-join side:
- * `insert into <np> (<joinKey>, <set cols…>) select k.<jk>, k.<val…> from __vmupd_keys k
- * where <every np PK k col> is null and k.<jk> is not null` (§ Outer Joins — Updates). It
+ * `insert into <np> (<joinKey>, <set cols…>) select k.<jk>, min(k.<val…>) from __vmupd_keys k
+ * where <every np PK k col> is null and k.<jk> is not null group by k.<jk>` (§ Outer Joins —
+ * Updates). The `group by k.<jk>` de-dups per dangling join key so a shared missing partner
+ * materializes exactly once (a fan-out of N preserved rows would otherwise double-insert the
+ * partner PK); the value projections are `min` so each is single-valued per group. It
  * fires only for the affected rows the join null-extended (the non-preserved PK captured
  * null) whose preserved-side join key is non-null (a null key cannot seed a joinable row).
  * The new row carries the EC join key (so the preserved row joins it), the assigned
@@ -1651,6 +1658,13 @@ function buildNullExtendedInsert(
 	// Insert columns: the non-preserved join column (= the captured preserved-side join
 	// value, so the preserved row joins the freshly materialized row) followed by each
 	// assigned base column (= its captured value). The join column is threaded once.
+	//
+	// De-dup per dangling join key: a `group by k.<jkAlias>` collapses the N preserved rows
+	// that share one missing partner to a single materialized row (else N rows projecting the
+	// same join key would each insert the partner PK → `UNIQUE constraint failed`). The join
+	// column projection IS the GROUP BY key (bare); each value column is wrapped in `min` so
+	// it is single-valued per group — a no-op for a constant / np-only SET, a deterministic
+	// pick for a value that differs per preserved row (mirrors the matched read-back's `min`).
 	const targetColumns: string[] = [npJoinColumn];
 	const projections: AST.ResultColumn[] = [
 		{ type: 'column', expr: { type: 'column', name: jkAlias, table: 'k' }, alias: npJoinColumn },
@@ -1659,7 +1673,7 @@ function buildNullExtendedInsert(
 	for (const c of cols) {
 		if (c.baseColumn.toLowerCase() === joinColLower) continue; // join column already threaded
 		targetColumns.push(c.baseColumn);
-		projections.push({ type: 'column', expr: { type: 'column', name: c.valAlias, table: 'k' }, alias: c.baseColumn });
+		projections.push({ type: 'column', expr: { type: 'function', name: 'min', args: [{ type: 'column', name: c.valAlias, table: 'k' }] }, alias: c.baseColumn });
 	}
 	assertNullExtendedInsertCovered(view, npSide.schema, targetColumns);
 
@@ -1676,6 +1690,7 @@ function buildNullExtendedInsert(
 		columns: projections,
 		from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
 		where,
+		groupBy: [{ type: 'column', name: jkAlias, table: 'k' }],
 	};
 	const statement: AST.InsertStmt = {
 		type: 'insert',
@@ -2390,19 +2405,32 @@ function stripSideQualifier(
  * `<pk_j>` bind to the lowered UPDATE's own target row (the owning side), matching the
  * per-side identifying EXISTS so each target row reads the captured pre-mutation partner
  * value of its joined row. Composite owning keys conjoin one equality per PK column.
+ *
+ * `dedupAggregate` wraps the projection in that aggregate (`min(k.<srcAlias>)`) so the
+ * correlated read is single-valued even when the owning PK matches MORE THAN ONE capture
+ * row — the non-preserved-side fan-out case, where N preserved rows share one non-preserved
+ * partner so its PK matches all N captures (§ Outer Joins). For a constant / np-only SET the
+ * captured value is identical across the group so `min` is an exact no-op de-dup; for a
+ * value that genuinely differs per preserved row it resolves the ambiguity deterministically
+ * rather than erroring at runtime. The cross-source `set` callers leave it off (their gate
+ * already proves at-most-one partner), keeping the bare-column form byte-identical.
  */
-export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[]): AST.Expression {
+export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[], dedupAggregate?: string): AST.Expression {
 	const conds = owningPk.map((pk, j): AST.Expression => ({
 		type: 'binary',
 		operator: '=',
 		left: { type: 'column', name: keyColumnName(owningSideIndex, j), table: 'k' },
 		right: { type: 'column', name: pk },
 	}));
+	const colRef: AST.ColumnExpr = { type: 'column', name: srcAlias, table: 'k' };
+	const projection: AST.Expression = dedupAggregate
+		? { type: 'function', name: dedupAggregate, args: [colRef] }
+		: colRef;
 	return {
 		type: 'subquery',
 		query: {
 			type: 'select',
-			columns: [{ type: 'column', expr: { type: 'column', name: srcAlias, table: 'k' } }],
+			columns: [{ type: 'column', expr: projection }],
 			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
 			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
 		},

@@ -2243,6 +2243,60 @@ update ojrv set cv = 99 where cc in (1, 3) returning cc, cv, pv;
 → [{"cc":1,"cv":99,"pv":777},{"cc":3,"cv":99,"pv":null}]
 
 -- ===================================
+-- Outer (LEFT) join NON-PRESERVED-side UPDATE — FAN-OUT (one non-preserved partner shared by
+-- several preserved rows). The matched read-back and the materialization INSERT de-dup per
+-- non-preserved partner (`min` read-back / `group by` join key), so a shared-partner write
+-- applies ONCE: a matched fan-out no longer errors `Scalar subquery returned more than one
+-- row`, and a materialization fan-out no longer double-inserts the partner PK
+-- (view-write-outer-join-nonpreserved-fanout-update). See docs/view-updateability.md § Outer Joins.
+-- ===================================
+pragma foreign_keys = false;
+create table fof_parent (pp integer primary key, pv integer null);
+create table fof_child (cc integer primary key, pr integer null, cv integer null);
+create view fofv as select c.cc as cc, c.cv as cv, p.pv as pv from fof_child c left join fof_parent p on p.pp = c.pr;
+
+-- Matched fan-out: cc=1 and cc=4 share ONE existing parent (pp = 10). The non-preserved pv
+-- update applies once to that parent; the unselected sibling cc=5 (also on parent 10) reads it.
+insert into fof_parent values (10, 100);
+insert into fof_child values (1, 10, 1000);
+insert into fof_child values (4, 10, 4000);
+insert into fof_child values (5, 10, 5000);
+update fofv set pv = 5 where cc in (1, 4);
+select cc, cv, pv from fofv order by cc;
+→ [{"cc":1,"cv":1000,"pv":5},{"cc":4,"cv":4000,"pv":5},{"cc":5,"cv":5000,"pv":5}]
+-- Exactly one parent row, updated once.
+select pp, pv from fof_parent order by pp;
+→ [{"pp":10,"pv":5}]
+
+-- Materialization fan-out: cc=6 and cc=7 null-extend on the SAME dangling key (pr = 99, no
+-- parent 99). The partner materializes ONCE (group by the join key); both children join it.
+delete from fof_parent;
+delete from fof_child;
+insert into fof_child values (6, 99, 6000);
+insert into fof_child values (7, 99, 7000);
+update fofv set pv = 7 where cc in (6, 7);
+select cc, cv, pv from fofv order by cc;
+→ [{"cc":6,"cv":6000,"pv":7},{"cc":7,"cv":7000,"pv":7}]
+select pp, pv from fof_parent order by pp;
+→ [{"pp":99,"pv":7}]
+
+-- Both fan-outs with RETURNING: each affected child surfaces once (ascending child-PK order).
+delete from fof_parent;
+delete from fof_child;
+insert into fof_parent values (10, 100);
+insert into fof_child values (1, 10, 1000);
+insert into fof_child values (4, 10, 4000);
+update fofv set pv = 5 where cc in (1, 4) returning cc, cv, pv;
+→ [{"cc":1,"cv":1000,"pv":5},{"cc":4,"cv":4000,"pv":5}]
+
+delete from fof_parent;
+delete from fof_child;
+insert into fof_child values (6, 99, 6000);
+insert into fof_child values (7, 99, 7000);
+update fofv set pv = 7 where cc in (6, 7) returning cc, cv, pv;
+→ [{"cc":6,"cv":6000,"pv":7},{"cc":7,"cv":7000,"pv":7}]
+
+-- ===================================
 -- Outer-join INSERT with FK ENFORCEMENT ON (the per-row conditional key thread).
 -- The preserved (FK-child) side threads the minted shared key into its join column
 -- only for rows whose non-preserved (FK-parent) partner is present that row; for a row
@@ -2407,6 +2461,39 @@ delete from rojv where cc = 2;
 select cc, cv, pv from rojv order by cc;
 → [{"cc":3,"cv":33,"pv":333},{"cc":4,"cv":44,"pv":null},{"cc":5,"cv":500,"pv":555}]
 pragma foreign_keys = false;
+
+-- ===================================
+-- RIGHT join NON-PRESERVED-side UPDATE — FAN-OUT (the mirror of the LEFT `fofv` block). The
+-- parent (left operand) is NON-preserved and shared by several preserved children; the per-
+-- partner de-dup keys off JoinSide.preserved, not source order, so the swap is transparent.
+-- ===================================
+pragma foreign_keys = false;
+create table rfof_parent (pp integer primary key, pv integer null);
+create table rfof_child (cc integer primary key, pr integer null, cv integer null);
+create view rfofv as select p.pv as pv, c.cc as cc, c.cv as cv from rfof_parent p right join rfof_child c on p.pp = c.pr;
+
+-- Matched fan-out: cc=1 and cc=4 share one existing parent pp=10 — pv update applies once.
+insert into rfof_parent values (10, 100);
+insert into rfof_child values (1, 10, 1000);
+insert into rfof_child values (4, 10, 4000);
+insert into rfof_child values (5, 10, 5000);
+update rfofv set pv = 5 where cc in (1, 4);
+select cc, cv, pv from rfofv order by cc;
+→ [{"cc":1,"cv":1000,"pv":5},{"cc":4,"cv":4000,"pv":5},{"cc":5,"cv":5000,"pv":5}]
+select pp, pv from rfof_parent order by pp;
+→ [{"pp":10,"pv":5}]
+
+-- Materialization fan-out: cc=6 and cc=7 null-extend on the same dangling key pr=99 — the
+-- partner materializes once.
+delete from rfof_parent;
+delete from rfof_child;
+insert into rfof_child values (6, 99, 6000);
+insert into rfof_child values (7, 99, 7000);
+update rfofv set pv = 7 where cc in (6, 7);
+select cc, cv, pv from rfofv order by cc;
+→ [{"cc":6,"cv":6000,"pv":7},{"cc":7,"cv":7000,"pv":7}]
+select pp, pv from rfof_parent order by pp;
+→ [{"pp":99,"pv":7}]
 
 -- ===================================
 -- RIGHT join, PRESERVED-side PK HIDDEN by the projection: the preserved side is the right
