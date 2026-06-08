@@ -483,6 +483,32 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		}
 	});
 
+	it('captured read-back over an INVISIBLE logical row fails safely and atomically (documented boundary)', async () => {
+		// Malformed base state: an anchor row (T_core 3) whose MANDATORY member T_b is missing, so the
+		// row is dropped by the body's inner join and never surfaces through the view — but it carries a
+		// (also-malformed) present T_c. The capture is built over the body (inner-joins T_b), so row 3 is
+		// absent from `__vmupd_keys`; the matched UPDATE / materialize filter off the ANCHOR subquery,
+		// which includes it. So the captured read-back MISSES (returns null), unlike the constant / anchor
+		// / self paths, which write the value straight to row 3's component. Here T_c.c is NOT NULL, so the
+		// null write raises a base constraint error — caught ATOMICALLY (row 3's T_c is untouched), never a
+		// silent corruption. (For a *nullable* optional column the read-back would instead write null and
+		// the row would stay invisible — no widen; that branch needs a fixture with both a mandatory
+		// non-anchor member and a nullable optional, which neither fixture has.) docs/lens.md
+		// § Current Limitations documents the divergence; it is confined to malformed states.
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('insert into main.T_core values (3, 30)');   // anchor present, T_b MISSING → invisible
+			await db.exec('insert into main.T_c values (3, 9999)');    // (malformed) present optional component
+			expect(await rows(db, 'select id from x.T where id = 3')).to.deep.equal([]);   // invisible through the view
+			// captured read-back misses → matched UPDATE proposes c := null → NOT NULL base reject (atomic).
+			await expectThrows(() => db.exec('update x.T set c = b + 1 where id = 3'), /not null/i);
+			expect(await rows(db, 'select c from main.T_c where id = 3')).to.deep.equal([{ c: 9999 }]);   // untouched
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('rejects an update of the shared key', async () => {
 		const db = new Database();
 		try {
