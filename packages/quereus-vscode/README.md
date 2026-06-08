@@ -9,7 +9,16 @@ Provides language support for Quereus SQL in VS Code:
 
 Development
 
-- Build: yarn workspace @quereus/quereus-vscode build
+- Build: yarn workspace quereus-vscode build (auto-builds @quereus/quereus)
+
+Manual steps:
+
+```
+yarn workspace @quereus/quereus build
+yarn workspace quereus-vscode build
+yarn workspace quereus-vscode package
+```
+
 - Launch: Open this folder in VS Code, run the "Run Extension" launch config.
 
 Schema awareness
