@@ -251,6 +251,9 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 				schema.collation = constraint.collation
 					? validateCollationForType(constraint.collation, logicalType, def.name)
 					: 'BINARY';
+				// Mark the collation as user-declared so modules can tell an explicit
+				// `COLLATE` clause apart from the implicit default (see ColumnSchema).
+				schema.collationExplicit = true;
 				break;
 			}
 			case 'generated':

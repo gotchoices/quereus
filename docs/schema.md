@@ -265,16 +265,35 @@ index store, the in-memory schema has the index but the catalog does not, so on
 reopen the index is missing and its store is orphaned. There is no two-phase
 protocol here.
 
-**Fixed physical key collation and PK `SET COLLATE`.** The store encodes every
+**Fixed physical key collation and PK collation reconciliation.** The store encodes every
 primary-key key's bytes under a single fixed table-level key collation K
 (`config.collation`, one of `BINARY` / `NOCASE`, default `NOCASE`), and enforces
 PK uniqueness *physically* against those bytes — not under the PK column's declared
-per-column collation. So `ALTER COLUMN … SET COLLATE` on a PK column is negotiated
-**accept-when-consistent / reject-when-divergent**: a target equal to K is applied
-schema-only (forward PK uniqueness is already correct under it), while a divergent
-target throws a sited `UNSUPPORTED` rather than silently applying a schema change the
-key bytes never honor. The reject is data-independent (it fires even on an empty
-table). See [`docs/sql.md` § ALTER COLUMN](sql.md#27-alter-table-statement) for the
+per-column collation. A **text** PK column whose declared collation diverges from K
+would therefore report one collation via `table_info()` while its key bytes
+(uniqueness / point-lookup / ordering) are governed by K — a silent declared≠enforced
+split. The store closes that gap symmetrically at both schema entry points:
+
+- **CREATE / connect.** `module.create` reconciles each text PK column against K: an
+  *implicit*-default divergent collation (e.g. the BINARY default under K = NOCASE) is
+  **normalized up to K** so `table_info()` reports the collation actually enforced, while
+  an *explicitly* declared divergent per-column PK collation (`x text collate binary
+  primary key` under K = NOCASE) throws a sited `UNSUPPORTED` — the faithful mirror of
+  the ALTER guard below. (The explicit-vs-implicit distinction rides on
+  `ColumnSchema.collationExplicit`, set by `columnDefToSchema` only for a `COLLATE`
+  clause.) The load path (`connect` / rehydrate) applies the same normalization but
+  **never rejects** — a persisted / hand-authored DDL must stay loadable; post-fix this
+  is largely a no-op because a normalized create persists `collate <K>` in its DDL.
+  Non-text PK columns (e.g. `integer primary key`) keep their declared collation —
+  collation governs key bytes only for text.
+- **`ALTER COLUMN … SET COLLATE` on a PK column** is negotiated
+  **accept-when-consistent / reject-when-divergent**: a target equal to K is applied
+  schema-only (forward PK uniqueness is already correct under it), while a divergent
+  target throws a sited `UNSUPPORTED` rather than silently applying a schema change the
+  key bytes never honor. The reject is data-independent (it fires even on an empty
+  table).
+
+See [`docs/sql.md` § ALTER COLUMN](sql.md#27-alter-table-statement) for the
 full SET COLLATE contract, including the non-PK UNIQUE re-validation that *does*
 reach memory parity and the custom-comparator dedup residual.
 

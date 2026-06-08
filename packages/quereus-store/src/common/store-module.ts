@@ -197,6 +197,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const config = this.parseConfig(tableSchema.vtabArgs as Record<string, SqlValue> | undefined);
 
+		// Reconcile text PK columns against the fixed physical key collation K BEFORE
+		// any storage side-effect, so an explicit divergent per-column PK collation
+		// rejects (sited UNSUPPORTED) without leaving a dangling store, and an implicit
+		// default is normalized up to K. The normalized schema is what StoreTable holds
+		// and what `finalizeCreatedTableSchema` registers (so `table_info` reports K).
+		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
+		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation, { reject: true });
+
 		// Eagerly initialize the store BEFORE creating the table or emitting events.
 		// This ensures the underlying storage (e.g., IndexedDB object store) exists
 		// before any schema change handlers try to access it.
@@ -206,7 +214,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const table = new StoreTable(
 			db,
 			this,
-			tableSchema,
+			reconciledSchema,
 			config,
 			this.eventEmitter
 			// isConnected defaults to false for newly created tables
@@ -220,7 +228,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			objectType: 'table',
 			schemaName: tableSchema.schemaName,
 			objectName: tableSchema.name,
-			ddl: generateTableDDL(tableSchema),
+			ddl: generateTableDDL(reconciledSchema),
 		});
 
 		return table;
@@ -285,10 +293,28 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const config = this.parseConfig(vtabArgs);
 
+		// Normalize any divergent text PK column up to the fixed key collation K, but
+		// NEVER reject on the load path — a persisted/hand-authored DDL must stay
+		// loadable. Post-fix this is largely a no-op (a normalized create persists
+		// `collate <K>`, so reopen re-parses to K and finds no divergence); it only
+		// bites legacy/hand-authored DDL with an explicit divergent PK collation.
+		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
+		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation, { reject: false });
+		if (reconciledSchema !== tableSchema) {
+			// A divergence on the load path means a legacy / hand-authored DDL declared a
+			// text PK collation that differs from K. We coerce it up to K rather than throw
+			// (the table must stay loadable) and log so the coercion is observable.
+			console.warn(
+				`[StoreModule] Normalized a divergent text PRIMARY KEY collation up to the `
+					+ `fixed table key collation '${keyCollation}' while connecting to `
+					+ `'${schemaName}.${tableName}'.`,
+			);
+		}
+
 		const table = new StoreTable(
 			db,
 			this,
-			tableSchema,
+			reconciledSchema,
 			config,
 			this.eventEmitter,
 			true // isConnected - DDL already exists in storage
@@ -1965,6 +1991,70 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		return this.tables.get(tableKey);
 	}
+}
+
+/**
+ * Reconcile each text PRIMARY KEY column's declared collation against the store's
+ * fixed physical key collation `keyCollation` (K = `config.collation`, default
+ * NOCASE), closing the CREATE-time silent-divergence gap that mirrors the ALTER
+ * SET COLLATE guard.
+ *
+ * The store encodes every TEXT primary-key segment under a single fixed
+ * table-level collation K (`StoreTable.encodeOptions`), NOT the per-column declared
+ * collation. So a text PK column whose declared collation diverges from K would
+ * report one collation via `table_info()` while its key bytes — uniqueness,
+ * point-lookup, ordering — are governed by K: the silent declared≠enforced split.
+ *
+ * Collation is meaningful only for text, so only PK members whose logical type is
+ * textual are considered (an `integer primary key` keeps its declared BINARY; the
+ * temporal text-physical types carry no collation and are unaffected). For each
+ * divergent text PK member:
+ *   - `reject: true` (CREATE): an EXPLICIT per-column collation throws a sited
+ *     `UNSUPPORTED` mirroring the ALTER guard; an IMPLICIT default is normalized to K.
+ *   - `reject: false` (connect / rehydrate): always normalize, never throw — a
+ *     persisted DDL must stay loadable (legacy / hand-authored divergence is
+ *     coerced up to K, not rejected).
+ *
+ * Returns the schema unchanged when no text PK column diverges (the common case
+ * once a normalized create persists `collate <K>` in its DDL); otherwise a new
+ * schema with a rebuilt `columns` array + `columnIndexMap`.
+ */
+function reconcilePkCollations(
+	schema: TableSchema,
+	keyCollation: string,
+	options: { reject: boolean },
+): TableSchema {
+	const pkIndices = new Set(schema.primaryKeyDefinition.map(def => def.index));
+	if (pkIndices.size === 0) return schema;
+
+	let changed = false;
+	const newColumns = schema.columns.map((col, idx) => {
+		if (!pkIndices.has(idx)) return col;
+		// Collation governs key bytes only for text; non-text PK columns (integer,
+		// real, blob, …) are encoded type-natively and keep their declared collation.
+		if (!col.logicalType.isTextual) return col;
+		const declared = (col.collation || 'BINARY').toUpperCase();
+		if (declared === keyCollation) return col; // already consistent with K
+
+		if (options.reject && col.collationExplicit) {
+			throw new QuereusError(
+				`Cannot create '${schema.schemaName}.${schema.name}': PRIMARY KEY column `
+					+ `'${col.name}' declares collation '${col.collation}', but this module `
+					+ `enforces PK uniqueness physically under a fixed table key collation `
+					+ `('${keyCollation}'); a divergent per-column PK collation is unsupported.`,
+				StatusCode.UNSUPPORTED,
+			);
+		}
+
+		// Implicit default (or lenient connect path): normalize up to K so
+		// `table_info()` reports the collation actually enforced by the key bytes.
+		changed = true;
+		return { ...col, collation: keyCollation };
+	});
+
+	if (!changed) return schema;
+	const columns = Object.freeze(newColumns);
+	return { ...schema, columns, columnIndexMap: buildColumnIndexMap(columns) };
 }
 
 /**
