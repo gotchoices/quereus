@@ -10,6 +10,7 @@ import { QuereusError } from '../src/common/errors.js';
 import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
 import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner/util/fd-utils.js';
 import { unwrapPassthroughSubquery } from '../src/planner/util/set-op-wrapper.js';
+import { surfacedInnerFlagNames } from '../src/planner/mutation/set-op.js';
 import { deriveViewColumns, viewColumnsFromUpdateLineage, resolveBaseSite } from '../src/planner/analysis/update-lineage.js';
 import { viewComplement } from '../src/planner/analysis/view-complement.js';
 import { computeRoundTrip, getPutComposesToIdentity } from '../src/schema/lens-prover.js';
@@ -3614,6 +3615,130 @@ describe('Property-Based Tests', () => {
 					expect(key, `flag idx ${flagIdx} must not be in a claimed key`).to.not.include(flagIdx);
 				}
 			}
+		});
+
+		// --- Surfaced-inner-flag enumeration over a flagged LEFT leg of a subtree operand ---
+		// (`set-op-subtree-leftleg-flag-surface`). The static `column_info` surface walks the
+		// surfaced inner flags via `surfacedInnerFlagNames`, which must mirror the plan's recursive
+		// `[L flags] ++ [R flags] ++ [own flags]` attribute layout across BOTH legs of every subtree
+		// operand (unwrapping left-compound wrappers). A flag declared on the LEFT leg of a subtree
+		// operand — at any depth, on either operand side — surfaces as a readable-but-non-writable
+		// view column, so `column_info` reports it `is_updatable = NO`, agreeing with the dynamic
+		// `set-op-membership-nested` reject. Before the fix the static walk descended only the RIGHT
+		// leg and pushed own flags in the wrong order, so deeper-left surfaced flags were missed /
+		// mis-ordered and over-claimed `YES`.
+		async function seedFlatTables(...names: string[]): Promise<void> {
+			for (const n of names) {
+				await db.exec(`create table ${n} (id integer primary key, x integer) using memory`);
+				await db.exec(`insert into ${n} values (1, 10), (2, 20)`);
+			}
+		}
+		/** Map column_name → is_updatable for `column_info(view)`. */
+		async function updatableByCol(view: string): Promise<Map<SqlValue, SqlValue>> {
+			return new Map((await readRows(`select column_name, is_updatable from column_info('${view}')`))
+				.map(r => [r.column_name, r.is_updatable]));
+		}
+		/** The static (AST-only) surfaced-inner-flag names for a body. */
+		function staticSurfaced(body: string): string[] {
+			return surfacedInnerFlagNames(new Parser().parse(body) as unknown as AST.QueryExpr);
+		}
+		/**
+		 * The plan-derived surfaced-inner-flag names: the planned root's attribute names sliced
+		 * between the `dataColCount` data columns and the body's `ownFlagCount` own (outer) flags —
+		 * exactly the slice `analysis.surfacedInnerFlagNames` takes from `viewColNames`.
+		 */
+		function planSurfaced(body: string, dataColCount: number, ownFlagCount: number): string[] {
+			const cols = findSetOp(body).getType().columns.map(c => c.name);
+			return cols.slice(dataColCount, cols.length - ownFlagCount);
+		}
+
+		it('RIGHT subtree operand with a flagged left leg: inP/inQ report NO, order [id,x,inP,inQ,inL,inR]', async () => {
+			await seedFlatTables('A', 'B', 'C', 'D');
+			const body = 'select id, x from A '
+				+ 'union exists left as inL, exists right as inR '
+				+ '( (select id, x from B union exists left as inP, exists right as inQ select id, x from C) '
+				+ '  union select id, x from D )';
+			await db.exec(`create view V as ${body}`);
+			// Plan layout: data [id,x] ++ surfaced-inner [inP,inQ] (subtree's left-leg own flags)
+			// ++ outer own [inL,inR].
+			expect(findSetOp(body).getType().columns.map(c => c.name))
+				.to.deep.equal(['id', 'x', 'inP', 'inQ', 'inL', 'inR']);
+			const cols = await updatableByCol('V');
+			expect(cols.get('id'), 'data col id').to.equal('YES');
+			expect(cols.get('x'), 'data col x').to.equal('YES');
+			expect(cols.get('inP'), 'surfaced inner (left-leg) flag inP').to.equal('NO');
+			expect(cols.get('inQ'), 'surfaced inner (left-leg) flag inQ').to.equal('NO');
+			expect(cols.get('inL'), 'outer own flag inL').to.equal('YES');
+			expect(cols.get('inR'), 'outer own flag inR').to.equal('YES');
+			// Order parity: static enumeration == plan-derived slice, element-for-element.
+			expect(staticSurfaced(body)).to.deep.equal(['inP', 'inQ']);
+			expect(staticSurfaced(body)).to.deep.equal(planSurfaced(body, 2, 2));
+			// Cross-check the dynamic write rejects the same flag — static NO is honest.
+			expect(await writeError('update V set inP = true where id = 2'), 'inP deferred')
+				.to.match(/set-op-membership-nested/);
+		});
+
+		it('LEFT (parallel-sibling) subtree operand with a flagged left leg: inP/inQ report NO', async () => {
+			await seedFlatTables('A', 'B', 'C', 'D');
+			// Parser lifts the parenthesized LEFT compound into a `select * from (compound)` wrapper;
+			// the static walk must unwrap it and still reach the deeper-left inP/inQ.
+			const body = '( (select id, x from B union exists left as inP, exists right as inQ select id, x from C) '
+				+ '  union select id, x from D ) '
+				+ 'union exists left as inL, exists right as inR '
+				+ 'select id, x from A';
+			await db.exec(`create view VL as ${body}`);
+			expect(findSetOp(body).getType().columns.map(c => c.name))
+				.to.deep.equal(['id', 'x', 'inP', 'inQ', 'inL', 'inR']);
+			const cols = await updatableByCol('VL');
+			expect(cols.get('inP'), 'surfaced inner (left-leg of LEFT sibling) flag inP').to.equal('NO');
+			expect(cols.get('inQ'), 'surfaced inner (left-leg of LEFT sibling) flag inQ').to.equal('NO');
+			expect(cols.get('inL'), 'outer own flag inL').to.equal('YES');
+			expect(cols.get('inR'), 'outer own flag inR').to.equal('YES');
+			expect(staticSurfaced(body)).to.deep.equal(['inP', 'inQ']);
+			expect(staticSurfaced(body)).to.deep.equal(planSurfaced(body, 2, 2));
+			expect(await writeError('update VL set inP = true where id = 2'), 'inP deferred')
+				.to.match(/set-op-membership-nested/);
+		});
+
+		it('deeper ≥3-level subtree with own flags alongside a flagged left leg: all four inner flags report NO', async () => {
+			await seedFlatTables('A', 'B', 'C', 'D', 'E');
+			// The subtree operand's middle node carries OWN flags (inM,inN) ALONGSIDE a flagged left
+			// leg (inP,inQ) — exercises the order fix (own flags appended AFTER both legs descend).
+			const body = 'select id, x from A '
+				+ 'union exists left as inL, exists right as inR '
+				+ '( ( (select id, x from B union exists left as inP, exists right as inQ select id, x from C) '
+				+ '    union exists left as inM, exists right as inN select id, x from D ) '
+				+ '  union select id, x from E )';
+			await db.exec(`create view VD as ${body}`);
+			// Plan layout: data [id,x] ++ surfaced-inner [inP,inQ,inM,inN] ++ outer own [inL,inR].
+			expect(findSetOp(body).getType().columns.map(c => c.name))
+				.to.deep.equal(['id', 'x', 'inP', 'inQ', 'inM', 'inN', 'inL', 'inR']);
+			const cols = await updatableByCol('VD');
+			for (const f of ['inP', 'inQ', 'inM', 'inN']) {
+				expect(cols.get(f), `surfaced inner flag ${f}`).to.equal('NO');
+			}
+			expect(cols.get('inL'), 'outer own flag inL').to.equal('YES');
+			expect(cols.get('inR'), 'outer own flag inR').to.equal('YES');
+			expect(cols.get('id'), 'data col id').to.equal('YES');
+			expect(cols.get('x'), 'data col x').to.equal('YES');
+			// Order parity pins the recursive left→right→own order against the plan.
+			expect(staticSurfaced(body)).to.deep.equal(['inP', 'inQ', 'inM', 'inN']);
+			expect(staticSurfaced(body)).to.deep.equal(planSurfaced(body, 2, 2));
+			expect(await writeError('update VD set inM = true where id = 2'), 'inM deferred')
+				.to.match(/set-op-membership-nested/);
+		});
+
+		it('right-spine regression: A union[inA,inSub] (B union[inB,inC] C) still reports inB/inC NO, inA YES', async () => {
+			await seedNested();
+			const cols = await updatableByCol('Vn');
+			expect(cols.get('id'), 'data col id').to.equal('YES');
+			expect(cols.get('x'), 'data col x').to.equal('YES');
+			expect(cols.get('inA'), 'own leaf flag inA').to.equal('YES');
+			expect(cols.get('inB'), 'surfaced inner flag inB').to.equal('NO');
+			expect(cols.get('inC'), 'surfaced inner flag inC').to.equal('NO');
+			// Order parity holds for the already-supported right-spine shape too.
+			expect(staticSurfaced(NESTED_BODY)).to.deep.equal(['inB', 'inC']);
+			expect(staticSurfaced(NESTED_BODY)).to.deep.equal(planSurfaced(NESTED_BODY, 2, 2));
 		});
 	});
 

@@ -217,30 +217,49 @@ function isSubtreeOperand(operand: AST.QueryExpr): boolean {
 
 /**
  * The **surfaced inner-branch membership-flag names** of a (possibly nested) set-op body —
- * every flag declared on a subtree operand, surfaced as a readable-but-non-writable column
- * of the outer view (the layout's `[L flags] ++ [R flags]`). Empty for a binary (non-nested)
- * body. Writing one addresses a branch *inside* a subtree operand (product-coordinate
- * addressing), so `buildUpdate` rejects it with a `set-op-membership-nested` diagnostic and
- * the `column_info` surface reports it `is_updatable = NO`.
+ * every flag declared on a subtree operand, surfaced as a readable-but-non-writable column of
+ * the outer view. Returned in the plan's recursive `[L flags] ++ [R flags] ++ [own flags]`
+ * attribute layout (`SetOperationNode.buildAttributes`), so this list lands element-for-element
+ * on the plan-derived `analysis.surfacedInnerFlagNames` (`viewColNames` minus the leading data
+ * cols and trailing own flags). Empty for a binary (non-nested) body. Writing one addresses a
+ * branch *inside* a subtree operand (product-coordinate addressing), so `buildUpdate` rejects it
+ * with a `set-op-membership-nested` diagnostic and the `column_info` surface reports it
+ * `is_updatable = NO`.
  */
 export function surfacedInnerFlagNames(selectAst: AST.QueryExpr): string[] {
 	const out: string[] = [];
 	if (selectAst.type === 'select' && selectAst.compound) {
-		// Walk BOTH operands in layout order (`[L flags] ++ [R flags]`). A parenthesized LEFT
-		// compound operand is lifted into a `select * from (compound)` wrapper, so unwrap it first —
-		// its inner flags surface too (`set-op-leftwrap-write`), and a write to one rejects with the
-		// clean `set-op-membership-nested` diagnostic rather than `unknown-view-column`.
-		collectSubtreeFlagNames(unwrapBranchSelect(leftBranchSelect(selectAst)), out);
+		// Walk BOTH operands in plan layout order: `[L operand surfaced] ++ [R operand surfaced]`
+		// (this node's OWN flags are `analysis.flags`, not surfaced-inner, and are excluded here).
+		// The unwrap of a parenthesized LEFT compound operand's `select * from (compound)` wrapper
+		// (`set-op-leftwrap-write`) lives INSIDE the recursion, so it applies uniformly at every
+		// level — pass the raw left/right operands here, not pre-unwrapped.
+		collectSubtreeFlagNames(leftBranchSelect(selectAst), out);
 		collectSubtreeFlagNames(selectAst.compound.select, out);
 	}
 	return out;
 }
 
-/** Collect every membership-flag name declared on `operand` and its deeper subtree operands. */
+/**
+ * Collect every membership-flag name `operand` (and its deeper subtree operands) surfaces, in
+ * the plan's recursive `[L flags] ++ [R flags] ++ [own flags]` attribute layout
+ * (`SetOperationNode.buildAttributes`): descend the LEFT leg, then the RIGHT leg, THEN append
+ * this node's OWN flags — so the result lands element-for-element on the plan-derived
+ * `analysis.surfacedInnerFlagNames` regardless of which leg declared a flag, at any depth.
+ *
+ * Each operand is first unwrapped via {@link unwrapBranchSelect} (a no-op on a direct operand)
+ * so a parenthesized LEFT compound operand's `select * from (compound)` wrapper is descended too
+ * (`set-op-leftwrap-write`) — a flag declared on either leg of a left- OR right-side subtree is
+ * reached, and a write to one rejects with the clean `set-op-membership-nested` diagnostic
+ * rather than `unknown-view-column`.
+ */
 function collectSubtreeFlagNames(operand: AST.QueryExpr, out: string[]): void {
-	if (operand.type !== 'select' || !operand.compound || operand.compound.op === 'diff') return;
-	for (const e of operand.compound.existence ?? []) out.push(e.name);
-	collectSubtreeFlagNames(operand.compound.select, out);
+	if (operand.type !== 'select') return;
+	const effective = unwrapBranchSelect(operand);
+	if (!effective.compound || effective.compound.op === 'diff') return;
+	collectSubtreeFlagNames(leftBranchSelect(effective), out);
+	collectSubtreeFlagNames(effective.compound.select, out);
+	for (const e of effective.compound.existence ?? []) out.push(e.name);
 }
 
 /** One membership flag declared on the set operation. */

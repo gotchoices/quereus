@@ -589,9 +589,17 @@ classifying it (`set-op-leftwrap-write`), so a parallel-sibling view reports its
 writability identically to the right. `is_insertable_into` is gated **off** to `NO` whenever **either**
 operand is a subtree (`setOpHasSubtreeOperand`, which now walks the unwrapped left too) — a
 conservative, honest under-claim, since inserting into a multi-leaf subtree is deferred to
-`set-op-membership-nested`. Per-column, a **surfaced inner flag** — on either side, since
-`surfacedInnerFlagNames` walks both operands — reports `is_updatable = 'NO'` (writing it is deferred),
-while data columns and own flags report `YES`.
+`set-op-membership-nested`. Per-column, a **surfaced inner flag** reports `is_updatable = 'NO'` (writing it is deferred),
+while data columns and own flags report `YES`. The surfaced-inner enumeration
+(`surfacedInnerFlagNames`) mirrors the plan's recursive `[L flags] ++ [R flags] ++ [own flags]`
+attribute layout across **BOTH legs** of every subtree operand (unwrapping each left-compound
+`select * from (compound)` wrapper) — descending left, then right, then appending the node's own
+flags. So `column_info` reports every surfaced inner flag `is_updatable = NO` in agreement with the
+dynamic `set-op-membership-nested` reject, for a flag declared on **either leg** of a left- OR
+right-side subtree operand **at any depth** (`set-op-subtree-leftleg-flag-surface`) — not just a
+subtree's own / right-leg flags. The enumeration lands element-for-element on the plan-derived
+`analysis.surfacedInnerFlagNames` (the `viewColNames` slice between the data columns and this body's
+own flags), so the static surface never drifts from the dynamic write.
 
 > **Implemented surface vs. the design below.** Binary set-op write-through is realized
 > through the **membership columns** above (`set-op-membership-write`): the explicit
