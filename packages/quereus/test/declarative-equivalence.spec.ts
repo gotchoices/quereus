@@ -3259,4 +3259,25 @@ describe('declarative-equivalence: default_collation', () => {
 			await db.close();
 		}
 	});
+
+	it('an inherited-collation index is idempotent under nocase — no index churn', async () => {
+		// Guards the differ's index-path threading (declaredIndexCanonicalBody →
+		// declaredColumnCollation): an index column with no explicit COLLATE inherits
+		// the table column's NOCASE (default-resolved) collation. The actual catalog
+		// index is built from that same NOCASE table column, so a re-diff must NOT
+		// drop+recreate the index.
+		const db = new Database();
+		try {
+			db.setOption('default_collation', 'nocase');
+			await db.exec('declare schema main { table t { id INTEGER PRIMARY KEY, name TEXT } index ix_name on t (name) }');
+			await db.exec('apply schema main');
+
+			const diff = diffOf(db);
+			expect(diff.indexesToDrop, 'no index drop').to.deep.equal([]);
+			expect(diff.indexesToCreate, 'no index recreate').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'no table alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
 });
