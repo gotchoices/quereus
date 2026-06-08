@@ -21,7 +21,7 @@ import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-no
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { readDefaultFor } from "../../planner/mutation/mutation-tags.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
-import { isSetOpMembershipBody, isSetOpBranchWritable } from "../../planner/mutation/set-op.js";
+import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, surfacedInnerFlagNames } from "../../planner/mutation/set-op.js";
 import type { ViewSchema } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -769,7 +769,14 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		// the conservative all-`NO` row to agree with the dynamic `propagate()` reject.
 		if (!isSetOpBranchWritable(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
 		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
-		return { isInsertableInto: true, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
+		// Update / delete fan-out recurses through a subtree operand to its member leaves
+		// (`nestable-flagged-set-ops`), so updatable / deletable stay YES at any depth. But
+		// inserting into a multi-leaf subtree has no single deterministic target leaf
+		// (product-coordinate addressing — `set-op-membership-nested`), so gate insertability
+		// to NO when ANY operand is a subtree — a conservative, honest under-claim agreeing
+		// with the dynamic insert-through reject.
+		const isInsertableInto = !setOpHasSubtreeOperand(view.selectAst);
+		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
 	// Non-decomposable join shape gate: cross / comma (implicit) / subquery- or
@@ -1087,13 +1094,18 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 		// with null base — a `SetOperationNode` root threads `updateLineage` ONLY for its
 		// membership flags (a read-only `set-op-branch` existence site) and NONE for its data
 		// columns, so `baseSiteOf` resolves no base for either, matching the dynamic reject.
+		// Nested (subtree) operands (`nestable-flagged-set-ops`): data columns + own flags stay
+		// writable-through-effect (`YES`); a SURFACED INNER flag (`inB`/`inC`) is read-only (`NO`) —
+		// writing it addresses a branch inside a subtree (product-coordinate `set-op-membership-nested`).
+		// Empty surfaced-inner set (the binary case) => all-`YES`, unchanged.
 		if (isSetOpMembershipBody(view.selectAst) && isSetOpBranchWritable(view.selectAst)) {
+			const innerFlags = new Set(surfacedInnerFlagNames(view.selectAst).map(n => n.toLowerCase()));
 			return root.getAttributes().map((attr, i): ColumnInfoRow => ({
 				schema: schemaName,
 				objectName: view.name,
 				cid: i,
 				columnName: attr.name,
-				isUpdatable: true,
+				isUpdatable: !innerFlags.has(attr.name.toLowerCase()),
 				baseTable: null,
 				baseColumn: null,
 			}));

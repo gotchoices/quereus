@@ -3,6 +3,7 @@ import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
 import type { ScalarType } from '../../common/datatype.js';
 import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
+import { SetOperationNode } from '../nodes/set-operation-node.js';
 import { buildSelectStmt } from '../building/select.js';
 import { buildExpression } from '../building/expression.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -48,8 +49,14 @@ import { cloneExpr, transformExpr } from './scope-transform.js';
  * and run back through {@link propagate} — reusing the single-source / multi-source
  * spines verbatim (the branch's own σ predicate, renames, and base routing are honored
  * by its spine). A branch that bottoms out in a base table emits one base op; a branch
- * that is itself a `SetOperationNode` would recurse again (the **nested** subtree write —
- * its per-leaf product-coordinate addressing is `set-op-membership-nested`).
+ * that is itself a `SetOperationNode` (a **subtree operand**, `nestable-flagged-set-ops`)
+ * recurses *here* for the unambiguous fan-out — a data-column UPDATE, a DELETE, and a
+ * `set <subtreeFlag> = false` drop fan out to every member leaf, sharing the ONE up-front
+ * capture (`fanBranchDataUpdate` / `fanBranchDelete`, detected via {@link analyzeSetOpBranches}).
+ * The genuinely ambiguous inserts into a subtree — `set <subtreeFlag> = true`, a
+ * surfaced-inner-flag write, and insert-through routing into a subtree side — have no single
+ * deterministic target leaf (product-coordinate addressing) and are rejected, pointing at
+ * `set-op-membership-nested`.
  *
  * **Per-branch correlation.** A fan-out / membership-delete op identifies the branch's
  * affected rows by a correlated `exists (select 1 from __vmupd_keys k where <k matches
@@ -65,10 +72,12 @@ import { cloneExpr, transformExpr } from './scope-transform.js';
  * operators — `except`'s always-false right flag inserts every visible row, `intersect`'s
  * always-true flags insert none).
  *
- * **v1 scope (binary, non-nested).** union / union all / except / intersect membership
- * writes, data-column fan-out, delete fan-out, and insert-through. Nested/subtree flags
- * and product-coordinate addressing are `set-op-membership-nested`; non-literal boolean
- * membership writes and the `strict` unspecified-case policy stay deferred.
+ * **Scope.** union / union all / except / intersect membership writes, data-column fan-out,
+ * delete fan-out, and insert-through, at any nesting depth for the unambiguous fan-out
+ * operations (data UPDATE / DELETE / `set <subtreeFlag> = false`). The ambiguous inserts
+ * into a subtree (`set <subtreeFlag> = true`, surfaced-inner-flag writes, insert-through into
+ * a subtree side) are `set-op-membership-nested` (product-coordinate addressing); non-literal
+ * boolean membership writes and the `strict` unspecified-case policy stay deferred.
  */
 
 /**
@@ -91,34 +100,82 @@ export function isSetOpMembershipBody(selectAst: AST.QueryExpr): boolean {
  * True iff a set-op membership body is reportable-writable by the static surfaces — the
  * no-plan shadow of {@link analyzeSetOpView}'s pre-write rejections: an outer LIMIT/OFFSET
  * (the body is not decomposable — a write would escape the limited window), a non-SELECT
- * right operand, a `select *` leg, a computed (non-plain-column) leg, or legs whose
- * plain-column counts disagree. Lets the `column_info` / `view_info` static surfaces gate
- * the membership-writable claim on the SAME shape the dynamic write enforces, instead of
- * reporting writable from the membership flag's presence alone. The branch-shape half is
- * non-recursive (one level): a nested-compound operand whose first leg is plain still passes
- * here, matching that `analyzeSetOpView` also defers the nested reject to write-time
- * `propagate` (`set-op-membership-nested`).
+ * right operand, a `select *` leg, or a computed (non-plain-column) leg. Lets the
+ * `column_info` / `view_info` static surfaces gate the membership-writable claim on the SAME
+ * shape the dynamic write enforces, instead of reporting writable from the membership flag's
+ * presence alone.
+ *
+ * **Recursive** (`nestable-flagged-set-ops`): an operand is branch-writable iff it is a
+ * plain-leg leaf OR a (recursively) branch-writable set-op body — so a nested view reports
+ * `is_updatable` / `is_deletable` = YES, agreeing with the dynamic accept (data + delete
+ * fan-out recurse through a subtree operand). Inserts into a subtree are deferred, so
+ * insertability is gated separately on {@link setOpHasSubtreeOperand}.
  */
 export function isSetOpBranchWritable(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.compound) return false;
-	// The dynamic `unsupported-limit` reject: an outer LIMIT/OFFSET puts the capture's filter
-	// above the window, so a write would escape it (`analyzeSetOpView` rejects this before any
-	// branch analysis). Mirror it so the static surface does not over-claim a windowed body.
+	return isSetOpBodyWritable(selectAst);
+}
+
+/**
+ * True iff a set-op body (its compound + both operands) is recursively branch-writable.
+ * Mirrors the dynamic write's pre-write rejections at this level — an outer LIMIT/OFFSET
+ * (a write would escape the window), then each operand checked via {@link isOperandWritable}.
+ */
+function isSetOpBodyWritable(selectAst: AST.SelectStmt): boolean {
+	if (!selectAst.compound) return false;
 	if (selectAst.limit || selectAst.offset) return false;
+	return isOperandWritable(leftBranchSelect(selectAst)) && isOperandWritable(selectAst.compound.select);
+}
+
+/**
+ * True iff an operand (a compound leg) is recursively branch-writable: a (recursively)
+ * writable set-op body, OR a plain-column leaf (the shape that round-trips a base column
+ * through the branch's single-source spine). A non-SELECT operand, a `select *` leg, or a
+ * computed leg is non-writable — the dynamic write rejects all three.
+ */
+function isOperandWritable(operand: AST.QueryExpr): boolean {
+	if (operand.type !== 'select') return false;
+	if (operand.compound && operand.compound.op !== 'diff') return isSetOpBodyWritable(operand);
+	return tryBranchColumnNames(operand) !== null;
+}
+
+/**
+ * True iff a membership body has a **subtree (compound) operand** — an inner
+ * `SetOperationNode` operand. Insert-through into a multi-leaf subtree has no single
+ * deterministic target leaf (product-coordinate addressing — `set-op-membership-nested`),
+ * so the static `is_insertable_into` surface gates to `NO` when this holds, while
+ * data/delete fan-out (which touches every member leaf) stays writable. The left operand is
+ * never a compound in SQL (a parenthesized left compound flattens to a subquery), so only
+ * the right operand is probed.
+ */
+export function setOpHasSubtreeOperand(selectAst: AST.QueryExpr): boolean {
+	if (selectAst.type !== 'select' || !selectAst.compound) return false;
 	const right = selectAst.compound.select;
-	// The dynamic `rightBranchSelect` reject: a non-SELECT right operand is not a
-	// recursively-writable body (v1 supports SELECT operands).
-	if (right.type !== 'select') return false;
-	const leftNames = tryBranchColumnNames(leftBranchSelect(selectAst));
-	const rightNames = tryBranchColumnNames(right);
-	// A `*` or computed leg (either side) probes `null` — non-writable; both legs must also
-	// agree in plain-column arity (the AST-only equivalent of `dataColNames.length !==
-	// dataColCount`, which a `*` leg short-circuits before reaching). A nested-compound
-	// operand whose first leg is plain still passes here (the probe is non-recursive); the
-	// dynamic path likewise defers that nested reject to write-time `propagate`
-	// (`set-op-membership-nested`) — a known, out-of-scope one-level-deep over-claim.
-	if (!leftNames || !rightNames) return false;
-	return leftNames.length === rightNames.length;
+	return right.type === 'select' && !!right.compound && right.compound.op !== 'diff';
+}
+
+/**
+ * The **surfaced inner-branch membership-flag names** of a (possibly nested) set-op body —
+ * every flag declared on a subtree operand, surfaced as a readable-but-non-writable column
+ * of the outer view (the layout's `[L flags] ++ [R flags]`). Empty for a binary (non-nested)
+ * body. Writing one addresses a branch *inside* a subtree operand (product-coordinate
+ * addressing), so `buildUpdate` rejects it with a `set-op-membership-nested` diagnostic and
+ * the `column_info` surface reports it `is_updatable = NO`.
+ */
+export function surfacedInnerFlagNames(selectAst: AST.QueryExpr): string[] {
+	const out: string[] = [];
+	if (selectAst.type === 'select' && selectAst.compound) {
+		// The left operand is never a compound in SQL; only the right operand can be a subtree.
+		collectSubtreeFlagNames(selectAst.compound.select, out);
+	}
+	return out;
+}
+
+/** Collect every membership-flag name declared on `operand` and its deeper subtree operands. */
+function collectSubtreeFlagNames(operand: AST.QueryExpr, out: string[]): void {
+	if (operand.type !== 'select' || !operand.compound || operand.compound.op === 'diff') return;
+	for (const e of operand.compound.existence ?? []) out.push(e.name);
+	collectSubtreeFlagNames(operand.compound.select, out);
 }
 
 /** One membership flag declared on the set operation. */
@@ -136,6 +193,15 @@ interface SetOpBranch {
 	readonly dataColNames: readonly string[];
 	/** This branch's declared membership flag, when one is declared. */
 	readonly flag?: MembershipFlag;
+	/**
+	 * True iff this operand is itself a set-operation body (a subtree) — its `selectAst`
+	 * carries a (non-diff) `compound`. A nested branch's fan-out (data UPDATE / DELETE /
+	 * `= false` flip) recurses through {@link analyzeSetOpBranches} to its member leaves
+	 * (sharing the one up-front capture); its `= true` flip / insert-through route is
+	 * rejected (a multi-leaf insert has no single deterministic target leaf —
+	 * `set-op-membership-nested`).
+	 */
+	readonly isNested: boolean;
 }
 
 interface SetOpAnalysis {
@@ -148,11 +214,18 @@ interface SetOpAnalysis {
 	readonly viewColNames: readonly string[];
 	/** Every view output column's scalar type, positional with {@link viewColNames}. */
 	readonly viewColTypes: readonly ScalarType[];
-	/** Count of data (non-flag) columns. */
+	/** Count of data (non-flag) columns (recursive `SetOperationNode.dataColumnCount()`). */
 	readonly dataColCount: number;
 	/** The data (non-flag) column names — `viewColNames.slice(0, dataColCount)`. */
 	readonly dataColNames: readonly string[];
 	readonly flags: readonly MembershipFlag[];
+	/**
+	 * Surfaced inner-branch flag names (the view columns that are neither data nor this
+	 * node's own flags — `[L flags] ++ [R flags]` of a subtree operand). Writing one is
+	 * deferred to `set-op-membership-nested`; `buildUpdate` rejects it with a clean
+	 * diagnostic rather than `unknown-view-column` (it IS a view column).
+	 */
+	readonly surfacedInnerFlagNames: readonly string[];
 	readonly branches: readonly [SetOpBranch, SetOpBranch];
 }
 
@@ -230,7 +303,19 @@ function analyzeSetOpView(ctx: PlanningContext, view: MutableViewLike): SetOpAna
 	const attrs = relRoot.getAttributes();
 	const viewColNames = attrs.map(a => a.name);
 	const viewColTypes = attrs.map(a => a.type);
-	const dataColCount = attrs.length - flags.length;
+	// Data-column count is the recursive DATA arity of the planned set operation
+	// (`SetOperationNode.dataColumnCount()`), NOT `attrs.length - flags.length`: with a nested
+	// (flagged) subtree operand, the surfaced inner flags inflate `attrs.length`, so subtracting
+	// only the OWN flags would mis-count them as data columns (`nestable-flagged-set-ops`).
+	const setOpNode = findSetOpNode(relRoot);
+	if (!setOpNode) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through view '${view.name}': the set-operation body produced no SetOperationNode`,
+		});
+	}
+	const dataColCount = setOpNode.dataColumnCount();
 	if (dataColCount <= 0) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-set-op',
@@ -239,6 +324,10 @@ function analyzeSetOpView(ctx: PlanningContext, view: MutableViewLike): SetOpAna
 		});
 	}
 	const dataColNames = viewColNames.slice(0, dataColCount);
+	// Surfaced inner flags sit BETWEEN the data columns and this node's own flags in the
+	// `[data] ++ [L flags] ++ [R flags] ++ [own flags]` layout — `viewColNames` minus the
+	// leading data columns and the trailing own flags. Empty for a binary (non-nested) body.
+	const surfacedInnerFlagNames = viewColNames.slice(dataColCount, viewColNames.length - flags.length);
 
 	// A scope resolving each view output column name to its producing attribute over the
 	// planned root — the same shape `createSetOperationScope` builds for the body itself,
@@ -258,7 +347,40 @@ function analyzeSetOpView(ctx: PlanningContext, view: MutableViewLike): SetOpAna
 		buildBranch(view, 'right', rightBranchSelect(view, compound.select), dataColCount, flags),
 	];
 
-	return { op: compound.op, root: relRoot, viewColScope, viewColNames, viewColTypes, dataColCount, dataColNames, flags, branches };
+	return { op: compound.op, root: relRoot, viewColScope, viewColNames, viewColTypes, dataColCount, dataColNames, surfacedInnerFlagNames, flags, branches };
+}
+
+/**
+ * The `SetOperationNode` inside a planned body root — the root itself for a bare compound
+ * body, else found by descending the relational spine (a body with an outer ORDER BY wraps
+ * the set op in a `SortNode`). Its recursive `dataColumnCount()` is the data arity the
+ * surfaced-inner-flag count subtraction (`attrs.length - flags.length`) over-counts.
+ */
+function findSetOpNode(node: RelationalPlanNode): SetOperationNode | undefined {
+	if (node instanceof SetOperationNode) return node;
+	for (const child of node.getRelations()) {
+		const found = findSetOpNode(child);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+/**
+ * Membership-free branch analysis of a nested (subtree) operand: its two inner branches,
+ * built without the membership gate `analyzeSetOpView` enforces (a flag-less subtree has no
+ * `compound.existence`). The data arity is the OUTER body's (`dataColCount`) — set
+ * operations preserve data columns at every depth (the `SetOperationNode` constructor
+ * enforces `dataArity(left) === dataArity(right)`), so an inner leaf has exactly the same
+ * data columns the outer capture froze. Used by the data/delete fan-out recursion.
+ */
+function analyzeSetOpBranches(view: MutableViewLike, branchView: MutableViewLike, dataColCount: number): readonly [SetOpBranch, SetOpBranch] {
+	const sel = branchView.selectAst as AST.SelectStmt;
+	const compound = sel.compound!;
+	const innerFlags: MembershipFlag[] = (compound.existence ?? []).map(e => ({ name: e.name, side: e.branch }));
+	return [
+		buildBranch(view, 'left', leftBranchSelect(sel), dataColCount, innerFlags),
+		buildBranch(view, 'right', rightBranchSelect(view, compound.select), dataColCount, innerFlags),
+	];
 }
 
 /** The left operand's SELECT — the compound statement stripped of its outer modifiers. */
@@ -302,7 +424,9 @@ function buildBranch(
 		selectAst: branchSelect,
 	};
 	const flag = flags.find(f => f.side === side);
-	return { side, view: branchView, dataColNames, ...(flag ? { flag } : {}) };
+	// A subtree operand carries its own (non-diff) compound; its fan-out recurses to leaves.
+	const isNested = !!branchSelect.compound && branchSelect.compound.op !== 'diff';
+	return { side, view: branchView, dataColNames, isNested, ...(flag ? { flag } : {}) };
 }
 
 /**
@@ -424,6 +548,18 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 			flips.set(flag.side, value);
 			continue;
 		}
+		// A surfaced inner flag (`inB`/`inC`) IS a view column, but writing it addresses a
+		// branch INSIDE a subtree operand (product-coordinate addressing) — deferred to
+		// `set-op-membership-nested`. Reject with a clean diagnostic (NOT `unknown-view-column`,
+		// which would mislead — the name resolves).
+		if (analysis.surfacedInnerFlagNames.some(n => n.toLowerCase() === asg.column.toLowerCase())) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-set-op',
+				column: asg.column,
+				table: view.name,
+				message: `cannot write through view '${view.name}': '${asg.column}' is a surfaced inner-branch membership flag of a nested set operation; writing it addresses a branch inside a subtree operand (product-coordinate addressing) — deferred to set-op-membership-nested`,
+			});
+		}
 		const position = analysis.dataColNames.findIndex(n => n.toLowerCase() === asg.column.toLowerCase());
 		if (position < 0) {
 			raiseMutationDiagnostic({
@@ -453,24 +589,26 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
 	const baseOps: BaseOp[] = [];
 
-	// Data fan-out: update the row in every branch it is currently a member of. The
-	// full-data-tuple `exists` correlation restricts each branch update to the rows
-	// actually present in that branch (a non-member branch matches no row), so the
-	// per-branch membership is honored without an explicit flag gate.
+	// Data fan-out: update the row in every member leaf, recursing through a subtree operand
+	// to its leaves. The full-data-tuple `exists` correlation restricts each leaf update to
+	// the rows actually present there (a non-member leaf matches no row), so the per-branch
+	// membership is honored without an explicit flag gate.
 	if (dataAssignments.length > 0) {
 		for (const branch of analysis.branches) {
-			baseOps.push(...buildBranchDataUpdate(ctx, view, analysis, branch, dataAssignments, stmt));
+			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, branch, dataAssignments, stmt));
 		}
 	}
 
-	// Membership flips.
+	// Membership flips. `= true` inserts into the branch (rejected for a subtree — a
+	// multi-leaf insert has no single target leaf); `= false` is a delete fan-out (recurses
+	// through a subtree to drop the row from its resident leaves).
 	for (const branch of analysis.branches) {
 		const flip = flips.get(branch.side);
 		if (flip === undefined) continue;
 		if (flip) {
 			baseOps.push(...buildBranchMembershipInsert(ctx, view, analysis, branch, dataAssignments, stmt));
 		} else {
-			baseOps.push(...buildBranchMembershipDelete(ctx, view, analysis, branch, stmt));
+			baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt));
 		}
 	}
 
@@ -486,19 +624,33 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 	return { baseOps, capture };
 }
 
-/** Fan a data-column UPDATE out to one branch: update its member rows (matched via the capture). */
-function buildBranchDataUpdate(
+/**
+ * Fan a data-column UPDATE out to one branch — recursing through a nested (subtree) operand
+ * to its member leaves, else updating the leaf's member rows (matched via the shared capture).
+ *
+ * The recursion reuses the SINGLE up-front capture: a subtree's leaves share the outer's data
+ * columns (nesting preserves them), so "update the leaf rows whose data tuple ∈ `__vmupd_keys`"
+ * is the same frozen-capture correlation rebuilt against each inner branch — no second capture.
+ * The positional `dataAssignments` fan unchanged (each re-mapped to the leaf's own column name
+ * at that data position via `branch.dataColNames[da.position]`); the value is cloned fresh at
+ * each leaf (its refs resolve against that leaf's columns when leg names match — the v1 caveat).
+ */
+function fanBranchDataUpdate(
 	ctx: PlanningContext,
-	_view: MutableViewLike,
+	view: MutableViewLike,
 	analysis: SetOpAnalysis,
 	branch: SetOpBranch,
 	dataAssignments: readonly DataAssignment[],
 	stmt: AST.UpdateStmt,
 ): BaseOp[] {
+	if (branch.isNested) {
+		const baseOps: BaseOp[] = [];
+		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
+			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt));
+		}
+		return baseOps;
+	}
 	const assignments: { column: string; value: AST.Expression }[] = dataAssignments.map(da => ({
-		// The branch's own column name at this data position (honors a leg rename); the
-		// value is in data-column terms — its refs resolve against the branch's columns
-		// when the leg column names match (the v1 caveat for column-referencing values).
 		column: branch.dataColNames[da.position],
 		value: cloneExpr(da.value),
 	}));
@@ -527,6 +679,18 @@ function buildBranchMembershipInsert(
 	dataAssignments: readonly DataAssignment[],
 	stmt: AST.UpdateStmt,
 ): BaseOp[] {
+	if (branch.isNested) {
+		// `set <subtreeFlag> = true` would insert the row into a multi-leaf subtree (B∪C) —
+		// "which leaf?" has no single deterministic answer (product-coordinate addressing).
+		// Deferred to `set-op-membership-nested`. (The `= false` flip routes to the delete
+		// fan-out, which IS unambiguous — it touches every member leaf.)
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op',
+			column: branch.flag?.name,
+			table: view.name,
+			message: `cannot write through view '${view.name}': 'set ${branch.flag?.name ?? '<flag>'} = true' inserts into a multi-leaf subtree operand, which has no single deterministic target leaf (product-coordinate addressing) — deferred to set-op-membership-nested`,
+		});
+	}
 	if (!branch.flag) {
 		// Unreachable on the flip path (a flip targets a declared flag's side), but guard.
 		raiseMutationDiagnostic({
@@ -566,14 +730,28 @@ function buildBranchMembershipInsert(
 	return propagate(ctx, branch.view, { op: 'insert', stmt: insertStmt });
 }
 
-/** `set <flag> = false`: delete the matching branch row for every captured row present in this branch. */
-function buildBranchMembershipDelete(
+/**
+ * Fan a DELETE out to one branch — recursing through a nested (subtree) operand to its member
+ * leaves, else deleting the leaf's matching rows (every captured row present there). Serves
+ * both the `delete from V` fan-out and the `set <subtreeFlag> = false` subtree drop (a
+ * delete fan-out into the subtree's leaves), so it takes either originating statement and
+ * reads only its shared `contextValues` / `schemaPath` / `loc`. Reuses the SINGLE up-front
+ * capture (the same frozen-data-tuple correlation, rebuilt against each inner branch).
+ */
+function fanBranchDelete(
 	ctx: PlanningContext,
-	_view: MutableViewLike,
+	view: MutableViewLike,
 	analysis: SetOpAnalysis,
 	branch: SetOpBranch,
-	stmt: AST.UpdateStmt,
+	stmt: AST.UpdateStmt | AST.DeleteStmt,
 ): BaseOp[] {
+	if (branch.isNested) {
+		const baseOps: BaseOp[] = [];
+		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
+			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt));
+		}
+		return baseOps;
+	}
 	const deleteStmt: AST.DeleteStmt = {
 		type: 'delete',
 		table: { type: 'identifier', name: branch.view.name },
@@ -591,18 +769,11 @@ function buildDelete(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 	rejectReturning(view, stmt.returning);
 	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
 	const baseOps: BaseOp[] = [];
-	// Delete from every branch the row is a member of (the full-tuple `exists` correlation
-	// restricts each branch delete to its resident rows — a non-member branch matches none).
+	// Delete from every member leaf at every depth — the fan recurses through a subtree
+	// operand to its leaves (the full-tuple `exists` correlation restricts each leaf delete to
+	// its resident rows, so a non-member leaf matches none).
 	for (const branch of analysis.branches) {
-		const deleteStmt: AST.DeleteStmt = {
-			type: 'delete',
-			table: { type: 'identifier', name: branch.view.name },
-			where: buildMemberExists(analysis, branch),
-			contextValues: stmt.contextValues,
-			schemaPath: stmt.schemaPath,
-			loc: stmt.loc,
-		};
-		baseOps.push(...propagate(ctx, branch.view, { op: 'delete', stmt: deleteStmt }));
+		baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt));
 	}
 	return { baseOps, capture };
 }
@@ -651,6 +822,16 @@ function buildInsertThrough(ctx: PlanningContext, view: MutableViewLike, analysi
 	const baseOps: BaseOp[] = [];
 	for (const branch of analysis.branches) {
 		if (!activeSides.has(branch.side)) continue;
+		if (branch.isNested) {
+			// Routing a VALUES row into a multi-leaf subtree operand has no single deterministic
+			// target leaf (product-coordinate addressing) — deferred to `set-op-membership-nested`.
+			// A leaf-only active side still inserts normally.
+			raiseMutationDiagnostic({
+				reason: 'unsupported-set-op',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': the active routing flag targets a multi-leaf subtree operand, which has no single deterministic target leaf for a VALUES row (product-coordinate addressing) — deferred to set-op-membership-nested`,
+			});
+		}
 		const values = stmt.source.values.map(row => layout.dataPositions.map(p => cloneExpr(row[p])));
 		const source: AST.SelectStmt | AST.ValuesStmt = { type: 'values', values };
 		const insertStmt: AST.InsertStmt = {
@@ -729,6 +910,12 @@ function resolveInsertLayout(view: MutableViewLike, analysis: SetOpAnalysis, stm
  * The branch columns are qualified with the synthetic branch-view name so {@link propagate}
  * lowers them to the target row (`__vm_self`); the `k.*` columns resolve to the injected
  * `__vmupd_keys` relation.
+ *
+ * In the nested fan-out the OUTER `analysis` is threaded unchanged, so `k.*` keeps naming the
+ * one outer capture's data columns while `branch.*` names the inner leaf's — sound because a
+ * subtree preserves the data columns at every depth (`buildBranch`'s arity check guarantees
+ * `branch.dataColNames.length === analysis.dataColCount`), and a leaf's rows ⊆ the subtree's,
+ * so the same frozen capture selects exactly the leaf rows to touch.
  */
 function buildMemberExists(analysis: SetOpAnalysis, branch: SetOpBranch): AST.Expression {
 	let pred: AST.Expression | undefined;

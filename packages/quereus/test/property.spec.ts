@@ -3029,6 +3029,204 @@ describe('Property-Based Tests', () => {
 		});
 	});
 
+	// --- Nested / subtree set-operation membership WRITES (nestable-flagged-set-ops) ---
+	// A `SetOperationNode` operand of an outer set-op is recursively WRITABLE for the
+	// unambiguous fan-out operations: a data-column UPDATE and a DELETE recurse through the
+	// subtree to its member leaves, and `set <subtreeFlag> = false` is a subtree delete — all
+	// sharing the ONE up-front capture. The ambiguous inserts into a subtree
+	// (`set <subtreeFlag> = true`, surfaced-inner-flag writes, insert-through into a subtree
+	// side) have no single deterministic target leaf (product-coordinate addressing) and are
+	// rejected cleanly, pointing at `set-op-membership-nested`.
+	describe('Nested / subtree set-operation membership writes', () => {
+		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
+			return out;
+		}
+		async function ids(sql: string): Promise<SqlValue[]> {
+			return (await readRows(sql)).map(r => Object.values(r)[0]);
+		}
+		async function writeError(sql: string): Promise<string> {
+			try { await db.exec(sql); return ''; }
+			catch (e) { return e instanceof Error ? e.message : String(e); }
+		}
+		/** First SetOperationNode in a logically-planned body. */
+		function findSetOp(sql: string): RelationalPlanNode {
+			const ast = new Parser().parse(sql) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			const root = (plan as unknown as { getRelations(): readonly RelationalPlanNode[] }).getRelations()[0];
+			let found: RelationalPlanNode | undefined;
+			const visit = (n: PlanNode): void => {
+				if (found) return;
+				if (n.nodeType === PlanNodeType.SetOperation) { found = n as RelationalPlanNode; return; }
+				for (const c of n.getChildren()) visit(c);
+			};
+			visit(root);
+			if (!found) throw new Error('no SetOperationNode in planned body');
+			return found;
+		}
+
+		// A={(1,10),(2,20)}, B={(2,20),(3,30),(5,50)}, C={(3,30),(4,40)} → (B∪C)={(2,20),(3,30),(4,40),(5,50)}.
+		// Membership by id: 1=A-only, 2=A&B, 3=B&C, 4=C-only, 5=B-only.
+		const NESTED_BODY = 'select id, x from A union exists left as inA, exists right as inSub '
+			+ '(select id, x from B union exists left as inB, exists right as inC select id, x from C)';
+		async function seedNested(viewBody = NESTED_BODY): Promise<void> {
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (1, 10), (2, 20)');
+			await db.exec('insert into B values (2, 20), (3, 30), (5, 50)');
+			await db.exec('insert into C values (3, 30), (4, 40)');
+			await db.exec(`create view Vn as ${viewBody}`);
+		}
+
+		it('data fan-out through a subtree: update reaches every member leaf (A-only, B∩C, B-only)', async () => {
+			await seedNested();
+			await db.exec('update Vn set x = 91 where id = 1'); // A only
+			await db.exec('update Vn set x = 93 where id = 3'); // B and C (subtree)
+			await db.exec('update Vn set x = 95 where id = 5'); // B only (subtree)
+			// A-only: only A updated; the subtree leaves have no id=1.
+			expect((await readRows('select x from A where id = 1'))[0].x).to.equal(91);
+			expect(await readRows('select x from B where id = 1')).to.deep.equal([]);
+			expect(await readRows('select x from C where id = 1')).to.deep.equal([]);
+			// B∩C: both subtree leaves updated; A has no id=3.
+			expect((await readRows('select x from B where id = 3'))[0].x).to.equal(93);
+			expect((await readRows('select x from C where id = 3'))[0].x).to.equal(93);
+			expect(await readRows('select x from A where id = 3')).to.deep.equal([]);
+			// B-only: only B updated; C has no id=5.
+			expect((await readRows('select x from B where id = 5'))[0].x).to.equal(95);
+			expect(await readRows('select x from C where id = 5')).to.deep.equal([]);
+			// PutGet: the view re-reads the new values, none escaping the predicate.
+			expect((await readRows('select x from Vn where id = 1'))[0].x).to.equal(91);
+			expect((await readRows('select x from Vn where id = 3'))[0].x).to.equal(93);
+			expect((await readRows('select x from Vn where id = 5'))[0].x).to.equal(95);
+		});
+
+		it('data fan-out value referencing a data column recurses (set x = x + 1)', async () => {
+			await seedNested();
+			await db.exec('update Vn set x = x + 1 where id = 2'); // A and B
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(21);
+			expect((await readRows('select x from B where id = 2'))[0].x).to.equal(21);
+		});
+
+		it('delete fan-out through a subtree: removes the row from every member leaf', async () => {
+			await seedNested();
+			await db.exec('delete from Vn where id in (1, 3, 5)');
+			expect(await ids('select id from A order by id')).to.deep.equal([2]);
+			expect(await ids('select id from B order by id')).to.deep.equal([2]);   // 3, 5 gone
+			expect(await ids('select id from C order by id')).to.deep.equal([4]);   // 3 gone
+			expect(await readRows('select id from Vn where id in (1, 3, 5)')).to.deep.equal([]);
+		});
+
+		it('set inSub = false drops the row from the subtree (delete fan-out into B and C)', async () => {
+			await seedNested();
+			await db.exec('update Vn set inSub = false where id = 3'); // B&C, not in A
+			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
+			expect(await readRows('select id from C where id = 3')).to.deep.equal([]);
+			expect(await readRows('select id from Vn where id = 3')).to.deep.equal([]);
+		});
+
+		it('flag-less subtree operand is writable for data + delete fan-out (the prior throw is gone)', async () => {
+			// `A union[inA,inSub] (B union C)` — the inner compound is flag-less; the read half
+			// already surfaced inSub, and now data/delete fan out through it.
+			await seedNested('select id, x from A union exists left as inA, exists right as inSub (select id, x from B union select id, x from C)');
+			await db.exec('update Vn set x = 93 where id = 3'); // subtree members B and C
+			expect((await readRows('select x from B where id = 3'))[0].x).to.equal(93);
+			expect((await readRows('select x from C where id = 3'))[0].x).to.equal(93);
+			await db.exec('delete from Vn where id = 4'); // C-only (in subtree)
+			expect(await readRows('select id from C where id = 4')).to.deep.equal([]);
+			expect(await readRows('select id from Vn where id = 4')).to.deep.equal([]);
+		});
+
+		it('except subtree operand: delete fan-out and set inSub=false recurse through the non-union inner node', async () => {
+			// inner (B except C) = {(2,20),(5,50)}; Vn = A ∪ that = {(1,10),(2,20),(5,50)}.
+			await seedNested('select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
+			// A delete of a subtree-resident row recurses to both inner leaves (no-op where absent).
+			await db.exec('delete from Vn where id = 5'); // in B, not C
+			expect(await readRows('select id from B where id = 5')).to.deep.equal([]);
+			expect(await readRows('select id from Vn where id = 5')).to.deep.equal([]);
+			// set inSub = false drops the subtree side of id=2 (in A and the subtree); B loses it.
+			await db.exec('update Vn set inSub = false where id = 2');
+			expect(await readRows('select id from B where id = 2')).to.deep.equal([]);
+			// id=2 still in A ⇒ still visible (inA true), now inSub false.
+			expect((await readRows('select inA, inSub from Vn where id = 2'))[0]).to.deep.equal({ inA: true, inSub: false });
+		});
+
+		it('deferred: set <subtreeFlag> = true rejects cleanly (names set-op-membership-nested)', async () => {
+			await seedNested();
+			const msg = await writeError('update Vn set inSub = true where id = 1');
+			expect(msg, 'rejects').to.not.equal('');
+			expect(msg).to.match(/set-op-membership-nested/);
+			expect(msg, 'not the misleading phase-1 message').to.not.match(/not updateable in phase 1/);
+			expect(msg, 'not unknown-view-column').to.not.match(/not a data or membership column/);
+		});
+
+		it('deferred: writing a surfaced inner flag rejects cleanly (named, not unknown-view-column)', async () => {
+			await seedNested();
+			const msg = await writeError('update Vn set inB = true where id = 2');
+			expect(msg, 'rejects').to.not.equal('');
+			expect(msg).to.match(/set-op-membership-nested/);
+			expect(msg, 'inB IS a view column — not unknown-view-column').to.not.match(/not a data or membership column/);
+			expect(msg).to.not.match(/not updateable in phase 1/);
+		});
+
+		it('deferred: insert-through routing to the subtree side rejects cleanly', async () => {
+			await seedNested();
+			const msg = await writeError('insert into Vn (id, x, inA, inSub) values (9, 90, true, true)');
+			expect(msg, 'rejects').to.not.equal('');
+			expect(msg).to.match(/set-op-membership-nested/);
+			expect(msg).to.not.match(/not updateable in phase 1/);
+		});
+
+		it('insert-through with a leaf-only active side still works (inSub = false routes to A)', async () => {
+			await seedNested();
+			await db.exec('insert into Vn (id, x, inA, inSub) values (9, 90, true, false)'); // A only
+			expect(await ids('select id from A where id = 9')).to.deep.equal([9]);
+			expect(await readRows('select id from B where id = 9')).to.deep.equal([]);
+			expect(await readRows('select id from C where id = 9')).to.deep.equal([]);
+		});
+
+		it('conflicting assignment recurses: set x and inSub=false rejects', async () => {
+			await seedNested();
+			const msg = await writeError('update Vn set x = 5, inSub = false where id = 3');
+			expect(msg, 'a data write + subtree removal of the same branch contradict').to.not.equal('');
+		});
+
+		it('static surface honesty: view_info / column_info agree with the dynamic write', async () => {
+			await seedNested();
+			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Vn')"))[0];
+			expect(info.is_updatable, 'updatable (data + flip-false fan out)').to.equal('YES');
+			expect(info.is_deletable, 'deletable (delete fan out)').to.equal('YES');
+			expect(info.is_insertable_into, 'insert into a subtree is deferred').to.equal('NO');
+			// column_info: data cols + own leaf flag inA = YES; surfaced inner flags inB/inC = NO.
+			const cols = new Map((await readRows("select column_name, is_updatable from column_info('Vn')")).map(r => [r.column_name, r.is_updatable]));
+			expect(cols.get('id'), 'data col id').to.equal('YES');
+			expect(cols.get('x'), 'data col x').to.equal('YES');
+			expect(cols.get('inA'), 'own leaf flag inA').to.equal('YES');
+			expect(cols.get('inB'), 'surfaced inner flag inB').to.equal('NO');
+			expect(cols.get('inC'), 'surfaced inner flag inC').to.equal('NO');
+			// Cross-check: the YES forms succeed dynamically and the deferred form rejects.
+			await db.exec('update Vn set x = 100 where id = 2');
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(100);
+			await db.exec('delete from Vn where id = 5');
+			expect(await readRows('select id from Vn where id = 5')).to.deep.equal([]);
+			expect(await writeError('update Vn set inB = true where id = 2'), 'inB deferred').to.match(/set-op-membership-nested/);
+		});
+
+		it('Key Soundness under write: the nested view stays keyed on data columns (no flag in a key)', async () => {
+			await seedNested();
+			await db.exec('update Vn set x = 99 where id = 3'); // a fan-out write
+			const nested = findSetOp(NESTED_BODY);
+			// Surfaced layout [id, x, inB, inC, inA, inSub]; keys stay on the data columns [0,1].
+			expect(nested.getType().columns.map(c => c.name)).to.deep.equal(['id', 'x', 'inB', 'inC', 'inA', 'inSub']);
+			for (const key of keysOf(nested)) {
+				for (const flagIdx of [2, 3, 4, 5]) {
+					expect(key, `flag idx ${flagIdx} must not be in a claimed key`).to.not.include(flagIdx);
+				}
+			}
+		});
+	});
+
 	// --- 16. View Round-Trip Laws ---
 	// The backward-direction dual of Key Soundness. Key Soundness keeps the
 	// FORWARD relational walk honest (claimed keys / isSet never over-claim on

@@ -368,12 +368,12 @@ read half buffers each operand's full row and emits each output row under the sa
 surfaced inner flag reads as `tuple ∈ <that operand's data relation>` row-by-row at every
 depth, defaulting **false** when the output row is absent from the operand (sound — an output
 row not present in an operand is in none of that operand's nested branches, so every such
-flag probe is false; verified for all four outer operators). The **write** half (writing a
-surfaced inner flag through to its nested branch) is the separate `nestable-flagged-set-ops`
-ticket. Until it lands, the static writability surfaces (`column_info` / `view_info`) over-claim
-a nested flagged body as writable — the same **one-level-deep** over-claim `isSetOpBranchWritable`
-already makes for any set-op operand (a known, out-of-scope deferral; the dynamic write correctly
-rejects nested bodies). Only the metadata is optimistic; reading the data columns is exact.
+flag probe is false; verified for all four outer operators). The **write** half landed as
+`nestable-flagged-set-ops`: a subtree operand is recursively writable for data-column UPDATE
+/ DELETE / `set <subtreeFlag> = false` fan-out, and the ambiguous subtree inserts are deferred
+to `set-op-membership-nested` (see § Set-operation membership writes → Nested / subtree
+operands). The static surfaces now agree — they report a nested body `is_updatable` /
+`is_deletable` = `YES`, `is_insertable_into` = `NO`, and a surfaced inner flag non-updatable.
 
 ### Set-operation membership writes
 
@@ -381,9 +381,13 @@ The first set-op view writability in the engine (`planner/mutation/set-op.ts`). 
 membership column **is** the branch presence, so *writing* it drives the branch's
 existence — the explicit, per-row control surface that replaces the never-built
 `quereus.update.*` routing-tag dispatch for set-ops (`union-branch` / `delete_via`,
-removed by `remove-update-routing-tag-surface`). Scope is the **binary
-(non-nested)** case: `union` / `union all` / `except` / `intersect`. Nested / subtree
-flags and product-coordinate addressing are `set-op-membership-nested`.
+removed by `remove-update-routing-tag-surface`). Scope is `union` / `union all` /
+`except` / `intersect` membership writes, with data-column UPDATE fan-out, DELETE fan-out,
+and `set <subtreeFlag> = false` recursing through a **nested / subtree operand** at any
+depth (`nestable-flagged-set-ops`). The genuinely ambiguous inserts into a multi-leaf
+subtree — `set <subtreeFlag> = true`, a surfaced-inner-flag write, and insert-through
+routing into a subtree side — have no single deterministic target leaf (product-coordinate
+addressing) and are deferred to `set-op-membership-nested`.
 
 A set-op view body is **not** routed through the single-source/join spines — `propagate`
 rejects a `SetOperationNode` body. Instead `building/view-mutation-builder.ts` intercepts a
@@ -403,7 +407,11 @@ against a **synthetic branch view-like** and run back through `propagate` — re
 spines verbatim (the branch's own σ predicate, column renames, and base routing are honored
 by its own spine; `no-default` / computed-column rejections fall out of the recursion). A
 branch that bottoms out in a base table emits one base op; a branch that is itself a
-`SetOperationNode` would recurse again (the nested subtree write — `set-op-membership-nested`).
+`SetOperationNode` (a **subtree operand**) **recurses here** for the unambiguous fan-out — a
+data-column UPDATE, a DELETE, and a `set <subtreeFlag> = false` drop fan out to every member
+leaf, sharing the ONE up-front capture (the recursion rebuilds the same frozen-data-tuple
+correlation against each inner branch, never a second capture; see § Nested / subtree
+operands). Inserting into a subtree is `set-op-membership-nested`.
 
 **Per-operator membership-write semantics** (uniform across operators because the probe
 flags already encode each operator's branch truth):
@@ -443,13 +451,37 @@ it — over a VALUES source (the flags are a uniform per-statement routing direc
 flag-less ambiguous multi-branch insert is rejected. RETURNING through a set-op membership
 write is not yet recoverable (rejected).
 
+**Nested / subtree operands** (`nestable-flagged-set-ops`). An operand of an outer set-op
+may itself be a (possibly flagged) `SetOperationNode` — `A union[inA,inSub] (B union[inB,inC]
+C)`. Such a **subtree operand** is recursively writable for the unambiguous fan-out
+operations: a data-column UPDATE fan-out, a DELETE fan-out, and `set <subtreeFlag> = false`
+(a delete fan-out into the subtree's leaves) all recurse through the subtree to its member
+leaves, **sharing the single up-front capture**. The recursion is sound because nesting
+preserves the data columns at every depth (the `SetOperationNode` arity check is data-only),
+so "touch the leaf rows whose data tuple ∈ `__vmupd_keys`" is the same frozen-capture
+correlation rebuilt against each inner branch — a leaf's rows ⊆ the subtree's, so no second
+capture is introduced and Halloween-safety is preserved at depth. A **flag-less subtree
+operand** (`A union[inA,inSub] (B union C)`) is writable through the same recursion (it need
+not declare inner flags to fan out). `intersect` / `except` subtree operands recurse the same
+way (the fan-out touches every resident leaf). The genuinely ambiguous inserts into a subtree
+are **deferred** to `set-op-membership-nested` (product-coordinate "which leaf?" addressing)
+with clean diagnostics: `set <subtreeFlag> = true` (insert into a multi-leaf subtree), a
+**surfaced-inner-flag** write (`set inB = …` through the outer view — addressing a branch
+*inside* the operand), and **insert-through** whose active routing flag is a subtree side.
+Each diagnostic names `set-op-membership-nested` and is neither the misleading
+`SetOperation … not updateable` message nor `unknown-view-column` (a surfaced inner flag IS a
+view column).
+
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of
 that tuple (the count variant is deferred). A data-fan-out value that *references* a data
 column requires the operand legs to use matching column names (a leg rename of a
 referenced column is not yet remapped); literal values are unaffected. A branch leg must
 be a plain (optionally renamed) base-column projection — a `select *` or computed leg
-column in a writable branch is rejected.
+column in a writable branch is rejected. **Static-surface partial on a subtree flag:** an own
+subtree flag (`inSub`) carries an `existence` site, so `column_info` reports it
+`is_updatable = YES` — accurate for its `= false` delete (which works) but optimistic for the
+deferred `= true` insert; the dynamic write still rejects the latter cleanly.
 
 **Static surfaces gate on branch writability.** `view_info` / `column_info` for a
 membership body now mirror the **non-decomposable join shape gate**: they confirm the
@@ -460,10 +492,15 @@ decomposable, a write would escape the window), a non-SELECT right operand, a `s
 leg, a computed leg, or legs whose plain-column counts disagree. A body that fails the probe
 reports the conservative shape (`view_info` all-`NO`, every `column_info` row
 `is_updatable = 'NO'` with null base), agreeing with the dynamic write's reject instead of
-over-claiming writable from the membership flag's presence alone. The probe is
-**non-recursive** (one level): a nested-compound operand whose first leg is plain still
-passes both the probe and the dynamic shape check — the nested reject is deferred to
-write-time `propagate` (`set-op-membership-nested`).
+over-claiming writable from the membership flag's presence alone. The probe is now
+**recursive** (`nestable-flagged-set-ops`): an operand is branch-writable iff it is a
+plain-column leaf OR a (recursively) branch-writable set-op body, so a nested view reports
+`is_updatable` / `is_deletable` = `YES` (data + delete fan-out genuinely recurse through the
+subtree). `is_insertable_into` is gated **off** to `NO` whenever any operand is a subtree
+(`setOpHasSubtreeOperand`) — a conservative, honest under-claim, since inserting into a
+multi-leaf subtree is deferred to `set-op-membership-nested`. Per-column, a **surfaced inner
+flag** reports `is_updatable = 'NO'` (writing it is deferred), while data columns and own
+flags report `YES`.
 
 > **Implemented surface vs. the design below.** Binary set-op write-through is realized
 > through the **membership columns** above (`set-op-membership-write`): the explicit
