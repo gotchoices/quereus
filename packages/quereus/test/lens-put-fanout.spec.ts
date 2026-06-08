@@ -29,7 +29,7 @@
  *   supplied attribute; singleton over the empty key.
  *
  * An **arbitrary** value written to an *optional columnar* member (a subquery, a cross-member
- * column, or a value mixing anchor + self leaves) is now admitted via the **single-identity
+ * column, or a value mixing anchor + self leaves) is admitted via the **single-identity
  * (anchor-key) per-row capture**: it is materialized once over the planned get body (which
  * null-extends an absent optional member, so the captured value already encodes per-row presence)
  * into the multi-source `__vmupd_keys` substrate, the matched UPDATE reads it back by the member
@@ -38,12 +38,17 @@
  * pre-mutation `b`. The two self-contained non-constant shapes — anchor-resolvable and member
  * self-reference — keep their tighter single-op / self-materialize lowering.
  *
+ * An **arbitrary value written to an EAV member** (a subquery, cross-member, anchor+self mix, or any
+ * EAV self-reference — which lowers to a subquery, since an EAV value column projects as a correlated
+ * subquery) rides the **same** capture, per attribute: the captured value substitutes the get-body
+ * projection over the anchor scan, the matched UPDATE reads it back by the entity column, and a
+ * non-null-filtered materialize INSERT reads it back by the anchor key (`on conflict (entity, attr)
+ * do nothing`). A captured null on a matched triple writes `val = null` (reads identically to absent
+ * through `x.E`); a captured null on an absent entity materializes no phantom triple.
+ *
  * Still deferred onto absent substrate (asserted to raise a precise diagnostic): a
  * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution), a
- * shared-key (identity) UPDATE, and an **arbitrary value written to an EAV member** (a subquery,
- * cross-member, anchor+self mix, or any EAV self-reference) — an EAV triple is one-to-many off the
- * anchor key, so the single-identity capture's single-row read-back is not well-defined (the
- * prereq-chained `view-write-decomposition-update-captured-eav` follow-up).
+ * shared-key (identity) UPDATE, and a composite/absent shared key.
  */
 
 import { expect } from 'chai';
@@ -1005,8 +1010,8 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 		mod.ads = [eavSplit()];
 		db.registerModule('eavmod', mod);
 		await db.exec('create table E_core (id integer primary key) using eavmod');
-		await db.exec('create table E_eav (eid integer, attr text, val integer, primary key (eid, attr)) using eavmod');
-		await db.exec('declare logical schema x { table E { id integer primary key, p integer, q integer } }');
+		await db.exec('create table E_eav (eid integer, attr text, val integer null, primary key (eid, attr)) using eavmod');
+		await db.exec('declare logical schema x { table E { id integer primary key, p integer null, q integer null } }');
 		await db.exec('apply schema x');
 		await db.exec('insert into main.E_core values (1), (2)');
 		await db.exec("insert into main.E_eav values (1, 'p', 11), (1, 'q', 12), (2, 'p', 21)");
@@ -1067,16 +1072,106 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 		}
 	});
 
-	it('rejects an EAV self-reference (set p = p + 1 lowers to a correlated subquery)', async () => {
+	it('captures an EAV self-reference (set p = p + 1) on a matched triple', async () => {
 		// An EAV value column is projected by the get body as a correlated subquery, so a
 		// self-reference `set p = p + 1` lowers to `(select val …) + 1` — a subquery value, which
-		// lands `arbitrary` (deferred to the shared-capture follow-up), never the `self` branch.
+		// lands `captured` and rides the single-identity capture: the matched 'p' triple of entity
+		// 1 reads its pre-mutation value (11) back, increments to 12.
 		const db = new Database();
 		try {
 			await setupEav(db);
-			await expectThrows(() => db.exec('update x.E set p = p + 1 where id = 1'), /capture substrate|subquery/i);
-			// Atomic: the matched triple is untouched.
-			expect(await rows(db, "select val from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 11 }]);
+			await db.exec('update x.E set p = p + 1 where id = 1');
+			expect(await rows(db, "select val from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 12 }]);
+			expect(await rows(db, 'select p from x.E where id = 1')).to.deep.equal([{ p: 12 }]);
+			// Entity 1's other triple ('q') and entity 2's 'p' are untouched.
+			expect(await rows(db, 'select eid, attr, val from main.E_eav order by eid, attr')).to.deep.equal([
+				{ eid: 1, attr: 'p', val: 12 }, { eid: 1, attr: 'q', val: 12 }, { eid: 2, attr: 'p', val: 21 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an EAV self-reference materializes nothing on an absent attribute (set q = q + 1, entity 2 lacks q)', async () => {
+		// Entity 2 has no 'q' triple, so the captured `q + 1` is `null + 1` = null → the non-null
+		// materialize filter suppresses it: no `(2, 'q', …)` triple springs, and `x.E.q` stays null.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set q = q + 1 where id = 2');
+			expect(await rows(db, "select count(*) as n from main.E_eav where eid = 2 and attr = 'q'")).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select q from x.E where id = 2')).to.deep.equal([{ q: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('captures an anchor-mixed EAV self-reference (set p = p + id * 10) over present + absent', async () => {
+		// `set p = p + id * 10` mixes the attribute self-reference (a subquery) with the anchor id —
+		// a value that previously hit `arbitrary`/reject. Entity 1 (has 'p' = 11) → 11 + 10 = 21;
+		// entity 2's absent 'q' would be null, but here we drive 'p' which entity 2 HAS (= 21) →
+		// 21 + 20 = 41 (materializes nothing new; both are matched triples).
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set p = p + id * 10');
+			expect(await rows(db, "select eid, val from main.E_eav where attr = 'p' order by eid")).to.deep.equal([
+				{ eid: 1, val: 21 }, { eid: 2, val: 41 },
+			]);
+			expect(await rows(db, 'select id, p from x.E order by id')).to.deep.equal([{ id: 1, p: 21 }, { id: 2, p: 41 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('materializes a captured EAV value on an absent attribute via an anchor-mixed self (set q = coalesce(q, 0) + id)', async () => {
+		// Entity 1 has 'q' = 12 → coalesce(12, 0) + 1 = 13 (matched UPDATE). Entity 2 lacks 'q' →
+		// coalesce(null, 0) + 2 = 2 (non-null → materialize the (2, 'q', 2) triple).
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set q = coalesce(q, 0) + id');
+			expect(await rows(db, "select eid, val from main.E_eav where attr = 'q' order by eid")).to.deep.equal([
+				{ eid: 1, val: 13 }, { eid: 2, val: 2 },
+			]);
+			expect(await rows(db, 'select id, q from x.E order by id')).to.deep.equal([{ id: 1, q: 13 }, { id: 2, q: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a captured-null matched triple reads null through x.E, then set p = 5 re-upserts it', async () => {
+		// Entity 2 HAS a 'p' triple (=21) but LACKS 'q', so `set p = q + 1` captures `null + 1` = null
+		// on its matched 'p' triple. The matched UPDATE is unfiltered, so it writes val = null (a benign
+		// physical divergence from the explicit `set p = null` delete — the triple stays, reading null
+		// through x.E). A subsequent constant `set p = 5` then re-upserts a real value into that triple.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set p = q + 1 where id = 2');
+			// The matched 'p' triple for entity 2 is now val = null (a benign physical divergence from delete).
+			expect(await rows(db, "select val from main.E_eav where eid = 2 and attr = 'p'")).to.deep.equal([{ val: null }]);
+			expect(await rows(db, 'select p from x.E where id = 2')).to.deep.equal([{ p: null }]);
+			// A subsequent constant write re-upserts a real value into the same triple.
+			await db.exec('update x.E set p = 5 where id = 2');
+			expect(await rows(db, "select val from main.E_eav where eid = 2 and attr = 'p'")).to.deep.equal([{ val: 5 }]);
+			expect(await rows(db, 'select p from x.E where id = 2')).to.deep.equal([{ p: 5 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('mixes a captured p (self-reference) and a constant q in one statement', async () => {
+		// `set p = p + 1, q = 99 where id = 1`: p routes captured (per-attribute, its own srcN), q routes
+		// the constant matched-UPDATE path — both coexist (independent triples). Entity 1: p 11→12, q 12→99.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set p = p + 1, q = 99 where id = 1');
+			expect(await rows(db, 'select attr, val from main.E_eav where eid = 1 order by attr')).to.deep.equal([
+				{ attr: 'p', val: 12 }, { attr: 'q', val: 99 },
+			]);
+			expect(await rows(db, 'select p, q from x.E where id = 1')).to.deep.equal([{ p: 12, q: 99 }]);
 		} finally {
 			await db.close();
 		}

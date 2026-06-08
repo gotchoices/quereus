@@ -6140,6 +6140,15 @@ describe('Property-Based Tests', () => {
 				await db.exec('update x.E set p = null where id = 1');
 				expect(await readRows("select count(*) as n from main.E_eav where entity = 1 and attr = 'p'")).to.deep.equal([{ n: 0 }]);
 				expect(await readRows('select p from x.E where id = 1')).to.deep.equal([{ p: null }]);
+				// captured self-reference (set p = p + 1 lowers to a subquery → single-identity capture):
+				// re-seed entity 1's 'p' triple, increment it through the capture (matched read-back).
+				await db.exec("insert into main.E_eav values (1, 'p', 11)");
+				await db.exec('update x.E set p = p + 1 where id = 1');
+				expect(await readRows("select val from main.E_eav where entity = 1 and attr = 'p'")).to.deep.equal([{ val: 12 }]);
+				// captured self-reference over an ABSENT attribute materializes nothing (null + 1 = null).
+				await db.exec('update x.E set q = q + 1 where id = 2');
+				expect(await readRows("select count(*) as n from main.E_eav where entity = 2 and attr = 'q'")).to.deep.equal([{ n: 0 }]);
+				expect(await readRows('select q from x.E where id = 2')).to.deep.equal([{ q: null }]);
 			});
 
 			// ----- reject-don't-widen: deferred decomposition shapes -----
@@ -6159,16 +6168,15 @@ describe('Property-Based Tests', () => {
 				await expectMutationReject('update x.T set c = b + 1 where b = 100', 'unsupported-decomposition-predicate'); // captured value, but non-anchor predicate
 			});
 
-			it('reject-do-not-widen: an EAV non-anchor predicate, and an arbitrary EAV value, are deferred', async () => {
+			it('reject-do-not-widen: an EAV non-anchor predicate is deferred (an arbitrary EAV value is NOT)', async () => {
 				await deployEav();
 				await db.exec('insert into main.E_core values (1)');
 				await db.exec("insert into main.E_eav values (1, 'p', 11)");
 				await expectMutationReject('delete from x.E where p = 11', 'unsupported-decomposition-predicate');    // non-anchor predicate
-				// An arbitrary EAV value stays deferred even though the columnar analogue is now captured: an
-				// EAV value column projects as a correlated subquery (so a self-reference lands `arbitrary`),
-				// and an EAV triple is one-to-many off the anchor key, so the single-identity capture's
-				// single-row read-back is not well-defined (the prereq-chained EAV-capture follow-up).
-				await expectMutationReject('update x.E set p = p + 1 where id = 1', 'unsupported-decomposition-update');
+				// An arbitrary EAV value (a self-reference, cross-member, or subquery — which an EAV value column
+				// lowers to a subquery for) is now SUPPORTED via the single-identity capture — the columnar
+				// analogue, asserted by the 'accepts' EAV test above. The only remaining EAV reject is
+				// STRUCTURAL (a non-anchor predicate), not value-shape.
 			});
 
 			it('reject-do-not-widen: a surrogate with no anchor default, and a composite shared key, are deferred', async () => {

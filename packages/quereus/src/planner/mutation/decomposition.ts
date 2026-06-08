@@ -79,11 +79,12 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   subsumes the retired same-statement reject. An
  *   **EAV pivot** member's write is the triple analogue, per attribute: a null deletes
  *   the triple, an anchor-resolvable value upserts it via `do update`, a constant value
- *   upserts it via matched UPDATE + `do nothing` materialize INSERT. An **arbitrary EAV** value
- *   (a subquery, a cross-member column, an anchor+self mix, or any EAV self-reference — which
- *   lowers to a subquery) stays rejected `unsupported-decomposition-update` (EAV capture is the
- *   prereq-chained follow-up — the columnar substrate above is single-identity, an EAV triple is
- *   one-to-many).
+ *   upserts it via matched UPDATE + `do nothing` materialize INSERT, and an **arbitrary EAV**
+ *   value (a subquery, a cross-member column, an anchor+self mix, or any EAV self-reference —
+ *   which an EAV value column lowers to a subquery for) rides the **same single-identity capture**
+ *   as the columnar arbitrary case: the captured value substitutes the get-body projection over the
+ *   anchor scan, the matched UPDATE reads it back by the entity column, and a non-null-filtered
+ *   materialize INSERT reads it back by the anchor key (`on conflict (entity, attr) do nothing`).
  * - **INSERT** fans out to one insert per member, **anchor first** (FK-order root).
  *   It rides the shared-surrogate mutation envelope `view-mutation-shared-surrogate-insert`
  *   ships (`ViewMutationNode.envelope` + `EnvelopeScanNode`): the user source is
@@ -112,16 +113,9 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   is *supported*: it substitutes into a predicate over the anchor's own base columns,
  *   which the anchor subquery already evaluates, so it does not defer.
  * - **UPDATE of a shared-key column** — a key write is an identity change, not a
- *   value write. (Optional-member and EAV value writes are **supported** — see
- *   the UPDATE bullet above; only a key/identity write stays rejected.)
- * - **UPDATE of an EAV member with an arbitrary value** — a value that embeds a subquery,
- *   reads a *different* member's column, mixes anchor + self leaves, or is an EAV
- *   self-reference (which lowers to a subquery over the triple store). An **optional
- *   columnar** member with such a value is now *supported* via the single-identity capture
- *   (see the UPDATE bullet); only EAV stays deferred, because an EAV triple is one-to-many
- *   off the anchor key (the columnar capture's single-row-per-anchor read-back is not
- *   well-defined). Deferred to the prereq-chained follow-up
- *   (`view-write-decomposition-update-captured-eav`).
+ *   value write. (Optional-member and EAV value writes — including arbitrary captured
+ *   values — are **supported**, see the UPDATE bullet above; only a key/identity write
+ *   stays rejected.)
  * - **composite shared keys** — v1 threads a single-column key (mirrors the
  *   single-column-PK boundary in `multi-source.ts`).
  */
@@ -752,9 +746,11 @@ function anchorDeleteOp(
  *
  * `capturedValues` is the optional **capture carrier** the builder threads (parallel to
  * `decomposeUpdate`'s `sourceValues` in multi-source.ts): when present, an **arbitrary**
- * value on an *optional columnar* member (a subquery, cross-member, or mixed anchor+self —
- * otherwise rejected) is lowered to base terms and accumulated as a `srcN` projection, and
- * its cell rides the per-row capture two-op path ({@link emitCapturedMemberUpdate}); the
+ * value on an *optional columnar* member OR an **EAV** member (a subquery, cross-member, or
+ * mixed anchor+self — and, for EAV, any self-reference, since an EAV value column lowers to a
+ * subquery — otherwise rejected) is lowered to base terms and accumulated as a `srcN`
+ * projection, and its cell rides the per-row capture two-op path
+ * ({@link emitCapturedMemberUpdate} for columnar, {@link emitEavCapturedAttr} for EAV); the
  * builder then materializes the values once over the planned body
  * ({@link buildDecompositionKeyCapture}) and every base op reads them back through the
  * context-injected `__vmupd_keys`. Absent the carrier (the legacy `propagateDecomposition`
@@ -775,8 +771,8 @@ export function decomposeUpdate(
 	// Capture carrier (mirrors multi-source.ts `decomposeUpdate`'s `registerCapturedExpr`):
 	// project an already-lowered base-term value into the up-front `__vmupd_keys` capture under
 	// a stable `srcN` alias (deduped by `key`), returning that alias. `canCapture` gates whether
-	// an arbitrary optional-columnar value is admitted (carrier present) or rejected (legacy
-	// carrier-absent path); the EAV / non-columnar reject is independent of it.
+	// an arbitrary value — on an optional-columnar OR an EAV member — is admitted (carrier present)
+	// or rejected (the legacy carrier-absent path).
 	const canCapture = capturedValues !== undefined;
 	const srcDedup = new Map<string, string>();
 	const registerCapturedExpr = capturedValues
@@ -849,7 +845,7 @@ export function decomposeUpdate(
 		const o = optional.get(member.relationId);
 		if (o) emitOptionalMemberUpdate(ctx, view, shape, member, o.cells, pred, stmt, ops, registerCapturedExpr);
 		const e = eav.get(member.relationId);
-		if (e) emitEavMemberUpdate(ctx, view, shape, member, e.cells, pred, stmt, ops);
+		if (e) emitEavMemberUpdate(ctx, view, shape, member, e.cells, pred, stmt, ops, registerCapturedExpr);
 	};
 	for (const member of shape.storage.members) {
 		if (member.relationId === shape.anchor.relationId) continue;
@@ -914,7 +910,13 @@ interface EavCell {
 	readonly attribute: string;
 	readonly value: AST.Expression;
 	readonly isNull: boolean;
-	/** `constant` or `anchor` only — an EAV `self` lowers to a subquery, so it lands `arbitrary` (rejected). */
+	/**
+	 * `constant`, `anchor`, or `captured` — an EAV value column substitutes to a correlated
+	 * subquery, so any EAV self-reference (or cross-member / embedded-subquery value) lowers to
+	 * a subquery and lands `captured`, threaded through the per-attribute triple pair at emit. A
+	 * `self` cell never reaches an EAV group (it requires bare owner-column refs, which an EAV
+	 * value never has). `captured` requires the build-path capture carrier.
+	 */
 	readonly kind: ValueKind;
 }
 
@@ -957,9 +959,10 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
 			return { kind: 'mandatory', member: route.member, basisColumn: route.baseColumn, value: rewriteAssignedValue(view, shape, route.member, asg.value) };
 		}
 		case 'eav': {
-			// An EAV pivot backs its logical columns as attribute triples: a non-null value
-			// upserts the triple, a null deletes it (the EAV analogue of the optional case). An
-			// arbitrary EAV value stays rejected — `canCapture` is moot for a non-columnar owner.
+			// An EAV pivot backs its logical columns as attribute triples: a null deletes the
+			// triple, a constant/anchor value upserts it, and an arbitrary value (a self-reference,
+			// cross-member, or subquery — all of which lower to a subquery for EAV) rides the
+			// single-identity capture when the carrier is present (`canCapture`), else is rejected.
 			const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg, canCapture);
 			return { kind: 'eav', member: route.member, attribute: declaredNames.get(logical) ?? asg.column, value, isNull, valueKind: kind };
 		}
@@ -1000,14 +1003,14 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
  *   an upsert (see {@link emitOptionalMemberUpdate} / {@link buildSelfMaterializeInsertSelect}).
  *
  * Anything else — a subquery, a cross-member column, an unqualified ref, or a single value
- * mixing anchor and self leaves — is **arbitrary**. On an **optional columnar** member with a
- * capture carrier present (`canCapture`) it is admitted as `captured`: lowered to base terms
- * and (at emit) projected into the up-front `__vmupd_keys` set, read back by the stitch key in
- * both branches ({@link emitCapturedMemberUpdate}). Without a carrier (the legacy
- * `propagateDecomposition` path) or on an **EAV** member (a triple is one-to-many off the anchor
- * key, so the single-row read-back is undefined; EAV is the follow-up), it stays rejected. An EAV
- * value column substitutes to a correlated subquery, so an EAV self-reference lands `arbitrary`
- * too (only `constant` / `anchor` reach an EAV cell). Classification reads the lowered value's
+ * mixing anchor and self leaves — is **arbitrary**. With a capture carrier present (`canCapture`)
+ * it is admitted as `captured` on **both** an optional columnar member and an **EAV** member:
+ * lowered to base terms and (at emit) projected into the up-front `__vmupd_keys` set, read back by
+ * the stitch key in both branches — by the member key for columnar ({@link emitCapturedMemberUpdate}),
+ * by the entity column / anchor key for the EAV per-attribute triple pair ({@link emitEavMemberUpdate}).
+ * An EAV value column substitutes to a correlated subquery, so an EAV self-reference (`set p = p + 1`)
+ * lowers to a subquery and reaches here as `captured` (only the carrier-absent legacy
+ * `propagateDecomposition` path still rejects it). Classification reads the lowered value's
  * column-ref **relationId qualifiers** (the synthesized body aliases each member by its
  * relationId — the same qualifier {@link rewriteAssignedValue} keys cross-member rejection on);
  * the owner is never the anchor (an optional/EAV member is mandatory-distinct), so `anchor` and
@@ -1027,19 +1030,20 @@ function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, owner
 		if ([...qualifiers].every(q => q === anchorId)) return { kind: 'anchor', value: lowered, isNull };
 		if (ownerIsColumnar && [...qualifiers].every(q => q === owner.relationId)) return { kind: 'self', value: lowered, isNull };
 	}
-	// Arbitrary value. An optional **columnar** member with a capture carrier admits it via the
-	// single-identity per-row capture (the value is registered + read back at emit); the cell
-	// just classifies `captured` here. EAV and the carrier-absent legacy path stay rejected.
-	if (canCapture && ownerIsColumnar) {
+	// Arbitrary value. With a capture carrier present it is admitted as `captured` — for an optional
+	// **columnar** member (read back by the member key in both branches) and for an **EAV** member
+	// alike (read back by the entity column / anchor key into the per-attribute triple pair; an EAV
+	// value column substitutes to a correlated subquery, so any EAV self-reference reaches here). The
+	// cell just classifies `captured`; the value is registered + read back at emit. Only the
+	// carrier-absent legacy `propagateDecomposition` path stays rejected.
+	if (canCapture) {
 		return { kind: 'captured', value: lowered, isNull };
 	}
 	raiseMutationDiagnostic({
 		reason: 'unsupported-decomposition-update',
 		column: asg.column,
 		table: view.name,
-		message: ownerIsColumnar
-			? `cannot update logical table '${view.name}': writing optional-member column '${asg.column}' with this value needs the per-row capture carrier to thread it across the matched-update and materialize-insert branches, which the legacy non-build path does not supply`
-			: `cannot update logical table '${view.name}': writing EAV-member column '${asg.column}' admits a constant or an anchor-resolvable value; this value embeds a subquery, reads a different member's column, or mixes anchor and self leaves, which an EAV triple cannot thread through the single-identity capture substrate (an EAV triple is one-to-many off the anchor key) — deferred to the EAV capture follow-up (view-write-decomposition-update-captured-eav)`,
+		message: `cannot update logical table '${view.name}': writing ${ownerIsColumnar ? 'optional-member' : 'EAV-member'} column '${asg.column}' with this value needs the per-row capture carrier to thread it across the matched-update and materialize branches, which the legacy non-build path does not supply`,
 	});
 }
 
@@ -1684,9 +1688,15 @@ function assertNoUnassignedValueColumnWiden(
  *   computed once over the anchor scan and matched entities read it via `excluded.<valCol>`.
  * - **`constant`** value → matched UPDATE of the value column + `on conflict (entity, attr)
  *   do nothing` materialize INSERT for entities lacking the triple.
+ * - **`captured`** value (an EAV self-reference `set p = p + 1`, a cross-member read, or an
+ *   embedded subquery — all of which an EAV value column lowers to a subquery for) → the
+ *   single-identity capture analogue ({@link emitEavCapturedAttr}): the value is materialized once
+ *   over the planned body under a `srcN`, the matched UPDATE reads it back by the **entity** column,
+ *   and a filtered materialize INSERT reads it back by the **anchor key** (non-null gated). Requires
+ *   the capture carrier (the build path).
  *
- * A `self` value cannot occur here: an EAV value column substitutes to a correlated subquery,
- * so an EAV self-reference lands `arbitrary` and is rejected before reaching a cell.
+ * A `self` value cannot occur here: an EAV value column substitutes to a correlated subquery, so a
+ * self-reference lowers to a subquery and classifies `captured`, not `self`.
  */
 function emitEavMemberUpdate(
 	ctx: PlanningContext,
@@ -1697,6 +1707,7 @@ function emitEavMemberUpdate(
 	pred: AST.Expression | undefined,
 	stmt: AST.UpdateStmt,
 	ops: BaseOp[],
+	registerCapturedExpr: ((key: string, expr: AST.Expression) => string) | undefined,
 ): void {
 	const pivot = member.attributePivot!;
 	for (const cell of cells) {
@@ -1704,6 +1715,8 @@ function emitEavMemberUpdate(
 			ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'delete'));
 		} else if (cell.kind === 'anchor') {
 			ops.push(buildEavInsertSelect(ctx, view, shape, member, pivot, cell, pred, stmt, 'update'));
+		} else if (cell.kind === 'captured') {
+			emitEavCapturedAttr(ctx, view, shape, member, pivot, cell, pred, stmt, ops, registerCapturedExpr);
 		} else {
 			ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'update'));
 			ops.push(buildEavInsertSelect(ctx, view, shape, member, pivot, cell, pred, stmt, 'nothing'));
@@ -1712,9 +1725,63 @@ function emitEavMemberUpdate(
 }
 
 /**
+ * Emit the captured triple pair for one arbitrary EAV attribute cell — the per-attribute analogue
+ * of {@link emitCapturedMemberUpdate} (columnar). The cell's already-lowered base-term value (a
+ * self-reference / cross-member / subquery value over the planned body) is projected into the
+ * up-front `__vmupd_keys` capture under a stable `srcN` alias, then:
+ *
+ * - the **matched UPDATE** ({@link buildEavAttrOp} `'update'`, value overridden by the read-back)
+ *   sets the value column of every existing `<attr>` triple for the matched entities to
+ *   `(select srcN from __vmupd_keys k where k.k0_0 = <entity>)` — the captured value correlated by
+ *   the entity column (which holds the anchor key, the shared stitch value). Unfiltered: a captured
+ *   null on a matched triple writes `val = null`, which reads identically to an absent triple
+ *   through the get-body subquery (a benign physical divergence from the explicit `set p = null`
+ *   delete — never a widen).
+ * - the **materialize INSERT** ({@link buildEavCapturedInsert}) creates one `<attr>` triple per
+ *   matched entity that lacks it, the value read back by the **anchor key**, gated on a runtime
+ *   non-null (so an entity whose captured value is null — e.g. incrementing an attribute it does
+ *   not have — springs no phantom triple) with `on conflict (entity, attr) do nothing` to cede the
+ *   entities that already have the triple to the matched UPDATE (emitted first).
+ *
+ * Requires the capture carrier (the build path); absent it the defensive legacy reject fires (an
+ * arbitrary EAV value cannot be threaded without the `__vmupd_keys` substrate).
+ */
+function emitEavCapturedAttr(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	pivot: NonNullable<DecompositionMember['attributePivot']>,
+	cell: EavCell,
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+	ops: BaseOp[],
+	registerCapturedExpr: ((key: string, expr: AST.Expression) => string) | undefined,
+): void {
+	if (!registerCapturedExpr) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-decomposition-update',
+			column: cell.attribute,
+			table: view.name,
+			message: `cannot update logical table '${view.name}': writing EAV attribute '${cell.attribute}' with this value needs the per-row capture carrier to thread it across the matched-update and materialize-insert triple pair, which the legacy non-build path does not supply`,
+		});
+	}
+	// Register the lowered value into the capture (one `srcN` per attribute), keyed by the attribute
+	// so both read-back sites (entity column, anchor key) bind the same alias.
+	const srcAlias = registerCapturedExpr(`cap:${member.relationId.toLowerCase()}:attr:${cell.attribute.toLowerCase()}`, cloneExpr(cell.value));
+	// Matched UPDATE: existing triples read the captured value back by the entity column.
+	ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'update',
+		capturedValueSubquery(srcAlias, 0, [pivot.entityColumn])));
+	// Materialize INSERT: entities lacking the triple, value read back by the anchor key, non-null filtered.
+	ops.push(buildEavCapturedInsert(ctx, view, shape, member, pivot, cell, srcAlias, pred, stmt));
+}
+
+/**
  * One matched EAV op for an attribute: `update <pivot> set <valCol> = <value>` (upsert
  * value branch) or `delete from <pivot>` (null branch), each scoped
- * `where <attrCol> = '<attribute>' and <entityCol> in (<anchor subquery>)`.
+ * `where <attrCol> = '<attribute>' and <entityCol> in (<anchor subquery>)`. `valueOverride`
+ * supplies the matched-UPDATE value for a `captured` cell (the `__vmupd_keys` read-back correlated
+ * by the entity column); absent, the cell's own lowered value is used (the `constant` branch).
  */
 function buildEavAttrOp(
 	ctx: PlanningContext,
@@ -1726,6 +1793,7 @@ function buildEavAttrOp(
 	pred: AST.Expression | undefined,
 	stmt: AST.UpdateStmt,
 	op: 'update' | 'delete',
+	valueOverride?: AST.Expression,
 ): BaseOp {
 	const where = combineAnd(eavAttrEquals(pivot, cell.attribute), {
 		type: 'in',
@@ -1743,7 +1811,7 @@ function buildEavAttrOp(
 	}
 	const statement: AST.UpdateStmt = {
 		type: 'update', table,
-		assignments: [{ column: pivot.valueColumn, value: cloneExpr(cell.value) }],
+		assignments: [{ column: pivot.valueColumn, value: valueOverride ?? cloneExpr(cell.value) }],
 		where,
 		contextValues: stmt.contextValues, schemaPath: stmt.schemaPath, loc: stmt.loc,
 	};
@@ -1802,6 +1870,61 @@ function buildEavInsertSelect(
 		columns: [pivot.entityColumn, pivot.attributeColumn, pivot.valueColumn],
 		source: select,
 		upsertClauses: [upsert],
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	return { table: ref, op: 'insert', statement };
+}
+
+/**
+ * Build the absent-entity materialize INSERT for a `captured` EAV attribute cell — the triple
+ * analogue of {@link buildCapturedMaterializeInsert} (columnar). `insert into <pivot> (<entity>,
+ * <attr>, <val>) select <anchorKey>, '<attribute>', (select srcN from __vmupd_keys k where k.k0_0
+ * = <anchorKey>) from <anchor> where <pred> and (select srcN …) is not null on conflict (<entity>,
+ * <attr>) do nothing`. The value and the non-null filter both read the captured `srcN` back by the
+ * anchor key. That non-null filter is the **runtime** analogue of the columnar self path's
+ * plan-time fold: a captured EAV value is data-dependent (a self-reference over an entity that
+ * lacks the attribute captures `null + …` = null), so a per-row filter — not a plan-time decision
+ * — gates whether the triple materializes, leaving no phantom null triple. `on conflict (entity,
+ * attr) do nothing` cedes entities that already have the triple to the matched UPDATE (emitted
+ * first); the `(entity, attr)` conflict target is the deploy-guaranteed pivot PK / non-partial
+ * UNIQUE (as in {@link buildEavInsertSelect}). Always emitted (the filter decides per row).
+ */
+function buildEavCapturedInsert(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	pivot: NonNullable<DecompositionMember['attributePivot']>,
+	cell: EavCell,
+	srcAlias: string,
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+): BaseOp {
+	const ref = resolveMemberTable(ctx, member);
+	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	// A fresh read-back subquery per use (projection + filter) — distinct AST nodes.
+	const capturedVal = (): AST.Expression => capturedValueSubquery(srcAlias, 0, [anchorKey]);
+	const projections: AST.ResultColumn[] = [
+		{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } },
+		{ type: 'column', expr: { type: 'literal', value: cell.attribute } },
+		{ type: 'column', expr: capturedVal() },
+	];
+	const nonNull: AST.Expression = { type: 'unary', operator: 'IS NOT NULL', expr: capturedVal() };
+	const where = combineAnd(pred ? cloneExpr(pred) : undefined, nonNull);
+	const select: AST.SelectStmt = {
+		type: 'select',
+		columns: projections,
+		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
+		where,
+	};
+	const statement: AST.InsertStmt = {
+		type: 'insert',
+		table: memberIdentifier(member),
+		columns: [pivot.entityColumn, pivot.attributeColumn, pivot.valueColumn],
+		source: select,
+		upsertClauses: [{ type: 'upsert', conflictTarget: [pivot.entityColumn, pivot.attributeColumn], action: 'nothing' }],
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
