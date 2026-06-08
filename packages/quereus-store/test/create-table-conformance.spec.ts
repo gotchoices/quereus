@@ -174,4 +174,29 @@ describe('CREATE conformance — store PK collation reconciliation', () => {
 		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
 		expect(await collationOf(db, 'x'), 'collation unchanged after reject').to.equal('NOCASE');
 	});
+
+	// ── K-parameterization: reconciliation tracks `config.collation`, not a hardcoded
+	// NOCASE. With K = BINARY the roles invert — the implicit BINARY default is now the
+	// consistent case, and an explicit `collate nocase` PK is the divergent one. These
+	// guard against the reconciler being silently pinned to the default K. ──────────
+
+	it('K=BINARY: implicit-default text PK is consistent and stays BINARY (no spurious normalize)', async () => {
+		await db.exec(`create table t (x text primary key) using store (collation = 'binary')`);
+		expect(await collationOf(db, 'x'), 'declared BINARY == enforced K=BINARY').to.equal('BINARY');
+		expect(await tableExists(db)).to.equal(true);
+	});
+
+	it('K=BINARY: explicit collate nocase on a text PK (≠ K) is rejected with a sited UNSUPPORTED', async () => {
+		const err = await attempt(db, `create table t (x text collate nocase primary key) using store (collation = 'binary')`);
+		expect(err, 'explicit divergence from K=BINARY must reject').to.be.instanceOf(QuereusError);
+		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
+		expect(err!.message, 'reject message names K').to.match(/binary/i);
+		expect(await tableExists(db)).to.equal(false);
+	});
+
+	it('K=BINARY: explicit collate binary on a text PK (== K) is honored', async () => {
+		await db.exec(`create table t (x text collate binary primary key) using store (collation = 'binary')`);
+		expect(await collationOf(db, 'x')).to.equal('BINARY');
+		expect(await tableExists(db)).to.equal(true);
+	});
 });
