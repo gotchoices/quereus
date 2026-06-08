@@ -5,19 +5,28 @@ import type { SqlValue, Row, CompareFn } from '../common/types.js';
  * Used for runtime capability discovery and isolation layer decisions.
  */
 export interface ModuleCapabilities {
-	/** Module provides transaction isolation (read-your-own-writes, snapshot reads) */
+	// ── Advisory / non-binding flags ──────────────────────────────────────────
+	// The five flags below (isolation, savepoints, persistent, secondaryIndexes,
+	// rangeScans) are ADVISORY: the engine does NOT consult them to choose a code
+	// path. They are asserted only in tests, and the isolation layer augments
+	// `isolation` / `savepoints` for its own bookkeeping — nothing reads them as a
+	// gate. Toggling one changes no engine behavior. Only `delegatesNotNullBackfill`
+	// and `permitsGrandfatheredCheckViolators` (below) are live capability gates.
+	// See docs/module-authoring.md § "Capability negotiation surface".
+
+	/** Advisory: module provides transaction isolation (read-your-own-writes, snapshot reads). Not engine-consulted. */
 	isolation?: boolean;
 
-	/** Module supports savepoints within transactions */
+	/** Advisory: module supports savepoints within transactions. Not engine-consulted. */
 	savepoints?: boolean;
 
-	/** Module persists data across restarts */
+	/** Advisory: module persists data across restarts. Not engine-consulted. */
 	persistent?: boolean;
 
-	/** Module supports secondary indexes */
+	/** Advisory: module supports secondary indexes. Not engine-consulted. */
 	secondaryIndexes?: boolean;
 
-	/** Module supports range scans (not just point lookups) */
+	/** Advisory: module supports range scans (not just point lookups). Not engine-consulted. */
 	rangeScans?: boolean;
 
 	/**

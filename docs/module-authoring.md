@@ -259,6 +259,92 @@ place — `'fully-reentrant'` would require either fresh-per-write layers
 or an iterator-safe mutation path. Layered stores, isolation wrappers,
 and persistent plugins stay default until their owners audit them.
 
+## Capability negotiation surface
+
+The `VirtualTableModule` contract signals capability three different ways, and the
+behavior when a module does *not* implement a surface ranges from a clean negotiated
+rejection to **silent divergence**. This section is the single inventory of every
+negotiation surface: how it is signaled, what the engine substitutes when the module
+omits it, and which built-in modules implement it. Module authors and reviewers should
+treat it as the reference for "what happens if my module doesn't do X".
+
+### Signaling styles
+
+| Signaling | Members | Engine consults it? |
+| --- | --- | --- |
+| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `shadowName` | yes, per call site (varies) |
+| **Static field** | `concurrencyMode`, `expectedLatencyMs` | yes, before dispatch (the clean model) |
+| **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first two |
+
+The static-field model (`concurrencyMode`, see [Concurrency Mode](#3-concurrency-mode-parallel-runtime) above) is the clean exemplar: a defaulted, queryable value the engine reads *before* it dispatches, to choose its path. The [recommended pattern](#recommended-capability-negotiation-pattern) generalizes toward it.
+
+### Classification legend
+
+Each surface below is tagged by how its **unsupported path** behaves:
+
+- **Negotiated rejection** — the engine consults presence (or catches a thrown `UNSUPPORTED`) and turns the unsupported case into a clean, sited error before / at dispatch.
+- **Engine-side fallback** — absence has a defined behavior the engine substitutes.
+- **Silent divergence** — the module no-ops a mandate it cannot meet, and the engine never learns. This is the bug class this inventory exists to surface.
+- **Data-dependent throw** — the module throws `CONSTRAINT` / `MISMATCH` per the arm's contract (correct — not a gap).
+
+### Surface inventory
+
+| Surface | Signaling | Unsupported-path | memory | store | isolation | leveldb / indexeddb |
+| --- | --- | --- | --- | --- | --- | --- |
+| `create` / `connect` / `destroy` | required | n/a | ✓ | ✓ | wraps underlying | via store |
+| `getBestAccessPlan` | presence | engine-side fallback (default full-scan; isolation returns a default plan when the underlying lacks it) | ✓ | ✓ | forwards | via store |
+| `supports` / `executePlan` | presence (pair) | engine-side fallback (index path) — isolation **deliberately suppresses** it so the overlay sees every row | — | — | suppressed | — |
+| `getMappingAdvertisements` | presence | engine-side fallback (name-match only) | ✓ tags | ✓ tags | forwards | via store |
+| `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
+| `shadowName` | presence | **dead** — declared on the interface but **never called anywhere** (see note below) | — | — | — | — |
+| `alterTable` (method present) | presence | negotiated rejection (each `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |
+| `renameTable` | presence | engine-side fallback (schema-only rename) | ✓ | ✓ physical move | forwards + rekeys maps | via store |
+| `beginSchemaBatch` / `endSchemaBatch` | presence | engine-side fallback (per-DDL commits) | n/a | ✓ | forwards | via store |
+| `notifyLensDeployment` | presence | engine-side fallback (no-op) | n/a | n/a | forwards | n/a |
+| `concurrencyMode` | static field | engine-side fallback (`'serial'`) | `reentrant-reads` | `serial` (default) | computed: `weaker(underlying, overlay)`, capped at `reentrant-reads` | via store |
+| `expectedLatencyMs` | static field | engine-side fallback (`0`) | 0 | 0 | forwards underlying | via store |
+| `getCapabilities().delegatesNotNullBackfill` | flag (live) | engine-side gate (ADD COLUMN skips `validateNotNullBackfill`) | off | off | inherits underlying | off |
+| `getCapabilities().permitsGrandfatheredCheckViolators` | flag (live) | engine-side gate (`TableReferenceNode` skips the CHECK lift) | off | off | inherits underlying | off |
+| `getCapabilities().{isolation,savepoints,persistent,secondaryIndexes,rangeScans}` | flag (informational) | **never consulted by engine** — asserted only in tests; isolation augments `isolation` / `savepoints` but nothing reads them | varies | varies | augments | varies |
+
+> **`shadowName` is unwired.** It is declared on `VirtualTableModule` but is never called anywhere in the engine. Treat it as deprecated / dead — do not implement a contract around it expecting the engine to consult it.
+
+> **Isolation wrapper asymmetry is intentional.** `IsolationModule` forwards the isolation-transparent hooks (`getBestAccessPlan`, `getMappingAdvertisements`, the batch + lens lifecycle hooks, `renameTable`, `alterTable`) but **suppresses** `supports` (so the overlay always sees every row to merge) and caps `concurrencyMode` / `expectedLatencyMs` at conservative defaults. See the **Transparent hook forwarding** paragraph in [`packages/quereus-isolation/README.md`](../packages/quereus-isolation/README.md) for the full rationale — do not restate it divergently here.
+
+### `alterTable` sub-arms — the fine-grained mandate layer
+
+`alterTable` presence is **one bit covering ~12 `SchemaChangeInfo` arms** (see [Schema Changes](#schema-changes-schemachangeinfo) below), each with its own mandate. This mismatch is the divergence hazard: a module can be "ALTER-capable" (the method is present) yet silently fail one arm it cannot honor. The `alterPrimaryKey` row is the model the [recommended pattern](#recommended-capability-negotiation-pattern) promotes to a universal rule: **try native → on `UNSUPPORTED` apply a defined fallback**.
+
+| Arm | Mandate | memory | store |
+| --- | --- | --- | --- |
+| `addColumn` | append column; backfill; NOT-NULL gated by `delegatesNotNullBackfill` | ✓ | ✓ |
+| `dropColumn` | remove slot + reindex | ✓ | ✓ |
+| `renameColumn` | schema-only | ✓ | ✓ |
+| `alterPrimaryKey` | re-key in place **or throw `UNSUPPORTED`** | throws `UNSUPPORTED` → engine `runAlterPrimaryKey` catches → **generic rebuild** | in-place re-key |
+| `addConstraint` | materialize + validate (unique / fk) | ✓ | ✓ unique / fk; throws `UNSUPPORTED` for others |
+| `dropConstraint` / `renameConstraint` | schema rewrite | ✓ | ✓ |
+| `alterColumn.setNotNull` | backfill from default or throw `CONSTRAINT` | ✓ | ✓ |
+| `alterColumn.setDataType` | physical convert or throw `MISMATCH` | ✓ | ✓ |
+| `alterColumn.setDefault` | schema-only | ✓ | ✓ |
+| `alterColumn.setCollation` (non-PK UNIQUE) | re-validate uniqueness under new collation | ✓ | ✓ |
+| `alterColumn.setCollation` (**PK column**) | re-key / re-validate PK under new collation (`module.ts` setCollation contract) | ✓ re-keys | **✗ silent no-op → SILENT DIVERGENCE** (known gap; tracked by `store-pk-collate-module-capability`) |
+
+> The PK-column `setCollation` cell is a **current** silent divergence, not an already-fixed case: the store's physical key bytes use a fixed table-level collation, so a PK-column `SET COLLATE` to a divergent collation is applied schema-only and never enforced. The `store-pk-collate-module-capability` work item introduces the per-arm negotiation (resolving the arm to `native | logical-enforce | reject`) that closes it.
+
+### Recommended capability-negotiation pattern
+
+These are the rules new modules and new contract points should follow. They generalize the clean models already in the tree (`concurrencyMode`, the `alterPrimaryKey` protocol) and retire the failure mode the inventory above flags.
+
+1. **Presence-signaling is reserved for purely-additive optional hooks** whose absence is already a clean engine-side fallback (`getMappingAdvertisements`, the batch / lens lifecycle notifications). Absence there means a documented no-op — it can never diverge.
+
+2. **Any contract point where the engine assumes a behavior must be declared and consulted before dispatch.** `concurrencyMode` is the template: a defaulted, queryable value the engine reads to choose its path. Generalize toward this, not toward more presence bits.
+
+3. **`getCapabilities()` is the single home for binding capability gates.** The five informational flags — `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` — are **advisory / non-binding**: the engine does not consult them, so toggling them changes nothing about engine behavior (they are asserted only in tests, and isolation augments `isolation` / `savepoints` for its own bookkeeping). Do not be misled into treating them as gates. (Their removal / relocation is a separate code ticket; the distinction is documented here, not yet acted on.)
+
+4. **Hard contract — no silent divergence.** A module that cannot honor an invoked `alterTable` arm MUST throw `QuereusError(StatusCode.UNSUPPORTED)` with a sited message — **never silently no-op**. The engine maps `UNSUPPORTED` to a defined fallback (generic rebuild, schema-only, or engine-side logical enforcement) or surfaces it as a clean user error. This promotes the existing `alterPrimaryKey` protocol to a universal rule.
+
+5. **Fine-grained ALTER negotiation.** Because `alterTable` presence is one coarse bit, a module advertises per-arm support that the engine consults at the relevant `run*` call site (the surface `store-pk-collate-module-capability` introduces — e.g. resolving a PK-column `setCollation` to `native | logical-enforce | reject`). New arms adopt the same shape as needs arise — incremental, not a giant up-front descriptor.
+
 ## Runtime Execution Modes
 
 ### Query-Based Execution
@@ -408,21 +494,55 @@ private async ensureConnection(): Promise<MyConnection> {
 
 ## Schema Changes (`SchemaChangeInfo`)
 
-When `ALTER TABLE` is executed, the engine calls `VirtualTable.alterSchema(changeInfo)` with a `SchemaChangeInfo` discriminated union describing the change. The current variants are:
+When `ALTER TABLE` performs a data-affecting change, the engine calls
+
+```typescript
+VirtualTableModule.alterTable(db, schemaName, tableName, change): Promise<TableSchema>
+```
+
+passing a `SchemaChangeInfo` discriminated union as `change` and registering the returned `TableSchema` in the catalog. This is a **module-level** hook (not a `VirtualTable.alterSchema` method — that older entry point no longer exists). The dispatch lives in `runtime/emit/alter-table.ts`: each `run*` helper resolves the change and, if `module.alterTable` is absent, throws a sited `QuereusError(StatusCode.UNSUPPORTED)`. `ALTER TABLE ... RENAME TO` is schema-only and routes through the separate `renameTable` hook instead.
+
+The current arms of the union (`vtab/module.ts`):
 
 ```typescript
 export type SchemaChangeInfo =
-	| { type: 'addColumn'; columnDef: ColumnDef }
+	| { type: 'addColumn'; columnDef: ColumnDef; backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue> }
 	| { type: 'dropColumn'; columnName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string; newColumnDefAst?: ColumnDef }
-	| { type: 'alterPrimaryKey'; newPkColumns: ReadonlyArray<{ index: number; desc: boolean }> };
+	| { type: 'alterPrimaryKey'; newPkColumns: ReadonlyArray<{ index: number; desc: boolean }> }
+	| { type: 'addConstraint'; constraint: TableConstraint }
+	| { type: 'dropConstraint'; constraintName: string }
+	| { type: 'renameConstraint'; oldName: string; newName: string }
+	| { type: 'alterColumn'; columnName: string;
+	    setNotNull?: boolean; setDataType?: string; setDefault?: Expression | null; setCollation?: string };
 ```
+
+### Per-arm mandate
+
+Each arm carries its own contract. A module that implements `alterTable` is responsible for every arm it is handed — see the [`alterTable` sub-arm table](#altertable-sub-arms--the-fine-grained-mandate-layer) for the implementation status of the built-in modules.
+
+| Arm | Mandate |
+| --- | --- |
+| `addColumn` | Append the column and backfill existing rows. A literal / NULL default is bulk-written; a non-foldable default (e.g. `new.<col>`) arrives as `backfillEvaluator`, which the module must call **per existing row**. NOT-NULL backfill rejection is gated by the `delegatesNotNullBackfill` capability. |
+| `dropColumn` | Remove the column slot and reindex remaining columns. |
+| `renameColumn` | Schema-only rename (no row migration). |
+| `alterPrimaryKey` | Re-key in place **or** throw `UNSUPPORTED` (see below). |
+| `addConstraint` | Materialize and validate the constraint (UNIQUE / FK) against existing rows; throw `CONSTRAINT` on a violation. |
+| `dropConstraint` / `renameConstraint` | Rewrite the schema (and any implicit covering index that backs a UNIQUE). No row migration. |
+| `alterColumn.setNotNull` | Backfill NULLs from the column default if present, else throw `CONSTRAINT`. |
+| `alterColumn.setDataType` | Schema-only if the physical type is unchanged; otherwise convert each row and throw `MISMATCH` on loss (narrowing, NaN, overflow). |
+| `alterColumn.setDefault` | Schema-only — new inserts pick up the default, existing rows are untouched. |
+| `alterColumn.setCollation` | Re-key / re-sort any PK / UNIQUE / index ordered by the column and re-validate uniqueness under the new collation (a set unique under `BINARY` may collide under `NOCASE` → throw `CONSTRAINT`). |
+
+### No silent divergence
+
+The hard rule for every arm: **a module that cannot honor the invoked change MUST throw `QuereusError(StatusCode.UNSUPPORTED)` with a sited message — never silently no-op.** A silent no-op (the store's PK-column `setCollation`, tracked by `store-pk-collate-module-capability`) leaves the catalog and the physical state diverged with the engine none the wiser; a thrown `UNSUPPORTED` lets the engine substitute a defined fallback or surface a clean user error. See the [recommended pattern](#recommended-capability-negotiation-pattern), rule 4.
 
 ### `alterPrimaryKey`
 
 The `alterPrimaryKey` variant is dispatched for `ALTER TABLE ... ALTER PRIMARY KEY (...)`. Each entry in `newPkColumns` gives the column `index` (0-based position in the table's column list) and whether the column is `desc`. An empty array means the table reverts to an implicit key.
 
-Modules that can re-key in place should handle the change directly and return an updated `TableSchema`. Modules that **cannot** re-key in place should throw `QuereusError(..., StatusCode.UNSUPPORTED)` — the runtime treats this as a signal to fall back to a generic table rebuild. The rebuild copies all rows from the old table to a new table with the updated PK definition, then swaps it in place.
+It is the template for the no-silent-divergence rule. Modules that can re-key in place should handle the change directly and return an updated `TableSchema`. Modules that **cannot** re-key in place should throw `QuereusError(StatusCode.UNSUPPORTED)` — `runAlterPrimaryKey` catches that specific code and falls back to a generic table rebuild that copies all rows from the old table into a new table with the updated PK definition, then swaps it in place (the memory module takes exactly this path; the store re-keys natively). Any other thrown error propagates unchanged.
 
 ## Best Practices
 
