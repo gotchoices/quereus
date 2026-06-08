@@ -27,11 +27,12 @@ import type * as AST from '../../parser/ast.js';
  * one call. A wrapper whose inner carries its own `compound` stops there (that inner is NOT
  * a pure wrapper — it re-compounds), so the inner compound is preserved verbatim.
  *
- * Used today by the read/plan path (`planner/building/select-compound.ts`). The write path
- * (`planner/mutation/set-op.ts` `leftBranchSelect`) does NOT yet unwrap — a write through a
- * left-wrapped compound view is currently rejected cleanly (it sees the synthetic `select *`);
- * `set-op-leftwrap-write` will reuse this same predicate there so neither path can drift on
- * what a pure wrapper is.
+ * Used by both the read/plan path (`planner/building/select-compound.ts`) and the write path
+ * (`planner/mutation/set-op.ts` `unwrapBranchSelect`, `set-op-leftwrap-write`), which share this
+ * one predicate so neither can drift on what a pure wrapper is. On the write side the unwrap makes
+ * a parenthesized LEFT compound operand a first-class subtree operand (its data UPDATE / DELETE /
+ * `set <subtreeFlag> = false` fan out through its leaves), exactly as the always-direct right
+ * compound operand already does.
  */
 export function unwrapPassthroughSubquery(sel: AST.SelectStmt): AST.QueryExpr | undefined {
 	if (!isPassthroughWrapper(sel)) return undefined;
