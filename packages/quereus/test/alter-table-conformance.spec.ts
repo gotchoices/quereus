@@ -1,0 +1,461 @@
+/**
+ * ALTER-conformance matrix — the "no silent divergence" contract.
+ *
+ * The hard rule (docs/module-authoring.md § "Schema Changes"): a
+ * `VirtualTableModule` that cannot honor an invoked `alterTable` arm MUST throw
+ * `QuereusError` with a sited message — never silently no-op. A statement that
+ * "succeeds but changes nothing" is the divergence signature this suite forbids
+ * (it is how the store PK-collation gap escaped review: a real mandate quietly
+ * became a schema-only update).
+ *
+ * Each (module × arm) cell must resolve to exactly one of:
+ *   - **honored** — the ALTER applies AND a post-ALTER read-back proves the
+ *     change is in force (a `table_info` probe or a behavioral probe), OR
+ *   - **clean reject** — a `QuereusError` whose `code` is one of the arm's
+ *     declared codes (`UNSUPPORTED`, or the data-dependent `CONSTRAINT` /
+ *     `MISMATCH`) with a non-empty, table/column-sited message.
+ *
+ * The forbidden third outcome — "did not throw, but the change never took
+ * effect" — is caught by running the honored arm's `confirm` read-back AFTER a
+ * non-throwing ALTER: if the ALTER silently no-op'd, `confirm` fails.
+ *
+ * This file covers the **memory** module (engine-native) and a stub module that
+ * omits `alterTable` entirely (asserting the engine's sited `UNSUPPORTED`). The
+ * store leg lives in `@quereus/store`'s test suite and the isolation-wrapped
+ * memory leg in `@quereus/isolation`'s — `@quereus/quereus` cannot depend on
+ * either (they depend on it), so the matrix is split across the three packages
+ * by necessity (see each leg's spec header).
+ */
+
+import { expect } from 'chai';
+import { Database } from '../src/index.js';
+import { MemoryTableModule } from '../src/vtab/memory/module.js';
+import { QuereusError } from '../src/common/errors.js';
+import { StatusCode, type SqlValue } from '../src/common/types.js';
+import type { AnyVirtualTableModule } from '../src/vtab/module.js';
+
+// ── Outcome contract ────────────────────────────────────────────────────────
+
+type Expectation =
+	| { kind: 'honored' }
+	| { kind: 'reject'; codes: StatusCode[]; site?: RegExp };
+
+/**
+ * One conformance arm: the seed SQL (parameterized by the `using` clause so the
+ * same arm runs against any module), the ALTER under test, its expected outcome,
+ * and a read-back probe that proves the post-state. For an honored arm `confirm`
+ * asserts the change is in force (failing on a silent no-op); for a reject arm it
+ * asserts the table is unchanged.
+ *
+ * `stubUnsupported` marks arms that surface the engine's sited `UNSUPPORTED`
+ * when `module.alterTable` is absent — i.e. arms with NO engine-side fallback.
+ * Exempt (false): ADD CHECK is engine-side; ALTER PRIMARY KEY has a rebuild
+ * fallback; RENAME COLUMN degrades to a documented engine-side schema-only
+ * rename. The memory leg runs every arm regardless; this flag only gates the
+ * no-`alterTable` stub leg.
+ */
+interface Arm {
+	label: string;
+	seed: (using: string) => string[];
+	alter: string;
+	memory: Expectation;
+	stubUnsupported: boolean;
+	confirm: (db: Database, outcome: 'honored' | 'rejected') => Promise<void>;
+}
+
+// ── Read-back helpers (the teeth: prove the change actually took effect) ──────
+
+async function rows(db: Database, sql: string, params?: SqlValue[]): Promise<Record<string, SqlValue>[]> {
+	const out: Record<string, SqlValue>[] = [];
+	for await (const r of db.eval(sql, params)) out.push(r);
+	return out;
+}
+
+async function columnNames(db: Database, table = 't'): Promise<string[]> {
+	return (await rows(db, `select name from table_info('${table}') order by cid`)).map(r => String(r.name));
+}
+
+async function columnInfo(db: Database, column: string, table = 't'): Promise<Record<string, SqlValue> | undefined> {
+	const all = await rows(db, `select name, type, notnull, pk, collation, dflt_value from table_info('${table}')`);
+	return all.find(r => String(r.name).toLowerCase() === column.toLowerCase());
+}
+
+async function pkColumns(db: Database, table = 't'): Promise<string[]> {
+	return (await rows(db, `select name from table_info('${table}') where pk > 0 order by pk`)).map(r => String(r.name));
+}
+
+/** Runs an ALTER, returning the thrown QuereusError or null. Re-throws non-Quereus errors (a crash is not a clean reject). */
+async function attemptAlter(db: Database, sql: string): Promise<QuereusError | null> {
+	try {
+		await db.exec(sql);
+		return null;
+	} catch (e) {
+		if (e instanceof QuereusError) return e;
+		throw e;
+	}
+}
+
+/** Asserts the given DML throws a CONSTRAINT (used by `confirm` to prove forward enforcement is live). */
+async function expectConstraint(db: Database, sql: string, label: string): Promise<void> {
+	const err = await attemptAlter(db, sql);
+	expect(err, `${label}: expected forward enforcement to reject "${sql}"`).to.be.instanceOf(QuereusError);
+	expect(err!.code, `${label}: enforcement error code`).to.equal(StatusCode.CONSTRAINT);
+}
+
+// ── The matrix ───────────────────────────────────────────────────────────────
+
+const ARMS: Arm[] = [
+	{
+		label: 'addColumn (nullable)',
+		seed: u => [`create table t (id integer primary key, name text)${u}`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t add column note text null`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const names = await columnNames(db);
+			if (outcome === 'honored') {
+				expect(names, 'new column present').to.include('note');
+				const r = await rows(db, `select note from t where id = 1`);
+				expect(r[0].note, 'existing row backfilled NULL').to.equal(null);
+			} else {
+				expect(names, 'table unchanged on reject').to.not.include('note');
+			}
+		},
+	},
+	{
+		label: 'addColumn (with literal DEFAULT)',
+		seed: u => [`create table t (id integer primary key, name text)${u}`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t add column qty integer default 7`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				const r = await rows(db, `select qty from t order by id`);
+				expect(r.map(x => x.qty), 'existing rows backfilled with DEFAULT').to.deep.equal([7, 7]);
+			} else {
+				expect(await columnNames(db), 'table unchanged on reject').to.not.include('qty');
+			}
+		},
+	},
+	{
+		label: 'addColumn NOT NULL, no DEFAULT, non-empty → CONSTRAINT',
+		seed: u => [`create table t (id integer primary key, name text)${u}`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t add column req text not null`,
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /req|not null/i },
+		stubUnsupported: true,
+		confirm: async (db) => {
+			expect(await columnNames(db), 'rejected add leaves the column absent').to.not.include('req');
+		},
+	},
+	{
+		label: 'dropColumn',
+		seed: u => [`create table t (id integer primary key, name text, extra text)${u}`, `insert into t values (1, 'a', 'x'), (2, 'b', 'y')`],
+		alter: `alter table t drop column extra`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const names = await columnNames(db);
+			if (outcome === 'honored') expect(names, 'dropped column gone').to.not.include('extra');
+			else expect(names, 'table unchanged on reject').to.include('extra');
+		},
+	},
+	{
+		label: 'renameColumn',
+		seed: u => [`create table t (id integer primary key, name text)${u}`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t rename column name to title`,
+		memory: { kind: 'honored' },
+		stubUnsupported: false, // engine degrades RENAME COLUMN to a schema-only rename when alterTable is absent
+		confirm: async (db, outcome) => {
+			const names = await columnNames(db);
+			if (outcome === 'honored') {
+				expect(names, 'new name present').to.include('title');
+				expect(names, 'old name gone').to.not.include('name');
+				const r = await rows(db, `select title from t where id = 1`);
+				expect(r[0].title, 'data preserved under new name').to.equal('a');
+			} else {
+				expect(names, 'table unchanged on reject').to.include('name');
+			}
+		},
+	},
+	{
+		label: 'alterPrimaryKey (memory: engine rebuild)',
+		seed: u => [`create table t (id integer primary key, code integer not null)${u}`, `insert into t values (1, 100), (2, 200)`],
+		alter: `alter table t alter primary key (code)`,
+		memory: { kind: 'honored' },
+		stubUnsupported: false, // memory throws UNSUPPORTED; the engine catches it and rebuilds
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				expect(await pkColumns(db), 'PK re-keyed to code').to.deep.equal(['code']);
+				const r = await rows(db, `select id from t where code = 100`);
+				expect(r[0]?.id, 'point lookup under new PK').to.equal(1);
+			} else {
+				expect(await pkColumns(db), 'PK unchanged on reject').to.deep.equal(['id']);
+			}
+		},
+	},
+	{
+		label: 'addConstraint UNIQUE',
+		seed: u => [`create table t (id integer primary key, email text)${u}`, `insert into t values (1, 'a@x'), (2, 'b@x')`],
+		alter: `alter table t add constraint u_email unique (email)`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') await expectConstraint(db, `insert into t values (3, 'a@x')`, 'UNIQUE');
+			else await db.exec(`insert into t values (3, 'a@x')`); // not enforced → no throw
+		},
+	},
+	{
+		label: 'addConstraint FOREIGN KEY',
+		seed: u => [
+			`pragma foreign_keys = true`,
+			`create table parent (pid integer primary key)${u}`,
+			`insert into parent values (1), (2)`,
+			`create table t (id integer primary key, pa integer)${u}`,
+			`insert into t values (1, 1), (2, 2)`,
+		],
+		alter: `alter table t add constraint fk_pa foreign key (pa) references parent(pid)`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') await expectConstraint(db, `insert into t values (3, 99)`, 'FK');
+			else await db.exec(`insert into t values (3, 99)`); // not enforced
+		},
+	},
+	{
+		// ADD CHECK stays in the engine emitter (runtime/emit/add-constraint.ts) and
+		// never routes through module.alterTable — so it is honored for EVERY module,
+		// memory and store alike. Hence `stubUnsupported: false` (exempt from the stub case).
+		label: 'addConstraint CHECK (engine-side)',
+		seed: u => [`create table t (id integer primary key, v integer)${u}`, `insert into t values (1, 5), (2, 9)`],
+		alter: `alter table t add constraint pos check (v > 0)`,
+		memory: { kind: 'honored' },
+		stubUnsupported: false,
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') await expectConstraint(db, `insert into t values (3, -1)`, 'CHECK');
+			else await db.exec(`insert into t values (3, -1)`);
+		},
+	},
+	{
+		label: 'dropConstraint',
+		seed: u => [
+			`create table t (id integer primary key, email text, constraint u_email unique (email))${u}`,
+			`insert into t values (1, 'a@x'), (2, 'b@x')`,
+		],
+		alter: `alter table t drop constraint u_email`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				await db.exec(`insert into t values (3, 'a@x')`); // dup now allowed
+				const cnt = await rows(db, `select count(*) as c from t where email = 'a@x'`);
+				expect(cnt[0].c, 'UNIQUE no longer enforced after drop').to.equal(2);
+			} else {
+				await expectConstraint(db, `insert into t values (3, 'a@x')`, 'dropConstraint-unchanged');
+			}
+		},
+	},
+	{
+		label: 'renameConstraint',
+		seed: u => [
+			`create table t (id integer primary key, email text, constraint u_email unique (email))${u}`,
+			`insert into t values (1, 'a@x'), (2, 'b@x')`,
+		],
+		alter: `alter table t rename constraint u_email to u2`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const names = (await rows(db, `select name from unique_constraint_info('t')`)).map(r => String(r.name));
+			if (outcome === 'honored') {
+				expect(names, 'constraint addressable under new name').to.include('u2');
+				expect(names, 'old name gone').to.not.include('u_email');
+			} else {
+				expect(names, 'name unchanged on reject').to.include('u_email');
+			}
+		},
+	},
+	{
+		label: 'alterColumn SET NOT NULL (data conforms)',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 5), (2, 9)`],
+		alter: `alter table t alter column v set not null`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(info?.notnull, 'column tightened to NOT NULL').to.equal(1);
+				await expectConstraint(db, `insert into t values (3, null)`, 'SET NOT NULL');
+			} else {
+				expect(info?.notnull, 'nullability unchanged on reject').to.equal(0);
+			}
+		},
+	},
+	{
+		label: 'alterColumn SET NOT NULL (existing NULL) → CONSTRAINT',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, null), (2, 9)`],
+		alter: `alter table t alter column v set not null`,
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /v|not null/i },
+		stubUnsupported: true,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'v');
+			expect(info?.notnull, 'nullability unchanged after rejected tighten').to.equal(0);
+		},
+	},
+	{
+		label: 'alterColumn DROP NOT NULL',
+		seed: u => [`create table t (id integer primary key, v integer not null)${u}`, `insert into t values (1, 5)`],
+		alter: `alter table t alter column v drop not null`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(info?.notnull, 'column relaxed to nullable').to.equal(0);
+				await db.exec(`insert into t values (3, null)`); // now permitted
+			} else {
+				expect(info?.notnull, 'nullability unchanged on reject').to.equal(1);
+			}
+		},
+	},
+	{
+		label: 'alterColumn SET DATA TYPE (lossy) → MISMATCH',
+		seed: u => [`create table t (id integer primary key, v text)${u}`, `insert into t values (1, 'abc'), (2, 'xyz')`],
+		alter: `alter table t alter column v set data type integer`,
+		memory: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /v|convert/i },
+		stubUnsupported: true,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'v');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after lossy reject').to.contain('text');
+		},
+	},
+	{
+		label: 'alterColumn SET DEFAULT',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 5)`],
+		alter: `alter table t alter column v set default 99`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				await db.exec(`insert into t (id) values (2)`);
+				const r = await rows(db, `select v from t where id = 2`);
+				expect(r[0].v, 'new insert picks up the SET DEFAULT').to.equal(99);
+			}
+		},
+	},
+	{
+		label: 'alterColumn SET COLLATE (non-PK UNIQUE, no collision) revalidates',
+		seed: u => [
+			`create table t (id integer primary key, name text, constraint u_name unique (name))${u}`,
+			`insert into t values (1, 'abc'), (2, 'xyz')`,
+		],
+		alter: `alter table t alter column name set collate nocase`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'name');
+			if (outcome === 'honored') {
+				expect(String(info?.collation).toUpperCase(), 'collation now NOCASE').to.equal('NOCASE');
+				// Forward UNIQUE is now collation-aware: 'ABC' collides with 'abc' under NOCASE.
+				await expectConstraint(db, `insert into t values (3, 'ABC')`, 'SET COLLATE revalidate');
+			} else {
+				expect(String(info?.collation).toUpperCase(), 'collation unchanged on reject').to.not.equal('NOCASE');
+			}
+		},
+	},
+];
+
+// ── No-`alterTable` stub: a module that omits the hook entirely. Every routed
+// arm must surface the engine's sited `UNSUPPORTED` ("does not support …"), not
+// a crash. Built by delegating create/connect/destroy to a memory module while
+// omitting `alterTable`/`renameTable` (it is NOT a MemoryTableModule subclass, so
+// the ALTER-PRIMARY-KEY memory-rebuild fast path is not mistakenly taken).
+
+function makeNoAlterModule(): AnyVirtualTableModule {
+	const inner = new MemoryTableModule();
+	return {
+		concurrencyMode: inner.concurrencyMode,
+		create: inner.create.bind(inner),
+		connect: inner.connect.bind(inner),
+		destroy: inner.destroy.bind(inner),
+		getCapabilities: inner.getCapabilities.bind(inner),
+		getBestAccessPlan: inner.getBestAccessPlan.bind(inner),
+		// alterTable + renameTable intentionally omitted.
+	};
+}
+
+// ── Drivers ──────────────────────────────────────────────────────────────────
+
+async function runArm(db: Database, arm: Arm, using: string, expectation: Expectation): Promise<void> {
+	for (const stmt of arm.seed(using)) await db.exec(stmt);
+	const err = await attemptAlter(db, arm.alter);
+
+	if (expectation.kind === 'honored') {
+		expect(err, `${arm.label}: expected honored, but ALTER threw: ${err?.message}`).to.equal(null);
+		await arm.confirm(db, 'honored');
+		return;
+	}
+
+	expect(
+		err,
+		`${arm.label}: expected a clean reject, but the ALTER succeeded — a statement that succeeds without taking effect is the silent-divergence signature this matrix forbids`,
+	).to.be.instanceOf(QuereusError);
+	expect(expectation.codes, `${arm.label}: reject code was ${err!.code} (${err!.message})`).to.include(err!.code);
+	expect(err!.message.trim().length, `${arm.label}: clean reject must carry a non-empty, sited message`).to.be.greaterThan(0);
+	if (expectation.site) expect(err!.message, `${arm.label}: reject message should be sited`).to.match(expectation.site);
+	await arm.confirm(db, 'rejected');
+}
+
+describe('ALTER conformance matrix — memory module', () => {
+	let db: Database;
+
+	afterEach(async () => {
+		if (db) await db.close();
+	});
+
+	for (const arm of ARMS) {
+		it(arm.label, async () => {
+			db = new Database();
+			await runArm(db, arm, '', arm.memory);
+		});
+	}
+});
+
+describe('ALTER conformance matrix — module without alterTable (sited UNSUPPORTED)', () => {
+	let db: Database;
+
+	afterEach(async () => {
+		if (db) await db.close();
+	});
+
+	// Only arms with NO engine-side fallback. ADD CHECK is engine-side; ALTER
+	// PRIMARY KEY has a rebuild fallback; RENAME COLUMN degrades to a schema-only
+	// rename — all three would be (legitimately) honored without alterTable, so
+	// they are exempt and covered separately below.
+	for (const arm of ARMS.filter(a => a.stubUnsupported)) {
+		it(`${arm.label} → UNSUPPORTED`, async () => {
+			db = new Database();
+			db.registerModule('noalter', makeNoAlterModule());
+			await runArm(db, arm, ' using noalter', {
+				kind: 'reject',
+				codes: [StatusCode.UNSUPPORTED],
+				site: /does not support|not support/i,
+			});
+		});
+	}
+
+	// RENAME COLUMN is documented to degrade to an engine-side schema-only rename
+	// when the module omits alterTable (module.ts: "renameColumn degrades to an
+	// engine-side schema-only rename instead"). Assert that contract explicitly —
+	// it is honored, and the read-back proves it is not a silent no-op.
+	it('renameColumn → honored via engine-side schema-only fallback', async () => {
+		db = new Database();
+		db.registerModule('noalter', makeNoAlterModule());
+		await db.exec(`create table t (id integer primary key, name text) using noalter`);
+		await db.exec(`insert into t values (1, 'a')`);
+		await db.exec(`alter table t rename column name to title`);
+		const names = await columnNames(db);
+		expect(names, 'new name present').to.include('title');
+		expect(names, 'old name gone').to.not.include('name');
+		const r = await rows(db, `select title from t where id = 1`);
+		expect(r[0].title, 'data preserved under the renamed column').to.equal('a');
+	});
+});

@@ -1,0 +1,377 @@
+/**
+ * ALTER-conformance matrix — isolation-wrapped-memory leg of the "no silent
+ * divergence" contract.
+ *
+ * Companion to `packages/quereus/test/alter-table-conformance.spec.ts` (memory +
+ * no-`alterTable` stub) and `packages/quereus-store/test/...` (store). The matrix
+ * is split across three packages because `@quereus/quereus` cannot depend on
+ * `@quereus/isolation` (the reverse holds) and because each leg reaches the engine
+ * by a different import root, so a single shared harness module cannot serve all
+ * three; the harness shape is duplicated per package, deliberately.
+ *
+ * `IsolationModule` forwards `alterTable` to the underlying module (here memory),
+ * so every (isolated × arm) outcome must MATCH the memory leg — honored arms stay
+ * honored, and crucially a memory `CONSTRAINT` / `MISMATCH` reject must NOT be
+ * turned into a silent success by the wrapper. The second describe block adds the
+ * wrapper-specific path: an open transaction with staged overlay rows, where the
+ * isolation layer pre-validates the issuer's own overlay before mutating the
+ * shared underlying (isolation-module.ts `alterTable`).
+ */
+
+import { describe, it, beforeEach, afterEach } from 'mocha';
+import { expect } from 'chai';
+import { Database, MemoryTableModule, QuereusError, StatusCode } from '@quereus/quereus';
+import type { SqlValue } from '@quereus/quereus';
+import { IsolationModule } from '../src/index.js';
+
+// ── Outcome contract ────────────────────────────────────────────────────────
+
+type Expectation =
+	| { kind: 'honored' }
+	| { kind: 'reject'; codes: StatusCode[]; site?: RegExp };
+
+interface Arm {
+	label: string;
+	seed: string[];
+	alter: string;
+	expect: Expectation;
+	confirm: (db: Database, outcome: 'honored' | 'rejected') => Promise<void>;
+}
+
+// ── Read-back helpers ─────────────────────────────────────────────────────────
+
+async function rows(db: Database, sql: string, params?: SqlValue[]): Promise<Record<string, SqlValue>[]> {
+	const out: Record<string, SqlValue>[] = [];
+	for await (const r of db.eval(sql, params)) out.push(r);
+	return out;
+}
+
+async function columnNames(db: Database, table = 't'): Promise<string[]> {
+	return (await rows(db, `select name from table_info('${table}') order by cid`)).map(r => String(r.name));
+}
+
+async function columnInfo(db: Database, column: string, table = 't'): Promise<Record<string, SqlValue> | undefined> {
+	const all = await rows(db, `select name, type, notnull, pk, collation, dflt_value from table_info('${table}')`);
+	return all.find(r => String(r.name).toLowerCase() === column.toLowerCase());
+}
+
+async function pkColumns(db: Database, table = 't'): Promise<string[]> {
+	return (await rows(db, `select name from table_info('${table}') where pk > 0 order by pk`)).map(r => String(r.name));
+}
+
+async function attemptAlter(db: Database, sql: string): Promise<QuereusError | null> {
+	try {
+		await db.exec(sql);
+		return null;
+	} catch (e) {
+		if (e instanceof QuereusError) return e;
+		throw e;
+	}
+}
+
+async function expectConstraint(db: Database, sql: string, label: string): Promise<void> {
+	const err = await attemptAlter(db, sql);
+	expect(err, `${label}: expected forward enforcement to reject "${sql}"`).to.be.instanceOf(QuereusError);
+	expect(err!.code, `${label}: enforcement code`).to.equal(StatusCode.CONSTRAINT);
+}
+
+// ── The matrix (outcomes must mirror the memory leg) ─────────────────────────
+
+const ARMS: Arm[] = [
+	{
+		label: 'addColumn (nullable)',
+		seed: [`create table t (id integer primary key, name text) using isolated`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t add column note text null`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const names = await columnNames(db);
+			if (outcome === 'honored') {
+				expect(names).to.include('note');
+				expect((await rows(db, `select note from t where id = 1`))[0].note).to.equal(null);
+			} else expect(names).to.not.include('note');
+		},
+	},
+	{
+		label: 'addColumn (with literal DEFAULT)',
+		seed: [`create table t (id integer primary key, name text) using isolated`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t add column qty integer default 7`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				expect((await rows(db, `select qty from t order by id`)).map(x => x.qty)).to.deep.equal([7, 7]);
+			} else expect(await columnNames(db)).to.not.include('qty');
+		},
+	},
+	{
+		label: 'addColumn NOT NULL, no DEFAULT, non-empty → CONSTRAINT',
+		seed: [`create table t (id integer primary key, name text) using isolated`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t add column req text not null`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /req|not null/i },
+		confirm: async (db) => { expect(await columnNames(db)).to.not.include('req'); },
+	},
+	{
+		label: 'dropColumn',
+		seed: [`create table t (id integer primary key, name text, extra text) using isolated`, `insert into t values (1, 'a', 'x'), (2, 'b', 'y')`],
+		alter: `alter table t drop column extra`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const names = await columnNames(db);
+			if (outcome === 'honored') expect(names).to.not.include('extra');
+			else expect(names).to.include('extra');
+		},
+	},
+	{
+		label: 'renameColumn',
+		seed: [`create table t (id integer primary key, name text) using isolated`, `insert into t values (1, 'a'), (2, 'b')`],
+		alter: `alter table t rename column name to title`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const names = await columnNames(db);
+			if (outcome === 'honored') {
+				expect(names).to.include('title');
+				expect(names).to.not.include('name');
+				expect((await rows(db, `select title from t where id = 1`))[0].title).to.equal('a');
+			} else expect(names).to.include('name');
+		},
+	},
+	{
+		label: 'addConstraint CHECK (engine-side)',
+		seed: [`create table t (id integer primary key, v integer) using isolated`, `insert into t values (1, 5), (2, 9)`],
+		alter: `alter table t add constraint pos check (v > 0)`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') await expectConstraint(db, `insert into t values (3, -1)`, 'CHECK');
+			else await db.exec(`insert into t values (3, -1)`);
+		},
+	},
+	{
+		label: 'renameConstraint',
+		seed: [`create table t (id integer primary key, email text, constraint u_email unique (email)) using isolated`, `insert into t values (1, 'a@x'), (2, 'b@x')`],
+		alter: `alter table t rename constraint u_email to u2`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const names = (await rows(db, `select name from unique_constraint_info('t')`)).map(r => String(r.name));
+			if (outcome === 'honored') {
+				expect(names).to.include('u2');
+				expect(names).to.not.include('u_email');
+			} else expect(names).to.include('u_email');
+		},
+	},
+	{
+		label: 'alterColumn SET NOT NULL (data conforms)',
+		seed: [`create table t (id integer primary key, v integer null) using isolated`, `insert into t values (1, 5), (2, 9)`],
+		alter: `alter table t alter column v set not null`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(info?.notnull).to.equal(1);
+				await expectConstraint(db, `insert into t values (3, null)`, 'SET NOT NULL');
+			} else expect(info?.notnull).to.equal(0);
+		},
+	},
+	{
+		label: 'alterColumn SET NOT NULL (existing NULL) → CONSTRAINT',
+		seed: [`create table t (id integer primary key, v integer null) using isolated`, `insert into t values (1, null), (2, 9)`],
+		alter: `alter table t alter column v set not null`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /v|not null/i },
+		confirm: async (db) => { expect((await columnInfo(db, 'v'))?.notnull).to.equal(0); },
+	},
+	{
+		label: 'alterColumn DROP NOT NULL',
+		seed: [`create table t (id integer primary key, v integer not null) using isolated`, `insert into t values (1, 5)`],
+		alter: `alter table t alter column v drop not null`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(info?.notnull).to.equal(0);
+				await db.exec(`insert into t values (3, null)`);
+			} else expect(info?.notnull).to.equal(1);
+		},
+	},
+	{
+		label: 'alterColumn SET DATA TYPE (lossy) → MISMATCH',
+		seed: [`create table t (id integer primary key, v text) using isolated`, `insert into t values (1, 'abc'), (2, 'xyz')`],
+		alter: `alter table t alter column v set data type integer`,
+		expect: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /v|convert/i },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'v'))?.type).toLowerCase()).to.contain('text');
+		},
+	},
+	{
+		label: 'alterColumn SET DEFAULT',
+		seed: [`create table t (id integer primary key, v integer null) using isolated`, `insert into t values (1, 5)`],
+		alter: `alter table t alter column v set default 99`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				await db.exec(`insert into t (id) values (2)`);
+				expect((await rows(db, `select v from t where id = 2`))[0].v).to.equal(99);
+			}
+		},
+	},
+];
+
+// ── Known isolation gaps (skipped, like the store PK-collation cell) ──────────
+//
+// These arms surface a real divergence: the isolated table builds its UNIQUE
+// merged-view enforcement structures from the schema at connect time and does
+// NOT refresh them after `alterTable`, so a runtime UNIQUE add / drop / collation
+// change is not honored by the overlay's pre-commit conflict check:
+//   - ADD UNIQUE  → the new constraint is missed by the merged-view pre-check; a
+//     duplicate slips through to the commit flush, where the underlying catches
+//     it and the layer raises StatusCode.INTERNAL ("isolation-layer invariant
+//     violation") instead of a clean CONSTRAINT.
+//   - DROP UNIQUE → the catalog drops the constraint (unique_constraint_info is
+//     empty) but a duplicate insert is STILL rejected — the enforcement persists.
+//   - SET COLLATE on a UNIQUE column → same root as ADD: the re-collated conflict
+//     is missed by the pre-check and surfaces as INTERNAL at flush.
+//
+// Owned by `isolation-runtime-constraint-propagation` (tickets/fix). Kept SKIPPED
+// so this harness stays green and independent; remove `.skip` once that lands.
+// (These are honored cleanly when the constraint is declared at CREATE — the
+// `cross-layer UNIQUE / PK conflict detection` suite in @quereus/store covers
+// that baseline.)
+const ISOLATION_GAP_ARMS: Arm[] = [
+	{
+		label: 'addConstraint UNIQUE (runtime-added) enforces with a clean CONSTRAINT',
+		seed: [`create table t (id integer primary key, email text) using isolated`, `insert into t values (1, 'a@x'), (2, 'b@x')`],
+		alter: `alter table t add constraint u_email unique (email)`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') await expectConstraint(db, `insert into t values (3, 'a@x')`, 'runtime UNIQUE');
+		},
+	},
+	{
+		label: 'dropConstraint UNIQUE stops enforcement',
+		seed: [`create table t (id integer primary key, email text, constraint u_email unique (email)) using isolated`, `insert into t values (1, 'a@x'), (2, 'b@x')`],
+		alter: `alter table t drop constraint u_email`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				await db.exec(`insert into t values (3, 'a@x')`); // should now be allowed
+				expect((await rows(db, `select count(*) as c from t where email = 'a@x'`))[0].c).to.equal(2);
+			}
+		},
+	},
+	{
+		label: 'alterColumn SET COLLATE (non-PK UNIQUE) revalidates with a clean CONSTRAINT',
+		seed: [`create table t (id integer primary key, name text, constraint u_name unique (name)) using isolated`, `insert into t values (1, 'abc'), (2, 'xyz')`],
+		alter: `alter table t alter column name set collate nocase`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			if (outcome === 'honored') {
+				expect(String((await columnInfo(db, 'name'))?.collation).toUpperCase()).to.equal('NOCASE');
+				await expectConstraint(db, `insert into t values (3, 'ABC')`, 'SET COLLATE revalidate');
+			}
+		},
+	},
+];
+
+// ── Driver ────────────────────────────────────────────────────────────────────
+
+async function runArm(db: Database, arm: Arm): Promise<void> {
+	for (const stmt of arm.seed) await db.exec(stmt);
+	const err = await attemptAlter(db, arm.alter);
+
+	if (arm.expect.kind === 'honored') {
+		expect(err, `${arm.label}: expected honored, but ALTER threw: ${err?.message}`).to.equal(null);
+		await arm.confirm(db, 'honored');
+		return;
+	}
+
+	expect(
+		err,
+		`${arm.label}: expected a clean reject, but the wrapper let the ALTER succeed — a silent success here would mean the isolation layer swallowed a memory reject`,
+	).to.be.instanceOf(QuereusError);
+	expect(arm.expect.codes, `${arm.label}: reject code was ${err!.code} (${err!.message})`).to.include(err!.code);
+	expect(err!.message.trim().length, `${arm.label}: reject must carry a sited message`).to.be.greaterThan(0);
+	if (arm.expect.site) expect(err!.message, `${arm.label}: reject message should be sited`).to.match(arm.expect.site);
+	await arm.confirm(db, 'rejected');
+}
+
+describe('ALTER conformance matrix — isolation-wrapped memory', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('isolated', new IsolationModule({ underlying: new MemoryTableModule() }));
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	for (const arm of ARMS) {
+		it(arm.label, async () => {
+			await runArm(db, arm);
+		});
+	}
+
+	// Skipped pending isolation-runtime-constraint-propagation (see ISOLATION_GAP_ARMS).
+	for (const arm of ISOLATION_GAP_ARMS) {
+		it.skip(`${arm.label} [isolation-runtime-constraint-propagation]`, async () => {
+			await runArm(db, arm);
+		});
+	}
+});
+
+// ── Wrapper-specific: ALTER over an open transaction with staged overlay rows.
+// The isolation layer pre-validates the issuer's own overlay before mutating the
+// shared underlying, so an honored arm migrates staged rows forward and a reject
+// arm still rejects (never a silent success) even when the only rows live in the
+// overlay.
+
+describe('ALTER over staged overlay rows (isolation layer)', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('isolated', new IsolationModule({ underlying: new MemoryTableModule() }));
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('honored ADD COLUMN migrates a staged overlay row forward (NULL in the new column)', async () => {
+		await db.exec(`create table t (id integer primary key, name text) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 'Alice')`); // lives only in the overlay
+		await db.exec(`alter table t add column score integer`);
+
+		const row = await db.get(`select id, name, score from t where id = 1`);
+		expect(row, 'staged row survives the ALTER').to.deep.equal({ id: 1, name: 'Alice', score: null });
+		await db.exec('commit');
+
+		const after = await db.get(`select score from t where id = 1`);
+		expect(after?.score, 'change persists past commit').to.equal(null);
+	});
+
+	it('does NOT turn a NOT-NULL backfill reject into a silent success when the table is non-empty only in the overlay', async () => {
+		await db.exec(`create table t (id integer primary key, name text) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 'Alice')`); // overlay-only; committed table is empty
+		// ADD COLUMN NOT NULL with no usable default against a (merged) non-empty table must reject,
+		// not silently succeed — the staged overlay row would otherwise carry a NULL in a NOT NULL column.
+		const err = await attemptAlter(db, `alter table t add column req text not null`);
+		expect(err, 'NOT NULL backfill must reject even when rows are overlay-only').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+		expect(await columnNames(db), 'column absent after the rejected ALTER').to.not.include('req');
+
+		await db.exec('rollback');
+	});
+
+	it('honored DROP COLUMN drops the column from a staged overlay row', async () => {
+		await db.exec(`create table t (id integer primary key, name text, extra text) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 'Alice', 'x')`);
+		await db.exec(`alter table t drop column extra`);
+
+		const row = await db.get(`select * from t where id = 1`);
+		expect(row, 'staged row reshaped without the dropped column').to.deep.equal({ id: 1, name: 'Alice' });
+
+		await db.exec('rollback');
+	});
+});
