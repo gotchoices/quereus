@@ -334,9 +334,10 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 
 	it('writes a null-propagating member self-reference (present increments, absent stays absent — the filtered materialize creates no row)', async () => {
 		// `set c = c + 1` lowers to `T_c.c + 1` — the owning member's own column. Present rows take the
-		// matched UPDATE; absent rows take a materialize INSERT whose null-substituted image is
-		// `null + 1` = null, so the runtime non-empty filter is constant-false and no row springs into
-		// being. The owner qualifier is stripped so the matched UPDATE targets T_c directly.
+		// matched UPDATE; for absent rows the null-substituted non-empty filter is `(null + 1) is not
+		// null` → constant-false, so the materialize INSERT is skipped at plan time (no row springs
+		// into being either way). The owner qualifier is stripped so the matched UPDATE targets T_c
+		// directly.
 		const db = new Database();
 		try {
 			await setup(db);
@@ -636,19 +637,61 @@ describe('lens decomposition put: UPDATE of a multi-value-column optional member
 		}
 	});
 
-	it('rejects a partial self-update that leaves a non-null-defaulted sibling value column unassigned', async () => {
-		// `set e1 = e1 + 1` on M_def (e2 carries `default 7`) is a self-reference, but its materialize
-		// INSERT for an absent row would leave e2 to its non-null default — silently widening the absent
-		// row's image. We cannot statically tell `e1 + 1` (null-propagating, never materializes) from
-		// `coalesce(e1, 0) + 1` (materializes), so the same widen gate the constant/anchor paths enforce
-		// rejects it. This is an intentional surface change: the old matched-update-only self path
-		// silently accepted this partial write.
+	it('a null-propagating partial self-update materializes nothing (present rows only), leaving a non-null-defaulted sibling unwidened', async () => {
+		// `set e1 = e1 + 1` on M_def (e2 carries `default 7`) is a null-propagating self-reference. Its
+		// null-substituted non-empty filter `((null + 1) is not null)` folds **constant-false** at plan
+		// time — no absent row can ever materialize — so the materialize INSERT is skipped, and with it
+		// (the gates live inside the builder) the unassigned-value-column widen gate. The group degrades
+		// to a present-rows-only matched UPDATE. The present row (id=1) updates e1 and keeps e2; the
+		// absent row (id=2) materializes nothing, so e2's default never widens it. This recovers the
+		// pre-materialize self-path behavior the unconditional gate had regressed into a reject.
 		const db = new Database();
 		try {
 			await setupMulti(db);
-			await expectThrows(() => db.exec('update x.M set e1 = e1 + 1 where id = 2'), /silently widening|base default/i);
+			await db.exec('update x.M set e1 = e1 + 1 where id = 1');   // present (e1=1) → e1=2, e2 untouched
+			expect(await rows(db, 'select id, e1, e2 from main.M_def order by id')).to.deep.equal([{ id: 1, e1: 2, e2: 1 }]);
+			await db.exec('update x.M set e1 = e1 + 1 where id = 2');   // absent → materializes nothing (no widen)
+			expect(await rows(db, 'select count(*) as n from main.M_def where id = 2')).to.deep.equal([{ n: 0 }]);
+			// The present row is untouched by the absent-row attempt; e2 was never widened to a default.
+			expect(await rows(db, 'select id, e1, e2 from main.M_def order by id')).to.deep.equal([{ id: 1, e1: 2, e2: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a genuinely-materializing partial self-update that leaves a non-null-defaulted sibling unassigned', async () => {
+		// `set e1 = coalesce(e1, 0) + 1` on M_def is a null→non-null self-reference: its filter
+		// `((coalesce(null, 0) + 1) is not null)` folds **constant-true**, so an absent row WOULD
+		// materialize. The materialize INSERT is therefore emitted and its widen gate fires — e2
+		// (`default 7`) is unassigned, so materializing would silently widen the absent row's image.
+		// Rejected at plan time. (Contrast the dead `e1 + 1` case above, now accepted: only a
+		// statically-live materialize trips the gate.)
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await expectThrows(() => db.exec('update x.M set e1 = coalesce(e1, 0) + 1 where id = 2'), /silently widening|base default/i);
 			// Atomic: nothing materialized.
 			expect(await rows(db, 'select count(*) as n from main.M_def where id = 2')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a non-foldable (parameterized) self value stays on the emit path and materializes (not silently skipped)', async () => {
+		// `set c1 = coalesce(c1, :x)` over M_opt (c1, c2 both nullable): a self-reference whose null-
+		// substituted filter `((coalesce(null, :x)) is not null)` cannot be folded at plan time — the
+		// parameter is unbound during plan-time folding (the evaluator uses an empty param map), so it
+		// throws and foldsConstantFalse stays conservative (`false`). The materialize INSERT is emitted
+		// (its widen gate passes: c2 is nullable-no-default). At runtime (:x = 5) the absent row (id=2)
+		// materializes coalesce(null, 5) = 5 with c2 landing null — proving the non-foldable path is
+		// **not** silently skipped (a skip would have left id=2 absent).
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = coalesce(c1, :x) where id = 2', { x: 5 });
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 100, c2: 200 }, { id: 2, c1: 5, c2: null },
+			]);
 		} finally {
 			await db.close();
 		}

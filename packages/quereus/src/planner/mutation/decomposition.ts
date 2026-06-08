@@ -10,6 +10,8 @@ import type { SqlValue } from '../../common/types.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd } from './single-source.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
+import { buildExpression } from '../building/expression.js';
+import { createRuntimeExpressionEvaluator } from '../analysis/const-evaluator.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
@@ -1075,17 +1077,28 @@ function emitOptionalMemberUpdate(
 	}
 
 	if (hasSelf) {
-		// Self-reference group → two distinct ops. Present rows take the matched UPDATE over the
-		// owner-qualifier-stripped values (their real prior member value). Absent rows take a
-		// materialize INSERT that evaluates the self-expression with the owner's own columns
-		// substituted to NULL (an absent row's prior value is null), gated by a runtime non-empty
-		// filter: a null-propagating self-expression (`c + 1` → null) materializes nothing, while a
-		// null→non-null one (`coalesce(c, 0) + 1`) does. The UPDATE must precede the INSERT so the
-		// matched rows are settled before the `do nothing` materialize cedes them (see the doc above
-		// for why these cannot collapse into a single upsert).
+		// Self-reference group → the matched UPDATE for present rows over the owner-qualifier-stripped
+		// values (their real prior member value), plus — only when the materialize is statically
+		// **live** — a materialize INSERT for absent rows that evaluates the self-expression with the
+		// owner's own columns substituted to NULL (an absent row's prior value is null), gated by a
+		// runtime non-empty filter: a null-propagating self-expression (`c + 1` → null) materializes
+		// nothing, while a null→non-null one (`coalesce(c, 0) + 1`) does.
+		//
+		// When that null-substituted non-empty filter folds **constant-false** at plan time (every
+		// self cell null-propagates and no non-null constant sibling keeps it alive), no absent row
+		// can ever materialize — so we emit ONLY the matched UPDATE (present-rows-only) and skip the
+		// INSERT. Because both soundness gates live inside {@link buildSelfMaterializeInsertSelect},
+		// skipping the call skips them with it: sound, since a gate is only a plan-time proxy for "a
+		// materialized row would violate", and no row materializes. A non-foldable / volatile /
+		// parameterized value cannot be proven dead, so it stays live (emit + gate) — conservative,
+		// matching the always-emit behavior. The UPDATE must precede the INSERT so the matched rows
+		// are settled before the `do nothing` materialize cedes them (see the doc above for why these
+		// cannot collapse into a single upsert).
 		ops.push(memberUpdateOp(ctx, view, shape, member,
 			cells.map(c => ({ column: c.basisColumn, value: stripMemberQualifier(c.value, member) })), pred, stmt));
-		ops.push(buildSelfMaterializeInsertSelect(ctx, view, shape, member, cells, pred, stmt));
+		if (!foldsConstantFalse(ctx, selfMaterializeNonEmptyFilter(cells, member))) {
+			ops.push(buildSelfMaterializeInsertSelect(ctx, view, shape, member, cells, pred, stmt));
+		}
 		return;
 	}
 
@@ -1217,6 +1230,11 @@ function buildOptionalMemberInsertSelect(
  * materializes. `on conflict (<memberKey>) do nothing` cedes present rows to the matched UPDATE
  * (which runs first), so only genuinely-absent rows are created — never an upsert (the matched and
  * materialize values are computed over different scans and disagree row-for-row by construction).
+ *
+ * The caller emits this builder (and therefore runs the two soundness gates) **only when the
+ * materialize is statically live** — when the null-substituted non-empty filter cannot be proven
+ * constant-false at plan time ({@link foldsConstantFalse}). A provably-dead materialize is skipped
+ * entirely, taking both gates with it (sound: no row materializes, so neither gate can be violated).
  */
 function buildSelfMaterializeInsertSelect(
 	ctx: PlanningContext,
@@ -1249,12 +1267,12 @@ function buildSelfMaterializeInsertSelect(
 	}
 	assertNoMissingNotNull(view, schema, targetColumns.map((baseColumn): DecompInsertColumn => ({ baseColumn })));
 
-	// Non-empty image filter: OR-chain `<nulledValue> is not null` so a null-propagating
-	// self-expression creates no phantom row (constant-false), conjoined with the user predicate.
-	const nonEmpty = nulled
-		.map((n): AST.Expression => ({ type: 'unary', operator: 'IS NOT NULL', expr: cloneExpr(n.value) }))
-		.reduce((acc, e): AST.Expression => acc ? { type: 'binary', operator: 'OR', left: acc, right: e } : e);
-	const where = combineAnd(pred ? cloneExpr(pred) : undefined, nonEmpty);
+	// Non-empty image filter (the shared {@link selfMaterializeNonEmptyFilter} OR-chain
+	// `<nulledValue> is not null`) so a null-propagating self-expression creates no phantom row
+	// (constant-false), conjoined with the user predicate. The identical filter, folded WITHOUT the
+	// user predicate, is the caller's static dead-materialize check ({@link foldsConstantFalse}); the
+	// shared helper keeps the two from drifting.
+	const where = combineAnd(pred ? cloneExpr(pred) : undefined, selfMaterializeNonEmptyFilter(cells, member));
 
 	const select: AST.SelectStmt = {
 		type: 'select',
@@ -1273,6 +1291,43 @@ function buildSelfMaterializeInsertSelect(
 		loc: stmt.loc,
 	};
 	return { table: ref, op: 'insert', statement };
+}
+
+/**
+ * The self-materialize non-empty image filter: the OR-chain `<nulledValue> is not null` over each
+ * cell's value with the owner's own columns substituted to NULL ({@link substituteOwnerColumnsWithNull}).
+ * Shared by {@link buildSelfMaterializeInsertSelect} (where it is conjoined with the user predicate as
+ * the emitted INSERT's WHERE) and the `hasSelf` branch's static dead-materialize check (folded on its
+ * own, {@link foldsConstantFalse}) so the two can never drift. `is not null` is total, so for a
+ * null-propagating self group with no non-null constant sibling every disjunct is `null is not null`
+ * → the whole chain folds constant-false.
+ */
+function selfMaterializeNonEmptyFilter(cells: readonly OptionalCell[], member: DecompositionMember): AST.Expression {
+	return cells
+		.map((c): AST.Expression => ({ type: 'unary', operator: 'IS NOT NULL', expr: substituteOwnerColumnsWithNull(c.value, member) }))
+		.reduce((acc, e): AST.Expression => acc ? { type: 'binary', operator: 'OR', left: acc, right: e } : e);
+}
+
+/**
+ * True when `expr` provably folds **constant-false** at plan time — used by the `hasSelf` branch to
+ * decide whether the self-materialize is dead (no absent row can materialize). We reuse the engine's
+ * own constant folding rather than hand-rolling an evaluator: build the expression to a scalar plan
+ * node ({@link buildExpression}) and run it through {@link createRuntimeExpressionEvaluator}. The
+ * input is the {@link selfMaterializeNonEmptyFilter} OR-chain (column-ref-free after null
+ * substitution — every self leaf is the owner's own column, a constant sibling carries none), so the
+ * fold is a deterministic plan-time constant. `is not null` never yields NULL, so a dead materialize
+ * folds to boolean `false` (defensively also `0` / `0n`). Anything else — a non-null fold, a Promise
+ * (async / non-constant), or a throw (volatile / unbound parameter) — is NOT provably dead, so we
+ * stay conservative and return `false` (emit the materialize + its gates).
+ */
+function foldsConstantFalse(ctx: PlanningContext, expr: AST.Expression): boolean {
+	try {
+		const node = buildExpression(ctx, expr);
+		const value = createRuntimeExpressionEvaluator(ctx.db)(node);
+		return value === false || value === 0 || value === 0n;
+	} catch {
+		return false;
+	}
 }
 
 /**
