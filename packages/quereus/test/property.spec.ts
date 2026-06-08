@@ -2523,6 +2523,164 @@ describe('Property-Based Tests', () => {
 			// Rejected on DIFF (symmetric difference desugars to two EXCEPTs — ambiguous).
 			expect(() => parser.parse('select id from A diff exists left as inA select id from B')).to.throw();
 		});
+
+		// --- Nestable flagged set-ops (read half, `nestable-flagged-set-ops-read`) ---
+		// A (possibly flagged) `SetOperationNode` may itself be an operand of an outer one
+		// (model (b)): the outer arity check / union schema / dedup / set identity are on
+		// DATA columns only, and an inner operand's flag columns are SURFACED as readable
+		// columns of the outer view under the projection rule
+		// `[data] ++ [L flags] ++ [R flags] ++ [own flags]`. A surfaced inner flag reads as
+		// `tuple ∈ <that operand's data relation>` (default-false when the output row is
+		// absent from the operand). The nested form is authored with a parenthesized right
+		// operand. The WRITE half is the separate `nestable-flagged-set-ops` ticket.
+		async function seedNested(): Promise<void> {
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			// A={(1,10),(2,20)}, B={(2,20),(3,30)}, C={(3,30),(4,40)} → (B∪C)={(2,20),(3,30),(4,40)}.
+			await db.exec('insert into A values (1, 10), (2, 20)');
+			await db.exec('insert into B values (2, 20), (3, 30)');
+			await db.exec('insert into C values (3, 30), (4, 40)');
+		}
+
+		const NESTED_BODY = 'select id, x from A union exists left as inA, exists right as inSub '
+			+ '(select id, x from B union exists left as inB, exists right as inC select id, x from C)';
+
+		it('nested read agreement: inA/inB/inC/inSub agree with A/B/C/(B∪C) row-by-row', async () => {
+			await seedNested();
+			await db.exec(`create view Vn as ${NESTED_BODY}`);
+			const rows = await readRows('select id, x, inB, inC, inA, inSub from Vn order by id');
+			expect(rows).to.deep.equal([
+				{ id: 1, x: 10, inB: false, inC: false, inA: true,  inSub: false }, // A only
+				{ id: 2, x: 20, inB: true,  inC: false, inA: true,  inSub: true  }, // A & B
+				{ id: 3, x: 30, inB: true,  inC: true,  inA: false, inSub: true  }, // B & C
+				{ id: 4, x: 40, inB: false, inC: true,  inA: false, inSub: true  }, // C only
+			]);
+			// Each surfaced flag agrees row-by-row with actual membership in its data relation.
+			const inA = new Set((await readRows('select id from A')).map(r => r.id));
+			const inB = new Set((await readRows('select id from B')).map(r => r.id));
+			const inC = new Set((await readRows('select id from C')).map(r => r.id));
+			const inSub = new Set((await readRows('select id from B union select id from C')).map(r => r.id));
+			for (const r of rows) {
+				expect(r.inA, `inA id=${r.id}`).to.equal(inA.has(r.id));
+				expect(r.inB, `inB id=${r.id}`).to.equal(inB.has(r.id));
+				expect(r.inC, `inC id=${r.id}`).to.equal(inC.has(r.id));
+				expect(r.inSub, `inSub id=${r.id}`).to.equal(inSub.has(r.id));
+			}
+		});
+
+		it('ORDER BY a surfaced inner flag resolves through createSetOperationScope at depth', async () => {
+			await seedNested();
+			// A trailing ORDER BY on the compound body references a SURFACED INNER flag (inB) —
+			// it must resolve through `createSetOperationScope`, which iterates the surfaced
+			// columns (data + inner flags + own flags) positionally at depth.
+			const rows = await readRows(`${NESTED_BODY} order by inB desc, id`);
+			// inB=true rows (ids 2,3 — present in B) sort first, then inB=false (ids 1,4).
+			expect(rows.map(r => r.id)).to.deep.equal([2, 3, 1, 4]);
+		});
+
+		it('outer intersect / except over a flagged subtree: surfaced inner flags agree with the probe', async () => {
+			await seedNested();
+			// intersect: visible rows are in A AND (B∪C) = {(2,20)}; inner flags read off the subtree row.
+			await db.exec('create view Vni as select id, x from A intersect exists left as inA, exists right as inSub '
+				+ '(select id, x from B union exists left as inB, exists right as inC select id, x from C)');
+			expect(await readRows('select id, x, inB, inC, inA, inSub from Vni order by id')).to.deep.equal([
+				{ id: 2, x: 20, inB: true, inC: false, inA: true, inSub: true },
+			]);
+			// except: visible rows are in A and NOT (B∪C) = {(1,10)}; absent from the subtree ⇒ inner flags default false.
+			await db.exec('create view Vne as select id, x from A except exists left as inA, exists right as inSub '
+				+ '(select id, x from B union exists left as inB, exists right as inC select id, x from C)');
+			expect(await readRows('select id, x, inB, inC, inA, inSub from Vne order by id')).to.deep.equal([
+				{ id: 1, x: 10, inB: false, inC: false, inA: true, inSub: false },
+			]);
+		});
+
+		it('nested union all: bag multiplicity preserved; surfaced inner flags read off the buffered rows', async () => {
+			await db.exec('create table P (id integer primary key, g integer) using memory');
+			await db.exec('create table Q (id integer primary key, g integer) using memory');
+			await db.exec('create table S (id integer primary key, g integer) using memory');
+			// P has the duplicate data tuple g=5 (×2); Q={5}, S={9} → inner (Q∪S)={5,9}.
+			await db.exec('insert into P values (1, 5), (2, 5)');
+			await db.exec('insert into Q values (1, 5)');
+			await db.exec('insert into S values (1, 9)');
+			// Outer UNION ALL keeps both P copies; inner is a flagged DISTINCT union (Q∪[inB,inC]S).
+			await db.exec('create view Vu as select g from P union all exists left as inA, exists right as inSub (select g from Q union exists left as inB, exists right as inC select g from S)');
+			// inB≡g∈Q={5}; inC≡g∈S={9}; inA≡g∈P={5}; inSub≡g∈(Q∪S)={5,9}.
+			const rows = await readRows('select g, inB, inC, inA, inSub from Vu order by g');
+			expect(rows).to.deep.equal([
+				{ g: 5, inB: true,  inC: false, inA: true,  inSub: true }, // P copy
+				{ g: 5, inB: true,  inC: false, inA: true,  inSub: true }, // P copy (bag keeps both)
+				{ g: 5, inB: true,  inC: false, inA: true,  inSub: true }, // inner (Q∪S) copy
+				{ g: 9, inB: false, inC: true,  inA: false, inSub: true }, // inner-only (g∉P) ⇒ inA false
+			]);
+		});
+
+		it('flag-less subtree read regression: inSub ≡ tuple ∈ (B∪C), no inner flags surfaced', async () => {
+			await seedNested();
+			// The inner `(B union C)` is flag-less, so only the outer inA/inSub surface — the one
+			// nested behavior that already worked stays green.
+			await db.exec('create view Vf as select id, x from A union exists left as inA, exists right as inSub (select id, x from B union select id, x from C)');
+			const rows = await readRows('select * from Vf order by id');
+			expect(Object.keys(rows[0]), 'no inner flags surfaced').to.deep.equal(['id', 'x', 'inA', 'inSub']);
+			expect(rows).to.deep.equal([
+				{ id: 1, x: 10, inA: true,  inSub: false }, // A only — inSub false (not in B∪C)
+				{ id: 2, x: 20, inA: true,  inSub: true  },
+				{ id: 3, x: 30, inA: false, inSub: true  },
+				{ id: 4, x: 40, inA: false, inSub: true  },
+			]);
+		});
+
+		it('flag-less outer surfaces inner flags: A union (B∪[inB,inC] C) still exposes inB/inC', async () => {
+			await seedNested();
+			// No outer membership, but the inner flagged compound's inB/inC surface as outer columns
+			// (selected via hasSurfacedFlags, not hasMembershipColumns).
+			await db.exec('create view Vo as select id, x from A union (select id, x from B union exists left as inB, exists right as inC select id, x from C)');
+			const rows = await readRows('select * from Vo order by id');
+			expect(Object.keys(rows[0]), 'inner flags surface, no own flags').to.deep.equal(['id', 'x', 'inB', 'inC']);
+			const inB = new Set((await readRows('select id from B')).map(r => r.id));
+			const inC = new Set((await readRows('select id from C')).map(r => r.id));
+			for (const r of rows) {
+				expect(r.inB, `inB id=${r.id}`).to.equal(inB.has(r.id));
+				expect(r.inC, `inC id=${r.id}`).to.equal(inC.has(r.id));
+			}
+			// (1,10) is A-only — absent from the subtree ⇒ both inner flags default false.
+			const a1 = rows.find(r => r.id === 1)!;
+			expect(a1.inB, 'A-only row default-false inB').to.equal(false);
+			expect(a1.inC, 'A-only row default-false inC').to.equal(false);
+		});
+
+		it('Key Soundness at depth: surfaced layout, no flag in a key, key → flag FD, shifted domains', async () => {
+			await seedNested();
+			const nested = findSetOp(NESTED_BODY);
+			// Surfaced layout [id, x, inB, inC, inA, inSub] — data first, then inner flags, then own flags.
+			const cols = nested.getType().columns;
+			expect(cols.map(c => c.name)).to.deep.equal(['id', 'x', 'inB', 'inC', 'inA', 'inSub']);
+			// Data columns / keys stay on [id, x]; no flag index appears in any claimed key (Inv. 1–2).
+			expect(nested.getType().columns.length).to.equal(6);
+			for (const key of keysOf(nested)) {
+				for (const flagIdx of [2, 3, 4, 5]) {
+					expect(key, `flag idx ${flagIdx} must not be in a claimed key`).to.not.include(flagIdx);
+				}
+			}
+			// key → flag FD present over the distinct nesting: the all-data superkey determines
+			// every surfaced flag (inner AND own — each is a function of the data tuple it probes).
+			const fds = nested.physical?.fds ?? [];
+			for (const flagIdx of [2, 3, 4, 5]) {
+				expect(fds.some(fd => fd.dependents.includes(flagIdx) && fd.determinants.length > 0),
+					`expected key → flag FD for idx ${flagIdx}`).to.equal(true);
+			}
+			// Every flag column is NOT NULL.
+			for (const flagIdx of [2, 3, 4, 5]) {
+				expect(cols[flagIdx].type.nullable, `flag idx ${flagIdx} NOT NULL`).to.equal(false);
+			}
+			// The OWN flags carry a {true,false} enum domain at their SHIFTED indices (4, 5),
+			// after the data columns and the surfaced inner flags.
+			const domains = nested.physical?.domainConstraints ?? [];
+			for (const flagIdx of [4, 5]) {
+				expect(domains.find(d => d.column === flagIdx && d.kind === 'enum'),
+					`expected {true,false} domain at shifted idx ${flagIdx}`).to.not.equal(undefined);
+			}
+		});
 	});
 
 	// --- Parenthesized compound set-operation legs (parenthesized-compound-set-op-legs) ---

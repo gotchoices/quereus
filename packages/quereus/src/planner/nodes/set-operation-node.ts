@@ -25,6 +25,25 @@ export interface SetOpMembershipSpec {
   readonly branch: 'left' | 'right';
 }
 
+/**
+ * Recursive DATA (non-flag) arity of a set-operation operand. Flags are always
+ * appended after the data columns at every depth, so a `SetOperationNode`'s data
+ * arity is its left operand's data arity — bottoming out at the left-most non-set-op
+ * leaf. A plain operand's data arity is simply its column count.
+ */
+function dataArity(node: RelationalPlanNode): number {
+  return node instanceof SetOperationNode ? node.dataColumnCount() : node.getType().columns.length;
+}
+
+/**
+ * Count of an operand's surfaced flag columns — everything beyond its data arity.
+ * Zero for an unflagged leaf or a flag-less set-op; the recursive total of surfaced
+ * flags for a (possibly nested) flagged set-op operand.
+ */
+function flagCount(node: RelationalPlanNode): number {
+  return node.getType().columns.length - dataArity(node);
+}
+
 export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
   readonly nodeType = PlanNodeType.SetOperation;
   private attributesCache: Cached<readonly Attribute[]>;
@@ -41,39 +60,88 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     public readonly membership?: readonly SetOpMembershipSpec[],
   ) {
     super(scope, left.getTotalCost() + right.getTotalCost());
-    // Validate column counts
-    const leftCols = left.getType().columns;
-    const rightCols = right.getType().columns;
-    if (leftCols.length !== rightCols.length) {
-      throw new QuereusError(`SET operation column count mismatch: left has ${leftCols.length}, right has ${rightCols.length}`, StatusCode.ERROR);
+    // Validate DATA column counts only. Alignment / the union schema / dedup / set
+    // identity are all on data columns (model (b), `nestable-flagged-set-ops`): an
+    // operand may itself be a (flagged) `SetOperationNode` whose flag columns inflate
+    // its total arity but NOT its data arity, so comparing totals would spuriously
+    // reject `A union[…] (B union[…] C)`. `dataArity` recurses to the left-most
+    // non-set-op leaf, so an inner operand's surfaced flags never enter the check.
+    const leftData = dataArity(left);
+    const rightData = dataArity(right);
+    if (leftData !== rightData) {
+      throw new QuereusError(`SET operation column count mismatch: left has ${leftData}, right has ${rightData}`, StatusCode.ERROR);
     }
     // TODO: optionally check type compatibility (affinity)
     this.attributesCache = new Cached(() => this.buildAttributes());
   }
 
-  /** True when this set operation exposes one or more membership flags. */
+  /** True when this set operation exposes its OWN membership flags. */
   get hasMembershipColumns(): boolean {
     return !!this.membership && this.membership.length > 0;
   }
 
-  /** Number of data (non-flag) columns — the left child's column count. */
-  private dataColumnCount(): number {
-    return this.left.getType().columns.length;
+  /**
+   * True when this node surfaces ANY flag column — its own membership flags OR an
+   * operand's surfaced flags (a flag-less outer over a flagged operand still surfaces
+   * the inner flags). The runtime read half selects the buffering surfacing runner on
+   * this, not on `hasMembershipColumns` alone.
+   */
+  get hasSurfacedFlags(): boolean {
+    return this.hasMembershipColumns || this.leftFlagCount > 0 || this.rightFlagCount > 0;
   }
 
+  /**
+   * Number of DATA (non-flag) columns — recursively the left-most non-set-op leaf's
+   * column count (flags are always appended after data, at every depth). Public: the
+   * runtime emitter and the write half both need it.
+   */
+  dataColumnCount(): number {
+    return dataArity(this.left);
+  }
+
+  /** Count of the LEFT operand's surfaced flag columns (0 for a plain / flag-less operand). */
+  private get leftFlagCount(): number {
+    return flagCount(this.left);
+  }
+
+  /** Count of the RIGHT operand's surfaced flag columns (0 for a plain / flag-less operand). */
+  private get rightFlagCount(): number {
+    return flagCount(this.right);
+  }
+
+  /**
+   * Output index where this node's OWN membership flags begin, after the data columns
+   * and BOTH operands' surfaced flag columns:
+   * `[data] ++ [L flags] ++ [R flags] ++ [own flags]`.
+   */
+  private get ownFlagBase(): number {
+    return this.dataColumnCount() + this.leftFlagCount + this.rightFlagCount;
+  }
+
+  /**
+   * Output attributes under the defined projection rule
+   * `[data] ++ [L flags] ++ [R flags] ++ [own flags]`:
+   *  - data: the first `dataColumnCount` attrs taken verbatim from the left child
+   *    (preserves data attribute ids so an ORDER BY / enclosing view still resolves);
+   *  - L / R flags: each operand's attrs BEYOND its own data arity (their inner spec
+   *    ids ride through verbatim, so a surfaced inner flag keeps the inner node's id);
+   *  - own flags: the appended `{true,false}` NOT NULL booleans with pre-minted ids.
+   */
   private buildAttributes(): readonly Attribute[] {
     const leftAttrs = this.left.getAttributes();
-    // Preserve left child's attributes directly to avoid any mapping issues
-    // This ensures ORDER BY expressions can resolve to the same attribute IDs.
-    if (!this.hasMembershipColumns) return leftAttrs;
-    // Membership flags are appended AFTER the data columns — boolean NOT NULL,
-    // never marked nullable, with their pre-minted stable ids. Appending (not
-    // perturbing the data attributes) keeps set identity / dedup on data columns only.
-    const out: Attribute[] = leftAttrs.slice();
-    for (const spec of this.membership!) {
-      out.push({ id: spec.attrId, name: spec.name, type: EXISTENCE_FLAG_TYPE });
-    }
-    return out;
+    // No flag anywhere → the result IS the left child's data attributes; preserve them
+    // directly (ids unchanged) so ORDER BY expressions resolve to the same ids.
+    if (!this.hasSurfacedFlags) return leftAttrs;
+    // `leftAttrs` is already `[data] ++ [L flags]` (the left operand's data attrs, which
+    // are this node's data attrs, then any surfaced left flags). Append the right
+    // operand's surfaced flags (beyond the shared data arity) and this node's own flags.
+    const dataCount = this.dataColumnCount();
+    const ownFlagAttrs: Attribute[] = (this.membership ?? []).map(spec => ({ id: spec.attrId, name: spec.name, type: EXISTENCE_FLAG_TYPE }));
+    return [
+      ...leftAttrs,
+      ...this.right.getAttributes().slice(dataCount),
+      ...ownFlagAttrs,
+    ];
   }
 
   getAttributes(): readonly Attribute[] {
@@ -92,17 +160,24 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     //    (the all-columns key) instead — copying `leftType.keys` here would
     //    over-claim (e.g. `select a,… from ta union select d,… from tb` has a
     //    non-unique first column).
-    //  - Membership flags are appended AFTER the data columns, so the key ColRefs
-    //    (which index data columns) stay valid and the flag is NEVER part of a key.
+    //  - Surfaced flags (own AND inner) are appended AFTER the data columns, so the key
+    //    ColRefs (which index data columns) stay valid and a flag is NEVER part of a key
+    //    at any depth (Key-Soundness Inv. 1–2).
     const keys = (this.op === 'intersect' || this.op === 'except') ? leftType.keys : [];
-    if (!this.hasMembershipColumns) {
+    if (!this.hasSurfacedFlags) {
       return { ...leftType, isSet, keys } as RelationType;
     }
-    const flagColumns: ColumnDef[] = this.membership!.map(spec => ({
-      name: spec.name,
-      type: EXISTENCE_FLAG_TYPE,
-    }));
-    return { ...leftType, isSet, keys, columns: [...leftType.columns, ...flagColumns] } as RelationType;
+    // Mirror buildAttributes' `[data] ++ [L flags] ++ [R flags] ++ [own flags]` layout.
+    // `leftType.columns` is already `[data] ++ [L flags]`; append the right operand's
+    // surfaced flag ColumnDefs (beyond the shared data arity) and this node's own flags.
+    const dataCount = this.dataColumnCount();
+    const ownFlagColumns: ColumnDef[] = (this.membership ?? []).map(spec => ({ name: spec.name, type: EXISTENCE_FLAG_TYPE }));
+    const columns = [
+      ...leftType.columns,
+      ...this.right.getType().columns.slice(dataCount),
+      ...ownFlagColumns,
+    ];
+    return { ...leftType, isSet, keys, columns } as RelationType;
   }
 
   getChildren(): readonly PlanNode[] {
@@ -167,18 +242,22 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
   private membershipFds(): ReadonlyArray<FunctionalDependency> | undefined {
     if (this.op === 'unionAll') return undefined;
     const dataColCount = this.dataColumnCount();
-    const totalCols = dataColCount + this.membership!.length;
+    // Own flags follow the data columns AND both operands' surfaced flags. The
+    // all-data superkey determines EVERY surfaced flag (own and inner — each is a
+    // function of the data tuple it probes), so `superkeyToFd` over the full width
+    // yields `key → {every surfaced flag}`.
+    const totalCols = this.ownFlagBase + this.membership!.length;
     const allDataCols = Array.from({ length: dataColCount }, (_, i) => i);
     const keyFd = superkeyToFd(allDataCols, totalCols);
     return keyFd ? [keyFd] : undefined;
   }
 
-  /** `{true,false}` enum domain per appended flag. */
+  /** `{true,false}` enum domain per OWN appended flag (at its shifted index). */
   private membershipDomains(): ReadonlyArray<DomainConstraint> {
-    const dataColCount = this.dataColumnCount();
+    const ownFlagBase = this.ownFlagBase;
     return this.membership!.map((_spec, i) => ({
       kind: 'enum' as const,
-      column: dataColCount + i,
+      column: ownFlagBase + i,
       values: [true, false],
     }));
   }
@@ -192,11 +271,11 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
    */
   private membershipConstantBindings(): ReadonlyArray<ConstantBinding> | undefined {
     if (this.op !== 'except' && this.op !== 'intersect') return undefined;
-    const dataColCount = this.dataColumnCount();
+    const ownFlagBase = this.ownFlagBase;
     const trueCols: number[] = [];
     const falseCols: number[] = [];
     this.membership!.forEach((spec, i) => {
-      const col = dataColCount + i;
+      const col = ownFlagBase + i;
       const isTrue = this.op === 'intersect' || spec.branch === 'left';
       (isTrue ? trueCols : falseCols).push(col);
     });

@@ -15,7 +15,9 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
   // are appended after, but dedup / probe identity is on data columns alone, so set
   // identity is never perturbed by the flags.
   const attributes = plan.getAttributes();
-  const dataColCount = plan.left.getType().columns.length;
+  // DATA arity is recursive (`plan.dataColumnCount()`), NOT `plan.left.getType().columns.length`
+  // — a flagged inner set-op operand on the left would over-count by its surfaced flags.
+  const dataColCount = plan.dataColumnCount();
   const dataComparator = createCollationRowComparator(
     attributes.slice(0, dataColCount).map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
   );
@@ -137,43 +139,58 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     }
   }
 
-  // Membership-flag runner (`<setop> exists <branch> as <name>`, read half). Uniform
-  // across the four operators: buffer each branch's DATA rows into a set (semijoin
-  // probe surface), produce the operator's normal output rows, and append one boolean
-  // per requested flag = `data-tuple ∈ <that branch's set>`. Dedup / multiplicity is
-  // still decided on data columns only, so set identity is unchanged by the flags.
-  async function* runWithMembership(_rctx: RuntimeContext, leftRows: AsyncIterable<Row>, rightRows: AsyncIterable<Row>): AsyncIterable<Row> {
-    const membership = plan.membership!;
+  // Surfaced-flag runner (`<setop> exists <branch> as <name>`, read half — generalized
+  // to nestable flagged set-ops, `nestable-flagged-set-ops`). Selected whenever the node
+  // surfaces ANY flag — its own membership flags OR an operand's flags (a flag-less outer
+  // over a flagged operand still surfaces the inner flags). Buffers each operand's FULL
+  // row (so the operand's flag columns survive), keys the probe sets on the DATA columns
+  // (storing the full row), and produces each output row under the projection rule
+  // `[data] ++ [L flags] ++ [R flags] ++ [own flags]`:
+  //   - L / R flags: if the data tuple is present in that operand, the stored operand
+  //     row's flag slice; else `false × <flag count>` (sound — an output row absent from
+  //     an operand is in none of its nested branches, so every such flag is false).
+  //   - own flags: the per-spec probe `data ∈ <branch set>` → boolean.
+  // Dedup / multiplicity is still decided on data columns only, so set identity is
+  // unchanged by the flags. A surfaced inner flag thus equals `tuple ∈ <that inner
+  // branch's data relation>` row-by-row at every depth.
+  async function* runWithSurfacedFlags(_rctx: RuntimeContext, leftRows: AsyncIterable<Row>, rightRows: AsyncIterable<Row>): AsyncIterable<Row> {
+    const membership = plan.membership ?? [];
+    const leftFlagCount = plan.left.getType().columns.length - dataColCount;
+    const rightFlagCount = plan.right.getType().columns.length - dataColCount;
+    // Probe sets keyed on the DATA columns (dataComparator), each storing the FULL
+    // operand row so its surfaced flag slice survives.
     const leftSet = new BTree<Row, Row>((row: Row) => row, dataComparator);
     const rightSet = new BTree<Row, Row>((row: Row) => row, dataComparator);
     const leftBuf: Row[] = [];
     const rightBuf: Row[] = [];
 
-    for await (const row of leftRows) {
-      const d = createOutputRow(row);
-      leftBuf.push(d);
-      leftSet.insert(d);
-    }
-    for await (const row of rightRows) {
-      const d = createOutputRow(row);
-      rightBuf.push(d);
-      rightSet.insert(d);
-    }
+    for await (const row of leftRows) { leftBuf.push(row); leftSet.insert(row); }
+    for await (const row of rightRows) { rightBuf.push(row); rightSet.insert(row); }
 
-    // Append one boolean per flag: `tuple ∈ <branch set>`. A clean {true,false}.
-    const appendFlags = (data: Row): Row => {
-      const out = data.slice();
-      for (const spec of membership) {
-        const set = spec.branch === 'left' ? leftSet : rightSet;
-        out.push(set.find(data).on ? true : false);
-      }
-      return out;
+    // An operand's surfaced flags for a data tuple: the stored full row's flag slice when
+    // present, else default-false (each flag = `tuple ∈ <nested branch>`, false when the
+    // tuple is absent from the operand). Flag values are a function of the data tuple, so
+    // the first stored row's slice is canonical even under a bag operand.
+    const leftFlagsFor = (data: Row): Row => {
+      if (leftFlagCount === 0) return [];
+      const stored = leftSet.get(data);
+      return stored ? stored.slice(dataColCount, dataColCount + leftFlagCount) : Array.from({ length: leftFlagCount }, () => false);
     };
+    const rightFlagsFor = (data: Row): Row => {
+      if (rightFlagCount === 0) return [];
+      const stored = rightSet.get(data);
+      return stored ? stored.slice(dataColCount, dataColCount + rightFlagCount) : Array.from({ length: rightFlagCount }, () => false);
+    };
+    const ownFlagsFor = (data: Row): Row =>
+      membership.map(spec => ((spec.branch === 'left' ? leftSet : rightSet).find(data).on ? true : false));
+
+    // [data] ++ [L flags] ++ [R flags] ++ [own flags].
+    const surface = (data: Row): Row => [...data, ...leftFlagsFor(data), ...rightFlagsFor(data), ...ownFlagsFor(data)];
 
     if (plan.op === 'unionAll') {
       // Bag: preserve multiplicity — every input row yields one output row.
-      for (const d of leftBuf) yield appendFlags(d);
-      for (const d of rightBuf) yield appendFlags(d);
+      for (const row of leftBuf) yield surface(createOutputRow(row));
+      for (const row of rightBuf) yield surface(createOutputRow(row));
       return;
     }
 
@@ -181,22 +198,25 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
     const yielded = new BTree<Row, Row>((row: Row) => row, dataComparator);
     switch (plan.op) {
       case 'union': {
-        for (const d of leftBuf) { if (yielded.insert(d).on) yield appendFlags(d); }
-        for (const d of rightBuf) { if (yielded.insert(d).on) yield appendFlags(d); }
+        for (const row of leftBuf) { const d = createOutputRow(row); if (yielded.insert(d).on) yield surface(d); }
+        for (const row of rightBuf) { const d = createOutputRow(row); if (yielded.insert(d).on) yield surface(d); }
         break;
       }
       case 'intersect': {
-        // Rows present in BOTH branches (deduped). Every visible row probes all-true.
-        for (const d of leftBuf) {
-          if (rightSet.find(d).on && yielded.insert(d).on) yield appendFlags(d);
+        // Rows present in BOTH branches (deduped). Own flags all probe true; an R flag
+        // reads the stored right row's slice (the tuple is in the right operand).
+        for (const row of leftBuf) {
+          const d = createOutputRow(row);
+          if (rightSet.find(d).on && yielded.insert(d).on) yield surface(d);
         }
         break;
       }
       case 'except': {
-        // Rows in left and NOT in right (deduped). A left flag probes true, a right
-        // flag probes false — exactly the A∖B membership, no special-casing needed.
-        for (const d of leftBuf) {
-          if (!rightSet.find(d).on && yielded.insert(d).on) yield appendFlags(d);
+        // Rows in left and NOT in right (deduped). Own flags: left true, right false; an
+        // R flag defaults false (the tuple is absent from the right operand).
+        for (const row of leftBuf) {
+          const d = createOutputRow(row);
+          if (!rightSet.find(d).on && yielded.insert(d).on) yield surface(d);
         }
         break;
       }
@@ -204,8 +224,8 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
   }
 
   let run: InstructionRun;
-  if (plan.hasMembershipColumns) {
-    run = runWithMembership as InstructionRun;
+  if (plan.hasSurfacedFlags) {
+    run = runWithSurfacedFlags as InstructionRun;
   } else {
     switch (plan.op) {
       case 'unionAll':

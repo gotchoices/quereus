@@ -346,6 +346,32 @@ selected whenever the node carries any flag, so an unused flag on a `union all` 
 forces the buffering runner instead of the streaming one (correctness is unaffected; the
 set-op sibling prune is deferred).
 
+**Nestable flagged set-ops (read half).** An operand of a `SetOperationNode` may itself be
+a (flagged) `SetOperationNode` — `A union[inA,inSub] (B union[inB,inC] C)`. Alignment, the
+union schema, dedup, and set identity are all on **data columns only**: the outer arity
+check compares each operand's recursive *data arity* (the left-most non-set-op leaf's column
+count — flags are always appended after data at every depth), so an inner operand's surfaced
+flags never inflate the check, and an inner flag never enters the outer's data-column set /
+dedup / claimed keys (Key-Soundness Inv. 1–2 hold at every depth). An inner operand's flag
+columns are **surfaced** as readable columns of the outer view under the defined projection
+rule
+
+```
+[ data columns ] ++ [ L's flag attrs ] ++ [ R's flag attrs ] ++ [ M's own flag attrs ]
+```
+
+— data taken verbatim from the left child (ids preserved), each operand's flag attributes
+threaded with their inner spec ids, then this node's own appended flags. A node surfaces
+flags when it has its own membership flags **or** either operand does (so a flag-less outer
+over a flagged operand — `A union (B∪[inB,inC] C)` — still surfaces `inB,inC`). The runtime
+read half buffers each operand's full row and emits each output row under the same rule: a
+surfaced inner flag reads as `tuple ∈ <that operand's data relation>` row-by-row at every
+depth, defaulting **false** when the output row is absent from the operand (sound — an output
+row not present in an operand is in none of that operand's nested branches, so every such
+flag probe is false; verified for all four outer operators). The **write** half (writing a
+surfaced inner flag through to its nested branch) is the separate `nestable-flagged-set-ops`
+ticket.
+
 ### Set-operation membership writes
 
 The first set-op view writability in the engine (`planner/mutation/set-op.ts`). A
