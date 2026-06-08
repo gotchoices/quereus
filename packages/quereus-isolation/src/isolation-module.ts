@@ -715,6 +715,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
 
+		// The cached underlying VirtualTable's `tableSchema` is a construction-time
+		// snapshot (e.g. MemoryTable.tableSchema); module-level alterTable rotates the
+		// underlying manager's schema but not this instance's field. Refresh it so a
+		// freshly-connected IsolatedTable's merged-view UNIQUE check (which reads
+		// this.tableSchema.uniqueConstraints / per-column collation) sees the post-alter
+		// constraint set. Mirrors the implicit instance refresh dropIndex already gets.
+		const underlyingState = this.getUnderlyingState(schemaName, tableName);
+		if (underlyingState) underlyingState.underlyingTable.tableSchema = updated;
+
 		// Migrate the issuer's own overlay (already validated above). Its NOT NULL /
 		// tombstone throw sites are unreachable after pre-validation.
 		if (ownEntry) {

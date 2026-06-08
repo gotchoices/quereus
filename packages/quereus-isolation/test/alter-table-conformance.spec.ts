@@ -213,24 +213,24 @@ const ARMS: Arm[] = [
 	},
 ];
 
-// ── Known isolation gaps (skipped, like the store PK-collation cell) ──────────
+// ── Runtime UNIQUE-constraint propagation across ALTER ────────────────────────
 //
-// These arms surface a real divergence: the isolated table builds its UNIQUE
-// merged-view enforcement structures from the schema at connect time and does
-// NOT refresh them after `alterTable`, so a runtime UNIQUE add / drop / collation
-// change is not honored by the overlay's pre-commit conflict check:
-//   - ADD UNIQUE  → the new constraint is missed by the merged-view pre-check; a
-//     duplicate slips through to the commit flush, where the underlying catches
-//     it and the layer raises StatusCode.INTERNAL ("isolation-layer invariant
-//     violation") instead of a clean CONSTRAINT.
-//   - DROP UNIQUE → the catalog drops the constraint (unique_constraint_info is
-//     empty) but a duplicate insert is STILL rejected — the enforcement persists.
-//   - SET COLLATE on a UNIQUE column → same root as ADD: the re-collated conflict
-//     is missed by the pre-check and surfaces as INTERNAL at flush.
+// These arms cover a divergence that `isolation-runtime-constraint-propagation`
+// closed: the isolated table reads its UNIQUE merged-view enforcement structures
+// from the underlying instance's `tableSchema` at connect time, and that snapshot
+// was not refreshed after a module-level `alterTable`. The fix re-points the cached
+// underlying VirtualTable's `tableSchema` to the schema `alterTable` returns, so a
+// runtime UNIQUE add / drop / collation change is honored by the overlay's
+// pre-commit conflict check:
+//   - ADD UNIQUE  → the new constraint is enforced by the merged-view pre-check; a
+//     duplicate is rejected with a clean CONSTRAINT (previously slipped to the
+//     commit flush and surfaced as StatusCode.INTERNAL).
+//   - DROP UNIQUE → the constraint is gone from the merged view, so a once-duplicate
+//     insert is now accepted (previously the stale enforcement still rejected it).
+//   - SET COLLATE on a UNIQUE column → the re-collated conflict is seen by the
+//     pre-check and rejected with a clean CONSTRAINT (previously INTERNAL at flush).
 //
-// Owned by `isolation-runtime-constraint-propagation` (tickets/fix). Kept SKIPPED
-// so this harness stays green and independent; remove `.skip` once that lands.
-// (These are honored cleanly when the constraint is declared at CREATE — the
+// (These are also honored cleanly when the constraint is declared at CREATE — the
 // `cross-layer UNIQUE / PK conflict detection` suite in @quereus/store covers
 // that baseline.)
 const ISOLATION_GAP_ARMS: Arm[] = [
@@ -309,9 +309,9 @@ describe('ALTER conformance matrix — isolation-wrapped memory', () => {
 		});
 	}
 
-	// Skipped pending isolation-runtime-constraint-propagation (see ISOLATION_GAP_ARMS).
+	// Runtime UNIQUE-constraint propagation across ALTER (see ISOLATION_GAP_ARMS).
 	for (const arm of ISOLATION_GAP_ARMS) {
-		it.skip(`${arm.label} [isolation-runtime-constraint-propagation]`, async () => {
+		it(`${arm.label} [isolation-runtime-constraint-propagation]`, async () => {
 			await runArm(db, arm);
 		});
 	}
