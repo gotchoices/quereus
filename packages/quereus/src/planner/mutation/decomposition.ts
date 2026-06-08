@@ -12,6 +12,8 @@ import { combineAnd } from './single-source.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
 import { buildExpression } from '../building/expression.js';
 import { createRuntimeExpressionEvaluator } from '../analysis/const-evaluator.js';
+import { containsNonDeterministicCall } from '../analysis/check-extraction.js';
+import { FunctionFlags } from '../../common/constants.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
@@ -1317,10 +1319,23 @@ function selfMaterializeNonEmptyFilter(cells: readonly OptionalCell[], member: D
  * substitution — every self leaf is the owner's own column, a constant sibling carries none), so the
  * fold is a deterministic plan-time constant. `is not null` never yields NULL, so a dead materialize
  * folds to boolean `false` (defensively also `0` / `0n`). Anything else — a non-null fold, a Promise
- * (async / non-constant), or a throw (volatile / unbound parameter) — is NOT provably dead, so we
- * stay conservative and return `false` (emit the materialize + its gates).
+ * (async / non-constant), or a throw (unbound parameter) — is NOT provably dead, so we stay
+ * conservative and return `false` (emit the materialize + its gates).
+ *
+ * A **non-deterministic** leaf (a function the registry flags non-`DETERMINISTIC` — `random()` or a
+ * volatile UDF — or a subquery, though a self cell carries none) short-circuits to `false` *before*
+ * the fold: a single plan-time evaluation is an unsound proxy for the per-row runtime filter when the
+ * value can vary, and a nullable volatile inside `coalesce(c, …)` could fold NULL (dead) at plan time
+ * yet yield non-null per row at runtime — dropping an absent row the always-emit path would have
+ * materialized. Keeping volatiles on the emit path matches the ticket's `set c = c + random()`
+ * edge-case and the `hasSelf` branch's own contract (only a *foldable* dead materialize is skipped).
  */
 function foldsConstantFalse(ctx: PlanningContext, expr: AST.Expression): boolean {
+	const isDeterministic = (name: string, argc: number): boolean => {
+		const fn = ctx.schemaManager.findFunction(name, argc) ?? ctx.schemaManager.findFunction(name, -1);
+		return fn ? (fn.flags & FunctionFlags.DETERMINISTIC) !== 0 : true;
+	};
+	if (containsNonDeterministicCall(expr, isDeterministic)) return false;
 	try {
 		const node = buildExpression(ctx, expr);
 		const value = createRuntimeExpressionEvaluator(ctx.db)(node);

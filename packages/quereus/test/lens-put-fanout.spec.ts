@@ -696,6 +696,28 @@ describe('lens decomposition put: UPDATE of a multi-value-column optional member
 			await db.close();
 		}
 	});
+
+	it('a non-deterministic self value stays on the emit path (the volatile gate blocks a plan-time dead-fold)', async () => {
+		// `set c1 = coalesce(c1, vol9())` over M_opt where `vol9` is a registry-**non-deterministic**
+		// scalar UDF. `foldsConstantFalse` must NOT fold a volatile to a static dead-materialize: a
+		// single plan-time evaluation is an unsound proxy for the per-row runtime filter (a nullable
+		// volatile could read null at plan time yet non-null per row). The determinism gate
+		// (`containsNonDeterministicCall`) short-circuits before the fold, so the materialize is emitted
+		// and the absent row (id=2) materializes coalesce(null, vol9()) = 9 — exercising a volatile self
+		// value the deterministic and parameterized arms above don't cover. (This also realigns the
+		// ticket's `set c = c + random()` edge-case onto the emit path.)
+		const db = new Database();
+		db.createScalarFunction('vol9', { numArgs: 0, deterministic: false }, () => 9);
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = coalesce(c1, vol9()) where id = 2');   // absent → materialize c1 = 9
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 100, c2: 200 }, { id: 2, c1: 9, c2: null },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 /**
