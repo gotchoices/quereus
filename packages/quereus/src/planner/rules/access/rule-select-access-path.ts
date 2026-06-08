@@ -1212,7 +1212,10 @@ function effectivePredicateCollation(constraint: PlannerPredicateConstraint): st
 	}
 	if (src instanceof BetweenNode) {
 		// BETWEEN is `expr >= lo AND expr <= hi`; each comparison resolves to the
-		// tested-expression (LHS) collation since the bounds are bare literals.
+		// tested-expression (LHS) collation. A `COLLATE` on a *bound* is dropped
+		// during constant folding / constraint extraction (the bound is reduced to a
+		// bare literal before this rule runs — see the `collate-on-between-bound`
+		// folding bug), so only the expr collation can ever reach this point.
 		return normalizeCollationName(src.expr.getType().collationName ?? 'BINARY');
 	}
 	// OR_RANGE carries an OR BinaryOpNode source (handled above); any other shape
