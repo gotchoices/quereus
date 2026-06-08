@@ -49,6 +49,11 @@ export {
 	buildDataKey,
 	buildIndexKey,
 	buildCatalogKey,
+	buildViewCatalogKey,
+	buildMaterializedViewCatalogKey,
+	classifyCatalogKey,
+	decodeMaterializedViewCatalogKey,
+	type CatalogEntryKind,
 	buildFullScanBounds,
 	buildIndexPrefixBounds,
 	buildCatalogScanBounds,
@@ -71,7 +76,7 @@ export {
 } from './events.js';
 
 // DDL generation (canonical implementation lives in @quereus/quereus)
-export { generateTableDDL, generateIndexDDL } from '@quereus/quereus';
+export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL } from '@quereus/quereus';
 
 // Transaction support
 export {

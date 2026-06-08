@@ -30,6 +30,8 @@ import type {
 	Schema,
 	MappingAdvertisement,
 	SchemaChangeEvent as EngineSchemaChangeEvent,
+	ViewSchema,
+	MaterializedViewSchema,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
@@ -44,16 +46,25 @@ import {
 	buildIndexKey,
 	buildFullScanBounds,
 	buildStatsKey,
+	buildViewCatalogKey,
+	buildMaterializedViewCatalogKey,
+	classifyCatalogKey,
+	decodeMaterializedViewCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
-import { generateTableDDL, generateIndexDDL, isHiddenImplicitIndex } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, isHiddenImplicitIndex } from '@quereus/quereus';
 
 /**
  * Result of catalog rehydration.
+ *
+ * `views` / `materializedViews` are additive (existing consumers — e.g.
+ * `quoomb-web` — read only `.errors`). Errors from any phase land in `errors`.
  */
 export interface RehydrationResult {
 	tables: string[];
 	indexes: string[];
+	views: string[];
+	materializedViews: string[];
 	errors: RehydrationError[];
 }
 
@@ -1511,8 +1522,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Load all DDL statements from the catalog store.
-	 * Used to restore persisted tables on startup.
+	 * Load all DDL **values** from the catalog store (keys discarded).
+	 * Used to restore persisted tables on startup and by tests asserting persisted DDL.
+	 * Note: this returns table, view, AND materialized-view entries intermixed —
+	 * {@link rehydrateCatalog} uses {@link loadCatalogEntries} (keys retained) to
+	 * classify them.
 	 */
 	async loadAllDDL(): Promise<string[]> {
 		const catalogStore = await this.provider.getCatalogStore();
@@ -1529,36 +1543,132 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Rehydrate persisted catalog into the in-memory schema manager.
+	 * Load every catalog entry as `{ key, ddl }`. Unlike {@link loadAllDDL} (values
+	 * only) this retains the key so {@link rehydrateCatalog} can classify each entry
+	 * (table / view / materialized view) by its reserved key prefix.
+	 */
+	private async loadCatalogEntries(): Promise<Array<{ key: Uint8Array; ddl: string }>> {
+		const catalogStore = await this.provider.getCatalogStore();
+		const decoder = new TextDecoder();
+		const entries: Array<{ key: Uint8Array; ddl: string }> = [];
+		for await (const entry of catalogStore.iterate(buildCatalogScanBounds())) {
+			entries.push({ key: entry.key, ddl: decoder.decode(entry.value) });
+		}
+		return entries;
+	}
+
+	/**
+	 * Rehydrate the persisted catalog into the in-memory schema manager, in
+	 * dependency order.
 	 *
-	 * Loads all DDL from the catalog store and imports each entry
-	 * individually. Parse failures are collected rather than fatal,
-	 * so a single corrupt entry does not prevent other tables from
-	 * loading.
+	 * Establishes the engine schema-change subscription up front (so a reopened DB
+	 * persists subsequent DDL even when its first post-reopen statement is a view/MV,
+	 * which never routes through a module hook — all the lazy subscription points are
+	 * table hooks). Then loads every catalog entry once, classifies each by its key
+	 * prefix into {tables, views, materialized views}, and imports in three phases:
 	 *
-	 * Call after `db.registerModule()` (and `db.setDefaultVtabName()`
-	 * if DDL may lack a USING clause).
+	 *   1. **Tables** — `importCatalog` (connect to existing storage; refresh connected
+	 *      `StoreTable` schemas).
+	 *   2. **Views** — `importCatalog` (engine silent-register; body validation deferred
+	 *      to query time, so order among views — and view-over-MV / view-over-view —
+	 *      does not matter, and no schema-change event fires → phase 2 writes nothing).
+	 *   3. **Materialized views** — re-materialize via `db.exec` per entry (re-runs the
+	 *      create emitter: rebuilds the memory backing from current source data,
+	 *      re-registers row-time maintenance, re-runs the eligibility gate). The re-exec
+	 *      re-fires `materialized_view_added` → the listener regenerates identical DDL →
+	 *      compare-skip (no churn).
+	 *
+	 * **MV-over-MV ordering** is handled by a fixpoint retry rather than a static topo
+	 * sort: the source `sourceTables` an MV resolves to (`_mv_<x>`) is computed at create
+	 * time and is NOT serialized in the DDL, so it is unavailable before exec. Instead,
+	 * an MV whose body reads a not-yet-built MV simply fails this round and succeeds once
+	 * its dependency is built; the loop repeats while any MV makes progress. This is
+	 * robust to arbitrary nesting depth (and covers the common single-level case for
+	 * free). A genuinely unbuildable MV — a missing (e.g. memory) source, or an
+	 * unresolvable cycle — makes no progress in a round and is recorded in `errors`.
+	 *
+	 * Per-entry errors in any phase are collected (not fatal) so one bad object does not
+	 * abort the rest.
+	 *
+	 * Call after `db.registerModule()` (and `db.setDefaultVtabName()` if DDL may lack a
+	 * USING clause).
 	 */
 	async rehydrateCatalog(db: Database): Promise<RehydrationResult> {
-		const ddlStatements = await this.loadAllDDL();
-		const result: RehydrationResult = { tables: [], indexes: [], errors: [] };
+		// Subscribe up front: a reopened DB whose first post-reopen DDL is a view/MV
+		// would otherwise miss the event (the lazy `ensureSchemaSubscription` points are
+		// all table hooks). Done even for an empty catalog. (Documented gap: a brand-new
+		// DB — never rehydrated — whose very first DDL is a view still relies on a prior
+		// store-table create/connect to establish the subscription.)
+		this.ensureSchemaSubscription(db);
 
-		if (ddlStatements.length === 0) {
-			return result;
+		const entries = await this.loadCatalogEntries();
+		const result: RehydrationResult = { tables: [], indexes: [], views: [], materializedViews: [], errors: [] };
+		if (entries.length === 0) return result;
+
+		const recordError = (ddl: string, e: unknown): void => {
+			const error = e instanceof Error ? e : new Error(String(e));
+			console.warn(
+				`[StoreModule] Failed to rehydrate DDL entry, skipping: ${error.message}\n  DDL: ${ddl.substring(0, 120)}`,
+			);
+			result.errors.push({ ddl, error });
+		};
+
+		// Classify every loaded entry by key prefix. The full-range catalog scan returns
+		// table, view, and MV entries intermixed; each must reach the correct phase — a
+		// view/MV entry fed to the table-phase importCatalog would fail-loud or mis-handle.
+		const tableDDLs: string[] = [];
+		const viewDDLs: string[] = [];
+		const mvEntries: Array<{ ddl: string; name: string }> = [];
+		for (const { key, ddl } of entries) {
+			switch (classifyCatalogKey(key)) {
+				case 'view': { viewDDLs.push(ddl); break; }
+				case 'materializedView': { mvEntries.push({ ddl, name: decodeMaterializedViewCatalogKey(key) }); break; }
+				default: { tableDDLs.push(ddl); break; }
+			}
 		}
 
-		for (const ddl of ddlStatements) {
+		// Phase 1 — tables. Per-entry import isolates a corrupt entry so the rest load.
+		for (const ddl of tableDDLs) {
 			try {
 				const imported = await db.schemaManager.importCatalog([ddl]);
 				result.tables.push(...imported.tables);
 				result.indexes.push(...imported.indexes);
-			} catch (e: unknown) {
-				const error = e instanceof Error ? e : new Error(String(e));
-				console.warn(
-					`[StoreModule] Failed to rehydrate DDL entry, skipping: ${error.message}\n  DDL: ${ddl.substring(0, 120)}`
-				);
-				result.errors.push({ ddl, error });
+			} catch (e) {
+				recordError(ddl, e);
 			}
+		}
+
+		// Phase 2 — views (silent register; deferred body validation → order-independent).
+		for (const ddl of viewDDLs) {
+			try {
+				const imported = await db.schemaManager.importCatalog([ddl]);
+				result.views.push(...imported.views);
+			} catch (e) {
+				recordError(ddl, e);
+			}
+		}
+
+		// Phase 3 — materialized views, dependency-ordered via fixpoint retry (see docstring).
+		let pending = mvEntries;
+		while (pending.length > 0) {
+			const failed: Array<{ entry: { ddl: string; name: string }; error: unknown }> = [];
+			let progressed = false;
+			for (const entry of pending) {
+				try {
+					await db.exec(entry.ddl);
+					result.materializedViews.push(entry.name);
+					progressed = true;
+				} catch (e) {
+					failed.push({ entry, error: e });
+				}
+			}
+			if (!progressed) {
+				// No MV built this round → the remaining failures are genuine (missing
+				// source, unresolvable cycle). Record them and stop.
+				for (const f of failed) recordError(f.entry.ddl, f.error);
+				break;
+			}
+			pending = failed.map(f => f.entry);
 		}
 
 		// Refresh each connected StoreTable from the now-current registry. During
@@ -1584,6 +1694,58 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const catalogKey = buildCatalogKey(schemaName, tableName);
 		const catalogStore = await this.provider.getCatalogStore();
 		await catalogStore.delete(catalogKey);
+	}
+
+	/**
+	 * Persist a plain view's catalog entry (DDL via `generateViewDDL`), keyed by its
+	 * reserved view prefix. Compare-write (skip identical) — see
+	 * {@link persistObjectCatalogEntryIfChanged}.
+	 */
+	async saveViewDDL(view: ViewSchema): Promise<void> {
+		await this.persistObjectCatalogEntryIfChanged(
+			buildViewCatalogKey(view.schemaName, view.name),
+			generateViewDDL(view),
+		);
+	}
+
+	/** Remove a plain view's catalog entry (on DROP VIEW). */
+	async removeViewDDL(schemaName: string, viewName: string): Promise<void> {
+		const catalogStore = await this.provider.getCatalogStore();
+		await catalogStore.delete(buildViewCatalogKey(schemaName, viewName));
+	}
+
+	/**
+	 * Persist a materialized view's catalog entry (DDL via `generateMaterializedViewDDL`),
+	 * keyed by its reserved MV prefix. Compare-write (skip identical) — see
+	 * {@link persistObjectCatalogEntryIfChanged}.
+	 */
+	async saveMaterializedViewDDL(mv: MaterializedViewSchema): Promise<void> {
+		await this.persistObjectCatalogEntryIfChanged(
+			buildMaterializedViewCatalogKey(mv.schemaName, mv.name),
+			generateMaterializedViewDDL(mv),
+		);
+	}
+
+	/** Remove a materialized view's catalog entry (on DROP MATERIALIZED VIEW). */
+	async removeMaterializedViewDDL(schemaName: string, mvName: string): Promise<void> {
+		const catalogStore = await this.provider.getCatalogStore();
+		await catalogStore.delete(buildMaterializedViewCatalogKey(schemaName, mvName));
+	}
+
+	/**
+	 * Compare-write a view/MV catalog entry: write only when the entry is absent or its
+	 * DDL differs from `newDDL` (skip identical). Unlike the table path's
+	 * {@link persistCatalogIfChanged} there is **no** absent→skip self-filter — a view/MV
+	 * belongs to this db's catalog unconditionally (one module instance serves one
+	 * Database). Skipping identical writes makes a rehydrate-time MV re-add (which
+	 * re-fires `materialized_view_added`) a no-op, so a second consecutive reopen yields
+	 * identical catalog bytes.
+	 */
+	private async persistObjectCatalogEntryIfChanged(key: Uint8Array, newDDL: string): Promise<void> {
+		const catalogStore = await this.provider.getCatalogStore();
+		const existing = await catalogStore.get(key);
+		if (existing !== undefined && new TextDecoder().decode(existing) === newDDL) return;
+		await catalogStore.put(key, new TextEncoder().encode(newDDL));
 	}
 
 	/**
@@ -1623,40 +1785,88 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Engine schema-change listener. Handles `table_modified` only (the event every
-	 * catalog-only tag swap fires via `commitTagUpdate`); all other event types are
-	 * ignored. Keeps a connected `StoreTable`'s cached schema consistent (SET TAGS
-	 * does not call `updateSchema`) and queues a read-compare-write that re-persists
-	 * the table's catalog DDL when (and only when) it actually changed.
+	 * Engine schema-change listener. Persists the catalog incrementally for the events
+	 * that bypass `module.alterTable` / `module.destroy`:
 	 *
-	 * Synchronous by contract (`notifyChange` does not await listeners); the async
-	 * write rides `persistQueue`, drained by `closeAll`/`whenCatalogPersisted`.
+	 * - `table_modified` — every catalog-only tag swap (and the redundant follow-up a
+	 *   structural ALTER fires). Keeps a connected `StoreTable`'s cached schema consistent
+	 *   (SET TAGS does not call `updateSchema`) then read-compare-writes the table bundle.
+	 * - `view_added` / `view_modified` / `view_removed` — plain `CREATE`/`ALTER … SET TAGS`/
+	 *   `DROP VIEW` (the engine fires these from the runtime emitters).
+	 * - `materialized_view_added` / `_modified` / `_refreshed` / `_removed` — MV lifecycle.
+	 *
+	 * Unlike the table path there is **no** catalog-absent self-filter for view/MV
+	 * add/remove: one `StoreModule` instance serves one `Database`, so that database's
+	 * views/MVs belong in its catalog unconditionally. The MV **backing** table
+	 * (`_mv_<name>`, memory module) fires `table_added`/`table_removed`/`table_modified`;
+	 * those stay ignored (`table_added`/`table_removed` fall through; backing
+	 * `table_modified` is catalog-absent → skipped), so the backing is never persisted.
+	 *
+	 * Synchronous by contract (`notifyChange` does not await listeners); every async write
+	 * rides `persistQueue`, drained by `closeAll`/`whenCatalogPersisted`.
 	 */
 	private onEngineSchemaChange = (event: EngineSchemaChangeEvent): void => {
-		if (event.type !== 'table_modified') return;
-
-		const newObject = event.newObject;
-		const tableKey = `${event.schemaName}.${event.objectName}`.toLowerCase();
-
-		// SET TAGS does not call `table.updateSchema`, so a connected instance's cached
-		// schema would otherwise go stale (and a later lazy `saveTableDDL` could re-write
-		// tag-less DDL). Persistence below always reads `newObject`, never this cache.
-		const connected = this.tables.get(tableKey);
-		if (connected) {
-			connected.updateSchema(newObject);
+		switch (event.type) {
+			case 'table_modified': {
+				// SET TAGS does not call `table.updateSchema`, so a connected instance's cached
+				// schema would otherwise go stale (and a later lazy `saveTableDDL` could re-write
+				// tag-less DDL). Persistence below always reads `newObject`, never this cache.
+				const tableKey = `${event.schemaName}.${event.objectName}`.toLowerCase();
+				const connected = this.tables.get(tableKey);
+				if (connected) connected.updateSchema(event.newObject);
+				const key = buildCatalogKey(event.schemaName, event.objectName);
+				const newObject = event.newObject;
+				this.enqueuePersist(() => this.persistCatalogIfChanged(key, newObject));
+				return;
+			}
+			case 'view_added':
+			case 'view_modified': {
+				const view = event.newObject;
+				this.enqueuePersist(() => this.saveViewDDL(view));
+				return;
+			}
+			case 'view_removed': {
+				const { schemaName, objectName } = event;
+				this.enqueuePersist(() => this.removeViewDDL(schemaName, objectName));
+				return;
+			}
+			case 'materialized_view_added':
+			case 'materialized_view_modified': {
+				const mv = event.newObject;
+				this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				return;
+			}
+			case 'materialized_view_refreshed': {
+				// DDL is usually unchanged by a REFRESH (body/tags identical) → compare-skip.
+				const mv = event.object;
+				this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				return;
+			}
+			case 'materialized_view_removed': {
+				const { schemaName, objectName } = event;
+				this.enqueuePersist(() => this.removeMaterializedViewDDL(schemaName, objectName));
+				return;
+			}
+			default:
+				return;
 		}
+	};
 
-		// Serialize per the queue so successive swaps (e.g. SET TAGS (a=1) then SET TAGS ())
-		// apply in order. Errors are swallowed+logged to mirror `notifyChange`'s own
-		// try/catch contract — a listener rejection must never escape.
-		const key = buildCatalogKey(event.schemaName, event.objectName);
+	/**
+	 * Append a catalog-persistence task to the serialized `persistQueue`, so successive
+	 * mutations (e.g. SET TAGS (a=1) then SET TAGS ()) apply in order and are drained by
+	 * `closeAll`/`whenCatalogPersisted` before the provider closes. Errors are
+	 * swallowed+logged to mirror `notifyChange`'s own try/catch contract — a listener
+	 * rejection must never escape.
+	 */
+	private enqueuePersist(work: () => Promise<void>): void {
 		this.persistQueue = this.persistQueue
-			.then(() => this.persistCatalogIfChanged(key, newObject))
+			.then(work)
 			.catch((err: unknown) => {
 				const message = err instanceof Error ? err.message : String(err);
 				console.warn(`[StoreModule] Failed to persist catalog DDL after schema change: ${message}`);
 			});
-	};
+	}
 
 	/**
 	 * Read-compare-write the catalog DDL for a table that just fired `table_modified`.

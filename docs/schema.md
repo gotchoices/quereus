@@ -92,7 +92,7 @@ Once exposed, the implicit index is **addressable and introspectable identically
 | `findSchemasContainingTable(tableName)` | Returns all schema names containing the table — useful for error messages |
 | `findFunction(funcName, nArg)` | Finds a function by name and argument count |
 
-**Persistence of catalog-only tag swaps (store-backed tables).** The tag setters above (and the equivalent `ALTER … SET TAGS`) are catalog-only — they swap the in-memory schema and fire a change event but deliberately do **not** call `module.alterTable`. The generic store module (`@quereus/store`) still re-persists them: it subscribes to the engine's `table_modified` events and re-writes the table's catalog DDL (via `generateTableDDL`) whenever the serialized form changes. So **table**, **column**, and **named-constraint** tags now survive close → reopen → `rehydrateCatalog` for `using store` tables. The re-write is a read-compare-write keyed by `{schema}.{table}`: a table with no catalog entry (a memory table, or a store table never persisted) is skipped, and a structural ALTER — whose own `alterTable` already wrote the final DDL — produces identical bytes and is skipped (no double-write). **Index** tags (`setIndexTags`) and **view / materialized-view** tags (`setViewTags` / `setMaterializedViewTags`) do **not** yet round-trip for store-backed databases, because the store catalog persists neither index nor view/MV DDL — tracked by backlog tickets `store-secondary-index-persistence` and `store-view-mv-persistence`.
+**Persistence of catalog-only tag swaps (store-backed tables).** The tag setters above (and the equivalent `ALTER … SET TAGS`) are catalog-only — they swap the in-memory schema and fire a change event but deliberately do **not** call `module.alterTable`. The generic store module (`@quereus/store`) still re-persists them: it subscribes to the engine's `table_modified` events and re-writes the table's catalog DDL (via `generateTableDDL`) whenever the serialized form changes. So **table**, **column**, and **named-constraint** tags now survive close → reopen → `rehydrateCatalog` for `using store` tables. The re-write is a read-compare-write keyed by `{schema}.{table}`: a table with no catalog entry (a memory table, or a store table never persisted) is skipped, and a structural ALTER — whose own `alterTable` already wrote the final DDL — produces identical bytes and is skipped (no double-write). The same subscription now also persists **views** and **materialized views**: the store listens for `view_added`/`view_removed`/`view_modified` and `materialized_view_added`/`_removed`/`_modified`/`_refreshed`, writing each object's DDL (via `generateViewDDL` / `generateMaterializedViewDDL`) under a reserved-prefix catalog key. So **view** and **materialized-view** tags (`setViewTags` / `setMaterializedViewTags`), as well as `CREATE`/`DROP VIEW` and `CREATE`/`DROP MATERIALIZED VIEW`, now round-trip too (see [Store catalog persistence](#store-catalog-persistence-bundled-index-ddl) for the key namespaces and rehydrate phasing). The only remaining gap is an *exposed implicit index*'s user tags (held on `UniqueConstraintSchema.exposedIndexTags`, separate from the bundled index DDL) — tracked by backlog `store-secondary-index-persistence`.
 
 ### DDL Operations
 
@@ -264,6 +264,62 @@ contract: if the catalog write fails after a `CREATE INDEX` built the physical
 index store, the in-memory schema has the index but the catalog does not, so on
 reopen the index is missing and its store is orphaned. There is no two-phase
 protocol here.
+
+### View and materialized-view persistence
+
+Views and materialized views are engine-level catalog objects that never pass
+through a vtab-module hook, so the store persists them by subscribing to their
+engine schema-change events (the same `SchemaChangeNotifier` it already uses for
+`table_modified`). Each object's DDL is written under a **reserved-prefix** catalog
+key so it can never collide with a same-named table entry (the engine enforces
+name-disjointness, but the key namespace does not rely on it):
+
+```
+table key  =  encode(`{schema}.{table}`)             // unprefixed (unchanged)
+view key   =  encode(`\x00view\x00{schema}.{view}`)
+mv key     =  encode(`\x00mview\x00{schema}.{mv}`)
+```
+
+A leading `0x00` byte is a valid KV key byte for the in-memory, LevelDB, and
+IndexedDB stores; table identifier keys never contain it, so `classifyCatalogKey`
+routes each loaded entry to the right phase. `buildCatalogScanBounds()` is a full
+range scan and returns the prefixed view/MV entries alongside table entries — that
+is intended; rehydrate classifies and routes them.
+
+**Incremental writes (the listener).** `view_added`/`view_modified` and
+`materialized_view_added`/`_modified`/`_refreshed` regenerate the object's DDL
+(`generateViewDDL` / `generateMaterializedViewDDL`, which read live tags) and
+compare-write (skip identical); `view_removed`/`materialized_view_removed` delete
+the entry. Unlike the table path there is no catalog-absent self-filter — one
+`StoreModule` serves one `Database`, so its views/MVs belong in its catalog
+unconditionally. The MV **backing** table (`_mv_<name>`, memory module) fires its
+own `table_*` events, which the store keeps ignoring, so the backing is never
+persisted (it is rebuilt on reopen). All writes ride the same serialized
+`persistQueue` drained by `closeAll`/`whenCatalogPersisted`.
+
+**Subscription is established in `rehydrateCatalog`** (not just lazily off the first
+table hook), so a reopened DB persists subsequent view/MV DDL even when its first
+post-reopen statement is a view. Gap: a brand-new DB never rehydrated, whose very
+first DDL is a view, still relies on a prior store-table create/connect to subscribe.
+
+**Rehydrate phasing.** `rehydrateCatalog` loads all entries once, classifies by key
+prefix, then imports in dependency order: (1) **tables** via `importCatalog`
+(connect to storage); (2) **views** via `importCatalog` (engine silent-register —
+body validation deferred to query time, so view-over-view and view-over-MV are
+order-independent and no event fires); (3) **materialized views** via `db.exec` per
+entry, which re-runs the create emitter (rebuilds the memory backing from current
+source data, re-registers row-time maintenance, re-runs the eligibility gate). The
+re-exec re-fires `materialized_view_added` → the listener regenerates identical DDL
+→ compare-skip (no churn), so a second consecutive reopen yields identical catalog
+bytes. MV-over-MV ordering uses a **fixpoint retry** (an MV whose body reads a
+not-yet-built MV fails the round and succeeds once its dependency is built) rather
+than a static topological sort — the resolved `sourceTables` (`_mv_<x>`) are not
+serialized in the DDL, so they are unavailable before exec. A genuinely unbuildable
+MV — a missing (e.g. memory) source, or an unresolvable cycle — makes no progress in
+a round and is recorded in the `RehydrationResult.errors` array (the result also
+gains additive `views` / `materializedViews` name arrays). An MV over a non-persisted
+(memory) source is therefore an inherent limitation: its source is absent on reopen,
+so it lands in `errors` and is not registered.
 
 ## Schema Path
 

@@ -18,6 +18,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { encodeCompositeKey, type EncodeOptions } from './encoding.js';
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 /**
  * Store name suffixes for different data types.
@@ -110,6 +111,79 @@ export function buildIndexKey(
  */
 export function buildCatalogKey(schemaName: string, tableName: string): Uint8Array {
 	return encoder.encode(`${schemaName}.${tableName}`.toLowerCase());
+}
+
+/**
+ * Reserved key-prefix strings for view / materialized-view catalog entries.
+ *
+ * Table entries keep their existing **unprefixed** key `{schema}.{table}` (a UTF-8
+ * encoding of an identifier, whose bytes are all printable — never `0x00`). View and
+ * MV entries are given a leading-`0x00` reserved prefix (`"\x00view\x00"` /
+ * `"\x00mview\x00"`) so they can never collide with a same-named table entry — a view
+ * (or MV) and a table may legally share a name. A leading `0x00` byte is a valid KV
+ * key byte for every provider (in-memory, LevelDB, and IndexedDB all accept arbitrary
+ * `Uint8Array` keys).
+ *
+ * Classification rule: {@link buildCatalogScanBounds} (no schema arg) is a full range
+ * scan (`gte: []`, `lt: [0xff]`) and so returns these prefixed view/MV entries
+ * alongside the unprefixed table entries (every prefix byte `0x00` < `0xff`).
+ * {@link classifyCatalogKey} routes each loaded entry to the correct rehydration phase
+ * by testing for these prefixes; the two prefixes are mutually exclusive ('v' vs 'm'
+ * after the leading `0x00`) and neither is a prefix of a table key.
+ */
+const VIEW_KEY_PREFIX = '\x00view\x00';
+const MVIEW_KEY_PREFIX = '\x00mview\x00';
+const VIEW_KEY_PREFIX_BYTES = encoder.encode(VIEW_KEY_PREFIX);
+const MVIEW_KEY_PREFIX_BYTES = encoder.encode(MVIEW_KEY_PREFIX);
+
+/** Kind of a loaded catalog entry, determined by its key prefix. */
+export type CatalogEntryKind = 'table' | 'view' | 'materializedView';
+
+/**
+ * Build a catalog key for a (non-materialized) view's DDL.
+ * Format: `\x00view\x00{schema}.{view}` (reserved prefix — never collides with a
+ * same-named table entry).
+ */
+export function buildViewCatalogKey(schemaName: string, viewName: string): Uint8Array {
+	return encoder.encode(`${VIEW_KEY_PREFIX}${`${schemaName}.${viewName}`.toLowerCase()}`);
+}
+
+/**
+ * Build a catalog key for a materialized view's DDL.
+ * Format: `\x00mview\x00{schema}.{mv}` (reserved prefix — never collides with a
+ * same-named table entry).
+ */
+export function buildMaterializedViewCatalogKey(schemaName: string, mvName: string): Uint8Array {
+	return encoder.encode(`${MVIEW_KEY_PREFIX}${`${schemaName}.${mvName}`.toLowerCase()}`);
+}
+
+/**
+ * Classify a loaded catalog key by its reserved prefix so `rehydrateCatalog` can
+ * route each entry to the correct phase. A view/MV entry must never be fed to the
+ * table-phase `importCatalog` (which would fail-loud or mis-handle it).
+ */
+export function classifyCatalogKey(key: Uint8Array): CatalogEntryKind {
+	if (startsWithBytes(key, VIEW_KEY_PREFIX_BYTES)) return 'view';
+	if (startsWithBytes(key, MVIEW_KEY_PREFIX_BYTES)) return 'materializedView';
+	return 'table';
+}
+
+/**
+ * Recover the qualified `{schema}.{name}` from a materialized-view catalog key
+ * (strips the reserved `\x00mview\x00` prefix). Used by `rehydrateCatalog` to name
+ * a re-materialized MV in its result — the re-exec path (`db.exec`) returns no name.
+ */
+export function decodeMaterializedViewCatalogKey(key: Uint8Array): string {
+	return decoder.decode(key).slice(MVIEW_KEY_PREFIX.length);
+}
+
+/** True when `key` begins with the byte sequence `prefix`. */
+function startsWithBytes(key: Uint8Array, prefix: Uint8Array): boolean {
+	if (key.length < prefix.length) return false;
+	for (let i = 0; i < prefix.length; i++) {
+		if (key[i] !== prefix[i]) return false;
+	}
+	return true;
 }
 
 /**

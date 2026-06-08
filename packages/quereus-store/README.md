@@ -40,11 +40,14 @@ The store module uses separate logical stores for different data types:
 **Key Formats:**
 - **Data keys**: Encoded primary key (no prefix)
 - **Index keys**: Encoded index columns + encoded PK
-- **Catalog keys**: `{schema}.{table}` as string
+- **Catalog keys**:
+  - Tables: `{schema}.{table}` as a string (the `CREATE TABLE` bundle, with its index DDL)
+  - Views: `\x00view\x00{schema}.{view}` (reserved-prefix; `generateViewDDL`)
+  - Materialized views: `\x00mview\x00{schema}.{mv}` (reserved-prefix; `generateMaterializedViewDDL`)
 
-This design eliminates redundant prefixes and groups related stores together by table name.
+This design eliminates redundant prefixes and groups related stores together by table name. The leading-`0x00` view/MV prefixes never collide with an unprefixed table key, so a view/MV may safely share a name with a table; a full catalog scan returns all three kinds intermixed and rehydrate classifies each by its key prefix.
 
-**Catalog DDL is re-persisted on catalog-only tag swaps.** `ALTER … SET TAGS` (and the programmatic `setTableTags` / `setColumnTags` / `setConstraintTags`) never reach `alterTable`, so the module subscribes to the engine's `table_modified` events and re-writes the `__catalog__` entry when `generateTableDDL` output changes — table / column / named-constraint tags survive close → reopen. These async writes are serialized and drained by `closeAll()` (or the `whenCatalogPersisted()` barrier) before the provider closes. Index and view/MV tag persistence is still pending (see backlog tickets `store-secondary-index-persistence` / `store-view-mv-persistence`), since the catalog persists neither index nor view/MV DDL.
+**Catalog DDL is re-persisted on catalog-only mutations.** `ALTER … SET TAGS` (and the programmatic `setTableTags` / `setColumnTags` / `setConstraintTags` / `setViewTags` / `setMaterializedViewTags`), plus `CREATE`/`DROP VIEW` and `CREATE`/`DROP MATERIALIZED VIEW`, never reach `module.alterTable`/`module.destroy`. The module subscribes to the engine's schema-change events (`table_modified`, the `view_*` events, and the `materialized_view_*` events) and writes the matching `__catalog__` entry when its `generate*DDL` output changes — table / column / constraint / **view** / **materialized-view** tags, and view/MV lifecycle, all survive close → reopen. These async writes are serialized and drained by `closeAll()` (or the `whenCatalogPersisted()` barrier) before the provider closes. On reopen, `rehydrateCatalog` classifies entries by key prefix and imports them in phases — tables → views → materialized views (MVs are re-materialized via `db.exec`, dependency-ordered for MV-over-MV). See [`docs/schema.md`](../../docs/schema.md#view-and-materialized-view-persistence) for the full design. The only remaining gap is an exposed implicit index's user tags (backlog `store-secondary-index-persistence`).
 
 ## Installation
 
@@ -308,7 +311,11 @@ console.log(hasIsolation(isolatedModule)); // true
 | `buildStatsStoreName` | Build store name for table stats |
 | `buildDataKey` | Build key for row data (encoded PK) |
 | `buildIndexKey` | Build key for index entry |
-| `buildCatalogKey` | Build key for catalog metadata |
+| `buildCatalogKey` | Build key for a table's catalog entry (`{schema}.{table}`) |
+| `buildViewCatalogKey` | Build key for a view's catalog entry (reserved `\x00view\x00` prefix) |
+| `buildMaterializedViewCatalogKey` | Build key for an MV's catalog entry (reserved `\x00mview\x00` prefix) |
+| `classifyCatalogKey` | Classify a loaded catalog key as `'table'` / `'view'` / `'materializedView'` |
+| `decodeMaterializedViewCatalogKey` | Recover `{schema}.{name}` from an MV catalog key |
 | `buildFullScanBounds` | Build bounds for full table scan |
 | `buildIndexPrefixBounds` | Build bounds for index prefix scan |
 | `buildCatalogScanBounds` | Build bounds for catalog scan |
