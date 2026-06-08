@@ -5869,6 +5869,23 @@ describe('Property-Based Tests', () => {
 				assertRowsEqual('np divergent-value fan-out (min of captured values applied once)',
 					await readRows('select pp, pv from np_parent order by pp'),
 					[{ pp: 10, pv: 1000 }], ['pp', 'pv']);
+
+				// Divergent-value MATERIALIZATION fan-out (`set pv = cv` over two DANGLING children
+				// sharing one missing key): the materialization INSERT's `group by k.<jk>` /
+				// `min(k.<val>)` must pick the minimum captured value (child 6 → 6000, child 7 →
+				// 7000 ⇒ 6000) and mint the partner ONCE — the create-branch mirror of the matched
+				// divergent case, exercising the materialization `min` (not just the read-back `min`).
+				await db.exec('delete from np_parent');
+				await db.exec('delete from np_child');
+				await db.exec('insert into np_child values (6, 99, 6000)');
+				await db.exec('insert into np_child values (7, 99, 7000)');
+				await db.exec('update npv set pv = cv where cc in (6, 7)');
+				assertRowsEqual('np divergent-value materialization fan-out (min minted once)',
+					await readRows('select pp, pv from np_parent order by pp'),
+					[{ pp: 99, pv: 6000 }], ['pp', 'pv']);
+				assertRowsEqual('np divergent-value materialization fan-out view image',
+					await readRows('select cc, cv, pv from npv order by cc'),
+					[{ cc: 6, cv: 6000, pv: 6000 }, { cc: 7, cv: 7000, pv: 6000 }], ['cc', 'cv', 'pv']);
 			});
 
 			// ----- Outer (RIGHT) join: non-preserved-side UPDATE (matched + null-extended) -----
@@ -6063,6 +6080,33 @@ describe('Property-Based Tests', () => {
 				assertRowsEqual('rnp materialization fan-out RETURNING parent base',
 					await readRows('select pp, pv from rnp_parent order by pp'),
 					[{ pp: 99, pv: 7 }], ['pp', 'pv']);
+
+				// Divergent-value fan-out (RIGHT mirror): `set pv = cv` over two children sharing one
+				// existing parent — the matched `min` read-back resolves the ambiguity deterministically
+				// (min of 1000, 4000 ⇒ 1000) exactly as the LEFT block, confirming the de-dup keys off
+				// JoinSide.preserved, not source order.
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_parent values (10, 100)');
+				await db.exec('insert into rnp_child values (1, 10, 1000)');
+				await db.exec('insert into rnp_child values (4, 10, 4000)');
+				await db.exec('insert into rnp_child values (5, 10, 5000)');
+				await db.exec('update rnpv set pv = cv where cc in (1, 4)');
+				assertRowsEqual('rnp divergent-value fan-out (min of captured values applied once)',
+					await readRows('select pp, pv from rnp_parent order by pp'),
+					[{ pp: 10, pv: 1000 }], ['pp', 'pv']);
+
+				// Divergent-value MATERIALIZATION fan-out (RIGHT mirror): two dangling children sharing
+				// one missing key; the materialization `group by`/`min` mints the partner once with the
+				// minimum captured value (6000).
+				await db.exec('delete from rnp_parent');
+				await db.exec('delete from rnp_child');
+				await db.exec('insert into rnp_child values (6, 99, 6000)');
+				await db.exec('insert into rnp_child values (7, 99, 7000)');
+				await db.exec('update rnpv set pv = cv where cc in (6, 7)');
+				assertRowsEqual('rnp divergent-value materialization fan-out (min minted once)',
+					await readRows('select pp, pv from rnp_parent order by pp'),
+					[{ pp: 99, pv: 6000 }], ['pp', 'pv']);
 			});
 
 			// ----- Outer (LEFT) join: existence-column WRITE (flag-flip ⇒ insert/delete) -----
