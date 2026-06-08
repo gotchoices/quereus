@@ -2,6 +2,8 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { isRelationalNode, type PlanNode, type RelationalComponentRef, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
+import { JoinNode } from '../nodes/join-node.js';
+import type { Scope } from '../scopes/scope.js';
 import { buildSelectStmt } from '../building/select.js';
 import { resolveBaseSite } from '../analysis/update-lineage.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
@@ -73,6 +75,45 @@ export interface BodyBackwardLineage {
 	readonly viewColToBaseRef: Map<string, AST.Expression>;
 	/** Per output column, in projection order. */
 	readonly columns: BackwardColumn[];
+	/**
+	 * The relational source the lowered base-term columns resolve against — the
+	 * outermost `JoinNode` for a join body (`anchor ⋈ members`, or an n-way join), or
+	 * the bare anchor table/retrieve node for an anchor-only body. Reused (not
+	 * re-planned) as the source an up-front identity/value capture builds on top of
+	 * ({@link findBodySource}; the decomposition dual of `analyzeJoinView`'s `joinNode`).
+	 */
+	readonly bodySource: RelationalPlanNode;
+	/**
+	 * {@link bodySource}'s combined column scope (`ctx.outputScopes.get(bodySource)`) — the
+	 * exact scope `buildSelectStmt` resolved the body's own predicate/projections against,
+	 * so a capture built over it resolves the member-relationId-qualified base columns
+	 * byte-identically. `undefined` when the source exposes no registered scope (a defensive
+	 * miss the capture builder rejects).
+	 */
+	readonly bodyScope: Scope | undefined;
+}
+
+/**
+ * The relational source a planned view body's lowered base columns resolve against: the
+ * **outermost** `JoinNode` reached from the root (a columnar / n-way join body — its nested
+ * joins ride inside via `getRelations()`), or — for an anchor-only body with no join (a
+ * value-only EAV decomposition) — the bare base `TableReferenceNode`. The generalized
+ * `findJoinNode` (multi-source.ts) the decomposition value capture and the EAV follow-up
+ * build their `Project(Filter(source))` capture on (§ Round-Trip Laws and the Derived
+ * Backward Walk). Falls back to `root` only if neither is found (defensive — every body
+ * analyzed here reaches ≥1 base table).
+ */
+export function findBodySource(root: RelationalPlanNode): RelationalPlanNode {
+	let join: RelationalPlanNode | undefined;
+	let table: RelationalPlanNode | undefined;
+	const visit = (n: PlanNode): void => {
+		if (join) return;
+		if (n instanceof JoinNode) { join = n; return; }
+		if (n instanceof TableReferenceNode && !table) table = n;
+		for (const child of n.getRelations()) visit(child);
+	};
+	visit(root);
+	return join ?? table ?? root;
 }
 
 /** Collect every `TableReferenceNode` in a planned body's relational spine, indexed by plan-node id. */
@@ -166,5 +207,13 @@ export function analyzeBodyLineage(ctx: PlanningContext, view: MutableViewLike):
 		});
 	});
 
-	return { sel, root, tableRefsById, viewColToBaseRef, columns };
+	// The relational source the lowered base-term columns resolve against + its combined
+	// column scope, captured from the SINGLE plan above (the body is planned once). The
+	// decomposition value capture / the EAV follow-up build their `Project(Filter(source))`
+	// over these rather than re-planning a cloned body (multi-source layers its own typed
+	// `findJoinNode` accessor on `root`; the two find the same outermost join).
+	const bodySource = findBodySource(root);
+	const bodyScope = ctx.outputScopes.get(bodySource);
+
+	return { sel, root, tableRefsById, viewColToBaseRef, columns, bodySource, bodyScope };
 }

@@ -6,7 +6,7 @@ import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
 import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
-import { analyzeDecompositionInsert, type DecompInsertOp } from '../mutation/decomposition.js';
+import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
 import { isSetOpMembershipBody, buildSetOpWrite } from '../mutation/set-op.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -107,16 +107,31 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 			? analyzeJoinView(ctx, view)
 			: undefined;
 
+	// A decomposition-backed logical table UPDATE: plan the synthesized body ONCE here (so no
+	// consumer re-plans it via AST — the same single-plan discipline the multi-source path
+	// follows) and route directly to the decomposition decomposer with a captured-value carrier.
+	// An arbitrary optional-columnar value rides the single-identity `__vmupd_keys` capture
+	// (folded into the keyCapture machinery below); constant/anchor/self updates build no capture
+	// and produce byte-identical base ops to the legacy `propagate` path. DELETE / INSERT through a
+	// decomposition stay on `propagate` / the insert envelope (unchanged).
+	const decompStorageShape = req.op === 'update' ? decompositionStorage(ctx, view) : undefined;
+	const decompShape: DecompShape | undefined = decompStorageShape ? analyzeDecomposition(ctx, view, decompStorageShape) : undefined;
+
 	// Cross-source SET values (`update v set a.x = b.y`) the multi-source UPDATE lowers
 	// to a correlated read of the captured partner column accumulate here, then thread
 	// into the identity capture so the same `__vmupd_keys` set carries them (§ Inner
 	// Join). Empty for delete / single-source / decomposition.
 	const sourceValues: CrossSourceValue[] = [];
+	// Arbitrary optional-columnar values a decomposition UPDATE lowers to a captured read-back
+	// accumulate here, then thread into the decomposition key capture (the dual of `sourceValues`).
+	const capturedValues: CapturedDecompValue[] = [];
 	let baseOps: BaseOp[];
 	if (msAnalysis && req.op === 'update') {
 		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, sourceValues);
 	} else if (msAnalysis && req.op === 'delete') {
 		baseOps = decomposeDelete(ctx, view, msAnalysis, req.stmt);
+	} else if (decompShape && req.op === 'update') {
+		baseOps = decomposeDecompositionUpdate(ctx, view, decompShape, req.stmt, capturedValues);
 	} else {
 		baseOps = propagate(ctx, view, withTags(req, tags));
 	}
@@ -160,8 +175,13 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// values back from that captured set (so the first op can't empty the join — or
 	// rewrite a predicate column — out from under the second op's identifying
 	// subquery), and the UPDATE RETURNING re-query re-projects by captured identity.
-	// Built once and shared.
-	const keyCapture = buildIdentityCapture(ctx, view, req, baseOps, msAnalysis, sourceValues);
+	// Built once and shared. A decomposition UPDATE that lowered ≥1 arbitrary value builds the
+	// single-identity (anchor-key) capture instead — the same `__vmupd_keys` substrate + downstream
+	// wiring (`injectKeyRef` / `withKeyCapture` / `identityCapture`), with `k0_0` the anchor key and
+	// one `srcN` per captured value. An empty carrier (constant/anchor/self) builds no capture.
+	const keyCapture = decompShape && req.op === 'update'
+		? (capturedValues.length > 0 ? buildDecompositionKeyCapture(ctx, view, decompShape, req.stmt.where, capturedValues) : undefined)
+		: buildIdentityCapture(ctx, view, req, baseOps, msAnalysis, sourceValues);
 	// EVERY multi-source update/delete base op now resolves `select k<side> from
 	// __vmupd_keys` against the context-backed key relation (single-side and both-sides
 	// alike — the live join-body subquery is retired), so inject a fresh key ref per op

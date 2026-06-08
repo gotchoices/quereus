@@ -1,6 +1,10 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { TableReferenceNode } from '../nodes/reference.js';
+import type { RelationalPlanNode } from '../nodes/plan-node.js';
+import type { Scope } from '../scopes/scope.js';
+import { FilterNode } from '../nodes/filter.js';
+import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildTableReference } from '../building/table.js';
 import type { StorageShape, DecompositionMember } from '../../vtab/mapping-advertisement.js';
 import type { ScalarType } from '../../common/datatype.js';
@@ -15,6 +19,7 @@ import { createRuntimeExpressionEvaluator } from '../analysis/const-evaluator.js
 import { containsNonDeterministicCall } from '../analysis/check-extraction.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
+import { keyColumnName, capturedValueSubquery, type MultiSourceKeyCapture } from './multi-source.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
@@ -59,12 +64,26 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  *   gated by a runtime non-empty filter (so a null-propagating expression materializes nothing
  *   while a null→non-null one does) and `on conflict (<memberKey>) do nothing` to cede matched
  *   rows — the two ops stay distinct because the matched and materialize values are computed over
- *   different scans. An
+ *   different scans. An **arbitrary** columnar value — one that embeds a subquery, reads a
+ *   *different* member's column, or mixes anchor + self leaves (`set c = b + 1`, `set c = c + a`,
+ *   `set c = (select …)`) — now rides a **single-identity (anchor-key) per-row capture** instead
+ *   of rejecting: every affected row's value is materialized ONCE over the planned get body (which
+ *   null-extends an absent optional member, so the captured value already encodes per-row presence)
+ *   into the multi-source `__vmupd_keys` substrate, and the matched UPDATE reads it back keyed by
+ *   the member key while a filtered materialize INSERT reads it keyed by the anchor key, gated on a
+ *   **runtime** non-null (the value is data-dependent, so the plan-time `foldsConstantFalse` of the
+ *   `self` fast-lane cannot decide it). Capturing the value pre-mutation is what makes a both-sides
+ *   write (`set c = b + 1, b = b + 100`) read `c` from the *pre-mutation* `b`
+ *   ({@link emitCapturedMemberUpdate} / {@link buildCapturedMaterializeInsert}; the capture relation
+ *   is {@link buildDecompositionKeyCapture}). A mixed anchor+self group rides this path too — it
+ *   subsumes the retired same-statement reject. An
  *   **EAV pivot** member's write is the triple analogue, per attribute: a null deletes
  *   the triple, an anchor-resolvable value upserts it via `do update`, a constant value
- *   upserts it via matched UPDATE + `do nothing` materialize INSERT. Any other value —
- *   a subquery, a cross-member column, or a value mixing anchor + self leaves — stays
- *   rejected `unsupported-decomposition-update` (the shared-capture follow-up).
+ *   upserts it via matched UPDATE + `do nothing` materialize INSERT. An **arbitrary EAV** value
+ *   (a subquery, a cross-member column, an anchor+self mix, or any EAV self-reference — which
+ *   lowers to a subquery) stays rejected `unsupported-decomposition-update` (EAV capture is the
+ *   prereq-chained follow-up — the columnar substrate above is single-identity, an EAV triple is
+ *   one-to-many).
  * - **INSERT** fans out to one insert per member, **anchor first** (FK-order root).
  *   It rides the shared-surrogate mutation envelope `view-mutation-shared-surrogate-insert`
  *   ships (`ViewMutationNode.envelope` + `EnvelopeScanNode`): the user source is
@@ -95,13 +114,14 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * - **UPDATE of a shared-key column** — a key write is an identity change, not a
  *   value write. (Optional-member and EAV value writes are **supported** — see
  *   the UPDATE bullet above; only a key/identity write stays rejected.)
- * - **UPDATE of an optional/EAV member with an arbitrary value** — a value that embeds
- *   a subquery, reads a *different* member's column, or mixes anchor + self leaves
- *   (and any EAV self-reference, which lowers to a subquery) needs a per-row capture
- *   substrate to thread it across the matched-update and materialize-insert branches.
- *   The two self-contained shapes — anchor-resolvable and member self-reference — are
- *   *supported* (see the UPDATE bullet); the rest is deferred to the shared-capture
- *   follow-up (`view-write-decomposition-update-arbitrary-value-capture`).
+ * - **UPDATE of an EAV member with an arbitrary value** — a value that embeds a subquery,
+ *   reads a *different* member's column, mixes anchor + self leaves, or is an EAV
+ *   self-reference (which lowers to a subquery over the triple store). An **optional
+ *   columnar** member with such a value is now *supported* via the single-identity capture
+ *   (see the UPDATE bullet); only EAV stays deferred, because an EAV triple is one-to-many
+ *   off the anchor key (the columnar capture's single-row-per-anchor read-back is not
+ *   well-defined). Deferred to the prereq-chained follow-up
+ *   (`view-write-decomposition-update-captured-eav`).
  * - **composite shared keys** — v1 threads a single-column key (mirrors the
  *   single-column-PK boundary in `multi-source.ts`).
  */
@@ -114,7 +134,7 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * synthesized body's projection list (docs/view-updateability.md § Round-Trip Laws
  * and the Derived Backward Walk, docs/lens.md § The Default Mapper).
  */
-interface DecompShape {
+export interface DecompShape {
 	readonly storage: StorageShape;
 	readonly anchor: DecompositionMember;
 	/** logical-column-name (lowercased) → its backing expression in the get body (from the shared consumer). */
@@ -123,6 +143,15 @@ interface DecompShape {
 	readonly columns: readonly BackwardColumn[];
 	/** Planned-body `TableReferenceNode` id → the decomposition member it realizes (join members only). */
 	readonly memberByTableId: ReadonlyMap<number, DecompositionMember>;
+	/**
+	 * The planned get body's relational source (the `anchor ⋈ members` join for a columnar
+	 * body) + its combined column scope — the source/scope {@link buildDecompositionKeyCapture}
+	 * builds the single-identity value capture over, resolving the member-relationId-qualified
+	 * base columns the lowered captured values carry (the decomposition dual of
+	 * `analyzeJoinView`'s `joinNode` / `joinScope`). Threaded from the shared body lineage.
+	 */
+	readonly bodySource: RelationalPlanNode;
+	readonly bodyScope: Scope | undefined;
 }
 
 /**
@@ -134,7 +163,7 @@ interface DecompShape {
  * not join sources, so they carry no planned `TableReferenceNode` and are absent
  * from {@link DecompShape.memberByTableId} (resolved off the advertisement instead).
  */
-function analyzeDecomposition(ctx: PlanningContext, view: MutableViewLike, storage: StorageShape): DecompShape {
+export function analyzeDecomposition(ctx: PlanningContext, view: MutableViewLike, storage: StorageShape): DecompShape {
 	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
 	if (!anchor) {
 		// Validated at advertisement resolution; defensive.
@@ -165,7 +194,10 @@ function analyzeDecomposition(ctx: PlanningContext, view: MutableViewLike, stora
 		}
 		if (matches.length === 1) memberByTableId.set(id, matches[0]);
 	}
-	return { storage, anchor, viewColToBaseRef: lineage.viewColToBaseRef, columns: lineage.columns, memberByTableId };
+	return {
+		storage, anchor, viewColToBaseRef: lineage.viewColToBaseRef, columns: lineage.columns, memberByTableId,
+		bodySource: lineage.bodySource, bodyScope: lineage.bodyScope,
+	};
 }
 
 /** How one logical column is backed, decided off the threaded backward lineage (+ advertisement for the deferred shapes). */
@@ -716,12 +748,47 @@ function anchorDeleteOp(
  * the per-attribute triple analogue (non-null → upsert, null → delete). The branches
  * are ordinary AST base ops keyed off the anchor subquery, not a new plan-node
  * substrate (the same realization consumer 1 used for the outer-join dual). Shared-key
- * (identity) / computed targets and cross-member value reads stay rejected.
+ * (identity) / computed targets stay rejected.
+ *
+ * `capturedValues` is the optional **capture carrier** the builder threads (parallel to
+ * `decomposeUpdate`'s `sourceValues` in multi-source.ts): when present, an **arbitrary**
+ * value on an *optional columnar* member (a subquery, cross-member, or mixed anchor+self —
+ * otherwise rejected) is lowered to base terms and accumulated as a `srcN` projection, and
+ * its cell rides the per-row capture two-op path ({@link emitCapturedMemberUpdate}); the
+ * builder then materializes the values once over the planned body
+ * ({@link buildDecompositionKeyCapture}) and every base op reads them back through the
+ * context-injected `__vmupd_keys`. Absent the carrier (the legacy `propagateDecomposition`
+ * path, unreachable from build), an arbitrary value stays rejected — the defensive legacy
+ * behaviour, exactly as `propagateMultiSource`'s update path does.
  */
-function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: DecompShape, stmt: AST.UpdateStmt): BaseOp[] {
+export function decomposeUpdate(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	stmt: AST.UpdateStmt,
+	capturedValues?: CapturedDecompValue[],
+): BaseOp[] {
 	rejectReturning(view, stmt.returning);
 	const pred = anchorPredicate(view, shape, stmt.where);
 	const declaredNames = declaredColumnNames(view);
+
+	// Capture carrier (mirrors multi-source.ts `decomposeUpdate`'s `registerCapturedExpr`):
+	// project an already-lowered base-term value into the up-front `__vmupd_keys` capture under
+	// a stable `srcN` alias (deduped by `key`), returning that alias. `canCapture` gates whether
+	// an arbitrary optional-columnar value is admitted (carrier present) or rejected (legacy
+	// carrier-absent path); the EAV / non-columnar reject is independent of it.
+	const canCapture = capturedValues !== undefined;
+	const srcDedup = new Map<string, string>();
+	const registerCapturedExpr = capturedValues
+		? (key: string, expr: AST.Expression): string => {
+			const existing = srcDedup.get(key);
+			if (existing) return existing;
+			const alias = `src${capturedValues.length}`;
+			srcDedup.set(key, alias);
+			capturedValues.push({ alias, expr });
+			return alias;
+		}
+		: undefined;
 
 	// Per-member accumulation. A member is exactly one kind (mandatory-columnar /
 	// optional-columnar / EAV), so at most one of the three maps holds a given member.
@@ -749,7 +816,7 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 	};
 
 	for (const asg of stmt.assignments) {
-		const routed = routeAssignment(view, shape, declaredNames, asg);
+		const routed = routeAssignment(view, shape, declaredNames, asg, canCapture);
 		switch (routed.kind) {
 			case 'mandatory': {
 				noteTarget(routed.member.relationId, routed.basisColumn.toLowerCase(), asg.column);
@@ -780,7 +847,7 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 		const m = mandatory.get(member.relationId);
 		if (m && m.length > 0) ops.push(memberUpdateOp(ctx, view, shape, member, m, pred, stmt));
 		const o = optional.get(member.relationId);
-		if (o) emitOptionalMemberUpdate(ctx, view, shape, member, o.cells, pred, stmt, ops);
+		if (o) emitOptionalMemberUpdate(ctx, view, shape, member, o.cells, pred, stmt, ops, registerCapturedExpr);
 		const e = eav.get(member.relationId);
 		if (e) emitEavMemberUpdate(ctx, view, shape, member, e.cells, pred, stmt, ops);
 	};
@@ -793,8 +860,21 @@ function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, shape: Dec
 }
 
 /**
+ * One arbitrary optional-columnar value captured into the up-front `__vmupd_keys` set: the
+ * `expr` is the assigned value lowered to base terms (member-relationId-qualified, over the
+ * planned get body), projected into the capture under the stable `alias` (`src0`, `src1`, …).
+ * Each base op reads it back correlated by the stitch key — by the member key (matched UPDATE)
+ * or the anchor key (materialize INSERT) — so the value is the **pre-mutation** one regardless
+ * of base-op order (the decomposition analogue of multi-source.ts `CrossSourceValue`).
+ */
+export interface CapturedDecompValue {
+	readonly alias: string;
+	readonly expr: AST.Expression;
+}
+
+/**
  * How an optional/EAV-member assigned value is scoped, after lowering to base terms — the
- * gate on whether a non-constant value is expressible without a new capture substrate.
+ * gate on whether a non-constant value is expressible without, or with, the capture substrate.
  */
 type ValueKind =
 	/** No column ref (a constant, or the null-literal delete / absent-no-op trigger). */
@@ -803,7 +883,11 @@ type ValueKind =
 	| 'anchor'
 	/** Every leaf is the **owning member's** own column (`set c = c + 1`) — matched UPDATE for present
 	 *  rows plus a null-substituted, non-empty-filtered materialize INSERT for absent rows (columnar). */
-	| 'self';
+	| 'self'
+	/** An **arbitrary** optional-columnar value (subquery / cross-member / mixed anchor+self) admitted
+	 *  via the single-identity per-row capture: materialized once over the planned body, read back by
+	 *  the stitch key in both branches ({@link emitCapturedMemberUpdate}). Columnar + carrier only. */
+	| 'captured';
 
 /** A lowered optional/EAV-member value plus its {@link ValueKind} classification. */
 interface LoweredValue {
@@ -817,7 +901,8 @@ interface LoweredValue {
 /** One assigned cell of an optional columnar member's update group. */
 interface OptionalCell {
 	readonly basisColumn: string;
-	/** Assigned value, already lowered to base terms (a constant, an anchor-resolvable expr, or a self-reference). */
+	/** Assigned value, already lowered to base terms (a constant, anchor-resolvable, self, or an
+	 *  arbitrary `captured` expr — the latter projected into `__vmupd_keys` over the planned body). */
 	readonly value: AST.Expression;
 	readonly isNull: boolean;
 	readonly kind: ValueKind;
@@ -849,7 +934,7 @@ type RoutedAssignment =
  * emptied delete) instead of rejected. A shared-key (identity) / computed / unbacked
  * target stays rejected with its precise diagnostic.
  */
-function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredNames: ReadonlyMap<string, string>, asg: AST.UpdateStmt['assignments'][number]): RoutedAssignment {
+function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredNames: ReadonlyMap<string, string>, asg: AST.UpdateStmt['assignments'][number], canCapture: boolean): RoutedAssignment {
 	const logical = asg.column.toLowerCase();
 	if (isSharedKeyColumn(shape, logical)) {
 		raiseMutationDiagnostic({
@@ -866,15 +951,16 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
 			// per-row materialization transition (matched → update, absent → insert, all
 			// value columns null → delete), realized as anchor-keyed AST base ops below.
 			if (route.member.presence !== 'mandatory' || route.nullExtended) {
-				const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg);
+				const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg, canCapture);
 				return { kind: 'optional', member: route.member, basisColumn: route.baseColumn, value, isNull, valueKind: kind };
 			}
 			return { kind: 'mandatory', member: route.member, basisColumn: route.baseColumn, value: rewriteAssignedValue(view, shape, route.member, asg.value) };
 		}
 		case 'eav': {
 			// An EAV pivot backs its logical columns as attribute triples: a non-null value
-			// upserts the triple, a null deletes it (the EAV analogue of the optional case).
-			const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg);
+			// upserts the triple, a null deletes it (the EAV analogue of the optional case). An
+			// arbitrary EAV value stays rejected — `canCapture` is moot for a non-columnar owner.
+			const { kind, value, isNull } = lowerMaterializedValue(view, shape, route.member, asg, canCapture);
 			return { kind: 'eav', member: route.member, attribute: declaredNames.get(logical) ?? asg.column, value, isNull, valueKind: kind };
 		}
 		case 'computed-mapping':
@@ -914,19 +1000,24 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
  *   an upsert (see {@link emitOptionalMemberUpdate} / {@link buildSelfMaterializeInsertSelect}).
  *
  * Anything else — a subquery, a cross-member column, an unqualified ref, or a single value
- * mixing anchor and self leaves — is `arbitrary` and rejected: threading it across both
- * branches needs the per-row capture substrate (deferred; backlog
- * `view-write-decomposition-update-arbitrary-value-capture`). An EAV value column substitutes
- * to a correlated subquery, so an EAV self-reference lands here too (only `constant` / `anchor`
- * reach an EAV cell). Classification reads the lowered value's column-ref **relationId
- * qualifiers** (the synthesized body aliases each member by its relationId — the same qualifier
- * {@link rewriteAssignedValue} keys cross-member rejection on); the owner is never the anchor
- * (an optional/EAV member is mandatory-distinct), so `anchor` and `self` never collide.
+ * mixing anchor and self leaves — is **arbitrary**. On an **optional columnar** member with a
+ * capture carrier present (`canCapture`) it is admitted as `captured`: lowered to base terms
+ * and (at emit) projected into the up-front `__vmupd_keys` set, read back by the stitch key in
+ * both branches ({@link emitCapturedMemberUpdate}). Without a carrier (the legacy
+ * `propagateDecomposition` path) or on an **EAV** member (a triple is one-to-many off the anchor
+ * key, so the single-row read-back is undefined; EAV is the follow-up), it stays rejected. An EAV
+ * value column substitutes to a correlated subquery, so an EAV self-reference lands `arbitrary`
+ * too (only `constant` / `anchor` reach an EAV cell). Classification reads the lowered value's
+ * column-ref **relationId qualifiers** (the synthesized body aliases each member by its
+ * relationId — the same qualifier {@link rewriteAssignedValue} keys cross-member rejection on);
+ * the owner is never the anchor (an optional/EAV member is mandatory-distinct), so `anchor` and
+ * `self` never collide.
  */
-function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, owner: DecompositionMember, asg: AST.UpdateStmt['assignments'][number]): LoweredValue {
+function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, owner: DecompositionMember, asg: AST.UpdateStmt['assignments'][number], canCapture: boolean): LoweredValue {
 	const lowered = substituteViewColumns(asg.value, shape, view);
 	const isNull = isNullLiteral(lowered);
 	const { qualifiers, hasUnqualifiedColumn, hasSubquery } = collectValueScopes(lowered);
+	const ownerIsColumnar = owner.attributePivot === undefined;
 
 	if (!hasSubquery && !hasUnqualifiedColumn && qualifiers.size === 0) {
 		return { kind: 'constant', value: lowered, isNull };
@@ -934,14 +1025,21 @@ function lowerMaterializedValue(view: MutableViewLike, shape: DecompShape, owner
 	if (!hasSubquery && !hasUnqualifiedColumn) {
 		const anchorId = shape.anchor.relationId;
 		if ([...qualifiers].every(q => q === anchorId)) return { kind: 'anchor', value: lowered, isNull };
-		const ownerIsColumnar = owner.attributePivot === undefined;
 		if (ownerIsColumnar && [...qualifiers].every(q => q === owner.relationId)) return { kind: 'self', value: lowered, isNull };
+	}
+	// Arbitrary value. An optional **columnar** member with a capture carrier admits it via the
+	// single-identity per-row capture (the value is registered + read back at emit); the cell
+	// just classifies `captured` here. EAV and the carrier-absent legacy path stay rejected.
+	if (canCapture && ownerIsColumnar) {
+		return { kind: 'captured', value: lowered, isNull };
 	}
 	raiseMutationDiagnostic({
 		reason: 'unsupported-decomposition-update',
 		column: asg.column,
 		table: view.name,
-		message: `cannot update logical table '${view.name}': writing optional/EAV-member column '${asg.column}' admits a constant, an anchor-resolvable value (every leaf resolves to an anchor base column, e.g. \`${asg.column} = <anchorCol> + 1\`), or a member self-reference (e.g. \`${asg.column} = ${asg.column} + 1\`); this value embeds a subquery, reads a different member's column, or mixes anchor and self leaves, which needs the per-row capture substrate to thread it across the matched-update and materialize-insert branches (deferred — see backlog view-write-decomposition-update-arbitrary-value-capture)`,
+		message: ownerIsColumnar
+			? `cannot update logical table '${view.name}': writing optional-member column '${asg.column}' with this value needs the per-row capture carrier to thread it across the matched-update and materialize-insert branches, which the legacy non-build path does not supply`
+			: `cannot update logical table '${view.name}': writing EAV-member column '${asg.column}' admits a constant or an anchor-resolvable value; this value embeds a subquery, reads a different member's column, or mixes anchor and self leaves, which an EAV triple cannot thread through the single-identity capture substrate (an EAV triple is one-to-many off the anchor key) — deferred to the EAV capture follow-up (view-write-decomposition-update-captured-eav)`,
 	});
 }
 
@@ -1028,11 +1126,16 @@ function rewriteAssignedValue(view: MutableViewLike, shape: DecompShape, owner: 
  * group, routed by the group's {@link ValueKind} composition (see the table in the file
  * header):
  *
- * - **mixes `anchor` and `self`** → reject `arbitrary`: the matched side would need a
- *   per-row correlated capture to thread the anchor value while the self cell reads the
- *   member's own prior value (deferred — the value-capture follow-up).
- * - **has an `anchor` cell** (no `self`) → a single **upsert** unifies the matched UPDATE
- *   and the absent materialize INSERT: the value is computed once over the anchor scan and
+ * - **has a `captured` cell, OR mixes `anchor` and `self`** → the whole group rides the
+ *   single-identity per-row capture ({@link emitCapturedMemberUpdate}): EVERY cell's value
+ *   (including any anchor/self/constant sibling) is materialized once over the planned body
+ *   under a `srcN`, the matched UPDATE reads each back by the member key, and a filtered
+ *   materialize INSERT reads each back by the anchor key (gated on a runtime non-null). This
+ *   subsumes the retired same-statement anchor+self reject — a mixed value, like any arbitrary
+ *   one, is now a captured value. Requires the capture carrier (the build path); absent it the
+ *   defensive legacy reject fires.
+ * - **has an `anchor` cell** (no `self`/`captured`) → a single **upsert** unifies the matched
+ *   UPDATE and the absent materialize INSERT: the value is computed once over the anchor scan and
  *   both branches read it (insert directly, matched via `excluded.<col>`). Constant cells
  *   fold in as literal projections / `do update set col = excluded.col`.
  * - **has a `self` cell** (no `anchor`) → present rows take the matched UPDATE (their real
@@ -1059,16 +1162,27 @@ function emitOptionalMemberUpdate(
 	pred: AST.Expression | undefined,
 	stmt: AST.UpdateStmt,
 	ops: BaseOp[],
+	registerCapturedExpr: ((key: string, expr: AST.Expression) => string) | undefined,
 ): void {
+	const hasCaptured = cells.some(c => c.kind === 'captured');
 	const hasAnchor = cells.some(c => c.kind === 'anchor');
 	const hasSelf = cells.some(c => c.kind === 'self');
 
-	if (hasAnchor && hasSelf) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-decomposition-update',
-			table: view.name,
-			message: `cannot update logical table '${view.name}': the update of optional member '${member.relationId}' mixes an anchor-resolvable value and a member self-reference in one statement; threading both across the matched-update and materialize branches needs the per-row capture substrate (deferred — see backlog view-write-decomposition-update-arbitrary-value-capture)`,
-		});
+	// A group with ≥1 arbitrary (`captured`) cell — or a mixed anchor+self group, which no
+	// single-branch fast lane expresses — rides the single-identity per-row capture: every cell's
+	// value is materialized once over the planned body and read back by the stitch key in both
+	// branches. A `captured` cell can only exist when the carrier is present (the classifier gated
+	// it), so the guard only ever fires for the legacy carrier-absent anchor+self case.
+	if (hasCaptured || (hasAnchor && hasSelf)) {
+		if (!registerCapturedExpr) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-decomposition-update',
+				table: view.name,
+				message: `cannot update logical table '${view.name}': the update of optional member '${member.relationId}' mixes an anchor-resolvable value and a member self-reference in one statement; threading both across the matched-update and materialize branches needs the per-row capture carrier, which the legacy non-build path does not supply`,
+			});
+		}
+		emitCapturedMemberUpdate(ctx, view, shape, member, cells, pred, stmt, ops, registerCapturedExpr);
+		return;
 	}
 
 	if (hasAnchor) {
@@ -1135,6 +1249,191 @@ function emitOptionalMemberUpdate(
 	if (cells.some(c => !c.isNull)) {
 		ops.push(buildOptionalMemberInsertSelect(ctx, view, shape, member, cells, pred, stmt, 'nothing'));
 	}
+}
+
+/**
+ * Emit the captured two-op path for an optional columnar member group that contains an
+ * arbitrary (`captured`) cell — or that mixes an anchor and a self cell (which no single-branch
+ * fast lane expresses). EVERY cell's already-lowered base-term value is projected into the
+ * up-front `__vmupd_keys` capture under a stable `srcN` alias (a `captured` cell's arbitrary
+ * value, but also any anchor/self/constant sibling — uniform, harmless: the capture over the
+ * planned body null-extends an absent optional member, so a self/cross-member value over an
+ * absent row already captures null). Then:
+ *
+ * - the **matched UPDATE** (unfiltered over the present rows) sets each value from the capture,
+ *   read back by the **member key** (`(select srcN from __vmupd_keys k where k.k0_0 = <memberKey>)`),
+ *   so a present row gets its real pre-mutation value; a captured-null on a matched row writes the
+ *   column null (a benign physical divergence — it reads identically to absent, never a widen).
+ * - the **materialize INSERT** ({@link buildCapturedMaterializeInsert}) over the absent rows reads
+ *   each value back by the **anchor key**, gated on ≥1 captured read-back being non-null at runtime
+ *   (so a self/cross-member value that captured null springs no phantom row) with
+ *   `on conflict (<memberKey>) do nothing` to cede matched rows to the UPDATE.
+ *
+ * The two ops cannot collapse into an upsert: the filter must suppress the absent branch without
+ * suppressing the matched write. The UPDATE precedes the INSERT so the matched rows are settled
+ * before the `do nothing` materialize cedes them. The capture is materialized pre-mutation
+ * (regardless of base-op order), so a both-sides write (`set c = b + 1, b = b + 100`) reads `c`
+ * from the pre-mutation `b`. Reuses {@link assertNoUnassignedValueColumnWiden} (raised here, before
+ * either op, so a widen reject stays atomic) + {@link assertNoMissingNotNull} (in the builder).
+ */
+function emitCapturedMemberUpdate(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	cells: readonly OptionalCell[],
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+	ops: BaseOp[],
+	registerCapturedExpr: (key: string, expr: AST.Expression) => string,
+): void {
+	const ref = resolveMemberTable(ctx, member);
+	const schema = ref.tableSchema;
+	const memberKey = singleKeyColumn(view, shape, member);
+
+	// View-soundness gate (atomic, before either op): an unassigned value column that would not
+	// land null cannot be materialized. Shared with the constant / self materialize builders.
+	assertNoUnassignedValueColumnWiden(view, shape, member, schema, cells);
+
+	// Register every cell's lowered value into the capture (one `srcN` per cell), keyed by its
+	// basis column so the two read-back sites (member key, anchor key) bind the same alias.
+	const srcByCell = cells.map(c =>
+		registerCapturedExpr(`cap:${member.relationId.toLowerCase()}:${c.basisColumn.toLowerCase()}`, cloneExpr(c.value)));
+
+	// Matched UPDATE (unfiltered over the present rows): each value read back by the member key.
+	ops.push(memberUpdateOp(ctx, view, shape, member,
+		cells.map((c, i) => ({ column: c.basisColumn, value: capturedValueSubquery(srcByCell[i], 0, [memberKey]) })),
+		pred, stmt));
+
+	// Materialize INSERT (filtered over the absent rows): each value read back by the anchor key.
+	ops.push(buildCapturedMaterializeInsert(ctx, view, shape, member, cells, srcByCell, pred, stmt));
+}
+
+/**
+ * Build the absent-row materialize INSERT for a captured optional-member group, modeled on
+ * {@link buildSelfMaterializeInsertSelect} (`'nothing'` flavour) but sourcing each value from the
+ * up-front `__vmupd_keys` capture rather than a null-substituted self-expression. The select is
+ * over the anchor; each projected value is `capturedValueSubquery(srcN, 0, [anchorKey])` — the
+ * captured read-back correlated by the anchor key (which holds the shared stitch-key value). The
+ * WHERE conjoins the user predicate with an OR-chain `<each captured read-back> is not null`, so a
+ * row whose every captured value is null (a self/cross-member value over an absent member, or a
+ * subquery returning null) materializes nothing — the **runtime** analogue of the self path's
+ * plan-time `foldsConstantFalse`, since a captured value is data-dependent and cannot be folded.
+ * `on conflict (<memberKey>) do nothing` cedes the matched rows to the UPDATE (emitted first).
+ * Always emitted (the filter decides per row). Runs {@link assertNoMissingNotNull} on the target
+ * columns (the widen gate already fired in the caller).
+ */
+function buildCapturedMaterializeInsert(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	member: DecompositionMember,
+	cells: readonly OptionalCell[],
+	srcByCell: readonly string[],
+	pred: AST.Expression | undefined,
+	stmt: AST.UpdateStmt,
+): BaseOp {
+	const ref = resolveMemberTable(ctx, member);
+	const schema = ref.tableSchema;
+	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	const memberKey = singleKeyColumn(view, shape, member);
+
+	const targetColumns: string[] = [memberKey];
+	const projections: AST.ResultColumn[] = [
+		{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } },
+	];
+	cells.forEach((c, i) => {
+		targetColumns.push(c.basisColumn);
+		projections.push({ type: 'column', expr: capturedValueSubquery(srcByCell[i], 0, [anchorKey]) });
+	});
+	assertNoMissingNotNull(view, schema, targetColumns.map((baseColumn): DecompInsertColumn => ({ baseColumn })));
+
+	// Non-empty image filter: OR over each captured value (read back by the anchor key) being
+	// non-null. A fresh `capturedValueSubquery` per disjunct (distinct AST nodes from the
+	// projections') keeps the filter self-contained.
+	const nonEmpty = cells
+		.map((_, i): AST.Expression => ({ type: 'unary', operator: 'IS NOT NULL', expr: capturedValueSubquery(srcByCell[i], 0, [anchorKey]) }))
+		.reduce((acc, e): AST.Expression => acc ? { type: 'binary', operator: 'OR', left: acc, right: e } : e);
+	const where = combineAnd(pred ? cloneExpr(pred) : undefined, nonEmpty);
+
+	const select: AST.SelectStmt = {
+		type: 'select',
+		columns: projections,
+		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
+		where,
+	};
+	const statement: AST.InsertStmt = {
+		type: 'insert',
+		table: memberIdentifier(member),
+		columns: targetColumns,
+		source: select,
+		upsertClauses: [{ type: 'upsert', conflictTarget: [memberKey], action: 'nothing' }],
+		contextValues: stmt.contextValues,
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+	return { table: ref, op: 'insert', statement };
+}
+
+/**
+ * Build the single-identity (anchor-key) per-row value capture for a decomposition columnar
+ * UPDATE — the decomposition dual of `buildMultiSourceKeyCapture` (multi-source.ts), reusing the
+ * shared `__vmupd_keys` substrate ({@link MultiSourceKeyCapture} / `makeMultiSourceKeyRef` /
+ * `keyColumnName`). Built as plan nodes directly over the **already-planned get body**
+ * (`shape.bodySource` + `shape.bodyScope`) — `Project_{k0_0, srcN…}(Filter_{anchorPred}(body))` —
+ * so the body is planned once and the captured value already encodes per-row presence (the body
+ * null-extends an absent optional member).
+ *
+ *  - `k0_0` (the only identity column) := the anchor key, read back by every base op (by the
+ *    member key in the matched UPDATE, the anchor key in the materialize INSERT — both correlate
+ *    `k.k0_0`, which holds the shared stitch-key value, since each member is keyed 1:1 to the
+ *    anchor).
+ *  - one `srcN` per {@link CapturedDecompValue}, in registration (= read-back) order, so the
+ *    flattened `keyColumns` align positionally with the projections every reader scans back.
+ *
+ * The identity predicate is the same anchor-resolvable lowering the base ops route on
+ * ({@link anchorPredicate}, re-validated here — idempotent); a non-anchor WHERE has already
+ * thrown in `decomposeUpdate` before any capture is requested (atomic).
+ */
+export function buildDecompositionKeyCapture(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	where: AST.Expression | undefined,
+	capturedValues: readonly CapturedDecompValue[],
+): MultiSourceKeyCapture {
+	const scope = shape.bodyScope;
+	if (!scope) {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: view.name,
+			message: `cannot write through logical table '${view.name}': the planned decomposition body did not expose a resolvable column scope for the value capture`,
+		});
+	}
+	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+
+	// The identifying predicate (anchor-resolvable user WHERE → base terms), built as a
+	// ScalarPlanNode over the body scope, then a Filter over the planned body source.
+	const predAst = anchorPredicate(view, shape, where);
+	const predicate = predAst ? buildExpression({ ...ctx, scope }, predAst) : undefined;
+	const filtered: RelationalPlanNode = predicate
+		? new FilterNode(scope, shape.bodySource, predicate)
+		: shape.bodySource;
+
+	// k0_0 := the anchor key, then one srcN per captured value (lowered over the body scope).
+	const keyColumns: { name: string; type: ScalarType }[] = [];
+	const projections: Projection[] = [];
+	const anchorKeyNode = buildExpression({ ...ctx, scope }, { type: 'column', name: anchorKey, table: shape.anchor.relationId });
+	keyColumns.push({ name: keyColumnName(0, 0), type: anchorKeyNode.getType() });
+	projections.push({ node: anchorKeyNode, alias: keyColumnName(0, 0) });
+	for (const cv of capturedValues) {
+		const node = buildExpression({ ...ctx, scope }, cv.expr);
+		keyColumns.push({ name: cv.alias, type: node.getType() });
+		projections.push({ node, alias: cv.alias });
+	}
+
+	const source = new ProjectNode(scope, filtered, projections, undefined, undefined, false);
+	return { source, descriptor: {}, keyColumns };
 }
 
 /**

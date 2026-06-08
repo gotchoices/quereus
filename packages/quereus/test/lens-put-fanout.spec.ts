@@ -28,15 +28,22 @@
  *   optional members gated per-row on a supplied value; EAV pivots emit one triple per
  *   supplied attribute; singleton over the empty key.
  *
+ * An **arbitrary** value written to an *optional columnar* member (a subquery, a cross-member
+ * column, or a value mixing anchor + self leaves) is now admitted via the **single-identity
+ * (anchor-key) per-row capture**: it is materialized once over the planned get body (which
+ * null-extends an absent optional member, so the captured value already encodes per-row presence)
+ * into the multi-source `__vmupd_keys` substrate, the matched UPDATE reads it back by the member
+ * key and a filtered materialize INSERT by the anchor key, gated on a runtime non-null. Capturing
+ * pre-mutation is what makes a both-sides write (`set c = b + 1, b = b + 100`) read `c` from the
+ * pre-mutation `b`. The two self-contained non-constant shapes — anchor-resolvable and member
+ * self-reference — keep their tighter single-op / self-materialize lowering.
+ *
  * Still deferred onto absent substrate (asserted to raise a precise diagnostic): a
  * non-anchor-predicate DELETE/UPDATE (snapshot-consistent multi-member execution), a
- * shared-key (identity) UPDATE, and an **arbitrary** value written to an optional/EAV
- * member (a subquery, a cross-member column, or a value mixing anchor + self leaves, and
- * any EAV self-reference) — which would need the per-row capture substrate to thread it
- * across both the matched-update and materialize-insert branches. The two self-contained
- * non-constant shapes — anchor-resolvable and member self-reference — are now supported; a
- * self-reference materializes an absent row whenever its null-substituted image is non-null
- * (`coalesce(c, 0) + 1`), and stays absent when null-propagating (`c + 1`).
+ * shared-key (identity) UPDATE, and an **arbitrary value written to an EAV member** (a subquery,
+ * cross-member, anchor+self mix, or any EAV self-reference) — an EAV triple is one-to-many off the
+ * anchor key, so the single-identity capture's single-row read-back is not well-defined (the
+ * prereq-chained `view-write-decomposition-update-captured-eav` follow-up).
  */
 
 import { expect } from 'chai';
@@ -390,25 +397,86 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		}
 	});
 
-	it('rejects a cross-member optional-member value (set c = b reads a different member)', async () => {
-		// `set c = b` lowers to `T_b.b` — a column on a *different* member than the optional member
-		// it assigns. Threading that across both branches needs the per-row capture substrate.
+	it('writes a cross-member optional value via the single-identity capture (present + absent)', async () => {
+		// `set c = b + 1` lowers to `T_b.b + 1` — a column on a *different* member (mandatory T_b)
+		// than the optional T_c it assigns. The value is materialized once over the planned body
+		// (which null-extends an absent T_c) into __vmupd_keys; the matched UPDATE reads it back by
+		// the member key, the materialize INSERT by the anchor key (gated on a runtime non-null).
 		const db = new Database();
 		try {
 			await setup(db);
-			await expectThrows(() => db.exec('update x.T set c = b where id = 1'), /capture substrate|different member/i);
-			// Atomic: the optional component is untouched.
-			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1000 }]);
+			// present (row 1 has a T_c row, b = 100) → c = b + 1 = 101.
+			await db.exec('update x.T set c = b + 1 where id = 1');
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 101 }]);
+			// absent (row 2 has no T_c, b = 200) → materialize c = b + 1 = 201.
+			await db.exec('update x.T set c = b + 1 where id = 2');
+			expect(await rows(db, 'select id, c from main.T_c order by id')).to.deep.equal([{ id: 1, c: 101 }, { id: 2, c: 201 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 201 }]);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('rejects a subquery optional-member value', async () => {
+	it('writes a subquery optional value via the capture (present + absent)', async () => {
+		// `set c = (select max(a) from main.T_core)` is an embedded subquery — neither anchor-resolvable
+		// nor a member self-reference — so it rides the capture: max(a) over T_core = 20, materialized
+		// once and read back in both branches.
 		const db = new Database();
 		try {
 			await setup(db);
-			await expectThrows(() => db.exec('update x.T set c = (select max(a) from main.T_core) where id = 1'), /capture substrate|subquery/i);
+			await db.exec('update x.T set c = (select max(a) from main.T_core) where id = 1');   // present → 20
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 20 }]);
+			await db.exec('update x.T set c = (select max(a) from main.T_core) where id = 2');   // absent → materialize 20
+			expect(await rows(db, 'select id, c from main.T_c order by id')).to.deep.equal([{ id: 1, c: 20 }, { id: 2, c: 20 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('writes a mixed self + anchor optional value via the capture (present updates, absent stays absent on null)', async () => {
+		// `set c = c + a` mixes the owning member's own column (T_c.c, self) and an anchor column
+		// (T_core.a) in one value — neither pure-anchor nor pure-self, so it rides the capture (this
+		// subsumes the retired same-statement anchor+self reject). The capture over the body null-extends
+		// an absent T_c, so an absent row captures `null + a` = null and materializes nothing.
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('update x.T set c = c + a where id = 1');   // present (c=1000, a=10) → 1010
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1010 }]);
+			await db.exec('update x.T set c = c + a where id = 2');   // absent → null + 20 = null → no materialize
+			expect(await rows(db, 'select id from main.T_c order by id')).to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select c from x.T where id = 2')).to.deep.equal([{ c: null }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a both-sides write reads the captured optional value from the pre-mutation sibling', async () => {
+		// `set c = b + 1, b = b + 100`: c (optional T_c) is captured reading T_b.b; b (mandatory T_b)
+		// is rewritten in place. The capture materializes `b + 1` BEFORE the b base op fires, so c reads
+		// the pre-mutation b (100), not the rewritten 200 — the ticket's headline ordering guarantee.
+		const db = new Database();
+		try {
+			await setup(db);
+			await db.exec('update x.T set c = b + 1, b = b + 100 where id = 1');
+			expect(await rows(db, 'select b from main.T_b where id = 1')).to.deep.equal([{ b: 200 }]);
+			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 101 }]);
+			// PutGet through the logical table holds row-for-row.
+			expect(await rows(db, 'select c, b from x.T where id = 1')).to.deep.equal([{ c: 101, b: 200 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('still gates a non-anchor WHERE on a captured value write (predicate reject, not value)', async () => {
+		// `set c = b + 1 where b = 100`: the value is now captured-admissible, but the WHERE references a
+		// non-anchor member (T_b), which still defers — the predicate gate fires before any op (atomic).
+		const db = new Database();
+		try {
+			await setup(db);
+			await expectThrows(() => db.exec('update x.T set c = b + 1 where b = 100'), /non-anchor decomposition member/i);
+			// Atomic: the optional component is untouched.
 			expect(await rows(db, 'select c from main.T_c where id = 1')).to.deep.equal([{ c: 1000 }]);
 		} finally {
 			await db.close();
@@ -558,19 +626,38 @@ describe('lens decomposition put: UPDATE of a multi-value-column optional member
 		}
 	});
 
-	it('rejects a value mixing an anchor-resolvable cell and a self-reference cell in one member', async () => {
-		// `set c1 = a + 1` (anchor) + `set c2 = c2 + 1` (self) on the same optional member: the
-		// matched side would need a per-row capture to thread the anchor value while the self cell
-		// reads the member's own prior value — deferred (the shared-capture follow-up).
+	it('admits a value mixing an anchor cell and a self-reference cell in one member via the capture', async () => {
+		// `set c1 = a + 1` (anchor) + `set c2 = c2 + 1` (self) on the same optional member: the mixed
+		// group rides the single-identity capture (subsuming the retired same-statement reject). Each
+		// cell is captured over the body; the matched UPDATE reads both back by the member key, the
+		// materialize INSERT by the anchor key (gated on a runtime non-null — c1's anchor value keeps
+		// the absent row live while c2's self value captures null).
 		const db = new Database();
 		try {
 			await setupMulti(db);
-			await expectThrows(
-				() => db.exec('update x.M set c1 = a + 1, c2 = c2 + 1 where id = 1'),
-				/mixes an anchor-resolvable value and a member self-reference/i,
-			);
-			// Atomic: the present component is untouched.
-			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 100, c2: 200 }]);
+			await db.exec('update x.M set c1 = a + 1, c2 = c2 + 1 where id = 1');   // present (a=10, c2=200)
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: 11, c2: 201 }]);
+			await db.exec('update x.M set c1 = a + 1, c2 = c2 + 1 where id = 2');   // absent (a=20): c1=21, c2=null+1=null
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
+				{ id: 1, c1: 11, c2: 201 }, { id: 2, c1: 21, c2: null },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a captured value that evaluates null on a matched row writes the column null (read-back, not just base row)', async () => {
+		// `set c1 = (select max(c1) from main.M_opt where c1 > 100000)` evaluates null (no such row). On
+		// the matched (present) row 1 the unfiltered matched UPDATE writes c1 = null — the component row
+		// survives (c2 = 200 keeps it; this is not the all-null DELETE fast-lane), and the logical table
+		// reads it back null. M_opt.c1 is `integer null`, so it can hold the captured null. Asserts the
+		// read-back, not just the base row (the materialize INSERT is filtered out — null read-back).
+		const db = new Database();
+		try {
+			await setupMulti(db);
+			await db.exec('update x.M set c1 = (select max(c1) from main.M_opt where c1 > 100000) where id = 1');
+			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([{ id: 1, c1: null, c2: 200 }]);
+			expect(await rows(db, 'select c1 from x.M where id = 1')).to.deep.equal([{ c1: null }]);
 		} finally {
 			await db.close();
 		}
@@ -714,6 +801,95 @@ describe('lens decomposition put: UPDATE of a multi-value-column optional member
 			expect(await rows(db, 'select id, c1, c2 from main.M_opt order by id')).to.deep.equal([
 				{ id: 1, c1: 100, c2: 200 }, { id: 2, c1: 9, c2: null },
 			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Captured arbitrary values on a **two-value-column** optional member (P_c: c1, c2) with a
+ * mandatory cross-member (P_b: b) — the shape neither the single-value T fixture nor the b-less M
+ * fixture exercises: multiple arbitrary cells that materialize NON-NULL on an absent row (b is
+ * mandatory, so it is always present in the capture over the planned body, even for the absent-c
+ * row). Drives the multi-srcN read-back and the multi-cell both-sides pre-mutation ordering.
+ */
+describe('lens decomposition put: UPDATE optional member with captured arbitrary values', () => {
+	function pairSplit(): MappingAdvertisement {
+		return {
+			id: 'P_core', logicalTable: 'P', role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'P_core',
+				members: [
+					{ relationId: 'P_core', relation: { schema: 'main', table: 'P_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+					{ relationId: 'P_b', relation: { schema: 'main', table: 'P_b' }, presence: 'mandatory', columns: [colMap('b', 'b')] },
+					{ relationId: 'P_c', relation: { schema: 'main', table: 'P_c' }, presence: 'optional', columns: [colMap('c1', 'c1'), colMap('c2', 'c2')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['P_core', ['id']], ['P_b', ['id']], ['P_c', ['id']]) },
+			},
+		};
+	}
+
+	async function setupPair(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [pairSplit()];
+		db.registerModule('pmod', mod);
+		await db.exec('create table P_core (id integer primary key, a integer) using pmod');
+		await db.exec('create table P_b (id integer primary key, b integer) using pmod');
+		await db.exec('create table P_c (id integer primary key, c1 integer null, c2 integer null) using pmod');
+		await db.exec('declare logical schema x { table P { id integer primary key, a integer, b integer, c1 integer null, c2 integer null } }');
+		await db.exec('apply schema x');
+		await db.exec('insert into main.P_core values (1, 10), (2, 20)');
+		await db.exec('insert into main.P_b values (1, 100), (2, 200)');
+		await db.exec('insert into main.P_c values (1, 1000, 2000)');   // id 1 present, id 2 absent
+	}
+
+	it('materializes multiple arbitrary cells (each its own srcN) on present + absent rows', async () => {
+		// `set c1 = b + 1, c2 = a + b`: two arbitrary (cross-member) cells, each registered as its own
+		// srcN. b is mandatory (present even for the absent-c row), so the absent row materializes
+		// non-null. Present row 1: c1 = 101, c2 = 110; absent row 2: materialize c1 = 201, c2 = 220.
+		const db = new Database();
+		try {
+			await setupPair(db);
+			await db.exec('update x.P set c1 = b + 1, c2 = a + b where id = 1');
+			expect(await rows(db, 'select id, c1, c2 from main.P_c order by id')).to.deep.equal([{ id: 1, c1: 101, c2: 110 }]);
+			await db.exec('update x.P set c1 = b + 1, c2 = a + b where id = 2');
+			expect(await rows(db, 'select id, c1, c2 from main.P_c order by id')).to.deep.equal([
+				{ id: 1, c1: 101, c2: 110 }, { id: 2, c1: 201, c2: 220 },
+			]);
+			expect(await rows(db, 'select * from x.P order by id')).to.deep.equal([
+				{ id: 1, a: 10, b: 100, c1: 101, c2: 110 }, { id: 2, a: 20, b: 200, c1: 201, c2: 220 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a multi-cell both-sides write reads the captured values from the pre-mutation sibling', async () => {
+		// `set c1 = b + 1, c2 = a + b, b = b + 100`: c1/c2 capture b BEFORE the b base op rewrites it,
+		// so they read the pre-mutation b = 100 (c1 = 101, c2 = 110) while b lands 200.
+		const db = new Database();
+		try {
+			await setupPair(db);
+			await db.exec('update x.P set c1 = b + 1, c2 = a + b, b = b + 100 where id = 1');
+			expect(await rows(db, 'select b from main.P_b where id = 1')).to.deep.equal([{ b: 200 }]);
+			expect(await rows(db, 'select id, c1, c2 from main.P_c order by id')).to.deep.equal([{ id: 1, c1: 101, c2: 110 }]);
+			expect(await rows(db, 'select c1, c2, b from x.P where id = 1')).to.deep.equal([{ c1: 101, c2: 110, b: 200 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a captured value over an absent sibling materializes nothing (multi-cell, all-null image)', async () => {
+		// `set c1 = b + 1, c2 = a + b where id = 2` already materialized above (b present). Here drop the
+		// absent row's value cells to null via a self+anchor mix whose image is entirely null on the
+		// absent row: `set c1 = c1 + a, c2 = c2 + a where id = 2` → both null + 20 = null → no row.
+		const db = new Database();
+		try {
+			await setupPair(db);
+			await db.exec('update x.P set c1 = c1 + a, c2 = c2 + a where id = 2');
+			expect(await rows(db, 'select count(*) as n from main.P_c where id = 2')).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select c1, c2 from x.P where id = 2')).to.deep.equal([{ c1: null, c2: null }]);
 		} finally {
 			await db.close();
 		}

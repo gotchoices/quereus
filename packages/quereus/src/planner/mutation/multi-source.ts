@@ -2350,7 +2350,7 @@ function stripSideQualifier(
  * per-side identifying EXISTS so each target row reads the captured pre-mutation partner
  * value of its joined row. Composite owning keys conjoin one equality per PK column.
  */
-function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[]): AST.Expression {
+export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[]): AST.Expression {
 	const conds = owningPk.map((pk, j): AST.Expression => ({
 		type: 'binary',
 		operator: '=',

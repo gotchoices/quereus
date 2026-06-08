@@ -5395,7 +5395,7 @@ describe('Property-Based Tests', () => {
 
 				await fc.assert(fc.asyncProperty(
 					fc.array(colRowArb, { maxLength: 8 }),
-					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-anchor', 'update-c-self', 'update-c-coalesce-self', 'update-c-null', 'delete'),
+					fc.constantFrom('insert', 'update-a', 'update-b', 'update-ab', 'update-c', 'update-c-anchor', 'update-c-self', 'update-c-coalesce-self', 'update-c-cross', 'update-c-null', 'delete'),
 					fc.integer({ min: 1, max: 6 }),    // id predicate
 					fc.integer({ min: 10, max: 20 }),  // NV  (a)
 					fc.integer({ min: 21, max: 30 }),  // NV2 (b)
@@ -5460,6 +5460,14 @@ describe('Property-Based Tests', () => {
 							// cannot reach.
 							await db.exec(`update x.T set c = coalesce(c, 0) + 1 where id = ${K}`);
 							if (core.has(K)) { cMap.set(K, (cMap.has(K) ? cMap.get(K)! : 0) + 1); mutated++; }
+						} else if (op === 'update-c-cross') {
+							// Arbitrary (cross-member) optional value: `set c = b + 1` reads a *different* member
+							// (T_b), so it rides the single-identity per-row capture — `b + 1` is materialized once
+							// over the planned body and read back in both branches. `b` is mandatory (seeded for
+							// every T_core here), so a matched anchor ends at c = b + 1 whether or not it already
+							// had a T_c row (the absent-materialize transition fires, since b + 1 is non-null).
+							await db.exec(`update x.T set c = b + 1 where id = ${K}`);
+							if (core.has(K)) { cMap.set(K, bMap.get(K)! + 1); mutated++; }
 						} else if (op === 'update-c-null') {
 							// All of T_c's value columns (just `c`) set null → the component row is
 							// emptied (deleted); an absent T_c stays absent (no-op).
@@ -6142,19 +6150,25 @@ describe('Property-Based Tests', () => {
 				await db.exec('insert into main.T_c values (1, 1000)');
 				await expectMutationReject('delete from x.T where b = 100', 'unsupported-decomposition-predicate'); // non-anchor predicate
 				await expectMutationReject('update x.T set id = 9 where id = 1', 'unsupported-decomposition-update'); // shared key (identity change)
-				// An ARBITRARY optional-member value (here a cross-member read of `b`, backed by T_b)
-				// still needs the per-row capture substrate (deferred). Anchor-resolvable (`set c = a + 1`)
-				// and self-reference values are now supported — fuzzed by the columnar PutGet oracle above
-				// (the `update-c-anchor`, null-propagating `update-c-self`, and non-null-propagating
-				// `update-c-coalesce-self` arms — the last covering the absent-materialize transition).
-				await expectMutationReject('update x.T set c = b where id = 1', 'unsupported-decomposition-update');
+				// An arbitrary optional COLUMNAR value (anchor-resolvable, self-reference, cross-member, a
+				// subquery, or a mix) is now SUPPORTED — anchor/self via their tighter lowering, the rest via
+				// the single-identity per-row capture — and fuzzed by the columnar PutGet oracle above (the
+				// `update-c-anchor`, `update-c-self`, `update-c-coalesce-self`, and `update-c-cross` arms). The
+				// remaining decomposition rejects are STRUCTURAL (non-anchor predicate / shared-key identity),
+				// not value-shape; a non-anchor WHERE still defers even with a captured-admissible value.
+				await expectMutationReject('update x.T set c = b + 1 where b = 100', 'unsupported-decomposition-predicate'); // captured value, but non-anchor predicate
 			});
 
-			it('reject-do-not-widen: an EAV non-anchor predicate is deferred', async () => {
+			it('reject-do-not-widen: an EAV non-anchor predicate, and an arbitrary EAV value, are deferred', async () => {
 				await deployEav();
 				await db.exec('insert into main.E_core values (1)');
 				await db.exec("insert into main.E_eav values (1, 'p', 11)");
 				await expectMutationReject('delete from x.E where p = 11', 'unsupported-decomposition-predicate');    // non-anchor predicate
+				// An arbitrary EAV value stays deferred even though the columnar analogue is now captured: an
+				// EAV value column projects as a correlated subquery (so a self-reference lands `arbitrary`),
+				// and an EAV triple is one-to-many off the anchor key, so the single-identity capture's
+				// single-row read-back is not well-defined (the prereq-chained EAV-capture follow-up).
+				await expectMutationReject('update x.E set p = p + 1 where id = 1', 'unsupported-decomposition-update');
 			});
 
 			it('reject-do-not-widen: a surrogate with no anchor default, and a composite shared key, are deferred', async () => {
