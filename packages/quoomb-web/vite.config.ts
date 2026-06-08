@@ -7,10 +7,7 @@ export default defineConfig({
 
   resolve: {
     alias: [
-      {
-        find: '@quereus/babel-fish',
-        replacement: resolve(__dirname, '../quereus-babel-fish/src/index.ts'),
-      },
+      // Intra-workspace packages (@quereus/*) resolve via workspace:^ in package.json
       // @quereus/store is now abstract-only, no platform-specific aliasing needed
     ],
   },
