@@ -372,11 +372,13 @@ flag probe is false; verified for all four outer operators). The **write** half 
 `nestable-flagged-set-ops`: a **union / union all** subtree operand is recursively writable for
 data-column UPDATE / DELETE / `set <subtreeFlag> = false` fan-out, and the ambiguous subtree
 inserts are deferred to `set-op-membership-nested` (see § Set-operation membership writes →
-Nested / subtree operands). An **`except` / `intersect` subtree operand is deferred**
-(`set-op-membership-nested-except`) — a blind fan-out would touch leaf rows the subtree
-excludes. The static surfaces agree — they report a nested union body `is_updatable` /
+Nested / subtree operands). A **flagged `except` / `intersect` subtree operand** is now writable
+for the same fan-out via a **membership gate** (`set-op-membership-nested-except`): the fan AND-s
+the captured subtree-membership boundary flag into each leaf member-exists, so it reaches only
+genuine subtree members; a **flag-less** non-union boundary stays deferred. The static surfaces
+agree — they report a nested union or flagged-except/intersect body `is_updatable` /
 `is_deletable` = `YES`, `is_insertable_into` = `NO`, a surfaced inner flag non-updatable, and a
-view with an `except` / `intersect` subtree operand all-`NO`.
+view with a flag-less `except` / `intersect` subtree operand all-`NO`.
 
 ### Set-operation membership writes
 
@@ -387,8 +389,10 @@ existence — the explicit, per-row control surface that replaces the never-buil
 removed by `remove-update-routing-tag-surface`). Scope is `union` / `union all` /
 `except` / `intersect` membership writes, with data-column UPDATE fan-out, DELETE fan-out,
 and `set <subtreeFlag> = false` recursing through a **nested / subtree operand** at any
-depth (`nestable-flagged-set-ops`; a **union / union all** subtree — an `except` / `intersect`
-subtree is deferred to `set-op-membership-nested-except`). The genuinely ambiguous inserts into a multi-leaf
+depth (`nestable-flagged-set-ops`). A **union / union all** subtree fans freely; a **flagged
+`except` / `intersect`** subtree fans **membership-gated** on its captured boundary flag
+(`set-op-membership-nested-except`), and only a **flag-less** non-union boundary stays deferred.
+The genuinely ambiguous inserts into a multi-leaf
 subtree — `set <subtreeFlag> = true`, a surfaced-inner-flag write, and insert-through
 routing into a subtree side — have no single deterministic target leaf (product-coordinate
 addressing) and are deferred to `set-op-membership-nested`.
@@ -411,12 +415,13 @@ against a **synthetic branch view-like** and run back through `propagate` — re
 spines verbatim (the branch's own σ predicate, column renames, and base routing are honored
 by its own spine; `no-default` / computed-column rejections fall out of the recursion). A
 branch that bottoms out in a base table emits one base op; a branch that is itself a
-`SetOperationNode` (a **union / union all subtree operand**) **recurses here** for the
+`SetOperationNode` (a **subtree operand**) **recurses here** for the
 unambiguous fan-out — a data-column UPDATE, a DELETE, and a `set <subtreeFlag> = false` drop
 fan out to every member leaf, sharing the ONE up-front capture (the recursion rebuilds the same
 frozen-data-tuple correlation against each inner branch, never a second capture; see § Nested /
-subtree operands). An `except` / `intersect` subtree operand is deferred
-(`set-op-membership-nested-except`). Inserting into a subtree is `set-op-membership-nested`.
+subtree operands). A **union** subtree fans freely; a **flagged `except` / `intersect`** subtree
+fans gated on its captured boundary flag (`set-op-membership-nested-except`), a flag-less one is
+deferred. Inserting into a subtree is `set-op-membership-nested`.
 
 **Per-operator membership-write semantics** (uniform across operators because the probe
 flags already encode each operator's branch truth):
@@ -464,17 +469,32 @@ operations: a data-column UPDATE fan-out, a DELETE fan-out, and `set <subtreeFla
 leaves, **sharing the single up-front capture**. The recursion is sound because nesting
 preserves the data columns at every depth (the `SetOperationNode` arity check is data-only),
 so "touch the leaf rows whose data tuple ∈ `__vmupd_keys`" is the same frozen-capture
-correlation rebuilt against each inner branch — and for a **union / union all** subtree a
+correlation rebuilt against each inner branch. For a **union / union all** subtree a
 leaf's rows ⊆ the subtree's, so the capture selects exactly the resident leaf rows to touch,
 no second capture is introduced, and Halloween-safety is preserved at depth. A **flag-less
-subtree operand** (`A union[inA,inSub] (B union C)`) is writable through the same recursion
-(it need not declare inner flags to fan out). **`except` / `intersect` subtree operands are
-deferred** (`set-op-membership-nested-except`): there a leaf is NOT a subset of the subtree (a
-row in both `B` and `C` is absent from `B except C`), so a blind fan-out would touch leaf rows
-the subtree excludes — rows whose `inSub` membership probe reads false — silently corrupting
-base rows the view never exposed as subtree members. A membership-gated fan-out (restricting
-the recursion to rows that are members of the subtree) is the deferred fix; until then the
-dynamic write and the static surfaces both reject an `except` / `intersect` subtree operand.
+union subtree operand** (`A union[inA,inSub] (B union C)`) is writable through the same recursion
+(it need not declare inner flags to fan out).
+
+**Membership-gated `except` / `intersect` subtree fan-out** (`set-op-membership-nested-except`).
+For an `except` / `intersect` subtree a leaf is NOT a subset of the subtree (a row in both `B`
+and `C` is absent from `B except C`), so a blind fan-out would touch leaf rows the subtree
+excludes — rows whose `inSub` probe reads false — silently corrupting base rows the view never
+exposed as subtree members. The fix **gates** the fan on the captured **subtree-membership
+boundary flag**: the `exists <branch> as <flag>` the OUTER compound declares for the subtree's
+side (`inSub`) is a view output column, so it sits in the capture, and AND-ing `k.<flag>` into
+each leaf's member-exists restricts the fan to genuine members. This restores the proven binary
+behavior at depth — for a binary `B except C` the capture holds only members (B\C), so fanning
+to both leaves is sound (C gets harmless no-ops); gating the nested fan on `k.inSub` makes it
+behave identically. The gate **accumulates one conjunct per non-union boundary descended**: in
+`A union[inA,inS1] (B except[inB,inS2] (C intersect[inC,inD] D))` a member of `B except (C∩D)`
+that is in C-only (not D) has `inS1=true` but `inS2=false`; gating only on `inS1` would wrongly
+touch C, while gating on `inS1 AND inS2` correctly skips C/D. A **union** boundary contributes
+nothing (a union leaf ⊆ its subtree, so leaf-presence already implies membership). The lone
+remaining deferral is a **flag-less non-union boundary** (`A union[inA] (B except C)` — no
+`inSub`): it surfaces no boundary probe to gate on, so the dynamic write and the static surfaces
+both reject it (`set-op-membership-nested-except`); synthesizing the probe from leaf flags
+(`inB AND NOT inC`) is a possible future enhancement.
+
 The genuinely ambiguous inserts into a subtree
 are **deferred** to `set-op-membership-nested` (product-coordinate "which leaf?" addressing)
 with clean diagnostics: `set <subtreeFlag> = true` (insert into a multi-leaf subtree), a
@@ -506,12 +526,15 @@ reports the conservative shape (`view_info` all-`NO`, every `column_info` row
 `is_updatable = 'NO'` with null base), agreeing with the dynamic write's reject instead of
 over-claiming writable from the membership flag's presence alone. The probe is now
 **recursive** (`nestable-flagged-set-ops`): an operand is branch-writable iff it is a
-plain-column leaf OR a (recursively) branch-writable **union / union all** set-op body, so a
+plain-column leaf OR a (recursively) branch-writable set-op body, so a
 nested union view reports `is_updatable` / `is_deletable` = `YES` (data + delete fan-out
-genuinely recurse through the subtree). An **`except` / `intersect` subtree operand is NOT
-branch-writable** (the fan-out is deferred — a leaf is not a subset of the subtree), so a view
-with such an operand reports the conservative all-`NO` shape, agreeing with the dynamic
-reject. `is_insertable_into` is gated **off** to `NO` whenever any operand is a subtree
+genuinely recurse through the subtree). A **flagged `except` / `intersect` subtree operand is
+branch-writable** (`set-op-membership-nested-except`): the probe threads each operand's
+**boundary-flag presence** (the `exists <branch> as <flag>` the parent compound declares for
+that side) and admits a non-union subtree IFF its side carries a boundary flag to gate the fan
+on — so a flagged except/intersect view reports `is_updatable` / `is_deletable` = `YES`, while a
+**flag-less** non-union boundary stays non-writable (the conservative all-`NO` shape), agreeing
+with the dynamic reject. `is_insertable_into` is gated **off** to `NO` whenever any operand is a subtree
 (`setOpHasSubtreeOperand`) — a conservative, honest under-claim, since inserting into a
 multi-leaf subtree is deferred to `set-op-membership-nested`. Per-column, a **surfaced inner
 flag** reports `is_updatable = 'NO'` (writing it is deferred), while data columns and own

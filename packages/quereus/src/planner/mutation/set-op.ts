@@ -53,6 +53,12 @@ import { cloneExpr, transformExpr } from './scope-transform.js';
  * recurses *here* for the unambiguous fan-out — a data-column UPDATE, a DELETE, and a
  * `set <subtreeFlag> = false` drop fan out to every member leaf, sharing the ONE up-front
  * capture (`fanBranchDataUpdate` / `fanBranchDelete`, detected via {@link analyzeSetOpBranches}).
+ * A **union / union all** subtree fans freely (a leaf ⊆ the subtree). An **`except` /
+ * `intersect`** subtree fan is **membership-gated** (`set-op-membership-nested-except`): a leaf
+ * can hold rows the subtree excludes, so the recursion AND-s the captured subtree-membership
+ * boundary flag (`exists <branch> as <flag>`) into each leaf's member-exists, restricting the
+ * fan to genuine members — one conjunct per non-union boundary descended. A flag-less non-union
+ * boundary has no boundary probe to gate on and stays deferred (rejected).
  * The genuinely ambiguous inserts into a subtree — `set <subtreeFlag> = true`, a
  * surfaced-inner-flag write, and insert-through routing into a subtree side — have no single
  * deterministic target leaf (product-coordinate addressing) and are rejected, pointing at
@@ -120,11 +126,20 @@ export function isSetOpBranchWritable(selectAst: AST.QueryExpr): boolean {
  * True iff a set-op body (its compound + both operands) is recursively branch-writable.
  * Mirrors the dynamic write's pre-write rejections at this level — an outer LIMIT/OFFSET
  * (a write would escape the window), then each operand checked via {@link isOperandWritable}.
+ *
+ * Threads each operand's **boundary-flag presence** (`exists <branch> as <flag>` declared on
+ * THIS compound for that side) into {@link isOperandWritable}: an `except` / `intersect` subtree
+ * operand is writable only when its side carries a boundary flag to gate the fan on, mirroring
+ * the dynamic `gateFlagForNonUnionSubtree` requirement.
  */
 function isSetOpBodyWritable(selectAst: AST.SelectStmt): boolean {
 	if (!selectAst.compound) return false;
 	if (selectAst.limit || selectAst.offset) return false;
-	return isOperandWritable(leftBranchSelect(selectAst)) && isOperandWritable(selectAst.compound.select);
+	const ex = selectAst.compound.existence ?? [];
+	const leftFlag = ex.some(e => e.branch === 'left');
+	const rightFlag = ex.some(e => e.branch === 'right');
+	return isOperandWritable(leftBranchSelect(selectAst), leftFlag)
+		&& isOperandWritable(selectAst.compound.select, rightFlag);
 }
 
 /**
@@ -132,28 +147,33 @@ function isSetOpBodyWritable(selectAst: AST.SelectStmt): boolean {
  * writable set-op body, OR a plain-column leaf (the shape that round-trips a base column
  * through the branch's single-source spine). A non-SELECT operand, a `select *` leg, or a
  * computed leg is non-writable — the dynamic write rejects all three.
+ *
+ * `hasGatingFlag` is whether the parent compound declared a boundary membership flag for this
+ * operand's side. A **union / union all** subtree ignores it (a leaf ⊆ the subtree, so the
+ * leaf-presence correlation already implies membership — no gate needed). An **`except` /
+ * `intersect`** subtree is writable IFF `hasGatingFlag` (the captured boundary flag gates the
+ * fan to genuine members — `set-op-membership-nested-except`); a flag-less non-union boundary
+ * stays deferred, so this returns `false`, agreeing with the dynamic reject. Leaf operands
+ * ignore `hasGatingFlag`.
  */
-function isOperandWritable(operand: AST.QueryExpr): boolean {
+function isOperandWritable(operand: AST.QueryExpr, hasGatingFlag: boolean): boolean {
 	if (operand.type !== 'select') return false;
 	if (operand.compound && operand.compound.op !== 'diff') {
-		// Only a union / union all subtree operand is recursively fannable: the fan-out's
-		// soundness rests on "a leaf's rows ⊆ the subtree's rows", which holds for union /
-		// union all but NOT for except / intersect (a leaf can hold rows the subtree's own set
-		// operation excludes). So an except / intersect subtree operand is not (yet)
-		// branch-writable — the dynamic fan-out rejects it (`set-op-membership-nested`), and
-		// this static probe agrees rather than over-claiming.
-		if (!isUnionLikeSubtree(operand.compound.op)) return false;
+		// An except / intersect subtree needs a boundary flag to gate the membership fan on.
+		if (!isUnionLikeSubtree(operand.compound.op) && !hasGatingFlag) return false;
 		return isSetOpBodyWritable(operand);
 	}
 	return tryBranchColumnNames(operand) !== null;
 }
 
 /**
- * True iff a subtree operand's set operator is fannable — `union` / `unionAll`, whose result
- * is a SUPERSET of each operand (so every resident leaf row is a member). `except` /
- * `intersect` are NOT: a leaf can hold rows the subtree excludes, so a blind delete / data
- * fan-out would touch non-member rows. Their membership-gated fan-out is deferred to
- * `set-op-membership-nested-except`.
+ * True iff a subtree operand's set operator is **union-like** (`union` / `unionAll`), whose
+ * result is a SUPERSET of each operand — every resident leaf row is a member, so the fan-out
+ * needs no membership gate. `except` / `intersect` are NOT union-like: a leaf can hold rows the
+ * subtree excludes, so their fan-out is gated on the captured subtree-membership boundary flag
+ * (`set-op-membership-nested-except`). This helper branches the gate logic (no extra conjunct
+ * for union-like, accumulate the boundary flag otherwise); a flag-less non-union boundary
+ * remains the lone deferral.
  */
 function isUnionLikeSubtree(op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'): boolean {
 	return op === 'union' || op === 'unionAll';
@@ -217,9 +237,11 @@ interface SetOpBranch {
 	 * True iff this operand is itself a set-operation body (a subtree) — its `selectAst`
 	 * carries a (non-diff) `compound`. A nested branch's fan-out (data UPDATE / DELETE /
 	 * `= false` flip) recurses through {@link analyzeSetOpBranches} to its member leaves
-	 * (sharing the one up-front capture); its `= true` flip / insert-through route is
-	 * rejected (a multi-leaf insert has no single deterministic target leaf —
-	 * `set-op-membership-nested`).
+	 * (sharing the one up-front capture); a **union** subtree fans freely, an **`except` /
+	 * `intersect`** subtree fans **gated on its captured boundary flag**
+	 * (`set-op-membership-nested-except`; a flag-less non-union boundary stays deferred). Its
+	 * `= true` flip / insert-through route is rejected (a multi-leaf insert has no single
+	 * deterministic target leaf — `set-op-membership-nested`).
 	 */
 	readonly isNested: boolean;
 }
@@ -645,26 +667,30 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 }
 
 /**
- * Reject a delete / data fan-out into an `except` / `intersect` subtree operand. The
- * recursion shares the ONE up-front capture and touches each resident leaf row whose data
- * tuple ∈ `__vmupd_keys` — sound only when "a leaf's rows ⊆ the subtree's rows" (union /
- * union all). For `except` / `intersect` a leaf can hold rows the subtree's own set operation
- * EXCLUDES (e.g. a row in both B and C is absent from `B except C`); if an OUTER operand makes
- * that row visible, it enters the capture, and a blind fan-out would delete / mutate it in the
- * inner leaves even though its `inSub` membership probe reads FALSE — silently corrupting base
- * rows the view never exposed as subtree members. Defer it cleanly until the membership-gated
- * fan-out (`set-op-membership-nested-except`) lands; union / union all subtree fan-out is sound
- * and stays supported.
+ * The captured subtree-membership boundary flag to gate a delete / data fan-out into an
+ * `except` / `intersect` subtree operand on — `branch.flag.name`, the `exists <branch> as
+ * <flag>` the OUTER compound declared for this side (a view output column, present in the
+ * capture, so `k.<flag>` probes "is this captured row a member of the subtree").
+ *
+ * Gating the recursion on this flag restores soundness: for `except` / `intersect` a leaf can
+ * hold rows the subtree EXCLUDES (e.g. a row in both B and C is absent from `B except C`); if
+ * an OUTER operand makes that row visible it enters the capture, and a blind fan-out would
+ * delete / mutate it in the inner leaves even though it is NOT a subtree member. AND-ing
+ * `k.<flag>` into the leaf member-exists restricts the fan to genuine members, making the
+ * nested fan behave exactly like the proven binary `except` / `intersect` fan.
+ *
+ * A **flag-less** non-union boundary (`A union[inA] (B except C)` — no `inSub`) surfaces no
+ * boundary probe column to gate on, so it stays **deferred**: reject cleanly, naming
+ * `set-op-membership-nested-except` (kept greppable as the remaining deferral).
  */
-function rejectNonUnionSubtreeFanout(view: MutableViewLike, branch: SetOpBranch): void {
+function gateFlagForNonUnionSubtree(view: MutableViewLike, branch: SetOpBranch): string {
+	if (branch.flag) return branch.flag.name;
 	const op = (branch.view.selectAst as AST.SelectStmt).compound?.op;
-	if (op === 'except' || op === 'intersect') {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-set-op',
-			table: view.name,
-			message: `cannot write through view '${view.name}': a delete / data fan-out through an ${op.toUpperCase()} subtree operand is deferred — a leaf can hold rows the subtree excludes, so a blind fan-out would touch rows that are not members of the subtree (membership-gated nested fan-out is set-op-membership-nested-except)`,
-		});
-	}
+	raiseMutationDiagnostic({
+		reason: 'unsupported-set-op',
+		table: view.name,
+		message: `cannot write through view '${view.name}': a delete / data fan-out through a flag-less ${(op ?? 'set').toUpperCase()} subtree operand is deferred — without a declared subtree-membership flag ('exists <branch> as <flag>') there is no captured boundary probe to gate the fan on, so it could touch leaf rows the subtree excludes (set-op-membership-nested-except)`,
+	});
 }
 
 /**
@@ -685,12 +711,19 @@ function fanBranchDataUpdate(
 	branch: SetOpBranch,
 	dataAssignments: readonly DataAssignment[],
 	stmt: AST.UpdateStmt,
+	gateFlags: readonly string[] = [],
 ): BaseOp[] {
 	if (branch.isNested) {
-		rejectNonUnionSubtreeFanout(view, branch);
+		// Accumulate the membership gate at every non-union boundary descended: a union
+		// subtree adds nothing (leaf ⊆ subtree), an except / intersect subtree contributes its
+		// boundary flag (`set-op-membership-nested-except`; flag-less rejects, still deferred).
+		const subOp = (branch.view.selectAst as AST.SelectStmt).compound!.op;
+		const innerGate = isUnionLikeSubtree(subOp)
+			? gateFlags
+			: [...gateFlags, gateFlagForNonUnionSubtree(view, branch)];
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
-			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt));
+			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt, innerGate));
 		}
 		return baseOps;
 	}
@@ -702,7 +735,7 @@ function fanBranchDataUpdate(
 		type: 'update',
 		table: { type: 'identifier', name: branch.view.name },
 		assignments,
-		where: buildMemberExists(analysis, branch),
+		where: buildMemberExists(analysis, branch, gateFlags),
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
@@ -788,19 +821,25 @@ function fanBranchDelete(
 	analysis: SetOpAnalysis,
 	branch: SetOpBranch,
 	stmt: AST.UpdateStmt | AST.DeleteStmt,
+	gateFlags: readonly string[] = [],
 ): BaseOp[] {
 	if (branch.isNested) {
-		rejectNonUnionSubtreeFanout(view, branch);
+		// Accumulate the membership gate at every non-union boundary descended (see
+		// `fanBranchDataUpdate`).
+		const subOp = (branch.view.selectAst as AST.SelectStmt).compound!.op;
+		const innerGate = isUnionLikeSubtree(subOp)
+			? gateFlags
+			: [...gateFlags, gateFlagForNonUnionSubtree(view, branch)];
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
-			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt));
+			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt, innerGate));
 		}
 		return baseOps;
 	}
 	const deleteStmt: AST.DeleteStmt = {
 		type: 'delete',
 		table: { type: 'identifier', name: branch.view.name },
-		where: buildMemberExists(analysis, branch),
+		where: buildMemberExists(analysis, branch, gateFlags),
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
@@ -959,10 +998,20 @@ function resolveInsertLayout(view: MutableViewLike, analysis: SetOpAnalysis, stm
  * In the nested fan-out the OUTER `analysis` is threaded unchanged, so `k.*` keeps naming the
  * one outer capture's data columns while `branch.*` names the inner leaf's — sound because a
  * subtree preserves the data columns at every depth (`buildBranch`'s arity check guarantees
- * `branch.dataColNames.length === analysis.dataColCount`), and a leaf's rows ⊆ the subtree's,
- * so the same frozen capture selects exactly the leaf rows to touch.
+ * `branch.dataColNames.length === analysis.dataColCount`).
+ *
+ * **Membership gate** (`set-op-membership-nested-except`). For a **union / union all** subtree
+ * a leaf's rows ⊆ the subtree's, so the frozen capture selects exactly the leaf rows to touch
+ * and no extra conjunct is needed (`gateFlags` empty). For an **`except` / `intersect`** subtree
+ * a leaf can hold rows the subtree EXCLUDES; if an outer operand makes such a row visible it
+ * enters the capture, and a blind fan-out would touch it in the leaves even though it is NOT a
+ * subtree member. To stay sound, each non-union boundary descended contributes its captured
+ * **subtree-membership boundary flag** (the `exists <branch> as <flag>` the OUTER compound
+ * declared for that side, a view output column present in `__vmupd_keys`); `gateFlags` AND-s a
+ * fresh `k.<flag>` per accumulated boundary into the predicate, restricting the fan to genuine
+ * members. Fresh `ColumnExpr` nodes are built per call because the gate is reused across leaves.
  */
-function buildMemberExists(analysis: SetOpAnalysis, branch: SetOpBranch): AST.Expression {
+function buildMemberExists(analysis: SetOpAnalysis, branch: SetOpBranch, gateFlags: readonly string[] = []): AST.Expression {
 	let pred: AST.Expression | undefined;
 	for (let i = 0; i < analysis.dataColCount; i++) {
 		const colMatch = nullSafeEqual(
@@ -970,6 +1019,12 @@ function buildMemberExists(analysis: SetOpAnalysis, branch: SetOpBranch): AST.Ex
 			{ type: 'column', name: branch.dataColNames[i], table: branch.view.name },
 		);
 		pred = pred ? { type: 'binary', operator: 'AND', left: pred, right: colMatch } : colMatch;
+	}
+	// AND the accumulated subtree-membership boundary flags in. `dataColCount > 0`
+	// (checked in `analyzeSetOpView`) guarantees `pred` is defined here.
+	for (const flag of gateFlags) {
+		const flagRef: AST.Expression = { type: 'column', name: flag, table: 'k' };
+		pred = pred ? { type: 'binary', operator: 'AND', left: pred, right: flagRef } : flagRef;
 	}
 	return {
 		type: 'exists',

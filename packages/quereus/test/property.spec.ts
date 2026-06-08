@@ -3138,13 +3138,11 @@ describe('Property-Based Tests', () => {
 			expect(await readRows('select id from Vn where id = 4')).to.deep.equal([]);
 		});
 
-		it('except / intersect subtree fan-out is deferred (a leaf is not a subset of the subtree)', async () => {
-			// A blind fan-out into an `except` / `intersect` subtree would touch leaf rows the
-			// subtree EXCLUDES — e.g. a row in BOTH B and C is absent from `B except C`, yet if an
-			// outer operand makes it visible it enters the capture and a naive recursion would
-			// delete / mutate it in B and C (its `inSub` probe reads false). That is silent base
-			// corruption, so the fan-out is deferred (`set-op-membership-nested-except`).
-			// id=7 sits in A, B, AND C ⇒ visible via A, but (B except C) excludes it.
+		it('except subtree (gated): a non-member visible via an outer operand is NOT touched (repro id in A,B,C)', async () => {
+			// `set-op-membership-nested-except`. id=7 sits in A, B, AND C ⇒ visible via A, but
+			// `(B except C)` EXCLUDES it (it's in C). The captured probe is (inA, inSub) =
+			// (true, false). The membership-gated fan AND-s `k.inSub` into the leaf member-exists,
+			// so the fan reaches A only — B and C (non-members) stay untouched, no silent corruption.
 			await db.exec('create table A (id integer primary key, x integer) using memory');
 			await db.exec('create table B (id integer primary key, x integer) using memory');
 			await db.exec('create table C (id integer primary key, x integer) using memory');
@@ -3154,25 +3152,137 @@ describe('Property-Based Tests', () => {
 			await db.exec('create view Vn as select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
 			// The row is visible only through A; its subtree membership probe reads false.
 			expect((await readRows('select inA, inSub from Vn where id = 7'))[0]).to.deep.equal({ inA: true, inSub: false });
-			// Delete / data-update / `set inSub = false` all reject rather than over-applying.
-			for (const sql of [
-				'delete from Vn where id = 7',
-				'update Vn set x = 99 where id = 7',
-				'update Vn set inSub = false where id = 7',
-			]) {
-				const msg = await writeError(sql);
-				expect(msg, `${sql} must reject`).to.not.equal('');
-				expect(msg, sql).to.match(/set-op-membership-nested-except|EXCEPT subtree operand is deferred/);
-			}
-			// The base rows are untouched — no silent corruption.
+			// delete → A only.
+			await db.exec('delete from Vn where id = 7');
+			expect(await readRows('select id from A where id = 7')).to.deep.equal([]);
 			expect(await readRows('select id from B where id = 7')).to.deep.equal([{ id: 7 }]);
 			expect(await readRows('select id from C where id = 7')).to.deep.equal([{ id: 7 }]);
 			expect((await readRows('select x from B where id = 7'))[0].x).to.equal(70);
-			// Static surfaces agree: an except/intersect subtree operand makes the view non-writable.
+			expect((await readRows('select x from C where id = 7'))[0].x).to.equal(70);
+			// re-seed A for the data-update / no-op checks.
+			await db.exec('insert into A values (7, 70)');
+			// update x → A only; B, C stay 70.
+			await db.exec('update Vn set x = 99 where id = 7');
+			expect((await readRows('select x from A where id = 7'))[0].x).to.equal(99);
+			expect((await readRows('select x from B where id = 7'))[0].x).to.equal(70);
+			expect((await readRows('select x from C where id = 7'))[0].x).to.equal(70);
+			// `set inSub = false` is a no-op (id=7 is already a non-member; the gated fan touches nothing).
+			await db.exec('update Vn set inSub = false where id = 7');
+			expect(await readRows('select id from B where id = 7')).to.deep.equal([{ id: 7 }]);
+			expect(await readRows('select id from C where id = 7')).to.deep.equal([{ id: 7 }]);
+			// Static surfaces: a flagged except subtree is now updatable / deletable (gated), not insertable.
 			const info = (await readRows("select is_updatable, is_deletable, is_insertable_into from view_info('Vn')"))[0];
-			expect(info.is_updatable, 'except subtree ⇒ not updatable').to.equal('NO');
-			expect(info.is_deletable, 'except subtree ⇒ not deletable').to.equal('NO');
+			expect(info.is_updatable, 'flagged except subtree ⇒ updatable (gated)').to.equal('YES');
+			expect(info.is_deletable, 'flagged except subtree ⇒ deletable (gated)').to.equal('YES');
+			expect(info.is_insertable_into, 'insert into a subtree is deferred').to.equal('NO');
+		});
+
+		it('except subtree (gated) dual: a genuine subtree member fans to its leaf', async () => {
+			// id=5 is in B only ⇒ a genuine member of `B except C` (inSub=true). The gate passes,
+			// so the fan reaches B; the C leaf no-ops (id=5 absent). id=7 (in A,B,C) is a non-member.
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (7, 70)');
+			await db.exec('insert into B values (5, 50), (7, 70)');
+			await db.exec('insert into C values (7, 70)');
+			await db.exec('create view Vn as select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
+			// id=5 is a genuine subtree member, visible via the subtree only.
+			expect((await readRows('select inA, inSub from Vn where id = 5'))[0]).to.deep.equal({ inA: false, inSub: true });
+			// update fans to B; C has no id=5 (harmless no-op).
+			await db.exec('update Vn set x = 55 where id = 5');
+			expect((await readRows('select x from B where id = 5'))[0].x).to.equal(55);
+			expect(await readRows('select id from C where id = 5')).to.deep.equal([]);
+			// PutGet: the view re-reads the new value.
+			expect((await readRows('select x from Vn where id = 5'))[0].x).to.equal(55);
+			// delete fans to B; the row leaves the view.
+			await db.exec('delete from Vn where id = 5');
+			expect(await readRows('select id from B where id = 5')).to.deep.equal([]);
+			expect(await readRows('select id from Vn where id = 5')).to.deep.equal([]);
+		});
+
+		it('intersect subtree (gated): non-member skipped, member fans to all branches', async () => {
+			// `A union[inA,inSub] (B intersect[inB,inC] C)`. id=2 is in A and B but NOT C ⇒ a
+			// non-member of `B∩C` (inSub=false), visible via A. id=3 is in A, B AND C ⇒ a member
+			// (inSub=true). A delete/update of id=2 must NOT touch B/C; id=3 deletes from both
+			// member branches (binary intersect semantics).
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (2, 20), (3, 30)');
+			await db.exec('insert into B values (2, 20), (3, 30)');
+			await db.exec('insert into C values (3, 30)');
+			await db.exec('create view Vn as select id, x from A union exists left as inA, exists right as inSub (select id, x from B intersect exists left as inB, exists right as inC select id, x from C)');
+			expect((await readRows('select inA, inSub from Vn where id = 2'))[0]).to.deep.equal({ inA: true, inSub: false });
+			expect((await readRows('select inA, inSub from Vn where id = 3'))[0]).to.deep.equal({ inA: true, inSub: true });
+			// Non-member id=2: update fans to A only; B keeps x=20, C never had it.
+			await db.exec('update Vn set x = 99 where id = 2');
+			expect((await readRows('select x from A where id = 2'))[0].x).to.equal(99);
+			expect((await readRows('select x from B where id = 2'))[0].x).to.equal(20);
+			// Member id=3: delete fans to A and BOTH intersect branches.
+			await db.exec('delete from Vn where id = 3');
+			expect(await readRows('select id from A where id = 3')).to.deep.equal([]);
+			expect(await readRows('select id from B where id = 3')).to.deep.equal([]);
+			expect(await readRows('select id from C where id = 3')).to.deep.equal([]);
+		});
+
+		it('flag-less non-union boundary stays deferred (set-op-membership-nested-except)', async () => {
+			// `A union[inA] (B except C)` — the except boundary declares no flag, so there is no
+			// captured probe to gate the fan on. Policy: deferred (reject + static all-NO).
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (7, 70)');
+			await db.exec('insert into B values (7, 70)');
+			await db.exec('insert into C values (7, 70)');
+			await db.exec('create view Vn as select id, x from A union exists left as inA (select id, x from B except select id, x from C)');
+			for (const sql of [
+				'delete from Vn where id = 7',
+				'update Vn set x = 99 where id = 7',
+			]) {
+				const msg = await writeError(sql);
+				expect(msg, `${sql} must reject`).to.not.equal('');
+				expect(msg, sql).to.match(/set-op-membership-nested-except/);
+			}
+			// Base rows untouched.
+			expect((await readRows('select x from B where id = 7'))[0].x).to.equal(70);
+			expect((await readRows('select x from C where id = 7'))[0].x).to.equal(70);
+			// Static surfaces report all-NO (no boundary flag to gate on).
+			const info = (await readRows("select is_updatable, is_deletable, is_insertable_into from view_info('Vn')"))[0];
+			expect(info.is_updatable, 'flag-less except subtree ⇒ not updatable').to.equal('NO');
+			expect(info.is_deletable, 'flag-less except subtree ⇒ not deletable').to.equal('NO');
 			expect(info.is_insertable_into).to.equal('NO');
+		});
+
+		it('three-level except/intersect mix: the conjunction gate skips C/D where the row is a non-member', async () => {
+			// `A union[inA,inS1] (B except[inB,inS2] (C intersect[inC,inD] D))`. id=9 is in B and
+			// C (not D): `C∩D` excludes it (inS2=false), so it IS a member of `B except (C∩D)`
+			// (inS1=true), reached via B. Gating ONLY on inS1 would touch C (leaf-present + inS1) —
+			// wrong; gating on inS1 AND inS2 (=false) correctly skips C/D. A view-row delete must
+			// remove from B only.
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (1, 10)');
+			await db.exec('insert into B values (9, 90)');
+			await db.exec('insert into C values (9, 90)');
+			await db.exec('insert into D values (8, 80)');
+			await db.exec('create view Vn as select id, x from A '
+				+ 'union exists left as inA, exists right as inS1 '
+				+ '(select id, x from B except exists left as inB, exists right as inS2 '
+				+ '(select id, x from C intersect exists left as inC, exists right as inD select id, x from D))');
+			// id=9: member of `B except (C∩D)` (inS1=true), non-member of `C∩D` (inS2=false).
+			expect((await readRows('select inS1, inS2 from Vn where id = 9'))[0]).to.deep.equal({ inS1: true, inS2: false });
+			// data update fans to B only; C/D untouched (skipped by the inS2 conjunct).
+			await db.exec('update Vn set x = 99 where id = 9');
+			expect((await readRows('select x from B where id = 9'))[0].x).to.equal(99);
+			expect((await readRows('select x from C where id = 9'))[0].x).to.equal(90);
+			// delete removes from B only; C keeps id=9.
+			await db.exec('delete from Vn where id = 9');
+			expect(await readRows('select id from B where id = 9')).to.deep.equal([]);
+			expect(await readRows('select id from C where id = 9')).to.deep.equal([{ id: 9 }]);
+			expect(await readRows('select id from D where id = 8')).to.deep.equal([{ id: 8 }]);
 		});
 
 		it('three-level union nesting: data + delete fan out to the deepest leaf', async () => {
