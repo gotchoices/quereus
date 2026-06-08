@@ -3138,18 +3138,69 @@ describe('Property-Based Tests', () => {
 			expect(await readRows('select id from Vn where id = 4')).to.deep.equal([]);
 		});
 
-		it('except subtree operand: delete fan-out and set inSub=false recurse through the non-union inner node', async () => {
-			// inner (B except C) = {(2,20),(5,50)}; Vn = A ∪ that = {(1,10),(2,20),(5,50)}.
-			await seedNested('select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
-			// A delete of a subtree-resident row recurses to both inner leaves (no-op where absent).
-			await db.exec('delete from Vn where id = 5'); // in B, not C
-			expect(await readRows('select id from B where id = 5')).to.deep.equal([]);
-			expect(await readRows('select id from Vn where id = 5')).to.deep.equal([]);
-			// set inSub = false drops the subtree side of id=2 (in A and the subtree); B loses it.
-			await db.exec('update Vn set inSub = false where id = 2');
-			expect(await readRows('select id from B where id = 2')).to.deep.equal([]);
-			// id=2 still in A ⇒ still visible (inA true), now inSub false.
-			expect((await readRows('select inA, inSub from Vn where id = 2'))[0]).to.deep.equal({ inA: true, inSub: false });
+		it('except / intersect subtree fan-out is deferred (a leaf is not a subset of the subtree)', async () => {
+			// A blind fan-out into an `except` / `intersect` subtree would touch leaf rows the
+			// subtree EXCLUDES — e.g. a row in BOTH B and C is absent from `B except C`, yet if an
+			// outer operand makes it visible it enters the capture and a naive recursion would
+			// delete / mutate it in B and C (its `inSub` probe reads false). That is silent base
+			// corruption, so the fan-out is deferred (`set-op-membership-nested-except`).
+			// id=7 sits in A, B, AND C ⇒ visible via A, but (B except C) excludes it.
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (7, 70)');
+			await db.exec('insert into B values (7, 70)');
+			await db.exec('insert into C values (7, 70)');
+			await db.exec('create view Vn as select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
+			// The row is visible only through A; its subtree membership probe reads false.
+			expect((await readRows('select inA, inSub from Vn where id = 7'))[0]).to.deep.equal({ inA: true, inSub: false });
+			// Delete / data-update / `set inSub = false` all reject rather than over-applying.
+			for (const sql of [
+				'delete from Vn where id = 7',
+				'update Vn set x = 99 where id = 7',
+				'update Vn set inSub = false where id = 7',
+			]) {
+				const msg = await writeError(sql);
+				expect(msg, `${sql} must reject`).to.not.equal('');
+				expect(msg, sql).to.match(/set-op-membership-nested-except|EXCEPT subtree operand is deferred/);
+			}
+			// The base rows are untouched — no silent corruption.
+			expect(await readRows('select id from B where id = 7')).to.deep.equal([{ id: 7 }]);
+			expect(await readRows('select id from C where id = 7')).to.deep.equal([{ id: 7 }]);
+			expect((await readRows('select x from B where id = 7'))[0].x).to.equal(70);
+			// Static surfaces agree: an except/intersect subtree operand makes the view non-writable.
+			const info = (await readRows("select is_updatable, is_deletable, is_insertable_into from view_info('Vn')"))[0];
+			expect(info.is_updatable, 'except subtree ⇒ not updatable').to.equal('NO');
+			expect(info.is_deletable, 'except subtree ⇒ not deletable').to.equal('NO');
+			expect(info.is_insertable_into).to.equal('NO');
+		});
+
+		it('three-level union nesting: data + delete fan out to the deepest leaf', async () => {
+			// A union (B union (C union D)) — a 3-deep right spine of unions. Verifies the fan-out
+			// recursion descends past two levels to the deepest leaf D and stays sound.
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (1, 10)');
+			await db.exec('insert into B values (2, 20)');
+			await db.exec('insert into C values (3, 30)');
+			await db.exec('insert into D values (4, 40), (1, 10)'); // id=1 is in A AND D
+			await db.exec('create view Vn as select id, x from A '
+				+ 'union exists left as inA, exists right as inS1 '
+				+ '(select id, x from B union exists left as inB, exists right as inS2 '
+				+ '(select id, x from C union exists left as inC, exists right as inD select id, x from D))');
+			// Data fan-out reaches the deepest leaf D (id=4 is D-only).
+			await db.exec('update Vn set x = 44 where id = 4');
+			expect((await readRows('select x from D where id = 4'))[0].x).to.equal(44);
+			// id=1 fans to BOTH A and the deepest leaf D.
+			await db.exec('update Vn set x = 11 where id = 1');
+			expect((await readRows('select x from A where id = 1'))[0].x).to.equal(11);
+			expect((await readRows('select x from D where id = 1'))[0].x).to.equal(11);
+			// Delete fan-out descends to D as well.
+			await db.exec('delete from Vn where id = 4');
+			expect(await readRows('select id from D where id = 4')).to.deep.equal([]);
+			expect(await readRows('select id from Vn where id = 4')).to.deep.equal([]);
 		});
 
 		it('deferred: set <subtreeFlag> = true rejects cleanly (names set-op-membership-nested)', async () => {

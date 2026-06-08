@@ -135,8 +135,28 @@ function isSetOpBodyWritable(selectAst: AST.SelectStmt): boolean {
  */
 function isOperandWritable(operand: AST.QueryExpr): boolean {
 	if (operand.type !== 'select') return false;
-	if (operand.compound && operand.compound.op !== 'diff') return isSetOpBodyWritable(operand);
+	if (operand.compound && operand.compound.op !== 'diff') {
+		// Only a union / union all subtree operand is recursively fannable: the fan-out's
+		// soundness rests on "a leaf's rows ⊆ the subtree's rows", which holds for union /
+		// union all but NOT for except / intersect (a leaf can hold rows the subtree's own set
+		// operation excludes). So an except / intersect subtree operand is not (yet)
+		// branch-writable — the dynamic fan-out rejects it (`set-op-membership-nested`), and
+		// this static probe agrees rather than over-claiming.
+		if (!isUnionLikeSubtree(operand.compound.op)) return false;
+		return isSetOpBodyWritable(operand);
+	}
 	return tryBranchColumnNames(operand) !== null;
+}
+
+/**
+ * True iff a subtree operand's set operator is fannable — `union` / `unionAll`, whose result
+ * is a SUPERSET of each operand (so every resident leaf row is a member). `except` /
+ * `intersect` are NOT: a leaf can hold rows the subtree excludes, so a blind delete / data
+ * fan-out would touch non-member rows. Their membership-gated fan-out is deferred to
+ * `set-op-membership-nested-except`.
+ */
+function isUnionLikeSubtree(op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'): boolean {
+	return op === 'union' || op === 'unionAll';
 }
 
 /**
@@ -625,6 +645,29 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 }
 
 /**
+ * Reject a delete / data fan-out into an `except` / `intersect` subtree operand. The
+ * recursion shares the ONE up-front capture and touches each resident leaf row whose data
+ * tuple ∈ `__vmupd_keys` — sound only when "a leaf's rows ⊆ the subtree's rows" (union /
+ * union all). For `except` / `intersect` a leaf can hold rows the subtree's own set operation
+ * EXCLUDES (e.g. a row in both B and C is absent from `B except C`); if an OUTER operand makes
+ * that row visible, it enters the capture, and a blind fan-out would delete / mutate it in the
+ * inner leaves even though its `inSub` membership probe reads FALSE — silently corrupting base
+ * rows the view never exposed as subtree members. Defer it cleanly until the membership-gated
+ * fan-out (`set-op-membership-nested-except`) lands; union / union all subtree fan-out is sound
+ * and stays supported.
+ */
+function rejectNonUnionSubtreeFanout(view: MutableViewLike, branch: SetOpBranch): void {
+	const op = (branch.view.selectAst as AST.SelectStmt).compound?.op;
+	if (op === 'except' || op === 'intersect') {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op',
+			table: view.name,
+			message: `cannot write through view '${view.name}': a delete / data fan-out through an ${op.toUpperCase()} subtree operand is deferred — a leaf can hold rows the subtree excludes, so a blind fan-out would touch rows that are not members of the subtree (membership-gated nested fan-out is set-op-membership-nested-except)`,
+		});
+	}
+}
+
+/**
  * Fan a data-column UPDATE out to one branch — recursing through a nested (subtree) operand
  * to its member leaves, else updating the leaf's member rows (matched via the shared capture).
  *
@@ -644,6 +687,7 @@ function fanBranchDataUpdate(
 	stmt: AST.UpdateStmt,
 ): BaseOp[] {
 	if (branch.isNested) {
+		rejectNonUnionSubtreeFanout(view, branch);
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
 			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt));
@@ -746,6 +790,7 @@ function fanBranchDelete(
 	stmt: AST.UpdateStmt | AST.DeleteStmt,
 ): BaseOp[] {
 	if (branch.isNested) {
+		rejectNonUnionSubtreeFanout(view, branch);
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
 			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt));
