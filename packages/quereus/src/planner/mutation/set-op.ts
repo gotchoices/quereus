@@ -694,6 +694,21 @@ function gateFlagForNonUnionSubtree(view: MutableViewLike, branch: SetOpBranch):
 }
 
 /**
+ * Accumulate the membership gate for descending into a nested (subtree) `branch`: a **union /
+ * union all** subtree adds nothing (a leaf ⊆ the subtree, so leaf-presence already implies
+ * membership), an **`except` / `intersect`** subtree contributes its captured boundary flag
+ * (`set-op-membership-nested-except`; a flag-less non-union boundary throws, staying deferred).
+ * Shared by {@link fanBranchDataUpdate} and {@link fanBranchDelete} so the two fan paths cannot
+ * drift on the gate logic.
+ */
+function accumulateInnerGate(view: MutableViewLike, branch: SetOpBranch, gateFlags: readonly string[]): readonly string[] {
+	const subOp = (branch.view.selectAst as AST.SelectStmt).compound!.op;
+	return isUnionLikeSubtree(subOp)
+		? gateFlags
+		: [...gateFlags, gateFlagForNonUnionSubtree(view, branch)];
+}
+
+/**
  * Fan a data-column UPDATE out to one branch — recursing through a nested (subtree) operand
  * to its member leaves, else updating the leaf's member rows (matched via the shared capture).
  *
@@ -714,13 +729,7 @@ function fanBranchDataUpdate(
 	gateFlags: readonly string[] = [],
 ): BaseOp[] {
 	if (branch.isNested) {
-		// Accumulate the membership gate at every non-union boundary descended: a union
-		// subtree adds nothing (leaf ⊆ subtree), an except / intersect subtree contributes its
-		// boundary flag (`set-op-membership-nested-except`; flag-less rejects, still deferred).
-		const subOp = (branch.view.selectAst as AST.SelectStmt).compound!.op;
-		const innerGate = isUnionLikeSubtree(subOp)
-			? gateFlags
-			: [...gateFlags, gateFlagForNonUnionSubtree(view, branch)];
+		const innerGate = accumulateInnerGate(view, branch, gateFlags);
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
 			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt, innerGate));
@@ -824,12 +833,7 @@ function fanBranchDelete(
 	gateFlags: readonly string[] = [],
 ): BaseOp[] {
 	if (branch.isNested) {
-		// Accumulate the membership gate at every non-union boundary descended (see
-		// `fanBranchDataUpdate`).
-		const subOp = (branch.view.selectAst as AST.SelectStmt).compound!.op;
-		const innerGate = isUnionLikeSubtree(subOp)
-			? gateFlags
-			: [...gateFlags, gateFlagForNonUnionSubtree(view, branch)];
+		const innerGate = accumulateInnerGate(view, branch, gateFlags);
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
 			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt, innerGate));

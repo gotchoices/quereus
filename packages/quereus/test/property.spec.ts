@@ -3201,6 +3201,52 @@ describe('Property-Based Tests', () => {
 			expect(await readRows('select id from Vn where id = 5')).to.deep.equal([]);
 		});
 
+		it('except subtree (gated): set <subtreeFlag> = false drops a genuine member from the subtree only', async () => {
+			// Positive boundary-flip case: id=5 is in A AND B (a genuine member of `B except C`,
+			// inSub=true; also visible via A). `set inSub = false` routes through the gated delete
+			// fan into the subtree leaves — inSub=true passes, so it drops id=5 from B (member leaf;
+			// C no-ops, absent). A is the LEFT outer operand and is NOT touched by a right-side flip,
+			// so the row stays visible via A.
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (5, 50)');
+			await db.exec('insert into B values (5, 50)');
+			await db.exec('create view Vn as select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
+			expect((await readRows('select inA, inSub from Vn where id = 5'))[0]).to.deep.equal({ inA: true, inSub: true });
+			await db.exec('update Vn set inSub = false where id = 5');
+			// Dropped from the subtree's member leaf B; still in A (the flip never touches the left operand).
+			expect(await readRows('select id from B where id = 5')).to.deep.equal([]);
+			expect((await readRows('select x from A where id = 5'))[0].x).to.equal(50);
+			// Now a non-member visible via A: inSub reads false.
+			expect((await readRows('select inA, inSub from Vn where id = 5'))[0]).to.deep.equal({ inA: true, inSub: false });
+		});
+
+		it('except subtree (gated): a data value referencing a leg column composes at depth (set x = x + 1)', async () => {
+			// The gate only adds WHERE conjuncts; the SET value is cloned per leaf and resolves
+			// against that leaf's columns. Confirm `set x = x + 1` composes with the membership gate
+			// for a genuine member (fans to B with x+1) while a non-member visible via A is skipped
+			// in the subtree (B keeps its value, only A increments).
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('insert into A values (5, 50), (7, 70)');
+			await db.exec('insert into B values (5, 50), (7, 70)');
+			await db.exec('insert into C values (7, 70)');
+			await db.exec('create view Vn as select id, x from A union exists left as inA, exists right as inSub (select id, x from B except exists left as inB, exists right as inC select id, x from C)');
+			// id=5: genuine member (in B, not C). id=7: non-member (in B AND C ⇒ excluded), visible via A.
+			expect((await readRows('select inSub from Vn where id = 5'))[0].inSub).to.equal(true);
+			expect((await readRows('select inSub from Vn where id = 7'))[0].inSub).to.equal(false);
+			await db.exec('update Vn set x = x + 1 where id = 5');
+			expect((await readRows('select x from A where id = 5'))[0].x).to.equal(51);
+			expect((await readRows('select x from B where id = 5'))[0].x).to.equal(51);
+			await db.exec('update Vn set x = x + 1 where id = 7');
+			expect((await readRows('select x from A where id = 7'))[0].x).to.equal(71);
+			// Non-member: B (and C) untouched by the gated subtree fan.
+			expect((await readRows('select x from B where id = 7'))[0].x).to.equal(70);
+			expect((await readRows('select x from C where id = 7'))[0].x).to.equal(70);
+		});
+
 		it('intersect subtree (gated): non-member skipped, member fans to all branches', async () => {
 			// `A union[inA,inSub] (B intersect[inB,inC] C)`. id=2 is in A and B but NOT C ⇒ a
 			// non-member of `B∩C` (inSub=false), visible via A. id=3 is in A, B AND C ⇒ a member
