@@ -3452,12 +3452,18 @@ pragma default_collation;
 pragma default_collation = 'binary';
 ```
 
-**Semantics (important):** `default_collation` is a **create-time authoring convenience
+**Semantics (important):** `default_collation` is a **schema-authoring convenience
 only**. The catalog always stores the concrete, resolved collation, and persisted DDL always
 emits an explicit `COLLATE` for any non-`BINARY` collation. So a table created under
 `default_collation = 'nocase'` round-trips its `NOCASE` columns unambiguously even when the
 database is later reopened (or its DDL re-executed) under a different — or the default —
 `default_collation`. An explicit `COLLATE` clause always overrides the session default.
+
+`ALTER TABLE ... ADD COLUMN` honors the default the same way `CREATE TABLE` does: an added
+text column with no explicit `COLLATE` resolves to the session default (non-text falls back to
+`BINARY`), so an added column gets the same collation a `CREATE`-d one would. `RENAME COLUMN`
+deliberately does **not** consult the default — it preserves the renamed column's existing
+collation rather than re-resolving it to the current session setting.
 
 #### 9.2.5 nondeterministic_schema
 

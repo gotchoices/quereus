@@ -3350,4 +3350,42 @@ describe('declarative-equivalence: default_collation', () => {
 			await db.close();
 		}
 	});
+
+	it('an ADD COLUMN migration emitted under nocase lands NOCASE when replayed under a BINARY session (cross-session portability)', async () => {
+		// Front A's payoff: the differ emits an EXPLICIT resolved COLLATE on added columns,
+		// so a migration authored under `default_collation = nocase` is self-contained — it
+		// carries `COLLATE NOCASE` in the DDL and lands NOCASE even when the executing session
+		// uses the out-of-box BINARY default (the explicit COLLATE wins in columnDefToSchema, so
+		// the session default is never consulted for that column). This is the structural
+		// guarantee the implementer flagged as asserted-but-untested; assert it directly.
+		const author = new Database();
+		let ddl: string[];
+		try {
+			author.setOption('default_collation', 'nocase');
+			await author.exec('create table t (id integer primary key, name text)');
+			await author.exec('declare schema main { table t { id INTEGER PRIMARY KEY, name TEXT, extra TEXT } }');
+			const diff = computeSchemaDiff(
+				author.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(author, 'main'),
+				'allow',
+				author.options.getStringOption('default_collation'),
+			);
+			ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.some(s => /add column.*extra.*collate\s+nocase/i.test(s)),
+				`emitted ADD COLUMN must carry an explicit COLLATE NOCASE, got:\n${ddl.join('\n')}`).to.be.true;
+		} finally {
+			await author.close();
+		}
+
+		const replay = new Database(); // out-of-box BINARY default — must NOT re-resolve the explicit COLLATE
+		try {
+			await replay.exec('create table t (id integer primary key, name text)');
+			for (const stmt of ddl) await replay.exec(stmt);
+			const t = replay.schemaManager.getTable('main', 't')!;
+			expect(t.columns.find(c => c.name === 'extra')!.collation,
+				'explicit COLLATE NOCASE survives a BINARY-session replay').to.equal('NOCASE');
+		} finally {
+			await replay.close();
+		}
+	});
 });
