@@ -358,6 +358,43 @@ const ARMS: Arm[] = [
 			} else expect(String(info?.collation).toUpperCase(), 'unexpected honor of a divergent PK collation').to.equal('NOCASE');
 		},
 	},
+	{
+		// PK column, DIVERGENT to a THIRD collation (RTRIM): K is always BINARY/NOCASE
+		// (config.collation's type), so an RTRIM (or any non-K) target on a PK column can
+		// never equal K and must reject. Guards the general `normalized !== K` branch with a
+		// collation outside the {target, K} = {BINARY, NOCASE} pair the other arms exercise.
+		label: 'alterColumn SET COLLATE rtrim on PK column (third collation, divergent from K) → UNSUPPORTED',
+		seed: [`create table t (name text collate nocase primary key) using store`, `insert into t values ('abc')`],
+		alter: `alter table t alter column name set collate rtrim`,
+		expect: { kind: 'reject', codes: [StatusCode.UNSUPPORTED], site: /name|primary key|collat/i },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'name');
+			expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
+			if (outcome === 'rejected') {
+				await db.exec(`insert into t values ('def')`);
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert succeeded post-reject').to.equal(2);
+			}
+		},
+	},
+	{
+		// COMPOSITE PK, single-member divergent change: altering one PK member to a divergent
+		// collation must reject — the guard's membership test (`primaryKeyDefinition.some(...)`)
+		// fires for any PK column, not just a single-column PK. `a` is a PK member declared
+		// NOCASE (== K), so SET COLLATE binary diverges and rejects; `b` is unaffected.
+		label: 'alterColumn SET COLLATE on a composite-PK member (divergent) → UNSUPPORTED',
+		seed: [`create table t (a text collate nocase, b integer, primary key (a, b)) using store`, `insert into t values ('abc', 1)`],
+		alter: `alter table t alter column a set collate binary`,
+		expect: { kind: 'reject', codes: [StatusCode.UNSUPPORTED], site: /\ba\b|primary key|collat/i },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'a');
+			expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
+			if (outcome === 'rejected') {
+				// the table is still writable after the failed ALTER
+				await db.exec(`insert into t values ('abc', 2)`);
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert succeeded post-reject').to.equal(2);
+			}
+		},
+	},
 ];
 
 // ── Driver ────────────────────────────────────────────────────────────────────
