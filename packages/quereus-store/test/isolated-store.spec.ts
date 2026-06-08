@@ -433,6 +433,42 @@ describe('Isolated Store Module', () => {
 			const afterCommit = await db.get('SELECT qty, qty2 FROM t_upd WHERE id = 1');
 			expect([afterCommit?.qty, afterCommit?.qty2]).to.deep.equal([100, 200]);
 		});
+
+		it('runtime ADD CONSTRAINT UNIQUE then duplicate INSERT is rejected (store underlying refresh)', async () => {
+			// isolation-runtime-constraint-propagation: a freshly-connected IsolatedTable's
+			// merged-view UNIQUE pre-check reads the cached underlying instance's tableSchema.
+			// The module-layer fix re-points that field to the schema alterTable returns; for
+			// StoreTable (which already refreshes its own tableSchema on alter) the write is a
+			// no-op. This arm proves that empirically — the memory ISOLATION_GAP_ARMS cover the
+			// path where the refresh actually matters.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE tau (id INTEGER PRIMARY KEY, email TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO tau VALUES (1, 'a@x'), (2, 'b@x')`);
+
+			await db.exec(`ALTER TABLE tau ADD CONSTRAINT u_email UNIQUE (email)`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`INSERT INTO tau VALUES (3, 'a@x')`);
+			} catch (e) { err = e as Error; }
+			expect(err?.message.toLowerCase(), 'runtime-added UNIQUE must reject a duplicate').to.include('unique constraint');
+		});
+
+		it('runtime DROP CONSTRAINT UNIQUE then once-duplicate INSERT is accepted (store underlying refresh)', async () => {
+			// Inverse of the ADD arm: dropping the constraint must stop merged-view enforcement
+			// for a freshly-connected IsolatedTable, so a value that was a duplicate is now allowed.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE tdu (id INTEGER PRIMARY KEY, email TEXT NOT NULL, CONSTRAINT u_email UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO tdu VALUES (1, 'a@x'), (2, 'b@x')`);
+
+			await db.exec(`ALTER TABLE tdu DROP CONSTRAINT u_email`);
+			await db.exec(`INSERT INTO tdu VALUES (3, 'a@x')`); // no longer a conflict
+
+			const dup = await asyncIterableToArray(db.eval(`SELECT count(*) AS c FROM tdu WHERE email = 'a@x'`));
+			expect(dup[0].c).to.equal(2);
+		});
 	});
 
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
