@@ -1,9 +1,10 @@
 import { transpileQuereusAstToMermaidEr } from '@quereus/babel-fish';
 import { Lexer, TokenType, parse, type DeclareSchemaStmt, type Statement } from '@quereus/quereus/parser';
 import { AlertTriangle, CheckCircle2, GitBranch, MoveDown, MoveLeft, MoveRight, MoveUp, RefreshCw, ZoomIn, ZoomOut } from 'lucide-react';
+import { type MermaidConfig } from 'mermaid';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MermaidBlock, MermaidService, type MermaidProps } from 'react-markdown-mermaid';
 import { useSessionStore } from '../stores/sessionStore.js';
+import { MermaidDiagram } from './MermaidDiagram.js';
 
 type MermaidTheme = 'default' | 'neutral' | 'dark' | 'forest' | 'base';
 
@@ -111,7 +112,6 @@ function buildMermaidFromDeclareSchema(block: DeclareSchemaBlock): string {
 
 export const ERDPanel: React.FC = () => {
 	const { tabs, activeTabId } = useSessionStore();
-	const mermaidService = useMemo(() => MermaidService.getInstance(), []);
 	const [declareBlocks, setDeclareBlocks] = useState<DeclareSchemaBlock[]>([]);
 	const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
 	const [diagramCode, setDiagramCode] = useState<string | null>(null);
@@ -225,7 +225,7 @@ export const ERDPanel: React.FC = () => {
 		}
 	}, []);
 
-	const mermaidConfig = useMemo<NonNullable<MermaidProps['mermaidConfig']>>(
+	const mermaidConfig = useMemo<MermaidConfig>(
 		() => ({
 			startOnLoad: false,
 			theme: activeTheme,
@@ -240,9 +240,10 @@ export const ERDPanel: React.FC = () => {
 
 	const handleThemeChange = useCallback((theme: MermaidTheme) => {
 		setActiveTheme(theme);
-		mermaidService.reset();
+		// Bumping the render version changes the diagram id, forcing a re-render
+		// with the new theme (MermaidDiagram re-initializes mermaid on each render).
 		setDiagramRenderVersion(prev => prev + 1);
-	}, [mermaidService]);
+	}, []);
 
 	const nudgePan = useCallback((deltaX: number, deltaY: number) => {
 		setPanX(prev => prev + deltaX);
@@ -395,10 +396,10 @@ export const ERDPanel: React.FC = () => {
 									minWidth: '100%',
 								}}
 							>
-								<MermaidBlock
+								<MermaidDiagram
 									id={`erd-${activeTheme}-${selectedBlockId ?? 'none'}-${diagramRenderVersion}`}
 									code={diagramCode}
-									mermaidConfig={mermaidConfig}
+									config={mermaidConfig}
 								/>
 							</div>
 						</div>

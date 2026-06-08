@@ -63,7 +63,6 @@
     "papaparse": "^5.5.3",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "react-markdown-mermaid": "^0.0.3",
     "react-split": "^2.0.14",
     "zustand": "^5.0.10"
   }
