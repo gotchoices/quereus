@@ -382,6 +382,29 @@ agree — they report a nested union or flagged-except/intersect body `is_updata
 `is_deletable` = `YES`, `is_insertable_into` = `NO`, a surfaced inner flag non-updatable, and a
 view with a flag-less `except` / `intersect` subtree operand all-`NO`.
 
+**Parenthesized LEFT-compound operand (read/plan, `set-op-leftwrap-arity`).** A `SetOperationNode`
+operand on the **left** is, in SQL, a parenthesized compound — `(A∪B) union[…] (C∪D)` — which the
+parser lifts into a `select * from (A∪B) as values_N` passthrough wrapper so the SELECT-level
+`compound` slot can host the outer operator. The build path (`planner/building/select-compound.ts`)
+**unwraps** that pure wrapper (`unwrapPassthroughSubquery`, shared with the write path) so the
+operand plan **is** the inner compound — a first-class subtree operand the recursive `dataArity` /
+`flagCount` machinery above already handles. Without the unwrap, building the wrapper as a `select *`
+`ProjectNode` over the inner `SetOperationNode` would count the inner's surfaced flag columns as
+**data** columns, and the outer arity check (`leftData !== rightData`) would throw `SET operation
+column count mismatch` — so a flagged **parallel-sibling** view (flagged compounds on *both* sides)
+could not even be planned. With the unwrap, such a view plans and reads under the same sum layout
+`[data] ++ [L flags] ++ [R flags] ++ [own flags]`, where the two siblings contribute distinct flag
+columns (e.g. `(A∪[inA,inB]B) union[inLsub,inRsub] (C∪[inC,inD]D)` reads `id, x, inA, inB, inC, inD,
+inLsub, inRsub`). The unwrap is recursive (it peels every pure-passthrough layer of a deeper left
+nest) and **shape-guarded** — only an exact `select *` over a single unaliased subquery source with
+no `where` / `group by` / `having` / `distinct` / `order by` / `limit` / `offset` / own `compound` is
+unwrapped; a projecting or filtering derived table (`select x from (A∪B) v`) stays an opaque
+relation. This is the **sum** surface (distinct flag names → distinct columns). Two siblings that
+**reuse** the same flag names (the **product** model — reused names merging into shared coordinate
+columns) are out of scope and currently rejected at create (the duplicate names collide in the set-op
+output scope); that merge is the deferred `set-op-product-coordinate-model`. Writes through the left
+wrapper are the separate `set-op-leftwrap-write`.
+
 ### Set-operation membership writes
 
 The first set-op view writability in the engine (`planner/mutation/set-op.ts`). A

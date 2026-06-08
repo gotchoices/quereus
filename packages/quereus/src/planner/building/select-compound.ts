@@ -11,6 +11,7 @@ import { LiteralNode } from '../nodes/scalar.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
+import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 import { buildValuesStmt } from './select.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -34,7 +35,17 @@ export function buildCompoundSelect(
 	// Build left side by cloning the statement without compound and stripping ORDER BY/LIMIT/OFFSET that belong to outer query
 	const { compound: _outerCompound, orderBy: outerOrderBy, limit: outerLimit, offset: outerOffset, ...leftCore } = stmt;
 
-	const leftPlan = buildSelectStmt(contextWithCTEs, leftCore as AST.SelectStmt, cteNodes) as RelationalPlanNode;
+	// A parenthesized LEFT compound operand (`(A∪B) union[…] (C∪D)`) is lifted by the parser
+	// into a `select * from (A∪B) as values_N` passthrough wrapper. Building that wrapper as a
+	// `select *` ProjectNode over the inner SetOperationNode would mis-count the inner's
+	// surfaced flag columns as DATA columns at the outer arity check, throwing for a flagged
+	// parallel-sibling view (`set-op-leftwrap-arity`). Unwrap the wrapper so the operand plan
+	// IS the inner compound — a first-class subtree operand the existing dataArity / flagCount
+	// recursion (`nestable-flagged-set-ops`) already handles. Only redirect to a SELECT inner;
+	// a VALUES / DML inner stays the wrapper (its data arity is its column count — no surfaced
+	// flags to miscount).
+	const leftToBuild = unwrapToSelect(leftCore as AST.SelectStmt);
+	const leftPlan = buildSelectStmt(contextWithCTEs, leftToBuild, cteNodes) as RelationalPlanNode;
 
 	// Right side: any QueryExpr. SELECT legs strip ORDER BY/LIMIT/OFFSET (those
 	// belong to the outer compound). VALUES legs build directly. DML legs
@@ -45,7 +56,9 @@ export function buildCompoundSelect(
 	switch (rightStmt.type) {
 		case 'select': {
 			const { orderBy: _rightOrderBy, limit: _rightLimit, offset: _rightOffset, ...rightCore } = rightStmt;
-			rightPlan = buildSelectStmt(contextWithCTEs, rightCore as AST.SelectStmt, cteNodes) as RelationalPlanNode;
+			// Symmetric unwrap: a (defensively) parenthesized compound right operand also builds
+			// as a direct SetOperationNode subtree operand rather than an opaque `select *`.
+			rightPlan = buildSelectStmt(contextWithCTEs, unwrapToSelect(rightCore as AST.SelectStmt), cteNodes) as RelationalPlanNode;
 			break;
 		}
 		case 'values':
@@ -100,6 +113,19 @@ export function buildCompoundSelect(
 	input = applyOuterLimitOffset(input, outerLimit, outerOffset, selectContext);
 
 	return input;
+}
+
+/**
+ * Resolve a set-op operand SELECT to the inner compound it parenthesizes, when it is a pure
+ * passthrough wrapper (`select * from (<select>) as values_N`) over a SELECT inner. Returns the
+ * inner SELECT so the operand builds as a direct `SetOperationNode` subtree operand; otherwise
+ * returns the operand unchanged. A VALUES / DML inner is NOT redirected — `buildSelectStmt`
+ * takes a `SelectStmt`, and such an inner has no surfaced flags to miscount, so the opaque
+ * wrapper (whose data arity is its column count) is already correct.
+ */
+function unwrapToSelect(sel: AST.SelectStmt): AST.SelectStmt {
+	const inner = unwrapPassthroughSubquery(sel);
+	return inner && inner.type === 'select' ? inner : sel;
 }
 
 /**

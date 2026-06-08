@@ -9,6 +9,7 @@ import { Parser } from '../src/parser/parser.js';
 import { QuereusError } from '../src/common/errors.js';
 import { assertTableSchemaEqual, assertProbeEquivalent } from './util/schema-equivalence.js';
 import { keysOf, isUnique, isAtMostOneRow, hasSingletonFd } from '../src/planner/util/fd-utils.js';
+import { unwrapPassthroughSubquery } from '../src/planner/util/set-op-wrapper.js';
 import { deriveViewColumns, viewColumnsFromUpdateLineage, resolveBaseSite } from '../src/planner/analysis/update-lineage.js';
 import { viewComplement } from '../src/planner/analysis/view-complement.js';
 import { computeRoundTrip, getPutComposesToIdentity } from '../src/schema/lens-prover.js';
@@ -2830,6 +2831,188 @@ describe('Property-Based Tests', () => {
 			const cols = ops[0].getType().columns.map(c => c.name);
 			expect(cols).to.include('inL');
 			expect(cols).to.include('inR');
+		});
+
+		// --- Parenthesized LEFT-compound operand arity (set-op-leftwrap-arity) ---
+		// A parenthesized LEFT compound operand is lifted by the parser into a
+		// `select * from (<compound>) as values_N` passthrough wrapper. The build path
+		// unwraps that wrapper so the operand is a first-class `SetOperationNode` subtree
+		// operand whose recursive DATA arity is counted correctly — without the unwrap a
+		// flagged inner compound's surfaced flag columns are mis-counted as data columns and
+		// the outer arity check throws `SET operation column count mismatch`. These tests pin
+		// the read/plan surface (the sum layout `[data] ++ [L flags] ++ [R flags] ++ [own
+		// flags]`); writes through the left wrapper are the separate `set-op-leftwrap-write`.
+		async function seedLeftwrap(): Promise<void> {
+			await db.exec('create table A (id integer primary key, x integer) using memory');
+			await db.exec('create table B (id integer primary key, x integer) using memory');
+			await db.exec('create table C (id integer primary key, x integer) using memory');
+			await db.exec('create table D (id integer primary key, x integer) using memory');
+			// A∪B = {1,2,3}; C∪D = {3,4,5}; the outer union = {1,2,3,4,5}. Disjoint-ish ranges
+			// so every flag (inner and outer) takes BOTH values across the visible rows.
+			await db.exec('insert into A values (1, 10), (2, 20)');
+			await db.exec('insert into B values (2, 20), (3, 30)');
+			await db.exec('insert into C values (3, 30), (4, 40)');
+			await db.exec('insert into D values (4, 40), (5, 50)');
+		}
+
+		async function readRows(sql: string): Promise<Record<string, SqlValue>[]> {
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of db.eval(sql)) out.push(r as Record<string, SqlValue>);
+			return out;
+		}
+
+		it('P1 regression: flag-less parallel siblings read unchanged through the left unwrap', async () => {
+			await seedLeftwrap();
+			// Flag-less inner compounds (no surfaced inner flags); only the OUTER inL/inR surface.
+			// This shape already planned + read before the unwrap; assert it reads byte-identically.
+			const sql = '(select id, x from A union select id, x from B)'
+				+ ' union exists left as inL, exists right as inR '
+				+ '(select id, x from C union select id, x from D)';
+			await db.exec(`create view V1 as ${sql}`);
+			expect(await readRows('select id, x, inL, inR from V1 order by id')).to.deep.equal([
+				{ id: 1, x: 10, inL: true,  inR: false }, // ∈ A∪B only
+				{ id: 2, x: 20, inL: true,  inR: false },
+				{ id: 3, x: 30, inL: true,  inR: true  }, // ∈ both subtrees
+				{ id: 4, x: 40, inL: false, inR: true  },
+				{ id: 5, x: 50, inL: false, inR: true  }, // ∈ C∪D only
+			]);
+		});
+
+		it('P2 distinct-name flagged parallel siblings: plans + reads the 8-column sum surface', async () => {
+			await seedLeftwrap();
+			// Both siblings are flagged compounds with DISTINCT flag names. Before the arity fix
+			// this threw `SET operation column count mismatch: left has 4, right has 2`.
+			const sql = '(select id, x from A union exists left as inA, exists right as inB select id, x from B)'
+				+ ' union exists left as inLsub, exists right as inRsub '
+				+ '(select id, x from C union exists left as inC, exists right as inD select id, x from D)';
+			// Plan surface: outer + the two inner sibling unions = 3 SetOperationNodes; the outer
+			// (first in DFS) exposes the sum layout `[id, x] ++ [inA, inB] ++ [inC, inD] ++ [inLsub, inRsub]`.
+			const ops = setOps(sql);
+			expect(ops.length, 'outer + two inner sibling unions').to.equal(3);
+			expect(ops[0].getType().columns.map(c => c.name)).to.deep.equal(
+				['id', 'x', 'inA', 'inB', 'inC', 'inD', 'inLsub', 'inRsub']);
+			// Key Soundness: every leg projects the 2 data columns (id, x), so a claimed key
+			// references only indices < 2 — no flag column (idx ≥ 2) appears in any key, at any depth.
+			for (const op of ops) {
+				for (const key of keysOf(op)) {
+					for (const idx of key) expect(idx, 'a key references only data columns, never a flag').to.be.lessThan(2);
+				}
+			}
+			// Read surface: each inner flag reads `tuple ∈ <its own leaf>`; each outer subtree flag
+			// reads `tuple ∈ <that subtree>` (inLsub ≡ ∈ A∪B, inRsub ≡ ∈ C∪D).
+			await db.exec(`create view V2 as ${sql}`);
+			expect(await readRows('select id, x, inA, inB, inC, inD, inLsub, inRsub from V2 order by id')).to.deep.equal([
+				{ id: 1, x: 10, inA: true,  inB: false, inC: false, inD: false, inLsub: true,  inRsub: false },
+				{ id: 2, x: 20, inA: true,  inB: true,  inC: false, inD: false, inLsub: true,  inRsub: false },
+				{ id: 3, x: 30, inA: false, inB: true,  inC: true,  inD: false, inLsub: true,  inRsub: true  },
+				{ id: 4, x: 40, inA: false, inB: false, inC: true,  inD: true,  inLsub: false, inRsub: true  },
+				{ id: 5, x: 50, inA: false, inB: false, inC: false, inD: true,  inLsub: false, inRsub: true  },
+			]);
+		});
+
+		it('depth-3 left nest: the recursive unwrap peels every layer; arity stays at the leaf', async () => {
+			await seedLeftwrap();
+			// `((A∪B) ∪ (C∪D)) union[inL,inR] (C∪D)` — a left operand that is itself a left-nested
+			// compound. The build recursion peels each wrapper layer; the outer data arity stays 2.
+			const sql = '(select id, x from A union select id, x from B)'
+				+ ' union (select id, x from C union select id, x from D)'
+				+ ' union exists left as inL, exists right as inR '
+				+ '(select id, x from C union select id, x from D)';
+			const ops = setOps(sql);
+			// (A∪B), (C∪D)#left, ((A∪B)∪(C∪D)), (C∪D)#right, outer = 5 SetOperationNodes.
+			expect(ops.length, 'five SetOperationNodes in the left-leaning nest').to.equal(5);
+			expect((ops[0] as unknown as { dataColumnCount(): number }).dataColumnCount(),
+				'outer data arity = left-most leaf count').to.equal(2);
+			expect(ops[0].getType().columns.map(c => c.name)).to.deep.equal(['id', 'x', 'inL', 'inR']);
+			await db.exec(`create view V3 as ${sql}`);
+			expect(await readRows('select id, x, inL, inR from V3 order by id')).to.deep.equal([
+				{ id: 1, x: 10, inL: true, inR: false }, // ∈ ((A∪B)∪(C∪D)) but ∉ (C∪D)
+				{ id: 2, x: 20, inL: true, inR: false },
+				{ id: 3, x: 30, inL: true, inR: true  },
+				{ id: 4, x: 40, inL: true, inR: true  },
+				{ id: 5, x: 50, inL: true, inR: true  },
+			]);
+		});
+
+		it('right-parenthesized form: a double-parenthesized right operand also builds as a SetOp', async () => {
+			await seedLeftwrap();
+			const sql = '(select id, x from A union select id, x from B)'
+				+ ' union exists left as inL, exists right as inR '
+				+ '((select id, x from C union select id, x from D))';
+			// Both operands resolve to direct SetOperationNodes (left + right inner + outer = 3).
+			expect(setOps(sql).length, 'both operands are direct SetOps').to.equal(3);
+			await db.exec(`create view V4 as ${sql}`);
+			expect(await readRows('select id, x, inL, inR from V4 order by id')).to.deep.equal([
+				{ id: 1, x: 10, inL: true,  inR: false },
+				{ id: 2, x: 20, inL: true,  inR: false },
+				{ id: 3, x: 30, inL: true,  inR: true  },
+				{ id: 4, x: 40, inL: false, inR: true  },
+				{ id: 5, x: 50, inL: false, inR: true  },
+			]);
+		});
+
+		it('except inner under the left wrapper: arity unaffected by operator; inner flags ride the stored slice', async () => {
+			await seedLeftwrap();
+			// The LEFT wrapper's inner is an EXCEPT (A except B = {1}); it computes inAx=true /
+			// inBx=false for its own visible rows. Surfaced through the outer UNION, those columns
+			// ride the inner's stored slice (default false for rows absent from the inner) — the
+			// same per-operator surfacing the right-side nested test pins, now on the left subtree.
+			const sql = '(select id, x from A except exists left as inAx, exists right as inBx select id, x from B)'
+				+ ' union exists left as inLsub, exists right as inRsub '
+				+ '(select id, x from C union exists left as inCx, exists right as inDx select id, x from D)';
+			expect(setOps(sql).length, 'left except + right union + outer').to.equal(3);
+			expect(setOps(sql)[0].getType().columns.map(c => c.name)).to.deep.equal(
+				['id', 'x', 'inAx', 'inBx', 'inCx', 'inDx', 'inLsub', 'inRsub']);
+			await db.exec(`create view Vex as ${sql}`);
+			expect(await readRows('select id, x, inAx, inBx, inCx, inDx, inLsub, inRsub from Vex order by id')).to.deep.equal([
+				// id=1 ∈ (A except B) → inner except flags inAx=true, inBx=false; ∉ right subtree.
+				{ id: 1, x: 10, inAx: true,  inBx: false, inCx: false, inDx: false, inLsub: true,  inRsub: false },
+				// ids 3,4,5 ∈ right subtree only → absent from the left except ⇒ inAx/inBx default false.
+				{ id: 3, x: 30, inAx: false, inBx: false, inCx: true,  inDx: false, inLsub: false, inRsub: true  },
+				{ id: 4, x: 40, inAx: false, inBx: false, inCx: true,  inDx: true,  inLsub: false, inRsub: true  },
+				{ id: 5, x: 50, inAx: false, inBx: false, inCx: false, inDx: true,  inLsub: false, inRsub: true  },
+			]);
+		});
+
+		it('reused-name parallel siblings (P3) are rejected at create — duplicate surfaced flags', async () => {
+			await seedLeftwrap();
+			// Both levels declare the SAME flag names (inA/inB), so the sum surface has duplicate
+			// columns. The set-op output scope rejects the collision rather than silently exposing
+			// duplicate names. Merging reused names into shared coordinate columns is the deferred
+			// `set-op-product-coordinate-model` (the product model, out of scope here).
+			const sql = '(select id, x from A union exists left as inA, exists right as inB select id, x from B)'
+				+ ' union exists left as inA, exists right as inB '
+				+ '(select id, x from A union exists left as inA, exists right as inB select id, x from B)';
+			let msg = '';
+			try { await readRows(sql); } catch (e) { msg = (e as Error).message; }
+			expect(msg, 'reused flag names collide in the set-op output scope').to.match(/already exists/i);
+		});
+
+		it('unwrapPassthroughSubquery: recognizes a pure `select * from (<compound>)` wrapper, rejects projections', () => {
+			// Pure passthrough → unwraps to the inner compound query-expr.
+			const inner = unwrapPassthroughSubquery(parseStmt('select * from (select 1 union select 2) v') as AST.SelectStmt);
+			expect(inner, 'pure passthrough unwraps').to.not.equal(undefined);
+			expect((inner as AST.SelectStmt).type).to.equal('select');
+			expect((inner as AST.SelectStmt).compound?.op, 'inner is the union compound').to.equal('union');
+			// A column-projecting leg narrows the surface — NOT a pure passthrough.
+			expect(unwrapPassthroughSubquery(parseStmt('select x from (select 1 union select 2) v') as AST.SelectStmt),
+				'projecting leg stays opaque').to.equal(undefined);
+			// A WHERE makes it a real filter, not a regrouping.
+			expect(unwrapPassthroughSubquery(parseStmt('select * from (select 1 union select 2) v where 1 = 1') as AST.SelectStmt),
+				'filtered wrapper stays opaque').to.equal(undefined);
+			// A base-table FROM is not a subquery passthrough.
+			expect(unwrapPassthroughSubquery(parseStmt('select * from t') as AST.SelectStmt),
+				'plain table source stays opaque').to.equal(undefined);
+		});
+
+		it('negative: a projecting derived-table left operand stays opaque and reads its narrowed surface', async () => {
+			await seedLeftwrap();
+			// `select x from (A∪B) v` projects only `x` — NOT a pure passthrough, so it is NOT
+			// unwrapped (unwrapping would restore the dropped `id` and break the 1-column arity).
+			// It builds as an opaque relation; the compound reads the single narrowed column.
+			const rows = await readRows('select x from (select id, x from A union select id, x from B) v union select x from C order by x');
+			expect(Object.keys(rows[0]), 'narrowed to a single column').to.deep.equal(['x']);
+			expect(rows.map(r => r.x)).to.deep.equal([10, 20, 30, 40]);
 		});
 
 		it('lens: a parenthesized compound lens body is rejected by the v1 guard (no crash)', () => {
