@@ -3207,3 +3207,56 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		}
 	});
 });
+
+describe('declarative-equivalence: default_collation', () => {
+	// Diff threading the live session default_collation, mirroring the runtime emitters.
+	function diffOf(db: Database) {
+		return computeSchemaDiff(
+			db.declaredSchemaManager.getDeclaredSchema('main')!,
+			collectSchemaCatalog(db, 'main'),
+			'allow',
+			db.options.getStringOption('default_collation'),
+		);
+	}
+
+	it('direct CREATE and declarative apply agree on an omitted-COLLATE column under nocase', async () => {
+		const direct = new Database();
+		const applied = new Database();
+		try {
+			direct.setOption('default_collation', 'nocase');
+			await direct.exec('create table t (id integer primary key, name text)');
+
+			applied.setOption('default_collation', 'nocase');
+			await applied.exec('declare schema main { table t { id INTEGER PRIMARY KEY, name TEXT } }');
+			await applied.exec('apply schema main');
+
+			const d = direct.schemaManager.getTable('main', 't')!;
+			const a = applied.schemaManager.getTable('main', 't')!;
+			assertTableSchemaEqual(d, a, 't');
+			// Both resolve the omitted COLLATE to NOCASE (the session default).
+			expect(d.columns.find(c => c.name === 'name')!.collation).to.equal('NOCASE');
+			expect(a.columns.find(c => c.name === 'name')!.collation).to.equal('NOCASE');
+			// INTEGER falls back to BINARY (does not support NOCASE).
+			expect(a.columns.find(c => c.name === 'id')!.collation).to.equal('BINARY');
+		} finally {
+			await direct.close();
+			await applied.close();
+		}
+	});
+
+	it('a second apply under nocase is idempotent — no spurious SET COLLATE', async () => {
+		const db = new Database();
+		try {
+			db.setOption('default_collation', 'nocase');
+			await db.exec('declare schema main { table t { id INTEGER PRIMARY KEY, name TEXT } }');
+			await db.exec('apply schema main');
+
+			// The live catalog column is NOCASE; the declared side must resolve the omitted
+			// COLLATE to NOCASE too (via the threaded default), so the diff is empty.
+			const diff = diffOf(db);
+			expect(diff.tablesToAlter, 'idempotent re-diff produces no alter under nocase').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});

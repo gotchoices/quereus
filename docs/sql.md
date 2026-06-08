@@ -3422,7 +3422,44 @@ create table users (
 
 **Note:** Primary key columns are always NOT NULL regardless of this setting.
 
-#### 9.2.4 nondeterministic_schema
+#### 9.2.4 default_collation
+
+Sets or queries the default **declared collation** for columns that carry no explicit
+`COLLATE` clause. Defaults to `'BINARY'`, so out of the box there is no behavior change —
+opt into `'NOCASE'` / `'RTRIM'` / any registered collation per database.
+
+**Values:**
+- `'BINARY'` (default): omitted-`COLLATE` columns are byte-compared (case-sensitive).
+- `'NOCASE'` / `'RTRIM'` / any registered collation name: omitted-`COLLATE` columns resolve
+  to that collation, **but only for types that support it** (text). Non-text columns
+  (`INTEGER`/`REAL`/`BLOB`) and empty-collation types (`JSON`, temporal) fall back to
+  `BINARY`. An invalid collation name is rejected at set time (the pragma value rolls back).
+
+```sql
+-- Make omitted-COLLATE text columns case-insensitive for this database
+pragma default_collation = 'nocase';
+
+create table users (
+  id integer primary key,     -- INTEGER → BINARY (NOCASE unsupported)
+  name text,                  -- TEXT, no COLLATE → resolves to NOCASE
+  code text collate binary    -- explicit COLLATE always wins → BINARY
+);
+
+-- Query current setting
+pragma default_collation;
+
+-- Restore byte-comparison default
+pragma default_collation = 'binary';
+```
+
+**Semantics (important):** `default_collation` is a **create-time authoring convenience
+only**. The catalog always stores the concrete, resolved collation, and persisted DDL always
+emits an explicit `COLLATE` for any non-`BINARY` collation. So a table created under
+`default_collation = 'nocase'` round-trips its `NOCASE` columns unambiguously even when the
+database is later reopened (or its DDL re-executed) under a different — or the default —
+`default_collation`. An explicit `COLLATE` clause always overrides the session default.
+
+#### 9.2.5 nondeterministic_schema
 
 Allows non-deterministic expressions (`random()`, `datetime('now')`, user-defined functions
 marked non-deterministic, etc.) inside DEFAULT, CHECK, and `GENERATED ALWAYS AS` clauses.
@@ -3466,7 +3503,7 @@ were created with. The option is not baked into any persisted schema.
 replay-contract discussion, and [Mutation Statements](module-authoring.md#mutation-statements)
 for how the captured artifact is structured.
 
-#### 9.2.5 schema_path
+#### 9.2.6 schema_path
 
 Sets or queries the default schema search path used when resolving unqualified table names. The value is a comma-separated list of schema names.
 

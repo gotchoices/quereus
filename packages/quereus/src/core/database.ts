@@ -13,7 +13,7 @@ import { createScalarFunction, createAggregateFunction } from '../func/registrat
 import { FunctionFlags } from '../common/constants.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
-import { BINARY_COLLATION, NOCASE_COLLATION, RTRIM_COLLATION, type CollationFunction } from '../util/comparison.js';
+import { BINARY_COLLATION, NOCASE_COLLATION, RTRIM_COLLATION, normalizeCollationName, type CollationFunction } from '../util/comparison.js';
 import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
 import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
@@ -248,6 +248,22 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 					throw new QuereusError(`Invalid default_column_nullability value: ${value}. Must be "nullable" or "not_null"`, StatusCode.ERROR);
 				}
 				log('Default column nullability changed to: %s', value);
+			}
+		});
+
+		this.options.registerOption('default_collation', {
+			type: 'string',
+			defaultValue: 'BINARY',
+			description: 'Default declared collation for columns with no explicit COLLATE (e.g. "BINARY", "NOCASE", "RTRIM", or any registered collation). Create-time authoring convenience only; the catalog stores concrete collations and persisted DDL always carries an explicit non-BINARY COLLATE.',
+			onChange: (event) => {
+				const value = event.newValue as string;
+				const normalized = normalizeCollationName(value);
+				// Validate at set time so a typo fails loudly, not at first comparison.
+				// The options framework rolls the value back when onChange throws.
+				if (this._getCollation(normalized) === undefined) {
+					throw new QuereusError(`Unknown collation '${value}' for default_collation`, StatusCode.ERROR);
+				}
+				log('Default collation changed to: %s', normalized);
 			}
 		});
 

@@ -11,6 +11,8 @@ import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { renameColumnInCheckExpression } from './rename-rewriter.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
+import { inferType } from '../types/registry.js';
+import { resolveDefaultCollation } from './table.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
@@ -157,6 +159,14 @@ export function computeSchemaDiff(
 	declaredSchema: AST.DeclareSchemaStmt,
 	actualCatalog: SchemaCatalog,
 	policy: RenamePolicy = 'allow',
+	/**
+	 * Session `default_collation` used to resolve an omitted COLLATE on the *declared*
+	 * side, matching how the CREATE path resolves it for a fresh `apply`. Defaults to
+	 * `'BINARY'` so direct callers (and the existing test suite, which runs under the
+	 * BINARY session default) keep byte-for-byte identical diffs. The emitters thread
+	 * the live `default_collation` session option.
+	 */
+	defaultCollation: string = 'BINARY',
 ): SchemaDiff {
 	const diff: SchemaDiff = {
 		tablesToCreate: [],
@@ -362,7 +372,7 @@ export function computeSchemaDiff(
 			// schema name, and the cross-table column-rename map so the constraint body
 			// comparison can reconcile a renamed local column / FK-parent-table /
 			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
-			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable);
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, defaultCollation);
 			// If this was a rename, set the alter target to the new name (post-rename)
 			if (matchedActual.name.toLowerCase() !== name) {
 				alterDiff.tableName = tableStmt.table.name;
@@ -473,7 +483,7 @@ export function computeSchemaDiff(
 		// the no-op rename op.
 		const declaredTableForIndex = declaredTables.get(declaredIndex.indexStmt.table.name.toLowerCase());
 		const indexColRenames = columnRenamesByTable.get(declaredIndex.indexStmt.table.name.toLowerCase()) ?? [];
-		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, targetSchemaName);
+		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, targetSchemaName, defaultCollation);
 		if (declaredBody !== matchedActual.definition) {
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
@@ -802,11 +812,11 @@ function explicitIndexColumnCollation(col: AST.IndexedColumn): string | undefine
  * Returns `'BINARY'` when no declared table is supplied (an index on a non-declared
  * table — not a coherent name-match) or the column is not found in it.
  */
-function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, columnName: string): string {
+function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, columnName: string, defaultCollation: string): string {
 	if (!declaredTable) return 'BINARY';
 	const lower = columnName.toLowerCase();
 	const col = declaredTable.tableStmt.columns.find(c => c.name.toLowerCase() === lower);
-	return col ? extractDeclaredCollation(col) : 'BINARY';
+	return col ? extractDeclaredCollation(col, defaultCollation) : 'BINARY';
 }
 
 /**
@@ -854,13 +864,17 @@ function declaredIndexCanonicalBody(
 	declaredTable: AST.DeclaredTable | undefined,
 	colRenames: ReadonlyArray<ColumnRenameOp>,
 	schemaName: string,
+	defaultCollation: string,
 ): string {
 	const columns: AST.IndexedColumn[] = indexStmt.columns.map(col => {
 		const bareName = indexedColumnBareName(col);
 		if (!bareName) return col;
 		// Collation resolves on the DECLARED (new) name — see the ordering note above.
+		// An inherited (no explicit index COLLATE) column resolves the table column's
+		// collation under the session default, matching the actual catalog index built
+		// from a default-resolved table column — so a non-BINARY default doesn't churn.
 		const effective = normalizeCollationName(
-			explicitIndexColumnCollation(col) || declaredColumnCollation(declaredTable, bareName) || 'BINARY',
+			explicitIndexColumnCollation(col) || declaredColumnCollation(declaredTable, bareName, defaultCollation) || 'BINARY',
 		);
 		// THEN inverse-rename the emitted name to its old (actual-catalog) form.
 		const oldName = colRenames.find(r => r.newName.toLowerCase() === bareName.toLowerCase())?.oldName ?? bareName;
@@ -1123,6 +1137,8 @@ function computeTableAlterDiff(
 	 * cross-table FK referenced-parent-column reconcile in {@link reconciledDeclaredBody}.
 	 */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	/** Session `default_collation` for resolving an omitted COLLATE on the declared side. */
+	defaultCollation: string,
 ): TableAlterDiff {
 	const diff: TableAlterDiff = {
 		// Default to actual's name; caller may override to declared name when this is a rename target.
@@ -1161,7 +1177,7 @@ function computeTableAlterDiff(
 	for (const col of declaredTable.tableStmt.columns) {
 		const matched = colRenames.pairs.get(col.name.toLowerCase());
 		if (!matched) continue;
-		const change = computeColumnAttributeChange(col, matched);
+		const change = computeColumnAttributeChange(col, matched, defaultCollation);
 		if (change) {
 			diff.columnsToAlter.push(change);
 		}
@@ -1345,13 +1361,20 @@ function extractDeclaredDefault(col: AST.ColumnDef): AST.Expression | null {
 
 /**
  * Extract a declared column's effective collation from its COLLATE constraint,
- * canonicalized (uppercase). Defaults to `'BINARY'` when none is declared — so
- * absent and an explicit `COLLATE BINARY` compare equal against the actual
- * catalog collation (which is normalized the same way).
+ * canonicalized (uppercase). When no COLLATE is declared, resolves the
+ * `defaultCollation` exactly as the engine's CREATE path does
+ * ({@link resolveDefaultCollation}) — so absent COLLATE and an explicit
+ * `COLLATE <default>` compare equal against the actual catalog collation, and an
+ * `apply schema` under a non-BINARY default stays idempotent (the live catalog
+ * column already carries the resolved default; resolving the declared side to the
+ * same value avoids a spurious `SET COLLATE`). `defaultCollation` is threaded from
+ * the live session — the cross-session rehydrate concern stays fixed-BINARY on the
+ * `importTable` path, not here.
  */
-function extractDeclaredCollation(col: AST.ColumnDef): string {
+function extractDeclaredCollation(col: AST.ColumnDef, defaultCollation: string): string {
 	const c = col.constraints?.find(c => c.type === 'collate');
-	return c?.collation ? normalizeCollationName(c.collation) : 'BINARY';
+	if (c) return c.collation ? normalizeCollationName(c.collation) : 'BINARY';
+	return resolveDefaultCollation(inferType(col.dataType), defaultCollation);
 }
 
 /**
@@ -1413,6 +1436,7 @@ function desiredTagSet(declared: Readonly<Record<string, SqlValue>> | undefined)
 function computeColumnAttributeChange(
 	declared: AST.ColumnDef,
 	actual: CatalogTable['columns'][number],
+	defaultCollation: string,
 ): ColumnAttributeChange | undefined {
 	const change: ColumnAttributeChange = { columnName: declared.name };
 	let any = false;
@@ -1447,7 +1471,7 @@ function computeColumnAttributeChange(
 	// Collation — declared COLLATE (default BINARY) vs actual, case-insensitive.
 	// Absent and BINARY are equal, so a column that never mentions COLLATE never
 	// churns a diff against an actual BINARY column.
-	const declaredCollation = extractDeclaredCollation(declared);
+	const declaredCollation = extractDeclaredCollation(declared, defaultCollation);
 	if (declaredCollation !== (actual.collation || 'BINARY').toUpperCase()) {
 		change.collation = declaredCollation;
 		any = true;

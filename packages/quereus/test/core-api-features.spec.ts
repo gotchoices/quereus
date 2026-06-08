@@ -277,6 +277,27 @@ describe('Core API Features', () => {
 				const value = db.getOption('default_column_nullability');
 				void expect(value).to.equal('nullable');
 			});
+
+			it('should default default_collation to BINARY', () => {
+				void expect(db.getOption('default_collation')).to.equal('BINARY');
+			});
+
+			it('should set and get default_collation', () => {
+				db.setOption('default_collation', 'nocase');
+				void expect(db.getOption('default_collation')).to.equal('nocase');
+			});
+
+			it('should reject an unknown default_collation and roll back', () => {
+				const before = db.getOption('default_collation');
+				void expect(before).to.equal('BINARY');
+
+				void expect(() => {
+					db.setOption('default_collation', 'no_such_collation');
+				}).to.throw(QuereusError);
+
+				// Value must remain unchanged after the rejected set
+				void expect(db.getOption('default_collation')).to.equal('BINARY');
+			});
 		});
 	});
 

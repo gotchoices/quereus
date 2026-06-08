@@ -109,8 +109,10 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
 		// Collect actual catalog
 		const actualCatalog = collectSchemaCatalog(rctx.db, schemaName);
 
-		// Compute diff
-		const diff = computeSchemaDiff(declaredSchema, actualCatalog);
+		// Compute diff. Thread the live default_collation so an omitted-COLLATE
+		// declared column resolves to the same effective collation the CREATE path
+		// would produce (parity + idempotency under a non-BINARY default).
+		const diff = computeSchemaDiff(declaredSchema, actualCatalog, 'allow', rctx.db.options.getStringOption('default_collation'));
 
 		// Generate migration DDL statements
 		const migrationStatements = generateMigrationDDL(diff, schemaName);
@@ -186,8 +188,11 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// Collect actual catalog
 		const actualCatalog = collectSchemaCatalog(rctx.db, schemaName);
 
-		// Compute diff (default rename_policy = 'allow' when unspecified)
-		const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow');
+		// Compute diff (default rename_policy = 'allow' when unspecified). Thread the
+		// live default_collation so an omitted-COLLATE declared column resolves to the
+		// same effective collation the CREATE path produces — keeping a fresh apply at
+		// parity with direct DDL and a re-apply idempotent under a non-BINARY default.
+		const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow', rctx.db.options.getStringOption('default_collation'));
 
 		// Generate migration DDL
 		const migrationStatements = generateMigrationDDL(diff, schemaName);

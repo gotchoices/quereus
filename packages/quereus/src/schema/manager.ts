@@ -1351,13 +1351,14 @@ export class SchemaManager {
 	private buildColumnSchemas(
 		astColumns: readonly AST.ColumnDef[],
 		astConstraints: readonly AST.TableConstraint[] | undefined,
-		defaultNotNull: boolean
+		defaultNotNull: boolean,
+		defaultCollation: string = 'BINARY'
 	): {
 		columns: ColumnSchema[];
 		pkDefinition: ReadonlyArray<import('./table.js').PrimaryKeyColumnDefinition>;
 		pkDefaultConflict: import('../common/constants.js').ConflictResolution | undefined;
 	} {
-		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull));
+		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull, defaultCollation));
 		const { pkDef: pkDefinition, defaultConflict: pkDefaultConflict, synthesized } = findPKDefinition(preliminaryColumnSchemas, astConstraints);
 
 		const columns = preliminaryColumnSchemas.map((col, idx) => {
@@ -1523,7 +1524,14 @@ export class SchemaManager {
 		stmt: AST.CreateTableStmt,
 		moduleName: string,
 		effectiveModuleArgs: Readonly<Record<string, SqlValue>>,
-		moduleInfo: { module: AnyVirtualTableModule; auxData?: unknown }
+		moduleInfo: { module: AnyVirtualTableModule; auxData?: unknown },
+		/**
+		 * Session `default_collation` for columns with no explicit COLLATE. The
+		 * caller decides: `createTable` passes the live session option (user-authored
+		 * CREATE), `importTable` passes `'BINARY'` (persisted DDL already made any
+		 * non-BINARY collation explicit, so an omitted COLLATE is canonical BINARY).
+		 */
+		defaultCollation: string = 'BINARY'
 	): TableSchema {
 		const targetSchemaName = stmt.table.schema || this.getCurrentSchemaName();
 		const tableName = stmt.table.name;
@@ -1532,7 +1540,7 @@ export class SchemaManager {
 		const defaultNotNull = defaultNullability === 'not_null';
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull);
+		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
 		const checkConstraints = this.extractCheckConstraints(astColumns, stmt.constraints);
 		const columnIndexMap = buildColumnIndexMap(columns);
 		const foreignKeys = this.extractForeignKeys(astColumns, stmt.constraints, columnIndexMap, tableName, targetSchemaName);
@@ -1595,9 +1603,11 @@ export class SchemaManager {
 		const tableName = stmt.table.name;
 		const defaultNullability = this.db.options.getStringOption('default_column_nullability');
 		const defaultNotNull = defaultNullability === 'not_null';
+		// User-authored declaration shares the CREATE surface, so honor the session default.
+		const defaultCollation = normalizeCollationName(this.db.options.getStringOption('default_collation'));
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull);
+		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
 		const checkConstraints = this.extractCheckConstraints(astColumns, stmt.constraints);
 		const columnIndexMap = buildColumnIndexMap(columns);
 		const foreignKeys = this.extractForeignKeys(astColumns, stmt.constraints, columnIndexMap, tableName, schemaName);
@@ -2233,7 +2243,9 @@ export class SchemaManager {
 		}
 
 		const { moduleName, effectiveModuleArgs, moduleInfo } = this.resolveModuleInfo(stmt);
-		const baseTableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo);
+		// User-authored CREATE: omitted-COLLATE columns resolve under the live session default.
+		const defaultCollation = normalizeCollationName(this.db.options.getStringOption('default_collation'));
+		const baseTableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo, defaultCollation);
 
 		const hasMutationContext = !!baseTableSchema.mutationContext && baseTableSchema.mutationContext.length > 0;
 		// `nondeterministic_schema = true` lifts the strict-rejection gate at CREATE TABLE.
@@ -2465,7 +2477,9 @@ export class SchemaManager {
 		const tableName = stmt.table.name;
 
 		const { moduleName, effectiveModuleArgs, moduleInfo } = this.resolveModuleInfo(stmt);
-		const tableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo);
+		// Rehydrate path: persisted DDL already made any non-BINARY collation explicit,
+		// so an omitted COLLATE is canonical BINARY regardless of the live session default.
+		const tableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo, 'BINARY');
 
 		try {
 			await moduleInfo.module.connect(

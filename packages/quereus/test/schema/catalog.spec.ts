@@ -371,6 +371,34 @@ describe('Schema Catalog', () => {
 			expect(afterNullable.columns.find(c => c.name === 'id')!.notNull).to.equal(true);
 			expect(afterNullable.columns.find(c => c.name === 'note')!.notNull).to.equal(false);
 		});
+
+		it('emits explicit COLLATE under default_collation and survives a reset roundtrip', async () => {
+			// Under a non-BINARY default_collation, an omitted-COLLATE text column resolves
+			// to that collation AND the catalog DDL must carry it explicitly so the column
+			// round-trips identically regardless of the reopen session default.
+			db.setOption('default_collation', 'nocase');
+			await db.exec('CREATE TABLE rt_dc (id INTEGER PRIMARY KEY, name TEXT) USING memory');
+
+			const created = db.schemaManager.getTable('main', 'rt_dc')!;
+			expect(created.columns.find(c => c.name === 'name')!.collation).to.equal('NOCASE');
+			// INTEGER does not support NOCASE → falls back to BINARY.
+			expect(created.columns.find(c => c.name === 'id')!.collation).to.equal('BINARY');
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			const entry = catalog.tables.find(t => t.name === 'rt_dc')!;
+			// Persisted DDL must name the non-BINARY collation explicitly (no session-default elision).
+			expect(entry.ddl).to.match(/"name"\s+TEXT[^,]*COLLATE\s+NOCASE/i);
+
+			await db.exec('DROP TABLE rt_dc');
+
+			// Re-exec the persisted DDL under a RESET-to-BINARY session: the explicit
+			// COLLATE in the DDL wins over the live default, so the column is still NOCASE.
+			db.setOption('default_collation', 'BINARY');
+			await db.exec(entry.ddl);
+			const reopened = db.schemaManager.getTable('main', 'rt_dc')!;
+			expect(reopened.columns.find(c => c.name === 'name')!.collation).to.equal('NOCASE');
+			expect(reopened.columns.find(c => c.name === 'id')!.collation).to.equal('BINARY');
+		});
 	});
 
 	describe('generateDeclaredDDL', () => {

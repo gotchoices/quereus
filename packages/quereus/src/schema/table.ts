@@ -200,13 +200,44 @@ export function validateCollationForType(
 }
 
 /**
+ * Effective collation for a column that carries NO explicit COLLATE clause, given
+ * the session `default_collation`. The default applies only when the column's
+ * logical type explicitly supports it; otherwise BINARY (so a non-text column under
+ * a non-BINARY default stays creatable / canonical).
+ *
+ * Used by {@link columnDefToSchema} (CREATE) AND the schema differ's
+ * `extractDeclaredCollation` (APPLY) so the two never drift — create/apply parity
+ * is what keeps `apply schema` idempotent under a non-BINARY default.
+ *
+ * The explicit `supportedCollations?.includes()` gate is deliberate and NOT the
+ * same as {@link validateCollationForType}'s throw: a type with
+ * `supportedCollations === undefined` (INTEGER/REAL/BLOB) is *accepted* by
+ * `validateCollationForType` for any collation, so routing the default through that
+ * path would silently give an INTEGER column a NOCASE collation. Gating on explicit
+ * support instead falls those types back to BINARY, as the design requires. TEXT
+ * supports BINARY/NOCASE/RTRIM; JSON/temporal carry an empty list ⇒ BINARY.
+ *
+ * Only the *implicit* default is gated this way; an *explicit* `COLLATE` clause
+ * keeps its existing (looser) {@link validateCollationForType} handling.
+ */
+export function resolveDefaultCollation(logicalType: LogicalType, defaultCollation: string): string {
+	const normalized = normalizeCollationName(defaultCollation);
+	if (normalized === 'BINARY') return 'BINARY';
+	if (logicalType.supportedCollations?.includes(normalized)) return normalized;
+	return 'BINARY';
+}
+
+/**
  * Converts a parsed ColumnDef AST node into a runtime ColumnSchema object
  *
  * @param def Column definition AST node
  * @param defaultNotNull Whether columns should be NOT NULL by default (Third Manifesto approach)
+ * @param defaultCollation Session `default_collation` applied to columns with no explicit
+ *   `COLLATE` clause (resolved via {@link resolveDefaultCollation}). Defaults to `'BINARY'`
+ *   (no behavior change); the rehydrate path passes `'BINARY'` so persisted DDL stays canonical.
  * @returns A runtime ColumnSchema object
  */
-export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true): ColumnSchema {
+export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true, defaultCollation: string = 'BINARY'): ColumnSchema {
 	// Infer logical type from the declared type name
 	const logicalType = inferType(def.dataType);
 
@@ -217,7 +248,7 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 		primaryKey: false,
 		pkOrder: 0,
 		defaultValue: null,
-		collation: 'BINARY',
+		collation: resolveDefaultCollation(logicalType, defaultCollation),
 		generated: false,
 	};
 
