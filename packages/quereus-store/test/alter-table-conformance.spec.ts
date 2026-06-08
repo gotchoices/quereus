@@ -150,7 +150,7 @@ const ARMS: Arm[] = [
 		label: 'addColumn NOT NULL, no DEFAULT, non-empty → CONSTRAINT',
 		seed: [`create table t (id integer primary key, name text) using store`, `insert into t values (1, 'a'), (2, 'b')`],
 		alter: `alter table t add column req text not null`,
-		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /req|not null/i },
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /\breq\b|not null/i },
 		confirm: async (db) => { expect(await columnNames(db), 'column absent after reject').to.not.include('req'); },
 	},
 	{
@@ -270,7 +270,7 @@ const ARMS: Arm[] = [
 		label: 'alterColumn SET NOT NULL (existing NULL) → CONSTRAINT',
 		seed: [`create table t (id integer primary key, v integer null) using store`, `insert into t values (1, null), (2, 9)`],
 		alter: `alter table t alter column v set not null`,
-		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /v|not null/i },
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /\bv\b|not null/i },
 		confirm: async (db) => { expect((await columnInfo(db, 'v'))?.notnull, 'unchanged after reject').to.equal(0); },
 	},
 	{
@@ -290,7 +290,7 @@ const ARMS: Arm[] = [
 		label: 'alterColumn SET DATA TYPE (lossy) → MISMATCH',
 		seed: [`create table t (id integer primary key, v text) using store`, `insert into t values (1, 'abc'), (2, 'xyz')`],
 		alter: `alter table t alter column v set data type integer`,
-		expect: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /v|convert/i },
+		expect: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /\bv\b|convert/i },
 		confirm: async (db) => {
 			expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after lossy reject').to.contain('text');
 		},

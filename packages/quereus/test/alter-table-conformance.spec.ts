@@ -141,7 +141,7 @@ const ARMS: Arm[] = [
 		label: 'addColumn NOT NULL, no DEFAULT, non-empty → CONSTRAINT',
 		seed: u => [`create table t (id integer primary key, name text)${u}`, `insert into t values (1, 'a'), (2, 'b')`],
 		alter: `alter table t add column req text not null`,
-		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /req|not null/i },
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /\breq\b|not null/i },
 		stubUnsupported: true,
 		confirm: async (db) => {
 			expect(await columnNames(db), 'rejected add leaves the column absent').to.not.include('req');
@@ -293,7 +293,7 @@ const ARMS: Arm[] = [
 		label: 'alterColumn SET NOT NULL (existing NULL) → CONSTRAINT',
 		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, null), (2, 9)`],
 		alter: `alter table t alter column v set not null`,
-		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /v|not null/i },
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /\bv\b|not null/i },
 		stubUnsupported: true,
 		confirm: async (db) => {
 			const info = await columnInfo(db, 'v');
@@ -320,7 +320,7 @@ const ARMS: Arm[] = [
 		label: 'alterColumn SET DATA TYPE (lossy) → MISMATCH',
 		seed: u => [`create table t (id integer primary key, v text)${u}`, `insert into t values (1, 'abc'), (2, 'xyz')`],
 		alter: `alter table t alter column v set data type integer`,
-		memory: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /v|convert/i },
+		memory: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /\bv\b|convert/i },
 		stubUnsupported: true,
 		confirm: async (db) => {
 			const info = await columnInfo(db, 'v');
