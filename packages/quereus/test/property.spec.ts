@@ -2198,10 +2198,11 @@ describe('Property-Based Tests', () => {
 			return found;
 		}
 
-		// The engine's compound grammar does not accept a parenthesized left leg at the
-		// outer level (a pre-existing limitation — `create view v as (select 1) union
-		// (select 2)` fails identically), so the membership clause is exercised in its
-		// supported non-parenthesized form: `<leg> union exists … <leg>`.
+		// Parenthesized compound legs now parse on either side (see the
+		// `Parenthesized compound set-operation legs` describe below for the
+		// grammar coverage). These read tests exercise the membership clause in
+		// its non-parenthesized form `<leg> union exists … <leg>`; the
+		// parenthesized-leg read-plan shape for membership is pinned separately.
 		async function createSchemas(): Promise<void> {
 			await db.exec('create table A (id integer primary key, x integer) using memory');
 			await db.exec('create table B (id integer primary key, x integer) using memory');
@@ -2440,9 +2441,9 @@ describe('Property-Based Tests', () => {
 
 		it('column_info / view_info: a select-* leg set-op view reports the non-writable shape', async () => {
 			await seed();
-			// A `*` leg has no static name list to align positionally — non-writable. Authored
-			// in the supported non-parenthesized compound form (a parenthesized left leg is
-			// rejected by the grammar; see the createSchemas comment above).
+			// A `*` leg has no static name list to align positionally — non-writable.
+			// Authored in the non-parenthesized compound form (parens are optional now,
+			// but the writability shape is independent of them).
 			await db.exec('create view Us as select id, x from A union exists left as inA, exists right as inB select * from B');
 			const info = (await readRows("select is_insertable_into, is_updatable, is_deletable from view_info('Us')"))[0];
 			expect(info.is_insertable_into).to.equal('NO');
@@ -2521,6 +2522,125 @@ describe('Property-Based Tests', () => {
 			]);
 			// Rejected on DIFF (symmetric difference desugars to two EXCEPTs — ambiguous).
 			expect(() => parser.parse('select id from A diff exists left as inA select id from B')).to.throw();
+		});
+	});
+
+	// --- Parenthesized compound set-operation legs (parenthesized-compound-set-op-legs) ---
+	// A parenthesized query expression `( <query-expr> )` is a relational operand on
+	// either side of a set operation (and as a view/CTE body or top-level query). Parens
+	// are the escape hatch into LEFT-associative grouping; unparenthesized chains keep
+	// their historical right-leaning shape. Pure grouping unwraps (no AST node); a grouped
+	// left operand is carried as a `select * from (<inner>) as <alias>` subquery wrapper.
+	describe('Parenthesized compound set-operation legs', () => {
+		function parseStmt(sql: string): any {
+			return new Parser().parse(sql);
+		}
+
+		/** All SetOperationNodes in a logically-planned body, in DFS order. */
+		function setOps(sql: string): RelationalPlanNode[] {
+			const ast = new Parser().parse(sql) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			const root = (plan as unknown as { getRelations(): readonly RelationalPlanNode[] }).getRelations()[0];
+			const found: RelationalPlanNode[] = [];
+			const visit = (n: PlanNode): void => {
+				if (n.nodeType === PlanNodeType.SetOperation) found.push(n as RelationalPlanNode);
+				for (const c of n.getChildren()) visit(c);
+			};
+			visit(root);
+			return found;
+		}
+
+		it('simple parens parse to a single-level compound (no wrapper)', () => {
+			const ast = parseStmt('(select 1) union (select 2)');
+			expect(ast.type).to.equal('select');
+			// The left operand is the bare `select 1` — NOT a `select * from (…)` wrapper.
+			expect(ast.from, 'no synthetic wrapper for the simple case').to.equal(undefined);
+			expect(ast.compound?.op).to.equal('union');
+			expect(ast.compound?.select?.type).to.equal('select');
+			expect(ast.compound?.select?.compound, 'right leg is a plain select').to.equal(undefined);
+		});
+
+		it('pure grouping unwraps: `(select 1)` ≡ `select 1`', () => {
+			const grouped = parseStmt('(select 1)');
+			const plain = parseStmt('select 1');
+			expect(grouped.type).to.equal('select');
+			expect(grouped.from, 'no wrapper for a pure-grouping parse').to.equal(undefined);
+			expect(grouped.compound).to.equal(undefined);
+			// Same column shape as the bare statement.
+			expect(grouped.columns.length).to.equal(plain.columns.length);
+		});
+
+		it('parallel siblings: a left wrapper + nested right compound, building to SetOp(SetOp, SetOp)', () => {
+			const sql = '(select 1 union select 2) union (select 3 union select 4)';
+			const ast = parseStmt(sql);
+			// Left operand carries a compound → wrapped once as `select * from (1∪2)`.
+			expect(ast.from?.[0]?.type, 'left compound is wrapped').to.equal('subquerySource');
+			expect(ast.from[0].subquery.compound?.op, 'wrapper holds the A∪B compound').to.equal('union');
+			// Right operand is itself a (nested) compound, used directly (no wrapper).
+			expect(ast.compound?.op).to.equal('union');
+			expect(ast.compound.select.compound?.op, 'right leg is C∪D').to.equal('union');
+			// Balanced, left-leaning plan: exactly three SetOperationNodes.
+			expect(setOps(sql).length, 'SetOp(union, SetOp, SetOp)').to.equal(3);
+		});
+
+		it('n-ary parenthesized chain is left-leaning with a single wrapper', () => {
+			const sql = '(select 1) union (select 2) union (select 3)';
+			const ast = parseStmt(sql);
+			expect(ast.from?.[0]?.type, 'accumulator wrapped after its slot filled').to.equal('subquerySource');
+			expect(ast.compound?.select?.compound, 'outer right leg is the plain select 3').to.equal(undefined);
+			expect(setOps(sql).length).to.equal(2);
+		});
+
+		it('regression: a right-nested parenthesized leg still parses', () => {
+			const ast = parseStmt('select 1 union (select 2 union select 3)');
+			expect(ast.from, 'no wrapper — left has no compound yet').to.equal(undefined);
+			expect(ast.compound?.op).to.equal('union');
+			expect(ast.compound.select.compound?.op, 'right leg keeps its inner union').to.equal('union');
+		});
+
+		it('a parenthesized leg binds its OWN order by / limit inside the parens', () => {
+			const ast = parseStmt('select 1 union (select 2 order by 1 limit 1)');
+			// Inner order/limit live on the right leg, NOT on the outer compound.
+			expect(ast.orderBy, 'outer compound has no order by').to.equal(undefined);
+			expect(ast.limit, 'outer compound has no limit').to.equal(undefined);
+			const right = ast.compound?.select;
+			expect(right?.orderBy?.length, 'inner order by binds inside the parens').to.equal(1);
+			expect(right?.limit, 'inner limit binds inside the parens').to.not.equal(undefined);
+		});
+
+		it('top-level parenthesized query: `(select 1) union (select 2);` parses (SQLite parity)', () => {
+			expect(() => parseStmt('(select 1) union (select 2)')).to.not.throw();
+		});
+
+		it('negative: empty / malformed parens throw a clear error', () => {
+			expect(() => parseStmt('()')).to.throw();
+			expect(() => parseStmt('(union select 1)')).to.throw();
+		});
+
+		it('negative: a parenthesized DML leg without RETURNING is rejected; with RETURNING accepted', () => {
+			expect(() => parseStmt('select 1 union (insert into t values (1))')).to.throw(/RETURNING/i);
+			expect(() => parseStmt('select 1 union (insert into t values (1) returning *)')).to.not.throw();
+		});
+
+		it('read-plan: nested membership `(A∪B) union exists … (C∪D)` builds with flags on the outer op', async () => {
+			await db.exec('create table a (id integer primary key, x integer) using memory');
+			await db.exec('create table b (id integer primary key, x integer) using memory');
+			const sql = '(select id, x from a union select id, x from b) union exists left as inL, exists right as inR (select id, x from a union select id, x from b)';
+			// Parses and builds a read plan (writability of the nested branches is the
+			// separate `set-op-membership-nested` ticket).
+			const ops = setOps(sql);
+			expect(ops.length, 'outer + two inner unions').to.equal(3);
+			// The OUTER set op (first in DFS) carries the two appended membership flags.
+			const cols = ops[0].getType().columns.map(c => c.name);
+			expect(cols).to.include('inL');
+			expect(cols).to.include('inR');
+		});
+
+		it('lens: a parenthesized compound lens body is rejected by the v1 guard (no crash)', () => {
+			// `(select 1) union (select 2)` parses to a plain compound select, which the lens
+			// guard rejects cleanly (compound bodies are unsupported in v1 lens overrides).
+			expect(() => parseStmt('declare lens for s_logical over s_basis { view t as (select 1) union (select 2) }'))
+				.to.throw(/compound|single SELECT/i);
 		});
 	});
 

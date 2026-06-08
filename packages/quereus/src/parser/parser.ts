@@ -244,16 +244,28 @@ export class Parser {
 		const resolutionContext = innerWith ?? outerWithContext;
 
 		const startToken = this.peek();
-		const kw = startToken.lexeme.toUpperCase();
 		let stmt: AST.QueryExpr;
-		switch (kw) {
-			case 'SELECT': this.advance(); stmt = this.selectStatement(startToken, resolutionContext); break;
-			case 'VALUES': this.advance(); stmt = this.valuesStatementWithOptionalCompound(startToken, resolutionContext); break;
-			case 'INSERT': this.advance(); stmt = this.insertStatement(startToken, resolutionContext); break;
-			case 'UPDATE': this.advance(); stmt = this.updateStatement(startToken, resolutionContext); break;
-			case 'DELETE': this.advance(); stmt = this.deleteStatement(startToken, resolutionContext); break;
-			default:
-				throw this.error(startToken, "Expected SELECT, VALUES, INSERT, UPDATE, or DELETE in query expression.");
+		if (this.check(TokenType.LPAREN)) {
+			// A parenthesized query expression `( <query-expr> )` is a valid first
+			// operand (view body / CTE body / FROM-subquery / scalar subquery all
+			// funnel here). Read it, then run the shared left-associative tail so
+			// `(…) union …` chains. Pure grouping (no compound follows) returns the
+			// inner expression unchanged — `(select 1)` ≡ `select 1`.
+			const firstOperand = this.parseCompoundOperand(resolutionContext, requireReturning);
+			stmt = this.checkCompoundOperator()
+				? this.parseCompoundTail(firstOperand, resolutionContext, startToken)
+				: firstOperand;
+		} else {
+			const kw = startToken.lexeme.toUpperCase();
+			switch (kw) {
+				case 'SELECT': this.advance(); stmt = this.selectStatement(startToken, resolutionContext); break;
+				case 'VALUES': this.advance(); stmt = this.valuesStatementWithOptionalCompound(startToken, resolutionContext); break;
+				case 'INSERT': this.advance(); stmt = this.insertStatement(startToken, resolutionContext); break;
+				case 'UPDATE': this.advance(); stmt = this.updateStatement(startToken, resolutionContext); break;
+				case 'DELETE': this.advance(); stmt = this.deleteStatement(startToken, resolutionContext); break;
+				default:
+					throw this.error(startToken, "Expected SELECT, VALUES, INSERT, UPDATE, or DELETE in query expression.");
+			}
 		}
 
 		if (innerWith) {
@@ -331,7 +343,13 @@ export class Parser {
 		const currentKeyword = startToken.lexeme.toUpperCase();
 		let stmt: AST.AstNode;
 
-		switch (currentKeyword) {
+		// A leading `(` is a parenthesized query expression at top level
+		// (`(select 1) union (select 2);` — SQLite parity). `parseQueryExpr`
+		// reads the operand and any compound tail; the post-switch WITH-attach
+		// below still folds an outer `with … (select …) union …` in.
+		if (this.check(TokenType.LPAREN)) {
+			stmt = this.parseQueryExpr(withClause);
+		} else switch (currentKeyword) {
 			case 'SELECT': this.advance(); stmt = this.selectStatement(startToken, withClause); break;
 			case 'INSERT': this.advance(); stmt = this.insertStatement(startToken, withClause); break;
 			case 'UPDATE': this.advance(); stmt = this.updateStatement(startToken, withClause); break;
@@ -588,29 +606,23 @@ export class Parser {
 	 */
 	selectStatement(startToken?: Token, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.SelectStmt {
 		const start = startToken ?? this.previous(); // Use provided or the keyword token
-		let lastConsumedToken = start; // Initialize lastConsumed
 
 		const distinct = this.matchKeyword('DISTINCT');
-		if (distinct) lastConsumedToken = this.previous();
 		const all = !distinct && this.matchKeyword('ALL');
-		if (all) lastConsumedToken = this.previous();
 
 		// Parse column list
 		const columns = this.columnList();
-		if (columns.length > 0) lastConsumedToken = this.previous(); // Update after last column element
 
 		// Parse FROM clause if present
 		let from: AST.FromClause[] | undefined;
 		if (this.match(TokenType.FROM)) {
 			from = this.tableSourceList(withClause);
-			if (from.length > 0) lastConsumedToken = this.previous(); // After last source/join
 		}
 
 		// Parse WHERE clause if present
 		let where: AST.Expression | undefined;
 		if (this.match(TokenType.WHERE)) {
 			where = this.expression();
-			lastConsumedToken = this.previous(); // After where expression
 		}
 
 		// Parse GROUP BY clause if present
@@ -620,89 +632,192 @@ export class Parser {
 			do {
 				groupBy.push(this.expression());
 			} while (this.match(TokenType.COMMA));
-			lastConsumedToken = this.previous(); // After last group by expression
 		}
 
 		// Parse HAVING clause if present
 		let having: AST.Expression | undefined;
 		if (this.match(TokenType.HAVING)) {
 			having = this.expression();
-			lastConsumedToken = this.previous(); // After having expression
 		}
 
-		// Parse WITH SCHEMA clause if present (must come before ORDER BY/LIMIT)
+		// Parse WITH SCHEMA clause if present (must come before compound / ORDER BY / LIMIT
+		// and is suppressed in compound-subquery position).
 		let schemaPath: string[] | undefined;
 		if (!isCompoundSubquery) {
 			schemaPath = this.parseSchemaPath();
-			if (schemaPath) {
-				lastConsumedToken = this.previous(); // After schema path
-			}
 		}
 
-		// Check for compound set operations (UNION / INTERSECT / EXCEPT) BEFORE ORDER BY/LIMIT
-		let compound: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: AST.QueryExpr; existence?: ReadonlyArray<AST.SetOpMembershipColumn> } | undefined;
-		if (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
-			const tok = this.previous();
-			let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
-			if (tok.type === TokenType.UNION) {
-				if (this.match(TokenType.ALL)) {
-					op = 'unionAll';
-				} else {
-					op = 'union';
-				}
-			} else if (tok.type === TokenType.INTERSECT) {
-				op = 'intersect';
-			} else if (tok.type === TokenType.EXCEPT) {
-				op = 'except';
-			} else {
-				op = 'diff';
-			}
+		const sel: AST.SelectStmt = {
+			type: 'select',
+			columns,
+			from,
+			where,
+			groupBy,
+			having,
+			distinct,
+			all,
+			schemaPath,
+			loc: _createLoc(start, this.previous()),
+		};
 
-			// Optional `<setop> exists <branch> as <name>` membership-column clause(s),
-			// AFTER the operator keyword (and any `all`) and BEFORE the right leg. One-token
-			// lookahead (`exists` followed by `left`/`right`, never `(`) distinguishes it from
-			// the `exists (<subquery>)` predicate, which never legally begins a compound leg.
-			const membershipExistence = this.setOpMembershipClauses(op);
+		// Compound set operations (UNION / INTERSECT / EXCEPT / DIFF) bind BEFORE
+		// ORDER BY / LIMIT — delegate to the shared left-associative tail parser.
+		const result = this.parseCompoundTail(sel, withClause, start);
 
-			// Compound leg is any QueryExpr (SELECT/VALUES/DML w/ RETURNING).
-			// For SELECT/VALUES legs we suppress ORDER BY / LIMIT so they bind
-			// to the outer compound — same rule the legacy code applied for
-			// SELECT, and the VALUES leg recurses so further compound chains
-			// continue past a VALUES right leg.
-			const usedParen = this.match(TokenType.LPAREN);
-			const legStartToken = this.peek();
-			let rightSelect: AST.QueryExpr;
-			if (this.check(TokenType.SELECT)) {
-				this.advance();
-				rightSelect = this.selectStatement(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (this.check(TokenType.VALUES)) {
-				this.advance();
-				rightSelect = this.valuesStatementWithOptionalCompound(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (
-				this.check(TokenType.WITH)
-				|| this.check(TokenType.INSERT)
-				|| this.check(TokenType.UPDATE)
-				|| this.check(TokenType.DELETE)
-			) {
-				rightSelect = this.parseQueryExpr(undefined, /*requireReturning*/ true);
-			} else {
-				throw this.error(this.peek(), "Expected SELECT, VALUES, or DML statement after set operation keyword.");
-			}
-			if (usedParen) {
-				this.consume(TokenType.RPAREN, "Expected ')' after parenthesized set operation.");
-			}
+		// ORDER BY / LIMIT / OFFSET apply to the final compound result; suppressed
+		// for a compound subquery (they bind to the outer compound).
+		this.parseTrailingOrderLimit(result, isCompoundSubquery);
 
-			lastConsumedToken = this.previous();
-			compound = membershipExistence
-				? { op, select: rightSelect, existence: membershipExistence }
-				: { op, select: rightSelect };
+		result.loc = _createLoc(start, this.previous());
+		return result;
+	}
+
+	/** True when the next token is a compound set-operation keyword. */
+	private checkCompoundOperator(): boolean {
+		return this.check(TokenType.UNION)
+			|| this.check(TokenType.INTERSECT)
+			|| this.check(TokenType.EXCEPT)
+			|| this.check(TokenType.DIFF);
+	}
+
+	/**
+	 * Decode a compound set-operation operator the caller has just consumed
+	 * (via `match`), plus the optional `<setop> exists <branch> as <name>`
+	 * membership-column clause(s) that sit between the operator keyword and the
+	 * right leg. One-token lookahead (`exists` followed by `left`/`right`, never
+	 * `(`) distinguishes the membership clause from the `exists (<subquery>)`
+	 * predicate, which never legally begins a compound leg.
+	 */
+	private parseCompoundOperator(): {
+		op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
+		existence?: ReadonlyArray<AST.SetOpMembershipColumn>;
+	} {
+		const tok = this.previous();
+		let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
+		if (tok.type === TokenType.UNION) {
+			op = this.match(TokenType.ALL) ? 'unionAll' : 'union';
+		} else if (tok.type === TokenType.INTERSECT) {
+			op = 'intersect';
+		} else if (tok.type === TokenType.EXCEPT) {
+			op = 'except';
+		} else {
+			op = 'diff';
 		}
+		const existence = this.setOpMembershipClauses(op);
+		return existence ? { op, existence } : { op };
+	}
 
-		// Parse ORDER BY clause if present (applies to final result after compound operations)
-		// Skip if this is a compound subquery as ORDER BY belongs to the outer compound
-		let orderBy: AST.OrderByClause[] | undefined;
-		if (!isCompoundSubquery && this.match(TokenType.ORDER) && this.consume(TokenType.BY, "Expected 'BY' after 'ORDER'.")) {
-			orderBy = [];
+	/**
+	 * Reads a single `query-term` operand of a set operation: either a
+	 * parenthesized query expression `( <query-expr> )` (full recursion — WITH,
+	 * nested compound, and the inner's OWN trailing ORDER BY / LIMIT all bind
+	 * inside the parens) or a bare keyword-led operand (SELECT / VALUES / DML).
+	 *
+	 * Bare SELECT / VALUES legs parse with `isCompoundSubquery=true` so a
+	 * trailing ORDER BY / LIMIT binds to the OUTER compound, and a bare SELECT
+	 * leg greedily consumes the remaining unparenthesized chain (preserving the
+	 * historical right-leaning shape). `requireReturning` is propagated so a
+	 * DML operand without RETURNING in a leg position is rejected.
+	 */
+	private parseCompoundOperand(
+		withClause: AST.WithClause | undefined,
+		requireReturning: boolean,
+	): AST.QueryExpr {
+		if (this.check(TokenType.LPAREN)) {
+			this.advance();
+			const inner = this.parseQueryExpr(withClause, requireReturning);
+			this.consume(TokenType.RPAREN, "Expected ')' after parenthesized query expression.");
+			return inner;
+		}
+		const start = this.peek();
+		if (this.check(TokenType.SELECT)) {
+			this.advance();
+			return this.selectStatement(start, withClause, /*isCompoundSubquery*/ true);
+		}
+		if (this.check(TokenType.VALUES)) {
+			this.advance();
+			return this.valuesStatementWithOptionalCompound(start, withClause, /*isCompoundSubquery*/ true);
+		}
+		if (this.check(TokenType.WITH) || this.check(TokenType.INSERT) || this.check(TokenType.UPDATE) || this.check(TokenType.DELETE)) {
+			return this.parseQueryExpr(undefined, requireReturning);
+		}
+		throw this.error(this.peek(), "Expected SELECT, VALUES, a DML statement, or '(' to begin a query operand.");
+	}
+
+	/**
+	 * Wraps an arbitrary query expression as `select * from (<inner>) as
+	 * <synthetic alias>` so the SELECT-level `compound` / ORDER BY / LIMIT slots
+	 * apply to it. Generalized from the VALUES-compound wrapper; the synthetic
+	 * alias is collision-proof per the inner's start offset (nested wraps live in
+	 * distinct subquery scopes, so identical aliases never collide).
+	 */
+	private wrapAsSubquerySelect(inner: AST.QueryExpr, startToken: Token): AST.SelectStmt {
+		const syntheticAlias = `values_${startToken.startOffset}`;
+		return {
+			type: 'select',
+			columns: [{ type: 'all' }],
+			from: [{
+				type: 'subquerySource',
+				subquery: inner,
+				alias: syntheticAlias,
+				loc: inner.loc,
+			}],
+			loc: inner.loc,
+		};
+	}
+
+	/**
+	 * Left-associative tail parser shared by every compound site. Consumes a
+	 * chain of `compound-op [membership] query-term` after an already-parsed
+	 * left operand and returns the resulting SELECT.
+	 *
+	 * A parenthesized operand iterates the loop (left-associative), wrapping the
+	 * accumulator whenever it cannot host the new compound — either it is not a
+	 * plain SELECT (e.g. a parenthesized VALUES/DML/compound operand) or its
+	 * `compound` slot is already taken. The first BARE keyword operand greedily
+	 * consumes the rest of the chain itself (its own `selectStatement` /
+	 * `valuesStatementWithOptionalCompound` recursion), so an unparenthesized
+	 * chain keeps today's right-leaning shape byte-for-byte. The user's explicit
+	 * parentheses are the only escape hatch into left-grouping.
+	 */
+	private parseCompoundTail(
+		left: AST.QueryExpr,
+		withClause: AST.WithClause | undefined,
+		startToken: Token,
+	): AST.SelectStmt {
+		let acc: AST.QueryExpr = left;
+		while (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
+			const { op, existence } = this.parseCompoundOperator();
+			const parenthesized = this.check(TokenType.LPAREN);
+			const right = this.parseCompoundOperand(withClause, /*requireReturning*/ true);
+
+			if (acc.type !== 'select' || acc.compound) {
+				acc = this.wrapAsSubquerySelect(acc, startToken);
+			}
+			acc.compound = existence ? { op, select: right, existence } : { op, select: right };
+
+			if (!parenthesized) break; // a bare operand already consumed the remaining chain
+		}
+		// `left` is a SelectStmt at every call site that may take zero iterations
+		// (selectStatement / continueSelectAfterFrom); the parenthesized entry only
+		// delegates here once a compound operator follows, and any iteration leaves
+		// `acc` a SELECT — so the result is always a SelectStmt.
+		return acc as AST.SelectStmt;
+	}
+
+	/**
+	 * Parses the trailing ORDER BY / LIMIT / OFFSET clauses that apply to the
+	 * final result of a (possibly compound) SELECT, mutating `sel` in place.
+	 * Suppressed entirely when `isCompoundSubquery` is set — those clauses then
+	 * bind to the enclosing compound, not this leg. Shared by `selectStatement`
+	 * and `continueSelectAfterFrom`.
+	 */
+	private parseTrailingOrderLimit(sel: AST.SelectStmt, isCompoundSubquery: boolean): void {
+		if (isCompoundSubquery) return;
+
+		// ORDER BY applies to the final result after compound operations.
+		if (this.match(TokenType.ORDER) && this.consume(TokenType.BY, "Expected 'BY' after 'ORDER'.")) {
+			sel.orderBy = [];
 			do {
 				const expr = this.expression();
 				const direction = this.match(TokenType.DESC) ? 'desc' :
@@ -724,48 +839,24 @@ export class Parser {
 				if (nulls) {
 					orderClause.nulls = nulls;
 				}
-				orderBy.push(orderClause);
+				sel.orderBy.push(orderClause);
 			} while (this.match(TokenType.COMMA));
-			lastConsumedToken = this.previous(); // After last order by clause
 		}
 
-		// Parse LIMIT clause if present (applies to final result after compound operations)
-		// Skip if this is a compound subquery as LIMIT belongs to the outer compound
-		let limit: AST.Expression | undefined;
-		let offset: AST.Expression | undefined;
-		if (!isCompoundSubquery && this.match(TokenType.LIMIT)) {
-			limit = this.expression();
-			lastConsumedToken = this.previous(); // After limit expression
+		// LIMIT applies to the final result after compound operations.
+		if (this.match(TokenType.LIMIT)) {
+			sel.limit = this.expression();
 
 			// LIMIT x OFFSET y syntax
 			if (this.match(TokenType.OFFSET)) {
-				offset = this.expression();
-				lastConsumedToken = this.previous(); // After offset expression
+				sel.offset = this.expression();
 			}
 			// LIMIT x, y syntax (x is offset, y is limit)
 			else if (this.match(TokenType.COMMA)) {
-				offset = limit;
-				limit = this.expression();
-				lastConsumedToken = this.previous(); // After second limit expression
+				sel.offset = sel.limit;
+				sel.limit = this.expression();
 			}
 		}
-
-		return {
-			type: 'select',
-			columns,
-			from,
-			where,
-			groupBy,
-			having,
-			orderBy,
-			limit,
-			offset,
-			distinct,
-			all,
-			compound,
-			schemaPath,
-			loc: _createLoc(start, lastConsumedToken),
-		};
 	}
 
 	/**
@@ -2322,116 +2413,37 @@ export class Parser {
 	 */
 	private valuesStatementWithOptionalCompound(startToken: Token, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.QueryExpr {
 		const values = this.valuesStatement(startToken);
-		const hasCompound = this.check(TokenType.UNION) || this.check(TokenType.INTERSECT) || this.check(TokenType.EXCEPT) || this.check(TokenType.DIFF);
+		const hasCompound = this.checkCompoundOperator();
 		const hasTrailing = !isCompoundSubquery && (this.check(TokenType.ORDER) || this.check(TokenType.LIMIT));
 		if (!hasCompound && !hasTrailing) {
 			return values;
 		}
 		// Wrap as `SELECT * FROM (<values>) AS <synthetic alias>` and continue
 		// parsing as a SELECT so the trailing clauses fold in naturally.
-		const syntheticAlias = `values_${startToken.startOffset}`;
-		const wrapped: AST.SelectStmt = {
-			type: 'select',
-			columns: [{ type: 'all' }],
-			from: [{
-				type: 'subquerySource',
-				subquery: values,
-				alias: syntheticAlias,
-				loc: values.loc,
-			}],
-			loc: values.loc,
-		};
-		return this.continueSelectAfterFrom(wrapped, withClause, isCompoundSubquery);
+		const wrapped = this.wrapAsSubquerySelect(values, startToken);
+		return this.continueSelectAfterFrom(wrapped, withClause, startToken, isCompoundSubquery);
 	}
 
 	/**
-	 * Picks up an in-progress SELECT after its FROM clause is already
-	 * populated and parses any remaining trailing clauses
-	 * (compound/ORDER/LIMIT). Used by `valuesStatementWithOptionalCompound`
-	 * to graft compound chains and trailing clauses onto a synthesized
-	 * SELECT-from-VALUES wrapper. The synthesized wrapper never carries
-	 * its own WHERE / GROUP BY / HAVING — bare VALUES at top level does not
-	 * accept those clauses, so they fall through as a statement-boundary
-	 * parse error rather than being silently absorbed by the wrapper.
+	 * Picks up an in-progress SELECT after its FROM clause is already populated
+	 * and parses any remaining trailing clauses by delegating to the shared
+	 * compound-tail / ORDER-LIMIT parsers. Used by
+	 * `valuesStatementWithOptionalCompound` to graft a compound chain and
+	 * trailing clauses onto a synthesized SELECT-from-VALUES wrapper. The
+	 * synthesized wrapper never carries its own WHERE / GROUP BY / HAVING — bare
+	 * VALUES at top level does not accept those clauses, so they fall through as
+	 * a statement-boundary parse error rather than being silently absorbed.
 	 *
-	 * `isCompoundSubquery` suppresses ORDER BY / LIMIT consumption — those
-	 * belong to the outer compound when this wrapper is a right leg.
+	 * `startToken` seeds the synthetic alias of any further subquery wrapper the
+	 * tail parser mints; `isCompoundSubquery` suppresses ORDER BY / LIMIT
+	 * consumption — those belong to the outer compound when this wrapper is a
+	 * right leg.
 	 */
-	private continueSelectAfterFrom(sel: AST.SelectStmt, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.SelectStmt {
-		// Compound chain.
-		if (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
-			const tok = this.previous();
-			let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
-			if (tok.type === TokenType.UNION) {
-				op = this.match(TokenType.ALL) ? 'unionAll' : 'union';
-			} else if (tok.type === TokenType.INTERSECT) {
-				op = 'intersect';
-			} else if (tok.type === TokenType.EXCEPT) {
-				op = 'except';
-			} else {
-				op = 'diff';
-			}
-			// `<setop> exists <branch> as <name>` membership-column clause(s) between the
-			// operator and the right leg (see `setOpMembershipClauses`).
-			const membershipExistence = this.setOpMembershipClauses(op);
-			const usedParen = this.match(TokenType.LPAREN);
-			const legStartToken = this.peek();
-			let rightLeg: AST.QueryExpr;
-			if (this.check(TokenType.SELECT)) {
-				this.advance();
-				rightLeg = this.selectStatement(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (this.check(TokenType.VALUES)) {
-				this.advance();
-				// Recurse so that further compound chains (`VALUES (1) UNION
-				// VALUES (2) UNION VALUES (3)`) wrap each VALUES leg and the
-				// chain continues. isCompoundSubquery=true suppresses
-				// trailing ORDER BY / LIMIT — those belong to the outermost
-				// compound result, not this leg.
-				rightLeg = this.valuesStatementWithOptionalCompound(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (this.check(TokenType.WITH) || this.check(TokenType.INSERT) || this.check(TokenType.UPDATE) || this.check(TokenType.DELETE)) {
-				rightLeg = this.parseQueryExpr(undefined, /*requireReturning*/ true);
-			} else {
-				throw this.error(this.peek(), "Expected SELECT, VALUES, or DML statement after set operation keyword.");
-			}
-			if (usedParen) {
-				this.consume(TokenType.RPAREN, "Expected ')' after parenthesized set operation.");
-			}
-			sel.compound = membershipExistence
-				? { op, select: rightLeg, existence: membershipExistence }
-				: { op, select: rightLeg };
-		}
-		if (isCompoundSubquery) {
-			return sel;
-		}
-		// ORDER BY / LIMIT apply to the final compound result.
-		if (this.match(TokenType.ORDER) && this.consume(TokenType.BY, "Expected 'BY' after 'ORDER'.")) {
-			sel.orderBy = [];
-			do {
-				const expr = this.expression();
-				const direction = this.match(TokenType.DESC) ? 'desc' : (this.match(TokenType.ASC) ? 'asc' : 'asc');
-				let nulls: 'first' | 'last' | undefined;
-				if (this.matchKeyword('NULLS')) {
-					if (this.matchKeyword('FIRST')) {
-						nulls = 'first';
-					} else if (this.matchKeyword('LAST')) {
-						nulls = 'last';
-					}
-				}
-				const ob: AST.OrderByClause = { expr, direction };
-				if (nulls) ob.nulls = nulls;
-				sel.orderBy.push(ob);
-			} while (this.match(TokenType.COMMA));
-		}
-		if (this.match(TokenType.LIMIT)) {
-			sel.limit = this.expression();
-			if (this.match(TokenType.OFFSET)) {
-				sel.offset = this.expression();
-			} else if (this.match(TokenType.COMMA)) {
-				sel.offset = sel.limit;
-				sel.limit = this.expression();
-			}
-		}
-		return sel;
+	private continueSelectAfterFrom(sel: AST.SelectStmt, withClause: AST.WithClause | undefined, startToken: Token, isCompoundSubquery: boolean = false): AST.SelectStmt {
+		// Compound chain (left-associative tail) binds before ORDER BY / LIMIT.
+		const result = this.parseCompoundTail(sel, withClause, startToken);
+		this.parseTrailingOrderLimit(result, isCompoundSubquery);
+		return result;
 	}
 
 	/** @internal */

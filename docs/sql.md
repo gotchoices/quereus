@@ -43,7 +43,8 @@ Each of these may appear at any **relation site**:
 - Scalar / row subquery (`(<query-expr>)`)
 - `IN (<query-expr>)` and `NOT IN (<query-expr>)`
 - `EXISTS (<query-expr>)`
-- Compound legs (`… UNION [ALL] | INTERSECT | EXCEPT | DIFF <query-expr>`)
+- Compound legs (`<query-expr> UNION [ALL] | INTERSECT | EXCEPT | DIFF <query-expr>`), where
+  either leg may itself be a parenthesized query expression (see the set-operation section)
 - CTE body (`WITH cte(cols) AS (<query-expr>) …`)
 - View body (`CREATE VIEW v[(cols)] AS <query-expr>`)
 
@@ -310,7 +311,20 @@ select [distinct | all] select_expr [, select_expr ...]
 - `except`: Rows in left not in right (set semantics)
 - `diff`: Symmetric difference = (A except B) union (B except A) (set semantics)
 
-> **Note:** Chained set operations are right-associative: `A except B union C` evaluates as `A except (B union C)`, not `(A except B) union C`. Use CTEs or subqueries to force left-to-right evaluation when needed.
+**Parenthesized operands.** A parenthesized query expression `( <query-expr> )` is a
+valid operand on **either side** of a set operation, and equally as a view body, CTE body,
+or top-level query — so `(select 1) union (select 2)`, `(A union B) union (C union D)`, and
+`create view v as (select 1) union (select 2)` all parse. The inner expression is a full
+query expression: it may carry its own `WITH`, a nested compound, and its own trailing
+`ORDER BY` / `LIMIT` (which bind **inside** the parentheses). Redundant grouping collapses:
+`(select 1)` ≡ `select 1`, and a simple `(select 1) union (select 2)` carries the same AST
+as the unparenthesized `select 1 union select 2`.
+
+> **Note (associativity):** Parenthesized operands group **as written** (left-associative):
+> `(A) union (B) union (C)` evaluates as `(A union B) union C`. Unparenthesized chains keep
+> their existing **right-leaning** grouping: `A except B union C` evaluates as
+> `A except (B union C)`, not `(A except B) union C`. Parentheses are the escape hatch — use
+> them (or CTEs/subqueries) to force a specific left-to-right evaluation order.
 
 #### Set-operation membership columns
 

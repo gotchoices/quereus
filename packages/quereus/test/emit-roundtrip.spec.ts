@@ -85,6 +85,36 @@ describe('Emit: statement round-trips', () => {
 			expect(() => parse('select id from a diff exists left as inA select id from b')).to.throw();
 		});
 
+		describe('parenthesized compound legs', () => {
+			// Parens are an escape hatch for left-associative grouping. The simple
+			// case carries the SAME AST as the plain compound, so stringify drops the
+			// redundant parens; the grouped case carries a `select * from (…)` wrapper
+			// that re-emits the parens structurally. Both are idempotent.
+			it('simple parens collapse to the plain compound (redundant parens dropped)', () => {
+				expect(roundTripStmt('(select 1) union (select 2)')).to.equal('select 1 union select 2');
+			});
+
+			it('regression: an unparenthesized compound is unchanged (right-leaning)', () => {
+				roundTripStmt('select a from t1 union select b from t2');
+			});
+
+			it('parallel siblings round-trip stably (left wrapper carried structurally)', () => {
+				roundTripStmt('(select a from t1 union select b from t2) union (select c from t3 union select d from t4)');
+			});
+
+			it('mixed-operator parenthesized chain round-trips stably', () => {
+				roundTripStmt('(select 1) intersect (select 2) except (select 3)');
+			});
+
+			it('parenthesized leg as a view body round-trips', () => {
+				roundTripStmt('create view v as (select 1) union (select 2)');
+			});
+
+			it('membership on the outer op of a parenthesized compound round-trips stably', () => {
+				roundTripStmt('(select id, x from a union select id, x from b) union exists left as inL, exists right as inR (select id, x from a union select id, x from b)');
+			});
+		});
+
 		it('subquery in FROM', () => {
 			roundTripStmt('select x from (select 1 as x) as sub');
 		});
