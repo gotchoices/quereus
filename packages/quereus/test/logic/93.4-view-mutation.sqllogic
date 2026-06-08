@@ -2235,6 +2235,46 @@ select pv from ojp2 order by pv;
 → [{"pv":777}]
 
 -- ===================================
+-- Multi-parent shared key (one child FK column references TWO optional parents on the
+-- same value). A single shared key cannot reference one parent but not the other, so a
+-- partial-supply row would silently lose the supplied value AND orphan the present
+-- parent. The shape is rejected at plan time (was: silent wrong result + orphan).
+-- Two inline `references` clauses on one column parse into two FK constraints.
+-- ===================================
+pragma foreign_keys = true;
+create table mpp1 (pp integer primary key default (coalesce((select max(pp) from mpp1), 0) + mutation_ordinal()), pv integer null);
+create table mpp2 (qq integer primary key default (coalesce((select max(qq) from mpp2), 0) + mutation_ordinal()), qv integer null);
+create table mpc (c integer primary key, pr integer null references mpp1(pp) references mpp2(qq), cv integer null);
+create view mpv as
+    select x.c as c, x.cv as cv, a.pv as pv, b.qv as qv
+    from mpc x left join mpp1 a on a.pp = x.pr
+               left join mpp2 b on b.qq = x.pr;
+
+-- Partial supply (p1 only): rejected at plan time — no orphan, no silent loss.
+insert into mpv (c, cv, pv, qv) values (2, 200, 30, null);
+-- error: single shared key
+
+-- The reject is static (shape-based), so even an all-parents-supplied row still rejects
+-- (the v1 over-rejection tradeoff; per-parent key columns are the future generalization).
+insert into mpv (c, cv, pv, qv) values (3, 300, 30, 40);
+-- error: single shared key
+
+-- The single-PARENT-columns shape (qv omitted) is NOT caught by this reject — p2 is
+-- statically inactive, so groups.length == 1. Under FK enforcement the child's pr then
+-- dangles the (untouched) mpp2 FK and errors loudly at runtime — pre-existing behavior,
+-- out of scope here (it is not the silent-loss bug). Left unasserted to avoid coupling to
+-- the exact FK-violation message text.
+
+-- No parent (or child) row leaked from the rejected inserts above.
+select count(*) as n from mpp1;
+→ [{"n":0}]
+select count(*) as n from mpp2;
+→ [{"n":0}]
+select count(*) as n from mpc;
+→ [{"n":0}]
+pragma foreign_keys = false;
+
+-- ===================================
 -- SUPPLIED shared key (the join key is a writable view column, not minted): the per-row
 -- key gate must NOT fire. The user's explicit key may reference a PRE-EXISTING parent the
 -- insert never touches (pv left null because the parent already exists); nulling it would

@@ -40,7 +40,7 @@ export type MutationDiagnosticReason =
 	| 'unsupported-decomposition-insert'    // internal guard: a decomposition INSERT is built via buildDecompositionInsert (envelope), not propagate
 	| 'unsupported-decomposition-update'    // UPDATE targets a decomposition shared-key (identity) column, or assigns an optional/EAV member a non-constant value (which would need the per-row capture substrate) — the optional/EAV constant-value materialization itself is supported
 	| 'unsupported-decomposition-predicate' // a decomposition DELETE/UPDATE WHERE references a non-anchor member — needs snapshot-consistent multi-member execution (deferred)
-	| 'unsupported-decomposition-key'       // a decomposition member has a composite/absent shared key (v1 is single-column)
+	| 'unsupported-decomposition-key'       // the single-column shared-key envelope cannot express this n-way shape: a decomposition member has a composite/absent shared key (v1 is single-column), OR a multi-source outer-join INSERT threads ONE shared key column into >1 presence-gated (optional) parent — one key value cannot reference some-but-not-all parents per row, so a partial-supply row would silently lose the value and orphan a parent (`view-write-outer-insert-shared-key-multi-parent-orphan`)
 	| 'unsupported-decomposition-member';   // two decomposition members resolve to the same base relation (a self-decomposition) — member routing is ambiguous
 
 /**

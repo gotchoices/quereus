@@ -629,6 +629,25 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 				if (!sideDeclaresFkOnto(sides[sideIndex], sides[partnerIndex])) continue;
 				groups.push([...partner.presenceGateIndices]);
 			}
+			// `groups.length >= 2` is the under-determined multi-parent shape: this FK-child
+			// threads its SINGLE shared key column into ≥2 presence-gated (outer-joined)
+			// parents (`cc.pr references p1(pp) references p2(qq)`, both LEFT-joined and
+			// supplied). One key value `K` must satisfy two FK constraints at once, so a
+			// both-create row needs BOTH parents present; a partial-supply row (one parent's
+			// value null) nulls `pr` entirely via the AND-gate, yet the present parent still
+			// materializes through its own presence filter — silently losing the supplied
+			// value and orphaning that parent. We cannot statically prove every row supplies
+			// all parents, so the shape is rejected rather than threaded as a broken AND-gated
+			// key (§ Outer Joins — Inserts; the per-parent-key-columns generalization is future
+			// work). The single-parent (`groups.length === 1`) gate below is the shipped,
+			// tested `ojv2` behavior and is unaffected.
+			if (groups.length >= 2) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-decomposition-key',
+					table: view.name,
+					message: `cannot insert through view '${view.name}': the FK-child side '${sides[sideIndex].schema.name}' threads a single shared key into ${groups.length} optional (outer-joined) parents; one key column cannot reference some-but-not-all of them per row (a multi-parent shared-key insert is not yet supported — supply all parents, or split into per-parent key columns)`,
+				});
+			}
 			if (groups.length > 0) {
 				const spec = specByIndex.get(sideIndex)!;
 				specByIndex.set(sideIndex, { ...spec, keyGate: { keyTargetIndex: 0, groups } });
