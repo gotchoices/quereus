@@ -94,9 +94,18 @@ SELECT 'B' COLLATE NOCASE BETWEEN 'a' AND 'c' AS yes2, 'B' BETWEEN 'a' AND 'c' A
 SELECT 'Hello' COLLATE NOCASE NOT BETWEEN 'a' AND 'z' AS no3, 'Hello' NOT BETWEEN 'a' AND 'z' AS yes3;
 → [{"no3":false,"yes3":true}]
 
--- COLLATE on lower bound propagates to BETWEEN
-SELECT 'hello' BETWEEN 'A' COLLATE NOCASE AND 'Z' AS yes4, 'hello' BETWEEN 'A' AND 'Z' AS no4;
-→ [{"yes4":true,"no4":false}]
+-- A COLLATE on a BETWEEN *bound* governs only that bound's comparison (per-bound,
+-- like `expr >= lo AND expr <= hi`), NOT the whole expression. The lower bound's NOCASE
+-- makes `'hello' >= 'A'` true, but the bare upper keeps `'hello' <= 'Z'` BINARY (false),
+-- so the whole BETWEEN is false — matching SQLite and the desugared two-comparison form.
+SELECT 'hello' BETWEEN 'A' COLLATE NOCASE AND 'Z' AS lo_collated, 'hello' BETWEEN 'A' AND 'Z' AS plain;
+→ [{"lo_collated":false,"plain":false}]
+
+-- A COLLATE on the *upper* bound likewise flips only that comparison: `'hello' <= 'Z'`
+-- under NOCASE is true ('hello' <= 'z'), and the bare lower `'hello' >= 'A'` is BINARY-true,
+-- so the BETWEEN is true.
+SELECT 'hello' BETWEEN 'A' AND 'Z' COLLATE NOCASE AS hi_collated;
+→ [{"hi_collated":true}]
 
 -- BETWEEN with NULL operands still returns NULL under COLLATE
 SELECT null COLLATE NOCASE BETWEEN 'a' AND 'z' AS r1, 'b' COLLATE NOCASE BETWEEN null AND 'z' AS r2;

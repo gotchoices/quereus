@@ -208,3 +208,80 @@ select id, case when status = 'active' collate NOCASE then 'match' else 'other' 
 → [{"id":1,"r":"match"},{"id":2,"r":"other"},{"id":3,"r":"other"},{"id":4,"r":"match"}]
 
 drop table coll_case;
+
+-- =============================================================================
+-- COLLATE on a BETWEEN *bound* (scan form)
+-- =============================================================================
+-- BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves its
+-- collation independently with bound (right-operand) precedence, so a COLLATE on a
+-- bound governs that bound's comparison. The tested column's implicit BINARY default
+-- must NOT shadow an explicit bound COLLATE. Regression for `collate-on-between-bound`.
+
+create table btw (id integer primary key, name text);
+insert into btw values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+
+-- Lower bound carries COLLATE NOCASE: `name >= 'bob' (NOCASE) AND name <= 'bob' (BINARY)`.
+-- 'BOB'/'Bob' are NOCASE-equal to 'bob' (lower passes) and BINARY-less-or-equal to 'bob'
+-- (upper passes). Previously returned [] because the BINARY column collation clobbered
+-- the bound's NOCASE.
+select id from btw where name between 'bob' collate NOCASE and 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+-- expr-side COLLATE stays correct (both comparisons inherit NOCASE).
+select id from btw where name collate NOCASE between 'bob' and 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+-- Desugared parity: the two-comparison form resolves identically per-bound.
+select id from btw where name >= 'bob' collate NOCASE and name <= 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+-- Upper bound carries the COLLATE: `name >= 'BOB' (BINARY) AND name <= 'bob' (NOCASE)`.
+select id from btw where name between 'BOB' and 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Desugared parity for the upper-collated form.
+select id from btw where name >= 'BOB' and name <= 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- NOT BETWEEN with a collated lower bound = `v < 'bob' (NOCASE) OR v > 'bob' (BINARY)`:
+-- the complement of the between rows, so 'Alice' (id 1) and 'charlie' (id 3).
+select id from btw where name not between 'bob' collate NOCASE and 'bob' order by id;
+→ [{"id":1},{"id":3}]
+
+drop table btw;
+
+-- =============================================================================
+-- COLLATE on a BETWEEN bound over an index (access-path cover classification)
+-- =============================================================================
+-- The access path resolves each bound's effective collation per-constraint
+-- (lower → `>=`, upper → `<=`) and either keeps the seek (collations match) or
+-- declines to a scan + residual (mismatch). All forms must agree with the scan.
+
+create table btw_nc (id integer primary key, name text);
+insert into btw_nc values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+create index idx_btw_nc on btw_nc (name collate NOCASE);
+
+-- Both bounds NOCASE over a NOCASE index: collations match on both bounds, so the
+-- seek is usable and returns the NOCASE-'bob'-equal rows directly.
+select id from btw_nc where name between 'bob' collate NOCASE and 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Mixed bounds over the NOCASE index (lower NOCASE matches, upper BINARY does not):
+-- the access path declines the seek and scans + residual, matching the scan form.
+select id from btw_nc where name between 'bob' collate NOCASE and 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+drop table btw_nc;
+
+-- BINARY index, both bounds NOCASE: the NOCASE bound collations do not match the
+-- BINARY index, so the seek is declined (it would under-fetch in BINARY order) and
+-- the scan + residual returns the NOCASE-correct rows. Previously the bound collation
+-- was ignored and the seek silently returned the wrong rows.
+create table btw_bin (id integer primary key, name text);
+insert into btw_bin values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+create index idx_btw_bin on btw_bin (name);
+
+select id from btw_bin where name between 'bob' collate NOCASE and 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+drop table btw_bin;

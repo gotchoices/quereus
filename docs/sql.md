@@ -2380,6 +2380,14 @@ where total > (
 expr collate collation_name
 ```
 
+In a comparison, the collation is taken from the right operand if it carries an explicit
+`COLLATE`, else the left operand, else the operands' declared/default collation (`BINARY`).
+`BETWEEN` is evaluated as two independent comparisons (`expr >= lower AND expr <= upper`), so a
+`COLLATE` on a **bound** governs only *that bound's* comparison — it does not propagate to the
+whole expression. For example `x BETWEEN 'a' COLLATE NOCASE AND 'z'` compares `x >= 'a'` under
+`NOCASE` but `x <= 'z'` under the default collation; to collate both sides, put the `COLLATE` on
+the tested expression (`x COLLATE NOCASE BETWEEN 'a' AND 'z'`).
+
 **CAST Expression:**
 ```sql
 cast(expr as type)

@@ -1199,8 +1199,8 @@ interface CollationCoverDecision {
  * Resolve a predicate constraint's effective comparison collation at plan time,
  * mirroring the runtime resolution in `emitComparisonOp` (binary.ts) and `emitIn`
  * (subquery.ts): a comparison takes the right operand's collation, else the left's,
- * else BINARY; an IN takes the condition (LHS) operand's collation; a BETWEEN takes
- * the tested expression's collation. The result is normalized.
+ * else BINARY; an IN takes the condition (LHS) operand's collation; a BETWEEN bound
+ * takes that bound's collation, else the tested expression's. The result is normalized.
  */
 function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
 	const src = constraint.sourceExpression;
@@ -1211,12 +1211,18 @@ function effectivePredicateCollation(constraint: PlannerPredicateConstraint): st
 		return normalizeCollationName(src.condition.getType().collationName ?? 'BINARY');
 	}
 	if (src instanceof BetweenNode) {
-		// BETWEEN is `expr >= lo AND expr <= hi`; each comparison resolves to the
-		// tested-expression (LHS) collation. A `COLLATE` on a *bound* is dropped
-		// during constant folding / constraint extraction (the bound is reduced to a
-		// bare literal before this rule runs — see the `collate-on-between-bound`
-		// folding bug), so only the expr collation can ever reach this point.
-		return normalizeCollationName(src.expr.getType().collationName ?? 'BINARY');
+		// BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves its
+		// collation independently with bound (right-operand) precedence, mirroring
+		// emitBetween. extractBetweenConstraints emits two constraints sharing this
+		// BetweenNode source — `op: '>='`/`'>'` for the lower bound, `'<='`/`'<'` for the
+		// upper — so the constraint's op selects which bound's collation applies. A
+		// `COLLATE` on a bound survives folding (it rides on the bound's type), so the
+		// bound collation can and must reach this point.
+		const exprColl = src.expr.getType().collationName;
+		const boundColl = (constraint.op === '<=' || constraint.op === '<')
+			? src.upper.getType().collationName
+			: src.lower.getType().collationName;
+		return normalizeCollationName(boundColl ?? exprColl ?? 'BINARY');
 	}
 	// OR_RANGE carries an OR BinaryOpNode source (handled above); any other shape
 	// defaults to BINARY, which only ever drives a (safe) decline on mismatch.
@@ -1255,13 +1261,26 @@ function primaryKeyCollationLookup(tableSchema: TableSchema): (colIdx: number) =
 
 /** Cover relation for a single seek column. See {@link CollationCover}. */
 function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean): CollationCover {
-	if (predColl === indexColl) return 'MATCH';
-	// BINARY equality ⟹ equal under any collation, so a non-BINARY index over-fetches
-	// a superset that an equality residual can recover. NOCASE/RTRIM are mutually
-	// incomparable and a finer index under-fetches — neither is salvageable.
-	if (isEquality && predColl === 'BINARY' && indexColl !== 'BINARY') {
-		return 'COARSER_SAFE';
+	if (isEquality) {
+		if (predColl === indexColl) return 'MATCH';
+		// BINARY equality ⟹ equal under any collation, so a non-BINARY index over-fetches
+		// a superset that an equality residual can recover. NOCASE/RTRIM are mutually
+		// incomparable and a finer index under-fetches — neither is salvageable.
+		if (predColl === 'BINARY' && indexColl !== 'BINARY') {
+			return 'COARSER_SAFE';
+		}
+		return 'MISMATCH_UNSAFE';
 	}
+	// Range (non-equality) seek: the memory runtime positions the seek by the index's
+	// declared collation but filters the range bounds — and early-terminates the walk —
+	// with a BINARY comparator (`plan-filter.ts` / `scan-layer.ts`). So a range seek
+	// reproduces the predicate ONLY when its effective collation is BINARY and the index
+	// is BINARY-ordered. Any non-BINARY collation (even one that matches the index)
+	// reorders the walked window relative to the BINARY bound filter — under-fetching
+	// case/space variants — so the seek is not a recoverable superset; decline to a
+	// scan + residual. (Honouring non-BINARY range bounds in the scan layer is tracked
+	// separately as `memory-range-seek-collation-bounds`.)
+	if (predColl === 'BINARY' && indexColl === 'BINARY') return 'MATCH';
 	return 'MISMATCH_UNSAFE';
 }
 
