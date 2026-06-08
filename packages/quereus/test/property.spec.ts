@@ -3740,6 +3740,64 @@ describe('Property-Based Tests', () => {
 			expect(staticSurfaced(NESTED_BODY)).to.deep.equal(['inB', 'inC']);
 			expect(staticSurfaced(NESTED_BODY)).to.deep.equal(planSurfaced(NESTED_BODY, 2, 2));
 		});
+
+		// Operator breadth: `collectSubtreeFlagNames` is operator-agnostic (descends any non-`diff`
+		// compound), so a flagged-LEFT-leg EXCEPT subtree must surface its inner flags `is_updatable
+		// = NO` identically to a union. This shape is fully branch-writable (the EXCEPT leg is gated
+		// by the subtree-`union`'s own `inSub` boundary flag — `set-op-membership-nested-except`), so
+		// `column_info` reports data cols YES via the short-circuit — a genuine surface-authority
+		// check, not just internal parity. Closes the union-only gap flagged at implement handoff.
+		it('EXCEPT subtree operand with a flagged left leg: inP/inQ/inSub report NO, data YES', async () => {
+			await seedFlatTables('A', 'B', 'C', 'D');
+			const body = 'select id, x from A '
+				+ 'union exists left as inL, exists right as inR '
+				+ '( (select id, x from B except exists left as inP, exists right as inQ select id, x from C) '
+				+ '  union exists left as inSub select id, x from D )';
+			await db.exec(`create view Vex as ${body}`);
+			expect(findSetOp(body).getType().columns.map(c => c.name))
+				.to.deep.equal(['id', 'x', 'inP', 'inQ', 'inSub', 'inL', 'inR']);
+			const cols = await updatableByCol('Vex');
+			expect(cols.get('id'), 'data col id').to.equal('YES');
+			expect(cols.get('x'), 'data col x').to.equal('YES');
+			for (const f of ['inP', 'inQ', 'inSub']) {
+				expect(cols.get(f), `surfaced inner flag ${f}`).to.equal('NO');
+			}
+			expect(cols.get('inL'), 'outer own flag inL').to.equal('YES');
+			expect(cols.get('inR'), 'outer own flag inR').to.equal('YES');
+			expect(staticSurfaced(body)).to.deep.equal(['inP', 'inQ', 'inSub']);
+			// The outer view's OWN flags are inL,inR (count 2); inSub is the subtree's own flag and
+			// is itself surfaced-inner, so it sits in the slice, not the trailing own-flag tail.
+			expect(staticSurfaced(body)).to.deep.equal(planSurfaced(body, 2, 2));
+			expect(await writeError('update Vex set inP = true where id = 1'), 'inP deferred')
+				.to.match(/set-op-membership-nested/);
+		});
+
+		// LEFT-side depth ≥3 surface order parity: a left-of-left-of-left wrapped nest. The recursion
+		// unwraps each `select * from (compound)` wrapper uniformly at every level, so the deepest
+		// left-leg flags (inP,inQ) and the mid-node own flags (inM,inN) surface in plan order even
+		// when the whole tower sits on the LEFT side. Pins the LEFT depth-3 parity left unasserted at
+		// implement handoff (VD's depth-3 was on the RIGHT spine; VL was one LEFT level).
+		it('LEFT depth-3 wrapped nest with own flags: inP/inQ/inM/inN report NO in plan order', async () => {
+			await seedFlatTables('A', 'B', 'C', 'D', 'E');
+			const body = '( ( (select id, x from B union exists left as inP, exists right as inQ select id, x from C) '
+				+ '    union exists left as inM, exists right as inN select id, x from D ) '
+				+ '  union select id, x from E ) '
+				+ 'union exists left as inL, exists right as inR '
+				+ 'select id, x from A';
+			await db.exec(`create view VL3 as ${body}`);
+			expect(findSetOp(body).getType().columns.map(c => c.name))
+				.to.deep.equal(['id', 'x', 'inP', 'inQ', 'inM', 'inN', 'inL', 'inR']);
+			const cols = await updatableByCol('VL3');
+			for (const f of ['inP', 'inQ', 'inM', 'inN']) {
+				expect(cols.get(f), `surfaced inner flag ${f}`).to.equal('NO');
+			}
+			expect(cols.get('id'), 'data col id').to.equal('YES');
+			expect(cols.get('inL'), 'outer own flag inL').to.equal('YES');
+			expect(staticSurfaced(body)).to.deep.equal(['inP', 'inQ', 'inM', 'inN']);
+			expect(staticSurfaced(body)).to.deep.equal(planSurfaced(body, 2, 2));
+			expect(await writeError('update VL3 set inP = true where id = 2'), 'inP deferred')
+				.to.match(/set-op-membership-nested/);
+		});
 	});
 
 	// --- Parenthesized LEFT-compound operand WRITES (set-op-leftwrap-write) ---
