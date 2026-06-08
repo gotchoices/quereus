@@ -66,9 +66,16 @@ unsupported case by policy, in increasing fidelity:
 
 ## Notes
 
-- Related to `module-capability-consistency-audit` (plan) — that ticket surveys the broader set
-  of engine↔module contract assumptions (setNotNull / setDataType / alterTable / renameTable /
-  concurrencyMode, presence-vs-flag signaling). Keep this ticket's capability surface consistent
-  with whatever the audit recommends, but **do not gate** this concrete fix on the audit landing.
+- Related to `module-capability-consistency-audit` (plan, now resolved) — that survey
+  classified the engine↔module contract surface (see `module-capability-negotiation-doc` for
+  the full inventory) and settled the pattern this ticket should adopt:
+  - **Declare per-arm support and consult it before dispatch** (the `concurrencyMode` model
+    generalized), so `runAlterColumn` routes a PK-column `setCollation` to
+    `native | logical-enforce | reject` instead of letting the store silently no-op.
+  - **Hard contract: never silently no-op.** This ticket's "fallback — reject" path must
+    throw `QuereusError(StatusCode.UNSUPPORTED)` with a sited message, not apply schema-only.
+  - When this lands, flip on the deferred PK-collation cell in
+    `module-alter-conformance-harness` (it is currently `skip`/`xfail` pending this fix).
+  Consistent with the audit, but **not gated** on it — proceed independently.
 - Supersedes the blocked `store-set-collate-pk-physical-rekey` ticket; the sibling
   `store-set-collate-existing-row-revalidation` (non-PK UNIQUE, validate-only) already landed.
