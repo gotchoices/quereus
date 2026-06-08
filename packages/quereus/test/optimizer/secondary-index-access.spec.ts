@@ -298,6 +298,81 @@ describe('Secondary index access path selection', () => {
 		});
 	});
 
+	// Collation cover: an index whose per-column collation differs from a
+	// predicate's effective comparison collation is not a complete substitute for
+	// the predicate. The access path must keep the seek + residual when the index
+	// over-fetches a provable superset (BINARY predicate over a coarser NOCASE
+	// index), or decline the seek + scan + residual otherwise (finer index, or any
+	// range mismatch). See `index-collation-mismatch-residual-filter`.
+	describe('collation-mismatched index seek retains a residual (or declines)', () => {
+		async function planOpsStr(q: string): Promise<string> {
+			const planRows: ResultRow[] = [];
+			for await (const r of db.eval("SELECT json_group_array(op) AS ops FROM query_plan(?)", [q])) {
+				planRows.push(r);
+			}
+			expect(planRows).to.have.lengthOf(1);
+			return planRows[0].ops as string;
+		}
+
+		async function setupNocaseIndex(): Promise<void> {
+			await db.exec("CREATE TABLE coll_idx (id INTEGER PRIMARY KEY, name TEXT) USING memory");
+			await db.exec("INSERT INTO coll_idx VALUES (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob')");
+			await db.exec("CREATE INDEX idx_name_nc ON coll_idx (name COLLATE NOCASE)");
+		}
+
+		it('coarser NOCASE index: BINARY equality keeps the seek AND adds a residual Filter', async () => {
+			await setupNocaseIndex();
+			const q = "SELECT id FROM coll_idx WHERE name = 'BOB' ORDER BY id";
+			const ops = await planOpsStr(q);
+			// Index is still used (not degraded to a full scan) ...
+			expect(ops).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			// ... and a residual Filter recovers the BINARY-exact matches.
+			expect(ops).to.match(/FILTER/i);
+
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results).to.deep.equal([{ id: 2 }]);
+		});
+
+		it('matching NOCASE predicate over NOCASE index returns both rows (no regression)', async () => {
+			await setupNocaseIndex();
+			const q = "SELECT id FROM coll_idx WHERE name = 'bob' COLLATE NOCASE ORDER BY id";
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results.map(r => r.id)).to.deep.equal([2, 4]);
+		});
+
+		it('BINARY range over NOCASE index declines the reordered seek (scan + residual)', async () => {
+			await setupNocaseIndex();
+			const q = "SELECT id FROM coll_idx WHERE name > 'BOB' ORDER BY id";
+			const ops = await planOpsStr(q);
+			// The NOCASE-ordered index window is not a superset under BINARY ordering,
+			// so the seek must be declined in favor of a filtered scan.
+			expect(ops).to.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+			expect(ops).to.match(/FILTER/i);
+
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			// 'charlie' (id 3) and 'Bob' (id 4) are both BINARY-greater than 'BOB';
+			// a NOCASE index seek would have missed 'Bob'.
+			expect(results.map(r => r.id)).to.deep.equal([3, 4]);
+		});
+
+		it('finer BINARY index: NOCASE equality declines the under-fetching seek (scan + residual)', async () => {
+			await db.exec("CREATE TABLE coll_bin (id INTEGER PRIMARY KEY, name TEXT) USING memory");
+			await db.exec("INSERT INTO coll_bin VALUES (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob')");
+			await db.exec("CREATE INDEX idx_name_bin ON coll_bin (name)");
+			const q = "SELECT id FROM coll_bin WHERE name = 'bob' COLLATE NOCASE ORDER BY id";
+			const ops = await planOpsStr(q);
+			// A BINARY seek for 'bob' would find nothing; correctness requires a scan.
+			expect(ops).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+
+			const results: ResultRow[] = [];
+			for await (const r of db.eval(q)) results.push(r);
+			expect(results.map(r => r.id)).to.deep.equal([2, 4]);
+		});
+	});
+
 	it('still uses PK seek when filtering on primary key', async () => {
 		await setup();
 		const q = "SELECT name FROM items WHERE id = 3";

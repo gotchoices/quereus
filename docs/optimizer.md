@@ -467,7 +467,7 @@ All plan nodes extend the base `PlanNode` class and implement category-specific 
 Rules are organized by optimization family in `src/planner/rules/`:
 
 **Access Path Selection** (`access/`)
-- `ruleSelectAccessPath`: Chooses between sequential scan, index scan, and index seek for both primary and secondary indexes
+- `ruleSelectAccessPath`: Chooses between sequential scan, index scan, and index seek for both primary and secondary indexes. **Collation cover**: an index seek is only a complete substitute for a predicate when the index column's collation equals the predicate's effective comparison collation (resolved at plan time exactly as `emitComparisonOp` / `emitIn` do at runtime). On a mismatch the rule classifies the cover relation per consumed seek constraint: a *coarser* equality index (a BINARY predicate over a NOCASE/RTRIM index) over-fetches a provable superset, so the seek is kept and the original predicate is re-applied as a residual `Filter` above the leaf; a *finer* index (a NOCASE/RTRIM predicate over a BINARY index, which under-fetches) or *any* range/prefix-range/OR_RANGE mismatch (a different collation reorders the walked window, so it is not a superset) declines the seek entirely and falls back to a `SeqScan` with the full predicate retained as a residual. The cover logic lives in the rule so it covers every index-style module uniformly (a module that matches constraints to index columns by position alone — e.g. the memory module — never sees collation). See `tickets/complete/index-collation-mismatch-residual-filter`.
 
 **Aggregation** (`aggregate/`)
 - `ruleAggregatePhysical`: Cost-based selection between `StreamAggregateNode` and `HashAggregateNode`. Scalar aggregates (no GROUP BY) always use stream. Already-sorted input always uses stream (preserves ordering). Unsorted input compares sort+stream cost vs hash cost and picks the cheaper option.
@@ -850,7 +850,7 @@ if (shouldCache(node, context)) {
 **Current Limitations**
 - **OR predicate extraction**: The constraint extractor handles OR-of-equality disjunctions (collapsed to IN for index multi-seek) and OR-of-range disjunctions on the same indexed column (collapsed to OR_RANGE for multi-range index seek). OR disjunctions across different indexes (`tickets/plan/2-or-to-union-rewriting.md`) remain as residual filters.
 - **Constant Folding**: Both scalar and relational constant folding are implemented. Constant relational subtrees (e.g., all-literal VALUES, constant subqueries) are replaced with `TableLiteralNode` via deferred materialization. See `docs/optimizer-const.md`.
-- **Access Path Selection**: Supports primary and secondary index seek/range via module-provided `indexName`/`seekColumnIndexes`. Prefix-equality + trailing-range on composite indexes is not yet supported (`tickets/plan/2-composite-index-advanced-seeks.md`).
+- **Access Path Selection**: Supports primary and secondary index seek/range via module-provided `indexName`/`seekColumnIndexes`. Prefix-equality + trailing-range on composite indexes is not yet supported (`tickets/plan/2-composite-index-advanced-seeks.md`). A seek over an index whose per-column collation differs from the predicate's effective comparison collation re-applies the predicate as a residual `Filter` (coarser equality index) or declines to a filtered scan (finer index, or any range mismatch) — see the collation-cover note under **Access Path Selection** in the Rule Catalog above.
 
 ## Streaming asof scan
 

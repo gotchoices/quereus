@@ -160,15 +160,41 @@ create index idx_name_lower on coll_idx (lower(name));
 select id from coll_idx where name = 'bob' collate NOCASE order by id;
 → [{"id":2},{"id":4}]
 
--- KNOWN GAP — a plain BINARY equality (`where name = 'BOB'`) currently
--- mis-evaluates *through* the NOCASE index: it returns id 2 AND 4 instead of just
--- id 2, because the access path seeks the NOCASE index without re-applying the
--- BINARY predicate as a residual filter. This is a latent planner bug surfaced by
--- enabling collated-index creation (the index could not be built before), tracked
--- by fix ticket `index-collation-mismatch-residual-filter`. The corrected
--- assertion (→ [{"id":2}]) is omitted here until that fix lands.
+-- A plain BINARY equality (`where name = 'BOB'`) over the coarser NOCASE index
+-- must re-apply the BINARY predicate as a residual filter above the seek, so the
+-- collation-equal-but-BINARY-distinct 'Bob' (id 4) is discarded. (Previously a
+-- latent planner bug returned id 2 AND 4, fixed by access-path collation cover.)
+select id from coll_idx where name = 'BOB' order by id;
+→ [{"id":2}]
+
+-- A BINARY range over the NOCASE index must not walk the reordered index window;
+-- the access path declines the seek and falls back to a scan + residual so the
+-- BINARY-correct rows are returned ('charlie' id 3 and 'Bob' id 4 are both
+-- BINARY-greater than 'BOB', while a NOCASE index seek would have missed 'Bob').
+select id from coll_idx where name > 'BOB' order by id;
+→ [{"id":3},{"id":4}]
 
 drop table coll_idx;
+
+-- =============================================================================
+-- Symmetric case: BINARY index, NOCASE-collated predicate (finer index)
+-- =============================================================================
+-- A BINARY index cannot satisfy a NOCASE equality (it UNDER-fetches: a residual
+-- cannot recover the rows the seek never visited), so the access path declines the
+-- index and scans + residual — all case variants are returned.
+
+create table coll_idx_bin (id integer primary key, name text);
+insert into coll_idx_bin values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+create index idx_name_bin on coll_idx_bin (name);
+
+select id from coll_idx_bin where name = 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Plain BINARY equality over the matching BINARY index is unaffected (no residual).
+select id from coll_idx_bin where name = 'Bob' order by id;
+→ [{"id":4}]
+
+drop table coll_idx_bin;
 
 -- =============================================================================
 -- COLLATE in CASE expression

@@ -23,12 +23,14 @@ import type { ColumnMeta, BestAccessPlanRequest, BestAccessPlanResult } from '..
 import { FilterInfo } from '../../../vtab/filter-info.js';
 import type { IndexConstraint, IndexConstraintUsage } from '../../../vtab/index-info.js';
 import type { SqlValue } from '../../../common/types.js';
-import { compareSqlValues } from '../../../util/comparison.js';
+import { compareSqlValues, normalizeCollationName } from '../../../util/comparison.js';
 import type { Scope } from '../../scopes/scope.js';
 import { TableReferenceNode } from '../../nodes/reference.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
-import { LiteralNode } from '../../nodes/scalar.js';
+import { LiteralNode, BinaryOpNode, BetweenNode } from '../../nodes/scalar.js';
+import { InNode } from '../../nodes/subquery.js';
+import type { TableSchema } from '../../../schema/table.js';
 import type * as AST from '../../../parser/ast.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 
@@ -71,7 +73,7 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 		log('Using index-style context provided by grow-retrieve');
 		const accessPlan = retrieveNode.moduleCtx.accessPlan;
 		const originalConstraints = retrieveNode.moduleCtx.originalConstraints as unknown as PlannerPredicateConstraint[];
-		const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, originalConstraints) as unknown as RelationalPlanNode;
+		const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, originalConstraints);
 		if (retrieveNode.moduleCtx.residualPredicate) {
 			return new FilterNode(retrieveNode.scope, physicalLeaf, retrieveNode.moduleCtx.residualPredicate);
 		}
@@ -168,7 +170,7 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	}
 
 	// Choose physical node based on access plan
-	const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, constraints) as unknown as RelationalPlanNode;
+	const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, constraints);
 
 	// If the Retrieve source contained a pipeline (e.g., Filter/Sort/Project), rebuild it above the physical leaf
 	let rebuiltPipeline: RelationalPlanNode = physicalLeaf;
@@ -217,7 +219,7 @@ function selectPhysicalNode(
 	tableRef: TableReferenceNode,
 	accessPlan: BestAccessPlanResult,
 	constraints: PlannerPredicateConstraint[]
-): SeqScanNode | IndexScanNode | IndexSeekNode | EmptyResultNode {
+): RelationalPlanNode {
 
 	// Empty result optimization (e.g., IS NULL on NOT NULL column)
 	if (accessPlan.rows === 0 && accessPlan.handledFilters.every(h => h)) {
@@ -272,7 +274,7 @@ function selectPhysicalNodeFromPlan(
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
 	providesOrdering: { column: number; desc: boolean }[] | undefined
-): SeqScanNode | IndexScanNode | IndexSeekNode | EmptyResultNode {
+): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	const seekCols = accessPlan.seekColumnIndexes!;
 	// Map accessPlan.indexName to physical node indexName ('_primary_' → 'primary')
@@ -311,6 +313,25 @@ function selectPhysicalNodeFromPlan(
 	}
 
 	if (allEquality && eqBySeekCol.size === seekCols.length) {
+		// Collation-cover analysis: a seek over an index whose per-column collation
+		// differs from the predicate's effective comparison collation is NOT a
+		// complete substitute for the predicate. Decline (scan + residual) on an
+		// unsafe mismatch; keep the seek and re-apply a residual when the index is a
+		// provable superset (BINARY predicate over a coarser index). See
+		// `index-collation-mismatch-residual-filter`.
+		const cover = classifyCollationCover(
+			seekCols.map(colIdx => ({ colIdx, constraint: eqBySeekCol.get(colIdx)! })),
+			true,
+			indexColumnCollationLookup(tableRef.tableSchema, accessPlan),
+		);
+		if (!cover.useIndex) {
+			log('Declining index seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
+			const scan = createSeqScan(tableRef);
+			return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+		}
+		const finishSeek = (leaf: IndexSeekNode): RelationalPlanNode =>
+			cover.residual ? new FilterNode(tableRef.scope, leaf, cover.residual) : leaf;
+
 		// Check for multi-value IN on a single-column seek (simple case)
 		const hasMultiValueIn = [...eqBySeekCol.values()].some(c =>
 			c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length > 1
@@ -353,7 +374,7 @@ function selectPhysicalNodeFromPlan(
 			};
 
 			log('Using index multi-seek on %s (IN with %d values)', physicalIndexName, seekKeys.length);
-			return new IndexSeekNode(
+			return finishSeek(new IndexSeekNode(
 				tableRef.scope,
 				tableRef,
 				fi,
@@ -363,7 +384,7 @@ function selectPhysicalNodeFromPlan(
 				providesOrdering,
 				accessPlan.cost,
 				advertisement,
-			);
+			));
 		}
 
 		if (hasMultiValueIn && seekCols.length > 1) {
@@ -418,7 +439,7 @@ function selectPhysicalNodeFromPlan(
 				};
 
 				log('Using composite index multi-seek on %s (cross-product of %d distinct non-null seeks, width %d)', physicalIndexName, effectiveTuples.length, seekWidth);
-				return new IndexSeekNode(
+				return finishSeek(new IndexSeekNode(
 					tableRef.scope,
 					tableRef,
 					fi,
@@ -428,7 +449,7 @@ function selectPhysicalNodeFromPlan(
 					providesOrdering,
 					accessPlan.cost,
 					advertisement,
-				);
+				));
 			}
 
 			// Dynamic/mixed composite: keep the raw cross-product over value indices and
@@ -461,7 +482,7 @@ function selectPhysicalNodeFromPlan(
 			};
 
 			log('Using composite index multi-seek on %s (cross-product of %d seeks, width %d)', physicalIndexName, crossProduct.length, seekWidth);
-			return new IndexSeekNode(
+			return finishSeek(new IndexSeekNode(
 				tableRef.scope,
 				tableRef,
 				fi,
@@ -471,7 +492,7 @@ function selectPhysicalNodeFromPlan(
 				providesOrdering,
 				accessPlan.cost,
 				advertisement,
-			);
+			));
 		}
 
 		// A literal NULL in any seek column makes the (row-value) equality UNKNOWN ⇒
@@ -502,7 +523,7 @@ function selectPhysicalNodeFromPlan(
 		};
 
 		log('Using index seek on %s (equality)', physicalIndexName);
-		return new IndexSeekNode(
+		return finishSeek(new IndexSeekNode(
 			tableRef.scope,
 			tableRef,
 			fi,
@@ -512,7 +533,7 @@ function selectPhysicalNodeFromPlan(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
-		);
+		));
 	}
 
 	// Check for prefix-equality + trailing-range pattern
@@ -549,6 +570,30 @@ function selectPhysicalNodeFromPlan(
 			if (prefixHasLiteralNull) {
 				log('Prefix-range seek on %s has a literal NULL prefix key — using empty result', physicalIndexName);
 				return createEmptyResultNode(tableRef);
+			}
+
+			// Collation-cover: any collation mismatch on a prefix-range seek reorders
+			// the walked index window (it is no longer a contiguous superset), so it
+			// cannot be salvaged with a residual — decline to a scan + residual.
+			{
+				const consumed: ConsumedConstraint[] = [];
+				for (const colIdx of prefixEqCols) {
+					const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
+						(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
+						handledByCol.has(c.columnIndex))!;
+					consumed.push({ colIdx, constraint: c });
+				}
+				const trailing = constraintsByCol.get(trailingRangeCol) ?? [];
+				const lo = trailing.find(c => (c.op === '>' || c.op === '>=') && handledByCol.has(c.columnIndex));
+				const hi = trailing.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
+				if (lo) consumed.push({ colIdx: trailingRangeCol, constraint: lo });
+				if (hi) consumed.push({ colIdx: trailingRangeCol, constraint: hi });
+				const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan));
+				if (!cover.useIndex) {
+					log('Declining prefix-range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
+					const scan = createSeqScan(tableRef);
+					return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+				}
 			}
 
 			const seekKeys: ScalarPlanNode[] = [];
@@ -617,6 +662,21 @@ function selectPhysicalNodeFromPlan(
 		const lower = colConstraints.find(c => (c.op === '>' || c.op === '>=') && handledByCol.has(c.columnIndex));
 		const upper = colConstraints.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
 
+		// Collation-cover: a range seek under a collation that differs from the
+		// predicate's reorders the index window, so it is never a superset — decline
+		// to a scan + residual on any mismatch.
+		{
+			const consumed: ConsumedConstraint[] = [];
+			if (lower) consumed.push({ colIdx: rangeCol, constraint: lower });
+			if (upper) consumed.push({ colIdx: rangeCol, constraint: upper });
+			const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan));
+			if (!cover.useIndex) {
+				log('Declining range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
+				const scan = createSeqScan(tableRef);
+				return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+			}
+		}
+
 		const seekKeys: ScalarPlanNode[] = [];
 		const rangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 
@@ -660,6 +720,22 @@ function selectPhysicalNodeFromPlan(
 
 	if (orRangeConstraint && orRangeConstraint.ranges) {
 		const ranges = orRangeConstraint.ranges as RangeSpec[];
+
+		// Collation-cover: an OR_RANGE seek walks multiple index windows whose order
+		// follows the index collation; any mismatch makes them non-supersets, so
+		// decline to a scan + residual.
+		{
+			const cover = classifyCollationCover(
+				[{ colIdx: orRangeConstraint.columnIndex, constraint: orRangeConstraint }],
+				false,
+				indexColumnCollationLookup(tableRef.tableSchema, accessPlan),
+			);
+			if (!cover.useIndex) {
+				log('Declining OR_RANGE seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
+				const scan = createSeqScan(tableRef);
+				return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+			}
+		}
 
 		// Build seekKeys: for each range, emit lower value then upper value
 		// Encode which ops each range has in rangeOps string
@@ -750,7 +826,7 @@ function selectPhysicalNodeLegacy(
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
 	providesOrdering: { column: number; desc: boolean }[] | undefined
-): SeqScanNode | IndexScanNode | IndexSeekNode | EmptyResultNode {
+): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	// Analyze the access plan to determine node type
 	const handledByCol = new Set<number>();
@@ -780,6 +856,20 @@ function selectPhysicalNodeLegacy(
 			return createEmptyResultNode(tableRef);
 		}
 
+		// Collation-cover: a PK seek whose column collation differs from the
+		// predicate's effective collation over/under-fetches. Keep the seek + residual
+		// for a coarser PK collation; decline to a scan + residual otherwise.
+		const cover = classifyCollationCover(
+			pkCols.map(pk => ({ colIdx: pk.index, constraint: eqByCol.get(pk.index)! })),
+			true,
+			primaryKeyCollationLookup(tableRef.tableSchema),
+		);
+		if (!cover.useIndex) {
+			log('Declining PK index seek (collation mismatch) — sequential scan + residual (legacy)');
+			const scan = createSeqScan(tableRef);
+			return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+		}
+
 		const seekKeys: ScalarPlanNode[] = pkCols.map(pk => {
 			const c = eqByCol.get(pk.index)!;
 			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
@@ -797,7 +887,7 @@ function selectPhysicalNodeLegacy(
 		};
 
 		log('Using index seek on primary key (legacy)');
-		return new IndexSeekNode(
+		const pkSeek = new IndexSeekNode(
 			tableRef.scope,
 			tableRef,
 			fi,
@@ -808,6 +898,7 @@ function selectPhysicalNodeLegacy(
 			accessPlan.cost,
 			advertisement,
 		);
+		return cover.residual ? new FilterNode(tableRef.scope, pkSeek, cover.residual) : pkSeek;
 	}
 
 	if (hasRangeConstraints) {
@@ -818,6 +909,20 @@ function selectPhysicalNodeLegacy(
 		const primaryFirstCol = (tableRef.tableSchema.primaryKeyDefinition?.[0]?.index) ?? (rangeCols[0]?.columnIndex ?? 0);
 		const lower = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '>' || c.op === '>='));
 		const upper = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '<' || c.op === '<='));
+
+		// Collation-cover: a PK range seek under a mismatched collation reorders the
+		// walked window, so decline to a scan + residual on any mismatch.
+		{
+			const consumed: ConsumedConstraint[] = [];
+			if (lower) consumed.push({ colIdx: primaryFirstCol, constraint: lower });
+			if (upper) consumed.push({ colIdx: primaryFirstCol, constraint: upper });
+			const cover = classifyCollationCover(consumed, false, primaryKeyCollationLookup(tableRef.tableSchema));
+			if (!cover.useIndex) {
+				log('Declining PK range seek (collation mismatch) — sequential scan + residual (legacy)');
+				const scan = createSeqScan(tableRef);
+				return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+			}
+		}
 
 		const seekKeys: ScalarPlanNode[] = [];
 		const rangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
@@ -1046,4 +1151,177 @@ function reduceLiteralSeekTuples(tuples: readonly SqlValue[][]): SqlValue[][] {
 		result.push(tuple);
 	}
 	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Collation-cover analysis
+//
+// An IndexSeek over a secondary index (or PK) whose per-column collation differs
+// from a predicate's effective comparison collation is NOT a complete substitute
+// for that predicate. A NOCASE index seek for a BINARY `name = 'BOB'`, for
+// instance, returns every NOCASE-equal entry (`'BOB'` AND `'Bob'`) — so the
+// access path must either keep the seek and re-apply the predicate as a residual
+// (when the index over-fetches a provable superset) or decline the seek and fall
+// back to a scan + residual (when the index under-fetches or a range mismatch
+// reorders the walked window). See `index-collation-mismatch-residual-filter`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-seek-constraint classification of how an index column's collation relates
+ * to the predicate's effective comparison collation. See {@link classifyConstraintCover}.
+ *
+ * - `MATCH`           — collations equal; the seek fully satisfies the predicate.
+ * - `COARSER_SAFE`    — equality op whose index collation is a provable superset of
+ *                       the predicate's (BINARY predicate over a non-BINARY index):
+ *                       the seek over-fetches a superset, so a residual recovers the
+ *                       exact matches.
+ * - `MISMATCH_UNSAFE` — anything else (a finer index that under-fetches, or any
+ *                       range/prefix mismatch that reorders the walked window): the
+ *                       seek cannot be made correct with a residual.
+ */
+type CollationCover = 'MATCH' | 'COARSER_SAFE' | 'MISMATCH_UNSAFE';
+
+/** A constraint consumed by a seek, paired with the table column index it seeks. */
+interface ConsumedConstraint {
+	colIdx: number;
+	constraint: PlannerPredicateConstraint;
+}
+
+/** Aggregate cover decision for a seek's consumed constraints. */
+interface CollationCoverDecision {
+	/** Whether the index seek may still be used (true) or must fall back to a scan (false). */
+	useIndex: boolean;
+	/** Residual predicate to re-apply above the leaf, or undefined when none is needed. */
+	residual?: ScalarPlanNode;
+}
+
+/**
+ * Resolve a predicate constraint's effective comparison collation at plan time,
+ * mirroring the runtime resolution in `emitComparisonOp` (binary.ts) and `emitIn`
+ * (subquery.ts): a comparison takes the right operand's collation, else the left's,
+ * else BINARY; an IN takes the condition (LHS) operand's collation; a BETWEEN takes
+ * the tested expression's collation. The result is normalized.
+ */
+function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
+	const src = constraint.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		return normalizeCollationName(src.right.getType().collationName ?? src.left.getType().collationName ?? 'BINARY');
+	}
+	if (src instanceof InNode) {
+		return normalizeCollationName(src.condition.getType().collationName ?? 'BINARY');
+	}
+	if (src instanceof BetweenNode) {
+		// BETWEEN is `expr >= lo AND expr <= hi`; each comparison resolves to the
+		// tested-expression (LHS) collation since the bounds are bare literals.
+		return normalizeCollationName(src.expr.getType().collationName ?? 'BINARY');
+	}
+	// OR_RANGE carries an OR BinaryOpNode source (handled above); any other shape
+	// defaults to BINARY, which only ever drives a (safe) decline on mismatch.
+	return 'BINARY';
+}
+
+/**
+ * Build a collation lookup for the columns of a module-provided index. Secondary
+ * index columns carry their own (already-normalized) collation; the primary key
+ * (`_primary_`/`primary`) falls back to the table column's declared collation.
+ */
+function indexColumnCollationLookup(
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult
+): (colIdx: number) => string {
+	const indexName = accessPlan.indexName;
+	const isPrimary = indexName === '_primary_' || indexName === 'primary';
+	const index = isPrimary ? undefined : tableSchema.indexes?.find(i => i.name === indexName);
+	return (colIdx: number): string => {
+		if (isPrimary) {
+			return normalizeCollationName(tableSchema.columns[colIdx]?.collation ?? 'BINARY');
+		}
+		const idxCol = index?.columns.find(c => c.index === colIdx);
+		return normalizeCollationName(idxCol?.collation ?? 'BINARY');
+	};
+}
+
+/**
+ * Build a collation lookup for primary-key columns (used by the legacy seek path,
+ * which addresses the PK directly without a module-provided index identity).
+ */
+function primaryKeyCollationLookup(tableSchema: TableSchema): (colIdx: number) => string {
+	return (colIdx: number): string =>
+		normalizeCollationName(tableSchema.columns[colIdx]?.collation ?? 'BINARY');
+}
+
+/** Cover relation for a single seek column. See {@link CollationCover}. */
+function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean): CollationCover {
+	if (predColl === indexColl) return 'MATCH';
+	// BINARY equality ⟹ equal under any collation, so a non-BINARY index over-fetches
+	// a superset that an equality residual can recover. NOCASE/RTRIM are mutually
+	// incomparable and a finer index under-fetches — neither is salvageable.
+	if (isEquality && predColl === 'BINARY' && indexColl !== 'BINARY') {
+		return 'COARSER_SAFE';
+	}
+	return 'MISMATCH_UNSAFE';
+}
+
+/**
+ * Classify a seek's consumed constraints by the collation-cover relation and derive
+ * an aggregate decision:
+ *  - any `MISMATCH_UNSAFE` → decline the seek; the caller scans and re-applies the
+ *    AND of *all* consumed constraints as a residual (so the scan stays filtered).
+ *  - else all `MATCH` → use the seek with no residual.
+ *  - else (some `COARSER_SAFE`) → use the seek but re-apply the AND of the
+ *    `COARSER_SAFE` constraints as a residual to discard the over-fetched rows.
+ *
+ * `isEquality` gates the `COARSER_SAFE` class: a coarser index can only over-fetch a
+ * *superset* for an equality/IN seek. For a range/prefix-range/OR_RANGE seek a
+ * collation mismatch reorders the index, so the walked window is not a superset and
+ * any mismatch is `MISMATCH_UNSAFE`.
+ */
+function classifyCollationCover(
+	consumed: ConsumedConstraint[],
+	isEquality: boolean,
+	collationForColumn: (colIdx: number) => string
+): CollationCoverDecision {
+	const allResiduals: ScalarPlanNode[] = [];
+	const coarserResiduals: ScalarPlanNode[] = [];
+	let anyUnsafe = false;
+
+	for (const { colIdx, constraint } of consumed) {
+		allResiduals.push(constraint.sourceExpression);
+		const predColl = effectivePredicateCollation(constraint);
+		const indexColl = collationForColumn(colIdx);
+		const cover = classifyConstraintCover(predColl, indexColl, isEquality);
+		if (cover === 'COARSER_SAFE') {
+			coarserResiduals.push(constraint.sourceExpression);
+		} else if (cover === 'MISMATCH_UNSAFE') {
+			anyUnsafe = true;
+		}
+	}
+
+	if (anyUnsafe) {
+		return { useIndex: false, residual: combineResidualExpressions(allResiduals) };
+	}
+	if (coarserResiduals.length > 0) {
+		return { useIndex: true, residual: combineResidualExpressions(coarserResiduals) };
+	}
+	return { useIndex: true };
+}
+
+/**
+ * AND-combine residual `sourceExpression`s into one predicate, de-duplicating by
+ * identity (a BETWEEN yields two constraints sharing one source node). Mirrors the
+ * `combineParts`/`combineResiduals` shape in constraint-extractor.ts.
+ */
+function combineResidualExpressions(exprs: ScalarPlanNode[]): ScalarPlanNode | undefined {
+	const unique: ScalarPlanNode[] = [];
+	for (const e of exprs) {
+		if (!unique.includes(e)) unique.push(e);
+	}
+	if (unique.length === 0) return undefined;
+	let acc = unique[0];
+	for (let i = 1; i < unique.length; i++) {
+		const right = unique[i];
+		const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+		acc = new BinaryOpNode(acc.scope, ast, acc, right);
+	}
+	return acc;
 }
