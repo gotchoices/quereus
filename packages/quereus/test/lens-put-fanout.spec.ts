@@ -1177,6 +1177,103 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 		}
 	});
 
+	it('captures cross-attribute both-sides PRE-mutation (set p = q + 1, q = p + 1)', async () => {
+		// Both values are captured once over the pre-mutation body before any base op fires, so
+		// each reads the OTHER attribute's pre-mutation value: p := q(12) + 1 = 13, q := p(11) + 1 = 12.
+		// A sequential (read-after-write) lowering would leak the freshly written p into q — pinning
+		// the capture-pre-mutation invariant for the EAV path (the columnar both-sides analogue).
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set p = q + 1, q = p + 1 where id = 1');
+			expect(await rows(db, 'select attr, val from main.E_eav where eid = 1 order by attr')).to.deep.equal([
+				{ attr: 'p', val: 13 }, { attr: 'q', val: 12 },
+			]);
+			expect(await rows(db, 'select p, q from x.E where id = 1')).to.deep.equal([{ p: 13, q: 12 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('captures an embedded subquery EAV value (set p = (select max(val) from main.E_eav))', async () => {
+		// A genuinely arbitrary (non-self) value — an embedded subquery over the pivot — rides the
+		// same capture: max(val) over {11,12,21} = 21, materialized once, written back to entity 1's 'p'.
+		const db = new Database();
+		try {
+			await setupEav(db);
+			await db.exec('update x.E set p = (select max(val) from main.E_eav) where id = 1');
+			expect(await rows(db, "select val from main.E_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 21 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a captured null on a matched triple over a NOT-NULL pivot value column raises atomically', async () => {
+		// The matched UPDATE is unfiltered, so a captured null (entity 2 has 'p', lacks 'q', so
+		// `set p = q + 1` captures null) writes `val = null`. With a NULLABLE value column that is a
+		// benign physical divergence (covered above); with a **NOT NULL** value column it instead
+		// hits the base NOT NULL constraint and raises atomically — reject-don't-widen, the EAV
+		// analogue of the columnar invisible-row NOT-NULL boundary (docs/lens.md § Current limitations).
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [eavSplit()];
+			db.registerModule('eavmod', mod);
+			await db.exec('create table E_core (id integer primary key) using eavmod');
+			await db.exec('create table E_eav (eid integer, attr text, val integer not null, primary key (eid, attr)) using eavmod');
+			await db.exec('declare logical schema x { table E { id integer primary key, p integer null, q integer null } }');
+			await db.exec('apply schema x');
+			await db.exec('insert into main.E_core values (1), (2)');
+			await db.exec("insert into main.E_eav values (1, 'p', 11), (1, 'q', 12), (2, 'p', 21)");
+			await expectThrows(() => db.exec('update x.E set p = q + 1 where id = 2'), /not null/i);
+			// Atomic: entity 2's 'p' triple keeps its prior value.
+			expect(await rows(db, "select val from main.E_eav where eid = 2 and attr = 'p'")).to.deep.equal([{ val: 21 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('captures a columnar member and an EAV member in one statement (no carrier collision)', async () => {
+		// One decomposition with BOTH an optional columnar member (c) and an EAV pivot (p). A single
+		// __vmupd_keys carrier holds both members' srcN — columnar keyed `cap:<rel>:<col>`, EAV
+		// `cap:<rel>:attr:<attr>` — so they never collide. `set c = c + 1, p = p + a` captures both
+		// over the pre-mutation body: c 100→101, p 1000 + a(10) = 1010.
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'M_core', logicalTable: 'M', role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'M_core',
+					members: [
+						{ relationId: 'M_core', relation: { schema: 'main', table: 'M_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+						{ relationId: 'M_c', relation: { schema: 'main', table: 'M_c' }, presence: 'optional', columns: [colMap('c', 'c')] },
+						{
+							relationId: 'M_eav', relation: { schema: 'main', table: 'M_eav' }, presence: 'optional', columns: [],
+							attributePivot: { entityColumn: 'eid', attributeColumn: 'attr', valueColumn: 'val' },
+						},
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['M_core', ['id']], ['M_c', ['id']], ['M_eav', ['eid']]) },
+				},
+			}];
+			db.registerModule('mmod', mod);
+			await db.exec('create table M_core (id integer primary key, a integer) using mmod');
+			await db.exec('create table M_c (id integer primary key, c integer null) using mmod');
+			await db.exec('create table M_eav (eid integer, attr text, val integer null, primary key (eid, attr)) using mmod');
+			await db.exec('declare logical schema y { table M { id integer primary key, a integer, c integer null, p integer null } }');
+			await db.exec('apply schema y');
+			await db.exec('insert into main.M_core values (1, 10)');
+			await db.exec('insert into main.M_c values (1, 100)');
+			await db.exec("insert into main.M_eav values (1, 'p', 1000)");
+			await db.exec('update y.M set c = c + 1, p = p + a where id = 1');
+			expect(await rows(db, 'select c from main.M_c where id = 1')).to.deep.equal([{ c: 101 }]);
+			expect(await rows(db, "select val from main.M_eav where eid = 1 and attr = 'p'")).to.deep.equal([{ val: 1010 }]);
+			expect(await rows(db, 'select c, p from y.M where id = 1')).to.deep.equal([{ c: 101, p: 1010 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('defers a DELETE filtered on an EAV-served column with the EAV-pivot diagnostic', async () => {
 		// A WHERE on an EAV column (projected by the get body as a correlated subquery, never
 		// a member `columns` entry) defers with the EAV-pivot message — distinct from the
