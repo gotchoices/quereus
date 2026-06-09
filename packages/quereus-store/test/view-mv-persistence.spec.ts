@@ -50,6 +50,22 @@ function createPersistentProvider(): KVStoreProvider & {
 		async closeStore() { /* no-op: durable storage survives a logical close */ },
 		async closeIndexStore() { /* no-op */ },
 		async closeAll() { /* no-op: data survives module close, mirroring real disk */ },
+		async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]) {
+			// Relocate the durable data + index stores so a renamed table's rows survive
+			// reopen (mirrors a real provider; without this the data would orphan under
+			// the old key). Stats are recomputed, so they need no relocation.
+			const move = (from: string, to: string) => {
+				const store = stores.get(from);
+				if (store) {
+					stores.delete(from);
+					stores.set(to, store);
+				}
+			};
+			move(`${schemaName}.${oldName}`, `${schemaName}.${newName}`);
+			for (const indexName of indexNames) {
+				move(`${schemaName}.${oldName}_idx_${indexName}`, `${schemaName}.${newName}_idx_${indexName}`);
+			}
+		},
 		_hardClose() {
 			for (const s of stores.values()) void s.close();
 			stores.clear();
@@ -97,6 +113,43 @@ describe('StoreModule view / materialized-view persistence', () => {
 		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
 		expect(result.views, 'view name reported').to.deep.equal(['main.v']);
 		expect(await rows(db2, 'select id, v from v')).to.deep.equal([{ id: 2, v: 20 }]);
+	});
+
+	it('a table RENAME rewrites a dependent view body and the new DDL survives reopen', async () => {
+		// The load-bearing end-to-end fact: `alter table … rename` rewrites the
+		// dependent view's body in place and fires `view_modified`, so the store
+		// re-persists the rewritten DDL. Without that event the stored DDL keeps the
+		// OLD table name and the view fails to rehydrate (`no such table: base`).
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10), (2, 20)`);
+		await db.exec(`create view v as select id, v from base where v >= 20`);
+		await db.exec(`alter table base rename to base2`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate after rename').to.have.lengthOf(0);
+		expect(result.views, 'view rehydrated').to.deep.equal(['main.v']);
+		// The persisted DDL references the NEW table name (drift would keep `base`).
+		expect(db2.schemaManager.getView('main', 'v')!.sql, 'DDL references new name')
+			.to.match(/\bbase2\b/);
+		// Queryable end-to-end — only works if the body resolves to `base2`.
+		expect(await rows(db2, 'select id, v from v')).to.deep.equal([{ id: 2, v: 20 }]);
+	});
+
+	it('a column RENAME rewrites a dependent view body and the new DDL survives reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10)`);
+		await db.exec(`create view v as select id, v from base`);
+		await db.exec(`alter table base rename column v to amount`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate after column rename').to.have.lengthOf(0);
+		expect(db2.schemaManager.getView('main', 'v')!.sql, 'DDL references new column name')
+			.to.match(/\bamount\b/);
+		expect(await rows(db2, 'select id, amount from v')).to.deep.equal([{ id: 1, amount: 10 }]);
 	});
 
 	it('view tags persist across reopen (SET, then ADD, then DROP)', async () => {
