@@ -251,8 +251,9 @@ create materialized view ok_lat_order as select g.id, f.value from g cross join 
 select id, value from ok_lat_order order by id, value;
 → [{"id":1,"value":1},{"id":1,"value":2},{"id":1,"value":3},{"id":1,"value":4},{"id":1,"value":5}]
 
--- a provably-1:1 FK join WITH a WHERE (the join-residual arm declines a partial join body) —
--- the body is keyed on the driving PK, so it is a set: full-rebuild floor.
+-- a provably-1:1 FK join WITH a partial WHERE — now a bounded-delta join-residual arm
+-- (mv-join-where-widening), not the floor. This `where jwp.name > 'm'` references the lookup
+-- jwp, so the lookup side is delete-capable; §24.5 exercises the membership flips under writes.
 create table jwp (id integer primary key, name text);
 create table jwt (id integer primary key, fk integer not null references jwp(id));
 insert into jwp values (1, 'alice'), (2, 'zoe');
@@ -1209,6 +1210,93 @@ select id, fk, name from jmv order by id;
 delete from jp where id = 9;
 select id, fk, name from jmv order by id;
 → [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- ===================================
+-- 24.5. 1:1 inner-join bodies WITH a partial WHERE (mv-join-where-widening). The join-residual
+--       arm now accepts a body WHERE, classified by which base table(s) it references:
+--        - a WHERE over the driving table T only (`where wta.amt > 5`) just relaxes the gate —
+--          the forward T-keyed residual already injects + applies it (an out-of-scope T row
+--          recomputes to zero rows ⇒ removed), and the lookup side stays UPSERT-ONLY because a
+--          T-column predicate cannot move the membership set {T : T.fk = P.id};
+--        - a WHERE referencing the lookup P (`where wpb.score > 5`) makes the lookup side
+--          DELETE-CAPABLE: per affected P key the membership residual (WHERE stripped) deletes
+--          every currently-referencing T.pk backing key, then the in-scope residual re-upserts
+--          the survivors — so a P write that flips a row's WHERE membership adds/removes it.
+-- ===================================
+
+-- --- T-only WHERE: forward residual handles T-side scope flips; lookup stays upsert-only. ---
+create table wpa (id integer primary key, name text);
+create table wta (id integer primary key, fk integer not null references wpa(id), amt integer);
+insert into wpa values (1, 'alice'), (2, 'bob');
+insert into wta values (10, 1, 2), (20, 1, 8), (30, 2, 4);
+create materialized view mvwa as select wta.id, wta.amt, wpa.name from wta join wpa on wta.fk = wpa.id where wta.amt > 5;
+
+-- Create time: only wta 20 (amt 8 > 5) is in scope.
+select id, amt, name from mvwa order by id;
+→ [{"id":20,"amt":8,"name":"alice"}]
+
+-- A driving-row update that moves it INTO the T-side scope (amt 2 → 9) adds its joined row.
+update wta set amt = 9 where id = 10;
+select id, amt, name from mvwa order by id;
+→ [{"id":10,"amt":9,"name":"alice"},{"id":20,"amt":8,"name":"alice"}]
+
+-- A driving-row update that moves it OUT of scope (amt 8 → 1) removes its backing row (the
+-- forward residual recomputes to zero rows, so the delete-without-upsert removes it).
+update wta set amt = 1 where id = 20;
+select id, amt, name from mvwa order by id;
+→ [{"id":10,"amt":9,"name":"alice"}]
+
+-- A lookup (wpa) name update refreshes the projected column of the in-scope joined row — no
+-- add/remove (upsert-only; a T-only predicate cannot move membership on a P write).
+update wpa set name = 'ALICE' where id = 1;
+select id, amt, name from mvwa order by id;
+→ [{"id":10,"amt":9,"name":"ALICE"}]
+
+-- --- P-referencing WHERE: the lookup side is delete-capable (membership flips). ---
+create table wpb (id integer primary key, name text, score integer);
+create table wtb (id integer primary key, fk integer not null references wpb(id));
+insert into wpb values (1, 'alice', 3), (2, 'bob', 7);
+insert into wtb values (10, 1), (20, 1), (30, 2);
+create materialized view mvwb as select wtb.id, wtb.fk, wpb.name, wpb.score from wtb join wpb on wtb.fk = wpb.id where wpb.score > 5;
+
+-- Create time: only rows joined to a wpb with score > 5 (wpb 2). wtb 30 (fk 2).
+select id, fk, name, score from mvwb order by id;
+→ [{"id":30,"fk":2,"name":"bob","score":7}]
+
+-- A lookup update that pulls wpb 1 INTO scope (score 3 → 8): the two wtb rows referencing it
+-- (10, 20) gain backing rows (membership residual delete is a no-op; in-scope residual upserts).
+update wpb set score = 8 where id = 1;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":10,"fk":1,"name":"alice","score":8},{"id":20,"fk":1,"name":"alice","score":8},{"id":30,"fk":2,"name":"bob","score":7}]
+
+-- A lookup update that pushes wpb 2 OUT of scope (score 7 → 2): wtb 30 is removed — the delete
+-- pass deletes its backing key and the in-scope residual returns nothing (upsert-only could not).
+update wpb set score = 2 where id = 2;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":10,"fk":1,"name":"alice","score":8},{"id":20,"fk":1,"name":"alice","score":8}]
+
+-- A driving FK-move re-evaluates the P-side predicate against the NEW p: move wtb 10 to fk 2
+-- (wpb 2 is now score 2, out of scope) → its joined row disappears (the forward residual
+-- applies the full WHERE, including the p column, against the live joined p).
+update wtb set fk = 2 where id = 10;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":20,"fk":1,"name":"alice","score":8}]
+
+-- An in-scope lookup payload update (wpb 1 stays score 8): the delete-then-upsert refreshes the
+-- projected name of its still-referencing row (wtb 20) without adding/removing.
+update wpb set name = 'ALICE' where id = 1;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":20,"fk":1,"name":"ALICE","score":8}]
+
+-- Mid-transaction membership flip + rollback reverts the delete-capable pass in lockstep.
+-- wpb 2 score 2 → 9 pulls its two referencing rows (wtb 10, 30 — both now fk 2) into scope.
+begin;
+update wpb set score = 9 where id = 2;
+select id, fk, name, score from mvwb where fk = 2 order by id;
+→ [{"id":10,"fk":2,"name":"bob","score":9},{"id":30,"fk":2,"name":"bob","score":9}]
+rollback;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":20,"fk":1,"name":"ALICE","score":8}]
 
 -- ===================================
 -- 25. End-of-statement flush boundary (mv-statement-flush-deferral). The DML executor now

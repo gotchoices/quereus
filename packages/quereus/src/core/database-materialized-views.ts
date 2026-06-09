@@ -34,6 +34,7 @@ import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { BlockNode } from '../planner/nodes/block.js';
 import { PlanNode, type ScalarPlanNode, type RowDescriptor, type RelationalPlanNode, isRelationalNode, isScalarNode } from '../planner/nodes/plan-node.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
+import { FilterNode } from '../planner/nodes/filter.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { EmissionContext } from '../runtime/emission-context.js';
@@ -337,14 +338,31 @@ export interface PrefixDeletePlan extends MaintenancePlanCommon {
  * includes `P`, so a write to `P` also fires maintenance, but the forward residual is
  * keyed on `T`'s PK and a `P` row joins *many* `T` rows. This plan therefore carries a
  * **second residual keyed on `P`'s PK** (`lookupResidualScheduler`): for a `P` change it
- * runs `… where P.pk = :pk0` against live state, returning every currently-joined row
- * (each carrying its `T.pk` backing key), and **upserts** each. No delete is needed —
- * with an inner join + enforced RI and no lookup-referencing WHERE (rejected at build),
- * the *set* of `T` rows joined to a given `P` row is determined by `T.fk` (a `T` column,
- * unchanged by a `P` write), so a `P` change only refreshes the lookup-projected columns
- * of existing backing rows, never adds/removes a backing row. See
- * `docs/incremental-maintenance.md` § join-residual and the soundness note in
- * {@link MaterializedViewManager.applyLookupResidual}.
+ * runs `… where P.pk = :pk0` (the body **including** its WHERE) against live state,
+ * returning every currently in-scope joined row (each carrying its `T.pk` backing key), and
+ * **upserts** each.
+ *
+ * **WHERE handling — bounded-delta over a partial-WHERE 1:1 join.** A body WHERE is
+ * classified at build by which base table(s) its columns reference
+ * ({@link MaterializedViewManager.buildJoinResidualPlan}):
+ *  - **`T`-only predicate** — no extra machinery. The forward (`T`) residual already injects
+ *    + applies the WHERE (an out-of-scope `T` row recomputes to zero residual rows ⇒ its
+ *    delete-without-upsert removes the backing row), and a `T`-column predicate cannot move
+ *    the membership set `{ T : T.fk = P.pk }`, so the lookup side stays **upsert-only**
+ *    (`lookupMembershipResidualScheduler` absent) — sound for the same reason the no-WHERE
+ *    arm is.
+ *  - **`P`-referencing predicate** (or both sides) — a `P` write can flip a row's WHERE truth
+ *    and so add/remove a backing row, which upsert-only could never delete. The lookup side
+ *    becomes **delete-capable**: `lookupMembershipResidualScheduler` is the body with
+ *    `injectKeyFilter` on `P` but the WHERE **stripped** (membership only). Per affected `P`
+ *    key {@link MaterializedViewManager.applyLookupResidual} runs it to delete **every**
+ *    currently-referencing `T.pk` backing key, then runs the in-scope `lookupResidualScheduler`
+ *    (WHERE retained) to upsert the survivors — a delete-then-upsert that converges the
+ *    membership both ways.
+ *
+ * Still inner/cross only; outer joins and **fanning** (non-1:1) joins continue to fall to the
+ * full-rebuild floor. See `docs/incremental-maintenance.md` § join-residual and the soundness
+ * note in {@link MaterializedViewManager.applyLookupResidual}.
  */
 export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidualPlan {
 	readonly kind: 'join-residual';
@@ -354,9 +372,17 @@ export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidual
 	bindParamPrefix: 'pk';
 	/** Lowercased `schema.table` of the lookup source `P` (distinct from `sourceBase` = `T`). */
 	lookupBase: string;
-	/** Cached scheduler for the lookup-keyed residual (the body with `injectKeyFilter`
-	 *  applied on `P`, `'pk'` prefix). Re-run per affected `P` key; returns the joined rows. */
+	/** Cached scheduler for the in-scope lookup-keyed residual (the body — WHERE **retained** —
+	 *  with `injectKeyFilter` applied on `P`, `'pk'` prefix). Re-run per affected `P` key;
+	 *  returns the currently in-scope joined rows to upsert. */
 	lookupResidualScheduler: Scheduler;
+	/** Delete-capable lookup membership residual (the body with the WHERE **stripped** and
+	 *  `injectKeyFilter` on `P`). Present **iff** the body WHERE references `P`: the lookup side
+	 *  must then delete the backing key of every currently-referencing `T` row (regardless of
+	 *  scope) before re-upserting the in-scope survivors, so a `P` write that flips a row's WHERE
+	 *  membership adds/removes its backing row. Absent for a no-WHERE or `T`-only-WHERE body
+	 *  (the lookup side is sound upsert-only — membership cannot move on a `P` write). */
+	lookupMembershipResidualScheduler?: Scheduler;
 	/** Source-`P` PK column indices (the lookup key). The affected key tuple for a `P`
 	 *  change is `lookupBindColumns.map(c => changedRow[c])`, bound to `pk{i}`. */
 	lookupBindColumns: number[];
@@ -1223,28 +1249,33 @@ export class MaterializedViewManager {
 	 * and `docs/incremental-maintenance.md` § join-residual.
 	 *
 	 * Soundness gates (a mismatch on any returns `null` → floor): exactly two base tables; no
-	 * aggregate over the join; **no WHERE** (a partial / lookup-referencing predicate's
-	 * upsert-only reverse residual is sound only when join membership is predicate-independent —
-	 * see {@link applyLookupResidual}); the backing PK is exactly `T`'s PK projected as
-	 * passthrough columns (so each changed `T` row maps to one backing row and the reverse
-	 * residual's rows carry the backing key); the join is provably 1:1 on `T`
-	 * ({@link proveOneToOneJoin} — no row loss via NOT-NULL FK→PK RI, no fan-out via the
-	 * join-frame `isUnique(T.pk)`); and the join is **inner/cross** (an outer join would make
-	 * the lookup-side reverse residual unsound — filtering `P` drops the null-extended rows).
-	 * A **non-deterministic** projection is the one hard reject (its arm-specific determinism
-	 * diagnostic must survive).
+	 * aggregate over the join; the backing PK is exactly `T`'s PK projected as passthrough
+	 * columns (so each changed `T` row maps to one backing row and the reverse residual's rows
+	 * carry the backing key); the join is provably 1:1 on `T` ({@link proveOneToOneJoin} — no
+	 * row loss via NOT-NULL FK→PK RI, no fan-out via the join-frame `isUnique(T.pk)`); and the
+	 * join is **inner/cross** (an outer join would make the lookup-side reverse residual unsound
+	 * — filtering `P` drops the null-extended rows). A **non-deterministic** projection is the
+	 * one hard reject (its arm-specific determinism diagnostic must survive).
+	 *
+	 * **A body WHERE is now accepted** (it is no longer a blanket reject): the predicate is
+	 * classified by which base table(s) its columns reference (reusing the per-base-ref
+	 * attribute→source-column maps below). A `T`-only predicate needs nothing extra — the
+	 * forward residual already carries it and the membership set `{ T : T.fk = P.pk }` cannot
+	 * move on a `P` write, so the lookup side stays upsert-only. A predicate referencing `P` (or
+	 * both sides) switches the lookup side to a **delete-capable** reverse residual by building
+	 * `lookupMembershipResidualScheduler` (the body with the WHERE stripped, keyed on `P`). See
+	 * {@link JoinResidualPlan}'s "WHERE handling" note and {@link applyLookupResidual}.
 	 */
 	private buildJoinResidualPlan(
 		mv: MaterializedViewSchema,
 		analyzed: BlockNode,
 		tableRefs: TableReferenceNode[],
 	): MaintenancePlan | null {
-		// >2-source join, an aggregate over the join, or a partial/lookup-referencing WHERE
-		// (the upsert-only reverse residual is sound only when join membership is
-		// predicate-independent) all have no join-residual binding → fall to the floor.
+		// A >2-source join or an aggregate over the join has no join-residual binding → floor.
+		// A body WHERE is no longer rejected here — it is classified (T-only vs P-referencing)
+		// below, after `T`/`P` are identified, and routed to the matching lookup-side strategy.
 		if (tableRefs.length !== 2) return null;
 		if (findAggregate(analyzed)) return null;
-		if (mv.selectAst.type === 'select' && mv.selectAst.where !== undefined) return null;
 
 		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
 		if (!backing) {
@@ -1339,17 +1370,38 @@ export class MaterializedViewManager {
 		const forwardResidual = this.compileResidual(analyzed, tRelKey, tPkCols, 'pk');
 		if (!forwardResidual) return null;
 
-		// Reverse (`P`) residual: the body with `P.pk = :pk0 AND …` injected on `P`. Drives
-		// lookup-side maintenance — finds every joined row referencing a changed `P` row.
+		// Reverse (`P`) **in-scope** residual: the body — WHERE retained — with `P.pk = :pk0 AND …`
+		// injected on `P`. Drives lookup-side maintenance — finds every currently in-scope joined
+		// row referencing a changed `P` row.
 		const pPkCols = pSchema.primaryKeyDefinition.map(d => d.index);
 		if (pPkCols.length === 0) return null;
 		const pRelKey = `${lookupBase}#${pRef.id ?? 'unknown'}`;
 		const reverseResidual = this.compileResidual(analyzed, pRelKey, pPkCols, 'pk');
 		if (!reverseResidual) return null;
 
+		// Classify the body WHERE by which base table(s) its columns reference: a predicate that
+		// references `P` (or both sides) can flip a row's WHERE membership on a `P` write, so the
+		// lookup side must become delete-capable; a `T`-only predicate cannot move membership, so
+		// the upsert-only reverse residual above stays sound. The membership residual is the body
+		// with the WHERE **stripped** and the key filter on `P` — it returns every currently
+		// referencing `T` row (regardless of scope) so its backing key can be deleted before the
+		// in-scope survivors are re-upserted. Absent for a no-WHERE / `T`-only-WHERE body.
+		const hasWhere = mv.selectAst.type === 'select' && mv.selectAst.where !== undefined;
+		// A volatile WHERE would make every residual (which embeds it) irreproducible → fall to
+		// the floor's pragma-gated whole-body determinism reject, not an unsound bounded-delta arm.
+		if (hasWhere && bodyWhereIsNonDeterministic(analyzed)) return null;
+		const whereReferencesLookup = hasWhere
+			&& bodyWhereReferencesLookup(analyzed, refInfos[tIndex].attrToCol, producingByAttrId);
+		let lookupMembershipResidual: Scheduler | undefined;
+		if (whereReferencesLookup) {
+			const membership = this.compileLookupMembershipResidual(mv, lookupBase, pPkCols);
+			if (!membership) return null; // could not strip + re-key the membership residual → floor
+			lookupMembershipResidual = membership;
+		}
+
 		// ── Cost gate (parity with the other residual arms) ──
 		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
-		const sourceStats = this.estimateMaintenanceStats(tSchema, backing.columns.length, /*hasPredicate*/ false);
+		const sourceStats = this.estimateMaintenanceStats(tSchema, backing.columns.length, hasWhere);
 		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
 		if (chosenStrategy !== 'residual-recompute') {
@@ -1376,9 +1428,50 @@ export class MaterializedViewManager {
 			backingPkSourceCols,
 			lookupBase,
 			lookupResidualScheduler: reverseResidual,
+			lookupMembershipResidualScheduler: lookupMembershipResidual,
 			lookupBindColumns: pPkCols,
 			lookupBindParamPrefix: 'pk',
 		};
+	}
+
+	/**
+	 * Compile the **lookup membership** residual for the join-residual arm's delete-capable
+	 * lookup side: the MV body with its top-level WHERE **stripped** (membership only) and a
+	 * key-equality filter injected on the lookup `P`, keyed `pk0…`. The WHERE is stripped at the
+	 * AST level (a shallow clone dropping `where`) and the body re-built + re-analyzed, so only
+	 * the WHERE is removed — the join, its `ON` condition, and any projection sub-expressions are
+	 * preserved. Re-analysis assigns fresh node ids, so `P`'s reference is re-located by base name
+	 * to compute the injection target. Returns `null` if the lookup ref or the key-filter
+	 * injection could not be resolved (the caller then falls to the full-rebuild floor).
+	 *
+	 * Run per affected `P` key, this residual returns **every** `T` row currently joined to `P`
+	 * via the join's `ON` condition — irrespective of the WHERE — so {@link applyLookupResidual}
+	 * can delete each one's `T.pk` backing key before the in-scope residual re-upserts the
+	 * survivors (the membership set the WHERE-bearing reverse residual would otherwise never
+	 * shrink).
+	 */
+	private compileLookupMembershipResidual(
+		mv: MaterializedViewSchema,
+		lookupBase: string,
+		pPkCols: readonly number[],
+	): Scheduler | null {
+		const db = this.ctx as unknown as Database;
+		const strippedAst = { ...(mv.selectAst as AST.SelectStmt), where: undefined };
+		const stripped = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
+			const { plan } = this.ctx._buildPlan([strippedAst as AST.Statement]);
+			return this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
+		});
+		// Re-locate `P` in the WHERE-stripped plan by base name (fresh node ids) to build the
+		// injection target key the way `compileResidual`'s callers do.
+		let pRelKey: string | undefined;
+		for (const [relKey, ref] of collectTableRefs(stripped)) {
+			if (`${ref.tableSchema.schemaName}.${ref.tableSchema.name}`.toLowerCase() === lookupBase) {
+				pRelKey = relKey;
+				break;
+			}
+		}
+		if (pRelKey === undefined) return null;
+		return this.compileResidual(stripped, pRelKey, pPkCols, 'pk');
 	}
 
 	/**
@@ -1729,21 +1822,37 @@ export class MaterializedViewManager {
 	/**
 	 * Maintain a `'join-residual'` MV for a **lookup-side (`P`)** change: refresh the joined
 	 * rows referencing each affected `P` key. Derive the affected `P` key(s) from the changed
-	 * row (OLD ∪ NEW, deduped on `P`'s PK), and for each run the lookup-keyed residual
-	 * (`… where P.pk = :pk0`) against live source state — returning every currently-joined
-	 * row, each carrying its `T.pk` backing key — and **upsert** each.
+	 * row (OLD ∪ NEW, deduped on `P`'s PK), and for each run the in-scope lookup-keyed residual
+	 * (`… where P.pk = :pk0`, the body's WHERE retained) against live source state — returning
+	 * every currently in-scope joined row, each carrying its `T.pk` backing key — and **upsert**
+	 * each.
 	 *
-	 * **No delete is performed, and that is sound.** For an inner/cross join with enforced
-	 * RI and no lookup-referencing WHERE (both required at build), the *set* of backing rows
-	 * referencing a given `P` row is `{ T : T.fk = P.pk }`, determined entirely by `T.fk` (a
-	 * `T` column the `P` write cannot change). So a `P` change can only re-derive the
-	 * lookup-projected columns of those existing backing rows (an upsert at the unchanged
-	 * `T.pk` key), never add or remove one: a `P` insert with no referencing `T` rows yields
-	 * an empty residual (no-op); a `P` delete is only admissible (RI) when no `T` references
-	 * it (empty residual); a `P` payload update upserts the affected rows with the new value.
-	 * A `T`-side membership change (insert/delete/FK-move) is the *forward* path's job and
-	 * fires its own maintenance. Returns the effective {@link BackingRowChange}(s) for the
-	 * MV-over-MV cascade. Per-row recompute is correct without batching for the same
+	 * **Upsert-only is sound for a no-WHERE / `T`-only-WHERE body.** For an inner/cross join with
+	 * enforced RI and a predicate that cannot reference `P`, the *set* of backing rows referencing
+	 * a given `P` row is `{ T : T.fk = P.pk }`, determined entirely by `T.fk` (a `T` column the
+	 * `P` write cannot change), and the WHERE — over `T` only — cannot flip on a `P` write. So a
+	 * `P` change can only re-derive the lookup-projected columns of those existing backing rows
+	 * (an upsert at the unchanged `T.pk` key), never add or remove one: a `P` insert with no
+	 * referencing `T` rows yields an empty residual (no-op); a `P` delete is only admissible (RI)
+	 * when no `T` references it (empty residual); a `P` payload update upserts the affected rows
+	 * with the new value.
+	 *
+	 * **A `P`-referencing WHERE needs the delete-capable pass.** When the body WHERE references
+	 * `P`, a `P` write can flip a joined row's WHERE truth and so add or remove its backing row —
+	 * which the in-scope upsert above (it returns *only* in-scope rows) could never delete. The
+	 * builder then supplies `lookupMembershipResidualScheduler` (the body with the WHERE stripped,
+	 * keyed on `P`). Per affected `P` key this runs the membership residual first and **deletes**
+	 * the `T.pk` backing key of **every** currently-referencing `T` row (regardless of scope —
+	 * the delete keys come from live `T` via the join, so they match existing backing keys and
+	 * touch nothing belonging to another `P`), then runs the in-scope residual and **upserts** the
+	 * survivors. A row leaving scope is deleted and not re-upserted (removed); a row entering
+	 * scope is deleted (a no-op if absent) and re-upserted (added); an unchanged in-scope row is
+	 * deleted then re-upserted (refreshed). The membership residual MUST ignore the WHERE — else a
+	 * row leaving scope would never be deleted.
+	 *
+	 * A `T`-side membership change (insert/delete/FK-move) is the *forward* path's job and fires
+	 * its own maintenance. Returns the effective {@link BackingRowChange}(s) for the MV-over-MV
+	 * cascade. Per-row recompute is correct without batching for the same
 	 * last-write-wins-against-live-state reason as {@link applyForwardResidual}.
 	 */
 	private async applyLookupResidual(
@@ -1764,6 +1873,17 @@ export class MaterializedViewManager {
 
 		const ops: MaintenanceOp[] = [];
 		for (const keyTuple of affected.values()) {
+			// Delete-capable (P-referencing WHERE): membership residual (WHERE stripped) →
+			// delete every currently-referencing T.pk backing key BEFORE re-upserting survivors,
+			// so a row that left the WHERE scope is removed. Ordering matters — deletes precede
+			// upserts so an unchanged in-scope row is refreshed, not dropped.
+			if (plan.lookupMembershipResidualScheduler) {
+				const members = await this.runResidual(plan.lookupMembershipResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
+				for (const row of members) {
+					const key = buildPrimaryKeyFromValues(plan.backingPkDefinition.map(d => row[d.index]), plan.backingPkDefinition);
+					ops.push({ kind: 'delete-key', key });
+				}
+			}
 			const recomputed = await this.runResidual(plan.lookupResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
 			for (const row of recomputed) ops.push({ kind: 'upsert', row });
 		}
@@ -2552,6 +2672,66 @@ function resolveTransitiveSourceCol(
 		return undefined;
 	}
 	return undefined;
+}
+
+/**
+ * True iff the analyzed join body's WHERE references the lookup table `P` (or any base other
+ * than the driving `T`) — the classification the join-residual arm uses to decide whether the
+ * lookup side must be delete-capable (see {@link MaterializedViewManager.buildJoinResidualPlan}).
+ * The body WHERE — possibly split by predicate-pushdown — surfaces as one or more
+ * {@link FilterNode}s above/around the join; the join's own `ON` condition lives inside the
+ * JoinNode (not a Filter) and so is excluded. Each column a filter predicate references is
+ * resolved against `T`'s attribute→source-column map (transitively); a reference that does NOT
+ * resolve to a `T` column is a `P` (the arm requires exactly two base refs, `T` and `P`) — or
+ * otherwise non-`T` — reference. Conservative by construction: an unresolved reference counts as
+ * lookup-referencing, so the cheaper `T`-only upsert-only path is taken only when **every**
+ * filter column provably belongs to `T`.
+ */
+function bodyWhereReferencesLookup(
+	analyzed: BlockNode,
+	tAttrToCol: Map<number, number>,
+	producingByAttrId: Map<number, ScalarPlanNode>,
+): boolean {
+	const filterAttrs = new Set<number>();
+	collectFilterPredicateAttrs(analyzed as unknown as PlanNode, filterAttrs);
+	for (const attrId of filterAttrs) {
+		if (resolveTransitiveSourceCol(attrId, tAttrToCol, producingByAttrId) === undefined) return true;
+	}
+	return false;
+}
+
+/** Collect every attribute id referenced by a ColumnReferenceNode inside any {@link FilterNode}
+ *  predicate in the plan (the body WHERE; the join `ON` condition is not a Filter). */
+function collectFilterPredicateAttrs(node: PlanNode, out: Set<number>): void {
+	if (node instanceof FilterNode) collectColumnRefAttrs(node.predicate as unknown as PlanNode, out);
+	for (const child of node.getChildren()) collectFilterPredicateAttrs(child as unknown as PlanNode, out);
+}
+
+/** Collect every {@link ColumnReferenceNode} attribute id in a scalar subtree. */
+function collectColumnRefAttrs(node: PlanNode, out: Set<number>): void {
+	if (node instanceof ColumnReferenceNode) out.add(node.attributeId);
+	for (const child of node.getChildren()) collectColumnRefAttrs(child as unknown as PlanNode, out);
+}
+
+/**
+ * True iff any {@link FilterNode} predicate in the body (the body WHERE) is non-deterministic.
+ * The join-residual arm embeds the body WHERE in every residual (forward, in-scope reverse, and
+ * — when delete-capable — membership), so a volatile predicate (`random()`/`now()`/a volatile
+ * UDF) would make them irreproducible and diverge from the plain view. The arm therefore declines
+ * such a body (returns `null` → the full-rebuild floor, which applies the **pragma-gated**
+ * whole-body determinism reject — rejected without `pragma nondeterministic_schema`, accepted as a
+ * wholesale rebuild with it), preserving the pre-WHERE-widening behavior rather than building an
+ * unsound bounded-delta residual.
+ */
+function bodyWhereIsNonDeterministic(analyzed: BlockNode): boolean {
+	const visit = (node: PlanNode): boolean => {
+		if (node instanceof FilterNode && !checkDeterministic(node.predicate).valid) return true;
+		for (const child of node.getChildren()) {
+			if (visit(child as unknown as PlanNode)) return true;
+		}
+		return false;
+	};
+	return visit(analyzed as unknown as PlanNode);
 }
 
 /** Read the output attributes of a block's final relational statement. */

@@ -459,6 +459,232 @@ describe('Materialized-view maintenance equivalence (1:1 inner-join shape)', () 
 	});
 });
 
+/* ──────────────────── 1:1 inner-join with a partial WHERE ──────────────────── */
+
+/**
+ * 1:1 inner-join bodies with a partial `WHERE`, maintained by the `'join-residual'` arm's
+ * bounded-delta WHERE handling (`mv-join-where-widening`). A `WHERE` over the driving table
+ * `t` only relaxes the gate (the forward `t`-keyed residual already injects + applies it; the
+ * lookup side stays upsert-only since a `t`-column predicate cannot move the membership set
+ * `{ t : t.fk = p.id }`). A `WHERE` referencing the lookup `p` (or both sides) switches the
+ * lookup side to a **delete-capable** reverse residual: per affected `p` key the membership
+ * residual (WHERE stripped) deletes every currently-referencing `t.id` backing key, then the
+ * in-scope residual re-upserts the survivors — so a `p` write that flips a row's WHERE
+ * membership adds/removes its backing row.
+ *
+ * Both sources carry a predicate column straddling the boundary 5 (`t.amt`, `p.score`), so the
+ * shared mutation generator drives every transition: a `t.amt` update moves a row across a
+ * `t`-side predicate (forward scope flip); a `p.score` update moves *every* `t` row joined to
+ * that `p` across a `p`-side predicate (the membership-flip add/remove the delete-capable pass
+ * exists for); an FK-move changes which `p` a `t` row joins (re-evaluating a `p`-side predicate
+ * against a different `p`). The oracle re-runs the same WHERE-bearing body live; the maintained
+ * backing must equal it as a multiset mid-transaction (reads-own-writes) and after rollback.
+ */
+type JoinWhereMutation =
+	| { readonly kind: 't-insert'; readonly id: number; readonly fk: number; readonly amt: number }
+	| { readonly kind: 't-update'; readonly id: number; readonly fk: number; readonly amt: number }
+	| { readonly kind: 't-updateKey'; readonly oldId: number; readonly newId: number; readonly fk: number; readonly amt: number }
+	| { readonly kind: 't-delete'; readonly id: number }
+	| { readonly kind: 'p-insert'; readonly id: number; readonly name: string; readonly score: number }
+	| { readonly kind: 'p-update'; readonly id: number; readonly name: string; readonly score: number }
+	| { readonly kind: 'p-delete'; readonly id: number };
+
+const joinWhereMutationArb: fc.Arbitrary<JoinWhereMutation> = (() => {
+	const tIdArb = fc.integer({ min: 1, max: 6 });
+	const fkArb = fc.integer({ min: 1, max: 8 });   // sometimes a missing p → tolerated FK violation
+	const newPArb = fc.integer({ min: 5, max: 8 });
+	const nameArb = fc.constantFrom('a', 'b', 'c', 'd', 'e', 'z');
+	const boundaryArb = fc.integer({ min: 0, max: 10 }); // straddles the `> 5` predicate boundary
+	return fc.oneof(
+		fc.record({ kind: fc.constant('t-insert' as const), id: tIdArb, fk: fkArb, amt: boundaryArb }),
+		fc.record({ kind: fc.constant('t-update' as const), id: tIdArb, fk: fkArb, amt: boundaryArb }),
+		fc.record({ kind: fc.constant('t-updateKey' as const), oldId: tIdArb, newId: tIdArb, fk: fkArb, amt: boundaryArb }),
+		fc.record({ kind: fc.constant('t-delete' as const), id: tIdArb }),
+		fc.record({ kind: fc.constant('p-insert' as const), id: newPArb, name: nameArb, score: boundaryArb }),
+		fc.record({ kind: fc.constant('p-update' as const), id: fc.integer({ min: 1, max: 8 }), name: nameArb, score: boundaryArb }),
+		fc.record({ kind: fc.constant('p-delete' as const), id: newPArb }),
+	);
+})();
+
+const joinWhereSqlFor = (m: JoinWhereMutation): string => {
+	switch (m.kind) {
+		case 't-insert': return `insert into t (id, fk, amt) values (${m.id}, ${m.fk}, ${m.amt})`;
+		case 't-update': return `update t set fk = ${m.fk}, amt = ${m.amt} where id = ${m.id}`;
+		case 't-updateKey': return `update t set id = ${m.newId}, fk = ${m.fk}, amt = ${m.amt} where id = ${m.oldId}`;
+		case 't-delete': return `delete from t where id = ${m.id}`;
+		case 'p-insert': return `insert into p (id, name, score) values (${m.id}, '${m.name}', ${m.score})`;
+		case 'p-update': return `update p set name = '${m.name}', score = ${m.score} where id = ${m.id}`;
+		case 'p-delete': return `delete from p where id = ${m.id}`;
+	}
+};
+
+/** One equivalence suite per partial-WHERE join body. `t (id pk, fk→p, amt)` and
+ *  `p (id pk, name, score)` give both sides a predicate column straddling 5. */
+function defineJoinWhereSuite(suiteTitle: string, body: string): void {
+	describe(suiteTitle, () => {
+		let db: Database;
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table p (id integer primary key, name text, score integer)');
+			await db.exec('create table t (id integer primary key, fk integer not null references p(id), amt integer)');
+			// Seed straddling the `> 5` boundary on both score (p) and amt (t); two t rows share fk=1.
+			await db.exec("insert into p (id, name, score) values (1, 'a', 3), (2, 'b', 7), (3, 'c', 5), (4, 'd', 9)");
+			await db.exec('insert into t (id, fk, amt) values (1, 1, 2), (2, 1, 8), (3, 2, 4), (4, 3, 6)');
+			await db.exec(`create materialized view mv as ${body}`);
+		});
+
+		afterEach(async () => { await db.close(); });
+
+		it('read(MV) == evaluate(body) across random t/p mutations, in-txn and after rollback', async () => {
+			await fc.assert(fc.asyncProperty(
+				fc.array(joinWhereMutationArb, { minLength: 1, maxLength: 14 }),
+				async (mutations) => {
+					await assertEquivalent(db, body, 'baseline');
+
+					await db.exec('begin');
+					try {
+						for (const m of mutations) await execTolerant(db, joinWhereSqlFor(m));
+						await assertEquivalent(db, body, 'in-transaction');
+					} finally {
+						await db.exec('rollback');
+					}
+
+					await assertEquivalent(db, body, 'post-rollback');
+				},
+			), { numRuns: 80 });
+		});
+	});
+}
+
+defineJoinWhereSuite(
+	'Materialized-view maintenance equivalence (1:1 inner-join, T-only WHERE)',
+	'select t.id, t.fk, t.amt, p.name from t join p on t.fk = p.id where t.amt > 5',
+);
+defineJoinWhereSuite(
+	'Materialized-view maintenance equivalence (1:1 inner-join, P-referencing WHERE)',
+	'select t.id, t.fk, p.name, p.score from t join p on t.fk = p.id where p.score > 5',
+);
+defineJoinWhereSuite(
+	'Materialized-view maintenance equivalence (1:1 inner-join, both-sides WHERE)',
+	'select t.id, t.fk, t.amt, p.name, p.score from t join p on t.fk = p.id where t.amt > 5 and p.score > 5',
+);
+
+/**
+ * Deterministic membership-flip edges of the partial-WHERE join arm — the cases the property
+ * suites only reach incidentally, pinned in both directions. The body
+ * `select t.id, t.fk, p.name, p.score from t join p on t.fk = p.id where p.score > 5` is
+ * delete-capable (P-referencing WHERE): a `p.score` update that crosses the boundary must add
+ * the newly-qualifying joined rows and remove the newly-disqualified ones.
+ */
+describe('Materialized-view maintenance equivalence (1:1 inner-join, P-WHERE membership flips)', () => {
+	let db: Database;
+	const body = 'select t.id, t.fk, p.name, p.score from t join p on t.fk = p.id where p.score > 5';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, name text, score integer)');
+		await db.exec('create table t (id integer primary key, fk integer not null references p(id), amt integer)');
+		// p1.score = 3 (out of scope), p2.score = 7 (in scope). Two t rows reference each.
+		await db.exec("insert into p (id, name, score) values (1, 'a', 3), (2, 'b', 7)");
+		await db.exec('insert into t (id, fk, amt) values (1, 1, 0), (2, 1, 0), (3, 2, 0), (4, 2, 0)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('a p update that pushes rows OUT of WHERE scope removes their backing rows (delete pass)', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		// p2 (score 7, in scope) has two referencing t rows (ids 3,4) in the backing.
+		expect((await readMultiset(db, 'select id from mv')).length, 'baseline in-scope rows (fk=2)').to.equal(2);
+		// Push p2 out of scope (7 → 1). Both joined rows must disappear — upsert-only could not.
+		await db.exec('update p set score = 1 where id = 2');
+		await assertEquivalent(db, body, 'after p out-of-scope');
+		expect((await readMultiset(db, 'select id from mv')).length, 'all rows left scope').to.equal(0);
+	});
+
+	it('a p update that pulls rows INTO WHERE scope adds their backing rows', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		// p1 (score 3, out of scope) has two referencing t rows (ids 1,2), absent from the backing.
+		const inScope = await readMultiset(db, 'select id from mv');
+		expect(inScope.length, 'baseline: only fk=2 rows in scope').to.equal(2);
+		// Pull p1 into scope (3 → 9). Its two joined rows must appear.
+		await db.exec('update p set score = 9 where id = 1');
+		await assertEquivalent(db, body, 'after p in-scope');
+		expect((await readMultiset(db, 'select id from mv')).length, 'fk=1 rows entered scope').to.equal(4);
+	});
+
+	it('a p payload update within scope refreshes the projected lookup columns (no add/remove)', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		await db.exec("update p set name = 'B!' where id = 2");  // stays in scope (score 7)
+		await assertEquivalent(db, body, 'after in-scope p payload update');
+		const named = await readMultiset(db, "select id from mv where name = 'B!'");
+		expect(named.length, 'both fk=2 rows refreshed, none added/removed').to.equal(2);
+	});
+});
+
+/**
+ * White-box check that the WHERE classification routes to the right lookup strategy (and is not
+ * silently floored): a `T`-only WHERE stays upsert-only (no membership residual built); a
+ * `P`-referencing or both-sides WHERE is delete-capable (membership residual present). Reaches
+ * into the registered `'join-residual'` plan via the manager internals.
+ */
+describe('Materialized-view join-residual partial-WHERE plan selection', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, name text, score integer)');
+		await db.exec('create table t (id integer primary key, fk integer not null references p(id), amt integer)');
+		await db.exec("insert into p (id, name, score) values (1, 'a', 3), (2, 'b', 7)");
+		await db.exec('insert into t (id, fk, amt) values (1, 1, 2), (2, 2, 8)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	interface JoinPlanLike { readonly kind: string; readonly lookupMembershipResidualScheduler?: unknown }
+	const planFor = (name: string): JoinPlanLike => {
+		const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as {
+			rowTime: Map<string, JoinPlanLike>;
+		};
+		const plan = mgr.rowTime.get(`main.${name}`.toLowerCase());
+		expect(plan, `${name} plan registered`).to.exist;
+		return plan!;
+	};
+
+	it('a T-only WHERE selects join-residual with an upsert-only lookup (no membership residual)', async () => {
+		await db.exec('create materialized view mv as select t.id, t.fk, p.name from t join p on t.fk = p.id where t.amt > 5');
+		const plan = planFor('mv');
+		expect(plan.kind, 'bounded-delta join arm, not floored').to.equal('join-residual');
+		expect(plan.lookupMembershipResidualScheduler, 'T-only WHERE stays upsert-only').to.be.undefined;
+	});
+
+	it('a P-referencing WHERE selects join-residual with a delete-capable lookup (membership residual present)', async () => {
+		await db.exec('create materialized view mv as select t.id, t.fk, p.name, p.score from t join p on t.fk = p.id where p.score > 5');
+		const plan = planFor('mv');
+		expect(plan.kind, 'bounded-delta join arm, not floored').to.equal('join-residual');
+		expect(plan.lookupMembershipResidualScheduler, 'P-referencing WHERE is delete-capable').to.exist;
+	});
+
+	it('a both-sides WHERE is classified P-referencing (delete-capable)', async () => {
+		await db.exec('create materialized view mv as select t.id, t.fk, t.amt, p.name from t join p on t.fk = p.id where t.amt > 5 and p.score > 5');
+		const plan = planFor('mv');
+		expect(plan.kind, 'bounded-delta join arm, not floored').to.equal('join-residual');
+		expect(plan.lookupMembershipResidualScheduler, 'both-sides WHERE is delete-capable').to.exist;
+	});
+
+	it('a volatile WHERE is declined by the arm (falls to the floor → rejected without the pragma)', async () => {
+		// The residuals embed the WHERE, so a volatile predicate would be irreproducible. The arm
+		// declines it (returns null), so it hits the floor's pragma-gated whole-body determinism
+		// reject — preserving the pre-WHERE-widening behavior rather than an unsound residual.
+		let caught: unknown;
+		try {
+			await db.exec('create materialized view mv as select t.id, p.name from t join p on t.fk = p.id where random() > 0');
+		} catch (e) { caught = e; }
+		expect(caught, 'a volatile WHERE join must reject').to.be.instanceOf(QuereusError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		expect((caught as QuereusError).message).to.contain('non-deterministic');
+	});
+});
+
 /* ─────────────────────────── full-rebuild floor ─────────────────────────── */
 
 /** A freshly-built `'full-rebuild'` plan, as inspected by the swap helper. */

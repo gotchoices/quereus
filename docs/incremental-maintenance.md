@@ -97,20 +97,34 @@ covering structure answers it.
 > `T`'s PK and one `P` row joins *many* `T` rows. The plan therefore carries a **second
 > residual keyed on `P`'s PK** (the body with `injectKeyFilter` applied on `P` instead of
 > `T`): for a `P` change it runs `… where P.pk = :pk0` against live state, returning every
-> currently-joined row — each carrying its `T.pk` backing key — and **upserts** each. **No
-> delete is needed**, and that is the soundness crux: with an inner/cross join + enforced RI
-> and no lookup-referencing `WHERE` (a `WHERE` body is declined by this arm — it falls to the
-> full-rebuild floor), the *set* of `T` rows joined to a
-> given `P` row is `{ T : T.fk = P.pk }`, determined entirely by `T.fk` (a `T` column a `P`
-> write cannot change). So a `P` change only re-derives the lookup-projected columns of
-> existing backing rows (an upsert at the unchanged `T.pk`), never adds or removes one. A
-> `T`-side membership change is the forward path's job. The plan is registered under **both**
-> source bases (`rowTimeBySource[T]` *and* `rowTimeBySource[P]`), and `maintainRowTime` passes
-> the changed base to `applyMaintenancePlan` so it routes to the forward (`T`) or reverse
-> (`P`) path. Outer joins are declined by this arm (filtering `P` for the reverse residual would
-> drop their null-extended rows); a partial `WHERE` and a **fanning** (non-1:1) keyed join are
-> declined too. None of these reject — the builder returns `null` and the body falls to the
-> full-rebuild floor.
+> currently in-scope joined row — each carrying its `T.pk` backing key — and **upserts** each.
+> For a no-`WHERE` (or `T`-only-`WHERE`) body **no delete is needed**, and that is the soundness
+> crux: with an inner/cross join + enforced RI and a predicate that cannot reference `P`, the
+> *set* of `T` rows joined to a given `P` row is `{ T : T.fk = P.pk }`, determined entirely by
+> `T.fk` (a `T` column a `P` write cannot change). So a `P` change only re-derives the
+> lookup-projected columns of existing backing rows (an upsert at the unchanged `T.pk`), never
+> adds or removes one. A `T`-side membership change is the forward path's job. The plan is
+> registered under **both** source bases (`rowTimeBySource[T]` *and* `rowTimeBySource[P]`), and
+> `maintainRowTime` passes the changed base to `applyMaintenancePlan` so it routes to the
+> forward (`T`) or reverse (`P`) path.
+>
+> **A partial `WHERE` is supported (`mv-join-where-widening`).** The body `WHERE` is classified
+> at build by which base table(s) its columns reference. A predicate over the **driving `T`
+> only** needs nothing extra: the forward residual already injects + applies it (an out-of-scope
+> `T` row recomputes to zero rows ⇒ its delete-without-upsert removes the backing row), and a
+> `T`-column predicate cannot move the membership set above, so the lookup side stays upsert-only.
+> A predicate referencing the **lookup `P`** (or both sides) *can* flip a row's `WHERE` truth on a
+> `P` write — adding or removing a backing row the upsert-only path could never delete — so the
+> reverse path becomes **delete-capable**: the plan carries a third residual, the body with the
+> `WHERE` **stripped** and `injectKeyFilter` on `P` (membership only). Per affected `P` key it runs
+> that membership residual to `delete` **every** currently-referencing `T.pk` backing key (the
+> delete keys come from live `T` via the join, so they match existing backing keys and never touch
+> another `P`'s rows), then runs the in-scope reverse residual (`WHERE` retained) to `upsert` the
+> survivors — a delete-then-upsert that converges the membership both ways. The membership residual
+> **must** ignore the `WHERE`, else a row leaving scope would never be deleted. Outer joins are
+> still declined (filtering `P` for the reverse residual would drop their null-extended rows), and a
+> **fanning** (non-1:1) keyed join is declined too — the builder returns `null` and the body falls
+> to the full-rebuild floor.
 >
 > **The `'prefix-delete'` arm — point-keyed vs prefix-keyed slice replacement.** A
 > single-source lateral-TVF fan-out body (`select T.pk…, f.* from T cross join lateral

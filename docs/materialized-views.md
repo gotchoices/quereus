@@ -291,7 +291,7 @@ A **1:1 row-preserving inner/cross join** (`select … from T join P on T.fk = P
 
 An FK-moving `UPDATE` (changing `T.fk`, not `T.pk`) recomputes the same `T.pk` slice against the new lookup row; a PK-changing `UPDATE` recomputes both the OLD and NEW `T.pk`.
 
-**Lookup side (`P`) — the reverse path.** A write to `P` cannot be keyed on `T`'s PK (one `P` row joins many `T` rows), so the plan carries a **second residual keyed on `P`'s PK** (the body with `injectKeyFilter` applied on `P`). Per changed `P` key (OLD ∪ NEW, deduped) it runs `… where P.pk = :pk0` against live state — returning every currently-joined row, each carrying its `T.pk` backing key — and **upserts** each. **No delete is performed.**
+**Lookup side (`P`) — the reverse path.** A write to `P` cannot be keyed on `T`'s PK (one `P` row joins many `T` rows), so the plan carries a **second residual keyed on `P`'s PK** (the body with `injectKeyFilter` applied on `P`). Per changed `P` key (OLD ∪ NEW, deduped) it runs `… where P.pk = :pk0` against live state — returning every currently in-scope joined row, each carrying its `T.pk` backing key — and **upserts** each. For a no-`WHERE` or `T`-only-`WHERE` body **no delete is performed**; a `P`-referencing `WHERE` adds a delete pass (see **`WHERE` handling** below).
 
 | source op | affected key(s) | maintenance |
 |---|---|---|
