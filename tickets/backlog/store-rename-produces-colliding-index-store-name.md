@@ -1,40 +1,89 @@
-description: RENAME TABLE can produce a colliding *index* store name — renaming `t`→`newName` relocates each `t_idx_x` to `newName_idx_x`, which may already name another object's store (a sibling table `newName_idx_x` or another table's index). The CREATE-time collision guard only checks the new *data* store name, not the relocated index store names.
+description: RENAME a store-backed table to a name whose computed *index* store names (`{schema}.{newName}_idx_{idx}`) collide with an existing data/index store is not guarded — the CREATE-time collision fix only checks the new *data* store name. The provider then relocates an index directory on top of another object's store and corrupts it.
 files:
-  - packages/quereus-store/src/common/store-module.ts        # renameTable — extend the collision guard to relocated index names
-  - packages/quereus-plugin-leveldb/src/provider.ts          # renameTableStores — already throws on destination-exists, but only per moved dir
-  - packages/quereus-plugin-indexeddb/src/provider.ts        # renameTableStores — same
+  - packages/quereus-store/src/common/store-module.ts        # renameTable — extend the assertStoreNameFree guard to cover each new index store name
+  - packages/quereus-store/src/common/key-builder.ts         # buildIndexStoreName — the name the rename would produce
+  - packages/quereus-plugin-leveldb/test/sibling-collision.spec.ts # add the persistent reject case here
 ----
 
-# RENAME producing a colliding index store name
+# RENAME producing a colliding *index* store name
 
-The `store-index-vs-sibling-table-name-collision-at-create` fix rejects a CREATE whose
-physical store name aliases an existing store, and extends that check to `renameTable`'s new
-**data** store name (`{schema}.{newName}`). It does **not** cover the case where the *index*
-stores relocated by the rename collide:
+## Context
 
-- Renaming `t` → `newName` moves each `t_idx_x` to `newName_idx_x`. If a sibling table is
-  literally named `newName_idx_x` (its data store is `{schema}.newName_idx_x`), or another
-  table already has an index whose store is `{schema}.newName_idx_x`, the relocation aliases
-  that store.
+`store-index-vs-sibling-table-name-collision-at-create` added CREATE-time physical
+store-name collision detection in `StoreModule` (`assertStoreNameFree` /
+`collectOccupiedStoreNames`). The `renameTable` arm of that fix guards **only** the
+renamed table's new **data** store name:
 
-The providers' `renameTableStores` each throw a low-level "destination already exists" error
-per moved directory/object store, so this is *not* silent corruption today — but it surfaces
-as a raw provider `Error` mid-rename (after some directories may already have moved),
-leaving the rename partially applied rather than a clean, atomic, sited pre-check reject.
+```
+candidate = buildDataStoreName(schemaName, newName)
+```
 
-## Expected behavior
+That catches renaming a table *into* a name already occupied by another object's
+store (including the table's own index-store name). It does **not** check the new
+**index** store names the rename will produce for the renamed table's secondary
+indexes.
 
-`renameTable` should pre-compute **all** new physical store names it is about to introduce
-(the new data store name *and* every relocated index store name), check them against the
-occupied-name set (reusing the helper from the CREATE-collision fix), and reject atomically
-with a clear `StatusCode.ERROR` **before** any physical relocation — so a colliding rename
-is a no-op, not a half-moved table.
+## The unguarded collision
 
-## Notes / scope
+A store-backed table's rename relocates not just its data directory but every index
+directory, re-deriving each as `buildIndexStoreName(schema, newName, idx.name)` =
+`{schema}.{newName}_idx_{idx}`. If any existing data/index store already occupies one
+of those names, the provider's relocation writes the moved index directory on top of
+the existing object and silently corrupts it.
 
-- Reuse `collectOccupiedStoreNames` from the CREATE fix; exclude the table being renamed
-  (its own current data/index stores are the *sources*, not collisions).
-- Add regression coverage for: (a) rename into a sibling whose name equals a would-be index
-  store name; (b) the partial-move atomicity (no directory/object store moved on reject).
-- Lower priority than the CREATE collision (rename into a colliding index name is rarer and
-  currently fails loud-but-messy rather than silently corrupting).
+Concrete reproduction:
+
+| step | object | physical store |
+|------|--------|----------------|
+| 1 | table `t` with index `archive`        | data `main.t`, index `main.t_idx_archive` |
+| 2 | sibling table `foo_idx_archive`       | data `main.foo_idx_archive` |
+| 3 | `alter table t rename to foo`         | new data `main.foo` (free — passes the existing guard) |
+|   | …but t's index `archive` re-derives to | `main.foo_idx_archive` == the sibling table's data store → **collision** |
+
+The current `renameTable` guard only checks `main.foo` (the data store), so the
+rename proceeds and the provider relocates `main.t_idx_archive` → `main.foo_idx_archive`,
+clobbering the `foo_idx_archive` table's rows.
+
+## Required behavior
+
+Before the physical relocation in `StoreModule.renameTable`, reject the rename when
+**any** of the renamed table's new index store names
+(`buildIndexStoreName(schemaName, newName, idx.name)` for each `idx` in the table's
+schema) already names an existing data or index store — reusing the same
+`collectOccupiedStoreNames` occupancy set the data-store guard uses.
+
+- The occupancy set must exclude the renamed table's **own** current stores
+  (`{schema}.{oldName}` and `{schema}.{oldName}_idx_*`), since those legitimately
+  move with the table. (The CREATE-time fix deliberately omitted self-exclusion
+  because at that point the simplest self-collision — rename into the table's own
+  index-store name — is itself the hazard and is better rejected; this deeper
+  index-name check is the case where self-exclusion is genuinely required, so the
+  occupancy/exclusion handling needs revisiting here.)
+- Error: `StatusCode.ERROR`, sited (name the candidate index store, the renamed
+  table + its index, and the conflicting existing object), actionable ("rename the
+  table to a different name, or drop/rename the conflicting object").
+- Must run before any provider relocation so the reject is a full no-op.
+
+## Acceptance
+
+- The table reproduction above (`t` w/ index `archive`, sibling `foo_idx_archive`,
+  `rename t → foo`) is rejected; the sibling's rows/store are untouched and no stray
+  directory is created.
+- The index-vs-index variant (rename producing `{newName}_idx_{x}` equal to another
+  table's existing index store) is likewise rejected.
+- Negative control: a normal rename (`t → t2`, no derived index name collides) still
+  succeeds and relocates all index directories.
+- Covered across the in-memory provider (fast lane,
+  `packages/quereus-store/test/store-name-collision.spec.ts`) and LevelDB
+  (`packages/quereus-plugin-leveldb/test/sibling-collision.spec.ts`).
+
+## Out of scope / notes
+
+- A full re-encoding of the store naming scheme (length-prefixing / escaped
+  delimiter) remains out of scope — same rationale as the CREATE-time ticket
+  (surgical reject beats a migration of every on-disk directory).
+- The in-memory harness `renameTableStores` in the store tests moves the data store
+  before the index stores; under a derived-name collision that ordering itself can
+  clobber — a correct provider must order/stage moves to avoid transient overwrite.
+  The guard above makes that moot by rejecting before relocation, but if the guard is
+  ever bypassed the provider ordering is a second latent hazard worth hardening.

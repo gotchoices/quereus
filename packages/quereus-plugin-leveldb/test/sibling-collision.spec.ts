@@ -53,6 +53,21 @@ describe('LevelDB sibling-table prefix collision', () => {
 	const dataDir = (table: string) => path.join(testDir, 'main', table);
 	const indexDir = (table: string, index: string) => path.join(testDir, 'main', `${table}_idx_${index}`);
 
+	/** Sorted list of directory entries under `main/` — for stray-dir assertions. */
+	const mainDirs = (): string[] => {
+		const root = path.join(testDir, 'main');
+		return fs.existsSync(root) ? fs.readdirSync(root).sort() : [];
+	};
+
+	async function attempt(sql: string): Promise<Error | null> {
+		try {
+			await db.exec(sql);
+			return null;
+		} catch (e) {
+			return e instanceof Error ? e : new Error(String(e));
+		}
+	}
+
 	it('RENAME t leaves a sibling table t_idx_archive intact on disk and in the engine', async () => {
 		await db.exec(`create table t (id integer primary key, b integer) using store`);
 		await db.exec(`create table "t_idx_archive" (id integer primary key, v integer) using store`);
@@ -95,5 +110,51 @@ describe('LevelDB sibling-table prefix collision', () => {
 		expect(fs.existsSync(indexDir('t', 'ix_b')), 't real index dir gone').to.be.false;
 		expect(fs.existsSync(dataDir('t_idx_archive')), 'sibling dir intact').to.be.true;
 		expect(await rows(`select v from "t_idx_archive" order by id`)).to.deep.equal([{ v: 100 }, { v: 200 }]);
+	});
+
+	// ── CREATE-time collision rejection (persistent companion) ──────────────────
+
+	it('rejects CREATE INDEX colliding with a sibling table data store; sibling rows + dirs intact', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create table "t_idx_archive" (id integer primary key, v integer) using store`);
+		await db.exec(`insert into "t_idx_archive" values (1, 100), (2, 200)`);
+
+		expect(fs.existsSync(dataDir('t_idx_archive')), 'sibling data dir exists').to.be.true;
+		const before = mainDirs();
+
+		// index `archive` on t → main/t_idx_archive == sibling table's data dir.
+		const err = await attempt(`create index archive on t (b)`);
+		expect(err, 'colliding CREATE INDEX must reject').to.be.instanceOf(Error);
+		expect((err as Error).message).to.match(/main\.t_idx_archive/);
+
+		// No-op reject: directory set is unchanged and the sibling's rows are intact
+		// (the index build never wrote into the sibling's data store).
+		expect(mainDirs(), 'rejected op created no stray directory').to.deep.equal(before);
+		expect(await rows(`select v from "t_idx_archive" order by id`)).to.deep.equal([{ v: 100 }, { v: 200 }]);
+
+		// Connection still usable afterward.
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		await db.exec(`create index ix_b on t (b)`);
+		expect(await rows(`select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+	});
+
+	it('rejects CREATE TABLE colliding with an existing index store; index dir + rows intact', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index archive on t (b)`); // index dir main/t_idx_archive
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+
+		expect(fs.existsSync(indexDir('t', 'archive')), 't index dir exists').to.be.true;
+		const before = mainDirs();
+
+		// New table `t_idx_archive` data dir → main/t_idx_archive == t's index dir.
+		const err = await attempt(`create table "t_idx_archive" (id integer primary key, v integer) using store`);
+		expect(err, 'colliding CREATE TABLE must reject').to.be.instanceOf(Error);
+		expect((err as Error).message).to.match(/main\.t_idx_archive/);
+
+		// No stray dir, and t's index-backed lookup still returns the row (index store
+		// was never overwritten by the rejected table's data store).
+		expect(mainDirs(), 'rejected op created no stray directory').to.deep.equal(before);
+		expect(await rows(`select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+		expect(await rows(`select id from t order by id`)).to.deep.equal([{ id: 1 }, { id: 2 }]);
 	});
 });

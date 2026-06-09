@@ -43,7 +43,9 @@ import { StoreTable, type StoreTableConfig, type StoreTableModule } from './stor
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
+	buildDataStoreName,
 	buildIndexKey,
+	buildIndexStoreName,
 	buildFullScanBounds,
 	buildStatsKey,
 	buildViewCatalogKey,
@@ -177,6 +179,91 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Build the set of physical store names this module's data/index stores
+	 * currently occupy in `schemaName`, mapping each name to a human description
+	 * of the logical object that owns it (for sited collision messages).
+	 *
+	 * Physical store names are built by string concatenation (`{schema}.{table}` /
+	 * `{schema}.{table}_idx_{index}`) and the `_idx_` delimiter is itself a legal
+	 * substring of any identifier, so two distinct logical objects (e.g. index
+	 * `archive` on `t` and a sibling table `t_idx_archive`) can collapse to the
+	 * same physical name. This set is the authoritative occupancy used by
+	 * {@link assertStoreNameFree} to reject such a collision at CREATE time.
+	 *
+	 * The occupancy is the union of two sources, robust to lazy connection and the
+	 * isolation wrapper (see the ticket's "Enumeration source" section):
+	 *   1. `this.tables` — every store table this module touched this session.
+	 *   2. the target schema's catalog tables whose `vtabModule === this` and which
+	 *      are not views — store-backed tables not yet lazily connected.
+	 * Names embed the schema prefix, so cross-schema entries never collide and no
+	 * per-schema filter on `this.tables` is needed. Memory-backed siblings and
+	 * views own no store in this provider and are excluded (the `=== this` /
+	 * `!isView` filter) to avoid false-positive rejects.
+	 *
+	 * No self-exclusion: at each guarded call the candidate object is not yet
+	 * registered (create/createIndex run before the engine adds it) so it cannot
+	 * self-collide; and for renameTable the renamed table's OWN stores being in the
+	 * set is intentional — renaming `t` into `t`'s own index-store name (`t` has
+	 * index `x`, rename → `t_idx_x`) is the "rename produces a colliding index
+	 * store name" hazard (parked in
+	 * tickets/backlog/store-rename-produces-colliding-index-store-name.md), so the
+	 * guard rejects it before relocation rather than letting the provider corrupt
+	 * data.
+	 */
+	private collectOccupiedStoreNames(db: Database, schemaName: string): Map<string, string> {
+		const names = new Map<string, string>();
+		const add = (s: TableSchema) => {
+			const dataName = buildDataStoreName(s.schemaName, s.name);
+			if (!names.has(dataName)) {
+				names.set(dataName, `data store of table '${s.schemaName}.${s.name}'`);
+			}
+			for (const idx of s.indexes ?? []) {
+				const idxName = buildIndexStoreName(s.schemaName, s.name, idx.name);
+				if (!names.has(idxName)) {
+					names.set(idxName, `index store of index '${idx.name}' on table '${s.schemaName}.${s.name}'`);
+				}
+			}
+		};
+		for (const t of this.tables.values()) {
+			add(t.getSchema());
+		}
+		for (const t of db.schemaManager.getSchemaOrFail(schemaName).getAllTables()) {
+			if (t.vtabModule !== this || t.isView) continue;
+			add(t);
+		}
+		return names;
+	}
+
+	/**
+	 * Throws `StatusCode.ERROR` when `candidate` (a physical store name produced by
+	 * the key-builder for an object about to be created/renamed) already names an
+	 * existing data or index store in `schemaName`. `candidateDesc` describes the
+	 * incoming logical object; the message names the candidate physical store and
+	 * both conflicting logical objects and is actionable (rename one of them).
+	 *
+	 * Must run BEFORE any storage side-effect (`getStore` / `getIndexStore` / the
+	 * physical relocation): the provider opens/creates the store eagerly, so a
+	 * guard that ran after would already have aliased the colliding object's store.
+	 */
+	private assertStoreNameFree(
+		db: Database,
+		schemaName: string,
+		candidate: string,
+		candidateDesc: string,
+	): void {
+		const occupiedBy = this.collectOccupiedStoreNames(db, schemaName).get(candidate);
+		if (occupiedBy !== undefined) {
+			throw new QuereusError(
+				`Physical store-name collision: the ${candidateDesc} would map to physical store `
+					+ `'${candidate}', which already backs the ${occupiedBy}. These two objects would `
+					+ `share one physical store and silently corrupt each other. Rename the table or the `
+					+ `colliding index.`,
+				StatusCode.ERROR,
+			);
+		}
+	}
+
+	/**
 	 * Creates a new store-backed table.
 	 * Called by CREATE TABLE.
 	 *
@@ -204,6 +291,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// and what `finalizeCreatedTableSchema` registers (so `table_info` reports K).
 		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
 		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation);
+
+		// Reject when this new table's physical data store name already names an
+		// existing store (the only real positive here is data-vs-index: a sibling
+		// index store `{schema}.t_idx_<x>` already occupies `{schema}.{thisTable}` —
+		// data-vs-data is prevented by engine table-name uniqueness). Must precede
+		// `getStore`, which eagerly opens/creates the directory.
+		const dataStoreName = buildDataStoreName(tableSchema.schemaName, tableSchema.name);
+		this.assertStoreNameFree(
+			db,
+			tableSchema.schemaName,
+			dataStoreName,
+			`data store of new table '${tableSchema.schemaName}.${tableSchema.name}'`,
+		);
 
 		// Eagerly initialize the store BEFORE creating the table or emitting events.
 		// This ensures the underlying storage (e.g., IndexedDB object store) exists
@@ -374,7 +474,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Creates an index on a store-backed table.
 	 */
 	async createIndex(
-		_db: Database,
+		db: Database,
 		schemaName: string,
 		tableName: string,
 		indexSchema: TableIndexSchema
@@ -388,6 +488,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				StatusCode.NOTFOUND
 			);
 		}
+
+		// Reject when this new index's physical store name already names an existing
+		// store: a sibling table's data store (`{schema}.t_idx_<x>` == sibling table
+		// `t_idx_<x>`) or another table's index store (index-vs-index, e.g.
+		// `a.b_idx_c` vs `a_idx_b.c` both → `{schema}.a_idx_b_idx_c`). The new index
+		// is not yet registered in the schema or the table's cached schema at this
+		// point, so the candidate cannot self-collide. Must precede `getIndexStore`,
+		// which opens/creates the directory that `buildIndexEntries` then writes into.
+		const indexStoreName = buildIndexStoreName(schemaName, tableName, indexSchema.name);
+		this.assertStoreNameFree(
+			db,
+			schemaName,
+			indexStoreName,
+			`index store of new index '${indexSchema.name}' on table '${schemaName}.${tableName}'`,
+		);
 
 		// Create the index store
 		const indexStore = await this.provider.getIndexStore(schemaName, tableName, indexSchema.name);
@@ -1233,6 +1348,24 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				StatusCode.ERROR,
 			);
 		}
+
+		// Reject renaming a table into a name already occupied by an existing
+		// physical store — e.g. rename some table to `q_idx_archive` while table `q`
+		// has index `archive` (both → `{schema}.q_idx_archive`). This also rejects
+		// renaming `t` into `t`'s OWN index-store name (`t` has index `x`, rename →
+		// `t_idx_x`): that is the "rename produces a colliding index store name"
+		// hazard (parked in
+		// tickets/backlog/store-rename-produces-colliding-index-store-name.md) — a
+		// clean reject here is strictly safer than letting the provider relocate into
+		// a transient self-collision and corrupt data. Must precede the physical
+		// relocation below.
+		const newDataStoreName = buildDataStoreName(schemaName, newName);
+		this.assertStoreNameFree(
+			db,
+			schemaName,
+			newDataStoreName,
+			`data store of table '${schemaName}.${newName}' (rename target)`,
+		);
 
 		// Capture the current schema BEFORE we drop in-memory references, so the
 		// new catalog DDL reflects the real column set.
