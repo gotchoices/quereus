@@ -125,6 +125,28 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 			.to.have.length(0);
 	});
 
+	// ---- Site 3b: RIGHT-outer mirror — the FANNED side is on the right ----
+	// The implement handoff flagged the RIGHT arm of `propagateJoinFds` as having no
+	// dedicated DISTINCT repro (only LEFT was pinned). `r right join l` makes `l` the
+	// preserved (right) side; `r.w = l.k` does not cover `r`'s key, so `l` fans out and
+	// its key FD must be dropped in right's own indices BEFORE the shift.
+	it('site 3b — DISTINCT over a fanning RIGHT join is RETAINED', async () => {
+		const sql = 'select distinct l.id, l.k from r right join l on r.w = l.k';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (right side l fanned out)')
+			.to.have.length.greaterThan(0);
+		// Without the gate the fanned (id,k)=(1,100) row would emit twice; the surviving
+		// DISTINCT collapses it to the one genuine distinct pair.
+		expect(await rowCount(db, sql), 'one distinct (id,k) row').to.equal(1);
+	});
+
+	it('site 3b control — DISTINCT over a key-covered (non-fanning) RIGHT join is ELIMINATED', () => {
+		// `r2.id = l.k` covers r2's PK (the left side), so the preserved right side `l`
+		// matches ≤1 left row and does not fan — its key survives ⇒ the body is a set.
+		const sql = 'select distinct l.id, l.k from r2 right join l on r2.id = l.k';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'right key survives a ≤1:1 right join')
+			.to.have.length(0);
+	});
+
 	// ---- Site 4: filter `a = b` equality bidirectional FD ----
 	it('site 4 — DISTINCT over `a = b` with NON-unique a/b is RETAINED', async () => {
 		const sql = 'select distinct a, b from tab where a = b';
