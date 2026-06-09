@@ -137,4 +137,28 @@ describe('IndexedDB invalidateCache prefix collision', () => {
 		expect(await tData.get(KEY)).to.deep.equal(FRESH);
 		expect(await sibling.get(KEY)).to.deep.equal(FRESH);
 	});
+
+	it('after RENAME, invalidateCache(new name) clears the re-registered index store', async () => {
+		// `renameTableStores` drops the old table's index mapping; the renamed table
+		// re-registers its index stores lazily on the next `getIndexStore`. Assert the
+		// new name's cross-tab invalidation reaches that re-registered index — the real
+		// post-rename correctness path, not just the harmless old-name no-op.
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10)`);
+		await db.exec(`alter table t rename to t2`);
+
+		// Re-open under the new name → getIndexStore re-registers main.t2_idx_ix_b.
+		const t2Data = await provider.getStore('main', 't2') as CachedKVStore;
+		const t2Index = await provider.getIndexStore('main', 't2', 'ix_b') as CachedKVStore;
+		expect(t2Data, 't2 data store is cached').to.be.instanceOf(CachedKVStore);
+		expect(t2Index, 't2 index store is cached').to.be.instanceOf(CachedKVStore);
+		await makeStale(t2Data);
+		await makeStale(t2Index);
+
+		provider.invalidateCache('main', 't2');
+
+		expect(await t2Data.get(KEY), 't2 data cache invalidated').to.deep.equal(FRESH);
+		expect(await t2Index.get(KEY), 't2 re-registered index cache invalidated').to.deep.equal(FRESH);
+	});
 });
