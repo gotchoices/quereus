@@ -8,7 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import { PredicateCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
 import { createTableInfoFromNode, extractConstraints } from '../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
-import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
+import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, isSuperkey, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
 import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
 
 /**
@@ -100,8 +100,28 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			isColumnNumeric,
 		);
 
-		// Predicate-derived FDs are unconditional — fold them in next.
+		// Predicate-derived FDs. The `∅ → col` constant FDs are always sound to fold.
+		// A `col1 = col2` conjunct also yields the bi-directional determination
+		// `{a}↔{b}` (via `extractEqualityFds`), which is a uniqueness claim only when
+		// one endpoint is a genuine key here. Over a narrow relation of non-unique
+		// columns (`select a, b from t where a = b`) it would otherwise let
+		// `deriveKeysFromFds` read a phantom all-columns key (a bag as a set). Gate the
+		// two-column determination FDs on endpoint superkey-ness against the filter's
+		// INPUT FDs (the genuine keys present before these equality FDs are added); the
+		// EC merge above already carries the equality unconditionally. `extractEqualityFds`
+		// is left untouched — it is shared with predicate-inference. (ticket
+		// fd-derived-key-bag-overclaim)
+		const inputFds = sourcePhysical?.fds ?? [];
+		const colCount = sourceAttrs.length;
 		for (const fd of predFds) {
+			if (fd.determinants.length === 1 && fd.dependents.length === 1) {
+				const a = fd.determinants[0];
+				const b = fd.dependents[0];
+				if (!isSuperkey(new Set([a]), inputFds, colCount)
+					&& !isSuperkey(new Set([b]), inputFds, colCount)) {
+					continue;
+				}
+			}
 			fds = addFd(fds, fd);
 		}
 

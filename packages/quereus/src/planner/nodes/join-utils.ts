@@ -281,10 +281,31 @@ export function propagateJoinFds(
 			const keptRightFds = rightPreserved ? rightFds : dropSideKeyFds(rightFds, rightColumnCount);
 			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(keptLeftFds, shiftFds(keptRightFds, leftColumnCount), opts);
 			let equiv: ReadonlyArray<ReadonlyArray<number>> = mergeEquivClasses(leftEC, shiftEquivClasses(rightEC, leftColumnCount));
+			// An equi-pair `{L}↔{R'}` is a value-equality determination, not inherently a
+			// uniqueness claim. Carried through unconditionally it lets a downstream
+			// key-dropping projection re-derive a spurious all-columns key on a narrow
+			// join (a bag read as a set — `deriveKeysFromFds` cannot tell a genuine key FD
+			// from an incidental all-covering determination). Emit the determination FDs
+			// only when one endpoint is a genuine superkey of the join product (its
+			// preserved, fan-out-aware keys): then both directions derive correct keys, and
+			// when neither endpoint is unique no key may be derived. The EC merge stays
+			// unconditional — value equality is always sound and carries constant
+			// propagation (ECs are not read by `keysOf`). The probe set is built from
+			// `preservedKeys` BEFORE the loop mutates `fds`, so an equi-pair can never
+			// justify itself. (ticket fd-derived-key-bag-overclaim)
+			const equiKeyFds: FunctionalDependency[] = [];
+			for (const key of preservedKeys) {
+				const keyFd = superkeyToFd(key, totalColumnCount);
+				if (keyFd) equiKeyFds.push(keyFd);
+			}
 			for (const p of equiPairs) {
 				const rShifted = p.right + leftColumnCount;
-				fds = addFd(fds, { determinants: [p.left], dependents: [rShifted] }, opts);
-				fds = addFd(fds, { determinants: [rShifted], dependents: [p.left] }, opts);
+				const endpointIsKey = isSuperkey(new Set([p.left]), equiKeyFds, totalColumnCount)
+					|| isSuperkey(new Set([rShifted]), equiKeyFds, totalColumnCount);
+				if (endpointIsKey) {
+					fds = addFd(fds, { determinants: [p.left], dependents: [rShifted] }, opts);
+					fds = addFd(fds, { determinants: [rShifted], dependents: [p.left] }, opts);
+				}
 				equiv = addEquivalence(equiv, p.left, rShifted);
 			}
 			fds = withKeyFds(fds);
@@ -303,13 +324,28 @@ export function propagateJoinFds(
 			return wrap(fds, equiv, bindings, domains);
 		}
 		case 'left': {
+			// A LEFT join fans out left rows when the equi-predicate does not cover a
+			// right-side key (one left row can match several right rows). When left's key
+			// is therefore NOT preserved, its KEY FDs remain true determinations but no
+			// longer encode uniqueness in the product — drop them (mirroring the
+			// inner/cross arm and ticket 4) so a downstream key-dropping projection cannot
+			// re-derive the left key as a spurious all-columns key (a bag read as a set).
+			const leftPreserved = preservedKeys.some(k => k.every(i => i < leftColumnCount));
+			const keptLeftFds = leftPreserved ? leftFds : dropSideKeyFds(leftFds, leftColumnCount);
 			// Left's bindings survive on left's columns; right's are dropped (the
 			// NULL-padding from unmatched left rows breaks any right-side pin).
-			const fds = withKeyFds(leftFds.slice());
+			const fds = withKeyFds(keptLeftFds.slice());
 			return wrap(fds, leftEC.map(c => c.slice()), leftBindings.map(b => ({ ...b })), leftDomains.slice());
 		}
 		case 'right': {
-			let fds: ReadonlyArray<FunctionalDependency> = shiftFds(rightFds, leftColumnCount);
+			// Mirror of LEFT: a RIGHT join fans out right rows when the equi-predicate
+			// does not cover a left-side key. Drop the right side's KEY FDs (in right's
+			// own indices, BEFORE the shift) when no preserved key lies within the right
+			// side, so a fanned right key cannot resurrect as an all-columns key.
+			const rightColumnCount = totalColumnCount - leftColumnCount;
+			const rightPreserved = preservedKeys.some(k => k.every(i => i >= leftColumnCount));
+			const keptRightFds = rightPreserved ? rightFds : dropSideKeyFds(rightFds, rightColumnCount);
+			let fds: ReadonlyArray<FunctionalDependency> = shiftFds(keptRightFds, leftColumnCount);
 			fds = withKeyFds(fds);
 			const equiv = shiftEquivClasses(rightEC, leftColumnCount);
 			const bindings = shiftConstantBindings(rightBindings, leftColumnCount);

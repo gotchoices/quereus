@@ -4,14 +4,14 @@ import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
-import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, isSuperkey, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { formatProjection } from '../../util/plan-formatter.js';
 import { ColumnReferenceNode } from './reference.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { ProjectionCapable } from '../framework/characteristics.js';
-import type { PhysicalProperties } from './plan-node.js';
+import type { PhysicalProperties, FunctionalDependency } from './plan-node.js';
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
 import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
 
@@ -231,13 +231,31 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		// augmented map carries through and which additionally emit a
 		// bi-directional FD when both the bare and derived columns are projected.
 		let fds = projectFds(sourcePhysical?.fds ?? [], map);
+		// Key FDs from the projected source keys — the projection's *real* keys,
+		// independent of the injective determination FDs gated below. Used both as the
+		// FDs layered onto the output and as the superkey probe set for the gate.
+		const projectedKeyFds: FunctionalDependency[] = [];
 		for (const key of projectedKeys) {
 			const keyFd = superkeyToFd(key, outputColCount);
-			if (keyFd) fds = addFd(fds, keyFd, { keyHints: projectedKeys });
+			if (keyFd) projectedKeyFds.push(keyFd);
 		}
+		for (const keyFd of projectedKeyFds) {
+			fds = addFd(fds, keyFd, { keyHints: projectedKeys });
+		}
+		// An injective projection emits the bi-directional FD `{bareOut}↔{outIdx}`
+		// (`SELECT id, id+1`). That determination is a uniqueness claim only when one
+		// endpoint is a genuine superkey here; over a narrow projection of a non-unique
+		// column (`SELECT -c, c` with `c` non-unique) it would otherwise let
+		// `deriveKeysFromFds` read a phantom all-columns key (a bag as a set). Gate the
+		// pair on endpoint superkey-ness against the projected keys; when an endpoint is
+		// a real key the other direction still derives the correct synonym key. (ticket
+		// fd-derived-key-bag-overclaim)
 		for (const [srcIdx, outIdx] of injectivePairs) {
 			const bareOut = map.get(srcIdx);
 			if (bareOut === undefined || bareOut === outIdx) continue;
+			const endpointIsKey = isSuperkey(new Set([bareOut]), projectedKeyFds, outputColCount)
+				|| isSuperkey(new Set([outIdx]), projectedKeyFds, outputColCount);
+			if (!endpointIsKey) continue;
 			fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx] }, { keyHints: projectedKeys });
 			fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut] }, { keyHints: projectedKeys });
 		}

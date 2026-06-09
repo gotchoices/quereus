@@ -360,15 +360,25 @@ describe('FD propagation per operator', () => {
 		expect(fdHas(props!.fds, [], [1])).to.equal(true);
 	});
 
-	it('Filter: col1 = col2 yields bi-FDs and an equivalence class', async () => {
+	it('Filter: col1 = col2 over a keyless relation yields the EC but GATES the determination FDs', async () => {
 		await db.exec("CREATE TABLE g (a INTEGER, b INTEGER) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM g WHERE a = b');
 		const props = physicalOf(rows, r => r.op === 'FILTER');
 		expect(props).to.not.equal(undefined);
-		expect(fdHas(props!.fds, [0], [1])).to.equal(true);
-		expect(fdHas(props!.fds, [1], [0])).to.equal(true);
+		// `g` has no key, so a/b are non-unique. The bi-directional determination
+		// `{a}↔{b}` would let `deriveKeysFromFds` read a phantom all-columns key
+		// (a bag as a set), so it is gated out (ticket fd-derived-key-bag-overclaim).
+		// The equivalence class is value-equality and survives unconditionally.
+		expect(fdHas(props!.fds, [0], [1])).to.equal(false);
+		expect(fdHas(props!.fds, [1], [0])).to.equal(false);
 		expect(classContains(props!.equivClasses, [0, 1])).to.equal(true);
 	});
+
+	// NOTE: the keyed-endpoint survival path for the filter `a = b` gate (when one
+	// column is a key the determination FDs are KEPT) is covered end-to-end by
+	// `test/fd-derived-key-bag-overclaim.spec.ts` (site-4 control). It is not unit-
+	// tested here because a keyed equality is pushed into the access path, leaving no
+	// FILTER node to inspect.
 
 	it('Filter: non-equality predicate contributes no FDs / ECs', async () => {
 		await db.exec("CREATE TABLE h (id INTEGER PRIMARY KEY, v INTEGER) USING memory");
@@ -451,7 +461,7 @@ describe('FD propagation per operator', () => {
 		expect(aggProps!.fds === undefined || Array.isArray(aggProps!.fds)).to.equal(true);
 	});
 
-	it('Inner JOIN: equi-pair adds bi-directional FDs and merges equivalence classes', async () => {
+	it('Inner JOIN: a fanning equi-pair merges the EC but GATES the determination FDs', async () => {
 		await db.exec("CREATE TABLE jl (id INTEGER PRIMARY KEY, v TEXT) USING memory");
 		await db.exec("CREATE TABLE jr (rid INTEGER PRIMARY KEY, l_id INTEGER) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM jl INNER JOIN jr ON jl.id = jr.l_id');
@@ -462,13 +472,17 @@ describe('FD propagation per operator', () => {
 			physicalOf(rows, r => r.op === 'JOIN');
 		expect(joinProps, 'expected join physical props').to.not.equal(undefined);
 		// Output column count: jl has 2 cols, so jr.rid is col 2 and jr.l_id is col 3.
-		// Equi-pair is (jl.id=0, jr.l_id=1+leftCols=3) ⇒ bi-FDs 0↔3 and EC {0,3}.
-		expect(fdHas(joinProps!.fds, [0], [3])).to.equal(true);
-		expect(fdHas(joinProps!.fds, [3], [0])).to.equal(true);
+		// Equi-pair is (jl.id=0, jr.l_id=1+leftCols=3). jl fans out (jr.l_id is
+		// non-unique), so the only preserved key is jr.rid (col 2) — neither equi
+		// endpoint is a superkey of the product. The bi-directional determination FDs
+		// would over-claim a key and are gated out (ticket fd-derived-key-bag-overclaim);
+		// the EC {0,3} (value equality) is merged unconditionally.
+		expect(fdHas(joinProps!.fds, [0], [3])).to.equal(false);
+		expect(fdHas(joinProps!.fds, [3], [0])).to.equal(false);
 		expect(classContains(joinProps!.equivClasses, [0, 3])).to.equal(true);
 	});
 
-	it('LEFT outer JOIN: right FDs and equi-pair FDs are dropped', async () => {
+	it('LEFT outer JOIN: right FDs / equi-pair FDs dropped, and a FANNED left key FD is dropped too', async () => {
 		await db.exec("CREATE TABLE lo (id INTEGER PRIMARY KEY, v TEXT) USING memory");
 		await db.exec("CREATE TABLE ro (rid INTEGER PRIMARY KEY, l_id INTEGER) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM lo LEFT JOIN ro ON lo.id = ro.l_id');
@@ -480,7 +494,25 @@ describe('FD propagation per operator', () => {
 		expect(fdHas(joinProps!.fds, [0], [3])).to.equal(false);
 		// No equivalence class merging left and right
 		expect(classContains(joinProps!.equivClasses, [0, 3])).to.equal(false);
-		// Left's PK FD `id (0) → v (1)` survives — null-padding only affects right columns
+		// `ro.l_id` is non-unique, so a single `lo` row can match several `ro` rows —
+		// the LEFT join fans the left side out. `lo.id` is therefore NOT unique in the
+		// product, and its key FD `{0} → {1}` is dropped (ticket
+		// fd-derived-key-bag-overclaim, Pattern A) so a downstream projection of just
+		// (lo.id, lo.v) cannot re-derive `lo.id` as a spurious key.
+		expect(fdHas(joinProps!.fds, [0], [1])).to.equal(false);
+	});
+
+	it('LEFT outer JOIN: a key-covered (non-fanning) left key FD survives', async () => {
+		await db.exec("CREATE TABLE ln (id INTEGER PRIMARY KEY, v TEXT) USING memory");
+		await db.exec("CREATE TABLE rn (rid INTEGER PRIMARY KEY, w TEXT) USING memory");
+		// `ln.k = rn.rid` covers rn's PK ⇒ each ln row matches ≤1 rn row ⇒ no fan-out,
+		// so left's key survives and its key FD is retained.
+		const rows = await planRows(db, 'SELECT * FROM ln LEFT JOIN rn ON ln.id = rn.rid');
+		const joinProps =
+			physicalOf(rows, r => r.op === 'HASHJOIN') ??
+			physicalOf(rows, r => r.op === 'MERGEJOIN') ??
+			physicalOf(rows, r => r.op === 'JOIN');
+		expect(joinProps).to.not.equal(undefined);
 		expect(fdHas(joinProps!.fds, [0], [1])).to.equal(true);
 	});
 

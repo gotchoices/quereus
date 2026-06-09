@@ -510,22 +510,6 @@
                 "fds": [
                   {
                     "dependents": [
-                      4
-                    ],
-                    "determinants": [
-                      3
-                    ]
-                  },
-                  {
-                    "dependents": [
-                      3
-                    ],
-                    "determinants": [
-                      4
-                    ]
-                  },
-                  {
-                    "dependents": [
                       1,
                       2,
                       3,
@@ -613,22 +597,6 @@
             ],
             "expectedLatencyMs": 0,
             "fds": [
-              {
-                "dependents": [
-                  4
-                ],
-                "determinants": [
-                  3
-                ]
-              },
-              {
-                "dependents": [
-                  3
-                ],
-                "determinants": [
-                  4
-                ]
-              },
               {
                 "dependents": [
                   1,
