@@ -141,6 +141,31 @@ covering structure answers it.
 > arm uses. The op is therefore the prefix-keyed analogue of `delete-key` — one base row's
 > fan-out replaced as a unit.
 >
+> **The `replace-all` `MaintenanceOp` — the whole-table primitive for the full-rebuild arm.**
+> Where `delete-key` replaces a point-keyed slice and `delete-by-prefix` a prefix-keyed slice,
+> `replace-all` replaces the backing's **entire** pending-effective contents with a supplied
+> `rows: Row[]`. It is the transactional backing replacement the always-correct
+> **full-rebuild** maintenance arm needs (the arm itself lands in a follow-on ticket): a body
+> for which no incremental arm is sound is maintained by recomputing it wholesale per writing
+> statement. That replacement must commit/roll-back in lockstep with the source write, so it
+> targets the backing's **pending** `TransactionLayer` — it cannot use the CREATE/REFRESH
+> `replaceBaseLayer` primitive, which swaps the committed *base* layer and would not roll back
+> on an aborted statement. `applyMaintenanceToLayer` (`vtab/memory/layer/manager.ts`) realizes
+> it as a **keyed diff by backing PK** against the layer's current rows: it snapshots the old
+> rows (the same whole-table effective scan, unscoped) into a PK-keyed btree, then for each new
+> row emits `insert` (key absent), `update` (key present, row differs), or **nothing** when the
+> row is unchanged — skipping an identical row so a no-op rebuild produces no btree churn and no
+> downstream cascade work — and emits `delete` for every old key absent from the new set. The
+> diff drives `recordUpsert`/`recordDelete` (so secondary-index + change-tracking bookkeeping
+> stay correct, exactly as the point ops do), and the returned `BackingRowChange[]` is the
+> realized minimal delta the MV-over-MV cascade consumes unchanged. Key matching uses the
+> backing PK comparator (honoring PK-column collation), and the skip-identical row comparison
+> uses `compareSqlValues` per column (not JS `===`), so a new row whose key only differs by
+> collation (`'apple'` vs a stored `'APPLE'` under a NOCASE PK) resolves to an `update` against
+> its old row rather than a spurious insert + delete that would leak index bookkeeping. There is
+> no row cap — the floor's unbounded cost is by design, bounded instead by the upstream
+> cost-gate / size-threshold reject. Covered by `test/vtab/maintenance-replace-all.spec.ts`.
+>
 > **Non-binary base-PK collation soundness.** `delete-by-prefix` early-terminates its prefix
 > scan on a **binary** value compare (`scan-layer.ts` / `plan-filter.ts`), but the backing
 > btree orders the base-PK prefix by the column's **declared collation**. These agree for the

@@ -1,6 +1,7 @@
 import type { Database } from '../../../core/database.js';
 import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, validateCollationForType } from '../../../schema/table.js';
 import { type BTreeKeyForPrimary } from '../types.js';
+import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer } from './base.js';
 import { TransactionLayer } from './transaction.js';
@@ -64,16 +65,26 @@ export type CoveringStructure =
  *   base row maps to many backing rows sharing the base-PK prefix. The backing
  *   btree is ordered by the composite PK with the base-PK columns leading, so the
  *   slice is a contiguous range the scan seeks to and early-terminates on.
+ * - `replace-all` replaces the backing's **entire** pending-effective contents with
+ *   `rows`, realized as the minimal keyed diff (by backing PK) against the current
+ *   rows: a new key absent from the old set is an `insert`, a present key whose row
+ *   differs is an `update`, an identical row at the same key is skipped (no btree
+ *   churn, no emitted change), and an old key absent from the new set is a `delete`.
+ *   It is the wholesale, **transactional** backing replacement the full-rebuild MV
+ *   arm needs — applied to the *pending* layer so it commits/rolls-back in lockstep
+ *   with the source write, unlike the `replaceBaseLayer` CREATE/REFRESH primitive.
  *
  * The point ops (`delete-key`/`upsert`) keep a one-source-row → one-backing-row
  * delta (covering-index, aggregate-residual); `delete-by-prefix` is the
- * one-source-row → N-backing-rows primitive — see `docs/materialized-views.md`
- * § Row-time refresh and `docs/incremental-maintenance.md` § prefix-delete.
+ * one-source-row → N-backing-rows primitive; `replace-all` is the whole-table
+ * primitive — see `docs/materialized-views.md` § Row-time refresh and
+ * `docs/incremental-maintenance.md` § prefix-delete / § replace-all.
  */
 export type MaintenanceOp =
 	| { kind: 'delete-key'; key: BTreeKeyForPrimary }
 	| { kind: 'upsert'; row: Row }
-	| { kind: 'delete-by-prefix'; keyPrefix: SqlValue[] };
+	| { kind: 'delete-by-prefix'; keyPrefix: SqlValue[] }
+	| { kind: 'replace-all'; rows: Row[] };
 
 /**
  * The *effective* per-row change {@link MemoryTableManager.applyMaintenanceToLayer}
@@ -264,6 +275,22 @@ export class MemoryTableManager {
 	 */
 	getEventEmitter(): VTableEventEmitter | undefined {
 		return this.eventEmitter;
+	}
+
+	/**
+	 * SQL-value row equality under each column's collation — the same comparison the
+	 * rest of the manager uses (`compareSqlValues`), not JS `===`. Used by the
+	 * `replace-all` maintenance diff to skip an unchanged row at a key, so equal values
+	 * of differing JS identity (e.g. a numeric stored as bigint vs number) are not
+	 * spuriously re-upserted. Rows of differing width compare unequal.
+	 */
+	private rowsEqual(a: Row, b: Row): boolean {
+		if (a.length !== b.length) return false;
+		const columns = this.tableSchema.columns;
+		for (let i = 0; i < a.length; i++) {
+			if (compareSqlValues(a[i], b[i], columns[i]?.collation) !== 0) return false;
+		}
+		return true;
 	}
 
 	/**
@@ -1341,14 +1368,17 @@ export class MemoryTableManager {
 	 * Returns the **effective** changes it applied (one {@link BackingRowChange} per
 	 * backing row it mutated): a `delete-key` that found a row → `delete`; an `upsert` →
 	 * `update` when it replaced an existing row, else `insert`; a `delete-by-prefix` →
-	 * one `delete` per matched row. A `delete-key`/`delete-by-prefix` that matches
-	 * nothing produces nothing. The MV-over-MV cascade feeds these onward to MVs reading
-	 * this backing table (see `database-materialized-views.ts` § cascade).
+	 * one `delete` per matched row; a `replace-all` → the minimal keyed diff between the
+	 * new and old contents (insert/update/delete, identical rows skipped). A
+	 * `delete-key`/`delete-by-prefix` that matches nothing — or a `replace-all` whose new
+	 * contents equal the old — produces nothing. The MV-over-MV cascade feeds these onward
+	 * to MVs reading this backing table (see `database-materialized-views.ts` § cascade).
 	 *
-	 * Async only because `delete-by-prefix` reuses the async layer scan to enumerate the
-	 * prefix slice; the point ops stay synchronous within the same pass, so a multi-row
-	 * statement's later rows still observe earlier rows' pending writes with no
-	 * interleaving (no await separates a single op's lookup from its record).
+	 * Async only because `delete-by-prefix` / `replace-all` reuse the async layer scan to
+	 * enumerate the affected (prefix / whole-table) slice; the point ops stay synchronous
+	 * within the same pass, so a multi-row statement's later rows still observe earlier
+	 * rows' pending writes with no interleaving (no await separates a single op's lookup
+	 * from its record).
 	 */
 	async applyMaintenanceToLayer(connection: MemoryTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]> {
 		const changes: BackingRowChange[] = [];
@@ -1391,6 +1421,57 @@ export class MemoryTableManager {
 					for (const { key, row } of matched) {
 						layer.recordDelete(key, row);
 						changes.push({ op: 'delete', oldRow: row });
+					}
+					break;
+				}
+				case 'replace-all': {
+					// Wholesale transactional replacement, realized as the minimal keyed diff
+					// (by backing PK) against the layer's current effective rows. Snapshot the
+					// old rows FIRST — the same whole-table effective iteration the
+					// `delete-by-prefix` arm scopes to a prefix — into a PK-keyed btree, so the
+					// diff is computed against a stable before-image regardless of the upserts
+					// applied below. Keys are compared with the table's PK comparator (honoring
+					// PK-column collation), so a new row whose key only differs by collation
+					// (e.g. 'apple' vs a stored 'APPLE' under a NOCASE PK) matches its old row
+					// and resolves to an `update` — never a spurious insert + delete that would
+					// leak secondary-index bookkeeping.
+					const oldByKey = new BTree<BTreeKeyForPrimary, { key: BTreeKeyForPrimary; row: Row }>(
+						e => e.key,
+						this.comparePrimaryKeys,
+					);
+					for await (const row of scanLayerImpl(layer, { indexName: 'primary', descending: false })) {
+						oldByKey.insert({ key: this.primaryKeyFunctions.extractFromRow(row), row });
+					}
+
+					// New-row keys (same PK comparator) for the delete pass's membership test.
+					const newKeys = new BTree<BTreeKeyForPrimary, BTreeKeyForPrimary>(
+						k => k,
+						this.comparePrimaryKeys,
+					);
+
+					// Insert/update/skip-identical pass, in new-row order.
+					for (const newRow of op.rows) {
+						const key = this.primaryKeyFunctions.extractFromRow(newRow);
+						newKeys.insert(key);
+						const existing = oldByKey.get(key);
+						if (!existing) {
+							layer.recordUpsert(key, newRow, null);
+							changes.push({ op: 'insert', newRow });
+						} else if (!this.rowsEqual(existing.row, newRow)) {
+							layer.recordUpsert(key, newRow, existing.row);
+							changes.push({ op: 'update', oldRow: existing.row, newRow });
+						}
+						// else: equal under each column's collation — a no-op, no emitted change.
+					}
+
+					// Delete pass: every old key absent from the new set, ascending PK order.
+					// `oldByKey` is a private snapshot, not mutated here, so iterating it while
+					// `recordDelete` mutates the layer's tree is safe.
+					for (const path of oldByKey.ascending(oldByKey.first())) {
+						const entry = oldByKey.at(path)!;
+						if (newKeys.get(entry.key) !== undefined) continue;
+						layer.recordDelete(entry.key, entry.row);
+						changes.push({ op: 'delete', oldRow: entry.row });
 					}
 					break;
 				}
