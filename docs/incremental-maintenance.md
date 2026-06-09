@@ -99,16 +99,18 @@ covering structure answers it.
 > `T`): for a `P` change it runs `… where P.pk = :pk0` against live state, returning every
 > currently-joined row — each carrying its `T.pk` backing key — and **upserts** each. **No
 > delete is needed**, and that is the soundness crux: with an inner/cross join + enforced RI
-> and no lookup-referencing `WHERE` (rejected at create), the *set* of `T` rows joined to a
+> and no lookup-referencing `WHERE` (a `WHERE` body is declined by this arm — it falls to the
+> full-rebuild floor), the *set* of `T` rows joined to a
 > given `P` row is `{ T : T.fk = P.pk }`, determined entirely by `T.fk` (a `T` column a `P`
 > write cannot change). So a `P` change only re-derives the lookup-projected columns of
 > existing backing rows (an upsert at the unchanged `T.pk`), never adds or removes one. A
 > `T`-side membership change is the forward path's job. The plan is registered under **both**
 > source bases (`rowTimeBySource[T]` *and* `rowTimeBySource[P]`), and `maintainRowTime` passes
 > the changed base to `applyMaintenancePlan` so it routes to the forward (`T`) or reverse
-> (`P`) path. Outer joins are deferred (filtering `P` for the reverse residual would drop
-> their null-extended rows); a partial `WHERE` and a **fanning** (non-1:1) keyed join are
-> deferred too.
+> (`P`) path. Outer joins are declined by this arm (filtering `P` for the reverse residual would
+> drop their null-extended rows); a partial `WHERE` and a **fanning** (non-1:1) keyed join are
+> declined too. None of these reject — the builder returns `null` and the body falls to the
+> full-rebuild floor.
 >
 > **The `'prefix-delete'` arm — point-keyed vs prefix-keyed slice replacement.** A
 > single-source lateral-TVF fan-out body (`select T.pk…, f.* from T cross join lateral
@@ -174,7 +176,14 @@ covering structure answers it.
 > **rejects a bag** (no provable key — a key-dropping projection, a `union all` of overlapping
 > inputs) with the relational *no-provable-unique-key / must-be-a-set* diagnostic; an all-columns
 > pseudo-key counts only when the body is provably a set (`keysOf` gates it on `isSet`), so a bag
-> still rejects rather than colliding duplicates on insert. It runs a **whole-body determinism**
+> still rejects rather than colliding duplicates on insert. (**Known gap:** the bag reject is only
+> as sound as the optimizer's `isSet` inference. A **fanning** (non-1:1) inner/cross join of two
+> sets is over-claimed a set by `buildJoinRelationType` — `join-utils.ts` derives `isSet` from
+> `leftType.isSet && rightType.isSet` without proving the join is row-preserving — so the floor
+> *accepts* such a body and then silently collapses the duplicates its all-columns backing key
+> cannot hold, diverging from the plain view. Tracked by fix ticket
+> `join-fanning-isset-overclaim`; once `isSet` is correct, the fanning join routes to this very bag
+> reject.) It runs a **whole-body determinism**
 > check (hard-reject unless `pragma nondeterministic_schema`, mirroring the per-arm rejects), and
 > collects **every** source the body reads into `sourceBases` so `planSourceBases` indexes the plan
 > under each — a write to *any* of them dirties the MV. The optimized body (read-side MV rewrite
@@ -183,10 +192,33 @@ covering structure answers it.
 > fresh-context `runScheduler` path the residual arms use, but with no params — it runs the whole
 > body, not a key-filtered slice), collects the rows, and applies a single `'replace-all'`
 > {@link MaintenanceOp}; the effective `BackingRowChange[]` drives the MV-over-MV cascade unchanged.
-> The arm is **wired and exercised in isolation** (`maintenance-equivalence.spec.ts` § full-rebuild
-> floor), but `buildMaintenancePlan` does not yet *route* bodies to it — the eligibility flip that
-> makes the floor the default (and the size-threshold reject for a full-rebuild-only body over a
-> large source) lands in a follow-on ticket.
+> **Eligibility is cost-gated with a floor, never a shape allowlist.** `buildMaintenancePlan` tries
+> a bounded-delta arm (`tryBuildBoundedDeltaArm`); a body whose shape fits **none** falls through to
+> `buildFullRebuildPlan`. Each arm builder likewise returns `null` (not a reject) on a sub-shape
+> mismatch and falls through. **No body is rejected for its shape** — the only four create-time
+> rejections are all *non-shape*: a **non-deterministic** body (hard-rejected in the matched arm so
+> its arm-specific diagnostic survives, or in the floor's whole-body determinism check), a **bag**
+> (no provable unique key — the floor's `keysOf` reject), a body with **no relational output**, and
+> the **size** reject below. The bounded-delta arms stay preferred by the argmin cost gate
+> (`selectMaintenanceStrategy`); full-rebuild is chosen exactly when no bounded-delta arm is sound
+> (an empty sound set resolves to the floor), so an existing eligible shape is unaffected.
+>
+> **The size reject — the one create-time gate the floor adds.** When full-rebuild is a body's
+> *only* sound strategy, every source write re-scans the whole body, so a large source makes each
+> write pathological. `buildFullRebuildPlan` reads the live row count of **every** participating
+> source from the `StatsProvider` and gates on the **largest** (a tiny driving table joined to a
+> huge lookup gates on the lookup), rejecting when it exceeds the configurable
+> `materialized_view_rebuild_row_threshold` option (default `MAINTENANCE_REBUILD_ROW_THRESHOLD` =
+> 10 000; reachable via `pragma materialized_view_rebuild_row_threshold = N`). The threshold is
+> threaded into `isFullRebuildPathological(stats, threshold)` (`planner/cost/index.ts`); a value of
+> `0` **disables** the reject (accept any size). The diagnostic names the offending source, its
+> estimated row count, the threshold, and how to raise/disable it.
+>
+> The arm is exercised in `maintenance-equivalence.spec.ts` § full-rebuild floor (isolation +
+> deferral) and end-to-end through `buildMaintenancePlan`'s routing in
+> `materialized-view-diagnostics.spec.ts` (the four non-shape rejects, the size reject + pragma
+> disable, largest-source gating) and `53-materialized-views-rowtime.sqllogic` § 7 (the flipped
+> shape acceptances).
 >
 > **The end-of-statement flush — full-rebuild is the one deferred arm.** Re-evaluating the whole
 > body per source row would be O(rows × body), so the full-rebuild arm is **deferred to a single
@@ -194,7 +226,12 @@ covering structure answers it.
 > `deferred: Set<string>` (MV keys): a `'full-rebuild'` plan is **marked dirty** there (no per-row
 > apply) instead of rebuilt, while the bounded-delta arms stay **per-row-immediate** (cheap, and the
 > covering-UNIQUE enforcement scan depends on their per-row backing visibility — a full-rebuild MV is
-> never a covering structure, so deferring it cannot starve that scan). The DML executor
+> never used as a covering structure, so deferring it cannot starve that scan). That invariant is
+> enforced at the lookup: `findRowTimeCoveringStructure` skips any plan whose `chosenStrategy` is
+> `'full-rebuild'`, so a join/`distinct`/… body that the coverage prover admits (now SQL-reachable
+> after the eligibility flip) and which falls to the floor still does **not** answer enforcement —
+> the auto-index does. (The eager `coveringStructureName` link the prover stamps is informational
+> only; the strategy skip is the authoritative gate.) The DML executor
 > (`runtime/emit/dml-executor.ts`) owns one `deferred` set per statement alongside the
 > `BackingConnectionCache`, threads it through every `maintainRowTimeStructures` call, and drains it
 > via `Database._flushDeferredRebuilds` → `MaterializedViewManager.flushDeferredRebuilds` at the

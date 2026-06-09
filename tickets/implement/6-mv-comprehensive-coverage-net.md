@@ -1,12 +1,12 @@
 description: The robustness net for comprehensive MV maintenance — extend the maintenance-equivalence property harness over every formerly-rejected body shape (the proof that no shape is a coverage gap), finish the companion timeless docs (architecture.md, future-enhancements backlog), and do the diagnostics sweep.
-prereq: mv-join-where-widening
+prereq: mv-join-where-widening, join-fanning-isset-overclaim
 files: packages/quereus/test/incremental/maintenance-equivalence.spec.ts, packages/quereus/test/logic/53-materialized-views-rowtime.sqllogic, packages/quereus/test/materialized-view-diagnostics.spec.ts, docs/architecture.md, docs/incremental-maintenance.md, tickets/backlog/known/5-view-lens-mv-future-enhancements.md
 ----
 
 The earlier tickets make every body maintainable; this one *proves* it and aligns the remaining docs. The maintenance-equivalence harness is the contract: over a zoo of body shapes and random source mutation batches, `read(MV) == evaluate(body)` must hold after every batch and after rollback. Extending it across the formerly-rejected shapes is what makes "comprehensive, never revisit" real — coverage is demonstrated, not asserted shape-by-shape.
 
 **Harness zoo extension** (`test/incremental/maintenance-equivalence.spec.ts`). Add body shapes that now route through the full-rebuild floor or the widened join arm:
-- fanning (non-1:1) inner join; outer (left) 1:1 join;
+- a fanning (non-1:1) inner join is a **bag** once `join-fanning-isset-overclaim` lands — it is a *reject*, not an equivalence-zoo case (add it to the diagnostics reject spec, per the "bag body is a reject" note below); outer (left) 1:1 join;
 - 2-leg `union` and `union all`-with-key... (only keyed/set bodies — a true bag body is a *reject*, tested separately);
 - a small recursive CTE;
 - a >2-source join;

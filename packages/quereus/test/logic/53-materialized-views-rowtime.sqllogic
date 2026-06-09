@@ -177,9 +177,10 @@ select * from s_o order by x;
 --    (re-evaluate the whole body, replace the backing). Only four NON-shape rejections
 --    remain: non-determinism, a bag (no provable unique key), no relational output, and a
 --    full-rebuild-only body over a source past the size threshold (the size reject needs
---    StatsProvider counts → covered in materialized-view-diagnostics.spec.ts; the threshold
---    pragma and its 0-disables behavior are in §27). This section pins the remaining rejects
---    (distinctive tails) AND the shape ACCEPTANCES the flip introduced.
+--    StatsProvider counts, and the threshold pragma / its 0-disables behavior / invalid-value
+--    rejection are all covered in materialized-view-diagnostics.spec.ts). This section pins the
+--    remaining rejects (distinctive tails) AND the shape ACCEPTANCES the flip introduced; §26
+--    below then exercises full-rebuild-floor maintenance end-to-end under SQL writes.
 -- ===================================
 
 create table g (id integer primary key, k integer, v integer);
@@ -1214,12 +1215,11 @@ select id, fk, name from jmv order by id;
 --     drains a per-statement deferred-rebuild set at the end-of-statement savepoint
 --     boundary — but ONLY the FULL-REBUILD arm is ever deferred there. Every arm above is
 --     a BOUNDED-DELTA arm, applied per source row immediately, so for these the deferred set
---     stays empty and the flush is a transparent no-op. The full-rebuild arm is not yet
---     reachable from `create materialized view` (the eligibility flip is a later ticket), so
---     its deferred-flush behavior is exercised white-box in
---     test/incremental/maintenance-equivalence.spec.ts (forceFullRebuild + an instrumented
---     rebuild counter) — one rebuild per bulk statement, atomic rollback of a dirtying
---     statement that fails, autocommit flush+commit, mixed-arm, and MV-over-MV mixed-arm.
+--     stays empty and the flush is a transparent no-op. The full-rebuild arm is now reachable
+--     from `create materialized view` (the eligibility flip — this ticket); §26 below exercises
+--     its deferred flush end-to-end under SQL writes, while its instrumented rebuild-count, atomic
+--     rollback, autocommit flush+commit, mixed-arm, and MV-over-MV mixed-arm behavior stays
+--     white-box in test/incremental/maintenance-equivalence.spec.ts (forceFullRebuild + a counter).
 --
 --     The cases below regression-guard that adding the deferred set + flush hook left the
 --     bounded-delta arms untouched: a bulk multi-row statement that also crosses a partial
@@ -1247,3 +1247,41 @@ select id, x from fb2 order by id;
 delete from fb where id in (2, 3);
 select id, x from fb2 order by id;
 → []
+
+-- ===================================
+-- 26. Full-rebuild floor maintenance under SQL writes (mv-eligibility-floor-fallthrough). A body
+--     that fits no bounded-delta arm — here a 2-source UNION — is maintained by the always-correct
+--     full-rebuild floor: re-evaluated wholesale at the end-of-statement flush, then `replace-all`
+--     onto the backing. insert / update / delete on EITHER source must reflect through the MV after
+--     each statement commits. (The deferred-flush internals — one rebuild per bulk statement,
+--     atomic rollback, mixed-arm — are white-box in maintenance-equivalence.spec.ts; this is the
+--     end-to-end SQL proof that the floor is now create-reachable and maintained.)
+-- ===================================
+
+create table u1 (id integer primary key, v integer);
+create table u2 (id integer primary key, v integer);
+insert into u1 values (1, 10), (2, 20);
+insert into u2 values (3, 30);
+create materialized view u_all as select id, v from u1 union select id, v from u2;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":10},{"id":2,"v":20},{"id":3,"v":30}]
+
+-- insert into the SECOND source → floor rebuild picks it up.
+insert into u2 values (4, 40);
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":10},{"id":2,"v":20},{"id":3,"v":30},{"id":4,"v":40}]
+
+-- update a row in the FIRST source → the rebuilt body reflects the new value.
+update u1 set v = 99 where id = 1;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":99},{"id":2,"v":20},{"id":3,"v":30},{"id":4,"v":40}]
+
+-- delete from the second source → the row leaves the rebuilt body.
+delete from u2 where id = 3;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":99},{"id":2,"v":20},{"id":4,"v":40}]
+
+-- a bulk multi-row UPDATE on the first source in one statement → all reflected after commit.
+update u1 set v = v + 1;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":100},{"id":2,"v":21},{"id":4,"v":40}]

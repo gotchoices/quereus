@@ -2097,11 +2097,16 @@ export class MaterializedViewManager {
 	 * Resolve the linked, enforcement-ready covering MV for a UNIQUE constraint on
 	 * `schema.table`, or `undefined`. The constraint's `coveringStructureName`
 	 * forward pointer (set by the eager prove-and-link) is the source of truth;
-	 * this confirms a live row-time plan exists for the source and the MV is not
-	 * `stale` (structural breakage) — only then is its backing table row-time
-	 * consistent enough to answer conflict resolution. O(1) negative fast path off
-	 * {@link rowTimeBySource} so a source table with no row-time covering MV pays a
-	 * single map lookup and stays on the synchronous index/scan path.
+	 * this confirms a live row-time plan exists for the source, the MV is not
+	 * `stale` (structural breakage), and the plan is **per-row maintained** — only
+	 * then is its backing table row-time consistent enough to answer conflict
+	 * resolution. A `'full-rebuild'` plan is deferred to the end-of-statement flush
+	 * (its backing lags the source mid-statement), so it can never serve as a
+	 * covering structure for a synchronous per-row UNIQUE probe — it is skipped here
+	 * regardless of any (informational) `coveringStructureName` link, which keeps the
+	 * eligibility flip from opening a stale-read enforcement path. O(1) negative fast
+	 * path off {@link rowTimeBySource} so a source table with no row-time covering MV
+	 * pays a single map lookup and stays on the synchronous index/scan path.
 	 */
 	findRowTimeCoveringStructure(
 		schemaName: string,
@@ -2118,6 +2123,9 @@ export class MaterializedViewManager {
 			if (!plan) continue;
 			const mv = plan.mv;
 			if (mv.name !== mvName) continue; // must be THE linked covering MV
+			// A deferred full-rebuild MV is not per-row consistent (reconciled only at
+			// the end-of-statement flush), so it cannot answer a synchronous probe.
+			if (plan.chosenStrategy === 'full-rebuild') return undefined;
 			if (mv.stale) return undefined; // not row-time consistent
 			return mv;
 		}

@@ -390,20 +390,24 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		}
 	});
 
-	it('create-time gate: a join body is rejected and the create rolls back cleanly (no MV, no link)', async () => {
-		// The prover admits this join body as covering (the prove() tests above), but
-		// a join body is not row-time maintainable, so the mandatory create gate
-		// rejects it. Join-body MVs are deferred to materialized-view-rowtime-general-bodies.
+	it('create-time gate: a 1:1 join body is now ACCEPTED (floor-maintained) but the deferred MV is NOT an enforcing covering structure', async () => {
+		// The prover admits this join body as covering (the prove() tests above). Under the
+		// cost-gated-with-floor model (ticket `mv-eligibility-floor-fallthrough`) no body is
+		// rejected for its shape: this 1:1 outer join is ACCEPTED and maintained by the
+		// full-rebuild floor (cf. 53-materialized-views-rowtime.sqllogic § 7, ok_join_outer).
 		const body = 'select o.customer_id, o.sku, o.id from orders o left join customers c on o.customer_id = c.id order by o.customer_id, o.sku';
 		const db = await freshDb(ORDERS_CUSTOMERS);
 		try {
-			let err: unknown;
-			try { await db.exec(`create materialized view ix as ${body}`); } catch (e) { err = e; }
-			expect(err, 'join body rejected at create').to.not.be.undefined;
-			expect(String((err as Error).message)).to.contain('cannot be materialized');
-			// Rolled back: no MV registered, and the UNIQUE constraint keeps no link.
-			expect(db.schemaManager.getMaterializedView('main', 'ix'), 'no MV after rejected create').to.be.undefined;
-			expect(db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0].coveringStructureName, 'no forward pointer').to.be.undefined;
+			await db.exec(`create materialized view ix as ${body}`); // accepted, no throw
+			expect(db.schemaManager.getMaterializedView('main', 'ix'), 'MV registered (no shape reject)').to.not.be.undefined;
+			// Soundness: a full-rebuild MV's backing is reconciled only at the end-of-statement
+			// flush, so it lags the source mid-statement and can NEVER answer a synchronous
+			// per-row UNIQUE probe. Enforcement must not resolve it as a covering structure —
+			// it falls back to the auto-index. (Guards the flip against stale-read enforcement;
+			// see findRowTimeCoveringStructure's full-rebuild skip.)
+			const uc = db.schemaManager.getTable('main', 'orders')!.uniqueConstraints![0];
+			expect(db._findRowTimeCoveringStructure('main', 'orders', uc),
+				'a deferred full-rebuild MV is not an enforcing covering structure').to.be.undefined;
 		} finally {
 			await db.close();
 		}
