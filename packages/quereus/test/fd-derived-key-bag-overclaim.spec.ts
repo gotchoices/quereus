@@ -34,6 +34,17 @@
  * value-equality lifted as an EC) just like sites 4–6:
  *
  *   7. guard-activated `{a}↔{b}` bi-FD          (implication CHECK + filter, a/b non-keyed)
+ *
+ * The fold gate keys off the FD SHAPE (single↔single), NOT the `valueEquality`
+ * marker, because `shiftFds` (join) / `projectFds` (subquery) reconstruct FD objects
+ * and drop the marker — so a marker-gated fold would resurface the over-claim once the
+ * FD reaches the Filter through a join/projection (site 7 marker-loss tests). Gating on
+ * shape also covers the ONE-WAY guarded determination FD (`… or b = a + 1` → `{a}→{b}`,
+ * never tagged value-equality), sealing it in the same pass:
+ *
+ *   8. guard-activated one-way `{a}→{b}` FD     (implication CHECK `b = a+1` + filter, a/b non-keyed)
+ *
+ * (ticket fd-oneway-guard-activation-key-bag-overclaim, folded into site 7's gate.)
  */
 
 import { expect } from 'chai';
@@ -125,6 +136,24 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 			create table tgactpk (a integer primary key, b integer, status text,
 				check (status <> 'active' or a = b));
 			insert into tgactpk values (1, 1, 'active'), (2, 2, 'active'), (3, 3, 'active');
+			-- Site 7 marker-loss probe: a single-row table to cross-join against, so the
+			-- value-equality FD reaches the Filter through the join's shiftFds (which
+			-- drops the valueEquality marker) / a subquery's projectFds. The fold gate
+			-- must still fire on the FD SHAPE, not the marker, or the over-claim resurfaces.
+			create table other (k integer primary key);
+			insert into other values (1);
+
+			-- Site 8 (one-way guarded determination): an implication CHECK with a
+			-- single-column-EXPRESSION body (b = a + 1) emits a one-way {a}->{b} [g]
+			-- (NOT tagged valueEquality). Activation must gate it identically; id is PK
+			-- so a/b are not keys.
+			create table tow (id integer primary key, a integer, b integer, status text,
+				check (status <> 'active' or b = a + 1));
+			insert into tow values (1, 1, 2, 'active'), (2, 1, 2, 'active'), (3, 3, 4, 'active');
+			-- Site 8 control: a IS the PK, so {a}→{b} is a sound key.
+			create table towpk (a integer primary key, b integer, status text,
+				check (status <> 'active' or b = a + 1));
+			insert into towpk values (1, 2, 'active'), (3, 4, 'active'), (5, 6, 'active');
 		`);
 	});
 	afterEach(async () => { await db.close(); });
@@ -246,6 +275,36 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 	it('site 7 control — DISTINCT where the activated endpoint a is the PK is ELIMINATED', () => {
 		const sql = `select distinct a, b from tgactpk where status = 'active'`;
 		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a,b} a real key ⇒ set')
+			.to.have.length(0);
+	});
+
+	// ---- Site 7 marker-loss: the gate must key off FD shape, not the marker ----
+	// `shiftFds` (join) / `projectFds` (subquery) reconstruct FD objects and DROP the
+	// `valueEquality` marker, so a marker-gated fold would resurface the over-claim
+	// (wrong results) once the value-equality FD reaches the Filter through one of them.
+	it('site 7 (join shiftFds drops marker) — DISTINCT over a cross-joined bi-FD is RETAINED', async () => {
+		const sql = `select distinct t.a, t.b from other o cross join tgact t where t.status = 'active'`;
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a/b not keys)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
+	});
+
+	it('site 7 (subquery projectFds drops marker) — DISTINCT over a projected bi-FD is RETAINED', async () => {
+		const sql = `select distinct a, b from (select a, b, status from tgact) where status = 'active'`;
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
+	});
+
+	// ---- Site 8: one-way guarded determination FD activated by the Filter ----
+	it('site 8 — DISTINCT over `select a,b` of a guard-activated one-way FD (NON-key) is RETAINED', async () => {
+		const sql = `select distinct a, b from tow where status = 'active'`;
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a/b not keys)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs: (1,2),(3,4)').to.equal(2);
+	});
+
+	it('site 8 control — DISTINCT where the one-way determinant a is the PK is ELIMINATED', () => {
+		const sql = `select distinct a, b from towpk where status = 'active'`;
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a}→{b} sound key ⇒ set')
 			.to.have.length(0);
 	});
 });

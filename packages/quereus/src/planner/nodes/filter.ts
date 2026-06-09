@@ -245,21 +245,30 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
  * Unentailed guarded FDs pass through unchanged so a later Filter / Join can
  * still activate them once additional facts land.
  *
- * A guarded **value-equality** body (`status <> 'active' or a = b`) emits the
- * mirror FDs `{a}→{b} [g]` and `{b}→{a} [g]`, each tagged `valueEquality` by
- * `recognizeGuardedBody`. Stripping the guard yields an unconditional `{a}↔{b}`,
- * which `deriveKeysFromFds` reads as a uniqueness claim — sound only when an
- * endpoint is a genuine key (else a narrow `select distinct a, b` re-derives a
- * phantom all-columns key, a bag as a set, and drops a REQUIRED DISTINCT). So we
- * gate the fold on endpoint superkey-ness against the filter's INPUT keys, and
- * surface the equality as an EC instead (returned via `activatedEquivPairs`,
- * lifted by the caller; `keysOf` never reads ECs). The EC lift keys off the
- * `valueEquality` marker — NOT the FD shape — because a coincidental
- * mutual-determination mirror (two partial UNIQUE indexes on a 2-col table, or
- * `b=a+1` + `a=b-1` checks) is structurally identical to a value-equality pair
- * but does NOT hold `a = b`; lifting an EC there would be unsound. Returns the
- * activated FD set plus any value-equality pairs to lift as ECs.
- * (ticket fd-guarded-activation-key-bag-overclaim, site 7; mirrors site 5.)
+ * Any activated **single↔single** determination FD `{a}→{b}` is read by
+ * `deriveKeysFromFds` as a uniqueness claim — sound only when an endpoint is a
+ * genuine key (else a narrow `select distinct a, b` re-derives a phantom
+ * all-columns key, a bag as a set, and drops a REQUIRED DISTINCT). So the fold is
+ * gated on endpoint superkey-ness against the filter's INPUT keys for **every**
+ * single↔single activated FD, regardless of its origin: a guarded value-equality
+ * body (`status <> 'active' or a = b` → mirror `{a}↔{b}`), a one-way determination
+ * (`… or b = a + 1` → `{a}→{b}`), and an index-derived guarded pair all over-claim
+ * identically. Gating on the FD SHAPE (not the `valueEquality` marker) is required
+ * for soundness because `shiftFds`/`projectFds` DROP the marker, so a value-equality
+ * FD activated through a join/projection arrives unmarked and would otherwise fold
+ * ungated. (Multi-dependent key FDs like `{c}→{id,region,amt}` from a partial UNIQUE
+ * are NOT single↔single and pass through — a genuinely unique determinant.)
+ *
+ * A genuine value-equality additionally surfaces its equality as an EC (returned via
+ * `activatedEquivPairs`, lifted by the caller; `keysOf` never reads ECs, so the EC is
+ * sound regardless of key-ness). The EC lift — and ONLY the EC lift — keys off the
+ * `valueEquality` marker, NOT the FD shape, because a coincidental mutual-determination
+ * mirror (two partial UNIQUE indexes on a 2-col table, or `b=a+1` + `a=b-1` checks) is
+ * structurally identical to a value-equality pair but does NOT hold `a = b`; lifting an
+ * EC there would be unsound. Losing the marker (join/projection path) therefore loses
+ * only the EC optimization — an under-claim — never soundness. Returns the activated FD
+ * set plus any value-equality pairs to lift as ECs.
+ * (tickets fd-guarded-activation-key-bag-overclaim site 7, fd-oneway-guard-activation-key-bag-overclaim; mirrors site 5.)
  */
 function activateGuardedFds(
 	sourceFds: ReadonlyArray<FunctionalDependency>,
@@ -279,16 +288,26 @@ function activateGuardedFds(
 			continue;
 		}
 		if (predicateImpliesGuard(predicate, fd.guard, ecs, bindings, attrIdToIndex, isColumnNonNullable, isColumnNumeric)) {
-			if (fd.valueEquality === true && fd.determinants.length === 1 && fd.dependents.length === 1) {
-				// Genuine value-equality (marker-gated): lift the equality as an EC
-				// unconditionally (sound, and not read by `keysOf`), and fold the
-				// now-unguarded determination FD only when an endpoint is a real key.
-				// `isSuperkey` probes against `sourceFds`, whose guarded FDs are
-				// skipped by `computeClosure`, so only the genuine unguarded input
-				// keys count — matching the site-4 / site-5 gates.
+			if (fd.determinants.length === 1 && fd.dependents.length === 1) {
+				// A single↔single activated determination FD `{a}→{b}` is read by
+				// `deriveKeysFromFds` as a uniqueness claim, sound only when an endpoint
+				// is a genuine key — else a narrow `select distinct a, b` re-derives a
+				// phantom all-columns key (a bag as a set) and drops a REQUIRED DISTINCT.
+				// Gate the fold on endpoint superkey-ness against the filter's INPUT keys
+				// for ALL single↔single activated FDs — NOT just `valueEquality`-tagged
+				// ones — because (a) the marker is dropped by shiftFds/projectFds, so a
+				// value-equality FD activated through a join/projection would otherwise
+				// fold ungated (wrong results), and (b) a one-way `{a}→{b}` (`b = a + 1`)
+				// over-claims identically. `isSuperkey` probes `sourceFds`, whose guarded
+				// FDs `computeClosure` skips, so only genuine unguarded input keys count
+				// (matching the site-4 / site-5 gates). A genuine value-equality
+				// additionally lifts its equality as an EC (sound, never read by `keysOf`);
+				// the `valueEquality` marker gates ONLY that EC lift, never the fold.
 				const a = fd.determinants[0];
 				const b = fd.dependents[0];
-				activatedEquivPairs.push([a, b]);
+				if (fd.valueEquality === true) {
+					activatedEquivPairs.push([a, b]);
+				}
 				if (!isSuperkey(new Set([a]), sourceFds, colCount)
 					&& !isSuperkey(new Set([b]), sourceFds, colCount)) {
 					continue;
