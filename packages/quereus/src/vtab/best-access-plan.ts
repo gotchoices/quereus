@@ -139,6 +139,27 @@ export interface BestAccessPlanResult {
 	};
 
 	/**
+	 * The module honours each index column's declared COLLATION when filtering and
+	 * positioning a NON-equality (range / BETWEEN / prefix-range / OR_RANGE) index
+	 * seek — i.e. it compares range bounds and early-terminates the walk under the
+	 * index collation, not a fixed BINARY comparator.
+	 *
+	 * Default/absent ⇒ the access-path collation-cover analysis
+	 * (`classifyConstraintCover` in `rule-select-access-path.ts`) conservatively
+	 * DECLINES a non-BINARY range seek (predicate collation = index collation but not
+	 * BINARY) and falls back to a scan + residual, because a BINARY bound filter over
+	 * a non-BINARY-ordered window would under-fetch case/space variants.
+	 *
+	 * When true, that range seek is permitted whenever the predicate's effective
+	 * collation equals the index collation (mirroring the equality MATCH arm). Only
+	 * modules whose runtime actually threads the index collation into the bound
+	 * compare may set this — the in-memory vtab does (`scan-layer.ts` /
+	 * `plan-filter.ts`); the store module does NOT (its range filter is BINARY), so
+	 * it leaves this off and keeps the conservative decline.
+	 */
+	honorsCollatedRangeBounds?: boolean;
+
+	/**
 	 * The access path supports O(log N) seek to the kth row in monotonic
 	 * order — i.e., LIMIT n OFFSET k can be pushed into the scan instead
 	 * of buffer-and-discard. Implies `monotonicOn` is set.

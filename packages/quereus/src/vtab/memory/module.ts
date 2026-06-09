@@ -210,7 +210,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		logger.debugLog(`[getBestAccessPlan] Selected plan: ${bestPlan.explains} (cost: ${bestPlan.cost}, rows: ${bestPlan.rows})`);
 
-		return bestPlan;
+		// The in-memory scan layer threads each index column's declared collation into
+		// the range-bound filter and early-termination (scan-plan → plan-filter /
+		// scan-layer), so a non-BINARY range/prefix seek visits the collation-correct
+		// window. Advertise this so the access-path collation-cover analysis permits a
+		// collation-matched non-BINARY range seek instead of declining to a scan.
+		return { ...bestPlan, honorsCollatedRangeBounds: true };
 	}
 
 	/**

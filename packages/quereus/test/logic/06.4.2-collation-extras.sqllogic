@@ -285,3 +285,49 @@ select id from btw_bin where name between 'bob' collate NOCASE and 'bob' collate
 → [{"id":2},{"id":4}]
 
 drop table btw_bin;
+
+-- =============================================================================
+-- Collation-matched non-BINARY range / BETWEEN over a matching-collation index
+-- =============================================================================
+-- A NOCASE (or RTRIM) range whose predicate collation matches the index collation
+-- uses an index seek on the in-memory backend (which threads the index collation into
+-- the bound filter + early-termination) and a scan + residual on backends whose range
+-- filter is BINARY (e.g. the store) — either way the rows must equal the
+-- collation-correct set. Result-only here so both backends are asserted identically;
+-- the plan-shape assertions live in test/optimizer/range-seek-collation-bounds.spec.ts.
+-- Regression for `memory-range-seek-collation-bounds`.
+
+-- NOCASE primary-key range. PK values are NOCASE-distinct, but their BINARY order
+-- ('Banana','CHERRY','apple','date') differs from NOCASE order ('apple','Banana',
+-- 'CHERRY','date'), so a BINARY bound filter would under-fetch.
+create table rng_pk_nc (name text collate NOCASE primary key, n integer);
+insert into rng_pk_nc values ('apple', 1), ('Banana', 2), ('CHERRY', 3), ('date', 4);
+
+select n from rng_pk_nc where name > 'banana' order by n;
+→ [{"n":3},{"n":4}]
+
+select n from rng_pk_nc where name between 'banana' and 'cherry' order by n;
+→ [{"n":2},{"n":3}]
+
+drop table rng_pk_nc;
+
+-- NOCASE secondary index over case-variant rows (non-unique index): the >= bound
+-- includes both 'Banana' and 'BANANA'.
+create table rng_sec_nc (id integer primary key, name text collate NOCASE);
+insert into rng_sec_nc values (1, 'apple'), (2, 'Banana'), (3, 'CHERRY'), (4, 'date'), (5, 'BANANA');
+create index idx_rng_sec_nc on rng_sec_nc (name);
+
+select id from rng_sec_nc where name >= 'banana' order by id;
+→ [{"id":2},{"id":3},{"id":4},{"id":5}]
+
+drop table rng_sec_nc;
+
+-- RTRIM range: trailing spaces ignored on both the bound and the stored values.
+create table rng_rtrim (id integer primary key, val text collate RTRIM);
+insert into rng_rtrim values (1, 'cat'), (2, 'cat  '), (3, 'dog'), (4, 'doe '), (5, 'ant');
+create index idx_rng_rtrim on rng_rtrim (val);
+
+select id from rng_rtrim where val > 'cat' order by id;
+→ [{"id":3},{"id":4}]
+
+drop table rng_rtrim;

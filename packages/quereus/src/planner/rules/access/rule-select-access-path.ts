@@ -276,6 +276,9 @@ function selectPhysicalNodeFromPlan(
 	providesOrdering: { column: number; desc: boolean }[] | undefined
 ): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
+	// Whether this module's runtime honours the index collation for range bounds —
+	// gates the collation-matched non-BINARY range/prefix seek (see classifyConstraintCover).
+	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	const seekCols = accessPlan.seekColumnIndexes!;
 	// Map accessPlan.indexName to physical node indexName ('_primary_' → 'primary')
 	const physicalIndexName = accessPlan.indexName === '_primary_' ? 'primary' : accessPlan.indexName!;
@@ -323,6 +326,7 @@ function selectPhysicalNodeFromPlan(
 			seekCols.map(colIdx => ({ colIdx, constraint: eqBySeekCol.get(colIdx)! })),
 			true,
 			indexColumnCollationLookup(tableRef.tableSchema, accessPlan),
+			honorsCollatedRangeBounds,
 		);
 		if (!cover.useIndex) {
 			log('Declining index seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
@@ -588,7 +592,7 @@ function selectPhysicalNodeFromPlan(
 				const hi = trailing.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
 				if (lo) consumed.push({ colIdx: trailingRangeCol, constraint: lo });
 				if (hi) consumed.push({ colIdx: trailingRangeCol, constraint: hi });
-				const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan));
+				const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
 				if (!cover.useIndex) {
 					log('Declining prefix-range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
 					const scan = createSeqScan(tableRef);
@@ -669,7 +673,7 @@ function selectPhysicalNodeFromPlan(
 			const consumed: ConsumedConstraint[] = [];
 			if (lower) consumed.push({ colIdx: rangeCol, constraint: lower });
 			if (upper) consumed.push({ colIdx: rangeCol, constraint: upper });
-			const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan));
+			const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
 			if (!cover.useIndex) {
 				log('Declining range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
 				const scan = createSeqScan(tableRef);
@@ -729,6 +733,7 @@ function selectPhysicalNodeFromPlan(
 				[{ colIdx: orRangeConstraint.columnIndex, constraint: orRangeConstraint }],
 				false,
 				indexColumnCollationLookup(tableRef.tableSchema, accessPlan),
+				honorsCollatedRangeBounds,
 			);
 			if (!cover.useIndex) {
 				log('Declining OR_RANGE seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
@@ -828,6 +833,7 @@ function selectPhysicalNodeLegacy(
 	providesOrdering: { column: number; desc: boolean }[] | undefined
 ): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
+	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	// Analyze the access plan to determine node type
 	const handledByCol = new Set<number>();
 	constraints.forEach((c, i) => {
@@ -863,6 +869,7 @@ function selectPhysicalNodeLegacy(
 			pkCols.map(pk => ({ colIdx: pk.index, constraint: eqByCol.get(pk.index)! })),
 			true,
 			primaryKeyCollationLookup(tableRef.tableSchema),
+			honorsCollatedRangeBounds,
 		);
 		if (!cover.useIndex) {
 			log('Declining PK index seek (collation mismatch) — sequential scan + residual (legacy)');
@@ -916,7 +923,7 @@ function selectPhysicalNodeLegacy(
 			const consumed: ConsumedConstraint[] = [];
 			if (lower) consumed.push({ colIdx: primaryFirstCol, constraint: lower });
 			if (upper) consumed.push({ colIdx: primaryFirstCol, constraint: upper });
-			const cover = classifyCollationCover(consumed, false, primaryKeyCollationLookup(tableRef.tableSchema));
+			const cover = classifyCollationCover(consumed, false, primaryKeyCollationLookup(tableRef.tableSchema), honorsCollatedRangeBounds);
 			if (!cover.useIndex) {
 				log('Declining PK range seek (collation mismatch) — sequential scan + residual (legacy)');
 				const scan = createSeqScan(tableRef);
@@ -1259,8 +1266,14 @@ function primaryKeyCollationLookup(tableSchema: TableSchema): (colIdx: number) =
 		normalizeCollationName(tableSchema.columns[colIdx]?.collation ?? 'BINARY');
 }
 
-/** Cover relation for a single seek column. See {@link CollationCover}. */
-function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean): CollationCover {
+/**
+ * Cover relation for a single seek column. See {@link CollationCover}.
+ *
+ * `honorsCollatedRangeBounds` is the module's advertisement (off by default) that its
+ * runtime filters range bounds under the index collation rather than BINARY; it gates
+ * the non-BINARY range MATCH and is ignored for equality.
+ */
+function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean, honorsCollatedRangeBounds: boolean): CollationCover {
 	if (isEquality) {
 		if (predColl === indexColl) return 'MATCH';
 		// BINARY equality ⟹ equal under any collation, so a non-BINARY index over-fetches
@@ -1271,16 +1284,16 @@ function classifyConstraintCover(predColl: string, indexColl: string, isEquality
 		}
 		return 'MISMATCH_UNSAFE';
 	}
-	// Range (non-equality) seek: the memory runtime positions the seek by the index's
-	// declared collation but filters the range bounds — and early-terminates the walk —
-	// with a BINARY comparator (`plan-filter.ts` / `scan-layer.ts`). So a range seek
-	// reproduces the predicate ONLY when its effective collation is BINARY and the index
-	// is BINARY-ordered. Any non-BINARY collation (even one that matches the index)
-	// reorders the walked window relative to the BINARY bound filter — under-fetching
-	// case/space variants — so the seek is not a recoverable superset; decline to a
-	// scan + residual. (Honouring non-BINARY range bounds in the scan layer is tracked
-	// separately as `memory-range-seek-collation-bounds`.)
-	if (predColl === 'BINARY' && indexColl === 'BINARY') return 'MATCH';
+	// Range (non-equality) seek. A BINARY-over-BINARY range always reproduces the
+	// predicate. A collation-MATCHED non-BINARY range (predColl === indexColl ≠ BINARY)
+	// reproduces it ONLY when the module's runtime filters the bounds — and
+	// early-terminates the walk — under that same index collation; the in-memory vtab
+	// does (`plan-filter.ts` / `scan-layer.ts`, threaded via `scan-plan.ts`) and
+	// advertises `honorsCollatedRangeBounds`, whereas a module that bound-filters BINARY
+	// would under-fetch case/space variants. Any collation MISMATCH reorders the walked
+	// window relative to the predicate's intended order and is never a recoverable
+	// superset (unlike a COARSER_SAFE equality), so it always declines.
+	if (predColl === indexColl && (predColl === 'BINARY' || honorsCollatedRangeBounds)) return 'MATCH';
 	return 'MISMATCH_UNSAFE';
 }
 
@@ -1296,12 +1309,15 @@ function classifyConstraintCover(predColl: string, indexColl: string, isEquality
  * `isEquality` gates the `COARSER_SAFE` class: a coarser index can only over-fetch a
  * *superset* for an equality/IN seek. For a range/prefix-range/OR_RANGE seek a
  * collation mismatch reorders the index, so the walked window is not a superset and
- * any mismatch is `MISMATCH_UNSAFE`.
+ * any mismatch is `MISMATCH_UNSAFE`. `honorsCollatedRangeBounds` (the module's
+ * advertisement, off by default) gates the collation-matched non-BINARY range MATCH;
+ * it is forwarded to {@link classifyConstraintCover} and ignored for equality.
  */
 function classifyCollationCover(
 	consumed: ConsumedConstraint[],
 	isEquality: boolean,
-	collationForColumn: (colIdx: number) => string
+	collationForColumn: (colIdx: number) => string,
+	honorsCollatedRangeBounds: boolean
 ): CollationCoverDecision {
 	const allResiduals: ScalarPlanNode[] = [];
 	const coarserResiduals: ScalarPlanNode[] = [];
@@ -1311,7 +1327,7 @@ function classifyCollationCover(
 		allResiduals.push(constraint.sourceExpression);
 		const predColl = effectivePredicateCollation(constraint);
 		const indexColl = collationForColumn(colIdx);
-		const cover = classifyConstraintCover(predColl, indexColl, isEquality);
+		const cover = classifyConstraintCover(predColl, indexColl, isEquality, honorsCollatedRangeBounds);
 		if (cover === 'COARSER_SAFE') {
 			coarserResiduals.push(constraint.sourceExpression);
 		} else if (cover === 'MISMATCH_UNSAFE') {

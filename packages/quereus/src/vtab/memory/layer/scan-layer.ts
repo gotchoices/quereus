@@ -136,7 +136,7 @@ export async function* scanLayer(
 					const keyArr = Array.isArray(primaryKey) ? primaryKey : [primaryKey];
 					let prefixMismatch = false;
 					for (let i = 0; i < plan.equalityPrefix.length; i++) {
-						if (compareSqlValues(keyArr[i], plan.equalityPrefix[i]) !== 0) {
+						if (compareSqlValues(keyArr[i], plan.equalityPrefix[i], plan.equalityPrefixCollations?.[i]) !== 0) {
 							prefixMismatch = true;
 							break;
 						}
@@ -145,15 +145,17 @@ export async function* scanLayer(
 				} else {
 					// Past the bound we terminate at — early exit. We seek from one end
 					// and terminate at the other, so this is the complement of
-					// seekFromUpper and holds for both physical walk directions.
+					// seekFromUpper and holds for both physical walk directions. The
+					// terminating compare uses the bound column's declared collation so a
+					// non-BINARY walk terminates at the collation-correct boundary.
 					const keyForComparison = Array.isArray(primaryKey) ? primaryKey[0] : primaryKey;
 					if (!seekFromUpper && plan.upperBound) {
-						const cmp = compareSqlValues(keyForComparison, plan.upperBound.value);
+						const cmp = compareSqlValues(keyForComparison, plan.upperBound.value, plan.boundCollation);
 						if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
 							break;
 						}
 					} else if (seekFromUpper && plan.lowerBound) {
-						const cmp = compareSqlValues(keyForComparison, plan.lowerBound.value);
+						const cmp = compareSqlValues(keyForComparison, plan.lowerBound.value, plan.boundCollation);
 						if (cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT)) {
 							break;
 						}
@@ -220,7 +222,7 @@ export async function* scanLayer(
 					const keyArr = Array.isArray(indexEntry.indexKey) ? indexEntry.indexKey : [indexEntry.indexKey];
 					let prefixMismatch = false;
 					for (let i = 0; i < plan.equalityPrefix.length; i++) {
-						if (compareSqlValues(keyArr[i], plan.equalityPrefix[i]) !== 0) {
+						if (compareSqlValues(keyArr[i], plan.equalityPrefix[i], plan.equalityPrefixCollations?.[i]) !== 0) {
 							prefixMismatch = true;
 							break;
 						}
@@ -230,15 +232,16 @@ export async function* scanLayer(
 				}
 				// Early termination: break once the leading column passes the bound we
 				// terminate at (the complement of seekFromUpper; holds for both
-				// physical walk directions).
+				// physical walk directions). Uses the bound column's declared collation
+				// so a non-BINARY index walk terminates at the collation-correct boundary.
 				const keyForComparison = Array.isArray(indexEntry.indexKey) ? indexEntry.indexKey[0] : indexEntry.indexKey;
 				if (!seekFromUpper && plan.upperBound) {
-					const cmp = compareSqlValues(keyForComparison, plan.upperBound.value);
+					const cmp = compareSqlValues(keyForComparison, plan.upperBound.value, plan.boundCollation);
 					if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
 						break;
 					}
 				} else if (seekFromUpper && plan.lowerBound) {
-					const cmp = compareSqlValues(keyForComparison, plan.lowerBound.value);
+					const cmp = compareSqlValues(keyForComparison, plan.lowerBound.value, plan.boundCollation);
 					if (cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT)) {
 						break;
 					}
