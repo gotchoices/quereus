@@ -189,6 +189,35 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(indexStoreSize('t', 'ix_v'), 'no orphaned index entries after re-key + delete').to.equal(0);
 	});
 
+	it('binary-config store: CREATE INDEX over existing rows and write-time maintenance agree on the index-column key collation', async () => {
+		// Regression for the build-vs-maintenance index-COLUMN encoding fix
+		// (store-pk-collate-physical-rekey): `buildIndexEntries` formerly hardcoded the
+		// index-column key collation to NOCASE while `updateSecondaryIndexes` (write-time
+		// maintenance) used the table's configured K. On a `collation = binary` store the
+		// two disagreed, so an index built over EXISTING rows (NOCASE bytes) could not be
+		// maintained by later DML (BINARY bytes) — a stale/orphaned-entry latent bug.
+		//
+		// `collation = binary` makes K = BINARY (vs the NOCASE default), and the index
+		// column values 'X' / 'x' differ ONLY in case, so the two encodings produce
+		// DIFFERENT bytes — the only configuration that exposes the mismatch.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, v text) using store (collation = binary)`);
+
+		// Insert BEFORE the index exists so CREATE INDEX populates it via buildIndexEntries
+		// (the build path), encoding the index-column 'X'/'x' values under K = BINARY.
+		await db.exec(`insert into t values (1, 'X'), (2, 'x')`);
+		await db.exec(`create index ix_v on t (v)`);
+		expect(indexStoreSize('t', 'ix_v'), 'one built entry per existing row').to.equal(2);
+
+		// DELETE drives write-time maintenance, which recomputes each index key under K.
+		// Had build used NOCASE while maintenance uses BINARY, the delete keys would not
+		// match the built entries and would orphan them — a drained index store proves the
+		// two paths agree on the index-column encoding for a BINARY-config store.
+		await db.exec(`delete from t`);
+		expect((await rows(db, `select count(*) as n from t`))[0].n, 'all rows deleted').to.equal(0);
+		expect(indexStoreSize('t', 'ix_v'), 'no orphaned index entries (build + maintenance agree under K=BINARY)').to.equal(0);
+	});
+
 	it('CREATE UNIQUE INDEX survives reopen and still rejects duplicates', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, email text) using store`);

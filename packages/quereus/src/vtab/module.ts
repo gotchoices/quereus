@@ -420,15 +420,18 @@ export type SchemaChangeInfo =
 		 *   - setDefault / drop default: schema-only. New inserts pick up the
 		 *     new default; existing rows are untouched.
 		 *   - setCollation: change the column's collation. A module that re-keys its
-		 *     own structures (e.g. memory) must re-key / re-sort any PK / UNIQUE / index
-		 *     that orders by the column and re-validate uniqueness under the new collation
-		 *     (a set unique under BINARY may collide under NOCASE → throw CONSTRAINT).
-		 *     A module that enforces the PRIMARY KEY *physically* under a fixed table key
-		 *     collation (e.g. the store) instead negotiates the PK-column case
-		 *     accept-when-consistent / reject-when-divergent: it MAY apply the change
-		 *     schema-only when the target equals that fixed key collation, and MUST throw
-		 *     UNSUPPORTED (sited) when it diverges — never silently no-op. Unlike tags,
-		 *     collation is real schema.
+		 *     own structures (memory AND the store) must re-key / re-sort any PK / UNIQUE /
+		 *     index that orders by the column and re-validate uniqueness under the new
+		 *     collation (a set unique under BINARY may collide under NOCASE → throw
+		 *     CONSTRAINT). The store keys each PK column under its own collation
+		 *     (`StoreTable.pkKeyCollations`) and so physically re-keys the data store +
+		 *     rebuilds dependent secondary indexes on a PK-column change, throwing
+		 *     CONSTRAINT all-or-nothing on a collision. A module that *cannot* re-key
+		 *     (e.g. it enforces the PK physically under a single fixed key collation it
+		 *     can't change) may instead negotiate accept-when-consistent /
+		 *     reject-when-divergent: apply schema-only when the target equals that fixed
+		 *     collation, and throw UNSUPPORTED (sited) when it diverges — never silently
+		 *     no-op. Unlike tags, collation is real schema.
 		 */
 		type: 'alterColumn';
 		columnName: string;
