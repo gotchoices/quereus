@@ -203,7 +203,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// default is normalized up to K. The normalized schema is what StoreTable holds
 		// and what `finalizeCreatedTableSchema` registers (so `table_info` reports K).
 		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
-		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation, { reject: true });
+		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation);
 
 		// Eagerly initialize the store BEFORE creating the table or emitting events.
 		// This ensures the underlying storage (e.g., IndexedDB object store) exists
@@ -293,28 +293,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const config = this.parseConfig(vtabArgs);
 
-		// Normalize any divergent text PK column up to the fixed key collation K, but
-		// NEVER reject on the load path — a persisted/hand-authored DDL must stay
-		// loadable. Post-fix this is largely a no-op (a normalized create persists
-		// `collate <K>`, so reopen re-parses to K and finds no divergence); it only
-		// bites legacy/hand-authored DDL with an explicit divergent PK collation.
-		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
-		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation, { reject: false });
-		if (reconciledSchema !== tableSchema) {
-			// A divergence on the load path means a legacy / hand-authored DDL declared a
-			// text PK collation that differs from K. We coerce it up to K rather than throw
-			// (the table must stay loadable) and log so the coercion is observable.
-			console.warn(
-				`[StoreModule] Normalized a divergent text PRIMARY KEY collation up to the `
-					+ `fixed table key collation '${keyCollation}' while connecting to `
-					+ `'${schemaName}.${tableName}'.`,
-			);
-		}
-
+		// The load path does NOT reconcile PK collations: a persisted / hand-authored
+		// DDL stays loadable as-declared. Physical key bytes are always K-encoded by
+		// `StoreTable.encodeOptions`, so a legacy divergent text-PK collation is a
+		// stale `table_info` declaration, not a correctness risk. Reconciling the
+		// transient `StoreTable` here would be pointless anyway — `importCatalog`'s
+		// post-import reconcile loop (`table.updateSchema(fresh)`) immediately
+		// overwrites it with the `SchemaManager`-registered schema. The genuine
+		// reopen-time migration is tracked in `store-pk-collate-legacy-reopen-divergence`.
 		const table = new StoreTable(
 			db,
 			this,
-			reconciledSchema,
+			tableSchema,
 			config,
 			this.eventEmitter,
 			true // isConnected - DDL already exists in storage
@@ -2012,12 +2002,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
  * Collation is meaningful only for text, so only PK members whose logical type is
  * textual are considered (an `integer primary key` keeps its declared BINARY; the
  * temporal text-physical types carry no collation and are unaffected). For each
- * divergent text PK member:
- *   - `reject: true` (CREATE): an EXPLICIT per-column collation throws a sited
- *     `UNSUPPORTED` mirroring the ALTER guard; an IMPLICIT default is normalized to K.
- *   - `reject: false` (connect / rehydrate): always normalize, never throw — a
- *     persisted DDL must stay loadable (legacy / hand-authored divergence is
- *     coerced up to K, not rejected).
+ * divergent text PK member: an EXPLICIT per-column collation
+ * (`col.collationExplicit`) throws a sited `UNSUPPORTED` mirroring the ALTER guard;
+ * an IMPLICIT default is normalized up to K.
+ *
+ * This is the CREATE path only — the load path (`connect` / rehydrate) does not
+ * reconcile, so a legacy persisted DDL stays loadable as-declared (see
+ * `store-pk-collate-legacy-reopen-divergence` for the deferred reopen migration).
  *
  * Returns the schema unchanged when no text PK column diverges (the common case
  * once a normalized create persists `collate <K>` in its DDL); otherwise a new
@@ -2026,7 +2017,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 function reconcilePkCollations(
 	schema: TableSchema,
 	keyCollation: string,
-	options: { reject: boolean },
 ): TableSchema {
 	const pkIndices = new Set(schema.primaryKeyDefinition.map(def => def.index));
 	if (pkIndices.size === 0) return schema;
@@ -2040,7 +2030,7 @@ function reconcilePkCollations(
 		const declared = (col.collation || 'BINARY').toUpperCase();
 		if (declared === keyCollation) return col; // already consistent with K
 
-		if (options.reject && col.collationExplicit) {
+		if (col.collationExplicit) {
 			throw new QuereusError(
 				`Cannot create '${schema.schemaName}.${schema.name}': PRIMARY KEY column `
 					+ `'${col.name}' declares collation '${col.collation}', but this module `
@@ -2050,8 +2040,8 @@ function reconcilePkCollations(
 			);
 		}
 
-		// Implicit default (or lenient connect path): normalize up to K so
-		// `table_info()` reports the collation actually enforced by the key bytes.
+		// Implicit default: normalize up to K so `table_info()` reports the collation
+		// actually enforced by the key bytes.
 		changed = true;
 		return { ...col, collation: keyCollation };
 	});

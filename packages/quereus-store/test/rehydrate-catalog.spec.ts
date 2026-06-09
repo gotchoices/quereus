@@ -5,7 +5,9 @@ import {
 	StoreModule,
 	InMemoryKVStore,
 	type KVStoreProvider,
+	type RehydrationResult,
 } from '../src/index.js';
+import { buildCatalogKey } from '../src/common/key-builder.js';
 
 function createInMemoryProvider(): KVStoreProvider & { stores: Map<string, InMemoryKVStore> } {
 	const stores = new Map<string, InMemoryKVStore>();
@@ -588,5 +590,68 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		);
 		// Satisfies both: > 0 AND parent pid=1 exists.
 		await db2.exec(`INSERT INTO bc VALUES (14, 1)`);
+	});
+
+	// The store load path no longer reconciles PK collations (ticket
+	// store-pk-collate-drop-ineffective-connect-leniency). A legacy / hand-authored
+	// persisted DDL whose text PK declares a collation diverging from the fixed key
+	// collation K must stay loadable AS-DECLARED: no misleading `[StoreModule]
+	// Normalized a divergent…` warning fires on reopen, and `table_info` reports the
+	// stale-but-loadable declared collation (BINARY here), not K (NOCASE). The old
+	// `connect` leniency arm only coerced the transient StoreTable — which the
+	// post-import reconcile loop immediately overwrote — so it logged a normalization
+	// that never survived reopen. Physical key bytes are always K-encoded, so this is
+	// a declared-side `table_info` fact, not a correctness risk. The genuine reopen
+	// migration stays deferred in store-pk-collate-legacy-reopen-divergence.
+	it('legacy divergent text-PK collation loads without a Normalized warning and reports the declared collation', async () => {
+		// A normal CREATE now REJECTS an explicit divergent PK collation, so hand-seed a
+		// raw catalog entry to stand in for a legacy persisted DDL. `using store` routes
+		// the entry through this module's rehydration; the key matches saveTableDDL's
+		// `buildCatalogKey(schema, table)`.
+		const catalogStore = await provider.getCatalogStore();
+		await catalogStore.put(
+			buildCatalogKey('main', 't'),
+			new TextEncoder().encode('create table t (x text collate binary primary key) using store'),
+		);
+
+		// Spy on console.warn so the assertion is that the *normalization* warning is
+		// gone — not merely that warnings are silent (recordError also uses console.warn).
+		const originalWarn = console.warn;
+		const warnings: string[] = [];
+		console.warn = (...captured: unknown[]) => { warnings.push(captured.map(String).join(' ')); };
+
+		const db = new Database();
+		let result!: RehydrationResult;
+		try {
+			const mod = new StoreModule(provider);
+			db.registerModule('store', mod);
+			result = await mod.rehydrateCatalog(db);
+		} finally {
+			console.warn = originalWarn;
+		}
+
+		// The legacy DDL parsed cleanly and registered the table (no recordError).
+		expect(result.errors, 'legacy divergent-PK DDL loads cleanly').to.have.lengthOf(0);
+		expect(result.tables, 'table t rehydrated').to.include('main.t');
+
+		// (a) No misleading "Normalized a divergent…" warning fired on the load path.
+		expect(
+			warnings.filter(w => /Normalized a divergent/.test(w)),
+			'load path no longer logs a normalization that never survives reopen',
+		).to.have.lengthOf(0);
+
+		// (b) table_info reports the stale-but-loadable DECLARED collation (BINARY),
+		// not the physical key collation K (NOCASE) — documented, not silently coerced.
+		const info = await asyncIterableToArray(db.eval(`select name, collation from table_info('t')`));
+		const x = info.find(r => String(r.name).toLowerCase() === 'x');
+		expect(x, 'column x present in table_info').to.not.be.undefined;
+		expect(String(x!.collation).toUpperCase(), 'declared (stale) collation reported as-is').to.equal('BINARY');
+
+		// The table is queryable and usable after reopen (key bytes are K-encoded).
+		expect(await asyncIterableToArray(db.eval('select x from t')), 'empty table reads back').to.deep.equal([]);
+		await db.exec(`insert into t values ('a')`);
+		expect(await asyncIterableToArray(db.eval('select x from t')), 'inserted row round-trips').to.deep.equal([{ x: 'a' }]);
+
+		await db.close();
 	});
 });

@@ -276,18 +276,24 @@ would therefore report one collation via `table_info()` while its key bytes
 (uniqueness / point-lookup / ordering) are governed by K — a silent declared≠enforced
 split. The store closes that gap symmetrically at both schema entry points:
 
-- **CREATE / connect.** `module.create` reconciles each text PK column against K: an
+- **CREATE.** `module.create` reconciles each text PK column against K: an
   *implicit*-default divergent collation (e.g. the BINARY default under K = NOCASE) is
   **normalized up to K** so `table_info()` reports the collation actually enforced, while
   an *explicitly* declared divergent per-column PK collation (`x text collate binary
   primary key` under K = NOCASE) throws a sited `UNSUPPORTED` — the faithful mirror of
   the ALTER guard below. (The explicit-vs-implicit distinction rides on
   `ColumnSchema.collationExplicit`, set by `columnDefToSchema` only for a `COLLATE`
-  clause.) The load path (`connect` / rehydrate) applies the same normalization but
-  **never rejects** — a persisted / hand-authored DDL must stay loadable; post-fix this
-  is largely a no-op because a normalized create persists `collate <K>` in its DDL.
-  Non-text PK columns (e.g. `integer primary key`) keep their declared collation —
-  collation governs key bytes only for text.
+  clause.) Non-text PK columns (e.g. `integer primary key`) keep their declared collation
+  — collation governs key bytes only for text.
+- **Load path (`connect` / rehydrate).** The load path does **not** reconcile: a legacy /
+  hand-authored persisted DDL with a divergent text-PK collation stays loadable
+  **as-declared**, and `table_info()` reports the declared (stale) collation as-is rather
+  than silently coercing it to K. This is harmless for correctness — physical key bytes
+  are always K-encoded by `StoreTable.encodeOptions`, so the divergence is a declared-side
+  `table_info` fact, not a uniqueness/ordering risk. (Post-fix this is the rare case
+  anyway: a normalized create persists `collate <K>` in its DDL, so reopen re-parses to K
+  and finds nothing to reconcile.) Reporting K after a reopen would require reconciling on
+  the engine import path — tracked in the deferred `store-pk-collate-legacy-reopen-divergence`.
 - **`ALTER COLUMN … SET COLLATE` on a PK column** is negotiated
   **accept-when-consistent / reject-when-divergent**: a target equal to K is applied
   schema-only (forward PK uniqueness is already correct under it), while a divergent
