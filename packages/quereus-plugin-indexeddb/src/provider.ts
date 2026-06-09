@@ -19,7 +19,6 @@ import {
 	CachedKVStore,
 	CATALOG_STORE_NAME,
 	STATS_STORE_NAME,
-	STORE_SUFFIX,
 	type CacheOptions,
 } from '@quereus/store';
 import { IndexedDBStore } from './store.js';
@@ -52,6 +51,15 @@ export interface IndexedDBProviderOptions {
 export class IndexedDBProvider implements KVStoreProvider {
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();
+	/**
+	 * Maps each table's data store name to the set of its own index store names.
+	 * Populated as index stores are opened via `getIndexStore`, this is the
+	 * authoritative per-table index list the provider would otherwise lack:
+	 * `invalidateCache` consults it to clear exactly a table's own caches rather
+	 * than prefix-scanning `{data}_idx_`, which also matches a sibling table
+	 * literally named `{table}_idx_<x>` (data store `{schema}.{table}_idx_<x>`).
+	 */
+	private indexStoresByTable = new Map<string, Set<string>>();
 	private catalogStore: IndexedDBStore | null = null;
 	private statsStore: IndexedDBStore | null = null;
 	private manager: IndexedDBManager;
@@ -70,6 +78,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 
 	async getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore> {
 		const storeName = buildIndexStoreName(schemaName, tableName, indexName);
+		this.registerIndexStore(buildDataStoreName(schemaName, tableName), storeName);
 		return this.getOrCreateStore(storeName);
 	}
 
@@ -109,6 +118,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 			await store.close();
 		}
 		this.stores.clear();
+		this.indexStoresByTable.clear();
 
 		if (this.catalogStore) {
 			await this.catalogStore.close();
@@ -128,6 +138,9 @@ export class IndexedDBProvider implements KVStoreProvider {
 		const storeName = buildIndexStoreName(schemaName, tableName, indexName);
 		await this.closeStoreByName(storeName);
 		await this.manager.deleteObjectStore(storeName);
+		// Drop the stale mapping so a sibling table that later reuses this physical
+		// name (allowed once the index is gone) is not mistaken for this table's index.
+		this.indexStoresByTable.get(buildDataStoreName(schemaName, tableName))?.delete(storeName);
 	}
 
 	async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void> {
@@ -168,6 +181,11 @@ export class IndexedDBProvider implements KVStoreProvider {
 		}
 
 		await this.manager.renameObjectStores(renameList);
+
+		// The old table's index mapping is now stale (its stores were relocated and
+		// their handles evicted). Drop it; the renamed table re-registers its index
+		// stores on next access via `getIndexStore`.
+		this.indexStoresByTable.delete(oldDataStoreName);
 	}
 
 	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
@@ -191,6 +209,10 @@ export class IndexedDBProvider implements KVStoreProvider {
 			await this.closeStoreByName(storeName);
 			await this.manager.deleteObjectStore(storeName);
 		}
+
+		// The table is gone; forget its index mapping so a future table reusing this
+		// data store name does not inherit stale index store associations.
+		this.indexStoresByTable.delete(dataStoreName);
 	}
 
 	/**
@@ -206,12 +228,25 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 */
 	invalidateCache(schemaName: string, tableName: string): void {
 		const dataStoreName = buildDataStoreName(schemaName, tableName);
-		const indexPrefix = `${dataStoreName}${STORE_SUFFIX.INDEX}`;
+		this.invalidateStore(dataStoreName);
 
-		for (const [name, store] of this.stores) {
-			if ((name === dataStoreName || name.startsWith(indexPrefix)) && store instanceof CachedKVStore) {
-				store.invalidateAll();
+		// Clear only this table's own index stores. We never prefix-scan
+		// `{data}_idx_`: that prefix also matches a sibling table literally named
+		// `{table}_idx_<x>` (data store `{schema}.{table}_idx_<x>`), and clearing it
+		// would needlessly drop an unrelated table's read cache.
+		const indexStores = this.indexStoresByTable.get(dataStoreName);
+		if (indexStores) {
+			for (const indexStoreName of indexStores) {
+				this.invalidateStore(indexStoreName);
 			}
+		}
+	}
+
+	/** Invalidate a single store's read cache, if that store is currently cached. */
+	private invalidateStore(storeName: string): void {
+		const store = this.stores.get(storeName);
+		if (store instanceof CachedKVStore) {
+			store.invalidateAll();
 		}
 	}
 
@@ -225,6 +260,16 @@ export class IndexedDBProvider implements KVStoreProvider {
 				store.invalidateAll();
 			}
 		}
+	}
+
+	/** Record that `indexStoreName` is an index store belonging to `dataStoreName`. */
+	private registerIndexStore(dataStoreName: string, indexStoreName: string): void {
+		let indexStores = this.indexStoresByTable.get(dataStoreName);
+		if (!indexStores) {
+			indexStores = new Set<string>();
+			this.indexStoresByTable.set(dataStoreName, indexStores);
+		}
+		indexStores.add(indexStoreName);
 	}
 
 	private async getOrCreateStore(storeName: string): Promise<KVStore> {
