@@ -219,9 +219,6 @@ export interface FullRebuildPlan extends MaintenancePlanCommon {
 	 *  not the backing it populates. Re-run to completion per writing statement, bound
 	 *  through the live transaction (reads-own-writes), to recompute every backing row. */
 	bodyScheduler: Scheduler;
-	/** Backing-table physical primary-key definition (the column order the btree keys on),
-	 *  the key the `'replace-all'` diff matches new rows against. */
-	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
 	/** Every source base (lowercased `schema.table`) the body reads — set-op legs, every
 	 *  join source, etc. The plan is indexed under each in `rowTimeBySource` (via
 	 *  {@link planSourceBases}), so a write to **any** of them triggers a rebuild; missing
@@ -1392,7 +1389,6 @@ export class MaterializedViewManager {
 				StatusCode.INTERNAL,
 			);
 		}
-		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
 
 		// Compile the whole optimized body once into a reusable scheduler (no key filter).
 		const bodyScheduler = new Scheduler(emitPlanNode(optimized, new EmissionContext(db)));
@@ -1420,7 +1416,6 @@ export class MaterializedViewManager {
 			chosenStrategy,
 			sourceStats,
 			bodyScheduler,
-			backingPkDefinition,
 			sourceBases,
 		};
 	}

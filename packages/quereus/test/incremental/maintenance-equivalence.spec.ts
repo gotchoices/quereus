@@ -465,7 +465,6 @@ describe('Materialized-view maintenance equivalence (1:1 inner-join shape)', () 
 interface FullRebuildPlanLike {
 	readonly kind: string;
 	readonly sourceBases: string[];
-	readonly backingPkDefinition: ReadonlyArray<{ readonly index: number }>;
 }
 
 /** White-box reach into the manager internals the swap helper drives. The map key is
@@ -539,6 +538,37 @@ defineEquivalenceSuite(
 	FULL_REBUILD_SHAPES,
 	db => { forceFullRebuild(db, 'main', 'mv'); },
 );
+
+/**
+ * Full-rebuild floor — the **body-goes-empty** edge, asserted deterministically (the
+ * property suites only reach it incidentally). When the body re-evaluates to zero rows the
+ * `'replace-all' []` must empty the backing (every prior row a `delete`), and a subsequent
+ * write must repopulate it from empty — exercising the empty↔non-empty transitions in both
+ * directions, end-to-end through the floor arm rather than at the layer level.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, body goes empty)', () => {
+	let db: Database;
+	const body = 'select id, a from src';
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+		await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2)');
+		await db.exec(`create materialized view mv as ${body}`);
+		forceFullRebuild(db, 'main', 'mv');
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('emptying every source row empties the backing, and a later insert repopulates it', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		await db.exec('delete from src');
+		expect((await readMultiset(db, 'select * from mv')).length, 'backing empty after all-delete').to.equal(0);
+		await assertEquivalent(db, body, 'after all-delete');
+		// Repopulate from empty: the next rebuild diffs against an empty before-image (all inserts).
+		await db.exec('insert into src (id, a, b, k) values (7, 9, 0, 0)');
+		expect((await readMultiset(db, 'select * from mv')).length, 'backing repopulated from empty').to.equal(1);
+		await assertEquivalent(db, body, 'after repopulate');
+	});
+});
 
 /**
  * Full-rebuild floor over a **multi-source** body (a 1:1 inner join). The body reads two
