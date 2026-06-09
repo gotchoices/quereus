@@ -45,6 +45,18 @@
  *   8. guard-activated one-way `{a}→{b}` FD     (implication CHECK `b = a+1` + filter, a/b non-keyed)
  *
  * (ticket fd-oneway-guard-activation-key-bag-overclaim, folded into site 7's gate.)
+ *
+ * Site 9 (ticket `fd-oneway-determination-key-bag-overclaim`) is the NON-guarded
+ * sibling of sites 7/8: a plain `check (b = a + 1)` (or its assertion-hoisted twin)
+ * emits the one-way determination FD directly on the `TableReferenceNode` — no
+ * guard, no EC pair. Sites 5/6 gated the bi-directional pair there but explicitly
+ * PRESERVED this one-way FD (they gated only on `equivPairs` membership, which the
+ * one-way FD lacks); that preservation was the bug. The producer fold now gates
+ * EVERY single-to-single FD on endpoint superkey-ness, regardless of `equivPairs`,
+ * mirroring the filter gate (site 4):
+ *
+ *   9.  unguarded one-way determination FD       (CHECK `b = a + 1`, no PK, project c away)
+ *   9b. same one-way FD, assertion-hoisted        (`not exists (... where b <> a + 1)`, no PK)
  */
 
 import { expect } from 'chai';
@@ -154,6 +166,21 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 			create table towpk (a integer primary key, b integer, status text,
 				check (status <> 'active' or b = a + 1));
 			insert into towpk values (1, 2, 'active'), (3, 4, 'active'), (5, 6, 'active');
+
+				-- Site 9 (unguarded one-way determination at the TableReference): a plain
+				-- CHECK (b = a + 1) with NO PK emits the one-way {a}->{b} (no EC, no guard).
+				-- Without the producer gate, select distinct a, b re-derives {a} as a phantom
+				-- key and drops the DISTINCT. c only makes the full source rows distinct.
+				create table teo (a integer, b integer, c integer, check (b = a + 1));
+				insert into teo values (1, 2, 10), (1, 2, 20), (3, 4, 30);
+				-- Site 9 control: a IS the PK, so {a}->{b} is a sound key.
+				create table teopk (a integer primary key, b integer, check (b = a + 1));
+				insert into teopk values (1, 2), (3, 4), (5, 6);
+				-- Site 9b (assertion-hoist): the same one-way determination hoisted per-row
+				-- from a canonical not-exists assertion onto a no-PK table.
+				create table teoh (a integer, b integer, c integer);
+				create assertion eq_h check (not exists (select 1 from teoh where b <> a + 1));
+				insert into teoh values (1, 2, 10), (1, 2, 20), (3, 4, 30);
 		`);
 	});
 	afterEach(async () => { await db.close(); });
@@ -306,5 +333,32 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 		const sql = `select distinct a, b from towpk where status = 'active'`;
 		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a}→{b} sound key ⇒ set')
 			.to.have.length(0);
+	});
+
+	// ---- Site 9: unguarded one-way determination FD at the TableReference ----
+	// The non-guarded sibling of sites 7/8: a plain `check (b = a + 1)` emits the
+	// one-way {a}→{b} directly on the table reference (no guard, no EC pair). The
+	// producer fold must gate it on endpoint superkey-ness exactly like the bi-FD
+	// sites 5/6, or `select distinct a, b` over a non-keyed table re-derives {a} as
+	// a phantom all-columns key and drops a REQUIRED DISTINCT (wrong results).
+	it('site 9 — DISTINCT over `select a, b` of a `check (b = a + 1)` NON-keyed table is RETAINED', async () => {
+		const sql = 'select distinct a, b from teo';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a not a key)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
+	});
+
+	it('site 9 control — DISTINCT over `select a, b` where a is the PK is ELIMINATED', () => {
+		const sql = 'select distinct a, b from teopk';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a}→{b} sound key ⇒ set')
+			.to.have.length(0);
+	});
+
+	// ---- Site 9b: the same one-way FD hoisted from a CREATE ASSERTION ----
+	it('site 9b — DISTINCT over `select a, b` of an assertion-hoisted one-way FD (NON-keyed) is RETAINED', async () => {
+		const sql = 'select distinct a, b from teoh';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a not a key)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
 	});
 });

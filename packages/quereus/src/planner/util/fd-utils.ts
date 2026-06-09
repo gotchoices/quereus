@@ -567,6 +567,67 @@ export function isSuperkey(
 }
 
 /**
+ * Fold each producer FD from `producerFds` onto `fds`, gating every
+ * single↔single `{a}→{b}` FD on endpoint superkey-ness against `keyProbeFds`.
+ *
+ * A determination / value-equality FD whose determinant AND dependent are both
+ * single columns is read by `deriveKeysFromFds` as a uniqueness claim — sound
+ * only when one endpoint is a genuine key here. Over a narrow non-unique
+ * relation (`check (a = b)` ⇒ `{a}↔{b}`, or `check (b = a + 1)` ⇒ `{a}→{b}`,
+ * then `select distinct a, b`) it would otherwise let `deriveKeysFromFds` read
+ * a phantom all-columns key (a bag as a set) and `rule-distinct-elimination`
+ * drop a REQUIRED DISTINCT (wrong results). So a single↔single FD folds only
+ * when `a` or `b` is a superkey of `keyProbeFds`; otherwise it is dropped — a
+ * sound under-claim. The gate keys off the FD SHAPE, NOT any `valueEquality`
+ * marker, because `shiftFds`/`projectFds` drop the marker and a marker-gated
+ * fold would resurface the over-claim through a join/projection.
+ *
+ * Everything else passes through unchanged: `∅ → col` constant FDs and
+ * multi-dependent key FDs (e.g. `{c}→{id,region,amt}` from a partial UNIQUE —
+ * a genuinely unique determinant).
+ *
+ * `skipGuarded` controls guarded-FD handling. When set (table-reference
+ * producer fold), a guarded FD passes through UNTOUCHED — it never participates
+ * in key derivation until Filter activation, which gates it there instead
+ * (`activateGuardedFds`). Filter predicate-derived FDs are already unguarded,
+ * so that caller leaves `skipGuarded` off.
+ *
+ * Shared by `TableReferenceNode.computePhysical` (CHECK / assertion-hoisted
+ * producers, `skipGuarded`) and `FilterNode.computePhysical` (predicate equality
+ * FDs). The EC merge stays unconditional in each caller. See tickets
+ * `fd-derived-key-bag-overclaim`, `fd-check-assertion-key-bag-overclaim`,
+ * `fd-oneway-determination-key-bag-overclaim`.
+ */
+export function foldSingleSingleGated(
+	fds: ReadonlyArray<FunctionalDependency>,
+	producerFds: ReadonlyArray<FunctionalDependency>,
+	keyProbeFds: ReadonlyArray<FunctionalDependency>,
+	colCount: number,
+	opts: { skipGuarded?: boolean } = {},
+): ReadonlyArray<FunctionalDependency> {
+	const skipGuarded = opts.skipGuarded === true;
+	let out = fds;
+	for (const fd of producerFds) {
+		if (
+			(!skipGuarded || fd.guard === undefined) &&
+			fd.determinants.length === 1 &&
+			fd.dependents.length === 1
+		) {
+			const a = fd.determinants[0];
+			const b = fd.dependents[0];
+			if (
+				!isSuperkey(new Set([a]), keyProbeFds, colCount) &&
+				!isSuperkey(new Set([b]), keyProbeFds, colCount)
+			) {
+				continue;
+			}
+		}
+		out = addFd(out, fd);
+	}
+	return out;
+}
+
+/**
  * Enumerate the minimal full-cover key sets discoverable from `fds`: for each
  * FD `K → Y` whose closure covers all columns, return `K` (greedily minimized
  * within `K`). Deduplicated by set equality.

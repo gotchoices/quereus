@@ -272,15 +272,35 @@ describe('CHECK-derived FDs/domains: end-to-end propagation', () => {
 	beforeEach(() => { db = new Database(); });
 	afterEach(async () => { await db.close(); });
 
-	it('table with check (b = a + 1): TableReference exposes FD a → b', async () => {
+	// The one-way determination FD `{a}→{b}` from `check (b = a + 1)` is still
+	// *emitted* by check-extraction, but it folds onto the TableReference's
+	// physical FDs only when an endpoint is a real declared key — otherwise it is
+	// gated away (a narrow `select distinct a, b` over a non-keyed table would
+	// otherwise re-derive `{a}` as a phantom key and drop a REQUIRED DISTINCT,
+	// wrong results). Ticket `fd-oneway-determination-key-bag-overclaim`. Both
+	// arms pin the gate: absent when `a` is not a key, present when it is.
+	it('table with check (b = a + 1): the one-way FD a → b is GATED AWAY when a is not a key', async () => {
+		// `id` is the PK, so neither `a` (col 1) nor `b` (col 2) is a key.
 		await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, CHECK (b = a + 1)) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM t');
 		const props = physicalOf(rows, r => r.op === 'TABLEREF' || r.op === 'TABLEREFERENCE' || r.node_type === 'TableReference')
 			?? physicalOf(rows, r => r.op === 'SEQSCAN' || r.op === 'SEQ SCAN' || r.op === 'INDEXSCAN');
 		expect(props, 'expected physical props on a leaf').to.not.equal(undefined);
-		// `a` is column index 1, `b` is column index 2.
+		// `a` is column index 1, `b` is column index 2 — the one-way FD must be gated.
 		const fd = props!.fds?.find(fd => fd.determinants.length === 1 && fd.determinants[0] === 1 && fd.dependents.includes(2));
-		expect(fd, 'expected FD a → b').to.not.equal(undefined);
+		expect(fd, 'one-way FD a → b must be gated away (a is not a real key)').to.equal(undefined);
+	});
+
+	it('table with check (b = a + 1): the one-way FD a → b is PRESENT when a is the PK', async () => {
+		// `a` (col 0) is the PK, so `{a}→{b}` is a sound key — the gate keeps it.
+		await db.exec("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, CHECK (b = a + 1)) USING memory");
+		const rows = await planRows(db, 'SELECT * FROM t');
+		const props = physicalOf(rows, r => r.op === 'TABLEREF' || r.op === 'TABLEREFERENCE' || r.node_type === 'TableReference')
+			?? physicalOf(rows, r => r.op === 'SEQSCAN' || r.op === 'SEQ SCAN' || r.op === 'INDEXSCAN');
+		expect(props, 'expected physical props on a leaf').to.not.equal(undefined);
+		// `a` is column index 0, `b` is column index 1.
+		const fd = props!.fds?.find(fd => fd.determinants.length === 1 && fd.determinants[0] === 0 && fd.dependents.includes(1));
+		expect(fd, 'expected FD a → b (a is the real key)').to.not.equal(undefined);
 	});
 
 	it("table with check (status in ('a','i')): TableReference carries the enum domain", async () => {

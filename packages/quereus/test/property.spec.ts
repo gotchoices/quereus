@@ -1645,6 +1645,12 @@ describe('Property-Based Tests', () => {
 			'select ta.a as xa, tb.d as xd, ta.c as xc from ta cross join tb',   // cross join
 			'select x, y from (select distinct b as x, c as y from ta)',         // projection over inner DISTINCT
 			'select distinct x, y from (select distinct b as x, c as y from ta)',// nested DISTINCT
+			// CHECK-derived one-way determination: `tc.b = tc.a + 1` emits the FD
+			// {a}→{b} at the (non-keyed) table reference. `select distinct a, b` must
+			// NOT let that FD re-derive {a} as a key — else the eliminated DISTINCT
+			// surfaces duplicate `a` rows and reds the soundness check (ticket
+			// fd-oneway-determination-key-bag-overclaim).
+			'select distinct a, b from tc',
 		];
 
 		const rowArbA = fc.record({
@@ -1656,17 +1662,31 @@ describe('Property-Based Tests', () => {
 			d: fc.integer({ min: 1, max: 8 }),
 			e: fc.integer({ min: 1, max: 3 }),
 		});
+		// tc carries `check (b = a + 1)`; `b` is computed from `a` so every generated
+		// row satisfies the constraint (an inserting violation would ABORT). `a`
+		// repeats across rows (small domain), which is what makes the gated `{a}→{b}`
+		// FD an over-claim if it ever leaked into a key.
+		const rowArbC = fc.record({
+			a: fc.integer({ min: 1, max: 4 }),
+			c: fc.integer({ min: 1, max: 3 }),
+		}).map(r => ({ a: r.a, b: r.a + 1, c: r.c }));
 
-		/** Create the two source tables (fresh `db` per `beforeEach`). */
+		/** Create the three source tables (fresh `db` per `beforeEach`). */
 		async function createTables(): Promise<void> {
 			await db.exec('create table ta (a integer primary key, b integer, c integer) using memory');
 			await db.exec('create table tb (d integer primary key, e integer) using memory');
+			await db.exec('create table tc (a integer, b integer, c integer, check (b = a + 1)) using memory');
 		}
 
-		/** Replace table contents with the generated rows, deduped by PK. */
-		async function seedTables(rowsA: { a: number; b: number; c: number }[], rowsB: { d: number; e: number }[]): Promise<void> {
+		/** Replace table contents with the generated rows, deduped by PK (tc is a bag — no PK). */
+		async function seedTables(
+			rowsA: { a: number; b: number; c: number }[],
+			rowsB: { d: number; e: number }[],
+			rowsC: { a: number; b: number; c: number }[],
+		): Promise<void> {
 			await db.exec('delete from ta');
 			await db.exec('delete from tb');
+			await db.exec('delete from tc');
 			const seenA = new Set<number>();
 			for (const r of rowsA) {
 				if (seenA.has(r.a)) continue;
@@ -1678,6 +1698,16 @@ describe('Property-Based Tests', () => {
 				if (seenB.has(r.d)) continue;
 				seenB.add(r.d);
 				await db.exec(`insert into tb values (${r.d}, ${r.e})`);
+			}
+			// tc has no declared PK ⇒ an implicit all-columns key, so EXACT-duplicate
+			// rows would collide. Dedup on the full tuple `(a,c)` (b = a + 1 is derived)
+			// — `a` still repeats across distinct `c`, keeping {a} genuinely non-unique.
+			const seenC = new Set<string>();
+			for (const r of rowsC) {
+				const sig = `${r.a},${r.c}`;
+				if (seenC.has(sig)) continue;
+				seenC.add(sig);
+				await db.exec(`insert into tc values (${r.a}, ${r.b}, ${r.c})`);
 			}
 		}
 
@@ -1747,9 +1777,10 @@ describe('Property-Based Tests', () => {
 			await fc.assert(fc.asyncProperty(
 				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbC, { minLength: 0, maxLength: 12 }),
 				fc.constantFrom(...queries),
-				async (rowsA, rowsB, q) => {
-					await seedTables(rowsA, rowsB);
+				async (rowsA, rowsB, rowsC, q) => {
+					await seedTables(rowsA, rowsB, rowsC);
 
 					const block = db.getPlan(q) as any;
 					const root = block.getRelations?.()[0];
@@ -1779,9 +1810,10 @@ describe('Property-Based Tests', () => {
 			await fc.assert(fc.asyncProperty(
 				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbC, { minLength: 0, maxLength: 12 }),
 				fc.constantFrom(...queries),
-				async (rowsA, rowsB, q) => {
-					await seedTables(rowsA, rowsB);
+				async (rowsA, rowsB, rowsC, q) => {
+					await seedTables(rowsA, rowsB, rowsC);
 
 					const block = db.getPlan(q) as unknown as PlanNode;
 					const nodes = collectRelationalNodes(block);
@@ -1880,9 +1912,10 @@ describe('Property-Based Tests', () => {
 			await fc.assert(fc.asyncProperty(
 				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbC, { minLength: 0, maxLength: 12 }),
 				fc.constantFrom(...queries),
-				async (rowsA, rowsB, q) => {
-					await seedTables(rowsA, rowsB);
+				async (rowsA, rowsB, rowsC, q) => {
+					await seedTables(rowsA, rowsB, rowsC);
 					const block = db.getPlan(q) as unknown as PlanNode;
 					for (const node of collectRelationalNodes(block)) {
 						const label = `${node.nodeType}[${node.id}] of \`${q}\``;

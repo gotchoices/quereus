@@ -1,6 +1,6 @@
 import type { BaseType, ScalarType, RelationType } from '../../common/datatype.js';
 import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency, type UpdateSite, type AttributeDefault } from './plan-node.js';
-import { addFd, closeConstantBindingsOverEcs, isSuperkey, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
+import { addFd, closeConstantBindingsOverEcs, foldSingleSingleGated, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
 import { seedTableForeignKeyInds } from '../util/ind-utils.js';
 import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
 import { getPartialUniqueGuardedFds } from '../analysis/partial-unique-extraction.js';
@@ -31,66 +31,6 @@ const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
 	constantBindings: [],
 	domainConstraints: [],
 };
-
-/**
- * Fold a producer's FDs (declared-CHECK-derived or assertion-hoisted) onto
- * `fds`, gating the over-claiming bi-directional value-equality pair.
- *
- * A `col1 = col2` CHECK / hoisted assertion emits the mutual determination
- * `{a}↔{b}` (both `{a}→{b}` and `{b}→{a}`). That pair is a uniqueness claim only
- * when one endpoint is a genuine declared key here — over a narrow non-unique
- * relation (e.g. `check (a = b)` then `select distinct a, b`) it otherwise lets
- * `deriveKeysFromFds` read a phantom all-columns key (a bag read as a set) and
- * `rule-distinct-elimination` drops a REQUIRED DISTINCT. So fold a single↔single
- * FD `{a}→{b}` whose unordered pair `{a,b}` is in the producer's `equivPairs`
- * only when `a` or `b` is a superkey of `realKeyFds`; otherwise drop it.
- *
- * Everything else passes through unchanged: `∅ → col` constant FDs, one-way
- * `other → col` expression FDs (e.g. `check (b = a + 1)` ⇒ `a → b`, which carries
- * NO equiv pair), and guarded implication-form FDs (they never participate in key
- * derivation until Filter activation, and `isSuperkey`/closure skip guards
- * anyway). `equivPairs` is the producer's authoritative value-equality marker —
- * `handleEquality` pushes a pair ONLY for the `col = col` shape — so it precisely
- * separates the over-claiming bi-FD from legitimate one-way single↔single FDs.
- *
- * Mirrors the filter consumption gate (`FilterNode.computePhysical`); the EC
- * merge stays unconditional in the caller. See ticket
- * `fd-check-assertion-key-bag-overclaim` (and its sibling
- * `fd-derived-key-bag-overclaim` for the four shipped sites).
- */
-function foldGatedProducerFds(
-	fds: ReadonlyArray<FunctionalDependency>,
-	producerFds: ReadonlyArray<FunctionalDependency>,
-	equivPairs: ReadonlyArray<readonly [number, number]>,
-	realKeyFds: ReadonlyArray<FunctionalDependency>,
-	colCount: number,
-): ReadonlyArray<FunctionalDependency> {
-	const equivPairKeys = new Set<string>();
-	for (const [a, b] of equivPairs) {
-		equivPairKeys.add(`${Math.min(a, b)},${Math.max(a, b)}`);
-	}
-	let out = fds;
-	for (const fd of producerFds) {
-		if (
-			fd.guard === undefined &&
-			fd.determinants.length === 1 &&
-			fd.dependents.length === 1
-		) {
-			const a = fd.determinants[0];
-			const b = fd.dependents[0];
-			if (equivPairKeys.has(`${Math.min(a, b)},${Math.max(a, b)}`)) {
-				if (
-					!isSuperkey(new Set([a]), realKeyFds, colCount) &&
-					!isSuperkey(new Set([b]), realKeyFds, colCount)
-				) {
-					continue;
-				}
-			}
-		}
-		out = addFd(out, fd);
-	}
-	return out;
-}
 
 /** Represents a reference to a table in the global schema. */
 export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNode, TableAccessCapable, ColumnBindingProvider {
@@ -207,9 +147,13 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		const checkExt: CheckExtraction = permitsCheckViolators
 			? EMPTY_CHECK_EXTRACTION
 			: getCheckExtraction(this.tableSchema);
-		// Gate the over-claiming bi-directional value-equality pair against the
-		// declared keys; everything else folds unchanged. See `foldGatedProducerFds`.
-		fds = foldGatedProducerFds(fds, checkExt.fds, checkExt.equivPairs, realKeyFds, colCount);
+		// Gate every single↔single determination/equality FD against the declared
+		// keys (`{a}↔{b}` from `check (a = b)`, `{a}→{b}` from `check (b = a + 1)`);
+		// only a real-declared-key endpoint lets it fold. Constant `∅→col` and
+		// multi-dependent key FDs pass through. Guarded FDs pass through untouched
+		// (`skipGuarded`) — gated at Filter activation instead. See
+		// `foldSingleSingleGated`; mirrors the filter consumption gate.
+		fds = foldSingleSingleGated(fds, checkExt.fds, realKeyFds, colCount, { skipGuarded: true });
 
 		// Guarded FDs from partial UNIQUE constraints (`CREATE UNIQUE INDEX (K)
 		// WHERE P`). The unconditional UC path in relationTypeFromTableSchema
@@ -229,10 +173,10 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			? getAssertionHoistedConstraints(this.schemaManager, this.tableSchema)
 			: undefined;
 		if (hoisted) {
-			// Same gate as checkExt, against the hoisted producer's own equivPairs
-			// and the shared declared-key probe. Folded AFTER checkExt so
-			// structurally-identical entries keep `declared-check` provenance.
-			fds = foldGatedProducerFds(fds, hoisted.fds, hoisted.equivPairs, realKeyFds, colCount);
+			// Same single↔single gate as checkExt, against the shared declared-key
+			// probe. Folded AFTER checkExt so structurally-identical entries keep
+			// `declared-check` provenance.
+			fds = foldSingleSingleGated(fds, hoisted.fds, realKeyFds, colCount, { skipGuarded: true });
 		}
 
 		let equivClasses: ReadonlyArray<ReadonlyArray<number>> = [];

@@ -8,7 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import { PredicateCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
 import { createTableInfoFromNode, extractConstraints } from '../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
-import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, isSuperkey, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
+import { addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, foldSingleSingleGated, isSuperkey, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
 import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
 
 /**
@@ -122,17 +122,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// fd-derived-key-bag-overclaim)
 		const inputFds = sourcePhysical?.fds ?? [];
 		const colCount = sourceAttrs.length;
-		for (const fd of predFds) {
-			if (fd.determinants.length === 1 && fd.dependents.length === 1) {
-				const a = fd.determinants[0];
-				const b = fd.dependents[0];
-				if (!isSuperkey(new Set([a]), inputFds, colCount)
-					&& !isSuperkey(new Set([b]), inputFds, colCount)) {
-					continue;
-				}
-			}
-			fds = addFd(fds, fd);
-		}
+		fds = foldSingleSingleGated(fds, predFds, inputFds, colCount);
 
 		// Attempt logical covered-key detection: if equality conjuncts cover a
 		// unique key on the source table, the Filter emits at-most-one row. Encode
