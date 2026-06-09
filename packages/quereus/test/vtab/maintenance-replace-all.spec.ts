@@ -194,4 +194,23 @@ describe('MemoryTableManager.applyMaintenanceToLayer — replace-all', () => {
 		]);
 		expect(await scanPrimary(manager, conn)).to.deep.equal([[1, 10], [3, 30]]);
 	});
+
+	it('composite PK: diffs by the full composite key, deletes in ascending composite-PK order', async () => {
+		await db.exec('create table tk (a integer, b integer, v integer, primary key (a, b)) using memory');
+		await db.exec('insert into tk values (1,1,10),(1,2,20),(2,1,30),(2,2,40)');
+		const { manager, conn } = managerAndConn('tk');
+
+		// New contents: (3,3,30) insert, (1,1,10) identical-skip. Old composite keys (1,2),
+		// (2,1), (2,2) are absent from the new set → deletes, emitted in ascending PK order.
+		const changes = await manager.applyMaintenanceToLayer(conn, [
+			{ kind: 'replace-all', rows: [[3, 3, 30], [1, 1, 10]] },
+		]);
+		expect(changes).to.deep.equal([
+			{ op: 'insert', newRow: [3, 3, 30] },
+			{ op: 'delete', oldRow: [1, 2, 20] },
+			{ op: 'delete', oldRow: [2, 1, 30] },
+			{ op: 'delete', oldRow: [2, 2, 40] },
+		]);
+		expect(await scanPrimary(manager, conn)).to.deep.equal([[1, 1, 10], [3, 3, 30]]);
+	});
 });
