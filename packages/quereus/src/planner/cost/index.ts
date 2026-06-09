@@ -227,11 +227,13 @@ export function chooseCheapest<T>(options: Array<{ cost: number; option: T }>): 
 export type MaintenanceStrategy = 'inverse-projection' | 'residual-recompute' | 'full-rebuild';
 
 /**
- * Source row count above which a per-write `'full-rebuild'` is pathological under the
- * synchronous (row-time, in-transaction) policy: every DML statement on the source
+ * Default source row count above which a per-write `'full-rebuild'` is pathological under
+ * the synchronous (row-time, in-transaction) policy: every DML statement on the source
  * would trigger a full scan of it. A body whose only sound strategy is `'full-rebuild'`
  * over a source larger than this is rejected at view-create time rather than degraded
- * per write (see {@link isFullRebuildPathological}).
+ * per write (see {@link isFullRebuildPathological}). This is the default for the
+ * configurable `materialized_view_rebuild_row_threshold` option; `0` disables the reject
+ * (accept any size).
  */
 export const MAINTENANCE_REBUILD_ROW_THRESHOLD = 10_000;
 
@@ -252,7 +254,10 @@ const DEFAULT_RESIDUAL_FALLBACK_RATIO = 0.5;
  * is `optimizer.tuning.deltaPerRowFallbackRatio`, used only on the no-stats path.
  */
 export interface MaintenanceSourceStats {
-	/** Estimated source row count (StatsProvider.tableRows). */
+	/** Estimated source row count (StatsProvider.tableRows). For a multi-source body fed
+	 *  to {@link isFullRebuildPathological} this is the **largest** participating source's
+	 *  count — every write rebuilds the whole body, so the largest source it scans governs
+	 *  whether the per-write full-rebuild is pathological. */
 	tableRows: number;
 	/** Estimated distinct groups/keys per change (StatsProvider.distinctValues); absent ⇒ no-stats path. */
 	distinctGroupsEstimate?: number;
@@ -344,10 +349,17 @@ export function selectMaintenanceStrategy(
  * the source is large and the body costs more than a full scan of it, so every DML
  * write would scan the whole source. The gate uses this to reject-at-create when
  * `'full-rebuild'` is a body's only sound strategy.
+ *
+ * `threshold` is the configurable row ceiling (the `materialized_view_rebuild_row_threshold`
+ * option; default {@link MAINTENANCE_REBUILD_ROW_THRESHOLD}). A `threshold` of `0` (or any
+ * non-positive value) **disables** the size reject — full-rebuild of any size is accepted.
+ * For a multi-source body `stats.tableRows` is the largest participating source (see
+ * {@link MaintenanceSourceStats.tableRows}).
  */
-export function isFullRebuildPathological(stats: MaintenanceSourceStats): boolean {
+export function isFullRebuildPathological(stats: MaintenanceSourceStats, threshold: number): boolean {
+	if (threshold <= 0) return false; // 0 disables the size reject (accept any size)
 	const fullScanCost = stats.tableRows * COST_CONSTANTS.SEQ_SCAN_PER_ROW;
-	return stats.tableRows > MAINTENANCE_REBUILD_ROW_THRESHOLD && stats.forwardBodyCost > fullScanCost;
+	return stats.tableRows > threshold && stats.forwardBodyCost > fullScanCost;
 }
 
 /**

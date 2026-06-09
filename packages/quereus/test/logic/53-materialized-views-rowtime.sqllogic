@@ -172,88 +172,106 @@ select * from s_o order by x;
 → [{"x":1,"id":1},{"x":2,"id":2}]
 
 -- ===================================
--- 7. Mandatory create-time gate — a body that is not row-time maintainable is
---    rejected at CREATE with a shape-specific diagnostic that steers to a plain
---    `view` / `create table … as`, and does NOT mention a refresh policy. Each
---    case asserts the DISTINCTIVE reason tail (not just the generic envelope), so
---    a reason silently changing to a different reject branch is caught.
---
---    NOTE on check ordering (the trap these strong assertions guard): the
---    `tableRefs.length` checks run FIRST, so several bodies surface a source-count
---    tail rather than the "naive" reason — a 2-table UNION trips "reads more than
---    one source table", and a recursive-CTE-only body (no base table) trips "reads
---    no source table". The literal tails below were captured from the engine.
+-- 7. Cost-gated-with-floor create gate. **No body is rejected for its SHAPE** — a shape
+--    that fits no bounded-delta arm is maintained by the always-correct full-rebuild floor
+--    (re-evaluate the whole body, replace the backing). Only four NON-shape rejections
+--    remain: non-determinism, a bag (no provable unique key), no relational output, and a
+--    full-rebuild-only body over a source past the size threshold (the size reject needs
+--    StatsProvider counts → covered in materialized-view-diagnostics.spec.ts; the threshold
+--    pragma and its 0-disables behavior are in §27). This section pins the remaining rejects
+--    (distinctive tails) AND the shape ACCEPTANCES the flip introduced.
 -- ===================================
 
 create table g (id integer primary key, k integer, v integer);
 insert into g values (1, 100, 5);
-
--- scalar aggregate (no GROUP BY) — one global row, deferred in v1. A `group by`
--- aggregate over bare columns is now ACCEPTED (residual-recompute — see §22).
-create materialized view bad_scalar_agg as select count(*) as c, sum(v) as sv from g;
--- error: scalar aggregate with no GROUP BY
-
--- join body that is NOT provably 1:1 — no NOT-NULL foreign key from the driving side to
--- the lookup PK, and the lookup join key (g2.w) is non-unique, so the join can fan out.
--- The join-residual arm rejects it on SHAPE, steering to a plain view. (A provably-1:1
--- FK join is now ACCEPTED — see §24.)
 create table g2 (id integer primary key, w integer);
-create materialized view bad_join as select g.id, g.v from g join g2 on g.k = g2.w;
--- error: is not a provably 1:1 row-preserving join
 
--- A provably-1:1 FK join WITH a WHERE clause — a partial join body is deferred in v1 (the
--- lookup-side reverse residual is upsert-only, sound only when join membership is
--- predicate-independent). Rejected on the WHERE gate, before the 1:1 proof.
-create table jwp (id integer primary key, name text);
-create table jwt (id integer primary key, fk integer not null references jwp(id));
-create materialized view bad_join_where as select jwt.id, jwp.name from jwt join jwp on jwt.fk = jwp.id where jwp.name > 'm';
--- error: its join body has a WHERE clause
+-- ── KEPT rejects (all non-shape) ──
 
--- The same provably-1:1 FK join as an OUTER (left) join — the lookup-side reverse residual
--- filters the lookup side, which would drop an outer join's null-extended rows, so an outer
--- 1:1 join is deferred in v1.
-create materialized view bad_join_outer as select jwt.id, jwp.name from jwt left join jwp on jwt.fk = jwp.id;
--- error: its body uses an outer join
-
--- set-operation body over two tables — multi-source, NOT the "set operation" tail
--- (the union references g and g2, so the source-count check trips first).
-create materialized view bad_union as select id, v from g union select id, w from g2;
--- error: its body reads more than one source table
-
--- LIMIT body
-create materialized view bad_limit as select id, v from g limit 10;
--- error: its body uses LIMIT/OFFSET
-
--- DISTINCT that drops the source PK (single source — DISTINCT tail reached)
-create materialized view bad_distinct as select distinct v from g;
--- error: its body uses DISTINCT
-
--- recursive-CTE body reads only the CTE (no base table) — "reads no source table"
-create materialized view bad_rec as with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r;
--- error: its body reads no source table
-
--- projection dropping a source PK column
-create materialized view bad_nopk as select v from g;
--- error: it does not project source primary-key column 'id'
-
--- non-DETERMINISTIC projected expression column — rejected on determinism (a row-time
--- backing value must be reproducible from the source row), a DISTINCT diagnostic from
--- the shape rejection below: a deterministic expression column (e.g. v + 1) is now
--- ACCEPTED (see §19), so this asserts the determinism gate specifically.
+-- non-deterministic projected expression — a reproducibility reject (the inverse-projection
+-- arm's arm-specific tail), NOT a shape reject.
 create materialized view bad_nondet as select id, random() as r from g;
 -- error: non-deterministic expression column 'r'
 
--- deterministic but NOT single-row evaluable: a correlated scalar subquery in the
--- projection — rejected on SHAPE, steering to a plain view.
-create materialized view bad_subq as select id, (select g.v) as vv from g;
--- error: containing a subquery
+-- a projection dropping the source PK leaves a non-keyed (bag) body — the floor's
+-- no-provable-unique-key reject (the single create row was distinct, so it reached the gate
+-- rather than failing the set contract at fill).
+create materialized view bad_nopk as select v from g;
+-- error: no provable unique key
 
--- Lateral-TVF fan-out whose `order by` reorders the composite product key so the base PK
--- no longer leads it — the by-prefix delete would be unsound, so it is rejected on SHAPE.
--- (A lateral TVF that advertises NO per-call key is likewise rejected on shape; that case
--- needs a custom keyless TVF and is covered in materialized-view-diagnostics.spec.ts.)
-create materialized view bad_lateral_order as select g.id, f.value from g cross join lateral generate_series(1, g.v) f order by f.value;
--- error: does not lead with the base source primary key
+-- a recursive-CTE `union all` body is a bag (overlapping inputs, no provable key) — floor reject.
+create materialized view bad_rec as with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r;
+-- error: no provable unique key
+
+-- ── FLIPPED acceptances (shape is no longer a reject) ──
+-- Each CREATEs and reads its snapshot; the floor (or a bounded-delta arm) maintains it.
+-- Deep maintenance equivalence is the property harness's job (maintenance-equivalence.spec.ts
+-- § full-rebuild floor); §26 below exercises floor maintenance under writes.
+
+-- DISTINCT (single source) — a set, maintained by the full-rebuild floor.
+create materialized view ok_distinct as select distinct v from g;
+select v from ok_distinct order by v;
+→ [{"v":5}]
+
+-- scalar aggregate (no GROUP BY) — one global row, full-rebuild floor.
+create materialized view ok_scalar as select count(*) as c, sum(v) as s from g;
+select c, s from ok_scalar;
+→ [{"c":1,"s":5}]
+
+-- UNION over two tables — a set, full-rebuild floor.
+create materialized view ok_union as select id, v from g union select id, w from g2;
+select id, v from ok_union order by id;
+→ [{"id":1,"v":5}]
+
+-- a WHERE-subquery over a second table — full-rebuild floor.
+create materialized view ok_wheresubq as select id, v from g where v in (select w from g2);
+select id, v from ok_wheresubq order by id;
+→ []
+
+-- LIMIT — full-rebuild floor.
+create materialized view ok_limit as select id, v from g limit 10;
+select id, v from ok_limit order by id;
+→ [{"id":1,"v":5}]
+
+-- a correlated scalar-subquery projection column — full-rebuild floor.
+create materialized view ok_subq as select id, (select g.v) as vv from g;
+select id, vv from ok_subq order by id;
+→ [{"id":1,"vv":5}]
+
+-- order-by aggregate (the order-by makes a non-group-key backing column, so the
+-- residual-recompute arm declines) — full-rebuild floor.
+create materialized view ok_obagg as select k, sum(v) as s from g group by k order by sum(v);
+select k, s from ok_obagg order by k;
+→ [{"k":100,"s":5}]
+
+-- a lateral-TVF fan-out whose `order by` reorders the composite key so the base PK no longer
+-- leads it (the prefix-delete arm declines) — full-rebuild floor.
+create materialized view ok_lat_order as select g.id, f.value from g cross join lateral generate_series(1, g.v) f order by f.value;
+select id, value from ok_lat_order order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":1,"value":3},{"id":1,"value":4},{"id":1,"value":5}]
+
+-- a provably-1:1 FK join WITH a WHERE (the join-residual arm declines a partial join body) —
+-- the body is keyed on the driving PK, so it is a set: full-rebuild floor.
+create table jwp (id integer primary key, name text);
+create table jwt (id integer primary key, fk integer not null references jwp(id));
+insert into jwp values (1, 'alice'), (2, 'zoe');
+insert into jwt values (10, 1), (20, 2);
+create materialized view ok_join_where as select jwt.id, jwp.name from jwt join jwp on jwt.fk = jwp.id where jwp.name > 'm';
+select id, name from ok_join_where order by id;
+→ [{"id":20,"name":"zoe"}]
+
+-- the same FK join as an OUTER (left) join (the join-residual arm declines an outer join) —
+-- still keyed on the driving PK: full-rebuild floor.
+create materialized view ok_join_outer as select jwt.id, jwp.name from jwt left join jwp on jwt.fk = jwp.id;
+select id, name from ok_join_outer order by id;
+→ [{"id":10,"name":"alice"},{"id":20,"name":"zoe"}]
+
+-- NOTE: a *fanning* (non-1:1) join such as `select g.id, g.v from g join g2 on g.k = g2.w`
+-- now also routes to the floor and is ACCEPTED at create, but the floor trusts the optimizer's
+-- set-inference (`keysOf`); when such a body actually fans out it can produce duplicates the
+-- backing key collapses, diverging from the plain view. That `isSet`/`keysOf` over-claim is a
+-- pre-existing optimizer gap the flip exposes — filed as a fix ticket — so it is deliberately
+-- NOT asserted here.
 
 -- ===================================
 -- 8. MV-over-MV cascade. A materialized view whose source is itself another MV's

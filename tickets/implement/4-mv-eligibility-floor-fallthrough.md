@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-09T07:39:52.230Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\4-mv-eligibility-floor-fallthrough.implement.2026-06-09T07-39-52-230Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Flip materialized-view eligibility from reject-on-shape to cost-gated-with-floor — no body is rejected for its shape. Shape mismatches in the arm builders fall through to `buildFullRebuildPlan`; hard rejects (non-determinism, bag/no-key, no output) remain; add the configurable `materialized_view_rebuild_row_threshold` size reject.
 prereq: mv-statement-flush-deferral
 files: packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/planner/cost/index.ts, packages/quereus/src/core/database.ts, packages/quereus/test/logic/53-materialized-views-rowtime.sqllogic, packages/quereus/test/materialized-view-diagnostics.spec.ts, docs/incremental-maintenance.md

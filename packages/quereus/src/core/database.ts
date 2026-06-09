@@ -37,6 +37,7 @@ import { Optimizer, DEFAULT_TUNING } from '../planner/optimizer.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
 import { registerBuiltinWindowFunctions } from '../func/builtins/builtin-window-functions.js';
 import { DatabaseOptionsManager } from './database-options.js';
+import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
 import type { InstructionTracer } from '../runtime/types.js';
 import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
 import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
@@ -300,6 +301,27 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				'Defaults to false (strict rejection) for backward compatibility.',
 			onChange: (event) => {
 				log('nondeterministic_schema changed to: %s', event.newValue);
+			}
+		});
+
+		this.options.registerOption('materialized_view_rebuild_row_threshold', {
+			type: 'number',
+			defaultValue: MAINTENANCE_REBUILD_ROW_THRESHOLD,
+			description: 'Largest source-row count for which a materialized view whose only sound maintenance ' +
+				'strategy is a full body rebuild is accepted at create. A full-rebuild MV over a larger source ' +
+				'is rejected (every write would re-scan the whole source). Set to 0 to disable the size reject ' +
+				'(accept any size). The check uses the largest participating source for a multi-source body.',
+			onChange: (event) => {
+				// Validate at set time so a bad value fails loudly; the options framework
+				// rolls the value back when onChange throws.
+				const value = event.newValue as number;
+				if (!Number.isFinite(value) || value < 0) {
+					throw new QuereusError(
+						`Invalid materialized_view_rebuild_row_threshold ${event.newValue}: must be a non-negative number (0 disables the size reject)`,
+						StatusCode.ERROR,
+					);
+				}
+				log('materialized_view_rebuild_row_threshold changed to: %s', value);
 			}
 		});
 	}

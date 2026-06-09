@@ -12,18 +12,18 @@
  *
  *  2. **Row-time write-through** (`maintainRowTime`) — the backing table is kept
  *     consistent *synchronously* with each source row-write, driven from the
- *     runtime DML boundary (not at COMMIT). Each MV is gated at create to the
- *     covering-index shape (a single row-preserving source whose body projects every
- *     source PK column as a passthrough column, with non-key columns optionally a
- *     deterministic scalar expression over the row), so each source row maps to exactly
- *     one backing row and maintenance is a pure projection of the changed row — delete
- *     the old image's backing key, upsert the new image's backing row; no body
- *     re-execution, no scan. The write targets the backing
- *     table's *pending* transaction layer through the same connection a `select`
- *     from the MV uses, so the change is visible mid-transaction (reads-own-writes)
- *     and is committed/rolled-back in lockstep with the source write by the
- *     coordinated commit. A body that is not row-time maintainable is rejected at
- *     create (see {@link MaterializedViewManager.buildMaintenancePlan}).
+ *     runtime DML boundary (not at COMMIT). Each MV's maintenance is **cost-gated with a
+ *     floor**: the builder matches the body to a bounded-delta arm (the covering-index
+ *     inverse projection, an aggregate / lateral-TVF / 1:1-join residual) when one fits —
+ *     each source row then maps to a bounded backing delta, no full scan — and otherwise
+ *     falls through to the always-correct **full-rebuild floor** (re-evaluate the whole
+ *     body, replace the backing). **No body is rejected for its shape;** the only
+ *     create-time rejections are non-shape (non-determinism, bag/no-key, no relational
+ *     output, and a full-rebuild-only body over a source past the size threshold). The
+ *     write targets the backing table's *pending* transaction layer through the same
+ *     connection a `select` from the MV uses, so the change is visible mid-transaction
+ *     (reads-own-writes) and is committed/rolled-back in lockstep with the source write by
+ *     the coordinated commit (see {@link MaterializedViewManager.buildMaintenancePlan}).
  */
 
 import type { SchemaManager } from '../schema/manager.js';
@@ -53,6 +53,7 @@ import { proveOneToOneJoin } from '../planner/analysis/coverage-prover.js';
 import { CapabilityDetectors } from '../planner/framework/characteristics.js';
 import {
 	selectMaintenanceStrategy,
+	isFullRebuildPathological,
 	seqScanCost,
 	filterCost,
 	projectCost,
@@ -106,9 +107,8 @@ export interface MaterializedViewManagerContext {
  * aggregates), `'prefix-delete'` (single-source lateral-TVF fan-out), and `'join-residual'`
  * (the provably-1:1 inner join) — each applied **per source row, immediately**. The
  * `'full-rebuild'` floor (the always-correct convergence point for bodies no bounded-delta
- * arm fits) is wired and dispatched ({@link MaterializedViewManager.applyFullRebuild}) but
- * not yet routed from the builder (the eligibility flip is a follow-on ticket); it is the
- * one **deferred** arm — marked dirty per row and rebuilt once per statement at
+ * arm fits) is the fall-through the builder routes to whenever no bounded-delta arm matches;
+ * it is the one **deferred** arm — marked dirty per row and rebuilt once per statement at
  * {@link MaterializedViewManager.flushDeferredRebuilds}.
  */
 export type MaintenancePlan =
@@ -209,12 +209,11 @@ export interface InverseProjectionPlan extends MaintenancePlanCommon {
  * once at registration into {@link bodyScheduler}; {@link MaterializedViewManager.applyFullRebuild}
  * runs it to completion against live source state and diffs the result into the backing.
  *
- * Reachability: `buildMaintenancePlan` does **not** yet route bodies here (the
- * eligibility-flip that makes the floor the default lands in a follow-on ticket). The arm
- * is wired and exercised in isolation; it is the one **deferred** arm — marked dirty per
- * source row and rebuilt exactly once at the end-of-statement flush
- * ({@link MaterializedViewManager.flushDeferredRebuilds}), so a bulk write is O(body) not
- * O(rows × body). See `docs/materialized-views.md` § Full-rebuild floor.
+ * Reachability: `buildMaintenancePlan` routes a body here whenever no bounded-delta arm
+ * fits ({@link MaterializedViewManager.tryBuildBoundedDeltaArm} returns `null`). It is the
+ * one **deferred** arm — marked dirty per source row and rebuilt exactly once at the
+ * end-of-statement flush ({@link MaterializedViewManager.flushDeferredRebuilds}), so a bulk
+ * write is O(body) not O(rows × body). See `docs/materialized-views.md` § Full-rebuild floor.
  */
 export interface FullRebuildPlan extends MaintenancePlanCommon {
 	readonly kind: 'full-rebuild';
@@ -829,39 +828,31 @@ export class MaterializedViewManager {
 	}
 
 	/**
-	 * Build the row-time maintenance plan for an eligible MV, or throw with a
-	 * shape-naming diagnostic. Eligibility is the covering-index shape: a single
-	 * row-preserving source `T` with a primary key, a linear
-	 * `TableReference → optional Filter → Project → optional Sort` body
-	 * (no aggregate / join / DISTINCT / set op / recursive CTE / TVF / LIMIT/OFFSET),
-	 * a projection that resolves every source PK column (and every backing-key column) to
-	 * a **passthrough** source column — non-key columns may instead be a **deterministic
-	 * scalar expression** over the source row (`materialized-view-rowtime-expression-
-	 * projections`) — and a partial WHERE evaluable on a single source row.
+	 * Build the row-time maintenance plan for an MV — **cost-gated, with a floor, never a
+	 * shape allowlist**. The builder tries to match a bounded-delta arm by shape
+	 * ({@link tryBuildBoundedDeltaArm}); a body that matches **none** falls through to the
+	 * always-correct {@link buildFullRebuildPlan} floor (re-evaluate the whole body, replace
+	 * the backing transactionally). **No body is rejected for its shape.** Only four
+	 * create-time rejections remain, all non-shape:
+	 *  - a **non-deterministic** body without `pragma nondeterministic_schema` — a hard reject
+	 *    in the matched arm (so the arm-specific determinism diagnostic survives) or, for a
+	 *    body matching no arm, in the floor's whole-body determinism check;
+	 *  - a **bag** (no provable unique key) — the floor's `keysOf` reject (a duplicate-producing
+	 *    body usually fails the set contract earlier, at create-fill);
+	 *  - a body with **no relational output**;
+	 *  - a **full-rebuild-only body over a source past the size threshold**
+	 *    ({@link isFullRebuildPathological}, the `materialized_view_rebuild_row_threshold` option).
 	 *
 	 * The single source may itself be another MV's backing table (an MV-over-MV body):
 	 * `building/select.ts` rewrites a reference to `mv1` into a `TableReference` against
-	 * `mv1`'s backing table, so the source base is `mv1`'s backing base and the same
-	 * eligibility checks evaluate against the (keyed `memory`) backing schema unchanged.
-	 * A write to `mv1` then drives `mv2` via the cascade in {@link maintainRowTime} — no
-	 * separate dependency structure: the existing `rowTimeBySource[backingBase]` index
-	 * already records the producer→consumer edge the moment `mv2` registers.
+	 * `mv1`'s backing table, so the source base is `mv1`'s backing base and the same checks
+	 * evaluate against the (keyed `memory`) backing schema unchanged. A write to `mv1` then
+	 * drives `mv2` via the cascade in {@link maintainRowTime}.
 	 *
 	 * Eligibility is a *cost choice* among the body's structurally-sound strategies
-	 * ({@link selectMaintenanceStrategy}). For the covering-index shape the sound set is
-	 * `['inverse-projection']` *only* — `'full-rebuild'` is the always-correct floor for
-	 * shapes where inverse projection is NOT sound (which the general-bodies (3) ticket
-	 * adds), so it is deliberately not a competitor here: were it in the sound set, a
-	 * small/empty source's body cost would undercut inverse projection's per-row cost and
-	 * argmin would pick the unwired `'full-rebuild'` arm. So this still only ever returns
-	 * the `'inverse-projection'` arm today, now annotated with the chosen strategy and its
-	 * cost inputs ({@link MaintenanceSourceStats}).
-	 *
-	 * The synchronous degrade-vs-reject machinery (`isFullRebuildPathological` reject-at-create,
-	 * `shouldDegradeToRebuild` per-write demotion, both in `planner/cost/index.ts`) is
-	 * implemented but **dormant**: it is unreachable while `'inverse-projection'` is the only
-	 * wired/sound arm. The general-bodies (3) ticket widens the sound set so the other arms —
-	 * and that machinery — become reachable.
+	 * ({@link selectMaintenanceStrategy}): the bounded-delta arms are preferred by the argmin
+	 * cost gate, and full-rebuild is selected exactly when no bounded-delta arm is sound (an
+	 * empty sound set resolves to the floor) — so an existing eligible shape is unaffected.
 	 */
 	private buildMaintenancePlan(mv: MaterializedViewSchema): MaintenancePlan {
 		const db = this.ctx as unknown as Database;
@@ -873,83 +864,95 @@ export class MaterializedViewManager {
 			return this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
 		});
 
-		const reject = (detail: string): never => {
-			throw new QuereusError(
-				`materialized view '${mv.name}' cannot be materialized: ${detail}. `
-					+ `A materialized view must be row-time maintainable — a passthrough or `
-					+ `deterministic-expression projection of a single keyed source. For this body, use a `
-					+ `plain 'create view' (live re-evaluation) or 'create table ... as <body>' (a one-off `
-					+ `snapshot)`,
-				StatusCode.UNSUPPORTED,
-			);
-		};
+		// Try a bounded-delta arm; a shape that fits none falls through to the floor.
+		const boundedDelta = this.tryBuildBoundedDeltaArm(mv, analyzed);
+		return boundedDelta ?? this.buildFullRebuildPlan(mv, analyzed);
+	}
 
-		// Single source `T`. (A join, self-join, or TVF fan-out surfaces ≥2 table
-		// references or a TVF node — caught here and by the node-type checks below.)
+	/**
+	 * Route the analyzed body to the matching bounded-delta arm, or return `null` when its
+	 * shape fits **no** bounded-delta arm (the caller then builds the full-rebuild floor).
+	 * Each arm builder likewise returns `null` on a sub-shape mismatch and falls through
+	 * here. The arms keep only **determinism** as a hard reject (so their arm-specific
+	 * determinism diagnostic survives — see the individual builders); every other mismatch
+	 * is a `null` fall-through. Bag / no-output / size rejects live in the floor.
+	 */
+	private tryBuildBoundedDeltaArm(mv: MaterializedViewSchema, analyzed: BlockNode): MaintenancePlan | null {
+		// A body that reads no source table has no bounded-delta arm → floor (which rejects
+		// a sourceless body). (A self-join / TVF fan-out surfaces ≥2 refs or a TVF node.)
 		const tableRefs = [...collectTableRefs(analyzed).values()];
-		if (tableRefs.length === 0) reject('its body reads no source table');
-		// A multi-source body is admitted ONLY as a provably-1:1 binary join (the join arm
-		// below). Any other multi-source body (e.g. a 2-table set operation) is rejected here
-		// so its diagnostic stays the source-count tail rather than a downstream reason.
-		if (tableRefs.length > 1 && !containsAnyJoin(analyzed)) {
-			reject('its body reads more than one source table (joins are not supported)');
+		if (tableRefs.length === 0) return null;
+
+		// Shapes no bounded-delta arm models — a window function reads across the partition,
+		// set ops / recursive CTEs / DISTINCT / row caps are out of the bounded-delta model.
+		// They are NOT rejected: a deterministic, keyed such body is maintained by the floor.
+		if (containsNodeType(analyzed, PlanNodeType.Window)) return null;
+		if (containsNodeType(analyzed, PlanNodeType.Distinct)) return null;
+		if (containsNodeType(analyzed, PlanNodeType.SetOperation)) return null;
+		if (containsNodeType(analyzed, PlanNodeType.RecursiveCTE)) return null;
+		if (mv.selectAst.type === 'select' && (mv.selectAst.limit !== undefined || mv.selectAst.offset !== undefined)) {
+			return null;
 		}
+
 		const tableRef = tableRefs[0];
 		const sourceSchema = tableRef.tableSchema;
 		const sourceBase = `${sourceSchema.schemaName}.${sourceSchema.name}`.toLowerCase();
 
-		// NOTE: an MV-over-MV body (a source that is itself another MV's backing table)
-		// is no longer rejected here. The cascade in `maintainRowTime` drives dependents
-		// of a backing write recursively (DAG-ordered, atomic within the statement); the
-		// eligibility checks below evaluate against the keyed backing schema unchanged.
-
-		// Structural rejections that hold for *every* maintenance shape. A window
-		// function reads across the partition, set ops / recursive CTEs / row caps are
-		// out of the row-time model entirely.
-		if (containsNodeType(analyzed, PlanNodeType.Window)) reject('its body uses a window function');
-		if (containsNodeType(analyzed, PlanNodeType.Distinct)) reject('its body uses DISTINCT');
-		if (containsNodeType(analyzed, PlanNodeType.SetOperation)) reject('its body uses a set operation (union/intersect/except)');
-		if (containsNodeType(analyzed, PlanNodeType.RecursiveCTE)) reject('its body uses a recursive CTE');
-		if (mv.selectAst.type === 'select' && (mv.selectAst.limit !== undefined || mv.selectAst.offset !== undefined)) {
-			reject('its body uses LIMIT/OFFSET');
-		}
-
 		// Single base source `T` joined to ONE lateral table-valued function — a fan-out
 		// body (each base row produces N backing rows) → the prefix-delete arm. Routed
-		// here, *before* the generic join rejection below, because a lateral fan-out
-		// surfaces BOTH a Join and a TableFunctionCall. The source-count check above
-		// already rejected a TVF-only body (0 base refs) and a multi-base join (≥2 refs);
-		// the builder soundness-checks the rest of the shape (single TVF/join, advertised
-		// composite product key, base PK leading the backing PK, deterministic fan-out).
+		// *before* the generic join branch below, because a lateral fan-out surfaces BOTH a
+		// Join and a TableFunctionCall. A multi-base TVF body falls to the floor.
 		if (containsNodeType(analyzed, PlanNodeType.TableFunctionCall)) {
-			if (tableRefs.length !== 1) {
-				reject('its body joins a lateral table-valued function to more than one base source table');
-			}
-			return this.buildLateralTvfPrefixDeletePlan(mv, analyzed, tableRef, sourceBase, reject);
+			if (tableRefs.length !== 1) return null;
+			return this.buildLateralTvfPrefixDeletePlan(mv, analyzed, tableRef, sourceBase);
 		}
 
-		// Provably-1:1 inner/cross join (`select … from T join P on T.fk = P.id`) →
-		// join-residual arm. A fanning (non-1:1) join, an outer join, a >2-source join, an
-		// aggregate over a join, or a partial WHERE is rejected inside the builder with a
-		// shape diagnostic. (The lateral-TVF fan-out above is matched first because it also
-		// surfaces a join node.)
+		// Any join → the provably-1:1 join-residual arm. A fanning (non-1:1) join, an outer
+		// join, a >2-source join, an aggregate over a join, or a partial WHERE returns `null`
+		// from the builder → floor. (The lateral-TVF fan-out above is matched first because
+		// it also surfaces a join node.)
 		if (containsAnyJoin(analyzed)) {
-			return this.buildJoinResidualPlan(mv, analyzed, tableRefs, reject);
+			return this.buildJoinResidualPlan(mv, analyzed, tableRefs);
 		}
+		// A non-join multi-source body (e.g. a WHERE-subquery over a second table) has no
+		// bounded-delta arm → floor.
+		if (tableRefs.length > 1) return null;
 
 		// Single-source aggregate (`group by` over bare columns) → residual-recompute arm.
-		// Each changed source row belongs to exactly one group; maintaining the MV means
-		// recomputing that group's backing row from live state (delete old slice → run the
-		// group-keyed residual → upsert). A scalar aggregate (no GROUP BY) is rejected in
-		// v1 by `buildAggregateResidualPlan`. This replaces the former blanket aggregate
-		// rejection.
+		// Each changed source row belongs to exactly one group; maintenance recomputes that
+		// group's backing row from live state. A scalar aggregate (no GROUP BY) falls to the
+		// floor.
 		const aggregate = findAggregate(analyzed);
 		if (aggregate) {
-			return this.buildAggregateResidualPlan(mv, analyzed, tableRef, sourceBase, aggregate, reject);
+			return this.buildAggregateResidualPlan(mv, analyzed, tableRef, sourceBase, aggregate);
 		}
 
+		// The covering-index shape → inverse-projection arm (the default single-source arm).
+		return this.buildInverseProjectionPlan(mv, analyzed, tableRef, sourceBase);
+	}
+
+	/**
+	 * Build an `'inverse-projection'` plan for the covering-index shape: a single
+	 * row-preserving source `T` with a primary key, a linear
+	 * `TableReference → optional Filter → Project → optional Sort` body, a projection that
+	 * resolves every source PK column (and every backing-key column) to a **passthrough**
+	 * source column — non-key columns may instead be a **deterministic scalar expression**
+	 * over the source row — and a partial WHERE evaluable on a single source row. Returns
+	 * `null` on any **shape** mismatch (the caller falls through to the full-rebuild floor);
+	 * a **non-deterministic** computed column is the one hard reject (its arm-specific
+	 * determinism diagnostic must survive rather than fall through to the floor's generic one).
+	 */
+	private buildInverseProjectionPlan(
+		mv: MaterializedViewSchema,
+		analyzed: BlockNode,
+		tableRef: TableReferenceNode,
+		sourceBase: string,
+	): MaintenancePlan | null {
+		const db = this.ctx as unknown as Database;
+		const sourceSchema = tableRef.tableSchema;
+
 		const sourcePkCols = sourceSchema.primaryKeyDefinition.map(d => d.index);
-		if (sourcePkCols.length === 0) reject(`its source '${sourceBase}' has no primary key`);
+		if (sourcePkCols.length === 0) return null; // source has no PK → floor
 
 		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
 		if (!backing) {
@@ -974,7 +977,7 @@ export class MaterializedViewManager {
 		});
 		const producingByAttrId = collectProducingExprs(analyzed);
 		const rootAttrs = relationalAttributes(analyzed);
-		if (!rootAttrs) reject('its body produced no relational output');
+		if (!rootAttrs) return null; // no relational output → floor (which hard-rejects it)
 
 		const projectors: BackingProjector[] = [];
 		for (let outCol = 0; outCol < rootAttrs!.length; outCol++) {
@@ -984,29 +987,29 @@ export class MaterializedViewManager {
 				projectors.push({ kind: 'passthrough', sourceCol });
 				continue;
 			}
-			// Computed column: a deterministic scalar over the source row. Reject a
-			// non-deterministic producer (determinism diagnostic) before checking shape,
-			// so `random()` fails on *determinism* and a deterministic-but-unsupported
-			// form fails on *shape* — distinct diagnostics.
+			// Computed column: a deterministic scalar over the source row. A
+			// non-deterministic producer is a HARD reject (the arm-specific determinism
+			// diagnostic must survive — so `random()` fails on *determinism*, not by silently
+			// falling to a still-rejected floor); a deterministic-but-unsupported *shape*
+			// (no resolvable producer, a subquery / cross-row reference, an async form)
+			// returns `null` → the floor.
 			const colName = attr?.name ?? `#${outCol}`;
 			const producing = attr ? producingByAttrId.get(attr.id) : undefined;
-			if (!producing) {
-				reject(`it projects output column '${colName}' with no resolvable source expression`);
-			}
-			const det = checkDeterministic(producing!);
+			if (!producing) return null;
+			const det = checkDeterministic(producing);
 			if (!det.valid) {
-				reject(`it projects a non-deterministic expression column '${colName}' (${det.expression}); `
-					+ `a row-time backing value must be reproducible from the source row`);
+				throw cannotMaterialize(mv.name,
+					`it projects a non-deterministic expression column '${colName}' (${det.expression}); `
+						+ `a row-time backing value must be reproducible from the source row`);
 			}
-			assertSingleRowEvaluable(producing!, sourceDescriptor, colName, reject);
+			if (!isSingleRowEvaluable(producing, sourceDescriptor)) return null;
 			let evalFn: (row: Row) => SqlValue;
 			try {
-				evalFn = compileSourceRowEvaluator(db, producing!, sourceDescriptor);
-			} catch (e) {
-				reject(`it projects expression column '${colName}' in a form that is not row-time `
-					+ `maintainable (${e instanceof Error ? e.message : String(e)})`);
+				evalFn = compileSourceRowEvaluator(db, producing, sourceDescriptor);
+			} catch {
+				return null; // not row-time maintainable as a single-row scalar → floor
 			}
-			projectors.push({ kind: 'expr', eval: evalFn! });
+			projectors.push({ kind: 'expr', eval: evalFn });
 		}
 
 		// Every source PK column must be projected as a passthrough column so the backing
@@ -1017,10 +1020,7 @@ export class MaterializedViewManager {
 			projectors.flatMap(p => p.kind === 'passthrough' ? [p.sourceCol] : []),
 		);
 		for (const pk of sourcePkCols) {
-			if (!passthroughSourceCols.has(pk)) {
-				reject(`it does not project source primary-key column '${sourceSchema.columns[pk]?.name ?? pk}' `
-					+ `as a passthrough column`);
-			}
+			if (!passthroughSourceCols.has(pk)) return null; // PK not passthrough-projected → floor
 		}
 
 		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
@@ -1029,44 +1029,38 @@ export class MaterializedViewManager {
 		// it and `lookupCoveringConflicts` recovers the source PK from it, both of which
 		// require a passthrough source-column identity.
 		for (const d of backingPkDefinition) {
-			if (projectors[d.index]?.kind !== 'passthrough') {
-				reject(`its backing primary key includes computed column '${backing.columns[d.index]?.name ?? d.index}' `
-					+ `(backing-key columns must be passthrough source columns)`);
-			}
+			if (projectors[d.index]?.kind !== 'passthrough') return null; // computed backing-key col → floor
 		}
 
 		// Partial WHERE must be evaluable on a single source row (no subqueries /
-		// cross-row references). `compilePredicate` throws on unsupported forms.
+		// cross-row references). `compilePredicate` throws on unsupported forms; an
+		// unsupported WHERE shape falls to the floor.
 		let predicate: CompiledPredicate | undefined;
 		const bodyWhere = mv.selectAst.type === 'select' ? mv.selectAst.where : undefined;
 		if (bodyWhere) {
 			try {
 				predicate = compilePredicate(bodyWhere, sourceSchema.columns);
-			} catch (e) {
-				reject(`its WHERE is not evaluable on a single source row (${e instanceof Error ? e.message : String(e)})`);
+			} catch {
+				return null; // WHERE not evaluable on a single source row → floor
 			}
 		}
 
 		// ── Cost gate (incremental-maintenance-cost-gate) ──
-		// The checks above establish soundness for the covering-index shape, whose only
-		// structurally-sound maintenance strategy is 'inverse-projection' (O(1) per changed
-		// row). Per the cost model inverse projection is never demoted to 'full-rebuild' for
-		// an eligible shape — 'full-rebuild' is the always-correct floor for bodies where
-		// inverse projection is NOT sound (which materialized-view-rowtime-general-bodies
-		// adds), so it is not a competitor here. Eligibility is thus a cost choice among the
-		// sound strategies (argmin maintenanceCost); for this shape it resolves to
-		// inverse-projection while recording the choice + the cost inputs the runtime reuses.
-		// The general-bodies ticket widens `soundStrategies` and activates the reject-at-create
-		// / degrade-to-rebuild machinery in planner/cost/index.ts once the other arms are wired.
+		// The covering-index shape's only structurally-sound maintenance strategy is
+		// 'inverse-projection' (O(1) per changed row); 'full-rebuild' is the floor for bodies
+		// this arm did NOT match (reached via the `null` fall-through above), so it is not a
+		// competitor here. Eligibility is thus a cost choice among the sound strategies (argmin
+		// maintenanceCost); for this shape it resolves to inverse-projection while recording the
+		// choice + the cost inputs the runtime reuses.
 		const soundStrategies: MaintenanceStrategy[] = ['inverse-projection'];
 		const sourceStats = this.estimateMaintenanceStats(sourceSchema, projectors.length, predicate !== undefined);
 		// Create-time change-cardinality estimate: ~1% of the source per statement (typical OLTP).
 		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
 
-		// Defensive: only 'inverse-projection' is wired today. A different choice would mean
-		// `soundStrategies` grew without the corresponding apply-arm — fail loud rather than
-		// register an unexecutable plan. Unreachable until the general-bodies ticket lands.
+		// Defensive: this arm's sound set is exactly ['inverse-projection']. A different choice
+		// would mean the set grew without the corresponding apply-arm — fail loud rather than
+		// register an unexecutable plan.
 		if (chosenStrategy !== 'inverse-projection') {
 			throw new QuereusError(
 				`Internal error: cost gate selected unwired strategy '${chosenStrategy}' for materialized view '${mv.name}'`,
@@ -1091,11 +1085,17 @@ export class MaterializedViewManager {
 	/**
 	 * Build a `'residual-recompute'` plan for a single-source aggregate body
 	 * (`select g1,…, agg(…) from T [where P] group by g1,…` over **bare** group columns),
-	 * or throw via `reject` with a shape diagnostic. Each changed source row belongs to
-	 * exactly one group `(g1,…)`; maintaining the MV means recomputing that group's
-	 * backing row from live state — delete the old slice, run the group-keyed residual,
-	 * upsert the recomputed slice (zero rows when the group emptied). See
-	 * {@link ResidualRecomputePlan} and `docs/incremental-maintenance.md` § residual-recompute.
+	 * or return `null` on a shape mismatch (the caller falls through to the full-rebuild
+	 * floor). Each changed source row belongs to exactly one group `(g1,…)`; maintaining the
+	 * MV means recomputing that group's backing row from live state — delete the old slice,
+	 * run the group-keyed residual, upsert the recomputed slice (zero rows when the group
+	 * emptied). See {@link ResidualRecomputePlan} and `docs/incremental-maintenance.md`
+	 * § residual-recompute.
+	 *
+	 * A **non-deterministic** group/aggregate expression is the one hard reject (the
+	 * arm-specific determinism diagnostic must survive); every other mismatch — a scalar
+	 * aggregate, a computed group key, a backing key that is not the group key — returns
+	 * `null` → the floor.
 	 *
 	 * NOTE: the group binding is derived **directly** from the aggregate node's bare GROUP
 	 * BY columns, not via `extractBindings`. `analyzeRowSpecific`'s `'group'` classification
@@ -1109,14 +1109,10 @@ export class MaterializedViewManager {
 		tableRef: TableReferenceNode,
 		sourceBase: string,
 		aggregate: AggregateLike,
-		reject: (detail: string) => never,
-	): MaintenancePlan {
-		// Require an explicit GROUP BY. A scalar aggregate (no GROUP BY) is one global
-		// row keyed by the empty key — deferred in v1 (the residual + harness do not yet
-		// cover the empty-key shape cleanly).
-		if (aggregate.groupBy.length === 0) {
-			reject('its body is a scalar aggregate with no GROUP BY (a single global row is not row-time maintainable in v1)');
-		}
+	): MaintenancePlan | null {
+		// A scalar aggregate (no GROUP BY) is one global row keyed by the empty key — no
+		// bounded-delta group binding, so it falls to the floor.
+		if (aggregate.groupBy.length === 0) return null;
 
 		// Map T's output attributes to source column indices. T is a bare
 		// `TableReferenceNode`, so output-column index == source-column index.
@@ -1131,28 +1127,24 @@ export class MaterializedViewManager {
 			resolveTransitiveSourceCol(attrId, sourceAttrToCol, producingByAttrId);
 
 		// Each GROUP BY expression must be a bare source column (a computed group key has
-		// no source-column index to bind / key the backing on).
+		// no source-column index to bind / key the backing on) → otherwise the floor.
 		const groupColumns: number[] = [];
 		for (const expr of aggregate.groupBy) {
-			if (!(expr instanceof ColumnReferenceNode)) {
-				reject('its GROUP BY includes a computed expression (only bare source columns are row-time maintainable in v1)');
-			}
+			if (!(expr instanceof ColumnReferenceNode)) return null;
 			const sourceCol = sourceAttrToCol.get((expr as ColumnReferenceNode).attributeId);
-			if (sourceCol === undefined) {
-				reject('its GROUP BY references a value that is not a column of the single source');
-			}
-			groupColumns.push(sourceCol!);
+			if (sourceCol === undefined) return null;
+			groupColumns.push(sourceCol);
 		}
 
 		// Determinism: a residual must reproduce exactly what `select <body>` returns, so a
-		// volatile group/aggregate expression (random()/now()/volatile UDF) is rejected.
+		// volatile group/aggregate expression (random()/now()/volatile UDF) is a HARD reject.
 		for (const expr of aggregate.groupBy) {
 			const det = checkDeterministic(expr);
-			if (!det.valid) reject(`it groups by a non-deterministic expression (${det.expression})`);
+			if (!det.valid) throw cannotMaterialize(mv.name, `it groups by a non-deterministic expression (${det.expression})`);
 		}
 		for (const agg of aggregate.aggregates) {
 			const det = checkDeterministic(agg.expression);
-			if (!det.valid) reject(`it aggregates a non-deterministic expression (${det.expression})`);
+			if (!det.valid) throw cannotMaterialize(mv.name, `it aggregates a non-deterministic expression (${det.expression})`);
 		}
 
 		// Backing table + its physical PK. The aggregate's group-key FD
@@ -1169,25 +1161,23 @@ export class MaterializedViewManager {
 		// Map each backing-PK column back to the source group column it projects, so a
 		// changed row's old backing-slice delete key can be built. Every backing-PK column
 		// MUST resolve to a GROUP BY source column — else the backing key is not the group
-		// key and point-keyed delete+upsert would be unsound.
+		// key and point-keyed delete+upsert would be unsound → fall to the floor.
 		const rootAttrs = relationalAttributes(analyzed);
-		if (!rootAttrs) reject('its body produced no relational output');
+		if (!rootAttrs) return null;
 		const groupColumnSet = new Set(groupColumns);
 		const backingPkSourceCols: number[] = [];
 		for (const d of backingPkDefinition) {
-			const attr = rootAttrs![d.index];
+			const attr = rootAttrs[d.index];
 			const sourceCol = attr ? resolveToSourceCol(attr.id) : undefined;
-			if (sourceCol === undefined || !groupColumnSet.has(sourceCol)) {
-				reject(`its backing primary key includes column '${backing.columns[d.index]?.name ?? d.index}', `
-					+ `which is not a GROUP BY source column (the backing key must be the group key)`);
-			}
-			backingPkSourceCols.push(sourceCol!);
+			if (sourceCol === undefined || !groupColumnSet.has(sourceCol)) return null;
+			backingPkSourceCols.push(sourceCol);
 		}
 
 		// Compile + cache the group-keyed residual once (the body with `g1 = :gk0 AND …`
 		// injected on T). Re-run per affected group key against the live transaction.
 		const relKey = `${sourceBase}#${tableRef.id ?? 'unknown'}`;
-		const residualScheduler = this.compileResidual(analyzed, relKey, groupColumns, 'gk', reject);
+		const residualScheduler = this.compileResidual(analyzed, relKey, groupColumns, 'gk');
+		if (!residualScheduler) return null; // could not parameterize the residual → floor
 
 		// ── Cost gate ──
 		// The residual is the structurally-sound incremental arm for an aggregate body;
@@ -1226,39 +1216,35 @@ export class MaterializedViewManager {
 
 	/**
 	 * Build a `'join-residual'` plan for a provably-1:1 row-preserving **inner/cross join**
-	 * body (`select … from T join P on T.fk = P.id`), or throw via `reject` with a shape
-	 * diagnostic. The driving table `T` is the one whose PK the optimizer surfaced as the
-	 * backing key (the 1:1 join collapses the composite product key to `T`'s PK); the other
-	 * base ref is the lookup `P`. See {@link JoinResidualPlan} and
-	 * `docs/incremental-maintenance.md` § join-residual.
+	 * body (`select … from T join P on T.fk = P.id`), or return `null` on a shape mismatch
+	 * (the caller falls through to the full-rebuild floor). The driving table `T` is the one
+	 * whose PK the optimizer surfaced as the backing key (the 1:1 join collapses the composite
+	 * product key to `T`'s PK); the other base ref is the lookup `P`. See {@link JoinResidualPlan}
+	 * and `docs/incremental-maintenance.md` § join-residual.
 	 *
-	 * Soundness gates: exactly two base tables; an aggregate over the join is rejected (a
-	 * different shape); **no WHERE** (a partial / lookup-referencing predicate is deferred —
-	 * see the lookup-side soundness note in {@link applyLookupResidual}); the backing PK is
-	 * exactly `T`'s PK projected as passthrough columns (so each changed `T` row maps to one
-	 * backing row and the reverse residual's rows carry the backing key); the join is
-	 * provably 1:1 on `T` ({@link proveOneToOneJoin} — no row loss via NOT-NULL FK→PK RI, no
-	 * fan-out via the join-frame `isUnique(T.pk)`); the join is **inner/cross** (an outer join
-	 * would make the lookup-side reverse residual unsound — filtering `P` drops the
-	 * null-extended rows); and deterministic projections.
+	 * Soundness gates (a mismatch on any returns `null` → floor): exactly two base tables; no
+	 * aggregate over the join; **no WHERE** (a partial / lookup-referencing predicate's
+	 * upsert-only reverse residual is sound only when join membership is predicate-independent —
+	 * see {@link applyLookupResidual}); the backing PK is exactly `T`'s PK projected as
+	 * passthrough columns (so each changed `T` row maps to one backing row and the reverse
+	 * residual's rows carry the backing key); the join is provably 1:1 on `T`
+	 * ({@link proveOneToOneJoin} — no row loss via NOT-NULL FK→PK RI, no fan-out via the
+	 * join-frame `isUnique(T.pk)`); and the join is **inner/cross** (an outer join would make
+	 * the lookup-side reverse residual unsound — filtering `P` drops the null-extended rows).
+	 * A **non-deterministic** projection is the one hard reject (its arm-specific determinism
+	 * diagnostic must survive).
 	 */
 	private buildJoinResidualPlan(
 		mv: MaterializedViewSchema,
 		analyzed: BlockNode,
 		tableRefs: TableReferenceNode[],
-		reject: (detail: string) => never,
-	): MaintenancePlan {
-		if (tableRefs.length !== 2) {
-			reject('its body reads more than two source tables (only a 1:1 binary join is row-time maintainable)');
-		}
-		if (findAggregate(analyzed)) {
-			reject('its body aggregates over a join (not row-time maintainable in v1)');
-		}
-		// A partial / lookup-referencing WHERE is deferred: the lookup-side reverse residual
-		// is upsert-only, sound only when join membership is predicate-independent.
-		if (mv.selectAst.type === 'select' && mv.selectAst.where !== undefined) {
-			reject('its join body has a WHERE clause (a partial join body is not row-time maintainable in v1; use a plain view)');
-		}
+	): MaintenancePlan | null {
+		// >2-source join, an aggregate over the join, or a partial/lookup-referencing WHERE
+		// (the upsert-only reverse residual is sound only when join membership is
+		// predicate-independent) all have no join-residual binding → fall to the floor.
+		if (tableRefs.length !== 2) return null;
+		if (findAggregate(analyzed)) return null;
+		if (mv.selectAst.type === 'select' && mv.selectAst.where !== undefined) return null;
 
 		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
 		if (!backing) {
@@ -1270,7 +1256,7 @@ export class MaterializedViewManager {
 		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
 
 		const rootAttrs = relationalAttributes(analyzed);
-		if (!rootAttrs) reject('its body produced no relational output');
+		if (!rootAttrs) return null;
 		const producingByAttrId = collectProducingExprs(analyzed);
 
 		// Per-base-ref attribute → source-column maps. `T` and `P` are bare
@@ -1289,85 +1275,77 @@ export class MaterializedViewManager {
 		let tIndex: number | undefined;
 		const backingPkSourceCols: number[] = [];
 		for (const d of backingPkDefinition) {
-			const attr = rootAttrs![d.index];
+			const attr = rootAttrs[d.index];
 			let resolvedRef: number | undefined;
 			let resolvedCol: number | undefined;
 			for (let i = 0; i < refInfos.length; i++) {
 				const sc = attr ? resolveTransitiveSourceCol(attr.id, refInfos[i].attrToCol, producingByAttrId) : undefined;
 				if (sc !== undefined) { resolvedRef = i; resolvedCol = sc; break; }
 			}
-			if (resolvedRef === undefined) {
-				reject('its backing primary key includes a column not projected from a single source table (the join is not provably 1:1 on one source — use a plain view)');
-			}
+			// A backing-PK column resolving to neither ref, or columns spanning both, means the
+			// backing is not keyed on a single source's PK (not provably 1:1) → fall to the floor.
+			if (resolvedRef === undefined) return null;
 			if (tIndex === undefined) tIndex = resolvedRef;
-			else if (tIndex !== resolvedRef) {
-				reject('its backing primary key spans both join sources (not a 1:1 join keyed on one source)');
-			}
+			else if (tIndex !== resolvedRef) return null;
 			backingPkSourceCols.push(resolvedCol!);
 		}
-		if (tIndex === undefined) reject('its body produced no backing key');
+		if (tIndex === undefined) return null;
 
-		const tRef = refInfos[tIndex!].ref;
-		const pRef = refInfos[tIndex! === 0 ? 1 : 0].ref;
+		const tRef = refInfos[tIndex].ref;
+		const pRef = refInfos[tIndex === 0 ? 1 : 0].ref;
 		const tSchema = tRef.tableSchema;
 		const pSchema = pRef.tableSchema;
 		const sourceBase = `${tSchema.schemaName}.${tSchema.name}`.toLowerCase();
 		const lookupBase = `${pSchema.schemaName}.${pSchema.name}`.toLowerCase();
-		if (sourceBase === lookupBase) {
-			reject('its body is a self-join (not row-time maintainable)');
-		}
+		if (sourceBase === lookupBase) return null; // self-join → floor
 
 		// The backing key must be EXACTLY the driving source's PK (each `T` row → one backing
 		// row). `keysOf` surfaced `T.pk` for the 1:1 join; verify it resolved to a real PK key
 		// (not the all-columns fallback) by set-equality with `T`'s declared PK.
 		const tPkCols = tSchema.primaryKeyDefinition.map(d => d.index);
-		if (tPkCols.length === 0) reject(`its driving source '${sourceBase}' has no primary key`);
+		if (tPkCols.length === 0) return null;
 		const backingPkSet = new Set(backingPkSourceCols);
-		if (backingPkSet.size !== tPkCols.length || !tPkCols.every(c => backingPkSet.has(c))) {
-			reject('its backing primary key is not exactly the driving source primary key (the join is not provably 1:1 — use a plain view)');
-		}
+		if (backingPkSet.size !== tPkCols.length || !tPkCols.every(c => backingPkSet.has(c))) return null;
 
 		// Prove the join is 1:1 on `T` (no row loss + no fan-out), reusing the coverage
-		// prover's shared join predicates over the analyzed body.
+		// prover's shared join predicates over the analyzed body. A fanning / non-1:1 join
+		// falls to the floor.
 		const root = rootRelationalNode(analyzed);
-		if (!root) reject('its body produced no relational output');
-		const proof = proveOneToOneJoin(root!, tSchema);
-		if (!proof.ok) {
-			reject(proof.reason === 'fanout'
-				? 'its join can fan out — one driving row may match many lookup rows (a fanning keyed join is not row-time maintainable in v1; use a plain view)'
-				: 'its body is not a provably 1:1 row-preserving join (only an inner/cross join on a NOT-NULL foreign key to the lookup primary key is row-time maintainable; use a plain view)');
-		}
+		if (!root) return null;
+		const proof = proveOneToOneJoin(root, tSchema);
+		if (!proof.ok) return null;
 
 		// Restrict to inner/cross: the lookup-side reverse residual filters `P`, which would
-		// drop an outer join's null-extended rows (unsound). An outer 1:1 join is deferred.
+		// drop an outer join's null-extended rows (unsound). An outer 1:1 join falls to the floor.
 		const topJoin = proof.topJoin;
 		const joinType = topJoin && CapabilityDetectors.isJoin(topJoin) ? topJoin.getJoinType() : undefined;
-		if (joinType !== 'inner' && joinType !== 'cross') {
-			reject('its body uses an outer join (only an inner/cross 1:1 join is row-time maintainable in v1; use a plain view)');
-		}
+		if (joinType !== 'inner' && joinType !== 'cross') return null;
 
 		// Determinism: the residual must reproduce exactly what `select <body>` returns, so a
-		// volatile projection (random()/now()/volatile UDF) is rejected.
-		for (const attr of rootAttrs!) {
+		// volatile projection (random()/now()/volatile UDF) is a HARD reject.
+		for (const attr of rootAttrs) {
 			const producing = attr ? producingByAttrId.get(attr.id) : undefined;
 			if (!producing) continue; // a bare passthrough column has no producing expr to check
 			const det = checkDeterministic(producing);
 			if (!det.valid) {
-				reject(`it projects a non-deterministic expression (${det.expression}); a row-time backing value must be reproducible from the source rows`);
+				throw cannotMaterialize(mv.name,
+					`it projects a non-deterministic expression (${det.expression}); a row-time backing value must be reproducible from the source rows`);
 			}
 		}
 
 		// Forward (`T`) residual: the body with `T.pk = :pk0 AND …` injected on `T`. Recomputes
 		// the one joined row for a changed `T` row (delegated to `applyForwardResidual`).
 		const tRelKey = `${sourceBase}#${tRef.id ?? 'unknown'}`;
-		const forwardResidual = this.compileResidual(analyzed, tRelKey, tPkCols, 'pk', reject);
+		const forwardResidual = this.compileResidual(analyzed, tRelKey, tPkCols, 'pk');
+		if (!forwardResidual) return null;
 
 		// Reverse (`P`) residual: the body with `P.pk = :pk0 AND …` injected on `P`. Drives
 		// lookup-side maintenance — finds every joined row referencing a changed `P` row.
 		const pPkCols = pSchema.primaryKeyDefinition.map(d => d.index);
-		if (pPkCols.length === 0) reject(`its lookup source '${lookupBase}' has no primary key`);
+		if (pPkCols.length === 0) return null;
 		const pRelKey = `${lookupBase}#${pRef.id ?? 'unknown'}`;
-		const reverseResidual = this.compileResidual(analyzed, pRelKey, pPkCols, 'pk', reject);
+		const reverseResidual = this.compileResidual(analyzed, pRelKey, pPkCols, 'pk');
+		if (!reverseResidual) return null;
 
 		// ── Cost gate (parity with the other residual arms) ──
 		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
@@ -1405,38 +1383,28 @@ export class MaterializedViewManager {
 
 	/**
 	 * Build a `'full-rebuild'` plan — the always-correct floor — for an MV whose body matches
-	 * no bounded-delta arm, or throw with a relational/determinism diagnostic. This is the
-	 * fall-through builder; `buildMaintenancePlan` does **not** route bodies here yet (the
-	 * eligibility flip is the next ticket), so today it is reached only by direct construction
-	 * (the isolation tests). See {@link FullRebuildPlan} and `docs/materialized-views.md`
-	 * § Full-rebuild floor / § Primary key inference.
+	 * no bounded-delta arm, or throw with a non-shape diagnostic. This is the fall-through
+	 * builder {@link tryBuildBoundedDeltaArm} routes to on a `null` (no bounded-delta arm fits).
+	 * See {@link FullRebuildPlan} and `docs/materialized-views.md` § Full-rebuild floor /
+	 * § Primary key inference.
 	 *
 	 * Create-time rejections (none shape-based — the floor accepts general bodies):
 	 * - **bag** body with no provable unique key (`keysOf` over the optimized body root is
 	 *   empty) — there is no row identity to materialize on. `keysOf` already gates its
 	 *   all-columns fallback on `isSet`, so a non-empty result is a real key (a true column
-	 *   key OR the all-columns key of a provable set) and an empty result is exactly a bag;
+	 *   key OR the all-columns key of a provable set) and an empty result is exactly a bag.
+	 *   (A duplicate-producing body usually fails the set contract earlier, at create-fill.)
 	 * - **non-deterministic** body (any `random()`/`now()`/volatile UDF anywhere in the plan)
 	 *   without `pragma nondeterministic_schema` — no maintenance could keep it equal to its
 	 *   plain view (mirrors the per-arm determinism rejects and the DDL determinism gate);
-	 * - body with **no relational output** (degenerate).
-	 *
-	 * The size-threshold reject for a full-rebuild-only body over a large source
-	 * ({@link isFullRebuildPathological}) is intentionally **not** here: it is meaningful only
-	 * once `buildMaintenancePlan` routes bodies to the floor, so it lands with the
-	 * eligibility-flip ticket (which owns the `pragma materialized_view_rebuild_row_threshold`
-	 * wiring) — see the ticket handoff.
+	 * - body with **no relational output** (degenerate);
+	 * - **size**: full-rebuild is the only sound strategy *and* the **largest** participating
+	 *   source exceeds the `materialized_view_rebuild_row_threshold` option
+	 *   ({@link isFullRebuildPathological}) — every DML write would re-scan that source.
+	 *   `0` disables the size reject (accept any size).
 	 */
 	private buildFullRebuildPlan(mv: MaterializedViewSchema, analyzed: BlockNode): FullRebuildPlan {
 		const db = this.ctx as unknown as Database;
-
-		const reject = (detail: string): never => {
-			throw new QuereusError(
-				`materialized view '${mv.name}' cannot be materialized: ${detail}. For this body, use a `
-					+ `plain 'create view' (live re-evaluation) or 'create table ... as <body>' (a one-off snapshot)`,
-				StatusCode.UNSUPPORTED,
-			);
-		};
 
 		// Optimize the whole body ONCE — read-side MV rewrite suppressed so it reads its
 		// sources, not the backing it populates — then derive the body's key + determinism
@@ -1445,7 +1413,7 @@ export class MaterializedViewManager {
 			() => this.ctx.optimizer.optimize(analyzed, db) as BlockNode,
 		);
 		const root = rootRelationalNode(optimized);
-		if (!root) reject('its body produced no relational output');
+		if (!root) throw cannotMaterialize(mv.name, 'its body produced no relational output');
 
 		// Backing key = the body's provable unique key. A bag (no provable key — a key-dropping
 		// projection, a `union all` of overlapping inputs, …) has no row identity to key a
@@ -1453,8 +1421,8 @@ export class MaterializedViewManager {
 		// when the body is provably a set (`keysOf` gates it on `isSet`); a bag with an
 		// all-columns "key" still resolves to empty here and rejects, else duplicates would
 		// collide on the backing key.
-		if (keysOf(root!).length === 0) {
-			reject('its body has no provable unique key — it is a bag (e.g. a key-dropping '
+		if (keysOf(root).length === 0) {
+			throw cannotMaterialize(mv.name, 'its body has no provable unique key — it is a bag (e.g. a key-dropping '
 				+ 'projection or a `union all` of overlapping inputs), so it must be a set');
 		}
 
@@ -1464,7 +1432,7 @@ export class MaterializedViewManager {
 		if (!db.options.getBooleanOption('nondeterministic_schema')) {
 			const nonDet = findNonDeterministic(analyzed);
 			if (nonDet) {
-				reject(`its body is non-deterministic (${nonDet}); a materialized view body must be `
+				throw cannotMaterialize(mv.name, `its body is non-deterministic (${nonDet}); a materialized view body must be `
 					+ 'reproducible to stay equal to its plain view (set `pragma nondeterministic_schema` to override)');
 			}
 		}
@@ -1477,7 +1445,7 @@ export class MaterializedViewManager {
 		const sourceBases = [...new Set(
 			tableRefs.map(ref => `${ref.tableSchema.schemaName}.${ref.tableSchema.name}`.toLowerCase()),
 		)];
-		if (sourceBases.length === 0) reject('its body reads no source table');
+		if (sourceBases.length === 0) throw cannotMaterialize(mv.name, 'its body reads no source table');
 
 		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
 		if (!backing) {
@@ -1487,15 +1455,39 @@ export class MaterializedViewManager {
 			);
 		}
 
+		// ── Cost gate + size reject ──
+		// Full-rebuild is the floor: an EMPTY sound set resolves to it (`selectMaintenanceStrategy`).
+		// Cost the rebuild against the LARGEST participating source — every write re-evaluates the
+		// whole body, so the largest source it scans governs whether the per-write rebuild is
+		// pathological (e.g. a tiny driving table joined to a huge lookup gates on the lookup).
+		// Re-resolve each source's CURRENT schema (the analyzed plan node may carry a pre-`analyze`
+		// snapshot whose `statistics` predates the latest counts) so the size gate reflects the
+		// live source size at create time.
+		const statsProvider = this.ctx.optimizer.getStats();
+		let largestSchema = tableRefs[0].tableSchema;
+		let largestRows = -1;
+		for (const ref of tableRefs) {
+			const live = this.liveSourceSchema(ref);
+			const rows = statsProvider.tableRows(live) ?? DEFAULT_SOURCE_ROWS;
+			if (rows > largestRows) { largestRows = rows; largestSchema = live; }
+		}
+		const sourceStats = this.estimateMaintenanceStats(largestSchema, backing.columns.length, /*hasPredicate*/ false);
+
+		// Size reject: full-rebuild is the only sound strategy here, so a source past the
+		// configurable threshold makes every write pathological. `0` disables the reject.
+		const rebuildThreshold = db.options.getNumberOption('materialized_view_rebuild_row_threshold');
+		if (isFullRebuildPathological(sourceStats, rebuildThreshold)) {
+			const largestBase = `${largestSchema.schemaName}.${largestSchema.name}`.toLowerCase();
+			throw cannotMaterialize(mv.name,
+				`its only sound maintenance strategy is a full body rebuild, but its largest source '${largestBase}' has `
+					+ `~${sourceStats.tableRows} rows, over the materialized_view_rebuild_row_threshold (${rebuildThreshold}) — `
+					+ `every write would re-scan it. Raise or disable the threshold `
+					+ `(\`pragma materialized_view_rebuild_row_threshold = 0\`)`);
+		}
+
 		// Compile the whole optimized body once into a reusable scheduler (no key filter).
 		const bodyScheduler = new Scheduler(emitPlanNode(optimized, new EmissionContext(db)));
 
-		// ── Cost gate ──
-		// Full-rebuild is the floor: an EMPTY sound set resolves to it (`selectMaintenanceStrategy`).
-		// We record the chosen strategy + the cost inputs for substrate parity (not consulted at
-		// apply time). Stats are taken over the first source as a representative (the
-		// largest-source size-threshold reject is deferred to the eligibility-flip ticket).
-		const sourceStats = this.estimateMaintenanceStats(tableRefs[0].tableSchema, backing.columns.length, /*hasPredicate*/ false);
 		const chosenStrategy = selectMaintenanceStrategy([], Math.max(1, sourceStats.tableRows * 0.01), sourceStats);
 		if (chosenStrategy !== 'full-rebuild') {
 			throw new QuereusError(
@@ -1522,20 +1514,18 @@ export class MaterializedViewManager {
 	 * the analyzed body with a key-equality filter injected on `T`'s `TableReferenceNode`
 	 * (parameterized `${paramPrefix}0…`), then optimized + emitted. Mirrors the assertion
 	 * evaluator's residual compilation (`database-assertions.ts`) so the two cannot drift.
-	 * Throws via `reject` if `injectKeyFilter` could not target `T`.
+	 * Returns `null` if `injectKeyFilter` could not target `T` (the arm builder then falls
+	 * through to the full-rebuild floor).
 	 */
 	private compileResidual(
 		analyzed: BlockNode,
 		relKey: string,
 		bindColumns: readonly number[],
 		paramPrefix: 'gk' | 'pk',
-		reject: (detail: string) => never,
-	): Scheduler {
+	): Scheduler | null {
 		const db = this.ctx as unknown as Database;
 		const rewritten = injectKeyFilter(analyzed, relKey, bindColumns, paramPrefix);
-		if (rewritten === analyzed) {
-			reject('its body could not be parameterized for residual maintenance (the source reference was not found)');
-		}
+		if (rewritten === analyzed) return null; // could not parameterize the residual → floor
 		// Suppress the read-side rewrite: the residual is the MV's own body (+ a key
 		// filter) compiled to maintain its backing, so it must stay over the source.
 		const optimized = db.schemaManager.withSuppressedMaterializedViewRewrite(
@@ -1793,74 +1783,67 @@ export class MaterializedViewManager {
 
 	/**
 	 * Build a `'prefix-delete'` plan for a single-source lateral-TVF fan-out body
-	 * (`select T.pk…, …, f.* from T cross join lateral tvf(<args over T>) f`), or throw via
-	 * `reject` with a shape diagnostic. The backing PK is the composite product key
-	 * `(T.pk ∪ tvf-key)` that `keysOf` advertises through the lateral join; the base PK is
-	 * its leading prefix. See {@link PrefixDeletePlan} and `docs/incremental-maintenance.md`
-	 * § prefix-delete.
+	 * (`select T.pk…, …, f.* from T cross join lateral tvf(<args over T>) f`), or return
+	 * `null` on a shape mismatch (the caller falls through to the full-rebuild floor). The
+	 * backing PK is the composite product key `(T.pk ∪ tvf-key)` that `keysOf` advertises
+	 * through the lateral join; the base PK is its leading prefix. See {@link PrefixDeletePlan}
+	 * and `docs/incremental-maintenance.md` § prefix-delete.
 	 *
-	 * Soundness gates: exactly one lateral TVF and one join (no nested/multi TVF, no
-	 * aggregate over the fan-out); a deterministic TVF + deterministic operands (the
-	 * residual must reproduce the body); the base PK projected and forming the **leading
-	 * prefix** of the backing PK with a non-empty TVF-key tail (so each base row's fan-out
-	 * rows are individually addressable and a by-prefix delete selects exactly one base
-	 * row's slice). An `order by` over the fan-out that reorders the composite key so the
-	 * base PK no longer leads is rejected here (steered to a plain view). The body's WHERE,
-	 * if any, is part of the residual (so an out-of-scope base row fans out to zero rows),
-	 * exactly as in the aggregate arm — no separate predicate is compiled.
+	 * Soundness gates (a mismatch on any returns `null` → floor): exactly one lateral TVF and
+	 * one join (no nested/multi TVF, no aggregate over the fan-out); the TVF advertises a
+	 * per-call key; the base PK projected and forming the **leading prefix** of the backing PK
+	 * with a non-empty TVF-key tail (so each base row's fan-out rows are individually
+	 * addressable and a by-prefix delete selects exactly one base row's slice). An `order by`
+	 * over the fan-out that reorders the composite key so the base PK no longer leads is a
+	 * `null` fall-through (the floor maintains it wholesale). The body's WHERE, if any, is part
+	 * of the residual (so an out-of-scope base row fans out to zero rows), exactly as in the
+	 * aggregate arm. A **non-deterministic** TVF / argument is the one hard reject (its
+	 * arm-specific determinism diagnostic must survive).
 	 */
 	private buildLateralTvfPrefixDeletePlan(
 		mv: MaterializedViewSchema,
 		analyzed: BlockNode,
 		tableRef: TableReferenceNode,
 		sourceBase: string,
-		reject: (detail: string) => never,
-	): MaintenancePlan {
-		// Exactly one lateral TVF and one join. A second base table is already rejected by
-		// the single-source check upstream; this rejects a second TVF / chained lateral
-		// join (`t join lateral tvf1 join lateral tvf2`).
-		if (countNodeType(analyzed, PlanNodeType.TableFunctionCall) !== 1) {
-			reject('its body calls more than one table-valued function (only a single lateral TVF fan-out is row-time maintainable)');
-		}
-		if (countJoins(analyzed) !== 1) {
-			reject('its body has more than one join over the lateral table-valued function (only a single base source joined to one lateral TVF is row-time maintainable)');
-		}
-		// An aggregate over the fan-out is a different shape — reject (the TVF route is taken
+	): MaintenancePlan | null {
+		// Exactly one lateral TVF and one join. A second base table is already excluded by
+		// the single-source check upstream; this falls to the floor for a second TVF / chained
+		// lateral join (`t join lateral tvf1 join lateral tvf2`).
+		if (countNodeType(analyzed, PlanNodeType.TableFunctionCall) !== 1) return null;
+		if (countJoins(analyzed) !== 1) return null;
+		// An aggregate over the fan-out is a different shape → floor (the TVF route is taken
 		// before the aggregate route, so an `... group by` over a lateral TVF lands here).
-		if (findAggregate(analyzed)) {
-			reject('its body aggregates over a lateral table-valued function (not row-time maintainable in v1)');
-		}
+		if (findAggregate(analyzed)) return null;
 
 		// Determinism: a residual must reproduce exactly what `select <body>` returns, so a
-		// volatile TVF (or a volatile argument expression) is rejected.
+		// volatile TVF (or a volatile argument expression) is a HARD reject.
 		const tvf = findTableFunctionCall(analyzed);
 		if (!tvf) {
 			// Unreachable — countNodeType(...) === 1 above guarantees one exists.
 			throw new QuereusError(`Internal error: lateral TVF node not found for materialized view '${mv.name}'`, StatusCode.INTERNAL);
 		}
 		if (tvf.physical.deterministic === false) {
-			reject(`it fans out through a non-deterministic table-valued function '${tvf.functionName}' (a row-time fan-out must be reproducible from the base row)`);
+			throw cannotMaterialize(mv.name,
+				`it fans out through a non-deterministic table-valued function '${tvf.functionName}' (a row-time fan-out must be reproducible from the base row)`);
 		}
 		for (const operand of tvf.operands) {
 			const det = checkDeterministic(operand);
-			if (!det.valid) reject(`it passes a non-deterministic argument (${det.expression}) to the lateral table-valued function`);
+			if (!det.valid) throw cannotMaterialize(mv.name, `it passes a non-deterministic argument (${det.expression}) to the lateral table-valued function`);
 		}
 
 		// The lateral TVF must advertise a per-call key, so the composite product key is a
 		// real column key `(base PK ∪ TVF key)` rather than the all-columns / `isSet`
 		// fallback. Without one the fan-out rows are not individually addressable by a proper
-		// key — the by-prefix delete + keyed upsert would be unsound — so reject (steer to a
-		// plain view). `getType().keys` carries the validated advertisement (an out-of-range
-		// key advertisement is dropped, leaving this empty), so it is the authoritative
+		// key — the by-prefix delete + keyed upsert would be unsound — so fall to the floor.
+		// `getType().keys` carries the validated advertisement (an out-of-range key
+		// advertisement is dropped, leaving this empty), so it is the authoritative
 		// "did the TVF advertise a usable key" signal.
-		if (tvf.getType().keys.length === 0) {
-			reject(`its lateral table-valued function '${tvf.functionName}' advertises no per-call key, so the fan-out rows are not individually addressable (use a plain view)`);
-		}
+		if (tvf.getType().keys.length === 0) return null;
 
 		// Base T's PK source columns.
 		const sourceSchema = tableRef.tableSchema;
 		const sourcePkCols = sourceSchema.primaryKeyDefinition.map(d => d.index);
-		if (sourcePkCols.length === 0) reject(`its base source '${sourceBase}' has no primary key`);
+		if (sourcePkCols.length === 0) return null;
 
 		// Backing table + its physical PK (the composite product key).
 		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
@@ -1879,30 +1862,23 @@ export class MaterializedViewManager {
 		tableRef.getAttributes().forEach((a, i) => sourceAttrToCol.set(a.id, i));
 		const producingByAttrId = collectProducingExprs(analyzed);
 		const rootAttrs = relationalAttributes(analyzed);
-		if (!rootAttrs) reject('its body produced no relational output');
+		if (!rootAttrs) return null;
 
 		// Prefix soundness: the LEADING `basePrefixLen` backing-PK columns must each
 		// project (transitively) a distinct base-T PK column, their set must equal the base
 		// PK, and there must be a non-empty TVF-key tail. So the base PK is the leading
 		// prefix of the composite product key and the by-prefix delete selects exactly one
-		// base row's fan-out.
+		// base row's fan-out. A composite key that did not form this way falls to the floor.
 		const basePrefixLen = sourcePkCols.length;
-		if (backingPkDefinition.length <= basePrefixLen) {
-			// Defensive: with an advertised TVF key (checked above) the product key carries a
-			// non-empty tail; a degenerate composite that collapsed to the base PK alone is
-			// not addressable per fan-out row.
-			reject('its backing primary key has no fan-out tail beyond the base primary key (the composite product key did not form — use a plain view)');
-		}
+		if (backingPkDefinition.length <= basePrefixLen) return null;
 		const basePkSet = new Set(sourcePkCols);
 		const leadingSourceCols = new Set<number>();
 		const backingPrefixSourceCols: number[] = [];
 		for (let i = 0; i < basePrefixLen; i++) {
 			const d = backingPkDefinition[i];
-			const attr = rootAttrs![d.index];
+			const attr = rootAttrs[d.index];
 			const sc = attr ? resolveTransitiveSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
-			if (sc === undefined || !basePkSet.has(sc)) {
-				reject('its backing primary key does not lead with the base source primary key (the base PK must be the leading prefix of the composite product key — an `order by` over the fan-out that reorders it is not row-time maintainable)');
-			}
+			if (sc === undefined || !basePkSet.has(sc)) return null; // base PK not the leading prefix → floor
 			// Soundness precondition for the binary prefix scan (the property
 			// `prefix-delete-noncase-collation-regression-test` locks in): the backing base-PK
 			// column MUST inherit the source PK column's collation. The btree orders this prefix
@@ -1929,26 +1905,23 @@ export class MaterializedViewManager {
 			leadingSourceCols.add(sc!);
 			backingPrefixSourceCols.push(sc!);
 		}
-		if (leadingSourceCols.size !== basePkSet.size) {
-			reject('its backing primary key prefix does not cover the base source primary key');
-		}
+		if (leadingSourceCols.size !== basePkSet.size) return null; // prefix does not cover the base PK → floor
 		// The TVF-key tail must NOT re-use a base-PK column — else the fan-out rows would
 		// not be distinguished and the "key" would be base-only (defensive: the product key
-		// places the TVF key, a distinct relation's columns, in the tail).
+		// places the TVF key, a distinct relation's columns, in the tail). Otherwise → floor.
 		for (let i = basePrefixLen; i < backingPkDefinition.length; i++) {
 			const d = backingPkDefinition[i];
-			const attr = rootAttrs![d.index];
+			const attr = rootAttrs[d.index];
 			const sc = attr ? resolveTransitiveSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
-			if (sc !== undefined && basePkSet.has(sc)) {
-				reject('its backing primary key repeats a base primary-key column in the fan-out tail (the TVF key must distinguish fan-out rows)');
-			}
+			if (sc !== undefined && basePkSet.has(sc)) return null;
 		}
 
 		// Compile + cache the base-PK-keyed residual once (the body with `T.pk = :pk0 AND …`
 		// injected on T). Re-run per affected base key against the live transaction; it
 		// re-runs the lateral join + TVF for that single base row, fanning out to N rows.
 		const relKey = `${sourceBase}#${tableRef.id ?? 'unknown'}`;
-		const residualScheduler = this.compileResidual(analyzed, relKey, sourcePkCols, 'pk', reject);
+		const residualScheduler = this.compileResidual(analyzed, relKey, sourcePkCols, 'pk');
+		if (!residualScheduler) return null; // could not parameterize the residual → floor
 
 		// ── Cost gate ──
 		// The fan-out residual shares the residual-recompute cost shape (a key-filtered
@@ -2073,6 +2046,19 @@ export class MaterializedViewManager {
 	 * covering-index body shape); `fallbackRatio` carries the detection kernel's
 	 * `deltaPerRowFallbackRatio` for the no-stats residual path.
 	 */
+	/**
+	 * The CURRENT `TableSchema` of a source `TableReferenceNode`, re-resolved through the
+	 * schema manager. A plan node captures the schema as of plan-build; a later `analyze`
+	 * replaces the catalog entry with one carrying fresh `statistics`, so the stale captured
+	 * schema would report pre-`analyze` row counts. Re-resolving keeps the floor's size gate
+	 * on the live source size. Falls back to the node's captured schema if the name no longer
+	 * resolves (it always should — the body planned).
+	 */
+	private liveSourceSchema(ref: TableReferenceNode): TableSchema {
+		const captured = ref.tableSchema;
+		return this.ctx._findTable(captured.name, captured.schemaName) ?? captured;
+	}
+
 	private estimateMaintenanceStats(
 		sourceSchema: TableSchema,
 		projectionCount: number,
@@ -2197,8 +2183,9 @@ export class MaterializedViewManager {
 		const plan = this.rowTime.get(mvKey(mv.schemaName, mv.name));
 		if (!plan) return [];
 		// Covering-conflict resolution reads the inverse projection (source↔backing
-		// column map). Only the `'inverse-projection'` arm carries it; the other arms
-		// are unreachable today (see {@link MaintenancePlan}) — defensively skip.
+		// column map). Only the `'inverse-projection'` arm carries it; the other arms do
+		// not cover a source UNIQUE constraint in the covering sense, so a covering
+		// structure is never linked to one — defensively skip if reached.
 		if (plan.kind !== 'inverse-projection') return [];
 
 		const [srcSchemaName, srcTableName] = plan.sourceBase.split('.');
@@ -2582,29 +2569,41 @@ function rootRelationalNode(block: BlockNode): RelationalPlanNode | undefined {
 }
 
 /**
- * Reject a computed projection expression that cannot be evaluated as a pure function
- * of the changed source row: a subquery / relational subtree (cross-row), or a column
- * reference that does not resolve to a source column (a correlated / outer reference).
- * This is the "shape" gate distinct from the determinism gate — a determinism failure
- * is caught earlier by `checkDeterministic`.
+ * The diagnostic for a create-time **hard** reject — one of the four non-shape rejections
+ * the cost-gated-with-floor model keeps (non-determinism, bag/no-key, no relational output,
+ * size). Names the MV and steers to a plain `view` (live re-evaluation) or
+ * `create table ... as <body>` (a one-off snapshot) — never a refresh policy, never the
+ * hidden `_mv_<name>` backing table. Used by the arm builders (for their arm-specific
+ * determinism diagnostic) and by {@link MaterializedViewManager.buildFullRebuildPlan}.
  */
-function assertSingleRowEvaluable(
-	expr: ScalarPlanNode,
-	sourceDescriptor: RowDescriptor,
-	colName: string,
-	reject: (detail: string) => never,
-): void {
-	const visit = (node: PlanNode): void => {
-		if (node !== expr && isRelationalNode(node)) {
-			reject(`it projects expression column '${colName}' containing a subquery `
-				+ `(only single-row scalar expressions over the source are row-time maintainable)`);
-		}
+function cannotMaterialize(mvName: string, detail: string): QuereusError {
+	return new QuereusError(
+		`materialized view '${mvName}' cannot be materialized: ${detail}. For this body, use a `
+			+ `plain 'create view' (live re-evaluation) or 'create table ... as <body>' (a one-off snapshot)`,
+		StatusCode.UNSUPPORTED,
+	);
+}
+
+/**
+ * True iff a computed projection expression can be evaluated as a pure function of the
+ * changed source row — i.e. it contains no subquery / relational subtree (cross-row) and
+ * every column reference resolves to a source column (no correlated / outer reference).
+ * This is the "shape" gate distinct from the determinism gate (a determinism failure is
+ * caught earlier by `checkDeterministic`); a `false` here is a `null` fall-through to the
+ * full-rebuild floor, not a hard reject.
+ */
+function isSingleRowEvaluable(expr: ScalarPlanNode, sourceDescriptor: RowDescriptor): boolean {
+	const visit = (node: PlanNode): boolean => {
+		if (node !== expr && isRelationalNode(node)) return false; // a subquery / relational subtree
 		if (node instanceof ColumnReferenceNode && sourceDescriptor[node.attributeId] === undefined) {
-			reject(`it projects expression column '${colName}' referencing a value outside the source row`);
+			return false; // references a value outside the source row
 		}
-		for (const child of node.getChildren()) visit(child as unknown as PlanNode);
+		for (const child of node.getChildren()) {
+			if (!visit(child as unknown as PlanNode)) return false;
+		}
+		return true;
 	};
-	visit(expr);
+	return visit(expr);
 }
 
 /**

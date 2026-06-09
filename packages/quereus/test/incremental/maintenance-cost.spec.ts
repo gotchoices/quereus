@@ -83,14 +83,27 @@ describe('selectMaintenanceStrategy — argmin over sound strategies', () => {
 });
 
 describe('isFullRebuildPathological — synchronous reject-at-create gate', () => {
+	const T = MAINTENANCE_REBUILD_ROW_THRESHOLD;
 	it('is true only when the source is large AND the body costs more than a full scan', () => {
-		const big = MAINTENANCE_REBUILD_ROW_THRESHOLD * 2;
+		const big = T * 2;
 		// Body more expensive than a full scan of a large source → pathological.
-		expect(isFullRebuildPathological({ tableRows: big, forwardBodyCost: big * 1.5 })).to.equal(true);
+		expect(isFullRebuildPathological({ tableRows: big, forwardBodyCost: big * 1.5 }, T)).to.equal(true);
 		// Large source but cheap body (≤ scan) → not pathological.
-		expect(isFullRebuildPathological({ tableRows: big, forwardBodyCost: big * 0.5 })).to.equal(false);
+		expect(isFullRebuildPathological({ tableRows: big, forwardBodyCost: big * 0.5 }, T)).to.equal(false);
 		// Small source → never pathological, even with an expensive body.
-		expect(isFullRebuildPathological({ tableRows: 1000, forwardBodyCost: 1e9 })).to.equal(false);
+		expect(isFullRebuildPathological({ tableRows: 1000, forwardBodyCost: 1e9 }, T)).to.equal(false);
+	});
+
+	it('a threshold of 0 disables the size reject (accept any size)', () => {
+		const huge = T * 1000;
+		expect(isFullRebuildPathological({ tableRows: huge, forwardBodyCost: huge * 10 }, 0)).to.equal(false);
+	});
+
+	it('honors a custom (lowered) threshold', () => {
+		// A source of 5 rows is pathological under a threshold of 2 (body > a full scan).
+		expect(isFullRebuildPathological({ tableRows: 5, forwardBodyCost: 100 }, 2)).to.equal(true);
+		// …but not under a threshold of 10.
+		expect(isFullRebuildPathological({ tableRows: 5, forwardBodyCost: 100 }, 10)).to.equal(false);
 	});
 });
 
