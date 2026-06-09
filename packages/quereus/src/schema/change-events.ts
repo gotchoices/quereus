@@ -63,11 +63,14 @@ export type ViewAddedEvent = SchemaObjectAdded<'view_added', ViewSchema>;
 export type ViewRemovedEvent = SchemaObjectRemoved<'view_removed', ViewSchema>;
 
 /**
- * Emitted after an in-place change to an existing (non-materialized) view —
- * currently only `ALTER VIEW … SET TAGS`. Distinct from `view_added` (which a
- * fresh create fires) so a cached write-through plan that recorded a `view`
- * dependency invalidates when the view's behavioral `quereus.update.*` tags
- * change, without re-triggering a persistence re-create.
+ * Emitted after an in-place change to an existing (non-materialized) view. Two
+ * sources fire it: `ALTER VIEW … SET TAGS`, and an `ALTER TABLE/COLUMN RENAME`
+ * that rewrites a dependent view's body in place (propagating the new
+ * table/column name into `selectAst` + `sql`). Distinct from `view_added`
+ * (which a fresh create fires) so a cached write-through plan that recorded a
+ * `view` dependency invalidates when the view changes, and so a store-backed
+ * catalog re-persists the (re-generated) view DDL — both without re-triggering
+ * a persistence re-create.
  */
 export type ViewModifiedEvent = SchemaObjectModified<'view_modified', ViewSchema>;
 

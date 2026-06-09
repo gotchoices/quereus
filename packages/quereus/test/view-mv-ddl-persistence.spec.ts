@@ -339,3 +339,89 @@ describe('view persistence: generators over LIVE-created schemas', () => {
 		}
 	});
 });
+
+// ============================================================================
+// ALTER TABLE/COLUMN RENAME rewrites a dependent plain view's body in place. The
+// rewrite now fires `view_modified` so a store-backed catalog (which persists views
+// from view_added/view_modified) re-persists the rewritten DDL — without that event
+// the stored view DDL would drift after a rename. The `newObject` carries the live
+// rewritten schema, so `generateViewDDL(newObject)` is the re-persistable DDL and
+// must reference the NEW table/column name.
+// ============================================================================
+
+/** Pluck the `view_modified` events for a given view name out of a captured stream. */
+function viewModifiedFor(events: SchemaChangeEvent[], name: string) {
+	return events.filter(
+		(e): e is SchemaChangeEvent & { type: 'view_modified' } =>
+			e.type === 'view_modified' && e.objectName === name);
+}
+
+describe('view persistence: RENAME rewrites a view body and fires view_modified', () => {
+	it('table rename fires one view_modified for the dependent view with rewritten DDL', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key)');
+			await db.exec('create view v as select id from t');
+			const events = await captureEvents(db, () => db.exec('alter table t rename to t2'));
+
+			const modified = viewModifiedFor(events, 'v');
+			expect(modified, 'exactly one view_modified for v').to.have.length(1);
+			expect(modified[0].schemaName).to.equal('main');
+			const ddl = generateViewDDL(modified[0].newObject);
+			expect(ddl, 'rewritten DDL references the new table name').to.match(/\bt2\b/);
+			expect(ddl, 'rewritten DDL no longer references a bare `from t`').to.not.match(/\bfrom\s+t\b/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('column rename fires one view_modified for the dependent view with rewritten DDL', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key)');
+			await db.exec('create view v as select id from t');
+			const events = await captureEvents(db, () => db.exec('alter table t rename column id to ident'));
+
+			const modified = viewModifiedFor(events, 'v');
+			expect(modified, 'exactly one view_modified for v').to.have.length(1);
+			const ddl = generateViewDDL(modified[0].newObject);
+			expect(ddl, 'rewritten DDL references the new column name').to.match(/\bident\b/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an unrelated view that does not name the renamed table fires no view_modified', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key)');
+			await db.exec('create view v as select id from t');
+			await db.exec('create view w as select 1 as a');
+			const events = await captureEvents(db, () => db.exec('alter table t rename to t2'));
+
+			expect(viewModifiedFor(events, 'v'), 'v was rewritten').to.have.length(1);
+			expect(viewModifiedFor(events, 'w'), 'w is untouched → no event').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('two dependent views → two view_modified events, each with rewritten DDL', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key)');
+			await db.exec('create view v1 as select id from t');
+			await db.exec('create view v2 as select id from t');
+			const events = await captureEvents(db, () => db.exec('alter table t rename to t2'));
+
+			const m1 = viewModifiedFor(events, 'v1');
+			const m2 = viewModifiedFor(events, 'v2');
+			expect(m1, 'one event for v1').to.have.length(1);
+			expect(m2, 'one event for v2').to.have.length(1);
+			expect(generateViewDDL(m1[0].newObject), 'v1 DDL rewritten').to.match(/\bt2\b/);
+			expect(generateViewDDL(m2[0].newObject), 'v2 DDL rewritten').to.match(/\bt2\b/);
+		} finally {
+			await db.close();
+		}
+	});
+});

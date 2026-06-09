@@ -435,7 +435,7 @@ The `SchemaChangeEvent` discriminated union includes:
 | `assertion_modified` | `oldObject`, `newObject: IntegrityAssertionSchema` | After assertion replacement |
 | `view_added` | `newObject: ViewSchema` | After `CREATE VIEW` (fired from the runtime emitter, not `Schema.addView`) |
 | `view_removed` | `oldObject: ViewSchema` | After `DROP VIEW` |
-| `view_modified` | `oldObject`, `newObject: ViewSchema` | After `ALTER VIEW … SET TAGS` |
+| `view_modified` | `oldObject`, `newObject: ViewSchema` | After `ALTER VIEW … SET TAGS`, or when an `ALTER TABLE/COLUMN RENAME` rewrites a dependent view body |
 | `materialized_view_added` | `newObject: MaterializedViewSchema` | After `CREATE MATERIALIZED VIEW` |
 | `materialized_view_removed` | `oldObject: MaterializedViewSchema` | After `DROP MATERIALIZED VIEW` |
 | `materialized_view_modified` | `oldObject`, `newObject: MaterializedViewSchema` | After `ALTER MATERIALIZED VIEW … SET TAGS` (catalog-only, no re-materialize) |

@@ -1325,6 +1325,16 @@ function propagateTableRenameInSchema(
 			if (changed) {
 				const updatedView = { ...view, sql: astToString(view.selectAst) };
 				schema.addView(updatedView);
+				// `renameTableInAst` mutated `view.selectAst` in place, so `oldObject`
+				// shares the rewritten AST (only `newObject.sql` differs). No consumer
+				// reads `oldObject.selectAst`; mirrors the table loop above (no clone).
+				notifier.notifyChange({
+					type: 'view_modified',
+					schemaName: schema.name,
+					objectName: updatedView.name,
+					oldObject: view,
+					newObject: updatedView,
+				});
 			}
 		}
 	}
@@ -1413,6 +1423,16 @@ function propagateColumnRenameInSchema(
 			if (changed) {
 				const updatedView = { ...view, sql: astToString(view.selectAst) };
 				schema.addView(updatedView);
+				// `renameColumnInAst` mutated `view.selectAst` in place, so `oldObject`
+				// shares the rewritten AST (only `newObject.sql` differs). No consumer
+				// reads `oldObject.selectAst`; mirrors the table loop above (no clone).
+				notifier.notifyChange({
+					type: 'view_modified',
+					schemaName: schema.name,
+					objectName: updatedView.name,
+					oldObject: view,
+					newObject: updatedView,
+				});
 			}
 		}
 	}
