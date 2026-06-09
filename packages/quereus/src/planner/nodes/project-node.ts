@@ -1,6 +1,6 @@
 import { PlanNodeType } from './plan-node-type.js';
 import { PlanNode, type RelationalPlanNode, type UnaryRelationalNode, type ScalarPlanNode, type Attribute, isRelationalNode } from './plan-node.js';
-import type { RelationType } from '../../common/datatype.js';
+import type { RelationType, ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
@@ -20,6 +20,34 @@ export interface Projection {
 	alias?: string;
 	/** Optional predefined attribute ID to preserve during optimization */
 	attributeId?: number;
+}
+
+/**
+ * Resolves the effective output type for a projection expression.
+ *
+ * For a bare {@link ColumnReferenceNode}, honor the type the SOURCE relation
+ * publishes for that attribute id — `sourceTypeById` is built from
+ * `source.getAttributes()` — rather than the column-ref's own captured
+ * `columnType`. The captured type is stamped at *build* time from the base-table
+ * column scope, so over an outer join it is stale: it ignores the null-extension
+ * the join applied to the lookup side (`p.name` reads NOT NULL even though the
+ * left-join output attribute is nullable). Trusting the source attribute makes
+ * the projection's output nullability correct, which is what `deriveBackingShape`
+ * stamps onto a materialized-view backing column.
+ *
+ * Falls back to `projNode.getType()` when the attribute id is not present in the
+ * source (e.g. a correlated reference to an outer relation) or for any non
+ * column-reference expression (the helper is then a no-op, so it is safe to apply
+ * uniformly at every type-derivation site).
+ */
+function effectiveProjectionType(
+	projNode: ScalarPlanNode,
+	sourceTypeById: ReadonlyMap<number, ScalarType>,
+): ScalarType {
+	if (projNode instanceof ColumnReferenceNode) {
+		return sourceTypeById.get(projNode.attributeId) ?? projNode.getType();
+	}
+	return projNode.getType();
 }
 
 /**
@@ -51,6 +79,11 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			const columnNames: string[] = [];
 			const nameCount = new Map<string, number>();
 
+			// Source attribute types by id: a bare column-ref projection inherits the
+			// type the source publishes for its attribute id (the null-extended,
+			// nullable type over an outer join), not its own stale captured `columnType`.
+			const sourceTypeById = this.sourceTypeById();
+
 			const columns = this.projections.map((proj) => {
 				// Determine base column name
 				let baseName: string;
@@ -79,7 +112,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 
 				return {
 					name: finalName,
-					type: proj.node.getType(),
+					type: effectiveProjectionType(proj.node, sourceTypeById),
 					generated: proj.node.nodeType !== PlanNodeType.ColumnReference,
 				};
 			});
@@ -125,12 +158,17 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			// Get the computed column names from the type
 			const outputType = this.getType();
 
+			// Same source-attr type resolution as outputTypeCache: a bare column-ref
+			// attribute carries the source's (null-extended) type, not its stale
+			// captured `columnType`.
+			const sourceTypeById = this.sourceTypeById();
+
 			// If preserveInputColumns is false, only create attributes for projections
 			if (!this.preserveInputColumns) {
 				return this.projections.map((proj, index) => ({
 					id: proj.attributeId ?? PlanNode.nextAttrId(),
 					name: outputType.columns[index].name,
-					type: proj.node.getType(),
+					type: effectiveProjectionType(proj.node, sourceTypeById),
 					sourceRelation: `${this.nodeType}:${this.id}`,
 					relationName: 'projection'
 				}));
@@ -143,7 +181,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 					return {
 						id: proj.attributeId,
 						name: outputType.columns[index].name,
-						type: proj.node.getType(),
+						type: effectiveProjectionType(proj.node, sourceTypeById),
 						sourceRelation: `${this.nodeType}:${this.id}`,
 						relationName: 'projection'
 					};
@@ -156,7 +194,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 					return {
 						id: proj.node.attributeId,
 						name: outputType.columns[index].name,
-						type: proj.node.getType(),
+						type: effectiveProjectionType(proj.node, sourceTypeById),
 						sourceRelation: `${this.nodeType}:${this.id}`,
 						relationName: 'projection'
 					};
@@ -166,12 +204,24 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 				return {
 					id: PlanNode.nextAttrId(),
 					name: outputType.columns[index].name,
-					type: proj.node.getType(),
+					type: effectiveProjectionType(proj.node, sourceTypeById),
 					sourceRelation: `${this.nodeType}:${this.id}`,
 					relationName: 'projection'
 				};
 			});
 		});
+	}
+
+	/** Maps each source attribute id to the type the source publishes for it.
+	 *  Built from `source.getAttributes()` (collision-free — attribute ids are
+	 *  globally unique). Backs {@link effectiveProjectionType} so every
+	 *  type-derivation site agrees on a bare column-ref's effective type. */
+	private sourceTypeById(): Map<number, ScalarType> {
+		const map = new Map<number, ScalarType>();
+		for (const attr of this.source.getAttributes()) {
+			map.set(attr.id, attr.type);
+		}
+		return map;
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -423,11 +473,15 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			return this;
 		}
 
-		// Create predefined attributes from the new projections
+		// Create predefined attributes from the new projections. `this.source` is
+		// unchanged here, so the same source-attr type map applies — a bare column-ref
+		// keeps the source's (null-extended) type rather than its stale captured type,
+		// so an optimizer rebuild cannot re-introduce the wrong nullability.
+		const sourceTypeById = this.sourceTypeById();
 		const predefinedAttributes = projections.map(proj => ({
 			id: proj.attributeId,
 			name: proj.alias,
-			type: proj.node.getType(),
+			type: effectiveProjectionType(proj.node, sourceTypeById),
 			sourceRelation: `${this.nodeType}:${this.id}`,
 			relationName: 'projection'
 		}));

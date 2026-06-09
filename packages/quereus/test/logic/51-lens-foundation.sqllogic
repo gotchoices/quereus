@@ -118,7 +118,10 @@ declare logical schema appcar {
 	table Car {
 		id integer primary key,
 		make text,
-		maxSpeed integer
+		-- Backed by the OPTIONAL Car_perf member: an unmatched row null-extends maxSpeed
+		-- (outer-joined), so the logical column must be nullable. (default_column_nullability
+		-- is `not_null`, so this needs the explicit `null`.)
+		maxSpeed integer null
 	}
 }
 

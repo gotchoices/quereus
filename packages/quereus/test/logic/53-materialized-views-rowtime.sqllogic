@@ -1466,3 +1466,44 @@ rollback;
 -- the whole transaction reverts source + backing in lockstep.
 select v from ff_mv order by v;
 → [{"v":5}]
+
+-- ===================================
+-- 30. Outer (left) join MV — nullable lookup column read-side folding
+--     (mv-outer-join-nullable-backing-isnull). The null-extended lookup column of a LEFT
+--     join must be stamped NULLABLE on the backing table, so a query against the MV with
+--     `name is null` / `is not null` null-checks at runtime instead of folding against a
+--     bogus NOT-NULL backing column. The MV must be indistinguishable from the equivalent
+--     plain view — including these predicate reads, which the full `select *` read never
+--     exercises.
+-- ===================================
+
+create table ojp (id integer primary key, name text);
+create table ojt (id integer primary key, fk integer);
+insert into ojp (id, name) values (1, 'a'), (3, 'c');
+-- fk=9 (id=2) references no ojp row → null-extended by the left join.
+insert into ojt (id, fk) values (1, 1), (2, 9), (3, 3);
+create materialized view oj_mv as select ojt.id, ojt.fk, ojp.name from ojt left join ojp on ojt.fk = ojp.id;
+
+-- full scan: the unmatched row carries a NULL lookup column.
+select id, fk, name from oj_mv order by id;
+→ [{"id":1,"fk":1,"name":"a"},{"id":2,"fk":9,"name":null},{"id":3,"fk":3,"name":"c"}]
+
+-- `name is null` returns the null-extended row (would be [] folded against a NOT-NULL backing).
+select id from oj_mv where name is null;
+→ [{"id":2}]
+
+-- `name is not null` returns only the matched rows (would be all rows folded against NOT-NULL).
+select id from oj_mv where name is not null order by id;
+→ [{"id":1},{"id":3}]
+
+-- equality is unaffected (it does not use the null fold).
+select id from oj_mv where name = 'a';
+→ [{"id":1}]
+
+-- a source write that null-extends another row is reflected through the predicate read: deleting
+-- the only matching ojp (id=1) null-extends ojt id=1 as well.
+delete from ojp where id = 1;
+select id from oj_mv where name is null order by id;
+→ [{"id":1},{"id":2}]
+select id from oj_mv where name is not null;
+→ [{"id":3}]

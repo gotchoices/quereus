@@ -1372,17 +1372,58 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, outer/l
 
 	it('a t row referencing a missing p is preserved (null-extended) in the backing', async () => {
 		await assertEquivalent(db, body, 'baseline');
-		// id=2 (fk=9, no matching p) is kept by the LEFT join with a NULL lookup column. Read the
-		// whole backing and check the row directly (a pushed-down `name is null` predicate folds
-		// against the backing's non-nullable lookup-column type — a read-path detail, not the
-		// maintained data, which `assertEquivalent` already proved correct).
-		expect(await readMultiset(db, 'select id, fk, name from mv'), 'unmatched t row null-extended')
-			.to.include(canonRow([2, 9, null]));
+		// id=2 (fk=9, no matching p) is kept by the LEFT join with a NULL lookup column. Read it
+		// via the NATURAL `name is null` predicate: the backing's lookup column is now correctly
+		// stamped nullable, so a pushed-down `name is null` null-checks at runtime rather than
+		// folding to FALSE against a bogus NOT-NULL backing type (mv-outer-join-nullable-backing-isnull).
+		expect(await readMultiset(db, 'select id from mv where name is null'), 'unmatched t row null-extended')
+			.to.deep.equal([canonRow([2])]);
 		// Deleting the only matching p (id=1) null-extends t id=1 too (no FK constraint blocks it).
 		await db.exec('delete from p where id = 1');
 		await assertEquivalent(db, body, 'after p delete null-extends its referencing t rows');
-		expect(await readMultiset(db, 'select id, fk, name from mv'), 'newly-unmatched t row null-extended')
-			.to.include(canonRow([1, 1, null]));
+		// Now both id=1 (newly unmatched) and id=2 read `name is null`; id=3 (fk=2 → p exists) does not.
+		expect(await readMultiset(db, 'select id from mv where name is null'), 'newly-unmatched t row null-extended')
+			.to.deep.equal([canonRow([1]), canonRow([2])]);
+		expect(await readMultiset(db, 'select id from mv where name is not null'), 'still-matched t row')
+			.to.deep.equal([canonRow([3])]);
+	});
+
+	it('is null / is not null reads over the MV agree with the live body (MV-indistinguishable-from-view)', async () => {
+		// The bug this pins: the backing's null-extended lookup column used to be stamped NOT NULL,
+		// so `where name is null` folded to FALSE against the backing (empty) while the live left-join
+		// body returned the null-extended rows — a read-side divergence the full `select *` equivalence
+		// never exercises. With the column stamped nullable, the predicate reads must match the live body.
+		// `assertEquivalent` already disables the read-side rewrite for the live oracle; mirror that here
+		// so the wrapped live body re-evaluates from the source rather than the backing it defines.
+		const assertPredEquiv = async (pred: string, phase: string): Promise<void> => {
+			const fromMv = await readMultiset(db, `select id from mv where ${pred}`);
+			const prev = db.optimizer.tuning;
+			db.optimizer.updateTuning({ ...prev, disabledRules: new Set([...(prev.disabledRules ?? []), 'materialized-view-rewrite']) });
+			let fromBody: string[];
+			try {
+				fromBody = await readMultiset(db, `select id from (${body}) where ${pred}`);
+			} finally {
+				db.optimizer.updateTuning(prev);
+			}
+			expect(fromMv, `${phase}: MV \`${pred}\` diverged from live body`).to.deep.equal(fromBody);
+		};
+
+		await assertPredEquiv('name is null', 'baseline is null');
+		await assertPredEquiv('name is not null', 'baseline is not null');
+
+		// Mutations that move rows across the matched/unmatched boundary: a new unmatched t row
+		// (null-extended), and a p insert that suddenly matches the previously-unmatched fk=9 row.
+		await db.exec('begin');
+		try {
+			await db.exec('insert into t (id, fk) values (5, 99)');     // fk=99: unmatched → null
+			await db.exec("insert into p (id, name) values (9, 'x')");  // now t.id=2 (fk=9) matches
+			await assertPredEquiv('name is null', 'in-txn is null');
+			await assertPredEquiv('name is not null', 'in-txn is not null');
+		} finally {
+			await db.exec('rollback');
+		}
+		await assertPredEquiv('name is null', 'post-rollback is null');
+		await assertPredEquiv('name is not null', 'post-rollback is not null');
 	});
 });
 

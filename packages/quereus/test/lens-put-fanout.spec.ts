@@ -154,7 +154,7 @@ async function setup(db: Database): Promise<void> {
 	await db.exec('create table T_core (id integer primary key, a integer) using admod');
 	await db.exec('create table T_b (id integer primary key, b integer) using admod');
 	await db.exec('create table T_c (id integer primary key, c integer) using admod');
-	await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+	await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer null } }');
 	await db.exec('apply schema x');
 
 	await db.exec('insert into main.T_core values (1, 10), (2, 20)');
@@ -1587,7 +1587,7 @@ describe('lens decomposition put: INSERT fan-out (edge cases)', () => {
 			await db.exec('create table T_core (id integer primary key, a integer) using atomicmod');
 			await db.exec('create table T_b (id integer primary key, b integer) using atomicmod');
 			await db.exec('create table T_c (id integer primary key, c integer) using atomicmod');
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer null } }');
 			await db.exec('apply schema x');
 			// Pre-seed ONLY T_b at id=7, so the anchor (T_core) insert succeeds but the
 			// second member (T_b) insert collides on its PK mid-fan-out.
@@ -1611,7 +1611,7 @@ describe('lens decomposition put: INSERT fan-out (edge cases)', () => {
 			await db.exec('create table T_core (id integer primary key, a integer) using nnmod');
 			await db.exec('create table T_b (id integer primary key, b integer not null) using nnmod');
 			await db.exec('create table T_c (id integer primary key, c integer) using nnmod');
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer null } }');
 			await db.exec('apply schema x');
 			// `b` (mandatory member T_b, NOT NULL, no default) is omitted — caught at
 			// analysis time, before any base op fires.
@@ -2141,7 +2141,7 @@ describe('lens decomposition put: stitch-key uniqueness guard', () => {
 			db.registerModule('wmod', mod);
 			await db.exec('create table W_core (id integer primary key, a integer) using wmod');
 			await db.exec('create table W_c (rid integer primary key default (coalesce((select max(rid) from W_c), 0) + mutation_ordinal()), id integer unique, c integer) using wmod');
-			await db.exec('declare logical schema x { table W { id integer primary key, a integer, c integer } }');
+			await db.exec('declare logical schema x { table W { id integer primary key, a integer, c integer null } }');
 			await db.exec('apply schema x'); // deploys: stitch key `id` is a declared UNIQUE
 			await db.exec('insert into main.W_core values (1, 10), (2, 20)');
 			await db.exec('insert into main.W_c (rid, id, c) values (100, 1, 1000)'); // only id 1 present
@@ -2294,7 +2294,7 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		await db.exec('create table Doc_core (sid integer primary key default (coalesce((select max(sid) from Doc_core), 0) + mutation_ordinal()), doc_key text, title text) using docmetamod');
 		await db.exec('create table Doc_body (doc_sid integer primary key, body text) using docmetamod');
 		await db.exec('create table Doc_meta (meta_sid integer primary key, note text) using docmetamod');
-		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text } }');
+		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text null } }');
 		await db.exec('apply schema x');
 		await db.exec("insert into main.Doc_core (sid, doc_key, title) values (100, 'k1', 'First'), (101, 'k2', 'Second')");
 		await db.exec("insert into main.Doc_body values (100, 'b1'), (101, 'b2')");
@@ -2419,7 +2419,7 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		// `title <> note` spans Doc_core (title) + Doc_meta (note) ⇒ write-row {title, note},
 		// resolvable on no single member op ⇒ deferred. `length(title) < 5` references only
 		// title (Doc_core) ⇒ write-row {title} ⇒ rides the Doc_core member op ⇒ fires.
-		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text, constraint xmember check (title <> note), constraint titlelen check (length(title) < 5) } }');
+		await db.exec('declare logical schema x { table Doc { docKey text primary key, title text, body text, note text null, constraint xmember check (title <> note), constraint titlelen check (length(title) < 5) } }');
 		await db.exec('apply schema x');
 		// Seed satisfies both CHECKs (titles len 3 < 5; title <> note): k1 carries the optional
 		// Doc_meta note, k2 does not. Direct basis inserts bypass the lens, so the seed itself
@@ -2597,7 +2597,7 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		// write-row column is matched against (`title` / `note` share their logical and basis
 		// spellings, so the un-descended `rewriteToBasisTerms` leaves the correlated ref intact).
 		await db.exec('create table Allowed (name text, kind text) using docsubqmod');
-		await db.exec(`declare logical schema x { table Doc { docKey text primary key, title text, body text, note text, ${checkSql} } }`);
+		await db.exec(`declare logical schema x { table Doc { docKey text primary key, title text, body text, note text null, ${checkSql} } }`);
 		await db.exec('apply schema x');
 		// Direct basis inserts bypass the lens, so the seed is not gated by the logical CHECK.
 		await db.exec("insert into main.Allowed (name, kind) values ('ok', 'g'), ('aaa', 'g'), ('bbb', 'g')");

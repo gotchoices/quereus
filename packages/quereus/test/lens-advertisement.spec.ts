@@ -115,7 +115,7 @@ describe('lens advertisement: resolution + storage', () => {
 			mod.ads = [columnarSplit(), ndTree()];
 			await setupSplitBasis(db, mod);
 
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer null, c integer null } }');
 			await db.exec('apply schema x');
 
 			const slot = db.schemaManager.getSchema('x')!.getLensSlot('T')!;
@@ -140,7 +140,7 @@ describe('lens advertisement: resolution + storage', () => {
 			const mod = new AdvertisingModule();
 			mod.ads = [columnarSplit()];
 			await setupSplitBasis(db, mod);
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer null, c integer null } }');
 			await db.exec('apply schema x');
 
 			const ad = db.schemaManager.getSchema('x')!.getLensSlot('T')!.advertisement!;
@@ -380,7 +380,7 @@ describe('lens advertisement: tag builder (buildAdvertisementsFromTags via memor
 				"quereus.lens.decomp.col.d1.b" = 'b'
 			)`);
 
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer } }');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer null } }');
 			await db.exec('apply schema x');
 
 			const ad = db.schemaManager.getSchema('x')!.getLensSlot('T')!.advertisement!;
@@ -433,7 +433,7 @@ describe('lens advertisement: introspection', () => {
 			const mod = new AdvertisingModule();
 			mod.ads = [columnarSplit()];
 			await setupSplitBasis(db, mod);
-			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer, c integer } }');
+			await db.exec('declare logical schema x { table T { id integer primary key, a integer, b integer null, c integer null } }');
 			await db.exec('apply schema x');
 
 			const prov = await rows(db, "select logical_column, advertised_member, advertisement_anchor from quereus_effective_lens('x', 'T') order by logical_column");
@@ -518,7 +518,7 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
 			await db.exec('insert into Car_perf values (1, 180)'); // car 2 has NO perf row
 
-			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer null } }');
 			await db.exec('apply schema x');
 
 			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Car')!;
@@ -557,7 +557,7 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			await db.exec('create table Cfg_kv (theme text, lang text, primary key ()) using admod');
 			await db.exec('insert into Cfg_exists values (1)'); // anchor present, no kv row
 
-			await db.exec('declare logical schema x { table Config { theme text, lang text, primary key () } }');
+			await db.exec('declare logical schema x { table Config { theme text null, lang text null, primary key () } }');
 			await db.exec('apply schema x');
 
 			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Config')!;
@@ -776,7 +776,7 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
 			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
 			await db.exec('insert into Car_perf values (1, 180)');
-			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer null } }');
 			await db.exec('apply schema x');
 
 			// INSERT fans out to every member (anchor + optional), threading the logical PK.
@@ -825,7 +825,7 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
 			await db.exec("insert into Car_core values (1, 'Honda'), (2, 'Mazda')");
 			await db.exec('insert into Car_perf values (1, 180)'); // car 2 has NO perf row
-			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer null } }');
 			await db.exec('apply schema x');
 
 			// Non-null-rejecting filter: the anchor-only row (car 2) survives.
@@ -877,7 +877,7 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 		db.registerModule('admod', mod);
 		await db.exec('create table Car_core (id integer primary key, make text) using admod');
 		await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
-		await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer } }');
+		await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer null } }');
 		await db.exec('apply schema x');
 		return db.schemaManager.getSchema('x')!.getLensSlot('Car')!;
 	}
@@ -1027,7 +1027,7 @@ describe('lens existence-anchor IND injection (lens-multi-source-ind-injection)'
 			await db.exec('create table Car_core (id integer primary key, make text) using admod');
 			await db.exec('create table Car_perf (id integer primary key, speed integer) using admod');
 			await db.exec('create table Car_trim (id integer primary key, trim text) using admod');
-			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer, trim text } }');
+			await db.exec('declare logical schema x { table Car { id integer primary key, make text, maxSpeed integer, trim text null } }');
 			await db.exec('apply schema x');
 
 			const inds = db.schemaManager.getSchema('x')!.getLensSlot('Car')!.injectedInds ?? [];
