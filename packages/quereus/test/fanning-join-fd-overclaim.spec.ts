@@ -40,8 +40,10 @@ describe('fanning-join FD over-claim: optimizer blast radius', () => {
 		await db.exec(`
 			create table g (id integer primary key, k integer, v integer);
 			create table g2 (id integer primary key, w integer);
+			create table g3 (id integer primary key, z integer);
 			insert into g values (1, 100, 5);
 			insert into g2 values (10, 100), (11, 100);
+			insert into g3 values (20, 100), (21, 100);
 		`);
 	});
 	afterEach(async () => { await db.close(); });
@@ -64,5 +66,19 @@ describe('fanning-join FD over-claim: optimizer blast radius', () => {
 			out.push(r as unknown as { id: number; v: number; c: number });
 		}
 		expect(out).to.deep.equal([{ id: 1, v: 5, c: 2 }]);
+	});
+
+	it('3-way fanning join: DISTINCT over (g.id, g.v) is RETAINED and groups are not collapsed', async () => {
+		// g (1 row) ⋈ g2 (2 rows, w=100) ⋈ g3 (2 rows, z=100) on the non-unique k ⇒ the single
+		// g row fans to 2×2 = 4 product rows. Dropping both lookup sides' columns leaves no key,
+		// so the body stays a bag through both join frames — no phantom {g.id} key may resurrect.
+		const plan = db.getPlan('select distinct g.id, g.v from g join g2 on g.k = g2.w join g3 on g.k = g3.z');
+		expect(findNodes(plan, DistinctNode), 'DISTINCT must survive a multi-frame fanning join').to.have.length.greaterThan(0);
+
+		const out: { id: number; v: number; c: number }[] = [];
+		for await (const r of db.eval('select g.id as id, g.v as v, count(*) as c from g join g2 on g.k = g2.w join g3 on g.k = g3.z group by g.id, g.v')) {
+			out.push(r as unknown as { id: number; v: number; c: number });
+		}
+		expect(out).to.deep.equal([{ id: 1, v: 5, c: 4 }]);
 	});
 });

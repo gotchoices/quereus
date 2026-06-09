@@ -44,6 +44,29 @@ Same root cause (`deriveKeysFromFds` unsound over a non-set), different FD sourc
 |---|---|---|
 | ticket 4 (fanning join) | a side's PK key FD surviving a fanning join, projected to cover all output cols | drop the unpreserved side's key FDs in `propagateJoinFds` |
 | this ticket (injective) | a `ProjectNode` injective bidirectional FD over a non-unique source column | NOT covered by ticket 4 |
+| this ticket (equi-pair) | the bidirectional equi-pair FDs `{L}↔{R'}` that `propagateJoinFds` adds for each equi-join column pair | NOT covered by ticket 4 |
+
+### Equi-pair source — confirmed during ticket-4 review (NOT a regression of ticket 4)
+
+`propagateJoinFds` (inner/cross arm) emits `{L}→{R'}` and `{R'}→{L}` for every equi-pair, *after*
+ticket-4's `dropSideKeyFds` runs. Projecting a fanning join down to **exactly the two equi-columns**
+makes either direction all-covering, so `deriveKeysFromFds` reads the bag as a set:
+
+```sql
+create table g  (id integer primary key, k integer, v integer);
+create table g2 (id integer primary key, w integer);
+insert into g  values (1, 100, 5);
+insert into g2 values (10, 100), (11, 100);
+
+select distinct g.k, g2.w from g join g2 on g.k = g2.w;
+-- Expected: 1 row (100,100).  Actual: 2 rows [(100,100),(100,100)] — DISTINCT eliminated.
+```
+
+Reproduces on clean HEAD **and** on the parent of ticket 4's implement commit (`d739abf0`), so it is
+pre-existing — ticket 4 is correctly scoped to side-*key* FDs and intentionally does not touch the
+equi-pair FDs. The producer-side cure mirrors the others: an equi-pair FD asserts an *equivalence*,
+not uniqueness, so it must not contribute an all-covering key on a non-set. Add a deterministic
+regression for the `distinct g.k, g2.w` repro alongside the injective one.
 
 There is also a **LEFT/RIGHT-outer analogue** noted in ticket 4: `propagateJoinFds`' `'left'`/`'right'`
 cases do `withKeyFds(leftFds.slice())`, unconditionally keeping the preserved side's key FDs even
@@ -82,6 +105,8 @@ Pick after weighing blast radius; the deep correctness oracle is the existing fu
 
 - Add a deterministic regression for the injective repro (DISTINCT retained + 2-row result), so the
   flaky fuzz seed is pinned by a stable test.
+- Add a deterministic regression for the equi-pair repro (`select distinct g.k, g2.w from g join g2
+  on g.k = g2.w` ⇒ DISTINCT retained, 1 row).
 - Implement the chosen fix; keep `lens-fd-contribution.spec.ts` (email physical-only-set DISTINCT
   elimination) green.
 - Close the LEFT/RIGHT-outer fanning FD analogue from ticket 4.
