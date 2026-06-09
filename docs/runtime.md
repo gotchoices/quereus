@@ -923,6 +923,17 @@ operation-specific body:
   row-time MV backing write that landed before a later maintenance throw) is
   undone.
 
+At the **end-of-statement boundary** — after the row loop completes and (for
+non-FAIL) **before** the statement savepoint releases — the generator drains its
+per-statement *deferred full-rebuild set* via `Database._flushDeferredRebuilds`.
+Only the full-rebuild materialized-view arm is deferred there (the bounded-delta
+arms apply per row inside `processRow`); each source row that touched a
+full-rebuild MV marked it dirty, and the flush rebuilds each such MV exactly once.
+Placing it inside the statement savepoint makes a failed rebuild roll the whole
+statement back, and a statement that aborts mid-loop never reaches the flush (so a
+dirtied-then-aborted MV leaves its backing untouched). See
+`docs/incremental-maintenance.md` § end-of-statement flush.
+
 The savepoint helpers used are always the broadcast variants
 (`_createSavepointBroadcast` / `_releaseSavepointBroadcast` /
 `_rollbackAndReleaseSavepointBroadcast`) so per-connection savepoint stacks stay

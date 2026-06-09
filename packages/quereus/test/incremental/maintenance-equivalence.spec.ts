@@ -765,3 +765,204 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 		expect(plan.sourceBases).to.deep.equal(['main.src']);
 	});
 });
+
+/* ─────────────────── full-rebuild floor — per-statement flush deferral ─────────────────── */
+
+/**
+ * Count how many times the floor arm actually re-evaluates a body. Patches the manager's
+ * `applyFullRebuild` instance method (shadowing the prototype), so every rebuild — the only
+ * caller is the end-of-statement {@link MaterializedViewManager.flushDeferredRebuilds} drain,
+ * since the DML boundary always defers — increments the counter. Install AFTER
+ * {@link forceFullRebuild}. The deferral guarantee under test: N source rows touching one
+ * full-rebuild MV in ONE statement ⇒ exactly ONE rebuild, not N.
+ */
+function instrumentRebuilds(db: Database): { count: () => number } {
+	const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as {
+		applyFullRebuild: (...args: unknown[]) => Promise<unknown>;
+	};
+	let n = 0;
+	const orig = mgr.applyFullRebuild;
+	mgr.applyFullRebuild = function (this: unknown, ...args: unknown[]) {
+		n++;
+		return orig.apply(this, args);
+	};
+	return { count: () => n };
+}
+
+/**
+ * The deferral the ticket adds: a full-rebuild MV is marked dirty per source row during the
+ * DML row loop and rebuilt EXACTLY ONCE at the end-of-statement flush (inside the statement-
+ * atomicity savepoint). These assert the observable consequences — one rebuild per bulk
+ * statement, atomic rollback of a failed statement that dirtied an MV, autocommit flush+commit,
+ * and a mixed (bounded-delta + full-rebuild) source staying consistent — that the per-row floor
+ * could not give affordably.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, per-statement flush)', () => {
+	let db: Database;
+	const body = 'select id, a from src';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+		await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2)');
+		await db.exec(`create materialized view mv as ${body}`);
+		forceFullRebuild(db, 'main', 'mv');
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('a bulk INSERT touching one full-rebuild MV rebuilds it EXACTLY ONCE (not per row)', async () => {
+		const rebuilds = instrumentRebuilds(db);
+		await db.exec('insert into src (id, a, b, k) values (10,1,1,1),(11,2,2,2),(12,3,3,3),(13,4,4,4),(14,5,5,5)');
+		expect(rebuilds.count(), 'one rebuild for a 5-row bulk insert (deferred to the flush)').to.equal(1);
+		// …and the single rebuild reflects every row of the bulk statement.
+		await assertEquivalent(db, body, 'after bulk insert');
+		expect((await readMultiset(db, 'select * from mv')).length, 'all rows present').to.equal(7);
+	});
+
+	it('a bulk UPDATE / DELETE each rebuild the MV exactly once', async () => {
+		await db.exec('insert into src (id, a, b, k) values (10,1,1,1),(11,2,2,2),(12,3,3,3)');
+		const rebuilds = instrumentRebuilds(db);
+		await db.exec('update src set a = a + 100');
+		expect(rebuilds.count(), 'one rebuild for the bulk update').to.equal(1);
+		await assertEquivalent(db, body, 'after bulk update');
+		await db.exec('delete from src where id >= 10');
+		expect(rebuilds.count(), 'one more rebuild for the bulk delete').to.equal(2);
+		await assertEquivalent(db, body, 'after bulk delete');
+	});
+
+	it('a multi-row statement that FAILS after dirtying the MV leaves the backing unchanged', async () => {
+		const before = await readMultiset(db, 'select * from mv');
+		const rebuilds = instrumentRebuilds(db);
+		// Row 1 (id=10) writes the source and dirties the MV; row 2 (id=1) collides on the
+		// source PK and aborts the whole statement. The flush never runs (the loop throws
+		// first), and the statement savepoint reverts row 1's source write — so neither the
+		// source nor the MV backing retains anything.
+		await execTolerant(db, 'insert into src (id, a, b, k) values (10, 9, 9, 9), (1, 9, 9, 9), (11, 9, 9, 9)');
+		expect(rebuilds.count(), 'a flush never ran for the aborted statement').to.equal(0);
+		expect(await readMultiset(db, 'select * from mv'), 'MV backing unchanged after the abort').to.deep.equal(before);
+		expect((await readMultiset(db, 'select id from src')).sort(), 'source unchanged after the abort')
+			.to.deep.equal([canonRow([1]), canonRow([2])].sort());
+		// And maintenance still works afterwards (the aborted statement left no orphaned dirty state).
+		await db.exec('insert into src (id, a, b, k) values (12, 7, 7, 7)');
+		await assertEquivalent(db, body, 'after a clean write following the abort');
+	});
+
+	it('an explicit-transaction ROLLBACK reverts a deferred rebuild in lockstep', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		await db.exec('begin');
+		await db.exec('insert into src (id, a, b, k) values (20, 1, 1, 1), (21, 2, 2, 2)');
+		// The rebuild ran at the (in-transaction) statement flush — visible mid-transaction.
+		await assertEquivalent(db, body, 'in-transaction');
+		expect((await readMultiset(db, 'select * from mv')).length, 'rebuilt rows visible pre-commit').to.equal(4);
+		await db.exec('rollback');
+		// The rebuild rode the source write's transaction layer, so rollback discards it.
+		await assertEquivalent(db, body, 'post-rollback');
+		expect((await readMultiset(db, 'select * from mv')).length, 'reverted to baseline').to.equal(2);
+	});
+
+	it('a bare autocommit INSERT flushes and commits the rebuild together with the source write', async () => {
+		// No BEGIN: the statement savepoint wraps the row loop + flush, then autocommit commits
+		// both the source write and the rebuilt backing. Two consecutive autocommit writes must
+		// both land — proving the first committed cleanly with no orphaned pending backing layer.
+		await db.exec('insert into src (id, a, b, k) values (30, 1, 1, 1)');
+		await assertEquivalent(db, body, 'after autocommit insert 1');
+		await db.exec('insert into src (id, a, b, k) values (31, 2, 2, 2)');
+		await assertEquivalent(db, body, 'after autocommit insert 2');
+		expect((await readMultiset(db, 'select * from mv')).length, 'both autocommit writes persisted').to.equal(4);
+	});
+});
+
+/**
+ * A single source feeding BOTH a bounded-delta (inverse-projection) MV and a full-rebuild MV.
+ * One write must maintain the incremental MV per-row during the loop AND the full-rebuild MV
+ * once at the flush; both end consistent with their live bodies. Proves the deferral does not
+ * disturb the per-row arms sharing the source.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, mixed-arm same source)', () => {
+	let db: Database;
+	const incBody = 'select id, a from src';
+	const fullBody = 'select id, b from src';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+		await db.exec('insert into src (id, a, b, k) values (1, 10, 100, 6), (2, 20, 200, 2)');
+		await db.exec(`create materialized view mv_inc as ${incBody}`);
+		await db.exec(`create materialized view mv_full as ${fullBody}`);
+		// Only mv_full is the floor; mv_inc stays inverse-projection (per-row immediate).
+		forceFullRebuild(db, 'main', 'mv_full');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const assertBoth = async (phase: string): Promise<void> => {
+		const incFrom = await readMultiset(db, 'select * from mv_inc');
+		const fullFrom = await readMultiset(db, 'select * from mv_full');
+		const prev = db.optimizer.tuning;
+		db.optimizer.updateTuning({ ...prev, disabledRules: new Set([...(prev.disabledRules ?? []), 'materialized-view-rewrite']) });
+		let incBodyRows: string[]; let fullBodyRows: string[];
+		try {
+			incBodyRows = await readMultiset(db, incBody);
+			fullBodyRows = await readMultiset(db, fullBody);
+		} finally {
+			db.optimizer.updateTuning(prev);
+		}
+		expect(incFrom, `${phase}: incremental MV diverged`).to.deep.equal(incBodyRows);
+		expect(fullFrom, `${phase}: full-rebuild MV diverged`).to.deep.equal(fullBodyRows);
+	};
+
+	it('a single write keeps both the incremental and full-rebuild MV consistent (one rebuild)', async () => {
+		const rebuilds = instrumentRebuilds(db);
+		await db.exec('insert into src (id, a, b, k) values (3, 30, 300, 9), (4, 40, 400, 1)');
+		expect(rebuilds.count(), 'the full-rebuild MV rebuilt once for the bulk insert').to.equal(1);
+		await assertBoth('after mixed-arm bulk insert');
+		await db.exec('update src set a = a + 1, b = b + 1 where id <= 2');
+		expect(rebuilds.count(), 'one more rebuild for the bulk update').to.equal(2);
+		await assertBoth('after mixed-arm bulk update');
+		await db.exec('delete from src where id = 1');
+		await assertBoth('after mixed-arm delete');
+	});
+});
+
+/**
+ * MV-over-MV with a **full-rebuild consumer over an incremental producer** — the converse of
+ * the "full-rebuild producer → incremental consumer" suite above. A source write maintains the
+ * incremental producer's backing inline during the loop; the consumer reads that backing, so it
+ * is dirtied via the cascade and rebuilt at the flush, AFTER the producer's inline write has
+ * landed (reads-own-writes at flush). The full rebuild must see the producer's just-updated
+ * backing and stay equal to the live 2-level body.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, full-rebuild consumer over incremental producer)', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table g (id integer primary key, v integer)');
+		await db.exec('insert into g values (1, 5)');
+		await db.exec('create materialized view mv_base as select id, v from g');
+		await db.exec('create materialized view mv_over as select id, v from mv_base');
+		// Maintain the CONSUMER by full-rebuild; the producer stays inverse-projection.
+		forceFullRebuild(db, 'main', 'mv_over');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const readOver = async (): Promise<Array<Record<string, number>>> => {
+		const rows: Array<Record<string, number>> = [];
+		for await (const r of db.eval('select id, v from mv_over order by id')) rows.push({ id: Number(r.id), v: Number(r.v) });
+		return rows;
+	};
+
+	it("an incremental producer's inline write drives the consumer's deferred full rebuild", async () => {
+		const rebuilds = instrumentRebuilds(db);
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 5 }]);
+		// INSERT: producer applies inline → cascade dirties the consumer → one rebuild at flush.
+		await db.exec('insert into g values (2, 7), (3, 9)');
+		expect(rebuilds.count(), 'one consumer rebuild for the bulk insert').to.equal(1);
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 5 }, { id: 2, v: 7 }, { id: 3, v: 9 }]);
+		// UPDATE of a projected column: producer re-keys inline → consumer rebuild sees it.
+		await db.exec('update g set v = 50 where id = 1');
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 50 }, { id: 2, v: 7 }, { id: 3, v: 9 }]);
+		// DELETE: producer removes inline → consumer rebuild drops the row.
+		await db.exec('delete from g where id = 2');
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 50 }, { id: 3, v: 9 }]);
+	});
+});

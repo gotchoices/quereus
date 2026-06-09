@@ -101,12 +101,15 @@ export interface MaterializedViewManagerContext {
  * keeps an MV's backing table consistent with a source row-write. A tagged union over
  * the maintenance strategies the incremental substrate names (the spike's
  * `incremental-maintenance-substrate-spike` design). The builder
- * ({@link MaterializedViewManager.buildMaintenancePlan}) produces three reachable arms:
+ * ({@link MaterializedViewManager.buildMaintenancePlan}) produces four bounded-delta arms:
  * `'inverse-projection'` (the covering-index shape), `'residual-recompute'` (single-source
- * aggregates), and `'prefix-delete'` (single-source lateral-TVF fan-out). The
- * `'full-rebuild'` arm is a reserved convergence point, **unreachable** until the cost
- * gate wires its selection logic; routing one through `applyMaintenancePlan` today trips a
- * loud `INTERNAL` guard.
+ * aggregates), `'prefix-delete'` (single-source lateral-TVF fan-out), and `'join-residual'`
+ * (the provably-1:1 inner join) — each applied **per source row, immediately**. The
+ * `'full-rebuild'` floor (the always-correct convergence point for bodies no bounded-delta
+ * arm fits) is wired and dispatched ({@link MaterializedViewManager.applyFullRebuild}) but
+ * not yet routed from the builder (the eligibility flip is a follow-on ticket); it is the
+ * one **deferred** arm — marked dirty per row and rebuilt once per statement at
+ * {@link MaterializedViewManager.flushDeferredRebuilds}.
  */
 export type MaintenancePlan =
 	| InverseProjectionPlan
@@ -208,9 +211,10 @@ export interface InverseProjectionPlan extends MaintenancePlanCommon {
  *
  * Reachability: `buildMaintenancePlan` does **not** yet route bodies here (the
  * eligibility-flip that makes the floor the default lands in a follow-on ticket). The arm
- * is wired and exercised in isolation; today it is invoked per-row (correct, not yet
- * amortized) — the per-statement deferral is the next ticket. See
- * `docs/materialized-views.md` § Full-rebuild floor.
+ * is wired and exercised in isolation; it is the one **deferred** arm — marked dirty per
+ * source row and rebuilt exactly once at the end-of-statement flush
+ * ({@link MaterializedViewManager.flushDeferredRebuilds}), so a bulk write is O(body) not
+ * O(rows × body). See `docs/materialized-views.md` § Full-rebuild floor.
  */
 export interface FullRebuildPlan extends MaintenancePlanCommon {
 	readonly kind: 'full-rebuild';
@@ -369,14 +373,17 @@ export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidual
  * (statement, backing) instead of once per source row. This amortizes the dominant
  * per-row overhead of a bulk `insert`/`update`/`delete` over a covered table.
  *
- * It is purely a resolution cache: each row's ops are still applied **immediately** to
- * the cached connection's pending transaction layer (per-row apply), so a later
+ * It is purely a resolution cache: each **bounded-delta** arm's per-row ops are still
+ * applied **immediately** to the cached connection's pending transaction layer, so a later
  * same-statement row's enforcement scan (`lookupCoveringConflicts`) still observes every
- * earlier row's backing write. There is no deferred/end-of-statement op flush — see
- * `docs/materialized-views.md` § Synchronous, transactional, per-statement. Because the
- * cache is scoped to one generator run, the connection it holds cannot be torn down
- * mid-statement; the cold enforcement/eviction paths that omit the cache re-resolve the
- * *same* connection deterministically, so reads-own-writes is unaffected.
+ * earlier row's backing write. The one exception is the **full-rebuild** arm, which the DML
+ * boundary defers to a single end-of-statement {@link MaterializedViewManager.flushDeferredRebuilds}
+ * (tracked in a separate per-statement dirty set, not this cache) — sound because a
+ * full-rebuild MV is never a covering structure, so no enforcement scan depends on its
+ * per-row visibility. See `docs/materialized-views.md` § Synchronous, transactional,
+ * per-statement. Because the cache is scoped to one generator run, the connection it holds
+ * cannot be torn down mid-statement; the cold enforcement/eviction paths that omit the cache
+ * re-resolve the *same* connection deterministically, so reads-own-writes is unaffected.
  */
 export type BackingConnectionCache = Map<string, MemoryTableConnection>;
 
@@ -565,11 +572,23 @@ export class MaterializedViewManager {
 	 * the same cache through, so a multi-level chain amortizes each level's resolution
 	 * too. Omitted by the cold enforcement/eviction callers, which re-resolve the same
 	 * connection deterministically.
+	 *
+	 * `deferred` is the optional per-statement deferred-rebuild set (MV keys). A
+	 * `'full-rebuild'` plan re-evaluates the WHOLE body, so applying it per source row is
+	 * O(rows × body) — pathological. When the DML boundary supplies a `deferred` set, a
+	 * full-rebuild plan is instead marked dirty here (no per-row apply) and rebuilt exactly
+	 * once at the end-of-statement {@link flushDeferredRebuilds} boundary. The bounded-delta
+	 * arms stay per-row-immediate (cheap, and the covering-UNIQUE enforcement scan depends on
+	 * their per-row backing visibility; a full-rebuild MV is never a covering structure, so
+	 * deferring it cannot starve that scan). A cold caller without a `deferred` set falls
+	 * through to an inline rebuild — a safe, unamortized fallback that the
+	 * enforcement/eviction callers never actually reach (they never name a full-rebuild MV).
 	 */
 	async maintainRowTime(
 		sourceBase: string,
 		change: BackingRowChange,
 		cache?: BackingConnectionCache,
+		deferred?: Set<string>,
 		depth = 0,
 	): Promise<void> {
 		const changedBase = sourceBase.toLowerCase();
@@ -578,14 +597,92 @@ export class MaterializedViewManager {
 		for (const key of keys) {
 			const plan = this.rowTime.get(key);
 			if (!plan) continue;
+			// Full-rebuild is the one deferred arm — mark dirty and drain at flush.
+			if (plan.kind === 'full-rebuild' && deferred) {
+				deferred.add(key);
+				continue;
+			}
 			const backingChanges = await this.applyMaintenancePlan(plan, change, changedBase, cache);
 			if (backingChanges.length === 0) continue;
 			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
 			this.assertCascadeDepth(depth + 1, backingBase);
 			for (const bc of backingChanges) {
-				await this.maintainRowTime(backingBase, bc, cache, depth + 1);
+				await this.maintainRowTime(backingBase, bc, cache, deferred, depth + 1);
 			}
+		}
+	}
+
+	/**
+	 * Flush the per-statement deferred full-rebuild set at the end-of-statement boundary:
+	 * rebuild every dirtied full-rebuild MV exactly once (not once per source row) and
+	 * cascade each rebuild's effective {@link BackingRowChange}(s) onward so MV-over-MV
+	 * consumers converge.
+	 *
+	 * Drained as a worklist over the producer→consumer DAG. Each rebuild calls
+	 * {@link applyFullRebuild} (re-run the whole body against live mid-transaction source
+	 * state → a `'replace-all'` diff) and routes the realized delta back through
+	 * {@link maintainRowTime} with the SAME `deferred` set: an incremental consumer applies
+	 * inline; a full-rebuild consumer re-dirties into the drain (rebuilt in a later round,
+	 * after its producer's delta has landed). The drain proceeds in **rounds** — each round
+	 * snapshots the current dirty set, clears it, and rebuilds each member, collecting the
+	 * next round's re-dirties — so a consumer is never permanently stale (a producer rebuilt
+	 * in the same round re-dirties it for the next), and convergence takes at most one round
+	 * per level of the full-rebuild sub-DAG.
+	 *
+	 * Termination: the dependency DAG is acyclic (a consumer MV requires its producer to
+	 * pre-exist), so the longest full-rebuild chain — hence the round count — is bounded by
+	 * the registered-row-time-MV count. Exceeding it signals a structurally-impossible cycle
+	 * and fails loud ({@link assertFlushRounds}) — the worklist analogue of
+	 * {@link assertCascadeDepth}. This should never fire.
+	 *
+	 * The DML executor calls this INSIDE the statement-atomicity savepoint (after the row
+	 * loop, before the savepoint release), so a failed rebuild rolls the whole statement
+	 * back. An empty set is a no-op (no overhead on statements touching no full-rebuild MV).
+	 */
+	async flushDeferredRebuilds(
+		deferred: Set<string>,
+		cache?: BackingConnectionCache,
+	): Promise<void> {
+		let round = 0;
+		while (deferred.size > 0) {
+			this.assertFlushRounds(++round);
+			const batch = [...deferred];
+			deferred.clear();
+			for (const key of batch) {
+				const plan = this.rowTime.get(key);
+				// Only full-rebuild plans are ever deferred; a non-full-rebuild key (or a
+				// plan released mid-flush) is a no-op. Defensive — `maintainRowTime` only
+				// ever adds `'full-rebuild'` keys.
+				if (!plan || plan.kind !== 'full-rebuild') continue;
+				const backingChanges = await this.applyFullRebuild(plan, cache);
+				if (backingChanges.length === 0) continue;
+				const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
+				if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
+				for (const bc of backingChanges) {
+					// Cascade at depth 0: an incremental consumer applies inline (its own
+					// `assertCascadeDepth` backstops that recursion); a full-rebuild consumer
+					// re-dirties `deferred` for the next round.
+					await this.maintainRowTime(backingBase, bc, cache, deferred);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Round backstop for {@link flushDeferredRebuilds}. The full-rebuild sub-DAG is acyclic,
+	 * so the drain converges in at most one round per chain level — bounded by the row-time
+	 * MV count. A round count beyond that (`+1` slack for an initial dirty set already
+	 * spanning multiple levels) signals a structural impossibility (a cycle) — fail loud
+	 * rather than spin. This should never fire.
+	 */
+	private assertFlushRounds(round: number): void {
+		if (round > this.rowTime.size + 1) {
+			throw new QuereusError(
+				`materialized-view deferred-rebuild flush exceeded maximum rounds (${this.rowTime.size + 1}) — `
+					+ `a row-time dependency cycle should be structurally impossible`,
+				StatusCode.INTERNAL,
+			);
 		}
 	}
 
@@ -1507,9 +1604,10 @@ export class MaterializedViewManager {
 	 * returned effective {@link BackingRowChange}(s) drive the MV-over-MV cascade unchanged.
 	 *
 	 * Unlike the bounded-delta arms this ignores the specific changed row — the floor
-	 * rebuilds wholesale. In this ticket it is invoked **per row** (correct, just not yet
-	 * amortized); the per-statement deferral that makes it affordable is the next ticket.
-	 * An empty body (zero rows) yields a `'replace-all' []`, which empties the backing.
+	 * rebuilds wholesale. It is therefore deferred to a single end-of-statement flush
+	 * ({@link flushDeferredRebuilds}) rather than run per source row, so a bulk statement
+	 * rebuilds exactly once; this is that one rebuild. An empty body (zero rows) yields a
+	 * `'replace-all' []`, which empties the backing.
 	 */
 	private async applyFullRebuild(
 		plan: FullRebuildPlan,

@@ -186,8 +186,36 @@ covering structure answers it.
 > The arm is **wired and exercised in isolation** (`maintenance-equivalence.spec.ts` § full-rebuild
 > floor), but `buildMaintenancePlan` does not yet *route* bodies to it — the eligibility flip that
 > makes the floor the default (and the size-threshold reject for a full-rebuild-only body over a
-> large source) lands in a follow-on ticket. Until then the arm is invoked **per row** (correct,
-> not yet amortized); the per-statement deferral that makes it affordable is that next ticket.
+> large source) lands in a follow-on ticket.
+>
+> **The end-of-statement flush — full-rebuild is the one deferred arm.** Re-evaluating the whole
+> body per source row would be O(rows × body), so the full-rebuild arm is **deferred to a single
+> per-statement flush** rather than run per row. `maintainRowTime` takes an optional per-statement
+> `deferred: Set<string>` (MV keys): a `'full-rebuild'` plan is **marked dirty** there (no per-row
+> apply) instead of rebuilt, while the bounded-delta arms stay **per-row-immediate** (cheap, and the
+> covering-UNIQUE enforcement scan depends on their per-row backing visibility — a full-rebuild MV is
+> never a covering structure, so deferring it cannot starve that scan). The DML executor
+> (`runtime/emit/dml-executor.ts`) owns one `deferred` set per statement alongside the
+> `BackingConnectionCache`, threads it through every `maintainRowTimeStructures` call, and drains it
+> via `Database._flushDeferredRebuilds` → `MaterializedViewManager.flushDeferredRebuilds` at the
+> **end-of-statement savepoint boundary** — after the row loop (so each rebuild reads *all* the
+> statement's source writes, reads-own-writes) and before the statement-atomicity savepoint releases
+> (so a failed rebuild rolls the whole statement back, and an aborted statement that only *dirtied*
+> an MV never flushes — the backing stays untouched). A bare autocommit write flushes and commits the
+> rebuild in lockstep with the source write. The flush is a **worklist drain** over the
+> producer→consumer DAG: each rebuild calls `applyFullRebuild` and routes the realized
+> `BackingRowChange[]` back through `maintainRowTime` with the *same* `deferred` set — an incremental
+> consumer applies inline, a full-rebuild consumer re-dirties into the drain. It proceeds in **rounds**
+> (snapshot the dirty set, clear it, rebuild each member, collect re-dirties for the next round), so a
+> consumer is never left stale by a producer rebuilt in the same round; convergence takes at most one
+> round per level of the full-rebuild sub-DAG. The DAG is acyclic (a consumer MV requires its producer
+> to pre-exist), so the round count is bounded by the registered-row-time-MV count — exceeding it is a
+> structurally-impossible cycle and fails loud (`assertFlushRounds`, the worklist analogue of the
+> cascade's `assertCascadeDepth`). Cold callers (enforcement/eviction) pass no `deferred` set; a
+> full-rebuild plan they reach (they never do — not a covering structure) falls through to a safe inline
+> rebuild. Deferral is exercised in `maintenance-equivalence.spec.ts` § full-rebuild floor, per-statement
+> flush (one rebuild per bulk statement via an instrumented rebuild counter, atomic rollback, autocommit,
+> mixed-arm, and MV-over-MV mixed-arm).
 >
 > **Non-binary base-PK collation soundness.** `delete-by-prefix` early-terminates its prefix
 > scan on a **binary** value compare (`scan-layer.ts` / `plan-filter.ts`), but the backing

@@ -81,17 +81,23 @@ function emitAutoDataEvent(
  *
  * `cache` is the per-statement {@link BackingConnectionCache} the generator owns: it
  * amortizes the backing-connection resolution over the whole statement (one scan per
- * backing instead of one per source row) while still applying each row's ops
- * immediately, so within-statement enforcement visibility is unchanged.
+ * backing instead of one per source row) while still applying each bounded-delta arm's
+ * ops immediately, so within-statement enforcement visibility is unchanged.
+ *
+ * `deferred` is the per-statement deferred-rebuild set the generator owns: a full-rebuild
+ * covering MV is marked dirty here (not applied per row) and rebuilt once at the
+ * end-of-statement flush ({@link runWithStatementSavepoints}). Bounded-delta arms stay
+ * per-row-immediate.
  */
 async function maintainRowTimeStructures(
 	ctx: RuntimeContext,
 	tableKey: string,
 	change: BackingRowChange,
 	cache: BackingConnectionCache,
+	deferred: Set<string>,
 ): Promise<void> {
 	if (!ctx.db._hasRowTimeCoveringStructures(tableKey)) return;
-	await ctx.db._maintainRowTimeCoveringStructures(tableKey, change, cache);
+	await ctx.db._maintainRowTimeCoveringStructures(tableKey, change, cache, deferred);
 }
 
 /**
@@ -341,6 +347,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		rows: AsyncIterable<Row>,
 		isFailMode: boolean,
 		processRow: (flatRow: Row) => Promise<Row | undefined>,
+		deferredRebuilds: Set<string>,
+		backingConnCache: BackingConnectionCache,
 	): AsyncIterable<Row> {
 		let failSavepointCounter = 0;
 
@@ -392,6 +400,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						yield rowToYield;
 					}
 				}
+				// End-of-statement boundary: drain the deferred full-rebuild set NOW — after
+				// every source row has been applied (so each rebuild reads all this
+				// statement's writes) and BEFORE the statement savepoint releases (so a
+				// failed rebuild rolls the whole statement back). Inside the try, so a flush
+				// error routes to the rollback branch below. A no-op when nothing deferred.
+				if (deferredRebuilds.size > 0) {
+					await ctx.db._flushDeferredRebuilds(deferredRebuilds, backingConnCache);
+				}
 				if (stmtSavepointName) {
 					await ctx.db._releaseSavepointBroadcast(stmtSavepointName);
 				}
@@ -430,6 +446,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Per-statement backing-connection cache: resolve each covering MV's backing
 		// connection once for the whole statement rather than once per source row.
 		const backingConnCache: BackingConnectionCache = new Map();
+		// Per-statement deferred full-rebuild set (MV keys): full-rebuild covering MVs
+		// are marked dirty during the row loop and rebuilt once at the end-of-statement
+		// flush in runWithStatementSavepoints.
+		const deferredRebuilds = new Set<string>();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
 		// Stamp the per-row mutation ordinal so a column `default` referencing
@@ -437,10 +457,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// position of the row being produced. The defaults are evaluated upstream as
 		// each row is *pulled*, so the ordinal is set BEFORE pulling — see
 		// `stampMutationOrdinal`.
-		yield* runWithStatementSavepoints(ctx, vtab, stampMutationOrdinal(ctx, rows), isFailMode, (flatRow) =>
-			processInsertRow(
-				ctx, vtab, needsAutoEvents, flatRow, contextRow, runtimeUpsertClauses, upsertEvaluators, backingConnCache,
+		yield* runWithStatementSavepoints(
+			ctx, vtab, stampMutationOrdinal(ctx, rows), isFailMode,
+			(flatRow) => processInsertRow(
+				ctx, vtab, needsAutoEvents, flatRow, contextRow, runtimeUpsertClauses, upsertEvaluators, backingConnCache, deferredRebuilds,
 			),
+			deferredRebuilds, backingConnCache,
 		);
 	}
 
@@ -487,6 +509,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		runtimeUpsertClauses: RuntimeUpsertClause[] | undefined,
 		upsertEvaluators: UpsertEvaluator[],
 		backingConnCache: BackingConnectionCache,
+		deferredRebuilds: Set<string>,
 	): Promise<Row | undefined> {
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
 		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
@@ -529,7 +552,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						pkColumnIndicesInSchema,
 					);
 					await maintainRowTimeStructures(ctx, tableKey,
-						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow }, backingConnCache);
+						{ op: 'update', oldRow: result.existingRow!, newRow: updateResult.updatedRow }, backingConnCache, deferredRebuilds);
 					await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow, plan.lensRouted);
 
 					if (needsAutoEvents) {
@@ -561,14 +584,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Internal REPLACE evictions (rows at OTHER PKs removed to resolve a non-PK
 		// UNIQUE conflict) run the full delete pipeline here, before the new row's
 		// own bookkeeping — evict-then-write, matching the substrate journal order.
-		await processEvictions(ctx, needsAutoEvents, tableKey, result.evictedRows, backingConnCache);
+		await processEvictions(ctx, needsAutoEvents, tableKey, result.evictedRows, backingConnCache, deferredRebuilds);
 
 		const replacedRow = result.replacedRow;
 
 		if (replacedRow) {
 			const newKeyValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
 			ctx.db._recordUpdate(tableKey, replacedRow, newRow, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow }, backingConnCache);
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow }, backingConnCache, deferredRebuilds);
 			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', replacedRow, undefined, plan.lensRouted);
 
 			if (needsAutoEvents) {
@@ -583,7 +606,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		} else {
 			const pkValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
 			ctx.db._recordInsert(tableKey, newRow, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'insert', newRow }, backingConnCache);
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'insert', newRow }, backingConnCache, deferredRebuilds);
 
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'insert', pkValues, undefined, [...newRow]);
@@ -613,6 +636,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		tableKey: string,
 		evictedRows: readonly Row[] | undefined,
 		backingConnCache: BackingConnectionCache,
+		deferredRebuilds: Set<string>,
 	): Promise<void> {
 		if (!evictedRows || evictedRows.length === 0) return;
 		for (const evicted of evictedRows) {
@@ -631,7 +655,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', evicted);
 			const evictedKeyValues = pkColumnIndicesInSchema.map(idx => evicted[idx]);
 			ctx.db._recordDelete(tableKey, evicted, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'delete', oldRow: evicted }, backingConnCache);
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'delete', oldRow: evicted }, backingConnCache, deferredRebuilds);
 			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', evicted);
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...evicted]);
@@ -648,12 +672,15 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
-		// Per-statement backing-connection cache (see runInsert).
+		// Per-statement backing-connection cache + deferred full-rebuild set (see runInsert).
 		const backingConnCache: BackingConnectionCache = new Map();
+		const deferredRebuilds = new Set<string>();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
-		yield* runWithStatementSavepoints(ctx, vtab, rows, isFailMode, (flatRow) =>
-			processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache),
+		yield* runWithStatementSavepoints(
+			ctx, vtab, rows, isFailMode,
+			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds),
+			deferredRebuilds, backingConnCache,
 		);
 	}
 
@@ -672,6 +699,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		flatRow: Row,
 		contextRow: Row | undefined,
 		backingConnCache: BackingConnectionCache,
+		deferredRebuilds: Set<string>,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
@@ -739,7 +767,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				pkColumnIndicesInSchema,
 			);
 			await maintainRowTimeStructures(ctx, tableKey,
-				{ op: 'delete', oldRow: result.replacedRow }, backingConnCache);
+				{ op: 'delete', oldRow: result.replacedRow }, backingConnCache, deferredRebuilds);
 			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', result.replacedRow, undefined, plan.lensRouted);
 			if (needsAutoEvents) {
 				emitAutoDataEvent(ctx, tableSchema, 'delete', evictedKeyValues, [...result.replacedRow]);
@@ -750,7 +778,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// UNIQUE conflict for this same update) run the full delete pipeline here,
 		// after any same-PK replacedRow handling and before the moved row's own
 		// bookkeeping — evict-then-write, matching the substrate journal order.
-		await processEvictions(ctx, needsAutoEvents, tableKey, result.evictedRows, backingConnCache);
+		await processEvictions(ctx, needsAutoEvents, tableKey, result.evictedRows, backingConnCache, deferredRebuilds);
 
 		// Track change (UPDATE): pass full rows so the change capture can
 		// project the columns any active subscription cares about.
@@ -761,7 +789,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			pkColumnIndicesInSchema,
 		);
 		await maintainRowTimeStructures(ctx, tableKey,
-			{ op: 'update', oldRow, newRow }, backingConnCache);
+			{ op: 'update', oldRow, newRow }, backingConnCache, deferredRebuilds);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
 		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
@@ -792,12 +820,15 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
-		// Per-statement backing-connection cache (see runInsert).
+		// Per-statement backing-connection cache + deferred full-rebuild set (see runInsert).
 		const backingConnCache: BackingConnectionCache = new Map();
+		const deferredRebuilds = new Set<string>();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
-		yield* runWithStatementSavepoints(ctx, vtab, rows, isFailMode, (flatRow) =>
-			processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache),
+		yield* runWithStatementSavepoints(
+			ctx, vtab, rows, isFailMode,
+			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds),
+			deferredRebuilds, backingConnCache,
 		);
 	}
 
@@ -816,6 +847,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		flatRow: Row,
 		contextRow: Row | undefined,
 		backingConnCache: BackingConnectionCache,
+		deferredRebuilds: Set<string>,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
@@ -865,7 +897,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			pkColumnIndicesInSchema,
 		);
 		await maintainRowTimeStructures(ctx, tableKey,
-			{ op: 'delete', oldRow }, backingConnCache);
+			{ op: 'delete', oldRow }, backingConnCache, deferredRebuilds);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
 		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);

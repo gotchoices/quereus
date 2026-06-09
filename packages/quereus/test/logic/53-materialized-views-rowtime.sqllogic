@@ -1190,3 +1190,42 @@ select id, fk, name from jmv order by id;
 delete from jp where id = 9;
 select id, fk, name from jmv order by id;
 → [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- ===================================
+-- 25. End-of-statement flush boundary (mv-statement-flush-deferral). The DML executor now
+--     drains a per-statement deferred-rebuild set at the end-of-statement savepoint
+--     boundary — but ONLY the FULL-REBUILD arm is ever deferred there. Every arm above is
+--     a BOUNDED-DELTA arm, applied per source row immediately, so for these the deferred set
+--     stays empty and the flush is a transparent no-op. The full-rebuild arm is not yet
+--     reachable from `create materialized view` (the eligibility flip is a later ticket), so
+--     its deferred-flush behavior is exercised white-box in
+--     test/incremental/maintenance-equivalence.spec.ts (forceFullRebuild + an instrumented
+--     rebuild counter) — one rebuild per bulk statement, atomic rollback of a dirtying
+--     statement that fails, autocommit flush+commit, mixed-arm, and MV-over-MV mixed-arm.
+--
+--     The cases below regression-guard that adding the deferred set + flush hook left the
+--     bounded-delta arms untouched: a bulk multi-row statement that also crosses a partial
+--     predicate inside a 2-level MV-over-MV chain still converges at every level, with the
+--     flush running (empty) after the row loop and before the statement commits.
+-- ===================================
+
+create table fb (id integer primary key, x integer);
+insert into fb values (1, 5), (2, -3), (3, 8);
+create materialized view fb1 as select id, x from fb where x > 0;
+create materialized view fb2 as select id, x from fb1;
+select id, x from fb2 order by id;
+→ [{"id":1,"x":5},{"id":3,"x":8}]
+
+-- ONE bulk UPDATE moves id=1 OUT of the inner predicate and id=2 INTO it, in a single
+-- statement: row-by-row maintenance applies during the loop, the (empty) full-rebuild flush
+-- is a no-op, and BOTH chain levels reflect the net result after the statement commits.
+update fb set x = case when id = 1 then -1 when id = 2 then 7 else x end;
+select id, x from fb1 order by id;
+→ [{"id":2,"x":7},{"id":3,"x":8}]
+select id, x from fb2 order by id;
+→ [{"id":2,"x":7},{"id":3,"x":8}]
+
+-- A bulk DELETE in one statement cascades through both levels; the post-loop flush is a no-op.
+delete from fb where id in (2, 3);
+select id, x from fb2 order by id;
+→ []

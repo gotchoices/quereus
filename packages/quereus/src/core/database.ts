@@ -1797,13 +1797,34 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  whole statement (one scan per backing, not one per source row). The cold
 	 *  eviction callers (memory `checkUniqueViaMaterializedView`, store-table.ts) omit
 	 *  it and re-resolve the same connection deterministically — the `DatabaseInternal`
-	 *  surface deliberately exposes only the two-arg form. */
+	 *  surface deliberately exposes only the two-arg form.
+	 *
+	 *  `deferred` is the optional per-statement deferred-rebuild set: a `'full-rebuild'`
+	 *  plan is marked dirty in it (no per-row apply) and drained once at the
+	 *  end-of-statement {@link _flushDeferredRebuilds}. The DML generator owns it; cold
+	 *  callers omit it (and never name a full-rebuild MV, which is never a covering
+	 *  structure — so an inline rebuild is at worst a safe, unreached fallback). */
 	public async _maintainRowTimeCoveringStructures(
 		sourceBase: string,
 		change: BackingRowChange,
 		cache?: BackingConnectionCache,
+		deferred?: Set<string>,
 	): Promise<void> {
-		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache);
+		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache, deferred);
+	}
+
+	/** @internal Drain the per-statement deferred full-rebuild set at the
+	 *  end-of-statement boundary: rebuild every dirtied full-rebuild covering MV exactly
+	 *  once and cascade each rebuild's delta onward (MV-over-MV). The DML generator calls
+	 *  this after the row loop and before releasing the statement-atomicity savepoint, so
+	 *  a failed rebuild rolls the whole statement back. `cache` is the same per-statement
+	 *  {@link BackingConnectionCache} the row loop used. See
+	 *  `database-materialized-views.ts` § flushDeferredRebuilds. */
+	public async _flushDeferredRebuilds(
+		deferred: Set<string>,
+		cache?: BackingConnectionCache,
+	): Promise<void> {
+		await this.materializedViewManager.flushDeferredRebuilds(deferred, cache);
 	}
 
 	/** @internal Resolve the linked, `row-time`, enforcement-ready covering MV for a
