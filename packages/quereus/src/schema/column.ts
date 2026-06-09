@@ -25,9 +25,9 @@ export interface ColumnSchema {
 	/**
 	 * Whether `collation` came from an explicit `COLLATE` clause (true) rather than
 	 * the implicit default (undefined). Lets a module distinguish a user-declared
-	 * collation from the default — e.g. the store module rejects an *explicitly*
-	 * divergent per-column PK collation but silently normalizes the implicit default
-	 * up to its fixed table key collation. Purely informational; absent ⇒ implicit.
+	 * collation from the default — e.g. the store module keys an *explicit* per-column
+	 * PK collation natively but applies its own table-level default collation to an
+	 * *implicit*-default text PK column. Purely informational; absent ⇒ implicit.
 	 */
 	collationExplicit?: boolean;
 	/** Whether the column is generated (GENERATED ALWAYS AS) */

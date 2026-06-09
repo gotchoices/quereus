@@ -142,14 +142,25 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
  * encoded bytes bit-inverted (`^0xff`). Bit-inversion of a fixed-width sortable
  * encoding preserves inverse byte-lex order, so natural iteration over the KV
  * store yields DESC order for those components.
+ *
+ * When `collations` is provided, each position with a defined entry encodes that
+ * component under its own collation, overriding `options.collation` — so a
+ * composite primary key can carry a *per-column* key collation (e.g. a BINARY
+ * member alongside a NOCASE member) rather than one collation for the whole key.
+ * A `undefined` entry (or no array) falls back to `options.collation`. Collation
+ * only affects TEXT/OBJECT encoding; non-text components ignore it, so a
+ * per-column override on an integer/real/blob member is a harmless no-op.
  */
 export function encodeCompositeKey(
   values: SqlValue[],
   options?: EncodeOptions,
   directions?: ReadonlyArray<boolean>,
+  collations?: ReadonlyArray<string | undefined>,
 ): Uint8Array {
   const parts = values.map((v, i) => {
-    const encoded = encodeValue(v, options);
+    const colCollation = collations?.[i];
+    const colOptions = colCollation !== undefined ? { ...options, collation: colCollation } : options;
+    const encoded = encodeValue(v, colOptions);
     if (directions && directions[i]) {
       for (let j = 0; j < encoded.length; j++) {
         encoded[j] ^= 0xff;

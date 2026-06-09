@@ -39,7 +39,7 @@ import type { CompiledPredicate } from '@quereus/quereus';
 import type { KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
-import { StoreTable, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -284,11 +284,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const config = this.parseConfig(tableSchema.vtabArgs as Record<string, SqlValue> | undefined);
 
-		// Reconcile text PK columns against the fixed physical key collation K BEFORE
-		// any storage side-effect, so an explicit divergent per-column PK collation
-		// rejects (sited UNSUPPORTED) without leaving a dangling store, and an implicit
-		// default is normalized up to K. The normalized schema is what StoreTable holds
-		// and what `finalizeCreatedTableSchema` registers (so `table_info` reports K).
+		// Apply the store's default key collation K to any IMPLICIT-default text PK column
+		// (an explicit per-column PK collation is honored natively by the per-column key
+		// encoding — see reconcilePkCollations / StoreTable.pkKeyCollations). The reconciled
+		// schema is what StoreTable holds and what `finalizeCreatedTableSchema` registers, so
+		// an undecorated text PK reports/keys under K rather than the engine BINARY default.
 		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
 		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation);
 
@@ -510,7 +510,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Build index entries for existing rows
 		const dataStore = await this.getStore(tableKey, table.getConfig());
 		const tableSchema = table.getSchema();
-		await this.buildIndexEntries(dataStore, indexStore, tableSchema, indexSchema);
+		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
+		await this.buildIndexEntries(dataStore, indexStore, tableSchema, indexSchema, keyCollation);
 
 		// Refresh the connected table's cached schema so subsequent DML
 		// maintains the new index (the engine's schema registry is updated
@@ -633,10 +634,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		dataStore: KVStore,
 		indexStore: KVStore,
 		tableSchema: TableSchema,
-		indexSchema: TableIndexSchema
+		indexSchema: TableIndexSchema,
+		keyCollation: string,
 	): Promise<void> {
-		const encodeOptions = { collation: 'NOCASE' as const };
+		// Index COLUMN values use the table-level key collation K; the PK SUFFIX uses
+		// each PK column's own key collation, so the suffix bytes match the data-store
+		// keys (and `StoreTable.updateSecondaryIndexes`' maintenance writes) exactly.
+		const encodeOptions = { collation: keyCollation };
 		const pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
+		const pkCollations = resolvePkKeyCollations(tableSchema.primaryKeyDefinition, tableSchema.columns, keyCollation);
 		const indexDirections = indexSchema.columns.map(col => !!col.desc);
 
 		const predicate: CompiledPredicate | undefined = indexSchema.predicate
@@ -695,11 +701,42 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				encodeOptions,
 				indexDirections,
 				pkDirections,
+				pkCollations,
 			);
 			batch.put(indexKey, new Uint8Array(0)); // Index value is empty
 		}
 
 		await batch.write();
+	}
+
+	/**
+	 * Clear and rebuild every secondary index of `schema` against the (already
+	 * re-encoded) data store. Secondary-index keys embed the PK suffix, so they must
+	 * be rewritten whenever the data-store PK key bytes change — which happens both
+	 * on `ALTER PRIMARY KEY` (the PK columns change) and on an `ALTER COLUMN … SET
+	 * COLLATE` on a PK member (a PK column's key collation changes). Shared by both
+	 * arms so the clear-then-rebuild stays identical. `schema` must already be the
+	 * post-ALTER schema (its `primaryKeyDefinition` + column collations drive the new
+	 * PK-suffix encoding via {@link buildIndexEntries}).
+	 */
+	private async rebuildSecondaryIndexes(
+		schemaName: string,
+		tableName: string,
+		tableKey: string,
+		table: StoreTable,
+		schema: TableSchema,
+	): Promise<void> {
+		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
+		const dataStore = await this.getStore(tableKey, table.getConfig());
+		for (const indexSchema of schema.indexes ?? []) {
+			const indexStore = await this.getIndexStore(schemaName, tableName, indexSchema.name);
+			const clearBatch = indexStore.batch();
+			for await (const entry of indexStore.iterate(buildFullScanBounds())) {
+				clearBatch.delete(entry.key);
+			}
+			await clearBatch.write();
+			await this.buildIndexEntries(dataStore, indexStore, schema, indexSchema, keyCollation);
+		}
 	}
 
 	/**
@@ -1032,16 +1069,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 				// Secondary index keys embed the PK suffix — clear + rebuild every
 				// index against the now-rekeyed data store.
-				const dataStore = await this.getStore(tableKey, table.getConfig());
-				for (const indexSchema of oldSchema.indexes ?? []) {
-					const indexStore = await this.getIndexStore(schemaName, tableName, indexSchema.name);
-					const clearBatch = indexStore.batch();
-					for await (const entry of indexStore.iterate(buildFullScanBounds())) {
-						clearBatch.delete(entry.key);
-					}
-					await clearBatch.write();
-					await this.buildIndexEntries(dataStore, indexStore, updatedSchema, indexSchema);
-				}
+				await this.rebuildSecondaryIndexes(schemaName, tableName, tableKey, table, updatedSchema);
 
 				table.updateSchema(updatedSchema);
 				await this.saveTableDDL(updatedSchema);
@@ -1238,45 +1266,20 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				} else if (change.setDefault !== undefined) {
 					newCol = { ...oldCol, defaultValue: change.setDefault };
 				} else if (change.setCollation !== undefined) {
-					// Per-column collation update. The store enforces PRIMARY KEY uniqueness
-					// PHYSICALLY under a single fixed table-level key collation K
-					// (`encodeOptions`), not the per-column declared collation, so a PK-column
-					// SET COLLATE is negotiated accept-when-consistent / reject-when-divergent by
-					// the guard below: schema-only when the target equals K, else a sited
-					// UNSUPPORTED — never a silent no-op. For non-PK UNIQUE constraints we DO
-					// re-validate existing rows under the new collation further below (Option A)
-					// — write-time UNIQUE enforcement is already collation-aware, so this reaches
-					// end-to-end parity with memory. Query-layer ORDER BY / `=` /
-					// `table_info().collation` pick the new collation up from the column schema
-					// once this updated schema re-registers.
+					// Per-column collation update. PRIMARY KEY uniqueness/ordering is enforced
+					// PHYSICALLY in the key bytes under a PER-COLUMN key collation
+					// (`StoreTable.pkKeyCollations`), so a PK-column SET COLLATE is honored
+					// natively by physically re-keying the data store + rebuilding every
+					// secondary index under the new collation (the `isPkColumn` block below),
+					// mirroring the memory module's primary re-key. A re-key that would collide
+					// under the new collation throws CONSTRAINT before any mutation. For non-PK
+					// UNIQUE constraints we re-validate existing rows under the new collation
+					// (Option A). Query-layer ORDER BY / `=` / `table_info().collation` pick the
+					// new collation up from the column schema once this updated schema re-registers.
 					const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
 					if (normalized === (oldCol.collation || 'BINARY')) {
-						return oldSchema; // already in desired state — no scan, no re-persist
+						return oldSchema; // already in desired state — no scan, no re-key, no re-persist
 					}
-					// PK-column divergence guard (runs BEFORE the non-PK UNIQUE re-validation
-					// block). The store enforces PRIMARY KEY uniqueness PHYSICALLY under a single
-					// fixed table-level key collation K (`StoreTable.encodeOptions`,
-					// = `config.collation || 'NOCASE'`), not the per-column declared collation.
-					// It therefore cannot enforce a PK column's uniqueness/ordering under a
-					// collation that diverges from K without a physical re-key, so reject such a
-					// change cleanly (throw `UNSUPPORTED`) rather than silently applying a
-					// schema-only change the key bytes won't honor. A consistent change
-					// (target == K) falls through and is applied schema-only below — forward PK
-					// uniqueness is already physically correct under it. Data-independent: it
-					// rejects even on an empty table.
-					if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-						const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
-						if (normalized !== keyCollation) {
-							throw new QuereusError(
-								`Cannot SET COLLATE to '${normalized}' on PRIMARY KEY column `
-									+ `'${change.columnName}' of '${schemaName}.${tableName}': this module `
-									+ `enforces PK uniqueness physically under a fixed table key collation `
-									+ `('${keyCollation}'); a divergent per-column PK collation is unsupported.`,
-								StatusCode.UNSUPPORTED,
-							);
-						}
-					}
-
 					newCol = { ...oldCol, collation: normalized };
 					collationChanged = true;
 				} else {
@@ -1296,7 +1299,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// column under the NEW collation (`updatedSchema` carries it). The first
 				// collision throws CONSTRAINT BEFORE any mutation/persist, so the table is
 				// left unchanged and writable (matches the ADD CONSTRAINT rollback shape).
-				// The PK is intentionally excluded — it never appears in `uniqueConstraints`.
+				// The PK is intentionally excluded — it never appears in `uniqueConstraints`;
+				// its physical re-key/re-validation is the `isPkColumn` block below.
 				if (collationChanged) {
 					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 						.filter(uc => uc.columns.includes(colIndex));
@@ -1306,6 +1310,20 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 							await this.validateUniqueOverExistingRows(dataStore, updatedSchema, uc);
 						}
 					}
+				}
+
+				// SET COLLATE on a PRIMARY KEY member (Option B physical re-key): re-encode
+				// every data-store key under the column's new key collation, then rebuild every
+				// secondary index (its keys embed the PK suffix). `rekeyRows` validates in a
+				// first pass and throws CONSTRAINT on a collision under the new collation WITHOUT
+				// mutating the store — so a coarser collation that collapses two distinct PKs
+				// (e.g. 'a'/'A' under BINARY→NOCASE) is rejected all-or-nothing, mirroring
+				// ALTER PRIMARY KEY. Runs AFTER the non-PK UNIQUE re-validation above so both
+				// throw-only checks precede the first store mutation. `updatedSchema.columns`
+				// carries the new collation, so the new key bytes follow it.
+				if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+					await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
+					await this.rebuildSecondaryIndexes(schemaName, tableName, tableKey, table, updatedSchema);
 				}
 
 				table.updateSchema(updatedSchema);
@@ -2121,31 +2139,29 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 }
 
 /**
- * Reconcile each text PRIMARY KEY column's declared collation against the store's
- * fixed physical key collation `keyCollation` (K = `config.collation`, default
- * NOCASE), closing the CREATE-time silent-divergence gap that mirrors the ALTER
- * SET COLLATE guard.
+ * Reconcile each text PRIMARY KEY column's declared collation at CREATE time.
  *
- * The store encodes every TEXT primary-key segment under a single fixed
- * table-level collation K (`StoreTable.encodeOptions`), NOT the per-column declared
- * collation. So a text PK column whose declared collation diverges from K would
- * report one collation via `table_info()` while its key bytes — uniqueness,
- * point-lookup, ordering — are governed by K: the silent declared≠enforced split.
+ * The store now encodes PRIMARY KEY uniqueness/ordering PHYSICALLY with a
+ * PER-COLUMN key collation (`StoreTable.pkKeyCollations`, drawn from each PK
+ * column's declared `collation`), so ANY declared PK collation is honored
+ * natively — an explicit `collate binary` text PK is keyed under BINARY, a
+ * `collate nocase` under NOCASE, etc. The only thing this reconcile still does is
+ * supply the store's table-level DEFAULT (`keyCollation` = K = `config.collation`,
+ * default NOCASE) to a text PK column that declares NO explicit collation, so an
+ * implicit-default text PK keeps the store's historical NOCASE-keyed behavior
+ * (rather than the engine's BINARY column default). An EXPLICIT collation — even
+ * one diverging from K — is left exactly as declared and re-keyed natively.
  *
- * Collation is meaningful only for text, so only PK members whose logical type is
- * textual are considered (an `integer primary key` keeps its declared BINARY; the
- * temporal text-physical types carry no collation and are unaffected). For each
- * divergent text PK member: an EXPLICIT per-column collation
- * (`col.collationExplicit`) throws a sited `UNSUPPORTED` mirroring the ALTER guard;
- * an IMPLICIT default is normalized up to K.
+ * Collation governs key bytes only for text, so only PK members whose logical type
+ * is textual are touched (an `integer primary key` keeps its BINARY; temporal
+ * text-physical types carry no collation). Non-PK columns are never touched.
  *
  * This is the CREATE path only — the load path (`connect` / rehydrate) does not
- * reconcile, so a legacy persisted DDL stays loadable as-declared (see
- * `store-pk-collate-legacy-reopen-divergence` for the deferred reopen migration).
+ * reconcile; the persisted DDL is the source of truth on reopen, and the column's
+ * (BINARY-elided) `COLLATE` clause round-trips the per-column key collation.
  *
- * Returns the schema unchanged when no text PK column diverges (the common case
- * once a normalized create persists `collate <K>` in its DDL); otherwise a new
- * schema with a rebuilt `columns` array + `columnIndexMap`.
+ * Returns the schema unchanged when no implicit text PK column needs the default
+ * applied; otherwise a new schema with a rebuilt `columns` array + `columnIndexMap`.
  */
 function reconcilePkCollations(
 	schema: TableSchema,
@@ -2160,21 +2176,15 @@ function reconcilePkCollations(
 		// Collation governs key bytes only for text; non-text PK columns (integer,
 		// real, blob, …) are encoded type-natively and keep their declared collation.
 		if (!col.logicalType.isTextual) return col;
+		// An EXPLICIT collation is honored as-declared — the per-column key encoding
+		// keys the column under it (Option B physical re-key parity with memory).
+		if (col.collationExplicit) return col;
 		const declared = (col.collation || 'BINARY').toUpperCase();
-		if (declared === keyCollation) return col; // already consistent with K
+		if (declared === keyCollation) return col; // implicit default already == K
 
-		if (col.collationExplicit) {
-			throw new QuereusError(
-				`Cannot create '${schema.schemaName}.${schema.name}': PRIMARY KEY column `
-					+ `'${col.name}' declares collation '${col.collation}', but this module `
-					+ `enforces PK uniqueness physically under a fixed table key collation `
-					+ `('${keyCollation}'); a divergent per-column PK collation is unsupported.`,
-				StatusCode.UNSUPPORTED,
-			);
-		}
-
-		// Implicit default: normalize up to K so `table_info()` reports the collation
-		// actually enforced by the key bytes.
+		// Implicit default diverges from K (e.g. the engine's BINARY column default
+		// under the store's NOCASE K): apply the store's table-level default so an
+		// undecorated text PK keeps the store's historical NOCASE-keyed semantics.
 		changed = true;
 		return { ...col, collation: keyCollation };
 	});

@@ -161,6 +161,34 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(r).to.deep.equal([{ id: 2 }]);
 	});
 
+	it('secondary index is rebuilt consistently after an ALTER COLUMN SET COLLATE re-key of the PK', async () => {
+		const { db } = open();
+		// Text PK keyed BINARY + a secondary index on a value column. Uppercase PK values
+		// so the BINARY→NOCASE re-key actually changes the data-key bytes (and thus the PK
+		// suffix embedded in every index key).
+		await db.exec(`create table t (k text collate binary primary key, v integer) using store`);
+		await db.exec(`create index ix_v on t (v)`);
+		await db.exec(`insert into t values ('A', 10), ('B', 20)`);
+		expect(indexStoreSize('t', 'ix_v'), 'one index entry per row pre-ALTER').to.equal(2);
+
+		// Re-key the PK under NOCASE: 'A'/'B' data keys become 'a'/'b'. The index must be
+		// cleared + rebuilt so its embedded PK suffix matches the re-encoded data keys.
+		await db.exec(`alter table t alter column k set collate nocase`);
+		expect(indexStoreSize('t', 'ix_v'), 'index entry count preserved across re-key').to.equal(2);
+
+		// Data survived the re-key intact (full-scan filter; the store does not read the index).
+		expect(await rows(db, `select k from t where v = 20`), 'row reachable after re-key').to.deep.equal([{ k: 'B' }]);
+
+		// DELETE drives index maintenance, which computes each index key under the NEW
+		// per-column PK collation. Had the rebuild embedded the STALE (BINARY) PK suffix,
+		// these deletes would not match the rebuilt entries and orphan them — so a
+		// fully-drained table whose index store is empty proves rebuild and write-time
+		// maintenance agree on the PK-suffix encoding.
+		await db.exec(`delete from t`);
+		expect((await rows(db, `select count(*) as n from t`))[0].n, 'all rows deleted').to.equal(0);
+		expect(indexStoreSize('t', 'ix_v'), 'no orphaned index entries after re-key + delete').to.equal(0);
+	});
+
 	it('CREATE UNIQUE INDEX survives reopen and still rejects duplicates', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, email text) using store`);

@@ -604,10 +604,11 @@ describe('StoreModule.rehydrateCatalog()', () => {
 	// a declared-side `table_info` fact, not a correctness risk. The genuine reopen
 	// migration stays deferred in store-pk-collate-legacy-reopen-divergence.
 	it('legacy divergent text-PK collation loads without a Normalized warning and reports the declared collation', async () => {
-		// A normal CREATE now REJECTS an explicit divergent PK collation, so hand-seed a
-		// raw catalog entry to stand in for a legacy persisted DDL. `using store` routes
-		// the entry through this module's rehydration; the key matches saveTableDDL's
-		// `buildCatalogKey(schema, table)`.
+		// Hand-seed a raw catalog entry to stand in for a legacy persisted DDL whose text PK
+		// declares BINARY. (A normal CREATE now HONORS that as a per-column BINARY key; this
+		// arm specifically guards the load path's no-reconcile / no-warn contract, so it seeds
+		// the catalog directly.) `using store` routes the entry through this module's
+		// rehydration; the key matches saveTableDDL's `buildCatalogKey(schema, table)`.
 		const catalogStore = await provider.getCatalogStore();
 		await catalogStore.put(
 			buildCatalogKey('main', 't'),
@@ -653,5 +654,58 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		expect(await asyncIterableToArray(db.eval('select x from t')), 'inserted row round-trips').to.deep.equal([{ x: 'a' }]);
 
 		await db.close();
+	});
+
+	// Per-column PK key collation survives a close → reopen. The store keys PRIMARY KEY
+	// columns under their declared collation (store-pk-collate-physical-rekey), so a
+	// divergent (BINARY) PK key collation — established either by an explicit `collate
+	// binary` CREATE or by a SET COLLATE re-key of a default-NOCASE PK — must still be in
+	// force after a fresh Database rehydrates the catalog: the re-encoded physical keys
+	// and the reloaded column collation must agree, or point lookups / uniqueness break.
+	it('per-column PK key collation round-trips through close → reopen', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+
+		// (1) explicit `collate binary` CREATE — holds a case-distinct pair NOCASE can't.
+		await db1.exec(`create table bpk (k text collate binary primary key) using store`);
+		await db1.exec(`insert into bpk values ('a'), ('A')`);
+
+		// (2) SET COLLATE re-key of a default-NOCASE PK to BINARY, then a case-distinct insert.
+		await db1.exec(`create table spk (k text primary key) using store`);
+		await db1.exec(`insert into spk values ('a')`);
+		await db1.exec(`alter table spk alter column k set collate binary`);
+		await db1.exec(`insert into spk values ('A')`);
+
+		await mod1.whenCatalogPersisted();
+
+		// Reopen: fresh module + Database over the SAME provider (stores persist).
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 'catalog rehydrates cleanly').to.have.lengthOf(0);
+
+		// (a) Both case-distinct pairs survived and read back under BINARY ordering
+		//     ('A' = 0x41 sorts before 'a' = 0x61).
+		expect(await asyncIterableToArray(db2.eval(`select k from bpk order by k`)), 'bpk under BINARY')
+			.to.deep.equal([{ k: 'A' }, { k: 'a' }]);
+		expect(await asyncIterableToArray(db2.eval(`select k from spk order by k`)), 'spk under BINARY')
+			.to.deep.equal([{ k: 'A' }, { k: 'a' }]);
+
+		// (b) table_info reports BINARY for each reopened PK column.
+		for (const t of ['bpk', 'spk']) {
+			const info = await asyncIterableToArray(db2.eval(`select name, collation from table_info('${t}')`));
+			const k = info.find(r => String(r.name).toLowerCase() === 'k');
+			expect(String(k!.collation).toUpperCase(), `${t}.k collation after reopen`).to.equal('BINARY');
+		}
+
+		// (c) BINARY uniqueness still enforced after reopen, and a point lookup addresses
+		//     the re-encoded keys.
+		await expectRejected(() => db2.exec(`insert into bpk values ('A')`), 'exact-dup PK rejected after reopen');
+		expect(await asyncIterableToArray(db2.eval(`select k from bpk where k = 'A'`)), 'point lookup under BINARY key')
+			.to.deep.equal([{ k: 'A' }]);
+
+		await db2.close();
 	});
 });

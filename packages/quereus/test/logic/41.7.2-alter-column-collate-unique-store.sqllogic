@@ -10,14 +10,14 @@
 -- integer PK, so the store's fixed-table-collation KEY encoding is irrelevant — both
 -- modules behave identically.
 --
--- Section 9: a PRIMARY KEY column's CONSISTENT collation change (target == the store's
--- fixed table key collation, NOCASE) also runs cross-module — memory re-keys its
--- primary structure, the store applies it schema-only because the target already
--- matches its physical key encoding, and both then enforce PK uniqueness under NOCASE.
--- The DIVERGENT PK case (target != the store's fixed key collation) is NOT here: the
--- store rejects it with UNSUPPORTED (asserted in packages/quereus-store/test/
--- alter-table-conformance.spec.ts), so it cannot be a cross-module sqllogic assertion.
--- The physically-impossible memory-only re-key collision fixture ('a'/'A') stays in
+-- Section 9: a PRIMARY KEY column's collation change runs cross-module. Both modules
+-- key the PK per-column and re-key the primary structure on SET COLLATE — memory
+-- re-keys its primary tree, the store physically re-encodes its data-store keys and
+-- rebuilds dependent secondary indexes (ticket store-pk-collate-physical-rekey). §9
+-- exercises a NON-colliding divergent change (NOCASE→BINARY) that is HONORED: a
+-- case-distinct PK that NOCASE collapsed now coexists, and ordering/uniqueness follow
+-- BINARY. The COLLIDING divergent case ('a'/'A' under BINARY→NOCASE rejects with
+-- CONSTRAINT, all-or-nothing) lives cross-module in
 -- 41.7.1-alter-column-collate-unique.sqllogic. The cross-module query-layer behavior
 -- lives in 41.7-alter-column-collate.sqllogic.
 
@@ -261,26 +261,28 @@ insert into nopg values (3, 'A@X');
 drop table nopg;
 
 -- ===================================
--- 9. PRIMARY KEY column, CONSISTENT collation change (target == the store's fixed key
---    collation, NOCASE) → succeeds on BOTH modules. Memory re-keys its primary
---    structure under NOCASE; the store applies the change schema-only because the
---    target already equals its fixed physical key collation. A non-colliding pair
---    survives the change, then a case-only duplicate of an existing PK collides under
---    NOCASE and is rejected on both modules. (Migrated from 41.7.1 §2 — it is no longer
---    memory-only now that the store honors the consistent case.)
+-- 9. PRIMARY KEY column, DIVERGENT collation change (NOCASE → BINARY) is HONORED
+--    cross-module via a physical re-key. The column is declared `collate nocase`
+--    EXPLICITLY so both modules start NOCASE-keyed (the store honors the explicit
+--    NOCASE per-column; memory keys NOCASE too). After re-keying to BINARY a
+--    case-distinct PK that NOCASE collapsed now coexists, and ordering/uniqueness
+--    follow BINARY. (The store re-keys per-column instead of rejecting the divergent
+--    change — ticket store-pk-collate-physical-rekey.)
 -- ===================================
 
-create table pko (k text primary key);
-insert into pko values ('alpha'), ('Beta');
+create table pkb (k text collate nocase primary key);
+insert into pkb values ('alpha'), ('beta');
 
-alter table pko alter column k set collate nocase;
+alter table pkb alter column k set collate binary;
 -- run
 
--- a case-only duplicate of an existing PK now collides under NOCASE
-insert into pko values ('ALPHA');
+-- under BINARY a case-distinct value now coexists (it would collide under NOCASE)
+insert into pkb values ('ALPHA');
+select k from pkb order by k;
+→ [{"k":"ALPHA"},{"k":"alpha"},{"k":"beta"}]
+
+-- an exact-duplicate PK still collides under BINARY
+insert into pkb values ('beta');
 -- error: UNIQUE constraint failed
 
-select k from pko order by k;
-→ [{"k":"alpha"},{"k":"Beta"}]
-
-drop table pko;
+drop table pkb;

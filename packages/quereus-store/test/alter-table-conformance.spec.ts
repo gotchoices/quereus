@@ -321,11 +321,11 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		// PK column, CONSISTENT change: target NOCASE == the store's fixed physical key
-		// collation K (default NOCASE). The store applies it schema-only — forward PK
-		// uniqueness is already physically correct under NOCASE. 'abc'/'ABD' are distinct
-		// under NOCASE keys, so both coexist and order under NOCASE.
-		label: 'alterColumn SET COLLATE on PK column (consistent: target == fixed key collation) → honored schema-only',
+		// PK column, CONSISTENT change: an implicit-default text PK is reconciled to the
+		// store's K (NOCASE) at CREATE, so `set collate nocase` matches the current
+		// collation and is a schema-only no-op (no re-key needed — the keys are already
+		// NOCASE). 'abc'/'ABD' are distinct under NOCASE, so both coexist and order under it.
+		label: 'alterColumn SET COLLATE on PK column (consistent: target == current collation) → honored no-op',
 		seed: [`create table t (name text primary key) using store`, `insert into t values ('abc'), ('ABD')`],
 		alter: `alter table t alter column name set collate nocase`,
 		expect: { kind: 'honored' },
@@ -339,59 +339,65 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		// PK column, DIVERGENT change: target BINARY != K (NOCASE). The store enforces the
-		// PK physically under K and cannot honor a divergent per-column PK collation without
-		// a physical re-key, so it throws a sited UNSUPPORTED — the negotiated rejection that
-		// closes the former silent-divergence gap. Reach it by declaring the column NOCASE
-		// first (so BINARY is a real change, not the BINARY→NOCASE consistent case).
-		label: 'alterColumn SET COLLATE on PK column (divergent from fixed key collation) → UNSUPPORTED',
+		// PK column, DIVERGENT change: target BINARY != K (NOCASE). The store keys the PK
+		// per-column, so it HONORS the change by physically re-keying the data store under
+		// BINARY (Option B). Declare the column NOCASE first so BINARY is a real change (not
+		// the BINARY→NOCASE consistent case). Read-back proves BINARY is in force: a
+		// case-distinct PK that NOCASE would have collapsed now coexists.
+		label: 'alterColumn SET COLLATE on PK column (divergent from fixed key collation) → honored re-key',
 		seed: [`create table t (name text collate nocase primary key) using store`, `insert into t values ('abc'), ('xyz')`],
 		alter: `alter table t alter column name set collate binary`,
-		expect: { kind: 'reject', codes: [StatusCode.UNSUPPORTED], site: /name|primary key|collat/i },
-		confirm: async (db, outcome) => {
-			const info = await columnInfo(db, 'name');
-			if (outcome === 'rejected') {
-				expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
-				// the table is still writable after the failed ALTER
-				await db.exec(`insert into t values ('def')`);
-				expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert succeeded post-reject').to.equal(3);
-			} else expect(String(info?.collation).toUpperCase(), 'unexpected honor of a divergent PK collation').to.equal('NOCASE');
+		expect: { kind: 'honored' },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'name'))?.collation).toUpperCase(), 'collation re-keyed to BINARY').to.equal('BINARY');
+			await db.exec(`insert into t values ('ABC')`); // distinct from 'abc' under BINARY
+			expect((await rows(db, `select count(*) as n from t`))[0].n, 'case-distinct PK coexists under BINARY').to.equal(3);
 		},
 	},
 	{
-		// PK column, DIVERGENT to a THIRD collation (RTRIM): K is always BINARY/NOCASE
-		// (config.collation's type), so an RTRIM (or any non-K) target on a PK column can
-		// never equal K and must reject. Guards the general `normalized !== K` branch with a
-		// collation outside the {target, K} = {BINARY, NOCASE} pair the other arms exercise.
-		label: 'alterColumn SET COLLATE rtrim on PK column (third collation, divergent from K) → UNSUPPORTED',
+		// PK column, DIVERGENT to a THIRD collation (RTRIM): the per-column key encoder
+		// honors RTRIM too. Read-back proves it: after the re-key, a trailing-space variant
+		// of an existing PK collides (RTRIM trims it before keying).
+		label: 'alterColumn SET COLLATE rtrim on PK column (third collation) → honored re-key',
 		seed: [`create table t (name text collate nocase primary key) using store`, `insert into t values ('abc')`],
 		alter: `alter table t alter column name set collate rtrim`,
-		expect: { kind: 'reject', codes: [StatusCode.UNSUPPORTED], site: /name|primary key|collat/i },
-		confirm: async (db, outcome) => {
-			const info = await columnInfo(db, 'name');
-			expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
-			if (outcome === 'rejected') {
-				await db.exec(`insert into t values ('def')`);
-				expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert succeeded post-reject').to.equal(2);
-			}
+		expect: { kind: 'honored' },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'name'))?.collation).toUpperCase(), 'collation re-keyed to RTRIM').to.equal('RTRIM');
+			await expectConstraint(db, `insert into t values ('abc   ')`, 'RTRIM PK key in force');
 		},
 	},
 	{
-		// COMPOSITE PK, single-member divergent change: altering one PK member to a divergent
-		// collation must reject — the guard's membership test (`primaryKeyDefinition.some(...)`)
-		// fires for any PK column, not just a single-column PK. `a` is a PK member declared
-		// NOCASE (== K), so SET COLLATE binary diverges and rejects; `b` is unaffected.
-		label: 'alterColumn SET COLLATE on a composite-PK member (divergent) → UNSUPPORTED',
+		// COMPOSITE PK, single-member divergent change: altering one PK member's collation
+		// re-keys the composite under (BINARY a, b). `a` is a PK member declared NOCASE
+		// (== K), so SET COLLATE binary is a real divergent change; `b`'s integer key is
+		// unaffected. Read-back: a case-distinct `a` now coexists for the same `b`.
+		label: 'alterColumn SET COLLATE on a composite-PK member (divergent) → honored re-key',
 		seed: [`create table t (a text collate nocase, b integer, primary key (a, b)) using store`, `insert into t values ('abc', 1)`],
 		alter: `alter table t alter column a set collate binary`,
-		expect: { kind: 'reject', codes: [StatusCode.UNSUPPORTED], site: /\ba\b|primary key|collat/i },
+		expect: { kind: 'honored' },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'a'))?.collation).toUpperCase(), 'member a re-keyed to BINARY').to.equal('BINARY');
+			await db.exec(`insert into t values ('ABC', 1)`); // distinct from ('abc',1) under BINARY a
+			expect((await rows(db, `select count(*) as n from t`))[0].n, 'case-distinct composite PK coexists').to.equal(2);
+		},
+	},
+	{
+		// PK column, DIVERGENT change that COLLIDES under the new collation: 'a'/'A' are
+		// distinct under the declared BINARY key but collapse to one NOCASE key. The re-key's
+		// first pass detects the collision and throws CONSTRAINT WITHOUT mutating the store —
+		// all-or-nothing, mirroring ALTER PRIMARY KEY's duplicate handling.
+		label: 'alterColumn SET COLLATE on PK column that collides under the new collation → CONSTRAINT',
+		seed: [`create table t (name text collate binary primary key) using store`, `insert into t values ('a'), ('A')`],
+		alter: `alter table t alter column name set collate nocase`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /unique|primary key|duplicate/i },
 		confirm: async (db, outcome) => {
-			const info = await columnInfo(db, 'a');
-			expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
+			// Rolled back: both case-distinct rows survive and the column is still BINARY.
+			expect(String((await columnInfo(db, 'name'))?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('BINARY');
 			if (outcome === 'rejected') {
-				// the table is still writable after the failed ALTER
-				await db.exec(`insert into t values ('abc', 2)`);
-				expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert succeeded post-reject').to.equal(2);
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'both rows survive the rejected re-key').to.equal(2);
+				await db.exec(`insert into t values ('B')`); // still writable
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'table writable post-reject').to.equal(3);
 			}
 		},
 	},
@@ -440,10 +446,12 @@ describe('ALTER conformance matrix — store module', () => {
 		});
 	}
 
-	// The former DEFERRED cell — ALTER COLUMN SET COLLATE on a PRIMARY KEY column —
-	// is now resolved by `store-pk-collate-module-capability` and lives as two live
-	// ARMS above: the CONSISTENT case (target == the store's fixed key collation) is
-	// honored schema-only, and the DIVERGENT case throws a sited UNSUPPORTED. The
-	// store enforces PK uniqueness physically under its fixed table key collation, so
-	// it never silently diverges on a per-column PK collation change.
+	// ALTER COLUMN SET COLLATE on a PRIMARY KEY column lives as four live ARMS above:
+	// the CONSISTENT case (target == the column's current collation) is a schema-only
+	// no-op; a DIVERGENT case (BINARY / RTRIM / a composite member) is HONORED by a
+	// physical re-key of the data store + secondary-index rebuild under the new
+	// per-column key collation; and a divergent change that COLLIDES under the new
+	// collation throws CONSTRAINT all-or-nothing. The store keys the PK per-column
+	// (`StoreTable.pkKeyCollations`), so it honors any PK collation natively — there is
+	// no longer a fixed-table-collation `UNSUPPORTED` reject.
 });

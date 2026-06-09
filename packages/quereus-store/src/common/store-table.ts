@@ -21,6 +21,7 @@ import {
 	compilePredicate,
 	type Database,
 	type DatabaseInternal,
+	type ColumnSchema,
 	type MaterializedViewSchema,
 	type TableSchema,
 	type TableIndexSchema,
@@ -91,6 +92,38 @@ function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | und
 }
 
 /**
+ * Resolve the per-column KEY collation for each primary-key column.
+ *
+ * The store encodes PRIMARY KEY uniqueness/ordering PHYSICALLY in the key bytes,
+ * so each text PK column's key must be encoded under that column's declared
+ * collation (BINARY / NOCASE / RTRIM — the registered encoders). Returns one
+ * entry per PK member, in `pkDef` order:
+ *   - text member → its declared `collation` (normalized upper-case), or
+ *     `fallback` (the table key collation K) when the column carries none.
+ *   - non-text member → `undefined`: collation is meaningless for
+ *     integer/real/blob keys (they encode type-natively), so the encoder ignores
+ *     it and the data/index key bytes are identical regardless.
+ *
+ * A custom comparator-only collation with no registered byte encoder still maps
+ * to NOCASE bytes inside `encodeText` (its `?? NOCASE_ENCODER` fallback); that
+ * residual is the same one documented for store UNIQUE enforcement and is out of
+ * scope here. Shared by {@link StoreTable} (data-key + index-maintenance) and
+ * `StoreModule.buildIndexEntries` (index rebuild) so the PK suffix encoding can
+ * never drift between the two.
+ */
+export function resolvePkKeyCollations(
+	pkDef: ReadonlyArray<{ index: number }>,
+	columns: ReadonlyArray<ColumnSchema>,
+	fallback: string,
+): (string | undefined)[] {
+	return pkDef.map(def => {
+		const col = columns[def.index];
+		if (!col || !col.logicalType.isTextual) return undefined;
+		return (col.collation || fallback).toUpperCase();
+	});
+}
+
+/**
  * Configuration for a store table.
  */
 export interface StoreTableConfig {
@@ -136,6 +169,14 @@ export class StoreTable extends VirtualTable {
 	protected eventEmitter?: StoreEventEmitter;
 	protected encodeOptions: EncodeOptions;
 	protected pkDirections: boolean[];
+	/**
+	 * Per-PK-column KEY collation (see {@link resolvePkKeyCollations}). Drives the
+	 * physical encoding of every data key and the PK suffix of every secondary-index
+	 * key, so a text PK column declared BINARY/NOCASE/RTRIM is keyed under its own
+	 * collation rather than one fixed table-level collation. Recomputed on every
+	 * {@link updateSchema} (an ALTER COLUMN SET COLLATE on a PK member changes it).
+	 */
+	protected pkKeyCollations: (string | undefined)[];
 	protected ddlSaved = false;
 
 	// Statistics tracking
@@ -172,6 +213,11 @@ export class StoreTable extends VirtualTable {
 		this.eventEmitter = eventEmitter;
 		this.encodeOptions = { collation: config.collation || 'NOCASE' };
 		this.pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
+		this.pkKeyCollations = resolvePkKeyCollations(
+			tableSchema.primaryKeyDefinition,
+			tableSchema.columns,
+			this.encodeOptions.collation ?? 'NOCASE',
+		);
 		this.ddlSaved = isConnected;
 	}
 
@@ -189,6 +235,11 @@ export class StoreTable extends VirtualTable {
 	updateSchema(newSchema: TableSchema): void {
 		this.tableSchema = newSchema;
 		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
+		this.pkKeyCollations = resolvePkKeyCollations(
+			newSchema.primaryKeyDefinition,
+			newSchema.columns,
+			this.encodeOptions.collation ?? 'NOCASE',
+		);
 	}
 
 	/**
@@ -270,9 +321,20 @@ export class StoreTable extends VirtualTable {
 	 * Only the data store is rewritten — secondary indexes are rebuilt by the
 	 * caller (the keys embed the PK suffix, so they must be rebuilt whenever
 	 * the PK changes).
+	 *
+	 * The new key for each row is encoded under `newColumns`'s per-column PK
+	 * collations, so this drives BOTH:
+	 *   - `ALTER PRIMARY KEY` — the PK *columns* change; `newColumns` defaults to the
+	 *     current column set (their collations are unchanged), and
+	 *   - `ALTER COLUMN … SET COLLATE` on a PK member — the PK columns stay the same
+	 *     but one column's collation changes; the caller passes the post-ALTER
+	 *     `updatedSchema.columns` so the new key bytes follow the new collation.
+	 * The OLD key is taken verbatim from the stored entry (never re-encoded), so the
+	 * old collation is implicit in the existing bytes and need not be supplied.
 	 */
 	async rekeyRows(
-		newPkDef: ReadonlyArray<{ index: number; desc: boolean }>,
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		newColumns: ReadonlyArray<ColumnSchema> = this.tableSchema!.columns,
 	): Promise<void> {
 		const store = await this.ensureStore();
 		const bounds = buildFullScanBounds();
@@ -281,10 +343,15 @@ export class StoreTable extends VirtualTable {
 		const pending = new Map<string, Pending>();
 
 		const newPkDirections = newPkDef.map(pk => !!pk.desc);
+		const newPkCollations = resolvePkKeyCollations(
+			newPkDef,
+			newColumns,
+			this.encodeOptions.collation ?? 'NOCASE',
+		);
 		for await (const entry of store.iterate(bounds)) {
 			const row = deserializeRow(entry.value);
 			const newPkValues = newPkDef.map(pk => row[pk.index]);
-			const newKey = buildDataKey(newPkValues, this.encodeOptions, newPkDirections);
+			const newKey = buildDataKey(newPkValues, this.encodeOptions, newPkDirections, newPkCollations);
 			const hex = bytesToHex(newKey);
 			if (pending.has(hex)) {
 				throw new QuereusError(
@@ -514,7 +581,7 @@ export class StoreTable extends VirtualTable {
 		const pkAccess = this.analyzePKAccess(filterInfo);
 
 		if (pkAccess.type === 'point') {
-			const key = buildDataKey(pkAccess.values!, this.encodeOptions, this.pkDirections);
+			const key = buildDataKey(pkAccess.values!, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 			const value = await store.get(key);
 			if (value) {
 				const row = deserializeRow(value);
@@ -664,7 +731,7 @@ export class StoreTable extends VirtualTable {
 				if (!values) throw new QuereusError('INSERT requires values', StatusCode.MISUSE);
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
 				const pk = this.extractPK(coerced);
-				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
+				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 
 				// Check for existing row (for conflict handling).
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
@@ -770,8 +837,8 @@ export class StoreTable extends VirtualTable {
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
 				const oldPk = this.extractPK(oldKeyValues);
 				const newPk = this.extractPK(coerced);
-				const oldKey = buildDataKey(oldPk, this.encodeOptions, this.pkDirections);
-				const newKey = buildDataKey(newPk, this.encodeOptions, this.pkDirections);
+				const oldKey = buildDataKey(oldPk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+				const newKey = buildDataKey(newPk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 
 				// Get old row for index updates
 				const oldRowData = await store.get(oldKey);
@@ -893,7 +960,7 @@ export class StoreTable extends VirtualTable {
 			case 'delete': {
 				if (!oldKeyValues) throw new QuereusError('DELETE requires oldKeyValues', StatusCode.MISUSE);
 				const pk = this.extractPK(oldKeyValues);
-				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
+				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 
 				// Get old row for index cleanup
 				const oldRowData = await store.get(key);
@@ -972,6 +1039,7 @@ export class StoreTable extends VirtualTable {
 					this.encodeOptions,
 					indexDirections,
 					this.pkDirections,
+					this.pkKeyCollations,
 				);
 
 				if (inTransaction && this.coordinator) {
@@ -990,6 +1058,7 @@ export class StoreTable extends VirtualTable {
 					this.encodeOptions,
 					indexDirections,
 					this.pkDirections,
+					this.pkKeyCollations,
 				);
 				// Index value is empty - we just need the key for lookups
 				const emptyValue = new Uint8Array(0);
@@ -1232,7 +1301,7 @@ export class StoreTable extends VirtualTable {
 	 */
 	private async readLiveRowByPk(pk: SqlValue[]): Promise<Row | null> {
 		const store = await this.ensureStore();
-		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
+		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 		const pending = this.coordinator?.isInTransaction()
 			? this.coordinator.getPendingOpsForStore(store)
 			: null;
@@ -1257,7 +1326,7 @@ export class StoreTable extends VirtualTable {
 		oldRow: Row,
 	): Promise<void> {
 		const store = await this.ensureStore();
-		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
+		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 		if (inTransaction && this.coordinator) {
 			this.coordinator.delete(key);
 		} else {

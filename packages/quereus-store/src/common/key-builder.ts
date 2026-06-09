@@ -76,13 +76,18 @@ export function buildStatsKey(schemaName: string, tableName: string): Uint8Array
  *
  * `directions[i] === true` marks PK column i as DESC — its encoded bytes are
  * bit-inverted so natural byte-lex iteration yields DESC order for that column.
+ *
+ * `collations[i]`, when defined, encodes PK column i under its own key collation
+ * (overriding `options.collation`), so each text PK column honors its declared
+ * collation in the physical key bytes. Non-text members ignore it.
  */
 export function buildDataKey(
 	pkValues: SqlValue[],
 	options?: EncodeOptions,
 	directions?: ReadonlyArray<boolean>,
+	collations?: ReadonlyArray<string | undefined>,
 ): Uint8Array {
-	return encodeCompositeKey(pkValues, options, directions);
+	return encodeCompositeKey(pkValues, options, directions, collations);
 }
 
 /**
@@ -92,6 +97,12 @@ export function buildDataKey(
  * The index columns come first for range scans, followed by PK for uniqueness.
  * `indexDirections` and `pkDirections` independently control DESC bit-inversion
  * for each half so ordered index scans honor per-column direction.
+ *
+ * `pkCollations[i]`, when defined, encodes the PK-suffix column i under its own
+ * key collation (overriding `options.collation`). The PK suffix MUST be encoded
+ * with the same per-column collations as the data key (see `buildDataKey`), so
+ * index maintenance (delete-then-insert on UPDATE/DELETE) addresses the same
+ * bytes the data store keys by. Index columns keep `options.collation`.
  */
 export function buildIndexKey(
 	indexValues: SqlValue[],
@@ -99,9 +110,10 @@ export function buildIndexKey(
 	options?: EncodeOptions,
 	indexDirections?: ReadonlyArray<boolean>,
 	pkDirections?: ReadonlyArray<boolean>,
+	pkCollations?: ReadonlyArray<string | undefined>,
 ): Uint8Array {
 	const indexEncoded = encodeCompositeKey(indexValues, options, indexDirections);
-	const pkEncoded = encodeCompositeKey(pkValues, options, pkDirections);
+	const pkEncoded = encodeCompositeKey(pkValues, options, pkDirections, pkCollations);
 	return concatBytes(indexEncoded, pkEncoded);
 }
 

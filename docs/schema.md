@@ -267,43 +267,45 @@ index store, the in-memory schema has the index but the catalog does not, so on
 reopen the index is missing and its store is orphaned. There is no two-phase
 protocol here.
 
-**Fixed physical key collation and PK collation reconciliation.** The store encodes every
-primary-key key's bytes under a single fixed table-level key collation K
-(`config.collation`, one of `BINARY` / `NOCASE`, default `NOCASE`), and enforces
-PK uniqueness *physically* against those bytes — not under the PK column's declared
-per-column collation. A **text** PK column whose declared collation diverges from K
-would therefore report one collation via `table_info()` while its key bytes
-(uniqueness / point-lookup / ordering) are governed by K — a silent declared≠enforced
-split. The store closes that gap symmetrically at both schema entry points:
+**Per-column PK key collation.** The store enforces PRIMARY KEY uniqueness/ordering
+*physically* in the key bytes, encoding each PK column under its own declared collation
+(`StoreTable.pkKeyCollations` — `BINARY` / `NOCASE` / `RTRIM`, the registered key
+encoders). So **any** declared PK collation is honored natively: `x text collate binary
+primary key` is keyed under BINARY, `collate nocase` under NOCASE, etc., reaching parity
+with the memory module. The table-level key collation K (`config.collation`, one of
+`BINARY` / `NOCASE`, default `NOCASE`) is now only a **default** for an undecorated text
+PK column, plus the collation used for secondary-index *column* values. The schema entry
+points:
 
-- **CREATE.** `module.create` reconciles each text PK column against K: an
-  *implicit*-default divergent collation (e.g. the BINARY default under K = NOCASE) is
-  **normalized up to K** so `table_info()` reports the collation actually enforced, while
-  an *explicitly* declared divergent per-column PK collation (`x text collate binary
-  primary key` under K = NOCASE) throws a sited `UNSUPPORTED` — the faithful mirror of
-  the ALTER guard below. (The explicit-vs-implicit distinction rides on
-  `ColumnSchema.collationExplicit`, set by `columnDefToSchema` only for a `COLLATE`
-  clause.) Non-text PK columns (e.g. `integer primary key`) keep their declared collation
-  — collation governs key bytes only for text.
-- **Load path (`connect` / rehydrate).** The load path does **not** reconcile: a legacy /
-  hand-authored persisted DDL with a divergent text-PK collation stays loadable
-  **as-declared**, and `table_info()` reports the declared (stale) collation as-is rather
-  than silently coercing it to K. This is harmless for correctness — physical key bytes
-  are always K-encoded by `StoreTable.encodeOptions`, so the divergence is a declared-side
-  `table_info` fact, not a uniqueness/ordering risk. (Post-fix this is the rare case
-  anyway: a normalized create persists `collate <K>` in its DDL, so reopen re-parses to K
-  and finds nothing to reconcile.) Reporting K after a reopen would require reconciling on
-  the engine import path — tracked in the deferred `store-pk-collate-legacy-reopen-divergence`.
-- **`ALTER COLUMN … SET COLLATE` on a PK column** is negotiated
-  **accept-when-consistent / reject-when-divergent**: a target equal to K is applied
-  schema-only (forward PK uniqueness is already correct under it), while a divergent
-  target throws a sited `UNSUPPORTED` rather than silently applying a schema change the
-  key bytes never honor. The reject is data-independent (it fires even on an empty
-  table).
+- **CREATE.** `module.create` applies the store default K to an *implicit*-default text PK
+  column (e.g. the engine's BINARY column default becomes NOCASE under K = NOCASE), so an
+  undecorated text PK keeps the store's historical NOCASE-keyed behavior; an *explicit*
+  `COLLATE` clause — even one diverging from K — is left exactly as declared and keyed
+  under it. (The explicit-vs-implicit distinction rides on `ColumnSchema.collationExplicit`,
+  set by `columnDefToSchema` only for a `COLLATE` clause.) Non-text PK columns (e.g.
+  `integer primary key`) keep their declared collation — collation governs key bytes only
+  for text.
+- **Load path (`connect` / rehydrate).** The load path does **not** reconcile — the
+  persisted DDL is the source of truth. The per-column key collation round-trips through
+  the column's `COLLATE` clause (`generateTableDDL` elides the default `BINARY` and emits
+  any non-`BINARY` collation explicitly), and the engine import path defaults a
+  no-`COLLATE` column to `BINARY`, so the reloaded column collation matches the collation
+  the physical keys were written under. (A genuinely *legacy* persisted DDL — written
+  before per-column keying, whose declared collation may not match its key bytes — is
+  loaded as-declared; the deferred reopen migration is tracked in
+  `store-pk-collate-legacy-reopen-divergence`.)
+- **`ALTER COLUMN … SET COLLATE` on a PK column** is honored by a **physical re-key**:
+  `StoreTable.rekeyRows` re-encodes every data-store key under the column's new collation
+  and `rebuildSecondaryIndexes` rebuilds each secondary index (whose keys embed the PK
+  suffix). A re-key that would collide under the new collation (e.g. `'a'`/`'A'` distinct
+  under BINARY but colliding under NOCASE) throws `CONSTRAINT` in the validation pass
+  **without mutating the store** — all-or-nothing, mirroring `ALTER PRIMARY KEY`. A target
+  equal to the column's current collation is a schema-only no-op (no re-key).
 
 See [`docs/sql.md` § ALTER COLUMN](sql.md#27-alter-table-statement) for the
-full SET COLLATE contract, including the non-PK UNIQUE re-validation that *does*
-reach memory parity and the custom-comparator dedup residual.
+full SET COLLATE contract, including the non-PK UNIQUE re-validation and the
+custom-comparator dedup residual (a comparator-only collation with no registered byte
+encoder still keys/dedups under NOCASE bytes).
 
 ### View and materialized-view persistence
 

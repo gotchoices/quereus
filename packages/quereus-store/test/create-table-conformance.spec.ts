@@ -1,18 +1,17 @@
 /**
- * CREATE-conformance — store leg of the "no silent divergence" contract for the
- * primary-key collation reconciliation performed at table-creation time.
+ * CREATE-conformance — store leg of the per-column PRIMARY KEY collation contract.
  *
  * Companion to `alter-table-conformance.spec.ts`. The store enforces PRIMARY KEY
- * uniqueness PHYSICALLY under a single fixed table-level key collation K
- * (`StoreTable.encodeOptions`, = `config.collation || 'NOCASE'`), not the
- * per-column declared collation. Without reconciliation a text PK column declared
- * with a collation that diverges from K would report one collation via
- * `table_info()` (e.g. the BINARY default) while its key bytes — uniqueness,
- * point-lookup, ordering — are governed by K (NOCASE): a silent declared≠enforced
- * split. `StoreModule.create` closes that gap by:
- *   - normalizing an IMPLICIT-default divergent text PK column up to K, and
- *   - rejecting an EXPLICITLY-declared divergent text PK collation with a sited
- *     `UNSUPPORTED` (the faithful mirror of the ALTER SET COLLATE guard).
+ * uniqueness/ordering PHYSICALLY in the key bytes under a PER-COLUMN key collation
+ * (`StoreTable.pkKeyCollations`, drawn from each PK column's declared `collation`),
+ * so ANY declared PK collation is honored natively — an explicit `collate binary`
+ * text PK is keyed under BINARY, `collate nocase` under NOCASE, `collate rtrim`
+ * under RTRIM. `StoreModule.create` only supplies the store's table-level DEFAULT
+ * K (`config.collation || 'NOCASE'`) to an IMPLICIT-default text PK column (so an
+ * undecorated text PK keeps the store's historical NOCASE-keyed behavior rather
+ * than the engine's BINARY column default); an EXPLICIT collation is left exactly
+ * as declared and keyed under it. There is no longer any declared≠enforced split,
+ * and no CREATE-time `UNSUPPORTED` reject for a divergent PK collation.
  *
  * Store backing: the in-memory KV provider (same as `alter-table.spec.ts`), so this
  * stays in the fast `yarn test` lane (no LevelDB).
@@ -116,34 +115,43 @@ describe('CREATE conformance — store PK collation reconciliation', () => {
 		expect(await tableExists(db)).to.equal(true);
 	});
 
-	it('explicit collate BINARY on a text PK (≠ K) is rejected with a sited UNSUPPORTED', async () => {
-		const err = await attempt(db, `create table t (x text collate binary primary key) using store`);
-		expect(err, 'expected a clean reject, not a silent declared≠enforced create').to.be.instanceOf(QuereusError);
-		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
-		expect(err!.message, 'reject message should be sited').to.match(/\bx\b|primary key|collat/i);
-		expect(await tableExists(db), 'table must not be created on reject').to.equal(false);
+	it('explicit collate BINARY on a text PK (≠ K) is honored — keyed under BINARY', async () => {
+		await db.exec(`create table t (x text collate binary primary key) using store`);
+		expect(await collationOf(db, 'x'), 'declared BINARY honored').to.equal('BINARY');
 
-		// The provider/connection is still usable: a consistent create succeeds afterward.
-		await db.exec(`create table t (x text primary key) using store`);
-		expect(await collationOf(db, 'x')).to.equal('NOCASE');
+		// Keyed under BINARY: 'a' and 'A' are distinct (would collide on a NOCASE key).
+		await db.exec(`insert into t values ('a')`);
+		await db.exec(`insert into t values ('A')`);
+		expect((await rows(db, `select count(*) as n from t`))[0].n, 'case-distinct PKs coexist under BINARY').to.equal(2);
+
+		// Ordering follows BINARY: 'A' (0x41) sorts before 'a' (0x61).
+		const ordered = (await rows(db, `select x from t order by x`)).map(r => String(r.x));
+		expect(ordered, 'PK ordering follows BINARY').to.deep.equal(['A', 'a']);
+
+		// An exact-duplicate PK still collides.
+		const dup = await attempt(db, `insert into t values ('a')`);
+		expect(dup, 'exact-duplicate PK rejected').to.be.instanceOf(QuereusError);
+		expect(dup!.code).to.equal(StatusCode.CONSTRAINT);
 	});
 
-	it('explicit collate RTRIM on a text PK (third collation, ≠ K) is rejected', async () => {
-		const err = await attempt(db, `create table t (x text collate rtrim primary key) using store`);
-		expect(err).to.be.instanceOf(QuereusError);
-		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
-		expect(await tableExists(db)).to.equal(false);
+	it('explicit collate RTRIM on a text PK (third collation, ≠ K) is honored — keyed under RTRIM', async () => {
+		await db.exec(`create table t (x text collate rtrim primary key) using store`);
+		expect(await collationOf(db, 'x'), 'declared RTRIM honored').to.equal('RTRIM');
+
+		await db.exec(`insert into t values ('a')`);
+		// RTRIM trims trailing whitespace before keying, so 'a   ' collides with 'a'.
+		const err = await attempt(db, `insert into t values ('a   ')`);
+		expect(err, 'trailing-space variant collides under RTRIM key').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
 	});
 
-	it('composite PK: explicit-divergent text member is rejected', async () => {
-		const err = await attempt(
-			db,
-			`create table t (a text collate binary, b integer, primary key (a, b)) using store`,
-		);
-		expect(err).to.be.instanceOf(QuereusError);
-		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
-		expect(err!.message).to.match(/\ba\b|primary key|collat/i);
-		expect(await tableExists(db)).to.equal(false);
+	it('composite PK: explicit-divergent text member is honored — member keyed under BINARY', async () => {
+		await db.exec(`create table t (a text collate binary, b integer, primary key (a, b)) using store`);
+		expect(await collationOf(db, 'a'), 'declared BINARY member honored').to.equal('BINARY');
+
+		await db.exec(`insert into t values ('a', 1)`);
+		await db.exec(`insert into t values ('A', 1)`); // distinct under BINARY a
+		expect((await rows(db, `select count(*) as n from t`))[0].n, 'case-distinct composite PKs coexist').to.equal(2);
 	});
 
 	it('composite PK: implicit text member is normalized to K; integer member unaffected', async () => {
@@ -164,34 +172,41 @@ describe('CREATE conformance — store PK collation reconciliation', () => {
 		expect(await collationOf(db, 'name'), 'only PK columns are reconciled').to.equal('BINARY');
 	});
 
-	it('after a default text-PK create, SET COLLATE binary is now a genuine divergent change and rejects', async () => {
-		// Post-fix the default text PK declares NOCASE (== K), so SET COLLATE binary is a
-		// real divergent change caught by the existing ALTER guard — no perpetuated
-		// divergence, no need for a `set collate nocase` "repair".
+	it('after a default text-PK create, SET COLLATE binary is honored via a physical re-key', async () => {
+		// The default text PK is keyed NOCASE (== K). SET COLLATE binary re-keys the data
+		// store under BINARY, after which a case-distinct PK that NOCASE would have
+		// collapsed can coexist.
 		await db.exec(`create table t (x text primary key) using store`);
-		const err = await attempt(db, `alter table t alter column x set collate binary`);
-		expect(err, 'divergent PK SET COLLATE should reject').to.be.instanceOf(QuereusError);
-		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
-		expect(await collationOf(db, 'x'), 'collation unchanged after reject').to.equal('NOCASE');
+		expect(await collationOf(db, 'x')).to.equal('NOCASE');
+		await db.exec(`insert into t values ('a')`);
+
+		await db.exec(`alter table t alter column x set collate binary`);
+		expect(await collationOf(db, 'x'), 'collation re-keyed to BINARY').to.equal('BINARY');
+
+		await db.exec(`insert into t values ('A')`); // now distinct under BINARY
+		expect((await rows(db, `select count(*) as n from t`))[0].n, 'case-distinct PK coexists post-re-key').to.equal(2);
 	});
 
-	// ── K-parameterization: reconciliation tracks `config.collation`, not a hardcoded
-	// NOCASE. With K = BINARY the roles invert — the implicit BINARY default is now the
-	// consistent case, and an explicit `collate nocase` PK is the divergent one. These
-	// guard against the reconciler being silently pinned to the default K. ──────────
+	// ── K-parameterization: the IMPLICIT-default normalize tracks `config.collation`,
+	// not a hardcoded NOCASE. With K = BINARY the implicit default is BINARY; an explicit
+	// `collate nocase` PK is still honored (keyed NOCASE) rather than normalized. These
+	// guard against the implicit-default fallback being silently pinned to the default K. ──
 
 	it('K=BINARY: implicit-default text PK is consistent and stays BINARY (no spurious normalize)', async () => {
 		await db.exec(`create table t (x text primary key) using store (collation = 'binary')`);
-		expect(await collationOf(db, 'x'), 'declared BINARY == enforced K=BINARY').to.equal('BINARY');
+		expect(await collationOf(db, 'x'), 'declared BINARY == implicit-default K=BINARY').to.equal('BINARY');
 		expect(await tableExists(db)).to.equal(true);
 	});
 
-	it('K=BINARY: explicit collate nocase on a text PK (≠ K) is rejected with a sited UNSUPPORTED', async () => {
-		const err = await attempt(db, `create table t (x text collate nocase primary key) using store (collation = 'binary')`);
-		expect(err, 'explicit divergence from K=BINARY must reject').to.be.instanceOf(QuereusError);
-		expect(err!.code, err!.message).to.equal(StatusCode.UNSUPPORTED);
-		expect(err!.message, 'reject message names K').to.match(/binary/i);
-		expect(await tableExists(db)).to.equal(false);
+	it('K=BINARY: explicit collate nocase on a text PK is honored — keyed under NOCASE', async () => {
+		await db.exec(`create table t (x text collate nocase primary key) using store (collation = 'binary')`);
+		expect(await collationOf(db, 'x'), 'declared NOCASE honored even though K=BINARY').to.equal('NOCASE');
+
+		// Keyed under NOCASE: 'a' and 'A' collide despite K=BINARY.
+		await db.exec(`insert into t values ('a')`);
+		const err = await attempt(db, `insert into t values ('A')`);
+		expect(err, 'NOCASE PK collision under an explicit NOCASE member').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
 	});
 
 	it('K=BINARY: explicit collate binary on a text PK (== K) is honored', async () => {

@@ -40,7 +40,7 @@ const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
-  '41.7.1-alter-column-collate-unique.sqllogic',  // Memory-only: the 'a'/'A' PK re-key collision is physically impossible on the store (its fixed NOCASE key encoding can't hold both rows). The store negotiates PK SET COLLATE instead — rejecting a divergent collation with UNSUPPORTED (asserted in quereus-store alter-table-conformance.spec.ts) and honoring a consistent one cross-module in 41.7.2-alter-column-collate-unique-store.sqllogic §9; non-PK UNIQUE/index cases also run cross-module there
+  // '41.7.1-alter-column-collate-unique.sqllogic' is now cross-module: the store keys the PK per-column (store-pk-collate-physical-rekey), so an explicit `collate binary` PK holds the 'a'/'A' pair and re-keys it under SET COLLATE just like memory
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'
