@@ -1954,6 +1954,7 @@ Quereus automatically defers certain row-level CHECK constraints to COMMIT time 
 
 - Immediate: Constraints that only reference the current row (including `OLD`/`NEW` references) are validated during the DML statement.
 - Auto-deferred: Constraints that reference other relations (e.g., contain subqueries) are validated at COMMIT using the same delta engine as global assertions. If any violation is found, COMMIT fails and the transaction is rolled back.
+- Row references: an unqualified column names the row being written (`NEW` for INSERT/UPDATE, `OLD` for DELETE); `new.<col>` / `old.<col>` name a row image explicitly. A self-reference qualified by the owning table — `check (t.qty > 0)` on table `t` — resolves like the unqualified form, except where a subquery inside the CHECK rebinds the table name (there it resolves to the subquery's relation, per normal scoping).
 
 Example:
 

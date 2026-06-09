@@ -170,3 +170,105 @@ insert into t_compound_gen (a, b) values (1, 2);
 select g from t_compound_gen;
 → [{"g":1}]
 drop table t_compound_gen;
+
+-- ===================================
+-- Table-qualified self-references in CHECK expressions
+-- `t.col` (or `schema.t.col`) on the owning table resolves like the
+-- unqualified column: NEW for INSERT/UPDATE, OLD for DELETE. Regression for
+-- the qualified form being accepted at DDL time but failing to resolve at
+-- the first write ("t.qty isn't a column").
+-- ===================================
+
+create table t_selfq (
+	id integer primary key,
+	qty integer,
+	constraint chk_qty check (t_selfq.qty > 0)
+);
+
+insert into t_selfq values (1, 5);
+
+select qty from t_selfq where id = 1;
+→ [{"qty":5}]
+
+insert into t_selfq values (2, -1);
+-- error: chk_qty
+
+update t_selfq set qty = 7 where id = 1;
+
+select qty from t_selfq where id = 1;
+→ [{"qty":7}]
+
+update t_selfq set qty = -3 where id = 1;
+-- error: chk_qty
+
+drop table t_selfq;
+
+-- schema-qualified self-reference
+create table t_selfq_s (
+	id integer primary key,
+	qty integer,
+	check (main.t_selfq_s.qty < 100)
+);
+
+insert into t_selfq_s values (1, 50);
+
+insert into t_selfq_s values (2, 200);
+-- error: CHECK
+
+drop table t_selfq_s;
+
+-- DELETE-op check: the qualified self-reference names the OLD row
+create table t_selfq_d (
+	id integer primary key,
+	qty integer,
+	constraint no_del_stock check on delete (t_selfq_d.qty = 0)
+);
+
+insert into t_selfq_d values (1, 0);
+insert into t_selfq_d values (2, 9);
+
+delete from t_selfq_d where id = 1;
+
+delete from t_selfq_d where id = 2;
+-- error: no_del_stock
+
+drop table t_selfq_d;
+
+-- correlated: the qualified self-reference reaches into a subquery over
+-- ANOTHER table (auto-deferred; the other table has no same-named column,
+-- so the reference still binds to the constraint row)
+create table caps (k integer primary key, cap integer);
+insert into caps values (1, 50);
+
+create table t_selfq_c (
+	id integer primary key,
+	qty integer,
+	constraint under_cap check (exists (select 1 from caps where t_selfq_c.qty <= caps.cap))
+);
+
+insert into t_selfq_c values (1, 10);
+
+select qty from t_selfq_c;
+→ [{"qty":10}]
+
+insert into t_selfq_c values (2, 99);
+-- error: under_cap
+
+drop table t_selfq_c;
+drop table caps;
+
+-- a subquery that REBINDS the owning table's name shadows the qualified
+-- self-reference (normal scoping): the inner `t_selfq_r.qty` is the
+-- subquery's row, so the max-row check accepts equal-to-max and rejects above
+create table t_selfq_r (
+	id integer primary key,
+	qty integer,
+	constraint within_max check (qty <= (select coalesce(max(t_selfq_r.qty), 10) from t_selfq_r))
+);
+
+insert into t_selfq_r values (1, 10);
+
+select qty from t_selfq_r;
+→ [{"qty":10}]
+
+drop table t_selfq_r;

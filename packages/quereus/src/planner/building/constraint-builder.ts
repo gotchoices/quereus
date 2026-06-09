@@ -13,6 +13,8 @@ import { PlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
+import { stripSelfQualifierInCheckExpression, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
+import { cloneExpr } from '../mutation/scope-transform.js';
 
 /**
  * Determines if a constraint should be checked for the given operation
@@ -63,6 +65,9 @@ export function buildConstraintChecks(
   // Filter constraints by operation (the table's own plus any threaded extras)
   const applicableConstraints = [...tableSchema.checkConstraints, ...additionalConstraints]
     .filter(constraint => shouldCheckConstraint(constraint, operation));
+
+  const resolveColumnInSource: ResolveColumnInSource = (schemaName, tableName, columnName) =>
+    ctx.schemaManager.getSchema(schemaName)?.getTable(tableName)?.columnIndexMap.has(columnName.toLowerCase()) ?? false;
 
   // Build expression nodes for each constraint
   return applicableConstraints.map(constraint => {
@@ -148,9 +153,21 @@ export function buildConstraintChecks(
       const constraintSchemaPath = [tableSchema.schemaName];
       const constraintCtx = { ...ctx, scope: constraintScope, schemaPath: constraintSchemaPath };
 
+      // Fold table-qualified self-references (`check (t.qty > 0)`) to the bare
+      // column form the row-context scope registers. Done as an AST rewrite on a
+      // clone (never the stored constraint) rather than by seeding `<table>.<col>`
+      // scope keys: this scope is an ancestor of every subquery planned inside
+      // the CHECK, and qualified keys would shadow inner relations through join
+      // peers' parent-chain fallback.
+      let constraintExpr = constraint.expr;
+      const stripped = cloneExpr(constraint.expr);
+      if (stripSelfQualifierInCheckExpression(stripped, tableSchema.name, tableSchema.schemaName, resolveColumnInSource)) {
+        constraintExpr = stripped;
+      }
+
       const expression = buildExpression(
         constraintCtx,
-        constraint.expr
+        constraintExpr
       ) as ScalarPlanNode;
 
       // Validate that the constraint expression is deterministic — skip when
