@@ -164,7 +164,10 @@ function rebuildFrom(
 ): AST.FromClause {
 	switch (fc.type) {
 		case 'table':
-			return { ...fc };
+			// Clone the nested table identifier too: in-place rewriters over a cloned
+			// tree (the schema differ's rename reconcile) mutate `table.name`, and a
+			// shared identifier would leak that mutation back into the source AST.
+			return { ...fc, table: { ...fc.table } };
 		case 'join':
 			return {
 				...fc,

@@ -2790,6 +2790,153 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		}
 	});
 
+	it('a CHECK with a QUALIFIED self-reference under a pure table rename emits ONLY the rename (no constraint churn)', async function () {
+		// A table-qualified self-ref (`t.qty`) embeds the table name in the CHECK body;
+		// the differ inverse-rewrites the qualifier NEW→OLD (the exact inverse of the
+		// forward rewriter the rename migration runs) so a pure table rename matches the
+		// actual (pre-rename) body — only the rename op is emitted.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (t.qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			// Rename t → t2; the CHECK self-qualifier follows the new name.
+			await db.exec(`declare schema main {
+				table t2 { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (t2.qty > 0) } with tags ("quereus.previous_name" = 't')
+			}`);
+			const diff = diffOf(db);
+			expect(diff.renames, 'table rename detected').to.deep.include({ kind: 'table', oldName: 't', newName: 't2' });
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 't2');
+			expect(alter?.constraintsToDrop ?? [], 'no spurious CHECK drop').to.deep.equal([]);
+			expect(alter?.constraintsToAdd ?? [], 'no spurious CHECK add').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The forward propagation rewrote the STORED qualifier (t.qty → t2.qty).
+			// (Runtime ENFORCEMENT of a table-qualified CHECK ref is a pre-existing
+			// engine gap independent of renames — `resolveColumn` rejects the qualifier
+			// at insert-build time even on a freshly created table — so enforcement is
+			// not asserted here; the unqualified-form tests cover enforcement.)
+			const chk = collectSchemaCatalog(db, 'main').tables
+				.find(t => t.name.toLowerCase() === 't2')!.namedConstraints
+				.find(c => c.name.toLowerCase() === 'chk')!;
+			expect(chk.definition, 'stored CHECK qualifier follows the rename').to.match(/t2\.qty > 0/i);
+
+			// Idempotent: re-diff is empty (relies on the forward qualifier propagation).
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK with a qualified ref under a table rename PLUS a column rename does not churn (seed alignment)', async function () {
+		// Covers the rewriter-seed bug: the declared qualifier carries the NEW table
+		// name (`t2.amount`) while the column rewrite is seeded with the OLD name — the
+		// qualifier-first inverse pass normalizes the qualifier to OLD so the OLD-seeded
+		// column reconcile applies too. Without it, neither dimension reconciled and the
+		// CHECK churned a drop+recreate.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (t.qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			// Rename t → t2 AND qty → amount at once; the CHECK references both new names.
+			await db.exec(`declare schema main {
+				table t2 {
+					id INTEGER PRIMARY KEY,
+					amount INTEGER with tags ("quereus.previous_name" = 'qty'),
+					constraint chk check (t2.amount > 0)
+				} with tags ("quereus.previous_name" = 't')
+			}`);
+			const diff = diffOf(db);
+			expect(diff.renames, 'table rename detected').to.deep.include({ kind: 'table', oldName: 't', newName: 't2' });
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 't2');
+			expect(alter?.columnsToRename, 'column rename detected').to.deep.equal([{ oldName: 'qty', newName: 'amount' }]);
+			expect(alter?.constraintsToDrop ?? [], 'no spurious CHECK drop').to.deep.equal([]);
+			expect(alter?.constraintsToAdd ?? [], 'no spurious CHECK add').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The forward propagation rewrote BOTH stored names: ALTER TABLE RENAME
+			// rewrote the qualifier (t → t2), then RENAME COLUMN rewrote the column
+			// under the new seed (qty → amount). (Runtime enforcement of a qualified
+			// CHECK ref is a pre-existing engine gap — see the pure-rename case above.)
+			const chk = collectSchemaCatalog(db, 'main').tables
+				.find(t => t.name.toLowerCase() === 't2')!.namedConstraints
+				.find(c => c.name.toLowerCase() === 'chk')!;
+			expect(chk.definition, 'stored CHECK follows both renames').to.match(/t2\.amount > 0/i);
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a genuine CHECK edit layered on a table rename still drops+recreates', async function () {
+		// Precedence guard for the qualifier reconcile: a real body edit (> 0 → >= 0)
+		// coinciding with the table rename survives the inverse-rewrite → drop+recreate.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (t.qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			// Rename t → t2 AND loosen the predicate (> 0 → >= 0) at once.
+			await db.exec(`declare schema main {
+				table t2 { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (t2.qty >= 0) } with tags ("quereus.previous_name" = 't')
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 't2');
+			expect(alter?.constraintsToDrop, 'genuine body edit drops old chk').to.deep.equal(['chk']);
+			expect(alter?.constraintsToAdd?.length, 'genuine body edit adds new chk').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// The recreate installed the NEW predicate under the NEW qualifier. (Runtime
+			// enforcement of a qualified CHECK ref is a pre-existing engine gap — see the
+			// pure-rename case above; the unqualified genuine-edit REGRESSION case earlier
+			// in this suite covers enforcement of a recreated predicate.)
+			const chk = collectSchemaCatalog(db, 'main').tables
+				.find(t => t.name.toLowerCase() === 't2')!.namedConstraints
+				.find(c => c.name.toLowerCase() === 'chk')!;
+			expect(chk.definition, 'recreated CHECK carries the edited predicate').to.match(/t2\.qty >= 0/i);
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK with an UNQUALIFIED ref under a pure table rename does not churn (regression guard)', async function () {
+		// An unqualified ref carries no table name, so the body is invariant under a
+		// table rename — the qualifier pass must not disturb it.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table t2 { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk check (qty > 0) } with tags ("quereus.previous_name" = 't')
+			}`);
+			const diff = diffOf(db);
+			expect(diff.renames, 'table rename detected').to.deep.include({ kind: 'table', oldName: 't', newName: 't2' });
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 't2');
+			expect(alter?.constraintsToDrop ?? [], 'no spurious CHECK drop').to.deep.equal([]);
+			expect(alter?.constraintsToAdd ?? [], 'no spurious CHECK add').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('REGRESSION: a genuine ALTER PRIMARY KEY on a self-referential-FK table commits with the deferred self-FK enforced', async function () {
 		// Engine-fix guard (rebuildMemoryTable connection cleanup), isolated from any
 		// column rename. A genuine PK change — here flipping the key to descending —

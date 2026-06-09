@@ -1045,17 +1045,102 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 	it('a table rename with an UNQUALIFIED partial-WHERE predicate does not churn the index', async () => {
 		// Regression guard: a partial predicate with an *unqualified* column reference
 		// carries no table name, so the body is invariant under a table rename — only the
-		// table rename op is emitted. (A *table-qualified* self-reference, e.g.
-		// `where t_old.active = 1`, DOES embed the table name and is NOT reconciled — it
-		// spuriously recreates; benign churn tracked by the backlog ticket
-		// `schema-differ-predicate-table-qualifier-reconcile`. The unqualified form is the
-		// idiomatic one and is pinned here.)
+		// table rename op is emitted. (A *table-qualified* self-reference embeds the table
+		// name and is reconciled by the qualifier inverse-rewrite — pinned by the
+		// qualified-predicate cases below. The unqualified form is the idiomatic one and
+		// is pinned here.)
 		const base = `table t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where active = 1`;
 		const mod = `table t_new { id INTEGER PRIMARY KEY, name TEXT, active INTEGER } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where active = 1`;
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'no index drop from a table rename under an unqualified predicate').to.deep.equal([]);
 		expect(diff.indexesToCreate, 'no index recreate from a table rename under an unqualified predicate').to.deep.equal([]);
 		expect(diff.renames, 'table rename op emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
+	});
+
+	// --- Concurrent TABLE-rename reconciliation in the partial-WHERE predicate ---
+	// A table-QUALIFIED self-reference (`where t_old.active = 1`) embeds the table
+	// name in the predicate body, so a pure table rename would otherwise churn a
+	// spurious drop+recreate. The differ inverse-rewrites the qualifier NEW→OLD over
+	// a cloned predicate (the exact inverse of the forward rewriter the rename
+	// migration runs) BEFORE the per-column rewrites — which are seeded with the OLD
+	// table name, so a qualified ref under both a table AND a column rename
+	// reconciles on both dimensions.
+
+	it('a table rename with a QUALIFIED partial-WHERE self-reference does not churn the index', async () => {
+		const base = `table t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where t_old.active = 1`;
+		const mod = `table t_new { id INTEGER PRIMARY KEY, name TEXT, active INTEGER } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where t_new.active = 1`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no index drop — the predicate qualifier is reconciled new→old').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate').to.deep.equal([]);
+		expect(diff.renames, 'table rename op emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
+	});
+
+	it('a table rename PLUS a column rename with a qualified predicate ref does not churn (seed alignment)', async () => {
+		// Covers the rewriter-seed alignment: the qualifier is normalized NEW→OLD first,
+		// then the column rewrite runs seeded with the OLD table name — so the qualified
+		// ref under the NEW table name (`t_new.is_active`) reconciles on BOTH dimensions.
+		// (Seeding the column rewrite with the NEW name, as before, would rewrite the
+		// column but strand the qualifier.)
+		const base = `table t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where t_old.active = 1`;
+		const mod = `table t_new { id INTEGER PRIMARY KEY, name TEXT, is_active INTEGER with tags ("quereus.previous_name" = 'active') } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where t_new.is_active = 1`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'no index drop — qualifier AND column reconciled').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate').to.deep.equal([]);
+		expect(diff.renames, 'table rename op emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
+		expect(diff.tablesToAlter[0].columnsToRename, 'column rename rides the table-alter channel').to.deep.equal([{ oldName: 'active', newName: 'is_active' }]);
+	});
+
+	it('a genuine predicate edit layered on a table rename still recreates', async () => {
+		// Precedence guard for the qualifier reconcile: a real predicate edit (literal
+		// 1 → 0) survives the inverse-rewrite → drop+recreate, alongside the rename op.
+		const base = `table t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where t_old.active = 1`;
+		const mod = `table t_new { id INTEGER PRIMARY KEY, name TEXT, active INTEGER } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where t_new.active = 0`;
+		const diff = await diffIndexEdit(base, mod);
+		expect(diff.indexesToDrop, 'genuine predicate edit recreates').to.deep.equal(['ix']);
+		expect(diff.indexesToCreate).to.have.length(1);
+		expect(diff.indexesToCreate[0], 'recreate carries the NEW qualifier + edited literal').to.match(/where t_new\.active = 0/i);
+		expect(diff.renames, 'table rename op still emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
+	});
+
+	it('a reconciled qualified-predicate table rename under require-hint does not trip the index guard', async () => {
+		// The reconcile yields zero index creates/drops, so the unhinted-rename guard
+		// has nothing to trip on (the table rename itself is hinted).
+		const base = `table t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where t_old.active = 1`;
+		const mod = `table t_new { id INTEGER PRIMARY KEY, name TEXT, active INTEGER } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where t_new.active = 1`;
+		const diff = await diffIndexEdit(base, mod, 'require-hint');
+		expect(diff.indexesToDrop, 'no index churn under require-hint').to.deep.equal([]);
+		expect(diff.indexesToCreate, 'no index recreate under require-hint').to.deep.equal([]);
+	});
+
+	it('applying a table rename under a QUALIFIED partial-WHERE index converges (stored qualifier rewritten, re-diff empty)', async () => {
+		// Diff #1 reconciles the predicate qualifier new→old (no drop+recreate — the
+		// migration runs only ALTER TABLE RENAME); convergence then depends on the
+		// forward propagation rewriting the STORED predicate's qualifier, so the
+		// re-diff sees `t_new.active` on both sides.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\ntable t_old { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix on t_old (name) where t_old.active = 1\n}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {\ntable t_new { id INTEGER PRIMARY KEY, name TEXT, active INTEGER } with tags ("quereus.previous_name" = 't_old')\nindex ix on t_new (name) where t_new.active = 1\n}`);
+			await db.exec('apply schema main');
+
+			// Post-apply, the catalog index DDL renders the NEW qualifier.
+			const actual = collectSchemaCatalog(db, 'main');
+			const ix = actual.indexes.find(i => i.name.toLowerCase() === 'ix')!;
+			expect(ix.ddl, 'stored predicate qualifier follows the rename').to.match(/WHERE t_new\.active = 1/i);
+			expect(ix.ddl, 'no stale reference to the old table name').to.not.match(/t_old\.active/i);
+
+			// Re-diff is empty — the apply converged in one cycle.
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToDrop, 'converged: no index drops').to.deep.equal([]);
+			expect(diff.indexesToCreate, 'converged: no index creates').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'converged: no table alters').to.deep.equal([]);
+			expect(diff.renames, 'converged: no rename re-trigger').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
 	});
 });
 

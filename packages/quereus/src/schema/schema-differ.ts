@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { renameColumnInCheckExpression } from './rename-rewriter.js';
+import { renameColumnInCheckExpression, renameTableInAst } from './rename-rewriter.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
@@ -477,13 +477,18 @@ export function computeSchemaDiff(
 		// drop+recreate (the column rename rides the table-alter channel). The rename
 		// lookup is keyed by the index's *declared* (post-rename) table name — exactly
 		// how `columnRenamesByTable` is keyed — so a table renamed in the same diff still
-		// resolves its column renames. The drop targets the actual (pre-rename) name and
-		// the recreate carries the declared (post-rename) name, so a genuine body change
-		// on a rename-matched index resolves to a correct drop+recreate that supersedes
-		// the no-op rename op.
+		// resolves its column renames. The index table's own in-diff rename is threaded
+		// too, so a table-qualified self-reference in the partial WHERE predicate
+		// reconciles alongside the column renames. The drop targets the actual
+		// (pre-rename) name and the recreate carries the declared (post-rename) name, so
+		// a genuine body change on a rename-matched index resolves to a correct
+		// drop+recreate that supersedes the no-op rename op.
 		const declaredTableForIndex = declaredTables.get(declaredIndex.indexStmt.table.name.toLowerCase());
 		const indexColRenames = columnRenamesByTable.get(declaredIndex.indexStmt.table.name.toLowerCase()) ?? [];
-		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, targetSchemaName, defaultCollation);
+		const indexTableRename = tableRenames.renames.find(
+			r => r.newName.toLowerCase() === declaredIndex.indexStmt.table.name.toLowerCase(),
+		);
+		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, indexTableRename, targetSchemaName, defaultCollation);
 		if (declaredBody !== matchedActual.definition) {
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
@@ -844,9 +849,11 @@ function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, c
  * drop+recreate. To reconcile, each resolved bare name is inverse-mapped from its NEW
  * name back to its OLD name (case-insensitive) so a pure rename matches the actual
  * body (no churn) while a genuine body edit layered on the rename still differs
- * (recreate). The index body excludes the `on <table>` reference, so a *table* rename
- * alone never churns — only column renames matter (strictly simpler than the
- * constraint FK case in {@link reconciledDeclaredBody}).
+ * (recreate). The indexed-column list carries bare names (no qualifiers) and the body
+ * excludes the `on <table>` reference, so a *table* rename alone never churns the
+ * column list — but the partial WHERE predicate CAN embed the table name as a
+ * qualifier (`where t.active = 1`), so the index table's own in-diff rename
+ * (`tableRename`) is reconciled there (see below).
  *
  * **Ordering is load-bearing**: the effective collation is resolved from the *new*
  * (declared) column name FIRST — the declared table's `ColumnDef` is keyed by the new
@@ -854,15 +861,24 @@ function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, c
  * this would look up the declared column's collation under the old name and miss it.
  *
  * The partial-index `where` predicate is reconciled the same way the constraint CHECK
- * path is: each renamed column is inverse-rewritten NEW→OLD over a cloned predicate
- * via {@link renameColumnInCheckExpression} (seeded with the index's table so
- * unqualified refs resolve), keeping a partial index over a renamed column from
- * churning. `schemaName` is the default schema for that rewriter.
+ * path is: the table QUALIFIER is inverse-rewritten NEW→OLD first (via
+ * {@link renameTableInAst} — the exact inverse of the forward rewriter the executed
+ * rename migration runs, so the diff-side reconcile and the migration cannot drift),
+ * THEN each renamed column is inverse-rewritten NEW→OLD via
+ * {@link renameColumnInCheckExpression} seeded with the OLD table name (qualifiers
+ * are pre-normalized to OLD by that point; unqualified refs resolve via the seed
+ * either way). This keeps a partial index over a renamed column AND/OR a qualified
+ * self-reference under a renamed table from churning, while a genuine predicate edit
+ * layered on either rename still differs (recreate). `schemaName` is the default
+ * schema for both rewriters. Known accepted edge (symmetric with the forward path):
+ * the rewriters are scope-naive about a subquery alias that happens to equal the new
+ * table name — worst case a spurious (valid) recreate.
  */
 function declaredIndexCanonicalBody(
 	indexStmt: AST.CreateIndexStmt,
 	declaredTable: AST.DeclaredTable | undefined,
 	colRenames: ReadonlyArray<ColumnRenameOp>,
+	tableRename: RenameOp | undefined,
 	schemaName: string,
 	defaultCollation: string,
 ): string {
@@ -880,14 +896,21 @@ function declaredIndexCanonicalBody(
 		const oldName = colRenames.find(r => r.newName.toLowerCase() === bareName.toLowerCase())?.oldName ?? bareName;
 		return { name: oldName, collation: effective, direction: col.direction };
 	});
-	// Reconcile the partial-WHERE predicate: inverse-rewrite each renamed column from
-	// its NEW name back to OLD over a clone (the rewriter mutates in place; indexStmt
-	// backs the recreate DDL). Skip the clone when nothing can match.
+	// Reconcile the partial-WHERE predicate: inverse-rewrite the table qualifier
+	// NEW→OLD first, then each renamed column NEW→OLD, over a clone (the rewriters
+	// mutate in place; indexStmt backs the recreate DDL). Skip the clone when nothing
+	// can match. The column rewrites are seeded with the OLD table name because the
+	// qualifier pass has already normalized qualified refs to it (with no table
+	// rename, OLD == declared, so the seed is unchanged).
 	let where = indexStmt.where;
-	if (where && colRenames.length > 0) {
+	if (where && (colRenames.length > 0 || tableRename)) {
 		const clone = cloneExpr(where);
+		if (tableRename) {
+			renameTableInAst(clone, tableRename.newName, tableRename.oldName, schemaName);
+		}
+		const seedTableName = tableRename?.oldName ?? indexStmt.table.name;
 		for (const r of colRenames) {
-			renameColumnInCheckExpression(clone, indexStmt.table.name, r.newName, r.oldName, schemaName);
+			renameColumnInCheckExpression(clone, seedTableName, r.newName, r.oldName, schemaName);
 		}
 		where = clone;
 	}
@@ -1021,7 +1044,12 @@ function inverseRenameStringColumns(
  * preserved.
  *
  * Reconciles only what each kind needs (surgical clone, never the whole tree):
- *   - CHECK:  inverse column renames on the expression (runtime CHECK rewriter).
+ *   - CHECK:  inverse table rename on a qualified self-reference's qualifier
+ *             (this table's own rename, looked up in `tableRenames` by its
+ *             actual/OLD name) FIRST, then inverse column renames on the
+ *             expression (runtime CHECK rewriter, seeded with the OLD table
+ *             name — correct unconditionally, since qualifiers are pre-
+ *             normalized to OLD by the qualifier pass).
  *   - UNIQUE: inverse column renames on the column list.
  *   - FK:     inverse column renames on the LOCAL (child) column list, inverse
  *             column renames on the referenced PARENT column list (via the parent
@@ -1045,8 +1073,16 @@ function reconciledDeclaredBody(
 	switch (tc.type) {
 		case 'check': {
 			if (!tc.expr) return d.definition;
-			// cloneExpr: the rewriter mutates in place; bodyAst backs ddl/definition.
+			// cloneExpr: the rewriters mutate in place; bodyAst backs ddl/definition.
 			const clone: AST.TableConstraint = { ...tc, expr: cloneExpr(tc.expr) };
+			// Qualifier first: a qualified self-reference in the declared CHECK carries
+			// the NEW table name (`check (t2.qty > 0)` after t→t2); inverse-rewrite it
+			// to the OLD name so the OLD-seeded column rewrites below see it.
+			// `tableName` is the actual (OLD) name, so match on `r.oldName`.
+			const selfRename = tableRenames.find(r => r.oldName.toLowerCase() === tableName.toLowerCase());
+			if (selfRename) {
+				renameTableInAst(clone.expr!, selfRename.newName, selfRename.oldName, schemaName);
+			}
 			for (const r of colRenames) {
 				// Inverse: rewrite the declared NEW column name back to its OLD name.
 				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName, schemaName);
