@@ -219,6 +219,65 @@ describe('memory range/prefix seek honours index collation (memory-range-seek-co
 		});
 	});
 
+	// --- NULL rows must be excluded by a bound seek (no residual to catch them) --
+	describe('NULL rows in a nullable column are excluded by the bound seek', () => {
+		// When the seek covers the predicate the planner drops the residual `Filter`,
+		// so the scan layer's bound filter is solely responsible for NULL semantics
+		// (`NULL <op> v` is never true). A pure upper-bound (`<`/`<=`) ascending seek
+		// walks the leading NULL block, so this is exactly where a missing NULL guard
+		// leaks rows. Exercised for both a NOCASE and a BINARY index (the latter guards
+		// the pre-existing path the collation work newly routes non-BINARY ranges onto).
+		async function expectSeekMatchesScan(
+			collation: string, where: string, expectedIds: number[],
+		): Promise<void> {
+			const colDef = `name TEXT ${collation} NULL`;
+			await db.exec(`CREATE TABLE nn_idx (id INTEGER PRIMARY KEY, ${colDef}) USING memory`);
+			await db.exec(`CREATE TABLE nn_scan (id INTEGER PRIMARY KEY, ${colDef}) USING memory`);
+			await db.exec("INSERT INTO nn_idx VALUES (1, 'apple'), (2, 'Banana'), (4, 'date')");
+			await db.exec("INSERT INTO nn_idx VALUES (3, NULL), (5, NULL)");
+			await db.exec("INSERT INTO nn_scan SELECT * FROM nn_idx");
+			await db.exec("CREATE INDEX idx_nn ON nn_idx (name)");
+
+			const idxQ = `SELECT id FROM nn_idx WHERE ${where} ORDER BY id`;
+			const scanQ = `SELECT id FROM nn_scan WHERE ${where} ORDER BY id`;
+			expect(await planOps(idxQ)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			const idxRows = (await rows(idxQ)).map(r => r.id);
+			expect(idxRows).to.deep.equal((await rows(scanQ)).map(r => r.id));
+			expect(idxRows).to.deep.equal(expectedIds);
+		}
+
+		it("NOCASE upper-bound (< 'cherry') seek excludes NULLs", async () => {
+			await expectSeekMatchesScan('COLLATE NOCASE', "name < 'cherry'", [1, 2]);
+		});
+
+		it("BINARY upper-bound (< 'cherry') seek excludes NULLs", async () => {
+			await expectSeekMatchesScan('COLLATE BINARY', "name < 'cherry'", [1, 2]);
+		});
+
+		it("NOCASE BETWEEN with NULLs present excludes them", async () => {
+			await expectSeekMatchesScan('COLLATE NOCASE', "name between 'apple' and 'cherry'", [1, 2]);
+		});
+
+		it("prefix-range with a NULL trailing range value excludes that row", async () => {
+			// Composite (name, year NULL): rows sharing the prefix but with a NULL trailing
+			// `year` must not pass the `year >= 2024` bound (NULL is never > a value).
+			await db.exec("CREATE TABLE pn_idx (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, year INTEGER NULL) USING memory");
+			await db.exec("CREATE TABLE pn_scan (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, year INTEGER NULL) USING memory");
+			await db.exec("INSERT INTO pn_idx VALUES (1, 'bob', 2025), (2, 'BOB', 2020)");
+			await db.exec("INSERT INTO pn_idx VALUES (3, 'Bob', NULL)");
+			await db.exec("INSERT INTO pn_scan SELECT * FROM pn_idx");
+			await db.exec("CREATE INDEX idx_pn ON pn_idx (name, year)");
+
+			const where = "name = 'bob' AND year >= 2024";
+			const idxQ = `SELECT id FROM pn_idx WHERE ${where} ORDER BY id`;
+			const scanQ = `SELECT id FROM pn_scan WHERE ${where} ORDER BY id`;
+			expect(await planOps(idxQ)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			const idxRows = (await rows(idxQ)).map(r => r.id);
+			expect(idxRows).to.deep.equal((await rows(scanQ)).map(r => r.id));
+			expect(idxRows).to.deep.equal([1]);
+		});
+	});
+
 	// --- the relaxed guard must NOT enable a genuine mismatch ----------------
 	describe('collation-mismatched range still declines the seek', () => {
 		it('NOCASE predicate over a BINARY index falls back to scan + residual', async () => {
