@@ -931,7 +931,10 @@ arms apply per row inside `processRow`); each source row that touched a
 full-rebuild MV marked it dirty, and the flush rebuilds each such MV exactly once.
 Placing it inside the statement savepoint makes a failed rebuild roll the whole
 statement back, and a statement that aborts mid-loop never reaches the flush (so a
-dirtied-then-aborted MV leaves its backing untouched). See
+dirtied-then-aborted MV leaves its backing untouched). FAIL mode still runs the
+flush after the loop, but — having no statement savepoint (it keeps prior rows via
+per-row savepoints) — a flush failure there does not unwind the already-applied
+rows, consistent with FAIL's keep-prior-rows semantics. See
 `docs/incremental-maintenance.md` § end-of-statement flush.
 
 The savepoint helpers used are always the broadcast variants

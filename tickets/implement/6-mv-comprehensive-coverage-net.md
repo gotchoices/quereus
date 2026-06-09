@@ -13,6 +13,8 @@ The earlier tickets make every body maintainable; this one *proves* it and align
 - a scalar (no-GROUP BY) aggregate;
 - partial-`WHERE` 1:1 joins (T-only, P-referencing, both-sides);
 - MV-over-MV chains that **mix** a full-rebuild producer with an incremental consumer (and vice-versa).
+- A **full-rebuild → full-rebuild** chain (and, if constructible, a full-rebuild *diamond* — one full-rebuild consumer over two full-rebuild producers). This is the only shape that drives `flushDeferredRebuilds` past **round 1**: until the eligibility flip (ticket `mv-eligibility-floor-fallthrough`) makes full-rebuild SQL-reachable, the flush-deferral ticket could only exercise single-round drains (incremental↔full-rebuild), so the multi-round worklist convergence and the `assertFlushRounds` bound are currently unverified by any test. Assert convergence at every level.
+- A **FAIL-mode** (`or fail`) bulk statement over a full-rebuild MV: the flush runs after the row loop with no statement savepoint, so a mid-statement abort keeps prior rows and the flush still rebuilds correctly. (Untested end-to-end while full-rebuild is SQL-unreachable.)
 For each: random insert/update/delete batches on every participating source, asserting `read(MV) == evaluate(body)` each batch and after a rolled-back batch. Keep the harness's negative self-test (a deliberately wrong oracle must red) so the net can't silently degenerate.
 
 **Reject coverage** (`materialized-view-diagnostics.spec.ts`). Confirm the *only* create-time rejects remaining are the four non-shape ones: non-deterministic body (no opt-out), bag / no-unique-key body, no-relational-output body, and full-rebuild-only-over-threshold; plus the pragma-disable acceptance. Remove/repoint every stale *shape* reject assertion.
