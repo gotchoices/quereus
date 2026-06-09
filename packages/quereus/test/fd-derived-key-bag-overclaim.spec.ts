@@ -17,6 +17,14 @@
  *   2. join equi-pair bidirectional FD         (`g.k = g2.w` fan-out)
  *   3. LEFT-outer side-key FD survives fan-out  (`l left join r on l.k = r.w`)
  *   4. filter `a = b` equality bidirectional FD (`where a = b`, a/b non-unique)
+ *
+ * Sites 5 and 6 (ticket `fd-check-assertion-key-bag-overclaim`) gate the same
+ * over-claim at the `TableReferenceNode` consumption site — the two remaining
+ * producers of the `{a}↔{b}` bi-FD — folding it only when one endpoint is a real
+ * declared key, mirroring the filter gate (site 4):
+ *
+ *   5. CHECK `check (a = b)` bidirectional FD   (3-col non-keyed table, project c away)
+ *   6. assertion-hoist `not exists (… a <> b)`  (same bi-FD, hoisted per-row)
  */
 
 import { expect } from 'chai';
@@ -79,6 +87,25 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 			-- Site 4 control: a IS the (unique) PK.
 			create table tpk2 (a integer primary key, b integer);
 			insert into tpk2 values (1, 1), (2, 5), (3, 3);
+
+			-- Site 5 (CHECK): tc has NO declared PK, so check (a = b) is the only
+			-- source of the a/b bi-FD. The bug hides at the 3-col TableReference
+			-- (closure of a is a,b, not all cols) and surfaces after select a,b drops c.
+			create table tc (a integer, b integer, c integer, check (a = b));
+			insert into tc values (1, 1, 10), (1, 1, 20), (2, 2, 30);
+			-- Site 5 control: a IS the (unique) PK, so the a/b pair is a real key.
+			create table tcpk (a integer primary key, b integer, c integer, check (a = b));
+			insert into tcpk values (1, 1, 10), (2, 2, 20), (3, 3, 30);
+
+			-- Site 6 (assertion-hoist): the assertion per-row a = b is hoisted onto
+			-- ta as the same a/b bi-FD; ta has no PK.
+			create table ta (a integer, b integer, c integer);
+			create assertion eq_ab check (not exists (select 1 from ta where a <> b));
+			insert into ta values (1, 1, 10), (1, 1, 20), (2, 2, 30);
+			-- Site 6 control: a IS the (unique) PK.
+			create table tapk (a integer primary key, b integer, c integer);
+			create assertion eq_ab_pk check (not exists (select 1 from tapk where a <> b));
+			insert into tapk values (1, 1, 10), (2, 2, 20), (3, 3, 30);
 		`);
 	});
 	afterEach(async () => { await db.close(); });
@@ -158,6 +185,34 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 	it('site 4 control — DISTINCT over `a = b` where a is the PK is ELIMINATED', () => {
 		const sql = 'select distinct a, b from tpk2 where a = b';
 		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ b unique under a=b ⇒ set')
+			.to.have.length(0);
+	});
+
+	// ---- Site 5: CHECK `check (a = b)` bidirectional FD at the TableReference ----
+	it('site 5 — DISTINCT over `select a, b` of a `check (a=b)` NON-keyed table is RETAINED', async () => {
+		const sql = 'select distinct a, b from tc';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a/b not a key)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
+	});
+
+	it('site 5 control — DISTINCT over `select a, b` where a is the PK is ELIMINATED', () => {
+		const sql = 'select distinct a, b from tcpk';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a,b} a real key ⇒ set')
+			.to.have.length(0);
+	});
+
+	// ---- Site 6: assertion-hoist `not exists (… where a <> b)` bidirectional FD ----
+	it('site 6 — DISTINCT over `select a, b` of an assertion-hoisted NON-keyed table is RETAINED', async () => {
+		const sql = 'select distinct a, b from ta';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a/b not a key)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
+	});
+
+	it('site 6 control — DISTINCT over `select a, b` where a is the PK is ELIMINATED', () => {
+		const sql = 'select distinct a, b from tapk';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a,b} a real key ⇒ set')
 			.to.have.length(0);
 	});
 });

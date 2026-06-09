@@ -89,19 +89,24 @@ describe('extractBindings: BindingMode per TableReference', () => {
 		expect((entry.mode as { kind: 'row'; keyColumns: number[] }).keyColumns).to.deep.equal([]);
 	});
 
-	it("emits 'row' on an FD-derived key and chooses the tighter (sub-PK) key", async () => {
-		// A no-PK table still has Quereus' implicit all-columns PK ({a,b}), so the
-		// classification was already 'row' before candidate-key sourcing. What the
-		// keysOf migration changes is the *chosen* key: CHECK (a = b) makes both
-		// {a} and {b} FD-derived (superkey) candidate keys, which subsume the
-		// implicit all-columns key. Equality on `a` then binds on the single
-		// column `[0]` instead of the full `[0, 1]` — a strictly tighter residual.
+	it("emits 'row' on the implicit all-columns key for a CHECK (a=b) NON-keyed table (bi-FD gated)", async () => {
+		// `t(a, b)` has no declared PK — only Quereus' implicit all-columns key
+		// {a,b} — so the classification is 'row' regardless. CHECK (a = b) emits the
+		// bi-directional determination FD {a}↔{b}, but the TableReference gate
+		// (ticket fd-check-assertion-key-bag-overclaim) folds that value-equality
+		// pair only when one endpoint is a genuine *declared* key; here neither is,
+		// so it is dropped. Dropping is the sound choice: deriving {a} as a sub-PK
+		// key is sound at this 2-col node only because the all-columns key co-holds,
+		// but the same FD survives a projection that strips that key (the
+		// wrong-results bug this ticket closes). With no FD-derived sub-PK key,
+		// equality on `a` binds on the full implicit key [0, 1]. (Pre-gate this
+		// asserted the tighter [0].)
 		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a = b)) USING memory");
 		const result = analyze(db, 'select * from t where a = 5');
 		const entry = findFor(result, 'main.t');
 		expect(entry.mode!.kind).to.equal('row');
 		const cols = (entry.mode as { kind: 'row'; keyColumns: number[] }).keyColumns;
-		expect(cols).to.deep.equal([0]);
+		expect(cols).to.deep.equal([0, 1]);
 	});
 
 	it("emits 'group' with groupColumns when GROUP BY pk covers PK", async () => {

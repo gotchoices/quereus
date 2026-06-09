@@ -91,10 +91,20 @@ describe('CHECK contribution gated by permitsGrandfatheredCheckViolators', () =>
 		expect(hasBtoA, 'no b→a FD under cap').to.be.false;
 	});
 
-	it('default (cap absent): equality CHECK (a = b) DOES lift to FDs', async () => {
+	it('default (cap absent): equality CHECK (a = b) lifts the EC (bi-FD gated by the key-bag fix)', async () => {
 		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, CHECK (a = b)) USING memory');
 		const ref = buildReference(new MemoryTableModule());
 		const phys = ref.computePhysical([]);
+		// Columns: id(0), a(1), b(2). The value-equality CHECK lifts the equivalence
+		// class {a, b} unconditionally — the EC merge is never gated (value-equality
+		// is always sound and ECs are not read by key derivation). The capability cap
+		// suppresses this (the paired "cap on" test asserts equivClasses undefined).
+		expect(phys.equivClasses, 'a≡b EC lifts without cap').to.deep.equal([[1, 2]]);
+		// The bi-directional determination FD {a}↔{b} is NOT folded here: neither a
+		// nor b is a declared key (the PK is `id`), so the TableReference key-bag gate
+		// (ticket fd-check-assertion-key-bag-overclaim) drops it — folding it would let
+		// `select a, b` read {a} as a key over the duplicate (a=b) rows (wrong results).
+		// Pre-gate this test asserted a→b and b→a present.
 		const fds = phys.fds ?? [];
 		const aIdx = 1;
 		const bIdx = 2;
@@ -106,7 +116,7 @@ describe('CHECK contribution gated by permitsGrandfatheredCheckViolators', () =>
 			fd.determinants.length === 1 && fd.determinants[0] === bIdx
 			&& fd.dependents.includes(aIdx),
 		);
-		expect(hasAtoB, 'a→b FD without cap').to.be.true;
-		expect(hasBtoA, 'b→a FD without cap').to.be.true;
+		expect(hasAtoB, 'a→b bi-FD gated (a not a key)').to.be.false;
+		expect(hasBtoA, 'b→a bi-FD gated (b not a key)').to.be.false;
 	});
 });
