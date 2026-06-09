@@ -2,6 +2,13 @@ description: Let a BINARY-keyed store honor a `→NOCASE` PRIMARY KEY `SET COLLA
 files: packages/quereus-store/src/common/store-module.ts, packages/quereus-store/src/common/store-table.ts, packages/quereus/test/logic/41.7.1-alter-column-collate-unique.sqllogic
 ----
 
+> **Triage (2026-06-08): superseded by `store-pk-collate-physical-rekey`.** That ticket's
+> per-column PK key collation + ALTER-time physical re-encode reaches full memory-module
+> parity and, per its own scope note, removes the need for this write-time scan *and* the
+> current `UNSUPPORTED` reject. These two are **alternatives, not a sequence** — keep this
+> ticket only as a cheaper one-direction interim if `store-pk-collate-physical-rekey` is
+> explicitly deprioritized; otherwise close it when that lands.
+
 ## Background
 
 `store-pk-collate-module-capability` resolved the store's PK-column `SET COLLATE` to

@@ -11,6 +11,13 @@ files:
 
 # View DDL reserved-tag validation: eager-at-create vs lazy-at-mutation
 
+> **Disposition (2026-06-08) — Options A/B SUPERSEDED.** The human chose the de-tag
+> reframe. Options A and B below (eager-at-create vs lazy-at-mutation) are kept as the
+> historical framing only; both are moot once the sole behavior-bearing `view-ddl` tag is
+> replaced by a first-class construct. See **`## De-tag reframe — first-class view
+> insert-default construct (design, 2026-06-08)`** at the end of this file for the chosen
+> direction and staging.
+
 > **Update (2026-06-07) — reframe under consideration (human, pending).** A third path sits
 > *above* Option A/B: stop carrying this *semantic* behavior as a tag at all. The only
 > behavior-bearing tag at this site is `quereus.update.default_for.<column>` (an omitted-insert

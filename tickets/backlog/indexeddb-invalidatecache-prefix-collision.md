@@ -4,6 +4,12 @@ files:
   - packages/quereus-plugin-indexeddb/src/broadcast.ts   # sole caller (~118), only has {schemaName, tableName}
 ----
 
+> **Triage (2026-06-08): subsumed by `store-index-vs-sibling-table-name-collision-at-create`
+> if that ticket adopts the unambiguous store-name *encoding* direction** — encoding removes
+> the `_idx_` substring ambiguity everywhere, this site included. Do not work this independently
+> until that ticket's direction is chosen: if it instead picks CREATE-time collision *detection*,
+> this benign over-invalidation survives and becomes a standalone fix at that point.
+
 # IndexedDB cross-tab cache invalidation collides on `{table}_idx_` prefix
 
 ## Context
