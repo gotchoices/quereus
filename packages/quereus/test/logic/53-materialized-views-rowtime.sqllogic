@@ -1507,3 +1507,35 @@ select id from oj_mv where name is null order by id;
 → [{"id":1},{"id":2}]
 select id from oj_mv where name is not null;
 → [{"id":3}]
+
+-- ===================================
+-- 31. Outer (right) join MV — the symmetric case: the null-extended side is the
+--     PRESERVED-against side AND carries the join's other PK. A `right join` keyed on the
+--     preserved right table null-extends the LEFT columns (including the left PK), which the
+--     projection-layer fix must likewise stamp nullable on the backing — not just a plain
+--     lookup column. (A `full` join has no provable key → bag → not materializable, so the
+--     right join is the materializable both-sided-null-extension analog.)
+-- ===================================
+
+create table rjl (id integer primary key, name text);
+create table rjr (id integer primary key, lid integer);
+insert into rjl (id, name) values (1, 'a'), (3, 'c');
+-- lid=9 (rjr id=20) references no rjl row → the LEFT side (name, left PK) is null-extended.
+insert into rjr (id, lid) values (10, 1), (20, 9), (30, 3);
+create materialized view rj_mv as select rjr.id as rid, rjr.lid, rjl.name, rjl.id as lid_pk from rjl right join rjr on rjr.lid = rjl.id;
+
+-- full scan: the unmatched right row null-extends BOTH the lookup column and the left PK.
+select rid, lid, name, lid_pk from rj_mv order by rid;
+→ [{"rid":10,"lid":1,"name":"a","lid_pk":1},{"rid":20,"lid":9,"name":null,"lid_pk":null},{"rid":30,"lid":3,"name":"c","lid_pk":3}]
+
+-- `name is null` over the null-extended lookup column reads at runtime (not folded to []).
+select rid from rj_mv where name is null;
+→ [{"rid":20}]
+
+-- `lid_pk is null` over the null-extended LEFT PK — the column a base-table PK stamps NOT NULL —
+-- must also read at runtime, the symmetric guard the left-join case cannot exercise.
+select rid from rj_mv where lid_pk is null;
+→ [{"rid":20}]
+
+select rid from rj_mv where name is not null order by rid;
+→ [{"rid":10},{"rid":30}]
