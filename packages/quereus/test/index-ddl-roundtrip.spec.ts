@@ -374,6 +374,19 @@ describe('ALTER rename propagation: stored partial-index predicates', () => {
 		expect(indexDDL('t', 'ix')).to.match(/WHERE t\.is_active = 1/);
 	});
 
+	it('RENAME TABLE under a UNIQUE partial index also rewrites the derived constraint predicate (shared AST)', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create unique index uq on t (name) where t.active = 1');
+		await db.exec('alter table t rename to t2');
+
+		const t2 = db.schemaManager.getTable('main', 't2')!;
+		const ix = t2.indexes!.find(i => i.name === 'uq')!;
+		const uc = t2.uniqueConstraints!.find(c => c.derivedFromIndex === 'uq')!;
+		expect(expressionToString(ix.predicate!), 'index predicate qualifier rewritten').to.equal('t2.active = 1');
+		expect(expressionToString(uc.predicate!), 'derived constraint predicate rewritten').to.equal('t2.active = 1');
+		expect(uc.predicate, 'still shared by reference — one in-place rewrite covers both').to.equal(ix.predicate);
+	});
+
 	it('RENAME COLUMN under a UNIQUE partial index also rewrites the derived constraint predicate (shared AST)', async () => {
 		await db.exec('create table t (id integer primary key, name text, active integer)');
 		await db.exec('create unique index uq on t (name) where active = 1');
