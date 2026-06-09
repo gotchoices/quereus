@@ -26,9 +26,13 @@ import type * as AST from '../../src/parser/ast.js';
  * `yarn test` (Mocha + ts-node/esm), no separate config.
  *
  * Shape sets covered: covering-index (`'inverse-projection'`), single-source aggregate
- * (`'residual-recompute'`), and single-source lateral-TVF fan-out (`'prefix-delete'`).
- * Shapes NOT covered here (future tickets extend the harness): fanning keyed joins and
- * MV-over-MV chains over these arms.
+ * (`'residual-recompute'`), single-source lateral-TVF fan-out (`'prefix-delete'`), 1:1
+ * inner/cross join with/without a partial WHERE (`'join-residual'`), and — via real
+ * `create materialized view` since the eligibility flip — the always-correct full-rebuild
+ * floor over every formerly-rejected shape (DISTINCT / set-op / recursive CTE / outer /
+ * >2-source join / scalar aggregate), full-rebuild→full-rebuild chains and diamonds (the
+ * multi-round flush), and OR FAIL. The one shape NOT here is the fanning (non-1:1) join — a
+ * *bag* reject pinned in `materialized-view-diagnostics.spec.ts`, not an equivalence case.
  */
 
 /** An eligible covering-index body shape: its defining SELECT is both the MV body and
@@ -705,11 +709,18 @@ interface ManagerHandle { readonly materializedViewManager: MvManagerInternals; 
 
 /**
  * Swap a registered MV's maintenance plan for a freshly-built `'full-rebuild'` plan over
- * the SAME body, reusing the create-time backing. `buildMaintenancePlan` does not route
- * bodies to the floor yet (the eligibility flip is the next ticket), so this is how the
- * floor arm is exercised end-to-end in isolation: the body must ALSO be a bounded-delta
- * shape so `create` produced a backing table at the right shape. After the swap, a source
- * write dispatches into `applyFullRebuild` (re-run the whole body → `'replace-all'`).
+ * the SAME body, reusing the create-time backing. This forces the floor arm onto a body the
+ * cost gate would otherwise maintain by a cheaper bounded-delta arm, so the floor's
+ * re-evaluate-and-`replace-all` is proven to agree with the bounded-delta arm for that body
+ * (a cross-check the SQL-created floor zoo below cannot give — those bodies have no bounded
+ * arm). The body must ALSO be a bounded-delta shape so `create` produced a backing table at
+ * the right shape. After the swap, a source write dispatches into `applyFullRebuild` (re-run
+ * the whole body → `'replace-all'`).
+ *
+ * NB: since `mv-eligibility-floor-fallthrough`, `buildMaintenancePlan` DOES route a
+ * shape-mismatched body to the floor (`tryBuildBoundedDeltaArm` → `buildFullRebuildPlan`), so
+ * genuine floor-only shapes (DISTINCT, set-op, recursive CTE, outer/>2-source join, scalar
+ * aggregate) are now create-able directly — see the SQL-created floor suites below.
  *
  * It re-derives the analyzed body exactly as `buildMaintenancePlan` does, calls the
  * manager's `buildFullRebuildPlan`, then re-installs the plan under every `sourceBases`
@@ -1190,5 +1201,576 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, full-re
 		// DELETE: producer removes inline → consumer rebuild drops the row.
 		await db.exec('delete from g where id = 2');
 		expect(await readOver()).to.deep.equal([{ id: 1, v: 50 }, { id: 3, v: 9 }]);
+	});
+});
+
+/* ════════════════ Comprehensive coverage net (mv-comprehensive-coverage-net) ════════════════
+ *
+ * The eligibility flip (`mv-eligibility-floor-fallthrough`) made a floor body SQL-reachable:
+ * `buildMaintenancePlan` now routes any body no bounded-delta arm fits to `buildFullRebuildPlan`.
+ * So the formerly-rejected shapes below are exercised END-TO-END through real `create
+ * materialized view` + SQL writes (not the `forceFullRebuild` swap above), the same path a user
+ * hits. Each suite proves `read(MV) == evaluate(body)` over random source mutation batches and
+ * after rollback — the proof that no shape is a coverage gap. The fanning (non-1:1) join is the
+ * one shape NOT here: it is a *bag* reject (`join-fanning-isset-overclaim`), pinned in
+ * `materialized-view-diagnostics.spec.ts`, not an equivalence-zoo case.
+ */
+
+/** White-box: the registered maintenance plan kind for `main.<name>` (proves a shape really
+ *  routes to the floor rather than being silently absorbed by a bounded-delta arm). */
+function registeredPlanKind(db: Database, name: string): string | undefined {
+	const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as { rowTime: Map<string, { kind: string }> };
+	return mgr.rowTime.get(`main.${name}`.toLowerCase())?.kind;
+}
+
+/** Read a query as a multiset with the answer-from-MV rewrite disabled — the live ground-truth
+ *  oracle (re-evaluates against the sources, never re-pointed at a backing). Mirrors the
+ *  rewrite-disable in {@link assertEquivalent} for queries that name something other than `mv`. */
+async function readGroundTruth(db: Database, sql: string): Promise<string[]> {
+	const prev = db.optimizer.tuning;
+	db.optimizer.updateTuning({ ...prev, disabledRules: new Set([...(prev.disabledRules ?? []), 'materialized-view-rewrite']) });
+	try { return await readMultiset(db, sql); } finally { db.optimizer.updateTuning(prev); }
+}
+
+/** Shadow the manager's private `assertFlushRounds` to capture the MAX deferred-rebuild
+ *  flush-round count reached. A single-level flush converges in round 1; a full-rebuild→
+ *  full-rebuild chain drives it to round 2+, exercising the multi-round worklist convergence
+ *  (and the `assertFlushRounds` bound) that single-round drains never reach. */
+function instrumentFlushRounds(db: Database): { max: () => number } {
+	const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as { assertFlushRounds: (n: number) => void };
+	let max = 0;
+	const orig = mgr.assertFlushRounds;
+	mgr.assertFlushRounds = function (this: unknown, n: number) { if (n > max) max = n; return orig.call(this, n); };
+	return { max: () => max };
+}
+
+/* ─────────── SQL-created single-source full-rebuild zoo (the same `src` generator) ─────────── */
+
+/**
+ * Single-source bodies that fit NO bounded-delta arm and so route to the full-rebuild floor —
+ * created directly via SQL (not swapped). The shared `mutationArb` (insert / non-key update /
+ * key-changing update / delete over `src`) drives them; the floor re-evaluates the whole body
+ * at the end-of-statement flush and `replace-all`s the backing, so each must stay equal to the
+ * live body — including the empty-source edge a `delete` reaches (a scalar aggregate still
+ * yields its one global row; a DISTINCT / UNION yields none).
+ */
+const FULL_REBUILD_SQL_SHAPES: readonly BodyShape[] = [
+	{ label: 'DISTINCT projection (a, b) — a set, keyed all-columns', body: 'select distinct a, b from src' },
+	{ label: 'scalar aggregate (no GROUP BY) — one global row', body: 'select count(*) as c, sum(a) as s, min(b) as mn, max(b) as mx from src' },
+	{ label: 'single-source UNION over disjoint WHERE legs (a set)', body: 'select id, a from src where k > 5 union select id, a from src where k <= 5' },
+	{ label: 'order-by aggregate (non-group-key backing order → floor)', body: 'select k, sum(a) as s from src group by k order by sum(a)' },
+];
+
+defineEquivalenceSuite(
+	'Materialized-view maintenance equivalence (full-rebuild floor, SQL-created single-source)',
+	FULL_REBUILD_SQL_SHAPES,
+);
+
+/** White-box guard: each SQL-created floor shape must actually register a `'full-rebuild'`
+ *  plan. If a future change let one fall into a bounded-delta arm, the equivalence suite above
+ *  would still pass (the arm is also correct) but would no longer be testing the *floor* — this
+ *  pins that it is. */
+describe('Materialized-view full-rebuild floor — SQL-created shapes route to the floor (not a bounded arm)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+		await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2), (3, 7, 1, 9)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	for (const shape of FULL_REBUILD_SQL_SHAPES) {
+		it(`${shape.label} → chosenStrategy 'full-rebuild'`, async () => {
+			await db.exec(`create materialized view mv as ${shape.body}`);
+			expect(registeredPlanKind(db, 'mv'), shape.label).to.equal('full-rebuild');
+		});
+	}
+});
+
+/* ─────────── full-rebuild floor — outer (left) 1:1 join ─────────── */
+
+/**
+ * A LEFT (outer) join of the same `T.fk → P.id` shape the `'join-residual'` arm handles for an
+ * inner join — but an outer join FALLS to the floor (its null-extended rows make the lookup-side
+ * reverse residual unsound: filtering `P` would drop them). `t.fk` is nullable and carries NO FK
+ * constraint, so a `t` row may reference a missing (or null) `p` and be **null-extended** — the
+ * row preservation an inner join never produces. Random mutations drive both sources; the floor
+ * re-evaluates the whole left join, so the maintained backing must equal the live body — null
+ * rows and all — mid-transaction (reads-own-writes) and after rollback.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, outer/left join)', () => {
+	let db: Database;
+	const body = 'select t.id, t.fk, p.name from t left join p on t.fk = p.id';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, name text)');
+		await db.exec('create table t (id integer primary key, fk integer)'); // nullable, no FK constraint
+		await db.exec("insert into p (id, name) values (1, 'a'), (2, 'b'), (3, 'c')");
+		await db.exec('insert into t (id, fk) values (1, 1), (2, 9), (3, 2)'); // fk=9 has no matching p → null-extended
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('routes to the full-rebuild floor (an outer join is not a bounded-delta arm)', () => {
+		expect(registeredPlanKind(db, 'mv')).to.equal('full-rebuild');
+	});
+
+	type OuterMutation =
+		| { readonly kind: 't-insert'; readonly id: number; readonly fk: number | null }
+		| { readonly kind: 't-update'; readonly id: number; readonly fk: number | null }
+		| { readonly kind: 't-updateKey'; readonly oldId: number; readonly newId: number; readonly fk: number | null }
+		| { readonly kind: 't-delete'; readonly id: number }
+		| { readonly kind: 'p-insert'; readonly id: number; readonly name: string }
+		| { readonly kind: 'p-update'; readonly id: number; readonly name: string }
+		| { readonly kind: 'p-delete'; readonly id: number };
+
+	const idArb6 = fc.integer({ min: 1, max: 6 });
+	// fk straddles matched (1..3), a fresh p key (4..5), an unmatched value (9), and NULL.
+	const fkArb = fc.oneof(fc.integer({ min: 1, max: 5 }), fc.constant(9), fc.constant(null));
+	const nameArb = fc.constantFrom('a', 'b', 'c', 'd', 'z');
+
+	const outerArb: fc.Arbitrary<OuterMutation> = fc.oneof(
+		fc.record({ kind: fc.constant('t-insert' as const), id: idArb6, fk: fkArb }),
+		fc.record({ kind: fc.constant('t-update' as const), id: idArb6, fk: fkArb }),
+		fc.record({ kind: fc.constant('t-updateKey' as const), oldId: idArb6, newId: idArb6, fk: fkArb }),
+		fc.record({ kind: fc.constant('t-delete' as const), id: idArb6 }),
+		fc.record({ kind: fc.constant('p-insert' as const), id: fc.integer({ min: 4, max: 5 }), name: nameArb }),
+		fc.record({ kind: fc.constant('p-update' as const), id: fc.integer({ min: 1, max: 5 }), name: nameArb }),
+		fc.record({ kind: fc.constant('p-delete' as const), id: fc.integer({ min: 1, max: 5 }) }),
+	);
+
+	const outerSql = (m: OuterMutation): string => {
+		const fkLit = (v: number | null) => (v === null ? 'null' : `${v}`);
+		switch (m.kind) {
+			case 't-insert': return `insert into t (id, fk) values (${m.id}, ${fkLit(m.fk)})`;
+			case 't-update': return `update t set fk = ${fkLit(m.fk)} where id = ${m.id}`;
+			case 't-updateKey': return `update t set id = ${m.newId}, fk = ${fkLit(m.fk)} where id = ${m.oldId}`;
+			case 't-delete': return `delete from t where id = ${m.id}`;
+			case 'p-insert': return `insert into p (id, name) values (${m.id}, '${m.name}')`;
+			case 'p-update': return `update p set name = '${m.name}' where id = ${m.id}`;
+			case 'p-delete': return `delete from p where id = ${m.id}`;
+		}
+	};
+
+	it('read(MV) == evaluate(body) across random t/p mutations (incl. null-extended), in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(outerArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, outerSql(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 50 });
+	});
+
+	it('a t row referencing a missing p is preserved (null-extended) in the backing', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		// id=2 (fk=9, no matching p) is kept by the LEFT join with a NULL lookup column. Read the
+		// whole backing and check the row directly (a pushed-down `name is null` predicate folds
+		// against the backing's non-nullable lookup-column type — a read-path detail, not the
+		// maintained data, which `assertEquivalent` already proved correct).
+		expect(await readMultiset(db, 'select id, fk, name from mv'), 'unmatched t row null-extended')
+			.to.include(canonRow([2, 9, null]));
+		// Deleting the only matching p (id=1) null-extends t id=1 too (no FK constraint blocks it).
+		await db.exec('delete from p where id = 1');
+		await assertEquivalent(db, body, 'after p delete null-extends its referencing t rows');
+		expect(await readMultiset(db, 'select id, fk, name from mv'), 'newly-unmatched t row null-extended')
+			.to.include(canonRow([1, 1, null]));
+	});
+});
+
+/* ─────────── full-rebuild floor — >2-source (3-way) join ─────────── */
+
+/**
+ * A 3-way join `a ⋈ b ⋈ c` over a NOT-NULL FK chain (`a.bid → b.id`, `b.cid → c.id`). The
+ * `'join-residual'` arm handles only the **two**-table 1:1 join, so a third source routes the
+ * body to the full-rebuild floor (which indexes the plan under all three bases — a write to any
+ * of a/b/c rebuilds). Random mutations on every source (FK violations + RI-restricted deletes
+ * tolerated as statement-atomic CONSTRAINT errors) keep the maintained backing equal to the live
+ * 3-way join after every batch and after rollback.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, >2-source join)', () => {
+	let db: Database;
+	const body = 'select a.id, b.id as bid, c.v from a join b on a.bid = b.id join c on b.cid = c.id';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table c (id integer primary key, v integer)');
+		await db.exec('create table b (id integer primary key, cid integer not null references c(id))');
+		await db.exec('create table a (id integer primary key, bid integer not null references b(id))');
+		await db.exec('insert into c (id, v) values (1, 10), (2, 20), (3, 30)');
+		await db.exec('insert into b (id, cid) values (1, 1), (2, 2), (3, 1)');
+		await db.exec('insert into a (id, bid) values (1, 1), (2, 2), (3, 3)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('routes to the full-rebuild floor and indexes under all three sources', () => {
+		const mgr = (db as unknown as ManagerHandle).materializedViewManager;
+		const plan = mgr.rowTime.get('main.mv') as unknown as FullRebuildPlanLike;
+		expect(plan.kind).to.equal('full-rebuild');
+		expect([...plan.sourceBases].sort()).to.deep.equal(['main.a', 'main.b', 'main.c']);
+	});
+
+	type ThreeWay =
+		| { readonly kind: 'a-insert'; readonly id: number; readonly bid: number }
+		| { readonly kind: 'a-update'; readonly id: number; readonly bid: number }
+		| { readonly kind: 'a-delete'; readonly id: number }
+		| { readonly kind: 'b-insert'; readonly id: number; readonly cid: number }
+		| { readonly kind: 'b-update'; readonly id: number; readonly cid: number }
+		| { readonly kind: 'b-delete'; readonly id: number }
+		| { readonly kind: 'c-insert'; readonly id: number; readonly v: number }
+		| { readonly kind: 'c-update'; readonly id: number; readonly v: number }
+		| { readonly kind: 'c-delete'; readonly id: number };
+
+	const key4 = fc.integer({ min: 1, max: 4 });   // small spaces so FK references hit/miss
+	const valArb2 = fc.integer({ min: 0, max: 99 });
+	const threeArb: fc.Arbitrary<ThreeWay> = fc.oneof(
+		fc.record({ kind: fc.constant('a-insert' as const), id: key4, bid: key4 }),
+		fc.record({ kind: fc.constant('a-update' as const), id: key4, bid: key4 }),
+		fc.record({ kind: fc.constant('a-delete' as const), id: key4 }),
+		fc.record({ kind: fc.constant('b-insert' as const), id: key4, cid: key4 }),
+		fc.record({ kind: fc.constant('b-update' as const), id: key4, cid: key4 }),
+		fc.record({ kind: fc.constant('b-delete' as const), id: key4 }),
+		fc.record({ kind: fc.constant('c-insert' as const), id: key4, v: valArb2 }),
+		fc.record({ kind: fc.constant('c-update' as const), id: key4, v: valArb2 }),
+		fc.record({ kind: fc.constant('c-delete' as const), id: key4 }),
+	);
+	const threeSql = (m: ThreeWay): string => {
+		switch (m.kind) {
+			case 'a-insert': return `insert into a (id, bid) values (${m.id}, ${m.bid})`;
+			case 'a-update': return `update a set bid = ${m.bid} where id = ${m.id}`;
+			case 'a-delete': return `delete from a where id = ${m.id}`;
+			case 'b-insert': return `insert into b (id, cid) values (${m.id}, ${m.cid})`;
+			case 'b-update': return `update b set cid = ${m.cid} where id = ${m.id}`;
+			case 'b-delete': return `delete from b where id = ${m.id}`;
+			case 'c-insert': return `insert into c (id, v) values (${m.id}, ${m.v})`;
+			case 'c-update': return `update c set v = ${m.v} where id = ${m.id}`;
+			case 'c-delete': return `delete from c where id = ${m.id}`;
+		}
+	};
+
+	it('read(MV) == evaluate(body) across random a/b/c mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(threeArb, { minLength: 1, maxLength: 14 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, threeSql(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 50 });
+	});
+});
+
+/* ─────────── full-rebuild floor — recursive CTE (transitive closure) ─────────── */
+
+/**
+ * A recursive-CTE transitive-closure body over an `edge(src, dst)` graph — a set (the `union`
+ * fixpoint dedupes), keyed all-columns `(a, b)`. Recursion fits no bounded-delta arm, so it routes
+ * to the floor and is rebuilt wholesale per writing statement. Random edge inserts/deletes over a
+ * small node space (so cycles and overlapping paths recur) keep the maintained closure equal to the
+ * live recursive body after every batch and after rollback. (A recursive body reading NO source
+ * table is a separate 'no source' reject — this one reads `edge`, so the floor maintains it.)
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, recursive CTE closure)', () => {
+	let db: Database;
+	const body = 'with recursive tc(a, b) as (select src, dst from edge union select t.a, e.dst from tc t join edge e on t.b = e.src) select a, b from tc';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table edge (src integer, dst integer, primary key (src, dst))');
+		await db.exec('insert into edge (src, dst) values (1, 2), (2, 3), (3, 4)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('routes to the full-rebuild floor', () => {
+		expect(registeredPlanKind(db, 'mv')).to.equal('full-rebuild');
+	});
+
+	type EdgeMutation =
+		| { readonly kind: 'insert'; readonly src: number; readonly dst: number }
+		| { readonly kind: 'delete'; readonly src: number; readonly dst: number };
+	const node = fc.integer({ min: 1, max: 4 });
+	const edgeArb: fc.Arbitrary<EdgeMutation> = fc.oneof(
+		fc.record({ kind: fc.constant('insert' as const), src: node, dst: node }),
+		fc.record({ kind: fc.constant('delete' as const), src: node, dst: node }),
+	);
+	const edgeSql = (m: EdgeMutation): string =>
+		m.kind === 'insert'
+			? `insert into edge (src, dst) values (${m.src}, ${m.dst})`
+			: `delete from edge where src = ${m.src} and dst = ${m.dst}`;
+
+	it('read(MV) == evaluate(closure) across random edge churn, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(edgeArb, { minLength: 1, maxLength: 10 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, edgeSql(m)); // tolerate PK-collision inserts
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 30 });
+	});
+
+	it('adding a closing edge grows the closure (multi-hop reachability)', async () => {
+		// Baseline 1→2→3→4 ⇒ closure {(1,2),(1,3),(1,4),(2,3),(2,4),(3,4)}.
+		expect((await readMultiset(db, 'select a, b from mv')).length, 'baseline closure size').to.equal(6);
+		// Add 4→1: now every node reaches every node (a 4-cycle) ⇒ 16 pairs.
+		await db.exec('insert into edge (src, dst) values (4, 1)');
+		await assertEquivalent(db, body, 'after closing the cycle');
+		expect((await readMultiset(db, 'select a, b from mv')).length, 'full 4×4 reachability').to.equal(16);
+	});
+});
+
+/* ─────────── full-rebuild → full-rebuild chain + diamond (multi-round flush) ─────────── */
+
+/**
+ * The shape that drives `flushDeferredRebuilds` PAST round 1: a full-rebuild producer feeding a
+ * full-rebuild consumer. A source write dirties only the producer (round 1); the producer's
+ * rebuild emits a delta that re-dirties the full-rebuild consumer, rebuilt in round 2. Until the
+ * eligibility flip made the floor SQL-reachable, no test could build two chained floor MVs, so the
+ * multi-round worklist convergence (and the `assertFlushRounds` bound) were unexercised. These
+ * assert convergence AT EVERY LEVEL plus the observed round count.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild → full-rebuild chain, multi-round flush)', () => {
+	let db: Database;
+	// mv_p keyed (a, b); mv_c distinct-a over mv_p (a is NOT unique in mv_p, so DISTINCT really
+	// dedupes → genuinely full-rebuild, not collapsed to a passthrough).
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer)');
+		await db.exec('insert into src (id, a, b) values (1, 10, 100), (2, 10, 200), (3, 20, 100)');
+		await db.exec('create materialized view mv_p as select distinct a, b from src');
+		await db.exec('create materialized view mv_c as select distinct a from mv_p');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const assertLevels = async (phase: string): Promise<void> => {
+		expect(await readMultiset(db, 'select a, b from mv_p'), `${phase}: mv_p`)
+			.to.deep.equal(await readGroundTruth(db, 'select distinct a, b from src'));
+		// distinct-a of distinct-(a,b) of src == distinct-a of src.
+		expect(await readMultiset(db, 'select a from mv_c'), `${phase}: mv_c`)
+			.to.deep.equal(await readGroundTruth(db, 'select distinct a from src'));
+	};
+
+	it('both levels are full-rebuild', () => {
+		expect(registeredPlanKind(db, 'mv_p'), 'producer').to.equal('full-rebuild');
+		expect(registeredPlanKind(db, 'mv_c'), 'consumer').to.equal('full-rebuild');
+	});
+
+	it('a write that propagates drives the flush to round 2 (both levels converge)', async () => {
+		await assertLevels('baseline');
+		const rounds = instrumentFlushRounds(db);
+		// Insert a brand-new `a` value → producer's distinct set changes → its rebuild re-dirties
+		// the consumer, forcing a second flush round.
+		await db.exec('insert into src (id, a, b) values (4, 30, 100)');
+		expect(rounds.max(), 'producer rebuild re-dirties the consumer → round 2').to.equal(2);
+		await assertLevels('after propagating insert');
+		expect(await readMultiset(db, 'select a from mv_c')).to.deep.equal([canonRow([10]), canonRow([20]), canonRow([30])].sort());
+	});
+
+	it('read(both MVs) == evaluate(bodies) across random mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(fc.record({
+				kind: fc.constantFrom('insert', 'update', 'delete'),
+				id: fc.integer({ min: 1, max: 6 }),
+				a: fc.integer({ min: 10, max: 40 }),
+				b: fc.integer({ min: 100, max: 400 }),
+			}), { minLength: 1, maxLength: 8 }),
+			async (muts) => {
+				await assertLevels('baseline');
+				await db.exec('begin');
+				try {
+					for (const m of muts) {
+						const sql = m.kind === 'insert' ? `insert into src (id, a, b) values (${m.id}, ${m.a}, ${m.b})`
+							: m.kind === 'update' ? `update src set a = ${m.a}, b = ${m.b} where id = ${m.id}`
+								: `delete from src where id = ${m.id}`;
+						await execTolerant(db, sql);
+					}
+					await assertLevels('in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertLevels('post-rollback');
+			},
+		), { numRuns: 30 });
+	});
+});
+
+/**
+ * A full-rebuild DIAMOND: two full-rebuild producers (`mv_p1`, `mv_p2`) over one source feeding a
+ * single full-rebuild consumer (`mv_c`, a `union` of both backings). One source write dirties both
+ * producers (round 1); each re-dirties the shared consumer, which is deduped in the dirty set and
+ * rebuilt ONCE in round 2 — the worklist's diamond-reconvergence.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild diamond, multi-round flush)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer)');
+		await db.exec('insert into src (id, a, b) values (1, 10, 100), (2, 20, 200)');
+		await db.exec('create materialized view mv_p1 as select distinct a from src');
+		await db.exec('create materialized view mv_p2 as select distinct b from src');
+		await db.exec('create materialized view mv_c as select a as x from mv_p1 union select b as x from mv_p2');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const groundTruthC = 'select a as x from src union select b as x from src';
+	const assertDiamond = async (phase: string): Promise<void> => {
+		expect(await readMultiset(db, 'select x from mv_c'), `${phase}: mv_c`)
+			.to.deep.equal(await readGroundTruth(db, groundTruthC));
+	};
+
+	it('all three MVs are full-rebuild', () => {
+		expect(registeredPlanKind(db, 'mv_p1')).to.equal('full-rebuild');
+		expect(registeredPlanKind(db, 'mv_p2')).to.equal('full-rebuild');
+		expect(registeredPlanKind(db, 'mv_c')).to.equal('full-rebuild');
+	});
+
+	it('a write through both producers reconverges the consumer in round 2', async () => {
+		await assertDiamond('baseline');
+		const rounds = instrumentFlushRounds(db);
+		await db.exec('insert into src (id, a, b) values (3, 30, 300)');
+		expect(rounds.max(), 'both producers (round 1) re-dirty the consumer → round 2').to.equal(2);
+		await assertDiamond('after insert');
+		expect((await readMultiset(db, 'select x from mv_c')).length, 'a-set ∪ b-set').to.equal(6);
+	});
+
+	it('read(consumer) == evaluate(union body) across random mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(fc.record({
+				kind: fc.constantFrom('insert', 'update', 'delete'),
+				id: fc.integer({ min: 1, max: 6 }),
+				a: fc.integer({ min: 10, max: 40 }),
+				b: fc.integer({ min: 100, max: 400 }),
+			}), { minLength: 1, maxLength: 8 }),
+			async (muts) => {
+				await assertDiamond('baseline');
+				await db.exec('begin');
+				try {
+					for (const m of muts) {
+						const sql = m.kind === 'insert' ? `insert into src (id, a, b) values (${m.id}, ${m.a}, ${m.b})`
+							: m.kind === 'update' ? `update src set a = ${m.a}, b = ${m.b} where id = ${m.id}`
+								: `delete from src where id = ${m.id}`;
+						await execTolerant(db, sql);
+					}
+					await assertDiamond('in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertDiamond('post-rollback');
+			},
+		), { numRuns: 25 });
+	});
+});
+
+/* ─────────── full-rebuild floor — FAIL-mode (or fail) bulk statement ─────────── */
+
+/**
+ * `INSERT OR FAIL` keeps the rows that already succeeded (it runs with NO statement-scope
+ * savepoint), so a mid-statement abort leaves the surviving source rows in place. The deferred
+ * full-rebuild flush therefore must still run on the abort path — otherwise the floor backing
+ * would lag the surviving rows mid-transaction. These pin that end-to-end: after a FAIL abort the
+ * full-rebuild MV equals the live body over exactly the surviving rows, and a rollback reverts
+ * the whole transaction (surviving rows + backing) in lockstep.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, OR FAIL mid-statement abort)', () => {
+	let db: Database;
+	const body = 'select distinct v from g';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table g (id integer primary key, v integer)');
+		await db.exec('insert into g (id, v) values (1, 5)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('an OR FAIL abort keeps prior rows AND flushes their full-rebuild MV (mv == live body)', async () => {
+		expect(registeredPlanKind(db, 'mv')).to.equal('full-rebuild');
+		await db.exec('begin');
+		// Row (10,9) inserts and dirties the floor MV; (1,9) collides on the PK → FAIL stops the
+		// statement but KEEPS (10,9); (11,11) never runs.
+		let threw = false;
+		try { await db.exec('insert or fail into g (id, v) values (10, 9), (1, 9), (11, 11)'); }
+		catch { threw = true; }
+		expect(threw, 'OR FAIL surfaces the conflict error').to.be.true;
+		// The surviving row is present in the source…
+		expect((await readMultiset(db, 'select id, v from g')).sort(), 'prior row kept')
+			.to.deep.equal([canonRow([1, 5]), canonRow([10, 9])].sort());
+		// …and the deferred flush ran on the abort path, so the floor MV reflects it.
+		await assertEquivalent(db, body, 'after OR FAIL abort');
+		expect(await readMultiset(db, 'select v from mv'), 'backing reflects the surviving rows')
+			.to.deep.equal([canonRow([5]), canonRow([9])].sort());
+		// A clean follow-on write still maintains correctly (no orphaned dirty state).
+		await db.exec('insert into g (id, v) values (12, 13)');
+		await assertEquivalent(db, body, 'after a clean follow-on write');
+		await db.exec('rollback');
+		// The whole transaction reverts — source and backing in lockstep.
+		expect(await readMultiset(db, 'select v from mv'), 'reverted to the committed baseline')
+			.to.deep.equal([canonRow([5])]);
+		await assertEquivalent(db, body, 'post-rollback');
+	});
+
+	it('OR FAIL over a source feeding BOTH a floor and an inverse-projection MV keeps both consistent', async () => {
+		await db.exec('create materialized view mv_inc as select id, v from g'); // bounded-delta, per-row immediate
+		expect(registeredPlanKind(db, 'mv_inc')).to.equal('inverse-projection');
+		await db.exec('begin');
+		try { await db.exec('insert or fail into g (id, v) values (20, 21), (1, 99), (22, 23)'); } catch { /* expected */ }
+		// mv_inc (per-row immediate): the failing row's per-row savepoint reverted its own write,
+		// the surviving row (20,21) landed. mv (floor): flushed on the abort path.
+		await assertEquivalent(db, body, 'floor MV after OR FAIL');
+		const incFrom = await readMultiset(db, 'select * from mv_inc');
+		expect(incFrom.sort(), 'inverse-projection MV reflects the surviving rows')
+			.to.deep.equal([canonRow([1, 5]), canonRow([20, 21])].sort());
+		await db.exec('rollback');
+	});
+});
+
+/* ─────────── negative self-test (the net must not silently degenerate) ─────────── */
+
+/**
+ * The whole net rests on {@link assertEquivalent} actually FAILING when the backing diverges from
+ * the body. If a refactor accidentally made it vacuous (e.g. comparing the backing to itself), every
+ * suite above would pass green while testing nothing. This deliberately feeds a WRONG oracle body
+ * and asserts the comparison reddens — so a degenerate harness is caught.
+ */
+describe('Materialized-view maintenance equivalence — negative self-test (a wrong oracle must red)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+		await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2)');
+		await db.exec('create materialized view mv as select id, a from src'); // backing = {(1,0),(2,3)}
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('assertEquivalent throws when the oracle body does not match the backing', async () => {
+		// Correct body passes.
+		await assertEquivalent(db, 'select id, a from src', 'control (correct oracle)');
+		// A deliberately wrong oracle (projects `b`, not `a`) must make the comparison fail.
+		let caught: unknown;
+		try { await assertEquivalent(db, 'select id, b from src', 'sabotage'); }
+		catch (e) { caught = e; }
+		expect(caught, 'the equivalence check must red on a mismatched oracle').to.not.be.undefined;
 	});
 });

@@ -414,6 +414,18 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			} catch (e) {
 				if (stmtSavepointName) {
 					await ctx.db._rollbackAndReleaseSavepointBroadcast(stmtSavepointName);
+				} else if (deferredRebuilds.size > 0) {
+					// OR FAIL keeps the rows that already succeeded (it runs with no
+					// statement-scope savepoint), so a mid-statement abort does NOT unwind
+					// them. Their deferred full-rebuild MVs must therefore still be flushed
+					// before the conflict error propagates — otherwise the backing would lag
+					// the surviving source rows mid-transaction (read(MV) != evaluate(body)).
+					// The failing row's own per-row savepoint already reverted its writes, so
+					// the rebuild re-evaluates over exactly the surviving rows. The original
+					// conflict error is re-thrown after the flush. (A flush failure here is a
+					// genuine maintenance error and supersedes the conflict error, matching
+					// "a maintenance error fails the source write".)
+					await ctx.db._flushDeferredRebuilds(deferredRebuilds, backingConnCache);
 				}
 				throw e;
 			}

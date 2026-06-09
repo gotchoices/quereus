@@ -190,14 +190,14 @@ covering structure answers it.
 > **rejects a bag** (no provable key — a key-dropping projection, a `union all` of overlapping
 > inputs) with the relational *no-provable-unique-key / must-be-a-set* diagnostic; an all-columns
 > pseudo-key counts only when the body is provably a set (`keysOf` gates it on `isSet`), so a bag
-> still rejects rather than colliding duplicates on insert. (**Known gap:** the bag reject is only
-> as sound as the optimizer's `isSet` inference. A **fanning** (non-1:1) inner/cross join of two
-> sets is over-claimed a set by `buildJoinRelationType` — `join-utils.ts` derives `isSet` from
-> `leftType.isSet && rightType.isSet` without proving the join is row-preserving — so the floor
-> *accepts* such a body and then silently collapses the duplicates its all-columns backing key
-> cannot hold, diverging from the plain view. Tracked by fix ticket
-> `join-fanning-isset-overclaim`; once `isSet` is correct, the fanning join routes to this very bag
-> reject.) It runs a **whole-body determinism**
+> still rejects rather than colliding duplicates on insert. (The bag reject is only as sound as the
+> optimizer's `isSet` inference: a **fanning** (non-1:1) inner/cross join must not be over-claimed a
+> set, or the floor would accept it and silently collapse the duplicates its all-columns backing key
+> cannot hold. `join-fanning-isset-overclaim` closed that — `buildJoinRelationType` (`join-utils.ts`)
+> no longer derives an inner/cross join's `isSet` from `leftType.isSet && rightType.isSet` without
+> proving row-preservation, so a fanning join now correctly carries no provable key and routes to
+> this very bag reject, pinned as a reject in `materialized-view-diagnostics.spec.ts`.) It runs a
+> **whole-body determinism**
 > check (hard-reject unless `pragma nondeterministic_schema`, mirroring the per-arm rejects), and
 > collects **every** source the body reads into `sourceBases` so `planSourceBases` indexes the plan
 > under each — a write to *any* of them dirties the MV. The optimized body (read-side MV rewrite
@@ -251,9 +251,14 @@ covering structure answers it.
 > via `Database._flushDeferredRebuilds` → `MaterializedViewManager.flushDeferredRebuilds` at the
 > **end-of-statement savepoint boundary** — after the row loop (so each rebuild reads *all* the
 > statement's source writes, reads-own-writes) and before the statement-atomicity savepoint releases
-> (so a failed rebuild rolls the whole statement back, and an aborted statement that only *dirtied*
-> an MV never flushes — the backing stays untouched). A bare autocommit write flushes and commits the
-> rebuild in lockstep with the source write. The flush is a **worklist drain** over the
+> (so a failed rebuild rolls the whole statement back, and an `ABORT`-class statement that only
+> *dirtied* an MV before aborting unwinds with the whole statement — its dirtied MVs revert, no flush
+> needed). A bare autocommit write flushes and commits the rebuild in lockstep with the source write.
+> **`OR FAIL` is the exception:** it runs with *no* statement-scope savepoint (prior rows survive), so
+> the generator also drains the deferred set on the FAIL throw path — before re-raising the conflict
+> error — so the floor backing reflects the surviving rows instead of lagging them (the failing row's
+> own per-row savepoint already reverted its writes, so the rebuild re-evaluates over just the
+> survivors). Without this, a `read(MV)` after an `OR FAIL` abort would diverge from the live body. The flush is a **worklist drain** over the
 > producer→consumer DAG: each rebuild calls `applyFullRebuild` and routes the realized
 > `BackingRowChange[]` back through `maintainRowTime` with the *same* `deferred` set — an incremental
 > consumer applies inline, a full-rebuild consumer re-dirties into the drain. It proceeds in **rounds**
@@ -266,7 +271,14 @@ covering structure answers it.
 > full-rebuild plan they reach (they never do — not a covering structure) falls through to a safe inline
 > rebuild. Deferral is exercised in `maintenance-equivalence.spec.ts` § full-rebuild floor, per-statement
 > flush (one rebuild per bulk statement via an instrumented rebuild counter, atomic rollback, autocommit,
-> mixed-arm, and MV-over-MV mixed-arm).
+> mixed-arm, and MV-over-MV mixed-arm). Since the eligibility flip made the floor SQL-reachable, the
+> *comprehensive coverage net* (`mv-comprehensive-coverage-net`) adds, over real `create materialized
+> view` bodies: the formerly-rejected floor shapes (DISTINCT / set-op / recursive CTE / outer / >2-source
+> join / scalar aggregate) under random mutation + rollback; the full-rebuild→full-rebuild chain and
+> diamond that drive the worklist **past round 1** (the multi-round convergence + `assertFlushRounds`
+> bound, unverifiable while single-round drains were all that was buildable); and the `OR FAIL`
+> abort-path flush above. The fanning (non-1:1) join is pinned as a *bag reject*, not an equivalence
+> case (`materialized-view-diagnostics.spec.ts`).
 >
 > **Non-binary base-PK collation soundness.** `delete-by-prefix` early-terminates its prefix
 > scan on a **binary** value compare (`scan-layer.ts` / `plan-filter.ts`), but the backing

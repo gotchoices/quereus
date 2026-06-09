@@ -1373,3 +1373,96 @@ select id, v from u_all order by id, v;
 update u1 set v = v + 1;
 select id, v from u_all order by id, v;
 → [{"id":1,"v":100},{"id":2,"v":21},{"id":4,"v":40}]
+
+-- ===================================
+-- 27. Full-rebuild → full-rebuild CHAIN (mv-comprehensive-coverage-net). Two chained floor MVs:
+--     a write to the base dirties only the producer (round 1); the producer's rebuild emits a
+--     delta that re-dirties the full-rebuild consumer, rebuilt in round 2 — the multi-round
+--     worklist convergence that only became SQL-buildable after the eligibility flip. ch_c
+--     distinct-a over ch_p (a is NOT unique in ch_p) is genuinely full-rebuild, not collapsed to
+--     a passthrough. (Round counts are white-box in maintenance-equivalence.spec.ts; this is the
+--     end-to-end SQL proof both levels converge.)
+-- ===================================
+
+create table ch (id integer primary key, a integer, b integer);
+insert into ch (id, a, b) values (1, 10, 100), (2, 10, 200), (3, 20, 100);
+create materialized view ch_p as select distinct a, b from ch;
+create materialized view ch_c as select distinct a from ch_p;
+select a, b from ch_p order by a, b;
+→ [{"a":10,"b":100},{"a":10,"b":200},{"a":20,"b":100}]
+select a from ch_c order by a;
+→ [{"a":10},{"a":20}]
+
+-- a write introducing a NEW `a` value propagates producer → consumer (drives the round-2 flush).
+insert into ch (id, a, b) values (4, 30, 100);
+select a from ch_c order by a;
+→ [{"a":10},{"a":20},{"a":30}]
+
+-- moving the only a=20 row to a=30 removes a=20 from the consumer (producer's set shrank).
+update ch set a = 30 where id = 3;
+select a from ch_c order by a;
+→ [{"a":10},{"a":30}]
+
+-- delete cascades through both levels.
+delete from ch where a = 10;
+select a, b from ch_p order by a, b;
+→ [{"a":30,"b":100}]
+select a from ch_c order by a;
+→ [{"a":30}]
+
+-- ===================================
+-- 28. Recursive-CTE transitive closure (mv-comprehensive-coverage-net). A recursive body fits no
+--     bounded-delta arm and reads a real source (`tcedge`), so it routes to the full-rebuild floor
+--     and is rebuilt wholesale per writing statement. Edge churn grows / shrinks the closure.
+-- ===================================
+
+create table tcedge (src integer, dst integer, primary key (src, dst));
+insert into tcedge (src, dst) values (1, 2), (2, 3);
+create materialized view tc_mv as
+  with recursive tc(a, b) as (
+    select src, dst from tcedge
+    union
+    select t.a, e.dst from tc t join tcedge e on t.b = e.src
+  ) select a, b from tc;
+select a, b from tc_mv order by a, b;
+→ [{"a":1,"b":2},{"a":1,"b":3},{"a":2,"b":3}]
+
+-- extend the chain 3→4: new multi-hop reachable pairs appear at every prefix.
+insert into tcedge (src, dst) values (3, 4);
+select a, b from tc_mv order by a, b;
+→ [{"a":1,"b":2},{"a":1,"b":3},{"a":1,"b":4},{"a":2,"b":3},{"a":2,"b":4},{"a":3,"b":4}]
+
+-- remove the middle edge 2→3: every path through it vanishes from the closure.
+delete from tcedge where src = 2 and dst = 3;
+select a, b from tc_mv order by a, b;
+→ [{"a":1,"b":2},{"a":3,"b":4}]
+
+-- ===================================
+-- 29. OR FAIL over a full-rebuild MV (mv-comprehensive-coverage-net). OR FAIL keeps the rows that
+--     already succeeded (no statement-scope savepoint wraps them), so a mid-statement abort leaves
+--     them in place — and the deferred full-rebuild flush must still run on the abort path, or the
+--     floor backing would lag the surviving rows mid-transaction. This pins that end-to-end: the MV
+--     reflects the kept rows after the abort, and a rollback reverts source + backing in lockstep.
+-- ===================================
+
+create table ff (id integer primary key, v integer);
+insert into ff (id, v) values (1, 5);
+create materialized view ff_mv as select distinct v from ff;
+select v from ff_mv order by v;
+→ [{"v":5}]
+
+begin;
+-- (10,9) succeeds and dirties the floor MV; (1,9) collides on the PK and FAILs the statement;
+-- (11,11) never runs.
+insert or fail into ff (id, v) values (10, 9), (1, 9), (11, 11);
+-- error: UNIQUE constraint failed
+-- the surviving source row is kept (OR FAIL does not unwind prior rows)…
+select id, v from ff order by id;
+→ [{"id":1,"v":5},{"id":10,"v":9}]
+-- …and the deferred full-rebuild flushed on the abort path, so the MV is NOT left stale at [5].
+select v from ff_mv order by v;
+→ [{"v":5},{"v":9}]
+rollback;
+-- the whole transaction reverts source + backing in lockstep.
+select v from ff_mv order by v;
+→ [{"v":5}]

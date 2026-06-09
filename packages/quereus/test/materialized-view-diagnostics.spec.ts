@@ -153,6 +153,9 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		['computed GROUP BY key (bag)', 'select k + 1 as kk, count(*) as c from g group by k + 1', 'no provable unique key'],
 		// A recursive-CTE `union all` body is a bag (overlapping inputs, no provable key).
 		['recursive-CTE union-all (bag)', 'with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r', 'no provable unique key'],
+		// A 2-leg `union all` does NOT dedup, so even over keyed legs it has no provable key —
+		// a bag (the keyed-set `union` counterpart is an accept case below).
+		['2-leg union all (bag — no dedup)', 'select id, v from g union all select id, w from g2', 'no provable unique key'],
 		// A fanning (non-1:1) inner join on a non-unique key: g.k = g2.w can match a g
 		// row to multiple g2 rows. Projecting to (g.id, g.v) drops g2's distinguishing
 		// columns, so the body is a bag — g's PK FD survives the join as a determination
@@ -191,6 +194,28 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 			await db.exec('drop materialized view ok_shape;');
 		});
 	}
+
+	// The floor's whole-body determinism reject is the one of the four with a per-schema opt-out:
+	// `pragma nondeterministic_schema` lifts it (mirroring CHECK / DEFAULT / GENERATED), so a
+	// non-deterministic FLOOR body that would otherwise reject now CREATEs. (A non-det body that
+	// matches a *bounded-delta* arm — e.g. `select id, random() …` → inverse-projection — keeps its
+	// arm-specific hard reject regardless of the pragma, since a bounded delta can never reproduce
+	// it; the pragma escape is for the floor's wholesale rebuild only. The size reject's opt-out is
+	// `…rebuild_row_threshold = 0`, in the dedicated size block below; bag / no-output have none.)
+	it('pragma nondeterministic_schema lifts the floor determinism reject (a non-det floor body then creates)', async () => {
+		// `select distinct random()` is a DISTINCT (floor) body; without the pragma the floor's
+		// whole-body determinism check rejects it.
+		const err = await captureError('create materialized view nd as select distinct random() as r from g;');
+		expect(err.message).to.contain('cannot be materialized');
+		expect(err.message).to.contain('non-deterministic');
+		expect(err.message).to.contain('nondeterministic_schema'); // names the override
+		expect(db.schemaManager.getMaterializedView('main', 'nd'), 'rejected without the pragma').to.be.undefined;
+
+		// With the pragma the floor's gate is lifted and the body registers.
+		await db.exec('pragma nondeterministic_schema = true;');
+		await db.exec('create materialized view nd as select distinct random() as r from g;');
+		expect(db.schemaManager.getMaterializedView('main', 'nd'), 'accepted under the pragma').to.not.be.undefined;
+	});
 
 	// A deterministic expression projection column (arithmetic / function) over the
 	// single source is now ACCEPTED and maintained as a pure per-row projection
