@@ -51,11 +51,13 @@ covering structure answers it.
 > uniformly. (`incremental-maintenance-plan-abstraction` landed the first step of the
 > fold: `applyRowTimeChange` is now `applyMaintenancePlan`, which dispatches on
 > `MaintenancePlan.kind`; the cascade flow is unchanged: `applyMaintenancePlan` →
-> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Four arms are
+> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Five arms are
 > wired today: `'inverse-projection'` (the covering-index shape), `'residual-recompute'`
 > (single-source aggregates, below), `'prefix-delete'` (single-source lateral-TVF
-> fan-out, below), and `'join-residual'` (1:1 inner/cross join, below). All are gated by the
-> maintenance-equivalence property harness `test/incremental/maintenance-equivalence.spec.ts`.)
+> fan-out, below), `'join-residual'` (1:1 inner/cross join, below), and `'full-rebuild'` (the
+> always-correct floor — re-evaluate the whole body and `'replace-all'` the backing, below).
+> All are gated by the maintenance-equivalence property harness
+> `test/incremental/maintenance-equivalence.spec.ts`.)
 >
 > **The `'residual-recompute'` arm — the synchronous analogue of the assertion
 > residual path.** A single-source aggregate body (`select g1,…, agg(…) from T [where
@@ -145,9 +147,8 @@ covering structure answers it.
 > Where `delete-key` replaces a point-keyed slice and `delete-by-prefix` a prefix-keyed slice,
 > `replace-all` replaces the backing's **entire** pending-effective contents with a supplied
 > `rows: Row[]`. It is the transactional backing replacement the always-correct
-> **full-rebuild** maintenance arm needs (the arm itself lands in a follow-on ticket): a body
-> for which no incremental arm is sound is maintained by recomputing it wholesale per writing
-> statement. That replacement must commit/roll-back in lockstep with the source write, so it
+> **full-rebuild** maintenance arm consumes: a body for which no incremental arm is sound is
+> maintained by recomputing it wholesale per writing statement. That replacement must commit/roll-back in lockstep with the source write, so it
 > targets the backing's **pending** `TransactionLayer` — it cannot use the CREATE/REFRESH
 > `replaceBaseLayer` primitive, which swaps the committed *base* layer and would not roll back
 > on an aborted statement. `applyMaintenanceToLayer` (`vtab/memory/layer/manager.ts`) realizes
@@ -165,6 +166,28 @@ covering structure answers it.
 > its old row rather than a spurious insert + delete that would leak index bookkeeping. There is
 > no row cap — the floor's unbounded cost is by design, bounded instead by the upstream
 > cost-gate / size-threshold reject. Covered by `test/vtab/maintenance-replace-all.spec.ts`.
+>
+> **The `'full-rebuild'` arm — the always-correct floor.** A body that matches no bounded-delta
+> shape is maintained by re-evaluating it in full. `buildFullRebuildPlan` is the fall-through
+> builder: it derives the backing key from the body's **provable unique key** (`keysOf` over the
+> optimized body root — a `union`, a multi-way 1:1 join, a `distinct`, … all carry one) and
+> **rejects a bag** (no provable key — a key-dropping projection, a `union all` of overlapping
+> inputs) with the relational *no-provable-unique-key / must-be-a-set* diagnostic; an all-columns
+> pseudo-key counts only when the body is provably a set (`keysOf` gates it on `isSet`), so a bag
+> still rejects rather than colliding duplicates on insert. It runs a **whole-body determinism**
+> check (hard-reject unless `pragma nondeterministic_schema`, mirroring the per-arm rejects), and
+> collects **every** source the body reads into `sourceBases` so `planSourceBases` indexes the plan
+> under each — a write to *any* of them dirties the MV. The optimized body (read-side MV rewrite
+> suppressed) is compiled once into `bodyScheduler`. Per source change, `applyFullRebuild` runs that
+> scheduler to completion against **live mid-transaction source state** (reads-own-writes, the same
+> fresh-context `runScheduler` path the residual arms use, but with no params — it runs the whole
+> body, not a key-filtered slice), collects the rows, and applies a single `'replace-all'`
+> {@link MaintenanceOp}; the effective `BackingRowChange[]` drives the MV-over-MV cascade unchanged.
+> The arm is **wired and exercised in isolation** (`maintenance-equivalence.spec.ts` § full-rebuild
+> floor), but `buildMaintenancePlan` does not yet *route* bodies to it — the eligibility flip that
+> makes the floor the default (and the size-threshold reject for a full-rebuild-only body over a
+> large source) lands in a follow-on ticket. Until then the arm is invoked **per row** (correct,
+> not yet amortized); the per-statement deferral that makes it affordable is that next ticket.
 >
 > **Non-binary base-PK collation soundness.** `delete-by-prefix` early-terminates its prefix
 > scan on a **binary** value compare (`scan-layer.ts` / `plan-filter.ts`), but the backing

@@ -1,8 +1,10 @@
 import { expect } from 'chai';
 import * as fc from 'fast-check';
 import { Database } from '../../src/core/database.js';
+import { Parser } from '../../src/parser/parser.js';
 import { QuereusError } from '../../src/common/errors.js';
 import { StatusCode, type SqlValue } from '../../src/common/types.js';
+import type * as AST from '../../src/parser/ast.js';
 
 /**
  * Maintenance-equivalence property harness — the correctness oracle for row-time
@@ -172,10 +174,19 @@ const AGGREGATE_SHAPES: readonly BodyShape[] = [
 /**
  * Define one equivalence suite per body shape: after every random mutation (and after
  * rollback), the synchronously-maintained MV backing must equal the live body as a
- * multiset. Shared by the covering-index (`'inverse-projection'`) and single-source
- * aggregate (`'residual-recompute'`) shape sets.
+ * multiset. Shared by the covering-index (`'inverse-projection'`), single-source
+ * aggregate (`'residual-recompute'`), and full-rebuild (`'full-rebuild'`) shape sets.
+ *
+ * `afterCreate` (optional) runs once per case immediately after the MV is created, before
+ * any mutation — the full-rebuild suites use it to swap the registered bounded-delta plan
+ * for a freshly-built `'full-rebuild'` plan over the same body (see {@link forceFullRebuild}),
+ * so the SAME property then exercises the floor arm end-to-end.
  */
-function defineEquivalenceSuite(suiteTitle: string, shapes: readonly BodyShape[]): void {
+function defineEquivalenceSuite(
+	suiteTitle: string,
+	shapes: readonly BodyShape[],
+	afterCreate?: (db: Database) => void,
+): void {
 	describe(suiteTitle, () => {
 		for (const shape of shapes) {
 			describe(shape.label, () => {
@@ -188,6 +199,7 @@ function defineEquivalenceSuite(suiteTitle: string, shapes: readonly BodyShape[]
 					// before every run by the always-rolled-back transaction below.
 					await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2), (3, 7, 1, 9)');
 					await db.exec(`create materialized view mv as ${shape.body}`);
+					if (afterCreate) afterCreate(db);
 				});
 
 				afterEach(async () => { await db.close(); });
@@ -447,49 +459,279 @@ describe('Materialized-view maintenance equivalence (1:1 inner-join shape)', () 
 	});
 });
 
-/** Minimal reach into the manager's private plan map so a stubbed-arm plan can be
- *  routed through the real DML maintenance path. The map key is lowercase
- *  `schema.name` (see `mvKey` in database-materialized-views.ts). */
-interface PlanMapHandle { readonly materializedViewManager: { readonly rowTime: Map<string, { kind: string }> }; }
+/* ─────────────────────────── full-rebuild floor ─────────────────────────── */
+
+/** A freshly-built `'full-rebuild'` plan, as inspected by the swap helper. */
+interface FullRebuildPlanLike {
+	readonly kind: string;
+	readonly sourceBases: string[];
+	readonly backingPkDefinition: ReadonlyArray<{ readonly index: number }>;
+}
+
+/** White-box reach into the manager internals the swap helper drives. The map key is
+ *  lowercase `schema.name` (see `mvKey` in database-materialized-views.ts). */
+interface MvManagerInternals {
+	buildFullRebuildPlan(mv: unknown, analyzed: unknown): FullRebuildPlanLike;
+	releaseRowTime(key: string): void;
+	readonly rowTime: Map<string, { kind: string }>;
+	readonly rowTimeBySource: Map<string, Set<string>>;
+}
+interface ManagerHandle { readonly materializedViewManager: MvManagerInternals; }
 
 /**
- * The `MaintenancePlan` union still has one stubbed arm (`'full-rebuild'`) that the
- * builder never emits today — a named convergence point for the cost-gate full-rebuild
- * selection, guarded by a loud `INTERNAL` throw in `applyMaintenancePlan` so a future
- * mis-wire fails fast rather than silently no-op'ing maintenance. The builder can't
- * produce it, so this white-box test mutates a registered plan's `kind` in place and
- * drives a real source write through the maintenance path to assert the guard fires
- * (and locks its wording + status code) until that selection is wired.
+ * Swap a registered MV's maintenance plan for a freshly-built `'full-rebuild'` plan over
+ * the SAME body, reusing the create-time backing. `buildMaintenancePlan` does not route
+ * bodies to the floor yet (the eligibility flip is the next ticket), so this is how the
+ * floor arm is exercised end-to-end in isolation: the body must ALSO be a bounded-delta
+ * shape so `create` produced a backing table at the right shape. After the swap, a source
+ * write dispatches into `applyFullRebuild` (re-run the whole body → `'replace-all'`).
  *
- * The `'residual-recompute'` arm is **no longer** a stub — it is wired for single-source
- * aggregate bodies (covered by the aggregate equivalence suite above), so mutating an
- * inverse-projection plan's kind to it would dispatch into the (unprepared) residual
- * path rather than the guard. It is therefore excluded here.
+ * It re-derives the analyzed body exactly as `buildMaintenancePlan` does, calls the
+ * manager's `buildFullRebuildPlan`, then re-installs the plan under every `sourceBases`
+ * entry (mirroring `registerMaterializedView`'s indexing) so a write to any of them fires
+ * maintenance.
  */
-describe('Materialized-view maintenance plan — stubbed-arm guard', () => {
-	for (const kind of ['full-rebuild'] as const) {
-		it(`throws INTERNAL when a '${kind}' plan reaches applyMaintenancePlan`, async () => {
-			const db = new Database();
-			try {
-				await db.exec('create table src (id integer primary key, a integer)');
-				await db.exec('create materialized view mv as select id, a from src');
-
-				// Force the registered plan onto a stub arm the builder never yields.
-				const plan = (db as unknown as PlanMapHandle).materializedViewManager.rowTime.get('main.mv');
-				expect(plan, 'expected a registered inverse-projection plan').to.exist;
-				plan!.kind = kind;
-
-				let caught: unknown;
-				try {
-					await db.exec('insert into src (id, a) values (1, 1)');
-				} catch (e) { caught = e; }
-
-				expect(caught, 'a stub-arm plan must trip the guard, not no-op').to.be.instanceOf(QuereusError);
-				expect((caught as QuereusError).code).to.equal(StatusCode.INTERNAL);
-				expect((caught as QuereusError).message).to.contain(kind).and.to.contain('not yet wired');
-			} finally {
-				await db.close();
-			}
-		});
+function forceFullRebuild(db: Database, schemaName: string, name: string): FullRebuildPlanLike {
+	const mgr = (db as unknown as ManagerHandle).materializedViewManager;
+	const mv = db.schemaManager.getMaterializedView(schemaName, name);
+	expect(mv, `${schemaName}.${name} MV registered`).to.exist;
+	const analyzed = db.schemaManager.withSuppressedMaterializedViewRewrite(
+		() => db.optimizer.optimizeForAnalysis(db._buildPlan([mv!.selectAst as AST.Statement]).plan, db),
+	);
+	const plan = mgr.buildFullRebuildPlan(mv, analyzed);
+	const key = `${schemaName}.${name}`.toLowerCase();
+	mgr.releaseRowTime(key);
+	mgr.rowTime.set(key, plan as unknown as { kind: string });
+	for (const base of plan.sourceBases) {
+		let set = mgr.rowTimeBySource.get(base);
+		if (!set) { set = new Set(); mgr.rowTimeBySource.set(base, set); }
+		set.add(key);
 	}
+	return plan;
+}
+
+/** Build the analyzed plan for an arbitrary body (not necessarily a registered MV), the
+ *  same pre-physical form `buildFullRebuildPlan` consumes. Used by the build-time reject
+ *  tests to drive `buildFullRebuildPlan` directly over bag / non-deterministic bodies. */
+function analyzeBody(db: Database, sql: string): unknown {
+	const ast = new Parser().parseAll(sql)[0] as AST.Statement;
+	return db.schemaManager.withSuppressedMaterializedViewRewrite(
+		() => db.optimizer.optimizeForAnalysis(db._buildPlan([ast]).plan, db),
+	);
+}
+
+/**
+ * Single-source full-rebuild floor shapes. Each body is BOTH a bounded-delta shape (so
+ * `create` produces a backing) AND a valid full-rebuild shape (a deterministic, keyed
+ * set), so {@link forceFullRebuild} can swap the plan and the SAME equivalence property
+ * proves the floor's re-evaluate-and-`replace-all` maintenance stays equal to the live
+ * body — across inserts/updates/deletes (the `replace-all` keyed diff exercises
+ * insert/update/delete/skip) and rollback.
+ */
+const FULL_REBUILD_SHAPES: readonly BodyShape[] = [
+	{ label: 'keyed projection (id, a)', body: 'select id, a from src' },
+	{ label: 'keyed projection + partial WHERE (k > 5)', body: 'select id, a, b from src where k > 5' },
+	{ label: 'single-source aggregate (group by k)', body: 'select k, count(*) as c, sum(a) as s from src group by k' },
+];
+
+defineEquivalenceSuite(
+	'Materialized-view maintenance equivalence (full-rebuild floor, single source)',
+	FULL_REBUILD_SHAPES,
+	db => { forceFullRebuild(db, 'main', 'mv'); },
+);
+
+/**
+ * Full-rebuild floor over a **multi-source** body (a 1:1 inner join). The body reads two
+ * sources, so the plan must be indexed under BOTH — a write to either `t` or `p` must
+ * trigger the wholesale rebuild. (The 1:1 join is create-able via the join-residual arm, so
+ * a backing exists for {@link forceFullRebuild} to reuse.) This is the end-to-end exercise
+ * of `FullRebuildPlan.sourceBases` / `planSourceBases` that the single-source suite cannot
+ * reach.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, multi-source join)', () => {
+	let db: Database;
+	let plan: FullRebuildPlanLike;
+	const body = 'select t.id, t.fk, p.name from t join p on t.fk = p.id';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table p (id integer primary key, name text)');
+		await db.exec('create table t (id integer primary key, fk integer not null references p(id))');
+		await db.exec("insert into p (id, name) values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')");
+		await db.exec('insert into t (id, fk) values (1, 1), (2, 1), (3, 2), (4, 3)');
+		await db.exec(`create materialized view mv as ${body}`);
+		plan = forceFullRebuild(db, 'main', 'mv');
+	});
+
+	afterEach(async () => { await db.close(); });
+
+	it('indexes the full-rebuild plan under every source the body reads', () => {
+		expect(plan.kind).to.equal('full-rebuild');
+		expect([...plan.sourceBases].sort()).to.deep.equal(['main.p', 'main.t']);
+	});
+
+	it('a lookup-side (p) write triggers a full rebuild that stays equal to the live body', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		await db.exec("update p set name = 'A!' where id = 1");
+		await assertEquivalent(db, body, 'after p name update');
+		// Both t rows with fk=1 (ids 1, 2) re-read p.name = 'A!' — proving the p write fired maintenance.
+		const rows = await readMultiset(db, "select id from mv where name = 'A!'");
+		expect(rows.length, 'rows referencing updated p name').to.equal(2);
+	});
+
+	it('a driving-side (t) write triggers a full rebuild that stays equal to the live body', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		await db.exec('delete from t where id = 2');
+		await assertEquivalent(db, body, 'after t delete');
+		expect((await readMultiset(db, 'select * from mv')).length, 'after t-delete row count').to.equal(3);
+	});
+
+	it('read(MV) == evaluate(body) across random t/p mutations, in-txn and after rollback', async () => {
+		type JoinMut =
+			| { readonly kind: 't-insert'; readonly id: number; readonly fk: number }
+			| { readonly kind: 't-updateFk'; readonly id: number; readonly fk: number }
+			| { readonly kind: 't-delete'; readonly id: number }
+			| { readonly kind: 'p-updateName'; readonly id: number; readonly name: string };
+		const joinMutArb: fc.Arbitrary<JoinMut> = fc.oneof(
+			fc.record({ kind: fc.constant('t-insert' as const), id: fc.integer({ min: 1, max: 6 }), fk: fc.integer({ min: 1, max: 5 }) }),
+			fc.record({ kind: fc.constant('t-updateFk' as const), id: fc.integer({ min: 1, max: 6 }), fk: fc.integer({ min: 1, max: 5 }) }),
+			fc.record({ kind: fc.constant('t-delete' as const), id: fc.integer({ min: 1, max: 6 }) }),
+			fc.record({ kind: fc.constant('p-updateName' as const), id: fc.integer({ min: 1, max: 4 }), name: fc.constantFrom('a', 'b', 'z') }),
+		);
+		const joinSql = (m: JoinMut): string => {
+			switch (m.kind) {
+				case 't-insert': return `insert into t (id, fk) values (${m.id}, ${m.fk})`;
+				case 't-updateFk': return `update t set fk = ${m.fk} where id = ${m.id}`;
+				case 't-delete': return `delete from t where id = ${m.id}`;
+				case 'p-updateName': return `update p set name = '${m.name}' where id = ${m.id}`;
+			}
+		};
+		await fc.assert(fc.asyncProperty(
+			fc.array(joinMutArb, { minLength: 1, maxLength: 10 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, joinSql(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 40 });
+	});
+});
+
+/**
+ * Full-rebuild floor as an **MV-over-MV producer**: a full-rebuild producer's wholesale
+ * `'replace-all'` still emits the minimal effective `BackingRowChange[]`, so the existing
+ * cascade drives a consumer MV reading the producer's backing — exactly as the bounded-delta
+ * arms do. Here the producer `mv_base` is swapped to full-rebuild and `mv_over` reads it; a
+ * source write to `g` rebuilds `mv_base` and the realized delta must propagate into `mv_over`.
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, MV-over-MV cascade)', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table g (id integer primary key, v integer)');
+		await db.exec('insert into g values (1, 5)');
+		await db.exec('create materialized view mv_base as select id, v from g');
+		await db.exec('create materialized view mv_over as select id, v from mv_base');
+		// Maintain the PRODUCER by full-rebuild; the consumer stays inverse-projection.
+		forceFullRebuild(db, 'main', 'mv_base');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const readOver = async (): Promise<Array<Record<string, number>>> => {
+		const rows: Array<Record<string, number>> = [];
+		for await (const r of db.eval('select id, v from mv_over order by id')) rows.push({ id: Number(r.id), v: Number(r.v) });
+		return rows;
+	};
+
+	it("a full-rebuild producer's replace-all delta cascades into a consumer MV", async () => {
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 5 }]);
+		// INSERT: producer rebuild emits an insert delta → consumer inserts.
+		await db.exec('insert into g values (2, 7)');
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 5 }, { id: 2, v: 7 }]);
+		// UPDATE: producer rebuild emits an update delta → consumer updates.
+		await db.exec('update g set v = 50 where id = 1');
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 50 }, { id: 2, v: 7 }]);
+		// DELETE: producer rebuild emits a delete delta → consumer deletes.
+		await db.exec('delete from g where id = 2');
+		expect(await readOver()).to.deep.equal([{ id: 1, v: 50 }]);
+	});
+});
+
+/**
+ * Build-time rejects of the full-rebuild floor (`buildFullRebuildPlan`), driven directly
+ * (the builder is not yet reached from `create`). The floor accepts general bodies — its
+ * only rejects are relational/determinism, NOT shape:
+ *  - a **bag** body with no provable unique key (`keysOf` empty) — including the all-columns
+ *    pseudo-key case, which `keysOf` already gates on `isSet`;
+ *  - a **non-deterministic** body, unless `pragma nondeterministic_schema` lifts the gate.
+ */
+describe('Materialized-view full-rebuild floor — build-time rejects', () => {
+	let db: Database;
+	let mgr: MvManagerInternals;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+		await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2)');
+		// A real keyed-set MV so a backing (`_mv_okmv`, PK id) exists for the cases that pass
+		// the relational/determinism gates and reach the backing lookup.
+		await db.exec('create materialized view okmv as select id, a from src');
+		mgr = (db as unknown as ManagerHandle).materializedViewManager;
+	});
+	afterEach(async () => { await db.close(); });
+
+	const okMv = (): unknown => db.schemaManager.getMaterializedView('main', 'okmv');
+
+	it('rejects a bag body (no provable unique key — a key-dropping projection) as not-a-set', () => {
+		const fakeMv = { name: 'bag', schemaName: 'main', backingTableName: '_mv_bag' };
+		let caught: unknown;
+		try { mgr.buildFullRebuildPlan(fakeMv, analyzeBody(db, 'select a from src')); }
+		catch (e) { caught = e; }
+		expect(caught, 'a bag body must reject').to.be.instanceOf(QuereusError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		expect((caught as QuereusError).message).to.contain('no provable unique key');
+		expect((caught as QuereusError).message).to.contain('must be a set');
+		expect((caught as QuereusError).message).to.contain('bag');
+	});
+
+	it('a key-dropping projection that is a *set* via DISTINCT is accepted (all-columns key)', () => {
+		// `select distinct a, k` drops the PK but DISTINCT makes it a provable set, so `keysOf`
+		// returns the all-columns key (a, k) — NOT a bag. It reaches the backing lookup; the
+		// okmv backing (PK id) does not match its shape, so it fails at the backing-PK derivation
+		// rather than the bag gate. The point pinned here: it is NOT rejected as a bag.
+		let caught: unknown;
+		try { mgr.buildFullRebuildPlan(okMv(), analyzeBody(db, 'select distinct a, k from src')); }
+		catch (e) { caught = e; }
+		// Either it builds (no throw) or it fails past the bag gate — never the bag diagnostic.
+		if (caught !== undefined) {
+			expect((caught as QuereusError).message, 'a DISTINCT set must not be rejected as a bag')
+				.to.not.contain('no provable unique key');
+		}
+	});
+
+	it('rejects a non-deterministic body unless pragma nondeterministic_schema is set', () => {
+		// Keyed (id is the source PK) so the determinism gate — not the bag gate — fires.
+		let caught: unknown;
+		try { mgr.buildFullRebuildPlan(okMv(), analyzeBody(db, 'select id, random() as r from src')); }
+		catch (e) { caught = e; }
+		expect(caught, 'a non-deterministic body must reject').to.be.instanceOf(QuereusError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		expect((caught as QuereusError).message).to.contain('non-deterministic');
+	});
+
+	it('accepts a non-deterministic body when pragma nondeterministic_schema is set', async () => {
+		await db.exec('pragma nondeterministic_schema = true');
+		// keysOf(id) is a key; determinism gate lifted; the okmv backing (PK id) matches the
+		// (id, r) body's leading key column — so a plan is built (no throw).
+		const plan = mgr.buildFullRebuildPlan(okMv(), analyzeBody(db, 'select id, random() as r from src'));
+		expect(plan.kind).to.equal('full-rebuild');
+		expect(plan.sourceBases).to.deep.equal(['main.src']);
+	});
 });

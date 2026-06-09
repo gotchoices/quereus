@@ -32,7 +32,7 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { BlockNode } from '../planner/nodes/block.js';
-import { PlanNode, type ScalarPlanNode, type RowDescriptor, type RelationalPlanNode, isRelationalNode } from '../planner/nodes/plan-node.js';
+import { PlanNode, type ScalarPlanNode, type RowDescriptor, type RelationalPlanNode, isRelationalNode, isScalarNode } from '../planner/nodes/plan-node.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { emitPlanNode } from '../runtime/emitters.js';
@@ -48,6 +48,7 @@ import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import { injectKeyFilter } from '../planner/analysis/key-filter.js';
+import { keysOf } from '../planner/util/fd-utils.js';
 import { proveOneToOneJoin } from '../planner/analysis/coverage-prover.js';
 import { CapabilityDetectors } from '../planner/framework/characteristics.js';
 import {
@@ -197,14 +198,36 @@ export interface InverseProjectionPlan extends MaintenancePlanCommon {
 }
 
 /**
- * The always-correct escape hatch: re-run the body to completion and swap the backing
- * base layer (the `rebuildBacking` strategy). Stub here — **unreachable** until
- * `incremental-maintenance-cost-gate` (1.6) wires the selector that routes to it when
- * inverse projection would cost more than a wholesale rebuild. Carries only the
- * common identity fields; the rebuild re-derives everything else from the MV body.
+ * The always-correct **floor**: a body for which no bounded-delta arm is sound is
+ * maintained by re-evaluating it in full per writing statement and replacing the backing
+ * transactionally (a single `'replace-all'` {@link MaintenanceOp} — a keyed diff against
+ * the backing's pending layer, so the delta still commits/rolls-back with the source
+ * write and still drives the MV-over-MV cascade). The whole optimized body is compiled
+ * once at registration into {@link bodyScheduler}; {@link MaterializedViewManager.applyFullRebuild}
+ * runs it to completion against live source state and diffs the result into the backing.
+ *
+ * Reachability: `buildMaintenancePlan` does **not** yet route bodies here (the
+ * eligibility-flip that makes the floor the default lands in a follow-on ticket). The arm
+ * is wired and exercised in isolation; today it is invoked per-row (correct, not yet
+ * amortized) — the per-statement deferral is the next ticket. See
+ * `docs/materialized-views.md` § Full-rebuild floor.
  */
 export interface FullRebuildPlan extends MaintenancePlanCommon {
 	readonly kind: 'full-rebuild';
+	/** The optimized body compiled once at registration — the **whole** body (no
+	 *  `injectKeyFilter`), with the read-side MV rewrite suppressed so it reads its sources,
+	 *  not the backing it populates. Re-run to completion per writing statement, bound
+	 *  through the live transaction (reads-own-writes), to recompute every backing row. */
+	bodyScheduler: Scheduler;
+	/** Backing-table physical primary-key definition (the column order the btree keys on),
+	 *  the key the `'replace-all'` diff matches new rows against. */
+	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	/** Every source base (lowercased `schema.table`) the body reads — set-op legs, every
+	 *  join source, etc. The plan is indexed under each in `rowTimeBySource` (via
+	 *  {@link planSourceBases}), so a write to **any** of them triggers a rebuild; missing
+	 *  one would leave the MV stale on that source's writes. `sourceBase` (the
+	 *  {@link MaintenancePlanCommon} field) holds the first of these for parity. */
+	sourceBases: string[];
 }
 
 /**
@@ -592,9 +615,10 @@ export class MaterializedViewManager {
 	 * apply it, and return the **effective** {@link BackingRowChange}(s) the backing
 	 * layer realized (so the cascade can drive this plan's own dependents). The builder
 	 * yields `'inverse-projection'` (covering-index shape), `'residual-recompute'`
-	 * (single-source aggregate), and `'prefix-delete'` (single-source lateral-TVF fan-out);
-	 * the `'full-rebuild'` arm is still a loud `INTERNAL` guard (unreachable until its
-	 * selection is wired — see {@link MaintenancePlan}).
+	 * (single-source aggregate), `'prefix-delete'` (single-source lateral-TVF fan-out), and
+	 * `'full-rebuild'` (the floor — re-evaluate the whole body and replace the backing). The
+	 * floor ignores the specific `change` (it rebuilds wholesale); the others derive a
+	 * bounded per-row delta from it.
 	 */
 	private async applyMaintenancePlan(
 		plan: MaintenancePlan,
@@ -612,11 +636,7 @@ export class MaterializedViewManager {
 			case 'join-residual':
 				return this.applyJoinResidual(plan, change, changedBase, cache);
 			case 'full-rebuild':
-				throw new QuereusError(
-					`materialized view '${plan.mv.name}': '${plan.kind}' maintenance is not yet wired `
-						+ `(reachable only once the cost-gate full-rebuild selection lands)`,
-					StatusCode.INTERNAL,
-				);
+				return this.applyFullRebuild(plan, cache);
 			default: {
 				// A new arm added to MaintenancePlan must extend this dispatch; the
 				// never-assignment makes that a compile error rather than a silent
@@ -1290,6 +1310,122 @@ export class MaterializedViewManager {
 	}
 
 	/**
+	 * Build a `'full-rebuild'` plan — the always-correct floor — for an MV whose body matches
+	 * no bounded-delta arm, or throw with a relational/determinism diagnostic. This is the
+	 * fall-through builder; `buildMaintenancePlan` does **not** route bodies here yet (the
+	 * eligibility flip is the next ticket), so today it is reached only by direct construction
+	 * (the isolation tests). See {@link FullRebuildPlan} and `docs/materialized-views.md`
+	 * § Full-rebuild floor / § Primary key inference.
+	 *
+	 * Create-time rejections (none shape-based — the floor accepts general bodies):
+	 * - **bag** body with no provable unique key (`keysOf` over the optimized body root is
+	 *   empty) — there is no row identity to materialize on. `keysOf` already gates its
+	 *   all-columns fallback on `isSet`, so a non-empty result is a real key (a true column
+	 *   key OR the all-columns key of a provable set) and an empty result is exactly a bag;
+	 * - **non-deterministic** body (any `random()`/`now()`/volatile UDF anywhere in the plan)
+	 *   without `pragma nondeterministic_schema` — no maintenance could keep it equal to its
+	 *   plain view (mirrors the per-arm determinism rejects and the DDL determinism gate);
+	 * - body with **no relational output** (degenerate).
+	 *
+	 * The size-threshold reject for a full-rebuild-only body over a large source
+	 * ({@link isFullRebuildPathological}) is intentionally **not** here: it is meaningful only
+	 * once `buildMaintenancePlan` routes bodies to the floor, so it lands with the
+	 * eligibility-flip ticket (which owns the `pragma materialized_view_rebuild_row_threshold`
+	 * wiring) — see the ticket handoff.
+	 */
+	private buildFullRebuildPlan(mv: MaterializedViewSchema, analyzed: BlockNode): FullRebuildPlan {
+		const db = this.ctx as unknown as Database;
+
+		const reject = (detail: string): never => {
+			throw new QuereusError(
+				`materialized view '${mv.name}' cannot be materialized: ${detail}. For this body, use a `
+					+ `plain 'create view' (live re-evaluation) or 'create table ... as <body>' (a one-off snapshot)`,
+				StatusCode.UNSUPPORTED,
+			);
+		};
+
+		// Optimize the whole body ONCE — read-side MV rewrite suppressed so it reads its
+		// sources, not the backing it populates — then derive the body's key + determinism
+		// from, and compile its scheduler from, the SAME optimized plan.
+		const optimized = db.schemaManager.withSuppressedMaterializedViewRewrite(
+			() => this.ctx.optimizer.optimize(analyzed, db) as BlockNode,
+		);
+		const root = rootRelationalNode(optimized);
+		if (!root) reject('its body produced no relational output');
+
+		// Backing key = the body's provable unique key. A bag (no provable key — a key-dropping
+		// projection, a `union all` of overlapping inputs, …) has no row identity to key a
+		// materialization on, so it must be a set. An all-columns pseudo-key is admitted only
+		// when the body is provably a set (`keysOf` gates it on `isSet`); a bag with an
+		// all-columns "key" still resolves to empty here and rejects, else duplicates would
+		// collide on the backing key.
+		if (keysOf(root!).length === 0) {
+			reject('its body has no provable unique key — it is a bag (e.g. a key-dropping '
+				+ 'projection or a `union all` of overlapping inputs), so it must be a set');
+		}
+
+		// Whole-body determinism: a non-deterministic body can never be kept equal to its
+		// plain view by any maintenance, so it is a hard reject unless the schema-determinism
+		// gate is lifted. Mirrors the per-arm determinism rejects (and the DDL gate).
+		if (!db.options.getBooleanOption('nondeterministic_schema')) {
+			const nonDet = findNonDeterministic(analyzed);
+			if (nonDet) {
+				reject(`its body is non-deterministic (${nonDet}); a materialized view body must be `
+					+ 'reproducible to stay equal to its plain view (set `pragma nondeterministic_schema` to override)');
+			}
+		}
+
+		// Every source the body reads (set-op legs, every join source, …) so a write to any of
+		// them triggers a rebuild. Collected from the (pre-physical) analyzed plan, where every
+		// source is a bare `TableReferenceNode` — the optimized plan may have wrapped them in
+		// physical access nodes.
+		const tableRefs = [...collectTableRefs(analyzed).values()];
+		const sourceBases = [...new Set(
+			tableRefs.map(ref => `${ref.tableSchema.schemaName}.${ref.tableSchema.name}`.toLowerCase()),
+		)];
+		if (sourceBases.length === 0) reject('its body reads no source table');
+
+		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+
+		// Compile the whole optimized body once into a reusable scheduler (no key filter).
+		const bodyScheduler = new Scheduler(emitPlanNode(optimized, new EmissionContext(db)));
+
+		// ── Cost gate ──
+		// Full-rebuild is the floor: an EMPTY sound set resolves to it (`selectMaintenanceStrategy`).
+		// We record the chosen strategy + the cost inputs for substrate parity (not consulted at
+		// apply time). Stats are taken over the first source as a representative (the
+		// largest-source size-threshold reject is deferred to the eligibility-flip ticket).
+		const sourceStats = this.estimateMaintenanceStats(tableRefs[0].tableSchema, backing.columns.length, /*hasPredicate*/ false);
+		const chosenStrategy = selectMaintenanceStrategy([], Math.max(1, sourceStats.tableRows * 0.01), sourceStats);
+		if (chosenStrategy !== 'full-rebuild') {
+			throw new QuereusError(
+				`Internal error: cost gate selected '${chosenStrategy}' for the full-rebuild floor of materialized view '${mv.name}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		return {
+			kind: 'full-rebuild',
+			mv,
+			sourceBase: sourceBases[0],
+			backingSchema: mv.schemaName,
+			backingTableName: mv.backingTableName,
+			chosenStrategy,
+			sourceStats,
+			bodyScheduler,
+			backingPkDefinition,
+			sourceBases,
+		};
+	}
+
+	/**
 	 * Compile the key-filtered residual for a binding into a reusable {@link Scheduler}:
 	 * the analyzed body with a key-equality filter injected on `T`'s `TableReferenceNode`
 	 * (parameterized `${paramPrefix}0…`), then optimized + emitted. Mirrors the assertion
@@ -1335,6 +1471,19 @@ export class MaterializedViewManager {
 		for (let i = 0; i < keyTuple.length; i++) {
 			params[`${bindParamPrefix}${i}`] = keyTuple[i];
 		}
+		return this.runScheduler(residualScheduler, params);
+	}
+
+	/**
+	 * Run a cached maintenance scheduler to completion against **live mid-transaction source
+	 * state** and collect its result rows. Bound through a fresh strict {@link RuntimeContext}
+	 * on the live `db` so the scan reuses the source's transaction connection and reads this
+	 * statement's pending writes (reads-own-writes). The no-`stmt`, fresh-context shape is the
+	 * synchronous analogue of `database-assertions.ts:executeResidualPerTuple`. Shared by the
+	 * key-filtered residual arms ({@link runResidual}, parameterized) and the whole-body
+	 * full-rebuild arm ({@link applyFullRebuild}, no params).
+	 */
+	private async runScheduler(scheduler: Scheduler, params: Record<string, SqlValue>): Promise<Row[]> {
 		const rctx: RuntimeContext = {
 			db: this.ctx as unknown as Database,
 			stmt: undefined,
@@ -1343,12 +1492,46 @@ export class MaterializedViewManager {
 			tableContexts: wrapTableContextsStrict(new Map()),
 			enableMetrics: false,
 		};
-		const result = await residualScheduler.run(rctx);
+		const result = await scheduler.run(rctx);
 		const rows: Row[] = [];
 		if (isAsyncIterable(result)) {
 			for await (const r of result as AsyncIterable<Row>) rows.push(r);
 		}
 		return rows;
+	}
+
+	/**
+	 * Maintain a `'full-rebuild'` MV: re-evaluate the **whole** body against live
+	 * mid-transaction source state and replace the backing transactionally. Run the cached
+	 * {@link FullRebuildPlan.bodyScheduler} to completion (no params — reads-own-writes via
+	 * the same fresh-context path the residual arms use), collect every recomputed row, and
+	 * apply a single `'replace-all'` {@link MaintenanceOp}: a keyed diff (by backing PK) of
+	 * the recomputed rows against the backing's current pending-layer contents (insert/
+	 * update/delete, identical rows skipped). The diff rides the backing's **pending**
+	 * `TransactionLayer`, so it commits/rolls-back in lockstep with the source write, and the
+	 * returned effective {@link BackingRowChange}(s) drive the MV-over-MV cascade unchanged.
+	 *
+	 * Unlike the bounded-delta arms this ignores the specific changed row — the floor
+	 * rebuilds wholesale. In this ticket it is invoked **per row** (correct, just not yet
+	 * amortized); the per-statement deferral that makes it affordable is the next ticket.
+	 * An empty body (zero rows) yields a `'replace-all' []`, which empties the backing.
+	 */
+	private async applyFullRebuild(
+		plan: FullRebuildPlan,
+		cache?: BackingConnectionCache,
+	): Promise<BackingRowChange[]> {
+		const rows = await this.runScheduler(plan.bodyScheduler, {});
+
+		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+		if (!backing) {
+			throw new QuereusError(
+				`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const manager = getBackingManager(backing);
+		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return manager.applyMaintenanceToLayer(connection, [{ kind: 'replace-all', rows }]);
 	}
 
 	/**
@@ -2085,12 +2268,34 @@ function mvKey(schemaName: string, name: string): string {
 
 /** Every source base (lowercased `schema.table`) a plan must be indexed under in
  *  `rowTimeBySource`. Single-source arms read one base; the 1:1-join arm also reads
- *  the lookup base, so a write to `P` fires maintenance too. */
+ *  the lookup base, so a write to `P` fires maintenance too; the full-rebuild floor reads
+ *  every source its body touches (set-op legs, all join sources). */
 function planSourceBases(plan: MaintenancePlan): string[] {
+	if (plan.kind === 'full-rebuild') {
+		return plan.sourceBases;
+	}
 	if (plan.kind === 'join-residual' && plan.lookupBase !== plan.sourceBase) {
 		return [plan.sourceBase, plan.lookupBase];
 	}
 	return [plan.sourceBase];
+}
+
+/** Walk the whole plan; return the string form of the first non-deterministic scalar
+ *  expression (a `random()`/`now()`/volatile UDF, anywhere in the body), or `undefined`
+ *  when the body is fully deterministic. The full-rebuild floor's whole-body determinism
+ *  gate uses this — a non-deterministic body can never be kept equal to its plain view.
+ *  `physical.deterministic` is computed lazily and propagates from leaves, so checking each
+ *  scalar node is sound on either the pre-physical or optimized plan. */
+function findNonDeterministic(node: PlanNode): string | undefined {
+	if (isScalarNode(node)) {
+		const det = checkDeterministic(node as ScalarPlanNode);
+		if (!det.valid) return det.expression ?? node.toString();
+	}
+	for (const child of node.getChildren()) {
+		const found = findNonDeterministic(child as unknown as PlanNode);
+		if (found) return found;
+	}
+	return undefined;
 }
 
 /** Canonical, order-stable, bigint-safe string for a key tuple — used to dedup the
