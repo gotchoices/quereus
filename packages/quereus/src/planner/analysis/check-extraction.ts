@@ -402,8 +402,12 @@ function recognizeGuardedBody(
 
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
-		fds.push({ determinants: [lIdx], dependents: [rIdx], guard });
-		fds.push({ determinants: [rIdx], dependents: [lIdx], guard });
+		// Tag the mirror pair as a genuine column value-equality so a downstream
+		// guard-activation (FilterNode) can soundly lift it as an EC — a one-way
+		// `col = expr` body (below) or an index-derived guarded mirror is NOT
+		// tagged and is never lifted (ticket fd-guarded-activation-key-bag-overclaim).
+		fds.push({ determinants: [lIdx], dependents: [rIdx], guard, valueEquality: true });
+		fds.push({ determinants: [rIdx], dependents: [lIdx], guard, valueEquality: true });
 		return;
 	}
 

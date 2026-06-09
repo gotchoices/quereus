@@ -51,6 +51,18 @@ export interface FunctionalDependency {
   readonly guard?: GuardPredicate;
   /** Optional provenance tag — informational for diagnostics, ignored by dedup. */
   readonly source?: ConstraintProvenance;
+  /**
+   * Set on the mirror FDs `{a}→{b}` / `{b}→{a}` emitted from a column-to-column
+   * value-equality body (`a = b`). Distinguishes a genuine value-equality (whose
+   * endpoints hold equal values) from a coincidental mutual-determination mirror
+   * (e.g. two partial UNIQUE indexes, or `b = a+1` + `a = b-1` checks) that is
+   * structurally identical but is NOT an equality. Currently only set on the
+   * GUARDED value-equality FDs from an implication-form CHECK (`recognizeGuardedBody`),
+   * so that `FilterNode` guard-activation can soundly lift the equality as an EC
+   * upon activation (ticket `fd-guarded-activation-key-bag-overclaim`). Ignored by
+   * dedup, like `source`.
+   */
+  readonly valueEquality?: boolean;
 }
 
 /**

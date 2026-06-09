@@ -25,6 +25,15 @@
  *
  *   5. CHECK `check (a = b)` bidirectional FD   (3-col non-keyed table, project c away)
  *   6. assertion-hoist `not exists (… a <> b)`  (same bi-FD, hoisted per-row)
+ *
+ * Site 7 (ticket `fd-guarded-activation-key-bag-overclaim`) seals the last
+ * producer: guard activation in the Filter. An implication-form CHECK
+ * (`status <> 'active' or a = b`) carries a guarded bi-FD `{a}↔{b} [guard]`; once
+ * the filter predicate entails the guard, `activateGuardedFds` strips the guard.
+ * That now-unconditional `{a}↔{b}` is gated on endpoint superkey-ness (and the
+ * value-equality lifted as an EC) just like sites 4–6:
+ *
+ *   7. guard-activated `{a}↔{b}` bi-FD          (implication CHECK + filter, a/b non-keyed)
  */
 
 import { expect } from 'chai';
@@ -106,6 +115,16 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 			create table tapk (a integer primary key, b integer, c integer);
 			create assertion eq_ab_pk check (not exists (select 1 from tapk where a <> b));
 			insert into tapk values (1, 1, 10), (2, 2, 20), (3, 3, 30);
+
+			-- Site 7 (guarded activation): implication-form CHECK guard activated by the
+			-- filter strips to a bi-FD {a}↔{b}; id is the PK so a/b are not keys.
+			create table tgact (id integer primary key, a integer, b integer, status text,
+				check (status <> 'active' or a = b));
+			insert into tgact values (1, 5, 5, 'active'), (2, 5, 5, 'active'), (3, 7, 7, 'active');
+			-- Site 7 control: a IS the PK, so the activated {a}↔{b} is a real key.
+			create table tgactpk (a integer primary key, b integer, status text,
+				check (status <> 'active' or a = b));
+			insert into tgactpk values (1, 1, 'active'), (2, 2, 'active'), (3, 3, 'active');
 		`);
 	});
 	afterEach(async () => { await db.close(); });
@@ -212,6 +231,20 @@ describe('FD-derived key bag over-claim: producer-side gating', () => {
 
 	it('site 6 control — DISTINCT over `select a, b` where a is the PK is ELIMINATED', () => {
 		const sql = 'select distinct a, b from tapk';
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a,b} a real key ⇒ set')
+			.to.have.length(0);
+	});
+
+	// ---- Site 7: guard activation in Filter strips a value-equality bi-FD ----
+	it('site 7 — DISTINCT over `select a,b` of a guard-activated bi-FD (NON-key) is RETAINED', async () => {
+		const sql = `select distinct a, b from tgact where status = 'active'`;
+		expect(findNodes(db.getPlan(sql), DistinctNode), 'DISTINCT must survive (a/b not keys)')
+			.to.have.length.greaterThan(0);
+		expect(await rowCount(db, sql), 'two distinct (a,b) pairs').to.equal(2);
+	});
+
+	it('site 7 control — DISTINCT where the activated endpoint a is the PK is ELIMINATED', () => {
+		const sql = `select distinct a, b from tgactpk where status = 'active'`;
 		expect(findNodes(db.getPlan(sql), DistinctNode), 'a unique ⇒ {a,b} a real key ⇒ set')
 			.to.have.length(0);
 	});

@@ -76,7 +76,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			equivClasses = mergeEquivClasses(equivClasses, equivPairs.map(p => [p[0], p[1]]));
 		}
 		const mergedBindings = mergeConstantBindings(sourcePhysical?.constantBindings ?? [], predBindings);
-		const constantBindings = closeConstantBindingsOverEcs(mergedBindings, equivClasses);
+		let constantBindings = closeConstantBindingsOverEcs(mergedBindings, equivClasses);
 
 		// Activate any guarded FDs on the source whose guard is entailed by the
 		// predicate (combined with the merged ECs/bindings). Activation replaces
@@ -90,7 +90,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			const attr = sourceAttrs[col];
 			return attr?.type.logicalType?.isNumeric === true;
 		};
-		let fds: ReadonlyArray<FunctionalDependency> = activateGuardedFds(
+		const activation = activateGuardedFds(
 			sourcePhysical?.fds ?? [],
 			this.predicate,
 			equivClasses,
@@ -98,7 +98,16 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			attrIdToIndex,
 			isColumnNonNullable,
 			isColumnNumeric,
+			sourceAttrs.length,
 		);
+		let fds: ReadonlyArray<FunctionalDependency> = activation.fds;
+		// A value-equality body activated by the guard contributes its equality as an EC
+		// unconditionally (sound regardless of key-ness, and not read by `keysOf`),
+		// mirroring the table-reference gate. Re-close bindings over the enlarged EC set.
+		if (activation.activatedEquivPairs.length > 0) {
+			equivClasses = mergeEquivClasses(equivClasses, activation.activatedEquivPairs);
+			constantBindings = closeConstantBindingsOverEcs(constantBindings, equivClasses);
+		}
 
 		// Predicate-derived FDs. The `∅ → col` constant FDs are always sound to fold.
 		// A `col1 = col2` conjunct also yields the bi-directional determination
@@ -235,6 +244,22 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
  * Entailed guarded FDs are replaced with their unconditional twin (`stripGuard`).
  * Unentailed guarded FDs pass through unchanged so a later Filter / Join can
  * still activate them once additional facts land.
+ *
+ * A guarded **value-equality** body (`status <> 'active' or a = b`) emits the
+ * mirror FDs `{a}→{b} [g]` and `{b}→{a} [g]`, each tagged `valueEquality` by
+ * `recognizeGuardedBody`. Stripping the guard yields an unconditional `{a}↔{b}`,
+ * which `deriveKeysFromFds` reads as a uniqueness claim — sound only when an
+ * endpoint is a genuine key (else a narrow `select distinct a, b` re-derives a
+ * phantom all-columns key, a bag as a set, and drops a REQUIRED DISTINCT). So we
+ * gate the fold on endpoint superkey-ness against the filter's INPUT keys, and
+ * surface the equality as an EC instead (returned via `activatedEquivPairs`,
+ * lifted by the caller; `keysOf` never reads ECs). The EC lift keys off the
+ * `valueEquality` marker — NOT the FD shape — because a coincidental
+ * mutual-determination mirror (two partial UNIQUE indexes on a 2-col table, or
+ * `b=a+1` + `a=b-1` checks) is structurally identical to a value-equality pair
+ * but does NOT hold `a = b`; lifting an EC there would be unsound. Returns the
+ * activated FD set plus any value-equality pairs to lift as ECs.
+ * (ticket fd-guarded-activation-key-bag-overclaim, site 7; mirrors site 5.)
  */
 function activateGuardedFds(
 	sourceFds: ReadonlyArray<FunctionalDependency>,
@@ -244,18 +269,35 @@ function activateGuardedFds(
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNonNullable: (col: number) => boolean,
 	isColumnNumeric: (col: number) => boolean,
-): FunctionalDependency[] {
+	colCount: number,
+): { fds: FunctionalDependency[]; activatedEquivPairs: Array<[number, number]> } {
 	const out: FunctionalDependency[] = [];
+	const activatedEquivPairs: Array<[number, number]> = [];
 	for (const fd of sourceFds) {
 		if (fd.guard === undefined) {
 			out.push(fd);
 			continue;
 		}
 		if (predicateImpliesGuard(predicate, fd.guard, ecs, bindings, attrIdToIndex, isColumnNonNullable, isColumnNumeric)) {
+			if (fd.valueEquality === true && fd.determinants.length === 1 && fd.dependents.length === 1) {
+				// Genuine value-equality (marker-gated): lift the equality as an EC
+				// unconditionally (sound, and not read by `keysOf`), and fold the
+				// now-unguarded determination FD only when an endpoint is a real key.
+				// `isSuperkey` probes against `sourceFds`, whose guarded FDs are
+				// skipped by `computeClosure`, so only the genuine unguarded input
+				// keys count — matching the site-4 / site-5 gates.
+				const a = fd.determinants[0];
+				const b = fd.dependents[0];
+				activatedEquivPairs.push([a, b]);
+				if (!isSuperkey(new Set([a]), sourceFds, colCount)
+					&& !isSuperkey(new Set([b]), sourceFds, colCount)) {
+					continue;
+				}
+			}
 			out.push(stripGuard(fd));
 		} else {
 			out.push(fd);
 		}
 	}
-	return out;
+	return { fds: out, activatedEquivPairs };
 }

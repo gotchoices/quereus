@@ -1498,15 +1498,21 @@ describe('Conditional FDs: end-to-end propagation', () => {
 		expect(guardedFd, 'expected a guarded FD on the source').to.not.equal(undefined);
 	});
 
-	it("filter with status='active' activates the guard: assigned_region determined by customer_region", async () => {
+	it("filter with status='active' activates the guard: assigned_region equivalent to customer_region", async () => {
 		await setupRegionTable();
 		const rows = await planRows(db, "SELECT * FROM t WHERE status = 'active'");
 		const filterProps = physicalOf(rows, r => r.op === 'FILTER');
 		expect(filterProps, 'expected Filter physical props').to.not.equal(undefined);
 		// Columns: id=0, customer_region=1, assigned_region=2, status=3.
-		// After activation, the body FDs should appear UNGUARDED.
-		expect(fdHas(filterProps!.fds, [1], [2])).to.equal(true);
-		expect(fdHas(filterProps!.fds, [2], [1])).to.equal(true);
+		// After activation, the value-equality body `assigned_region = customer_region`
+		// surfaces as an EC {1,2} — NOT as the bi-directional determination FD. Neither
+		// endpoint is a key (PK is id), so folding `{1}↔{2}` would let a later narrow
+		// projection read a phantom key (ticket fd-guarded-activation-key-bag-overclaim).
+		expect(fdHas(filterProps!.fds, [1], [2]), 'bi-FD {1}->{2} gated').to.equal(false);
+		expect(fdHas(filterProps!.fds, [2], [1]), 'bi-FD {2}->{1} gated').to.equal(false);
+		const ecs = filterProps!.equivClasses ?? [];
+		const hasEc = ecs.some(c => c.includes(1) && c.includes(2));
+		expect(hasEc, 'value-equality lifted as EC {1,2}').to.equal(true);
 	});
 
 	it("without status='active' the guarded FD does not activate", async () => {
