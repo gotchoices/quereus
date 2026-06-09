@@ -153,6 +153,11 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		['computed GROUP BY key (bag)', 'select k + 1 as kk, count(*) as c from g group by k + 1', 'no provable unique key'],
 		// A recursive-CTE `union all` body is a bag (overlapping inputs, no provable key).
 		['recursive-CTE union-all (bag)', 'with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r', 'no provable unique key'],
+		// A fanning (non-1:1) inner join on a non-unique key: g.k = g2.w can match a g
+		// row to multiple g2 rows. Projecting to (g.id, g.v) drops g2's distinguishing
+		// columns, so the body is a bag — g's PK FD survives the join as a determination
+		// but no longer encodes uniqueness, and must NOT resurrect as an all-columns key.
+		['fanning (non-1:1) inner join (bag)', 'select g.id, g.v from g join g2 on g.k = g2.w', 'no provable unique key'],
 	];
 
 	for (const [label, body, tail] of rejectCases) {

@@ -5,6 +5,7 @@ import { BOOLEAN_TYPE } from '../../types/builtin-types.js';
 import {
 	addEquivalence, addFd,
 	closeConstantBindingsOverEcs,
+	isSuperkey,
 	mergeConstantBindings,
 	mergeDomainConstraints,
 	mergeEquivClasses, mergeFds,
@@ -180,6 +181,24 @@ export function propagateJoinMonotonicOn(
 }
 
 /**
+ * Drop the KEY FDs of one join side — those whose determinant is a superkey of
+ * that side (its closure covers all `sideColumnCount` of the side's columns).
+ * Used when a fanning inner/cross join does not preserve the side's unique key:
+ * the determination still holds but is no longer a uniqueness claim, and keeping
+ * it lets a downstream projection re-derive a spurious all-columns key. Non-key
+ * (partial-determination) FDs are retained — they stay true under fan-out.
+ */
+function dropSideKeyFds(
+	fds: ReadonlyArray<FunctionalDependency>,
+	sideColumnCount: number,
+): ReadonlyArray<FunctionalDependency> {
+	return fds.filter(fd =>
+		fd.guard !== undefined ||
+		!isSuperkey(new Set(fd.determinants), fds, sideColumnCount),
+	);
+}
+
+/**
  * Propagate functional dependencies and equivalence classes through a join.
  *
  * Rules:
@@ -249,7 +268,18 @@ export function propagateJoinFds(
 	switch (joinType) {
 		case 'inner':
 		case 'cross': {
-			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(leftFds, shiftFds(rightFds, leftColumnCount), opts);
+			// A fanning (non-1:1) join duplicates the rows of a side whose unique key is not
+			// preserved (no preserved key lies entirely within that side's columns). Such a
+			// side's KEY FDs remain true as determinations but no longer encode uniqueness in
+			// the product; carried through unchanged they let a downstream projection that drops
+			// the other side's columns spuriously re-derive the side key as an all-columns key
+			// (a bag read as a set). Drop those side-key FDs here when the side is not preserved.
+			const rightColumnCount = totalColumnCount - leftColumnCount;
+			const leftPreserved = preservedKeys.some(k => k.every(i => i < leftColumnCount));
+			const rightPreserved = preservedKeys.some(k => k.every(i => i >= leftColumnCount));
+			const keptLeftFds = leftPreserved ? leftFds : dropSideKeyFds(leftFds, leftColumnCount);
+			const keptRightFds = rightPreserved ? rightFds : dropSideKeyFds(rightFds, rightColumnCount);
+			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(keptLeftFds, shiftFds(keptRightFds, leftColumnCount), opts);
 			let equiv: ReadonlyArray<ReadonlyArray<number>> = mergeEquivClasses(leftEC, shiftEquivClasses(rightEC, leftColumnCount));
 			for (const p of equiPairs) {
 				const rShifted = p.right + leftColumnCount;
