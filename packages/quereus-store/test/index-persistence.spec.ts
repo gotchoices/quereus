@@ -394,6 +394,58 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(db2.schemaManager.findTable('t'), 'old name not present').to.be.undefined;
 	});
 
+	it('RENAME TABLE under a table-qualified partial WHERE: persisted predicate follows the rename and rehydrates', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b) where t.b > 0`);
+		await db.exec(`insert into t values (1, 10), (2, -1)`);
+
+		await db.exec(`alter table t rename to t2`);
+		// The propagated predicate rewrite re-persists via the async table_modified
+		// listener — drain it before reading the catalog.
+		await mod.whenCatalogPersisted();
+
+		// The re-persisted catalog DDL renders the NEW qualifier; a stale `t.b`
+		// would reference a no-longer-existing table.
+		const entry = (await catalogEntry('t2'))!;
+		expect(entry, 'persisted index DDL carries the renamed qualifier').to.match(/WHERE t2\.b > 0/);
+		expect(entry, 'no stale qualifier survives').to.not.match(/\bt\.b\b/);
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen(); // asserts zero rehydration errors
+
+		const ix = (await indexInfo(db2, 't2')).find(r => r.index_name === 'ix_b')!;
+		expect(ix.partial, 'rehydrated index is partial').to.equal(1);
+		expect(indexStoreSize('t2', 'ix_b'), 'only the in-scope row is indexed').to.equal(1);
+	});
+
+	it('RENAME COLUMN under a partial WHERE: persisted predicate follows the rename and rehydrates', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b) where b > 0`);
+		await db.exec(`insert into t values (1, 10), (2, -1)`);
+
+		await db.exec(`alter table t rename column b to c`);
+		await mod.whenCatalogPersisted();
+
+		// A stale `WHERE b > 0` would name a column that no longer exists, failing
+		// predicate compilation on rehydrate.
+		const entry = (await catalogEntry('t'))!;
+		expect(entry, 'persisted index DDL carries the renamed column').to.match(/WHERE c > 0/);
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen(); // asserts zero rehydration errors
+
+		const ix = (await indexInfo(db2, 't')).find(r => r.index_name === 'ix_b')!;
+		expect(ix.partial, 'rehydrated index is partial').to.equal(1);
+		expect(indexStoreSize('t', 'ix_b'), 'only the in-scope row is indexed').to.equal(1);
+
+		// Write-time maintenance still honors the predicate under the new name.
+		await db2.exec(`insert into t values (3, 5)`);
+		await db2.exec(`insert into t values (4, -7)`);
+		expect(indexStoreSize('t', 'ix_b'), 'in-scope insert indexed, out-of-scope excluded').to.equal(2);
+	});
+
 	it('ALTER INDEX SET / ADD / DROP TAGS round-trip via index_info after reopen', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, b integer) using store`);

@@ -49,3 +49,41 @@ rather than in the engine alongside tables/views.
 - Watch the eligibility gate: `registerMaterializedView` throws on a body that is
   not row-time maintainable. On import this should surface as a recorded
   rehydration error (not a hard abort), matching the per-entry error contract.
+- **Downstream consumer:** the plan ticket `mv-backing-module-pluggability`
+  generalizes exactly this materialize core (backing in a non-memory module), so
+  keep the extracted helper's seams clean — backing creation/fill should flow
+  through `buildBackingTableSchema` / `createBackingTable` / `getBackingManager`
+  rather than inlining memory-module specifics beyond what those already carry.
+  Do not generalize beyond memory here; just don't smear the boundary.
+
+## TODO
+
+- Extract `materializeView(db, mvDefinition)` (or equivalent) into
+  `materialized-view-helpers.ts`: derive shape → create backing → collect body
+  rows → `replaceBaseLayer` (with the "must be a set" duplicate-key factory) →
+  `addMaterializedView` → `registerMaterializedView`, rolling back the
+  half-built backing on any throw, exactly as the create emitter does today.
+- Rewire `emitCreateMaterializedView` onto the helper — behavior, events, and
+  error surfaces unchanged.
+- Add silent `importMaterializedView` to `SchemaManager` and a
+  `createMaterializedView` arm to `importDDL`/`importCatalog`; no
+  `materialized_view_added` event; MV name in the import result.
+- Surface a row-time-eligibility throw during import as a recorded per-entry
+  rehydration error, not a hard abort.
+- Replace the store rehydrate phase-3 `db.exec` loop in `store-module.ts` with
+  `importCatalog`, preserving tables → views → MVs ordering and per-entry error
+  collection.
+- Implement/verify topological MV-over-MV ordering (an MV whose `sourceTables`
+  names another MV's backing table imports after its producer), including
+  depth ≥ 3 chains.
+- Tests: existing `store-view-mv-catalog-persistence` round-trip suite passes
+  unchanged; new engine test for `importCatalog` of an MV (backing rebuilt and
+  filled, row-time maintenance live — a post-import source write maintains the
+  backing — and no `materialized_view_added` fired); MV-over-MV rehydrate test
+  with a depth-2+ chain; an import of an ineligible body records an error and
+  continues.
+- `yarn build`, lint, `yarn test`; run `yarn test:store` since the store
+  rehydrate path is directly modified.
+- Update any docs/README text describing the db.exec rehydrate split
+  (`packages/quereus-store/README.md`, `docs/materialized-views.md` if it
+  mentions rehydration mechanics).

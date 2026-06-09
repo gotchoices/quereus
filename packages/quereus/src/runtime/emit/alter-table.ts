@@ -171,9 +171,10 @@ async function runRenameTable(
 		newObject: updatedTableSchema,
 	});
 
-	// Propagate the rename into dependent objects (CHECK / FK in this and other
-	// tables, view bodies). Best-effort AST rewrite — there is no global
-	// dependency tracker yet, so we walk the catalog and patch in-place.
+	// Propagate the rename into dependent objects (CHECK / FK / partial-index
+	// predicates in this and other tables, view bodies). Best-effort AST
+	// rewrite — there is no global dependency tracker yet, so we walk the
+	// catalog and patch in-place.
 	propagateTableRename(rctx, tableSchema.schemaName, oldName, newName);
 
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
@@ -240,8 +241,8 @@ async function runRenameColumn(
 		newObject: updatedTableSchema,
 	});
 
-	// Propagate the rename into dependent objects (CHECK / FK in this and other
-	// tables, view bodies).
+	// Propagate the rename into dependent objects (CHECK / FK / partial-index
+	// predicates in this and other tables, view bodies).
 	propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName);
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
@@ -1276,10 +1277,10 @@ async function rebuildViaShadowTable(
 
 /**
  * Propagates a table rename into every dependent schema object the catalog
- * knows about: CHECK expressions, FK references, and view bodies. Walks every
- * schema (not just the renamed table's home schema) so cross-schema FK
- * references are picked up. View `selectAst` is mutated in place because the
- * planner re-walks it on every reference.
+ * knows about: CHECK expressions, FK references, partial-index predicates, and
+ * view bodies. Walks every schema (not just the renamed table's home schema)
+ * so cross-schema FK references are picked up. View `selectAst` is mutated in
+ * place because the planner re-walks it on every reference.
  */
 function propagateTableRename(
 	rctx: RuntimeContext,
@@ -1364,12 +1365,23 @@ function rewriteTableForTableRename(
 		return { ...fk, referencedTable: newName };
 	});
 
+	// Partial-index predicates: the AST is mutated in place, so the derived
+	// UNIQUE constraint of a unique partial index (which shares the predicate
+	// by reference — see appendIndexToTableSchema) is rewritten with it.
+	const newIndexes = (table.indexes ?? []).map(idx => {
+		const rewrote = renameTableInAst(idx.predicate, oldName, newName, renamedSchemaLower);
+		if (!rewrote) return idx;
+		changed = true;
+		return { ...idx };
+	});
+
 	if (!changed) return table;
 
 	return Object.freeze({
 		...table,
 		checkConstraints: Object.freeze(newChecks),
 		foreignKeys: table.foreignKeys ? Object.freeze(newFks) : table.foreignKeys,
+		indexes: table.indexes ? Object.freeze(newIndexes) : table.indexes,
 	});
 }
 
@@ -1480,12 +1492,26 @@ function rewriteTableForColumnRename(
 		return { ...fk, referencedColumnNames: Object.freeze(newRefNames) };
 	});
 
+	// Partial-index predicates resolve unqualified refs against the indexed
+	// table, the same implicit seed CHECK expressions use. As with checks, the
+	// AST is mutated in place, so the derived UNIQUE constraint of a unique
+	// partial index (sharing the predicate by reference) is rewritten with it.
+	const newIndexes = (table.indexes ?? []).map(idx => {
+		const rewrote = isRenamedTable
+			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)
+			: renameColumnInAst(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower);
+		if (!rewrote) return idx;
+		changed = true;
+		return { ...idx };
+	});
+
 	if (!changed) return table;
 
 	return Object.freeze({
 		...table,
 		checkConstraints: Object.freeze(newChecks),
 		foreignKeys: table.foreignKeys ? Object.freeze(newFks) : table.foreignKeys,
+		indexes: table.indexes ? Object.freeze(newIndexes) : table.indexes,
 	});
 }
 

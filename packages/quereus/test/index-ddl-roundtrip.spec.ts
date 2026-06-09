@@ -23,7 +23,7 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { generateTableDDL, generateIndexDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
-import { createIndexToString } from '../src/emit/ast-stringify.js';
+import { createIndexToString, expressionToString } from '../src/emit/ast-stringify.js';
 import { computeSchemaDiff, type SchemaDiff, type RenamePolicy } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
 import type { CreateIndexStmt, DeclaredIndex, IndexedColumn, DeclareSchemaStmt } from '../src/parser/ast.js';
@@ -311,6 +311,89 @@ describe('CREATE INDEX DDL round-trip: importCatalog multi-statement entries', (
 		} finally {
 			await dst.close();
 		}
+	});
+});
+
+// ============================================================================
+// ALTER TABLE RENAME / RENAME COLUMN propagation into stored partial-index
+// predicates.
+//
+// The forward rename propagation (runtime/emit/alter-table.ts) rewrites the
+// `IndexSchema.predicate` AST alongside CHECK expressions and FK references,
+// so the catalog DDL rendered by `generateIndexDDL` (the store persistence
+// payload) never references a renamed-away table qualifier or column name.
+// The AST is rewritten in place, so the derived UNIQUE constraint of a unique
+// partial index — which shares the predicate by reference (see
+// `appendIndexToTableSchema`) — is covered by the same rewrite.
+// ============================================================================
+
+describe('ALTER rename propagation: stored partial-index predicates', () => {
+	let db: Database;
+
+	beforeEach(() => { db = new Database(); });
+	afterEach(async () => { await db.close(); });
+
+	/** The catalog DDL of the named index on the named table, post-ALTER. */
+	function indexDDL(tableName: string, indexName: string): string {
+		const table = db.schemaManager.getTable('main', tableName)!;
+		const ix = table.indexes!.find(i => i.name === indexName)!;
+		return generateIndexDDL(ix, table);
+	}
+
+	it('RENAME TABLE rewrites a table-qualified predicate to the new qualifier', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create index ix on t (name) where t.active = 1');
+		await db.exec('alter table t rename to t2');
+
+		const ddl = indexDDL('t2', 'ix');
+		expect(ddl, 'predicate qualifier follows the table rename').to.match(/WHERE t2\.active = 1/);
+		expect(ddl, 'no stale reference to the old table name').to.not.match(/\bt\.active\b/);
+	});
+
+	it('RENAME TABLE leaves an unqualified predicate untouched', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create index ix on t (name) where active = 1');
+		await db.exec('alter table t rename to t2');
+
+		expect(indexDDL('t2', 'ix')).to.match(/WHERE active = 1/);
+	});
+
+	it('RENAME COLUMN rewrites an unqualified predicate reference', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create index ix on t (name) where active = 1');
+		await db.exec('alter table t rename column active to is_active');
+
+		expect(indexDDL('t', 'ix'), 'unqualified ref follows the column rename').to.match(/WHERE is_active = 1/);
+	});
+
+	it('RENAME COLUMN rewrites a table-qualified predicate reference', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create index ix on t (name) where t.active = 1');
+		await db.exec('alter table t rename column active to is_active');
+
+		expect(indexDDL('t', 'ix')).to.match(/WHERE t\.is_active = 1/);
+	});
+
+	it('RENAME COLUMN under a UNIQUE partial index also rewrites the derived constraint predicate (shared AST)', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create unique index uq on t (name) where active = 1');
+		await db.exec('alter table t rename column active to is_active');
+
+		const t = db.schemaManager.getTable('main', 't')!;
+		const ix = t.indexes!.find(i => i.name === 'uq')!;
+		const uc = t.uniqueConstraints!.find(c => c.derivedFromIndex === 'uq')!;
+		expect(expressionToString(ix.predicate!), 'index predicate rewritten').to.equal('is_active = 1');
+		expect(expressionToString(uc.predicate!), 'derived constraint predicate rewritten').to.equal('is_active = 1');
+		expect(uc.predicate, 'still shared by reference — one in-place rewrite covers both').to.equal(ix.predicate);
+	});
+
+	it('a like-named predicate column on ANOTHER table is not rewritten', async () => {
+		await db.exec('create table t (id integer primary key, name text, active integer)');
+		await db.exec('create table u (id integer primary key, name text, active integer)');
+		await db.exec('create index ixu on u (name) where active = 1');
+		await db.exec('alter table t rename column active to is_active');
+
+		expect(indexDDL('u', 'ixu'), 'other table predicate unchanged').to.match(/WHERE active = 1/);
 	});
 });
 
@@ -884,6 +967,36 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 			const rows: Record<string, unknown>[] = [];
 			for await (const r of db.eval('select email_addr from t where id = 1')) rows.push(r as Record<string, unknown>);
 			expect(rows, 'row survived the rename, readable under email_addr').to.deep.equal([{ email_addr: 'a@x' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('applying a pure column rename under a PARTIAL index converges (stored predicate rewritten, re-diff empty)', async () => {
+		// Diff #1 reconciles the index body new→old (no drop+recreate — the
+		// migration runs only RENAME COLUMN), so convergence depends on the rename
+		// propagation rewriting the STORED predicate; with it left stale, the
+		// re-diff would drop+recreate the index one apply cycle late.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {\ntable t { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }\nindex ix_active on t (name) where active = 1\n}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {\ntable t { id INTEGER PRIMARY KEY, name TEXT, is_active INTEGER with tags ("quereus.previous_name" = 'active') }\nindex ix_active on t (name) where is_active = 1\n}`);
+			await db.exec('apply schema main');
+
+			// Post-apply, the catalog index DDL renders the NEW column name.
+			const actual = collectSchemaCatalog(db, 'main');
+			const ix = actual.indexes.find(i => i.name.toLowerCase() === 'ix_active')!;
+			expect(ix.ddl, 'stored predicate follows the rename').to.match(/WHERE is_active = 1/i);
+			expect(ix.ddl, 'no stale reference to the old column name').to.not.match(/where active = 1/i);
+
+			// Re-diff is empty — the apply converged in one cycle.
+			const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+			const diff = computeSchemaDiff(declared, actual);
+			expect(diff.indexesToDrop, 'converged: no index drops').to.deep.equal([]);
+			expect(diff.indexesToCreate, 'converged: no index creates').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'converged: no table alters').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
