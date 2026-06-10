@@ -2815,14 +2815,17 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			await db.exec('apply schema main');
 
 			// The forward propagation rewrote the STORED qualifier (t.qty → t2.qty).
-			// (Runtime ENFORCEMENT of a table-qualified CHECK ref is a pre-existing
-			// engine gap independent of renames — `resolveColumn` rejects the qualifier
-			// at insert-build time even on a freshly created table — so enforcement is
-			// not asserted here; the unqualified-form tests cover enforcement.)
 			const chk = collectSchemaCatalog(db, 'main').tables
 				.find(t => t.name.toLowerCase() === 't2')!.namedConstraints
 				.find(c => c.name.toLowerCase() === 'chk')!;
 			expect(chk.definition, 'stored CHECK qualifier follows the rename').to.match(/t2\.qty > 0/i);
+
+			// And the rewritten qualified self-ref still ENFORCES under the new name
+			// (the constraint planner folds the qualifier at plan time).
+			await db.exec('insert into t2 values (1, 5)');
+			let rejected = false;
+			try { await db.exec('insert into t2 values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'negative qty rejected by the renamed qualified CHECK').to.be.true;
 
 			// Idempotent: re-diff is empty (relies on the forward qualifier propagation).
 			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
@@ -2864,12 +2867,17 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 
 			// The forward propagation rewrote BOTH stored names: ALTER TABLE RENAME
 			// rewrote the qualifier (t → t2), then RENAME COLUMN rewrote the column
-			// under the new seed (qty → amount). (Runtime enforcement of a qualified
-			// CHECK ref is a pre-existing engine gap — see the pure-rename case above.)
+			// under the new seed (qty → amount).
 			const chk = collectSchemaCatalog(db, 'main').tables
 				.find(t => t.name.toLowerCase() === 't2')!.namedConstraints
 				.find(c => c.name.toLowerCase() === 'chk')!;
 			expect(chk.definition, 'stored CHECK follows both renames').to.match(/t2\.amount > 0/i);
+
+			// And it still ENFORCES under both new names.
+			await db.exec('insert into t2 values (1, 5)');
+			let rejected = false;
+			try { await db.exec('insert into t2 values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'negative amount rejected by the doubly-renamed qualified CHECK').to.be.true;
 
 			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
 			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
@@ -2899,14 +2907,17 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 
 			await db.exec('apply schema main');
 
-			// The recreate installed the NEW predicate under the NEW qualifier. (Runtime
-			// enforcement of a qualified CHECK ref is a pre-existing engine gap — see the
-			// pure-rename case above; the unqualified genuine-edit REGRESSION case earlier
-			// in this suite covers enforcement of a recreated predicate.)
+			// The recreate installed the NEW predicate under the NEW qualifier.
 			const chk = collectSchemaCatalog(db, 'main').tables
 				.find(t => t.name.toLowerCase() === 't2')!.namedConstraints
 				.find(c => c.name.toLowerCase() === 'chk')!;
 			expect(chk.definition, 'recreated CHECK carries the edited predicate').to.match(/t2\.qty >= 0/i);
+
+			// And the EDITED boundary enforces: 0 now passes (>= 0), -1 still rejects.
+			await db.exec('insert into t2 values (1, 0)');
+			let rejected = false;
+			try { await db.exec('insert into t2 values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'negative qty rejected by the recreated qualified CHECK').to.be.true;
 
 			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
 		} finally {
