@@ -18,16 +18,17 @@ Synchronous per-write maintenance is cheapest when the backing delta is a bounde
 A materialized view is realized as two cooperating schema objects:
 
 ```
-CREATE MATERIALIZED VIEW mv AS <body>
+CREATE MATERIALIZED VIEW mv [USING <module>(...)] AS <body>
         │
         ├─ backing TableSchema      "_mv_mv"   ← stored rows, real virtual table
-        │     (memory module; primary-keyed; hidden from user catalog)
+        │     (backing-host module — memory default; primary-keyed; hidden from user catalog)
         │
         └─ MaterializedViewSchema   "mv"             ← the name users reference
-              (body AST, inferred PK, bodyHash, sourceTables, backingTableName)
+              (body AST, inferred PK, bodyHash, sourceTables, backingTableName,
+               backingModuleName/backingModuleArgs when non-default)
 ```
 
-- **Backing table.** The materialized rows live in an ordinary `TableSchema` registered under the reserved derived name `_mv_<name>` (`backingTableNameFor`). The backing module is the in-memory table module; a `USING <module>(...)` clause parses and is retained for forward compatibility but is otherwise ignored. Backing tables are excluded from user-facing catalog enumeration — they are an implementation detail. The engine never reaches into the backing module's internals: every privileged backing operation (maintenance writes, the wholesale create/refresh fill, the enforcement scan) routes through the module-neutral [backing-host capability](#backing-host-capability), for which the memory module is the default and reference implementation.
+- **Backing table.** The materialized rows live in an ordinary `TableSchema` registered under the reserved derived name `_mv_<name>` (`backingTableNameFor`). The backing module is **pluggable**: `USING <module>(...)` places the backing table in any registered module that implements the [backing-host capability](#backing-host-capability); omitting the clause keeps the in-memory default. The module identity is recorded on the MV schema (`backingModuleName`/`backingModuleArgs`, absent for the default — an explicit `using memory()` normalizes to absent, so the two spellings are one schema record), emitted by the DDL generator, honored on catalog import, and preserved across refresh shape-rebuilds; the declarative differ compares it separately from `bodyHash` (a module change is a drop+recreate, never a hash-formula change). Backing tables are excluded from user-facing catalog enumeration — they are an implementation detail. The engine never reaches into the backing module's internals: every privileged backing operation (maintenance writes, the wholesale create/refresh fill, the enforcement scan) routes through the module-neutral [backing-host capability](#backing-host-capability), for which the memory module is the default and reference implementation; all MV semantics (row-time maintenance, reads-own-writes, commit/rollback lockstep, MV-over-MV cascade, covering-UNIQUE enforcement, refresh, rename propagation, drop) hold regardless of the hosting module. See the [cross-module atomicity note](#cross-module-atomicity) for the one durability caveat.
 
 - **MV record.** A `MaterializedViewSchema` is registered in `Schema.materializedViews` (separate from `Schema.tables` and `Schema.views`). It retains the parsed body AST, the inferred logical primary key, the `bodyHash`, the qualified source-table dependencies, and the backing table's name.
 
@@ -66,7 +67,11 @@ Contract highlights:
 - **Read-only to user DML.** A backing table must reject user DML (READONLY) while admitting `applyMaintenance`/`replaceContents`.
 - **Concurrency.** The engine adds no latching around the privileged surface; each host owns its own discipline under the `VtabConcurrencyMode` its module declares (the memory host's pending layer is private to the connection and mutated synchronously, so it needs none).
 
-The engine resolves the host through `resolveBackingHost` (`runtime/emit/materialized-view-helpers.ts`); the memory implementation is a thin adapter over `MemoryTableManager` (`MemoryTableModule.getBackingHost`), delegating to `applyMaintenanceToLayer`, `replaceBaseLayer`, and the layer scan. `USING <module>(...)` selecting a different capability-bearing module is the follow-on step.
+The engine resolves the host through `resolveBackingHost` (`runtime/emit/materialized-view-helpers.ts`); the memory implementation is a thin adapter over `MemoryTableManager` (`MemoryTableModule.getBackingHost`), delegating to `applyMaintenanceToLayer`, `replaceBaseLayer`, and the layer scan. `USING <module>(...)` selects any capability-bearing module as the host: the create builder gates on `getBackingHost` presence (a capability-less or unknown module is a sited error), and `buildBackingTableSchema` re-checks as defense-in-depth for the catalog-import path. One soft edge rides on `alterTable` rather than the capability: source column-rename propagation renames the backing's shifted columns through the host module's `alterTable`; a host without it leaves the MV stale (recoverable by `refresh`) instead of renaming in place — see [`docs/module-authoring.md` § Backing Host](module-authoring.md).
+
+#### Cross-module atomicity
+
+With the backing in module **B** and the body's sources in module **A**, one source-write transaction spans both modules' connections. The Database's coordinated commit covers them — the backing delta and the source write commit or roll back together in normal operation — but coordinated commit is **not two-phase commit**: with two *durable* modules, a crash between their commit acknowledgements can leave source and backing divergent on disk. The accepted position is to document this window rather than restrict module combinations: catalog **rehydrate refills the backing from the body** (import re-materializes; a durable module's own pre-rehydrated `_mv_<name>` table is dropped and refilled), so any divergence self-heals at the next open. A future adopt-without-refill fast path (skipping the refill when the backing is provably current) is gated to same-module sources for exactly this reason.
 
 ## DDL statements
 
@@ -82,8 +87,9 @@ create materialized view mv [if not exists] [(col, ...)]
 ```
 
 - `<body>` is any relation-producing `QueryExpr` with a provable unique key (see [Maintenance strategy](#maintenance-strategy)). An explicit column list renames the body's output columns (arity must match).
+- `using <module>(...)` places the backing table in the named [backing-host](#backing-host-capability) module; omitted ⇒ the in-memory default (`mem` is an alias for `memory`). An unknown module or one without the capability is rejected at build time. An explicit `using memory()` with no args normalizes to the same schema record as an omitted clause.
 - There is **no** `with refresh = '...'` clause. Every materialized view is row-time maintained.
-- The body is evaluated immediately and the result stored. On any failure during the fill — or if the body is rejected (see [Maintenance strategy](#maintenance-strategy)) — the backing table is rolled back and the MV is **not** registered; a create is all-or-nothing.
+- The body is evaluated immediately and the result stored. On any failure during the fill — or if the body is rejected (see [Maintenance strategy](#maintenance-strategy)) — the backing table is rolled back (from the named module) and the MV is **not** registered; a create is all-or-nothing.
 
 ### `REFRESH MATERIALIZED VIEW`
 
@@ -476,6 +482,7 @@ apply schema main;
 
 - **DDL round-trip.** `apply schema` and schema export emit canonical `create materialized view ...` DDL via `ast-stringify`, so a schema survives `schema → DDL → parse → schema` with no shape change.
 - **Definition-change rebuild.** The differ keys rebuild detection on `bodyHash` (`toBase64Url(fnv1aHash(<canonical definition>))` — the explicit column list + canonical body SQL + `insert defaults` clause, rendered by `viewDefinitionToCanonicalString`; shared by MV creation, the rename-propagation rewrite, and the differ). When a declared MV's definition hash differs from the live MV's `bodyHash`, the differ schedules a **drop + recreate** (materialized views have no in-place `ALTER` primitive) — an in-diff source table/column rename is reconciled first so a pure rename does not churn a rebuild (see [schema.md](schema.md)). The recreate re-materializes from current sources, in apply order — after source tables and views are created, before assertions. An unchanged definition produces no create and no drop. Tags are excluded from the canonical definition: a tag-only change takes in-place `SET TAGS`, never a rebuild.
+- **Backing-module change.** The `using <module>(...)` identity is compared as a **separate field**, not folded into `bodyHash` (a hash-formula change would spuriously rebuild every already-persisted MV). Both sides normalize (absent ⇒ `memory`, `mem` aliased) and args compare under a stable-key-order render, so declaring `using memory()` against a default-backed MV never churns, while a real module (or args) change takes the same drop+recreate path a body drift does — re-materializing the backing into the newly declared module.
 
 ## Covering structures
 
@@ -543,7 +550,6 @@ The following extensions build on this substrate but are not yet realized:
 - **Bag (multiplicity-keyed) materialization.** A body with no provable unique key is rejected today (no row identity to materialize on). A Z-set-style backing — distinct rows plus a multiplicity count, expanded on read — would lift that at the cost of a hidden count column and a read-time expansion.
 - **Concurrent refresh** — overlapping refreshes and refresh-while-read beyond the current atomic base-layer swap.
 - **MV-over-MV write-through** — DML against an MV whose source is *itself* an MV (routing one level down to the inner MV's own write-through) is rejected today.
-- **Backing-module pluggability** — honor `USING <module>(...)` so the stored relation can live in a module other than the in-memory table.
 - **Non-binary covering MV prefix scan** — thread per-column collation into `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`) so non-binary covering MVs also use the prefix scan instead of the full-scan fallback.
 - **Precise change-scope projection** — a per-source row/group `Database.watch` scope mirroring the maintenance projection, rather than the current `full`-per-source union.
 - **Lens / layered schemas** — indexes and set-level constraint enforcement expressed as covering materialized views in the basis layer. See [Lenses and Layered Schemas](lens.md).

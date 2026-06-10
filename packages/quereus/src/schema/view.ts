@@ -79,6 +79,18 @@ export interface MaterializedViewSchema {
 	/** Backing-table identity. Same schemaName; conventional derived name. */
 	backingTableName: string;
 
+	/**
+	 * Backing-host module the backing table lives in, from the create's
+	 * `using <module>(...)` clause. Absent ⇒ `'memory'` (the default): an
+	 * explicit `using memory()`/`mem()` with no args normalizes to absent at
+	 * create ({@link normalizeBackingModule}), so the two spellings are one
+	 * identical schema record and already-persisted catalogs are unperturbed.
+	 */
+	backingModuleName?: string;
+
+	/** Backing-module args from the `using` clause; recorded only when non-empty. */
+	backingModuleArgs?: Readonly<Record<string, SqlValue>>;
+
 	/** Inferred PK of the view output, derived from `keysOf` on the optimized body.
 	 *  NOTE: `keysOf` returns column-index arrays WITHOUT direction; `desc` defaults
 	 *  false. When `keysOf` yields no usable key, the all-columns key is used
@@ -146,6 +158,60 @@ export interface MaterializedViewSchema {
  *  prefix; backing tables are hidden from user-facing catalog enumeration. */
 export function backingTableNameFor(mvName: string): string {
 	return `_mv_${mvName}`;
+}
+
+/**
+ * Normalized backing-module identity for a materialized view's
+ * `using <module>(...)` clause. `moduleName` is the name to RESOLVE (default
+ * applied, `mem` aliased, lowercased); `storedModuleName`/`storedModuleArgs`
+ * are what the schema RECORDS — absent for the memory default with no args,
+ * so an explicit `using memory()` and an omitted clause produce one identical
+ * schema record, identical generated DDL, and no differ churn between the two
+ * spellings. Explicit `using memory(...)` with non-empty args is the one case
+ * that still records (and round-trips) the clause.
+ */
+export interface NormalizedBackingModule {
+	moduleName: string;
+	storedModuleName?: string;
+	storedModuleArgs?: Readonly<Record<string, SqlValue>>;
+}
+
+/** Normalizes a declared backing-module name: absent ⇒ `'memory'`; `mem` is an
+ *  alias for `memory`; lowercased (module registration is case-insensitive). */
+export function normalizeBackingModuleName(name: string | undefined): string {
+	const lower = (name ?? 'memory').toLowerCase();
+	return lower === 'mem' ? 'memory' : lower;
+}
+
+/** Applies the backing-module normalization decision — single source of truth
+ *  shared by the create builder and the catalog-import path. */
+export function normalizeBackingModule(
+	moduleName: string | undefined,
+	moduleArgs: Readonly<Record<string, SqlValue>> | undefined,
+): NormalizedBackingModule {
+	const name = normalizeBackingModuleName(moduleName);
+	const args = moduleArgs && Object.keys(moduleArgs).length > 0 ? Object.freeze({ ...moduleArgs }) : undefined;
+	if (name === 'memory' && !args) return { moduleName: name };
+	return { moduleName: name, storedModuleName: name, storedModuleArgs: args };
+}
+
+/**
+ * Stable (sorted-key) canonical render of a backing-module args record — the
+ * comparison key for the args half of the backing-module identity. The
+ * declarative differ compares this separately from `bodyHash` (the module is
+ * deliberately NOT folded into the hash formula, which would spuriously
+ * rebuild every already-persisted MV). Empty/absent renders ''.
+ */
+export function canonicalBackingModuleArgs(args: Readonly<Record<string, SqlValue>> | undefined): string {
+	if (!args) return '';
+	return Object.keys(args).sort().map(k => `${k}=${renderBackingArgValue(args[k])}`).join(',');
+}
+
+function renderBackingArgValue(v: SqlValue): string {
+	if (v === null || v === undefined) return 'null';
+	if (typeof v === 'string') return JSON.stringify(v);
+	if (v instanceof Uint8Array) return `x'${Array.from(v, b => b.toString(16).padStart(2, '0')).join('')}'`;
+	return String(v); // number | bigint | boolean — distinct from the quoted string render
 }
 
 /**

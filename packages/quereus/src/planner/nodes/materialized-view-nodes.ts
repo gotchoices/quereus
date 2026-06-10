@@ -27,6 +27,10 @@ export class CreateMaterializedViewNode extends VoidNode {
 		public readonly sql: string,
 		public readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>,
 		public readonly tags?: Readonly<Record<string, SqlValue>>,
+		/** Normalized backing-host module from `using <module>(...)`; undefined = memory default. */
+		public readonly backingModuleName?: string,
+		/** Backing-module args; recorded only when non-empty. */
+		public readonly backingModuleArgs?: Readonly<Record<string, SqlValue>>,
 	) {
 		super(scope, 1); // Low cost for DDL operations
 	}
@@ -44,6 +48,7 @@ export class CreateMaterializedViewNode extends VoidNode {
 			ifNotExists: this.ifNotExists,
 			columns: this.columns,
 			bodySql: this.bodySql,
+			...(this.backingModuleName ? { backingModuleName: this.backingModuleName } : {}),
 		};
 	}
 

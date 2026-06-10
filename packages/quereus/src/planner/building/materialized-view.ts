@@ -9,22 +9,33 @@ import { planViewBody } from './create-view.js';
 import { astToString, createMaterializedViewToString } from '../../emit/ast-stringify.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-
-/** Backing modules accepted in v1. The AST keeps the slot forward-compatible. */
-const SUPPORTED_BACKING_MODULES = new Set(['memory', 'mem']);
+import { normalizeBackingModule } from '../../schema/view.js';
 
 /**
  * Builds a plan node for CREATE MATERIALIZED VIEW. Validates the body (reusing
  * the CREATE VIEW gate so DML bodies and arity mismatches are rejected with the
- * same diagnostics) and restricts the backing module to `mem()` in v1.
+ * same diagnostics) and gates the `using <module>(...)` backing clause on the
+ * backing-host capability: any registered module implementing `getBackingHost`
+ * can host the backing table (memory is the default).
  */
 export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.CreateMaterializedViewStmt): CreateMaterializedViewNode {
 	const schemaName = stmt.view.schema || ctx.db.schemaManager.getCurrentSchemaName();
 	const viewName = stmt.view.name;
 
-	if (stmt.moduleName && !SUPPORTED_BACKING_MODULES.has(stmt.moduleName.toLowerCase())) {
+	const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
+	const moduleInfo = ctx.db.schemaManager.getModule(backing.moduleName);
+	if (!moduleInfo?.module) {
 		throw new QuereusError(
-			`only mem() backing is supported for materialized views in v1 (got '${stmt.moduleName}')`,
+			`no virtual table module named '${backing.moduleName}'`,
+			StatusCode.ERROR,
+			undefined,
+			stmt.view.loc?.start.line,
+			stmt.view.loc?.start.column,
+		);
+	}
+	if (!moduleInfo.module.getBackingHost) {
+		throw new QuereusError(
+			`module '${backing.moduleName}' cannot host a materialized-view backing table (it does not implement the backing-host capability)`,
 			StatusCode.UNSUPPORTED,
 			undefined,
 			stmt.view.loc?.start.line,
@@ -49,7 +60,13 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 	// Row-time eligibility (the body must be a passthrough projection of a single
 	// keyed source) is checked entirely at runtime in the create emitter, against
 	// the optimized/analyzed body — there is no build-time AST rejection to do here.
-	const sql = createMaterializedViewToString(stmt);
+	// The stored DDL is canonicalized over the NORMALIZED module identity so an
+	// explicit `using memory()` round-trips identically to an omitted clause.
+	const sql = createMaterializedViewToString({
+		...stmt,
+		moduleName: backing.storedModuleName,
+		moduleArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
+	});
 	const bodySql = astToString(stmt.select);
 
 	return new CreateMaterializedViewNode(
@@ -63,6 +80,8 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 		sql,
 		stmt.insertDefaults,
 		stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
+		backing.storedModuleName,
+		backing.storedModuleArgs,
 	);
 }
 

@@ -172,11 +172,11 @@ export function generateViewDDL(view: ViewSchema): string {
  *
  * Mirrors {@link generateViewDDL} via `createMaterializedViewToString`, reading
  * **current** `tags` so a `materialized_view_modified` (SET TAGS) round-trips.
- * Deliberately omits `moduleName`/`moduleArgs`: the backing is always a memory
- * table in v1 and the `using` clause is informational only — on reopen the backing
- * is rebuilt as a memory table regardless, and a re-parse with no `using` still
- * builds a valid MV (the build only rejects a *named* unsupported module; absent
- * module defaults to memory).
+ * The `using <module>(...)` clause is emitted from
+ * `backingModuleName`/`backingModuleArgs`, which are present only when
+ * non-default (the create path normalizes an explicit `using memory()` to
+ * absent — see `normalizeBackingModule`), so the memory default stays
+ * clause-free and canonical.
  */
 export function generateMaterializedViewDDL(mv: MaterializedViewSchema): string {
 	const stmt: AST.CreateMaterializedViewStmt = {
@@ -185,6 +185,8 @@ export function generateMaterializedViewDDL(mv: MaterializedViewSchema): string 
 		ifNotExists: false,
 		columns: mv.columns ? [...mv.columns] : undefined,
 		select: mv.selectAst,
+		moduleName: mv.backingModuleName,
+		moduleArgs: mv.backingModuleArgs ? { ...mv.backingModuleArgs } : undefined,
 		insertDefaults: mv.insertDefaults,
 		tags: mv.tags ? { ...mv.tags } : undefined,
 	};

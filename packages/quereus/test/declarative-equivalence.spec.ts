@@ -30,6 +30,7 @@ import { StatusCode } from '../src/common/types.js';
 import { computeSchemaHash } from '../src/schema/schema-hasher.js';
 import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
+import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import {
 	assertTableSchemaEqual,
 	assertViewSchemaEqual,
@@ -1415,6 +1416,128 @@ describe('declarative-equivalence: materialized views', () => {
 			}`);
 			const hash3 = computeSchemaHash(db.declaredSchemaManager.getDeclaredSchema('main')!);
 			expect(hash3, 'changing the MV body should change the schema hash').to.not.equal(hash1);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('changing only the MV backing module triggers a drop+recreate; bodyHash is unperturbed', async function () {
+		const db = new Database();
+		const mem2 = new MemoryTableModule();
+		db.registerModule('mem2', mem2);
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10)');
+			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+
+			// Same body, new backing module: only the module comparison fires.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2() as select id, x from t
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.materializedViewsToDrop, 'module-only change must drop').to.deep.equal(['mv']);
+			expect(diff.materializedViewsToCreate, 'module-only change must recreate').to.have.length(1);
+			expect(diff.materializedViewsToCreate[0]).to.match(/using mem2/i);
+
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
+			expect(mv.backingModuleName).to.equal('mem2');
+			expect(db.schemaManager.getTable('main', '_mv_mv')!.vtabModuleName).to.equal('mem2');
+			expect(mem2.tables.has('main._mv_mv'), 'backing migrated into mem2').to.equal(true);
+			expect(mv.bodyHash, 'module identity is NOT folded into the hash').to.equal(beforeHash);
+			const r: Array<Record<string, unknown>> = [];
+			for await (const row of db.eval('select id, x from mv')) r.push(row);
+			expect(r, 'rows survive the re-materialization').to.deep.equal([{ id: 1, x: 10 }]);
+
+			// Converged: re-diff is empty.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.materializedViewsToCreate).to.deep.equal([]);
+			expect(diff2.materializedViewsToDrop).to.deep.equal([]);
+
+			// Reverse direction: dropping the clause migrates back to memory.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			const diff3 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff3.materializedViewsToDrop, 'reverse module change must drop').to.deep.equal(['mv']);
+			await db.exec('apply schema main');
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.backingModuleName).to.be.undefined;
+			expect(mem2.tables.has('main._mv_mv'), 'old mem2 backing destroyed').to.equal(false);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('declaring `using memory()` / `using mem()` against a default-backed MV is no-drift', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+
+			for (const spelling of ['using memory()', 'using mem()', 'using memory', '']) {
+				await db.exec(`declare schema main {
+					table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+					materialized view mv ${spelling} as select id, x from t
+				}`);
+				const diff = computeSchemaDiff(
+					db.declaredSchemaManager.getDeclaredSchema('main')!,
+					collectSchemaCatalog(db, 'main'),
+				);
+				expect(diff.materializedViewsToCreate, `'${spelling}' must not recreate`).to.deep.equal([]);
+				expect(diff.materializedViewsToDrop, `'${spelling}' must not drop`).to.deep.equal([]);
+			}
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('changing only the backing-module ARGS triggers a drop+recreate (stable-key-order comparison)', async function () {
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2 (k = 'a') as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+
+			// Identical args ⇒ no drift.
+			const diff0 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff0.materializedViewsToCreate).to.deep.equal([]);
+			expect(diff0.materializedViewsToDrop).to.deep.equal([]);
+
+			// Changed arg value ⇒ drop+recreate.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2 (k = 'b') as select id, x from t
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.materializedViewsToDrop, 'args-only change must drop').to.deep.equal(['mv']);
+			expect(diff.materializedViewsToCreate, 'args-only change must recreate').to.have.length(1);
 		} finally {
 			await db.close();
 		}

@@ -39,9 +39,10 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 			);
 		}
 
-		// The materialize core (derive backing shape → create + fill the memory
-		// backing → register record + row-time maintenance, rolling back on any
-		// throw) is shared with the catalog-import path — see materializeView.
+		// The materialize core (derive backing shape → create + fill the backing
+		// in the declared host module → register record + row-time maintenance,
+		// rolling back on any throw) is shared with the catalog-import path — see
+		// materializeView.
 		const mv = await materializeView(db, {
 			schemaName: plan.schemaName,
 			viewName: plan.viewName,
@@ -51,6 +52,8 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 			columns: plan.columns,
 			insertDefaults: plan.insertDefaults,
 			tags: plan.tags,
+			backingModuleName: plan.backingModuleName,
+			backingModuleArgs: plan.backingModuleArgs,
 		});
 
 		sm.getChangeNotifier().notifyChange({

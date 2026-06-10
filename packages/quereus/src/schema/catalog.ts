@@ -74,6 +74,13 @@ export interface CatalogMaterializedView {
 	 *  compares this against a declared MV's recomputed definition hash to
 	 *  detect "definition changed → rebuild". */
 	bodyHash: string;
+	/** Normalized backing-host module when non-default (absent ⇒ memory). The
+	 *  differ compares backing-module identity SEPARATELY from `bodyHash` (the
+	 *  module is deliberately not folded into the hash formula); a mismatch
+	 *  takes the same drop+recreate path a body drift does. */
+	backingModuleName?: string;
+	/** Backing-module args; recorded only when non-empty. */
+	backingModuleArgs?: Readonly<Record<string, SqlValue>>;
 	tags?: Readonly<Record<string, SqlValue>>;
 }
 
@@ -307,6 +314,8 @@ function materializedViewSchemaToCatalog(mvSchema: MaterializedViewSchema): Cata
 		name: mvSchema.name,
 		ddl: mvSchema.sql,
 		bodyHash: mvSchema.bodyHash,
+		backingModuleName: mvSchema.backingModuleName,
+		backingModuleArgs: mvSchema.backingModuleArgs,
 		tags: mvSchema.tags,
 	};
 }

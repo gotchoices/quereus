@@ -310,6 +310,16 @@ the host owns its own concurrency discipline under the module's declared
 [`docs/materialized-views.md` § Backing-host capability](materialized-views.md#backing-host-capability)
 for the engine-side view.
 
+A capability-advertising module is selectable as an MV's backing host via
+`create materialized view mv using <module>(args) as <body>` (omitting the
+clause defaults to memory) — the create builder and the catalog-import path
+both gate on `getBackingHost` presence and reject a capability-less module with
+a sited `UNSUPPORTED`. One soft edge rides on `alterTable` rather than the
+capability itself: source column-rename propagation renames the backing's
+shifted columns through the host module's `alterTable`; a host without it
+throws `UNSUPPORTED` and the propagation's failure path marks the MV stale
+(recoverable by `refresh`) instead of renaming in place.
+
 ## Capability negotiation surface
 
 The `VirtualTableModule` contract signals capability three different ways, and the
@@ -346,7 +356,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `getBestAccessPlan` | presence | engine-side fallback (default full-scan; isolation returns a default plan when the underlying lacks it) | ✓ | ✓ | forwards | via store |
 | `supports` / `executePlan` | presence (pair) | engine-side fallback (index path) — isolation **deliberately suppresses** it so the overlay sees every row | — | — | suppressed | — |
 | `getMappingAdvertisements` | presence | engine-side fallback (name-match only) | ✓ tags | ✓ tags | forwards | via store |
-| `getBackingHost` | presence | negotiated rejection (the engine only creates MV backing tables on the memory module today; resolving a host from a module without the capability is a sited `INTERNAL`) | ✓ | — | — | — |
+| `getBackingHost` | presence | negotiated rejection (`create materialized view … using <module>` and catalog import both reject a capability-less module with a sited `UNSUPPORTED`; resolving a host on an already-created backing without the capability is a sited `INTERNAL` — engine bug) | ✓ | — | — | — |
 | `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
 | `shadowName` | presence | **dead** — declared on the interface but **never called anywhere** (see note below) | — | — | — | — |
 | `alterTable` (method present) | presence | negotiated rejection (each data-affecting `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent — except `renameColumn`, which degrades to an engine-side schema-only rename) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |

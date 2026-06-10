@@ -1,6 +1,5 @@
 ----
 description: Rename the `tag-target-not-found` mutation-diagnostic reason — it is now raised only for `insert defaults (col = expr, …)` clause entries; no tag is involved.
-prereq: view-insert-defaults-not-rewritten-on-source-rename
 files:
   - packages/quereus/src/planner/mutation/mutation-diagnostic.ts
   - packages/quereus/src/planner/mutation/single-source.ts        # resolveDefaultForColumn raises it
@@ -22,5 +21,6 @@ the diagnostic catalog in docs/view-updateability.md, and every test asserting
 the reason string. No behavior change; reason strings are part of the structured
 `MutationDiagnostic` surface, and backwards compatibility is not yet a concern.
 
-Deferred until `view-insert-defaults-not-rewritten-on-source-rename` lands —
-that fix reproduces via this reason and renaming first would churn it.
+Was deferred until the insert-defaults source-rename fix landed; that work is
+complete (`view-insert-defaults-rewrite-on-source-rename`), so this rename is
+now unblocked.

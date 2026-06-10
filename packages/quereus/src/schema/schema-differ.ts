@@ -2,7 +2,7 @@ import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './c
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, indexedColumnBareName, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
-import { computeBodyHash } from './view.js';
+import { computeBodyHash, normalizeBackingModuleName, canonicalBackingModuleArgs } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
@@ -465,6 +465,13 @@ export function computeSchemaDiff(
 	// table/column rename does not churn a spurious rebuild — the rename ops
 	// themselves trigger the live MV rename propagation at apply, which rewrites
 	// the body and re-stamps `bodyHash` to converge.
+	//
+	// Backing-module identity (`using <module>(...)`) is compared as a SEPARATE
+	// field, not folded into the hash (changing the hash formula would spuriously
+	// rebuild every already-persisted MV): both sides normalize (absent ⇒ memory,
+	// `mem` aliased) and args compare under a stable-key-order render, so
+	// `using memory()` vs absent never churns while a real module change takes
+	// the same drop+recreate path a body drift does.
 	for (const [name, declaredMv] of declaredMaterializedViews) {
 		const actual = actualMaterializedViews.get(name);
 		if (!actual) {
@@ -475,7 +482,10 @@ export function computeSchemaDiff(
 			if (bodyDrifted && (tableRenames.renames.length > 0 || columnRenamesByTable.size > 0)) {
 				bodyDrifted = computeBodyHash(reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName)) !== actual.bodyHash;
 			}
-			if (bodyDrifted) {
+			const moduleDrifted =
+				normalizeBackingModuleName(stmt.moduleName) !== normalizeBackingModuleName(actual.backingModuleName)
+				|| canonicalBackingModuleArgs(stmt.moduleArgs) !== canonicalBackingModuleArgs(actual.backingModuleArgs);
+			if (bodyDrifted || moduleDrifted) {
 				// Definition changed → drop+recreate (the recreate re-materializes AND
 				// carries the declared tags); never also emit a SET TAGS for this MV.
 				diff.materializedViewsToDrop.push(name);

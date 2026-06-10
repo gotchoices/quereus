@@ -163,17 +163,28 @@ export function computeBackingPrimaryKey(shape: BackingShape): ReadonlyArray<{ i
 
 /**
  * Constructs the backing-table {@link TableSchema} for a materialized view from a
- * derived {@link BackingShape}. Module is always `memory` in v1.
+ * derived {@link BackingShape}, hosted in `moduleName` (default `'memory'`).
+ * The capability check here is defense-in-depth — the create builder already
+ * gates, but the catalog-import path reaches this without it.
  */
 export function buildBackingTableSchema(
 	db: Database,
 	schemaName: string,
 	backingTableName: string,
 	shape: BackingShape,
+	moduleName?: string,
+	moduleArgs?: Readonly<Record<string, SqlValue>>,
 ): TableSchema {
-	const moduleInfo = db.schemaManager.getModule('memory');
+	const resolvedModuleName = moduleName ?? 'memory';
+	const moduleInfo = db.schemaManager.getModule(resolvedModuleName);
 	if (!moduleInfo || !moduleInfo.module) {
-		throw new QuereusError(`No virtual table module named 'memory'`, StatusCode.INTERNAL);
+		throw new QuereusError(`no virtual table module named '${resolvedModuleName}'`, StatusCode.ERROR);
+	}
+	if (!moduleInfo.module.getBackingHost) {
+		throw new QuereusError(
+			`module '${resolvedModuleName}' cannot host a materialized-view backing table (it does not implement the backing-host capability)`,
+			StatusCode.UNSUPPORTED,
+		);
 	}
 
 	const backingPk = computeBackingPrimaryKey(shape);
@@ -197,8 +208,8 @@ export function buildBackingTableSchema(
 		primaryKeyDefinition: Object.freeze(pkDefinition),
 		checkConstraints: Object.freeze([]),
 		vtabModule: moduleInfo.module,
-		vtabModuleName: 'memory',
-		vtabArgs: {},
+		vtabModuleName: resolvedModuleName,
+		vtabArgs: moduleArgs ? { ...moduleArgs } : {},
 		vtabAuxData: moduleInfo.auxData,
 		isView: false,
 		estimatedRows: 0,
@@ -245,14 +256,20 @@ export interface MaterializeViewDefinition {
 	/** Per-column omitted-insert defaults from `insert defaults (col = expr, …)`. */
 	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	tags?: Readonly<Record<string, SqlValue>>;
+	/** Normalized backing-host module (absent ⇒ memory default — see
+	 *  `normalizeBackingModule` in schema/view.ts). */
+	backingModuleName?: string;
+	/** Backing-module args; recorded only when non-empty. */
+	backingModuleArgs?: Readonly<Record<string, SqlValue>>;
 }
 
 /**
  * The materialize core shared by `emitCreateMaterializedView` and the
  * catalog-import path (`SchemaManager.importMaterializedView`): derive the
- * backing shape from the planned body → create the (memory) backing table →
- * fill it from the body → register the `MaterializedViewSchema` → compile +
- * register row-time write-through maintenance. Returns the registered schema.
+ * backing shape from the planned body → create the backing table in the
+ * declared backing-host module (memory default) → fill it from the body →
+ * register the `MaterializedViewSchema` → compile + register row-time
+ * write-through maintenance. Returns the registered schema.
  *
  * Fires `table_added` for the backing table (it is created like any table) but
  * deliberately does NOT fire `materialized_view_added` — the create emitter
@@ -282,7 +299,7 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		);
 	}
 	const backingTableName = backingTableNameFor(def.viewName);
-	const backingSchema = buildBackingTableSchema(db, def.schemaName, backingTableName, shape);
+	const backingSchema = buildBackingTableSchema(db, def.schemaName, backingTableName, shape, def.backingModuleName, def.backingModuleArgs);
 	const completeBacking = await sm.createBackingTable(backingSchema);
 
 	try {
@@ -306,6 +323,8 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		insertDefaults: def.insertDefaults,
 		tags: def.tags,
 		backingTableName,
+		backingModuleName: def.backingModuleName,
+		backingModuleArgs: def.backingModuleArgs,
 		primaryKey: shape.primaryKey,
 		// Hash the canonical DEFINITION (explicit columns + body + insert-defaults
 		// clause), NOT the executable bodySql — the differ recomputes the same form
@@ -471,7 +490,9 @@ export async function rebuildBackingTable(
 	const rows: Row[] = await collectBodyRows(db, astToString(mv.selectAst));
 
 	await sm.dropTable(mv.schemaName, mv.backingTableName, /*ifExists*/ true);
-	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.backingTableName, shape);
+	// Rebuild into the MV's OWN backing module — falling back to memory here
+	// would silently migrate a non-default backing on the first shape rebuild.
+	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.backingTableName, shape, mv.backingModuleName, mv.backingModuleArgs);
 	const completeBacking = await sm.createBackingTable(backingSchema);
 	try {
 		const host = resolveBackingHost(db, completeBacking);
@@ -781,8 +802,9 @@ async function applyMaterializedViewRewrite(
  * table. The backing's column names were derived from the body's output names at
  * create ({@link deriveBackingShape}); after the body rewrite a bare passthrough
  * projection of the renamed column exposes the NEW name, so the backing follows —
- * positionally, data-preserving, via the module's own `renameColumn` (the backing
- * is always a memory table in v1). Explicit-column MVs (`mv(a, b)`) and
+ * positionally, data-preserving, via the host module's own `alterTable` (a host
+ * without `alterTable` throws UNSUPPORTED and the caller's failure path leaves
+ * the MV stale). Explicit-column MVs (`mv(a, b)`) and
  * expression-aliased outputs produce no mismatch and no-op. Any structural
  * difference (count / types / PK) is NOT a rename outcome — throw so the caller's
  * failure path leaves the MV stale rather than rebuilding data here.

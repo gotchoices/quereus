@@ -12,7 +12,7 @@ import type { ColumnSchema } from './column.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema } from './constraint-builder.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
-import { backingTableNameFor } from './view.js';
+import { backingTableNameFor, normalizeBackingModule } from './view.js';
 import { isHiddenImplicitIndex, findExposedImplicitConstraintIndex } from './catalog.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
@@ -2567,15 +2567,51 @@ export class SchemaManager {
 		// rehydrates even into a schema that holds no tables.
 		this.getOrCreateSchema(targetSchemaName);
 
+		// Honor the re-parsed `using <module>(...)` clause (the generator emits it
+		// only when non-default). An unknown or capability-less module throws from
+		// buildBackingTableSchema inside materializeView — the caller records it
+		// as a per-entry rehydration error.
+		const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
+
+		// A durable backing-host module may have rehydrated its own `_mv_<name>`
+		// table (phase 1) before this MV catalog entry imports (phase 3), so the
+		// create-time "already exists" collision check would reject the import. A
+		// pre-existing table owned by the MV's own backing module IS that
+		// rehydrated backing: drop it and re-materialize from the body (the
+		// adopt-without-refill fast path is deferred — see `store-mv-backing-host`).
+		// A table in a DIFFERENT module is not ours — fail the entry rather than
+		// dropping user data. The create emitter keeps the plain collision error.
+		const backingTableName = backingTableNameFor(viewName);
+		const preExisting = this.getTable(targetSchemaName, backingTableName);
+		if (preExisting) {
+			if ((preExisting.vtabModuleName ?? '').toLowerCase() === backing.moduleName) {
+				await this.dropTable(targetSchemaName, backingTableName, /*ifExists*/ true);
+			} else {
+				throw new QuereusError(
+					`cannot import materialized view '${targetSchemaName}.${viewName}': table '${backingTableName}' already exists in module '${preExisting.vtabModuleName}', not the MV's backing module '${backing.moduleName}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+
 		await materializeView(this.db, {
 			schemaName: targetSchemaName,
 			viewName,
-			sql: createMaterializedViewToString(stmt),
+			// Canonicalize the stored DDL over the NORMALIZED module identity
+			// (mirrors the create builder): a hand-written `using memory()` entry
+			// rehydrates to the same clause-free record an omitted clause yields.
+			sql: createMaterializedViewToString({
+				...stmt,
+				moduleName: backing.storedModuleName,
+				moduleArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
+			}),
 			selectAst: stmt.select,
 			bodySql: astToString(stmt.select),
 			columns: stmt.columns,
 			insertDefaults: stmt.insertDefaults,
 			tags: stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
+			backingModuleName: backing.storedModuleName,
+			backingModuleArgs: backing.storedModuleArgs,
 		});
 		log(`Imported materialized view %s.%s`, targetSchemaName, viewName);
 

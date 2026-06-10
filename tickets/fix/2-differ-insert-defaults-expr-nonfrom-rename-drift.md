@@ -1,4 +1,5 @@
 description: Declarative differ does not inverse-reconcile a column rename of a NON-FROM table referenced inside a view's `insert defaults` expr subquery — spurious drift → drop+recreate (MV: rebuild churn). Forward rename propagation handles this case; the inverse path should mirror it.
+prereq: schema-differ-cross-table-column-rename-subquery-reconcile
 files:
   - packages/quereus/src/schema/schema-differ.ts                # reconciledDeclaredViewDefinition — clause expr inverse pass iterates fromTables only
   - packages/quereus/src/schema/rename-rewriter.ts              # renameColumnInInsertDefaults — the forward mirror (seeded walk for FROM tables, plain renameColumnInAst otherwise)
