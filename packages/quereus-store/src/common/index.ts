@@ -52,7 +52,6 @@ export {
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
 	classifyCatalogKey,
-	decodeMaterializedViewCatalogKey,
 	type CatalogEntryKind,
 	buildFullScanBounds,
 	buildIndexPrefixBounds,

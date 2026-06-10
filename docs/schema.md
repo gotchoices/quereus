@@ -164,13 +164,13 @@ Clears all tables, functions, and views from all schemas. Does not call module d
 
 ### Catalog Import
 
-#### `importCatalog(ddlStatements): Promise<{ tables: string[]; indexes: string[]; views: string[] }>`
+#### `importCatalog(ddlStatements): Promise<{ tables: string[]; indexes: string[]; views: string[]; materializedViews: string[] }>`
 
 Imports existing schema objects without creating new storage. Used when connecting to a backend that already contains data. For each DDL statement:
 - `CREATE TABLE` calls `module.connect()` instead of `module.create()`
 - `CREATE INDEX` registers the index metadata without calling `module.createIndex()`, reconstructing the index with full fidelity from the re-parsed DDL — the `UNIQUE` flag, the partial `WHERE` predicate, and per-column collation (including the collate-wrapped column form the parser folds `COLLATE` into). A `CREATE UNIQUE INDEX` also re-synthesizes its `derivedFromIndex` UNIQUE constraint, exactly as the live create path does.
 - `CREATE VIEW` registers a plain view **without planning the body** — body validation is deferred to first reference (mirroring how `importTable` defers create-time work via `connect`). This makes view rehydration order-independent: a view over another view, a materialized view, or a not-yet-imported relation registers regardless of phase order, and a broken body surfaces only when the view is queried. The imported view name appears in the `views` result array.
-- `CREATE MATERIALIZED VIEW` is **not** supported here and throws (fail-loud) — an MV's backing must be re-materialized, so the store re-execs its create statement rather than importing it silently.
+- `CREATE MATERIALIZED VIEW` **re-materializes** through the same `materializeView` core the create emitter uses (`runtime/emit/materialized-view-helpers.ts`): the body is re-planned against the already-imported sources, the memory backing table is rebuilt and filled, and row-time maintenance is re-registered — but no `materialized_view_added` fires (`table_added` for the backing table still does, as on create). Unlike a plain view the body plans **eagerly** (the backing cannot fill without running it), so MV import is order-dependent: sources — including another MV's backing for MV-over-MV — must already be registered. A body that cannot plan, fills with duplicate keys ("must be a set"), or fails the row-time eligibility gate throws after the half-built backing is rolled back. The imported MV name appears in the `materializedViews` result array.
 - Schema change events are not emitted (these are existing objects)
 
 Each entry in `ddlStatements` may hold **more than one** statement: a table can be bundled with the `CREATE INDEX`es that belong to it in a single string, imported in document order (so the table precedes its indexes). Single-statement entries remain valid. Any unsupported statement type throws (fail-loud), so the store's `rehydrateCatalog` records the failure rather than silently dropping the object.
@@ -345,23 +345,23 @@ post-reopen statement is a view. Gap: a brand-new DB never rehydrated, whose ver
 first DDL is a view, still relies on a prior store-table create/connect to subscribe.
 
 **Rehydrate phasing.** `rehydrateCatalog` loads all entries once, classifies by key
-prefix, then imports in dependency order: (1) **tables** via `importCatalog`
-(connect to storage); (2) **views** via `importCatalog` (engine silent-register —
-body validation deferred to query time, so view-over-view and view-over-MV are
-order-independent and no event fires); (3) **materialized views** via `db.exec` per
-entry, which re-runs the create emitter (rebuilds the memory backing from current
-source data, re-registers row-time maintenance, re-runs the eligibility gate). The
-re-exec re-fires `materialized_view_added` → the listener regenerates identical DDL
-→ compare-skip (no churn), so a second consecutive reopen yields identical catalog
+prefix, then imports in dependency order — every phase through `importCatalog`:
+(1) **tables** (connect to storage); (2) **views** (engine silent-register — body
+validation deferred to query time, so view-over-view and view-over-MV are
+order-independent and no event fires); (3) **materialized views** per entry (engine
+re-materialize via the shared `materializeView` core: rebuilds the memory backing
+from current source data, re-registers row-time maintenance, re-runs the eligibility
+gate). Import is silent — no `materialized_view_added` fires — so rehydration writes
+nothing back to the catalog and a second consecutive reopen yields identical catalog
 bytes. MV-over-MV ordering uses a **fixpoint retry** (an MV whose body reads a
 not-yet-built MV fails the round and succeeds once its dependency is built) rather
 than a static topological sort — the resolved `sourceTables` (`_mv_<x>`) are not
-serialized in the DDL, so they are unavailable before exec. A genuinely unbuildable
-MV — a missing (e.g. memory) source, or an unresolvable cycle — makes no progress in
-a round and is recorded in the `RehydrationResult.errors` array (the result also
-gains additive `views` / `materializedViews` name arrays). An MV over a non-persisted
-(memory) source is therefore an inherent limitation: its source is absent on reopen,
-so it lands in `errors` and is not registered.
+serialized in the DDL, so they are unavailable before import. A genuinely unbuildable
+MV — a missing (e.g. memory) source, an ineligible body, or an unresolvable cycle —
+makes no progress in a round and is recorded in the `RehydrationResult.errors` array
+(the result also gains additive `views` / `materializedViews` name arrays). An MV
+over a non-persisted (memory) source is therefore an inherent limitation: its source
+is absent on reopen, so it lands in `errors` and is not registered.
 
 ## Schema Path
 

@@ -29,7 +29,8 @@ import { ParameterScope } from '../planner/scopes/param.js';
 import type { ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { hasNativeEventSupport } from '../util/event-support.js';
 import type { VTableSchemaChangeEvent } from '../vtab/events.js';
-import { quoteIdentifier, createViewToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, createViewToString, createMaterializedViewToString, astToString } from '../emit/ast-stringify.js';
+import { materializeView } from '../runtime/emit/materialized-view-helpers.js';
 
 const log = createLogger('schema:manager');
 const warnLog = log.extend('warn');
@@ -2361,8 +2362,10 @@ export class SchemaManager {
 	 *
 	 * This method:
 	 * 1. Parses each DDL statement
-	 * 2. Registers the schema objects (tables, indexes)
-	 * 3. Calls module.connect() instead of module.create()
+	 * 2. Registers the schema objects (tables, indexes, views, materialized views)
+	 * 3. Calls module.connect() instead of module.create() for tables (a
+	 *    materialized view's memory backing is re-materialized instead — see
+	 *    {@link importMaterializedView})
 	 * 4. Skips schema change hooks (since these are existing objects)
 	 *
 	 * Each DDL string may hold **one or more** statements: a catalog entry can
@@ -2375,8 +2378,8 @@ export class SchemaManager {
 	 * @param ddlStatements Array of DDL strings (each one or more CREATE TABLE / CREATE INDEX, etc.)
 	 * @returns Array of imported object names
 	 */
-	async importCatalog(ddlStatements: string[]): Promise<{ tables: string[]; indexes: string[]; views: string[] }> {
-		const imported = { tables: [] as string[], indexes: [] as string[], views: [] as string[] };
+	async importCatalog(ddlStatements: string[]): Promise<{ tables: string[]; indexes: string[]; views: string[]; materializedViews: string[] }> {
+		const imported = { tables: [] as string[], indexes: [] as string[], views: [] as string[], materializedViews: [] as string[] };
 
 		for (const ddl of ddlStatements) {
 			try {
@@ -2385,8 +2388,10 @@ export class SchemaManager {
 						imported.tables.push(result.name);
 					} else if (result.type === 'index') {
 						imported.indexes.push(result.name);
-					} else {
+					} else if (result.type === 'view') {
 						imported.views.push(result.name);
+					} else {
+						imported.materializedViews.push(result.name);
 					}
 				}
 			} catch (e) {
@@ -2396,7 +2401,8 @@ export class SchemaManager {
 			}
 		}
 
-		log('Imported catalog: %d tables, %d indexes, %d views', imported.tables.length, imported.indexes.length, imported.views.length);
+		log('Imported catalog: %d tables, %d indexes, %d views, %d materialized views',
+			imported.tables.length, imported.indexes.length, imported.views.length, imported.materializedViews.length);
 		return imported;
 	}
 
@@ -2407,22 +2413,23 @@ export class SchemaManager {
 	 * statement type throws — `rehydrateCatalog` relies on this fail-loud contract
 	 * to record import errors rather than silently dropping objects.
 	 */
-	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index' | 'view'; name: string }>> {
+	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index' | 'view' | 'materializedView'; name: string }>> {
 		const parser = new Parser();
 		const statements = parser.parseAll(ddl);
 
-		const results: Array<{ type: 'table' | 'index' | 'view'; name: string }> = [];
+		const results: Array<{ type: 'table' | 'index' | 'view' | 'materializedView'; name: string }> = [];
 		for (const stmt of statements) {
 			if (stmt.type === 'createTable') {
 				results.push(await this.importTable(stmt as AST.CreateTableStmt));
 			} else if (stmt.type === 'createIndex') {
 				results.push(await this.importIndex(stmt as AST.CreateIndexStmt));
 			} else if (stmt.type === 'createView') {
-				// Plain views import silently (body planning deferred to first
-				// reference). Materialized views deliberately fall through to the
-				// fail-loud error below — MV rehydration re-execs the create
-				// store-side so the backing is re-materialized, not imported here.
+				// Plain views import silently (body planning deferred to first reference).
 				results.push(this.importView(stmt as AST.CreateViewStmt));
+			} else if (stmt.type === 'createMaterializedView') {
+				// Materialized views re-materialize (backing rebuilt from current source
+				// data, row-time maintenance re-registered) — silent like the other arms.
+				results.push(await this.importMaterializedView(stmt as AST.CreateMaterializedViewStmt));
 			} else {
 				throw new QuereusError(`importCatalog does not support statement type: ${stmt.type}`, StatusCode.ERROR);
 			}
@@ -2466,6 +2473,47 @@ export class SchemaManager {
 		log(`Imported view %s.%s`, targetSchemaName, viewName);
 
 		return { type: 'view', name: `${targetSchemaName}.${viewName}` };
+	}
+
+	/**
+	 * Import a materialized view from its parsed DDL by re-materializing it
+	 * through the shared {@link materializeView} core: the body is re-planned
+	 * against the current (already-imported) sources, the memory backing table is
+	 * rebuilt and filled, and row-time maintenance is re-registered — the same
+	 * work the create emitter does, minus the `materialized_view_added` event (a
+	 * store rehydrating its own catalog must not re-emit persistence events;
+	 * `table_added` still fires for the backing table, exactly as on create).
+	 *
+	 * Unlike {@link importView}, the body plans EAGERLY (the backing cannot be
+	 * filled without running it), so MV import is order-dependent: the body's
+	 * sources — including another MV's backing for MV-over-MV — must already be
+	 * registered. The store's `rehydrateCatalog` orders MVs after tables/views
+	 * and resolves MV-over-MV chains by fixpoint retry. A body that cannot plan,
+	 * fills with duplicate keys, or fails the row-time eligibility gate in
+	 * `registerMaterializedView` throws (after {@link materializeView} rolls the
+	 * half-built backing back), and the caller records it as a per-entry
+	 * rehydration error.
+	 */
+	private async importMaterializedView(stmt: AST.CreateMaterializedViewStmt): Promise<{ type: 'materializedView'; name: string }> {
+		const targetSchemaName = stmt.view.schema || this.getCurrentSchemaName();
+		const viewName = stmt.view.name;
+
+		// Create the schema if absent (mirrors importTable/importView) so an MV
+		// rehydrates even into a schema that holds no tables.
+		this.getOrCreateSchema(targetSchemaName);
+
+		await materializeView(this.db, {
+			schemaName: targetSchemaName,
+			viewName,
+			sql: createMaterializedViewToString(stmt),
+			selectAst: stmt.select,
+			bodySql: astToString(stmt.select),
+			columns: stmt.columns,
+			tags: stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
+		});
+		log(`Imported materialized view %s.%s`, targetSchemaName, viewName);
+
+		return { type: 'materializedView', name: `${targetSchemaName}.${viewName}` };
 	}
 
 	/**

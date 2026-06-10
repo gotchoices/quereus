@@ -51,7 +51,6 @@ import {
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
 	classifyCatalogKey,
-	decodeMaterializedViewCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
 import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, isHiddenImplicitIndex } from '@quereus/quereus';
@@ -1769,15 +1768,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *   2. **Views** — `importCatalog` (engine silent-register; body validation deferred
 	 *      to query time, so order among views — and view-over-MV / view-over-view —
 	 *      does not matter, and no schema-change event fires → phase 2 writes nothing).
-	 *   3. **Materialized views** — re-materialize via `db.exec` per entry (re-runs the
-	 *      create emitter: rebuilds the memory backing from current source data,
-	 *      re-registers row-time maintenance, re-runs the eligibility gate). The re-exec
-	 *      re-fires `materialized_view_added` → the listener regenerates identical DDL →
-	 *      compare-skip (no churn).
+	 *   3. **Materialized views** — `importCatalog` per entry (engine re-materialize:
+	 *      rebuilds the memory backing from current source data, re-registers row-time
+	 *      maintenance, re-runs the eligibility gate — the same core the create emitter
+	 *      uses, but silent: no `materialized_view_added` fires, so phase 3 writes
+	 *      nothing back to the catalog).
 	 *
 	 * **MV-over-MV ordering** is handled by a fixpoint retry rather than a static topo
 	 * sort: the source `sourceTables` an MV resolves to (`_mv_<x>`) is computed at create
-	 * time and is NOT serialized in the DDL, so it is unavailable before exec. Instead,
+	 * time and is NOT serialized in the DDL, so it is unavailable before import. Instead,
 	 * an MV whose body reads a not-yet-built MV simply fails this round and succeeds once
 	 * its dependency is built; the loop repeats while any MV makes progress. This is
 	 * robust to arbitrary nesting depth (and covers the common single-level case for
@@ -1815,11 +1814,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// view/MV entry fed to the table-phase importCatalog would fail-loud or mis-handle.
 		const tableDDLs: string[] = [];
 		const viewDDLs: string[] = [];
-		const mvEntries: Array<{ ddl: string; name: string }> = [];
+		const mvDDLs: string[] = [];
 		for (const { key, ddl } of entries) {
 			switch (classifyCatalogKey(key)) {
 				case 'view': { viewDDLs.push(ddl); break; }
-				case 'materializedView': { mvEntries.push({ ddl, name: decodeMaterializedViewCatalogKey(key) }); break; }
+				case 'materializedView': { mvDDLs.push(ddl); break; }
 				default: { tableDDLs.push(ddl); break; }
 			}
 		}
@@ -1846,26 +1845,26 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 
 		// Phase 3 — materialized views, dependency-ordered via fixpoint retry (see docstring).
-		let pending = mvEntries;
+		let pending = mvDDLs;
 		while (pending.length > 0) {
-			const failed: Array<{ entry: { ddl: string; name: string }; error: unknown }> = [];
+			const failed: Array<{ ddl: string; error: unknown }> = [];
 			let progressed = false;
-			for (const entry of pending) {
+			for (const ddl of pending) {
 				try {
-					await db.exec(entry.ddl);
-					result.materializedViews.push(entry.name);
+					const imported = await db.schemaManager.importCatalog([ddl]);
+					result.materializedViews.push(...imported.materializedViews);
 					progressed = true;
 				} catch (e) {
-					failed.push({ entry, error: e });
+					failed.push({ ddl, error: e });
 				}
 			}
 			if (!progressed) {
 				// No MV built this round → the remaining failures are genuine (missing
-				// source, unresolvable cycle). Record them and stop.
-				for (const f of failed) recordError(f.entry.ddl, f.error);
+				// source, ineligible body, unresolvable cycle). Record them and stop.
+				for (const f of failed) recordError(f.ddl, f.error);
 				break;
 			}
-			pending = failed.map(f => f.entry);
+			pending = failed.map(f => f.ddl);
 		}
 
 		// Refresh each connected StoreTable from the now-current registry. During
@@ -1934,9 +1933,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * DDL differs from `newDDL` (skip identical). Unlike the table path's
 	 * {@link persistCatalogIfChanged} there is **no** absent→skip self-filter — a view/MV
 	 * belongs to this db's catalog unconditionally (one module instance serves one
-	 * Database). Skipping identical writes makes a rehydrate-time MV re-add (which
-	 * re-fires `materialized_view_added`) a no-op, so a second consecutive reopen yields
-	 * identical catalog bytes.
+	 * Database). Skipping identical writes makes any event whose regenerated DDL is
+	 * unchanged (e.g. a `materialized_view_refreshed`) a no-op, so a second consecutive
+	 * reopen yields identical catalog bytes. (Rehydration itself fires no view/MV events
+	 * at all — `importCatalog` is silent.)
 	 */
 	private async persistObjectCatalogEntryIfChanged(key: Uint8Array, newDDL: string): Promise<void> {
 		const catalogStore = await this.provider.getCatalogStore();

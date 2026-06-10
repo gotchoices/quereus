@@ -13,8 +13,11 @@
  *      tag-carrying, re-parseable DDL (a parse→generate→parse fixed point) so a
  *      `view_modified` (SET TAGS, which leaves the stored `sql` stale) round-trips.
  *   3. `SchemaManager.importCatalog` silently registers a plain view from its DDL
- *      without planning the body (queryable, body validation deferred), names it
- *      in the `.views` result, and still fails loud on a materialized view.
+ *      without planning the body (queryable, body validation deferred) and names
+ *      it in the `.views` result. A materialized view imports through the same
+ *      entry point by re-materializing (shared `materializeView` core): the
+ *      backing is rebuilt and filled, row-time maintenance re-registers, the name
+ *      lands in `.materializedViews` — and no `materialized_view_added` fires.
  */
 
 import { expect } from 'chai';
@@ -155,17 +158,108 @@ describe('view persistence: importCatalog silent view registration', () => {
 		}
 	});
 
-	it('a materialized view DDL still fails loud through importCatalog', async () => {
+});
+
+describe('view persistence: importCatalog materialized-view re-materialization', () => {
+	it('rebuilds + fills the backing, keeps maintenance live, names it in .materializedViews, fires no event', async () => {
 		const db = new Database();
 		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			await db.exec('insert into base values (1, 10), (2, 20)');
+
+			const events = await captureEvents(db, async () => {
+				const result = await db.schemaManager.importCatalog([
+					"create materialized view mv as select id, v from base with tags (purpose = 'test')",
+				]);
+				expect(result.materializedViews, 'MV named in the result').to.deep.equal(['main.mv']);
+				expect(result.tables).to.deep.equal([]);
+				expect(result.views).to.deep.equal([]);
+			});
+			// Silent — import must not re-emit a persistence event for the MV itself.
+			expect(events.filter(e => e.type === 'materialized_view_added'), 'import is silent').to.have.length(0);
+
+			// Registered with tags, and the backing table was rebuilt and filled.
+			const mv = db.schemaManager.getMaterializedView('main', 'mv');
+			expect(mv?.tags).to.deep.equal({ purpose: 'test' });
+			expect(db.schemaManager.getTable('main', backingTableNameFor('mv')), 'backing registered').to.exist;
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+
+			// Row-time maintenance is live: a post-import source write maintains the backing.
+			await db.exec('insert into base values (3, 30)');
+			await db.exec('update base set v = 99 where id = 1');
+			await db.exec('delete from base where id = 2');
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 99 }, { id: 3, v: 30 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an MV over another MV imports when its producer precedes it (rehydrate order contract)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			await db.exec('insert into base values (1, 10), (2, 20)');
+			const result = await db.schemaManager.importCatalog([
+				'create materialized view inner_mv as select id, v from base',
+				'create materialized view outer_mv as select id, v from inner_mv',
+			]);
+			expect(result.materializedViews).to.deep.equal(['main.inner_mv', 'main.outer_mv']);
+			expect(await rows(db, 'select id, v from outer_mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+			// Maintenance cascades up the imported chain.
+			await db.exec('insert into base values (3, 30)');
+			expect(await rows(db, 'select id, v from outer_mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an ineligible body (non-deterministic column) fails the import and rolls back cleanly', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			await db.exec('insert into base values (1, 10)');
 			let threw = false;
 			try {
-				await db.schemaManager.importCatalog(['create materialized view mv as select 1 as a']);
+				// random() plans and fills fine but fails the row-time eligibility gate
+				// in registerMaterializedView — un-creatable via SQL, but a catalog entry
+				// could carry it; the store records the throw as a per-entry error.
+				await db.schemaManager.importCatalog([
+					'create materialized view mv as select id, random() as r from base',
+				]);
 			} catch (e) {
 				threw = true;
-				expect((e as Error).message).to.match(/does not support statement type/);
+				expect((e as Error).message).to.match(/non-deterministic/i);
 			}
-			expect(threw, 'MV import must fail loud').to.equal(true);
+			expect(threw, 'eligibility gate fails the import').to.equal(true);
+			// Rolled back: neither the MV record nor its half-built backing remain.
+			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a duplicate-producing body fails the fill with the "must be a set" diagnostic and rolls back', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			await db.exec('insert into base values (1, 10), (2, 10)');
+			let threw = false;
+			try {
+				// Projecting only the non-key column produces duplicate rows under the
+				// all-columns fallback key — the fill's duplicate-key gate throws.
+				await db.schemaManager.importCatalog(['create materialized view mv as select v from base']);
+			} catch (e) {
+				threw = true;
+				expect((e as Error).message).to.match(/must be a set/i);
+			}
+			expect(threw, 'fill gate fails the import').to.equal(true);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
 		} finally {
 			await db.close();
 		}

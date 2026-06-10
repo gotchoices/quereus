@@ -18,7 +18,6 @@ import type { SqlValue } from '@quereus/quereus';
 import { encodeCompositeKey, type EncodeOptions } from './encoding.js';
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
 /**
  * Store name suffixes for different data types.
@@ -178,15 +177,6 @@ export function classifyCatalogKey(key: Uint8Array): CatalogEntryKind {
 	if (startsWithBytes(key, VIEW_KEY_PREFIX_BYTES)) return 'view';
 	if (startsWithBytes(key, MVIEW_KEY_PREFIX_BYTES)) return 'materializedView';
 	return 'table';
-}
-
-/**
- * Recover the qualified `{schema}.{name}` from a materialized-view catalog key
- * (strips the reserved `\x00mview\x00` prefix). Used by `rehydrateCatalog` to name
- * a re-materialized MV in its result — the re-exec path (`db.exec`) returns no name.
- */
-export function decodeMaterializedViewCatalogKey(key: Uint8Array): string {
-	return decoder.decode(key).slice(MVIEW_KEY_PREFIX.length);
 }
 
 /** True when `key` begins with the byte sequence `prefix`. */

@@ -1,6 +1,7 @@
 import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
-import { StatusCode, type Row } from '../../common/types.js';
+import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
+import type * as AST from '../../parser/ast.js';
 import { astToString } from '../../emit/ast-stringify.js';
 import type { PlanNode, RelationalPlanNode } from '../../planner/nodes/plan-node.js';
 import { TableReferenceNode } from '../../planner/nodes/reference.js';
@@ -9,13 +10,14 @@ import { proveCoverage } from '../../planner/analysis/coverage-prover.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule } from '../../schema/table.js';
 import type { MaterializedViewSchema } from '../../schema/view.js';
+import { backingTableNameFor, computeBodyHash } from '../../schema/view.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import type { MemoryTableManager } from '../../vtab/memory/layer/manager.js';
 
 // Canonical body-hash lives next to the MV schema definition so the declarative
 // differ can share it without depending on the runtime layer. Re-exported here
 // for the create/refresh emitters that already import from this module.
-export { computeBodyHash } from '../../schema/view.js';
+export { computeBodyHash };
 
 /**
  * Purpose-built diagnostic for a bag (duplicate-producing) materialized-view
@@ -216,6 +218,104 @@ export async function collectBodyRows(db: Database, bodySql: string): Promise<Ro
 			await stmt.finalize();
 		}
 	});
+}
+
+/**
+ * Everything needed to materialize an MV — identity, canonical DDL, and the body
+ * in both AST and canonical-SQL form. Satisfied by the create plan node
+ * (`CreateMaterializedViewNode`) and by a re-parsed catalog entry
+ * (`SchemaManager.importMaterializedView`).
+ */
+export interface MaterializeViewDefinition {
+	schemaName: string;
+	viewName: string;
+	/** Canonical full `create materialized view` DDL text (round-trippable). */
+	sql: string;
+	/** Body AST — retained on the MV schema for refresh, declarative emission, and body-hash. */
+	selectAst: AST.QueryExpr;
+	/** Canonical SQL of the body alone (re-planned here to derive and fill the backing). */
+	bodySql: string;
+	/** Explicit column list from `create materialized view mv(a, b) ...`, when present. */
+	columns?: ReadonlyArray<string>;
+	tags?: Readonly<Record<string, SqlValue>>;
+}
+
+/**
+ * The materialize core shared by `emitCreateMaterializedView` and the
+ * catalog-import path (`SchemaManager.importMaterializedView`): derive the
+ * backing shape from the planned body → create the (memory) backing table →
+ * fill it from the body → register the `MaterializedViewSchema` → compile +
+ * register row-time write-through maintenance. Returns the registered schema.
+ *
+ * Fires `table_added` for the backing table (it is created like any table) but
+ * deliberately does NOT fire `materialized_view_added` — the create emitter
+ * notifies after this returns, while import stays silent (a store rehydrating
+ * its own catalog must not re-emit persistence events).
+ *
+ * Rollback-on-throw: a fill failure (including the "must be a set"
+ * duplicate-key gate) drops the half-built backing; a registration failure (the
+ * mandatory row-time eligibility gate runs there) also unlinks and deregisters
+ * the MV record — either way the schema is left exactly as before the call.
+ * Existence/collision checks are the caller's job (the create emitter checks
+ * before calling; on import a duplicate surfaces as a backing-table conflict).
+ */
+export async function materializeView(db: Database, def: MaterializeViewDefinition): Promise<MaterializedViewSchema> {
+	const sm = db.schemaManager;
+
+	const shape = deriveBackingShape(db, def.bodySql, def.columns);
+	const backingTableName = backingTableNameFor(def.viewName);
+	const backingSchema = buildBackingTableSchema(db, def.schemaName, backingTableName, shape);
+	const completeBacking = await sm.createBackingTable(backingSchema);
+
+	try {
+		const rows: Row[] = await collectBodyRows(db, def.bodySql);
+		const manager = getBackingManager(completeBacking);
+		await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
+	} catch (e) {
+		// Roll back: drop the backing table, do not register the MV.
+		try {
+			await sm.dropTable(def.schemaName, backingTableName, /*ifExists*/ true);
+		} catch { /* best-effort cleanup */ }
+		throw e;
+	}
+
+	const mv: MaterializedViewSchema = {
+		name: def.viewName,
+		schemaName: def.schemaName,
+		sql: def.sql,
+		selectAst: def.selectAst,
+		columns: def.columns,
+		tags: def.tags,
+		backingTableName,
+		primaryKey: shape.primaryKey,
+		bodyHash: computeBodyHash(def.bodySql),
+		ordering: shape.ordering,
+		sourceTables: shape.sourceTables,
+		stale: false,
+		origin: 'explicit',
+	};
+	// Eagerly record the constraint↔structure link if this MV covers a UNIQUE
+	// constraint (informational — enforcement still routes through the
+	// synchronously-maintained auto-index).
+	linkCoveredUniqueConstraints(db, mv, def.bodySql);
+	sm.addMaterializedView(mv);
+
+	// Compile + register row-time write-through maintenance. The mandatory
+	// eligibility gate runs here (it needs the analyzed body) and throws on a
+	// body that is not row-time maintainable — roll the whole MV back so an
+	// ineligible body errors cleanly.
+	try {
+		db.registerMaterializedView(mv);
+	} catch (e) {
+		unlinkCoveredUniqueConstraints(db, mv);
+		sm.removeMaterializedView(def.schemaName, def.viewName);
+		try {
+			await sm.dropTable(def.schemaName, backingTableName, /*ifExists*/ true);
+		} catch { /* best-effort cleanup */ }
+		throw e;
+	}
+
+	return mv;
 }
 
 /**

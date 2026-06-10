@@ -6,23 +6,16 @@ import type {
 import type { Instruction, RuntimeContext } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
-import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
-import type { MaterializedViewSchema } from '../../schema/view.js';
-import { backingTableNameFor } from '../../schema/view.js';
+import { StatusCode, type SqlValue } from '../../common/types.js';
 import { astToString } from '../../emit/ast-stringify.js';
 import {
+	materializeView,
 	deriveBackingShape,
-	buildBackingTableSchema,
-	computeBodyHash,
-	collectBodyRows,
-	getBackingManager,
 	rebuildBacking,
 	rebuildBackingTable,
 	backingShapeMatches,
 	revalidateBody,
-	linkCoveredUniqueConstraints,
 	unlinkCoveredUniqueConstraints,
-	materializedViewNotASetError,
 } from './materialized-view-helpers.js';
 
 export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ctx: EmissionContext): Instruction {
@@ -46,61 +39,18 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 			);
 		}
 
-		// Derive backing shape from the optimized body, then create the backing
-		// table and fill it. A failure during fill rolls back the backing table so
-		// the MV is never half-registered.
-		const shape = deriveBackingShape(db, plan.bodySql, plan.columns);
-		const backingTableName = backingTableNameFor(plan.viewName);
-		const backingSchema = buildBackingTableSchema(db, plan.schemaName, backingTableName, shape);
-		const completeBacking = await sm.createBackingTable(backingSchema);
-
-		try {
-			const rows: Row[] = await collectBodyRows(db, plan.bodySql);
-			const manager = getBackingManager(completeBacking);
-			await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(plan.schemaName, plan.viewName));
-		} catch (e) {
-			// Roll back: drop the backing table, do not register the MV.
-			try {
-				await sm.dropTable(plan.schemaName, backingTableName, /*ifExists*/ true);
-			} catch { /* best-effort cleanup */ }
-			throw e;
-		}
-
-		const mv: MaterializedViewSchema = {
-			name: plan.viewName,
+		// The materialize core (derive backing shape → create + fill the memory
+		// backing → register record + row-time maintenance, rolling back on any
+		// throw) is shared with the catalog-import path — see materializeView.
+		const mv = await materializeView(db, {
 			schemaName: plan.schemaName,
+			viewName: plan.viewName,
 			sql: plan.sql,
 			selectAst: plan.selectStmt,
+			bodySql: plan.bodySql,
 			columns: plan.columns,
 			tags: plan.tags,
-			backingTableName,
-			primaryKey: shape.primaryKey,
-			bodyHash: computeBodyHash(plan.bodySql),
-			ordering: shape.ordering,
-			sourceTables: shape.sourceTables,
-			stale: false,
-			origin: 'explicit',
-		};
-		// Eagerly record the constraint↔structure link if this MV covers a UNIQUE
-		// constraint (informational — enforcement still routes through the
-		// synchronously-maintained auto-index).
-		linkCoveredUniqueConstraints(db, mv, plan.bodySql);
-		sm.addMaterializedView(mv);
-
-		// Compile + register row-time write-through maintenance. The mandatory
-		// eligibility gate runs here (it needs the analyzed body) and throws on a
-		// body that is not row-time maintainable — roll the whole MV back so an
-		// ineligible body errors cleanly at create time.
-		try {
-			db.registerMaterializedView(mv);
-		} catch (e) {
-			unlinkCoveredUniqueConstraints(db, mv);
-			sm.removeMaterializedView(plan.schemaName, plan.viewName);
-			try {
-				await sm.dropTable(plan.schemaName, backingTableName, /*ifExists*/ true);
-			} catch { /* best-effort cleanup */ }
-			throw e;
-		}
+		});
 
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_added',

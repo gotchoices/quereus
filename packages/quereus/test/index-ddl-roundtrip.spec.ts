@@ -291,7 +291,7 @@ describe('CREATE INDEX DDL round-trip: importCatalog multi-statement entries', (
 		const dst = new Database();
 		try {
 			const result = await dst.schemaManager.importCatalog(['']);
-			expect(result).to.deep.equal({ tables: [], indexes: [], views: [] });
+			expect(result).to.deep.equal({ tables: [], indexes: [], views: [], materializedViews: [] });
 		} finally {
 			await dst.close();
 		}

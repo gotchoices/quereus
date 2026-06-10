@@ -443,8 +443,34 @@ describe('StoreModule view / materialized-view persistence', () => {
 		await mod.closeAll();
 
 		const { db: db2, result } = await reopen();
-		// The MV entry persisted, but its source is gone → phase-3 exec throws → error.
+		// The MV entry persisted, but its source is gone → phase-3 import throws → error.
 		expect(result.errors, 'one MV failed to re-materialize').to.have.lengthOf(1);
 		expect(db2.schemaManager.getMaterializedView('main', 'mvm'), 'MV not registered').to.be.undefined;
+	});
+
+	it('an ineligible MV body records a rehydration error; the rest still rehydrate', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10)`);
+		await db.exec(`create materialized view good as select id, v from base`);
+		await mod.closeAll();
+
+		// Hand-plant an MV entry whose body fails the row-time eligibility gate (a
+		// non-deterministic projected column). Un-creatable via SQL — create rejects
+		// it — but a catalog could carry it (e.g. written by an older version), and
+		// rehydrate must record it per-entry rather than abort the phase.
+		const catalog = await provider.getCatalogStore();
+		await catalog.put(
+			buildMaterializedViewCatalogKey('main', 'bad'),
+			new TextEncoder().encode('create materialized view main.bad as select id, random() as r from base'),
+		);
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'the bad MV recorded one error').to.have.lengthOf(1);
+		expect(result.errors[0].error.message).to.match(/non-deterministic/i);
+		expect(result.materializedViews, 'the good MV still rehydrated').to.deep.equal(['main.good']);
+		expect(db2.schemaManager.getMaterializedView('main', 'bad'), 'bad MV not registered').to.be.undefined;
+		expect(db2.schemaManager.getTable('main', '_mv_bad'), 'no half-built backing left behind').to.be.undefined;
+		expect(await rows(db2, 'select id, v from good')).to.deep.equal([{ id: 1, v: 10 }]);
 	});
 });
