@@ -404,8 +404,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// stale `table_info` declaration, not a correctness risk. Reconciling the
 		// transient `StoreTable` here would be pointless anyway — `importCatalog`'s
 		// post-import reconcile loop (`table.updateSchema(fresh)`) immediately
-		// overwrites it with the `SchemaManager`-registered schema. The genuine
-		// reopen-time migration is tracked in `store-pk-collate-legacy-reopen-divergence`.
+		// overwrites it with the `SchemaManager`-registered schema. A genuine
+		// reopen-time migration (an engine import-path hook reconciling the
+		// *registered* schema to K) was considered and deliberately not built:
+		// only pre-`store-pk-collate-create-time-divergence` data can carry such a
+		// DDL, and backwards compatibility is out of scope (AGENTS.md). If legacy
+		// migration ever comes into scope, the fix is a module-consulted
+		// normalization hook on `importCatalog`/`rehydrateCatalog`.
 		const table = new StoreTable(
 			db,
 			this,

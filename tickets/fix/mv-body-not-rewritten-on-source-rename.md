@@ -64,3 +64,24 @@ design.
 - Decide whether a store-backed catalog re-persists the MV via `materialized_view_modified`
   (already wired to `saveMaterializedViewDDL` in `store-module.ts`) — same reuse argument as
   the plain-view `view_modified` decision.
+
+## Disposition (2026-06-09, human decision)
+
+**Full rewrite — parallel to plain views.** The design question above is settled: a source
+table/column rename rewrites a dependent MV's body exactly as it rewrites a plain view's
+(option 1), consistent with the "MV ≡ faster view" stance. The staleness-listener keying fix
+is subsumed (rewrite updates `sourceTables`, so the keying becomes consistent), but verify a
+rename that *fails* mid-propagation still leaves the MV stale rather than silently frozen.
+
+Fix-stage scope: reproduce both observable consequences (frozen-snapshot read; REFRESH error),
+then emit implement ticket(s) covering:
+
+- `propagateTableRename` / `propagateColumnRename` walk `getAllMaterializedViews()` and rewrite
+  `selectAst` like plain views;
+- recompute `sourceTables` + `bodyHash`, re-register row-time maintenance (the cached plan
+  references the old source name — see `releaseRowTime` / registration in
+  `database-materialized-views.ts`);
+- fire `materialized_view_modified` so a store-backed catalog re-persists
+  (`saveMaterializedViewDDL` is already wired in `store-module.ts`);
+- MV-over-MV: a renamed source under a chained MV cascades the rewrite/keying correctly;
+- backing table itself is NOT renamed (`_mv_<name>` keys off the MV name, which is unchanged).

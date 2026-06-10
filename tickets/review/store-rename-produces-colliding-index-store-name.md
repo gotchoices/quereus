@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-10T01:36:56.043Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\store-rename-produces-colliding-index-store-name.review.2026-06-10T01-36-56-043Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: Review — RENAME collision guard now covers relocated index store names: renameTable guards every introduced physical name (new data store + each `{newName}_idx_{x}`) against a once-collected occupied map before any side effect; LevelDB renameTableStores pre-scans ALL destinations before moving any directory.
 files:

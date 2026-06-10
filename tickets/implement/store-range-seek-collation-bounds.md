@@ -63,3 +63,20 @@ store is collation-correct; the gap is purely the post-fetch row filter.)
   memory and store via `yarn test` / `yarn test:store`) continues to pass with identical
   result rows; only the store plan improves.
 - No regression for BINARY ranges or for collation-mismatched ranges (still declined).
+
+## TODO
+
+- Thread each PK/index column's declared collation into `StoreTable.compareValues`'s
+  LT/LE/GT/GE arms (reuse the store's existing collation resolution — the same source
+  its key encoders and `comparePrimaryKey` use; do not re-derive).
+- Audit seek-start / early-termination logic for the same BINARY assumption and make it
+  collation-aware in lockstep (mirror what `memory-range-seek-collation-bounds` did for
+  the memory vtab).
+- Set `honorsCollatedRangeBounds: true` in the store's `getBestAccessPlan` result once
+  the filter is collation-correct.
+- Tests: store-backed NOCASE and RTRIM PK range + BETWEEN seek vs seq-scan row parity
+  (case/space-variant fixtures that under-fetch under raw `<`/`>`); BINARY-range and
+  collation-mismatched-range negative controls (still correct, mismatch still declined);
+  `yarn test` and `yarn test:store` green (store code path is directly modified).
+- Update the access-path note in `docs/optimizer.md` if it names the memory module as
+  the only `honorsCollatedRangeBounds` advertiser.
