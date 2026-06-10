@@ -175,6 +175,27 @@ describe('View plan dependencies and invalidation', () => {
 			await stmt.finalize();
 		});
 
+		it('an ALTER on a same-named view in another schema does not invalidate', async () => {
+			// objectName matches ('v' in both schemas) — this pins the *schemaName*
+			// half of the listener's dep compare, which the unrelated-view case above
+			// (different objectName) cannot reach.
+			await db.exec(`
+				create table t (id integer primary key);
+				create view v as select id from t;
+				create view temp.v as select id from t;
+			`);
+			const stmt = db.prepare('insert into v (id) values (1)');
+			const p1 = stmt.compile();
+			expect(stmt.compile(), 'compile() caches the plan (control)').to.equal(p1);
+
+			await db.exec(`alter view temp.v set tags (display_name = 'x')`);
+			expect(stmt.compile(), 'schemaName mismatch must not invalidate').to.equal(p1);
+
+			await db.exec(`alter view v set tags (display_name = 'y')`);
+			expect(stmt.compile(), 'the main-schema view still invalidates (control)').to.not.equal(p1);
+			await stmt.finalize();
+		});
+
 		it('a prepared SELECT from a view keeps its plan across a view tag change', async () => {
 			// The read plan's deps carry the base table, so a listener IS installed —
 			// this pins that the `view`-typed dep match is what gates invalidation,
