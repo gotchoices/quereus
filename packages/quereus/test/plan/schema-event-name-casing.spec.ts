@@ -125,4 +125,39 @@ describe('Schema-event name casing — cached-plan invalidation', () => {
 		expect(stmt.compile(), 'the self-consistent stored-name tag path keeps invalidating').to.not.equal(p1);
 		await stmt.finalize();
 	});
+
+	it('unqualified CREATE VIEW / DROP VIEW are symmetric under a non-main current schema', async () => {
+		// buildCreateViewStmt lands unqualified names in the CURRENT schema (not a
+		// hardcoded 'main'); buildDropViewStmt must resolve the same way or the
+		// create/drop pair targets two different schemas. The view body qualifies
+		// its table: unqualified READ references resolve via schema_path (main,
+		// temp), which is independent of the current schema.
+		db.schemaManager.addSchema('aux');
+		db.schemaManager.setCurrentSchema('aux');
+		await db.exec(`
+			create table t (id integer primary key);
+			create view v as select id from aux.t;
+		`);
+		expect(db.schemaManager.getView('aux', 'v'), 'unqualified CREATE VIEW lands in the current schema').to.exist;
+
+		await db.exec(`drop view v`);
+		expect(db.schemaManager.getView('aux', 'v'), 'unqualified DROP VIEW resolves in the current schema').to.be.undefined;
+	});
+
+	it('unqualified CREATE INDEX / DROP INDEX are symmetric under a non-main current schema', async () => {
+		// createIndex resolves unqualified names against the current schema;
+		// buildDropIndexStmt must match (it formerly hardcoded 'main').
+		db.schemaManager.addSchema('aux');
+		db.schemaManager.setCurrentSchema('aux');
+		await db.exec(`
+			create table t (id integer primary key, x integer);
+			create index idx on t (x);
+		`);
+		expect(db.schemaManager.getTable('aux', 't')!.indexes?.some(i => i.name === 'idx'),
+			'unqualified CREATE INDEX lands in the current schema').to.be.true;
+
+		await db.exec(`drop index idx`);
+		expect(db.schemaManager.getTable('aux', 't')!.indexes?.some(i => i.name === 'idx'),
+			'unqualified DROP INDEX resolves in the current schema').to.not.be.true;
+	});
 });
