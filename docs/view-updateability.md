@@ -860,7 +860,7 @@ interface MutationDiagnostic {
     | 'aggregate-target'                // aggregate-shaped column written
     | 'null-extended-create-conflict'   // outer-join insert supplies only non-preserved columns (no preserved anchor), OR a non-preserved-side update's null-extended materialization insert leaves a not-null-without-default base column unset
     | 'unsupported-outer-join-update'    // update of a non-preserved outer-join column with no preserved anchor to key the materialization (a FULL outer join, or a non-preserved side related to no preserved side by an equi-join key) — the LEFT-anchored case is shipped
-    | 'tag-target-not-found'            // an `insert defaults (col = expr, …)` entry names a column that is neither a view nor a base column (reason name retained from the tag-era surface the clause replaced)
+    | 'default-target-not-found'        // an `insert defaults (col = expr, …)` entry names a column that is neither a view nor a base column
     | 'mutual-fk-restrict-delete'       // two-side join DELETE fan-out over a mutual FK whose ON DELETE actions no side order can satisfy under immediate enforcement
     | 'conflicting-assignment'          // two SET targets lower to the same base column
     | 'predicate-contradiction';        // statement's predicate is unsatisfiable

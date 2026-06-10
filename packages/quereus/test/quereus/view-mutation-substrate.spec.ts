@@ -176,3 +176,40 @@ describe('View Mutation Substrate (cross-source cardinality)', () => {
 		expect(plan.nodeType).to.equal(PlanNodeType.ViewMutation);
 	});
 });
+
+/**
+ * Machine-readable reason gate for the `insert defaults (col = expr, …)`
+ * unknown-column guard: a clause entry naming a column that is neither a view
+ * nor a base column raises `default-target-not-found` at plan time. The
+ * sqllogic suite (93.4) pins only the human message; this pins the `reason`.
+ */
+describe('View Mutation Substrate (insert defaults unknown column)', () => {
+	it('rejects an unknown insert-defaults column with default-target-not-found', async () => {
+		const db = new Database();
+		await db.exec(`create table dft (id integer primary key, created integer)`);
+		await db.exec(`create view dft_v as select id from dft insert defaults (nope = 1)`);
+		const parameterScope = new ParameterScope(new GlobalScope(db.schemaManager));
+		const ctx: PlanningContext = {
+			db,
+			schemaManager: db.schemaManager,
+			parameters: {},
+			scope: parameterScope,
+			cteNodes: new Map(),
+			schemaDependencies: new BuildTimeDependencyTracker(),
+			schemaCache: new Map(),
+			cteReferenceCache: new Map(),
+			outputScopes: new Map(),
+		};
+		const ast = new Parser().parseAll(`insert into dft_v values (1)`)[0] as AST.InsertStmt;
+		let caught: unknown;
+		try {
+			buildInsertStmt(ctx, ast);
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught, 'a ViewMutationError is raised at plan time').to.be.instanceOf(ViewMutationError);
+		const err = caught as ViewMutationError;
+		expect(err.mutationDiagnostic.reason).to.equal('default-target-not-found');
+		expect(err.message).to.contain(`names column 'nope'`);
+	});
+});

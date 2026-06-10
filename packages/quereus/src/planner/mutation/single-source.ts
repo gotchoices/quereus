@@ -658,7 +658,7 @@ function requireBaseColumn(vc: ViewColumn): string {
  * Resolve an insert-default column name (from the `insert defaults (col = expr, …)`
  * clause) to its base column. The name may be a base column (the documented
  * projected-away case) or a view column with `base` lineage. An unknown name is
- * a structured `tag-target-not-found` — a typo must fail loudly, not silently
+ * a structured `default-target-not-found` — a typo must fail loudly, not silently
  * no-op. `spelling` names the offending clause entry in the diagnostic.
  */
 function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: MutableViewLike, spelling: string): string {
@@ -667,7 +667,7 @@ function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: 
 	const vc = analysis.viewColumns.find(c => c.name.toLowerCase() === colName);
 	if (vc && vc.lineage.kind === 'base') return vc.lineage.baseColumnName;
 	raiseMutationDiagnostic({
-		reason: 'tag-target-not-found',
+		reason: 'default-target-not-found',
 		column: colName,
 		table: view.name,
 		message: `cannot write through view '${view.name}': ${spelling} names column '${colName}', which is not a column of the view or its base table '${analysis.baseTable.name}'`,
