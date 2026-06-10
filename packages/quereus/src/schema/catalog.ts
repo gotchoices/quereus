@@ -68,8 +68,11 @@ export interface CatalogView {
 export interface CatalogMaterializedView {
 	name: string;
 	ddl: string;
-	/** Canonical body hash — the differ compares this against a declared MV's
-	 *  recomputed body hash to detect "body changed → rebuild". */
+	/** Canonical definition hash (`computeBodyHash` over
+	 *  `viewDefinitionToCanonicalString` — explicit column list + body +
+	 *  `insert defaults` clause; name / schema / tags excluded). The differ
+	 *  compares this against a declared MV's recomputed definition hash to
+	 *  detect "definition changed → rebuild". */
 	bodyHash: string;
 	tags?: Readonly<Record<string, SqlValue>>;
 }

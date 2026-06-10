@@ -387,7 +387,7 @@ apply schema main;
 ```
 
 - **DDL round-trip.** `apply schema` and schema export emit canonical `create materialized view ...` DDL via `ast-stringify`, so a schema survives `schema → DDL → parse → schema` with no shape change.
-- **Body-change rebuild.** The differ keys rebuild detection on `bodyHash` (`toBase64Url(fnv1aHash(<canonical body SQL>))`, shared by MV creation and the differ). When a declared MV's body hash differs from the live MV's `bodyHash`, the differ schedules a **drop + recreate** (materialized views have no in-place `ALTER` primitive). The recreate re-materializes from current sources, in apply order — after source tables and views are created, before assertions. An unchanged body produces no create and no drop. Tags do not perturb the schema version (they are stripped before hashing).
+- **Definition-change rebuild.** The differ keys rebuild detection on `bodyHash` (`toBase64Url(fnv1aHash(<canonical definition>))` — the explicit column list + canonical body SQL + `insert defaults` clause, rendered by `viewDefinitionToCanonicalString`; shared by MV creation, the rename-propagation rewrite, and the differ). When a declared MV's definition hash differs from the live MV's `bodyHash`, the differ schedules a **drop + recreate** (materialized views have no in-place `ALTER` primitive) — an in-diff source table/column rename is reconciled first so a pure rename does not churn a rebuild (see [schema.md](schema.md)). The recreate re-materializes from current sources, in apply order — after source tables and views are created, before assertions. An unchanged definition produces no create and no drop. Tags are excluded from the canonical definition: a tag-only change takes in-place `SET TAGS`, never a rebuild.
 
 ## Covering structures
 

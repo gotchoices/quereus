@@ -1496,7 +1496,7 @@ Any other body (general joins, set-operations, recursion, `distinct`, `limit`/`o
 
 **Covering structures.** A materialized view that projects a UNIQUE constraint's columns (plus the source PK), ordered by those columns, can *cover* that constraint — its backing table then answers `insert or replace` / `or ignore` / conflict detection at O(log n), row-time. This is the substrate the [lens](#211-logical-schemas-and-lenses) layer's set-level enforcement builds on.
 
-**Declarative schema.** A `materialized view` item is accepted inside `declare schema { … }`; a body change (detected by `bodyHash`) schedules a drop-and-recreate.
+**Declarative schema.** A `materialized view` item is accepted inside `declare schema { … }`; a definition change — body, explicit column list, or `insert defaults` clause, detected by `bodyHash` over the canonical definition — schedules a drop-and-recreate.
 
 ```sql
 create materialized view mv as select id, x from t order by x;

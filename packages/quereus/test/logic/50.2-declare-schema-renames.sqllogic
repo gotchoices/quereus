@@ -489,3 +489,47 @@ diff schema main;
 
 drop view rh_v;
 drop table rh_t;
+
+-- ===================================
+-- 15. In-diff COLUMN rename reconciles a dependent MATERIALIZED VIEW (no spurious rebuild)
+-- ===================================
+
+-- The MV mirror of §11: the differ's hash compare reconciles the in-diff
+-- column rename (no DROP MATERIALIZED VIEW / re-materialization), and the live
+-- column-rename propagation rewrites the MV body and re-stamps bodyHash with
+-- the same canonical-definition formula, so the re-diff converges.
+
+create table stock_t (id integer primary key, amount integer not null);
+create materialized view stock_mv as select id, amount from stock_t;
+insert into stock_t values (1, 5);
+
+declare schema main {
+	table stock_t {
+		id integer primary key,
+		qty integer not null with tags ("quereus.previous_name" = 'amount')
+	}
+
+	materialized view stock_mv as select id, qty from stock_t
+}
+
+-- run
+
+-- Only the rename op — no MV drop/create.
+diff schema main;
+→ [{"ddl": "ALTER TABLE stock_t RENAME COLUMN amount TO qty"}]
+
+apply schema main;
+
+-- run
+
+-- Row-time maintenance survived; the MV's output column followed the rename.
+insert into stock_t values (2, 7);
+select * from stock_mv order by id;
+→ [{"id": 1, "qty": 5}, {"id": 2, "qty": 7}]
+
+-- Converged: the propagation re-stamp and the differ formula agree.
+diff schema main;
+→ []
+
+drop materialized view stock_mv;
+drop table stock_t;
