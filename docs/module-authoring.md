@@ -259,6 +259,57 @@ place — `'fully-reentrant'` would require either fresh-per-write layers
 or an iterator-safe mutation path. Layered stores, isolation wrappers,
 and persistent plugins stay default until their owners audit them.
 
+### 4. Backing Host (Materialized-View Backing Tables)
+
+A module may volunteer to host materialized-view backing tables by implementing
+the optional `getBackingHost` hook — presence of the method is the capability
+(the `getMappingAdvertisements` signaling style):
+
+```typescript
+interface VirtualTableModule {
+  getBackingHost?(db: Database, schemaName: string, tableName: string): BackingHost | undefined;
+}
+```
+
+`BackingHost` (`vtab/backing-host.ts`; `BackingHost`, `BackingScanRequest`,
+`MaintenanceOp`, and `BackingRowChange` are exported from the package root) is
+the privileged per-table surface the engine drives MV maintenance through:
+
+- `ownsConnection(conn)` — true when `conn` is a live connection to **this**
+  backing-table incarnation. The host must be pinned to one incarnation (capture
+  the table's internal handle by reference at resolve time): after a
+  drop+recreate of the same name, the new host must reject the old
+  incarnation's connections.
+- `connect()` — a fresh `VirtualTableConnection`; the engine registers it so
+  coordinated commit/rollback (savepoint replay included) covers its pending
+  state in lockstep with the source write.
+- `applyMaintenance(conn, ops)` — apply an ordered `MaintenanceOp` batch
+  (`delete-key` / `upsert` / `delete-by-prefix` / `replace-all`) to `conn`'s
+  **pending** transaction state, bypassing user-DML read-only enforcement while
+  keeping secondary-index / change-tracking bookkeeping. Returns the
+  **effective** `BackingRowChange`s realized — exact reporting is part of the
+  contract (the MV-over-MV cascade replays them; no-op ops yield nothing,
+  `replace-all` yields the minimal keyed diff). Later reads on `conn` must
+  observe the applied ops (reads-own-writes).
+- `replaceContents(rows, onDuplicateKey?)` — atomically replace the
+  **committed** contents (create-fill / refresh); throw `onDuplicateKey()` (or a
+  generic `CONSTRAINT`) on a duplicate PK; concurrent readers see pre- or
+  post-swap state, never partial.
+- `scanEffective(conn, { equalityPrefix?, descending? })` — reads-own-writes
+  scan over `conn`'s effective state in PK order, honoring `equalityPrefix` as a
+  seek + early-terminate leading-PK prefix range.
+
+**Cost contract:** PK-ordered storage with O(log n) keyed
+upsert/delete/point-lookup **and** the ordered prefix-range scan are required —
+do not advertise the capability without them (the engine does not gate per
+maintenance arm). A backing table must reject user DML (READONLY) while
+admitting the privileged surface, and the engine adds no latching around it —
+the host owns its own concurrency discipline under the module's declared
+`concurrencyMode`. The memory module is the reference implementation
+(`MemoryTableModule.getBackingHost`); see
+[`docs/materialized-views.md` § Backing-host capability](materialized-views.md#backing-host-capability)
+for the engine-side view.
+
 ## Capability negotiation surface
 
 The `VirtualTableModule` contract signals capability three different ways, and the
@@ -272,7 +323,7 @@ treat it as the reference for "what happens if my module doesn't do X".
 
 | Signaling | Members | Engine consults it? |
 | --- | --- | --- |
-| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `shadowName` | yes, per call site (varies) |
+| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `shadowName` | yes, per call site (varies) |
 | **Static field** | `concurrencyMode`, `expectedLatencyMs` | yes, before dispatch (the clean model) |
 | **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first two |
 
@@ -295,6 +346,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `getBestAccessPlan` | presence | engine-side fallback (default full-scan; isolation returns a default plan when the underlying lacks it) | ✓ | ✓ | forwards | via store |
 | `supports` / `executePlan` | presence (pair) | engine-side fallback (index path) — isolation **deliberately suppresses** it so the overlay sees every row | — | — | suppressed | — |
 | `getMappingAdvertisements` | presence | engine-side fallback (name-match only) | ✓ tags | ✓ tags | forwards | via store |
+| `getBackingHost` | presence | negotiated rejection (the engine only creates MV backing tables on the memory module today; resolving a host from a module without the capability is a sited `INTERNAL`) | ✓ | — | — | — |
 | `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
 | `shadowName` | presence | **dead** — declared on the interface but **never called anywhere** (see note below) | — | — | — | — |
 | `alterTable` (method present) | presence | negotiated rejection (each data-affecting `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent — except `renameColumn`, which degrades to an engine-side schema-only rename) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |

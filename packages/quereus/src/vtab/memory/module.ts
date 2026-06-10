@@ -1,10 +1,14 @@
 import { QuereusError } from '../../common/errors.js';
-import { StatusCode } from '../../common/types.js';
+import { StatusCode, type Row } from '../../common/types.js';
 import type { Database } from '../../core/database.js';
 import { type TableSchema, type IndexSchema, IndexColumnSchema } from '../../schema/table.js';
 import { MemoryTable } from './table.js';
 import type { VirtualTableModule, SchemaChangeInfo } from '../module.js';
 import { MemoryTableManager } from './layer/manager.js';
+import type { BackingHost, BackingScanRequest, MaintenanceOp, BackingRowChange } from '../backing-host.js';
+import type { VirtualTableConnection } from '../connection.js';
+import { MemoryVirtualTableConnection } from './connection.js';
+import type { MemoryTableConnection } from './layer/connection.js';
 import type { MemoryTableConfig } from './types.js';
 import { createMemoryTableLoggers } from './utils/logging.js';
 import { AccessPlanBuilder, validateAccessPlan } from '../best-access-plan.js';
@@ -60,6 +64,58 @@ function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): R
 		}
 	}
 	return cols.size === 0 ? EMPTY_COLUMN_SET : cols;
+}
+
+/**
+ * The memory module's {@link BackingHost} — the reference implementation of the
+ * backing-host capability (see `vtab/backing-host.ts` for the contract). A thin
+ * adapter over one {@link MemoryTableManager}, captured **by reference**: a
+ * drop+recreate of the same table name builds a fresh manager, so a host (and
+ * its `ownsConnection`) is pinned to one backing-table incarnation and never
+ * adopts a stale same-name connection from a previous one.
+ */
+class MemoryBackingHost implements BackingHost {
+	constructor(private readonly manager: MemoryTableManager) {}
+
+	ownsConnection(conn: VirtualTableConnection): boolean {
+		return conn instanceof MemoryVirtualTableConnection
+			&& conn.getMemoryConnection().tableManager === this.manager;
+	}
+
+	connect(): VirtualTableConnection {
+		const qualifiedName = `${this.manager.schemaName}.${this.manager.tableName}`;
+		return new MemoryVirtualTableConnection(qualifiedName, this.manager.connect());
+	}
+
+	applyMaintenance(conn: VirtualTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]> {
+		return this.manager.applyMaintenanceToLayer(this.unwrap(conn), ops);
+	}
+
+	replaceContents(rows: readonly Row[], onDuplicateKey?: () => QuereusError): Promise<void> {
+		return this.manager.replaceBaseLayer(rows, onDuplicateKey);
+	}
+
+	scanEffective(conn: VirtualTableConnection, req: BackingScanRequest): AsyncIterable<Row> {
+		const memConn = this.unwrap(conn);
+		// Pending transaction state layered over committed (reads-own-writes),
+		// in PK order — the same start-layer choice a `select` from the MV makes.
+		return this.manager.scanLayer(memConn.pendingTransactionLayer ?? memConn.readLayer, {
+			indexName: 'primary',
+			descending: req.descending ?? false,
+			equalityPrefix: req.equalityPrefix,
+		});
+	}
+
+	private unwrap(conn: VirtualTableConnection): MemoryTableConnection {
+		if (!this.ownsConnection(conn)) {
+			throw new QuereusError(
+				`connection '${conn.connectionId}' does not belong to backing table `
+					+ `'${this.manager.schemaName}.${this.manager.tableName}' (or to this incarnation of it)`,
+				StatusCode.INTERNAL,
+			);
+		}
+		return (conn as MemoryVirtualTableConnection).getMemoryConnection();
+	}
 }
 
 /**
@@ -126,6 +182,17 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 */
 	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
 		return buildAdvertisementsFromTags(basisSchema);
+	}
+
+	/**
+	 * Backing-host capability (see `vtab/backing-host.ts`): resolve the
+	 * privileged surface for a table this module owns, or undefined when the
+	 * table is unknown to it. The returned host captures the table's CURRENT
+	 * {@link MemoryTableManager} by reference, pinning it to this incarnation.
+	 */
+	getBackingHost(_db: Database, schemaName: string, tableName: string): BackingHost | undefined {
+		const manager = this.tables.get(`${schemaName}.${tableName}`.toLowerCase());
+		return manager ? new MemoryBackingHost(manager) : undefined;
 	}
 
 	/**

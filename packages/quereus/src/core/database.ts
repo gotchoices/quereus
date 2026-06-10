@@ -59,7 +59,7 @@ import type { ExternalRowChange, IngestExternalChangesOptions } from './database
 import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { MaterializedViewManager, type BackingConnectionCache } from './database-materialized-views.js';
-import type { BackingRowChange } from '../vtab/memory/layer/manager.js';
+import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
 import { Table } from './table-handle.js';

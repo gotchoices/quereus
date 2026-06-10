@@ -1,9 +1,22 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { getBackingManager } from '../../src/runtime/emit/materialized-view-helpers.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import type { MemoryTableManager } from '../../src/vtab/memory/layer/manager.js';
 import type { MemoryTableConnection } from '../../src/vtab/memory/layer/connection.js';
+import type { TableSchema } from '../../src/schema/table.js';
 import type { Row } from '../../src/common/types.js';
+
+/** Test-local manager resolver: these layer-mechanics suites need the raw
+ *  {@link MemoryTableManager}, which the engine itself no longer reaches for
+ *  directly (it routes through the module-neutral backing-host capability —
+ *  see `vtab/backing-host.ts`). */
+function getBackingManager(schema: TableSchema): MemoryTableManager {
+	expect(schema.vtabModule, `'${schema.name}' module`).to.be.instanceOf(MemoryTableModule);
+	const manager = (schema.vtabModule as MemoryTableModule).tables
+		.get(`${schema.schemaName}.${schema.name}`.toLowerCase());
+	expect(manager, `memory manager for '${schema.name}'`).to.not.be.undefined;
+	return manager!;
+}
 
 /**
  * Targeted unit coverage for the `delete-by-prefix` {@link MaintenanceOp} arm of

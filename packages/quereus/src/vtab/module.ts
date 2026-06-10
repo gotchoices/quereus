@@ -7,6 +7,7 @@ import type { BestAccessPlanRequest, BestAccessPlanResult } from './best-access-
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { ModuleCapabilities } from './capabilities.js';
 import type { MappingAdvertisement } from './mapping-advertisement.js';
+import type { BackingHost } from './backing-host.js';
 import type { Schema } from '../schema/schema.js';
 import type { LensDeploymentSnapshot } from '../schema/lens.js';
 import type { Row, SqlValue } from '../common/types.js';
@@ -254,6 +255,15 @@ export interface VirtualTableModule<
 		db: Database,
 		basisSchema: Schema,
 	): readonly MappingAdvertisement[];
+
+	/**
+	 * Optional. Returns the privileged backing-host surface for a table this
+	 * module owns, or undefined when the table is unknown to it. Presence of
+	 * the method is the capability (mirrors getMappingAdvertisements): a module
+	 * implementing it may host materialized-view backing tables. See
+	 * vtab/backing-host.ts for the semantic and cost contract.
+	 */
+	getBackingHost?(db: Database, schemaName: string, tableName: string): BackingHost | undefined;
 
 	/**
 	 * Alter an existing table's structure. Called by ALTER TABLE for

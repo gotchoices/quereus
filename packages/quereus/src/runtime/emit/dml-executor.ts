@@ -16,7 +16,7 @@ import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
 import type { BackingConnectionCache } from '../../core/database-materialized-views.js';
-import type { BackingRowChange } from '../../vtab/memory/layer/manager.js';
+import type { BackingRowChange } from '../../vtab/backing-host.js';
 
 /**
  * Module-scope counter producing unique statement-savepoint names across

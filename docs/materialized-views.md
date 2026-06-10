@@ -27,7 +27,7 @@ CREATE MATERIALIZED VIEW mv AS <body>
               (body AST, inferred PK, bodyHash, sourceTables, backingTableName)
 ```
 
-- **Backing table.** The materialized rows live in an ordinary `TableSchema` registered under the reserved derived name `_mv_<name>` (`backingTableNameFor`). The backing module is the in-memory table module; a `USING <module>(...)` clause parses and is retained for forward compatibility but is otherwise ignored. Backing tables are excluded from user-facing catalog enumeration — they are an implementation detail.
+- **Backing table.** The materialized rows live in an ordinary `TableSchema` registered under the reserved derived name `_mv_<name>` (`backingTableNameFor`). The backing module is the in-memory table module; a `USING <module>(...)` clause parses and is retained for forward compatibility but is otherwise ignored. Backing tables are excluded from user-facing catalog enumeration — they are an implementation detail. The engine never reaches into the backing module's internals: every privileged backing operation (maintenance writes, the wholesale create/refresh fill, the enforcement scan) routes through the module-neutral [backing-host capability](#backing-host-capability), for which the memory module is the default and reference implementation.
 
 - **MV record.** A `MaterializedViewSchema` is registered in `Schema.materializedViews` (separate from `Schema.tables` and `Schema.views`). It retains the parsed body AST, the inferred logical primary key, the `bodyHash`, the qualified source-table dependencies, and the backing table's name.
 
@@ -40,9 +40,33 @@ The backing table's logical primary key is the body's own key, so each body row 
 - For the bounded-delta arms the key is structural: the **covering-index** shape maps `T`'s primary key through the projection (the gate requires every PK column to be a passthrough output column); the **aggregate** arm keys on the group key; the **lateral-TVF** arm keys on the composite product key `(T.pk ∪ tvf-key)`; the **1:1-join** arm keys on the driving table's PK.
 - For the **full-rebuild floor** the key is the body's **provable unique key** (`keysOf` over the optimized body root — a set operation over keyed legs, a multi-way 1:1 join, a `distinct`, etc. all carry one).
 
-A body with **no** provable unique key — a *bag*, e.g. a key-dropping projection or a `union all` of overlapping inputs — has no row identity to key a materialization on and is **rejected** at create (a relational reject, not a shape reject; a multiplicity-keyed bag materialization is a [future](#current-limitations)). The create-time fill guards duplicate backing keys defensively (the transactional replace / `replaceBaseLayer` carry an `onDuplicateKey` factory raising a "must be a set" diagnostic); for a body with a sound key that guard never fires.
+A body with **no** provable unique key — a *bag*, e.g. a key-dropping projection or a `union all` of overlapping inputs — has no row identity to key a materialization on and is **rejected** at create (a relational reject, not a shape reject; a multiplicity-keyed bag materialization is a [future](#current-limitations)). The create-time fill guards duplicate backing keys defensively (the transactional replace and the backing host's `replaceContents` carry an `onDuplicateKey` factory raising a "must be a set" diagnostic); for a body with a sound key that guard never fires.
 
 > **Physical vs logical key.** The backing table's *physical* `primaryKeyDefinition` may lead with the body's `order by` columns (so a btree scan reproduces the body order), appending the logical key as a uniqueness-preserving tiebreaker. `MaterializedViewSchema.primaryKey` keeps the logical identity. The covering-structure work generalizes this into a proper materialized index.
+
+### Backing-host capability
+
+The privileged surface the engine needs from a backing table's module is factored into a module-neutral capability, `BackingHost` (`vtab/backing-host.ts`), resolved per table via the optional `VirtualTableModule.getBackingHost(db, schemaName, tableName)` — presence of the method is the capability, mirroring `getMappingAdvertisements`. One `BackingHost` instance corresponds to one live backing-table *incarnation*: a drop+recreate (refresh's shape rebuild) yields a new host whose `ownsConnection` rejects the previous incarnation's connections, so a stale same-name connection is never adopted.
+
+The surface (see the doc comments in `vtab/backing-host.ts` for the full contract):
+
+| Member | Role |
+| --- | --- |
+| `ownsConnection(conn)` | True when `conn` is a live connection to *this* backing incarnation — how the engine re-finds the coordinated backing connection among the Database's registered connections. |
+| `connect()` | Fresh `VirtualTableConnection`; the engine registers it so coordinated commit/rollback (savepoint replay included) covers its pending state in lockstep with the source write. |
+| `applyMaintenance(conn, ops)` | Privileged, ordered `MaintenanceOp` application into `conn`'s **pending** transaction state. Bypasses user-DML read-only enforcement, keeps secondary-index / change-tracking bookkeeping, and returns the **effective** `BackingRowChange`s realized. |
+| `replaceContents(rows, onDuplicateKey?)` | Atomic replacement of the **committed** contents (create-fill / refresh). Throws `onDuplicateKey()` on a duplicate PK; concurrent readers see pre- or post-swap state, never partial. |
+| `scanEffective(conn, { equalityPrefix?, descending? })` | Reads-own-writes scan over `conn`'s effective state (pending over committed) in PK order, honoring `equalityPrefix` as a seek + early-terminate prefix range — the covering-UNIQUE enforcement scan. |
+
+Contract highlights:
+
+- **Cost.** PK-ordered storage with O(log n) keyed upsert/delete/point-lookup **and** an ordered prefix-range scan are *required*. This keeps every bounded-delta arm (`delete-by-prefix` included) and the covering-UNIQUE prefix lookup module-agnostic. A module that cannot provide the ordered prefix scan must not advertise the capability — there is deliberately no per-arm gating (both real host candidates are ordered-KV, and per-module arm gating would fragment the maintenance planner).
+- **Effective-change reporting is part of the contract**, not an optimization: the [MV-over-MV cascade](#mv-over-mv-cascade) routes each returned `BackingRowChange` back through `maintainRowTime`, so over- or under-reporting corrupts consumer MVs. No-op ops yield nothing; `replace-all` yields the minimal keyed diff.
+- **Transactionality.** `applyMaintenance` writes the connection's pending state; commit/rollback ride the registered `VirtualTableConnection`'s generic `begin/commit/rollback/savepoint` surface.
+- **Read-only to user DML.** A backing table must reject user DML (READONLY) while admitting `applyMaintenance`/`replaceContents`.
+- **Concurrency.** The engine adds no latching around the privileged surface; each host owns its own discipline under the `VtabConcurrencyMode` its module declares (the memory host's pending layer is private to the connection and mutated synchronously, so it needs none).
+
+The engine resolves the host through `resolveBackingHost` (`runtime/emit/materialized-view-helpers.ts`); the memory implementation is a thin adapter over `MemoryTableManager` (`MemoryTableModule.getBackingHost`), delegating to `applyMaintenanceToLayer`, `replaceBaseLayer`, and the layer scan. `USING <module>(...)` selecting a different capability-bearing module is the follow-on step.
 
 ## DDL statements
 
@@ -67,11 +91,11 @@ create materialized view mv [if not exists] [(col, ...)]
 refresh materialized view mv;
 ```
 
-Re-evaluates the body against current source data and atomically replaces the backing table's contents (`replaceBaseLayer` builds a fresh base layer and swaps it under the schema-change latch; readers use start-of-call snapshot isolation, so a concurrent scan sees either the old contents or the new — never a torn state).
+Re-evaluates the body against current source data and atomically replaces the backing table's contents via the backing host's `replaceContents` (in the memory module, `replaceBaseLayer` builds a fresh base layer and swaps it under the schema-change latch; readers use start-of-call snapshot isolation, so a concurrent scan sees either the old contents or the new — never a torn state).
 
 **Shape-aware.** Refresh first re-derives the backing's *shape* (columns/types/PK/ordering) from the re-planned body (`deriveBackingShape`) and compares it to the live backing (`backingShapeMatches`):
 
-- **Unchanged shape (the fast path):** the data-only `replaceBaseLayer` above runs, so the backing `TableSchema` identity is preserved and cached prepared plans / the optimizer's MV-body-root cache stay warm. This is the common periodic-refresh case.
+- **Unchanged shape (the fast path):** the data-only `replaceContents` above runs, so the backing `TableSchema` identity is preserved and cached prepared plans / the optimizer's MV-body-root cache stay warm. This is the common periodic-refresh case.
 - **Shifted shape (rebuild):** a source `alter` can shift the body's output shape — most visibly a `select *` body, whose new source column *interleaves* into the output while the create-time backing did not reorder. Stuffing the new rows into the stale backing schema would surface body values under the wrong column labels (a latent direct-read corruption) and break the positional backing↔body alignment the [join read-rewrite](#join-subsumption) relies on. So refresh **rebuilds the backing table** (`rebuildBackingTable`: drop + recreate at the new shape via the same `buildBackingTableSchema` → `createBackingTable` → fill path as create, then re-derives `mv.primaryKey`/`ordering`/`sourceTables`). The drop/create fire `table_removed`/`table_added` on `_mv_<name>`, which invalidate any cached prepared plan scanning the backing and cascade staleness to any consumer MV over this backing. A fill failure (e.g. the reshaped body is duplicate-producing under the new PK) drops the half-built backing and leaves the MV `stale` so the next read errors rather than serving an empty relation.
 
 An MV with an **explicit column list** (`mv(a, b, c)`) whose body output *count* shifts under a source change is **not** silently reshaped — refresh errors with a "drop and recreate" diagnostic, since the column list is a declared interface. After the rebuild, row-time maintenance is re-registered against the new backing shape (see [Schema-change staleness](#schema-change-staleness)).

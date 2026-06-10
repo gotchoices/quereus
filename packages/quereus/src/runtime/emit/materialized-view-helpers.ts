@@ -15,8 +15,7 @@ import type { Schema } from '../../schema/schema.js';
 import { generateMaterializedViewDDL } from '../../schema/ddl-generator.js';
 import { renameTableInAst, renameColumnInAst, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
-import { MemoryTableModule } from '../../vtab/memory/module.js';
-import type { MemoryTableManager } from '../../vtab/memory/layer/manager.js';
+import type { BackingHost } from '../../vtab/backing-host.js';
 
 const log = createLogger('runtime:emit:materialized-view');
 
@@ -288,8 +287,8 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 
 	try {
 		const rows: Row[] = await collectBodyRows(db, def.bodySql);
-		const manager = getBackingManager(completeBacking);
-		await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
+		const host = resolveBackingHost(db, completeBacking);
+		await host.replaceContents(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
 	} catch (e) {
 		// Roll back: drop the backing table, do not register the MV.
 		try {
@@ -363,8 +362,8 @@ export async function rebuildBacking(db: Database, mv: MaterializedViewSchema): 
 			StatusCode.INTERNAL,
 		);
 	}
-	const manager = getBackingManager(backing);
-	await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
+	const host = resolveBackingHost(db, backing);
+	await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
 }
 
 /**
@@ -450,8 +449,8 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
  * schema change has shifted the body's output shape (columns/types/PK/ordering),
  * so the backing no longer corresponds column-for-column to the re-planned body.
  * Mirrors the create path (`emitCreateMaterializedView`) exactly —
- * `buildBackingTableSchema` → `createBackingTable` → fill via `replaceBaseLayer` —
- * so there is one code path for "make the backing match the body".
+ * `buildBackingTableSchema` → `createBackingTable` → fill via the backing host's
+ * `replaceContents` — so there is one code path for "make the backing match the body".
  *
  * The body rows are collected BEFORE the old backing is dropped (the body reads
  * the sources with the rewrite suppressed, never the backing it populates), so
@@ -475,8 +474,8 @@ export async function rebuildBackingTable(
 	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.backingTableName, shape);
 	const completeBacking = await sm.createBackingTable(backingSchema);
 	try {
-		const manager = getBackingManager(completeBacking);
-		await manager.replaceBaseLayer(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
+		const host = resolveBackingHost(db, completeBacking);
+		await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
 	} catch (e) {
 		try {
 			await sm.dropTable(mv.schemaName, mv.backingTableName, /*ifExists*/ true);
@@ -485,21 +484,29 @@ export async function rebuildBackingTable(
 	}
 }
 
-/** Resolves the {@link MemoryTableManager} backing a materialized view's table. */
-export function getBackingManager(backingSchema: TableSchema): MemoryTableManager {
+/**
+ * Resolves the {@link BackingHost} for a materialized view's backing table via
+ * the owning module's backing-host capability (`vtab/backing-host.ts`). INTERNAL
+ * when the module lacks the capability or does not know the table — a backing
+ * table is engine-created on a capability-checked module, so either is a bug.
+ */
+export function resolveBackingHost(db: Database, backingSchema: TableSchema): BackingHost {
 	const module = requireVtabModule(backingSchema);
-	if (!(module instanceof MemoryTableModule)) {
+	if (!module.getBackingHost) {
 		throw new QuereusError(
-			`materialized view backing table '${backingSchema.name}' is not a memory table`,
+			`materialized view backing table '${backingSchema.name}' is owned by module `
+				+ `'${backingSchema.vtabModuleName}', which does not implement the backing-host capability`,
 			StatusCode.INTERNAL,
 		);
 	}
-	const key = `${backingSchema.schemaName}.${backingSchema.name}`.toLowerCase();
-	const manager = module.tables.get(key);
-	if (!manager) {
-		throw new QuereusError(`backing table manager not found for '${key}'`, StatusCode.INTERNAL);
+	const host = module.getBackingHost(db, backingSchema.schemaName, backingSchema.name);
+	if (!host) {
+		throw new QuereusError(
+			`backing host not found for '${backingSchema.schemaName}.${backingSchema.name}'`,
+			StatusCode.INTERNAL,
+		);
 	}
-	return manager;
+	return host;
 }
 
 /**

@@ -61,14 +61,11 @@ import {
 	type MaintenanceSourceStats,
 	type MaintenanceStrategy,
 } from '../planner/cost/index.js';
-import { getBackingManager } from '../runtime/emit/materialized-view-helpers.js';
+import { resolveBackingHost } from '../runtime/emit/materialized-view-helpers.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
-import type { BackingRowChange, MaintenanceOp, MemoryTableManager } from '../vtab/memory/layer/manager.js';
-import { MemoryVirtualTableConnection } from '../vtab/memory/connection.js';
+import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backing-host.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
-import type { MemoryTableConnection } from '../vtab/memory/layer/connection.js';
-import type { ScanPlan } from '../vtab/memory/layer/scan-plan.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
 import { compareSqlValues } from '../util/comparison.js';
 import type { MaterializedViewSchema } from '../schema/view.js';
@@ -390,7 +387,7 @@ export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidual
 }
 
 /**
- * Per-statement cache of resolved backing {@link MemoryTableConnection}s, keyed by the
+ * Per-statement cache of resolved backing {@link VirtualTableConnection}s, keyed by the
  * lowercased backing `schema.table`. Created **once per DML generator run** (one
  * statement) and threaded through the maintenance path so the backing-connection
  * resolution — a scan over *all* the Database's active connections in
@@ -410,7 +407,7 @@ export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidual
  * cannot be torn down mid-statement; the cold enforcement/eviction paths that omit the cache
  * re-resolve the *same* connection deterministically, so reads-own-writes is unaffected.
  */
-export type BackingConnectionCache = Map<string, MemoryTableConnection>;
+export type BackingConnectionCache = Map<string, VirtualTableConnection>;
 
 export class MaterializedViewManager {
 	private unsubscribeSchemaChanges: (() => void) | null = null;
@@ -824,17 +821,30 @@ export class MaterializedViewManager {
 				StatusCode.INTERNAL,
 			);
 		}
-		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-		return manager.applyMaintenanceToLayer(connection, ops);
+		const host = this.backingHost(backing);
+		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return host.applyMaintenance(connection, ops);
+	}
+
+	/**
+	 * Resolve the {@link BackingHost} capability surface for a backing table —
+	 * see `vtab/backing-host.ts` for the contract. The host is resolved fresh per
+	 * use (a map lookup on the owning module), so a drop+recreate of the backing
+	 * always yields the new incarnation's host.
+	 */
+	private backingHost(backing: TableSchema): BackingHost {
+		// The ctx IS the Database (same construction as buildMaintenancePlan's cast).
+		return resolveBackingHost(this.ctx as unknown as Database, backing);
 	}
 
 	/**
 	 * Obtain (lazily create + register) the backing table's
-	 * {@link MemoryTableConnection} for the current transaction. Reuses the same
-	 * connection a `select` from the MV resolves to (so reads-own-writes holds);
-	 * a freshly created connection is registered with the Database so the
-	 * coordinated commit/rollback covers its pending layer in lockstep with the
+	 * {@link VirtualTableConnection} for the current transaction. Reuses the same
+	 * connection a `select` from the MV resolves to (so reads-own-writes holds) —
+	 * matched among the Database's registered connections by
+	 * {@link BackingHost.ownsConnection}, which is pinned to the live backing
+	 * incarnation; a freshly created connection is registered with the Database so
+	 * the coordinated commit/rollback covers its pending state in lockstep with the
 	 * source write.
 	 *
 	 * When an optional per-statement {@link BackingConnectionCache} is supplied, the
@@ -847,27 +857,23 @@ export class MaterializedViewManager {
 	 * cache holds exactly what an uncached re-resolution would return.
 	 */
 	private async getBackingConnection(
-		manager: MemoryTableManager,
+		host: BackingHost,
 		qualifiedName: string,
 		cache?: BackingConnectionCache,
-	): Promise<MemoryTableConnection> {
+	): Promise<VirtualTableConnection> {
 		const cacheKey = qualifiedName.toLowerCase();
 		const cached = cache?.get(cacheKey);
 		if (cached) return cached;
 		for (const c of this.ctx.getConnectionsForTable(qualifiedName)) {
-			if (c instanceof MemoryVirtualTableConnection) {
-				const mc = c.getMemoryConnection();
-				if (mc.tableManager === manager) {
-					cache?.set(cacheKey, mc);
-					return mc;
-				}
+			if (host.ownsConnection(c)) {
+				cache?.set(cacheKey, c);
+				return c;
 			}
 		}
-		const memConn = manager.connect();
-		const vtabConn = new MemoryVirtualTableConnection(qualifiedName, memConn);
-		await this.ctx.registerConnection(vtabConn);
-		cache?.set(cacheKey, memConn);
-		return memConn;
+		const conn = host.connect();
+		await this.ctx.registerConnection(conn);
+		cache?.set(cacheKey, conn);
+		return conn;
 	}
 
 	/**
@@ -1722,9 +1728,9 @@ export class MaterializedViewManager {
 				StatusCode.INTERNAL,
 			);
 		}
-		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-		return manager.applyMaintenanceToLayer(connection, [{ kind: 'replace-all', rows }]);
+		const host = this.backingHost(backing);
+		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return host.applyMaintenance(connection, [{ kind: 'replace-all', rows }]);
 	}
 
 	/**
@@ -1797,9 +1803,9 @@ export class MaterializedViewManager {
 				StatusCode.INTERNAL,
 			);
 		}
-		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-		return manager.applyMaintenanceToLayer(connection, ops);
+		const host = this.backingHost(backing);
+		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return host.applyMaintenance(connection, ops);
 	}
 
 	/**
@@ -1913,9 +1919,9 @@ export class MaterializedViewManager {
 				StatusCode.INTERNAL,
 			);
 		}
-		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-		return manager.applyMaintenanceToLayer(connection, ops);
+		const host = this.backingHost(backing);
+		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return host.applyMaintenance(connection, ops);
 	}
 
 	/**
@@ -2156,9 +2162,9 @@ export class MaterializedViewManager {
 				StatusCode.INTERNAL,
 			);
 		}
-		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-		return manager.applyMaintenanceToLayer(connection, ops);
+		const host = this.backingHost(backing);
+		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+		return host.applyMaintenance(connection, ops);
 	}
 
 	/**
@@ -2365,22 +2371,21 @@ export class MaterializedViewManager {
 
 		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
 		if (!backing) return [];
-		const manager = getBackingManager(backing);
-		const connection = await this.getBackingConnection(manager, `${plan.backingSchema}.${plan.backingTableName}`);
-		const startLayer = connection.pendingTransactionLayer ?? connection.readLayer;
+		const host = this.backingHost(backing);
+		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`);
 
 		const conflicts: Array<{ pk: SqlValue[]; row?: Row }> = [];
 		// Fast path: a backing-PK prefix scan keyed on `newRow`'s UC values. The
 		// covering-index shape guarantees the leading backing-PK columns are the UC
 		// columns, so this seeks to the matching block and early-terminates instead of
 		// scanning the whole backing. `undefined` ⇒ the gate failed (non-binary
-		// collation / unexpected shape) and we fall back to the full layer scan, which
-		// re-compares with the source collation and is therefore collation-correct.
+		// collation / unexpected shape) and we fall back to the full effective scan,
+		// which re-compares with the source collation and is therefore
+		// collation-correct. The host executes the scan over the connection's
+		// effective (reads-own-writes) state; the binary-collation soundness gate
+		// stays engine-side in {@link tryBuildCoveringPrefix}.
 		const equalityPrefix = this.tryBuildCoveringPrefix(plan, uc, sourceSchema, newRow);
-		const scanPlan: ScanPlan = equalityPrefix
-			? { indexName: 'primary', descending: false, equalityPrefix }
-			: { indexName: 'primary', descending: false };
-		for await (const backingRow of manager.scanLayer(startLayer, scanPlan)) {
+		for await (const backingRow of host.scanEffective(connection, { equalityPrefix })) {
 			let match = true;
 			for (let k = 0; k < uc.columns.length; k++) {
 				const coll = sourceSchema.columns[uc.columns[k]]?.collation;

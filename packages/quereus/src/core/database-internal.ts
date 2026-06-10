@@ -9,7 +9,7 @@
  */
 
 import type { VirtualTableConnection } from '../vtab/connection.js';
-import type { BackingRowChange } from '../vtab/memory/layer/manager.js';
+import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaterializedViewSchema } from '../schema/view.js';

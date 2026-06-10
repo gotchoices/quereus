@@ -1,0 +1,148 @@
+/**
+ * Backing-host capability: the module-neutral, privileged surface a virtual
+ * table module exposes so the engine can host a materialized view's backing
+ * table inside it. Resolved per table via
+ * {@link VirtualTableModule.getBackingHost} — presence of that method is the
+ * capability (mirrors `getMappingAdvertisements`). The memory module is the
+ * default and reference implementation (`vtab/memory/module.ts`).
+ *
+ * ## Cost contract
+ *
+ * A backing host MUST provide PK-ordered storage with O(log n) keyed
+ * upsert / delete / point-lookup AND an ordered prefix-range scan (seek to a
+ * leading-PK equality prefix, walk in PK order, early-terminate when the
+ * prefix stops matching). This is what keeps every bounded-delta maintenance
+ * arm (`delete-by-prefix` included) and the covering-UNIQUE prefix lookup
+ * module-agnostic. A module that cannot provide the ordered prefix scan must
+ * NOT advertise the capability — the engine does not gate per maintenance arm.
+ *
+ * ## Effective-change reporting
+ *
+ * Reporting the EFFECTIVE per-row changes from {@link BackingHost.applyMaintenance}
+ * is part of the contract, not an optimization: the MV-over-MV cascade routes
+ * each returned {@link BackingRowChange} back through `maintainRowTime`, so
+ * over- or under-reporting corrupts consumer MVs.
+ *
+ * ## Transactionality
+ *
+ * `applyMaintenance` writes the connection's PENDING transaction state;
+ * commit/rollback ride the registered {@link VirtualTableConnection}'s
+ * `begin/commit/rollback/savepoint` surface (already generic), so the backing
+ * delta commits/rolls-back in lockstep with the source write under the
+ * Database's coordinated commit.
+ *
+ * ## Read-only to user DML
+ *
+ * A backing table must reject user DML (READONLY) while admitting
+ * `applyMaintenance` / `replaceContents` — the privileged surface deliberately
+ * bypasses the user-write permission check.
+ *
+ * ## Concurrency
+ *
+ * The engine adds no latching around the privileged surface: each host owns
+ * its own concurrency discipline under the {@link VtabConcurrencyMode} its
+ * module declares (the memory host's pending layer is private to the
+ * connection and mutated synchronously, so it needs none).
+ */
+
+import type { Row, SqlValue } from '../common/types.js';
+import type { QuereusError } from '../common/errors.js';
+import type { VirtualTableConnection } from './connection.js';
+import type { BTreeKeyForPrimary } from './memory/types.js';
+
+/**
+ * A single row-time-maintenance operation applied to an MV backing table's
+ * pending transaction state by {@link BackingHost.applyMaintenance}.
+ *
+ * - `delete-key` removes the row with this full primary key (no-op if absent).
+ * - `upsert` replaces the row sharing this row's PK, or inserts when absent.
+ * - `delete-by-prefix` removes **every** row whose leading PK columns equal
+ *   `keyPrefix` (no-op when nothing matches). It replaces a whole prefix-keyed
+ *   *slice* — used by the lateral-TVF fan-out arm (`'prefix-delete'`), where one
+ *   base row maps to many backing rows sharing the base-PK prefix. The backing
+ *   storage is ordered by the composite PK with the base-PK columns leading, so
+ *   the slice is a contiguous range the scan seeks to and early-terminates on.
+ * - `replace-all` replaces the backing's **entire** pending-effective contents with
+ *   `rows`, realized as the minimal keyed diff (by backing PK) against the current
+ *   rows: a new key absent from the old set is an `insert`, a present key whose row
+ *   differs is an `update`, an identical row at the same key is skipped (no storage
+ *   churn, no emitted change), and an old key absent from the new set is a `delete`.
+ *   It is the wholesale, **transactional** backing replacement the full-rebuild MV
+ *   arm needs — applied to the *pending* transaction state so it commits/rolls-back
+ *   in lockstep with the source write, unlike the
+ *   {@link BackingHost.replaceContents} CREATE/REFRESH primitive.
+ *
+ * The point ops (`delete-key`/`upsert`) keep a one-source-row → one-backing-row
+ * delta (covering-index, aggregate-residual); `delete-by-prefix` is the
+ * one-source-row → N-backing-rows primitive; `replace-all` is the whole-table
+ * primitive — see `docs/materialized-views.md` § Row-time refresh and
+ * `docs/incremental-maintenance.md` § prefix-delete / § replace-all.
+ */
+export type MaintenanceOp =
+	| { kind: 'delete-key'; key: BTreeKeyForPrimary }
+	| { kind: 'upsert'; row: Row }
+	| { kind: 'delete-by-prefix'; keyPrefix: SqlValue[] }
+	| { kind: 'replace-all'; rows: Row[] };
+
+/**
+ * The *effective* per-row change {@link BackingHost.applyMaintenance} applied
+ * to a backing table's pending state — the same `{ op, oldRow?, newRow? }`
+ * shape the row-time maintenance hook already consumes for a source write. The
+ * host knows each op's before-image (it looks it up to apply the op), so it
+ * reports the realized change without the caller re-reading the backing table.
+ *
+ * This is what drives the **MV-over-MV cascade**: a backing write to MV `B` is itself
+ * a row-write that every MV reading `B`'s backing must see, so the cascade routes each
+ * `BackingRowChange` back through `maintainRowTime(B.backingBase, change)`. It is the
+ * same shape as the inbound source change by design (unify, don't duplicate) — see
+ * `core/database-materialized-views.ts` § cascade. The external-change ingestion
+ * seam (`Database.ingestExternalRowChanges`) consumes the same shape.
+ *
+ * A discriminated union over `op`: an `insert` carries only the new image, a `delete`
+ * only the old, an `update` both. The maintenance hook narrows on `op` rather than
+ * non-null-asserting `oldRow`/`newRow`, so a mis-paired hook site fails at compile time
+ * rather than at runtime.
+ */
+export type BackingRowChange =
+	| { op: 'insert'; oldRow?: undefined; newRow: Row }
+	| { op: 'delete'; oldRow: Row; newRow?: undefined }
+	| { op: 'update'; oldRow: Row; newRow: Row };
+
+/** Scan request for the reads-own-writes effective-state scan. */
+export interface BackingScanRequest {
+	/** Leading-PK equality values to seek to (the ordered-PK contract);
+	 *  omit for a full scan in PK order. */
+	equalityPrefix?: SqlValue[];
+	descending?: boolean;
+}
+
+/**
+ * Privileged per-backing-table surface a backing-host module exposes.
+ * Resolved via {@link VirtualTableModule.getBackingHost}; one instance per
+ * live backing-table incarnation (a drop+recreate yields a NEW host whose
+ * ownsConnection rejects the old incarnation's connections).
+ */
+export interface BackingHost {
+	/** True when `conn` is a live connection to THIS backing-table incarnation. */
+	ownsConnection(conn: VirtualTableConnection): boolean;
+	/** Fresh connection for the current transaction. The caller registers it
+	 *  with the Database so coordinated commit/rollback (savepoint-stack replay
+	 *  included) covers its pending state in lockstep with the source write. */
+	connect(): VirtualTableConnection;
+	/** Privileged ordered op application into `conn`'s pending transaction
+	 *  state: bypasses user-DML read-only enforcement, keeps secondary-index /
+	 *  change-tracking bookkeeping, and returns the EFFECTIVE per-row changes
+	 *  realized (the cascade contract — no-op ops yield nothing; `replace-all`
+	 *  yields the minimal keyed diff). Later reads on `conn` (scanEffective,
+	 *  point lookups) must observe the applied ops (reads-own-writes). */
+	applyMaintenance(conn: VirtualTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]>;
+	/** Atomically replace the COMMITTED contents with `rows` (create-fill /
+	 *  refresh). Throws `onDuplicateKey()` (or a generic CONSTRAINT) on a
+	 *  duplicate PK among `rows`. Concurrent readers see pre- or post-swap
+	 *  state, never partial. */
+	replaceContents(rows: readonly Row[], onDuplicateKey?: () => QuereusError): Promise<void>;
+	/** Reads-own-writes scan over `conn`'s effective state (pending transaction
+	 *  state layered over committed), in PK order, honoring `equalityPrefix`
+	 *  as a seek + early-terminate prefix range. */
+	scanEffective(conn: VirtualTableConnection, req: BackingScanRequest): AsyncIterable<Row>;
+}

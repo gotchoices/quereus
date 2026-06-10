@@ -27,6 +27,7 @@ import type { Expression } from '../../../parser/ast.js';
 import { compilePredicate } from '../utils/predicate.js';
 import type { MemoryIndex } from '../index.js';
 import type { MaterializedViewSchema } from '../../../schema/view.js';
+import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 
 let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
@@ -52,62 +53,6 @@ const logger = createMemoryTableLoggers('layer:manager');
 export type CoveringStructure =
 	| { kind: 'memory-index'; index: MemoryIndex }
 	| { kind: 'materialized-view'; view: MaterializedViewSchema };
-
-/**
- * A single row-time-maintenance operation applied to an MV backing table's
- * pending transaction layer by {@link MemoryTableManager.applyMaintenanceToLayer}.
- *
- * - `delete-key` removes the row with this full primary key (no-op if absent).
- * - `upsert` replaces the row sharing this row's PK, or inserts when absent.
- * - `delete-by-prefix` removes **every** row whose leading PK columns equal
- *   `keyPrefix` (no-op when nothing matches). It replaces a whole prefix-keyed
- *   *slice* — used by the lateral-TVF fan-out arm (`'prefix-delete'`), where one
- *   base row maps to many backing rows sharing the base-PK prefix. The backing
- *   btree is ordered by the composite PK with the base-PK columns leading, so the
- *   slice is a contiguous range the scan seeks to and early-terminates on.
- * - `replace-all` replaces the backing's **entire** pending-effective contents with
- *   `rows`, realized as the minimal keyed diff (by backing PK) against the current
- *   rows: a new key absent from the old set is an `insert`, a present key whose row
- *   differs is an `update`, an identical row at the same key is skipped (no btree
- *   churn, no emitted change), and an old key absent from the new set is a `delete`.
- *   It is the wholesale, **transactional** backing replacement the full-rebuild MV
- *   arm needs — applied to the *pending* layer so it commits/rolls-back in lockstep
- *   with the source write, unlike the `replaceBaseLayer` CREATE/REFRESH primitive.
- *
- * The point ops (`delete-key`/`upsert`) keep a one-source-row → one-backing-row
- * delta (covering-index, aggregate-residual); `delete-by-prefix` is the
- * one-source-row → N-backing-rows primitive; `replace-all` is the whole-table
- * primitive — see `docs/materialized-views.md` § Row-time refresh and
- * `docs/incremental-maintenance.md` § prefix-delete / § replace-all.
- */
-export type MaintenanceOp =
-	| { kind: 'delete-key'; key: BTreeKeyForPrimary }
-	| { kind: 'upsert'; row: Row }
-	| { kind: 'delete-by-prefix'; keyPrefix: SqlValue[] }
-	| { kind: 'replace-all'; rows: Row[] };
-
-/**
- * The *effective* per-row change {@link MemoryTableManager.applyMaintenanceToLayer}
- * applied to a backing table's pending layer — the same `{ op, oldRow?, newRow? }`
- * shape the row-time maintenance hook already consumes for a source write. The layer
- * knows each op's before-image (it looks it up to apply the op), so it reports the
- * realized change without the caller re-reading the backing table.
- *
- * This is what drives the **MV-over-MV cascade**: a backing write to MV `B` is itself
- * a row-write that every MV reading `B`'s backing must see, so the cascade routes each
- * `BackingRowChange` back through `maintainRowTime(B.backingBase, change)`. It is the
- * same shape as the inbound source change by design (unify, don't duplicate) — see
- * `core/database-materialized-views.ts` § cascade.
- *
- * A discriminated union over `op`: an `insert` carries only the new image, a `delete`
- * only the old, an `update` both. The maintenance hook narrows on `op` rather than
- * non-null-asserting `oldRow`/`newRow`, so a mis-paired hook site fails at compile time
- * rather than at runtime.
- */
-export type BackingRowChange =
-	| { op: 'insert'; oldRow?: undefined; newRow: Row }
-	| { op: 'delete'; oldRow: Row; newRow?: undefined }
-	| { op: 'update'; oldRow: Row; newRow: Row };
 
 /** Origin + structure name for a UNIQUE constraint's implicit covering structure. */
 export interface ImplicitCoveringStructure {

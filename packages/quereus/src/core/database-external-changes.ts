@@ -21,7 +21,7 @@ import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { Row } from '../common/types.js';
 import type { TableSchema } from '../schema/table.js';
-import type { BackingRowChange } from '../vtab/memory/layer/manager.js';
+import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { BackingConnectionCache } from './database-materialized-views.js';
 import type { Database } from './database.js';
 import type { ExternalRowChange, IngestExternalChangesOptions } from './database-internal.js';
