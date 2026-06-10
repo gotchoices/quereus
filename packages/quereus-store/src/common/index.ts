@@ -75,7 +75,7 @@ export {
 } from './events.js';
 
 // DDL generation (canonical implementation lives in @quereus/quereus)
-export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL } from '@quereus/quereus';
+export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, generateIndexTagsDDL } from '@quereus/quereus';
 
 // Transaction support
 export {

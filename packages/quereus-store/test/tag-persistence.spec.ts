@@ -454,6 +454,81 @@ describe('StoreModule catalog-only tag persistence', () => {
 		expect(diffRows, 'no drift on a converged schema').to.deep.equal([]);
 	});
 
+	it('multiple exposed implicit indexes on one table each persist their own tags', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, email text,
+			constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true),
+			constraint uq_email unique (email) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1', 'e1')`);
+		await db.exec(`alter index uq_vin set tags (a = '1')`);
+		await db.exec(`alter index uq_email set tags (b = '2')`);
+		await mod.whenCatalogPersisted();
+
+		// One alter line per constraint, in uniqueConstraints array order — the
+		// byte-determinism the compare-write relies on.
+		const bundle = await readCatalogEntry('t');
+		const vinAt = bundle.indexOf('alter index main.uq_vin set tags (');
+		const emailAt = bundle.indexOf('alter index main.uq_email set tags (');
+		expect(vinAt, 'uq_vin line present').to.be.greaterThan(-1);
+		expect(emailAt, 'uq_email line present').to.be.greaterThan(-1);
+		expect(vinAt, 'lines follow uniqueConstraints order').to.be.lessThan(emailAt);
+
+		await mod.closeAll();
+		const db2 = await reopen();
+		const ucs = db2.schemaManager.findTable('t')!.uniqueConstraints!;
+		expect(ucs.find(c => c.name === 'uq_vin')!.exposedIndexTags).to.deep.equal({ a: '1' });
+		expect(ucs.find(c => c.name === 'uq_email')!.exposedIndexTags).to.deep.equal({ b: '2' });
+	});
+
+	it('hand-crafted add/drop tags bundle lines exercise the merge and drop import arms', async () => {
+		// The generator only ever emits the whole-set replace form, so rehydrate
+		// normally exercises only that arm of the import path. Write merge/drop
+		// lines directly into the catalog bytes to cover the other two.
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin set tags (base = 'keep', stale = true)`);
+		await mod.closeAll();
+
+		const catalog = await provider.getCatalogStore();
+		const key = buildCatalogKey('main', 't');
+		const existing = new TextDecoder().decode((await catalog.get(key))!);
+		const appended = existing
+			+ `\nalter index main.uq_vin add tags (extra = 7)`
+			+ `\nalter index main.uq_vin drop tags (stale)`;
+		await catalog.put(key, new TextEncoder().encode(appended));
+
+		const db2 = await reopen();
+		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints!.find(c => c.name === 'uq_vin')!;
+		expect(uc.exposedIndexTags).to.deep.equal({ base: 'keep', extra: 7 });
+	});
+
+	it('an alter-index line with an unresolvable target records a per-entry rehydrate error', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await mod.closeAll();
+
+		// Simulate corruption: an alter line whose target resolves nowhere (the
+		// constraint is unexposed, so the fallback also misses → NOTFOUND).
+		const catalog = await provider.getCatalogStore();
+		const key = buildCatalogKey('main', 't');
+		const existing = new TextDecoder().decode((await catalog.get(key))!);
+		await catalog.put(key, new TextEncoder().encode(existing + `\nalter index main.uq_vin set tags (x = 1)`));
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 'fail-loud: the bad line is recorded per-entry').to.have.lengthOf(1);
+		expect(result.errors[0].error.message).to.match(/uq_vin/);
+		// Statements apply in document order, so the CREATE TABLE earlier in the
+		// same entry already registered (import is not transactional); only the
+		// result tally skips the errored entry.
+		expect(db2.schemaManager.findTable('t'), 'table registered before the bad line').to.not.be.undefined;
+		expect(result.tables).to.deep.equal([]);
+	});
+
 	it('after closeAll the listener is detached: a later table_modified does not persist', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key) using store`);

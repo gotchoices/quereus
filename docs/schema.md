@@ -180,12 +180,13 @@ Each entry in `ddlStatements` may hold **more than one** statement: a table can 
 Canonical schema → DDL generators are exported from the package entry point:
 
 ```typescript
-import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, generateIndexTagsDDL } from '@quereus/quereus';
 
 const ddl = generateTableDDL(tableSchema, db?);                  // CREATE TABLE ...
 const idxDdl = generateIndexDDL(indexSchema, tableSchema, db?);  // CREATE INDEX ...
 const viewDdl = generateViewDDL(viewSchema);                     // CREATE VIEW main.v ...
 const mvDdl = generateMaterializedViewDDL(mvSchema);             // CREATE MATERIALIZED VIEW main.mv ...
+const tagDdl = generateIndexTagsDDL(schemaName, indexName, tags); // alter index s.i set tags (...)
 ```
 
 `generateViewDDL` / `generateMaterializedViewDDL` lift the stored schema back into the equivalent `CreateView` / `CreateMaterializedView` AST and render it through the shared `ast-stringify` emitter (the same schema→AST-lift strategy `generateTableDDL` uses for constraints), so the persistence path and the declarative AST→SQL path cannot drift. They emit a **fully-qualified** (`schema.name`) name so a re-parse registers into the correct schema regardless of the session's current schema, and read the **live** `tags` — so an `ALTER VIEW … SET TAGS` (which swaps the in-memory schema without rewriting the stored `sql`) round-trips. `generateMaterializedViewDDL` deliberately omits the `USING` clause: the backing is always a memory table in v1 and the clause is informational only — on reopen the backing rebuilds as memory regardless, and a re-parse with no `USING` still builds a valid MV. Both are a `parse → generate → parse` fixed point.
