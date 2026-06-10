@@ -290,12 +290,15 @@ drop table btw_bin;
 -- Collation-matched non-BINARY range / BETWEEN over a matching-collation index
 -- =============================================================================
 -- A NOCASE (or RTRIM) range whose predicate collation matches the index collation
--- uses an index seek on the in-memory backend (which threads the index collation into
--- the bound filter + early-termination) and a scan + residual on backends whose range
--- filter is BINARY (e.g. the store) — either way the rows must equal the
--- collation-correct set. Result-only here so both backends are asserted identically;
--- the plan-shape assertions live in test/optimizer/range-seek-collation-bounds.spec.ts.
--- Regression for `memory-range-seek-collation-bounds`.
+-- uses an index seek on BOTH backends: the in-memory vtab threads the index collation
+-- into the bound filter + early-termination, and the store compares pushed bounds
+-- under the column's declared collation in its post-fetch row filter
+-- (StoreTable.compareValues) — both advertise `honorsCollatedRangeBounds`. The seek
+-- drops the residual Filter, so these rows are produced by the module's own bound
+-- filter. Result-only here so both backends are asserted identically; plan-shape
+-- assertions live in test/optimizer/range-seek-collation-bounds.spec.ts (memory) and
+-- packages/quereus-store/test/pushdown.spec.ts (store). Regression for
+-- `memory-range-seek-collation-bounds` and `store-range-seek-collation-bounds`.
 
 -- NOCASE primary-key range. PK values are NOCASE-distinct, but their BINARY order
 -- ('Banana','CHERRY','apple','date') differs from NOCASE order ('apple','Banana',
@@ -309,7 +312,45 @@ select n from rng_pk_nc where name > 'banana' order by n;
 select n from rng_pk_nc where name between 'banana' and 'cherry' order by n;
 → [{"n":2},{"n":3}]
 
+-- Mismatch negative control: an explicit BINARY bound collation does not match the
+-- NOCASE PK, so the access path still declines the seek (scan + residual) on both
+-- backends and returns the BINARY-correct rows (only 'date' is BINARY-> 'banana').
+select n from rng_pk_nc where name > 'banana' collate BINARY order by n;
+→ [{"n":4}]
+
 drop table rng_pk_nc;
+
+-- RTRIM primary-key range / BETWEEN. The bounds carry trailing spaces, so a raw
+-- BINARY bound filter would both over-fetch ('cat ' > 'cat' in bytes, but they are
+-- RTRIM-equal) and under-fetch ('cat ' < 'cat  ' in bytes, but RTRIM-equal).
+create table rng_pk_rt (val text collate RTRIM primary key, n integer);
+insert into rng_pk_rt values ('ant', 1), ('cat ', 2), ('dog', 3);
+
+-- 'cat ' RTRIM-equals the bound 'cat', so > excludes it.
+select n from rng_pk_rt where val > 'cat' order by n;
+→ [{"n":3}]
+
+-- The bound's trailing spaces are ignored: >= 'cat  ' includes the RTRIM-equal 'cat '.
+select n from rng_pk_rt where val >= 'cat  ' order by n;
+→ [{"n":2},{"n":3}]
+
+-- Both BETWEEN bounds trim: ['ant','cat'] keeps 'ant' and 'cat ', excludes 'dog'.
+select n from rng_pk_rt where val between 'ant  ' and 'cat  ' order by n;
+→ [{"n":1},{"n":2}]
+
+drop table rng_pk_rt;
+
+-- BINARY negative control: an EXPLICIT `collate BINARY` PK (explicit so the store
+-- does not reconcile the column to its NOCASE key-collation default) keeps plain
+-- BINARY range semantics on both backends — uppercase sorts before lowercase, so
+-- 'apple' and 'date' are BINARY-greater than 'CHERRY' while 'Banana' is not.
+create table rng_pk_b (name text collate BINARY primary key, n integer);
+insert into rng_pk_b values ('Banana', 1), ('apple', 2), ('CHERRY', 3), ('date', 4);
+
+select n from rng_pk_b where name > 'CHERRY' order by n;
+→ [{"n":2},{"n":4}]
+
+drop table rng_pk_b;
 
 -- NOCASE secondary index over case-variant rows (non-unique index): the >= bound
 -- includes both 'Banana' and 'BANANA'.

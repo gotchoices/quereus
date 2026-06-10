@@ -667,7 +667,12 @@ export class StoreTable extends VirtualTable {
 	): AsyncIterable<Row> {
 		const bounds = buildFullScanBounds();
 
-		// TODO: Refine bounds based on range constraints
+		// TODO: Refine bounds based on range constraints. When implemented, the
+		// bound keys must be encoded under the same per-PK-column collations the
+		// data keys use (pkKeyCollations) so the iterated window is a superset of
+		// the collation-aware filter below — matchesFilters stays the authoritative
+		// row filter either way. Today the full key space is visited, so there is
+		// no seek-start/early-termination carrying a BINARY assumption.
 		for await (const entry of store.iterate(bounds)) {
 			const row = deserializeRow(entry.value);
 			if (this.matchesFilters(row, filterInfo)) {
@@ -690,8 +695,15 @@ export class StoreTable extends VirtualTable {
 
 			const rowValue = row[constraint.iColumn];
 			const filterValue = filterInfo.args[argvIndex - 1];
+			// Compare under the column's DECLARED collation (undefined ⇒ BINARY) — the
+			// same resolution the access path's collation-cover analysis uses
+			// (indexColumnCollationLookup / primaryKeyCollationLookup) when it decides
+			// a pushed constraint is fully covered, and the same source this file's
+			// UNIQUE checks compare under. On a collation MATCH the planner drops the
+			// residual Filter, so this filter alone must reproduce the predicate.
+			const collation = this.tableSchema!.columns[constraint.iColumn]?.collation;
 
-			if (!this.compareValues(rowValue, constraint.op, filterValue)) {
+			if (!this.compareValues(rowValue, constraint.op, filterValue, collation)) {
 				return false;
 			}
 		}
@@ -699,21 +711,28 @@ export class StoreTable extends VirtualTable {
 		return true;
 	}
 
-	/** Compare two values according to an operator. */
-	protected compareValues(a: SqlValue, op: IndexConstraintOp, b: SqlValue): boolean {
+	/**
+	 * Compare two values according to an operator, under `collation` (the column's
+	 * declared collation; undefined ⇒ BINARY). Delegates to the engine's
+	 * `compareSqlValues`, so the LT/LE/GT/GE range bounds honour a NOCASE/RTRIM
+	 * column collation rather than a raw BINARY JS comparison — the capability
+	 * `StoreModule.getBestAccessPlan` advertises via `honorsCollatedRangeBounds`.
+	 * NULL on either side fails every operator except EQ-with-both-NULL (the
+	 * internal point-lookup convention; the planner never pushes `= NULL`).
+	 */
+	protected compareValues(a: SqlValue, op: IndexConstraintOp, b: SqlValue, collation?: string): boolean {
 		if (a === null || b === null) {
 			return op === IndexConstraintOp.EQ ? a === b : false;
 		}
 
+		const cmp = compareSqlValues(a, b, collation);
 		switch (op) {
-			case IndexConstraintOp.EQ:
-				return a === b || (typeof a === 'string' && typeof b === 'string' &&
-					this.config.collation === 'NOCASE' && a.toLowerCase() === b.toLowerCase());
-			case IndexConstraintOp.NE: return a !== b;
-			case IndexConstraintOp.LT: return a < b;
-			case IndexConstraintOp.LE: return a <= b;
-			case IndexConstraintOp.GT: return a > b;
-			case IndexConstraintOp.GE: return a >= b;
+			case IndexConstraintOp.EQ: return cmp === 0;
+			case IndexConstraintOp.NE: return cmp !== 0;
+			case IndexConstraintOp.LT: return cmp < 0;
+			case IndexConstraintOp.LE: return cmp <= 0;
+			case IndexConstraintOp.GT: return cmp > 0;
+			case IndexConstraintOp.GE: return cmp >= 0;
 			default: return true;
 		}
 	}

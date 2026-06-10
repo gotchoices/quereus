@@ -1477,9 +1477,26 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 	/**
 	 * Modern access planning interface.
+	 *
+	 * Every plan is stamped with `honorsCollatedRangeBounds`: the store's post-fetch
+	 * row filter (`StoreTable.matchesFilters` → `compareValues`) compares each pushed
+	 * constraint — including LT/LE/GT/GE range bounds — under the column's declared
+	 * collation, so the access path's collation-cover analysis may keep a
+	 * collation-matched non-BINARY (NOCASE/RTRIM) PK range/BETWEEN seek instead of
+	 * declining to a SeqScan + residual (see `classifyConstraintCover` in
+	 * rule-select-access-path.ts). There is no seek-start/early-termination to thread
+	 * the collation into — the range scan visits the full key space and post-filters
+	 * (see `StoreTable.scanPKRange`). Mirrors the memory module's advertisement.
 	 */
 	getBestAccessPlan(
 		_db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest
+	): BestAccessPlanResult {
+		return { ...this.computeBestAccessPlan(tableInfo, request), honorsCollatedRangeBounds: true };
+	}
+
+	private computeBestAccessPlan(
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult {

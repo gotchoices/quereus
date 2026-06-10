@@ -1288,8 +1288,9 @@ function classifyConstraintCover(predColl: string, indexColl: string, isEquality
 	// predicate. A collation-MATCHED non-BINARY range (predColl === indexColl ≠ BINARY)
 	// reproduces it ONLY when the module's runtime filters the bounds — and
 	// early-terminates the walk — under that same index collation; the in-memory vtab
-	// does (`plan-filter.ts` / `scan-layer.ts`, threaded via `scan-plan.ts`) and
-	// advertises `honorsCollatedRangeBounds`, whereas a module that bound-filters BINARY
+	// does (`plan-filter.ts` / `scan-layer.ts`, threaded via `scan-plan.ts`), as does
+	// the store (collation-aware post-fetch filter, `StoreTable.compareValues`), and both
+	// advertise `honorsCollatedRangeBounds`, whereas a module that bound-filters BINARY
 	// would under-fetch case/space variants. Any collation MISMATCH reorders the walked
 	// window relative to the predicate's intended order and is never a recoverable
 	// superset (unlike a COARSER_SAFE equality), so it always declines.

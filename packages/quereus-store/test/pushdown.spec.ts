@@ -139,4 +139,89 @@ describe('StoreModule predicate pushdown', () => {
 			]);
 		});
 	});
+
+	// Regression for `store-range-seek-collation-bounds`: the store advertises
+	// `honorsCollatedRangeBounds` (its post-fetch row filter compares pushed range
+	// bounds under the column's declared collation), so a collation-matched
+	// non-BINARY PK range/BETWEEN now uses the index seek — and, because the MATCH
+	// cover drops the residual Filter, StoreTable.compareValues alone must
+	// reproduce the predicate's collation semantics.
+	describe('collated PK range seek (store-range-seek-collation-bounds)', () => {
+		async function planOps(query: string): Promise<string> {
+			const rows = await asyncIterableToArray(
+				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+			);
+			expect(rows).to.have.lengthOf(1);
+			return rows[0].ops as string;
+		}
+
+		async function values(query: string): Promise<unknown[]> {
+			const rows = await asyncIterableToArray(db.eval(query));
+			return rows.map(r => r.n);
+		}
+
+		describe('NOCASE primary key', () => {
+			beforeEach(async () => {
+				// NOCASE-distinct values whose BINARY order ('Banana','CHERRY','apple',
+				// 'date') differs from NOCASE order — a BINARY bound filter under-fetches.
+				await db.exec(`create table fruits (name text collate NOCASE primary key, n integer) using store`);
+				await db.exec(`insert into fruits values ('apple', 1), ('Banana', 2), ('CHERRY', 3), ('date', 4)`);
+			});
+
+			it('range uses the PK seek and returns NOCASE-correct rows', async () => {
+				const q = `select n from fruits where name > 'banana' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await values(q)).to.deep.equal([3, 4]);
+			});
+
+			it('BETWEEN uses the PK seek and honours NOCASE on both bounds', async () => {
+				const q = `select n from fruits where name between 'banana' and 'cherry' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await values(q)).to.deep.equal([2, 3]);
+			});
+
+			it('collation-mismatched bound still declines to scan + residual', async () => {
+				const q = `select n from fruits where name > 'banana' collate BINARY order by n`;
+				const ops = await planOps(q);
+				expect(ops).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(ops).to.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+				// BINARY: only 'date' is greater than 'banana'.
+				expect(await values(q)).to.deep.equal([4]);
+			});
+		});
+
+		describe('RTRIM primary key', () => {
+			beforeEach(async () => {
+				await db.exec(`create table pets (val text collate RTRIM primary key, n integer) using store`);
+				await db.exec(`insert into pets values ('ant', 1), ('cat ', 2), ('dog', 3)`);
+			});
+
+			it("> excludes the RTRIM-equal trailing-space variant", async () => {
+				const q = `select n from pets where val > 'cat' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				// 'cat ' RTRIM-equals 'cat' (a raw BINARY compare would over-fetch it).
+				expect(await values(q)).to.deep.equal([3]);
+			});
+
+			it('>= with a trailing-space bound includes the RTRIM-equal row', async () => {
+				const q = `select n from pets where val >= 'cat  ' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				// A raw BINARY compare would under-fetch 'cat ' ('cat ' < 'cat  ' in bytes).
+				expect(await values(q)).to.deep.equal([2, 3]);
+			});
+		});
+
+		describe('explicit BINARY primary key (negative control)', () => {
+			it('range seeks and keeps plain BINARY semantics', async () => {
+				// Explicit BINARY so the store does not reconcile the PK column to its
+				// NOCASE key-collation default.
+				await db.exec(`create table bins (name text collate BINARY primary key, n integer) using store`);
+				await db.exec(`insert into bins values ('Banana', 1), ('apple', 2), ('CHERRY', 3), ('date', 4)`);
+				const q = `select n from bins where name > 'CHERRY' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				// BINARY: uppercase sorts before lowercase, so 'apple' and 'date' qualify.
+				expect(await values(q)).to.deep.equal([2, 4]);
+			});
+		});
+	});
 });

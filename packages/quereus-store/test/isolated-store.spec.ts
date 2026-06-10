@@ -179,6 +179,39 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	// Regression for `store-range-seek-collation-bounds` on the MERGED query path:
+	// with the store advertising `honorsCollatedRangeBounds`, a collation-matched
+	// NOCASE PK range is pushed down with NO residual Filter, so inside a
+	// transaction the overlay (memory) filter and the underlying (store) filter
+	// are each solely responsible for reproducing the NOCASE bound on their half
+	// of the merge.
+	describe('collated PK range under an open transaction', () => {
+		beforeEach(async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`create table fruits (name text collate NOCASE primary key, n integer) using store`);
+			// Committed rows in the underlying store. 'CHERRY' is BINARY-less than
+			// the bound 'banana' (0x43 < 0x62) but NOCASE-greater.
+			await db.exec(`insert into fruits values ('apple', 1), ('CHERRY', 3)`);
+		});
+
+		it('merges overlay and underlying rows under the NOCASE range bound', async () => {
+			await db.exec('BEGIN');
+			// Uncommitted overlay rows: 'DATE' is BINARY-less than 'banana' but
+			// NOCASE-greater — a BINARY overlay bound filter would drop it.
+			await db.exec(`insert into fruits values ('Banana', 2), ('DATE', 4)`);
+
+			const rows = await asyncIterableToArray(
+				db.eval(`select n from fruits where name > 'banana' order by n`),
+			);
+			// NOCASE: 'CHERRY' (committed) and 'DATE' (uncommitted) qualify;
+			// 'Banana' is NOCASE-equal to the bound (excluded by >), 'apple' is below.
+			expect(rows.map(r => r.n)).to.deep.equal([3, 4]);
+
+			await db.exec('ROLLBACK');
+		});
+	});
+
 	// Note: The following tests verify the isolation layer infrastructure when wrapping
 	// the store module. Full integration requires additional work on transaction
 	// coordination between the store module and the overlay memory module.
