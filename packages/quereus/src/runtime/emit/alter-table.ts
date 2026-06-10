@@ -1472,7 +1472,7 @@ async function propagateColumnRenameInSchema(
 			// FROM-table set scopes the clause rewrite; collecting it after the body
 			// rewrite is safe (a column rename never changes table names).
 			const clause = view.insertDefaults?.length
-				? renameColumnInInsertDefaults(view.insertDefaults, collectFromTableNames(view.selectAst), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
+				? renameColumnInInsertDefaults(view.insertDefaults, collectFromTableNames(view.selectAst, renamedSchemaName), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
 				: null;
 			if (bodyChanged || clause?.changed) {
 				const updatedView = clause?.changed

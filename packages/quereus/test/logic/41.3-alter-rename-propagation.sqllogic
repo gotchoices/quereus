@@ -846,3 +846,27 @@ select id, w from v_vd4;
 
 drop view v_vd4;
 drop table t_vd4;
+
+-- ===================================
+-- 22. RENAME COLUMN on a same-named table in ANOTHER schema must NOT rewrite
+--     the clause (FROM-table scoping is schema-aware)
+-- ===================================
+-- The view's FROM table is temp.t_vd5; renaming main.t_vd5's column must leave
+-- the clause alone — `collectFromTableNames` excludes cross-schema sources, so
+-- a bare-name collision cannot false-rewrite the target and break inserts.
+
+create table temp.t_vd5 (id integer primary key, name text, created integer not null);
+create table t_vd5 (id integer primary key, created integer not null);
+create view v_vd5 as select id, name from temp.t_vd5 insert defaults (created = 99);
+
+alter table t_vd5 rename column created to created_at;
+
+-- the clause still targets temp.t_vd5.created, which did not rename
+insert into v_vd5 values (1, 'x');
+
+select id, name, created from temp.t_vd5;
+→ [{"id":1,"name":"x","created":99}]
+
+drop view v_vd5;
+drop table t_vd5;
+drop table temp.t_vd5;

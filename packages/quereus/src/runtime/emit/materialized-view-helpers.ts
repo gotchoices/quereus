@@ -687,7 +687,7 @@ export async function propagateColumnRenameToMaterializedViews(
 		try {
 			const bodyChanged = renameColumnInAst(mv.selectAst, tableName, oldCol, newCol, renamedSchemaName);
 			const clause = mv.insertDefaults?.length
-				? renameColumnInInsertDefaults(mv.insertDefaults, collectFromTableNames(mv.selectAst), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
+				? renameColumnInInsertDefaults(mv.insertDefaults, collectFromTableNames(mv.selectAst, renamedSchemaName), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
 				: null;
 			if (!bodyChanged && !clause?.changed) continue;
 			await applyMaterializedViewRewrite(

@@ -1023,7 +1023,7 @@ function reconciledDeclaredViewDefinition(
 ): string {
 	// FROM tables under their DECLARED (new) names — collected before the inverse
 	// table pass below rewrites the clone's references to OLD names.
-	const fromTables = collectFromTableNames(select);
+	const fromTables = collectFromTableNames(select, schemaName);
 
 	const selectClone = cloneQueryExpr(select);
 	for (const r of tableRenames) {

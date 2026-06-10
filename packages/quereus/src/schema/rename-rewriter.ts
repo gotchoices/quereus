@@ -884,17 +884,28 @@ function isResultColumnExposure(
  * tables an `insert defaults` clause's columns can belong to — the clause's
  * `column` names a BASE-TABLE column of the view's FROM table (often projected
  * away, so the select-body rewrite cannot catch it) and its `expr` evaluates in
- * that base table's inserted-row context. A column rename never changes table
- * names, so the forward rename propagation can collect before or after its
- * body rewrite; the differ's inverse path collects from the ORIGINAL declared
- * body (declared/new names — the key its rename map uses) BEFORE its inverse
- * table pass rewrites the references to their old forms.
+ * that base table's inserted-row context. Only sources in `defaultSchemaName`
+ * (explicitly qualified or unqualified) are collected — a cross-schema FROM
+ * entry that merely shares the renamed table's name must not scope the clause
+ * rewrite to it. A column rename never changes table names, so the forward
+ * rename propagation can collect before or after its body rewrite; the
+ * differ's inverse path collects from the ORIGINAL declared body
+ * (declared/new names — the key its rename map uses) BEFORE its inverse table
+ * pass rewrites the references to their old forms.
+ *
+ * Limitation: a CTE shadowing a same-named real table is still collected (no
+ * WITH-scope tracking here). A view whose FROM is a CTE is not insertable, so
+ * its clause is dormant either way; the differ shares the same blind spot, so
+ * forward propagation and inverse reconciliation stay in agreement.
  */
-export function collectFromTableNames(query: AST.QueryExpr): Set<string> {
+export function collectFromTableNames(query: AST.QueryExpr, defaultSchemaName: string): Set<string> {
 	const names = new Set<string>();
 	const visitFrom = (item: AST.FromClause): void => {
 		if (item.type === 'table') {
-			names.add((item as AST.TableSource).table.name.toLowerCase());
+			const table = (item as AST.TableSource).table;
+			if (schemaMatches(table.schema, defaultSchemaName)) {
+				names.add(table.name.toLowerCase());
+			}
 		} else if (item.type === 'join') {
 			const join = item as AST.JoinClause;
 			visitFrom(join.left);
