@@ -1032,29 +1032,10 @@ function declaredIndexCanonicalBody(
  * drop+recreate). Callers short-circuit the raw-equal compare and call this
  * only on mismatch with renames present.
  *
- * Reconciled parts:
- *   - body:    inverse table renames over a CLONE of the select (the rewriters
- *              mutate in place; the declared stmt backs the recreate DDL) for
- *              ALL in-diff renames FIRST — so both a direct FROM reference and
- *              a cross-table reference in a subquery normalize to OLD names —
- *              THEN each renamed table's column renames NEW→OLD, seeded with
- *              that table's OLD name (qualifiers are pre-normalized to OLD by
- *              the table pass; with no own-table rename OLD == declared).
- *              Sequential inverse application is order-independent:
- *              `resolveRenames` makes chains/swaps unrepresentable, so no
- *              inverse output (oldName) can match another inverse input
- *              (newName).
- *   - clause:  each `insert defaults` entry's `column` names a base-table
- *              column of the view's FROM table — inverse-renamed via that
- *              table's column renames ({@link collectFromTableNames} scopes the
- *              lookup to FROM tables so an unrelated table's rename cannot
- *              false-rewrite); its `expr` gets the same inverse rewriters as
- *              the body, with column renames applied via the CHECK-expression
- *              entry point (the expr has no FROM of its own — the base table
- *              seeds the scope, exactly like the constraint/index predicates).
- *   - columns: the explicit column list names the VIEW's own output columns —
- *              stable identity untouched by source renames — so it passes
- *              through unchanged.
+ * The explicit column list names the VIEW's own output columns — stable
+ * identity untouched by source renames — so it passes through unchanged; the
+ * body and `insert defaults` clause reconcile via
+ * {@link inverseRenamedViewParts} with ALL in-diff table renames threaded.
  */
 function reconciledDeclaredViewDefinition(
 	columns: ReadonlyArray<string> | undefined,
@@ -1065,6 +1046,47 @@ function reconciledDeclaredViewDefinition(
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
 ): string {
+	const parts = inverseRenamedViewParts(select, insertDefaults, tableRenames, columnRenamesByTable, schemaName);
+	return viewDefinitionToCanonicalString(columns, parts.select, parts.insertDefaults);
+}
+
+/**
+ * Core inverse-rename pass shared by {@link reconciledDeclaredViewDefinition}
+ * (which threads ALL in-diff table renames) and {@link columnReconciledViewStmt}
+ * (which passes none — its render must keep declared table names): clones the
+ * declared select and `insert defaults` clause (the rewriters mutate in place;
+ * the declared stmt backs the declared-schema store / recreate DDL) and
+ * rewrites the in-diff renames NEW→OLD.
+ *
+ * Reconciled parts:
+ *   - body:    inverse table renames over the select clone for ALL threaded
+ *              renames FIRST — so both a direct FROM reference and a
+ *              cross-table reference in a subquery normalize to OLD names —
+ *              THEN each renamed table's column renames NEW→OLD, seeded with
+ *              that table's OLD name (qualifiers are pre-normalized to OLD by
+ *              the table pass; with no own-table rename — in particular with
+ *              no table pass at all — the seed is the DECLARED name the
+ *              qualifiers still carry). Sequential inverse application is
+ *              order-independent: `resolveRenames` makes chains/swaps
+ *              unrepresentable, so no inverse output (oldName) can match
+ *              another inverse input (newName).
+ *   - clause:  each `insert defaults` entry's `column` names a base-table
+ *              column of the view's FROM table — inverse-renamed via that
+ *              table's column renames ({@link collectFromTableNames} scopes the
+ *              lookup to FROM tables so an unrelated table's rename cannot
+ *              false-rewrite); its `expr` gets the same inverse rewriters as
+ *              the body, with column renames applied via the CHECK-expression
+ *              entry point (the expr has no FROM of its own — the base table
+ *              seeds the scope, exactly like the constraint/index predicates).
+ */
+function inverseRenamedViewParts(
+	select: AST.QueryExpr,
+	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+	tableRenames: ReadonlyArray<RenameOp>,
+	/** Declared (new) table name (lowercased) → that table's column renames. */
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	schemaName: string,
+): { select: AST.QueryExpr; insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined } {
 	// FROM tables under their DECLARED (new) names — collected before the inverse
 	// table pass below rewrites the clone's references to OLD names.
 	const fromTables = collectFromTableNames(select, schemaName);
@@ -1109,7 +1131,7 @@ function reconciledDeclaredViewDefinition(
 		});
 	}
 
-	return viewDefinitionToCanonicalString(columns, selectClone, reconciledDefaults);
+	return { select: selectClone, insertDefaults: reconciledDefaults };
 }
 
 /**
@@ -1122,10 +1144,10 @@ function reconciledDeclaredViewDefinition(
  * create, the live column-rename propagation rewrites the fresh body, so the
  * post-apply state and a re-diff converge. Unlike
  * {@link reconciledDeclaredViewDefinition} there is NO inverse table pass (it
- * would name a table that no longer exists at create time), so the column
- * rewrites are seeded with each table's DECLARED name — the body's qualifiers
- * still carry it. Clones before rewriting (the declared stmt backs the
- * declared-schema store); identity when the diff carries no column renames.
+ * would name a table that no longer exists at create time) — the shared
+ * {@link inverseRenamedViewParts} core runs with no table renames, seeding the
+ * column rewrites with each table's DECLARED name, which the body's qualifiers
+ * still carry. Identity when the diff carries no column renames.
  */
 function columnReconciledViewStmt(
 	stmt: AST.CreateViewStmt,
@@ -1134,45 +1156,8 @@ function columnReconciledViewStmt(
 	schemaName: string,
 ): AST.CreateViewStmt {
 	if (columnRenamesByTable.size === 0) return stmt;
-
-	const fromTables = collectFromTableNames(stmt.select, schemaName);
-
-	const selectClone = cloneQueryExpr(stmt.select);
-	for (const [declaredTableName, colRenames] of columnRenamesByTable) {
-		for (const r of colRenames) {
-			renameColumnInAst(selectClone, declaredTableName, r.newName, r.oldName, schemaName);
-		}
-	}
-
-	// The `insert defaults` clause mirrors reconciledDeclaredViewDefinition's
-	// handling minus the table pass: each entry's `column` names a base column of
-	// a FROM table (inverse-mapped via the FROM-scoped lookup), and its `expr`
-	// evaluates in that base table's inserted-row context — the CHECK-expression
-	// entry point, seeded with the DECLARED table name.
-	let reconciledDefaults = stmt.insertDefaults;
-	if (stmt.insertDefaults && stmt.insertDefaults.length > 0) {
-		reconciledDefaults = stmt.insertDefaults.map(d => {
-			let column = d.column;
-			for (const ft of fromTables) {
-				const r = columnRenamesByTable.get(ft)?.find(cr => cr.newName.toLowerCase() === column.toLowerCase());
-				if (r) {
-					column = r.oldName;
-					break;
-				}
-			}
-			const exprClone = cloneExpr(d.expr);
-			for (const ft of fromTables) {
-				const colRenames = columnRenamesByTable.get(ft);
-				if (!colRenames) continue;
-				for (const r of colRenames) {
-					renameColumnInCheckExpression(exprClone, ft, r.newName, r.oldName, schemaName);
-				}
-			}
-			return { column, expr: exprClone };
-		});
-	}
-
-	return { ...stmt, select: selectClone, insertDefaults: reconciledDefaults };
+	const parts = inverseRenamedViewParts(stmt.select, stmt.insertDefaults, [], columnRenamesByTable, schemaName);
+	return { ...stmt, select: parts.select, insertDefaults: parts.insertDefaults };
 }
 
 /**
