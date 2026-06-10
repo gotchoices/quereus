@@ -157,4 +157,31 @@ describe('LevelDB sibling-table prefix collision', () => {
 		expect(await rows(`select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
 		expect(await rows(`select id from t order by id`)).to.deep.equal([{ id: 1 }, { id: 2 }]);
 	});
+
+	it('rejects RENAME relocating an index onto a sibling table data store; no directory moved', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index x on t (b)`); // index dir main/t_idx_x
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		await db.exec(`create table "u_idx_x" (id integer primary key, v integer) using store`);
+		await db.exec(`insert into "u_idx_x" values (1, 100), (2, 200)`);
+
+		expect(fs.existsSync(indexDir('t', 'x')), 't real index dir exists').to.be.true;
+		expect(fs.existsSync(dataDir('u_idx_x')), 'sibling data dir exists').to.be.true;
+		const before = mainDirs();
+
+		// Rename t → u: the new data dir main/u is free, but relocating t's index x
+		// would land on main/u_idx_x — the sibling table's data dir.
+		const err = await attempt(`alter table t rename to u`);
+		expect(err, 'rename relocating an index onto a sibling data store must reject').to.be.instanceOf(Error);
+		expect((err as Error).message).to.match(/main\.u_idx_x/);
+
+		// Atomic reject: NO directory moved — the StoreModule guard fires before the
+		// provider relocation, and the provider's own all-destinations pre-scan is
+		// the backstop (no half-renamed table even when called directly).
+		expect(mainDirs(), 'directory set unchanged on reject').to.deep.equal(before);
+
+		// Both tables remain fully usable without recovery.
+		expect(await rows(`select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+		expect(await rows(`select v from "u_idx_x" order by id`)).to.deep.equal([{ v: 100 }, { v: 200 }]);
+	});
 });

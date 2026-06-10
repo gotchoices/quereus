@@ -207,10 +207,9 @@ describe('Store CREATE-time physical store-name collision detection', () => {
 		await db.exec(`create index archive on t (b)`); // t's OWN index store main.t_idx_archive
 		await db.exec(`insert into t values (1, 10), (2, 20)`);
 
-		// Rename t → t_idx_archive: candidate main.t_idx_archive == t's own index store.
-		// This is the "rename produces a colliding index store name" hazard (parked
-		// out of scope); the guard rejects it BEFORE relocation rather than letting the
-		// provider corrupt data, so t survives intact under its old name.
+		// Rename t → t_idx_archive: candidate main.t_idx_archive == t's own index
+		// store. A footprint-swap rename providers cannot relocate safely; the guard
+		// rejects it BEFORE relocation, so t survives intact under its old name.
 		const err = await attempt(db, `alter table t rename to "t_idx_archive"`);
 		expect(err, 'colliding-index-store rename must reject').to.be.instanceOf(QuereusError);
 		expect(err!.code, err!.message).to.equal(StatusCode.ERROR);
@@ -219,5 +218,65 @@ describe('Store CREATE-time physical store-name collision detection', () => {
 		// t is untouched: still readable under its original name, index still backs lookups.
 		expect(await rows(db, `select id from t order by id`)).to.deep.equal([{ id: 1 }, { id: 2 }]);
 		expect(await rows(db, `select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+	});
+
+	it('rejects RENAME whose RELOCATED index store collides with a sibling table data store; all intact', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index x on t (b)`); // index store main.t_idx_x
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		await db.exec(`create table "u_idx_x" (id integer primary key, v integer) using store`);
+		await db.exec(`insert into "u_idx_x" values (1, 100), (2, 200)`);
+
+		// Rename t → u: the new DATA store main.u is free, but relocating t's index
+		// x would land on main.u_idx_x — the sibling table's data store. The
+		// in-memory provider's `move` silently overwrites its destination, so a
+		// guard miss here is silent corruption, not an error.
+		const err = await attempt(db, `alter table t rename to u`);
+		expect(err, 'rename relocating an index onto a sibling data store must reject').to.be.instanceOf(QuereusError);
+		expect(err!.code, err!.message).to.equal(StatusCode.ERROR);
+		expect(err!.message, 'message names the candidate physical store').to.match(/main\.u_idx_x/);
+		expect(err!.message, 'message is a sited collision message').to.match(/collision/i);
+
+		// Sibling rows intact — nothing aliased or overwrote its data store.
+		expect(await rows(db, `select v from "u_idx_x" order by id`)).to.deep.equal([{ v: 100 }, { v: 200 }]);
+
+		// Atomicity: the guard fired before any side effect, so t needs no recovery —
+		// the very next statements read it under its old name with a working index.
+		expect(await rows(db, `select id from t order by id`)).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		expect(await rows(db, `select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+	});
+
+	it('negative control: RENAME t→u succeeds when the sibling is u_idx_y and t\'s index is x', async () => {
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index x on t (b)`); // relocates to main.u_idx_x — distinct from main.u_idx_y
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		await db.exec(`create table "u_idx_y" (id integer primary key, v integer) using store`);
+		await db.exec(`insert into "u_idx_y" values (1, 100)`);
+
+		const err = await attempt(db, `alter table t rename to u`);
+		expect(err, 'non-colliding rename must not be falsely rejected').to.equal(null);
+
+		// Both tables fully usable: index-backed lookup on u works, sibling intact.
+		expect(await rows(db, `select id from u where b = 20`)).to.deep.equal([{ id: 2 }]);
+		expect(await rows(db, `select v from "u_idx_y" order by id`)).to.deep.equal([{ v: 100 }]);
+	});
+
+	it('rejects an own-footprint swap: renaming table u_idx_x (with index x) to u; data intact', async () => {
+		await db.exec(`create table "u_idx_x" (id integer primary key, b integer) using store`);
+		await db.exec(`create index x on "u_idx_x" (b)`); // index store main.u_idx_x_idx_x
+		await db.exec(`insert into "u_idx_x" values (1, 10), (2, 20)`);
+
+		// Rename u_idx_x → u: the relocated index store name main.u_idx_x equals the
+		// table's own OLD data store. Only safe if the provider moves the data dir
+		// before the index dir — a move-ordering contract no provider guarantees —
+		// so the guard conservatively rejects (no self-exclusion of own stores).
+		const err = await attempt(db, `alter table "u_idx_x" rename to u`);
+		expect(err, 'own-footprint swap rename must reject').to.be.instanceOf(QuereusError);
+		expect(err!.code, err!.message).to.equal(StatusCode.ERROR);
+		expect(err!.message).to.match(/main\.u_idx_x/);
+
+		// Table untouched under its old name; index still backs lookups.
+		expect(await rows(db, `select id from "u_idx_x" where b = 20`)).to.deep.equal([{ id: 2 }]);
+		expect(await rows(db, `select id from "u_idx_x" order by id`)).to.deep.equal([{ id: 1 }, { id: 2 }]);
 	});
 });

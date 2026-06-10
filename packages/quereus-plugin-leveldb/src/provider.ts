@@ -167,6 +167,32 @@ export class LevelDBProvider implements KVStoreProvider {
 			throw new Error(`Cannot rename '${oldName}' to '${newName}': store already open under the new name`);
 		}
 
+		// Plan every directory move up front and check ALL destinations before
+		// touching anything: a destination check interleaved with the moves would
+		// fail only after earlier directories had already relocated, leaving a
+		// half-renamed table (and on POSIX, renaming onto an existing EMPTY
+		// directory succeeds — a silent clobber, not even an error). Source paths
+		// mirror getStore/getIndexStore (original-case `{table}` /
+		// `{table}_idx_{index}`), and only directories named in the schema are
+		// moved rather than readdir-scanning the `{oldName}_idx_` prefix (which
+		// would relocate a sibling table's directory too).
+		const schemaDir = path.join(this.basePath, schemaName);
+		const moves: Array<{ from: string; to: string }> = [];
+		const planMove = async (from: string, to: string) => {
+			if (!(await pathExists(from))) return; // not yet materialized — nothing to move
+			if (await pathExists(to)) {
+				throw new Error(`Cannot rename '${oldName}' to '${newName}': destination path '${to}' already exists`);
+			}
+			moves.push({ from, to });
+		};
+		await planMove(path.join(schemaDir, oldName), path.join(schemaDir, newName));
+		for (const indexName of indexNames) {
+			await planMove(
+				path.join(schemaDir, `${oldName}${STORE_SUFFIX.INDEX}${indexName}`),
+				path.join(schemaDir, `${newName}${STORE_SUFFIX.INDEX}${indexName}`),
+			);
+		}
+
 		// Close all open handles for the old table (data + indexes) so LevelDB
 		// releases its file locks before we move the directories. Index handles are
 		// closed by exact store key, not by scanning `{oldName}_idx_` — that prefix
@@ -176,26 +202,8 @@ export class LevelDBProvider implements KVStoreProvider {
 			await this.closeStoreByName(`${schemaName}.${oldName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase());
 		}
 
-		// Move data directory, if present.
-		const schemaDir = path.join(this.basePath, schemaName);
-		const oldDataPath = path.join(schemaDir, oldName);
-		const newDataPath = path.join(schemaDir, newName);
-		if (await pathExists(oldDataPath)) {
-			if (await pathExists(newDataPath)) {
-				throw new Error(`Cannot rename '${oldName}' to '${newName}': destination path '${newDataPath}' already exists`);
-			}
-			await fs.promises.rename(oldDataPath, newDataPath);
-		}
-
-		// Move exactly the table's index directories under the new table name. The
-		// path mirrors getIndexStore (original-case `{table}_idx_{index}`), and we
-		// move only directories named in the schema rather than readdir-scanning the
-		// `{oldName}_idx_` prefix (which would relocate a sibling's directory too).
-		for (const indexName of indexNames) {
-			const oldIndexPath = path.join(schemaDir, `${oldName}${STORE_SUFFIX.INDEX}${indexName}`);
-			if (!(await pathExists(oldIndexPath))) continue;
-			const newIndexPath = path.join(schemaDir, `${newName}${STORE_SUFFIX.INDEX}${indexName}`);
-			await fs.promises.rename(oldIndexPath, newIndexPath);
+		for (const { from, to } of moves) {
+			await fs.promises.rename(from, to);
 		}
 	}
 

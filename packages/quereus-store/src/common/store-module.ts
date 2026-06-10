@@ -201,13 +201,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * No self-exclusion: at each guarded call the candidate object is not yet
 	 * registered (create/createIndex run before the engine adds it) so it cannot
-	 * self-collide; and for renameTable the renamed table's OWN stores being in the
-	 * set is intentional — renaming `t` into `t`'s own index-store name (`t` has
-	 * index `x`, rename → `t_idx_x`) is the "rename produces a colliding index
-	 * store name" hazard (parked in
-	 * tickets/backlog/store-rename-produces-colliding-index-store-name.md), so the
-	 * guard rejects it before relocation rather than letting the provider corrupt
-	 * data.
+	 * self-collide; and for renameTable the renamed table's OWN stores stay in the
+	 * set deliberately. Any overlap between a name the rename introduces and an
+	 * own current store is a footprint-swap rename (`t` with index `x` → `t_idx_x`,
+	 * or table `u_idx_x` with index `x` → `u`) that providers cannot relocate
+	 * safely — relocation order determines whether a source is clobbered before it
+	 * is moved — while no benign rename produces such an overlap. Keeping own
+	 * stores in the set therefore causes no false rejects and keeps the
+	 * reject-before-any-side-effect guarantee uniform.
 	 */
 	private collectOccupiedStoreNames(db: Database, schemaName: string): Map<string, string> {
 		const names = new Map<string, string>();
@@ -243,14 +244,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Must run BEFORE any storage side-effect (`getStore` / `getIndexStore` / the
 	 * physical relocation): the provider opens/creates the store eagerly, so a
 	 * guard that ran after would already have aliased the colliding object's store.
+	 *
+	 * Callers checking several candidates against the same occupancy (renameTable
+	 * checks the new data store plus every relocated index store) pass a
+	 * precomputed `occupied` map so the occupancy is collected once, not per call.
 	 */
 	private assertStoreNameFree(
 		db: Database,
 		schemaName: string,
 		candidate: string,
 		candidateDesc: string,
+		occupied?: Map<string, string>,
 	): void {
-		const occupiedBy = this.collectOccupiedStoreNames(db, schemaName).get(candidate);
+		const occupiedBy = (occupied ?? this.collectOccupiedStoreNames(db, schemaName)).get(candidate);
 		if (occupiedBy !== undefined) {
 			throw new QuereusError(
 				`Physical store-name collision: the ${candidateDesc} would map to physical store `
@@ -1366,26 +1372,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			);
 		}
 
-		// Reject renaming a table into a name already occupied by an existing
-		// physical store — e.g. rename some table to `q_idx_archive` while table `q`
-		// has index `archive` (both → `{schema}.q_idx_archive`). This also rejects
-		// renaming `t` into `t`'s OWN index-store name (`t` has index `x`, rename →
-		// `t_idx_x`): that is the "rename produces a colliding index store name"
-		// hazard (parked in
-		// tickets/backlog/store-rename-produces-colliding-index-store-name.md) — a
-		// clean reject here is strictly safer than letting the provider relocate into
-		// a transient self-collision and corrupt data. Must precede the physical
-		// relocation below.
-		const newDataStoreName = buildDataStoreName(schemaName, newName);
-		this.assertStoreNameFree(
-			db,
-			schemaName,
-			newDataStoreName,
-			`data store of table '${schemaName}.${newName}' (rename target)`,
-		);
-
-		// Capture the current schema BEFORE we drop in-memory references, so the
-		// new catalog DDL reflects the real column set.
+		// Capture the current schema BEFORE the guard (and before we drop in-memory
+		// references): the guard needs the index list to compute every relocated
+		// store name, and the new catalog DDL must reflect the real column set.
 		const existing = this.tables.get(oldKey);
 		const currentSchema: TableSchema | undefined =
 			existing?.getSchema() ?? db.schemaManager.getTable(schemaName, oldName);
@@ -1394,6 +1383,36 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// exactly these index stores instead of prefix-scanning `{oldName}_idx_`,
 		// which would also catch a sibling table named `{oldName}_idx_<x>`.
 		const indexNames = (currentSchema?.indexes ?? []).map(i => i.name);
+
+		// Reject when ANY physical name the rename introduces — the new data store
+		// AND each relocated index store `{schema}.{newName}_idx_{x}` — already
+		// names an existing store. E.g. rename some table to `q_idx_archive` while
+		// table `q` has index `archive` (both → `{schema}.q_idx_archive`); or rename
+		// `t`→`u` while `t` has index `x` and a sibling table is literally named
+		// `u_idx_x`, which would relocate `t`'s index onto the sibling's data store.
+		// The renamed table's own current stores stay in the occupied set (see
+		// collectOccupiedStoreNames): an introduced name can only equal an own store
+		// in a footprint-swap rename providers cannot relocate safely. All checks
+		// run before the FIRST side effect (the coordinator commit, disconnect, and
+		// cache evictions below, then the physical relocation) so a colliding
+		// rename is a clean no-op.
+		const occupied = this.collectOccupiedStoreNames(db, schemaName);
+		this.assertStoreNameFree(
+			db,
+			schemaName,
+			buildDataStoreName(schemaName, newName),
+			`data store of table '${schemaName}.${newName}' (rename target)`,
+			occupied,
+		);
+		for (const indexName of indexNames) {
+			this.assertStoreNameFree(
+				db,
+				schemaName,
+				buildIndexStoreName(schemaName, newName, indexName),
+				`index store of index '${indexName}' on table '${schemaName}.${newName}' (rename target)`,
+				occupied,
+			);
+		}
 
 		// ALTER TABLE is effectively DDL-committing on a store-backed table:
 		// once we move the on-disk directory, prior buffered writes can no
