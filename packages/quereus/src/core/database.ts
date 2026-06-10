@@ -1779,6 +1779,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * re-query; it never misses a change. A no-op when no subscription matches.
 	 * Async to mirror the post-commit watcher path (handlers may be async).
 	 *
+	 * When the host has the actual row images, prefer the precise,
+	 * in-transaction {@link ingestExternalRowChanges} seam instead: row-granular
+	 * watch hits at commit, plus MV maintenance, assertion evaluation, and
+	 * opt-in FK actions.
+	 *
 	 * @param tableName  The table whose watchers to fire.
 	 * @param schemaName Defaults to the current schema
 	 *   (`schemaManager.getCurrentSchemaName()`).

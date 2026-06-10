@@ -339,6 +339,69 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 			expect(await readAll(db, 'select * from mv')).to.deep.equal([]);
 			expect(events).to.have.length(0);
 		});
+
+		it('explicit: a mid-batch error leaves the caller transaction OPEN with only that batch unwound', async () => {
+			const events: WatchEvent[] = [];
+			const sub = db.watch(rowsWatch('t', 'id', 'x'), e => { events.push(e); });
+
+			await db.exec('begin');
+			await db.ingestExternalRowChanges([chg('t', { op: 'insert', newRow: ['x', 'a'] })]);
+			await expectThrows(
+				() => db.ingestExternalRowChanges([
+					chg('t', { op: 'insert', newRow: ['y', 'b'] }),
+					chg('t', { op: 'insert', newRow: ['z'] }), // arity error mid-batch
+				]),
+				'arity',
+			);
+
+			// The caller's transaction survives (caller decides); the failed
+			// batch's savepoint unwound its derived effects; the earlier batch's
+			// effects are intact and commit normally.
+			expect(db.getAutocommit(), 'caller transaction left open').to.equal(false);
+			expect((await readAll(db, 'select id from mv order by id')).map(r => r.id),
+				'first batch intact, failed batch unwound').to.deep.equal(['x']);
+
+			await db.exec('commit');
+			sub.unsubscribe();
+			expect(events, 'capture from the surviving batch dispatches at commit').to.have.length(1);
+			expect(events[0].matched[0].hits).to.deep.equal([['x']]);
+		});
+	});
+
+	describe('change capture → commit-time global assertions', () => {
+		beforeEach(async () => {
+			await db.exec('create table t (id integer primary key, v integer)');
+			await db.exec(
+				'create assertion non_negative check (not exists (select 1 from t where v < 0))');
+		});
+
+		it('a violating inbound batch fails the implicit commit; state resets cleanly', async () => {
+			// Assertion evaluation re-reads the table, so the violating row must
+			// be physically present — directWrite is the external storage write.
+			await directWrite(db, 't', 'insert', [1, -5]);
+			const events: WatchEvent[] = [];
+			const sub = db.watch(rowsWatch('t', 'id', 1), e => { events.push(e); });
+
+			await expectThrows(
+				() => db.ingestExternalRowChanges([chg('t', { op: 'insert', newRow: [1, -5] })]),
+				'non_negative',
+			);
+			sub.unsubscribe();
+
+			expect(db.getAutocommit(), 'failed commit resets to autocommit').to.equal(true);
+			expect(events, 'no watch dispatch on a failed commit').to.have.length(0);
+		});
+
+		it('captureChanges: false opts the batch out of assertion evaluation', async () => {
+			await directWrite(db, 't', 'insert', [1, -5]);
+			// Nothing captured → empty change log → assertions are not evaluated
+			// at the implicit commit (the opt-out half of the capture facet).
+			await db.ingestExternalRowChanges(
+				[chg('t', { op: 'insert', newRow: [1, -5] })],
+				{ captureChanges: false },
+			);
+			expect(db.getAutocommit()).to.equal(true);
+		});
 	});
 
 	describe('validation and edge cases', () => {
@@ -376,6 +439,43 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 			expect((err as QuereusError).code).to.equal(StatusCode.MISUSE);
 			expect(await readAll(db, 'select * from mv'), 'earlier change unwound').to.deep.equal([]);
 			expect(db.getAutocommit()).to.equal(true);
+		});
+
+		it('a change against a non-default schema resolves and captures with executor parity', async () => {
+			await db.exec('create table temp.t2 (id text primary key, v text)');
+			const events: WatchEvent[] = [];
+			const sub = db.watch(db.prepare('select * from temp.t2').getChangeScope(), e => { events.push(e); });
+
+			await db.ingestExternalRowChanges([
+				{ schemaName: 'temp', tableName: 't2', change: { op: 'insert', newRow: ['x', 'a'] } },
+			]);
+			sub.unsubscribe();
+
+			// The capture key resolved to temp.t2 (not main.t2), so the watch
+			// projected onto the temp table matched.
+			expect(events).to.have.length(1);
+		});
+
+		it("an update change missing its oldRow → MISUSE (shape, not a deep TypeError)", async () => {
+			await db.exec('create table t (id text primary key, v text)');
+			const err = await expectThrows(
+				() => db.ingestExternalRowChanges([
+					chg('t', { op: 'update', newRow: ['x', 'a'] } as unknown as ExternalRowChange['change']),
+				]),
+				"oldRow is required for op 'update'",
+			);
+			expect((err as QuereusError).code).to.equal(StatusCode.MISUSE);
+		});
+
+		it('an unrecognized op → MISUSE', async () => {
+			await db.exec('create table t (id text primary key, v text)');
+			const err = await expectThrows(
+				() => db.ingestExternalRowChanges([
+					chg('t', { op: 'upsert', newRow: ['x', 'a'] } as unknown as ExternalRowChange['change']),
+				]),
+				"unknown op 'upsert'",
+			);
+			expect((err as QuereusError).code).to.equal(StatusCode.MISUSE);
 		});
 
 		it('empty batch is a no-op and begins no transaction', async () => {

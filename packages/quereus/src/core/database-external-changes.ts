@@ -21,6 +21,7 @@ import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { Row } from '../common/types.js';
 import type { TableSchema } from '../schema/table.js';
+import type { BackingRowChange } from '../vtab/memory/layer/manager.js';
 import type { BackingConnectionCache } from './database-materialized-views.js';
 import type { Database } from './database.js';
 import type { ExternalRowChange, IngestExternalChangesOptions } from './database-internal.js';
@@ -66,15 +67,52 @@ function resolveTableSchema(
 	return tableSchema;
 }
 
-/** Reject a reported row whose arity disagrees with the table's column count —
- *  the rows must be FULL table rows in schema column order. */
-function assertRowArity(tableSchema: TableSchema, row: Row, which: 'oldRow' | 'newRow'): void {
+/** Reject a missing or mis-sized row image — the rows must be FULL table rows
+ *  in schema column order. Presence is part of the SHAPE contract (the trust
+ *  boundary covers semantics, not malformed reports): without it a JS caller's
+ *  missing image surfaces as a TypeError deep inside capture/maintenance. */
+function assertRowShape(
+	tableSchema: TableSchema,
+	row: Row | undefined,
+	which: 'oldRow' | 'newRow',
+	op: string,
+): void {
+	if (row === undefined) {
+		throw new QuereusError(
+			`ingestExternalRowChanges: ${which} is required for op '${op}'`,
+			StatusCode.MISUSE,
+		);
+	}
 	if (row.length !== tableSchema.columns.length) {
 		throw new QuereusError(
 			`ingestExternalRowChanges: ${which} arity ${row.length} does not match `
 				+ `'${tableSchema.schemaName}.${tableSchema.name}' column count ${tableSchema.columns.length}`,
 			StatusCode.MISUSE,
 		);
+	}
+}
+
+/** Validate one reported change's shape: a recognized `op` carrying the images
+ *  that op requires (insert: new, delete: old, update: both), each a full table
+ *  row. The {@link BackingRowChange} union enforces this at compile time; this
+ *  is the runtime mirror for JS callers. */
+function assertChangeShape(tableSchema: TableSchema, change: BackingRowChange): void {
+	switch (change.op) {
+		case 'insert':
+			assertRowShape(tableSchema, change.newRow, 'newRow', change.op);
+			break;
+		case 'delete':
+			assertRowShape(tableSchema, change.oldRow, 'oldRow', change.op);
+			break;
+		case 'update':
+			assertRowShape(tableSchema, change.oldRow, 'oldRow', change.op);
+			assertRowShape(tableSchema, change.newRow, 'newRow', change.op);
+			break;
+		default:
+			throw new QuereusError(
+				`ingestExternalRowChanges: unknown op '${(change as { op: string }).op}'`,
+				StatusCode.MISUSE,
+			);
 	}
 }
 
@@ -125,8 +163,7 @@ export async function ingestExternalRowChangeBatch(
 			for (const item of changes) {
 				const tableSchema = resolveTableSchema(db, tableMemo, item);
 				const { change } = item;
-				if (change.oldRow !== undefined) assertRowArity(tableSchema, change.oldRow, 'oldRow');
-				if (change.newRow !== undefined) assertRowArity(tableSchema, change.newRow, 'newRow');
+				assertChangeShape(tableSchema, change);
 
 				// Derived from the RESOLVED schema — byte-identical to the DML
 				// executor's key, so capture/watch matching gets executor parity.

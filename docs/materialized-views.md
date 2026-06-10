@@ -361,7 +361,7 @@ interface IngestExternalChangesOptions {
 }
 ```
 
-`changes` is a flat **ordered** array — order is semantic for FK actions and capture (origin order = parents-before-children etc.). Rows are FULL table rows in schema column order (arity-checked → `MISUSE`); an unknown table or schema errors with `NOTFOUND` before any effect. `oldRow` images must be accurate before-images — they key the backing deletes and the capture log; when the same row changes twice in one batch, each change's `oldRow` must be the true before-image of *that* change (the prior change's `newRow`). The table key is derived from the **resolved** schema (`schemaName.tableName`, byte-identical to the DML executor's), so capture/watch matching gets executor parity.
+`changes` is a flat **ordered** array — order is semantic for FK actions and capture (origin order = parents-before-children etc.). Rows are FULL table rows in schema column order (shape-checked → `MISUSE`: a recognized `op`, the images that op requires — insert: new, delete: old, update: both — each matching the table's column count); an unknown table or schema errors with `NOTFOUND` before any effect. `oldRow` images must be accurate before-images — they key the backing deletes and the capture log; when the same row changes twice in one batch, each change's `oldRow` must be the true before-image of *that* change (the prior change's `newRow`). The table key is derived from the **resolved** schema (`schemaName.tableName`, byte-identical to the DML executor's), so capture/watch matching gets executor parity.
 
 ### Facets (per call; DML-executor order per change)
 
