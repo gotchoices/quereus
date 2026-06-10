@@ -86,7 +86,7 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		// Re-derive the canonical backing shape from the (re-planned) body. A source
 		// `alter` can shift the body's output shape (columns/types/PK/ordering) — most
 		// visibly for a `select *` body, whose new source column interleaves into the
-		// output while the create-time backing does not. Only `replaceBaseLayer`-ing the
+		// output while the create-time backing does not. Only `replaceContents`-ing the
 		// new rows into the stale backing schema would surface body values under the wrong
 		// column labels (a latent direct-read corruption) and break the positional
 		// backing↔body alignment the join read-rewrite relies on. So compare the derived

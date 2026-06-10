@@ -43,15 +43,15 @@ covering structure answers it.
 > **MV-over-MV cascade.** A materialized view whose source is another MV's backing table
 > is maintained synchronously in the same row-time pass, *not* through this kernel. A
 > backing write is itself a row-write, so each MV's per-row maintenance reports the
-> **effective** backing changes it applied (`applyMaintenancePlan` → the layer's
-> `applyMaintenanceToLayer` returns a `BackingRowChange[]`), and the manager routes
+> **effective** backing changes it applied (`applyMaintenancePlan` → the backing
+> host's `applyMaintenance` returns a `BackingRowChange[]`), and the manager routes
 > those onward to any MV reading that backing — `maintainRowTime` recurses, DAG-ordered
 > and atomic within the statement. This path is *arm-agnostic*: it routes whatever
 > per-row backing delta a maintenance plan produces, so a chain may mix maintenance arms
 > uniformly. (`incremental-maintenance-plan-abstraction` landed the first step of the
 > fold: `applyRowTimeChange` is now `applyMaintenancePlan`, which dispatches on
 > `MaintenancePlan.kind`; the cascade flow is unchanged: `applyMaintenancePlan` →
-> `applyMaintenanceToLayer` → `BackingRowChange[]` → `maintainRowTime`. Five arms are
+> the backing host's `applyMaintenance` → `BackingRowChange[]` → `maintainRowTime`. Five arms are
 > wired today: `'inverse-projection'` (the covering-index shape), `'residual-recompute'`
 > (single-source aggregates, below), `'prefix-delete'` (single-source lateral-TVF
 > fan-out, below), `'join-residual'` (1:1 inner/cross join, below), and `'full-rebuild'` (the
