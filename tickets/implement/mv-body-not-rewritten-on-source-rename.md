@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-10T06:15:50.147Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\mv-body-not-rewritten-on-source-rename.implement.2026-06-10T06-15-50-147Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: ALTER TABLE/COLUMN RENAME must rewrite a dependent materialized view's body in place (parallel to the plain-view rewrite), re-key sourceTables/bodyHash, re-register row-time maintenance, and fire materialized_view_modified — while never clearing a pre-existing stale flag and leaving the MV stale if the rewrite fails mid-way.
 files:
   - packages/quereus/src/runtime/emit/alter-table.ts                 # propagateTableRenameInSchema / propagateColumnRenameInSchema — add the MV loop (mirrors the plain-view loop)
