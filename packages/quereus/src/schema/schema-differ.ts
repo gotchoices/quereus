@@ -9,6 +9,7 @@ import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, collectFromTableNames } from './rename-rewriter.js';
+import type { ResolveColumnInSource } from './rename-rewriter.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
@@ -362,6 +363,31 @@ export function computeSchemaDiff(
 		}
 	}
 
+	// Declared-side column-existence resolver for the scope-aware seeded column
+	// rewrites in the reconcilers (the optional `ResolveColumnInSource` arg of
+	// `renameColumnInCheckExpression`). The forward rename propagation passes a
+	// live schemaManager lookup (see `rewriteTableForColumnRename` in
+	// runtime/emit/alter-table.ts); the diff side has no live catalog for the
+	// post-rename world, so it answers from the DECLARED column sets instead:
+	// the inverse walk's match target (`oldCol`) is the rename's NEW column
+	// name, and the question being answered is "in the declared world, does
+	// this inner FROM source expose that name (so the unqualified ref binds
+	// there, not to the owning seed)?". The walk's `realSources` carry OLD
+	// table names when the inverse table-rename pass has pre-normalized
+	// qualifiers (and DECLARED names when it hasn't — `columnReconciledViewStmt`),
+	// hence the old→new table-name mapping before the declared lookup: an
+	// already-declared name simply misses the rename find and passes through.
+	// Cross-schema sources answer false (the catalog is single-schema) —
+	// conservative where the forward path's live lookup could say yes; worst
+	// case a benign drop+recreate.
+	const targetSchemaLower = targetSchemaName.toLowerCase();
+	const resolveDeclaredColumn: ResolveColumnInSource = (schema, table, column) => {
+		if (schema !== targetSchemaLower) return false;
+		const declaredName = tableRenames.renames.find(r => r.oldName.toLowerCase() === table)?.newName.toLowerCase() ?? table;
+		const dt = declaredTables.get(declaredName);
+		return dt?.tableStmt.columns.some(c => c.name.toLowerCase() === column) ?? false;
+	};
+
 	// Tables: creates / alters
 	for (const [name, declaredTable] of declaredTables) {
 		const tableStmt = declaredTable.tableStmt;
@@ -372,7 +398,7 @@ export function computeSchemaDiff(
 			// schema name, and the cross-table column-rename map so the constraint body
 			// comparison can reconcile a renamed local column / FK-parent-table /
 			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
-			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, defaultCollation);
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, resolveDeclaredColumn, defaultCollation);
 			// If this was a rename, set the alter target to the new name (post-rename)
 			if (matchedActual.name.toLowerCase() !== name) {
 				alterDiff.tableName = tableStmt.table.name;
@@ -443,7 +469,7 @@ export function computeSchemaDiff(
 		const stmt = declaredView.viewStmt;
 		let definitionDrifted = viewDefinitionToCanonicalString(stmt.columns, stmt.select, stmt.insertDefaults) !== matchedActual.definition;
 		if (definitionDrifted && (tableRenames.renames.length > 0 || columnRenamesByTable.size > 0)) {
-			definitionDrifted = reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName) !== matchedActual.definition;
+			definitionDrifted = reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn) !== matchedActual.definition;
 		}
 		if (definitionDrifted) {
 			diff.viewsToDrop.push(matchedActual.name);
@@ -455,7 +481,7 @@ export function computeSchemaDiff(
 			// Hinted rename, definition unchanged → drop(old) + recreate(declared),
 			// rendered with in-diff column renames inverse-applied (NEW→OLD).
 			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(createViewToString(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName)));
+			diff.viewsToCreate.push(createViewToString(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn)));
 			viewRecreates++;
 			continue;
 		}
@@ -496,7 +522,7 @@ export function computeSchemaDiff(
 			const stmt = declaredMv.viewStmt;
 			let bodyDrifted = computeBodyHash(viewDefinitionToCanonicalString(stmt.columns, stmt.select, stmt.insertDefaults)) !== actual.bodyHash;
 			if (bodyDrifted && (tableRenames.renames.length > 0 || columnRenamesByTable.size > 0)) {
-				bodyDrifted = computeBodyHash(reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName)) !== actual.bodyHash;
+				bodyDrifted = computeBodyHash(reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn)) !== actual.bodyHash;
 			}
 			const moduleDrifted =
 				normalizeBackingModuleName(stmt.moduleName) !== normalizeBackingModuleName(actual.backingModuleName)
@@ -1045,8 +1071,10 @@ function reconciledDeclaredViewDefinition(
 	/** Declared (new) table name (lowercased) → that table's column renames. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
+	/** Declared-side column-existence resolver for the seeded `insert defaults` expr rewrites (see `computeSchemaDiff`). */
+	resolveDeclaredColumn: ResolveColumnInSource,
 ): string {
-	const parts = inverseRenamedViewParts(select, insertDefaults, tableRenames, columnRenamesByTable, schemaName);
+	const parts = inverseRenamedViewParts(select, insertDefaults, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
 	return viewDefinitionToCanonicalString(columns, parts.select, parts.insertDefaults);
 }
 
@@ -1077,7 +1105,11 @@ function reconciledDeclaredViewDefinition(
  *              false-rewrite); its `expr` gets the same inverse rewriters as
  *              the body, with column renames applied via the CHECK-expression
  *              entry point (the expr has no FROM of its own — the base table
- *              seeds the scope, exactly like the constraint/index predicates).
+ *              seeds the scope, exactly like the constraint/index predicates),
+ *              threaded with the declared-side scope resolver so an inner
+ *              subquery ref binding to a like-named column on its own FROM is
+ *              not falsely captured by the seed (the forward
+ *              `renameColumnInInsertDefaults` takes the same hook).
  */
 function inverseRenamedViewParts(
 	select: AST.QueryExpr,
@@ -1086,6 +1118,8 @@ function inverseRenamedViewParts(
 	/** Declared (new) table name (lowercased) → that table's column renames. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
+	/** Declared-side column-existence resolver for the seeded `insert defaults` expr rewrites (see `computeSchemaDiff`). */
+	resolveDeclaredColumn: ResolveColumnInSource,
 ): { select: AST.QueryExpr; insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined } {
 	// FROM tables under their DECLARED (new) names — collected before the inverse
 	// table pass below rewrites the clone's references to OLD names.
@@ -1124,7 +1158,7 @@ function inverseRenamedViewParts(
 				const ownRename = tableRenames.find(r => r.newName.toLowerCase() === ft);
 				const seedTableName = ownRename?.oldName ?? ft;
 				for (const r of colRenames) {
-					renameColumnInCheckExpression(exprClone, seedTableName, r.newName, r.oldName, schemaName);
+					renameColumnInCheckExpression(exprClone, seedTableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
 				}
 			}
 			return { column, expr: exprClone };
@@ -1154,9 +1188,11 @@ function columnReconciledViewStmt(
 	/** Declared (new) table name (lowercased) → that table's column renames. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
+	/** Declared-side column-existence resolver for the seeded `insert defaults` expr rewrites (see `computeSchemaDiff`). */
+	resolveDeclaredColumn: ResolveColumnInSource,
 ): AST.CreateViewStmt {
 	if (columnRenamesByTable.size === 0) return stmt;
-	const parts = inverseRenamedViewParts(stmt.select, stmt.insertDefaults, [], columnRenamesByTable, schemaName);
+	const parts = inverseRenamedViewParts(stmt.select, stmt.insertDefaults, [], columnRenamesByTable, schemaName, resolveDeclaredColumn);
 	return { ...stmt, select: parts.select, insertDefaults: parts.insertDefaults };
 }
 
@@ -1349,13 +1385,20 @@ function inverseRenameStringColumns(
  *             mirroring the forward path (`rewriteTableForTableRename` walks
  *             every table's CHECKs), so both a qualified self-reference and a
  *             cross-table reference inside a subquery reconcile — then inverse
- *             column renames on the expression (runtime CHECK rewriter, seeded
- *             with the OLD table name — correct unconditionally, since
- *             qualifiers are pre-normalized to OLD by the qualifier pass, and
- *             cross-table renames never alter the seed). Sequential inverse
- *             application is order-independent: `resolveRenames` makes rename
- *             chains/swaps unrepresentable, so no inverse output (oldName) can
- *             match another inverse input (newName).
+ *             column renames, in two passes mirroring the forward
+ *             `rewriteTableForColumnRename` branch split: the OWNING table's
+ *             renames via the seeded CHECK rewriter (OLD-table seed — correct
+ *             unconditionally, since qualifiers are pre-normalized to OLD by
+ *             the qualifier pass — plus the declared-side scope resolver, so
+ *             an unqualified inner-subquery ref binding to a like-named column
+ *             on its own FROM source is not falsely captured by the seed),
+ *             then OTHER tables' renames via the plain scope-aware walk (no
+ *             seed, no resolver — exactly the forward non-owning branch).
+ *             Within each pass, sequential inverse application is
+ *             order-independent: `resolveRenames` makes rename chains/swaps
+ *             unrepresentable, so no inverse output (oldName) can match
+ *             another inverse input (newName). BETWEEN the passes order
+ *             matters — owning first (see the cross-table loop's comment).
  *   - UNIQUE: inverse column renames on the column list.
  *   - FK:     inverse column renames on the LOCAL (child) column list, inverse
  *             column renames on the referenced PARENT column list (via the parent
@@ -1374,6 +1417,8 @@ function reconciledDeclaredBody(
 	schemaName: string,
 	/** Declared (new) table name (lowercased) → that table's column renames; for the FK parent-column reconcile. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	/** Declared-side column-existence resolver for the seeded CHECK rewrites (see `computeSchemaDiff`). */
+	resolveDeclaredColumn: ResolveColumnInSource,
 ): string {
 	const tc = d.bodyAst;
 	switch (tc.type) {
@@ -1396,7 +1441,37 @@ function reconciledDeclaredBody(
 			}
 			for (const r of colRenames) {
 				// Inverse: rewrite the declared NEW column name back to its OLD name.
-				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName, schemaName);
+				// The declared-side resolver keeps the seeded walk scope-aware — an
+				// unqualified ref inside a subquery whose own FROM source exposes the
+				// NEW name (in the declared world) binds there, not to the owning
+				// seed, so it is NOT inverse-rewritten — mirroring the forward seeded
+				// call in `rewriteTableForColumnRename` (owning-table branch).
+				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
+			}
+			// Cross-table column renames: a subquery in this CHECK may reference
+			// ANOTHER table whose column was renamed in this same diff; the forward
+			// propagation rewrites those refs via the plain scope-aware walk (no seed
+			// frame, no resolver — `rewriteTableForColumnRename`'s non-owning branch),
+			// so the inverse uses the same walker: an unqualified ref only rewrites
+			// when the renamed table sits in an enclosing FROM frame, which is exactly
+			// right for subquery references. The map key is the DECLARED (new) table
+			// name; the qualifier pass above already rewrote the clone's references to
+			// OLD names, so map the walk's table seed back. The owning table's entry
+			// is skipped — its renames are `colRenames`, handled by the seeded loop
+			// above (`tableName` is the ACTUAL/old owning name, so the comparison
+			// holds even when the owning table was itself renamed). ORDER MATTERS:
+			// owning-seeded inverse FIRST. With the reverse order, a compound diff
+			// (owning `qty→cap` + referenced `lim.cap→capacity`) has this loop turn
+			// the inner `capacity` back into `cap`, which the owning inverse then
+			// falsely captures; owning-first leaves the inner ref spelled `capacity`
+			// (no match) until this loop fixes it.
+			for (const [declaredTableName, renames] of columnRenamesByTable) {
+				const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
+				const seedTableName = ownRename?.oldName ?? declaredTableName;
+				if (seedTableName.toLowerCase() === tableName.toLowerCase()) continue;
+				for (const r of renames) {
+					renameColumnInAst(clone.expr!, seedTableName, r.newName, r.oldName, schemaName);
+				}
 			}
 			return constraintBodyToCanonicalString(clone);
 		}
@@ -1484,6 +1559,8 @@ function computeTableAlterDiff(
 	 * cross-table FK referenced-parent-column reconcile in {@link reconciledDeclaredBody}.
 	 */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	/** Declared-side column-existence resolver for the scope-aware CHECK reconcile (see `computeSchemaDiff`). */
+	resolveDeclaredColumn: ResolveColumnInSource,
 	/** Session `default_collation` for resolving an omitted COLLATE on the declared side. */
 	defaultCollation: string,
 ): TableAlterDiff {
@@ -1601,7 +1678,7 @@ function computeTableAlterDiff(
 		// reconciliation, so the drop+recreate (and its rename-suppression) is kept.
 		if (
 			d.definition !== matchedActual.definition &&
-			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable) !== matchedActual.definition
+			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn) !== matchedActual.definition
 		) {
 			constraintsToDrop.push(matchedActual.name); // drop old
 			constraintsToAdd.push(d.ddl);               // add new (declared name + tags)
