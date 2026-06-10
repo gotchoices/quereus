@@ -292,7 +292,7 @@ export class SchemaManager {
 		if (existing) {
 			this.changeNotifier.notifyChange({
 				type: 'assertion_modified',
-				schemaName: schemaName,
+				schemaName: schema.name,
 				objectName: assertion.name,
 				oldObject: existing,
 				newObject: assertion,
@@ -300,7 +300,7 @@ export class SchemaManager {
 		} else {
 			this.changeNotifier.notifyChange({
 				type: 'assertion_added',
-				schemaName: schemaName,
+				schemaName: schema.name,
 				objectName: assertion.name,
 				newObject: assertion,
 			});
@@ -320,7 +320,7 @@ export class SchemaManager {
 		if (removed) {
 			this.changeNotifier.notifyChange({
 				type: 'assertion_removed',
-				schemaName: schemaName,
+				schemaName: schema.name,
 				objectName: name,
 				oldObject: existing,
 			});
@@ -692,7 +692,11 @@ export class SchemaManager {
 		schema.addTable(newSchema);
 		this.changeNotifier.notifyChange({
 			type: 'table_modified',
-			schemaName: targetSchemaName,
+			// Stored names of the swapped object, not the raw ALTER args — see
+			// canonicalSchemaName for the emitter/stored-name invariant. A raw
+			// `targetSchemaName` here (e.g. `alter index MAIN.idx set tags`) would
+			// miss the table dep's stored `'main'`.
+			schemaName: newSchema.schemaName,
 			objectName: newSchema.name,
 			oldObject: oldSchema,
 			newObject: newSchema,
@@ -909,11 +913,10 @@ export class SchemaManager {
 		schema.addView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'view_modified',
-			// Canonical names (not the raw ALTER args) so the event matches the `view`
-			// plan dependency, which records `view.schemaName` / `view.name` and is
-			// compared exactly by the statement listener — mirrors `commitTagUpdate`'s
-			// `newSchema.name`. A case-differing ALTER (e.g. `alter view MAIN.MYVIEW`
-			// on `create view MyView` in `main`) would otherwise miss on either field.
+			// Stored names of the swapped object, not the raw ALTER args — see
+			// canonicalSchemaName for the emitter/stored-name invariant. A
+			// case-differing ALTER (e.g. `alter view MAIN.MYVIEW` on
+			// `create view MyView` in `main`) would otherwise miss on either field.
 			schemaName: schema.name,
 			objectName: updated.name,
 			oldObject: view,
@@ -978,8 +981,8 @@ export class SchemaManager {
 		schema.addMaterializedView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'materialized_view_modified',
-			// Canonical names (not the raw ALTER args) so the event matches the `view`
-			// plan dependency's exact schema/object compare — see `updateViewTags`.
+			// Stored names of the swapped object, not the raw ALTER args — see
+			// canonicalSchemaName for the emitter/stored-name invariant.
 			schemaName: schema.name,
 			objectName: updated.name,
 			oldObject: mv,
@@ -1252,12 +1255,14 @@ export class SchemaManager {
 			throw new QuereusError(`Failed to remove table ${tableName} from schema ${schemaName}, though it was initially found.`, StatusCode.INTERNAL);
 		}
 
-		// Notify schema change listeners if table was removed
+		// Notify schema change listeners if table was removed. Stored names of the
+		// dropped object, not the raw drop args — see canonicalSchemaName for the
+		// emitter/stored-name invariant.
 		if (removed) {
 			this.changeNotifier.notifyChange({
 				type: 'table_removed',
-				schemaName: schemaName,
-				objectName: tableName,
+				schemaName: tableSchema.schemaName,
+				objectName: tableSchema.name,
 				oldObject: tableSchema
 			});
 
@@ -1267,8 +1272,8 @@ export class SchemaManager {
 				this.db._getEventEmitter().emitAutoSchemaEvent(tableSchema.vtabModuleName ?? 'memory', {
 					type: 'drop',
 					objectType: 'table',
-					schemaName: schemaName,
-					objectName: tableName,
+					schemaName: tableSchema.schemaName,
+					objectName: tableSchema.name,
 				});
 			}
 		}
@@ -1317,6 +1322,26 @@ export class SchemaManager {
 			throw new QuereusError(`Schema not found: ${name}`);
 		}
 		return schema;
+	}
+
+	/**
+	 * Canonical form of a raw (statement-supplied) schema qualifier.
+	 *
+	 * The invalidation contract this anchors: stored `schemaName` on
+	 * tables/views/MVs is canonical, and every schema-change emitter fires the
+	 * *stored* names of the object it swapped. `Statement.compile()` compares
+	 * recorded dependencies against events exactly, so a raw-cased name on
+	 * either side silently misses cached-plan invalidation.
+	 *
+	 * `Schema.name` is invariantly lowercase (every construction site
+	 * lowercases), so an existing schema canonicalizes through its Schema
+	 * object; an absent one (a plan-time reference that may resolve by run
+	 * time, a catalog import into a not-yet-created schema) folds the way the
+	 * Schema constructor would. Existence is NOT validated here — lookup sites
+	 * keep their own missing-schema handling.
+	 */
+	canonicalSchemaName(raw: string): string {
+		return this.schemas.get(raw.toLowerCase())?.name ?? raw.toLowerCase();
 	}
 
 	/**
@@ -1550,7 +1575,11 @@ export class SchemaManager {
 		 */
 		defaultCollation: string = 'BINARY'
 	): TableSchema {
-		const targetSchemaName = stmt.table.schema || this.getCurrentSchemaName();
+		// Stored schemaName is canonical (see canonicalSchemaName); the table name
+		// keeps its declared display casing.
+		const targetSchemaName = stmt.table.schema
+			? this.canonicalSchemaName(stmt.table.schema)
+			: this.getCurrentSchemaName();
 		const tableName = stmt.table.name;
 
 		const defaultNullability = this.db.options.getStringOption('default_column_nullability');
@@ -2068,8 +2097,12 @@ export class SchemaManager {
 
 		this.changeNotifier.notifyChange({
 			type: 'table_modified',
-			schemaName: targetSchemaName,
-			objectName: tableName,
+			// Stored names of the swapped table, not the raw statement spelling — see
+			// canonicalSchemaName for the emitter/stored-name invariant. A raw
+			// `create index … on T` (stored `t`) or an unqualified CREATE INDEX against
+			// a `MAIN.`-created table would otherwise miss the cached plan's table dep.
+			schemaName: updatedTableSchema.schemaName,
+			objectName: updatedTableSchema.name,
 			oldObject: tableSchema,
 			newObject: updatedTableSchema
 		});
@@ -2077,7 +2110,7 @@ export class SchemaManager {
 		this.emitAutoSchemaEventIfNeeded(tableSchema.vtabModuleName, {
 			type: 'create',
 			objectType: 'index',
-			schemaName: targetSchemaName,
+			schemaName: updatedTableSchema.schemaName,
 			objectName: indexName,
 		});
 
@@ -2171,6 +2204,12 @@ export class SchemaManager {
 			}
 		}
 
+		// Stored display casing of the dropped index, for the events below (the
+		// raw `indexName` arg may differ in case).
+		const storedIndexName = ownerTable.indexes!.find(
+			idx => idx.name.toLowerCase() === lowerIndexName
+		)!.name;
+
 		// Remove the index from the table schema, along with any uniqueConstraint
 		// that was synthesized from this index (see appendIndexToTableSchema).
 		const updatedIndexes = (ownerTable.indexes || []).filter(
@@ -2190,7 +2229,9 @@ export class SchemaManager {
 
 		this.changeNotifier.notifyChange({
 			type: 'table_modified',
-			schemaName,
+			// Stored names of the swapped table, not the raw drop args — see
+			// canonicalSchemaName for the emitter/stored-name invariant.
+			schemaName: ownerTable.schemaName,
 			objectName: ownerTable.name,
 			oldObject: ownerTable,
 			newObject: updatedTableSchema
@@ -2199,8 +2240,8 @@ export class SchemaManager {
 		this.emitAutoSchemaEventIfNeeded(ownerTable.vtabModuleName, {
 			type: 'drop',
 			objectType: 'index',
-			schemaName,
-			objectName: indexName,
+			schemaName: ownerTable.schemaName,
+			objectName: storedIndexName,
 		});
 
 		log(`Successfully dropped index %s from table %s.%s`, indexName, schemaName, ownerTable.name);
@@ -2293,16 +2334,18 @@ export class SchemaManager {
 
 		this.changeNotifier.notifyChange({
 			type: 'table_added',
-			schemaName: targetSchemaName,
-			objectName: tableName,
+			// Stored names of the registered table — see canonicalSchemaName for the
+			// emitter/stored-name invariant.
+			schemaName: completeTableSchema.schemaName,
+			objectName: completeTableSchema.name,
 			newObject: completeTableSchema
 		});
 
 		this.emitAutoSchemaEventIfNeeded(moduleName, {
 			type: 'create',
 			objectType: 'table',
-			schemaName: targetSchemaName,
-			objectName: tableName,
+			schemaName: completeTableSchema.schemaName,
+			objectName: completeTableSchema.name,
 		});
 
 		return completeTableSchema;
@@ -2507,7 +2550,11 @@ export class SchemaManager {
 	 * await.
 	 */
 	private importView(stmt: AST.CreateViewStmt): { type: 'view'; name: string } {
-		const targetSchemaName = stmt.view.schema || this.getCurrentSchemaName();
+		// Create the schema if absent (mirrors importTable) so a view rehydrates
+		// even into a schema that holds no tables; its `.name` is the canonical
+		// stored schemaName (see canonicalSchemaName).
+		const schema = this.getOrCreateSchema(stmt.view.schema || this.getCurrentSchemaName());
+		const targetSchemaName = schema.name;
 		const viewName = stmt.view.name;
 
 		const viewSchema: ViewSchema = {
@@ -2519,10 +2566,6 @@ export class SchemaManager {
 			insertDefaults: stmt.insertDefaults,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
-
-		// Create the schema if absent (mirrors importTable) so a view rehydrates
-		// even into a schema that holds no tables.
-		const schema = this.getOrCreateSchema(targetSchemaName);
 
 		schema.addView(viewSchema);
 		log(`Imported view %s.%s`, targetSchemaName, viewName);
@@ -2550,7 +2593,9 @@ export class SchemaManager {
 	 * rehydration error.
 	 */
 	private async importMaterializedView(stmt: AST.CreateMaterializedViewStmt): Promise<{ type: 'materializedView'; name: string }> {
-		const targetSchemaName = stmt.view.schema || this.getCurrentSchemaName();
+		// Canonical stored schemaName (see canonicalSchemaName) — the schema itself
+		// is created below, after the DML-body gate.
+		const targetSchemaName = this.canonicalSchemaName(stmt.view.schema || this.getCurrentSchemaName());
 		const viewName = stmt.view.name;
 
 		// A DML body (insert/update/delete … returning) parses but is un-creatable —

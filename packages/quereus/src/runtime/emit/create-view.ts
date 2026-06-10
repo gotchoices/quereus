@@ -54,7 +54,10 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 		// no-op above.
 		rctx.db.schemaManager.getChangeNotifier().notifyChange({
 			type: 'view_added',
-			schemaName: plan.schemaName,
+			// Stored names of the registered ViewSchema — see
+			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant
+			// (plan.schemaName is already canonical via the builder, so they coincide).
+			schemaName: viewSchema.schemaName,
 			objectName: viewSchema.name,
 			newObject: viewSchema,
 		});

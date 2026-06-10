@@ -55,7 +55,9 @@ export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruc
 		if (removed && existingView) {
 			rctx.db.schemaManager.getChangeNotifier().notifyChange({
 				type: 'view_removed',
-				schemaName: plan.schemaName,
+				// Stored names of the dropped view — see
+				// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
+				schemaName: existingView.schemaName,
 				objectName: existingView.name,
 				oldObject: existingView,
 			});

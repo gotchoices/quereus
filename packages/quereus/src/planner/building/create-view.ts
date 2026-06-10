@@ -45,8 +45,11 @@ export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.Q
  * Builds a plan node for CREATE VIEW statements.
  */
 export function buildCreateViewStmt(ctx: PlanningContext, stmt: AST.CreateViewStmt): CreateViewNode {
-	// Extract schema and view name
-	const schemaName = stmt.view.schema || 'main';
+	// Canonical schemaName (see SchemaManager.canonicalSchemaName) — it becomes
+	// the stored ViewSchema.schemaName in the create emitter. Unqualified names
+	// land in the current schema, matching the other DDL builders.
+	const sm = ctx.db.schemaManager;
+	const schemaName = stmt.view.schema ? sm.canonicalSchemaName(stmt.view.schema) : sm.getCurrentSchemaName();
 	const viewName = stmt.view.name;
 
 	// If an explicit column list was provided, validate that its arity matches the body's projection.

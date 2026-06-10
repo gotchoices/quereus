@@ -58,8 +58,10 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_added',
-			schemaName: plan.schemaName,
-			objectName: plan.viewName,
+			// Stored names of the registered MV — see
+			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
+			schemaName: mv.schemaName,
+			objectName: mv.name,
 			newObject: mv,
 		});
 		return null;
@@ -135,8 +137,10 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		mv.stale = false;
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_refreshed',
-			schemaName: plan.schemaName,
-			objectName: plan.viewName,
+			// Stored names of the refreshed MV, not the raw statement spelling — see
+			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
+			schemaName: mv.schemaName,
+			objectName: mv.name,
 			object: mv,
 		});
 		return null;
@@ -183,8 +187,10 @@ export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: E
 		sm.removeMaterializedView(plan.schemaName, plan.viewName);
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_removed',
-			schemaName: plan.schemaName,
-			objectName: plan.viewName,
+			// Stored names of the dropped MV, not the raw statement spelling — see
+			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
+			schemaName: mv.schemaName,
+			objectName: mv.name,
 			oldObject: mv,
 		});
 		return null;

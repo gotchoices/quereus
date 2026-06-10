@@ -19,7 +19,10 @@ import { normalizeBackingModule } from '../../schema/view.js';
  * can host the backing table (memory is the default).
  */
 export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.CreateMaterializedViewStmt): CreateMaterializedViewNode {
-	const schemaName = stmt.view.schema || ctx.db.schemaManager.getCurrentSchemaName();
+	// Canonical schemaName (see SchemaManager.canonicalSchemaName) — it flows into
+	// the stored MV record and its backing TableSchema via materializeView.
+	const sm = ctx.db.schemaManager;
+	const schemaName = stmt.view.schema ? sm.canonicalSchemaName(stmt.view.schema) : sm.getCurrentSchemaName();
 	const viewName = stmt.view.name;
 
 	const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
@@ -87,12 +90,14 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 
 /** Builds a plan node for REFRESH MATERIALIZED VIEW. */
 export function buildRefreshMaterializedViewStmt(ctx: PlanningContext, stmt: AST.RefreshMaterializedViewStmt): RefreshMaterializedViewNode {
-	const schemaName = stmt.name.schema || ctx.db.schemaManager.getCurrentSchemaName();
+	const sm = ctx.db.schemaManager;
+	const schemaName = stmt.name.schema ? sm.canonicalSchemaName(stmt.name.schema) : sm.getCurrentSchemaName();
 	return new RefreshMaterializedViewNode(ctx.scope, stmt.name.name, schemaName);
 }
 
 /** Builds a plan node for DROP MATERIALIZED VIEW. */
 export function buildDropMaterializedViewStmt(ctx: PlanningContext, stmt: AST.DropStmt): DropMaterializedViewNode {
-	const schemaName = stmt.name.schema || ctx.db.schemaManager.getCurrentSchemaName();
+	const sm = ctx.db.schemaManager;
+	const schemaName = stmt.name.schema ? sm.canonicalSchemaName(stmt.name.schema) : sm.getCurrentSchemaName();
 	return new DropMaterializedViewNode(ctx.scope, stmt.name.name, schemaName, stmt.ifExists);
 }

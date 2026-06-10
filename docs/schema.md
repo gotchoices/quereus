@@ -462,7 +462,7 @@ The `SchemaChangeEvent` discriminated union includes:
 | `collation_added` | _(name only)_ | After collation registration |
 | `collation_removed` | _(name only)_ | After collation removal |
 
-All events carry `schemaName` and `objectName` fields.
+All events carry `schemaName` and `objectName` fields. **Naming contract:** events fire the *stored* names of the object that was swapped — `schemaName` is the canonical (lowercase) schema name (stored `schemaName` on tables/views/MVs is canonicalized at create/import time via `SchemaManager.canonicalSchemaName`), and `objectName` is the object's stored display casing, never the raw spelling from the triggering statement. Prepared statements rely on this: `Statement.compile()` invalidates its cached plan by comparing recorded dependencies (which carry stored names) against event names **exactly**, so a raw-cased name on either side would silently miss invalidation.
 
 Listener errors are caught and logged — a failing listener does not disrupt other listeners or the originating operation.
 
