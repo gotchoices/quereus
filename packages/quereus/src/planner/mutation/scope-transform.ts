@@ -88,11 +88,51 @@ export function transformExpr(
 			return { ...expr, query: descend ? descend(expr.query) : expr.query };
 		case 'exists':
 			return { ...expr, subquery: descend ? descend(expr.subquery) : expr.subquery };
+		case 'windowFunction':
+			// Window args / partitionBy / orderBy / frame bounds sit in the same scalar
+			// scope as sibling projections, so the substitution threads through them.
+			return {
+				...expr,
+				function: { ...expr.function, args: expr.function.args.map(a => transformExpr(a, substitute, descend)) },
+				window: expr.window ? transformWindowDefinition(expr.window, substitute, descend) : undefined,
+			};
 		default:
-			// literal / identifier / parameter / windowFunction / functionSource —
+			// literal / identifier / parameter / functionSource —
 			// no nested scalar/relational operand to rewrite.
 			return { ...expr };
 	}
+}
+
+/** Rebuild an OVER clause, threading the substitution through partitionBy /
+ *  orderBy / frame-bound value expressions. */
+function transformWindowDefinition(
+	window: AST.WindowDefinition,
+	substitute: (col: AST.ColumnExpr) => AST.Expression | undefined,
+	descend?: (query: AST.QueryExpr) => AST.QueryExpr,
+): AST.WindowDefinition {
+	return {
+		...window,
+		partitionBy: window.partitionBy?.map(p => transformExpr(p, substitute, descend)),
+		orderBy: window.orderBy?.map(ob => ({ ...ob, expr: transformExpr(ob.expr, substitute, descend) })),
+		frame: window.frame
+			? {
+				...window.frame,
+				start: transformFrameBound(window.frame.start, substitute, descend),
+				end: window.frame.end && transformFrameBound(window.frame.end, substitute, descend),
+			}
+			: undefined,
+	};
+}
+
+/** Rebuild a window frame bound; `preceding` / `following` carry a value expression. */
+function transformFrameBound(
+	bound: AST.WindowFrameBound,
+	substitute: (col: AST.ColumnExpr) => AST.Expression | undefined,
+	descend?: (query: AST.QueryExpr) => AST.QueryExpr,
+): AST.WindowFrameBound {
+	return bound.type === 'preceding' || bound.type === 'following'
+		? { ...bound, value: transformExpr(bound.value, substitute, descend) }
+		: { ...bound };
 }
 
 /** Deep structural clone of an expression, including any nested subqueries. */
@@ -110,8 +150,9 @@ export function cloneQueryExpr(query: AST.QueryExpr): AST.QueryExpr {
  * scope-aware. The substitution decides purely on the column's own qualifier
  * (e.g. {@link cloneQueryExpr}'s no-op, or the multi-source SET-value qualifier
  * strip), so the enclosing scope is irrelevant and the same `substitute` is
- * applied at every nesting depth. The `with` clause is preserved structurally —
- * a CTE body cannot correlate to the enclosing query, so it needs no rewrite.
+ * applied at every nesting depth. The `with` clause is cloned without
+ * substitution — a CTE body cannot correlate to the enclosing query, so it
+ * needs no rewrite, only severed sharing (see {@link cloneWithClause}).
  */
 export function mapQueryExprUniform(
 	query: AST.QueryExpr,
@@ -121,9 +162,9 @@ export function mapQueryExprUniform(
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, descend);
 	if (query.type === 'select') return rebuildSelect(query, onExpr, descend, descend);
 	if (query.type === 'values') return { ...query, values: query.values.map(row => row.map(onExpr)) };
-	// INSERT/UPDATE/DELETE … RETURNING as a subquery — structural shallow clone (no
-	// scalar operands to thread here; the view-mutation descent rejects these).
-	return { ...query };
+	// INSERT/UPDATE/DELETE … RETURNING as a subquery — pure structural deep clone
+	// (no substitution threading; the view-mutation descent rejects DML subqueries).
+	return cloneDmlStmt(query);
 }
 
 /**
@@ -132,7 +173,9 @@ export function mapQueryExprUniform(
  * `having`, `orderBy`, `limit`, `offset`, and join `ON` conditions), `onNested`
  * to a subquery nested in that scope (a FROM `SubquerySource`), and `onLeg` to a
  * sibling compound / union leg (which correlates to the SAME outer scope as this
- * select, not to this select's FROM). The `with` clause is preserved structurally.
+ * select, not to this select's FROM). The `with` clause is cloned without
+ * substitution — a CTE body cannot correlate to the enclosing query, so it needs
+ * no rewrite, only severed sharing (see {@link cloneWithClause}).
  */
 function rebuildSelect(
 	sel: AST.SelectStmt,
@@ -142,6 +185,7 @@ function rebuildSelect(
 ): AST.SelectStmt {
 	return {
 		...sel,
+		withClause: cloneWithClause(sel.withClause),
 		columns: sel.columns.map(rc => rc.type === 'all' ? { ...rc } : { ...rc, expr: onExpr(rc.expr) }),
 		from: sel.from?.map(fc => rebuildFrom(fc, onExpr, onNested)),
 		where: sel.where ? onExpr(sel.where) : undefined,
@@ -179,6 +223,94 @@ function rebuildFrom(
 			return { ...fc, args: fc.args.map(onExpr) };
 		case 'subquerySource':
 			return { ...fc, subquery: onNested(fc.subquery) };
+	}
+}
+
+// --- structural deep clones (no substitution) ------------------------------
+// In-place rewriters (the schema differ's rename reconcile, the constraint
+// builder's qualifier strip) run over trees produced by `cloneExpr` /
+// `cloneQueryExpr` and mutate nodes in place — so every subtree the walkers can
+// reach must be rebuilt, never shared with the source AST.
+
+/**
+ * Pure structural clone of a `with` clause. CTE bodies go through
+ * {@link cloneQueryExpr}, NOT the substitution descend — a CTE body cannot
+ * correlate to the enclosing query, so no rewrite applies; the clone only
+ * severs reference sharing.
+ */
+function cloneWithClause(withClause: AST.WithClause | undefined): AST.WithClause | undefined {
+	if (!withClause) return undefined;
+	return {
+		...withClause,
+		ctes: withClause.ctes.map(cte => ({
+			...cte,
+			columns: cte.columns && [...cte.columns],
+			query: cloneQueryExpr(cte.query),
+		})),
+		options: withClause.options && { ...withClause.options },
+	};
+}
+
+/** Structural clone of a RETURNING / projection column list. */
+function cloneResultColumns(columns: AST.ResultColumn[] | undefined): AST.ResultColumn[] | undefined {
+	return columns?.map(rc => rc.type === 'all' ? { ...rc } : { ...rc, expr: cloneExpr(rc.expr) });
+}
+
+/** Structural clone of mutation-context assignments. */
+function cloneContextValues(values: AST.ContextAssignment[] | undefined): AST.ContextAssignment[] | undefined {
+	return values?.map(cv => ({ ...cv, value: cloneExpr(cv.value) }));
+}
+
+/** Structural clone of an ON CONFLICT clause (conflict target, assignments, WHERE). */
+function cloneUpsertClause(clause: AST.UpsertClause): AST.UpsertClause {
+	return {
+		...clause,
+		conflictTarget: clause.conflictTarget && [...clause.conflictTarget],
+		assignments: clause.assignments?.map(a => ({ ...a, value: cloneExpr(a.value) })),
+		where: clause.where && cloneExpr(clause.where),
+	};
+}
+
+/**
+ * Pure structural deep clone of an INSERT/UPDATE/DELETE … RETURNING subquery.
+ * No substitution is threaded — the scope-aware view-mutation descent rejects
+ * DML subqueries before reaching here ({@link transformScopedQuery}).
+ */
+function cloneDmlStmt(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt): AST.QueryExpr {
+	switch (stmt.type) {
+		case 'insert':
+			return {
+				...stmt,
+				withClause: cloneWithClause(stmt.withClause),
+				table: { ...stmt.table },
+				columns: stmt.columns && [...stmt.columns],
+				source: cloneQueryExpr(stmt.source),
+				upsertClauses: stmt.upsertClauses?.map(cloneUpsertClause),
+				returning: cloneResultColumns(stmt.returning),
+				contextValues: cloneContextValues(stmt.contextValues),
+				schemaPath: stmt.schemaPath && [...stmt.schemaPath],
+			};
+		case 'update':
+			return {
+				...stmt,
+				withClause: cloneWithClause(stmt.withClause),
+				table: { ...stmt.table },
+				assignments: stmt.assignments.map(a => ({ ...a, value: cloneExpr(a.value) })),
+				where: stmt.where && cloneExpr(stmt.where),
+				returning: cloneResultColumns(stmt.returning),
+				contextValues: cloneContextValues(stmt.contextValues),
+				schemaPath: stmt.schemaPath && [...stmt.schemaPath],
+			};
+		case 'delete':
+			return {
+				...stmt,
+				withClause: cloneWithClause(stmt.withClause),
+				table: { ...stmt.table },
+				where: stmt.where && cloneExpr(stmt.where),
+				returning: cloneResultColumns(stmt.returning),
+				contextValues: cloneContextValues(stmt.contextValues),
+				schemaPath: stmt.schemaPath && [...stmt.schemaPath],
+			};
 	}
 }
 
