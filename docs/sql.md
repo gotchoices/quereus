@@ -3934,7 +3934,7 @@ insert_stmt        = "insert" [ "or" conflict_resolution ] "into" table_name
                      [ "(" column_name { "," column_name } ")" ]
                      ( values_clause | select_stmt )
                      { upsert_clause }
-                     [ context_clause ]
+                     { context_clause | tags_clause }
                      [ with_schema_clause ]
                      [ returning_clause ] ;
 
@@ -3952,13 +3952,13 @@ values_stmt        = values_clause [ order_by_clause ] [ limit_clause ] ;
 update_stmt        = "update" table_name
                      "set" column_name "=" expr { "," column_name "=" expr }
                      [ where_clause ]
-                     [ context_clause ]
+                     { context_clause | tags_clause }
                      [ with_schema_clause ]
                      [ returning_clause ] ;
 
 /* DELETE statement */
 delete_stmt        = "delete" "from" table_name [ where_clause ]
-                     [ context_clause ]
+                     { context_clause | tags_clause }
                      [ with_schema_clause ]
                      [ returning_clause ] ;
 

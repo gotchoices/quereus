@@ -221,3 +221,32 @@ with w as (insert into dml_tags with tags ("quereus.bogus" = 1) values (5, 'c') 
 
 select id from dml_tags order by id;
 → [{"id": 1}, {"id": 3}]
+
+-- DML as INSERT source: the inner statement's reserved tag validates at the
+-- inner statement's own builder entry; neither table is written.
+create table dml_sink (id integer primary key, note text);
+
+-- run
+
+insert into dml_sink insert into dml_tags with tags ("quereus.bogus" = 1) values (9, 'q') returning *;
+-- error: unknown reserved tag
+
+select count(*) as n from dml_sink;
+→ [{"n": 0}]
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- view-mediated write with free-form statement tags: the single-source lowering
+-- clones the statement (tags ride along) and re-enters the base builder, where
+-- re-validation is a no-op — the write lands exactly once.
+create view dml_v as select id, note from dml_tags;
+
+-- run
+
+insert into dml_v with tags (audit = true) values (7, 'via view');
+
+-- run
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}, {"id": 7}]
