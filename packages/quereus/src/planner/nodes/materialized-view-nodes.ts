@@ -49,6 +49,7 @@ export class CreateMaterializedViewNode extends VoidNode {
 			columns: this.columns,
 			bodySql: this.bodySql,
 			...(this.backingModuleName ? { backingModuleName: this.backingModuleName } : {}),
+			...(this.backingModuleArgs ? { backingModuleArgs: this.backingModuleArgs } : {}),
 		};
 	}
 

@@ -465,6 +465,35 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 		}
 	});
 
+	it('an ineligible body rolls the half-built backing out of the NAMED module on import', async () => {
+		const db = new Database();
+		const mem2 = new MemoryTableModule();
+		db.registerModule('mem2', mem2);
+		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			await db.exec('insert into base values (1, 10)');
+			let threw = false;
+			try {
+				// random() plans and fills fine (the mem2 backing is created) but fails
+				// the row-time eligibility gate in registerMaterializedView — the
+				// rollback must drop the backing from mem2, not the default module.
+				await db.schemaManager.importCatalog([
+					'create materialized view mv using mem2 as select id, random() as r from base',
+				]);
+			} catch (e) {
+				threw = true;
+				expect((e as Error).message).to.match(/non-deterministic/i);
+			}
+			expect(threw, 'eligibility gate fails the import').to.equal(true);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			expect(mem2.tables.has(`main.${backingTableNameFor('mv')}`.toLowerCase()),
+				'no half-built backing left in mem2').to.equal(false);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a hand-written `using memory()` entry rehydrates to the clause-free canonical record', async () => {
 		const db = new Database();
 		try {
