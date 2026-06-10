@@ -20,6 +20,7 @@ import {
 	snapshotStaleMaterializedViews,
 	propagateTableRenameToMaterializedViews,
 	propagateColumnRenameToMaterializedViews,
+	restoreUnaffectedMaterializedViews,
 } from './materialized-view-helpers.js';
 
 const log = createLogger('runtime:emit:alter-table');
@@ -1311,6 +1312,10 @@ async function propagateTableRename(
 	for (const schema of rctx.db.schemaManager._getAllSchemas()) {
 		await propagateTableRenameInSchema(rctx.db, schema, renamedSchemaName, oldName, newName, preStaleMvs);
 	}
+	// After all per-schema rewrites and their cascade events: restore any MV this
+	// statement's events marked stale that the rename provably did not affect
+	// (e.g. a dependent of another source whose only change was an FK rewrite).
+	await restoreUnaffectedMaterializedViews(rctx.db, preStaleMvs);
 }
 
 async function propagateTableRenameInSchema(
@@ -1435,6 +1440,11 @@ async function propagateColumnRename(
 	for (const schema of schemaManager._getAllSchemas()) {
 		await propagateColumnRenameInSchema(rctx.db, schema, renamedSchemaName, tableName, oldCol, newCol, resolveColumnInSource, preStaleMvs);
 	}
+	// After all per-schema rewrites and their cascade events: restore any MV this
+	// statement's events marked stale that the rename provably did not affect — a
+	// body that never names the renamed column, or a `select *` body whose output
+	// is a pure name shift (carried onto the live backing by the pass).
+	await restoreUnaffectedMaterializedViews(rctx.db, preStaleMvs);
 }
 
 async function propagateColumnRenameInSchema(

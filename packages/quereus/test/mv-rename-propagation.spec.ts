@@ -12,6 +12,9 @@
  *   3. The failure path: a mid-propagation failure (re-registration throws)
  *      leaves the MV stale with its row-time plan released, rather than serving
  *      a silently frozen snapshot as live.
+ *   4. The end-of-statement restoration pass (`restoreUnaffectedMaterializedViews`)
+ *      retries every MV the statement left stale: a persistent failure stays
+ *      stale (REFRESH recovers), a transient one is healed within the statement.
  */
 
 import { expect } from 'chai';
@@ -172,18 +175,19 @@ describe('MV rename propagation: staleness discipline', () => {
 			await db.exec('insert into t values (1, 10)');
 			await db.exec('create materialized view mv as select id, v from t');
 
-			// Make the re-registration step fail once (the propagation's last step).
+			// Make re-registration fail for the whole statement — both the rewrite
+			// path and the end-of-statement restoration pass (which retries every MV
+			// the statement left stale) hit it.
 			const original = db.registerMaterializedView.bind(db);
 			let failures = 0;
-			db.registerMaterializedView = (mv: MaterializedViewSchema) => {
+			db.registerMaterializedView = (_mv: MaterializedViewSchema) => {
 				failures++;
-				if (failures === 1) throw new Error('injected registration failure');
-				original(mv);
+				throw new Error('injected registration failure');
 			};
 
 			// The statement itself succeeds — propagation is best-effort per MV.
 			await db.exec('alter table t rename to t2');
-			expect(failures, 'the injected failure fired during propagation').to.equal(1);
+			expect(failures, 'the rewrite and the restoration pass both attempted re-registration').to.equal(2);
 
 			const mv = getMv(db, 'mv');
 			expect(mv.stale, 'failure path force-marks the MV stale').to.equal(true);
@@ -191,7 +195,9 @@ describe('MV rename propagation: staleness discipline', () => {
 			await db.exec('insert into t2 values (2, 20)');
 			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
 
-			// The body WAS rewritten before the failure, so REFRESH recovers fully.
+			// Heal the registration hook; the body WAS rewritten before the failure,
+			// so REFRESH recovers fully.
+			db.registerMaterializedView = original;
 			await db.exec('refresh materialized view mv');
 			expect(getMv(db, 'mv').stale).to.equal(false);
 			expect(await rows(db, 'select id, v from mv order by id'))
@@ -199,6 +205,39 @@ describe('MV rename propagation: staleness discipline', () => {
 			await db.exec('insert into t2 values (3, 30)');
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a transient mid-propagation failure is healed by the end-of-statement restoration pass', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer not null)');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec('create materialized view mv as select id, v from t');
+
+			// Fail only the FIRST re-registration (the changed-AST rewrite path). The
+			// restoration pass at the end of the statement retries: the rewritten body
+			// revalidates against the renamed catalog and the backing shape matches,
+			// so the MV is restored live within the same statement.
+			const original = db.registerMaterializedView.bind(db);
+			let failures = 0;
+			db.registerMaterializedView = (mv: MaterializedViewSchema) => {
+				failures++;
+				if (failures === 1) throw new Error('injected transient registration failure');
+				original(mv);
+			};
+
+			await db.exec('alter table t rename to t2');
+			expect(failures, 'the rewrite failed once, then the restoration pass retried').to.equal(2);
+
+			const mv = getMv(db, 'mv');
+			expect(mv.stale ?? false, 'restored live by the restoration pass').to.equal(false);
+			// Maintenance re-attached: writes propagate again.
+			await db.exec('insert into t2 values (2, 20)');
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
 		} finally {
 			await db.close();
 		}

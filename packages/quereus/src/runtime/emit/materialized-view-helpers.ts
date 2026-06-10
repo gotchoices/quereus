@@ -693,8 +693,10 @@ export async function propagateTableRenameToMaterializedViews(
  * its body AST OR its `insert defaults` clause changed — the clause's target is
  * typically a projected-away NOT NULL column the body never mentions, so a
  * clause-only change must still re-hash, regenerate DDL, and fire the event. An
- * MV neither rewrite touches that the schema-change listener marked stale (e.g.
- * a `select *` body) stays on the existing stale→REFRESH path. A changed BODY
+ * MV neither rewrite touches that the schema-change listener marked stale (an
+ * unreferenced-column rename, a `select *` body) is restored by the
+ * {@link restoreUnaffectedMaterializedViews} pass the ALTER emitter runs after
+ * all per-schema loops. A changed BODY
  * can shift the MV's *exposed output names* (a bare passthrough projection of
  * the renamed column — plain-view parity), which
  * {@link applyMaterializedViewRewrite} carries onto the live backing table; a
@@ -778,13 +780,9 @@ async function applyMaterializedViewRewrite(
 	schema.addMaterializedView(updated);
 
 	if (!wasPreStale) {
-		if (renamedColumns) {
-			await renameShiftedBackingColumns(db, schema, updated, bodySql);
-		}
-		// Re-register BEFORE clearing `stale`: if registration throws, the catch in
-		// the caller leaves the MV stale rather than serving an unmaintained backing.
-		db.registerMaterializedView(updated);
-		updated.stale = false;
+		// Only a changed BODY can shift output names; a table rename / clause-only
+		// change skips the backing-name pass (no re-plan needed).
+		await restoreMaterializedViewLive(db, schema, updated, renamedColumns ? { bodySql } : undefined);
 	}
 	// Fired for still-stale MVs too: the rewritten body must re-persist so a
 	// post-reopen REFRESH resolves the new name.
@@ -795,6 +793,104 @@ async function applyMaterializedViewRewrite(
 		oldObject: mv,
 		newObject: updated,
 	});
+}
+
+/**
+ * The shared restore tail both per-MV restore paths run — the changed-AST rewrite
+ * ({@link applyMaterializedViewRewrite}) and the provably-unaffected restoration
+ * pass ({@link restoreUnaffectedMaterializedViews}) — so the restore discipline
+ * cannot drift between them: carry any body output-name shift onto the live
+ * backing (`backingNames` present), re-register row-time maintenance, and only
+ * then clear `stale`.
+ *
+ * `backingNames` is absent when the body's output names provably did not move (a
+ * table rename / clause-only change), skipping the backing-name pass and its body
+ * re-plan; when present, `shape` short-circuits the re-derivation for a caller
+ * that already planned the body.
+ */
+async function restoreMaterializedViewLive(
+	db: Database,
+	schema: Schema,
+	mv: MaterializedViewSchema,
+	backingNames?: { bodySql: string; shape?: BackingShape },
+): Promise<void> {
+	if (backingNames) {
+		await renameShiftedBackingColumns(db, schema, mv, backingNames.bodySql, backingNames.shape);
+	}
+	// Re-register BEFORE clearing `stale`: if registration throws, the caller's
+	// failure path leaves the MV stale rather than serving an unmaintained backing.
+	db.registerMaterializedView(mv);
+	mv.stale = false;
+}
+
+/**
+ * Restores every dependent MV that THIS rename statement marked stale but the
+ * rename provably did not affect. Runs once at the end of the table-/column-rename
+ * propagation, after all per-schema loops — so every body rewrite, backing-column
+ * rename, and cascade event has already fired and the catalog is fully renamed.
+ *
+ * The schema-change listener marks **every** MV whose `sourceTables` includes a
+ * `table_modified` table stale (and detaches its row-time plan), but the rename
+ * propagation only restores MVs it processes (changed AST / clause, or — table
+ * rename — `sourceTables` carrying the old base). An MV the rename does not touch
+ * fell through stale-but-valid: reads silently served the now-unmaintained backing
+ * and writes never propagated until a manual REFRESH. Three concrete shapes: a
+ * column rename the body never references; a rename whose only effect on another
+ * source is a constraint rewrite (e.g. an FK `references` target) firing that
+ * source's `table_modified`; and a `select *` body whose output is a pure name
+ * shift (the AST is unchanged, so the body rewrite never sees it).
+ *
+ * Per candidate (`stale` now, not stale at the pre-statement snapshot — a
+ * pre-existing flag means the backing may be BEHIND and only REFRESH may clear it):
+ * re-derive the backing shape from the body against the renamed catalog; a
+ * **structural** mismatch is not a rename no-op → leave stale (REFRESH's
+ * shape-mismatch rebuild owns it); otherwise run the shared restore tail —
+ * {@link renameShiftedBackingColumns} carries a pure name shift onto the live
+ * backing (no-op when names already match; its backing `table_modified`
+ * deliberately cascades staleness to chained MVs referencing the old output name),
+ * then re-register row-time maintenance and clear `stale`.
+ *
+ * Deliberately fires NO `materialized_view_modified`: the MV record (AST, hash,
+ * sql, sourceTables) is unchanged here — `stale` is runtime state, not persisted.
+ * Walks all schemas (the listener marks cross-schema dependents too), in creation
+ * order — topological for same-schema MV chains, so a producer restores before its
+ * consumer is examined. A chained MV whose body references a renamed-away producer
+ * output name fails shape derivation and stays stale (staleness-diagnostic parity
+ * with a broken plain-view chain). Best-effort like the rest of the propagation:
+ * a per-MV failure logs, leaves that MV stale, and continues.
+ */
+export async function restoreUnaffectedMaterializedViews(
+	db: Database,
+	preStale: ReadonlySet<string>,
+): Promise<void> {
+	for (const mv of db.schemaManager.getAllMaterializedViews()) {
+		if (!mv.stale || preStale.has(mvStaleKey(mv))) continue;
+		try {
+			const schema = db.schemaManager.getSchemaOrFail(mv.schemaName);
+			const bodySql = astToString(mv.selectAst);
+			// Throws when the body no longer plans against the renamed catalog
+			// (e.g. a chained MV referencing a renamed-away output name) → catch
+			// below leaves it stale.
+			const shape = deriveBackingShape(db, bodySql, mv.columns);
+			const backing = schema.getTable(mv.backingTableName);
+			if (!backing) {
+				throw new QuereusError(
+					`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+					StatusCode.INTERNAL,
+				);
+			}
+			const mismatch = describeBackingShapeMismatch(backing, shape);
+			if (mismatch) {
+				log('Leaving materialized view %s.%s stale after rename: backing shape mismatch (%s) — REFRESH rebuilds it',
+					mv.schemaName, mv.name, mismatch);
+				continue;
+			}
+			await restoreMaterializedViewLive(db, schema, mv, { bodySql, shape });
+		} catch (e) {
+			log('Could not restore materialized view %s.%s after rename; leaving it stale: %s',
+				mv.schemaName, mv.name, e instanceof Error ? e.message : String(e));
+		}
+	}
 }
 
 /**
@@ -820,8 +916,9 @@ async function renameShiftedBackingColumns(
 	schema: Schema,
 	mv: MaterializedViewSchema,
 	bodySql: string,
+	preDerivedShape?: BackingShape,
 ): Promise<void> {
-	const shape = deriveBackingShape(db, bodySql, mv.columns);
+	const shape = preDerivedShape ?? deriveBackingShape(db, bodySql, mv.columns);
 	const backing = schema.getTable(mv.backingTableName);
 	if (!backing) {
 		throw new QuereusError(
