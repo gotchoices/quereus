@@ -40,11 +40,16 @@ but never touch `view.insertDefaults`:
   constructs are expected to ride rename propagation like the body does.
 - The regenerated DDL after the body rewrite (`view_modified` → store re-persist via
   `generateViewDDL`) carries the clause verbatim, so the stale name also persists.
-- **Materialized views**: MVs are not rename-rewritten at all today — that whole gap
-  (body included) is `mv-body-not-rewritten-on-source-rename` (fix/, human-dispositioned
-  to full rewrite). Whoever implements that ticket should include
-  `MaterializedViewSchema.insertDefaults` in the rewrite for the same reasons; this
-  ticket covers the **plain-view** clause.
+- **Materialized views**: the MV *body* rewrite has since landed
+  (`mv-body-not-rewritten-on-source-rename`, complete) — `applyMaterializedViewRewrite`
+  in `runtime/emit/materialized-view-helpers.ts` rewrites the body, re-keys derived
+  fields, and regenerates/persists the DDL. It carries `insertDefaults` **verbatim**,
+  so the stale clause name round-trips into the re-persisted MV DDL exactly as it does
+  for plain views. **This ticket therefore owns BOTH fields**: the plain-view clause in
+  the `propagate{Table,Column}RenameInSchema` view loops AND
+  `MaterializedViewSchema.insertDefaults` (same `ViewInsertDefault` shape) inside the MV
+  propagation — rewrite it on the shallow clone in `applyMaterializedViewRewrite`
+  *before* `generateMaterializedViewDDL` reads it.
 
 ## Expected behavior
 
