@@ -154,8 +154,9 @@ export interface BestAccessPlanResult {
 	 * collation equals the index collation (mirroring the equality MATCH arm). Only
 	 * modules whose runtime actually threads the index collation into the bound
 	 * compare may set this — the in-memory vtab does (`scan-layer.ts` /
-	 * `plan-filter.ts`); the store module does NOT (its range filter is BINARY), so
-	 * it leaves this off and keeps the conservative decline.
+	 * `plan-filter.ts`), and so does the store module (its post-fetch row filter
+	 * `StoreTable.compareValues` compares every pushed bound under the column's
+	 * declared collation via `compareSqlValues`).
 	 */
 	honorsCollatedRangeBounds?: boolean;
 

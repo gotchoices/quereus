@@ -209,6 +209,24 @@ describe('StoreModule predicate pushdown', () => {
 				// A raw BINARY compare would under-fetch 'cat ' ('cat ' < 'cat  ' in bytes).
 				expect(await values(q)).to.deep.equal([2, 3]);
 			});
+
+			it('point lookup matches the RTRIM-equal stored row', async () => {
+				// The RTRIM key encoding maps 'cat' to the stored 'cat ' entry, so the
+				// post-fetch EQ re-check in matchesFilters must also compare under RTRIM —
+				// the old raw `a === b` EQ would have silently dropped the fetched row.
+				expect(await values(`select n from pets where val = 'cat'`)).to.deep.equal([2]);
+			});
+		});
+
+		describe('blob primary key point lookup', () => {
+			it('EQ re-check compares blob content, not reference', async () => {
+				// The point lookup fetches by key, then matchesFilters re-checks the EQ
+				// constraint. The old raw `a === b` EQ compared Uint8Array references,
+				// silently dropping every fetched blob row; compareSqlValues compares bytes.
+				await db.exec(`create table blobs (b blob primary key, n integer) using store`);
+				await db.exec(`insert into blobs values (x'0102', 1), (x'0103', 2)`);
+				expect(await values(`select n from blobs where b = x'0102'`)).to.deep.equal([1]);
+			});
 		});
 
 		describe('explicit BINARY primary key (negative control)', () => {
