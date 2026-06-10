@@ -11,9 +11,10 @@ import type { SqlValue } from '../../src/common/types.js';
  * `insert defaults (…)` clause), so the old observable this spec pinned — a
  * cached write-through plan re-ROUTING after a tag change — no longer exists.
  * (`buildViewMutation` still records the `view` plan dependency, and the tag
- * setters still fire `view_modified` / `materialized_view_modified`; with no
- * behavioral tag there is no longer a way to observe that invalidation through
- * tags alone.) What remains pinned here:
+ * setters still fire `view_modified` / `materialized_view_modified`; that
+ * dependency recording and the invalidation it drives are pinned at the unit
+ * level in `view-dependency-invalidation.spec.ts`, via `_buildPlan` deps and
+ * plan-object identity across `compile()` calls.) What remains pinned here:
  *
  * - `SET TAGS` / `ADD TAGS` validate eagerly at the `view-ddl` site
  *   (`buildSetObjectTags`), so a retired `quereus.update.*` key can never be

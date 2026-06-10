@@ -909,11 +909,12 @@ export class SchemaManager {
 		schema.addView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'view_modified',
-			schemaName: targetSchemaName,
-			// Canonical stored name (not the raw `viewName` arg) so the event matches
-			// the `view` plan dependency, which records `view.name` — mirrors
-			// `commitTagUpdate`'s `newSchema.name`. A case-differing ALTER (e.g.
-			// `alter view MYVIEW` on `create view MyView`) would otherwise miss.
+			// Canonical names (not the raw ALTER args) so the event matches the `view`
+			// plan dependency, which records `view.schemaName` / `view.name` and is
+			// compared exactly by the statement listener — mirrors `commitTagUpdate`'s
+			// `newSchema.name`. A case-differing ALTER (e.g. `alter view MAIN.MYVIEW`
+			// on `create view MyView` in `main`) would otherwise miss on either field.
+			schemaName: schema.name,
 			objectName: updated.name,
 			oldObject: view,
 			newObject: updated,
@@ -977,9 +978,9 @@ export class SchemaManager {
 		schema.addMaterializedView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'materialized_view_modified',
-			schemaName: targetSchemaName,
-			// Canonical stored name (not the raw `name` arg) so the event matches the
-			// `view` plan dependency, which records `view.name` — see `updateViewTags`.
+			// Canonical names (not the raw ALTER args) so the event matches the `view`
+			// plan dependency's exact schema/object compare — see `updateViewTags`.
+			schemaName: schema.name,
 			objectName: updated.name,
 			oldObject: mv,
 			newObject: updated,

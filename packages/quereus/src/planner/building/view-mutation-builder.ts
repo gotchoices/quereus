@@ -58,7 +58,8 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// validation above must re-run against the view's *current* tags (a newly-added
 	// invalid tag must surface on the next run of an already-cached statement).
 	// Read-only `select … from v` records no view dependency — view tags do not affect
-	// read results, so its plan need not invalidate on a tag change.
+	// read results, so its plan need not invalidate on a tag change. Both halves
+	// (recording and invalidation) are pinned in test/plan/view-dependency-invalidation.spec.ts.
 	ctx.schemaDependencies.recordDependency(
 		{ type: 'view', schemaName: view.schemaName, objectName: view.name },
 		view,
