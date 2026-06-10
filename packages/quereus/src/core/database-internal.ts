@@ -15,6 +15,36 @@ import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaterializedViewSchema } from '../schema/view.js';
 
 /**
+ * One externally-applied row change to report through
+ * {@link DatabaseInternal.ingestExternalRowChanges}. `change` rows are FULL
+ * table rows in schema column order; `oldRow` images must be accurate
+ * before-images (they key the backing deletes and the capture log). When the
+ * same row is changed more than once in a batch, each change's `oldRow` must
+ * be the true before-image of *that* change (i.e. the prior change's `newRow`).
+ */
+export interface ExternalRowChange {
+	/** Defaults to the current schema (`schemaManager.getCurrentSchemaName()`). */
+	schemaName?: string;
+	tableName: string;
+	/** The row change: `{ op: 'insert'|'update'|'delete', oldRow?, newRow? }`. */
+	change: BackingRowChange;
+}
+
+/** Per-call facet selection for {@link DatabaseInternal.ingestExternalRowChanges}. */
+export interface IngestExternalChangesOptions {
+	/** Row-time covering-structure maintenance over the reported changes (default true). */
+	maintainMaterializedViews?: boolean;
+	/** Change capture (`_record*`): feeds `Database.watch` post-commit dispatch AND
+	 *  commit-time global-assertion evaluation (default true). */
+	captureChanges?: boolean;
+	/** Parent-side FK actions for update/delete changes: transitive RESTRICT
+	 *  enforcement + CASCADE / SET NULL / SET DEFAULT propagation (default FALSE —
+	 *  a replication stream usually already carries the origin's cascade effects;
+	 *  re-running them would double-apply). */
+	applyForeignKeyActions?: boolean;
+}
+
+/**
  * Internal database methods for virtual table connection management.
  *
  * Extension packages that implement custom virtual tables with transaction
@@ -119,10 +149,43 @@ export interface DatabaseInternal {
 	 * Synchronously maintain every `row-time` covering structure on `sourceBase`
 	 * for one source row-write. Used by a source vtab to keep a covering MV's
 	 * backing table consistent for an eviction performed directly on its storage
-	 * (which bypasses the DML-executor row-time hook).
+	 * (which bypasses the DML-executor row-time hook). This is the vtab-internal,
+	 * called-from-within-a-statement seam — a host reporting externally-applied
+	 * writes from OUTSIDE a statement uses {@link ingestExternalRowChanges},
+	 * which must NOT be called from this context (exec-mutex deadlock).
 	 */
 	_maintainRowTimeCoveringStructures(
 		sourceBase: string,
 		change: BackingRowChange,
+	): Promise<void>;
+
+	/**
+	 * Batch ingestion seam for externally-applied row changes: drives the
+	 * post-write pipeline (change capture, batch-amortized row-time MV
+	 * maintenance, opt-in parent-side FK actions) for writes the caller has
+	 * already applied directly to module storage — bypassing the DML executor —
+	 * inside the coordinated transaction.
+	 *
+	 * The seam trusts the origin: it re-validates NOTHING (no CHECK, NOT NULL,
+	 * UNIQUE, or child-side FK existence). The reported rows must already be
+	 * visible to a vtab read within the active transaction (the residual and
+	 * full-rebuild maintenance arms re-read the source through the vtab).
+	 * Module data events are NOT emitted — the external writer owns its module
+	 * event emission (and the `remote` flag).
+	 *
+	 * Runs inside the caller's active transaction when one exists; otherwise
+	 * begins an implicit transaction it finalizes itself (the batch is its own
+	 * autocommit boundary). The batch's derived effects are atomic: a mid-batch
+	 * error unwinds all of them via the batch savepoint (the externally-applied
+	 * storage rows are NOT unwound by Quereus). Serialized against concurrent
+	 * statements via the exec mutex — do NOT call from within statement
+	 * execution or vtab callbacks (deadlock); the two-arg
+	 * {@link _maintainRowTimeCoveringStructures} covers that context. For the
+	 * coarse, no-transaction whole-table watch invalidation alternative, see
+	 * `Database.notifyExternalChange`.
+	 */
+	ingestExternalRowChanges(
+		changes: readonly ExternalRowChange[],
+		options?: IngestExternalChangesOptions,
 	): Promise<void>;
 }

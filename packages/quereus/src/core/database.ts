@@ -54,6 +54,8 @@ import {
 	type SchemaChangeSubscriptionOptions,
 } from './database-events.js';
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
+import { ingestExternalRowChangeBatch } from './database-external-changes.js';
+import type { ExternalRowChange, IngestExternalChangesOptions } from './database-internal.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { MaterializedViewManager, type BackingConnectionCache } from './database-materialized-views.js';
@@ -1788,6 +1790,42 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		await this.watcherManager.notifyExternalTableChange(fqName);
 	}
 
+	/**
+	 * Batch ingestion seam for externally-applied row changes: drives the
+	 * post-write pipeline — change capture (`Database.watch` post-commit
+	 * dispatch + commit-time global assertions), batch-amortized row-time
+	 * materialized-view maintenance, and opt-in parent-side FK actions — for
+	 * writes the caller has already applied directly to module storage,
+	 * bypassing the DML executor. The precise, in-transaction alternative to
+	 * the coarse whole-table {@link notifyExternalChange}.
+	 *
+	 * `changes` is a flat ORDERED array (order is semantic for FK actions and
+	 * capture: origin order = parents-before-children etc.); each change's
+	 * `oldRow` must be the accurate before-image of *that* change. The seam
+	 * trusts the origin — it re-validates NOTHING (no CHECK / NOT NULL /
+	 * UNIQUE / child-side FK existence), and it does NOT emit module data
+	 * events (the external writer owns those, including the `remote` flag).
+	 *
+	 * Transaction contract: runs inside the caller's active transaction when
+	 * one exists (the reported rows must already be visible to a vtab read
+	 * within it — the residual/full-rebuild maintenance arms re-read the
+	 * source); otherwise begins an implicit transaction it commits at batch
+	 * end. The batch's DERIVED effects are atomic via a batch savepoint; a
+	 * mid-batch error unwinds them all (the externally-applied storage rows
+	 * are NOT unwound by Quereus). Serialized via the exec mutex — do NOT call
+	 * from within statement execution or vtab callbacks (deadlock); the
+	 * two-arg `_maintainRowTimeCoveringStructures` is the seam for that
+	 * context. See `docs/materialized-views.md` § External row-change
+	 * ingestion for the full contract.
+	 */
+	public async ingestExternalRowChanges(
+		changes: readonly ExternalRowChange[],
+		options?: IngestExternalChangesOptions,
+	): Promise<void> {
+		this.checkOpen();
+		await ingestExternalRowChangeBatch(this, changes, options);
+	}
+
 	/** @internal Compile + register an MV for row-time write-through maintenance.
 	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate). */
 	public registerMaterializedView(mv: MaterializedViewSchema): void {
@@ -1826,7 +1864,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  whole statement (one scan per backing, not one per source row). The cold
 	 *  eviction callers (memory `checkUniqueViaMaterializedView`, store-table.ts) omit
 	 *  it and re-resolve the same connection deterministically — the `DatabaseInternal`
-	 *  surface deliberately exposes only the two-arg form.
+	 *  surface deliberately exposes only the two-arg form (a host reporting writes from
+	 *  OUTSIDE a statement uses the batch-amortized {@link ingestExternalRowChanges}
+	 *  seam instead).
 	 *
 	 *  `deferred` is the optional per-statement deferred-rebuild set: a `'full-rebuild'`
 	 *  plan is marked dirty in it (no per-row apply) and drained once at the

@@ -341,6 +341,70 @@ Because maintenance is part of the writing transaction and never re-reads the so
 
 `Database.watch` on a materialized view projects to the MV's **sources** (the backing table is maintained off the user change log) — see [Change-scope projection](#change-scope-projection).
 
+Everything above is driven from *inside* the engine's own write path. Two seams exist for writes the engine did **not** execute: the vtab-internal two-arg `DatabaseInternal._maintainRowTimeCoveringStructures(sourceBase, change)` (the REPLACE-eviction hook a source vtab calls from *within* a statement — MV-only, cold, per-row) and the batch ingestion seam below (the host-facing surface for everything else).
+
+## External row-change ingestion
+
+`Database.ingestExternalRowChanges(changes, options?)` is the batch seam by which a host that has applied row changes **directly to module storage** — sync-inbound replication, a direct row-store write — reports them so the post-write pipeline runs anyway, inside the coordinated transaction. The batch is the external analogue of one DML statement: one savepoint scope, one `BackingConnectionCache`, one deferred full-rebuild set, one flush.
+
+```ts
+interface ExternalRowChange {
+	schemaName?: string;          // defaults to the current schema
+	tableName: string;
+	change: BackingRowChange;     // { op: 'insert'|'update'|'delete', oldRow?, newRow? }
+}
+
+interface IngestExternalChangesOptions {
+	maintainMaterializedViews?: boolean;  // default true
+	captureChanges?: boolean;             // default true
+	applyForeignKeyActions?: boolean;     // default FALSE (opt-in)
+}
+```
+
+`changes` is a flat **ordered** array — order is semantic for FK actions and capture (origin order = parents-before-children etc.). Rows are FULL table rows in schema column order (arity-checked → `MISUSE`); an unknown table or schema errors with `NOTFOUND` before any effect. `oldRow` images must be accurate before-images — they key the backing deletes and the capture log; when the same row changes twice in one batch, each change's `oldRow` must be the true before-image of *that* change (the prior change's `newRow`). The table key is derived from the **resolved** schema (`schemaName.tableName`, byte-identical to the DML executor's), so capture/watch matching gets executor parity.
+
+### Facets (per call; DML-executor order per change)
+
+- **`captureChanges`** (default on) — `_recordInsert/_recordUpdate/_recordDelete`: feeds `Database.watch` post-commit dispatch (row-granular hits, fires at commit) AND commit-time global-assertion evaluation. With capture on, inbound changes participate in assertion evaluation — intended (delegated invariant maintenance); capture off opts out of both watch and assertions.
+- **`maintainMaterializedViews`** (default on) — row-time covering-structure maintenance over the reported changes, batch-amortized exactly like one statement: bounded-delta arms apply per change immediately; full-rebuild MVs are dirtied per change and rebuilt **once per batch** at the flush — O(body), not O(rows × body); MV-over-MV consumers converge via the existing flush worklist.
+- **`applyForeignKeyActions`** (default **off**) — parent-side actions for `update`/`delete` changes only (inserts have no parent-side actions): the transitive RESTRICT walk, then CASCADE / SET NULL / SET DEFAULT propagation. Off by default because a replication stream usually already carries the origin's cascade effects — re-running them would double-apply. The RESTRICT walk runs POST-application (like the executor's REPLACE-eviction handling): the storage change already happened, there is no pre-mutation point, and the child rows it keys off still exist because the cascade hasn't run yet. Cascade DML issued by the seam re-enters the full DML pipeline, so cascaded child writes get their own capture, MV maintenance, and transitive actions. Both FK helpers run `lensRouted = false` (an external change is a physical basis write), and both early-return under `pragma foreign_keys = off` (no error, no action).
+
+Facet selection is per-call only — there is no registered per-source policy (every current consumer is a single integration layer per host; revisit if multiple independent reporters appear).
+
+### Trust boundary
+
+The seam re-validates **nothing** — no CHECK, NOT NULL, UNIQUE, or child-side FK existence (the origin enforced them). Covering-UNIQUE backings are maintained **blindly**: the inverse-projection upsert is keyed by backing PK, so an origin-unenforced UNIQUE collision degrades to last-writer-wins in the backing — identical to the existing eviction path. Garbage in, garbage out.
+
+**Module data events are NOT a facet.** The external writer owns its module event emission and the `remote` flag (a sync adapter already emits `remote: true` itself; the seam re-emitting would double-fire sync change recording).
+
+A change reported against an MV backing table (`_mv_x`) directly is out of contract — the backing is engine-owned.
+
+### Transaction & visibility contract
+
+- The call runs inside an active coordinated transaction (or its own implicit one); backing connections register lazily and `registerConnection` replays the active savepoint depth — which includes the batch savepoint — so commit/rollback/savepoint stay in lockstep (existing behavior, no new code).
+- Residual / join-residual / full-rebuild arms re-read the source **through the vtab against live state**: the inbound rows must already be visible to a vtab read within the transaction when the seam is driven. True for both motivating cases: committed-KV direct writes (sync adapter) and connection-pending-layer writes (in-transaction apply).
+- A mid-batch error unwinds the batch's **derived** effects (backing writes, cascade DML, capture entries — the change log is savepoint-layered) via the batch savepoint; the externally-applied storage rows are NOT unwound by Quereus. For RESTRICT to genuinely *protect* (not merely report), the caller must apply its storage writes transactionally with the seam; with pre-committed storage the caller owns reconciliation on throw.
+- Batch boundaries mirror `runWithStatementSavepoints`: the deferred full-rebuild flush runs after every change has been applied (each rebuild reads the whole batch) and BEFORE the savepoint release (a failed rebuild unwinds the batch). With no active transaction the seam begins an implicit one and commits it at batch end (watch dispatch fires there); inside an explicit caller transaction, dispatch waits for the caller's commit, and a caller rollback discards backing deltas and capture in lockstep. A mid-batch error inside an explicit caller transaction leaves the transaction open with the batch savepoint unwound (caller decides).
+- The whole batch is serialized against concurrent statements via the exec mutex. **Do not call from within statement execution or vtab callbacks** (deadlock on the mutex); the two-arg eviction seam covers that context.
+- An empty batch is a true no-op: no transaction begin, no savepoint.
+
+### Relationship to `Database.notifyExternalChange`
+
+`notifyExternalChange(tableName, schemaName?)` stays as the coarse, no-transaction, whole-table watch invalidation (over-fires, never misses). The seam's capture facet is the precise, in-transaction alternative: row-granular hits, fires at commit, and additionally feeds global assertions. Use `notifyExternalChange` when you only know "something in this table changed"; use the seam when you have the row images.
+
+### DML replay vs. the ingestion seam
+
+When inbound changes could instead be replayed as SQL (`insert or replace …` / `delete …`):
+
+| concern | DML replay (`insert or replace …` / `delete …`) | ingestion seam |
+|---|---|---|
+| pipeline facets | all, always (constraints, defaults, events, capture, MV, FK) | selected facets; no constraint re-validation |
+| per-row cost | plan + execute per statement (prepared stmts amortize partially) | no planning; maintenance batch-amortized (one connection-resolve per backing, one rebuild per full-rebuild MV per batch) |
+| inbound conflicts | engine-enforced — may reject or transform the inbound row | origin trusted verbatim |
+| FK actions | always re-run (double-applies a stream that carries origin cascade effects) | opt-in per call |
+| storage write | through the vtab — module-owned secondary indexes maintained | already applied by the caller; module index upkeep is the caller's/module's job |
+| recommended for | low-volume sync; tables with local-only constraints | bulk inbound application over origin-validated streams |
+
 ## Schema-change staleness
 
 Row-time maintenance keeps an MV consistent with its sources' *data*. But a *schema* change to a source (drop / alter) can break the body outright. The `MaterializedViewManager` subscribes to `table_removed` / `table_modified` change events and marks any MV whose `sourceTables` includes the changed table as **stale**.

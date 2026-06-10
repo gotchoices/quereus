@@ -301,6 +301,13 @@ covering structure answers it.
 > (layer-level unit cases + a NOCASE-base-PK equivalence suite + `53-…-rowtime.sqllogic`
 > §23.5).
 
+> **External writes.** The DML executor is not the only driver of this pipeline: a host that
+> applies row changes directly to module storage (bypassing the executor entirely) reports them
+> through `Database.ingestExternalRowChanges`, whose batch replays the same facets — change
+> capture, batch-amortized row-time maintenance (one `BackingConnectionCache` + one deferred
+> full-rebuild set + one flush per batch), and opt-in FK actions — inside the coordinated
+> transaction. See [Materialized Views § External row-change ingestion](materialized-views.md#external-row-change-ingestion).
+
 ## Pipeline at a glance
 
 ```
@@ -526,6 +533,7 @@ const dispose = deltaExecutor.register({
 - Analysis surface ("what to bind"): [Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable)
 - Public reactive API / `ChangeScope`: [Change-scope Documentation](change-scope.md)
 - Synchronous (off-kernel) materialization: [Materialized Views](materialized-views.md)
+- Externally-applied writes → this pipeline: [Materialized Views § External row-change ingestion](materialized-views.md#external-row-change-ingestion)
 - Layered schemas / lenses: [Lenses and Layered Schemas](lens.md)
 - Source: `src/planner/analysis/binding-extractor.ts`,
   `src/planner/analysis/key-filter.ts`, `src/runtime/delta-executor.ts`,
