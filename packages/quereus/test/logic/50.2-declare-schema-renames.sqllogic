@@ -533,3 +533,237 @@ diff schema main;
 
 drop materialized view stock_mv;
 drop table stock_t;
+
+-- ===================================
+-- 16. Hinted VIEW rename, definition unchanged → drop + recreate
+-- ===================================
+
+-- A view has no ALTER VIEW … RENAME TO primitive, so a hint-matched rename
+-- resolves to drop(old) + recreate(declared) emitted from the view buckets
+-- (previously this pair diffed empty and applied as a silent no-op).
+
+create table vr_t (id integer primary key, name text);
+create view v_old as select id, name from vr_t;
+insert into vr_t values (1, 'A');
+
+declare schema main {
+	table vr_t {
+		id integer primary key,
+		name text
+	}
+
+	view v_new as select id, name from vr_t with tags ("quereus.previous_name" = 'v_old')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS v_old"}, {"ddl": "create view v_new as select id, name from vr_t with tags (\"quereus.previous_name\" = 'v_old')"}]
+
+apply schema main;
+
+-- run
+
+-- Only the new name exists.
+select name from schema() where type = 'view' order by name;
+→ [{"name": "v_new"}]
+
+select * from v_new order by id;
+→ [{"id": 1, "name": "A"}]
+
+-- Idempotent: the hint tag stored verbatim is inert (name match wins before
+-- hint resolution; the drift compare strips the hint keys).
+diff schema main;
+→ []
+
+drop view v_new;
+drop table vr_t;
+
+-- ===================================
+-- 17. Hinted INDEX rename, body unchanged → drop + recreate
+-- ===================================
+
+create table ir_t (id integer primary key, category text);
+create index ix_old on ir_t (category);
+
+declare schema main {
+	table ir_t {
+		id integer primary key,
+		category text
+	}
+
+	index ix_new on ir_t (category) with tags ("quereus.previous_name" = 'ix_old')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP INDEX IF EXISTS ix_old"}, {"ddl": "create index ix_new on ir_t (category) with tags (\"quereus.previous_name\" = 'ix_old')"}]
+
+apply schema main;
+
+-- run
+
+select name, tbl_name from schema() where type = 'index';
+→ [{"name": "ix_new", "tbl_name": "ir_t"}]
+
+diff schema main;
+→ []
+
+drop index ix_new;
+drop table ir_t;
+
+-- ===================================
+-- 18. Hinted VIEW rename + non-hint tag drift → recreate carries the tags
+-- ===================================
+
+-- The in-place SET TAGS branch requires a name match, so on a rename the
+-- declared tag set must ride the recreate (no separate ALTER VIEW … SET TAGS,
+-- no double-emit).
+
+create table tv_t (id integer primary key, v integer);
+create view tv_old as select id, v from tv_t;
+
+declare schema main {
+	table tv_t {
+		id integer primary key,
+		v integer
+	}
+
+	view tv_new as select id, v from tv_t with tags ("quereus.previous_name" = 'tv_old', owner = 'team-x')
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+-- The recreate carried the declared tags, including the non-hint key.
+select json_extract(tags, '$.owner') as owner from schema() where type = 'view' and name = 'tv_new';
+→ [{"owner": "team-x"}]
+
+diff schema main;
+→ []
+
+drop view tv_new;
+drop table tv_t;
+
+-- ===================================
+-- 19. Hinted VIEW rename + in-diff COLUMN rename of its source
+-- ===================================
+
+-- The recreate must name the OLD column: creates precede RENAME COLUMN in
+-- migration order and CREATE VIEW plans its body at create time. After the
+-- create, the live column-rename propagation rewrites the fresh body, so the
+-- re-diff converges.
+
+create table cr_t (id integer primary key, fullname text not null);
+create view crv_old as select id, fullname from cr_t;
+insert into cr_t values (1, 'Carol');
+
+declare schema main {
+	table cr_t {
+		id integer primary key,
+		full_name text not null with tags ("quereus.previous_name" = 'fullname')
+	}
+
+	view crv_new as select id, full_name from cr_t with tags ("quereus.previous_name" = 'crv_old')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS crv_old"}, {"ddl": "create view crv_new as select id, fullname from cr_t with tags (\"quereus.previous_name\" = 'crv_old')"}, {"ddl": "ALTER TABLE cr_t RENAME COLUMN fullname TO full_name"}]
+
+apply schema main;
+
+-- run
+
+-- Selecting through the renamed view sees the renamed column.
+select * from crv_new order by id;
+→ [{"id": 1, "full_name": "Carol"}]
+
+diff schema main;
+→ []
+
+drop view crv_new;
+drop table cr_t;
+
+-- ===================================
+-- 20. Hinted INDEX rename + in-diff COLUMN rename of its table
+-- ===================================
+
+create table irc_t (id integer primary key, amount integer not null);
+create index irc_old on irc_t (amount);
+
+declare schema main {
+	table irc_t {
+		id integer primary key,
+		qty integer not null with tags ("quereus.previous_name" = 'amount')
+	}
+
+	index irc_new on irc_t (qty) with tags ("quereus.previous_name" = 'irc_old')
+}
+
+-- run
+
+-- The recreate names the OLD column (RENAME COLUMN runs after creates); the
+-- propagation rewrites the fresh index's columns.
+diff schema main;
+→ [{"ddl": "DROP INDEX IF EXISTS irc_old"}, {"ddl": "create index irc_new on irc_t (amount) with tags (\"quereus.previous_name\" = 'irc_old')"}, {"ddl": "ALTER TABLE irc_t RENAME COLUMN amount TO qty"}]
+
+apply schema main;
+
+-- run
+
+select name from schema() where type = 'index';
+→ [{"name": "irc_new"}]
+
+diff schema main;
+→ []
+
+drop index irc_new;
+drop table irc_t;
+
+-- ===================================
+-- 21. require-hint: hinted view + index renames apply cleanly
+-- ===================================
+
+-- A hinted rename's drop+create pair is deliberate, not an ambiguous unhinted
+-- rename — it must not trip the require-hint guard (excluded from the counts,
+-- like the body-change recreates of §14).
+
+create table rh2_t (id integer primary key, v integer);
+create view rh2_vold as select id, v from rh2_t;
+create index rh2_ixold on rh2_t (v);
+
+declare schema main {
+	table rh2_t {
+		id integer primary key,
+		v integer
+	}
+
+	view rh2_vnew as select id, v from rh2_t with tags ("quereus.previous_name" = 'rh2_vold')
+
+	index rh2_ixnew on rh2_t (v) with tags ("quereus.previous_name" = 'rh2_ixold')
+}
+
+-- run
+
+apply schema main options (rename_policy = 'require-hint');
+
+-- run
+
+diff schema main;
+→ []
+
+select name from schema() where type = 'view';
+→ [{"name": "rh2_vnew"}]
+
+select name from schema() where type = 'index';
+→ [{"name": "rh2_ixnew"}]
+
+drop view rh2_vnew;
+drop index rh2_ixnew;
+drop table rh2_t;

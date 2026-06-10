@@ -833,7 +833,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 	});
 
 	it('a pure collation body-change recreate does not trip require-hint policy', async () => {
-		// A collation-driven recreate is a body change (counts in indexBodyRecreates),
+		// A collation-driven recreate is a body change (counts in indexRecreates),
 		// so it is excluded from the unhinted-rename guard, exactly as other body changes.
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix on t (email)`, `${TABLE}\nindex ix on t (email collate nocase)`, 'require-hint');
 		expect(diff.indexesToDrop).to.deep.equal(['ix']);
@@ -1015,17 +1015,22 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		}
 	});
 
-	it('a renamed index over a concurrently-renamed column emits the index rename only (no body recreate)', async () => {
+	it('a renamed index over a concurrently-renamed column recreates under the OLD column name', async () => {
 		// The index is matched via its own previous_name hint (ix_old → ix_new) AND its
 		// referenced column is renamed (email → email_addr). The body reconcile still
-		// applies on the rename-matched index, so a pure column rename under a pure index
-		// rename yields just the two rename ops — no drop+recreate.
+		// applies on the rename-matched index (no body drift), but the `kind: 'index'`
+		// rename op is metadata only — the convergence DDL is the hinted-rename
+		// drop+recreate, rendered with the in-diff column rename inverse-applied
+		// (creates precede RENAME COLUMN in migration order; the live propagation
+		// rewrites the fresh index afterwards).
 		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_old on t (email)`;
 		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_new on t (email_addr) with tags ("quereus.previous_name" = 'ix_old')`;
 		const diff = await diffIndexEdit(base, mod);
-		expect(diff.indexesToDrop, 'no drop — index rename op handles the name change').to.deep.equal([]);
-		expect(diff.indexesToCreate, 'no recreate — reconciled body matches').to.deep.equal([]);
-		expect(diff.renames, 'index rename op emitted').to.deep.include({ kind: 'index', oldName: 'ix_old', newName: 'ix_new' });
+		expect(diff.indexesToDrop, 'drop targets the actual (old) index name').to.deep.equal(['ix_old']);
+		expect(diff.indexesToCreate, 'one recreate under the declared name').to.have.length(1);
+		expect(diff.indexesToCreate[0], 'recreate names the OLD column (RENAME COLUMN has not run yet)').to.match(/\(email\)/i);
+		expect(diff.indexesToCreate[0], 'recreate does not name the NEW column').to.not.match(/email_addr/i);
+		expect(diff.renames, 'index rename op still recorded (metadata)').to.deep.include({ kind: 'index', oldName: 'ix_old', newName: 'ix_new' });
 		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
 	});
 

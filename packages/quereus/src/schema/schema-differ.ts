@@ -405,7 +405,8 @@ export function computeSchemaDiff(
 	}
 	diff.tablesToDrop = orderDropsByFKDependency(dropSet, actualTables);
 
-	// Views: creates / drops / definition-change recreates / in-place tag changes.
+	// Views: creates / drops / definition-change recreates / hinted-rename
+	// recreates / in-place tag changes.
 	// A matched view (name- OR rename-matched) whose canonical definition drifted
 	// (explicit column list, body, or the `insert defaults` clause — see
 	// `viewDefinitionToCanonicalString`) drops+recreates: a plain view is
@@ -419,13 +420,20 @@ export function computeSchemaDiff(
 	// correctness-critical, not just churn: `generateMigrationDDL` emits view
 	// creates BEFORE the table-alter block where RENAME COLUMN lives, and CREATE
 	// VIEW plans its body at create time — an unreconciled recreate naming the
-	// NEW column would fail at apply. A pure name match whose definition is
-	// unchanged but tags drifted still takes the in-place `ALTER VIEW … SET TAGS`
-	// (a rename-matched view has no in-place primitive, so its tags ride the
-	// drop+recreate the standard buckets already drive). A definition-changed
-	// rename-matched view resolves to drop(actual old name) + create(declared new
-	// name), superseding the no-op rename.
-	let viewBodyRecreates = 0; // pure-create/-drop counts for require-hint exclusion
+	// NEW column would fail at apply. A RENAME-matched view (hinted via
+	// quereus.id / quereus.previous_name) resolves to drop(actual old name) +
+	// create(declared new name) whether or not its definition changed — its
+	// `kind: 'view'` rename op is metadata only (no ALTER VIEW … RENAME TO
+	// primitive), so the convergence DDL must come from these buckets. A
+	// definition-UNCHANGED hinted rename renders the recreate with the in-diff
+	// COLUMN renames inverse-applied while keeping declared TABLE names (table
+	// renames run before creates; column renames run after — see
+	// `columnReconciledViewStmt`); the recreate carries the declared tags, so a
+	// rename + tag drift converges through it and the in-place SET TAGS branch
+	// below never double-emits (renames `continue` past it). A pure name match
+	// whose definition is unchanged but tags drifted still takes the in-place
+	// `ALTER VIEW … SET TAGS`.
+	let viewRecreates = 0; // deliberate drop+create pairs, excluded from the require-hint counts
 	for (const [name, declaredView] of declaredViews) {
 		const matchedActual = viewRenames.pairs.get(name);
 		if (!matchedActual) {
@@ -440,10 +448,18 @@ export function computeSchemaDiff(
 		if (definitionDrifted) {
 			diff.viewsToDrop.push(matchedActual.name);
 			diff.viewsToCreate.push(createViewToString(stmt));
-			viewBodyRecreates++;
+			viewRecreates++;
 			continue;
 		}
-		if (matchedActual.name.toLowerCase() === name && tagsDrifted(stmt.tags, matchedActual.tags)) {
+		if (matchedActual.name.toLowerCase() !== name) {
+			// Hinted rename, definition unchanged → drop(old) + recreate(declared),
+			// rendered with in-diff column renames inverse-applied (NEW→OLD).
+			diff.viewsToDrop.push(matchedActual.name);
+			diff.viewsToCreate.push(createViewToString(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName)));
+			viewRecreates++;
+			continue;
+		}
+		if (tagsDrifted(stmt.tags, matchedActual.tags)) {
 			diff.viewTagsChanges.push({ name: stmt.view.name, tags: desiredTagSet(stmt.tags) });
 		}
 	}
@@ -500,16 +516,25 @@ export function computeSchemaDiff(
 		if (!declaredMaterializedViews.has(name)) diff.materializedViewsToDrop.push(name);
 	}
 
-	// Indexes: creates / drops / body-change recreates / in-place tag changes.
+	// Indexes: creates / drops / body-change recreates / hinted-rename recreates /
+	// in-place tag changes.
 	// A name-matched index whose canonical body drifted (UNIQUE-ness, column
 	// set/order/direction, partial WHERE) drops+recreates — the same drop+recreate
 	// shape MVs use, since an index has no in-place "redefine" primitive. The
 	// recreate carries the declared tags, so a body change SUPPRESSES any separate
 	// SET TAGS for that index (mutually exclusive per object, mirroring the MV
-	// precedence above). A pure name match whose body is unchanged but tags drifted
-	// still takes the in-place `ALTER INDEX … SET TAGS` (as views do — a renamed
-	// index has no in-place primitive, so its tags ride the drop+recreate).
-	let indexBodyRecreates = 0; // pure-create/-drop counts for require-hint exclusion
+	// precedence above). A RENAME-matched index (hinted) resolves to drop(actual
+	// old name) + create(declared new name) whether or not its body changed — the
+	// `kind: 'index'` rename op is metadata only (no ALTER INDEX … RENAME TO
+	// primitive), so the convergence DDL must come from these buckets; the
+	// rebuild cost on a pure rename is the documented tradeoff. A body-UNCHANGED
+	// hinted rename renders the recreate with the in-diff COLUMN renames
+	// inverse-applied while keeping declared TABLE names (see
+	// `columnReconciledIndexStmt`); the recreate carries the declared tags, so the
+	// in-place SET TAGS branch below never double-emits (renames `continue` past
+	// it). A pure name match whose body is unchanged but tags drifted still takes
+	// the in-place `ALTER INDEX … SET TAGS`.
+	let indexRecreates = 0; // deliberate drop+create pairs, excluded from the require-hint counts
 	for (const [name, declaredIndex] of declaredIndexes) {
 		const matchedActual = indexRenames.pairs.get(name);
 		if (!matchedActual) {
@@ -543,11 +568,20 @@ export function computeSchemaDiff(
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
 			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
-			indexBodyRecreates++;
+			indexRecreates++;
 			continue;
 		}
-		// Body unchanged → in-place tag change (pure name match only, as before).
-		if (matchedActual.name.toLowerCase() === name && tagsDrifted(declaredIndex.indexStmt.tags, matchedActual.tags)) {
+		if (matchedActual.name.toLowerCase() !== name) {
+			// Hinted rename, body unchanged → drop(old) + recreate(declared),
+			// rendered with in-diff column renames inverse-applied (NEW→OLD).
+			diff.indexesToDrop.push(matchedActual.name);
+			const reconciledStmt = columnReconciledIndexStmt(declaredIndex.indexStmt, indexColRenames, columnRenamesByTable, targetSchemaName);
+			diff.indexesToCreate.push(createIndexToString(applyIndexDefaults(reconciledStmt, targetSchemaName)));
+			indexRecreates++;
+			continue;
+		}
+		// Body unchanged → in-place tag change (pure name match only — renames `continue` above).
+		if (tagsDrifted(declaredIndex.indexStmt.tags, matchedActual.tags)) {
 			diff.indexTagsChanges.push({ name: declaredIndex.indexStmt.index.name, tags: desiredTagSet(declaredIndex.indexStmt.tags) });
 		}
 	}
@@ -557,15 +591,15 @@ export function computeSchemaDiff(
 	}
 
 	// Apply 'require-hint' policy: any unhinted name change is an error rather
-	// than a silent drop+create. A body-change recreate counts as both a create and
-	// a drop, which would falsely trip the unhinted-rename guard — so exclude those
-	// from the view/index counts (the constraint path does the same with its pure
-	// counts): a definition recreate is a deliberate drop+create of a matched
-	// object, not an ambiguous rename.
+	// than a silent drop+create. A body-change OR hinted-rename recreate counts as
+	// both a create and a drop, which would falsely trip the unhinted-rename guard
+	// — so exclude those from the view/index counts (the constraint path does the
+	// same with its pure counts): both are deliberate drop+create pairs of a
+	// matched object, not an ambiguous unhinted rename.
 	if (policy === 'require-hint') {
 		enforceRequireHint('table', diff.tablesToCreate.length, diff.tablesToDrop.length);
-		enforceRequireHint('view', diff.viewsToCreate.length - viewBodyRecreates, diff.viewsToDrop.length - viewBodyRecreates);
-		enforceRequireHint('index', diff.indexesToCreate.length - indexBodyRecreates, diff.indexesToDrop.length - indexBodyRecreates);
+		enforceRequireHint('view', diff.viewsToCreate.length - viewRecreates, diff.viewsToDrop.length - viewRecreates);
+		enforceRequireHint('index', diff.indexesToCreate.length - indexRecreates, diff.indexesToDrop.length - indexRecreates);
 	}
 
 	// Assertions (no rename support — names are explicitly part of the contract).
@@ -1076,6 +1110,127 @@ function reconciledDeclaredViewDefinition(
 	}
 
 	return viewDefinitionToCanonicalString(columns, selectClone, reconciledDefaults);
+}
+
+/**
+ * Declared {@link AST.CreateViewStmt} with the in-diff COLUMN renames
+ * inverse-applied (NEW→OLD); table references untouched. Renders the recreate
+ * DDL of a hinted-RENAME-matched view whose definition is otherwise unchanged:
+ * in migration order the create runs AFTER `ALTER TABLE … RENAME TO` (declared
+ * table names are already live) but BEFORE `ALTER TABLE … RENAME COLUMN` (a
+ * body naming the NEW column would fail to plan at create time). After the
+ * create, the live column-rename propagation rewrites the fresh body, so the
+ * post-apply state and a re-diff converge. Unlike
+ * {@link reconciledDeclaredViewDefinition} there is NO inverse table pass (it
+ * would name a table that no longer exists at create time), so the column
+ * rewrites are seeded with each table's DECLARED name — the body's qualifiers
+ * still carry it. Clones before rewriting (the declared stmt backs the
+ * declared-schema store); identity when the diff carries no column renames.
+ */
+function columnReconciledViewStmt(
+	stmt: AST.CreateViewStmt,
+	/** Declared (new) table name (lowercased) → that table's column renames. */
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	schemaName: string,
+): AST.CreateViewStmt {
+	if (columnRenamesByTable.size === 0) return stmt;
+
+	const fromTables = collectFromTableNames(stmt.select, schemaName);
+
+	const selectClone = cloneQueryExpr(stmt.select);
+	for (const [declaredTableName, colRenames] of columnRenamesByTable) {
+		for (const r of colRenames) {
+			renameColumnInAst(selectClone, declaredTableName, r.newName, r.oldName, schemaName);
+		}
+	}
+
+	// The `insert defaults` clause mirrors reconciledDeclaredViewDefinition's
+	// handling minus the table pass: each entry's `column` names a base column of
+	// a FROM table (inverse-mapped via the FROM-scoped lookup), and its `expr`
+	// evaluates in that base table's inserted-row context — the CHECK-expression
+	// entry point, seeded with the DECLARED table name.
+	let reconciledDefaults = stmt.insertDefaults;
+	if (stmt.insertDefaults && stmt.insertDefaults.length > 0) {
+		reconciledDefaults = stmt.insertDefaults.map(d => {
+			let column = d.column;
+			for (const ft of fromTables) {
+				const r = columnRenamesByTable.get(ft)?.find(cr => cr.newName.toLowerCase() === column.toLowerCase());
+				if (r) {
+					column = r.oldName;
+					break;
+				}
+			}
+			const exprClone = cloneExpr(d.expr);
+			for (const ft of fromTables) {
+				const colRenames = columnRenamesByTable.get(ft);
+				if (!colRenames) continue;
+				for (const r of colRenames) {
+					renameColumnInCheckExpression(exprClone, ft, r.newName, r.oldName, schemaName);
+				}
+			}
+			return { column, expr: exprClone };
+		});
+	}
+
+	return { ...stmt, select: selectClone, insertDefaults: reconciledDefaults };
+}
+
+/**
+ * Declared {@link AST.CreateIndexStmt} with the in-diff COLUMN renames
+ * inverse-applied (NEW→OLD); table references untouched. The index analogue of
+ * {@link columnReconciledViewStmt}, rendering the recreate DDL of a
+ * hinted-RENAME-matched index whose body is otherwise unchanged. Indexed-column
+ * bare names map NEW→OLD via the index table's own renames (both indexed-column
+ * forms — plain and the parser's collate-folded `col COLLATE x`). The partial
+ * WHERE predicate reuses the walk shape of {@link declaredIndexCanonicalBody}
+ * minus its inverse table pass: the own table's renames via the
+ * CHECK-expression entry point seeded with the DECLARED table name (qualifiers
+ * still carry it — no table pass pre-normalized them), other tables' renames
+ * via the plain scope-aware walk (a cross-table predicate reference is
+ * unreachable today — the memory backend rejects it at create time — kept for
+ * symmetry with the canonical-body reconciler). After the create, the live
+ * column-rename propagation rewrites the indexed columns and predicate, so a
+ * re-diff converges. Identity when the diff carries no column renames.
+ */
+function columnReconciledIndexStmt(
+	stmt: AST.CreateIndexStmt,
+	/** The index's own table's in-diff column renames. */
+	colRenames: ReadonlyArray<ColumnRenameOp>,
+	/** Declared (new) table name (lowercased) → that table's column renames. */
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	schemaName: string,
+): AST.CreateIndexStmt {
+	if (columnRenamesByTable.size === 0) return stmt;
+
+	const columns: AST.IndexedColumn[] = stmt.columns.map(col => {
+		const bareName = indexedColumnBareName(col);
+		if (!bareName) return col;
+		const rename = colRenames.find(r => r.newName.toLowerCase() === bareName.toLowerCase());
+		if (!rename) return col;
+		if (col.name) return { ...col, name: rename.oldName };
+		// Collate-folded form: the bare name lives on col.expr.expr.name.
+		const collate = col.expr as AST.CollateExpr;
+		const inner = collate.expr as AST.ColumnExpr;
+		return { ...col, expr: { ...collate, expr: { ...inner, name: rename.oldName } } };
+	});
+
+	let where = stmt.where;
+	if (where) {
+		const clone = cloneExpr(where);
+		for (const r of colRenames) {
+			renameColumnInCheckExpression(clone, stmt.table.name, r.newName, r.oldName, schemaName);
+		}
+		const ownTableLower = stmt.table.name.toLowerCase();
+		for (const [declaredTableName, renames] of columnRenamesByTable) {
+			if (declaredTableName === ownTableLower) continue;
+			for (const r of renames) {
+				renameColumnInAst(clone, declaredTableName, r.newName, r.oldName, schemaName);
+			}
+		}
+		where = clone;
+	}
+
+	return { ...stmt, columns, where };
 }
 
 /**
@@ -1812,17 +1967,17 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 
 	// Renames first — they free old names for subsequent creates and re-target
 	// dependents (handled inside ALTER TABLE ... RENAME by the rename rewriter).
-	// Tables get a primitive ALTER TABLE RENAME; views/indexes/named constraints
-	// have no engine primitive yet — fall back to drop+recreate is left to the
-	// caller (we surface only the rename op here for tables and the alter-diff
-	// pipeline already drops+recreates non-table objects via diff.viewsToDrop /
-	// indexesToDrop when no rename hint is present).
+	// Only tables have a rename primitive. The other RenameOp kinds are metadata
+	// here: a hinted view/index rename's convergence DDL is emitted by
+	// computeSchemaDiff itself as drop(old) + recreate(declared) through the
+	// standard viewsToDrop/viewsToCreate / indexesToDrop/indexesToCreate buckets
+	// (whether or not the definition also changed), and a constraint rename rides
+	// the table-alter channel (RENAME CONSTRAINT below).
 	for (const r of diff.renames) {
 		if (r.kind === 'table') {
 			statements.push(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.oldName)} RENAME TO ${quoteIdentifier(r.newName)}`);
 		}
-		// View / index / constraint renames have no primitive — caller emits
-		// drop+recreate via the standard buckets.
+		// Non-table rename ops emit no DDL here — see the note above.
 	}
 
 	// Drop assertions first (they may reference tables)
