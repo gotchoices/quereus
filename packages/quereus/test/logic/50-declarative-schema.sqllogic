@@ -1047,3 +1047,47 @@ insert into decl_expo_idx.ExpoTbl values (2, 'VIN001');
 -- error: UNIQUE
 
 drop table decl_expo_idx.ExpoTbl;
+
+-- ===================================================================
+-- View `insert defaults (col = expr, …)` survives the declare/diff/apply
+-- round-trip: the diff renders the clause in the create DDL, the apply
+-- re-parses that DDL, and an insert through the applied view supplies the
+-- defaulted column. Declared in `main` since declarative views in
+-- non-main schemas are emitted without a schema prefix (see the
+-- compound-tail blocks above). `main` is empty at this point in the file
+-- (the last `apply schema main` reconciled it down to a single view,
+-- since dropped), so the diff is exactly the two creates.
+-- ===================================================================
+
+declare schema main {
+	table decl_dfl (
+		id INTEGER PRIMARY KEY,
+		name TEXT,
+		created INTEGER NOT NULL
+	)
+
+	view decl_dfl_v as select id, name from decl_dfl insert defaults (created = 424242)
+}
+
+-- run
+
+-- The rendered create DDL carries the clause in canonical form.
+diff schema main;
+→ [{"ddl": "create table decl_dfl (id INTEGER primary key, name TEXT, created INTEGER not null)"}, {"ddl": "create view decl_dfl_v as select id, name from decl_dfl insert defaults (created = 424242)"}]
+
+apply schema main;
+
+-- run
+
+-- Write-through: the applied view supplies the omitted not-null column.
+insert into decl_dfl_v values (1, 'x');
+select * from decl_dfl order by id;
+→ [{"id":1,"name":"x","created":424242}]
+
+-- Converged: an identical re-declare diffs empty (declared and actual agree,
+-- clause included).
+diff schema main;
+→ []
+
+drop view decl_dfl_v;
+drop table decl_dfl;

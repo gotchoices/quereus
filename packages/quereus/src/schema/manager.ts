@@ -2462,6 +2462,7 @@ export class SchemaManager {
 			sql: createViewToString(stmt),
 			selectAst: stmt.select,
 			columns: stmt.columns ? Object.freeze([...stmt.columns]) : undefined,
+			insertDefaults: stmt.insertDefaults,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 
@@ -2520,6 +2521,7 @@ export class SchemaManager {
 			selectAst: stmt.select,
 			bodySql: astToString(stmt.select),
 			columns: stmt.columns,
+			insertDefaults: stmt.insertDefaults,
 			tags: stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
 		});
 		log(`Imported materialized view %s.%s`, targetSchemaName, viewName);

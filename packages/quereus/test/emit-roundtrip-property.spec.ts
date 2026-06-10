@@ -518,6 +518,15 @@ const cteSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	};
 });
 
+/** `insert defaults (col = expr, …)` entries — distinct columns, literal exprs. */
+const insertDefaultsArb: fc.Arbitrary<AST.ViewInsertDefault[] | undefined> = fc.option(
+	fc.uniqueArray(
+		fc.tuple(identArb, literalArb).map(([column, expr]): AST.ViewInsertDefault => ({ column, expr })),
+		{ minLength: 1, maxLength: 3, selector: d => d.column },
+	),
+	{ nil: undefined },
+);
+
 /**
  * CREATE VIEW with either a SELECT or VALUES body. When the body is VALUES
  * we drop the explicit column list because its arity is generator-coupled
@@ -529,12 +538,14 @@ const createViewArb: fc.Arbitrary<AST.CreateViewStmt> = fc.tuple(
 	fc.boolean(),
 	fc.option(uniqueIdents(1), { nil: undefined }),
 	queryExprArb,
-).map(([name, ifNotExists, columns, body]): AST.CreateViewStmt => ({
+	insertDefaultsArb,
+).map(([name, ifNotExists, columns, body, insertDefaults]): AST.CreateViewStmt => ({
 	type: 'createView',
 	view: { type: 'identifier', name },
 	ifNotExists,
 	columns: body.type === 'values' ? undefined : columns,
 	select: body,
+	insertDefaults,
 }));
 
 // ------------------------------------------------------------------------
@@ -632,7 +643,8 @@ const declaredViewItemArb: fc.Arbitrary<AST.DeclaredView> = fc.record({
 	name: identArb,
 	cols: fc.option(uniqueIdents(1), { nil: undefined }),
 	select: simpleSelectArb,
-}).map(({ name, cols, select }): AST.DeclaredView => ({
+	insertDefaults: insertDefaultsArb,
+}).map(({ name, cols, select, insertDefaults }): AST.DeclaredView => ({
 	type: 'declaredView',
 	viewStmt: {
 		type: 'createView',
@@ -640,6 +652,7 @@ const declaredViewItemArb: fc.Arbitrary<AST.DeclaredView> = fc.record({
 		ifNotExists: false,
 		columns: cols,
 		select,
+		insertDefaults,
 	},
 }));
 

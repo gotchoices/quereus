@@ -328,6 +328,16 @@ export interface CreateAssertionStmt extends AstNode {
 	check: Expression; // The CHECK (<violation-query>) expression
 }
 
+/**
+ * One entry of a view's `insert defaults (col = expr, …)` clause: a per-column
+ * default supplied when an insert through the view omits the column. The column
+ * may name a base column the view projects away or a base-lineage view column.
+ */
+export interface ViewInsertDefault {
+	column: string;
+	expr: Expression;
+}
+
 // CREATE VIEW statement
 export interface CreateViewStmt extends AstNode {
 	type: 'createView';
@@ -336,6 +346,8 @@ export interface CreateViewStmt extends AstNode {
 	columns?: string[];
 	/** View body — any relation-producing form. Bare `VALUES (...)` is permitted. */
 	select: QueryExpr;
+	/** Trailing `insert defaults (col = expr, …)` clause — omitted-insert defaults for write-through. */
+	insertDefaults?: ReadonlyArray<ViewInsertDefault>;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 
@@ -351,6 +363,8 @@ export interface CreateMaterializedViewStmt extends AstNode {
 	moduleName?: string;
 	/** Optional backing-module arguments (forward-compatible; ignored in v1). */
 	moduleArgs?: Record<string, SqlValue>;
+	/** Trailing `insert defaults (col = expr, …)` clause — omitted-insert defaults for write-through. */
+	insertDefaults?: ReadonlyArray<ViewInsertDefault>;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 

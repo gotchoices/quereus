@@ -849,16 +849,22 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		}
 	}
 
-	// View-level `default_for.<col>` tags (Divergence 1): the `tag-default`
-	// provenance is never threaded onto `PhysicalProperties` (it is consumed only
-	// in the rewrite), so this body is planned without the view's tags and the
-	// walk above misses it. Fold each tag column into `defaultable` directly,
+	// View-level insert defaults (Divergence 1): the `tag-default` provenance is
+	// never threaded onto `PhysicalProperties` (it is consumed only in the
+	// rewrite), so this body is planned without the view's defaults and the walk
+	// above misses them. Fold each defaulted column into `defaultable` directly,
 	// mirroring `resolveDefaultForColumn` — a base column of a reachable target
 	// (the common projected-away case) or a visible view-output column with base
-	// lineage. Unlike the rewrite, an unresolvable name is silently skipped: a
-	// read-only introspection surface stays on its never-throw posture (the
-	// per-view try/catch would otherwise collapse the row to all-`NO`).
-	for (const colName of readDefaultFor(view.tags).keys()) {
+	// lineage. Sources are the first-class `insert defaults (col = expr, …)`
+	// clause and the deprecated `default_for.<col>` view-DDL tag (alive until
+	// `remove-view-default-for-tag`); only the column NAME matters here, so the
+	// union suffices — precedence between them is the rewrite's concern. Unlike
+	// the rewrite, an unresolvable name is silently skipped: a read-only
+	// introspection surface stays on its never-throw posture (the per-view
+	// try/catch would otherwise collapse the row to all-`NO`).
+	const defaultedColumns = new Set<string>(readDefaultFor(view.tags).keys());
+	for (const d of view.insertDefaults ?? []) defaultedColumns.add(d.column.toLowerCase());
+	for (const colName of defaultedColumns) {
 		let resolved = false;
 		for (const id of targetIds) {
 			const match = tableRefsById.get(id)?.tableSchema.columns

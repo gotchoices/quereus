@@ -49,6 +49,7 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 			selectAst: plan.selectStmt,
 			bodySql: plan.bodySql,
 			columns: plan.columns,
+			insertDefaults: plan.insertDefaults,
 			tags: plan.tags,
 		});
 

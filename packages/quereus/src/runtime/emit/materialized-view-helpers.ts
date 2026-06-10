@@ -237,6 +237,8 @@ export interface MaterializeViewDefinition {
 	bodySql: string;
 	/** Explicit column list from `create materialized view mv(a, b) ...`, when present. */
 	columns?: ReadonlyArray<string>;
+	/** Per-column omitted-insert defaults from `insert defaults (col = expr, …)`. */
+	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	tags?: Readonly<Record<string, SqlValue>>;
 }
 
@@ -296,6 +298,7 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		sql: def.sql,
 		selectAst: def.selectAst,
 		columns: def.columns,
+		insertDefaults: def.insertDefaults,
 		tags: def.tags,
 		backingTableName,
 		primaryKey: shape.primaryKey,

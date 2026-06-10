@@ -58,6 +58,8 @@ export interface MutableViewLike {
 	readonly schemaName: string;
 	readonly selectAst: AST.QueryExpr;
 	readonly columns?: ReadonlyArray<string>;
+	/** Per-column omitted-insert defaults from `insert defaults (col = expr, …)`. */
+	readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** View-level metadata tags — the `view-ddl` site of the override surface. */
 	readonly tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -655,13 +657,14 @@ function requireBaseColumn(vc: ViewColumn): string {
 }
 
 /**
- * Resolve a `default_for.<col>` column name to its base column. The name may be
- * a base column (the documented `default_for.created` case, where the column is
- * projected away by the view) or a view column with `base` lineage. An unknown
- * name is a structured `tag-target-not-found` — a typo must fail loudly, not
- * silently no-op.
+ * Resolve an insert-default column name (from the `insert defaults (col = expr, …)`
+ * clause or a `default_for.<col>` tag) to its base column. The name may be a base
+ * column (the documented projected-away case) or a view column with `base`
+ * lineage. An unknown name is a structured `tag-target-not-found` — a typo must
+ * fail loudly, not silently no-op. `spelling` names the offending declaration in
+ * the diagnostic (the clause entry or the tag key).
  */
-function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: MutableViewLike): string {
+function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: MutableViewLike, spelling: string): string {
 	const baseCol = analysis.baseTable.columns.find(c => c.name.toLowerCase() === colName);
 	if (baseCol) return baseCol.name;
 	const vc = analysis.viewColumns.find(c => c.name.toLowerCase() === colName);
@@ -670,7 +673,7 @@ function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: 
 		reason: 'tag-target-not-found',
 		column: colName,
 		table: view.name,
-		message: `cannot write through view '${view.name}': 'quereus.update.default_for.${colName}' names column '${colName}', which is not a column of the view or its base table '${analysis.baseTable.name}'`,
+		message: `cannot write through view '${view.name}': ${spelling} names column '${colName}', which is not a column of the view or its base table '${analysis.baseTable.name}'`,
 	});
 }
 
@@ -730,15 +733,34 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 		}
 	}
 
-	// `quereus.update.default_for.<col>` supplies an omitted-insert default ahead
-	// of the base column's declared default (docs/view-updateability.md §Projection
-	// step 5, § Tags). It fills only a column the insert and the constant-FD chain
-	// left omitted — an explicit user value or a stronger predicate pin wins.
-	for (const [colName, exprText] of readDefaultFor(tags)) {
-		const baseCol = resolveDefaultForColumn(analysis, colName, view);
-		if (isSupplied(baseCol)) continue;
+	// Omitted-insert defaults, applied ahead of the base column's declared default
+	// (docs/view-updateability.md § Projection step 5, § View insert defaults). A
+	// default fills only a column the insert and the constant-FD chain left omitted
+	// — an explicit user value or a stronger predicate pin always wins. Among the
+	// default sources themselves, per resolved base column:
+	//   1. the statement-level `default_for.<col>` tag (the per-statement override),
+	//   2. the view's first-class `insert defaults (col = expr, …)` clause,
+	//   3. the deprecated view-level `default_for.<col>` tag — shadowed by the
+	//      clause; alive only until `remove-view-default-for-tag` deletes it.
+	// Each pass appends only still-unsupplied base columns, so order realizes
+	// precedence. Pass 3 iterates the merged map (statement over view); its
+	// statement entries were appended in pass 1, so `isSupplied` skips them.
+	const applyDefault = (colName: string, makeExpr: () => AST.Expression, spelling: string): void => {
+		const baseCol = resolveDefaultForColumn(analysis, colName, view, spelling);
+		if (isSupplied(baseCol)) return;
 		appendColumns.push(baseCol);
-		appendExprs.push(parseExpressionString(exprText));
+		appendExprs.push(makeExpr());
+	};
+	for (const [colName, exprText] of readDefaultFor(stmt.tags)) {
+		applyDefault(colName, () => parseExpressionString(exprText), `'quereus.update.default_for.${colName}'`);
+	}
+	// The clause value is already an AST expression — no text re-lowering. Pushing
+	// the schema-held node is safe: the VALUES rewrite below clones per row.
+	for (const d of view.insertDefaults ?? []) {
+		applyDefault(d.column.toLowerCase(), () => d.expr, `'insert defaults (${d.column} = …)'`);
+	}
+	for (const [colName, exprText] of readDefaultFor(tags)) {
+		applyDefault(colName, () => parseExpressionString(exprText), `'quereus.update.default_for.${colName}'`);
 	}
 
 	const finalColumns = [...baseColumns, ...appendColumns];

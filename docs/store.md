@@ -227,6 +227,17 @@ The module uses separate logical stores for different data types:
 - Simpler iteration (no prefix filtering needed)
 - Unified stats store eliminates late database upgrades for stats
 
+**Physical name collisions:** store names are built by concatenation and `_idx_` is a
+legal substring of any identifier, so two distinct logical objects can collapse to the
+same physical name (index `archive` on table `q` and a sibling table literally named
+`q_idx_archive` both map to `main.q_idx_archive`). The module rejects any DDL that would
+introduce such a collision — `CREATE TABLE`, `CREATE INDEX`, and
+`ALTER TABLE ... RENAME TO` (which checks the new data store name plus every relocated
+index store name) — with a sited error *before* any storage side effect, so a rejected
+statement is a clean no-op. Providers implementing `renameTableStores` should still check
+every destination before moving anything (the bundled LevelDB and IndexedDB providers do)
+as a backstop against on-disk state the catalog doesn't know about.
+
 ### Key Formats
 
 **Data Keys** (in `{schema}.{table}` store):

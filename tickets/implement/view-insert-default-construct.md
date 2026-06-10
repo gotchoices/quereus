@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-10T02:49:20.716Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\view-insert-default-construct.implement.2026-06-10T02-49-20-714Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: First-class view insert-default construct — `create [materialized] view v (cols) as <body> insert defaults (col = expr, …)` — replacing the `quereus.update.default_for.<column>` reserved tag's behavior with a real language construct carrying AST `Expression` values (not re-parsed text). Behavior-preserving addition; the tag's removal lands in the chained `remove-view-default-for-tag`. Converted from blocked/view-ddl-reserved-tag-eager-validation per the human-approved de-tag reframe (2026-06-08).
 files:
   - packages/quereus/src/parser/ast.ts                          # CreateViewStmt/CreateMaterializedViewStmt: add insertDefaults?: ReadonlyArray<{ column: string; expr: Expression }>

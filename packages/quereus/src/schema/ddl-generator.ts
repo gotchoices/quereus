@@ -161,6 +161,7 @@ export function generateViewDDL(view: ViewSchema): string {
 		ifNotExists: false,
 		columns: view.columns ? [...view.columns] : undefined,
 		select: view.selectAst,
+		insertDefaults: view.insertDefaults,
 		tags: view.tags ? { ...view.tags } : undefined,
 	};
 	return createViewToString(stmt);
@@ -184,6 +185,7 @@ export function generateMaterializedViewDDL(mv: MaterializedViewSchema): string 
 		ifNotExists: false,
 		columns: mv.columns ? [...mv.columns] : undefined,
 		select: mv.selectAst,
+		insertDefaults: mv.insertDefaults,
 		tags: mv.tags ? { ...mv.tags } : undefined,
 	};
 	return createMaterializedViewToString(stmt);

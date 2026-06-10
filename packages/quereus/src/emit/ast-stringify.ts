@@ -1062,6 +1062,13 @@ export function createIndexBodyToCanonicalString(stmt: AST.CreateIndexStmt): str
 	return parts.join(' ');
 }
 
+/** `insert defaults (col = expr, …)` clause of a view definition, or '' when absent. */
+function insertDefaultsClauseToString(insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined): string {
+	if (!insertDefaults || insertDefaults.length === 0) return '';
+	const entries = insertDefaults.map(d => `${quoteIdentifier(d.column)} = ${expressionToString(d.expr)}`);
+	return `insert defaults (${entries.join(', ')})`;
+}
+
 export function createViewToString(stmt: AST.CreateViewStmt): string {
 	const parts: string[] = ['create'];
 	parts.push('view');
@@ -1075,6 +1082,9 @@ export function createViewToString(stmt: AST.CreateViewStmt): string {
 
 	// View body is a QueryExpr — astToString dispatches on the discriminator.
 	parts.push('as', astToString(stmt.select));
+
+	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
+	if (defaultsStr) parts.push(defaultsStr);
 
 	const viewTagStr = tagsClauseToString(stmt.tags);
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
@@ -1097,6 +1107,9 @@ export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewS
 	if (usingClause) parts.push(usingClause);
 
 	parts.push('as', astToString(stmt.select));
+
+	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
+	if (defaultsStr) parts.push(defaultsStr);
 
 	const viewTagStr = tagsClauseToString(stmt.tags);
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
@@ -1352,6 +1365,9 @@ function declaredViewToString(it: AST.DeclaredView): string {
 	// View body is a QueryExpr — astToString dispatches on the discriminator.
 	parts.push('as', astToString(stmt.select));
 
+	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
+	if (defaultsStr) parts.push(defaultsStr);
+
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());
 
@@ -1369,6 +1385,9 @@ function declaredMaterializedViewToString(it: AST.DeclaredMaterializedView): str
 	if (usingClause) parts.push(usingClause);
 
 	parts.push('as', astToString(stmt.select));
+
+	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
+	if (defaultsStr) parts.push(defaultsStr);
 
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());

@@ -19,6 +19,7 @@ export class CreateViewNode extends VoidNode {
 		public readonly columns: string[] | undefined,
 		public readonly selectStmt: AST.QueryExpr,
 		public readonly sql: string,
+		public readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>,
 		public readonly tags?: Readonly<Record<string, SqlValue>>
 	) {
 		super(scope, 1); // Low cost for DDL operations

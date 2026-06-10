@@ -90,7 +90,7 @@ The rules below apply identically to view bodies, CTE bodies, subqueries in `fro
 2. **Constant FD** — a column constrained to a constant by an upstream selection predicate (the relation carries the FD `∅ → c = v`) takes that constant.
 3. **FD reconstruction** — a column functionally determined by other surviving / supplied columns is reconstructed symbolically from the FD's right-hand side.
 4. **EC propagation** — a column in an equivalence class with a supplied column or a constant takes the EC representative's value.
-5. The view's `default_for` tag (expression over surviving columns).
+5. The view's declared insert default — an `insert defaults (col = expr, …)` clause entry (expression over surviving columns), or per statement the `default_for` tag override (§ [View insert defaults](#view-insert-defaults)).
 6. The base column's declared `default` — including a **generated default** (sequence, surrogate allocator, clock read), which resolves through the mutation-context envelope (§ [Mutation Context](#mutation-context)) at per-row cadence and, when the column is a shared join key, threads the one captured value through every branch of the decomposition.
 7. For nullable columns, `null`.
 
@@ -173,7 +173,7 @@ Outer joins introduce **null-extended** lineage on the non-preserved side(s). Fo
 **Updates on a non-preserved-side column** split into two cases:
 
 - *Row is non-null-extended in the matched view row* (guard holds): the propagation is a normal update on the non-preserved base, with row-identifying predicate built from the projected portion of the joined row's identifying predicate.
-- *Row is null-extended* (guard fails — the non-preserved side had no matching row): the update is rewritten as an **insert** on the non-preserved side. Values for the join-predicate columns come from the preserved side via EC; values for non-`set` columns come from defaults or `default_for` tags; values for `set` columns come from the user's assignment. If the resulting insert lacks a `not null`-without-default value, the entire propagation fails with a diagnostic.
+- *Row is null-extended* (guard fails — the non-preserved side had no matching row): the update is rewritten as an **insert** on the non-preserved side. Values for the join-predicate columns come from the preserved side via EC; values for non-`set` columns come from defaults or declared insert defaults; values for `set` columns come from the user's assignment. If the resulting insert lacks a `not null`-without-default value, the entire propagation fails with a diagnostic.
 
 **Inserts** through an outer-joined view follow the join's structural intent. An insert with values for both sides produces inserts on both sides under the join predicate. An insert with values only for the preserved side produces a single preserved-side insert (the resulting row is null-extended through the view). An insert with values only for the non-preserved side requires the join predicate to be satisfiable against an existing preserved row; otherwise it is rejected.
 
@@ -688,9 +688,24 @@ Built-in functions ship with profiles. `cast`-style conversions advertise `inver
 
 **How writability follows from the profile.** The plan-node backward walk resolves every projection to a `base` `UpdateSite` — `identity` / rename (`b as bc`), `passthrough` (an identity-on-value transform: `b collate nocase`, a no-op `cast(b as <same logical type>)`; *no* inverse), or `inverse` (a non-identity invertible transform: `b + 1`; inverse *present*) — else `computed` / `null-extended` (read-only). Both mutation spines route the **full writable-base set** (identity + passthrough + inverse) on the UPDATE write path, applying a site's `inverse` only when present: `set bp = 9` on a `b + 1 as bp` column lowers to `set b = 9 - 1`; `set bc = v` on a `b collate nocase as bc` passthrough column lowers to `set b = v` (no inverse applied). INSERT is **insertable for the inverse-absent subset** — `identity` / rename and `passthrough` store the value verbatim — while `inverse` and `opaque` columns are non-insertable (the lowering writes the value raw, with no hook to apply an inverse). The two spines share an identical insertability gate (`writable && inverse === undefined`). The static `view_info` / `column_info` surfaces read the same plan-node lineage and report a `base` site (identity, passthrough, or inverse) writable, agreeing with the dynamic truth.
 
+## View insert defaults
+
+A view (or materialized view) declares omitted-insert defaults **first-class**, as a trailing clause after the body (before `with tags`):
+
+```sql
+create view dfi_v (id, name) as select id, name from dfi
+  insert defaults (created = epoch_ms('now'));
+```
+
+Each entry names a base column the view projects away (the dominant case — the column has no slot in the view's rename-only output column list) or a `base`-lineage view column, and carries a real SQL **expression** (a first-class AST value with a source location — not re-parsed tag text). At write-through the expression is evaluated per omitted-insert row at step 5 of the insert-defaulting chain (§ [Projection](#projection)): after the user value / constant-FD / FD-reconstruction / EC-propagation sources, ahead of the base column's declared `default`. It inherits base-column-default determinism rules — a non-deterministic value resolves through the mutation-context envelope. An entry naming a column that is neither a base column nor a base-lineage view column is a hard sited diagnostic at write time; the read-only `view_info` surface conservatively *skips* such an entry instead (never-throw posture), so `is_insertable_into` stays honest-conservative.
+
+The clause is accepted identically by `create materialized view` (every MV is a single-source passthrough, so MV write-through shares the same rewrite spine; the defaulted source column is transparent to row-time backing maintenance) and by declarative `view` / `materialized view` items, and it round-trips through `export_schema` and the declarative renderers.
+
+Two tag forms interact with the clause during the deprecation window (see the table below): the **statement-level** `default_for` tag remains the per-statement override and wins over the clause for that statement's duration; the **view-DDL** `default_for` tag is deprecated — the clause shadows it per column — and is removed by the chained `remove-view-default-for-tag` work.
+
 ## Tags: The Override Surface
 
-Default propagation is deterministic and predicate-honest, and there is exactly **one** override mechanism left in the `quereus.update.*` namespace: `default_for.<column>`, which supplies a *value* for an omitted insert column. **Write routing is no longer a tag.** It is expressed three ways, in order of precedence:
+Default propagation is deterministic and predicate-honest, and there is exactly **one** override mechanism left in the `quereus.update.*` namespace: `default_for.<column>`, which supplies a *value* for an omitted insert column — first-class at the view as the `insert defaults` clause (§ [View insert defaults](#view-insert-defaults)); the tag spelling survives at the statement site as the per-statement override (the view-DDL tag site is deprecated-pending-removal). **Write routing is no longer a tag.** It is expressed three ways, in order of precedence:
 
 1. **Predicates** rule — narrowing the row-identifying predicate to a single branch/side routes there.
 2. **Per-row presence/membership columns** state routing explicitly and writably — the outer-join existence column (`exists … as hasP`, write `false` to delete the matched non-preserved side, `true` to materialize it) and the set-op membership columns (`set inB = false` to drop a branch). These are real, writable view columns, so the routing lives in the data shape and is self-documenting.
@@ -704,7 +719,7 @@ Tags are collected at two sites: the view DDL (`ViewSchema.tags`, validated `vie
 
 | Tag | Where | Effect |
 |---|---|---|
-| `"quereus.update.default_for.<column>"` | view DDL, projection, dml statement | Default expression for `insert` through the view when the column is omitted. The expression may reference any surviving column. A statement-level binding overrides the view-level default for that statement. |
+| `"quereus.update.default_for.<column>"` | view DDL *(deprecated)*, projection *(deprecated)*, dml statement | Default expression for `insert` through the view when the column is omitted. The expression may reference any surviving column. A statement-level binding overrides the view's declared default (clause or tag) for that statement. |
 
 `default_for` is the **only** retained `quereus.update.*` key. A statement-level binding appears in a `with tags (...)` clause on the statement, where a `with context (...)` clause would sit (before `set` / the `values` source / `where`, or trailing):
 
@@ -712,7 +727,7 @@ Tags are collected at two sites: the view DDL (`ViewSchema.tags`, validated `vie
 insert into v with tags ("quereus.update.default_for.created" = 'epoch_ms(''now'')') values (...);
 ```
 
-A `default_for` value is a TEXT **expression** (parsed as SQL), so a non-literal must be SQL-quoted as shown. Statement-level tags override view-level tags for the duration of the statement.
+A `default_for` value is a TEXT **expression** (parsed as SQL), so a non-literal must be SQL-quoted as shown. Per omitted column, precedence among the default sources is: statement-level tag → `insert defaults` clause → view-level tag (deprecated; shadowed by the clause when both name the same column — the overlap exists only until `remove-view-default-for-tag` deletes the view-DDL tag site).
 
 ## Multi-Base-Table Mutations
 
@@ -887,7 +902,7 @@ Each row exposes the per-view propagation summary (`'YES'` / `'NO'` text to matc
 |---|---|
 | `schema` | schema name (`main`, `temp`, …). |
 | `name` | view name. |
-| `is_insertable_into` | `'YES'` if every `not null`-without-declared-default, non-generated base column of every reachable base has a recoverable value — projected, or a recoverable default (constant-FD selection pin / declared base default / `default_for`). |
+| `is_insertable_into` | `'YES'` if every `not null`-without-declared-default, non-generated base column of every reachable base has a recoverable value — projected, or a recoverable default (constant-FD selection pin / declared base default / view-declared insert default). |
 | `is_updatable` | `'YES'` if at least one output column has `base` lineage. Per-column updateability is exposed by the companion `column_info(name)` TVF. |
 | `is_deletable` | `'YES'` if the row-identifying predicate is constructible at every base reachable from the view — operationally, every reachable base's PK columns are exposed through `base` lineage. |
 | `effective_targets` | JSON array of base-table names that mutations through the view may touch by default (`'[]'` when none). |

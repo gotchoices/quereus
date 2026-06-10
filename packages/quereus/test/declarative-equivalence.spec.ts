@@ -748,6 +748,33 @@ describe('declarative-equivalence: views', () => {
 			],
 		});
 	});
+
+	it('view with insert defaults clause — schema field and write-through agree on both paths', async function () {
+		await runCase({
+			name: 'view-insert-defaults',
+			directDDL: [
+				'create table dfl (id integer primary key, name text, created integer not null)',
+				'create view dfl_v as select id, name from dfl insert defaults (created = 424242)',
+			],
+			declarativeBody: `table dfl { id INTEGER PRIMARY KEY, name TEXT, created INTEGER NOT NULL }
+
+			view dfl_v as
+				select id, name from dfl insert defaults (created = 424242)`,
+			expectTables: ['dfl'],
+			expectViews: ['dfl_v'],
+			// Write THROUGH the view on both paths — the clause must supply the
+			// omitted not-null `created` on the direct and the applied DB alike.
+			postSetup: [
+				"insert into dfl_v values (1, 'alpha')",
+			],
+			probes: [
+				{
+					sql: 'select id, name, created from dfl order by id',
+					expect: { rows: [{ id: 1, name: 'alpha', created: 424242 }] },
+				},
+			],
+		});
+	});
 });
 
 // ============================================================================

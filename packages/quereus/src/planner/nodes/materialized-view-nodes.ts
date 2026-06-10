@@ -25,6 +25,7 @@ export class CreateMaterializedViewNode extends VoidNode {
 		public readonly bodySql: string,
 		/** Original full DDL text (round-trippable). */
 		public readonly sql: string,
+		public readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>,
 		public readonly tags?: Readonly<Record<string, SqlValue>>,
 	) {
 		super(scope, 1); // Low cost for DDL operations

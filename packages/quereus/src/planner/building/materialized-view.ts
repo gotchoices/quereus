@@ -61,6 +61,7 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 		stmt.select,
 		bodySql,
 		sql,
+		stmt.insertDefaults,
 		stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
 	);
 }

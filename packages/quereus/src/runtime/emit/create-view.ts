@@ -32,6 +32,7 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 			sql: plan.sql,
 			selectAst: plan.selectStmt,
 			columns: plan.columns,
+			insertDefaults: plan.insertDefaults,
 			tags: plan.tags,
 		};
 

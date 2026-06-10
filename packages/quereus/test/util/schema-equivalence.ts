@@ -225,6 +225,9 @@ export function assertViewSchemaEqual(direct: ViewSchema, applied: ViewSchema, l
 	// View body — structural compare via assertAstEquivalent.
 	try {
 		assertAstEquivalent(direct.selectAst, applied.selectAst, `${root}selectAst`);
+		// `insert defaults (col = expr, …)` — entries carry AST expressions, so the
+		// same structural comparator applies (missing ≡ empty array).
+		assertAstEquivalent(direct.insertDefaults ?? [], applied.insertDefaults ?? [], `${root}insertDefaults`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		expect.fail(msg);
@@ -249,6 +252,7 @@ export function assertMaterializedViewSchemaEqual(direct: MaterializedViewSchema
 	eq(direct.bodyHash, applied.bodyHash, `${root}bodyHash`);
 	try {
 		assertAstEquivalent(direct.selectAst, applied.selectAst, `${root}selectAst`);
+		assertAstEquivalent(direct.insertDefaults ?? [], applied.insertDefaults ?? [], `${root}insertDefaults`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		expect.fail(msg);

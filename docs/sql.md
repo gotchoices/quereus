@@ -1412,6 +1412,7 @@ A view is a named query. Selecting from it re-evaluates the body on every refere
 ```sql
 create view [if not exists] view_name [(column[, ...])]
   as query_expr
+[insert defaults (column = expr [, ...])]
 [with tags (key = value [, ...])]
 
 drop view [if exists] view_name;
@@ -1419,12 +1420,15 @@ drop view [if exists] view_name;
 
 - `query_expr` is any relation-producing expression — a `select`, a `values (...)`, or a `with … select`. A **DML body** (`insert`/`update`/`delete … returning`) is **rejected at create time**: a view re-evaluates per reference, so a write-per-read body is incoherent.
 - An optional column list renames the body's output columns (arity must match).
+- `insert defaults (col = expr, ...)` declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; the target is resolved (and a typo rejected) at write time, not at create.
 - `with tags (...)` attaches metadata; the reserved `quereus.update.*` namespace influences write-through (see [§2.9](#29-updatable-views)).
 
 **Examples:**
 ```sql
 create view ActiveUsers as select * from Users where active = 1;
 create view UserNames(uid, label) as select id, name from Users;
+create view NewUsers(uid, label) as select id, name from Users
+  insert defaults (created = epoch_ms('now'));
 drop view if exists ActiveUsers;
 ```
 
@@ -1439,7 +1443,7 @@ Reads and writes through a view report the *base* table(s) to `getChangeScope()`
 - A **passthrough or renamed** column (`c`, `c as alias`) routes the value straight to its base column — writable on both `insert` and `update`.
 - An **invertible-expression** column (`v + 1 as w`) is writable on `update` (the assignment is lowered through the inverse: `set w = 9` ⇒ `set v = 8`). It is **not** insertable.
 - A **computed / non-invertible** column (`lower(name)`, a window or aggregate output) is **read-only**; writing it raises the `no-inverse` diagnostic.
-- A column **omitted** from an `insert` but pinned by an equality predicate is supplied automatically: `create view GreenMen as select * from Men where color = 'green'` lets `insert into GreenMen (name) values ('Bob')` default `color` to `'green'`. Base-column `default`s fill the rest; a `not null` column with no available value is rejected.
+- A column **omitted** from an `insert` but pinned by an equality predicate is supplied automatically: `create view GreenMen as select * from Men where color = 'green'` lets `insert into GreenMen (name) values ('Bob')` default `color` to `'green'`. A view-declared `insert defaults (col = expr, ...)` entry fills a still-omitted column next (ahead of the base column's declared `default` — the dominant use is a base column the view projects away); base-column `default`s fill the rest; a `not null` column with no available value is rejected.
 - A top-level reference in `where` / `set` / `returning` must name a **view** column — a base column the view projects away does not silently resolve (`unknown-view-column`).
 
 ```sql
@@ -1453,11 +1457,11 @@ delete from GreenMen where id = 7;                    -- routes to Men
 
 **`returning`** through a view projects rows through the *view's* column list, evaluated against post-mutation state (single-source all ops; multi-source `update` / `delete`).
 
-**Override tag (`quereus.update.*`).** Write *routing* is not a tag — it is expressed by predicates and per-row writable **presence/membership columns** (the outer-join existence column, the set-op membership columns). The sole retained `quereus.update.*` tag supplies a *value*:
+**Insert defaults and the override tag (`quereus.update.*`).** A view declares omitted-insert defaults first-class via the trailing `insert defaults (col = expr, ...)` clause ([§2.8](#28-create-view-statement)); the expression is evaluated per omitted-insert row, ahead of the base column's declared `default`. Write *routing* is not a tag — it is expressed by predicates and per-row writable **presence/membership columns** (the outer-join existence column, the set-op membership columns). The sole retained `quereus.update.*` tag supplies a *value*, per statement:
 
 | Tag | Effect |
 |---|---|
-| `quereus.update.default_for.<col>` | Default expression for an omitted `insert` column. |
+| `quereus.update.default_for.<col>` | Statement-level default expression for an omitted `insert` column — overrides the view's declared default for that statement. (The view-DDL site of this tag is deprecated; use the `insert defaults` clause, which shadows it.) |
 
 ```sql
 insert into v with tags ("quereus.update.default_for.created" = 'epoch_ms(''now'')') values (...);
@@ -1474,6 +1478,7 @@ A materialized view stores its body in a keyed backing relation kept consistent 
 create materialized view [if not exists] view_name [(column[, ...])]
   [using module_name [(module_args...)]]
   as query_expr
+[insert defaults (column = expr [, ...])]
 [with tags (key = value [, ...])]
 
 refresh materialized view view_name;
@@ -1483,6 +1488,7 @@ drop materialized view [if exists] view_name;
 - The body is evaluated and stored at create; create is all-or-nothing.
 - `refresh` is **not required for currency** (row-time maintenance keeps it live); it is an explicit resync verb, useful after a source *schema* change marks the view `stale`.
 - `using module(...)` is parsed for forward compatibility but v1 always backs the view with the in-memory table module.
+- `insert defaults (col = expr, ...)` carries the same omitted-insert-default semantics as on a plain view ([§2.8](#28-create-view-statement)) — the default is supplied on the rewritten *source* insert and is transparent to row-time backing maintenance.
 - `drop table` / `drop view` reject a materialized-view name and redirect to `drop materialized view` (and vice-versa).
 
 **Eligibility (enforced at create).** Row-time maintenance is only affordable for bodies whose per-write delta is bounded, so the accepted shape is narrow. Eligible bodies:
@@ -4037,14 +4043,16 @@ indexed_column     = column_name [ "collate" collation_name ] [ "asc" | "desc" ]
 /* CREATE VIEW statement */
 create_view_stmt   = "create" "view" [ "if" "not" "exists" ]
                      view_name [ "(" column_name { "," column_name } ")" ] "as" select_stmt
-                     [ tags_clause ] ;
+                     [ insert_defaults_clause ] [ tags_clause ] ;
+
+insert_defaults_clause = "insert" "defaults" "(" column_name "=" expr { "," column_name "=" expr } ")" ;
 
 /* CREATE / REFRESH MATERIALIZED VIEW statements.
    The body is any query expression — a select_stmt, values_stmt, or with_clause select_stmt. */
 create_materialized_view_stmt = "create" "materialized" "view"
                      [ "if" "not" "exists" ] view_name [ "(" column_name { "," column_name } ")" ]
                      [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ] "as" select_stmt
-                     [ tags_clause ] ;
+                     [ insert_defaults_clause ] [ tags_clause ] ;
 
 refresh_materialized_view_stmt = "refresh" "materialized" "view" view_name ;
 

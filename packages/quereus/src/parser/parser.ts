@@ -2682,6 +2682,9 @@ export class Parser {
 		// them (mutating views are out of scope for this milestone).
 		const select = this.parseQueryExpr(withClause, /*requireReturning*/ true);
 
+		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
+		const insertDefaults = this.parseInsertDefaultsClause();
+
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
 		if (this.matchKeyword('WITH')) {
@@ -2698,9 +2701,45 @@ export class Parser {
 			ifNotExists,
 			columns,
 			select,
+			insertDefaults,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
+	}
+
+	/**
+	 * Parse the optional trailing `insert defaults ( col = expr , … )` clause of a
+	 * view / materialized-view definition — per-column omitted-insert defaults for
+	 * write-through (the first-class replacement for the deprecated
+	 * `quereus.update.default_for.<column>` view-DDL tag). Returns undefined when
+	 * the clause is absent. Commits only once DEFAULTS follows INSERT, so a stray
+	 * `insert` after a complete view body still surfaces as the same downstream
+	 * syntax error it did before this clause existed.
+	 */
+	private parseInsertDefaultsClause(): AST.ViewInsertDefault[] | undefined {
+		if (!this.check(TokenType.INSERT)) return undefined;
+		this.advance();
+		if (!this.peekKeyword('DEFAULTS')) {
+			this.current--; // Not our clause — back up the INSERT and stop.
+			return undefined;
+		}
+		this.advance();
+		this.consume(TokenType.LPAREN, "Expected '(' after INSERT DEFAULTS.");
+		const defaults: AST.ViewInsertDefault[] = [];
+		const seen = new Set<string>();
+		do {
+			const columnToken = this.peek();
+			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in INSERT DEFAULTS.");
+			if (seen.has(column.toLowerCase())) {
+				throw this.error(columnToken, `Duplicate column '${column}' in INSERT DEFAULTS.`);
+			}
+			seen.add(column.toLowerCase());
+			this.consume(TokenType.EQUAL, `Expected '=' after INSERT DEFAULTS column '${column}'.`);
+			const expr = this.expression();
+			defaults.push({ column, expr });
+		} while (this.match(TokenType.COMMA));
+		this.consume(TokenType.RPAREN, "Expected ')' after INSERT DEFAULTS list.");
+		return defaults;
 	}
 
 	/**
@@ -2764,6 +2803,9 @@ export class Parser {
 		// DML bodies parse here but the planner rejects them.
 		const select = this.parseQueryExpr(withClause, /*requireReturning*/ true);
 
+		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
+		const insertDefaults = this.parseInsertDefaultsClause();
+
 		// Parse the trailing `with tags (...)` metadata clause.
 		let tags: Record<string, SqlValue> | undefined;
 		while (this.matchKeyword('WITH')) {
@@ -2783,6 +2825,7 @@ export class Parser {
 			select,
 			moduleName,
 			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
+			insertDefaults,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
@@ -3542,6 +3585,9 @@ export class Parser {
 		this.consumeKeyword('AS', "Expected AS before view body in view declaration.");
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 
+		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
+		const insertDefaults = this.parseInsertDefaultsClause();
+
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
 		if (this.matchKeyword('WITH')) {
@@ -3558,6 +3604,7 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			select,
+			insertDefaults,
 			tags
 		};
 
@@ -3602,6 +3649,9 @@ export class Parser {
 		this.consumeKeyword('AS', "Expected AS before view body in materialized view declaration.");
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 
+		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
+		const insertDefaults = this.parseInsertDefaultsClause();
+
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
 		if (this.matchKeyword('WITH')) {
@@ -3620,6 +3670,7 @@ export class Parser {
 			select,
 			moduleName,
 			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
+			insertDefaults,
 			tags
 		};
 

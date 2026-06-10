@@ -24,6 +24,14 @@ export interface ViewSchema {
 	selectAst: AST.QueryExpr;
 	/** Columns explicitly defined in CREATE VIEW (e.g., CREATE VIEW v(a,b) AS...) */
 	columns?: ReadonlyArray<string>; // Optional list of explicitly named columns
+	/**
+	 * Per-column omitted-insert defaults from the `insert defaults (col = expr, …)`
+	 * clause. Consumed by the insert write-through rewrite (step 5 of the
+	 * insert-defaulting precedence chain — docs/view-updateability.md § View insert
+	 * defaults) and by `view_info`'s insertability derivation. Takes precedence over
+	 * the deprecated `quereus.update.default_for.<column>` view-DDL tag.
+	 */
+	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
 }
@@ -60,6 +68,12 @@ export interface MaterializedViewSchema {
 	selectAst: AST.QueryExpr;
 	/** Columns explicitly defined in CREATE MATERIALIZED VIEW (e.g. `mv(a, b)`). */
 	columns?: ReadonlyArray<string>;
+	/**
+	 * Per-column omitted-insert defaults from the `insert defaults (col = expr, …)`
+	 * clause — same semantics as {@link ViewSchema.insertDefaults}; MV write-through
+	 * shares the single-source rewrite spine, so the field is read identically.
+	 */
+	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing). */
 	tags?: Readonly<Record<string, SqlValue>>;
 

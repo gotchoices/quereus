@@ -98,9 +98,20 @@ const EMPTY_RECORD_DEFAULT_FIELDS: Record<string, Set<string>> = {
 
 const POSITIONAL_KEYS = new Set(['loc', 'start', 'end', 'line', 'column', 'offset', 'pos', 'span', 'comments']);
 
+/**
+ * True when `key` holds positional metadata on this node. `column` doubles as a
+ * data field (UPDATE SET assignments, view insert-default entries) — only its
+ * numeric form (loc.start.column) is positional, so string-valued `column`
+ * survives the compare.
+ */
+function isPositionalKey(key: string, value: unknown): boolean {
+	if (!POSITIONAL_KEYS.has(key)) return false;
+	return key !== 'column' || typeof value !== 'string';
+}
+
 const CASE_INSENSITIVE_STRING_KEYS = new Set([
 	'name', 'table', 'schema', 'alias', 'collation',
-	'tableName', 'schemaName', 'columnName',
+	'tableName', 'schemaName', 'columnName', 'column',
 	'oldName', 'newName', 'savepoint',
 	'moduleName',
 	'targetType',
@@ -110,7 +121,7 @@ const CASE_INSENSITIVE_STRING_KEYS = new Set([
 function normalize(value: unknown, key: string, parentType?: string): unknown {
 	if (value === null || value === undefined) return value;
 
-	if (POSITIONAL_KEYS.has(key)) return undefined;
+	if (isPositionalKey(key, value)) return undefined;
 	// Drop lexeme on literals — parser sets it conditionally; storage class is captured by `value`'s typeof.
 	if (key === 'lexeme' && parentType === 'literal') return undefined;
 
@@ -296,7 +307,7 @@ export function astEquivalent(
 	const meaningfulKeys = (obj: Record<string, unknown>): Set<string> => {
 		const out = new Set<string>();
 		for (const k of Object.keys(obj)) {
-			if (POSITIONAL_KEYS.has(k)) continue;
+			if (isPositionalKey(k, obj[k])) continue;
 			if (k === 'lexeme' && obj['type'] === 'literal') continue;
 			// Drop tags if it's an empty record — emitter omits empty WITH TAGS.
 			if (k === 'tags' && obj[k] && typeof obj[k] === 'object' && Object.keys(obj[k] as object).length === 0) continue;
