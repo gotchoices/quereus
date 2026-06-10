@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst } from './rename-rewriter.js';
+import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, collectFromTableNames } from './rename-rewriter.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
@@ -974,38 +974,6 @@ function declaredIndexCanonicalBody(
 		where = clone;
 	}
 	return createIndexBodyToCanonicalString({ ...indexStmt, columns, where });
-}
-
-/**
- * Lowercased table names referenced by the top-level FROM of a view body
- * (recursing into joins and compound tails, NOT into subqueries). These are the
- * tables an `insert defaults` clause's columns can belong to — the clause's
- * `column` names a BASE-TABLE column of the view's FROM table (often projected
- * away, so the select-body rewrite cannot catch it) and its `expr` evaluates in
- * that base table's inserted-row context. Collected from the ORIGINAL declared
- * body (declared/new names — the key `columnRenamesByTable` uses), before any
- * inverse table rename rewrites the references to their old forms.
- */
-function collectFromTableNames(query: AST.QueryExpr): Set<string> {
-	const names = new Set<string>();
-	const visitFrom = (item: AST.FromClause): void => {
-		if (item.type === 'table') {
-			names.add((item as AST.TableSource).table.name.toLowerCase());
-		} else if (item.type === 'join') {
-			const join = item as AST.JoinClause;
-			visitFrom(join.left);
-			visitFrom(join.right);
-		}
-	};
-	const visitQuery = (q: AST.QueryExpr | undefined): void => {
-		if (!q || q.type !== 'select') return;
-		const stmt = q as AST.SelectStmt;
-		(stmt.from ?? []).forEach(visitFrom);
-		visitQuery(stmt.union);
-		if (stmt.compound) visitQuery(stmt.compound.select);
-	};
-	visitQuery(query);
-	return names;
 }
 
 /**

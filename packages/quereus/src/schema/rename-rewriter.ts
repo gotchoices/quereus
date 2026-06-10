@@ -875,6 +875,110 @@ function isResultColumnExposure(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// `insert defaults` clause (views / materialized views)
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Lowercased table names referenced by the top-level FROM of a view body
+ * (recursing into joins and compound tails, NOT into subqueries). These are the
+ * tables an `insert defaults` clause's columns can belong to — the clause's
+ * `column` names a BASE-TABLE column of the view's FROM table (often projected
+ * away, so the select-body rewrite cannot catch it) and its `expr` evaluates in
+ * that base table's inserted-row context. A column rename never changes table
+ * names, so the forward rename propagation can collect before or after its
+ * body rewrite; the differ's inverse path collects from the ORIGINAL declared
+ * body (declared/new names — the key its rename map uses) BEFORE its inverse
+ * table pass rewrites the references to their old forms.
+ */
+export function collectFromTableNames(query: AST.QueryExpr): Set<string> {
+	const names = new Set<string>();
+	const visitFrom = (item: AST.FromClause): void => {
+		if (item.type === 'table') {
+			names.add((item as AST.TableSource).table.name.toLowerCase());
+		} else if (item.type === 'join') {
+			const join = item as AST.JoinClause;
+			visitFrom(join.left);
+			visitFrom(join.right);
+		}
+	};
+	const visitQuery = (q: AST.QueryExpr | undefined): void => {
+		if (!q || q.type !== 'select') return;
+		const stmt = q as AST.SelectStmt;
+		(stmt.from ?? []).forEach(visitFrom);
+		visitQuery(stmt.union);
+		if (stmt.compound) visitQuery(stmt.compound.select);
+	};
+	visitQuery(query);
+	return names;
+}
+
+/**
+ * Table rename over a view's `insert defaults` clause: descend into each
+ * entry's `expr` (a subquery inside it may reference any table); the entry's
+ * `column` names a base COLUMN, untouched by a table rename. Exprs are
+ * mutated in place (consistent with the body `selectAst` handling); the input
+ * array is returned as-is. Returns null when the clause is empty/undefined.
+ */
+export function renameTableInInsertDefaults(
+	defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+	oldName: string,
+	newName: string,
+	defaultSchemaName: string,
+): { defaults: ReadonlyArray<AST.ViewInsertDefault>; changed: boolean } | null {
+	if (!defaults || defaults.length === 0) return null;
+	let changed = false;
+	for (const d of defaults) {
+		if (renameTableInAst(d.expr, oldName, newName, defaultSchemaName)) changed = true;
+	}
+	return { defaults, changed };
+}
+
+/**
+ * Column rename over a view's `insert defaults` clause — the forward mirror of
+ * the differ's inverse reconciliation (`reconciledDeclaredViewDefinition`):
+ *
+ * - `column` names a base column of the view's FROM table, so it rewrites when
+ *   the renamed table is among `fromTables` and the name matches `oldColName`
+ *   case-insensitively.
+ * - `expr` evaluates in the FROM table's inserted-row context — exactly a
+ *   CHECK expression's scope — so when the renamed table is a FROM table it
+ *   gets the seeded {@link renameColumnInCheckExpression} walk; otherwise the
+ *   plain scope-aware {@link renameColumnInAst} still catches subquery
+ *   references to an unrelated renamed table.
+ *
+ * The same-schema gate is the caller's responsibility. Exprs are mutated in
+ * place; the returned array is fresh only so a changed `column` string can be
+ * swapped without mutating the (frozen) input entries. Returns null when the
+ * clause is empty/undefined.
+ */
+export function renameColumnInInsertDefaults(
+	defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+	fromTables: ReadonlySet<string>,
+	tableName: string,
+	oldColName: string,
+	newColName: string,
+	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): { defaults: ReadonlyArray<AST.ViewInsertDefault>; changed: boolean } | null {
+	if (!defaults || defaults.length === 0) return null;
+	const isFromTable = fromTables.has(tableName.toLowerCase());
+	const oldColLower = oldColName.toLowerCase();
+	let changed = false;
+	const rewritten = defaults.map(d => {
+		const exprChanged = isFromTable
+			? renameColumnInCheckExpression(d.expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource)
+			: renameColumnInAst(d.expr, tableName, oldColName, newColName, defaultSchemaName);
+		if (exprChanged) changed = true;
+		if (isFromTable && d.column.toLowerCase() === oldColLower) {
+			changed = true;
+			return { ...d, column: newColName };
+		}
+		return d;
+	});
+	return { defaults: rewritten, changed };
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Self-qualifier strip (CHECK expressions)
 // ──────────────────────────────────────────────────────────────────────
 

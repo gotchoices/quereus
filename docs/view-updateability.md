@@ -701,6 +701,8 @@ Each entry names a base column the view projects away (the dominant case — the
 
 The clause is accepted identically by `create materialized view` (every MV is a single-source passthrough, so MV write-through shares the same rewrite spine; the defaulted source column is transparent to row-time backing maintenance) and by declarative `view` / `materialized view` items, and it round-trips through `export_schema` and the declarative renderers.
 
+The clause **rides `ALTER TABLE … RENAME TO / RENAME COLUMN` propagation** alongside the body: a rename of a FROM-table base column rewrites the entry's target `column` (the dominant projected-away case, which the body rewrite alone would never touch), and a renamed table or column inside an entry's `expr` subquery rewrites scope-aware — when the renamed table is a FROM table the expr gets the CHECK-expression seed, since it evaluates in that base table's inserted-row context (`renameTableInInsertDefaults` / `renameColumnInInsertDefaults` in `schema/rename-rewriter.ts`; the declarative differ applies the same logic inversely when reconciling a declared definition against a not-yet-renamed catalog). A clause-only rewrite (body untouched) still fires exactly one `view_modified` / `materialized_view_modified`, so the regenerated DDL, the MV's `bodyHash`, and a store-backed catalog all carry the new name.
+
 The clause is the **only** insert-default surface. Its precursor — the `quereus.update.default_for.<column>` reserved tag, at both its view-DDL and statement-level sites — has been removed: a stray occurrence is an `unknown-reserved-tag` error like any other retired key. A per-statement default has no replacement surface; supply the column an explicit value in the insert instead.
 
 ## Tags

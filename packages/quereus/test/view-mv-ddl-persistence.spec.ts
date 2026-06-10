@@ -24,7 +24,8 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { generateViewDDL, generateMaterializedViewDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
-import { backingTableNameFor, type ViewSchema, type MaterializedViewSchema } from '../src/schema/view.js';
+import { backingTableNameFor, computeBodyHash, type ViewSchema, type MaterializedViewSchema } from '../src/schema/view.js';
+import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
 import type { SchemaChangeEvent } from '../src/schema/change-events.js';
 
 async function rows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
@@ -597,6 +598,43 @@ describe('view persistence: RENAME rewrites a view body and fires view_modified'
 		}
 	});
 
+	it('clause-only column rename (defaulted column projected away) fires one view_modified with rewritten insert defaults', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, name text, created integer not null)');
+			await db.exec('create view v as select id, name from t insert defaults (created = 99)');
+			const events = await captureEvents(db, () => db.exec('alter table t rename column created to created_at'));
+
+			// The body never names `created`, so this is a pure clause rewrite — it
+			// must still fire exactly one view_modified for the store re-persist.
+			const modified = viewModifiedFor(events, 'v');
+			expect(modified, 'exactly one view_modified for v').to.have.length(1);
+			const ddl = generateViewDDL(modified[0].newObject);
+			expect(ddl, 'rewritten DDL names the new clause target').to.match(/insert defaults \(created_at = 99\)/);
+			expect(ddl, 'old clause target gone').to.not.match(/created\s*=/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('table rename inside an insert defaults expr subquery fires one view_modified with rewritten DDL', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table audit (c integer primary key)');
+			await db.exec('create table t (id integer primary key, ts integer not null)');
+			await db.exec('create view v as select id from t insert defaults (ts = (select max(c) from audit))');
+			const events = await captureEvents(db, () => db.exec('alter table audit rename to audit2'));
+
+			const modified = viewModifiedFor(events, 'v');
+			expect(modified, 'exactly one view_modified for v').to.have.length(1);
+			const ddl = generateViewDDL(modified[0].newObject);
+			expect(ddl, 'rewritten DDL references the new table inside the expr subquery').to.match(/\baudit2\b/);
+			expect(ddl, 'old table name gone').to.not.match(/\baudit\b/);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('two dependent views → two view_modified events, each with rewritten DDL', async () => {
 		const db = new Database();
 		try {
@@ -665,6 +703,51 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			const ddl = generateMaterializedViewDDL(modified[0].newObject);
 			expect(ddl, 'regenerated DDL references the new column name').to.match(/\bw\b/);
 			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('clause-only column rename fires one materialized_view_modified; DDL, sql, and bodyHash carry the rewritten clause', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, name text, created integer not null)');
+			await db.exec('create materialized view mv as select id, name from t insert defaults (created = 55)');
+			const events = await captureEvents(db, () => db.exec('alter table t rename column created to created_at'));
+
+			// The body never names `created` — pre-fix the propagation `continue`d
+			// here and the catalog/DDL kept the stale clause.
+			const modified = mvModifiedFor(events, 'mv');
+			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
+			const mv = modified[0].newObject;
+			const ddl = generateMaterializedViewDDL(mv);
+			expect(ddl, 'regenerated DDL names the new clause target').to.match(/insert defaults \(created_at = 55\)/);
+			expect(ddl, 'old clause target gone').to.not.match(/created\s*=/);
+			expect(mv.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
+			// The hash must be computed from the POST-rename clause — exactly what
+			// the differ recomputes from the post-rename declared form.
+			expect(mv.bodyHash, 'bodyHash hashes the rewritten clause').to.equal(
+				computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.selectAst, mv.insertDefaults)));
+			expect(mv.stale, 'MV stays live after a clause-only rewrite').to.not.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('table rename inside an MV insert defaults expr subquery fires one event with rewritten DDL', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table audit (c integer primary key)');
+			await db.exec('create table t (id integer primary key, ts integer not null)');
+			await db.exec('create materialized view mv as select id from t insert defaults (ts = (select max(c) from audit))');
+			const events = await captureEvents(db, () => db.exec('alter table audit rename to audit2'));
+
+			const modified = mvModifiedFor(events, 'mv');
+			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
+			const ddl = generateMaterializedViewDDL(modified[0].newObject);
+			expect(ddl, 'regenerated DDL references the new table inside the expr subquery').to.match(/\baudit2\b/);
+			expect(ddl, 'old table name gone').to.not.match(/\baudit\b/);
+			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL').to.equal(ddl);
 		} finally {
 			await db.close();
 		}

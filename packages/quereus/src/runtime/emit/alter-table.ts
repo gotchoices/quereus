@@ -12,7 +12,7 @@ import { validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints,
 import type { ColumnDef } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
-import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames } from '../../schema/rename-rewriter.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
@@ -1343,13 +1343,18 @@ async function propagateTableRenameInSchema(
 
 	if (schema.name.toLowerCase() === renamedSchemaLower) {
 		for (const view of Array.from(schema.getAllViews())) {
-			const changed = renameTableInAst(view.selectAst, oldName, newName, renamedSchemaName);
-			if (changed) {
+			const bodyChanged = renameTableInAst(view.selectAst, oldName, newName, renamedSchemaName);
+			// An `insert defaults` expr subquery can reference the renamed table even
+			// when the body never names it, so a clause-only rewrite must still fire
+			// the (single) view_modified below.
+			const clause = renameTableInInsertDefaults(view.insertDefaults, oldName, newName, renamedSchemaName);
+			if (bodyChanged || clause?.changed) {
 				const updatedView = { ...view, sql: astToString(view.selectAst) };
 				schema.addView(updatedView);
-				// `renameTableInAst` mutated `view.selectAst` in place, so `oldObject`
-				// shares the rewritten AST (only `newObject.sql` differs). No consumer
-				// reads `oldObject.selectAst`; mirrors the table loop above (no clone).
+				// The rewriters mutated `view.selectAst` / the clause exprs in place, so
+				// `oldObject` shares the rewritten ASTs (only `newObject.sql` differs).
+				// No consumer reads `oldObject.selectAst`; mirrors the table loop above
+				// (no clone).
 				notifier.notifyChange({
 					type: 'view_modified',
 					schemaName: schema.name,
@@ -1461,13 +1466,23 @@ async function propagateColumnRenameInSchema(
 
 	if (schema.name.toLowerCase() === renamedSchemaLower) {
 		for (const view of Array.from(schema.getAllViews())) {
-			const changed = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, renamedSchemaName);
-			if (changed) {
-				const updatedView = { ...view, sql: astToString(view.selectAst) };
+			const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, renamedSchemaName);
+			// `insert defaults` targets a base column of the view's FROM table —
+			// usually projected away, so the body rewrite alone never sees it. The
+			// FROM-table set scopes the clause rewrite; collecting it after the body
+			// rewrite is safe (a column rename never changes table names).
+			const clause = view.insertDefaults?.length
+				? renameColumnInInsertDefaults(view.insertDefaults, collectFromTableNames(view.selectAst), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
+				: null;
+			if (bodyChanged || clause?.changed) {
+				const updatedView = clause?.changed
+					? { ...view, insertDefaults: clause.defaults, sql: astToString(view.selectAst) }
+					: { ...view, sql: astToString(view.selectAst) };
 				schema.addView(updatedView);
-				// `renameColumnInAst` mutated `view.selectAst` in place, so `oldObject`
-				// shares the rewritten AST (only `newObject.sql` differs). No consumer
-				// reads `oldObject.selectAst`; mirrors the table loop above (no clone).
+				// The rewriters mutated `view.selectAst` / the clause exprs in place, so
+				// `oldObject` shares the rewritten ASTs (only `sql` — and the clause
+				// array when a `column` entry changed — differ). No consumer reads
+				// `oldObject.selectAst`; mirrors the table loop above (no clone).
 				notifier.notifyChange({
 					type: 'view_modified',
 					schemaName: schema.name,
@@ -1483,7 +1498,7 @@ async function propagateColumnRenameInSchema(
 		// row-time re-registration, staleness discipline (the listener marked every
 		// dependent MV stale during the rename's notify; only statement-local
 		// staleness is cleared, per the pre-statement snapshot).
-		await propagateColumnRenameToMaterializedViews(db, schema, renamedSchemaName, tableName, oldCol, newCol, preStaleMvs);
+		await propagateColumnRenameToMaterializedViews(db, schema, renamedSchemaName, tableName, oldCol, newCol, preStaleMvs, resolveColumnInSource);
 	}
 }
 
