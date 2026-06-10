@@ -264,6 +264,7 @@ console.log(hasIsolation(isolatedModule)); // true
 | `IterateOptions` | Iteration options (type) |
 | `StoreModule` | Generic VirtualTableModule |
 | `StoreTable` | Virtual table implementation |
+| `resolvePkKeyCollations` | Per-PK-column key collations (pass to `buildDataKey`/`buildIndexKey` to match `StoreTable`'s key bytes) |
 | `StoreConnection` | Transaction connection |
 | `TransactionCoordinator` | Transaction management |
 | `StoreEventEmitter` | Event system for data/schema changes |

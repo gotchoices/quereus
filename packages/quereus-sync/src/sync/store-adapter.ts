@@ -8,7 +8,7 @@
 
 import type { Database, SqlValue, Row, TableSchema } from '@quereus/quereus';
 import type { KVStore, StoreEventEmitter } from '@quereus/store';
-import { buildDataKey, serializeRow, deserializeRow } from '@quereus/store';
+import { buildDataKey, resolvePkKeyCollations, serializeRow, deserializeRow } from '@quereus/store';
 import type {
   ApplyToStoreCallback,
   ApplyToStoreOptions,
@@ -215,7 +215,8 @@ async function applyRowChanges(
 
   const encodeOptions = { collation };
   const pkDirections = tableSchema.primaryKeyDefinition.map(p => !!p.desc);
-  const dataKey = buildDataKey(pk, encodeOptions, pkDirections);
+  const pkCollations = resolvePkKeyCollations(tableSchema.primaryKeyDefinition, tableSchema.columns, collation);
+  const dataKey = buildDataKey(pk, encodeOptions, pkDirections, pkCollations);
 
   // Check for delete operations first
   const deleteChange = changes.find(c => c.type === 'delete');

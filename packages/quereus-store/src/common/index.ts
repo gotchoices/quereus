@@ -92,6 +92,7 @@ export { CachedKVStore, type CacheOptions } from './cached-kv-store.js';
 // Generic store table and connection
 export {
   StoreTable,
+  resolvePkKeyCollations,
   type StoreTableConfig,
   type StoreTableModule,
 } from './store-table.js';

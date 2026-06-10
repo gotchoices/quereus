@@ -871,8 +871,8 @@ describe('Sync Protocol E2E', () => {
         schemaName: 'main',
         name: 'test',
         columns: [
-          { name: 'id' },
-          { name: 'value' },
+          { name: 'id', logicalType: { isTextual: false } },
+          { name: 'value', logicalType: { isTextual: true } },
         ],
         primaryKeyDefinition: [{ index: 0, desc: false }],
         columnIndexMap: new Map([
@@ -986,8 +986,8 @@ describe('Sync Protocol E2E', () => {
         schemaName: 'main',
         name: 'test',
         columns: [
-          { name: 'id' },
-          { name: 'value' },
+          { name: 'id', logicalType: { isTextual: false } },
+          { name: 'value', logicalType: { isTextual: true } },
         ],
         primaryKeyDefinition: [{ index: 0, desc: false }],
         columnIndexMap: new Map([
@@ -1112,8 +1112,8 @@ describe('Sync Protocol E2E', () => {
         schemaName: 'main',
         name: 'test',
         columns: [
-          { name: 'id' },
-          { name: 'value' },
+          { name: 'id', logicalType: { isTextual: false } },
+          { name: 'value', logicalType: { isTextual: true } },
         ],
         primaryKeyDefinition: [{ index: 0, desc: false }],
         columnIndexMap: new Map([
