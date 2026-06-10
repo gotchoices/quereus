@@ -481,6 +481,38 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Returns the connected StoreTable for `schemaName.tableName`, lazily
+	 * reconnecting from the engine's schema registry when absent.
+	 *
+	 * `renameTable` evicts the old key from `this.tables` and expects the next
+	 * `connect()` to repopulate under the new name, but `apply schema` can run
+	 * follow-up DDL (ALTER TABLE, CREATE/DROP INDEX) against the new name
+	 * without an intervening connect. Mirror connect()'s schemaManager lookup
+	 * so that DDL finds the moved table. Safe for the index paths because
+	 * SchemaManager calls the module BEFORE mutating the registered table
+	 * schema, so the reconnected cache matches what a connected instance holds.
+	 */
+	private getOrReconnectTable(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+		let table = this.tables.get(tableKey);
+		if (!table) {
+			const registeredSchema = db.schemaManager.getTable(schemaName, tableName);
+			if (registeredSchema) {
+				table = new StoreTable(
+					db,
+					this,
+					registeredSchema,
+					this.parseConfig(registeredSchema.vtabArgs ?? {}),
+					this.eventEmitter,
+					true, // isConnected - DDL already exists in storage
+				);
+				this.tables.set(tableKey, table);
+			}
+		}
+		return table;
+	}
+
+	/**
 	 * Creates an index on a store-backed table.
 	 */
 	async createIndex(
@@ -490,7 +522,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		indexSchema: TableIndexSchema
 	): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		const table = this.tables.get(tableKey);
+		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
 		if (!table) {
 			throw new QuereusError(
@@ -562,13 +594,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * cached index-store handle, and tears down the underlying index store.
 	 */
 	async dropIndex(
-		_db: Database,
+		db: Database,
 		schemaName: string,
 		tableName: string,
 		indexName: string,
 	): Promise<void> {
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		const table = this.tables.get(tableKey);
+		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
 		if (!table) {
 			throw new QuereusError(
@@ -814,26 +845,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	): Promise<TableSchema> {
 		this.ensureSchemaSubscription(db);
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		// Lazy-connect: `renameTable` evicts the old key from `this.tables` and
-		// expects the next `connect()` to repopulate under the new name, but
-		// `apply schema` can call `alterTable` immediately after a rename without
-		// an intervening connect. Mirror connect()'s schemaManager lookup so the
-		// follow-up ALTER finds the moved table.
-		let table = this.tables.get(tableKey);
-		if (!table) {
-			const registeredSchema = db.schemaManager.getTable(schemaName, tableName);
-			if (registeredSchema) {
-				table = new StoreTable(
-					db,
-					this,
-					registeredSchema,
-					this.parseConfig(registeredSchema.vtabArgs ?? {}),
-					this.eventEmitter,
-					true, // isConnected - DDL already exists in storage
-				);
-				this.tables.set(tableKey, table);
-			}
-		}
+		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
 		if (!table) {
 			throw new QuereusError(
