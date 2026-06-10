@@ -263,6 +263,17 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 	const sm = db.schemaManager;
 
 	const shape = deriveBackingShape(db, def.bodySql, def.columns);
+	// Build-time creation already validated declared-column arity (with a
+	// build-located diagnostic); this guards the import path, where the only
+	// earlier gate is the parser. Lives here — not in deriveBackingShape — because
+	// the refresh path reaches a legitimate mismatch after a source ALTER and has
+	// its own "drop and recreate" diagnostic.
+	if (def.columns && def.columns.length > 0 && def.columns.length !== shape.columns.length) {
+		throw new QuereusError(
+			`materialized view '${def.schemaName}.${def.viewName}' has ${def.columns.length} declared columns but body produces ${shape.columns.length}`,
+			StatusCode.ERROR,
+		);
+	}
 	const backingTableName = backingTableNameFor(def.viewName);
 	const backingSchema = buildBackingTableSchema(db, def.schemaName, backingTableName, shape);
 	const completeBacking = await sm.createBackingTable(backingSchema);

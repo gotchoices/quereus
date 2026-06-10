@@ -2498,6 +2498,17 @@ export class SchemaManager {
 		const targetSchemaName = stmt.view.schema || this.getCurrentSchemaName();
 		const viewName = stmt.view.name;
 
+		// A DML body (insert/update/delete … returning) parses but is un-creatable —
+		// `planViewBody` rejects it at build time. Reject it here too, BEFORE
+		// materializing: a corrupt or hand-edited catalog entry would otherwise
+		// EXECUTE the mutation against live source tables during rehydrate.
+		if (stmt.select.type === 'insert' || stmt.select.type === 'update' || stmt.select.type === 'delete') {
+			throw new QuereusError(
+				`${stmt.select.type.toUpperCase()} cannot be used as a materialized view body`,
+				StatusCode.ERROR,
+			);
+		}
+
 		// Create the schema if absent (mirrors importTable/importView) so an MV
 		// rehydrates even into a schema that holds no tables.
 		this.getOrCreateSchema(targetSchemaName);

@@ -264,6 +264,57 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 			await db.close();
 		}
 	});
+
+	it('a DML body is rejected before materializing — the mutation never executes', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			await db.exec('insert into base values (1, 10), (2, 20)');
+			let threw = false;
+			try {
+				// Parses (the MV grammar accepts any QueryExpr with RETURNING) but is
+				// un-creatable — planViewBody rejects it at build time. Import must
+				// reject it too, BEFORE the fill would execute the delete.
+				await db.schemaManager.importCatalog([
+					'create materialized view mv as delete from base returning *',
+				]);
+			} catch (e) {
+				threw = true;
+				expect((e as Error).message).to.match(/cannot be used as a materialized view body/i);
+			}
+			expect(threw, 'DML body fails the import').to.equal(true);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			// Crucially: the source rows were NOT deleted by the rejected import.
+			expect(await rows(db, 'select id, v from base order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a declared-column arity mismatch fails the import and rolls back', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table base (id integer primary key, v integer)');
+			let threw = false;
+			try {
+				// Un-creatable (the builder validates arity) but a corrupt catalog entry
+				// could carry it; the derive-shape gate rejects it on import.
+				await db.schemaManager.importCatalog([
+					'create materialized view mv (a, b, c) as select id, v from base',
+				]);
+			} catch (e) {
+				threw = true;
+				expect((e as Error).message).to.match(/3 declared columns but body produces 2/i);
+			}
+			expect(threw, 'arity gate fails the import').to.equal(true);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================
