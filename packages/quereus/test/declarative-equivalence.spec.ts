@@ -2975,6 +2975,151 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		}
 	});
 
+	it('a CHECK whose subquery references ANOTHER renamed table emits ONLY the rename (no constraint churn)', async function () {
+		// Cross-table reconcile: the CHECK body on `a` embeds a DIFFERENT table's name
+		// inside a subquery (`select max(cap) from lim`). Renaming lim → lim2 must not
+		// churn a's CHECK — the differ inverse-rewrites ALL in-diff table renames
+		// (mirroring the forward rewriter, which walks every table's CHECKs), not just
+		// the owning table's own rename.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table lim { id INTEGER PRIMARY KEY, cap INTEGER }
+				table a { id INTEGER PRIMARY KEY, qty INTEGER,
+					constraint chk check (qty <= (select max(cap) from lim)) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into lim values (1, 10)');
+
+			// Rename lim → lim2; a's CHECK subquery follows the new name.
+			await db.exec(`declare schema main {
+				table lim2 { id INTEGER PRIMARY KEY, cap INTEGER } with tags ("quereus.previous_name" = 'lim')
+				table a { id INTEGER PRIMARY KEY, qty INTEGER,
+					constraint chk check (qty <= (select max(cap) from lim2)) }
+			}`);
+			const diff = diffOf(db);
+			expect(diff.renames, 'table rename detected').to.deep.include({ kind: 'table', oldName: 'lim', newName: 'lim2' });
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'a');
+			expect(alter?.constraintsToDrop ?? [], 'no spurious cross-table CHECK drop').to.deep.equal([]);
+			expect(alter?.constraintsToAdd ?? [], 'no spurious cross-table CHECK add').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// The forward propagation rewrote the STORED subquery reference (lim → lim2).
+			const chk = collectSchemaCatalog(db, 'main').tables
+				.find(t => t.name.toLowerCase() === 'a')!.namedConstraints
+				.find(c => c.name.toLowerCase() === 'chk')!;
+			expect(chk.definition, 'stored CHECK subquery follows the rename').to.match(/from lim2/i);
+
+			// And the rewritten subquery still ENFORCES against the renamed table.
+			await db.exec('insert into a values (1, 5)');
+			let rejected = false;
+			try { await db.exec('insert into a values (2, 99)'); } catch { rejected = true; }
+			expect(rejected, 'over-cap qty rejected by the CHECK over the renamed table').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK referencing the OWNING and ANOTHER table, both renamed in one diff, does not churn', async function () {
+		// Both halves at once: the owning table's qualified self-reference AND the
+		// cross-table subquery reference each follow their table's rename. The all-
+		// renames inverse loop reconciles both in one pass (each rename's inverse is
+		// independent — resolveRenames makes chains/swaps unrepresentable).
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table lim { id INTEGER PRIMARY KEY, cap INTEGER }
+				table a { id INTEGER PRIMARY KEY, qty INTEGER,
+					constraint chk check (a.qty <= (select max(cap) from lim)) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into lim values (1, 10)');
+
+			// Rename BOTH tables; the CHECK references both new names.
+			await db.exec(`declare schema main {
+				table lim2 { id INTEGER PRIMARY KEY, cap INTEGER } with tags ("quereus.previous_name" = 'lim')
+				table a2 { id INTEGER PRIMARY KEY, qty INTEGER,
+					constraint chk check (a2.qty <= (select max(cap) from lim2)) } with tags ("quereus.previous_name" = 'a')
+			}`);
+			const diff = diffOf(db);
+			expect(diff.renames, 'lim rename detected').to.deep.include({ kind: 'table', oldName: 'lim', newName: 'lim2' });
+			expect(diff.renames, 'a rename detected').to.deep.include({ kind: 'table', oldName: 'a', newName: 'a2' });
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'a2');
+			expect(alter?.constraintsToDrop ?? [], 'no spurious CHECK drop').to.deep.equal([]);
+			expect(alter?.constraintsToAdd ?? [], 'no spurious CHECK add').to.deep.equal([]);
+
+			await db.exec('apply schema main');
+
+			// Both stored references follow their renames.
+			const chk = collectSchemaCatalog(db, 'main').tables
+				.find(t => t.name.toLowerCase() === 'a2')!.namedConstraints
+				.find(c => c.name.toLowerCase() === 'chk')!;
+			expect(chk.definition, 'stored self-qualifier follows the rename').to.match(/a2\.qty/i);
+			expect(chk.definition, 'stored subquery reference follows the rename').to.match(/from lim2/i);
+
+			// And the doubly-rewritten CHECK still ENFORCES.
+			await db.exec('insert into a2 values (1, 5)');
+			let rejected = false;
+			try { await db.exec('insert into a2 values (2, 99)'); } catch { rejected = true; }
+			expect(rejected, 'over-cap qty rejected after both renames').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+			expect(diffOf(db).renames, 'idempotent re-apply produces no further rename').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: a genuine CHECK edit layered on a CROSS-table rename still drops+recreates', async function () {
+		// Precedence guard for the cross-table reconcile: a real body edit (max → min)
+		// coinciding with the referenced table's rename survives the inverse-rewrite
+		// → drop+recreate, alongside the rename.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table lim { id INTEGER PRIMARY KEY, cap INTEGER }
+				table a { id INTEGER PRIMARY KEY, qty INTEGER,
+					constraint chk check (qty <= (select max(cap) from lim)) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into lim values (1, 10), (2, 3)');
+
+			// Rename lim → lim2 AND tighten the predicate (max → min) at once.
+			await db.exec(`declare schema main {
+				table lim2 { id INTEGER PRIMARY KEY, cap INTEGER } with tags ("quereus.previous_name" = 'lim')
+				table a { id INTEGER PRIMARY KEY, qty INTEGER,
+					constraint chk check (qty <= (select min(cap) from lim2)) }
+			}`);
+			const diff = diffOf(db);
+			const alter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'a');
+			expect(alter?.constraintsToDrop, 'genuine body edit drops old chk').to.deep.equal(['chk']);
+			expect(alter?.constraintsToAdd?.length, 'genuine body edit adds new chk').to.equal(1);
+
+			await db.exec('apply schema main');
+
+			// The recreate installed the EDITED predicate against the renamed table.
+			const chk = collectSchemaCatalog(db, 'main').tables
+				.find(t => t.name.toLowerCase() === 'a')!.namedConstraints
+				.find(c => c.name.toLowerCase() === 'chk')!;
+			expect(chk.definition, 'recreated CHECK carries the edited predicate').to.match(/min\(cap\)/i);
+			expect(chk.definition, 'recreated CHECK references the renamed table').to.match(/from lim2/i);
+
+			// And the EDITED boundary enforces: min(cap) = 3, so 3 passes and 5 rejects.
+			await db.exec('insert into a values (1, 3)');
+			let rejected = false;
+			try { await db.exec('insert into a values (2, 5)'); } catch { rejected = true; }
+			expect(rejected, 'qty above min(cap) rejected by the recreated CHECK').to.be.true;
+
+			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('REGRESSION: a genuine ALTER PRIMARY KEY on a self-referential-FK table commits with the deferred self-FK enforced', async function () {
 		// Engine-fix guard (rebuildMemoryTable connection cleanup), isolated from any
 		// column rename. A genuine PK change — here flipping the key to descending —
