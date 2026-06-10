@@ -125,4 +125,25 @@ describe('store-adapter PK key collation', () => {
 		// phantom second copy instead of updating in place.
 		expect(await collect(db, `select x, v from t`)).to.deep.equal([{ x: 'A', v: 'remote' }]);
 	});
+
+	it('composite PK mixes per-column collations with the table-level fallback', async () => {
+		// a → declared BINARY, b → non-text (collation ignored), c → no declared
+		// collation so it falls back to K = NOCASE. The remote pk arrives with a
+		// case-flipped 'z' for c: under the NOCASE fallback it must still address
+		// the row the store keyed for 'Z', while 'A' must match BINARY-exactly.
+		await db.exec(`create table t (a text collate binary, b integer, c text, v text, primary key (a, b, c)) using store`);
+		await db.exec(`insert into t values ('A', 1, 'Z', 'local')`);
+
+		let res = await applyToStore([
+			{ type: 'update', schema: 'main', table: 't', pk: ['A', 1, 'z'], columns: { v: 'remote' } },
+		], [], { remote: true });
+		expect(res.errors).to.have.length(0);
+		expect(await collect(db, `select a, b, c, v from t`)).to.deep.equal([{ a: 'A', b: 1, c: 'Z', v: 'remote' }]);
+
+		res = await applyToStore([
+			{ type: 'delete', schema: 'main', table: 't', pk: ['A', 1, 'z'] },
+		], [], { remote: true });
+		expect(res.errors).to.have.length(0);
+		expect(await collect(db, `select a from t`)).to.deep.equal([]);
+	});
 });

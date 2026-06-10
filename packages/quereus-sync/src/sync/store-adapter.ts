@@ -34,7 +34,12 @@ export interface SyncStoreAdapterOptions {
   events: StoreEventEmitter;
   /** Function to get table schema by name. */
   getTableSchema: (schemaName: string, tableName: string) => TableSchema | undefined;
-  /** Collation for text key encoding. */
+  /**
+   * Table-level key collation K — must match the store module's configured
+   * collation (default 'NOCASE'). A text PK column's own declared collation
+   * overrides K for that column (via `resolvePkKeyCollations`), mirroring how
+   * `StoreTable` keys its rows.
+   */
   collation?: 'BINARY' | 'NOCASE';
 }
 

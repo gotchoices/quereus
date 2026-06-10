@@ -20,7 +20,7 @@ import { StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
 import { generateSiteId } from '../../src/clock/site.js';
 import { compareHLC } from '../../src/clock/hlc.js';
 import type { SyncManager } from '../../src/sync/manager.js';
-import type { SqlValue } from '@quereus/quereus';
+import type { SqlValue, TableSchema } from '@quereus/quereus';
 
 // ============================================================================
 // Test Infrastructure
@@ -87,6 +87,29 @@ class MockDataStore {
   getRow(schema: string, table: string, pk: SqlValue[]): Map<string, SqlValue> | undefined {
     return this.tables.get(`${schema}.${table}`)?.get(JSON.stringify(pk));
   }
+}
+
+/**
+ * Minimal TableSchema stand-in for `main.test (id INTEGER PRIMARY KEY, value TEXT)`.
+ * Carries only the fields the sync paths actually read: identity, columns with
+ * `logicalType.isTextual` (consumed by the store adapter's
+ * `resolvePkKeyCollations`), `primaryKeyDefinition`, and `columnIndexMap`.
+ * If the adapter starts reading more schema fields, extend this one factory.
+ */
+function makeTestTableSchema(): TableSchema {
+  return {
+    schemaName: 'main',
+    name: 'test',
+    columns: [
+      { name: 'id', logicalType: { isTextual: false } },
+      { name: 'value', logicalType: { isTextual: true } },
+    ],
+    primaryKeyDefinition: [{ index: 0, desc: false }],
+    columnIndexMap: new Map([
+      ['id', 0],
+      ['value', 1],
+    ]),
+  } as unknown as TableSchema;
 }
 
 /** Represents a sync replica (host or guest) */
@@ -867,19 +890,7 @@ describe('Sync Protocol E2E', () => {
      */
     it('should sync data through coordinator (full flow simulation)', async function() {
       this.timeout(5000);
-      const tableSchema = {
-        schemaName: 'main',
-        name: 'test',
-        columns: [
-          { name: 'id', logicalType: { isTextual: false } },
-          { name: 'value', logicalType: { isTextual: true } },
-        ],
-        primaryKeyDefinition: [{ index: 0, desc: false }],
-        columnIndexMap: new Map([
-          ['id', 0],
-          ['value', 1],
-        ]),
-      };
+      const tableSchema = makeTestTableSchema();
 
       // Browser A (source)
       const browserAStore = new InMemoryKVStore();
@@ -892,7 +903,7 @@ describe('Sync Protocol E2E', () => {
         config,
         browserASyncEvents,
         browserADataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Coordinator (no schema, no applyToStore - just CRDT metadata)
@@ -918,7 +929,7 @@ describe('Sync Protocol E2E', () => {
         config,
         browserBSyncEvents,
         browserBDataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Step 1: Browser A creates table and inserts row
@@ -982,19 +993,7 @@ describe('Sync Protocol E2E', () => {
     it('should sync data to late-joining browser via getChangesSince', async function() {
       this.timeout(5000);
 
-      const tableSchema = {
-        schemaName: 'main',
-        name: 'test',
-        columns: [
-          { name: 'id', logicalType: { isTextual: false } },
-          { name: 'value', logicalType: { isTextual: true } },
-        ],
-        primaryKeyDefinition: [{ index: 0, desc: false }],
-        columnIndexMap: new Map([
-          ['id', 0],
-          ['value', 1],
-        ]),
-      };
+      const tableSchema = makeTestTableSchema();
 
       // Browser A (source)
       const browserAStore = new InMemoryKVStore();
@@ -1007,7 +1006,7 @@ describe('Sync Protocol E2E', () => {
         config,
         browserASyncEvents,
         browserADataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Coordinator (no schema, no applyToStore - just CRDT metadata)
@@ -1059,7 +1058,7 @@ describe('Sync Protocol E2E', () => {
         config,
         browserBSyncEvents,
         browserBDataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Browser B requests all changes from coordinator (no sinceHLC)
@@ -1108,19 +1107,7 @@ describe('Sync Protocol E2E', () => {
       const syncMetaStore = new InMemoryKVStore();
       const tableDataStore = new InMemoryKVStore();
 
-      const tableSchema = {
-        schemaName: 'main',
-        name: 'test',
-        columns: [
-          { name: 'id', logicalType: { isTextual: false } },
-          { name: 'value', logicalType: { isTextual: true } },
-        ],
-        primaryKeyDefinition: [{ index: 0, desc: false }],
-        columnIndexMap: new Map([
-          ['id', 0],
-          ['value', 1],
-        ]),
-      };
+      const tableSchema = makeTestTableSchema();
 
       const events = new StoreEventEmitter();
       const syncEvents = new SyncEventEmitterImpl();
@@ -1137,7 +1124,7 @@ describe('Sync Protocol E2E', () => {
           throw new Error(`Unknown table: ${schemaName}.${tableName}`);
         },
         events,
-        getTableSchema: () => tableSchema as unknown as import('@quereus/quereus').TableSchema,
+        getTableSchema: () => tableSchema,
         collation: 'NOCASE',
       });
 
@@ -1147,7 +1134,7 @@ describe('Sync Protocol E2E', () => {
         config,
         syncEvents,
         applyToStore,
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Simulate receiving remote changes
