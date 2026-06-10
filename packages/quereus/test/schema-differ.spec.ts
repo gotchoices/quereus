@@ -602,6 +602,65 @@ describe('Schema Differ', () => {
 			expect(diff.materializedViewsToCreate).to.deep.equal([]);
 		});
 
+		it('combined table+column rename on a non-FROM table in a clause-expr subquery reconciles (OLD-name seed mapping)', () => {
+			// audit → audit2 AND audit.c → c2 in the same diff: the inverse table
+			// pass rewrites the clause-expr subquery's FROM to the OLD name `audit`
+			// BEFORE the cross-table column walk runs, so that walk must seed with
+			// the OLD table name (the ownRename mapping) — seeding with the declared
+			// name would miss the ref and churn a spurious recreate.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, ts integer }
+					table audit2 {
+						id integer primary key,
+						c2 integer with tags ("quereus.previous_name" = 'c')
+					} with tags ("quereus.previous_name" = 'audit')
+					view v as select id from t insert defaults (ts = (select max(c2) from audit2))
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
+					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
+				],
+				[catalogView('create view v as select id from t insert defaults (ts = (select max(c) from audit))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.renames).to.deep.include({ kind: 'table', oldName: 'audit', newName: 'audit2' });
+		});
+
+		it('a hinted view rename renders its recreate DDL with the non-FROM clause-expr ref inverse-renamed', () => {
+			// Cross-table variant of the resolver-guarded recreate-DDL spec above:
+			// `columnReconciledViewStmt` shares the cross-table pass (with no table
+			// renames), and in migration order the view create emits BEFORE audit's
+			// RENAME COLUMN — so the recreate must spell the OLD name `c`; the
+			// post-create forward propagation rewrites it to `c2` (clause exprs plan
+			// lazily at write-through time, so both spellings converge).
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, ts integer }
+					table audit {
+						id integer primary key,
+						c2 integer with tags ("quereus.previous_name" = 'c')
+					}
+					view v2 as select id from t insert defaults (ts = (select max(c2) from audit)) with tags ("quereus.previous_name" = 'v')
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
+					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
+				],
+				[catalogView('create view v as select id from t insert defaults (ts = (select max(c) from audit))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
+			expect(diff.viewsToCreate).to.have.length(1);
+			expect(diff.viewsToCreate[0], 'non-FROM clause-expr subquery ref spelled under the OLD name').to.match(/max\(c\)/);
+		});
+
 		it('a genuine definition edit layered on an in-diff rename still recreates', () => {
 			const declared = parseDeclaredSchema(
 				`declare schema main {
