@@ -14,7 +14,7 @@
 import { expect } from 'chai';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { cloneExpr } from '../../src/planner/mutation/scope-transform.js';
-import { renameTableInAst, renameColumnInCheckExpression } from '../../src/schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInCheckExpression, stripSelfQualifierInCheckExpression } from '../../src/schema/rename-rewriter.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
 describe('cloneExpr isolation vs in-place rename rewriters', () => {
@@ -82,6 +82,37 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const clone = cloneExpr(src);
 		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', 'main');
 		expect(changed, 'rewriter should hit the upsert clause in the clone').to.equal(true);
+		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
+	});
+
+	it('table rename through a DELETE-RETURNING subquery does NOT leak into the source AST', () => {
+		const src = parseExpressionString('exists (delete from old_t where a > 0 returning a)');
+		const before = expressionToString(src);
+		const clone = cloneExpr(src);
+		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', 'main');
+		expect(changed, 'rewriter should hit the DELETE target in the clone').to.equal(true);
+		expect(expressionToString(clone)).to.contain('renamed_t');
+		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
+	});
+
+	it('table rename through a WITH clause on a DML subquery does NOT leak into the source AST', () => {
+		const src = parseExpressionString(
+			'exists (with c as (select x from old_t) insert into t2 (a) select x from c returning a)');
+		const before = expressionToString(src);
+		const clone = cloneExpr(src);
+		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', 'main');
+		expect(changed, 'rewriter should hit the DML-attached CTE body in the clone').to.equal(true);
+		expect(expressionToString(clone)).to.contain('renamed_t');
+		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
+	});
+
+	it('self-qualifier strip through a window function does NOT leak into the source AST', () => {
+		const src = parseExpressionString('exists (select sum(t.v) over (partition by t.v order by t.v) from u)');
+		const before = expressionToString(src);
+		const clone = cloneExpr(src);
+		const changed = stripSelfQualifierInCheckExpression(clone, 't', 'main', () => false);
+		expect(changed, 'strip should hit the window function in the clone').to.equal(true);
+		expect(expressionToString(clone)).to.not.contain('t.v');
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
 	});
 });
