@@ -312,8 +312,11 @@ export type RelationalComponentRef =
  * Per-attribute insert-default provenance — the value used when an `insert`
  * through the relation omits the column. Sourced from constant-FD selection
  * predicates (`constant-fd`), declared base-column defaults (`base-default`),
- * or a view's `insert defaults (col = expr, …)` clause (`view-insert-default`).
- * The value is symbolic (literal, parameter, or context binding).
+ * or a view's `insert defaults (col = expr, …)` clause (`view-insert-default` —
+ * declared but not yet threaded: view defaults are realized in the write-through
+ * rewrite, and `view_info`'s derivation folds clause columns directly; see
+ * `deriveViewInfo`'s Divergence-1 note). The value is symbolic (literal,
+ * parameter, or context binding).
  *
  * NOTE for the consumer: `value` lives in the **base** column's domain, not the
  * projected output domain. When the owning `UpdateSite` is `base` with an
