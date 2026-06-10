@@ -539,9 +539,7 @@ function deriveSurrogateMemberKeys(
  * deploy-summary warning channel (`docs/lens.md:169`) is `3-lens-prover` Phase
  * C's to build. Errors take precedence — warnings only log when none fail.
  *
- * This validates shape/site only. `quereus.update.*` keys are reachable through
- * the same {@link validateReservedTags} entry point but are NOT wired into any
- * DML/view path here (that is `view-mutation-plan-node-substrate` Phase 2's).
+ * This validates shape/site only — no reserved tag carries behavior read here.
  */
 function validateLensTags(slot: LensSlot): void {
 	const diagnostics: TagDiagnostic[] = [

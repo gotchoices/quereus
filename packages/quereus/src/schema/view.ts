@@ -28,8 +28,7 @@ export interface ViewSchema {
 	 * Per-column omitted-insert defaults from the `insert defaults (col = expr, …)`
 	 * clause. Consumed by the insert write-through rewrite (step 5 of the
 	 * insert-defaulting precedence chain — docs/view-updateability.md § View insert
-	 * defaults) and by `view_info`'s insertability derivation. Takes precedence over
-	 * the deprecated `quereus.update.default_for.<column>` view-DDL tag.
+	 * defaults) and by `view_info`'s insertability derivation.
 	 */
 	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */

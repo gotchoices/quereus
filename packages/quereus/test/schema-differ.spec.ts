@@ -264,12 +264,24 @@ describe('Schema Differ', () => {
 			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
 		});
 
-		it('accepts quereus.update.default_for on a declared view (legal at view-ddl)', () => {
-			// default_for is the sole retained quereus.update.* override and is legal at view-ddl.
+		it('accepts the rename hints on a declared view (legal at view-ddl)', () => {
+			// quereus.id / quereus.previous_name are the only reserved keys legal at
+			// view-ddl (inert on a direct create; the differ reads them for renames).
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key, x integer } view v as select id from t with tags ("quereus.id" = 'v-1') }`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+		});
+
+		it('throws on the removed quereus.update.default_for tag on a declared view', () => {
+			// default_for was the last quereus.update.* key; the first-class
+			// `insert defaults (col = expr, …)` clause replaced it, so it is unknown
+			// at any site — including its former view-ddl home.
 			const declared = parseDeclaredSchema(
 				`declare schema main { table t { id integer primary key, x integer } view v as select id from t with tags ("quereus.update.default_for.x" = '0') }`
 			);
-			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /unknown reserved tag/i);
 		});
 
 		it('throws on the removed quereus.update.policy routing tag on a declared view', () => {

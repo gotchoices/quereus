@@ -312,8 +312,8 @@ export type RelationalComponentRef =
  * Per-attribute insert-default provenance — the value used when an `insert`
  * through the relation omits the column. Sourced from constant-FD selection
  * predicates (`constant-fd`), declared base-column defaults (`base-default`),
- * or a `quereus.update.default_for` tag (`tag-default`). The value is symbolic
- * (literal, parameter, or context binding).
+ * or a view's `insert defaults (col = expr, …)` clause (`view-insert-default`).
+ * The value is symbolic (literal, parameter, or context binding).
  *
  * NOTE for the consumer: `value` lives in the **base** column's domain, not the
  * projected output domain. When the owning `UpdateSite` is `base` with an
@@ -323,7 +323,7 @@ export type RelationalComponentRef =
  * orchestrator owns this interpretation and cross-op default precedence.
  */
 export interface AttributeDefault {
-	readonly kind: 'constant-fd' | 'base-default' | 'tag-default';
+	readonly kind: 'constant-fd' | 'base-default' | 'view-insert-default';
 	readonly value: Expression;
 }
 
@@ -399,7 +399,7 @@ export interface PhysicalProperties {
 
   /**
    * Per-attribute insert-default provenance (constant-FD selection defaults,
-   * declared base defaults, `default_for` tags). Keyed by `Attribute.id`.
+   * declared base defaults, view insert-defaults). Keyed by `Attribute.id`.
    * Companion to `updateLineage` — what fills an omitted insert column.
    */
   attributeDefaults?: ReadonlyMap<number, AttributeDefault>;

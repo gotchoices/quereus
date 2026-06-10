@@ -892,7 +892,8 @@ export class SchemaManager {
 	 * re-registers the swapped {@link ViewSchema}, and fires `view_modified` so a
 	 * cached write-through plan that recorded a `view` dependency (every
 	 * view-/MV-mediated write does — see `buildViewMutation`) is invalidated when
-	 * the view's behavioral `quereus.update.*` tags change. This event is distinct
+	 * the view's tags change (tag validation re-runs at plan time, so a
+	 * newly-invalid tag must surface on the next run). This event is distinct
 	 * from the (non-existent) plain-view create event, so it triggers no maintenance
 	 * re-registration. `compute` decides replace / merge / drop and may throw before
 	 * any mutation (drop-of-absent NOTFOUND), leaving the catalog untouched.
@@ -962,7 +963,7 @@ export class SchemaManager {
 	 * deliberately distinct from `materialized_view_added` (what create emits): the
 	 * MV maintenance manager re-registers on `_added` but ignores `_modified`. The
 	 * event invalidates a cached write-through plan that recorded a `view` dependency
-	 * when the MV's behavioral `quereus.update.*` tags change. `compute` may throw
+	 * when the MV's tags change (tag validation re-runs at plan time). `compute` may throw
 	 * before any mutation (drop-of-absent NOTFOUND), leaving the catalog untouched.
 	 */
 	private updateMaterializedViewTags(name: string, compute: TagCompute, schemaName?: string): void {

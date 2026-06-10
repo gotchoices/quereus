@@ -56,8 +56,8 @@ export function parseSelect(sql: string): SelectStmt {
  *
  * Wraps the expression in a `select <expr>` and extracts the projected column's
  * expression — the established pattern for one-off expression parsing (see the
- * parser/emit specs). Used to lower the TEXT value of a `default_for`/expression
- * reserved tag into an AST node for the view-mutation override surface.
+ * parser/emit specs). Used to lower synthesized SQL fragments (e.g. the
+ * view-mutation presence predicates) into AST nodes.
  *
  * @param exprSql A SQL scalar expression (e.g. `epoch_ms('now')`, `42`)
  * @returns The parsed expression AST

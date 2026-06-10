@@ -7,28 +7,27 @@ import type { SqlValue } from '../common/types.js';
  * only keys under the `quereus.` prefix are governed here. The namespace is a
  * precise mini-language designed across the docs:
  *
- * - `quereus.update.default_for.<column>`
- *   — the sole view-mutation override: an insert-value supply for an omitted
- *   column (`docs/view-updateability.md` § Tags: The Override Surface). Write
- *   *routing* is no longer a tag — it is expressed per-row by writable
- *   presence/membership columns (outer-join existence column, set-op membership
- *   columns), so the routing tags (`target`/`exclude`/`delete_via`/`policy`) were
- *   removed.
  * - `quereus.lens.ack.<code>[:<target>]`, `quereus.lens.access.<col>`
  *   — lens advisory acknowledgments / access-pattern hints (`docs/lens.md`
  *   § Acknowledging advisories).
+ * - `quereus.id` / `quereus.previous_name`
+ *   — declarative-differ rename hints (docs/schema.md § Rename Detection).
+ *
+ * No reserved tag carries *behavior* — view-mutation semantics moved to
+ * first-class constructs (write routing to per-row presence/membership columns;
+ * omitted-insert defaults to the `insert defaults (col = expr, …)` view clause,
+ * which retired the last `quereus.update.*` key, `default_for.<column>`).
  *
  * This module is the single shape/site validation entry point those keys flow
  * through. It is **additive and behavior-neutral**: it reads no reserved tag's
- * *semantics* (propagation, default expressions, ack fingerprinting, escalation
- * policy all stay in their owning tickets); it only proves that a `quereus.*`
- * key is spelled correctly (matches a {@link ReservedTagSpec}), sits where it is
- * legal ({@link TagSite}), and carries a well-shaped value
- * ({@link TagValueSchema}) — surfacing a sited {@link TagDiagnostic} otherwise.
+ * *semantics* (ack fingerprinting, escalation policy stay in their owning
+ * tickets); it only proves that a `quereus.*` key is spelled correctly (matches
+ * a {@link ReservedTagSpec}), sits where it is legal ({@link TagSite}), and
+ * carries a well-shaped value ({@link TagValueSchema}) — surfacing a sited
+ * {@link TagDiagnostic} otherwise.
  *
- * The two downstream consumers (the lens prover's reserved-tag parser, and the
- * view-mutation `quereus.update.*` override surface) read through
- * {@link getReservedTag} / {@link getReservedTagByTemplate} rather than
+ * Downstream consumers (e.g. the lens prover's reserved-tag parser) read
+ * through {@link getReservedTag} / {@link getReservedTagByTemplate} rather than
  * re-parsing the namespace at scattered sites.
  */
 
@@ -38,12 +37,11 @@ export const RESERVED_TAG_NAMESPACE = 'quereus.';
 /**
  * The declaration / statement site a tag was found at. Validation is
  * site-sensitive: a key valid in one position can be illegal in another (e.g.
- * `quereus.update.default_for.<column>` is meaningful on a view DDL / projection /
- * DML statement, but not on a logical-table site).
+ * `quereus.lens.writable` is meaningful on a logical column, but not on a
+ * logical-table site).
  */
 export type TagSite =
 	| 'view-ddl'            // CREATE VIEW / CREATE MATERIALIZED VIEW WITH TAGS (also a physical declared view in the differ)
-	| 'projection'          // a result-column tag (reserved for default_for)
 	| 'dml-stmt'            // INSERT/UPDATE/DELETE ... WITH (...) statement-level tag
 	| 'logical-table'       // tags on a declared logical TableSchema
 	| 'logical-constraint'  // tags on a logical RowConstraint/Unique/ForeignKey schema
@@ -80,16 +78,15 @@ export const LENS_WRITABLE_INTENT_TAG = 'quereus.lens.writable';
 
 /**
  * The shape a reserved tag's value must satisfy. Validation here is purely
- * structural — e.g. an `'expression'` value must be TEXT, but its SQL validity
- * is the consuming ticket's concern, not this registry's.
+ * structural — e.g. a `'string'` value must be TEXT; what the text *means* is
+ * the consuming ticket's concern, not this registry's.
  */
 export type TagValueSchema =
 	| 'string'
 	| 'boolean'                            // a SQL boolean (true/false); e.g. expose_implicit_index
 	| 'csv-of-identifiers'                 // comma-separated identifier names (e.g. decomp shared-key columns)
 	| { readonly enum: readonly string[] } // closed value set, e.g. a lens decomp role/presence/keykind
-	| 'required-nonempty-rationale'        // non-empty TEXT; empty => warning
-	| 'expression';                        // a SQL expression string (default_for.<col>)
+	| 'required-nonempty-rationale';       // non-empty TEXT; empty => warning
 
 /**
  * One entry in the reserved-tag spec table. `key` is either an exact key string
@@ -175,20 +172,10 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		valueSchema: 'boolean',
 		description: 'Surface a UNIQUE constraint\'s implicit covering structure in the catalog / export_schema (boolean; default hidden).',
 	},
-	// --- quereus.update.* : the sole retained view-mutation override ---
-	{
-		// docs/view-updateability.md § Tags (view DDL / projection) + the statement-level
-		// `insert into v with ("quereus.update.default_for.created" = …)`. The statement
-		// site supplies a per-statement omitted-insert default that overrides the
-		// view-level default for that statement's duration. Routing is no longer a tag —
-		// per-row presence/membership columns express it (target/exclude/delete_via/policy
-		// were removed).
-		key: { template: 'quereus.update.default_for.<column>' },
-		sites: siteSet('view-ddl', 'projection', 'dml-stmt'),
-		valueSchema: 'expression',
-		description: 'Default expression for insert through the view when the column is omitted (view DDL, projection, or per-statement).',
-	},
 	// --- quereus.lens.* : lens advisory acknowledgments / access hints ---
+	// (The former quereus.update.* family is gone: routing became per-row
+	// presence/membership columns; default_for.<column> became the first-class
+	// `insert defaults (col = expr, …)` view clause.)
 	{
 		// docs/lens.md:176, 190 — code is <code>[:<target>]; remainder captured whole.
 		key: { template: 'quereus.lens.ack.<code>' },
@@ -406,8 +393,8 @@ interface MatchedSpec {
  * Finds the spec a reserved key matches. Exact specs are tried first, then
  * single-placeholder templates (remainder captured whole, including any
  * `:target` refinement — sub-parsing is the consumer's job). A template whose
- * remainder would be empty does not match (so `quereus.update.default_for.` with
- * no column is an unknown key).
+ * remainder would be empty does not match (so `quereus.lens.ack.` with no code
+ * is an unknown key).
  */
 function matchSpec(key: string): MatchedSpec | undefined {
 	for (const spec of RESERVED_TAGS) {
@@ -460,7 +447,6 @@ function validateTagValue(
 	}
 	switch (schema) {
 		case 'string':
-		case 'expression':
 			return isText(value)
 				? undefined
 				: invalidValue(key, site, `must be a text value`, 'error');
@@ -542,7 +528,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.update.default_for.<column>, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 
@@ -578,7 +564,6 @@ function invalidValue(
 function siteLabel(site: TagSite): string {
 	switch (site) {
 		case 'view-ddl': return 'a view declaration';
-		case 'projection': return 'a result column';
 		case 'dml-stmt': return 'a DML statement';
 		case 'logical-table': return 'a logical table';
 		case 'logical-constraint': return 'a logical constraint';

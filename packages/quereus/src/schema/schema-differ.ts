@@ -1457,9 +1457,9 @@ function stableStringify(v: unknown): string {
 /**
  * Rename-hint keys excluded from tag-drift comparison: they drive rename
  * detection ({@link resolveRenames}), not data state, so a tag set carrying only
- * a hint must not churn out a `SET TAGS` after the rename completes. Behavioral
- * reserved tags (`quereus.update.*`, `quereus.lens.*`,
- * `quereus.expose_implicit_index`, …) are real schema state and ARE compared.
+ * a hint must not churn out a `SET TAGS` after the rename completes. All other
+ * reserved tags (`quereus.lens.*`, `quereus.expose_implicit_index`, …) are real
+ * schema state and ARE compared.
  */
 const RENAME_HINT_KEYS = new Set([QUEREUS_TAG_PREFIX + 'id', QUEREUS_TAG_PREFIX + 'previous_name']);
 

@@ -10,7 +10,7 @@ import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as de
 import { isSetOpMembershipBody, buildSetOpWrite } from '../mutation/set-op.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
-import { collectMutationTags } from '../mutation/mutation-tags.js';
+import { validateMutationTags } from '../mutation/mutation-tags.js';
 import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints, collectLensParentSideForeignKeyConstraints, collectLensSetLevelConstraints, hasCommitTimeSetLevelObligation } from '../mutation/lens-enforcement.js';
 import { ConflictResolution } from '../../common/constants.js';
 import { buildInsertStmt } from './insert.js';
@@ -42,18 +42,19 @@ const log = createLogger('planner:view-mutation');
  * wrapped subtree is byte-identical to what the retired AST rewrite re-planned.
  */
 export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): PlanNode {
-	// Collect, site-validate, and merge the view-level + statement-level reserved
-	// `quereus.update.*` override tags (a sited error is raised here, before any
-	// base op is built — atomic). The decomposers read the merged map off the req.
-	const tags = collectMutationTags(view, req.stmt);
+	// Site-validate the view-level + statement-level reserved tags (a sited error
+	// for a typo'd / mis-sited `quereus.*` key is raised here, before any base op
+	// is built — atomic). No reserved tag carries mutation behavior anymore.
+	validateMutationTags(view, req.stmt);
 
 	// Record a `view` schema dependency for the mutated view/MV. This is the single
 	// funnel for ALL view-/MV-mediated writes (single-source, multi-source,
 	// decomposition, set-op, lens), so recording here — rather than at each builder's
 	// getView site — covers every write-through path DRY. It exists so that an
 	// `ALTER VIEW/MATERIALIZED VIEW … SET TAGS` (which fires `view_modified` /
-	// `materialized_view_modified`) invalidates this cached write-through plan, since
-	// the view's behavioral `quereus.update.*` tags steer the routing collected above.
+	// `materialized_view_modified`) invalidates this cached write-through plan: the
+	// validation above must re-run against the view's *current* tags (a newly-added
+	// invalid tag must surface on the next run of an already-cached statement).
 	// Read-only `select … from v` records no view dependency — view tags do not affect
 	// read results, so its plan need not invalidate on a tag change.
 	ctx.schemaDependencies.recordDependency(
@@ -133,7 +134,7 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	} else if (decompShape && req.op === 'update') {
 		baseOps = decomposeDecompositionUpdate(ctx, view, decompShape, req.stmt, capturedValues);
 	} else {
-		baseOps = propagate(ctx, view, withTags(req, tags));
+		baseOps = propagate(ctx, view, req);
 	}
 	// Lens row-local enforcement: when the target is a lens-backed logical table,
 	// its prover-classified `enforced-row-local` CHECK obligations (rewritten to
@@ -442,16 +443,6 @@ function rejectLensSetLevelConflictResolution(ctx: PlanningContext, view: Mutabl
 	if (req.stmt.onConflict === ConflictResolution.REPLACE) reject('insert or replace');
 	if (req.stmt.onConflict === ConflictResolution.IGNORE) reject('insert or ignore');
 	if (req.stmt.upsertClauses && req.stmt.upsertClauses.length > 0) reject('upsert (on conflict do …)');
-}
-
-/** Attach the merged override tags to the request (discriminant preserved). */
-function withTags(req: MutationRequest, tags: MutationRequest['tags']): MutationRequest {
-	if (tags === undefined) return req;
-	switch (req.op) {
-		case 'insert': return { op: 'insert', stmt: req.stmt, tags };
-		case 'update': return { op: 'update', stmt: req.stmt, tags };
-		case 'delete': return { op: 'delete', stmt: req.stmt, tags };
-	}
 }
 
 /**

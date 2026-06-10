@@ -19,7 +19,6 @@ import { createLogger } from "../../common/logger.js";
 import type * as AST from "../../parser/ast.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
-import { readDefaultFor } from "../../planner/mutation/mutation-tags.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
 import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, surfacedInnerFlagNames } from "../../planner/mutation/set-op.js";
 import type { ViewSchema } from "../../schema/view.js";
@@ -832,7 +831,7 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	if (preservedTargets.size === 0) return CONSERVATIVE_VIEW_INFO;
 
 	// Defaultable base columns: every (node, attribute) carrying an insert default
-	// (`constant-fd` selection pin, declared `base-default`, `tag-default`),
+	// (`constant-fd` selection pin, declared `base-default`, `view-insert-default`),
 	// resolved through THAT node's own lineage back to a base column. Walking the
 	// whole spine — not just the root — recovers a *projected-away* constant-FD
 	// column (e.g. `select name from t where color = 'green'`, where `color`'s
@@ -849,21 +848,17 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		}
 	}
 
-	// View-level insert defaults (Divergence 1): the `tag-default` provenance is
-	// never threaded onto `PhysicalProperties` (it is consumed only in the
-	// rewrite), so this body is planned without the view's defaults and the walk
-	// above misses them. Fold each defaulted column into `defaultable` directly,
-	// mirroring `resolveDefaultForColumn` — a base column of a reachable target
-	// (the common projected-away case) or a visible view-output column with base
-	// lineage. Sources are the first-class `insert defaults (col = expr, …)`
-	// clause and the deprecated `default_for.<col>` view-DDL tag (alive until
-	// `remove-view-default-for-tag`); only the column NAME matters here, so the
-	// union suffices — precedence between them is the rewrite's concern. Unlike
-	// the rewrite, an unresolvable name is silently skipped: a read-only
-	// introspection surface stays on its never-throw posture (the per-view
-	// try/catch would otherwise collapse the row to all-`NO`).
-	const defaultedColumns = new Set<string>(readDefaultFor(view.tags).keys());
-	for (const d of view.insertDefaults ?? []) defaultedColumns.add(d.column.toLowerCase());
+	// View-level insert defaults (Divergence 1): the `view-insert-default`
+	// provenance is never threaded onto `PhysicalProperties` (it is consumed only
+	// in the rewrite), so this body is planned without the view's defaults and the
+	// walk above misses them. Fold each `insert defaults (col = expr, …)` clause
+	// column into `defaultable` directly, mirroring `resolveDefaultForColumn` — a
+	// base column of a reachable target (the common projected-away case) or a
+	// visible view-output column with base lineage. Unlike the rewrite, an
+	// unresolvable name is silently skipped: a read-only introspection surface
+	// stays on its never-throw posture (the per-view try/catch would otherwise
+	// collapse the row to all-`NO`).
+	const defaultedColumns = new Set<string>((view.insertDefaults ?? []).map(d => d.column.toLowerCase()));
 	for (const colName of defaultedColumns) {
 		let resolved = false;
 		for (const id of targetIds) {

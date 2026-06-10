@@ -1121,29 +1121,28 @@ select bid, aref from m_b order by bid;
 → [{"bid":10,"aref":1},{"bid":20,"aref":null}]
 
 -- ===================================
--- Phase 3.4: view insert defaults + the `quereus.update.*` override surface +
--- per-row routing. A view's omitted-insert defaults are declared first-class —
--- `create view v as <body> insert defaults (col = expr, …)` — replacing the
--- view-DDL `default_for` tag (deprecated; alive until remove-view-default-for-tag,
--- and shadowed per column by the clause). The statement-level `default_for` tag
--- remains the per-statement override and wins over the clause. Write *routing* is
--- no longer a tag — predicates rule, and a per-row writable presence/existence
--- column states a non-default side explicitly. The removed routing keys
--- (target / exclude / delete_via / policy) are now `unknown-reserved-tag` errors.
--- See docs/view-updateability.md § View insert defaults.
+-- Phase 3.4: view insert defaults + per-row routing. A view's omitted-insert
+-- defaults are declared first-class — `create view v as <body> insert defaults
+-- (col = expr, …)` — the construct that replaced the removed
+-- `quereus.update.default_for.<column>` tag (view-DDL and statement-level alike;
+-- a per-statement default is expressible as an explicit insert value). Write
+-- *routing* is no longer a tag either — predicates rule, and a per-row writable
+-- presence/existence column states a non-default side explicitly. Every retired
+-- `quereus.update.*` key is now an `unknown-reserved-tag` error. See
+-- docs/view-updateability.md § View insert defaults.
 -- ===================================
 
--- --- default_for: statement-level omitted-insert default (single-source) ---
+-- --- the retired statement-level default_for tag is unknown at the dml-stmt site ---
 create table df_t (id integer primary key, created integer, note text);
 create view df_v as select id, note from df_t;
 
--- `created` is projected away by the view; the statement-level default_for tag
--- supplies it (ahead of the base column's own default).
 insert into df_v with tags ("quereus.update.default_for.created" = '777') values (5, 'x');
+-- error: unknown reserved tag
+-- the rejected insert wrote nothing.
 select * from df_t order by id;
-→ [{"id":5,"created":777,"note":"x"}]
+→ []
 
--- --- insert defaults: view-declared default, overridden statement-over-view ---
+-- --- insert defaults: the view-declared omitted-insert default ---
 create table df2 (id integer primary key, created integer);
 create view df2_v as select id from df2 insert defaults (created = 111);
 
@@ -1153,15 +1152,6 @@ insert into df2_v values (1);
 select * from df2 order by id;
 → [{"id":1,"created":111}]
 
--- statement-level default_for overrides the view-declared default for this statement.
-insert into df2_v with tags ("quereus.update.default_for.created" = '222') values (2);
-select * from df2 order by id;
-→ [{"id":1,"created":111},{"id":2,"created":222}]
-
--- a default_for naming a column that is neither a view nor a base column -> error.
-insert into df2_v with tags ("quereus.update.default_for.nope" = '0') values (3);
--- error: not a column
-
 -- --- insert defaults: non-literal expression, alongside a renamed column list ---
 create table df3 (id integer primary key, created integer, label text);
 create view df3_v (ident, tag) as select id, label from df3 insert defaults (created = 100 + 11);
@@ -1169,21 +1159,16 @@ insert into df3_v values (1, 'x');
 select * from df3 order by id;
 → [{"id":1,"created":111,"label":"x"}]
 
--- --- the clause shadows the deprecated view-level default_for tag (same column) ---
-create table df4 (id integer primary key, created integer);
-create view df4_v as select id from df4 insert defaults (created = 333)
-    with tags ("quereus.update.default_for.created" = '444');
-insert into df4_v values (1);
-select * from df4 order by id;
-→ [{"id":1,"created":333}]
-
--- --- view-level default_for tag alone still works (deprecated overlap window;
--- remove-view-default-for-tag flips this case to the clause) ---
+-- --- the retired view-DDL default_for tag is unknown at mutation ---
+-- View-DDL tag validation is lazy (the create succeeds; the rename hints are the
+-- only reserved keys still legal there, inert on a direct create) — the
+-- write-through fails, and nothing is written.
 create table df5 (id integer primary key, created integer);
 create view df5_v as select id from df5 with tags ("quereus.update.default_for.created" = '555');
 insert into df5_v values (1);
+-- error: unknown reserved tag
 select * from df5 order by id;
-→ [{"id":1,"created":555}]
+→ []
 
 -- --- insert defaults naming an unknown column: hard sited error at write ---
 create table df6 (id integer primary key, created integer);
@@ -1276,16 +1261,15 @@ insert into bvu_v values (1);
 -- error: unknown reserved tag
 
 -- ===================================
--- Phase 3.4: adversarial edges (review pass) — default_for precedence and a
+-- Phase 3.4: adversarial edges (review pass) — insert-default precedence and a
 -- single-source view carrying a removed routing tag.
 -- ===================================
 
--- --- default_for precedence: an explicit supply of the column wins ---
+-- --- insert-default precedence: an explicit supply of the column wins ---
 -- The view projects `created`, so a statement that supplies it explicitly must
--- override the view-level default_for; an omitted insert still takes the default.
+-- override the view's declared insert default; an omitted insert still takes it.
 create table dfp (id integer primary key, created integer);
-create view dfp_v as select id, created from dfp
-    with tags ("quereus.update.default_for.created" = '111');
+create view dfp_v as select id, created from dfp insert defaults (created = 111);
 insert into dfp_v (id, created) values (1, 999);
 insert into dfp_v (id) values (2);
 select * from dfp order by id;

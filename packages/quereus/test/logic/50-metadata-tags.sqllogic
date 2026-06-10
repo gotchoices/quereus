@@ -500,13 +500,21 @@ CREATE TABLE RsvInlineBadCon (
 -- error: reserved tag
 
 -- Mis-sited but otherwise-valid key on an inline named constraint rejected:
--- quereus.update.default_for.<col> is view-ddl / projection / dml-stmt only ⇒
--- tag-not-allowed-here at the physical-constraint site.
+-- quereus.lens.writable is logical-column only ⇒ tag-not-allowed-here at the
+-- physical-constraint site.
 CREATE TABLE RsvInlineMissite (
     id INTEGER PRIMARY KEY,
-    qty INTEGER CONSTRAINT chk_qty2 CHECK (qty > 0) WITH TAGS ("quereus.update.default_for.qty" = '0')
+    qty INTEGER CONSTRAINT chk_qty2 CHECK (qty > 0) WITH TAGS ("quereus.lens.writable" = true)
 );
 -- error: not allowed
+
+-- The retired quereus.update.default_for.<col> key (replaced by the view-level
+-- `insert defaults (…)` clause) is unknown — still rejected, different reason.
+CREATE TABLE RsvInlineRetired (
+    id INTEGER PRIMARY KEY,
+    qty INTEGER CONSTRAINT chk_qty3 CHECK (qty > 0) WITH TAGS ("quereus.update.default_for.qty" = '0')
+);
+-- error: unknown reserved tag
 
 -- Valid functional tag quereus.expose_implicit_index accepted on an inline NAMED
 -- UNIQUE constraint and round-trips through unique_constraint_info (the same tag
@@ -583,10 +591,15 @@ ALTER TABLE AddCon ADD CONSTRAINT c_chk CHECK (id > 0) WITH TAGS ("quereus.bogus
 -- error: reserved tag
 
 -- Mis-sited but otherwise-valid key on ADD CONSTRAINT rejected:
--- quereus.update.default_for.<col> is view-ddl / projection / dml-stmt only ⇒
--- tag-not-allowed-here at the physical-constraint site.
-ALTER TABLE AddCon ADD CONSTRAINT c_chk2 CHECK (id > 0) WITH TAGS ("quereus.update.default_for.id" = '0');
+-- quereus.lens.writable is logical-column only ⇒ tag-not-allowed-here at the
+-- physical-constraint site.
+ALTER TABLE AddCon ADD CONSTRAINT c_chk2 CHECK (id > 0) WITH TAGS ("quereus.lens.writable" = true);
 -- error: not allowed
+
+-- The retired quereus.update.default_for.<col> key (replaced by the view-level
+-- `insert defaults (…)` clause) is unknown — still rejected, different reason.
+ALTER TABLE AddCon ADD CONSTRAINT c_chk3 CHECK (id > 0) WITH TAGS ("quereus.update.default_for.id" = '0');
+-- error: unknown reserved tag
 
 -- Valid functional tag quereus.expose_implicit_index accepted on an ADD CONSTRAINT
 -- UNIQUE and round-trips through unique_constraint_info (the same tag catalog.ts

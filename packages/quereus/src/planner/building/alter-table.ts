@@ -134,8 +134,8 @@ export function buildAlterTableStmt(
 
     case 'setTags': {
       // Validate any reserved `quereus.*` tags at the matching site so a typo
-      // (e.g. `quereus.update.taget`) fails loudly here rather than being stored.
-      // The CREATE / declarative paths route tags through the same registry.
+      // (e.g. `quereus.expose_implicit_indx`) fails loudly here rather than being
+      // stored. The CREATE / declarative paths route tags through the same registry.
       const target = stmt.action.target;
       const site: TagSite =
         target.kind === 'column' ? 'physical-column'

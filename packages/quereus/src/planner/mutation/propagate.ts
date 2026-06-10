@@ -9,7 +9,6 @@ import { rewriteViewInsert, rewriteViewUpdate, rewriteViewDelete, type MutableVi
 import { isJoinBody, propagateMultiSource } from './multi-source.js';
 import { propagateDecomposition } from './decomposition.js';
 import type { StorageShape } from '../../vtab/mapping-advertisement.js';
-import type { ReservedTagMap } from './mutation-tags.js';
 
 export type { MutableViewLike } from './single-source.js';
 
@@ -167,17 +166,15 @@ export interface BaseOp {
 }
 
 /**
- * The view-mediated mutation to decompose. `tags` carries the merged, already
- * site-validated reserved `quereus.update.*` override surface (view-level tags
- * with statement-level tags layered on top — see `mutation-tags.ts`). It is
- * populated by `building/view-mutation-builder.ts` before propagation; the
- * decomposers consume it to narrow the base set / supply insert defaults / pick
- * a deletion side / apply the strict-vs-lenient policy.
+ * The view-mediated mutation to decompose. Reserved tags carry no mutation
+ * behavior (they are validated — and rejected when typo'd / mis-sited — by
+ * `mutation-tags.ts` before propagation); the decomposers read everything they
+ * need from the statement and the view schema itself.
  */
 export type MutationRequest =
-	| { readonly op: 'insert'; readonly stmt: AST.InsertStmt; readonly tags?: ReservedTagMap }
-	| { readonly op: 'update'; readonly stmt: AST.UpdateStmt; readonly tags?: ReservedTagMap }
-	| { readonly op: 'delete'; readonly stmt: AST.DeleteStmt; readonly tags?: ReservedTagMap };
+	| { readonly op: 'insert'; readonly stmt: AST.InsertStmt }
+	| { readonly op: 'update'; readonly stmt: AST.UpdateStmt }
+	| { readonly op: 'delete'; readonly stmt: AST.DeleteStmt };
 
 /**
  * The decomposition storage shape to fan a mutation out across, or `undefined`
@@ -260,7 +257,7 @@ export function propagate(ctx: PlanningContext, view: MutableViewLike, req: Muta
 
 	switch (req.op) {
 		case 'insert': {
-			const statement = rewriteViewInsert(ctx, req.stmt, view, req.tags);
+			const statement = rewriteViewInsert(ctx, req.stmt, view);
 			return [{ table: resolveBaseTable(ctx, statement), op: 'insert', statement }];
 		}
 		case 'update': {

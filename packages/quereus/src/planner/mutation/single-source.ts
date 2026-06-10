@@ -8,8 +8,6 @@ import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { deriveViewColumns, resolveBaseSite, type ViewColumn } from '../analysis/update-lineage.js';
-import { readDefaultFor, type ReservedTagMap } from './mutation-tags.js';
-import { parseExpressionString } from '../../parser/index.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { transformExpr, cloneExpr, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
 
@@ -60,7 +58,7 @@ export interface MutableViewLike {
 	readonly columns?: ReadonlyArray<string>;
 	/** Per-column omitted-insert defaults from `insert defaults (col = expr, …)`. */
 	readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
-	/** View-level metadata tags — the `view-ddl` site of the override surface. */
+	/** View-level metadata tags — validated at the `view-ddl` site on mutation. */
 	readonly tags?: Readonly<Record<string, SqlValue>>;
 }
 
@@ -658,11 +656,10 @@ function requireBaseColumn(vc: ViewColumn): string {
 
 /**
  * Resolve an insert-default column name (from the `insert defaults (col = expr, …)`
- * clause or a `default_for.<col>` tag) to its base column. The name may be a base
- * column (the documented projected-away case) or a view column with `base`
- * lineage. An unknown name is a structured `tag-target-not-found` — a typo must
- * fail loudly, not silently no-op. `spelling` names the offending declaration in
- * the diagnostic (the clause entry or the tag key).
+ * clause) to its base column. The name may be a base column (the documented
+ * projected-away case) or a view column with `base` lineage. An unknown name is
+ * a structured `tag-target-not-found` — a typo must fail loudly, not silently
+ * no-op. `spelling` names the offending clause entry in the diagnostic.
  */
 function resolveDefaultForColumn(analysis: ViewAnalysis, colName: string, view: MutableViewLike, spelling: string): string {
 	const baseCol = analysis.baseTable.columns.find(c => c.name.toLowerCase() === colName);
@@ -684,7 +681,7 @@ function remapper(analysis: ViewAnalysis): (col: AST.ColumnExpr) => AST.Expressi
 
 // --- INSERT ---------------------------------------------------------------
 
-export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike, tags?: ReservedTagMap): AST.InsertStmt {
+export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, view: MutableViewLike): AST.InsertStmt {
 	const analysis = analyzeView(ctx, view);
 
 	// A view column is INSERTABLE iff it has a writable base site with NO inverse:
@@ -734,33 +731,17 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 	}
 
 	// Omitted-insert defaults, applied ahead of the base column's declared default
-	// (docs/view-updateability.md § Projection step 5, § View insert defaults). A
-	// default fills only a column the insert and the constant-FD chain left omitted
-	// — an explicit user value or a stronger predicate pin always wins. Among the
-	// default sources themselves, per resolved base column:
-	//   1. the statement-level `default_for.<col>` tag (the per-statement override),
-	//   2. the view's first-class `insert defaults (col = expr, …)` clause,
-	//   3. the deprecated view-level `default_for.<col>` tag — shadowed by the
-	//      clause; alive only until `remove-view-default-for-tag` deletes it.
-	// Each pass appends only still-unsupplied base columns, so order realizes
-	// precedence. Pass 3 iterates the merged map (statement over view); its
-	// statement entries were appended in pass 1, so `isSupplied` skips them.
-	const applyDefault = (colName: string, makeExpr: () => AST.Expression, spelling: string): void => {
-		const baseCol = resolveDefaultForColumn(analysis, colName, view, spelling);
-		if (isSupplied(baseCol)) return;
-		appendColumns.push(baseCol);
-		appendExprs.push(makeExpr());
-	};
-	for (const [colName, exprText] of readDefaultFor(stmt.tags)) {
-		applyDefault(colName, () => parseExpressionString(exprText), `'quereus.update.default_for.${colName}'`);
-	}
-	// The clause value is already an AST expression — no text re-lowering. Pushing
-	// the schema-held node is safe: the VALUES rewrite below clones per row.
+	// (docs/view-updateability.md § Projection step 5, § View insert defaults): the
+	// view's `insert defaults (col = expr, …)` clause fills only a column the
+	// insert and the constant-FD chain left omitted — an explicit user value or a
+	// stronger predicate pin always wins. The clause value is already an AST
+	// expression — no text re-lowering. Pushing the schema-held node is safe: the
+	// VALUES rewrite below clones per row.
 	for (const d of view.insertDefaults ?? []) {
-		applyDefault(d.column.toLowerCase(), () => d.expr, `'insert defaults (${d.column} = …)'`);
-	}
-	for (const [colName, exprText] of readDefaultFor(tags)) {
-		applyDefault(colName, () => parseExpressionString(exprText), `'quereus.update.default_for.${colName}'`);
+		const baseCol = resolveDefaultForColumn(analysis, d.column.toLowerCase(), view, `'insert defaults (${d.column} = …)'`);
+		if (isSupplied(baseCol)) continue;
+		appendColumns.push(baseCol);
+		appendExprs.push(d.expr);
 	}
 
 	const finalColumns = [...baseColumns, ...appendColumns];

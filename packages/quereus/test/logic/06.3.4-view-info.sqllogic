@@ -201,17 +201,10 @@ insert into dfi_v (id, name) values (1, 'x');
 select * from dfi order by id;
 → [{"id":1,"name":"x","created":999}]
 
--- The deprecated view-level default_for tag still rescues insertability the same
--- way (overlap window; remove-view-default-for-tag deletes the tag path).
-create view dfi_v_tag as select id, name from dfi
-    with tags ("quereus.update.default_for.created" = '999');
-select is_insertable_into from view_info('dfi_v_tag');
-→ [{"is_insertable_into":"YES"}]
-
 -- Negative control: same table+view shape WITHOUT a declared default → not
--- insertable (isolates the default as the sole cause of the YES above).
-create view dfi_v_notag as select id, name from dfi;
-select is_insertable_into from view_info('dfi_v_notag');
+-- insertable (isolates the clause as the sole cause of the YES above).
+create view dfi_v_nodefault as select id, name from dfi;
+select is_insertable_into from view_info('dfi_v_nodefault');
 → [{"is_insertable_into":"NO"}]
 
 -- An unresolvable insert-default name (a typo) is silently skipped, NOT raised: a

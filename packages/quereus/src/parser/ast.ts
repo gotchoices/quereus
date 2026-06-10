@@ -225,7 +225,7 @@ export interface InsertStmt extends AstNode {
 	returning?: ResultColumn[];
 	contextValues?: ContextAssignment[]; // Optional mutation context assignments
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
-	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level reserved/override tags
+	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level metadata tags (reserved keys validated at the dml-stmt site)
 }
 
 // UPDATE statement
@@ -246,7 +246,7 @@ export interface UpdateStmt extends AstNode {
 	returning?: ResultColumn[];
 	contextValues?: ContextAssignment[]; // Optional mutation context assignments
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
-	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level reserved/override tags
+	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level metadata tags (reserved keys validated at the dml-stmt site)
 }
 
 // DELETE statement
@@ -266,7 +266,7 @@ export interface DeleteStmt extends AstNode {
 	returning?: ResultColumn[];
 	contextValues?: ContextAssignment[]; // Optional mutation context assignments
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
-	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level reserved/override tags
+	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level metadata tags (reserved keys validated at the dml-stmt site)
 }
 
 // VALUES statement

@@ -42,11 +42,29 @@ apply schema bad_unknown;
 
 -- ===================================
 -- 2. Mis-sited reserved key on a logical table → error at apply
---    (`quereus.update.default_for.<col>` is legal only at a view DDL /
---    projection / DML statement, never on a logical table)
+--    (`quereus.lens.writable` is legal only on a logical column, never on the
+--    logical table itself)
 -- ===================================
 
 declare logical schema bad_site {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags ("quereus.lens.writable" = true)
+}
+
+-- run
+
+apply schema bad_site;
+-- error: not allowed
+
+-- ===================================
+-- 2b. The retired `quereus.update.default_for.<col>` key → unknown at apply
+--     (the first-class `insert defaults (…)` view clause replaced it; a stray
+--     occurrence is an unknown key now, no longer a mis-site)
+-- ===================================
+
+declare logical schema bad_retired {
 	table Car {
 		id integer primary key,
 		vin text
@@ -55,8 +73,8 @@ declare logical schema bad_site {
 
 -- run
 
-apply schema bad_site;
--- error: not allowed
+apply schema bad_retired;
+-- error: unknown reserved tag
 
 -- ===================================
 -- 3. Empty lens.ack rationale → WARNING (deploy succeeds), not an error

@@ -2710,11 +2710,9 @@ export class Parser {
 	/**
 	 * Parse the optional trailing `insert defaults ( col = expr , … )` clause of a
 	 * view / materialized-view definition — per-column omitted-insert defaults for
-	 * write-through (the first-class replacement for the deprecated
-	 * `quereus.update.default_for.<column>` view-DDL tag). Returns undefined when
-	 * the clause is absent. Commits only once DEFAULTS follows INSERT, so a stray
-	 * `insert` after a complete view body still surfaces as the same downstream
-	 * syntax error it did before this clause existed.
+	 * write-through. Returns undefined when the clause is absent. Commits only once
+	 * DEFAULTS follows INSERT, so a stray `insert` after a complete view body still
+	 * surfaces as the same downstream syntax error it did before this clause existed.
 	 */
 	private parseInsertDefaultsClause(): AST.ViewInsertDefault[] | undefined {
 		if (!this.check(TokenType.INSERT)) return undefined;
