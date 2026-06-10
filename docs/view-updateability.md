@@ -90,7 +90,7 @@ The rules below apply identically to view bodies, CTE bodies, subqueries in `fro
 2. **Constant FD** — a column constrained to a constant by an upstream selection predicate (the relation carries the FD `∅ → c = v`) takes that constant.
 3. **FD reconstruction** — a column functionally determined by other surviving / supplied columns is reconstructed symbolically from the FD's right-hand side.
 4. **EC propagation** — a column in an equivalence class with a supplied column or a constant takes the EC representative's value.
-5. The view's declared insert default — an `insert defaults (col = expr, …)` clause entry (expression over surviving columns), or per statement the `default_for` tag override (§ [View insert defaults](#view-insert-defaults)).
+5. The view's declared insert default — an `insert defaults (col = expr, …)` clause entry (a self-contained expression — see § [View insert defaults](#view-insert-defaults)), or per statement the `default_for` tag override.
 6. The base column's declared `default` — including a **generated default** (sequence, surrogate allocator, clock read), which resolves through the mutation-context envelope (§ [Mutation Context](#mutation-context)) at per-row cadence and, when the column is a shared join key, threads the one captured value through every branch of the decomposition.
 7. For nullable columns, `null`.
 
@@ -697,7 +697,7 @@ create view dfi_v (id, name) as select id, name from dfi
   insert defaults (created = epoch_ms('now'));
 ```
 
-Each entry names a base column the view projects away (the dominant case — the column has no slot in the view's rename-only output column list) or a `base`-lineage view column, and carries a real SQL **expression** (a first-class AST value with a source location — not re-parsed tag text). At write-through the expression is evaluated per omitted-insert row at step 5 of the insert-defaulting chain (§ [Projection](#projection)): after the user value / constant-FD / FD-reconstruction / EC-propagation sources, ahead of the base column's declared `default`. It inherits base-column-default determinism rules — a non-deterministic value resolves through the mutation-context envelope. An entry naming a column that is neither a base column nor a base-lineage view column is a hard sited diagnostic at write time; the read-only `view_info` surface conservatively *skips* such an entry instead (never-throw posture), so `is_insertable_into` stays honest-conservative.
+Each entry names a base column the view projects away (the dominant case — the column has no slot in the view's rename-only output column list) or a `base`-lineage view column, and carries a real SQL **expression** (a first-class AST value with a source location — not re-parsed tag text). At write-through the expression is evaluated per omitted-insert row at step 5 of the insert-defaulting chain (§ [Projection](#projection)): after the user value / constant-FD / FD-reconstruction / EC-propagation sources, ahead of the base column's declared `default`. The expression must be **self-contained** (literals, function calls, subqueries — no references to the inserted row's columns): the rewrite appends it as an extra cell on each `VALUES` row, where a column reference has nothing to bind against and fails at plan time. An entry naming a column that is neither a base column nor a base-lineage view column is a hard sited diagnostic at write time; the read-only `view_info` surface conservatively *skips* such an entry instead (never-throw posture), so `is_insertable_into` stays honest-conservative.
 
 The clause is accepted identically by `create materialized view` (every MV is a single-source passthrough, so MV write-through shares the same rewrite spine; the defaulted source column is transparent to row-time backing maintenance) and by declarative `view` / `materialized view` items, and it round-trips through `export_schema` and the declarative renderers.
 
@@ -719,7 +719,7 @@ Tags are collected at two sites: the view DDL (`ViewSchema.tags`, validated `vie
 
 | Tag | Where | Effect |
 |---|---|---|
-| `"quereus.update.default_for.<column>"` | view DDL *(deprecated)*, projection *(deprecated)*, dml statement | Default expression for `insert` through the view when the column is omitted. The expression may reference any surviving column. A statement-level binding overrides the view's declared default (clause or tag) for that statement. |
+| `"quereus.update.default_for.<column>"` | view DDL *(deprecated)*, projection *(deprecated)*, dml statement | Default expression for `insert` through the view when the column is omitted. The expression must be self-contained (same evaluation context as the clause — § [View insert defaults](#view-insert-defaults)). A statement-level binding overrides the view's declared default (clause or tag) for that statement. |
 
 `default_for` is the **only** retained `quereus.update.*` key. A statement-level binding appears in a `with tags (...)` clause on the statement, where a `with context (...)` clause would sit (before `set` / the `values` source / `where`, or trailing):
 

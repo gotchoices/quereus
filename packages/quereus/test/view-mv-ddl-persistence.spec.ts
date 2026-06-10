@@ -143,6 +143,26 @@ describe('view persistence: importCatalog silent view registration', () => {
 		}
 	});
 
+	it('rehydrates the insert defaults clause — write-through supplies the defaulted column', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, name text, created integer not null)');
+			const result = await db.schemaManager.importCatalog([
+				'create view v as select id, name from t insert defaults (created = 999)',
+			]);
+			expect(result.views).to.deep.equal(['main.v']);
+			const schema = db.schemaManager.getView('main', 'v');
+			expect(schema?.insertDefaults, 'clause survives rehydration').to.have.length(1);
+			expect(schema?.insertDefaults?.[0].column).to.equal('created');
+			// The rehydrated clause drives write-through: the omitted not-null column fills.
+			await db.exec("insert into v values (1, 'x')");
+			expect(await rows(db, 'select id, name, created from t'))
+				.to.deep.equal([{ id: 1, name: 'x', created: 999 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a view over another (later-imported) view imports order-independently', async () => {
 		const db = new Database();
 		try {
@@ -191,6 +211,28 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 			await db.exec('delete from base where id = 2');
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 99 }, { id: 3, v: 30 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rehydrates the insert defaults clause — MV write-through supplies the defaulted source column', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, name text, created integer not null)');
+			const result = await db.schemaManager.importCatalog([
+				'create materialized view mv as select id, name from t insert defaults (created = 777)',
+			]);
+			expect(result.materializedViews).to.deep.equal(['main.mv']);
+			const schema = db.schemaManager.getMaterializedView('main', 'mv');
+			expect(schema?.insertDefaults, 'clause survives re-materialization').to.have.length(1);
+			expect(schema?.insertDefaults?.[0].column).to.equal('created');
+			await db.exec("insert into mv values (1, 'a')");
+			expect(await rows(db, 'select id, name, created from t'))
+				.to.deep.equal([{ id: 1, name: 'a', created: 777 }]);
+			// Reads-own-writes: backing maintenance projected the defaulted source row.
+			expect(await rows(db, 'select id, name from mv order by id'))
+				.to.deep.equal([{ id: 1, name: 'a' }]);
 		} finally {
 			await db.close();
 		}
@@ -337,6 +379,7 @@ function viewSchemaFromDDL(ddl: string): ViewSchema {
 		sql: ddl,
 		selectAst: stmt.select,
 		columns: stmt.columns ? [...stmt.columns] : undefined,
+		insertDefaults: stmt.insertDefaults,
 		tags: stmt.tags,
 	};
 }
@@ -352,6 +395,7 @@ function mvSchemaFromDDL(ddl: string): MaterializedViewSchema {
 		sql: ddl,
 		selectAst: stmt.select,
 		columns: stmt.columns ? [...stmt.columns] : undefined,
+		insertDefaults: stmt.insertDefaults,
 		tags: stmt.tags,
 		backingTableName: backingTableNameFor(stmt.view.name),
 		primaryKey: [],
@@ -371,6 +415,8 @@ function matrix(kind: 'view' | 'materialized view'): { name: string; ddl: string
 		{ name: 'explicit column list', ddl: `${k} (x, y) as select 1, 2` },
 		{ name: 'compound-SELECT body', ddl: `${k} as select 1 as a union all select 2 as a` },
 		{ name: 'VALUES body', ddl: `${k} as values (1, 2), (3, 4)` },
+		{ name: 'insert defaults clause', ddl: `${k} as select 1 as a insert defaults (created = 42 + 1)` },
+		{ name: 'insert defaults clause + tags', ddl: `${k} as select 1 as a insert defaults (c1 = 7, c2 = epoch_ms('now')) with tags (k = 'v')` },
 	];
 }
 

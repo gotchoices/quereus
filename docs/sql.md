@@ -1420,7 +1420,7 @@ drop view [if exists] view_name;
 
 - `query_expr` is any relation-producing expression — a `select`, a `values (...)`, or a `with … select`. A **DML body** (`insert`/`update`/`delete … returning`) is **rejected at create time**: a view re-evaluates per reference, so a write-per-read body is incoherent.
 - An optional column list renames the body's output columns (arity must match).
-- `insert defaults (col = expr, ...)` declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; the target is resolved (and a typo rejected) at write time, not at create.
+- `insert defaults (col = expr, ...)` declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; each `expr` must be self-contained (it cannot reference the inserted row's columns); the target is resolved (and a typo rejected) at write time, not at create.
 - `with tags (...)` attaches metadata; the reserved `quereus.update.*` namespace influences write-through (see [§2.9](#29-updatable-views)).
 
 **Examples:**

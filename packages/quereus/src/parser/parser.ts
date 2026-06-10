@@ -2720,7 +2720,10 @@ export class Parser {
 		if (!this.check(TokenType.INSERT)) return undefined;
 		this.advance();
 		if (!this.peekKeyword('DEFAULTS')) {
-			this.current--; // Not our clause — back up the INSERT and stop.
+			// Not our clause — back up the INSERT and stop. Bare cursor rewind is safe
+			// only because the rewound token is INSERT: advance() has one non-cursor
+			// side effect (LPAREN/RPAREN parenStack maintenance), which INSERT never hits.
+			this.current--;
 			return undefined;
 		}
 		this.advance();
