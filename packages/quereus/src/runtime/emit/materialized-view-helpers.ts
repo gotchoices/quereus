@@ -11,8 +11,14 @@ import type { ColumnSchema } from '../../schema/column.js';
 import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule } from '../../schema/table.js';
 import type { MaterializedViewSchema } from '../../schema/view.js';
 import { backingTableNameFor, computeBodyHash } from '../../schema/view.js';
+import type { Schema } from '../../schema/schema.js';
+import { generateMaterializedViewDDL } from '../../schema/ddl-generator.js';
+import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
+import { createLogger } from '../../common/logger.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import type { MemoryTableManager } from '../../vtab/memory/layer/manager.js';
+
+const log = createLogger('runtime:emit:materialized-view');
 
 // Canonical body-hash lives next to the MV schema definition so the declarative
 // differ can share it without depending on the runtime layer. Re-exported here
@@ -372,25 +378,66 @@ export async function rebuildBacking(db: Database, mv: MaterializedViewSchema): 
  * output) — the caller then rebuilds the backing to match the re-planned body.
  */
 export function backingShapeMatches(current: TableSchema, shape: BackingShape): boolean {
-	if (current.columns.length !== shape.columns.length) return false;
+	if (!backingShapeMatchesStructurally(current, shape)) return false;
+	for (let i = 0; i < shape.columns.length; i++) {
+		if (current.columns[i].name.toLowerCase() !== shape.columns[i].name.toLowerCase()) return false;
+	}
+	return true;
+}
+
+/**
+ * The structural (name-blind) half of {@link backingShapeMatches}: column count,
+ * per-column logical type / not-null / collation, and the physical PK. The rename
+ * propagation ({@link propagateColumnRenameToMaterializedViews}) uses it to assert
+ * a source column rename produced a *pure name shift* in the body's output before
+ * carrying the new names onto the live backing — anything structural is not a
+ * rename outcome and fails the propagation instead of rebuilding data.
+ */
+function backingShapeMatchesStructurally(current: TableSchema, shape: BackingShape): boolean {
+	return describeBackingShapeMismatch(current, shape) === null;
+}
+
+/** Names the first structural difference between the live backing and the derived
+ *  shape (null when structurally identical) — the diagnostic half of
+ *  {@link backingShapeMatchesStructurally}. */
+function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape): string | null {
+	if (current.columns.length !== shape.columns.length) {
+		return `column count ${current.columns.length} → ${shape.columns.length}`;
+	}
 	for (let i = 0; i < shape.columns.length; i++) {
 		const a = current.columns[i];
 		const b = shape.columns[i];
-		if (a.name.toLowerCase() !== b.name.toLowerCase()) return false;
-		if (a.logicalType !== b.logicalType) return false;
-		if ((a.notNull === true) !== (b.notNull === true)) return false;
-		if ((a.collation ?? 'BINARY') !== (b.collation ?? 'BINARY')) return false;
+		// By NAME, not identity: logical types resolve through the (name-interned)
+		// registry, but a module may rebuild its TableSchema with fresh instances
+		// after an ALTER (the store module does), so identity is spuriously false.
+		if (a.logicalType.name.toUpperCase() !== b.logicalType.name.toUpperCase()) {
+			return `column ${i} type ${a.logicalType.name} → ${b.logicalType.name}`;
+		}
+		if ((a.notNull === true) !== (b.notNull === true)) {
+			return `column ${i} not-null ${a.notNull === true} → ${b.notNull === true}`;
+		}
+		if ((a.collation ?? 'BINARY') !== (b.collation ?? 'BINARY')) {
+			return `column ${i} collation ${a.collation ?? 'BINARY'} → ${b.collation ?? 'BINARY'}`;
+		}
 	}
 	const shapePk = computeBackingPrimaryKey(shape);
 	const currentPk = current.primaryKeyDefinition;
-	if (currentPk.length !== shapePk.length) return false;
-	for (let i = 0; i < shapePk.length; i++) {
-		if (currentPk[i].index !== shapePk[i].index) return false;
-		if ((currentPk[i].desc === true) !== (shapePk[i].desc === true)) return false;
-		const shapeColl = shape.columns[shapePk[i].index]?.collation ?? 'BINARY';
-		if ((currentPk[i].collation ?? 'BINARY') !== shapeColl) return false;
+	if (currentPk.length !== shapePk.length) {
+		return `primary-key length ${currentPk.length} → ${shapePk.length}`;
 	}
-	return true;
+	for (let i = 0; i < shapePk.length; i++) {
+		if (currentPk[i].index !== shapePk[i].index) {
+			return `primary-key column ${i} index ${currentPk[i].index} → ${shapePk[i].index}`;
+		}
+		if ((currentPk[i].desc === true) !== (shapePk[i].desc === true)) {
+			return `primary-key column ${i} direction`;
+		}
+		const shapeColl = shape.columns[shapePk[i].index]?.collation ?? 'BINARY';
+		if ((currentPk[i].collation ?? 'BINARY') !== shapeColl) {
+			return `primary-key column ${i} collation ${currentPk[i].collation ?? 'BINARY'} → ${shapeColl}`;
+		}
+	}
+	return null;
 }
 
 /**
@@ -530,4 +577,263 @@ export function revalidateBody(db: Database, mvName: string, bodySql: string): R
 		);
 	}
 	return root;
+}
+
+/* ──────────────── ALTER … RENAME propagation into MV bodies ──────────────── */
+
+/**
+ * Lowercased `schema.name` keys of every MV that is stale *right now*. The rename
+ * emitters snapshot this BEFORE the statement's first schema-change notify, so the
+ * propagation pass can distinguish "stale from this very rename statement" (safe to
+ * clear after a successful in-place rewrite — no DML can interleave within the
+ * statement) from "stale from an earlier un-refreshed change" (the backing may
+ * already be behind — writes during staleness are not maintained — so only a
+ * successful REFRESH may clear it).
+ */
+export function snapshotStaleMaterializedViews(db: Database): ReadonlySet<string> {
+	const out = new Set<string>();
+	for (const mv of db.schemaManager.getAllMaterializedViews()) {
+		if (mv.stale) out.add(mvStaleKey(mv));
+	}
+	return out;
+}
+
+function mvStaleKey(mv: Pick<MaterializedViewSchema, 'schemaName' | 'name'>): string {
+	return `${mv.schemaName}.${mv.name}`.toLowerCase();
+}
+
+/**
+ * Rewrites every dependent materialized view in `schema` after a source TABLE
+ * RENAME — the MV mirror of the plain-view loop in `propagateTableRenameInSchema`
+ * ("MV ≡ faster view"): the caller applies the same same-schema gate, and the body
+ * `selectAst` is mutated in place by the same `renameTableInAst` walker. An MV is
+ * processed when its AST changed OR its `sourceTables` carries the old base —
+ * the latter catches a body that reads the renamed table *through a plain view*
+ * (the view's AST was rewritten by the view loop, but this MV's own AST never
+ * names the table while its row-time plan is still keyed under the old base).
+ *
+ * Per processed MV the derived fields are recomputed on a shallow clone
+ * (`sourceTables` re-keyed old→new, `bodyHash`, regenerated `sql`, the `covers`
+ * reverse link), then {@link applyMaterializedViewRewrite} re-registers row-time
+ * maintenance / preserves pre-existing staleness and fires
+ * `materialized_view_modified`. Failures mark the MV stale and propagation
+ * continues — best-effort, like the rest of the rename propagation.
+ */
+export async function propagateTableRenameToMaterializedViews(
+	db: Database,
+	schema: Schema,
+	renamedSchemaName: string,
+	oldName: string,
+	newName: string,
+	preStale: ReadonlySet<string>,
+): Promise<void> {
+	const schemaLower = renamedSchemaName.toLowerCase();
+	const oldBase = `${schemaLower}.${oldName.toLowerCase()}`;
+	const newBase = `${schemaLower}.${newName.toLowerCase()}`;
+	for (const mv of Array.from(schema.getAllMaterializedViews())) {
+		try {
+			const changed = renameTableInAst(mv.selectAst, oldName, newName, renamedSchemaName);
+			if (!changed && !mv.sourceTables.includes(oldBase)) continue;
+			const covers = mv.covers
+				&& mv.covers.schemaName.toLowerCase() === schemaLower
+				&& mv.covers.tableName.toLowerCase() === oldName.toLowerCase()
+				? { ...mv.covers, tableName: newName }
+				: mv.covers;
+			await applyMaterializedViewRewrite(db, schema, mv, {
+				sourceTables: mv.sourceTables.map(s => (s === oldBase ? newBase : s)),
+				covers,
+			}, preStale, /*renamedColumns*/ false);
+		} catch (e) {
+			failMaterializedViewRenamePropagation(db, schema, mv, e);
+		}
+	}
+}
+
+/**
+ * Rewrites every dependent materialized view in `schema` after a source COLUMN
+ * RENAME — the MV mirror of the plain-view loop in `propagateColumnRenameInSchema`
+ * (same same-schema gate at the caller, same in-place `renameColumnInAst` walk).
+ * Only MVs whose AST actually changed are processed: `sourceTables` is keyed by
+ * table (unchanged here), and an unchanged-AST MV that the schema-change listener
+ * marked stale (e.g. a `select *` body) stays on the existing stale→REFRESH path.
+ * A changed body can shift the MV's *exposed output names* (a bare passthrough
+ * projection of the renamed column — plain-view parity), which
+ * {@link applyMaterializedViewRewrite} carries onto the live backing table.
+ */
+export async function propagateColumnRenameToMaterializedViews(
+	db: Database,
+	schema: Schema,
+	renamedSchemaName: string,
+	tableName: string,
+	oldCol: string,
+	newCol: string,
+	preStale: ReadonlySet<string>,
+): Promise<void> {
+	for (const mv of Array.from(schema.getAllMaterializedViews())) {
+		try {
+			if (!renameColumnInAst(mv.selectAst, tableName, oldCol, newCol, renamedSchemaName)) continue;
+			await applyMaterializedViewRewrite(db, schema, mv, {}, preStale, /*renamedColumns*/ true);
+		} catch (e) {
+			failMaterializedViewRenamePropagation(db, schema, mv, e);
+		}
+	}
+}
+
+/**
+ * The per-MV core both rename propagations share. `mv.selectAst` has already been
+ * rewritten in place; recompute the derived fields on a shallow clone (mirroring
+ * the tag setters — `oldObject` in the event shares the rewritten AST, only the
+ * derived fields differ) and swap it into the catalog. The regenerated `sql` reads
+ * the rewritten AST, so the `materialized_view_modified` → store re-persist path
+ * round-trips the new name.
+ *
+ * Staleness discipline: `stale` means the row-time plan was released and the
+ * backing may already be BEHIND, so a flag that predates this statement is never
+ * cleared — the body/sql/hash/sources are still rewritten (a later REFRESH then
+ * resolves the new name; today it cannot), but maintenance is NOT re-registered
+ * and the backing columns are NOT renamed (refresh's shape-mismatch rebuild owns
+ * that). An MV that was live before the statement is fully restored: backing
+ * column names follow the body's output names (column rename only), row-time
+ * maintenance re-plans against the already-renamed catalog (re-keying the
+ * source-base index, recomputing `sourceScope`), and the staleness this very
+ * statement's events set is cleared — no DML can interleave within the statement,
+ * so the backing cannot be behind.
+ */
+async function applyMaterializedViewRewrite(
+	db: Database,
+	schema: Schema,
+	mv: MaterializedViewSchema,
+	overrides: Partial<Pick<MaterializedViewSchema, 'sourceTables' | 'covers'>>,
+	preStale: ReadonlySet<string>,
+	renamedColumns: boolean,
+): Promise<void> {
+	const wasPreStale = preStale.has(mvStaleKey(mv));
+	const bodySql = astToString(mv.selectAst);
+	const updated: MaterializedViewSchema = {
+		...mv,
+		...overrides,
+		bodyHash: computeBodyHash(bodySql),
+	};
+	updated.sql = generateMaterializedViewDDL(updated);
+	schema.addMaterializedView(updated);
+
+	if (!wasPreStale) {
+		if (renamedColumns) {
+			await renameShiftedBackingColumns(db, schema, updated, bodySql);
+		}
+		// Re-register BEFORE clearing `stale`: if registration throws, the catch in
+		// the caller leaves the MV stale rather than serving an unmaintained backing.
+		db.registerMaterializedView(updated);
+		updated.stale = false;
+	}
+	// Fired for still-stale MVs too: the rewritten body must re-persist so a
+	// post-reopen REFRESH resolves the new name.
+	db.schemaManager.getChangeNotifier().notifyChange({
+		type: 'materialized_view_modified',
+		schemaName: updated.schemaName,
+		objectName: updated.name,
+		oldObject: mv,
+		newObject: updated,
+	});
+}
+
+/**
+ * Carries a column-rename-induced output-name shift onto the MV's live backing
+ * table. The backing's column names were derived from the body's output names at
+ * create ({@link deriveBackingShape}); after the body rewrite a bare passthrough
+ * projection of the renamed column exposes the NEW name, so the backing follows —
+ * positionally, data-preserving, via the module's own `renameColumn` (the backing
+ * is always a memory table in v1). Explicit-column MVs (`mv(a, b)`) and
+ * expression-aliased outputs produce no mismatch and no-op. Any structural
+ * difference (count / types / PK) is NOT a rename outcome — throw so the caller's
+ * failure path leaves the MV stale rather than rebuilding data here.
+ *
+ * The backing `table_modified` fired on a real rename deliberately cascades: a
+ * chained MV whose body references the OLD output name is marked stale by the
+ * manager's listener and surfaces the staleness diagnostic on its next read
+ * (parity with a broken plain-view chain — strictly better than silently freezing),
+ * and cached plans scanning the backing directly recompile against the new names.
+ */
+async function renameShiftedBackingColumns(
+	db: Database,
+	schema: Schema,
+	mv: MaterializedViewSchema,
+	bodySql: string,
+): Promise<void> {
+	const shape = deriveBackingShape(db, bodySql, mv.columns);
+	const backing = schema.getTable(mv.backingTableName);
+	if (!backing) {
+		throw new QuereusError(
+			`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+			StatusCode.INTERNAL,
+		);
+	}
+	const mismatch = describeBackingShapeMismatch(backing, shape);
+	if (mismatch) {
+		throw new QuereusError(
+			`materialized view '${mv.schemaName}.${mv.name}': source column rename shifted the body's backing shape structurally (beyond a pure name shift): ${mismatch}`,
+			StatusCode.INTERNAL,
+		);
+	}
+	const module = requireVtabModule(backing);
+	let current = backing;
+	for (let i = 0; i < shape.columns.length; i++) {
+		const liveCol = current.columns[i];
+		const newName = shape.columns[i].name;
+		if (liveCol.name.toLowerCase() === newName.toLowerCase()) continue;
+		if (!module.alterTable) {
+			throw new QuereusError(
+				`module for backing table '${backing.name}' does not support ALTER TABLE`,
+				StatusCode.UNSUPPORTED,
+			);
+		}
+		current = await module.alterTable(db, mv.schemaName, backing.name, {
+			type: 'renameColumn',
+			oldName: liveCol.name,
+			newName,
+			newColumnDefAst: backingColumnDef(liveCol, newName),
+		});
+	}
+	if (current !== backing) {
+		schema.addTable(current);
+		db.schemaManager.getChangeNotifier().notifyChange({
+			type: 'table_modified',
+			schemaName: mv.schemaName,
+			objectName: backing.name,
+			oldObject: backing,
+			newObject: current,
+		});
+	}
+}
+
+/** Minimal ColumnDef AST for a backing-column rename. Backing columns carry only
+ *  type / not-null / PK / collation — never defaults or generated expressions
+ *  (see {@link buildBackingTableSchema}) — so the lift is total. */
+function backingColumnDef(col: ColumnSchema, newName: string): AST.ColumnDef {
+	const constraints: AST.ColumnDef['constraints'] = [col.notNull ? { type: 'notNull' } : { type: 'null' }];
+	if (col.primaryKey) constraints.push({ type: 'primaryKey', direction: col.pkDirection });
+	if (col.collation && col.collation !== 'BINARY') constraints.push({ type: 'collate', collation: col.collation });
+	return { name: newName, dataType: col.logicalType.name, constraints };
+}
+
+/**
+ * Failure path for one MV's rename rewrite: whatever partial state the rewrite
+ * reached (AST possibly mutated, catalog record possibly swapped), the MV must not
+ * keep serving its backing as if live — force-mark it stale, release its row-time
+ * plan, and invalidate cached backing reads so the next reference re-hits the
+ * build-time stale guard. A pre-existing stale flag is unaffected (it is never
+ * cleared here). The caller continues with the remaining MVs.
+ */
+function failMaterializedViewRenamePropagation(
+	db: Database,
+	schema: Schema,
+	mv: MaterializedViewSchema,
+	cause: unknown,
+): void {
+	log('Rename propagation failed for materialized view %s.%s; leaving it stale: %s',
+		mv.schemaName, mv.name, cause instanceof Error ? cause.message : String(cause));
+	// The shallow clone may or may not have been swapped in before the throw —
+	// mark whichever object the catalog currently holds.
+	const live = schema.getMaterializedView(mv.name) ?? mv;
+	db.markMaterializedViewStale(live);
 }

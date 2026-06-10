@@ -535,6 +535,23 @@ export class MaterializedViewManager {
 		this.releaseRowTime(mvKey(schemaName, name));
 	}
 
+	/**
+	 * Force-mark an MV stale: set the flag, detach its row-time plan, and invalidate
+	 * cached prepared-statement plans reading its backing so the next reference
+	 * re-hits the build-time stale guard. Mirrors the schema-change listener's stale
+	 * transition exactly; exposed for the ALTER … RENAME propagation failure path
+	 * (a dependent MV whose in-place body rewrite / backing rename / re-registration
+	 * failed mid-way must not keep serving its backing as if live).
+	 */
+	markMaterializedViewStale(mv: MaterializedViewSchema): void {
+		if (!mv.stale) {
+			mv.stale = true;
+			log('Marked materialized view %s.%s stale (forced)', mv.schemaName, mv.name);
+		}
+		this.releaseRowTime(mvKey(mv.schemaName, mv.name));
+		this.emitBackingInvalidation(mv);
+	}
+
 	dispose(): void {
 		if (this.unsubscribeSchemaChanges) {
 			this.unsubscribeSchemaChanges();

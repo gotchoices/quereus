@@ -1799,6 +1799,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.materializedViewManager.unregisterMaterializedView(schemaName, name);
 	}
 
+	/** @internal Force-mark an MV stale: detach its row-time plan and invalidate cached
+	 *  backing reads so the next reference re-hits the build-time stale guard
+	 *  (ALTER … RENAME propagation failure path). */
+	public markMaterializedViewStale(mv: MaterializedViewSchema): void {
+		this.materializedViewManager.markMaterializedViewStale(mv);
+	}
+
 	/** @internal Cheap synchronous guard for the per-row DML maintenance hook: true
 	 *  iff a `row-time` covering structure reads `sourceBase` (lowercased or raw
 	 *  `schema.table`). Lets a hot write path skip the maintenance call entirely when

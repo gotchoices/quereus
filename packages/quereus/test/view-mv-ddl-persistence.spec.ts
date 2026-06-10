@@ -616,3 +616,73 @@ describe('view persistence: RENAME rewrites a view body and fires view_modified'
 		}
 	});
 });
+
+// ============================================================================
+// The MV mirror of the section above: ALTER TABLE/COLUMN RENAME rewrites a
+// dependent materialized view's body in place and fires
+// `materialized_view_modified` — the same event the store-backed catalog's
+// `saveMaterializedViewDDL` listener persists from — carrying the live rewritten
+// schema, so the regenerated DDL round-trips the NEW source name.
+// ============================================================================
+
+/** Pluck the `materialized_view_modified` events for a given MV name out of a captured stream. */
+function mvModifiedFor(events: SchemaChangeEvent[], name: string) {
+	return events.filter(
+		(e): e is SchemaChangeEvent & { type: 'materialized_view_modified' } =>
+			e.type === 'materialized_view_modified' && e.objectName === name);
+}
+
+describe('view persistence: RENAME rewrites an MV body and fires materialized_view_modified', () => {
+	it('table rename fires one materialized_view_modified with DDL round-tripping the new source name', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer)');
+			await db.exec('create materialized view mv as select id, v from t');
+			const events = await captureEvents(db, () => db.exec('alter table t rename to t2'));
+
+			const modified = mvModifiedFor(events, 'mv');
+			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
+			expect(modified[0].schemaName).to.equal('main');
+			const ddl = generateMaterializedViewDDL(modified[0].newObject);
+			expect(ddl, 'regenerated DDL references the new table name').to.match(/\bt2\b/);
+			expect(ddl, 'regenerated DDL no longer references a bare `from t`').to.not.match(/\bfrom\s+t\b/i);
+			expect(parse(ddl).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
+			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('column rename fires one materialized_view_modified with DDL naming the new column', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer)');
+			await db.exec('create materialized view mv as select id, v from t');
+			const events = await captureEvents(db, () => db.exec('alter table t rename column v to w'));
+
+			const modified = mvModifiedFor(events, 'mv');
+			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
+			const ddl = generateMaterializedViewDDL(modified[0].newObject);
+			expect(ddl, 'regenerated DDL references the new column name').to.match(/\bw\b/);
+			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an unrelated MV that does not read the renamed table fires no event', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer)');
+			await db.exec('create table u (id integer primary key, x integer)');
+			await db.exec('create materialized view mv_t as select id, v from t');
+			await db.exec('create materialized view mv_u as select id, x from u');
+			const events = await captureEvents(db, () => db.exec('alter table t rename to t2'));
+
+			expect(mvModifiedFor(events, 'mv_t'), 'mv_t was rewritten').to.have.length(1);
+			expect(mvModifiedFor(events, 'mv_u'), 'mv_u is untouched → no event').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+});

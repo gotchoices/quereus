@@ -14,7 +14,13 @@ import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
 import type { Schema } from '../../schema/schema.js';
+import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
+import {
+	snapshotStaleMaterializedViews,
+	propagateTableRenameToMaterializedViews,
+	propagateColumnRenameToMaterializedViews,
+} from './materialized-view-helpers.js';
 
 const log = createLogger('runtime:emit:alter-table');
 
@@ -162,6 +168,12 @@ async function runRenameTable(
 	schema.removeTable(oldName);
 	schema.addTable(updatedTableSchema);
 
+	// Snapshot which MVs are stale BEFORE this statement's first schema-change
+	// notify: the MV propagation below restores staleness set by this very
+	// statement's events, but must never clear a pre-existing flag (the backing
+	// may already be behind; only REFRESH can safely clear that).
+	const preStaleMvs = snapshotStaleMaterializedViews(rctx.db);
+
 	// Notify schema change
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
@@ -172,10 +184,10 @@ async function runRenameTable(
 	});
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
-	// predicates in this and other tables, view bodies). Best-effort AST
-	// rewrite — there is no global dependency tracker yet, so we walk the
-	// catalog and patch in-place.
-	propagateTableRename(rctx, tableSchema.schemaName, oldName, newName);
+	// predicates in this and other tables, view and materialized-view bodies).
+	// Best-effort AST rewrite — there is no global dependency tracker yet, so we
+	// walk the catalog and patch in-place.
+	await propagateTableRename(rctx, tableSchema.schemaName, oldName, newName, preStaleMvs);
 
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
 	return null;
@@ -233,6 +245,12 @@ async function runRenameColumn(
 	// Update the schema catalog
 	schema.addTable(updatedTableSchema);
 
+	// Snapshot pre-statement MV staleness BEFORE the notify below: the notify's
+	// listener marks every dependent MV stale, and the propagation must be able to
+	// tell that statement-local staleness (restorable after a successful rewrite)
+	// apart from a pre-existing flag (never cleared — only REFRESH may).
+	const preStaleMvs = snapshotStaleMaterializedViews(rctx.db);
+
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
@@ -242,8 +260,8 @@ async function runRenameColumn(
 	});
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
-	// predicates in this and other tables, view bodies).
-	propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName);
+	// predicates in this and other tables, view and materialized-view bodies).
+	await propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName, preStaleMvs);
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
 	return null;
@@ -1277,30 +1295,33 @@ async function rebuildViaShadowTable(
 
 /**
  * Propagates a table rename into every dependent schema object the catalog
- * knows about: CHECK expressions, FK references, partial-index predicates, and
- * view bodies. Walks every schema (not just the renamed table's home schema)
- * so cross-schema FK references are picked up. View `selectAst` is mutated in
- * place because the planner re-walks it on every reference.
+ * knows about: CHECK expressions, FK references, partial-index predicates,
+ * view bodies, and materialized-view bodies. Walks every schema (not just the
+ * renamed table's home schema) so cross-schema FK references are picked up.
+ * View `selectAst` is mutated in place because the planner re-walks it on
+ * every reference.
  */
-function propagateTableRename(
+async function propagateTableRename(
 	rctx: RuntimeContext,
 	renamedSchemaName: string,
 	oldName: string,
 	newName: string,
-): void {
-	const notifier = rctx.db.schemaManager.getChangeNotifier();
+	preStaleMvs: ReadonlySet<string>,
+): Promise<void> {
 	for (const schema of rctx.db.schemaManager._getAllSchemas()) {
-		propagateTableRenameInSchema(schema, renamedSchemaName, oldName, newName, notifier);
+		await propagateTableRenameInSchema(rctx.db, schema, renamedSchemaName, oldName, newName, preStaleMvs);
 	}
 }
 
-function propagateTableRenameInSchema(
+async function propagateTableRenameInSchema(
+	db: Database,
 	schema: Schema,
 	renamedSchemaName: string,
 	oldName: string,
 	newName: string,
-	notifier: import('../../schema/change-events.js').SchemaChangeNotifier,
-): void {
+	preStaleMvs: ReadonlySet<string>,
+): Promise<void> {
+	const notifier = db.schemaManager.getChangeNotifier();
 	const renamedSchemaLower = renamedSchemaName.toLowerCase();
 
 	for (const table of Array.from(schema.getAllTables())) {
@@ -1338,6 +1359,13 @@ function propagateTableRenameInSchema(
 				});
 			}
 		}
+
+		// Materialized views: same in-place body rewrite as plain views ("MV ≡
+		// faster view"), plus the derived-field re-key, row-time re-registration,
+		// and staleness discipline the MV record needs. Runs AFTER the view loop
+		// so a body reading the renamed table through a view re-plans against the
+		// already-rewritten view.
+		await propagateTableRenameToMaterializedViews(db, schema, renamedSchemaName, oldName, newName, preStaleMvs);
 	}
 }
 
@@ -1385,34 +1413,36 @@ function rewriteTableForTableRename(
 	});
 }
 
-function propagateColumnRename(
+async function propagateColumnRename(
 	rctx: RuntimeContext,
 	renamedSchemaName: string,
 	tableName: string,
 	oldCol: string,
 	newCol: string,
-): void {
+	preStaleMvs: ReadonlySet<string>,
+): Promise<void> {
 	const schemaManager = rctx.db.schemaManager;
-	const notifier = schemaManager.getChangeNotifier();
 	const resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource = (s, t, col) => {
 		const targetSchema = schemaManager.getSchema(s);
 		const targetTable = targetSchema?.getTable(t);
 		return targetTable?.columnIndexMap.has(col.toLowerCase()) ?? false;
 	};
 	for (const schema of schemaManager._getAllSchemas()) {
-		propagateColumnRenameInSchema(schema, renamedSchemaName, tableName, oldCol, newCol, notifier, resolveColumnInSource);
+		await propagateColumnRenameInSchema(rctx.db, schema, renamedSchemaName, tableName, oldCol, newCol, resolveColumnInSource, preStaleMvs);
 	}
 }
 
-function propagateColumnRenameInSchema(
+async function propagateColumnRenameInSchema(
+	db: Database,
 	schema: Schema,
 	renamedSchemaName: string,
 	tableName: string,
 	oldCol: string,
 	newCol: string,
-	notifier: import('../../schema/change-events.js').SchemaChangeNotifier,
 	resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource,
-): void {
+	preStaleMvs: ReadonlySet<string>,
+): Promise<void> {
+	const notifier = db.schemaManager.getChangeNotifier();
 	const renamedSchemaLower = renamedSchemaName.toLowerCase();
 
 	for (const table of Array.from(schema.getAllTables())) {
@@ -1447,6 +1477,13 @@ function propagateColumnRenameInSchema(
 				});
 			}
 		}
+
+		// Materialized views: same in-place body rewrite as plain views, then the
+		// MV-specific tail — backing-column rename for a shifted output name,
+		// row-time re-registration, staleness discipline (the listener marked every
+		// dependent MV stale during the rename's notify; only statement-local
+		// staleness is cleared, per the pre-statement snapshot).
+		await propagateColumnRenameToMaterializedViews(db, schema, renamedSchemaName, tableName, oldCol, newCol, preStaleMvs);
 	}
 }
 

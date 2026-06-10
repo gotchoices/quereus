@@ -1,0 +1,206 @@
+/**
+ * ALTER TABLE/COLUMN RENAME propagation into dependent materialized views —
+ * the catalog-level invariants the sqllogic file
+ * (53.2-materialized-view-rename-propagation.sqllogic) cannot see:
+ *
+ *   1. Derived-field re-keying: `sourceTables`, `bodyHash`, regenerated `sql`,
+ *      and the `materialized_view_modified` event a store-backed catalog
+ *      re-persists from.
+ *   2. The staleness discipline: a pre-existing stale flag is never cleared by
+ *      the rename (the backing may already be behind), but the body IS rewritten
+ *      so a later REFRESH resolves the new name — before the fix it could not.
+ *   3. The failure path: a mid-propagation failure (re-registration throws)
+ *      leaves the MV stale with its row-time plan released, rather than serving
+ *      a silently frozen snapshot as live.
+ */
+
+import { expect } from 'chai';
+import { Database } from '../src/core/database.js';
+import { parse } from '../src/parser/index.js';
+import type { MaterializedViewSchema } from '../src/schema/view.js';
+import type { SchemaChangeEvent } from '../src/schema/change-events.js';
+
+async function rows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
+	const out: Record<string, unknown>[] = [];
+	for await (const r of db.eval(sql)) out.push(r as Record<string, unknown>);
+	return out;
+}
+
+/** Collect every schema-change event a database fires while `fn` runs. */
+async function captureEvents(db: Database, fn: () => Promise<void>): Promise<SchemaChangeEvent[]> {
+	const events: SchemaChangeEvent[] = [];
+	const off = db.schemaManager.getChangeNotifier().addListener(e => events.push(e));
+	try {
+		await fn();
+	} finally {
+		off();
+	}
+	return events;
+}
+
+function getMv(db: Database, name: string): MaterializedViewSchema {
+	const mv = db.schemaManager.getMaterializedView('main', name);
+	expect(mv, `materialized view '${name}' exists`).to.not.equal(undefined);
+	return mv!;
+}
+
+describe('MV rename propagation: derived fields and events', () => {
+	it('TABLE rename re-keys sourceTables/bodyHash/sql and fires materialized_view_modified', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer not null)');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec('create materialized view mv as select id, v from t');
+			const before = getMv(db, 'mv');
+			const hashBefore = before.bodyHash;
+			expect(before.sourceTables).to.deep.equal(['main.t']);
+
+			const events = await captureEvents(db, () => db.exec('alter table t rename to t2'));
+
+			const mv = getMv(db, 'mv');
+			expect(mv.stale ?? false, 'MV stays live').to.equal(false);
+			expect(mv.sourceTables, 'source key re-keyed to the new base').to.deep.equal(['main.t2']);
+			expect(mv.bodyHash, 'body hash follows the rewritten body').to.not.equal(hashBefore);
+			expect(mv.sql.toLowerCase(), 'regenerated DDL names the new table').to.include('t2');
+			expect(parse(mv.sql).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
+
+			const modified = events.filter(e => e.type === 'materialized_view_modified');
+			expect(modified, 'one materialized_view_modified (the store re-persist trigger)').to.have.length(1);
+			if (modified[0].type === 'materialized_view_modified') {
+				expect(modified[0].objectName).to.equal('mv');
+				expect(modified[0].newObject.sql.toLowerCase()).to.include('t2');
+			}
+			expect(events.filter(e => e.type === 'materialized_view_added'), 'no re-create event').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('COLUMN rename renames the shifted backing column in place (data preserved)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table s (id integer primary key, v integer not null)');
+			await db.exec('insert into s values (1, 10)');
+			await db.exec('create materialized view mv as select id, v from s');
+			const hashBefore = getMv(db, 'mv').bodyHash;
+
+			await db.exec('alter table s rename column v to w');
+
+			const mv = getMv(db, 'mv');
+			expect(mv.stale ?? false, 'MV stays live').to.equal(false);
+			expect(mv.sourceTables, 'table key unchanged by a column rename').to.deep.equal(['main.s']);
+			expect(mv.bodyHash).to.not.equal(hashBefore);
+
+			const backing = db.schemaManager.getTable('main', mv.backingTableName);
+			expect(backing, 'backing table exists').to.not.equal(undefined);
+			expect(backing!.columns.map(c => c.name), 'backing column follows the exposed output name')
+				.to.deep.equal(['id', 'w']);
+			// Data-preserving: the pre-rename row is still there under the new name.
+			expect(await rows(db, 'select id, w from mv order by id')).to.deep.equal([{ id: 1, w: 10 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('TABLE rename reaches an MV reading the renamed table THROUGH a plain view', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer not null)');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec('create view tv as select id, v from t');
+			await db.exec('create materialized view mv as select id, v from tv');
+			expect(getMv(db, 'mv').sourceTables, 'source resolves through the view').to.deep.equal(['main.t']);
+
+			await db.exec('alter table t rename to t2');
+
+			const mv = getMv(db, 'mv');
+			expect(mv.stale ?? false, 'MV stays live').to.equal(false);
+			expect(mv.sourceTables, 're-keyed even though the MV AST never names the table').to.deep.equal(['main.t2']);
+			// Row-time maintenance re-registered under the new base: writes propagate.
+			await db.exec('insert into t2 values (2, 20)');
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('MV rename propagation: staleness discipline', () => {
+	it('a pre-existing stale flag survives the rename, and REFRESH then resolves the new name', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer not null)');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec('create materialized view mv as select id, v from t');
+
+			// Any source schema change marks the MV stale and releases its plan.
+			await db.exec('alter table t add column extra integer null');
+			expect(getMv(db, 'mv').stale, 'stale from the un-refreshed source change').to.equal(true);
+			// Writes during staleness are NOT maintained — the backing is now behind.
+			await db.exec('insert into t values (2, 20, null)');
+			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
+
+			await db.exec('alter table t rename to t2');
+
+			const mv = getMv(db, 'mv');
+			expect(mv.stale, 'rename must NOT clear a pre-existing stale flag').to.equal(true);
+			expect(mv.sourceTables, 'but the body IS rewritten for a later refresh').to.deep.equal(['main.t2']);
+			expect(mv.sql.toLowerCase()).to.include('t2');
+			// Still behind: no re-registration happened.
+			await db.exec('insert into t2 values (3, 30, null)');
+			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
+
+			// REFRESH resolves the rewritten body (errored "Table 't' not found" before the fix),
+			// clears the flag, and re-attaches maintenance.
+			await db.exec('refresh materialized view mv');
+			expect(getMv(db, 'mv').stale).to.equal(false);
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+			await db.exec('insert into t2 values (4, 40, null)');
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }, { id: 4, v: 40 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a mid-propagation failure leaves the MV stale (not silently frozen); REFRESH recovers', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, v integer not null)');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec('create materialized view mv as select id, v from t');
+
+			// Make the re-registration step fail once (the propagation's last step).
+			const original = db.registerMaterializedView.bind(db);
+			let failures = 0;
+			db.registerMaterializedView = (mv: MaterializedViewSchema) => {
+				failures++;
+				if (failures === 1) throw new Error('injected registration failure');
+				original(mv);
+			};
+
+			// The statement itself succeeds — propagation is best-effort per MV.
+			await db.exec('alter table t rename to t2');
+			expect(failures, 'the injected failure fired during propagation').to.equal(1);
+
+			const mv = getMv(db, 'mv');
+			expect(mv.stale, 'failure path force-marks the MV stale').to.equal(true);
+			// Row-time plan released: writes do not propagate while stale.
+			await db.exec('insert into t2 values (2, 20)');
+			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
+
+			// The body WAS rewritten before the failure, so REFRESH recovers fully.
+			await db.exec('refresh materialized view mv');
+			expect(getMv(db, 'mv').stale).to.equal(false);
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+			await db.exec('insert into t2 values (3, 30)');
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
