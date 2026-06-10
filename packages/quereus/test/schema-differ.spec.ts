@@ -469,6 +469,66 @@ describe('Schema Differ', () => {
 			expect(diff.viewsToCreate).to.deep.equal([]);
 		});
 
+		it('an in-diff rename whose NEW name collides with a clause-subquery FROM table\'s column reconciles scope-aware (declared-side resolver)', () => {
+			// Gap-B cousin for the `insert defaults` expr: t.qty → cap while lim — the
+			// clause expr's subquery FROM — also has a `cap`. The seeded inverse walk
+			// must leave the inner ref bound to lim (the declared-side resolver answers
+			// from the declared column sets) and rewrite only the outer ref; a false
+			// capture would render `max(qty)` and churn a spurious recreate.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table lim { id integer primary key, cap integer }
+					table t {
+						id integer primary key,
+						cap integer with tags ("quereus.previous_name" = 'qty'),
+						extra integer
+					}
+					view v as select id from t insert defaults (extra = cap + (select max(cap) from lim))
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('lim', [{ name: 'id', primaryKey: true }, { name: 'cap' }]),
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'qty' }, { name: 'extra' }]),
+				],
+				[catalogView('create view v as select id from t insert defaults (extra = qty + (select max(cap) from lim))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop, 'inner subquery ref not falsely inverse-captured — no recreate').to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+		});
+
+		it('a hinted view rename renders its recreate DDL with the resolver-guarded inverse (inner subquery ref preserved)', () => {
+			// `columnReconciledViewStmt` renders actual recreate DDL, not just a compare:
+			// the RENAME COLUMN emits after view creates, so the create must spell the
+			// OLD column name for the outer ref — while the inner `max(cap)` legitimately
+			// binds to lim's own column and must NOT be inverse-captured (a false capture
+			// would render `max(qty)`, which fails at apply: lim has no qty).
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table lim { id integer primary key, cap integer }
+					table t {
+						id integer primary key,
+						cap integer with tags ("quereus.previous_name" = 'qty'),
+						extra integer
+					}
+					view v2 as select id from t insert defaults (extra = cap + (select max(cap) from lim)) with tags ("quereus.previous_name" = 'v')
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('lim', [{ name: 'id', primaryKey: true }, { name: 'cap' }]),
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'qty' }, { name: 'extra' }]),
+				],
+				[catalogView('create view v as select id from t insert defaults (extra = qty + (select max(cap) from lim))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
+			expect(diff.viewsToCreate).to.have.length(1);
+			expect(diff.viewsToCreate[0], 'outer ref inverse-renamed to the OLD column name').to.match(/extra = qty \+/);
+			expect(diff.viewsToCreate[0], 'inner subquery ref NOT falsely inverse-captured').to.match(/max\(cap\)/);
+		});
+
 		it('a genuine definition edit layered on an in-diff rename still recreates', () => {
 			const declared = parseDeclaredSchema(
 				`declare schema main {
