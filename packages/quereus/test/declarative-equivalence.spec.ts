@@ -1299,6 +1299,90 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
+	it('changing only the MV insert-defaults clause triggers a drop+recreate on re-apply', async function () {
+		// Regression (ticket view-insert-defaults-declarative-drift-undetected):
+		// the body hash used to cover `astToString(select)` only, so a clause-only
+		// change diffed empty and write-through kept supplying the OLD default.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, created INTEGER NOT NULL }
+				materialized view mv as select id, x from t insert defaults (created = 111)
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into mv values (1, 10)');
+			const before: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select created from t where id = 1')) before.push(r);
+			expect(before).to.deep.equal([{ created: 111 }]);
+			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+
+			// Same body, clause 111 → 222: must surface as a drop+recreate.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, created INTEGER NOT NULL }
+				materialized view mv as select id, x from t insert defaults (created = 222)
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.materializedViewsToDrop, 'clause-only change must drop').to.deep.equal(['mv']);
+			expect(diff.materializedViewsToCreate, 'clause-only change must recreate').to.have.length(1);
+
+			await db.exec('apply schema main');
+			await db.exec('insert into mv values (2, 20)');
+			const after: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select created from t where id = 2')) after.push(r);
+			expect(after, 'write-through must use the NEW default').to.deep.equal([{ created: 222 }]);
+
+			const afterHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			expect(afterHash, 'bodyHash should change when the clause changes').to.not.equal(beforeHash);
+
+			// Converged: re-diff yields no create and no drop.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.materializedViewsToCreate).to.deep.equal([]);
+			expect(diff2.materializedViewsToDrop).to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('changing only the MV explicit column list triggers a drop+recreate on re-apply', async function () {
+		// The explicit list renames the backing-table columns, so it is
+		// definitional — part of the canonical definition the body hash covers.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv (a, b) as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv (a, c) as select id, x from t
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.materializedViewsToDrop, 'column-list-only change must drop').to.deep.equal(['mv']);
+			expect(diff.materializedViewsToCreate, 'column-list-only change must recreate').to.have.length(1);
+
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10)');
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select a, c from mv')) rows.push(r);
+			expect(rows).to.deep.equal([{ a: 1, c: 10 }]);
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash).to.not.equal(beforeHash);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('re-applying an unchanged MV is a no-op and the schema hash is stable', async function () {
 		const db = new Database();
 		try {

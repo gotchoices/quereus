@@ -85,11 +85,13 @@ export interface MaterializedViewSchema {
 	 *  (Quereus default). Such an MV is incremental-ineligible until Phase 2. */
 	primaryKey: ReadonlyArray<{ index: number; desc: boolean }>;
 
-	/** `toBase64Url(fnv1aHash(...))` of the canonical body SQL (astToString of the
-	 *  parsed body — not a plan-structure serialization, which embeds unstable node ids).
-	 *  Consumed by the declarative-schema differ (sibling ticket) to detect
-	 *  "body changed → rebuild". Populated here even though the differ wiring
-	 *  lands next ticket. */
+	/** `toBase64Url(fnv1aHash(...))` of the canonical DEFINITION string —
+	 *  explicit column list + body + `insert defaults` clause, rendered by
+	 *  `viewDefinitionToCanonicalString` (not a plan-structure serialization,
+	 *  which embeds unstable node ids). Consumed by the declarative-schema
+	 *  differ to detect "definition changed → rebuild"; a clause-only or
+	 *  explicit-columns-only change therefore re-materializes, exactly as a
+	 *  body change does (tags stay a separate channel — `SET TAGS`, no rebuild). */
 	bodyHash: string;
 
 	/** Body ordering captured from the optimized body (for the materialized-index path).
@@ -147,17 +149,20 @@ export function backingTableNameFor(mvName: string): string {
 }
 
 /**
- * Canonical body hash for a materialized view: `toBase64Url(fnv1aHash(bodySql))`
- * over the body's canonical SQL (`astToString` of the parsed body, supplied by
- * the caller — NOT a plan-structure serialization, which embeds unstable node
- * ids). Stable per body; changes when the body changes.
+ * Canonical definition hash for a materialized view:
+ * `toBase64Url(fnv1aHash(...))` over the canonical DEFINITION string supplied
+ * by the caller — `viewDefinitionToCanonicalString(columns, selectAst,
+ * insertDefaults)`, i.e. the explicit column list + the body's canonical SQL +
+ * the `insert defaults` clause (NOT a plan-structure serialization, which
+ * embeds unstable node ids). Stable per definition; changes when any
+ * definitional part changes.
  *
- * Single source of truth shared by MV creation (which stamps
- * {@link MaterializedViewSchema.bodyHash}) and the declarative-schema differ
- * (which recomputes it from a declared MV's body to detect "body changed →
- * rebuild"). Both sides MUST hash the same canonical-SQL form, so they call
- * this one function.
+ * Single source of truth shared by MV creation / the rename-propagation
+ * rewrite (which stamp {@link MaterializedViewSchema.bodyHash}) and the
+ * declarative-schema differ (which recomputes it from a declared MV to detect
+ * "definition changed → rebuild"). All sides MUST hash the same canonical
+ * form, so they call this one function over that one renderer.
  */
-export function computeBodyHash(bodySql: string): string {
-	return toBase64Url(fnv1aHash(bodySql));
+export function computeBodyHash(canonicalDefinition: string): string {
+	return toBase64Url(fnv1aHash(canonicalDefinition));
 }

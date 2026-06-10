@@ -7,9 +7,10 @@ import { expect } from 'chai';
 import { generateMigrationDDL, computeSchemaDiff } from '../src/schema/schema-differ.js';
 import type { SchemaDiff } from '../src/schema/schema-differ.js';
 import type * as AST from '../src/parser/ast.js';
-import type { SchemaCatalog, CatalogTable } from '../src/schema/catalog.js';
+import type { SchemaCatalog, CatalogTable, CatalogView } from '../src/schema/catalog.js';
 import { QuereusError } from '../src/common/errors.js';
 import { Parser } from '../src/parser/parser.js';
+import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
 
 function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	const stmt = new Parser().parse(sql);
@@ -17,8 +18,8 @@ function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	return stmt;
 }
 
-function makeCatalog(tables: CatalogTable[] = []): SchemaCatalog {
-	return { schemaName: 'main', tables, views: [], materializedViews: [], indexes: [], assertions: [] };
+function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = []): SchemaCatalog {
+	return { schemaName: 'main', tables, views, materializedViews: [], indexes: [], assertions: [] };
 }
 
 function catalogTable(name: string, pkColumn: string): CatalogTable {
@@ -29,6 +30,39 @@ function catalogTable(name: string, pkColumn: string): CatalogTable {
 		primaryKey: [{ columnName: pkColumn, desc: false }],
 		referencedTables: [],
 		namedConstraints: [],
+	};
+}
+
+/** A multi-column actual table for the column-rename reconciliation cases. */
+function catalogTableWithColumns(name: string, columns: Array<{ name: string; primaryKey?: boolean }>): CatalogTable {
+	return {
+		name,
+		ddl: '',
+		columns: columns.map(c => ({
+			name: c.name,
+			type: 'integer',
+			notNull: !!c.primaryKey,
+			primaryKey: !!c.primaryKey,
+			defaultValue: null,
+			collation: 'BINARY',
+		})),
+		primaryKey: columns.filter(c => c.primaryKey).map(c => ({ columnName: c.name, desc: false })),
+		referencedTables: [],
+		namedConstraints: [],
+	};
+}
+
+/** Builds a CatalogView from CREATE VIEW DDL the way `viewSchemaToCatalog` does
+ *  (same canonical renderer over the parsed statement's definitional fields). */
+function catalogView(sql: string): CatalogView {
+	const stmt = new Parser().parse(sql);
+	if (stmt.type !== 'createView') throw new Error(`Expected createView, got ${stmt.type}`);
+	const view = stmt as AST.CreateViewStmt;
+	return {
+		name: view.view.name,
+		ddl: sql,
+		definition: viewDefinitionToCanonicalString(view.columns, view.select, view.insertDefaults),
+		tags: view.tags,
 	};
 }
 
@@ -317,6 +351,141 @@ describe('Schema Differ', () => {
 			);
 			expect(() => computeSchemaDiff(declared, makeCatalog([catalogTable('client', 'id'), catalogTable('customer', 'id')])))
 				.to.throw(QuereusError, /unknown reserved tag/i);
+		});
+	});
+
+	describe('view definition drift (canonical compare + rename reconciliation)', () => {
+		it('clause-only drift on a name-matched view → drop+recreate, no SET TAGS', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key } view v as select id from t insert defaults (created = 222) }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[catalogView('create view v as select id from t insert defaults (created = 111)')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal(['v']);
+			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id from t insert defaults (created = 222)']);
+			expect(diff.viewTagsChanges, 'a recreate carries the declared tags — no separate SET TAGS').to.deep.equal([]);
+		});
+
+		it('identical definition with tag drift → in-place SET TAGS, no recreate', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key } view v as select id from t with tags (owner = 'a') }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[catalogView('create view v as select id from t')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewTagsChanges).to.deep.equal([{ name: 'v', tags: { owner: 'a' } }]);
+		});
+
+		it('a definition recreate under require-hint does not trip the unhinted-rename guard', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key } view v as select id from t where id > 0 }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[catalogView('create view v as select id from t')],
+			);
+			const diff = computeSchemaDiff(declared, catalog, 'require-hint');
+			expect(diff.viewsToDrop).to.deep.equal(['v']);
+			expect(diff.viewsToCreate).to.have.length(1);
+		});
+
+		it('in-diff column rename reconciles body, clause expression, and an unrenamed clause target — no recreate', () => {
+			// Declared references the NEW column name in the body projection AND
+			// inside an insert-defaults expression; the actual catalog still carries
+			// the OLD name at diff time. The inverse-applied declared definition must
+			// match the actual, leaving only the RENAME COLUMN op.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t {
+						id integer primary key,
+						newc integer with tags ("quereus.previous_name" = 'oldc'),
+						extra integer
+					}
+					view v as select id, newc from t insert defaults (extra = newc + 1)
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'oldc' }, { name: 'extra' }])],
+				[catalogView('create view v as select id, oldc from t insert defaults (extra = oldc + 1)')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.tablesToAlter[0]?.columnsToRename).to.deep.equal([{ oldName: 'oldc', newName: 'newc' }]);
+		});
+
+		it('in-diff rename of the clause TARGET column reconciles — no recreate', () => {
+			// The clause column names a base-table column the body projects away, so
+			// the select-body rewrite alone cannot reconcile it — the clause-specific
+			// inverse rename (scoped to the view's FROM tables) must.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t {
+						id integer primary key,
+						newc integer with tags ("quereus.previous_name" = 'oldc')
+					}
+					view v as select id from t insert defaults (newc = 1)
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'oldc' }])],
+				[catalogView('create view v as select id from t insert defaults (oldc = 1)')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+		});
+
+		it('an unrelated table\'s column rename does NOT rewrite the clause target (FROM-scoped lookup)', () => {
+			// `other` renames a column whose NEW name collides with the view's clause
+			// target on `t`; since `other` is not in the view's FROM, the clause must
+			// not be inverse-rewritten — the definitions match raw and stay matched.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, marker integer }
+					table other {
+						id integer primary key,
+						marker integer with tags ("quereus.previous_name" = 'old_marker')
+					}
+					view v as select id from t insert defaults (marker = 1)
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'marker' }]),
+					catalogTableWithColumns('other', [{ name: 'id', primaryKey: true }, { name: 'old_marker' }]),
+				],
+				[catalogView('create view v as select id from t insert defaults (marker = 1)')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+		});
+
+		it('a genuine definition edit layered on an in-diff rename still recreates', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t {
+						id integer primary key,
+						newc integer with tags ("quereus.previous_name" = 'oldc')
+					}
+					view v as select id, newc from t where id > 0
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'oldc' }])],
+				[catalogView('create view v as select id, oldc from t')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal(['v']);
+			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id, newc from t where id > 0']);
 		});
 	});
 });

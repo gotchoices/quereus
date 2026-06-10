@@ -1091,3 +1091,134 @@ diff schema main;
 
 drop view decl_dfl_v;
 drop table decl_dfl;
+
+-- ===================================================================
+-- View definition drift on a NAME-MATCHED view (ticket
+-- view-insert-defaults-declarative-drift-undetected): a changed /
+-- removed / added `insert defaults` clause and a changed body each
+-- diff as DROP VIEW + CREATE VIEW. Previously all four diffed EMPTY —
+-- a stale default survived apply silently. Tag-only drift still takes
+-- the in-place SET TAGS path (declarative-equivalence unit tests).
+-- `main` is empty again at this point in the file.
+-- ===================================================================
+
+create table vd_t (id integer primary key, name text, created integer not null);
+create view vd_v as select id, name from vd_t insert defaults (created = 111);
+
+-- run
+
+-- Baseline: write-through uses the original default.
+insert into vd_v values (1, 'a');
+select created from vd_t where id = 1;
+→ [{"created": 111}]
+
+-- Clause changed (111 → 222) on the name-matched view.
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t insert defaults (created = 222)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t insert defaults (created = 222)"}]
+
+apply schema main;
+
+-- run
+
+-- Write-through now uses the NEW default (it kept writing 111 before this fix).
+insert into vd_v values (2, 'b');
+select created from vd_t where id = 2;
+→ [{"created": 222}]
+
+-- Converged: re-diff is empty.
+diff schema main;
+→ []
+
+-- Clause removed: drift again → drop+recreate; an insert omitting the
+-- NOT NULL column now fails (nothing supplies it anymore).
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t"}]
+
+apply schema main;
+
+-- run
+
+insert into vd_v values (3, 'c');
+-- error: NOT NULL constraint failed: vd_t.created
+
+diff schema main;
+→ []
+
+-- Clause added (the inverse migration): drift → drop+recreate; the
+-- defaulted write-through works again with the new value.
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t insert defaults (created = 333)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t insert defaults (created = 333)"}]
+
+apply schema main;
+
+-- run
+
+insert into vd_v values (4, 'd');
+select created from vd_t where id = 4;
+→ [{"created": 333}]
+
+-- Body changed (added a predicate), same name and clause: drift → drop+recreate.
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t where id > 2 insert defaults (created = 333)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t where id > 2 insert defaults (created = 333)"}]
+
+apply schema main;
+
+-- run
+
+-- The new body filters: rows 1 (id=1) and 2 (id=2) are excluded; row 3 errored.
+select id from vd_v order by id;
+→ [{"id": 4}]
+
+diff schema main;
+→ []
+
+drop view vd_v;
+drop table vd_t;

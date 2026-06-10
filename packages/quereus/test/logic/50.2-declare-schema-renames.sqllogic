@@ -331,3 +331,161 @@ apply schema main;
 -- error: unknown reserved tag
 
 drop table widget;
+
+-- ===================================
+-- 11. In-diff COLUMN rename reconciles a dependent view (no spurious recreate)
+-- ===================================
+
+-- A name-matched view whose declared body references a column renamed in the
+-- SAME diff must NOT recreate: the differ inverse-applies the in-diff renames
+-- before comparing canonical definitions. This is correctness-critical, not
+-- just churn — generateMigrationDDL emits view creates BEFORE the table-alter
+-- block where RENAME COLUMN lives, and CREATE VIEW plans its body at create
+-- time, so an unreconciled recreate naming the NEW column would fail at apply.
+
+create table emp (emp_id integer primary key, fullname text not null, created integer not null);
+create view emp_v as select emp_id, fullname from emp insert defaults (created = 7);
+insert into emp values (1, 'Carol', 0);
+
+declare schema main {
+	table emp {
+		emp_id integer primary key,
+		full_name text not null with tags ("quereus.previous_name" = 'fullname'),
+		created integer not null
+	}
+
+	view emp_v as select emp_id, full_name from emp insert defaults (created = 7)
+}
+
+-- run
+
+-- Only the rename op — no DROP VIEW / CREATE VIEW.
+diff schema main;
+→ [{"ddl": "ALTER TABLE emp RENAME COLUMN fullname TO full_name"}]
+
+apply schema main;
+
+-- run
+
+-- The live rename propagation rewrote the view body to the new column name.
+select * from emp_v order by emp_id;
+→ [{"emp_id": 1, "full_name": "Carol"}]
+
+-- Write-through via the (rename-untouched) insert-defaults clause still works.
+insert into emp_v values (2, 'Dan');
+select created from emp where emp_id = 2;
+→ [{"created": 7}]
+
+-- Converged.
+diff schema main;
+→ []
+
+drop view emp_v;
+drop table emp;
+
+-- ===================================
+-- 12. In-diff TABLE rename reconciles a dependent view (no spurious recreate)
+-- ===================================
+
+create table dept_old (id integer primary key, dname text);
+create view dept_v as select id, dname from dept_old;
+insert into dept_old values (1, 'Eng');
+
+declare schema main {
+	table dept_new {
+		id integer primary key,
+		dname text
+	} with tags ("quereus.previous_name" = 'dept_old')
+
+	view dept_v as select id, dname from dept_new
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE dept_old RENAME TO dept_new"}]
+
+apply schema main;
+
+-- run
+
+select * from dept_v;
+→ [{"id": 1, "dname": "Eng"}]
+
+diff schema main;
+→ []
+
+drop view dept_v;
+drop table dept_new;
+
+-- ===================================
+-- 13. In-diff TABLE rename reconciles a dependent MATERIALIZED VIEW (no spurious rebuild)
+-- ===================================
+
+create table inv_old (id integer primary key, qty integer not null);
+create materialized view inv_mv as select id, qty from inv_old;
+insert into inv_old values (1, 5);
+
+declare schema main {
+	table inv_new {
+		id integer primary key,
+		qty integer not null
+	} with tags ("quereus.previous_name" = 'inv_old')
+
+	materialized view inv_mv as select id, qty from inv_new
+}
+
+-- run
+
+-- Only the table rename — no DROP MATERIALIZED VIEW / re-materialization.
+diff schema main;
+→ [{"ddl": "ALTER TABLE inv_old RENAME TO inv_new"}]
+
+apply schema main;
+
+-- run
+
+-- Row-time maintenance still tracks the renamed source.
+insert into inv_new values (2, 7);
+select * from inv_mv order by id;
+→ [{"id": 1, "qty": 5}, {"id": 2, "qty": 7}]
+
+-- Converged: the rename propagation re-stamped the live bodyHash from the
+-- rewritten body, matching the declared definition's hash.
+diff schema main;
+→ []
+
+drop materialized view inv_mv;
+drop table inv_new;
+
+-- ===================================
+-- 14. require-hint: a view DEFINITION recreate is not an ambiguous rename
+-- ===================================
+
+-- A definition-change recreate emits both a view drop and a view create; the
+-- require-hint guard must not mistake that deliberate pair for an unhinted
+-- rename (mirroring the index body-recreate exclusion).
+
+create table rh_t (id integer primary key, v integer);
+create view rh_v as select id from rh_t;
+
+declare schema main {
+	table rh_t {
+		id integer primary key,
+		v integer
+	}
+
+	view rh_v as select id from rh_t where id > 0
+}
+
+-- run
+
+apply schema main options (rename_policy = 'require-hint');
+
+-- run
+
+diff schema main;
+→ []
+
+drop view rh_v;
+drop table rh_t;

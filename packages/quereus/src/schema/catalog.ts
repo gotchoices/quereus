@@ -2,7 +2,7 @@ import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, IndexColumnSchema, UniqueConstraintSchema } from './table.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { generateTableDDL, generateIndexDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
@@ -51,6 +51,17 @@ export interface CatalogTable {
 export interface CatalogView {
 	name: string;
 	ddl: string;
+	/**
+	 * Canonical definition string (explicit column list, body, `insert defaults`
+	 * clause; name / schema / tags excluded — see
+	 * `viewDefinitionToCanonicalString`). The differ compares this against a
+	 * declared view's definition — rendered by the same function — to detect a
+	 * name-matched view whose definition changed (→ drop+recreate), mirroring
+	 * `CatalogIndex.definition`. Tags are kept separate (and out of `definition`)
+	 * so a tag-only change takes `ALTER VIEW … SET TAGS`, not a needless
+	 * drop+recreate.
+	 */
+	definition: string;
 	tags?: Readonly<Record<string, SqlValue>>;
 }
 
@@ -283,6 +294,7 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 	return {
 		name: viewSchema.name,
 		ddl: viewSchema.sql,
+		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst, viewSchema.insertDefaults),
 		tags: viewSchema.tags,
 	};
 }

@@ -2,7 +2,7 @@ import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
-import { astToString } from '../../emit/ast-stringify.js';
+import { astToString, viewDefinitionToCanonicalString } from '../../emit/ast-stringify.js';
 import type { PlanNode, RelationalPlanNode } from '../../planner/nodes/plan-node.js';
 import { TableReferenceNode } from '../../planner/nodes/reference.js';
 import { keysOf } from '../../planner/util/fd-utils.js';
@@ -308,7 +308,12 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		tags: def.tags,
 		backingTableName,
 		primaryKey: shape.primaryKey,
-		bodyHash: computeBodyHash(def.bodySql),
+		// Hash the canonical DEFINITION (explicit columns + body + insert-defaults
+		// clause), NOT the executable bodySql — the differ recomputes the same form
+		// from a declared MV, so a clause-only or explicit-columns-only change is
+		// detected as drift. `def.bodySql` stays select-only: it feeds execution
+		// (collectBodyRows / deriveBackingShape / linkCoveredUniqueConstraints).
+		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
 		ordering: shape.ordering,
 		sourceTables: shape.sourceTables,
 		stale: false,
@@ -712,7 +717,11 @@ async function applyMaterializedViewRewrite(
 	const updated: MaterializedViewSchema = {
 		...mv,
 		...overrides,
-		bodyHash: computeBodyHash(bodySql),
+		// Canonical-definition hash (columns + body + insert-defaults clause) —
+		// must match the formula stamped at create / recomputed by the differ, or
+		// every post-rename diff would churn a spurious rebuild. `bodySql`
+		// (select-only) still feeds renameShiftedBackingColumns below.
+		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.selectAst, mv.insertDefaults)),
 	};
 	updated.sql = generateMaterializedViewDDL(updated);
 	schema.addMaterializedView(updated);

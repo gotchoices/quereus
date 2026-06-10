@@ -1069,6 +1069,42 @@ function insertDefaultsClauseToString(insertDefaults: ReadonlyArray<AST.ViewInse
 	return `insert defaults (${entries.join(', ')})`;
 }
 
+/**
+ * Renders the **canonical definition** of a view or materialized view — the
+ * comparison key the declarative differ uses to detect a name-matched view whose
+ * definition changed. Covers the three definitional parts: the explicit column
+ * list (`v(a, b)` — for an MV it also names the backing-table columns), the body
+ * (`astToString` of the QueryExpr), and the `insert defaults (col = expr, …)`
+ * clause (write-through behavior). Excludes the view name / schema / `if not
+ * exists` / tags — tags are a separate diff channel (`ALTER VIEW … SET TAGS`),
+ * mirroring `CatalogIndex.definition`.
+ *
+ * Both diff sides funnel through here (the actual side from the live
+ * `ViewSchema` / `MaterializedViewSchema` fields, the declared side from the
+ * `CreateViewStmt` / `CreateMaterializedViewStmt` fields), and both ASTs come
+ * from the same parser and render through this same emitter, so keyword case /
+ * whitespace cannot churn. Deliberately NO identifier case-folding — unlike the
+ * constraint / index canonical bodies (whose recreates re-validate or rebuild,
+ * so they fold to avoid expensive churn), a case-only edit here recreates a
+ * plain view (free — data-less) or rebuilds an MV (pre-existing behavior of the
+ * select-only hash). See docs/schema.md § View / materialized-view definition
+ * changes.
+ */
+export function viewDefinitionToCanonicalString(
+	columns: ReadonlyArray<string> | undefined,
+	select: AST.QueryExpr,
+	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+): string {
+	const parts: string[] = [];
+	if (columns && columns.length > 0) {
+		parts.push(`(${columns.map(quoteIdentifier).join(', ')})`);
+	}
+	parts.push(astToString(select));
+	const defaultsStr = insertDefaultsClauseToString(insertDefaults);
+	if (defaultsStr) parts.push(defaultsStr);
+	return parts.join(' ');
+}
+
 export function createViewToString(stmt: AST.CreateViewStmt): string {
 	const parts: string[] = ['create'];
 	parts.push('view');
