@@ -1103,13 +1103,19 @@ function reconciledDeclaredViewDefinition(
  *              table's column renames ({@link collectFromTableNames} scopes the
  *              lookup to FROM tables so an unrelated table's rename cannot
  *              false-rewrite); its `expr` gets the same inverse rewriters as
- *              the body, with column renames applied via the CHECK-expression
- *              entry point (the expr has no FROM of its own — the base table
- *              seeds the scope, exactly like the constraint/index predicates),
- *              threaded with the declared-side scope resolver so an inner
- *              subquery ref binding to a like-named column on its own FROM is
- *              not falsely captured by the seed (the forward
- *              `renameColumnInInsertDefaults` takes the same hook).
+ *              the body, with column renames applied in two passes mirroring
+ *              the forward `renameColumnInInsertDefaults` branch split: FROM
+ *              tables' renames via the CHECK-expression entry point (the expr
+ *              has no FROM of its own — the base table seeds the scope,
+ *              exactly like the constraint/index predicates), threaded with
+ *              the declared-side scope resolver so an inner subquery ref
+ *              binding to a like-named column on its own FROM is not falsely
+ *              captured by the seed; THEN non-FROM tables' renames (reachable
+ *              only through a subquery in the expr) via the plain scope-aware
+ *              walk — no seed frame, no resolver, exactly the body pass's
+ *              iteration with the FROM tables skipped. FROM-seeded first,
+ *              cross-table second — the same load-bearing ordering as the
+ *              constraint CHECK reconcile's owning-first split.
  */
 function inverseRenamedViewParts(
 	select: AST.QueryExpr,
@@ -1159,6 +1165,24 @@ function inverseRenamedViewParts(
 				const seedTableName = ownRename?.oldName ?? ft;
 				for (const r of colRenames) {
 					renameColumnInCheckExpression(exprClone, seedTableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
+				}
+			}
+			// Cross-table pass: renames on tables NOT in the view's FROM, reachable
+			// only through a clause-expr subquery — the body pass's iteration with
+			// the FROM tables skipped (just handled seeded above; FROM-first ordering
+			// is load-bearing, see the constraint CHECK reconcile). Plain scope-aware
+			// walk, no seed frame / resolver — forward parity with
+			// `renameColumnInInsertDefaults`'s non-FROM branch. Via the shared
+			// `columnReconciledViewStmt` path (no table renames) a hinted view-rename
+			// recreate now spells the OLD name for such a ref; the post-create
+			// forward RENAME COLUMN propagation rewrites it forward again, so both
+			// spellings converge (clause exprs plan lazily at write-through time).
+			for (const [declaredTableName, colRenames] of columnRenamesByTable) {
+				if (fromTables.has(declaredTableName)) continue;
+				const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
+				const seedTableName = ownRename?.oldName ?? declaredTableName;
+				for (const r of colRenames) {
+					renameColumnInAst(exprClone, seedTableName, r.newName, r.oldName, schemaName);
 				}
 			}
 			return { column, expr: exprClone };

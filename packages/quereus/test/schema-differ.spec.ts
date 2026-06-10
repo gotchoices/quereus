@@ -7,10 +7,11 @@ import { expect } from 'chai';
 import { generateMigrationDDL, computeSchemaDiff } from '../src/schema/schema-differ.js';
 import type { SchemaDiff } from '../src/schema/schema-differ.js';
 import type * as AST from '../src/parser/ast.js';
-import type { SchemaCatalog, CatalogTable, CatalogView } from '../src/schema/catalog.js';
+import type { SchemaCatalog, CatalogTable, CatalogView, CatalogMaterializedView } from '../src/schema/catalog.js';
 import { QuereusError } from '../src/common/errors.js';
 import { Parser } from '../src/parser/parser.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
+import { computeBodyHash } from '../src/schema/view.js';
 
 function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	const stmt = new Parser().parse(sql);
@@ -18,8 +19,8 @@ function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	return stmt;
 }
 
-function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = []): SchemaCatalog {
-	return { schemaName: 'main', tables, views, materializedViews: [], indexes: [], assertions: [] };
+function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = [], materializedViews: CatalogMaterializedView[] = []): SchemaCatalog {
+	return { schemaName: 'main', tables, views, materializedViews, indexes: [], assertions: [] };
 }
 
 function catalogTable(name: string, pkColumn: string): CatalogTable {
@@ -63,6 +64,21 @@ function catalogView(sql: string): CatalogView {
 		ddl: sql,
 		definition: viewDefinitionToCanonicalString(view.columns, view.select, view.insertDefaults),
 		tags: view.tags,
+	};
+}
+
+/** Builds a CatalogMaterializedView from CREATE MATERIALIZED VIEW DDL the way
+ *  `materializedViewSchemaToCatalog` does (same hash over the same canonical
+ *  renderer applied to the parsed statement's definitional fields). */
+function catalogMaterializedView(sql: string): CatalogMaterializedView {
+	const stmt = new Parser().parse(sql);
+	if (stmt.type !== 'createMaterializedView') throw new Error(`Expected createMaterializedView, got ${stmt.type}`);
+	const mv = stmt as AST.CreateMaterializedViewStmt;
+	return {
+		name: mv.view.name,
+		ddl: sql,
+		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select, mv.insertDefaults)),
+		tags: mv.tags,
 	};
 }
 
@@ -527,6 +543,63 @@ describe('Schema Differ', () => {
 			expect(diff.viewsToCreate).to.have.length(1);
 			expect(diff.viewsToCreate[0], 'outer ref inverse-renamed to the OLD column name').to.match(/extra = qty \+/);
 			expect(diff.viewsToCreate[0], 'inner subquery ref NOT falsely inverse-captured').to.match(/max\(cap\)/);
+		});
+
+		it('a non-FROM table\'s column rename referenced in a clause-expr subquery reconciles — pure rename, no recreate', () => {
+			// `audit` is not in the view's FROM; the clause expr reaches its renamed
+			// column only through a subquery. The body pass and the forward
+			// `renameColumnInInsertDefaults` both handle this shape — the clause-expr
+			// inverse must too (cross-table pass), else the canonical strings differ
+			// and the view churns a spurious drop+recreate.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, ts integer }
+					table audit {
+						id integer primary key,
+						c2 integer with tags ("quereus.previous_name" = 'c')
+					}
+					view v as select id from t insert defaults (ts = (select max(c2) from audit))
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
+					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
+				],
+				[catalogView('create view v as select id from t insert defaults (ts = (select max(c) from audit))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.tablesToAlter.find(t => t.tableName === 'audit')?.columnsToRename,
+				'only the RENAME COLUMN op remains').to.deep.equal([{ oldName: 'c', newName: 'c2' }]);
+		});
+
+		it('MV twin: a non-FROM table\'s column rename in a clause-expr subquery does not rebuild', () => {
+			// Same shape against the materialized-view hash compare — an unreconciled
+			// clause expr would drift the recomputed bodyHash and force a needless
+			// drop+recreate-with-rebuild.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, ts integer }
+					table audit {
+						id integer primary key,
+						c2 integer with tags ("quereus.previous_name" = 'c')
+					}
+					materialized view mv as select id from t insert defaults (ts = (select max(c2) from audit))
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
+					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
+				],
+				[],
+				[catalogMaterializedView('create materialized view mv as select id from t insert defaults (ts = (select max(c) from audit))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.materializedViewsToDrop).to.deep.equal([]);
+			expect(diff.materializedViewsToCreate).to.deep.equal([]);
 		});
 
 		it('a genuine definition edit layered on an in-diff rename still recreates', () => {
