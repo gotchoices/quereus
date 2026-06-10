@@ -7,7 +7,7 @@
 -- table (bare passthrough projections expose the NEW name, plain-view parity).
 -- An MV the rename provably does NOT affect — an unreferenced column rename, a
 -- constraint-only rewrite of another source, a `select *` pure name shift — is
--- restored after the statement rather than left silently stale (§10–§12).
+-- restored after the statement rather than left silently stale (§10–§13).
 
 -- ===================================
 -- 1. RENAME TABLE: dependent MV stays live
@@ -330,3 +330,33 @@ select id, w from mv12 order by id;
 
 drop materialized view mv12;
 drop table rs;
+
+-- ===================================
+-- 13. Chained MVs under the restoration pass: the `select *` producer's restore
+--     renames its backing column, whose table_modified re-marks the consumer
+--     stale MID-pass; the consumer is examined after the producer (creation
+--     order) and — referencing only the unshifted column — is itself restored.
+--     The whole chain stays live.
+-- ===================================
+
+create table cs (id integer primary key, v integer not null);
+insert into cs values (1, 10);
+create materialized view mv13p as select * from cs;
+create materialized view mv13c as select id from mv13p;
+
+alter table cs rename column v to w;
+
+-- both live: a write to the base cascades producer → consumer
+insert into cs values (2, 20);
+select id, w from mv13p order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+select id from mv13c order by id;
+→ [{"id":1},{"id":2}]
+
+refresh materialized view mv13c;
+select id from mv13c order by id;
+→ [{"id":1},{"id":2}]
+
+drop materialized view mv13c;
+drop materialized view mv13p;
+drop table cs;

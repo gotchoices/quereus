@@ -872,6 +872,16 @@ export async function restoreUnaffectedMaterializedViews(
 			// (e.g. a chained MV referencing a renamed-away output name) → catch
 			// below leaves it stale.
 			const shape = deriveBackingShape(db, bodySql, mv.columns);
+			// The retry of a failure-marked MV must not revive an inconsistent record: a
+			// rewrite that threw between the in-place AST mutation and the catalog swap
+			// leaves the OLD record (un-re-keyed `sourceTables`, old `sql`) holding the
+			// rewritten body. Registering that would compute `sourceScope` (and key the
+			// read-side rewrite) off the wrong bases — leave it stale instead.
+			if (!sameSourceTables(mv.sourceTables, shape.sourceTables)) {
+				log('Leaving materialized view %s.%s stale after rename: recorded sourceTables disagree with the re-planned body — REFRESH recovers',
+					mv.schemaName, mv.name);
+				continue;
+			}
 			const backing = schema.getTable(mv.backingTableName);
 			if (!backing) {
 				throw new QuereusError(
@@ -891,6 +901,14 @@ export async function restoreUnaffectedMaterializedViews(
 				mv.schemaName, mv.name, e instanceof Error ? e.message : String(e));
 		}
 	}
+}
+
+/** Set-equality over qualified (already-lowercased) source-table lists. Order is
+ *  irrelevant — both sides come from `collectSourceTables`' Set walk. */
+function sameSourceTables(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
+	if (a.length !== b.length) return false;
+	const set = new Set(a);
+	return b.every(s => set.has(s));
 }
 
 /**
