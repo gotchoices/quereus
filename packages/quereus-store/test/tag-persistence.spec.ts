@@ -263,6 +263,197 @@ describe('StoreModule catalog-only tag persistence', () => {
 		expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'name', 'age']);
 	});
 
+	// --- Exposed implicit index user tags (UniqueConstraintSchema.exposedIndexTags) ---
+	// Store mode never materializes the implicit covering index as an IndexSchema,
+	// so its user tags ride a trailing `alter index … set tags` line in the catalog
+	// bundle, re-applied silently by importDDL on rehydrate.
+
+	/** Decode the catalog bundle for main.<table>. */
+	async function readCatalogEntry(tableName: string): Promise<string> {
+		const catalog = await provider.getCatalogStore();
+		const bytes = await catalog.get(buildCatalogKey('main', tableName));
+		expect(bytes, `catalog entry for ${tableName} present`).to.not.be.undefined;
+		return new TextDecoder().decode(bytes!);
+	}
+
+	it('exposed implicit index tags persist across reopen (SET TAGS) and surface via schema()', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin set tags (purpose = 'lookup', audited = true)`);
+		await mod.whenCatalogPersisted();
+
+		// The bundle carries the canonical whole-set alter-index line.
+		expect(await readCatalogEntry('t')).to.match(/alter index main\.uq_vin set tags \(/);
+
+		await mod.closeAll();
+		const db2 = await reopen();
+		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints!.find(c => c.name === 'uq_vin')!;
+		expect(uc.exposedIndexTags).to.deep.equal({ purpose: 'lookup', audited: true });
+		// The exposure flag stays on uc.tags, never leaking into the index tags.
+		expect(uc.tags).to.deep.equal({ 'quereus.expose_implicit_index': true });
+
+		// Surfaced identically to a live session through the synthetic catalog entry.
+		const rows: unknown[] = [];
+		for await (const row of db2.eval(`select json_extract(tags, '$.purpose') as purpose from schema() where type = 'index' and name = 'uq_vin'`)) {
+			rows.push(row);
+		}
+		expect(rows).to.deep.equal([{ purpose: 'lookup' }]);
+	});
+
+	it('ADD TAGS / DROP TAGS on an exposed implicit index normalize into the persisted whole-set form', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin add tags (a = 'x', keep = true)`);
+		await db.exec(`alter index uq_vin drop tags (a)`);
+		await mod.closeAll();
+
+		const db2 = await reopen();
+		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints!.find(c => c.name === 'uq_vin')!;
+		expect(uc.exposedIndexTags).to.deep.equal({ keep: true });
+	});
+
+	it('clearing exposed implicit index tags removes the alter-index line and round-trips empty', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin set tags (x = '1')`);
+		await db.exec(`alter index uq_vin set tags ()`);
+		await mod.whenCatalogPersisted();
+
+		expect(await readCatalogEntry('t'), 'cleared tags emit no alter-index line').to.not.match(/alter index/i);
+
+		await mod.closeAll();
+		const db2 = await reopen();
+		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints!.find(c => c.name === 'uq_vin')!;
+		expect(uc.exposedIndexTags).to.be.undefined;
+	});
+
+	it('an unexposed UNIQUE constraint contributes no alter-index line', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await mod.whenCatalogPersisted();
+
+		expect(await readCatalogEntry('t')).to.not.match(/alter index/i);
+	});
+
+	it('a structural ALTER with tagged exposed implicit index still writes the catalog exactly once', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin set tags (purpose = 'lookup')`);
+		await mod.whenCatalogPersisted(); // drain the tag write before spying
+
+		const catalog: KVStore = await provider.getCatalogStore();
+		let putCount = 0;
+		const origPut = catalog.put.bind(catalog);
+		catalog.put = async (key: Uint8Array, value: Uint8Array) => {
+			putCount++;
+			await origPut(key, value);
+		};
+
+		// The module's own alterTable write and the follow-up table_modified listener
+		// pass must both render the bundle — including the alter-index tag line —
+		// byte-identically, so the listener skips.
+		await db.exec(`alter table t add column age integer null`);
+		await mod.whenCatalogPersisted();
+		expect(putCount, 'exactly one catalog write; listener skipped identical bundle').to.equal(1);
+
+		await mod.closeAll();
+		const db2 = await reopen();
+		const t = db2.schemaManager.findTable('t')!;
+		expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'vin', 'age']);
+		expect(t.uniqueConstraints!.find(c => c.name === 'uq_vin')!.exposedIndexTags).to.deep.equal({ purpose: 'lookup' });
+	});
+
+	it('tags on an unnamed UC follow the implicit name across a column rename', async () => {
+		const { db, mod } = open();
+		// Unnamed table-level UNIQUE: implicit index name derives from the column (_uc_vin).
+		await db.exec(`create table t (id integer primary key, vin text, unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index _uc_vin set tags (purpose = 'lookup')`);
+		await db.exec(`alter table t rename column vin to chassis`);
+		await mod.whenCatalogPersisted();
+
+		// Emitted name and reopen-time resolution both derive from the post-rename
+		// schema, so the bundle targets _uc_chassis.
+		expect(await readCatalogEntry('t')).to.match(/alter index main\._uc_chassis set tags \(/);
+
+		await mod.closeAll();
+		const db2 = await reopen();
+		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints![0];
+		expect(uc.exposedIndexTags).to.deep.equal({ purpose: 'lookup' });
+
+		// Addressable under the renamed implicit name.
+		await db2.exec(`alter index _uc_chassis add tags (extra = true)`);
+		const uc2 = db2.schemaManager.findTable('t')!.uniqueConstraints![0];
+		expect(uc2.exposedIndexTags).to.deep.equal({ purpose: 'lookup', extra: true });
+	});
+
+	it('dropping the exposure flag drops the tags from persistence (accepted divergence)', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin set tags (purpose = 'lookup')`);
+		await db.exec(`alter table t alter constraint uq_vin drop tags ("quereus.expose_implicit_index")`);
+		await mod.whenCatalogPersisted();
+
+		// An unexposed constraint emits no alter-index line (emitting one would make
+		// the import NOTFOUND-fail), even while exposedIndexTags lingers in-session.
+		expect(await readCatalogEntry('t')).to.not.match(/alter index/i);
+
+		// In-session, re-exposing resurrects the dormant tags.
+		await db.exec(`alter table t alter constraint uq_vin add tags ("quereus.expose_implicit_index" = true)`);
+		const live = db.schemaManager.findTable('t')!.uniqueConstraints!.find(c => c.name === 'uq_vin')!;
+		expect(live.exposedIndexTags, 'dormant tags resurrect in-session').to.deep.equal({ purpose: 'lookup' });
+
+		// But across a reopen taken while unexposed, the tags are gone for good.
+		await db.exec(`alter table t alter constraint uq_vin drop tags ("quereus.expose_implicit_index")`);
+		await mod.closeAll();
+		const db2 = await reopen();
+		await db2.exec(`alter table t alter constraint uq_vin add tags ("quereus.expose_implicit_index" = true)`);
+		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints!.find(c => c.name === 'uq_vin')!;
+		expect(uc.exposedIndexTags, 're-exposing after reopen yields no tags').to.be.undefined;
+	});
+
+	it('a rehydrated tagged exposed implicit index does not churn the declarative differ', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, vin text, constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
+		await db.exec(`insert into t values (1, 'v1')`);
+		await db.exec(`alter index uq_vin set tags (purpose = 'lookup')`);
+		await mod.closeAll();
+
+		// Reopen with the store as default module (mirrors the converged-schema
+		// pattern in rehydrate-catalog.spec.ts) and re-declare the same shape: a
+		// converged schema diffs empty — the rehydrated exposedIndexTags must not
+		// surface phantom index ops.
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		db2.setDefaultVtabName('store');
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors).to.have.lengthOf(0);
+
+		await db2.exec(`
+			declare schema main
+				using (default_vtab_module = 'store')
+			{
+				table t (
+					id INTEGER PRIMARY KEY,
+					vin TEXT,
+					constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)
+				);
+			}
+		`);
+		const diffRows: unknown[] = [];
+		for await (const row of db2.eval('diff schema main')) {
+			diffRows.push(row);
+		}
+		expect(diffRows, 'no drift on a converged schema').to.deep.equal([]);
+	});
+
 	it('after closeAll the listener is detached: a later table_modified does not persist', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key) using store`);

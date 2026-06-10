@@ -24,7 +24,7 @@ import type { ColumnSchema } from './column.js';
 import type { ViewSchema, MaterializedViewSchema } from './view.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, createMaterializedViewToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, createMaterializedViewToString, alterIndexToString } from '../emit/ast-stringify.js';
 import { normalizeCollationName } from '../util/comparison.js';
 
 /**
@@ -189,6 +189,33 @@ export function generateMaterializedViewDDL(mv: MaterializedViewSchema): string 
 		tags: mv.tags ? { ...mv.tags } : undefined,
 	};
 	return createMaterializedViewToString(stmt);
+}
+
+/**
+ * Canonical `alter index "<schema>"."<name>" set tags (...)` statement applying
+ * `tags` as a whole-set replacement — the vehicle a store-backed catalog bundle
+ * uses to persist an *exposed implicit index*'s user tags
+ * (`UniqueConstraintSchema.exposedIndexTags`), which have no `CREATE INDEX` line
+ * to ride (the index is never materialized in store mode). Lifts the equivalent
+ * {@link AST.AlterIndexStmt} and renders it via the shared `alterIndexToString`
+ * emitter, so the persisted form re-parses to exactly the statement a live
+ * `ALTER INDEX … SET TAGS` produces and the two paths cannot drift. Always emits
+ * the replace form (canonical whole-set, mirroring the declarative differ's
+ * convention); callers skip empty/absent tag records rather than emitting a
+ * clearing statement. The emitter renders lowercase (`alter index …`) while the
+ * CREATE lines are uppercase — purely cosmetic, both re-parse.
+ */
+export function generateIndexTagsDDL(
+	schemaName: string | undefined,
+	indexName: string,
+	tags: Readonly<Record<string, SqlValue>>,
+): string {
+	const stmt: AST.AlterIndexStmt = {
+		type: 'alterIndex',
+		name: { type: 'identifier', name: indexName, schema: schemaName },
+		action: { type: 'setTags', mode: 'replace', tags: { ...tags } },
+	};
+	return alterIndexToString(stmt);
 }
 
 /**

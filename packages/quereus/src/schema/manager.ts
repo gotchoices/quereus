@@ -1035,6 +1035,22 @@ export class SchemaManager {
 	 */
 	private updateIndexTags(indexName: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
+		const { oldSchema, newSchema } = this.resolveIndexTagSwap(targetSchemaName, indexName, compute);
+		this.commitTagUpdate(targetSchemaName, oldSchema, newSchema);
+	}
+
+	/**
+	 * Resolve-and-swap core shared by {@link updateIndexTags} (live ALTER — commits
+	 * via {@link commitTagUpdate}, firing `table_modified`) and the catalog-import
+	 * path ({@link applyImportedIndexTags} — commits silently). Resolves `indexName`
+	 * within `targetSchemaName` and returns the owning table plus its swapped
+	 * replacement with the computed tags applied; mutates nothing itself.
+	 */
+	private resolveIndexTagSwap(
+		targetSchemaName: string,
+		indexName: string,
+		compute: TagCompute,
+	): { oldSchema: TableSchema; newSchema: TableSchema } {
 		const schema = this.getSchemaOrFail(targetSchemaName);
 		const lower = indexName.toLowerCase();
 
@@ -1051,8 +1067,7 @@ export class SchemaManager {
 			// aborts before any swap.
 			const nextTags = compute(matched.tags);
 			const updatedIndexes = table.indexes!.map(idx => (idx.name.toLowerCase() === lower ? { ...idx, tags: nextTags } : idx));
-			this.commitTagUpdate(targetSchemaName, table, { ...table, indexes: Object.freeze(updatedIndexes) });
-			return;
+			return { oldSchema: table, newSchema: { ...table, indexes: Object.freeze(updatedIndexes) } };
 		}
 
 		// Fallback (store mode): the exposed implicit covering index is not
@@ -1074,8 +1089,7 @@ export class SchemaManager {
 				else delete next.exposedIndexTags;
 				return next;
 			});
-			this.commitTagUpdate(targetSchemaName, table, { ...table, uniqueConstraints: Object.freeze(updatedConstraints) });
-			return;
+			return { oldSchema: table, newSchema: { ...table, uniqueConstraints: Object.freeze(updatedConstraints) } };
 		}
 
 		throw new QuereusError(`Index '${indexName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
@@ -2410,9 +2424,13 @@ export class SchemaManager {
 	/**
 	 * Import every statement in a DDL string without creating storage, in document
 	 * order. A single string may carry several statements (a table bundled with
-	 * its indexes); single-statement entries remain valid. Any unsupported
-	 * statement type throws — `rehydrateCatalog` relies on this fail-loud contract
-	 * to record import errors rather than silently dropping objects.
+	 * its indexes); single-statement entries remain valid. An `alter index … tags`
+	 * statement (the store bundle's vehicle for exposed-implicit-index user tags)
+	 * applies silently against the just-imported table and contributes no result
+	 * entry — it modifies an existing object rather than importing one. Any other
+	 * unsupported statement type throws — `rehydrateCatalog` relies on this
+	 * fail-loud contract to record import errors rather than silently dropping
+	 * objects.
 	 */
 	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index' | 'view' | 'materializedView'; name: string }>> {
 		const parser = new Parser();
@@ -2431,11 +2449,45 @@ export class SchemaManager {
 				// Materialized views re-materialize (backing rebuilt from current source
 				// data, row-time maintenance re-registered) — silent like the other arms.
 				results.push(await this.importMaterializedView(stmt as AST.CreateMaterializedViewStmt));
+			} else if (stmt.type === 'alterIndex') {
+				// Tag re-application on an already-imported object — no result entry.
+				this.applyImportedIndexTags(stmt as AST.AlterIndexStmt);
 			} else {
 				throw new QuereusError(`importCatalog does not support statement type: ${stmt.type}`, StatusCode.ERROR);
 			}
 		}
 		return results;
+	}
+
+	/**
+	 * Apply an `alter index … {set|add|drop} tags` statement during catalog import,
+	 * **silently** — no `notifyChange`, mirroring {@link importTable}/{@link importIndex}
+	 * (a store rehydrating its own catalog must not re-emit persistence events).
+	 * Shares {@link resolveIndexTagSwap} with the live {@link updateIndexTags} path,
+	 * so the bundle's statement resolves exactly as a user-issued ALTER would —
+	 * materialized `IndexSchema` first, then the exposed-implicit-constraint
+	 * fallback (the store-bundle case: the `alter index` line follows its
+	 * `CREATE TABLE` in the same entry, so the constraint is already registered).
+	 * All three action forms map through the shared `freezeTags`/`mutateTagRecord`
+	 * helpers, though the bundle generator only emits the whole-set replace form.
+	 * An unresolvable target throws NOTFOUND — the bundle and its alter line come
+	 * from one `TableSchema` snapshot, so a miss indicates real corruption, which
+	 * `rehydrateCatalog` records per-entry.
+	 */
+	private applyImportedIndexTags(stmt: AST.AlterIndexStmt): void {
+		const targetSchemaName = stmt.name.schema ?? this.getCurrentSchemaName();
+		const action = stmt.action;
+		let compute: TagCompute;
+		if (action.type === 'dropTags') {
+			compute = current => this.mutateTagRecord(current, { op: 'drop', keys: action.keys });
+		} else if (action.mode === 'merge') {
+			compute = current => this.mutateTagRecord(current, { op: 'merge', tags: action.tags });
+		} else {
+			compute = () => this.freezeTags(action.tags);
+		}
+		const { newSchema } = this.resolveIndexTagSwap(targetSchemaName, stmt.name.name, compute);
+		this.getSchemaOrFail(targetSchemaName).addTable(newSchema);
+		log(`Applied imported index tags for %s in schema %s`, stmt.name.name, targetSchemaName);
 	}
 
 	/**

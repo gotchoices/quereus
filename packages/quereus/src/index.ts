@@ -139,8 +139,9 @@ export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateF
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';
-export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL } from './schema/ddl-generator.js';
-export { isHiddenImplicitIndex } from './schema/catalog.js';
+export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
+export { isHiddenImplicitIndex, exposedImplicitIndexes } from './schema/catalog.js';
+export type { SyntheticExposedIndex } from './schema/catalog.js';
 
 // Partial-index predicate compilation (used by store modules to honor partial UNIQUE)
 export { compilePredicate } from './vtab/memory/utils/predicate.js';

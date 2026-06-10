@@ -1270,7 +1270,7 @@ function alterMaterializedViewToString(stmt: AST.AlterMaterializedViewStmt): str
 	return `alter materialized view ${expressionToString(stmt.name)} ${objectTagsActionToString(stmt.action)}`;
 }
 
-function alterIndexToString(stmt: AST.AlterIndexStmt): string {
+export function alterIndexToString(stmt: AST.AlterIndexStmt): string {
 	return `alter index ${expressionToString(stmt.name)} ${objectTagsActionToString(stmt.action)}`;
 }
 

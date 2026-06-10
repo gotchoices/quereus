@@ -53,7 +53,7 @@ import {
 	classifyCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
-import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, isHiddenImplicitIndex } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
 
 /**
  * Result of catalog rehydration.
@@ -1714,9 +1714,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Build the catalog entry for a table: its CREATE TABLE DDL followed by one
-	 * `CREATE [UNIQUE] INDEX` statement per persistable secondary index, newline-
-	 * joined into a single multi-statement bundle keyed by `{schema}.{table}`.
+	 * Build the catalog entry for a table: its CREATE TABLE DDL, one
+	 * `CREATE [UNIQUE] INDEX` statement per persistable secondary index, and one
+	 * `alter index … set tags (…)` statement per exposed implicit index carrying
+	 * user tags, newline-joined into a single multi-statement bundle keyed by
+	 * `{schema}.{table}`.
 	 *
 	 * Bundling the indexes into the table's own entry means every existing
 	 * re-persist path — `saveTableDDL` (each `alterTable` arm, `renameTable`) and
@@ -1735,12 +1737,29 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * is defensive. A `CREATE UNIQUE INDEX`'s derived UNIQUE constraint is already
 	 * excluded from the table DDL by the generator, so it round-trips solely via
 	 * its own `CREATE UNIQUE INDEX` line — no doubling.
+	 *
+	 * An *exposed* implicit index (a non-derived UNIQUE constraint tagged
+	 * `quereus.expose_implicit_index = true`, never materialized in store mode)
+	 * must NOT get a synthetic `CREATE INDEX` line — re-import would materialize a
+	 * real `IndexSchema` and change the store-mode shape. Its user tags
+	 * (`UniqueConstraintSchema.exposedIndexTags`) instead ride a trailing
+	 * `alter index … set tags` line, which `importDDL` re-applies silently after
+	 * the CREATE TABLE in the same entry has registered the constraint. Empty tag
+	 * records emit no line, and `exposedImplicitIndexes` returns `[]` for
+	 * memory-mode tables (name materialized) and orders descriptors by the
+	 * `uniqueConstraints` array, so the bundle stays byte-deterministic — which
+	 * the compare-write in `persistCatalogIfChanged` relies on.
 	 */
 	private buildCatalogEntry(tableSchema: TableSchema): string {
 		const parts: string[] = [generateTableDDL(tableSchema)];
 		for (const idx of tableSchema.indexes ?? []) {
 			if (isHiddenImplicitIndex(tableSchema, idx.name)) continue;
 			parts.push(generateIndexDDL(idx, tableSchema));
+		}
+		for (const desc of exposedImplicitIndexes(tableSchema)) {
+			if (desc.tags && Object.keys(desc.tags).length > 0) {
+				parts.push(generateIndexTagsDDL(tableSchema.schemaName, desc.name, desc.tags));
+			}
 		}
 		return parts.join('\n');
 	}
@@ -2124,9 +2143,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const existing = await catalogStore.get(key);
 		if (existing === undefined) return; // not store-backed in this catalog — skip
 
-		// Regenerate the full bundle (table DDL + its index DDL): a SET TAGS on an
-		// index fires `table_modified` on the OWNING table with the updated index in
-		// `tableSchema.indexes`, so the changed index DDL re-persists here with no
+		// Regenerate the full bundle (table DDL + index DDL + exposed-implicit-index
+		// tag DDL): a SET TAGS on an index fires `table_modified` on the OWNING table
+		// with the updated index in `tableSchema.indexes` — or, for an exposed
+		// implicit index, with the updated `exposedIndexTags` on the originating
+		// UNIQUE constraint — so the changed DDL re-persists here with no
 		// index-specific plumbing. An identical bundle is what makes a structural
 		// ALTER (and the createIndex follow-up event) a no-op — no double-write.
 		const newDDL = this.buildCatalogEntry(newObject);
