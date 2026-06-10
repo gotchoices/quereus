@@ -30,6 +30,8 @@ import { validateDeterministicDefault, validateDeterministicGenerated } from '..
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
+import { validateReservedTags } from '../../schema/reserved-tags.js';
+import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
 /**
  * Creates a uniform row expansion projection that maps any relational source
@@ -447,6 +449,13 @@ export function buildInsertStmt(
 	 */
 	defaultRowContextScope?: Scope,
 ): PlanNode {
+	// Statement-level WITH TAGS validates at the dml-stmt site on EVERY authoring
+	// path — base table, view/MV-mediated (before the view dispatch below), and
+	// nested DML (CTE / FROM / expression position), since they all re-enter this
+	// builder. A typo'd or mis-sited `quereus.*` key fails here before any plan is
+	// built, mirroring the DDL surfaces; free-form keys pass untouched.
+	raiseStmtTagDiagnostics(validateReservedTags(stmt.tags, 'dml-stmt'), stmt);
+
 	// Apply schema path from statement if present
 	const contextWithSchemaPath = stmt.schemaPath
 		? { ...ctx, schemaPath: stmt.schemaPath }

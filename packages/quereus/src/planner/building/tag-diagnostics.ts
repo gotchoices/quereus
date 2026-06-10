@@ -27,8 +27,9 @@ export function columnTagDiagnostics(column: AST.ColumnDef): TagDiagnostic[] {
  * Raise the first error diagnostic via the shared reserved-tag policy, threading the
  * statement's source location for a sited error. Warnings (e.g. an empty ack
  * rationale) never block — they hit a no-op sink. Shared by every plan-build tag
- * surface (CREATE TABLE / CREATE INDEX / ALTER … ADD / ALTER … SET TAGS) so they all
- * raise through one policy site.
+ * surface (CREATE TABLE / CREATE INDEX / ALTER … ADD / ALTER … SET TAGS / the
+ * INSERT/UPDATE/DELETE `WITH TAGS` dml-stmt entries) so they all raise through one
+ * policy site.
  */
 export function raiseStmtTagDiagnostics(diagnostics: TagDiagnostic[], stmt: AST.AstNode): void {
 	raiseReservedTagDiagnostics(diagnostics, {

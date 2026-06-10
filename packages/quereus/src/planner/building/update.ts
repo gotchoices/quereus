@@ -21,6 +21,8 @@ import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-b
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { buildViewMutation } from './view-mutation-builder.js';
+import { validateReservedTags } from '../../schema/reserved-tags.js';
+import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
 export function buildUpdateStmt(
   ctx: PlanningContext,
@@ -42,6 +44,10 @@ export function buildUpdateStmt(
    */
   lensRouted = false,
 ): PlanNode {
+  // Statement-level WITH TAGS validates at the dml-stmt site on every authoring
+  // path — base table, view/MV-mediated, nested DML (see buildInsertStmt).
+  raiseStmtTagDiagnostics(validateReservedTags(stmt.tags, 'dml-stmt'), stmt);
+
   // Block DML on committed pseudo-schema
   if (isCommittedSchemaRef(stmt.table.schema)) {
     throw new QuereusError(`Cannot modify committed-state table 'committed.${stmt.table.name}'`, StatusCode.ERROR);

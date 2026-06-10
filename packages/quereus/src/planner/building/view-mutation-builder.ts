@@ -42,9 +42,11 @@ const log = createLogger('planner:view-mutation');
  * wrapped subtree is byte-identical to what the retired AST rewrite re-planned.
  */
 export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): PlanNode {
-	// Site-validate the view-level + statement-level reserved tags (a sited error
-	// for a typo'd / mis-sited `quereus.*` key is raised here, before any base op
-	// is built — atomic). No reserved tag carries mutation behavior anymore.
+	// Site-validate the view-level reserved tags (a sited error for a typo'd /
+	// mis-sited `quereus.*` key on the view/MV is raised here, before any base op
+	// is built — atomic). The statement's own tags were already validated at the
+	// dml-stmt site by the builder entry that dispatched here. No reserved tag
+	// carries mutation behavior anymore.
 	validateMutationTags(view, req.stmt);
 
 	// Record a `view` schema dependency for the mutated view/MV. This is the single

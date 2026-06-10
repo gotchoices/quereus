@@ -157,3 +157,67 @@ apply schema user_tag;
 
 select vin from user_tag.Car order by id;
 → [{"vin": "VIN001"}, {"vin": "VIN002"}]
+
+-- ===================================
+-- 7. Base-table DML statement tags (`insert/update/delete … with tags (…)`)
+--    validate at the `dml-stmt` site at builder entry — the same hard error
+--    the view-mediated path raises (93.4-view-mutation.sqllogic covers that
+--    path). No reserved key is currently legal at the DML-statement site, so
+--    every `quereus.*` key there is rejected: unknown key →
+--    unknown-reserved-tag; known-but-mis-sited key → tag-not-allowed-here.
+--    Free-form keys pass untouched. A rejected statement writes nothing.
+-- ===================================
+
+create table dml_tags (id integer primary key, note text);
+
+-- run
+
+insert into dml_tags values (1, 'seed');
+
+-- run
+
+-- unknown reserved key on a base-table INSERT → error; nothing written.
+insert into dml_tags with tags ("quereus.bogus" = 1) values (2, 'x');
+-- error: unknown reserved tag
+
+select * from dml_tags order by id;
+→ [{"id": 1, "note": "seed"}]
+
+-- the retired statement-level `quereus.update.default_for.<col>` key is unknown
+-- on a base-table UPDATE too (the view path already rejects it); row unchanged.
+update dml_tags with tags ("quereus.update.default_for.note" = '0') set note = 'changed' where id = 1;
+-- error: unknown reserved tag
+
+select note from dml_tags where id = 1;
+→ [{"note": "seed"}]
+
+-- a KNOWN reserved key mis-sited on a DML statement → tag-not-allowed-here
+-- (distinct from the unknown-key error); row still present.
+delete from dml_tags with tags ("quereus.id" = 'x') where id = 1;
+-- error: not allowed on a DML statement
+
+select count(*) as n from dml_tags;
+→ [{"n": 1}]
+
+-- free-form statement tags (outside quereus.*) are untouched — the write lands.
+insert into dml_tags with tags (provenance = 'import', audit = true) values (3, 'y');
+
+-- run
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- mixed free-form + reserved still fails atomically — nothing written.
+insert into dml_tags with tags (audit = true, "quereus.bogus" = 1) values (4, 'z');
+-- error: unknown reserved tag
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- nested DML: a reserved statement tag on DML inside a CTE validates at the
+-- nested statement's own builder entry.
+with w as (insert into dml_tags with tags ("quereus.bogus" = 1) values (5, 'c') returning *) select id from w;
+-- error: unknown reserved tag
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
