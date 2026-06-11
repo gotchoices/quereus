@@ -1,4 +1,5 @@
 description: MV backing tables do not actually reject user DML anywhere — the backing-host contract's "read-only to user DML (READONLY)" line is unenforced in memory, store, and the isolation wrapper. Decide the enforcement seam and realize it uniformly.
+prereq: maintained-table-unified-model
 difficulty: hard
 files:
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts  # buildBackingTableSchema (never sets isReadOnly)
@@ -42,15 +43,17 @@ guards; the engine-level seam also covers future hosts for free.
 Key tests: direct DML against `_mv_` in all three configurations; REFRESH /
 maintenance / rehydrate-refill still pass; sited error message.
 
-## Interplay: maintained-table lifecycle (`maintained-table-attachment`)
+## Interplay: maintained-table lifecycle (now planned)
 
-The maintained-table design (plan ticket `maintained-table-attachment`;
-docs/materialized-views.md § Current limitations "First-class derivation
-lifecycle") makes the derivation an *attachment* and the backing potentially
-a first-class named table that outlives it. Whatever enforcement seam is
-chosen here must key off **the presence of a derivation attachment / MV
-record**, not the `_mv_` name pattern — so that detaching the derivation
-(promotion to a plain base table) sheds READONLY structurally, and a
-first-class-named maintained table is enforced identically to a hidden
-`_mv_` one. This favors the engine-level (planner/builder) seam suggested
-above over per-module name checks.
+The maintained-table design landed at plan stage as the **unified model**
+(`maintained-table-unified-model` and successors): one `TableSchema`
+carrying an optional `derivation` attachment — no `_mv_` names, no dual
+registration. The enforcement seam here must key off **`table.derivation`
+presence**, never a name pattern — so `alter table … drop maintained`
+(detach, in `maintained-table-attach-detach-verbs`) sheds READONLY
+structurally with the catalog flip. This settles the seam question in
+favor of the engine-level (planner/builder) check: reject user mutation
+plans targeting any derivation-bearing table (message naming the
+derivation), while the privileged `applyMaintenance` / `replaceContents` /
+attach-reconcile paths stay open. The per-module guards then become
+defense-in-depth at most.
