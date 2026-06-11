@@ -127,6 +127,24 @@ const columnRefArb: fc.Arbitrary<AST.ColumnExpr> = identArb.map(name => ({
 /** Simple expression: literal or column reference. */
 const simpleExprArb: fc.Arbitrary<AST.Expression> = fc.oneof(literalArb, columnRefArb);
 
+/** `new.<col>` reference — the surface an authored inverse uses for the written view row. */
+const newQualifiedRefArb: fc.Arbitrary<AST.ColumnExpr> = identArb.map(name => ({
+	type: 'column' as const,
+	name,
+	table: 'new',
+}));
+
+/**
+ * `with inverse (col = expr, …)` assignment list on an expression result column
+ * (`ResultColumnExpr.inverse`) — distinct targets (a duplicate is a parse
+ * error), exprs spanning literals, bare refs, and `new.`-qualified refs.
+ */
+const inverseClauseArb: fc.Arbitrary<AST.ResultColumnInverse[]> = fc.uniqueArray(
+	fc.tuple(identArb, fc.oneof(simpleExprArb, newQualifiedRefArb))
+		.map(([column, expr]): AST.ResultColumnInverse => ({ column, expr })),
+	{ minLength: 1, maxLength: 3, selector: a => a.column },
+);
+
 /**
  * Comparison binary expression — `col > 0` etc. Restricted to one shape so
  * we don't have to model operator precedence in the arbitrary.
@@ -350,9 +368,48 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 // CREATE VIEW (minimal)
 // ------------------------------------------------------------------------
 
-const simpleSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(identArb, identArb).map(([col, table]): AST.SelectStmt => ({
+/**
+ * `select <col> [with inverse (…)] from <table>` — the result column sometimes
+ * carries an authored-inverse clause, so every QueryExpr-accepting site fed by
+ * this arbitrary (CTE body, view body, subquery source, compound leg, …) also
+ * probes clause survival in nested positions.
+ */
+const simpleSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
+	identArb,
+	identArb,
+	fc.option(inverseClauseArb, { nil: undefined }),
+).map(([col, table, inverse]): AST.SelectStmt => ({
 	type: 'select',
-	columns: [{ type: 'column', expr: { type: 'column', name: col } }],
+	columns: [{ type: 'column', expr: { type: 'column', name: col }, ...(inverse ? { inverse } : {}) }],
+	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
+}));
+
+/**
+ * `select <col> [as alias] [with inverse (…)], … from t` — drives
+ * `ResultColumnExpr.inverse` directly across 1–3 result columns, each
+ * independently aliased and/or carrying the clause, so alias⨯inverse
+ * coexistence and the comma boundary between a clause and the next result
+ * column are probed structurally (the net for stealth field-drops in
+ * `resultColumnToString`).
+ */
+const selectWithInverseArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
+	fc.array(
+		fc.tuple(
+			identArb,
+			fc.option(identArb, { nil: undefined }),
+			fc.option(inverseClauseArb, { nil: undefined }),
+		),
+		{ minLength: 1, maxLength: 3 },
+	),
+	identArb,
+).map(([cols, table]): AST.SelectStmt => ({
+	type: 'select',
+	columns: cols.map(([name, alias, inverse]): AST.ResultColumn => ({
+		type: 'column',
+		expr: { type: 'column', name },
+		...(alias ? { alias } : {}),
+		...(inverse ? { inverse } : {}),
+	})),
 	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
 }));
 
@@ -1049,6 +1106,10 @@ describe('AST round-trip property: QueryExpr at every accepting site', () => {
 
 	it('CommonTableExpr.query body round-trips structurally', () => {
 		fc.assert(fc.property(cteSelectArb, checkRoundTrip), { numRuns: 100 });
+	});
+
+	it('ResultColumnExpr.inverse (alias ⨯ clause ⨯ multi-column) round-trips structurally', () => {
+		fc.assert(fc.property(selectWithInverseArb, checkRoundTrip), { numRuns: 200 });
 	});
 });
 

@@ -455,10 +455,24 @@ export interface ReleaseStmt extends AstNode {
 
 // --- Supporting Types ---
 
+/**
+ * One assignment of a result column's `with inverse (col = expr, …)` clause: an
+ * authored write-back expression computing a FROM-source base column from the
+ * written view row (referenced via `new.<output-col>`). Inert metadata until the
+ * view write path consumes it; shape mirrors {@link ViewInsertDefault}.
+ * See docs/view-updateability.md § Authored inverses.
+ */
+export interface ResultColumnInverse {
+	column: string;
+	expr: Expression;
+}
+
 export type ResultColumnExpr = {
 	type: 'column',
 	expr: Expression,
-	alias?: string
+	alias?: string,
+	/** Optional `with inverse (col = expr, …)` clause — authored write-back expressions for view write-through. */
+	inverse?: ReadonlyArray<ResultColumnInverse>,
 }
 
 // Result column in SELECT

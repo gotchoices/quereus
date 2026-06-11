@@ -516,6 +516,23 @@ function lowerWindowFrameBoundIdentifiers(bound: AST.WindowFrameBound): AST.Wind
 		: bound;
 }
 
+/**
+ * Convert a result column (SELECT column list / RETURNING) to string:
+ * `*` / `t.*` / `expr [as alias] [with inverse (col = expr, …)]`.
+ */
+function resultColumnToString(col: AST.ResultColumn): string {
+	if (col.type === 'all') {
+		return col.table ? `${quoteIdentifier(col.table)}.*` : '*';
+	}
+	let colStr = expressionToString(col.expr);
+	if (col.alias) colStr += ` as ${quoteIdentifier(col.alias)}`;
+	if (col.inverse && col.inverse.length > 0) {
+		const assignments = col.inverse.map(a => `${quoteIdentifier(a.column)} = ${expressionToString(a.expr)}`);
+		colStr += ` with inverse (${assignments.join(', ')})`;
+	}
+	return colStr;
+}
+
 // Statement stringify functions
 export function selectToString(stmt: AST.SelectStmt): string {
 	const parts: string[] = [];
@@ -529,16 +546,7 @@ export function selectToString(stmt: AST.SelectStmt): string {
 	if (stmt.distinct) parts.push('distinct');
 	if (stmt.all) parts.push('all');
 
-	const columns = stmt.columns.map(col => {
-		if (col.type === 'all') {
-			return col.table ? `${quoteIdentifier(col.table)}.*` : '*';
-		} else {
-			let colStr = expressionToString(col.expr);
-			if (col.alias) colStr += ` as ${quoteIdentifier(col.alias)}`;
-			return colStr;
-		}
-	});
-	parts.push(columns.join(', '));
+	parts.push(stmt.columns.map(resultColumnToString).join(', '));
 
 	if (stmt.from && stmt.from.length > 0) {
 		parts.push('from', stmt.from.map(fromClauseToString).join(', '));
@@ -770,16 +778,7 @@ export function insertToString(stmt: AST.InsertStmt): string {
 	}
 
 	if (stmt.returning && stmt.returning.length > 0) {
-		const returning = stmt.returning.map(col => {
-			if (col.type === 'all') {
-				return col.table ? `${quoteIdentifier(col.table)}.*` : '*';
-			} else {
-				let colStr = expressionToString(col.expr);
-				if (col.alias) colStr += ` as ${quoteIdentifier(col.alias)}`;
-				return colStr;
-			}
-		});
-		parts.push('returning', returning.join(', '));
+		parts.push('returning', stmt.returning.map(resultColumnToString).join(', '));
 	}
 
 	return parts.join(' ');
@@ -849,16 +848,7 @@ export function updateToString(stmt: AST.UpdateStmt): string {
 	}
 
 	if (stmt.returning && stmt.returning.length > 0) {
-		const returning = stmt.returning.map(col => {
-			if (col.type === 'all') {
-				return col.table ? `${quoteIdentifier(col.table)}.*` : '*';
-			} else {
-				let colStr = expressionToString(col.expr);
-				if (col.alias) colStr += ` as ${quoteIdentifier(col.alias)}`;
-				return colStr;
-			}
-		});
-		parts.push('returning', returning.join(', '));
+		parts.push('returning', stmt.returning.map(resultColumnToString).join(', '));
 	}
 
 	return parts.join(' ');
@@ -893,16 +883,7 @@ export function deleteToString(stmt: AST.DeleteStmt): string {
 	}
 
 	if (stmt.returning && stmt.returning.length > 0) {
-		const returning = stmt.returning.map(col => {
-			if (col.type === 'all') {
-				return col.table ? `${quoteIdentifier(col.table)}.*` : '*';
-			} else {
-				let colStr = expressionToString(col.expr);
-				if (col.alias) colStr += ` as ${quoteIdentifier(col.alias)}`;
-				return colStr;
-			}
-		});
-		parts.push('returning', returning.join(', '));
+		parts.push('returning', stmt.returning.map(resultColumnToString).join(', '));
 	}
 
 	return parts.join(' ');

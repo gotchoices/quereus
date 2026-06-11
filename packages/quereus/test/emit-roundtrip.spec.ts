@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { parse, parseAll } from '../src/parser/index.js';
 import { astToString, expressionToString, quoteIdentifier } from '../src/emit/index.js';
-import type { SelectStmt } from '../src/parser/index.js';
+import type { CreateViewStmt, ResultColumnExpr, SelectStmt } from '../src/parser/index.js';
 
 /** Round-trip a full statement: parse → stringify → parse → stringify, compare strings */
 function roundTripStmt(sql: string): string {
@@ -213,6 +213,136 @@ describe('Emit: statement round-trips', () => {
 				const reparsed = parse(astToString(stmt)) as SelectStmt;
 				expect(reparsed.withClause?.ctes[0].materializationHint, sql).to.equal(expected);
 			}
+		});
+	});
+
+	describe('result-column WITH INVERSE (authored inverses)', () => {
+		/** Narrow the first result column to the expression form. */
+		function firstExprColumn(stmt: SelectStmt): ResultColumnExpr {
+			const col = stmt.columns[0];
+			if (col.type !== 'column') throw new Error('Expected expression result column');
+			return col;
+		}
+
+		it('single assignment with alias', () => {
+			roundTripStmt('select a + 1 as b with inverse (a = new.b - 1) from t');
+		});
+
+		it('multiple assignments', () => {
+			roundTripStmt("select b || ' ' || c as full_name with inverse (b = substr(new.full_name, 1, instr(new.full_name, ' ') - 1), c = substr(new.full_name, instr(new.full_name, ' ') + 1)) from t");
+		});
+
+		it('case expression body and case inverse expression', () => {
+			roundTripStmt("select case code20 when 'A1' then 'A' when 'A2' then 'A' else code20 end as code with inverse (code20 = case new.code when 'A' then 'A1' else new.code end) from t");
+		});
+
+		it('clause without an alias', () => {
+			roundTripStmt('select a + 1 with inverse (a = new.x - 1) from t');
+		});
+
+		it('parses into ResultColumnExpr.inverse with new.-qualified refs', () => {
+			const stmt = parse('select a + 1 as b with inverse (a = new.b - 1) from t') as SelectStmt;
+			const col = firstExprColumn(stmt);
+			expect(col.alias).to.equal('b');
+			expect(col.inverse).to.have.length(1);
+			expect(col.inverse![0].column).to.equal('a');
+			const inv = col.inverse![0].expr;
+			expect(inv.type).to.equal('binary');
+			if (inv.type !== 'binary') throw new Error('unreachable');
+			// `new.b` is an ordinary qualified column reference — no parser special-casing.
+			expect(inv.left).to.deep.include({ type: 'column', name: 'b', table: 'new' });
+		});
+
+		it('comma bounds the clause — next result column parses', () => {
+			const str = roundTripStmt('select a + 1 with inverse (b = x - 1), c from t');
+			const stmt = parse(str) as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			expect(firstExprColumn(stmt).inverse).to.have.length(1);
+			const second = stmt.columns[1];
+			if (second.type !== 'column') throw new Error('Expected expression result column');
+			expect(second.expr).to.deep.include({ type: 'column', name: 'c' });
+			expect(second.inverse).to.equal(undefined);
+		});
+
+		it('empty assignment list is a parse error', () => {
+			expect(() => parse('select a with inverse () from t')).to.throw();
+		});
+
+		it('duplicate target column is a parse error', () => {
+			expect(() => parse('select a with inverse (b = 1, b = 2) from t')).to.throw();
+		});
+
+		it('star result columns cannot carry the clause', () => {
+			expect(() => parse('select * with inverse (a = 1) from t')).to.throw();
+			expect(() => parse('select t.* with inverse (a = 1) from t')).to.throw();
+		});
+
+		it('inverse stays usable as an identifier', () => {
+			roundTripStmt('select inverse from t');
+			roundTripStmt('select x as inverse from t');
+			const stmt = parse('select inverse from t') as SelectStmt;
+			expect(firstExprColumn(stmt).expr).to.deep.include({ type: 'column', name: 'inverse' });
+		});
+
+		// --- `with` lookahead neighbors: commit only when WITH is followed by INVERSE ---
+
+		it('statement-trailing WITH SCHEMA on a FROM-less select stays with the statement', () => {
+			const stmt = parse('select a with schema main') as SelectStmt;
+			expect(stmt.schemaPath).to.deep.equal(['main']);
+			expect(firstExprColumn(stmt).inverse).to.equal(undefined);
+		});
+
+		it('inverse clause coexists with statement-trailing WITH SCHEMA', () => {
+			const stmt = parse('select a + 1 as b with inverse (a = new.b - 1) from t with schema main') as SelectStmt;
+			expect(stmt.schemaPath).to.deep.equal(['main']);
+			expect(firstExprColumn(stmt).inverse).to.have.length(1);
+		});
+
+		it("view body's trailing WITH TAGS stays with the view", () => {
+			const stmt = parse("create view v as select 1 with tags (k = 'x')") as CreateViewStmt;
+			expect(stmt.tags).to.deep.equal({ k: 'x' });
+			const body = stmt.select;
+			if (body.type !== 'select') throw new Error('Expected select body');
+			expect(firstExprColumn(body).inverse).to.equal(undefined);
+		});
+
+		it("view body's trailing INSERT DEFAULTS stays with the view", () => {
+			const stmt = parse('create view v as select a from t insert defaults (b = 1)') as CreateViewStmt;
+			expect(stmt.insertDefaults).to.have.length(1);
+			const body = stmt.select;
+			if (body.type !== 'select') throw new Error('Expected select body');
+			expect(firstExprColumn(body).inverse).to.equal(undefined);
+		});
+
+		// --- the clause survives everywhere select parses ---
+
+		it('CTE body', () => {
+			roundTripStmt('with v as (select a + 1 as b with inverse (a = new.b - 1) from t) select b from v');
+		});
+
+		it('subquery in FROM', () => {
+			roundTripStmt('select b from (select a + 1 as b with inverse (a = new.b - 1) from t) as s');
+		});
+
+		it('view body, alone and with trailing insert defaults + tags', () => {
+			roundTripStmt('create view v as select a + 1 as b with inverse (a = new.b - 1) from t');
+			roundTripStmt("create view v as select a + 1 as b with inverse (a = new.b - 1) from t insert defaults (c = 1) with tags (k = 'x')");
+		});
+
+		it('compound legs', () => {
+			roundTripStmt('select a + 1 as b with inverse (a = new.b - 1) from t union select c + 1 as b with inverse (c = new.b - 1) from u');
+		});
+
+		it('lens-block view body', () => {
+			roundTripStmt('declare lens for logical over base { view v as select a + 1 as b with inverse (a = new.b - 1) from base.t }');
+		});
+
+		it('declarative-schema view item', () => {
+			roundTripStmt('declare schema main { view v as select a + 1 as b with inverse (a = new.b - 1) from t }');
+		});
+
+		it('RETURNING result column (shared columnList path)', () => {
+			roundTripStmt('insert into t (a) values (1) returning a + 1 as b with inverse (a = new.b - 1)');
 		});
 	});
 

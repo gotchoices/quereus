@@ -905,7 +905,11 @@ export class Parser {
 					alias = this.getIdentifierValue(aliasToken);
 				}
 
-				columns.push({ type: 'column', expr, alias });
+				// Optional trailing `with inverse (col = expr, …)` — authored
+				// write-back expressions (docs/view-updateability.md § Authored inverses)
+				const inverse = this.parseInverseClause();
+
+				columns.push({ type: 'column', expr, alias, inverse });
 			}
 		} while (this.match(TokenType.COMMA));
 
@@ -2741,6 +2745,44 @@ export class Parser {
 		} while (this.match(TokenType.COMMA));
 		this.consume(TokenType.RPAREN, "Expected ')' after INSERT DEFAULTS list.");
 		return defaults;
+	}
+
+	/**
+	 * Parse the optional `with inverse ( col = expr , … )` clause trailing an
+	 * expression result column — authored write-back expressions for view
+	 * write-through (inert metadata until the write path consumes it; validation
+	 * is build-time). Returns undefined when the clause is absent. `inverse` is
+	 * contextual: commits only once INVERSE follows WITH, so a statement-trailing
+	 * `with schema` / `with context` / `with tags` after the column list stays
+	 * with the outer parser. An empty assignment list is a parse error.
+	 */
+	private parseInverseClause(): AST.ResultColumnInverse[] | undefined {
+		if (!this.check(TokenType.WITH)) return undefined;
+		this.advance();
+		if (!this.peekKeyword('INVERSE')) {
+			// Not our clause — back up the WITH and stop. Bare cursor rewind is safe
+			// only because the rewound token is WITH: advance() has one non-cursor
+			// side effect (LPAREN/RPAREN parenStack maintenance), which WITH never hits.
+			this.current--;
+			return undefined;
+		}
+		this.advance();
+		this.consume(TokenType.LPAREN, "Expected '(' after WITH INVERSE.");
+		const assignments: AST.ResultColumnInverse[] = [];
+		const seen = new Set<string>();
+		do {
+			const columnToken = this.peek();
+			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in WITH INVERSE.");
+			if (seen.has(column.toLowerCase())) {
+				throw this.error(columnToken, `Duplicate column '${column}' in WITH INVERSE.`);
+			}
+			seen.add(column.toLowerCase());
+			this.consume(TokenType.EQUAL, `Expected '=' after WITH INVERSE column '${column}'.`);
+			const expr = this.expression();
+			assignments.push({ column, expr });
+		} while (this.match(TokenType.COMMA));
+		this.consume(TokenType.RPAREN, "Expected ')' after WITH INVERSE list.");
+		return assignments;
 	}
 
 	/**
