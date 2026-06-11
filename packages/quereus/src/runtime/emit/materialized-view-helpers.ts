@@ -137,7 +137,18 @@ function deriveBackingShapeUnguarded(
 	}
 	const primaryKey = pkIndices.map(idx => ({ index: idx, desc: false }));
 
-	const ordering = root.physical?.ordering?.map(o => ({ index: o.column, desc: o.desc }));
+	// A COARSENING key must be the backing's physical key EXACTLY: the loud
+	// create-fill and the LWW merge both rest on the backing btree equating
+	// colliding source keys, and the ordering-seeded physical PK
+	// (computeBackingPrimaryKey leads with the body's `order by` columns) would
+	// widen uniqueness past K' — colliding siblings would then coexist silently,
+	// defeating both. So drop the ordering seed for a coarsened key; the only
+	// cost is the clustering optimization (`mv.ordering` is informational). A
+	// non-coarsening lineage key is a true key, so the seed stays uniqueness-
+	// preserving there, exactly as for a `keysOf`-proved key.
+	const ordering = coarsenedKey
+		? undefined
+		: root.physical?.ordering?.map(o => ({ index: o.column, desc: o.desc }));
 
 	return {
 		columns,

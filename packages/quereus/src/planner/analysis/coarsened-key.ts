@@ -209,26 +209,38 @@ export function deriveCoarsenedBackingKey(root: RelationalPlanNode): CoarsenedBa
 	const outAttrs = root.getAttributes();
 	const outputToSource = outAttrs.map(a => resolveValuePreservingSourceCol(a.id, sourceAttrToCol, producingByAttrId));
 
-	// 3. K' exists iff the source PK is fully covered by traced outputs (first
-	//    covering output per PK column, for determinism). Classify coarsening
-	//    per column from the output vs source enforcement collations.
+	// 3. K' exists iff the source PK is fully covered by traced outputs. When a PK
+	//    column is covered by SEVERAL outputs (the same source column projected
+	//    under different wrappers), prefer a NON-coarsening one — it yields a true
+	//    unique key where a coarsening sibling would force the LWW contract (and
+	//    its warning) needlessly; ties break to the first covering output, for
+	//    determinism. Classify coarsening per column from the output vs source
+	//    enforcement collations.
 	const outputColumns = root.getType().columns;
 	const keyIndices: number[] = [];
 	const columns: CoarsenedKeyColumn[] = [];
 	for (const def of sourcePk) {
-		const outputIndex = outputToSource.findIndex(sc => sc === def.index);
-		if (outputIndex < 0) return undefined;
-		const outputCollation = normalizeCollation(outputColumns[outputIndex]?.type.collationName);
 		const sourceCollation = normalizeCollation(def.collation ?? sourceTable.columns[def.index]?.collation);
+		// BINARY is the finest collation, so refinement to it never equates
+		// source-distinct values; any other difference is (conservatively) coarser.
+		const coarsensAt = (outIdx: number): boolean => {
+			const outputCollation = normalizeCollation(outputColumns[outIdx]?.type.collationName);
+			return outputCollation !== sourceCollation && outputCollation !== 'BINARY';
+		};
+		let outputIndex = -1;
+		for (let i = 0; i < outputToSource.length; i++) {
+			if (outputToSource[i] !== def.index) continue;
+			if (outputIndex < 0) outputIndex = i;
+			if (!coarsensAt(i)) { outputIndex = i; break; }
+		}
+		if (outputIndex < 0) return undefined;
 		keyIndices.push(outputIndex);
 		columns.push({
 			outputIndex,
 			sourceColumn: def.index,
-			outputCollation,
+			outputCollation: normalizeCollation(outputColumns[outputIndex]?.type.collationName),
 			sourceCollation,
-			// BINARY is the finest collation, so refinement to it never equates
-			// source-distinct values; any other difference is (conservatively) coarser.
-			coarsens: outputCollation !== sourceCollation && outputCollation !== 'BINARY',
+			coarsens: coarsensAt(outputIndex),
 		});
 	}
 

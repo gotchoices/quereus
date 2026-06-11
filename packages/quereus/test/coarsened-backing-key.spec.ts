@@ -97,6 +97,59 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		});
 	});
 
+	it('an ORDER BY coarsened body keys the backing on the coarsened key alone (no ordering seed)', async () => {
+		// The ordering-seeded physical PK (order-by columns leading the key) would
+		// widen uniqueness past K' — colliding siblings would coexist silently,
+		// defeating the loud fill and the LWW merge. A coarsening key suppresses
+		// the seed; only the clustering optimization is lost.
+		await db.exec('create table ord_src (handle text primary key, email text)');
+		await db.exec("insert into ord_src values ('Bob', 'b@x'), ('bob', 'b2@x')");
+		// Colliding seed data must stay LOUD even with an ORDER BY in the body.
+		await expectExecError(db,
+			'create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email',
+			'must be a set');
+		expect(db.schemaManager.getTable('main', '_mv_ord_v')).to.equal(undefined);
+
+		// Over clean data: creates, physical PK is exactly the coarsened key at
+		// NOCASE, and a colliding insert LWW-merges (the contract the seed broke).
+		await db.exec("delete from ord_src where handle = 'bob'");
+		await db.exec('create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email');
+		const backing = db.schemaManager.getTable('main', '_mv_ord_v')!;
+		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([0]);
+		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('NOCASE');
+		await db.exec("insert into ord_src values ('BOB', 'b3@x')");
+		const rows: unknown[] = [];
+		for await (const r of db.eval('select handle, email from ord_v')) rows.push(r);
+		expect(rows).to.deep.equal([{ handle: 'BOB', email: 'b3@x' }]);
+	});
+
+	it('a NON-coarsening lineage key keeps the ordering seed (true key, uniqueness-preserving)', async () => {
+		await db.exec('create table ord_nck (h text collate nocase primary key, v integer)');
+		await db.exec("insert into ord_nck values ('Bob', 2), ('Al', 1)");
+		await db.exec('create materialized view ord_nck_v as select h collate binary as h, v from ord_nck order by v');
+		expect(db.schemaManager.getMaterializedView('main', 'ord_nck_v')!.coarsenedKey).to.equal(undefined);
+		const backing = db.schemaManager.getTable('main', '_mv_ord_nck_v')!;
+		// Physical PK leads with the order-by column, logical key appended — the
+		// same seeding a keysOf-proved key gets.
+		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
+	});
+
+	it('prefers a non-coarsening covering output over a coarsening sibling of the same PK column', async () => {
+		await db.exec('create table dual (h text primary key, v integer)');
+		await db.exec("insert into dual values ('Bob', 1)");
+		// Both outputs cover the source PK column; h2 (BINARY = the source
+		// enforcement collation) is a true key, so no coarsening stamp and the
+		// backing keys on h2 — not on the coarsening h1 the earlier output index
+		// would have picked.
+		await db.exec('create materialized view dual_v as select h collate nocase as h1, h collate binary as h2, v from dual');
+		const mv = db.schemaManager.getMaterializedView('main', 'dual_v')!;
+		expect(mv.coarsenedKey).to.equal(undefined);
+		expect(mv.primaryKey).to.deep.equal([{ index: 1, desc: false }]);
+		const backing = db.schemaManager.getTable('main', '_mv_dual_v')!;
+		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1]);
+		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('BINARY');
+	});
+
 	it('bodies with no lineage key keep the bag rejection', async () => {
 		await db.exec('create table t (id integer primary key, v text)');
 		await db.exec("insert into t values (1, 'a')");

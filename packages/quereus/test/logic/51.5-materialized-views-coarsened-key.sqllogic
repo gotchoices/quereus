@@ -141,3 +141,21 @@ insert into nck values ('Bob', 1);
 create materialized view nck_v as select h collate binary as h, v from nck;
 select h, v from nck_v;
 → [{"h":"Bob","v":1}]
+
+-- ===================================
+-- 8. An ORDER BY coarsened body keeps the contract: the ordering seed is
+--    suppressed so the backing keys on K' alone — colliding seed data stays
+--    LOUD and a colliding insert still LWW-merges (with the seed, the widened
+--    physical key would have admitted both siblings silently)
+-- ===================================
+
+create table ord_src (handle text collate binary primary key, email text);
+insert into ord_src values ('Bob', 'b@x.test'), ('bob', 'b2@x.test');
+create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email;
+-- error: must be a set
+
+delete from ord_src where handle = 'bob';
+create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email;
+insert into ord_src values ('BOB', 'b3@x.test');
+select handle, email from ord_v;
+→ [{"handle":"BOB","email":"b3@x.test"}]
