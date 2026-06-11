@@ -31,7 +31,7 @@ import { SortNode } from '../src/planner/nodes/sort.js';
 import { AggregateNode } from '../src/planner/nodes/aggregate-node.js';
 import { StreamAggregateNode } from '../src/planner/nodes/stream-aggregate.js';
 import { HashAggregateNode } from '../src/planner/nodes/hash-aggregate.js';
-import { isUniqueDeterminant, keysOf, type KeyRel } from '../src/planner/util/fd-utils.js';
+import { addFd, closureCoversAll, isUniqueDeterminant, keysOf, type KeyRel } from '../src/planner/util/fd-utils.js';
 
 function findNodes<T extends PlanNode>(plan: PlanNode, ctor: new (...args: never[]) => T): T[] {
 	const out: T[] = [];
@@ -110,6 +110,36 @@ describe('isUniqueDeterminant (kind-aware uniqueness reachability)', () => {
 		// correct, which is why `isUnique` no longer needs its old
 		// proper-subset guard on the closure branch.
 		expect(isUniqueDeterminant(new Set([0, 1]), [uniq([0], [1])], 2, false)).to.equal(true);
+	});
+
+	it('closureCoversAll is COVERAGE ONLY — true wherever the closure covers, bag or set', () => {
+		// The same determination-only bag probe that isUniqueDeterminant rejects:
+		// coverage holds, uniqueness does not. The pair of answers is the
+		// coverage-vs-uniqueness split the rename (isSuperkey → closureCoversAll)
+		// exists to make explicit.
+		expect(closureCoversAll(new Set([0]), [det([0], [1])], 2)).to.equal(true);
+		expect(isUniqueDeterminant(new Set([0]), [det([0], [1])], 2, false)).to.equal(false);
+		// Guarded FDs never participate in closure.
+		const guarded: FunctionalDependency = {
+			determinants: [0], dependents: [1], kind: 'determination',
+			guard: { clauses: [{ kind: 'eq-literal', column: 1, value: 1 }] },
+		};
+		expect(closureCoversAll(new Set([0]), [guarded], 2)).to.equal(false);
+	});
+
+	it('FD cap eviction keeps the unique witness (enforceCap unique-first bias)', () => {
+		// Fill past a small cap with plain determinations, then land a 'unique'
+		// FD under eviction pressure: the unique-first bias must keep the
+		// witness, since evicting it would silently turn every reachable
+		// uniqueness read into an under-claim.
+		const cap = 4;
+		let fds: ReadonlyArray<FunctionalDependency> = [];
+		for (let i = 1; i <= cap; i++) {
+			fds = addFd(fds, det([i], [i + 1]), { cap });
+		}
+		fds = addFd(fds, uniq([0], [1, 2]), { cap });
+		expect(fds).to.have.length(cap);
+		expect(fds.some(fd => fd.kind === 'unique'), 'the unique witness must survive eviction').to.equal(true);
 	});
 });
 
