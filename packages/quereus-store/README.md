@@ -198,6 +198,7 @@ const caps = storeModule.getCapabilities();
 - No snapshot isolation: between connections, reads see only committed data, and concurrent readers may observe partial writes
 - Within a transaction, reads through the table's shared coordinator DO see that transaction's own pending writes (read-your-own-writes)
 - Savepoints (create / release / rollback-to) work within a transaction via the coordinator's buffered op log
+  - Caveat: a DDL-commit operation (`replaceContents` / `renameTable`, e.g. `refresh materialized view` or `alter table … rename`) commits the coordinator mid-transaction, clearing the savepoint stack. A later `rollback to` / `release` targeting a now-vanished savepoint degrades to a no-op (warn-and-return) rather than throwing; the committed DDL and everything before it stays committed
 
 ## Materialized-View Backing Host
 
