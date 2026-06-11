@@ -1,4 +1,5 @@
 description: A "replicable" determinism class for functions — bit-identical across peers/platforms/app-versions, stronger than the existing per-database determinism gate — declared on UDFs, auto-satisfied by builtins, and demanded by backing hosts (via a backing-host capability field) whose tables replicate, validated at materialized-view/derivation create.
+difficulty: hard
 files:
   - packages/quereus/src/func/registration.ts        # UDF flag surface
   - packages/quereus/src/vtab/backing-host.ts        # host-declared requirement

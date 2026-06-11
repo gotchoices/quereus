@@ -1,5 +1,6 @@
 ----
 description: Module-facing vtab calls still receive the raw statement spelling of schema/object names — decide whether they should get canonical stored names like everything else
+difficulty: hard
 files:
   - packages/quereus/src/schema/manager.ts        # createIndex → vtabModule.createIndex(db, targetSchemaName, tableName, …); dropIndex → module.dropIndex(db, schemaName, …); importTable → module.connect(…, targetSchemaName, …)
   - packages/quereus-store/src/common/store-module.ts  # store keys derived from these args

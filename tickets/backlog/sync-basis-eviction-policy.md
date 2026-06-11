@@ -1,4 +1,5 @@
 description: Mapped-since / unmapped-since bookkeeping for basis tables — maintained module/sync-side off the existing notifyLensDeployment snapshot, with the three-state classification (directly mapped → derivation-source only → unreferenced) and a default retention/eviction policy in the sync system. No new core-engine surface expected.
+difficulty: hard
 files:
   - packages/quereus/src/vtab/module.ts              # notifyLensDeployment (existing hook — the data source)
   - packages/quereus-sync/                           # policy + bookkeeping home

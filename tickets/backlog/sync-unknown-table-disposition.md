@@ -1,4 +1,5 @@
 description: A configured disposition + telemetry in @quereus/sync for inbound changes that reference a table outside the receiver's basis (the post-retirement straggler case), plus the retention-horizon configuration that retirement timing inherits. No wire versioning — table presence is the unit of compatibility.
+difficulty: hard
 files:
   - packages/quereus-sync/src/sync/                  # applyChanges path; where the unknown table surfaces today
   - docs/migration.md                                # § 4 Contract / Retirement (the spec)

@@ -1,4 +1,5 @@
 description: Column-vs-column comparisons resolve collation with right-operand precedence (emitComparisonOp), diverging from SQLite's left-operand rule — `a = b` with a NOCASE-declared left column and a plain TEXT right column compares BINARY ('Bob' = 'bob' is false where SQLite says true). Decide whether to align with SQLite or document the divergence as engine semantics, and pin whichever with tests.
+difficulty: hard
 files:
   - packages/quereus/src/runtime/emit/binary.ts                            # emitComparisonOp — right-else-left-else-BINARY
   - packages/quereus/src/planner/rules/access/rule-select-access-path.ts   # effectivePredicateCollation mirrors the same rule

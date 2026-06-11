@@ -1,4 +1,5 @@
 description: lens-prover consumes CHECK-derived domains without the permitsGrandfatheredCheckViolators capability gate that reference.ts applies — latent unsoundness for plugin modules that grandfather check violators.
+difficulty: easy
 files:
   - packages/quereus/src/schema/lens-prover.ts                        # enumerableDomain(getCheckExtraction(...)) call sites (~1014, ~1086)
   - packages/quereus/src/planner/nodes/reference.ts                   # the existing consumer-side capability gate to mirror (~130-142)

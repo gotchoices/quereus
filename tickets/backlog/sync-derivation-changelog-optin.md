@@ -1,4 +1,5 @@
 description: Per-table opt-in for recording materialized-view/derivation maintenance writes in the sync change log — a reserved tag the backing host module reads inside applyMaintenance — so a migration target's derived rows replicate while index/perf MVs stay local. Default off. Depends on no-op upsert suppression (echo prevention) and the store backing host.
+difficulty: hard
 prereq: mv-noop-upsert-suppression, store-backing-host
 files:
   - packages/quereus-store/src/common/backing-host.ts   # (once landed) the host that reads the tag

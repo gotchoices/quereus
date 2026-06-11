@@ -1,4 +1,5 @@
 description: OR-of-equalities collapse to IN is collation-blind — wrong query results (proven). `where b = 'bob' collate nocase or b = 'x' collate nocase` returns only BINARY matches because the IN it collapses to compares under the bare column's collation, dropping the disjuncts' NOCASE. Same family as ticket collation-blind-equality-fact-extraction (the folded-NOCASE-literal shape), at sites that ticket did not cover.
+difficulty: hard
 files:
   - packages/quereus/src/planner/analysis/predicate-normalizer.ts          # tryCollapseOrToIn — the proven wrong-results site
   - packages/quereus/src/planner/analysis/constraint-extractor.ts          # collapseBranchesToIn, tryCollapseToOrRange — same family, pushdown side

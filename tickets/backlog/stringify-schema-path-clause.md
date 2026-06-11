@@ -1,4 +1,5 @@
 description: ast-stringify silently drops the `with schema` clause (`schemaPath`) on SELECT and DML statements — parse(stringify(ast)) loses the schema search path.
+difficulty: easy
 files:
   - packages/quereus/src/emit/ast-stringify.ts          # no `schemaPath` emission anywhere
   - packages/quereus/src/parser/parser.ts               # parseSchemaPath / parseTrailingWithClauses produce it

@@ -1,5 +1,6 @@
 ----
 description: Let a proven-bijective authored inverse make its logical column key-reconstructible — PK/UNIQUE over an authored column currently forces read-only / lens.unrealizable-constraint even when the prover has proved the mapping a bijection.
+difficulty: hard
 files:
   - packages/quereus/src/schema/lens-prover.ts   # isReconstructibleColumn (bare-column test), checkKeyReconstructibility, classifyCheckConstraint, proveForwardInjective
   - packages/quereus/test/logic/55.5-lens-authored-inverse.sqllogic  # scenario 13 pins today's read-only behavior

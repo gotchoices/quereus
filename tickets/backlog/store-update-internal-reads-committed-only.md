@@ -1,4 +1,5 @@
 description: StoreTable.update()'s internal reads (insert PK-conflict probe, update/delete oldRow reads, PK-change conflict probe) are committed-only and miss this transaction's pending ops — silent PK overwrite instead of UNIQUE error, leaked secondary-index entries, wrong stats deltas, and events missing oldRow for intra-transaction rows. Pre-existing; masked under the isolation wrapper; observable on the bare StoreModule.
+difficulty: hard
 files:
   - packages/quereus-store/src/common/store-table.ts   # update() arms; readLiveRowByPk (the existing pending-overlay read primitive)
   - packages/quereus-store/src/common/transaction.ts   # getPendingOpsForStore (read-side index, landed in store-backing-host-substrate)

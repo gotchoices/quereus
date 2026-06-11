@@ -1,4 +1,5 @@
 description: Unify the inverse-projection arm's same-key real-change reporting to a single `update` (upsert-only when old/new projected images share the backing key) instead of the current delete+insert pair, matching the residual arms' post-suppression reporting shape.
+difficulty: easy
 files:
   - packages/quereus/src/core/database-materialized-views.ts   # applyInverseProjection UPDATE branch
   - packages/quereus/test/incremental/maintenance-equivalence.spec.ts  # pins the current delete+insert shape ("real same-key change still reports (delete + insert, as before)")

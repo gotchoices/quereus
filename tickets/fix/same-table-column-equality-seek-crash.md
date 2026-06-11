@@ -1,4 +1,5 @@
 description: Pre-existing runtime crash — a same-table column-to-column equality whose column side is seekable against a key (`where b = c` with PK on b) throws "No row context found for column c" at runtime. The constraint extractor mints an op-'=' constraint with bindingKind 'expression' and valueExpr = the same-table column reference; the access path appears to consume it as a seek key whose value expression is then emitted outside any row context. Discovered during the collation-blind-equality-fact-extraction implement pass; unrelated to collations (reproduces with plain BINARY text columns at HEAD).
+difficulty: easy
 files:
   - packages/quereus/src/planner/analysis/constraint-extractor.ts   # extractBinaryConstraint: col = same-table col ⇒ bindingKind 'expression', correlated false
   - packages/quereus/src/planner/rules/access/rule-select-access-path.ts  # consumes '=' constraints for seeks — likely treats the expression binding as a bindable seek value

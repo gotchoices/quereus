@@ -1,4 +1,5 @@
 description: Adopt fast path trusts a backing whose MV was stale at clean close — the marker attests "no crash", not "maintenance was live", so adopt can serve a behind backing as fresh.
+difficulty: hard
 files:
   - packages/quereus/src/core/database-materialized-views.ts   # schema-change listener: table_modified on a source marks dependents stale + detaches row-time maintenance
   - packages/quereus-store/src/common/store-module.ts          # closeAll marker write; rehydrateCatalog marker consume + phase-3 trust threading

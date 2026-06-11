@@ -1,4 +1,5 @@
 description: MV backing tables do not actually reject user DML anywhere — the backing-host contract's "read-only to user DML (READONLY)" line is unenforced in memory, store, and the isolation wrapper. Decide the enforcement seam and realize it uniformly.
+difficulty: hard
 files:
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts  # buildBackingTableSchema (never sets isReadOnly)
   - packages/quereus/src/vtab/memory/layer/manager.ts               # isReadOnly guards incl. replaceBaseLayer (would throw!)

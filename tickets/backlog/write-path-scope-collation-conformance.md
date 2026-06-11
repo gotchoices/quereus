@@ -1,4 +1,5 @@
 description: Remaining hand-built write-path scope/attribute types omit collationName — comparisons inside DEFAULT expressions and RETURNING projections may resolve BINARY against declared-collation columns, diverging from the read path. Conformance gap only; no fact-soundness impact.
+difficulty: easy
 files:
   - packages/quereus/src/planner/building/constraint-builder.ts   # buildNotNullDefaults colType (~line 279) omits collationName
   - packages/quereus/src/planner/building/insert.ts               # OLD/NEW attribute types (~line 298) omit collationName

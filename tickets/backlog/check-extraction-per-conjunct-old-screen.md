@@ -1,4 +1,5 @@
 description: Precision refinement — screen `old.` row-image refs per AND-conjunct instead of per whole CHECK, so mixed transition/invariant checks keep contributing their invariant conjuncts.
+difficulty: easy
 files:
   - packages/quereus/src/planner/analysis/check-extraction.ts         # isRowInvariantCheck / containsOldRowImageRef (whole-check today), walkConjunction (AND decomposition already exists)
   - packages/quereus/test/optimizer/check-derived-fds.spec.ts         # row-invariant gate unit block to extend

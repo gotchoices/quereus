@@ -1,6 +1,7 @@
 ----
 description: Design sketch — first-class row (tuple) type as a foundational structural type (named + ordinal attributes, optional keys/constraints); reframe RelationType as a set/bag *of* a RowType. Enables row-valued parameters, typed field access, row spread into columns, row literals, and row-value comparison.
 files: packages/quereus/src/common/datatype.ts, packages/quereus/src/common/types.ts, packages/quereus/src/types/logical-type.ts, packages/quereus/src/types/registry.ts, packages/quereus/src/types/builtin-types.ts, packages/quereus/src/types/json-type.ts, packages/quereus/src/common/type-inference.ts, packages/quereus/src/core/param.ts, packages/quereus/src/planner/scopes/param.ts, packages/quereus/src/planner/nodes/reference.ts, packages/quereus/src/runtime/emit/parameter.ts, packages/quereus/src/planner/nodes/values-node.ts, packages/quereus/src/planner/building/select.ts, packages/quereus/src/planner/building/insert.ts, packages/quereus/src/planner/building/select-projections.ts, packages/quereus/src/util/comparison.ts, docs/types.md, docs/architecture.md
+difficulty: hard
 ----
 
 > **Status: design sketch, not greenlit.** Captured 2026-06 from a design exploration. The core direction (first-class row type, foundational, `RelationType` as a collection *of* a `RowType`) is agreed; several decisions are recorded below and a few are explicitly left open. Do not promote to `plan/` until the open questions — especially the *pure-vs-hybrid* type model and the scope of the `RelationType` refactor — have a human decision.

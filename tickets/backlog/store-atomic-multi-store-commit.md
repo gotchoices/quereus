@@ -1,4 +1,5 @@
 description: Optional provider capability for an atomic multi-store write batch, so one transaction's writes across a table's data store, its index stores, and sibling tables (incl. MV backings) land in ONE durable commit — closing the per-store crash window the store currently accepts.
+difficulty: hard
 files:
   - packages/quereus-store/src/common/kv-store.ts          # KVStoreProvider capability surface
   - packages/quereus-store/src/common/transaction.ts       # commit currently writes one batch per store

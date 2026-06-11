@@ -1,4 +1,5 @@
 description: Migrate quereus-sync's store adapter (applyRowChanges) onto Database.ingestExternalRowChanges so remote changes applied directly to the KV store drive covering MVs, Database.watch, and (policy-gated) FK actions; also the tracking home for the adapter's dark secondary-index gap flagged by store-pk-collate-sync-adapter-rekey.
+difficulty: hard
 prereq: external-row-change-ingestion
 files:
   - packages/quereus-sync/src/sync/store-adapter.ts               # applyRowChanges / applyDelete / applyColumnUpdates write committed KV directly

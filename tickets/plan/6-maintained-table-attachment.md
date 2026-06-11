@@ -1,4 +1,5 @@
 description: Design the first-class derivation lifecycle ("maintained tables") — stable backing identity, adopt-on-create, attach/detach verbs (promote MV→base table / demote base table→maintained), and declarative-differ recognition of those transitions as non-destructive. The substrate the synced-migration pattern's expand/flip/contract phases stand on.
+difficulty: hard
 files:
   - docs/migration.md                                              # the consuming pattern (expand/converge/flip/contract)
   - docs/materialized-views.md                                     # § Current limitations "First-class derivation lifecycle" bullet (the spec seed); § Substrate

@@ -1,4 +1,5 @@
 description: Audit — relation-key promotion and covered-key/coverage gates now assume a specific enforcement collation per uniqueness source (PK and table-level UNIQUE enforce under the declared column collation; index-derived UNIQUE under the index's per-column collation). Verified empirically for the memory module; the store module (and other storage plugins) may key/enforce under different collations (e.g. a module-level default applied to implicit-collation PK columns), which would re-open the finer-enforcement key over-claim the memory-side gate closed. Verify each module's actual enforcement collation and align or gate accordingly.
+difficulty: hard
 files:
   - packages/quereus/src/planner/type-utils.ts                       # enforcementCollationCoversDeclared — the promotion gate + its assumptions
   - packages/quereus/src/vtab/memory/layer/manager.ts                # memory UC checks (declared collation) vs index lookups (index collation)

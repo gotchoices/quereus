@@ -1,5 +1,6 @@
 ----
 description: The MV staleness listener marks every dependent MV stale (and detaches its row-time plan) on ANY table_modified, including changes that only touch constraint metadata (CHECK/FK/index-predicate rewrites) — needlessly de-livening MVs outside renames, e.g. declarative migrations that only retarget FKs.
+difficulty: hard
 files:
   - packages/quereus/src/core/database-materialized-views.ts   # subscribeToSchemaChanges
   - packages/quereus/src/runtime/emit/alter-table.ts            # constraint-only table_modified emitters: rewriteTableForTableRename/rewriteTableForColumnRename, runDropConstraint, runRenameConstraint

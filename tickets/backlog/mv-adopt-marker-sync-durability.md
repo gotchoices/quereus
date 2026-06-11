@@ -1,4 +1,5 @@
 description: Clean-shutdown marker single-use property can fail under power loss — the consume-side delete and the session's data writes flush independently across separate KV stores, so a lost delete resurrects the marker across a genuine crash window.
+difficulty: hard
 files:
   - packages/quereus-store/src/common/store-module.ts        # consumeCleanShutdownMarker (read + delete at open); closeAll marker write
   - packages/quereus-store/src/common/kv-store.ts            # KVStore contract — no durability/sync surface today
