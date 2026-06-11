@@ -427,6 +427,11 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
 			expect(db2.schemaManager.getMaterializedView('main', 'mv')!.stale ?? false, 'refill cleared staleness')
 				.to.equal(false);
+			// Re-armed, not merely flag-cleared: a post-reopen source write now reaches
+			// the refilled backing (the very maintenance that was detached at close).
+			await db2.exec('insert into src values (4, 40)');
+			expect(await rows(db2, 'select id, v from mv order by id'), 'live maintenance re-armed after refill')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }, { id: 4, v: 40 }]);
 		});
 
 		it('a stale-then-refreshed MV adopts (refresh clears the flag before close)', async () => {

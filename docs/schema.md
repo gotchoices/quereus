@@ -365,7 +365,8 @@ first DDL is a view, still relies on a prior store-table create/connect to subsc
 
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown
 marker (the reserved `\x00meta\x00clean_shutdown` catalog entry `closeAll` writes
-after every batch flushed — read and immediately deleted, single-use), then loads
+after every batch flushed — read and immediately deleted, single-use; its value is
+the JSON set of `schema.mv` names that were **stale-at-close**), then loads
 all entries once, classifies by key prefix (meta entries never reach DDL import;
 `loadAllDDL` filters them too), then imports in dependency order — every phase
 through `importCatalog`:
@@ -374,8 +375,9 @@ validation deferred to query time, so view-over-view and view-over-MV are
 order-independent and no event fires); (3) **materialized views** per entry (engine
 re-materialize via the shared `materializeView` core: rebuilds the memory backing
 from current source data, re-registers row-time maintenance, re-runs the eligibility
-gate). Phase 3 threads `{ trustBackings: <marker consumed>, adoptedBackings }` into
-each `importCatalog` call, enabling the store-hosted-backing **adopt fast path**
+gate). Phase 3 threads `{ trustBackings, adoptedBackings }` into each `importCatalog`
+call — `trustBackings` is decided **per entry** (`<marker present> && this MV was not
+stale-at-close`), enabling the store-hosted-backing **adopt fast path**
 (no refill) when every gate passes — see
 [`docs/materialized-views.md` § Cross-module atomicity](materialized-views.md#cross-module-atomicity).
 Import is silent — no `materialized_view_added` fires — so rehydration writes
