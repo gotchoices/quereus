@@ -168,6 +168,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [View Updateability](../../docs/view-updateability.md) — write-through for views, CTEs, and subqueries-in-FROM; per-operator semantics and override tags
 * [Materialized Views](../../docs/materialized-views.md) — keyed derived relations, synchronous row-time maintenance, write-through, covering structures, declarative-schema round-trip
 * [Lenses and Layered Schemas](../../docs/lens.md) — logical/basis separation and bidirectional per-table lenses
+* [Schema Migration in a Synced Database](../../docs/migration.md) — evolving schemas across replicated peers with lenses and maintained basis tables
 * [Type System](../../docs/types.md) — logical/physical types, temporal types, JSON, custom types
 * [Functions](../../docs/functions.md) — built-in scalar, aggregate, window, and JSON functions
 * [Memory Tables](../../docs/memory-table.md) — built-in MemoryTable module

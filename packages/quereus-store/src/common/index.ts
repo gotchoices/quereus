@@ -105,6 +105,9 @@ export {
 } from './store-table.js';
 export { StoreConnection } from './store-connection.js';
 
+// Materialized-view backing host (engine backing-host capability over a store table)
+export { StoreBackingHost } from './backing-host.js';
+
 // Generic store module
 export { StoreModule, type StoreModuleConfig, type RehydrationResult, type RehydrationError } from './store-module.js';
 

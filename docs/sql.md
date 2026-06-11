@@ -294,7 +294,7 @@ select [distinct | all] select_expr [, select_expr ...]
 - `with clause`: Common Table Expressions (CTEs) for temporary named result sets
 - `distinct`: Removes duplicate rows from the result set
 - `all`: Includes all rows (default behavior)
-- `select_expr`: Column expressions to be returned; `*` for all columns
+- `select_expr`: Column expressions to be returned; `*` for all columns. A result column may carry an optional trailing `with inverse (column = expr, ...)` clause supplying authored write-back expressions for updatable-view write-through (see [§2.9](#29-updatable-views))
 - `from`: Tables, views, or subqueries to retrieve data from
 - `where`: Filters rows based on a condition
 - `group by`: Groups rows that have the same values
@@ -1442,7 +1442,7 @@ Reads and writes through a view report the *base* table(s) to `getChangeScope()`
 
 - A **passthrough or renamed** column (`c`, `c as alias`) routes the value straight to its base column — writable on both `insert` and `update`.
 - An **invertible-expression** column (`v + 1 as w`) is writable on `update` (the assignment is lowered through the inverse: `set w = 9` ⇒ `set v = 8`). It is **not** insertable.
-- A **computed / non-invertible** column (`lower(name)`, a window or aggregate output) is **read-only**; writing it raises the `no-inverse` diagnostic.
+- A **computed / non-invertible** column (`lower(name)`, a window or aggregate output) is **read-only**; writing it raises the `no-inverse` diagnostic — *unless* the result column carries an **authored inverse**: `expr as col with inverse (base_col = expr-over-NEW, ...)` upgrades the column to writable on both `update` and `insert` (each assignment computes a base column from the written view row, referenced via the mandatory `new.` qualifier). Targets must be base columns of the FROM sources; `new.*` references must be output columns of the select — both validated at build time wherever the clause appears. See [View Updateability § Authored inverses](view-updateability.md#authored-inverses-with-inverse).
 - A column **omitted** from an `insert` but pinned by an equality predicate is supplied automatically: `create view GreenMen as select * from Men where color = 'green'` lets `insert into GreenMen (name) values ('Bob')` default `color` to `'green'`. A view-declared `insert defaults (col = expr, ...)` entry fills a still-omitted column next (ahead of the base column's declared `default` — the dominant use is a base column the view projects away); base-column `default`s fill the rest; a `not null` column with no available value is rejected.
 - A top-level reference in `where` / `set` / `returning` must name a **view** column — a base column the view projects away does not silently resolve (`unknown-view-column`).
 

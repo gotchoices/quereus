@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -158,10 +158,32 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	private readonly connectionInFlight = new Map<string, Promise<VirtualTableConnection>>();
 
+	/**
+	 * Backing-host capability forward (engine `vtab/backing-host.ts`) — assigned in
+	 * the constructor ONLY when the underlying module implements it, so method
+	 * PRESENCE mirrors the underlying (presence IS the capability; a wrapper around
+	 * a capability-less module must not advertise it). A straight delegate is
+	 * correct: every backing write is privileged (`applyMaintenance` /
+	 * `replaceContents` bypass user DML entirely), so the per-connection overlay
+	 * never holds backing rows and the underlying host's pending state is the only
+	 * state there is. Mid-transaction `select`s of the MV reach that pending state
+	 * through the merged read (empty overlay → underlying reads-own-writes), and at
+	 * commit/rollback the backing's IsolatedConnection flushes a no-op empty overlay
+	 * while the host's own connection commits/rolls back the underlying pending —
+	 * disjoint state, so ordering between the two is immaterial.
+	 */
+	getBackingHost?: (db: Database, schemaName: string, tableName: string) => BackingHost | undefined;
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
 		this.tombstoneColumn = config.tombstoneColumn ?? '_tombstone';
+
+		const underlyingGetBackingHost = this.underlying.getBackingHost;
+		if (underlyingGetBackingHost) {
+			this.getBackingHost = (db, schemaName, tableName) =>
+				underlyingGetBackingHost.call(this.underlying, db, schemaName, tableName);
+		}
 	}
 
 	/**

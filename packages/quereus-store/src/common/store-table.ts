@@ -45,6 +45,7 @@ import {
 	buildDataKey,
 	buildIndexKey,
 	buildFullScanBounds,
+	buildPkPrefixBounds,
 	buildStatsKey,
 } from './key-builder.js';
 import {
@@ -482,9 +483,17 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Ensure the coordinator is available and connection is registered.
+	 * Resolve + cache this table's TransactionCoordinator and hook the stats
+	 * lifecycle callbacks, WITHOUT creating or registering a connection.
+	 * Synchronous (the coordinator is thunk-constructed — see
+	 * `StoreTableModule.getCoordinator`), so the backing host's resolution path can
+	 * call it eagerly. Attaching matters for reads: `iterateEffective` /
+	 * `readEffectiveRowByKey` consult `this.coordinator` for the pending merge, so a
+	 * table whose only writer is the privileged backing host (which queues ops on the
+	 * module-level coordinator, never through `update()`) must still hold the
+	 * reference for its read paths to be reads-own-writes.
 	 */
-	protected async ensureCoordinator(): Promise<TransactionCoordinator> {
+	attachCoordinator(): TransactionCoordinator {
 		if (!this.coordinator) {
 			const tableKey = `${this.schemaName}.${this.tableName}`.toLowerCase();
 			this.coordinator = this.storeModule.getCoordinator(tableKey, this.config);
@@ -494,13 +503,21 @@ export class StoreTable extends VirtualTable {
 				onRollback: () => this.discardPendingStats(),
 			});
 		}
+		return this.coordinator;
+	}
+
+	/**
+	 * Ensure the coordinator is available and connection is registered.
+	 */
+	protected async ensureCoordinator(): Promise<TransactionCoordinator> {
+		const coordinator = this.attachCoordinator();
 
 		if (!this.connection) {
-			this.connection = new StoreConnection(this.tableName, this.coordinator);
+			this.connection = new StoreConnection(this.tableName, coordinator);
 			await (this.db as DatabaseInternal).registerConnection(this.connection);
 		}
 
-		return this.coordinator;
+		return coordinator;
 	}
 
 	/** Apply pending stats on commit. */
@@ -1254,8 +1271,9 @@ export class StoreTable extends VirtualTable {
 			const predicate = this.compileFor(uc);
 			if (predicate && predicate.evaluate(newRow) !== true) continue;
 
-			// Prefer a linked row-time covering MV: its backing table (always the
-			// `memory` module, queried through the db with reads-own-writes) answers
+			// Prefer a linked row-time covering MV: its backing table (hosted by any
+			// backing-host-capable module — memory by default, this store module under
+			// `using store` — queried through the db with reads-own-writes) answers
 			// the uniqueness question, mirroring the memory enforcement path. Falls
 			// back to the per-scan source search when no row-time covering MV exists.
 			const coveringMv = (this.db as DatabaseInternal)._findRowTimeCoveringStructure(schema.schemaName, schema.name, uc);
@@ -1386,8 +1404,41 @@ export class StoreTable extends VirtualTable {
 	 * candidates against the source of truth.
 	 */
 	private async readLiveRowByPk(pk: SqlValue[]): Promise<Row | null> {
+		return this.readEffectiveRowByKey(this.encodeDataKey(pk));
+	}
+
+	// ── Backing-host surface ──────────────────────────────────────────────
+	// Narrow public surface `StoreBackingHost` (backing-host.ts) drives. Each
+	// method addresses the table's CURRENT schema/encoding state, so a host
+	// resolved fresh per engine call always keys and merges consistently with
+	// the table's own read/write paths.
+
+	/** Encode `pkValues` (in PK-definition order) exactly as the data store keys rows. */
+	encodeDataKey(pkValues: SqlValue[]): Uint8Array {
+		return buildDataKey(pkValues, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+	}
+
+	/**
+	 * Byte bounds covering every data key whose leading PK columns equal
+	 * `prefixValues` — encoded under the same per-column DESC directions and key
+	 * collations as {@link encodeDataKey}, so seek + early-terminate addresses the
+	 * exact slice. An empty prefix yields full-scan bounds.
+	 */
+	encodePkPrefixBounds(prefixValues: SqlValue[]): { gte: Uint8Array; lt?: Uint8Array } {
+		return buildPkPrefixBounds(
+			prefixValues,
+			this.encodeOptions,
+			this.pkDirections.slice(0, prefixValues.length),
+			this.pkKeyCollations.slice(0, prefixValues.length),
+		);
+	}
+
+	/**
+	 * Effective (pending-over-committed) point read by encoded data key: a pending
+	 * delete ⇒ null, a pending put ⇒ its value, else the committed store entry.
+	 */
+	async readEffectiveRowByKey(key: Uint8Array): Promise<Row | null> {
 		const store = await this.ensureStore();
-		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 		// Default-store bucket — see the matching note in findUniqueConflict.
 		const pending = this.coordinator?.isInTransaction()
 			? this.coordinator.getPendingOpsForStore()
@@ -1400,6 +1451,45 @@ export class StoreTable extends VirtualTable {
 		}
 		const value = await store.get(key);
 		return value ? deserializeRow(value) : null;
+	}
+
+	/**
+	 * Effective ordered entry scan within `bounds` (see {@link iterateEffective}).
+	 * Opens the data store first — which fires the lazy first-access `saveTableDDL`
+	 * for a freshly created table, the catalog write a store-backed MV backing
+	 * relies on to survive reopen.
+	 */
+	async *iterateEffectiveEntries(
+		bounds: IterateOptions,
+		reverse = false,
+	): AsyncIterable<KVEntry> {
+		const store = await this.ensureStore();
+		yield* this.iterateEffective(store, bounds, reverse);
+	}
+
+	/** Buffer a privileged row-count delta, applied at coordinator commit (host writes). */
+	trackPrivilegedMutation(delta: number): void {
+		this.trackMutation(delta, true);
+	}
+
+	/**
+	 * Reset statistics to an absolute committed row count and flush immediately.
+	 * Used by the host's `replaceContents` (create-fill / refresh), where the new
+	 * count is exact, replacing any drifted delta-tracked estimate.
+	 */
+	async resetStats(rowCount: number): Promise<void> {
+		this.cachedStats = { rowCount, updatedAt: Date.now() };
+		this.pendingStatsDelta = 0;
+		this.mutationCount = 0;
+		await this.flushStats();
+	}
+
+	/**
+	 * Open (and cache) the data store, firing the lazy first-access `saveTableDDL`.
+	 * Public for the host's `replaceContents`, which writes the store directly.
+	 */
+	openDataStore(): Promise<KVStore> {
+		return this.ensureStore();
 	}
 
 	/**

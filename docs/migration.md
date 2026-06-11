@@ -1,0 +1,140 @@
+# Schema Migration in a Synced Database
+
+How an application evolves its schema when the database is replicated across peers that upgrade at different times. This document builds directly on [Lenses and Layered Schemas](lens.md) and [Materialized Views](materialized-views.md); read those first. The sync machinery referenced here is `@quereus/sync` (CRDT column-level LWW over HLC timestamps).
+
+## The problem
+
+A synced application cannot coordinate upgrades. At any moment some peers run the new app version and some run the old, both reading and writing, both expecting their changes to reach everyone. A migration mechanism that requires "stop the world, transform, resume" — or a protocol version negotiation — does not fit. The mechanism must let *both* schema versions operate concurrently against shared data, converge, and let the old representation retire without a deadline.
+
+The lens architecture supplies exactly the needed separation: each app version carries its own **logical schema** and **lens**, both app-local artifacts that never sync; what peers share is the **basis** — module-backed tables replicated by the sync layer. Migration is then purely a matter of how two different lenses map onto one shared, evolving basis.
+
+## The invariant: a frozen, shared basis
+
+> **All intersecting basis tables between peers are identity- and configuration-stable: a basis table consistently holds the same meaning and the same layout, everywhere, for its whole life.**
+
+This is the load-bearing rule, and everything else in this document is a consequence of it:
+
+- **Table presence is the unit of compatibility.** There is no schema version number on the wire and none is needed. Two peers interoperate on exactly the basis tables they both hold; a peer simply ignores nothing and negotiates nothing — a table either exists with its one fixed meaning, or it does not exist. (What a peer does with inbound changes for a table *outside* its basis is a sync-layer policy — see [Retirement](#retirement-the-contract-phase).)
+- **Physical layout is frozen at publication.** Once a basis table is declared and made physical, its layout never changes unless the change is *completely transparent* — and transparency is the **module's** call, not the engine's. Quereus's logical/physical type separation makes many nominal changes (e.g. an integer-width widening) genuinely transparent for the memory and store modules, which hold JavaScript values; a module that cannot support the declared type faithfully should error at declaration, consistently, rather than approximate. Anything not attested transparent routes to the parallel-table pattern below.
+- **Evolution is additive.** A changed representation is a *new* basis table plus a derivation from the old — never an in-place mutation of the old. This is the distributed restatement of the deploy-time rule in [lens.md § Deployment](lens.md#deployment-is-a-compile-step): logical evolution produces additive basis diffs, and logical removals detach mappings rather than dropping basis storage.
+
+## The pattern: expand → converge → flip → contract
+
+A representation change runs through four phases. Only the first requires app code; the rest are observation and housekeeping.
+
+### 1. Expand — publish the new table as a derivation of the old
+
+The upgraded app's deployment declares, in the **basis** schema, a new table for the new representation, *maintained from* the old one — today expressed as a materialized view over the old basis table, with the conversion in the body and the backing placed in the synced store module:
+
+```sql
+-- Basis (shared). Contact_v1 is the existing table; handle was BINARY-keyed.
+declare schema Store {
+  table Contact_v1 (handle text primary key, email text) using store();
+
+  -- New representation: handle compared NOCASE. Value-preserving conversion.
+  create materialized view Contact_v2
+    using store()
+    as select handle collate nocase as handle, email
+       from Contact_v1;
+}
+
+-- Logical (app-local, v2 app only): the design just says what it wants.
+declare logical schema App {
+  table Contact (handle text collate nocase primary key, email text);
+}
+
+-- Lens (app-local, v2 app only): map the design over the new representation.
+declare lens for App over Store {
+  view Contact as select handle, email from Contact_v2;
+}
+```
+
+The old (authoritative) table stays exactly as it was; old-version peers are untouched and unaware. The new table is **derived**: row-time maintenance keeps it consistent with the old table inside every writing transaction, on every peer that has deployed the definition.
+
+What each peer sees during the window:
+
+- **An upgraded peer writing through the new logical table** — the lens resolves to the derived table; write-through rewrites the DML to target the *source* (`Contact_v1`); the source write fires row-time maintenance, which re-derives the affected `Contact_v2` rows in the same statement. Both tables change together, atomically, and both sync out.
+- **An old peer writing `Contact_v1` directly** (through its own v1 lens) — only `Contact_v1` changes locally. When the change syncs to any upgraded peer, the inbound application (via `Database.ingestExternalRowChanges` with `maintainMaterializedViews` on) fires the derivation there, and the derived rows sync onward — including back to old peers, which store `Contact_v2` as an opaque, unmapped basis table. Upgraded peers thus act as **derivation proxies** for the whole network.
+- **An old peer that later upgrades** — `Contact_v2` already exists locally with synced data; the deploy attaches the definition to the existing rows rather than re-deriving from scratch (the adopt path — see [Gaps](#current-gaps)), reconciling any lag by diff rather than refill.
+
+Convergence holds because the derivation is a **pure, replicable function** of the source rows ([requirements below](#determinism-requirements)): every peer that runs it computes identical bytes, so concurrent derivation writes at different peers carry different HLC stamps but the same values, and column-level LWW settles on one of them harmlessly. Value-identical maintenance writes are suppressed (no entry in the change log), so the derivation does not echo between peers.
+
+### 2. Converge — observe, don't guess
+
+The developer's question — "has everyone upgraded?" — decomposes into a static signal and a dynamic one:
+
+- **Static (per peer):** every basis table is in one of three states, computable from existing metadata — **directly mapped** (the deployed lens backs a logical column with it — from the lens deployment snapshot's `relationBacking`), **derivation-source only** (referenced solely as a maintained table's source — `Contact_v1` once the local lens points at `Contact_v2`), or **unreferenced**. The transition into *derivation-source only* is the "this table is now legacy" signal.
+- **Dynamic (network-wide):** the sync layer's peer census — when did a change to `Contact_v1` last originate at a peer whose deployment still maps it directly? The sync system, not the engine, owns this (the engine has no notion of peers); the [`notifyLensDeployment`](lens.md#module-deployment-notification) hook already delivers the mapped set to every module on each deploy, so the sync/store layer can maintain mapped-since / unmapped-since bookkeeping with no new engine surface.
+
+### 3. Flip — make the new table authoritative
+
+When old-schema writers have (or are believed to have) drained, reverse the derivation: redefine `Contact_v1` as maintained *from* `Contact_v2` with the inverse body, and drop the `Contact_v2` derivation. Nothing moves physically — both tables exist with the same rows; only the maintenance direction changes.
+
+- The flip is available exactly when the conversion is **invertible over the data** — trivially true for value-preserving changes (collation, transparent type changes), true for lossy changes only where an [authored inverse](#writability-during-the-window) supplies the representative mapping.
+- After the flip, a straggler old peer is still served: its *reads* of `Contact_v1` see correctly derived data, and its inbound *writes* to `Contact_v1` can be applied at upgraded peers by **DML replay through the table name** (`insert or replace` / `delete` via the engine rather than the bulk ingest seam — see [materialized-views.md § DML replay vs. the ingestion seam](materialized-views.md#dml-replay-vs-the-ingestion-seam)), which rides write-through to land in `Contact_v2`. Retirement stops being urgent: the compatibility table can persist indefinitely at the cost of its storage.
+
+### 4. Contract — retire the old table
+
+Drop the `Contact_v1` derivation and remove it from the basis schema. The engine's part ends there (the same boundary as [lens.md § GC of detached prior basis storage](lens.md#current-limitations)); reclaiming the physical storage is the storage module's / application's / sync layer's job, under a policy:
+
+- **Retention horizon.** A CRDT deployment already needs a tombstone-retention horizon ("changes older than T are not guaranteed deliverable"). Retirement inherits it: drop the legacy table no sooner than the horizon after the last directly-mapped write, and a peer offline longer than the horizon was already outside the delivery guarantee for ordinary reasons.
+- **Unknown-table disposition.** Once retired, a straggler's inbound changes reference a table outside the receiver's basis. The receiver detects this structurally (no version check — the table simply isn't there); the sync layer needs a configured disposition (ignore / quarantine / store-and-forward) **plus telemetry**, because the failure mode is otherwise silent write loss the straggler never learns about.
+
+## Writability during the window
+
+While the old table is authoritative, every write through the new logical schema must reach it through the derivation's inverse. The rule:
+
+> **During the parallel phase, writability through the new schema is exactly the invertible fragment. Full writability arrives at the flip.**
+
+- **Value-preserving conversions** (`collate nocase`, no-op casts) are `passthrough` in the [invertibility registry](view-updateability.md#scalar-invertibility) — fully writable, nothing to author.
+- **Registry-invertible conversions** (`±k` arithmetic, declared lossless casts) — writable via the composed inverse.
+- **Lossy conversions are the developer's prerogative** — e.g. collapsing twenty legacy codes into three. The forward `case` mapping is ordinary SQL in the derivation body; with no inverse the column is simply **read-only through the new schema until the flip** (a write reds `no-inverse` — never silently dropped). A developer who wants writability during the window authors the inverse explicitly with the [`with inverse` clause](view-updateability.md#authored-inverses-with-inverse): the write stores a chosen representative. PutGet (what you write is what you read back) is still checked; GetPut (round-tripping the base is the identity) is *intentionally surrendered* for a non-injective mapping — a write normalizes — and surfaces as an acknowledgeable advisory (`lens.getput-lossy`), not an error.
+- A direct write to a derived column with neither kind of inverse is incoherent during the window even in principle: maintenance would re-derive and clobber it on the next source write. The engine's read-only stance is not a limitation here; it is the correct semantics.
+
+## Determinism requirements
+
+A synced derivation must be a **pure function of the source rows, bit-identical across peers, platforms, and app versions** — strictly stronger than the engine's existing per-database determinism gate (which admits a UDF that is stable on one machine but platform-dependent). Consequences:
+
+- Built-in functions qualify automatically (Quereus implements its own collation and case-folding, so NOCASE semantics cannot drift between peers' JS engines). A UDF used in a synced derivation must be declared **replicable** (see [Gaps](#current-gaps)) — a deliberate authoring assertion, validated at create when the backing host demands it.
+- **A derivation must not mint identity.** Per-peer generation (`uuid7()` in a derivation body) is already rejected by the determinism gate; the subtler rule is that a *new* identity column in a migration target must be **derived** from source data (a hash of the source key) — or the column must wait until after the flip, when it can be an ordinary write-time default. Write-time surrogate defaults on ordinary tables are unaffected: they are evaluated once at the origin peer, captured as resolved values, and replicate as data.
+
+## Convergence hazards
+
+**Key coarsening.** A conversion can weaken row identity — NOCASE makes `'Bob'` and `'bob'` one key. The hazards split by loudness:
+
+- **At deploy (loud):** the create-time fill rejects duplicate backing keys, so a peer upgrading over data that already collides fails atomically, before any catalog mutation. Correct: this is a data problem the developer must resolve (merge the source rows) before the migration can deploy.
+- **In the window (silent):** an old peer inserts a colliding row; it arrives at upgraded peers through the ingest seam, which re-validates nothing, and the keyed derivation upsert last-writer-wins — two source rows silently merge into one derived row. And as long as both source rows live, each edit to either re-asserts its image into the shared derived key: the derived row **oscillates deterministically** (every peer agrees at every quiescent point) but does not settle until the source rows are merged.
+
+The structural fact is statically detectable — the derivation's key fails to functionally determine the source primary key — so the create path should warn ("collisions will last-write-win until source rows are merged"), with runtime collision telemetry as the operational complement. Detection, not prevention: the merge-on-coarsen behavior is often exactly what the migration intends.
+
+**Constraint divergence.** More generally, the old schema may admit states the new schema rejects (the new uniqueness above is the common case). The stance: the *old* table's constraints govern while it is authoritative; the new schema's stricter constraints are fully enforced only against the new table once it is authoritative. A migration that needs the stricter invariant to hold *during* the window must clean the data first — there is no mechanism that can retroactively reject a concurrent old-peer write without breaking convergence.
+
+## Synced vs. local derived tables
+
+Most materialized views are **local** — covering indexes and performance caches, derivable on demand, with no business in the change log (replicating a derived index to a peer that derives its own is pure waste). A migration target is the exception: its rows must exist independently of the source, because the source is scheduled to die.
+
+"Synced" is deliberately **not a core-engine concept**. The differences are expressed at existing seams:
+
+| need | where it lives |
+|---|---|
+| backing stored in the synced module | `using store(...)` on the materialized view |
+| maintenance writes recorded in the sync change log | the backing host module's decision inside `applyMaintenance`, opted in per table via a reserved tag (default **off** — a privileged maintenance write emits no module data events otherwise) |
+| value-identical upsert suppression (echo prevention) | universal maintenance behavior, not a sync feature |
+| replicable-determinism validation | the backing-host capability declares the requirement; the engine validates at create |
+
+The engine never learns the word "synced": it learns that *this host* demands a stricter determinism class and that *this table* opted into change-logging. The sync-store module is simply a host that demands them.
+
+## The degenerate case: when no parallel table is needed
+
+Not every logical change needs the pattern. A **collation change on a non-key, non-unique column is purely a lens-boundary property**: declare the new collation in the logical schema, lens straight onto the unchanged basis table, done — no new basis table, no window, no retirement. Even a collation change participating in a *unique* constraint may only need a local (unsynced) covering MV with the new ordering for enforcement, since the bytes never change. The full parallel-table pattern is forced only when the **shared representation itself** must change: a key's identity semantics, a value transform, a non-transparent type change, a split or merge. Reach for the cheapest mechanism that suffices.
+
+## Current gaps
+
+The pattern above is the design target; these pieces are pending (tracked as tickets):
+
+- **Authored inverses** (`with inverse (col = expr, …)` on result columns) — parser/AST, write-path consumption, lens-prover integration ([view-updateability.md § Authored inverses](view-updateability.md#authored-inverses-with-inverse)).
+- **First-class derivation lifecycle** — stable backing identity, adopt-on-create (attach a derivation to an existing table's data), attach/detach verbs (the flip and the contract phases), and declarative-differ recognition of attach/detach as non-destructive ([materialized-views.md § Current limitations](materialized-views.md#current-limitations)).
+- **Value-identical upsert suppression** in the bounded-delta maintenance arms (the full-rebuild floor already diffs).
+- **Replicable determinism class** for UDFs + host-declared requirements on the backing-host capability.
+- **Key-coarsening detection** — the static create-time warning and runtime collision telemetry.
+- **Sync-layer policies** — per-table change-logging opt-in for maintenance writes, unknown-table disposition + telemetry, retention-horizon-driven retirement, and mapped-since bookkeeping over `notifyLensDeployment`.

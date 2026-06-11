@@ -32,6 +32,7 @@ import type {
 	SchemaChangeEvent as EngineSchemaChangeEvent,
 	ViewSchema,
 	MaterializedViewSchema,
+	BackingHost,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
@@ -39,6 +40,7 @@ import type { CompiledPredicate } from '@quereus/quereus';
 import type { KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
+import { StoreBackingHost } from './backing-host.js';
 import { StoreTable, resolvePkKeyCollations, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
@@ -167,6 +169,35 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 */
 	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
 		return buildAdvertisementsFromTags(basisSchema);
+	}
+
+	/**
+	 * Backing-host capability (engine `vtab/backing-host.ts`): resolve the
+	 * privileged surface for a store table this module owns, or undefined when the
+	 * table is unknown to it. The host binds the CURRENT (StoreTable, coordinator)
+	 * pair — `destroy` evicts both maps, so a drop+recreate yields fresh instances
+	 * and the returned host is pinned to one backing-table incarnation (the engine
+	 * resolves hosts fresh per call, never caching them). Resolution goes through
+	 * {@link getOrReconnectTable} so a rehydrated-but-untouched (or rename-evicted)
+	 * backing still resolves; the ownership pre-check keeps the reconnect fallback
+	 * from adopting a registered table owned by a different module (`vtabModule`
+	 * must be this StoreModule, or a wrapper — IsolationModule — exposing it as
+	 * `underlying`). Attaching the coordinator eagerly makes the shared
+	 * StoreTable's read paths merge the host's pending writes (reads-own-writes
+	 * for a `select` from the MV mid-transaction).
+	 */
+	getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+		if (!this.tables.has(tableKey)) {
+			const registered = db.schemaManager.getTable(schemaName, tableName);
+			const wrapper = registered?.vtabModule as { underlying?: unknown } | undefined;
+			if (!registered || (registered.vtabModule !== this && wrapper?.underlying !== this)) {
+				return undefined;
+			}
+		}
+		const table = this.getOrReconnectTable(db, schemaName, tableName);
+		if (!table) return undefined;
+		return new StoreBackingHost(table, table.attachCoordinator());
 	}
 
 	/**

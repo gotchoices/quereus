@@ -40,3 +40,16 @@ guards; the engine-level seam also covers future hosts for free.
 
 Key tests: direct DML against `_mv_` in all three configurations; REFRESH /
 maintenance / rehydrate-refill still pass; sited error message.
+
+## Interplay: maintained-table lifecycle (`maintained-table-attachment`)
+
+The maintained-table design (plan ticket `maintained-table-attachment`;
+docs/materialized-views.md § Current limitations "First-class derivation
+lifecycle") makes the derivation an *attachment* and the backing potentially
+a first-class named table that outlives it. Whatever enforcement seam is
+chosen here must key off **the presence of a derivation attachment / MV
+record**, not the `_mv_` name pattern — so that detaching the derivation
+(promotion to a plain base table) sheds READONLY structurally, and a
+first-class-named maintained table is enforced identically to a hidden
+`_mv_` one. This favors the engine-level (planner/builder) seam suggested
+above over per-module name checks.

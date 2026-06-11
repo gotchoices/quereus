@@ -2307,8 +2307,10 @@ export class MaterializedViewManager {
 	 *
 	 * Reads-own-writes: the scan resolves to the backing table's coordinated
 	 * connection (the same one {@link maintainRowTime} writes), so the backing
-	 * reflects all prior rows of the statement. The backing is always the `memory`
-	 * module regardless of the source module.
+	 * reflects all prior rows of the statement. The backing is hosted by whatever
+	 * backing-host-capable module the MV declared (`memory` by default, the store
+	 * module under `using store`), independent of the source module — the host's
+	 * `scanEffective` abstracts the storage.
 	 *
 	 * The conflict check is a **backing-PK prefix scan** keyed on `newRow`'s UC
 	 * values — O(log n + matches) rather than the former O(n) full backing scan.

@@ -199,6 +199,19 @@ const caps = storeModule.getCapabilities();
 - Within a transaction, reads through the table's shared coordinator DO see that transaction's own pending writes (read-your-own-writes)
 - Savepoints (create / release / rollback-to) work within a transaction via the coordinator's buffered op log
 
+## Materialized-View Backing Host
+
+The store module implements the engine's backing-host capability
+(`StoreBackingHost`), so `create materialized view mv using store as <body>`
+places the MV's backing table in persistent storage. Maintenance writes ride
+the per-table `TransactionCoordinator`'s pending state (committing/rolling back
+in lockstep with the source write), mid-transaction reads of the MV see pending
+maintenance through the read-your-own-writes merge, and the backing's text
+primary-key columns are keyed under the store's `collation` arg (default
+`NOCASE` — pass `using store(collation = 'BINARY')` for byte-exact keys). The
+isolation wrapper forwards the capability automatically. See
+[`docs/materialized-views.md` § The store host](../../docs/materialized-views.md#the-store-host-using-store).
+
 ## Transaction Isolation
 
 To add full ACID transaction semantics with snapshot isolation, wrap the store module with the `IsolationModule`:

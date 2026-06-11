@@ -306,7 +306,10 @@ maintenance arm). A backing table must reject user DML (READONLY) while
 admitting the privileged surface, and the engine adds no latching around it —
 the host owns its own concurrency discipline under the module's declared
 `concurrencyMode`. The memory module is the reference implementation
-(`MemoryTableModule.getBackingHost`); see
+(`MemoryTableModule.getBackingHost`); the store module is the second realized
+host (`StoreBackingHost` in `@quereus/store` — pending state on the per-table
+`TransactionCoordinator`, reads-own-writes via the store's pending-merge read
+paths, with the isolation wrapper forwarding the capability conditionally); see
 [`docs/materialized-views.md` § Backing-host capability](materialized-views.md#backing-host-capability)
 for the engine-side view.
 
@@ -356,7 +359,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `getBestAccessPlan` | presence | engine-side fallback (default full-scan; isolation returns a default plan when the underlying lacks it) | ✓ | ✓ | forwards | via store |
 | `supports` / `executePlan` | presence (pair) | engine-side fallback (index path) — isolation **deliberately suppresses** it so the overlay sees every row | — | — | suppressed | — |
 | `getMappingAdvertisements` | presence | engine-side fallback (name-match only) | ✓ tags | ✓ tags | forwards | via store |
-| `getBackingHost` | presence | negotiated rejection (`create materialized view … using <module>` and catalog import both reject a capability-less module with a sited `UNSUPPORTED`; resolving a host on an already-created backing without the capability is a sited `INTERNAL` — engine bug) | ✓ | — | — | — |
+| `getBackingHost` | presence | negotiated rejection (`create materialized view … using <module>` and catalog import both reject a capability-less module with a sited `UNSUPPORTED`; resolving a host on an already-created backing without the capability is a sited `INTERNAL` — engine bug) | ✓ | ✓ (`StoreBackingHost` — coordinator-pending) | conditional forward (constructor-assigned **only when the underlying implements it**, so method presence mirrors the underlying — a wrapper around a capability-less module must not advertise) | via store |
 | `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
 | `shadowName` | presence | **dead** — declared on the interface but **never called anywhere** (see note below) | — | — | — | — |
 | `alterTable` (method present) | presence | negotiated rejection (each data-affecting `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent — except `renameColumn`, which degrades to an engine-side schema-only rename) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |
