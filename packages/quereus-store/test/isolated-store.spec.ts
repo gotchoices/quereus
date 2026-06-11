@@ -146,7 +146,9 @@ describe('Isolated Store Module', () => {
 			const storeModule = new StoreModule(provider);
 			const caps = storeModule.getCapabilities();
 			expect(caps.isolation).to.be.false;
-			expect(caps.savepoints).to.be.false;
+			// Savepoints work without isolation: the coordinator's buffered op log
+			// supports create/release/rollback-to (see store-ryow.spec savepoint test).
+			expect(caps.savepoints).to.be.true;
 			expect(caps.persistent).to.be.true;
 			expect(caps.secondaryIndexes).to.be.true;
 			expect(caps.rangeScans).to.be.true;

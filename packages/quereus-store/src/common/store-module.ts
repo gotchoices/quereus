@@ -150,7 +150,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	getCapabilities(): ModuleCapabilities {
 		return {
 			isolation: false,
-			savepoints: false,
+			// Coordinator-buffered ops support savepoint create/release/rollback-to
+			// within a transaction (advisory flag — not engine-consulted).
+			savepoints: true,
 			persistent: true,
 			secondaryIndexes: true,
 			rangeScans: true,

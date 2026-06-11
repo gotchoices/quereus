@@ -43,8 +43,12 @@ export interface PendingStoreOps {
 /**
  * Key-ordered view of buffered ops targeting a specific store: the merge input
  * for read-your-own-writes scans. `puts` is sorted ascending by encoded key
- * bytes (the KVStore iteration order); `deletes` is the same hex set as
- * {@link PendingStoreOps}.
+ * bytes (the KVStore iteration order).
+ *
+ * Unlike {@link PendingStoreOps}, both members are point-in-time COPIES: a
+ * merge scan holds this view across awaits where further coordinator
+ * mutations can interleave (e.g. pipelined DML over an open cursor), so the
+ * view must stay stable for the scan's lifetime.
  */
 export interface OrderedPendingOps {
   /** Pending puts sorted ascending by encoded key bytes. */
@@ -200,11 +204,15 @@ export class TransactionCoordinator {
           ops.push(op);
         }
 
-        // Write a batch per store. The default store is resolved lazily here —
-        // and only when default-bucket ops exist, so a coordinator that only
-        // ever targeted explicit stores never opens the default.
+        // Resolve the default store lazily here — and only when default-bucket
+        // ops exist, so a coordinator that only ever targeted explicit stores
+        // never opens the default. Resolving BEFORE any batch is written keeps
+        // a failed resolve from stranding a partial multi-store commit.
+        const defaultStore = opsByStore.has(null) ? await this.resolveStore() : null;
+
+        // Write a batch per store.
         for (const [target, ops] of opsByStore) {
-          const targetStore = target ?? await this.resolveStore();
+          const targetStore = target ?? defaultStore!;
           const batch = targetStore.batch();
           for (const op of ops) {
             if (op.type === 'put') {
@@ -326,9 +334,15 @@ export class TransactionCoordinator {
    * Map a per-op / per-query store argument to its index bucket. `undefined`
    * means "the default store" (the `null` bucket); an explicit handle that is
    * the resolved default also folds into the default bucket so both addressing
-   * forms see the same ops. While the default is still an unresolved thunk no
-   * caller can hold its handle (it has never been opened through this
-   * coordinator), so role-vs-identity ambiguity cannot arise.
+   * forms see the same ops.
+   *
+   * CONTRACT: while the default is an unresolved thunk, callers must address
+   * it by omission, never by handle. The handle may well exist elsewhere (e.g.
+   * opened through the owning module's store cache), but passing it here
+   * before resolution would file ops in a handle-keyed bucket invisible to
+   * default-bucket readers. In-package callers honor this: data-store ops are
+   * always queued/read with no store argument; explicit handles are used only
+   * for index stores, which are never the default.
    */
   private bucketKey(store?: KVStore): KVStore | null {
     if (store === undefined) return null;
@@ -375,8 +389,9 @@ export class TransactionCoordinator {
   /**
    * Key-ordered pending view for the given store (or the default if omitted):
    * puts sorted ascending by encoded key bytes plus the delete set — the merge
-   * input for read-your-own-writes scans. Sorts on demand (pending sets are
-   * transaction-sized).
+   * input for read-your-own-writes scans. Copies and sorts on demand (pending
+   * sets are transaction-sized), so the returned view is a stable snapshot
+   * even when coordinator mutations interleave with a long-lived merge scan.
    */
   getOrderedPendingOps(store?: KVStore): OrderedPendingOps {
     const bucket = this.pendingIndex.get(this.bucketKey(store));
@@ -384,6 +399,6 @@ export class TransactionCoordinator {
       return EMPTY_ORDERED;
     }
     const puts = Array.from(bucket.puts.values()).sort((a, b) => compareBytes(a.key, b.key));
-    return { puts, deletes: bucket.deletes };
+    return { puts, deletes: new Set(bucket.deletes) };
   }
 }

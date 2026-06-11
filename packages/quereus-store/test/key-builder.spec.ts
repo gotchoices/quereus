@@ -156,10 +156,13 @@ describe('key-builder', () => {
 	});
 
 	describe('buildIndexPrefixBounds', () => {
-		it('returns full scan for empty prefix', () => {
+		it('returns unbounded full scan for empty prefix (no 0xff cap)', () => {
+			// Index stores are per-index, so a full index scan must not cap at
+			// [0xff]: a leading DESC NULL column encodes with a 0xff type byte and
+			// would otherwise be excluded.
 			const bounds = buildIndexPrefixBounds([]);
 			expect(bounds.gte).to.deep.equal(new Uint8Array(0));
-			expect(bounds.lt).to.deep.equal(new Uint8Array([0xff]));
+			expect(bounds.lt).to.be.undefined;
 		});
 
 		it('returns prefix-based range for non-empty prefix', () => {

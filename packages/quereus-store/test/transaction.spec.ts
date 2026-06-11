@@ -443,6 +443,22 @@ describe('TransactionCoordinator', () => {
 			expect(coordinator.getOrderedPendingOps().puts).to.have.length(1);
 			expect(coordinator.getOrderedPendingOps(store).puts).to.have.length(1);
 		});
+
+		it('returns a stable snapshot unaffected by later coordinator mutations', () => {
+			// Merge scans hold the view across awaits where pipelined DML can queue
+			// further ops — those must not bleed into an in-flight scan's view.
+			coordinator.begin();
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.delete(new Uint8Array([2]));
+
+			const view = coordinator.getOrderedPendingOps();
+			coordinator.put(new Uint8Array([3]), new Uint8Array([30]));
+			coordinator.delete(new Uint8Array([4]));
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20])); // un-deletes 2
+
+			expect(view.puts.map(p => Array.from(p.key))).to.deep.equal([[1]]);
+			expect([...view.deletes]).to.deep.equal([bytesToHex(new Uint8Array([2]))]);
+		});
 	});
 
 	describe('lazy default store', () => {

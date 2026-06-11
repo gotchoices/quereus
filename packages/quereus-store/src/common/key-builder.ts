@@ -211,6 +211,12 @@ export function buildFullScanBounds(): { gte: Uint8Array } {
  * `lt` is omitted when the encoded prefix is all-0xff bytes (e.g. a single
  * leading DESC NULL, whose type byte inverts to 0xff) — no finite exclusive
  * upper bound exists, so the scan runs to the end of the store.
+ *
+ * An empty prefix yields unbounded full-scan bounds: index stores are
+ * per-index, so every key belongs to this index, and capping at `lt: [0xff]`
+ * would wrongly exclude entries whose leading column is a DESC NULL (encoded
+ * with a 0xff type byte) — the same trap {@link buildFullScanBounds} documents
+ * for data stores.
  */
 export function buildIndexPrefixBounds(
 	prefixValues: SqlValue[],
@@ -218,7 +224,7 @@ export function buildIndexPrefixBounds(
 	directions?: ReadonlyArray<boolean>,
 ): { gte: Uint8Array; lt?: Uint8Array } {
 	if (prefixValues.length === 0) {
-		return { gte: new Uint8Array(0), lt: new Uint8Array([0xff]) };
+		return buildFullScanBounds();
 	}
 
 	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions);

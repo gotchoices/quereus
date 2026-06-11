@@ -187,7 +187,7 @@ const caps = storeModule.getCapabilities();
 
 // {
 //   isolation: false,      // Store module does NOT provide transaction isolation
-//   savepoints: false,     // No savepoint support without isolation layer
+//   savepoints: true,      // Coordinator-buffered ops support savepoints within a transaction
 //   persistent: true,      // Data persists across restarts
 //   secondaryIndexes: true,// Supports secondary indexes
 //   rangeScans: true       // Supports range scans
@@ -197,7 +197,7 @@ const caps = storeModule.getCapabilities();
 **Important:** The base `StoreModule` does not provide transaction isolation:
 - No snapshot isolation: between connections, reads see only committed data, and concurrent readers may observe partial writes
 - Within a transaction, reads through the table's shared coordinator DO see that transaction's own pending writes (read-your-own-writes)
-- Savepoints are not supported
+- Savepoints (create / release / rollback-to) work within a transaction via the coordinator's buffered op log
 
 ## Transaction Isolation
 
