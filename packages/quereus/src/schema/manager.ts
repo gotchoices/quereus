@@ -30,7 +30,7 @@ import type { ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { hasNativeEventSupport } from '../util/event-support.js';
 import type { VTableSchemaChangeEvent } from '../vtab/events.js';
 import { quoteIdentifier, createViewToString, createMaterializedViewToString, astToString } from '../emit/ast-stringify.js';
-import { materializeView } from '../runtime/emit/materialized-view-helpers.js';
+import { materializeView, adoptMaterializedView, deriveBackingShape, backingShapeMatches, type MaterializeViewDefinition, type BackingShape } from '../runtime/emit/materialized-view-helpers.js';
 
 const log = createLogger('schema:manager');
 const warnLog = log.extend('warn');
@@ -44,6 +44,38 @@ export interface GenericModuleCallOptions extends BaseModuleConfig {
 	moduleArgs?: readonly string[];
 	statementColumns?: readonly AST.ColumnDef[];
 	statementConstraints?: readonly AST.TableConstraint[];
+}
+
+/**
+ * Options for {@link SchemaManager.importCatalog}, controlling the
+ * materialized-view adopt-without-refill fast path. Both default off: a plain
+ * `importCatalog(ddl)` always drops and refills a pre-existing same-module
+ * backing — the always-correct posture.
+ */
+export interface ImportCatalogOptions {
+	/**
+	 * Caller-attested trust in pre-existing durable backings (adopt gate 5):
+	 * the caller asserts the store has NOT crashed since those backings were
+	 * last written — e.g. the store module sets this from its consumed
+	 * clean-shutdown catalog marker. Without that attestation, a crash between
+	 * two durable modules' commit acknowledgements could have left source and
+	 * backing divergent on disk (coordinated commit is not 2PC), and the
+	 * DDL-level adopt gates cannot see content divergence — so adopt is never
+	 * taken and any divergence self-heals through the refill.
+	 */
+	trustBackings?: boolean;
+	/**
+	 * Shared adopt ledger for one rehydration session: lowercased qualified
+	 * names (`schema._mv_<name>`) of every backing adopted so far, appended on
+	 * each successful adopt. An MV whose body reads another MV's backing may
+	 * only adopt when that upstream backing is IN this set — an upstream that
+	 * was refilled this session may hold new content, so its dependents must
+	 * refill too; an upstream that adopted is unchanged, so trust composes.
+	 * Pass one Set across all `importCatalog` calls of the session (the store's
+	 * MV fixpoint rounds compose through it). Omitting it means no `_mv_`-source
+	 * MV can adopt.
+	 */
+	adoptedBackings?: Set<string>;
 }
 
 /**
@@ -2419,6 +2451,10 @@ export class SchemaManager {
 	 * Import catalog objects from DDL statements without triggering storage creation.
 	 * Used when connecting to existing storage that already contains data.
 	 *
+	 * Options enable the materialized-view **adopt-without-refill fast path**
+	 * (see {@link importMaterializedView}); omitted, every MV refills — the
+	 * always-correct default.
+	 *
 	 * This method:
 	 * 1. Parses each DDL statement
 	 * 2. Registers the schema objects (tables, indexes, views, materialized views)
@@ -2435,14 +2471,15 @@ export class SchemaManager {
 	 * table-before-index ordering across entries is required.)
 	 *
 	 * @param ddlStatements Array of DDL strings (each one or more CREATE TABLE / CREATE INDEX, etc.)
+	 * @param options Adopt-fast-path options for materialized views — see {@link ImportCatalogOptions}
 	 * @returns Array of imported object names
 	 */
-	async importCatalog(ddlStatements: string[]): Promise<{ tables: string[]; indexes: string[]; views: string[]; materializedViews: string[] }> {
+	async importCatalog(ddlStatements: string[], options?: ImportCatalogOptions): Promise<{ tables: string[]; indexes: string[]; views: string[]; materializedViews: string[] }> {
 		const imported = { tables: [] as string[], indexes: [] as string[], views: [] as string[], materializedViews: [] as string[] };
 
 		for (const ddl of ddlStatements) {
 			try {
-				for (const result of await this.importDDL(ddl)) {
+				for (const result of await this.importDDL(ddl, options)) {
 					if (result.type === 'table') {
 						imported.tables.push(result.name);
 					} else if (result.type === 'index') {
@@ -2476,7 +2513,7 @@ export class SchemaManager {
 	 * fail-loud contract to record import errors rather than silently dropping
 	 * objects.
 	 */
-	private async importDDL(ddl: string): Promise<Array<{ type: 'table' | 'index' | 'view' | 'materializedView'; name: string }>> {
+	private async importDDL(ddl: string, options?: ImportCatalogOptions): Promise<Array<{ type: 'table' | 'index' | 'view' | 'materializedView'; name: string }>> {
 		const parser = new Parser();
 		const statements = parser.parseAll(ddl);
 
@@ -2492,7 +2529,9 @@ export class SchemaManager {
 			} else if (stmt.type === 'createMaterializedView') {
 				// Materialized views re-materialize (backing rebuilt from current source
 				// data, row-time maintenance re-registered) — silent like the other arms.
-				results.push(await this.importMaterializedView(stmt as AST.CreateMaterializedViewStmt));
+				// Under `options.trustBackings` a pre-existing durable backing that
+				// passes every adopt gate is adopted without the refill.
+				results.push(await this.importMaterializedView(stmt as AST.CreateMaterializedViewStmt, options));
 			} else if (stmt.type === 'alterIndex') {
 				// Tag re-application on an already-imported object — no result entry.
 				this.applyImportedIndexTags(stmt as AST.AlterIndexStmt);
@@ -2591,8 +2630,15 @@ export class SchemaManager {
 	 * `registerMaterializedView` throws (after {@link materializeView} rolls the
 	 * half-built backing back), and the caller records it as a per-entry
 	 * rehydration error.
+	 *
+	 * **Adopt fast path.** A pre-existing table at the backing name in the MV's
+	 * own backing module (a durable host's phase-1 rehydration of its backing)
+	 * is ADOPTED — registered as-is, no body re-execution — iff ALL gates pass
+	 * (see {@link tryAdoptPreExistingBacking}); otherwise it is dropped and the
+	 * MV refills through {@link materializeView}. Only import ever adopts —
+	 * create and refresh are unchanged.
 	 */
-	private async importMaterializedView(stmt: AST.CreateMaterializedViewStmt): Promise<{ type: 'materializedView'; name: string }> {
+	private async importMaterializedView(stmt: AST.CreateMaterializedViewStmt, options?: ImportCatalogOptions): Promise<{ type: 'materializedView'; name: string }> {
 		// Canonical stored schemaName (see canonicalSchemaName) — the schema itself
 		// is created below, after the DML-body gate.
 		const targetSchemaName = this.canonicalSchemaName(stmt.view.schema || this.getCurrentSchemaName());
@@ -2619,28 +2665,7 @@ export class SchemaManager {
 		// as a per-entry rehydration error.
 		const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
 
-		// A durable backing-host module may have rehydrated its own `_mv_<name>`
-		// table (phase 1) before this MV catalog entry imports (phase 3), so the
-		// create-time "already exists" collision check would reject the import. A
-		// pre-existing table owned by the MV's own backing module IS that
-		// rehydrated backing: drop it and re-materialize from the body (the
-		// adopt-without-refill fast path is deferred — see `store-mv-backing-host`).
-		// A table in a DIFFERENT module is not ours — fail the entry rather than
-		// dropping user data. The create emitter keeps the plain collision error.
-		const backingTableName = backingTableNameFor(viewName);
-		const preExisting = this.getTable(targetSchemaName, backingTableName);
-		if (preExisting) {
-			if ((preExisting.vtabModuleName ?? '').toLowerCase() === backing.moduleName) {
-				await this.dropTable(targetSchemaName, backingTableName, /*ifExists*/ true);
-			} else {
-				throw new QuereusError(
-					`cannot import materialized view '${targetSchemaName}.${viewName}': table '${backingTableName}' already exists in module '${preExisting.vtabModuleName}', not the MV's backing module '${backing.moduleName}'`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-		}
-
-		await materializeView(this.db, {
+		const def: MaterializeViewDefinition = {
 			schemaName: targetSchemaName,
 			viewName,
 			// Canonicalize the stored DDL over the NORMALIZED module identity
@@ -2658,10 +2683,99 @@ export class SchemaManager {
 			tags: stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
 			backingModuleName: backing.storedModuleName,
 			backingModuleArgs: backing.storedModuleArgs,
-		});
+		};
+
+		// A durable backing-host module may have rehydrated its own `_mv_<name>`
+		// table (phase 1) before this MV catalog entry imports (phase 3), so the
+		// create-time "already exists" collision check would reject the import. A
+		// pre-existing table owned by the MV's own backing module IS that
+		// rehydrated backing: adopt it when every gate passes, else drop it and
+		// re-materialize from the body. A table in a DIFFERENT module is not
+		// ours — fail the entry rather than dropping user data. The create
+		// emitter keeps the plain collision error.
+		const backingTableName = backingTableNameFor(viewName);
+		const preExisting = this.getTable(targetSchemaName, backingTableName);
+		if (preExisting) {
+			if ((preExisting.vtabModuleName ?? '').toLowerCase() === backing.moduleName) {
+				if (options?.trustBackings && await this.tryAdoptPreExistingBacking(def, preExisting, backing.moduleName, options.adoptedBackings)) {
+					log(`Adopted materialized view %s.%s (durable backing trusted; refill skipped)`, targetSchemaName, viewName);
+					return { type: 'materializedView', name: `${targetSchemaName}.${viewName}` };
+				}
+				await this.dropTable(targetSchemaName, backingTableName, /*ifExists*/ true);
+			} else {
+				throw new QuereusError(
+					`cannot import materialized view '${targetSchemaName}.${viewName}': table '${backingTableName}' already exists in module '${preExisting.vtabModuleName}', not the MV's backing module '${backing.moduleName}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+
+		await materializeView(this.db, def);
 		log(`Imported materialized view %s.%s`, targetSchemaName, viewName);
 
 		return { type: 'materializedView', name: `${targetSchemaName}.${viewName}` };
+	}
+
+	/**
+	 * The adopt-without-refill gate check + adopt for a pre-existing same-module
+	 * backing during MV import. Returns true when the backing was adopted; false
+	 * means "fall back to drop+refill". A body that cannot PLAN throws instead of
+	 * falling back: the backing must NOT be dropped on a planning failure — in
+	 * the store's fixpoint rehydration an MV-over-MV dependent legitimately fails
+	 * to plan until its upstream's round lands, and dropping here would destroy
+	 * the rows a later round could adopt (a genuinely un-plannable body then
+	 * errors per-entry with the backing preserved as a plain table — data-safe).
+	 * Gates, of five (the caller already verified gate 1, same-module, and
+	 * gate 5, `trustBackings`):
+	 *
+	 * 2. **Shape** — `backingShapeMatches(preExisting, deriveBackingShape(...))`:
+	 *    the persisted backing is column-for-column what the re-planned body
+	 *    would build (names, logical types, not-null, collation, physical PK).
+	 * 3. **bodyHash** — automatic by construction: the catalog persists DDL and
+	 *    import re-parses it, recomputing `computeBodyHash` from the same
+	 *    canonical definition — there is no independently persisted hash that
+	 *    could diverge, so no runtime check is possible or needed.
+	 * 4. **Sources** — every table the body reads lives in the SAME module as
+	 *    the backing (one storage substrate ⇒ the divergence window is the
+	 *    documented crash window the marker attests against; a cross-module
+	 *    source — e.g. memory — was itself just recomputed, so persisted backing
+	 *    rows may be stale relative to it), AND every `_mv_` source was itself
+	 *    ADOPTED this session (`adoptedBackings`) — a refilled upstream may hold
+	 *    new content its dependents must reflect.
+	 *
+	 * A throw from `adoptMaterializedView` itself (the row-time eligibility gate
+	 * in registration) propagates — per-entry error, backing left registered as
+	 * a plain table (see the helper's rollback contract).
+	 */
+	private async tryAdoptPreExistingBacking(
+		def: MaterializeViewDefinition,
+		preExisting: TableSchema,
+		backingModuleName: string,
+		adoptedBackings: Set<string> | undefined,
+	): Promise<boolean> {
+		// Throws when the body cannot plan — deliberately NOT caught (see docstring).
+		const shape: BackingShape = deriveBackingShape(this.db, def.bodySql, def.columns);
+		// Declared-column arity mismatch: let the refill arm raise its sited error.
+		if (def.columns && def.columns.length > 0 && def.columns.length !== shape.columns.length) {
+			return false;
+		}
+		if (!backingShapeMatches(preExisting, shape)) return false;
+
+		for (const qualified of shape.sourceTables) {
+			const dot = qualified.indexOf('.');
+			const sourceSchema = dot >= 0 ? qualified.slice(0, dot) : this.getCurrentSchemaName();
+			const sourceName = dot >= 0 ? qualified.slice(dot + 1) : qualified;
+			const source = this.getTable(sourceSchema, sourceName);
+			if (!source) return false;
+			if ((source.vtabModuleName ?? '').toLowerCase() !== backingModuleName) return false;
+			// `_mv_`-prefixed sources are (by reserved-name convention) other MVs'
+			// backings; require they were adopted, not refilled, this session.
+			if (sourceName.startsWith('_mv_') && !adoptedBackings?.has(qualified)) return false;
+		}
+
+		await adoptMaterializedView(this.db, def, preExisting, shape);
+		adoptedBackings?.add(`${def.schemaName}.${backingTableNameFor(def.viewName)}`.toLowerCase());
+		return true;
 	}
 
 	/**

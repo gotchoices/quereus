@@ -362,6 +362,87 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 }
 
 /**
+ * The adopt-without-refill counterpart of {@link materializeView}: the
+ * registration tail without create+fill, for the catalog-import path
+ * (`SchemaManager.importMaterializedView`) when a pre-existing durable backing
+ * passed every adopt gate (same module, shape match, all sources same-module
+ * with upstream `_mv_` backings themselves adopted, caller-attested
+ * `trustBackings`). The backing's rows are trusted as-is — no body execution.
+ *
+ * **Backing schema re-stamp.** `preExisting` is a phase-1 DDL round-trip and
+ * loses ScalarType fidelity the refill path would carry (the registry-interned
+ * logical types survive only by name in DDL). Re-registering the body-derived
+ * {@link buildBackingTableSchema} result — shape-verified identical by the
+ * caller's `backingShapeMatches` gate — makes post-adopt state equivalent to
+ * post-refill state for the row-time plan `registerMaterializedView` binds.
+ * Module identity/args come from `def` exactly as the refill path's
+ * `buildBackingTableSchema` call does (gate 1 verified the registered module
+ * matches); `estimatedRows` carries over from the registered schema (the rows
+ * are preserved, so the prior estimate stays truthful). The module-side LIVE
+ * table instance still caches the phase-1 schema — the importing host
+ * reconciles it after import (the store module's `rehydrateCatalog` runs
+ * `StoreTable.updateSchema` over every connected table); reads are unaffected
+ * either way since the shapes are identical.
+ *
+ * Rollback on a registration failure (the mandatory row-time eligibility gate
+ * runs there): unlink + `removeMaterializedView` + rethrow, but — unlike
+ * {@link materializeView} — the backing table stays REGISTERED, reverting to
+ * its plain-table state. Dropping a durable backing on a registration error
+ * would destroy the very rows a later retry could adopt; the caller records
+ * the throw as a per-entry rehydration error.
+ */
+export async function adoptMaterializedView(
+	db: Database,
+	def: MaterializeViewDefinition,
+	preExisting: TableSchema,
+	shape: BackingShape,
+): Promise<MaterializedViewSchema> {
+	const sm = db.schemaManager;
+	const backingTableName = backingTableNameFor(def.viewName);
+
+	const stamped = buildBackingTableSchema(db, def.schemaName, backingTableName, shape, def.backingModuleName, def.backingModuleArgs);
+	sm.getSchemaOrFail(def.schemaName).addTable({ ...stamped, estimatedRows: preExisting.estimatedRows ?? 0 });
+
+	// Same record formula as materializeView — bodyHash by construction agrees
+	// with what the refill arm (and the declarative differ) computes from the
+	// same re-parsed canonical definition, so an adopted and a refilled MV
+	// record are indistinguishable (fixed point: export DDL after adopt ==
+	// after refill).
+	const mv: MaterializedViewSchema = {
+		name: def.viewName,
+		schemaName: def.schemaName,
+		sql: def.sql,
+		selectAst: def.selectAst,
+		columns: def.columns,
+		insertDefaults: def.insertDefaults,
+		tags: def.tags,
+		backingTableName,
+		backingModuleName: def.backingModuleName,
+		backingModuleArgs: def.backingModuleArgs,
+		primaryKey: shape.primaryKey,
+		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
+		ordering: shape.ordering,
+		sourceTables: shape.sourceTables,
+		stale: false,
+		origin: 'explicit',
+	};
+	linkCoveredUniqueConstraints(db, mv, def.bodySql);
+	sm.addMaterializedView(mv);
+
+	try {
+		db.registerMaterializedView(mv);
+	} catch (e) {
+		unlinkCoveredUniqueConstraints(db, mv);
+		sm.removeMaterializedView(def.schemaName, def.viewName);
+		// Deliberately NOT dropping the backing: it reverts to a plain table
+		// (re-stamped schema is shape-identical to its phase-1 state).
+		throw e;
+	}
+
+	return mv;
+}
+
+/**
  * Full-rebuild of a materialized view's backing table: re-run the body to
  * completion and atomically swap the backing table's base layer. This is the
  * always-correct path shared by manual `refresh materialized view` and the

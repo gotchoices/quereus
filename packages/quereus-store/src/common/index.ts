@@ -51,6 +51,8 @@ export {
 	buildCatalogKey,
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
+	buildMetaCatalogKey,
+	CLEAN_SHUTDOWN_META_NAME,
 	classifyCatalogKey,
 	type CatalogEntryKind,
 	buildFullScanBounds,

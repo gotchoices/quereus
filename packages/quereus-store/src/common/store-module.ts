@@ -52,6 +52,8 @@ import {
 	buildStatsKey,
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
+	buildMetaCatalogKey,
+	CLEAN_SHUTDOWN_META_NAME,
 	classifyCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
@@ -1836,7 +1838,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Used to restore persisted tables on startup and by tests asserting persisted DDL.
 	 * Note: this returns table, view, AND materialized-view entries intermixed —
 	 * {@link rehydrateCatalog} uses {@link loadCatalogEntries} (keys retained) to
-	 * classify them.
+	 * classify them. Meta entries (e.g. the clean-shutdown marker) are not DDL
+	 * and are filtered out.
 	 */
 	async loadAllDDL(): Promise<string[]> {
 		const catalogStore = await this.provider.getCatalogStore();
@@ -1845,6 +1848,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const ddlStatements: string[] = [];
 
 		for await (const entry of catalogStore.iterate(bounds)) {
+			if (classifyCatalogKey(entry.key) === 'meta') continue;
 			const ddl = decoder.decode(entry.value);
 			ddlStatements.push(ddl);
 		}
@@ -1886,7 +1890,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *      rebuilds the memory backing from current source data, re-registers row-time
 	 *      maintenance, re-runs the eligibility gate — the same core the create emitter
 	 *      uses, but silent: no `materialized_view_added` fires, so phase 3 writes
-	 *      nothing back to the catalog).
+	 *      nothing back to the catalog). A store-hosted backing that phase 1 already
+	 *      rehydrated is **adopted without the refill** when the engine's adopt gates
+	 *      pass — see the clean-shutdown marker below.
+	 *
+	 * **Clean-shutdown marker.** Before anything loads, the reserved
+	 * `\x00meta\x00clean_shutdown` catalog entry (written by {@link closeAll} after
+	 * every batch flushed) is consumed: read into `trustBackings`, then **deleted
+	 * immediately** — single-use, so a crash later in this session (or a second
+	 * rehydrate without an intervening clean close) is detected at the next open and
+	 * every adopt falls back to the always-correct drop+refill, self-healing any
+	 * crash-window divergence (coordinated commit is not 2PC across stores). Phase 3
+	 * threads `{ trustBackings, adoptedBackings }` into each per-entry `importCatalog`;
+	 * the one shared `adoptedBackings` set composes across fixpoint rounds (an upstream
+	 * MV adopted in round 1 enables its dependent in round 2, while a refilled upstream
+	 * forces dependents to refill).
 	 *
 	 * **MV-over-MV ordering** is handled by a fixpoint retry rather than a static topo
 	 * sort: the source `sourceTables` an MV resolves to (`_mv_<x>`) is computed at create
@@ -1911,6 +1929,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// store-table create/connect to establish the subscription.)
 		this.ensureSchemaSubscription(db);
 
+		// Consume the clean-shutdown marker FIRST (before the catalog scan): its
+		// presence is the adopt trust basis for this rehydration only, and deleting
+		// it immediately makes it single-use.
+		const trustBackings = await this.consumeCleanShutdownMarker();
+
 		const entries = await this.loadCatalogEntries();
 		const result: RehydrationResult = { tables: [], indexes: [], views: [], materializedViews: [], errors: [] };
 		if (entries.length === 0) return result;
@@ -1933,6 +1956,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			switch (classifyCatalogKey(key)) {
 				case 'view': { viewDDLs.push(ddl); break; }
 				case 'materializedView': { mvDDLs.push(ddl); break; }
+				// Meta entries are store-internal, never DDL. (The marker itself was
+				// already consumed above; this guards any future meta key.)
+				case 'meta': { break; }
 				default: { tableDDLs.push(ddl); break; }
 			}
 		}
@@ -1958,14 +1984,17 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			}
 		}
 
-		// Phase 3 — materialized views, dependency-ordered via fixpoint retry (see docstring).
+		// Phase 3 — materialized views, dependency-ordered via fixpoint retry (see
+		// docstring). One shared adopt ledger across all rounds: adopted upstream
+		// backings unlock their dependents' adoption in later rounds.
+		const adoptedBackings = new Set<string>();
 		let pending = mvDDLs;
 		while (pending.length > 0) {
 			const failed: Array<{ ddl: string; error: unknown }> = [];
 			let progressed = false;
 			for (const ddl of pending) {
 				try {
-					const imported = await db.schemaManager.importCatalog([ddl]);
+					const imported = await db.schemaManager.importCatalog([ddl], { trustBackings, adoptedBackings });
 					result.materializedViews.push(...imported.materializedViews);
 					progressed = true;
 				} catch (e) {
@@ -1995,6 +2024,20 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 
 		return result;
+	}
+
+	/**
+	 * Consume the clean-shutdown marker: report whether it was present, deleting
+	 * it in the same breath (single-use). Absence — a fresh store, a crash, or a
+	 * prior rehydrate without an intervening {@link closeAll} — yields false, so
+	 * every materialized-view adopt this session falls back to refill.
+	 */
+	private async consumeCleanShutdownMarker(): Promise<boolean> {
+		const catalogStore = await this.provider.getCatalogStore();
+		const markerKey = buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME);
+		const present = (await catalogStore.get(markerKey)) !== undefined;
+		if (present) await catalogStore.delete(markerKey);
+		return present;
 	}
 
 	/**
@@ -2240,6 +2283,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 		this.tables.clear();
 		this.coordinators.clear();
+
+		// Every batch has flushed (persist queue drained, tables disconnected):
+		// attest the clean shutdown so the next open may take the materialized-view
+		// adopt fast path. Consumed (single-use) by `rehydrateCatalog`. Written
+		// LAST, immediately before the provider closes — anything that dies before
+		// this line leaves no marker and the next open refills.
+		const catalogStore = await this.provider.getCatalogStore();
+		await catalogStore.put(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME), new TextEncoder().encode('1'));
 
 		await this.provider.closeAll();
 		this.stores.clear();

@@ -144,11 +144,13 @@ export function buildCatalogKey(schemaName: string, tableName: string): Uint8Arr
  */
 const VIEW_KEY_PREFIX = '\x00view\x00';
 const MVIEW_KEY_PREFIX = '\x00mview\x00';
+const META_KEY_PREFIX = '\x00meta\x00';
 const VIEW_KEY_PREFIX_BYTES = encoder.encode(VIEW_KEY_PREFIX);
 const MVIEW_KEY_PREFIX_BYTES = encoder.encode(MVIEW_KEY_PREFIX);
+const META_KEY_PREFIX_BYTES = encoder.encode(META_KEY_PREFIX);
 
 /** Kind of a loaded catalog entry, determined by its key prefix. */
-export type CatalogEntryKind = 'table' | 'view' | 'materializedView';
+export type CatalogEntryKind = 'table' | 'view' | 'materializedView' | 'meta';
 
 /**
  * Build a catalog key for a (non-materialized) view's DDL.
@@ -169,13 +171,36 @@ export function buildMaterializedViewCatalogKey(schemaName: string, mvName: stri
 }
 
 /**
+ * Build a catalog key for a store-internal meta entry (not DDL). Format:
+ * `\x00meta\x00{name}` — same reserved leading-`0x00` scheme as the view/MV
+ * prefixes, so a meta key can never collide with a table entry, and the 'm'-vs
+ * `\x00meta`/`\x00mview` byte sequences diverge at the second character.
+ * Today's only meta entry is the clean-shutdown marker
+ * ({@link CLEAN_SHUTDOWN_META_NAME}).
+ */
+export function buildMetaCatalogKey(name: string): Uint8Array {
+	return encoder.encode(`${META_KEY_PREFIX}${name}`);
+}
+
+/**
+ * Reserved meta-entry name for the clean-shutdown marker: written by
+ * `StoreModule.closeAll` after every batch has flushed, consumed (read +
+ * immediately deleted — single-use) by `rehydrateCatalog`. Its presence at open
+ * attests no crash since the last close, which is the trust basis for the
+ * materialized-view adopt-without-refill fast path.
+ */
+export const CLEAN_SHUTDOWN_META_NAME = 'clean_shutdown';
+
+/**
  * Classify a loaded catalog key by its reserved prefix so `rehydrateCatalog` can
  * route each entry to the correct phase. A view/MV entry must never be fed to the
- * table-phase `importCatalog` (which would fail-loud or mis-handle it).
+ * table-phase `importCatalog` (which would fail-loud or mis-handle it); a meta
+ * entry is not DDL at all and must never reach any import phase.
  */
 export function classifyCatalogKey(key: Uint8Array): CatalogEntryKind {
 	if (startsWithBytes(key, VIEW_KEY_PREFIX_BYTES)) return 'view';
 	if (startsWithBytes(key, MVIEW_KEY_PREFIX_BYTES)) return 'materializedView';
+	if (startsWithBytes(key, META_KEY_PREFIX_BYTES)) return 'meta';
 	return 'table';
 }
 

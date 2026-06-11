@@ -323,6 +323,21 @@ shifted columns through the host module's `alterTable`; a host without it
 throws `UNSUPPORTED` and the propagation's failure path marks the MV stale
 (recoverable by `refresh`) instead of renaming in place.
 
+**Durable hosts and the rehydrate adopt fast path.** By default, catalog import
+drops a pre-existing same-module `_mv_<name>` table and refills it from the body
+— always correct, never trusting persisted derived rows. A durable host that
+wants the adopt-without-refill fast path on reopen does two things: persist its
+backing as an **ordinary table entry** in its catalog (so its own rehydration
+phase 1 reconnects the table before the MV entries import), and pass
+`importCatalog`'s `trustBackings: true` (plus one shared `adoptedBackings` set
+across the session's calls) **only when it can attest no crash since the last
+open** — the store module's vehicle is a single-use clean-shutdown catalog
+marker written by `closeAll` and consumed at `rehydrateCatalog`. Never pass
+`trustBackings` unconditionally: the engine's remaining gates are DDL-level and
+cannot see content divergence from a crash. See
+[`docs/materialized-views.md` § Cross-module atomicity](materialized-views.md#cross-module-atomicity)
+for the full gate set.
+
 ## Capability negotiation surface
 
 The `VirtualTableModule` contract signals capability three different ways, and the
