@@ -186,11 +186,15 @@ covering structure answers it.
 > downstream cascade work — and emits `delete` for every old key absent from the new set. The
 > diff drives `recordUpsert`/`recordDelete` (so secondary-index + change-tracking bookkeeping
 > stay correct, exactly as the point ops do), and the returned `BackingRowChange[]` is the
-> realized minimal delta the MV-over-MV cascade consumes unchanged. Key matching uses the
-> backing PK comparator (honoring PK-column collation), and the skip-identical row comparison
-> uses `compareSqlValues` per column (not JS `===`), so a new row whose key only differs by
-> collation (`'apple'` vs a stored `'APPLE'` under a NOCASE PK) resolves to an `update` against
-> its old row rather than a spurious insert + delete that would leak index bookkeeping. There is
+> realized minimal delta the MV-over-MV cascade consumes unchanged. Collation governs **key
+> pairing** only: key matching uses the backing PK comparator (honoring PK-column collation),
+> so a new row whose key only differs by collation (`'apple'` vs a stored `'APPLE'` under a
+> NOCASE PK) pairs with its old row and resolves to an `update` rather than a spurious insert +
+> delete that would leak index bookkeeping. The skip-identical **value** comparison is instead
+> byte-faithful (`rowsValueIdentical`, BINARY per column — numeric-storage-class tolerant but
+> byte-exact for text), the SAME discipline as the point-op upsert skip: a paired row is skipped
+> only when byte-identical, so a collation-equal / byte-different paired row (a case-only PK
+> rewrite under NOCASE) is an `update` that re-keys the stored bytes. There is
 > no row cap — the floor's unbounded cost is by design, bounded instead by the upstream
 > cost-gate / size-threshold reject. Covered by `test/vtab/maintenance-replace-all.spec.ts`.
 >

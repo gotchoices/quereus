@@ -42,7 +42,6 @@
 import {
 	QuereusError,
 	StatusCode,
-	compareSqlValues,
 	rowsValueIdentical,
 	type Row,
 	type SqlValue,
@@ -184,9 +183,11 @@ export class StoreBackingHost implements BackingHost {
 	 * by ENCODED data-key bytes, which fold each PK column's key collation — so a
 	 * new row whose key differs only by collation (e.g. 'apple' vs a stored 'APPLE'
 	 * under a NOCASE-keyed PK) matches its old row and resolves to an `update`,
-	 * mirroring memory's PK-comparator diff. Value-identical rows at the same key
-	 * are skipped (no storage churn, no emitted change) under each column's
-	 * declared collation, exactly as `applyMaintenanceToLayer` skips them.
+	 * mirroring memory's PK-comparator diff. Collation governs KEY identity only:
+	 * a paired row is skipped (no storage churn, no emitted change) ONLY when its
+	 * VALUE is byte-faithful-identical (`rowsValueIdentical`), exactly as
+	 * `applyMaintenanceToLayer` skips them — so a collation-equal / byte-different
+	 * paired row is an `update` that re-keys the stored bytes.
 	 */
 	private async applyReplaceAll(rows: readonly Row[], changes: BackingRowChange[]): Promise<void> {
 		// Snapshot the old effective contents first (stable before-image for the
@@ -207,11 +208,14 @@ export class StoreBackingHost implements BackingHost {
 				this.coordinator.put(key, serializeRow(newRow));
 				this.table.trackPrivilegedMutation(+1);
 				changes.push({ op: 'insert', newRow });
-			} else if (!this.rowsEqual(existing.row, newRow)) {
+			} else if (!rowsValueIdentical(existing.row, newRow)) {
 				this.coordinator.put(key, serializeRow(newRow));
 				changes.push({ op: 'update', oldRow: existing.row, newRow });
 			}
-			// else: equal under each column's collation — a no-op, no emitted change.
+			// else: byte-identical at this key — a true no-op, no emitted change. The skip is
+			// byte-faithful (`rowsValueIdentical`): a collation-equal / byte-different paired
+			// row (a case-only rewrite under a NOCASE PK) is an `update` that re-keys the
+			// stored bytes, matching the point-op upsert skip above and the memory host.
 		}
 
 		for (const { key, row } of oldByKey.values()) {
@@ -324,22 +328,5 @@ export class StoreBackingHost implements BackingHost {
 			return [key as SqlValue];
 		}
 		return key as SqlValue[];
-	}
-
-	/**
-	 * SQL-value row equality under each column's declared collation (mirrors the
-	 * memory manager's `rowsEqual`): the **`replace-all`** wholesale diff's
-	 * skip-identical comparison ONLY, so equal values of differing JS identity
-	 * (bigint vs number) are not spuriously re-upserted. Rows of differing width
-	 * compare unequal. The point-op `upsert` skip instead uses the byte-faithful
-	 * `rowsValueIdentical` (see vtab/backing-host.ts for why the disciplines differ).
-	 */
-	private rowsEqual(a: Row, b: Row): boolean {
-		if (a.length !== b.length) return false;
-		const columns = this.table.getSchema().columns;
-		for (let i = 0; i < a.length; i++) {
-			if (compareSqlValues(a[i], b[i], columns[i]?.collation) !== 0) return false;
-		}
-		return true;
 	}
 }

@@ -27,8 +27,12 @@ function getBackingManager(schema: TableSchema): MemoryTableManager {
  *
  *  - a new key absent from the old set → `insert`;
  *  - a present key whose row differs → `update`;
- *  - an identical row at the same key → skipped (no btree churn, no emitted change);
+ *  - a byte-identical row at the same key → skipped (no btree churn, no emitted change);
  *  - an old key absent from the new set → `delete`.
+ *
+ * Key pairing is collation-aware (the PK comparator), but the skip-identical VALUE
+ * compare is byte-faithful (`rowsValueIdentical`): a collation-equal / byte-different
+ * paired row is an `update` that re-keys the stored bytes — one discipline, not two.
  *
  * Exercises the layer mechanics directly (memory tables) rather than through the MV path.
  */
@@ -117,13 +121,14 @@ describe('MemoryTableManager.applyMaintenanceToLayer — replace-all', () => {
 		expect(await scanPrimary(manager, conn)).to.deep.equal([[1, 10], [2, 20]]);
 	});
 
-	it('row equality honors compareSqlValues, not JS === (cross-type numeric is not re-upserted)', async () => {
+	it('row equality is SQL-value byte-faithful (rowsValueIdentical), not JS === (cross-type numeric is not re-upserted)', async () => {
 		await db.exec('create table t (id integer primary key, v integer) using memory');
 		const { manager, conn } = managerAndConn('t');
 
 		// Seed the backing with a JS *number* 5 via a raw upsert (the maintenance path does
 		// not coerce values), then replace-all with a SQL-equal JS *bigint* 5n. JS `===`
-		// would see 5 !== 5n and spuriously update; compareSqlValues sees them equal → skip.
+		// would see 5 !== 5n and spuriously update; rowsValueIdentical is numeric-storage-class
+		// tolerant (5 ≡ 5n) → skip. (Byte-faithful for text, but numeric classes still fold.)
 		await manager.applyMaintenanceToLayer(conn, [{ kind: 'upsert', row: [1, 5] }]);
 
 		const changes = await manager.applyMaintenanceToLayer(conn, [
@@ -134,15 +139,34 @@ describe('MemoryTableManager.applyMaintenanceToLayer — replace-all', () => {
 		expect(await scanPrimary(manager, conn)).to.deep.equal([[1, 5]]);
 	});
 
-	it('NOCASE PK: a key differing only by case matches its old row (collation-equal rows skip)', async () => {
+	it('NOCASE PK: a collation-equal key with byte-different bytes is an update that re-keys the stored bytes', async () => {
 		await db.exec('create table tc (name text collate nocase primary key, v integer) using memory');
 		await db.exec("insert into tc values ('Apple',1),('Banana',2)");
 		const { manager, conn } = managerAndConn('tc');
 
-		// Same rows but lower-cased keys: each NOCASE-equals its stored key AND the payload
-		// matches, so the whole replacement is a no-op (the stored casing is retained).
+		// Same rows but lower-cased keys: each NOCASE-equals its stored key (paired as an
+		// update, never a spurious insert + delete), but the key BYTES differ — so the skip
+		// (byte-faithful `rowsValueIdentical`) does NOT fire. Both rows re-key to the new
+		// byte value, the byte-exact maintenance-equivalence oracle's requirement.
 		const changes = await manager.applyMaintenanceToLayer(conn, [
 			{ kind: 'replace-all', rows: [['apple', 1], ['banana', 2]] },
+		]);
+		expect(changes).to.deep.equal([
+			{ op: 'update', oldRow: ['Apple', 1], newRow: ['apple', 1] },
+			{ op: 'update', oldRow: ['Banana', 2], newRow: ['banana', 2] },
+		]);
+		expect(await scanPrimary(manager, conn)).to.deep.equal([['apple', 1], ['banana', 2]]);
+	});
+
+	it('NOCASE PK: a byte-identical row at the same key still skips (the narrowed skip suppresses true no-ops)', async () => {
+		await db.exec('create table tc (name text collate nocase primary key, v integer) using memory');
+		await db.exec("insert into tc values ('Apple',1),('Banana',2)");
+		const { manager, conn } = managerAndConn('tc');
+
+		// Replace-all with the EXACT stored bytes: each paired row is byte-identical, so the
+		// byte-faithful skip fires and the whole replacement is a complete no-op.
+		const changes = await manager.applyMaintenanceToLayer(conn, [
+			{ kind: 'replace-all', rows: [['Apple', 1], ['Banana', 2]] },
 		]);
 		expect(changes).to.deep.equal([]);
 		expect(await scanPrimary(manager, conn)).to.deep.equal([['Apple', 1], ['Banana', 2]]);

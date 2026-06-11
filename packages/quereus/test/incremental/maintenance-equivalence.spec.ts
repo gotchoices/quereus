@@ -808,6 +808,95 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, body go
 });
 
 /**
+ * Full-rebuild floor over a **NOCASE base-PK** body — the collation shape the integer-PK
+ * floor suites above never reach (the existing NOCASE suite is the bounded-delta
+ * `'prefix-delete'` arm, not the floor). The floor's `replace-all` diff pairs keys
+ * collation-aware (the PK comparator: a new 'apple' pairs with a stored 'APPLE' → an
+ * `update`, never a spurious insert + delete that would leak secondary-index bookkeeping)
+ * but skips an unchanged paired row BYTE-faithfully (`rowsValueIdentical`): a collation-equal
+ * / byte-different paired row (a case-only PK rewrite under NOCASE) re-keys the stored bytes.
+ * Were the skip collation-aware (the prior `rowsEqual`), the rebuild would keep the stale
+ * stored casing and `read(MV) != evaluate(body)` — the precise divergence this exercises. The
+ * body is a bounded-delta keyed projection (so `create` builds a backing) swapped to
+ * full-rebuild via {@link forceFullRebuild}; the oracle re-runs it live and the maintained
+ * backing must equal it byte-exactly (`canonRow` is byte-faithful).
+ */
+describe('Materialized-view maintenance equivalence (full-rebuild floor, NOCASE PK)', () => {
+	let db: Database;
+	const body = 'select id, v from t';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id text collate nocase primary key, v integer)');
+		// Mixed-case committed seed so a case-only rewrite changes the stored bytes.
+		await db.exec("insert into t (id, v) values ('apple', 1), ('Banana', 2)");
+		await db.exec(`create materialized view mv as ${body}`);
+		forceFullRebuild(db, 'main', 'mv');
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('a case-only PK rewrite (same NOCASE key) re-keys the stored bytes via the full rebuild', async () => {
+		await assertEquivalent(db, body, 'baseline');
+		// 'apple' → 'APPLE' is the SAME PK under NOCASE but a different stored byte value. The
+		// rebuild's replace-all pairs the new 'APPLE' with the stored 'apple' (collation-aware
+		// key identity → an update, not insert + delete) and, because the skip is byte-faithful,
+		// re-keys the stored bytes to 'APPLE'. A collation-aware skip would (wrongly) keep 'apple'.
+		await db.exec("update t set id = 'APPLE' where id = 'apple'");
+		await assertEquivalent(db, body, 'after case-only rewrite');
+		// Byte-exact: the stored id is now 'APPLE' (re-keyed), 'apple' is gone, 'Banana' untouched.
+		const ids = await readMultiset(db, 'select distinct id from mv');
+		expect(ids, 'old-case key re-keyed to the new byte value').to.deep.equal(
+			[canonRow(['APPLE']), canonRow(['Banana'])].sort(),
+		);
+	});
+
+	type TextMutation =
+		| { readonly kind: 'insert'; readonly id: string; readonly v: number }
+		| { readonly kind: 'update'; readonly id: string; readonly v: number }
+		| { readonly kind: 'updateKey'; readonly oldId: string; readonly newId: string; readonly v: number }
+		| { readonly kind: 'delete'; readonly id: string };
+
+	// Single letters in both cases — `'a'`/`'A'` are the SAME PK under NOCASE, so inserts
+	// collide (tolerated CONSTRAINT) and key-changes are sometimes case-only rewrites
+	// (same NOCASE key, different stored bytes — the skip-fidelity case), sometimes real moves.
+	const idArb = fc.constantFrom('a', 'A', 'b', 'B', 'c', 'C', 'd');
+	const vArb = fc.integer({ min: 0, max: 9 });
+	const textMutationArb: fc.Arbitrary<TextMutation> = fc.oneof(
+		fc.record({ kind: fc.constant('insert' as const), id: idArb, v: vArb }),
+		fc.record({ kind: fc.constant('update' as const), id: idArb, v: vArb }),
+		fc.record({ kind: fc.constant('updateKey' as const), oldId: idArb, newId: idArb, v: vArb }),
+		fc.record({ kind: fc.constant('delete' as const), id: idArb }),
+	);
+	const textSqlFor = (m: TextMutation): string => {
+		switch (m.kind) {
+			case 'insert': return `insert into t (id, v) values ('${m.id}', ${m.v})`;
+			case 'update': return `update t set v = ${m.v} where id = '${m.id}'`;
+			case 'updateKey': return `update t set id = '${m.newId}', v = ${m.v} where id = '${m.oldId}'`;
+			case 'delete': return `delete from t where id = '${m.id}'`;
+		}
+	};
+
+	it('read(MV) == evaluate(body) across random NOCASE-PK mutations incl. case-only rewrites, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(textMutationArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, textSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 60 });
+	});
+});
+
+/**
  * Full-rebuild floor over a **multi-source** body (a 1:1 inner join). The body reads two
  * sources, so the plan must be indexed under BOTH — a write to either `t` or `p` must
  * trigger the wholesale rebuild. (The 1:1 join is create-able via the join-residual arm, so

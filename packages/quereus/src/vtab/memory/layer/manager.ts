@@ -223,22 +223,6 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * SQL-value row equality under each column's collation — the same comparison the
-	 * rest of the manager uses (`compareSqlValues`), not JS `===`. Used by the
-	 * `replace-all` maintenance diff to skip an unchanged row at a key, so equal values
-	 * of differing JS identity (e.g. a numeric stored as bigint vs number) are not
-	 * spuriously re-upserted. Rows of differing width compare unequal.
-	 */
-	private rowsEqual(a: Row, b: Row): boolean {
-		if (a.length !== b.length) return false;
-		const columns = this.tableSchema.columns;
-		for (let i = 0; i < a.length; i++) {
-			if (compareSqlValues(a[i], b[i], columns[i]?.collation) !== 0) return false;
-		}
-		return true;
-	}
-
-	/**
 	 * Compute which columns changed between old and new rows.
 	 */
 	private computeChangedColumns(oldRow: Row, newRow: Row): string[] {
@@ -1350,11 +1334,10 @@ export class MemoryTableManager {
 						// Value-identical against the EFFECTIVE row (pending over committed):
 						// nothing changes, so write nothing and report nothing — the
 						// skip-identical upsert contract (vtab/backing-host.ts), the point-op
-						// analogue of the replace-all diff's identical-row skip. Identity is
-						// byte-faithful (`rowsValueIdentical`, BINARY per column) — narrower
-						// than replace-all's collation-aware `rowsEqual`, because a
-						// collation-equal / byte-different point upsert (a case-only rewrite
-						// under NOCASE) is a real change that must re-key the stored bytes.
+						// analogue of the replace-all diff's identical-row skip. Both skips are
+						// byte-faithful (`rowsValueIdentical`, BINARY per column): a collation-equal
+						// / byte-different row (a case-only rewrite under NOCASE) is a real change
+						// that must re-key the stored bytes — collation governs key identity only.
 						break;
 					}
 					layer.recordUpsert(key, op.row, existing);
@@ -1389,11 +1372,12 @@ export class MemoryTableManager {
 					// old rows FIRST — the same whole-table effective iteration the
 					// `delete-by-prefix` arm scopes to a prefix — into a PK-keyed btree, so the
 					// diff is computed against a stable before-image regardless of the upserts
-					// applied below. Keys are compared with the table's PK comparator (honoring
+					// applied below. Collation governs KEY identity only: keys are compared with the table's PK comparator (honoring
 					// PK-column collation), so a new row whose key only differs by collation
 					// (e.g. 'apple' vs a stored 'APPLE' under a NOCASE PK) matches its old row
 					// and resolves to an `update` — never a spurious insert + delete that would
-					// leak secondary-index bookkeeping.
+					// leak secondary-index bookkeeping. VALUE fidelity of a paired row is
+						// byte-faithful (`rowsValueIdentical`, below) — one discipline, not two.
 					const oldByKey = new BTree<BTreeKeyForPrimary, { key: BTreeKeyForPrimary; row: Row }>(
 						e => e.key,
 						this.comparePrimaryKeys,
@@ -1416,11 +1400,15 @@ export class MemoryTableManager {
 						if (!existing) {
 							layer.recordUpsert(key, newRow, null);
 							changes.push({ op: 'insert', newRow });
-						} else if (!this.rowsEqual(existing.row, newRow)) {
+						} else if (!rowsValueIdentical(existing.row, newRow)) {
 							layer.recordUpsert(key, newRow, existing.row);
 							changes.push({ op: 'update', oldRow: existing.row, newRow });
 						}
-						// else: equal under each column's collation — a no-op, no emitted change.
+						// else: byte-identical at this key — a true no-op, no emitted change.
+						// The skip is byte-faithful (`rowsValueIdentical`): a collation-equal /
+						// byte-different paired row (a case-only rewrite under a NOCASE PK) is an
+						// `update` that re-keys the stored bytes, matching the point-op upsert skip
+						// and the byte-exact maintenance-equivalence oracle.
 					}
 
 					// Delete pass: every old key absent from the new set, ascending PK order.

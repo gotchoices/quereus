@@ -358,4 +358,28 @@ describe('backing-host capability (store): DESC / NOCASE leading PK', () => {
 			[['A', 1, 'a1'], ['a', 2, 'a2']]);
 		conn.rollback();
 	});
+
+	it('replace-all: a collation-equal / byte-different row re-keys; a byte-identical row skips (byte-faithful, memory-host parity)', async () => {
+		const host = resolveHost();
+		const conn = host.connect();
+		// Wholesale replacement with the EXACT committed bytes → every paired row is
+		// byte-identical, so the byte-faithful skip fires and nothing is emitted.
+		expect(await host.applyMaintenance(conn, [
+			{ kind: 'replace-all', rows: [['a', 1, 'a1'], ['a', 2, 'a2'], ['b', 1, 'b1']] },
+		])).to.deep.equal([]);
+
+		// Now replace-all where only ('a',1) differs by KEY case ('A'): the key NOCASE-pairs
+		// with the stored 'a' (same encoded data key — an update, never insert + delete), but
+		// the VALUE compare is byte-faithful, so the byte-different row re-keys the stored
+		// bytes. ('a',2) and ('b',1) are byte-identical → skipped.
+		expect(await host.applyMaintenance(conn, [
+			{ kind: 'replace-all', rows: [['A', 1, 'a1'], ['a', 2, 'a2'], ['b', 1, 'b1']] },
+		])).to.deep.equal([
+			{ op: 'update', oldRow: ['a', 1, 'a1'], newRow: ['A', 1, 'a1'] },
+		]);
+		// Full scan follows physical key order (name DESC, k ASC); the re-keyed bytes show.
+		expect(await collect(host.scanEffective(conn, {}))).to.deep.equal(
+			[['b', 1, 'b1'], ['A', 1, 'a1'], ['a', 2, 'a2']]);
+		conn.rollback();
+	});
 });
