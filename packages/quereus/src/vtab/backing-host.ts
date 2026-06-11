@@ -77,10 +77,15 @@ import type { BTreeKeyForPrimary } from './memory/types.js';
  *   semantics (`test/vtab/maintenance-replace-all.spec.ts`).
  * - `delete-by-prefix` removes **every** row whose leading PK columns equal
  *   `keyPrefix` (no-op when nothing matches). It replaces a whole prefix-keyed
- *   *slice* — used by the lateral-TVF fan-out arm (`'prefix-delete'`), where one
- *   base row maps to many backing rows sharing the base-PK prefix. The backing
- *   storage is ordered by the composite PK with the base-PK columns leading, so
- *   the slice is a contiguous range the scan seeks to and early-terminates on.
+ *   *slice* — one base row mapping to many backing rows sharing the base-PK
+ *   prefix. The backing storage is ordered by the composite PK with the base-PK
+ *   columns leading, so the slice is a contiguous range the scan seeks to and
+ *   early-terminates on. The lateral-TVF fan-out arm (`'prefix-delete'`) was its
+ *   original consumer but now applies a keyed diff over the same prefix range
+ *   (`scanEffective` + point ops), so the engine currently produces no
+ *   `delete-by-prefix`; it stays in the contract — implemented by both hosts,
+ *   pinned by `test/vtab/maintenance-prefix-delete.spec.ts` — for future
+ *   prefix-slice consumers (e.g. a fanning-keyed-join arm).
  * - `replace-all` replaces the backing's **entire** pending-effective contents with
  *   `rows`, realized as the minimal keyed diff (by backing PK) against the current
  *   rows: a new key absent from the old set is an `insert`, a present key whose row

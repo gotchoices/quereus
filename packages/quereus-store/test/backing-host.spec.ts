@@ -341,4 +341,21 @@ describe('backing-host capability (store): DESC / NOCASE leading PK', () => {
 		expect(await collect(host.scanEffective(conn, {}))).to.deep.equal([['b', 1, 'b1']]);
 		conn.rollback();
 	});
+
+	it('a collation-equal / byte-different upsert is NOT suppressed (byte-faithful skip, memory-host parity)', async () => {
+		const host = resolveHost();
+		const conn = host.connect();
+		// Byte-identical to the committed row → suppressed (writes nothing, reports nothing).
+		expect(await host.applyMaintenance(conn, [{ kind: 'upsert', row: ['a', 1, 'a1'] }]))
+			.to.deep.equal([]);
+		// 'A' NOCASE-matches the stored key 'a' (key identity is collation-aware: same
+		// encoded data key) but the skip is byte-faithful (`rowsValueIdentical`), so this
+		// is a real update that replaces the stored bytes — never a skip (the engine's
+		// vtab/backing-host.ts § value-identical suppression).
+		expect(await host.applyMaintenance(conn, [{ kind: 'upsert', row: ['A', 1, 'a1'] }]))
+			.to.deep.equal([{ op: 'update', oldRow: ['a', 1, 'a1'], newRow: ['A', 1, 'a1'] }]);
+		expect(await collect(host.scanEffective(conn, { equalityPrefix: ['a'] }))).to.deep.equal(
+			[['A', 1, 'a1'], ['a', 2, 'a2']]);
+		conn.rollback();
+	});
 });
