@@ -13,6 +13,7 @@ import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
 import { ColumnReferenceNode } from './reference.js';
 import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { isValueDiscriminatingEquality } from '../analysis/comparison-collation.js';
 import { deriveJoinUpdateLineage, type JoinExistenceSite } from '../analysis/update-lineage.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
@@ -33,6 +34,25 @@ export interface ExistenceColumnSpec {
 /**
  * Extract equi-join column index pairs from a join condition (AND-of-equalities).
  * Returns pairs of {left, right} column indices.
+ *
+ * An equi-pair is a VALUE-level pairing fact — its consumers (join key
+ * coverage, FD/EC propagation, FK-alignment rules, join elimination, the
+ * coverage prover) all assume matched rows are value-equal on the pair, so a
+ * pair is only recognized when the comparison is value-discriminating
+ * (`isValueDiscriminatingEquality`): for textual columns, every collation
+ * either side contributes must be BINARY. A NOCASE comparison over a
+ * BINARY-keyed column matches several distinct key values, so a pair minted
+ * from it would falsely claim key coverage / preserved keys (ticket
+ * `collation-blind-equality-fact-extraction`). Declared-non-BINARY equi-joins
+ * therefore contribute NO pairs (a sound under-claim: keys combine as a cross
+ * product, eliminations don't fire). Physical join algorithm selection is
+ * unaffected — it uses its own extractor (`rules/join/equi-pair-extractor.ts`)
+ * and resolves collations at emit time.
+ *
+ * Operands must be **bare** `ColumnReferenceNode`s: a `COLLATE`-wrapped side
+ * (`l.x = r.b collate nocase`) is structurally rejected. That exclusion is
+ * load-bearing — do not "improve" this with a collate-unwrapping step without
+ * re-deriving the gate above against the wrapper's collation.
  */
 export function extractEquiPairsFromCondition(
 	condition: ScalarPlanNode | undefined,
@@ -58,7 +78,8 @@ export function extractEquiPairsFromCondition(
 				continue;
 			}
 			if (op === '=') {
-				if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) {
+				if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
+					&& isValueDiscriminatingEquality(n.left, n.right)) {
 					let lIdx = leftIdToIndex.get(n.left.attributeId);
 					let rIdx = rightIdToIndex.get(n.right.attributeId);
 					if (lIdx !== undefined && rIdx !== undefined) {

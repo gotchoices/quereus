@@ -30,6 +30,7 @@ import { FilterNode } from '../../nodes/filter.js';
 import { extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
 import { LiteralNode, BinaryOpNode, BetweenNode } from '../../nodes/scalar.js';
 import { InNode } from '../../nodes/subquery.js';
+import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation } from '../../analysis/comparison-collation.js';
 import type { TableSchema } from '../../../schema/table.js';
 import type * as AST from '../../../parser/ast.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
@@ -1203,33 +1204,32 @@ interface CollationCoverDecision {
 }
 
 /**
- * Resolve a predicate constraint's effective comparison collation at plan time,
- * mirroring the runtime resolution in `emitComparisonOp` (binary.ts) and `emitIn`
- * (subquery.ts): a comparison takes the right operand's collation, else the left's,
- * else BINARY; an IN takes the condition (LHS) operand's collation; a BETWEEN bound
- * takes that bound's collation, else the tested expression's. The result is normalized.
+ * Resolve a predicate constraint's effective comparison collation at plan time
+ * via the shared runtime-mirroring helpers in `analysis/comparison-collation.ts`
+ * (one resolution for plan-time facts and runtime behavior — they cannot drift):
+ * a comparison takes the right operand's collation, else the left's, else BINARY
+ * (`emitComparisonOp`); an IN takes the condition (LHS) operand's collation
+ * (`emitIn`); a BETWEEN bound takes that bound's collation, else the tested
+ * expression's (`emitBetween`). The result is normalized.
  */
 function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
 	const src = constraint.sourceExpression;
 	if (src instanceof BinaryOpNode) {
-		return normalizeCollationName(src.right.getType().collationName ?? src.left.getType().collationName ?? 'BINARY');
+		return effectiveComparisonCollation(src.left, src.right);
 	}
 	if (src instanceof InNode) {
-		return normalizeCollationName(src.condition.getType().collationName ?? 'BINARY');
+		return effectiveInCollation(src.condition);
 	}
 	if (src instanceof BetweenNode) {
-		// BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves its
-		// collation independently with bound (right-operand) precedence, mirroring
-		// emitBetween. extractBetweenConstraints emits two constraints sharing this
-		// BetweenNode source — `op: '>='`/`'>'` for the lower bound, `'<='`/`'<'` for the
+		// BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves
+		// its collation independently with bound (right-operand) precedence.
+		// extractBetweenConstraints emits two constraints sharing this BetweenNode
+		// source — `op: '>='`/`'>'` for the lower bound, `'<='`/`'<'` for the
 		// upper — so the constraint's op selects which bound's collation applies. A
-		// `COLLATE` on a bound survives folding (it rides on the bound's type), so the
-		// bound collation can and must reach this point.
-		const exprColl = src.expr.getType().collationName;
-		const boundColl = (constraint.op === '<=' || constraint.op === '<')
-			? src.upper.getType().collationName
-			: src.lower.getType().collationName;
-		return normalizeCollationName(boundColl ?? exprColl ?? 'BINARY');
+		// `COLLATE` on a bound survives folding (it rides on the bound's type), so
+		// the bound collation can and must reach this point.
+		const bound = (constraint.op === '<=' || constraint.op === '<') ? src.upper : src.lower;
+		return effectiveBetweenBoundCollation(src.expr, bound);
 	}
 	// OR_RANGE carries an OR BinaryOpNode source (handled above); any other shape
 	// defaults to BINARY, which only ever drives a (safe) decline on mismatch.

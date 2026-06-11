@@ -90,6 +90,11 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			const attr = sourceAttrs[col];
 			return attr?.type.logicalType?.isNumeric === true;
 		};
+		// The column's declared collation — what guard scopes are evaluated under
+		// at index-maintenance time (table-ref attrs carry the schema collation;
+		// projections pass types through unchanged).
+		const declaredCollationOf = (col: number): string =>
+			sourceAttrs[col]?.type.collationName ?? 'BINARY';
 		const activation = activateGuardedFds(
 			sourcePhysical?.fds ?? [],
 			this.predicate,
@@ -98,6 +103,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			attrIdToIndex,
 			isColumnNonNullable,
 			isColumnNumeric,
+			declaredCollationOf,
 		);
 		let fds: ReadonlyArray<FunctionalDependency> = activation.fds;
 		// A value-equality body activated by the guard contributes its equality as an EC
@@ -259,6 +265,7 @@ function activateGuardedFds(
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNonNullable: (col: number) => boolean,
 	isColumnNumeric: (col: number) => boolean,
+	declaredCollationOf: (col: number) => string,
 ): { fds: FunctionalDependency[]; activatedEquivPairs: Array<[number, number]> } {
 	const out: FunctionalDependency[] = [];
 	const activatedEquivPairs: Array<[number, number]> = [];
@@ -267,7 +274,7 @@ function activateGuardedFds(
 			out.push(fd);
 			continue;
 		}
-		if (predicateImpliesGuard(predicate, fd.guard, ecs, bindings, attrIdToIndex, isColumnNonNullable, isColumnNumeric)) {
+		if (predicateImpliesGuard(predicate, fd.guard, ecs, bindings, attrIdToIndex, isColumnNonNullable, isColumnNumeric, declaredCollationOf)) {
 			if (fd.valueEquality === true && fd.determinants.length === 1 && fd.dependents.length === 1) {
 				activatedEquivPairs.push([fd.determinants[0], fd.dependents[0]]);
 			}

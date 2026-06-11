@@ -1562,17 +1562,40 @@ describe('Property-Based Tests', () => {
 		}
 
 		/**
+		 * Fold a cell for key-distinctness under its column's OUTPUT collation —
+		 * the collation key consumers compare under (the DISTINCT emitter resolves
+		 * each attribute's collation; an MV backing PK uses the output collation).
+		 * NOCASE folds case; RTRIM folds trailing spaces; BINARY/undefined and
+		 * non-text values are identity. A claimed key must be distinct under this
+		 * folding — value-distinct-but-NOCASE-equal key tuples are an over-claim
+		 * (ticket `collation-blind-equality-fact-extraction`).
+		 */
+		function foldCellForCollation(v: SqlValue, collation: string | undefined): SqlValue {
+			if (typeof v !== 'string' || collation === undefined) return v;
+			const norm = collation.trim().toUpperCase();
+			if (norm === 'NOCASE') return v.toLowerCase();
+			if (norm === 'RTRIM') return v.replace(/ +$/u, '');
+			return v;
+		}
+
+		/**
 		 * Positional core of the soundness check: throws on the first
 		 * contradiction between the claimed uniqueness facts and the actual rows,
 		 * where each row is a tuple of values ordered to match the node's columns
 		 * and each key is a list of column indices. Shared by Tier 1 (result node,
 		 * via the record adapter below) and Tier 2 (isolated per-node rows).
+		 *
+		 * `collations[i]` is the output collation of column `i` (from the node's
+		 * `RelationType.columns[i].type.collationName`); key distinctness is
+		 * checked under it via {@link foldCellForCollation}. The `isSet` check
+		 * stays value-based — set-ness is a full-row value claim.
 		 */
 		function checkKeysAndSet(
 			label: string,
 			keys: readonly (readonly number[])[],
 			isSet: boolean,
 			rows: readonly SqlValue[][],
+			collations: readonly (string | undefined)[] = [],
 		): void {
 			for (const key of keys) {
 				if (key.length === 0) {
@@ -1584,7 +1607,7 @@ describe('Property-Based Tests', () => {
 				}
 				const seen = new Set<string>();
 				for (const row of rows) {
-					const sig = tupleSig(key.map(i => row[i]));
+					const sig = tupleSig(key.map(i => foldCellForCollation(row[i], collations[i])));
 					if (seen.has(sig)) {
 						throw new Error(`over-claim: key [${key}] is not unique on ${label} (duplicate ${sig})`);
 					}
@@ -1603,6 +1626,11 @@ describe('Property-Based Tests', () => {
 			}
 		}
 
+		/** Output collations per column index, read off a relational node's type. */
+		function outputCollationsOf(node: { getType(): { columns: ReadonlyArray<{ type?: { collationName?: string } }> } }): (string | undefined)[] {
+			return node.getType().columns.map(c => c.type?.collationName);
+		}
+
 		/**
 		 * Record adapter over {@link checkKeysAndSet}: projects each row-object to
 		 * a positional tuple in `cols` order. Shared by the Tier-1 property below
@@ -1614,9 +1642,10 @@ describe('Property-Based Tests', () => {
 			isSet: boolean,
 			cols: readonly string[],
 			rows: readonly Record<string, SqlValue>[],
+			collations: readonly (string | undefined)[] = [],
 		): void {
 			const positional = rows.map(row => cols.map(c => row[c]));
-			checkKeysAndSet(`\`${q}\``, keys, isSet, positional);
+			checkKeysAndSet(`\`${q}\``, keys, isSet, positional, collations);
 		}
 
 		// Query shapes spanning the node zoo, shared by both tiers. Output column
@@ -1654,6 +1683,18 @@ describe('Property-Based Tests', () => {
 			// surfaces duplicate `a` rows and reds the soundness check (ticket
 			// fd-oneway-determination-key-bag-overclaim).
 			'select distinct a, b from tc',
+			// --- Collation shapes (ticket collation-blind-equality-fact-extraction).
+			// td carries mixed-case TEXT: s BINARY (part of PK (s,u)), t declared NOCASE.
+			'select s, t, u from td',                                            // text-bearing scan (key (s,u) BINARY)
+			'select s collate nocase as scn, u as ucn from td',                  // collated projection — key must NOT pass through (NOCASE-folded (scn,ucn) repeats)
+			'select distinct t from td',                                         // DISTINCT under the column's NOCASE output collation
+			'select s as ps, u as pu, t as pt from td where s = \'ab\' collate nocase', // collate-wrapped filter pin — must mint no value facts
+			'select s as cs, u as cu from td where s = \'ab\' collate nocase and u = 1', // NOCASE pin + BINARY pin covering the PK — must NOT claim ≤1 row
+			'select s as ds, u as du from td where s = \'ab\' and u = 1',        // BINARY covered-key control (≤1 row claim is sound)
+			'select d1.u as ju1, d2.u as ju2, d2.s as js from td d1 join td d2 on d1.t = d2.s', // collation-asymmetric equi-join (NOCASE t vs BINARY s)
+			// Partial-unique + collated discharge: te has `unique (x) where b = 'ab'`.
+			'select x as qx, id as qid from te where b = \'ab\' collate nocase', // out-of-scope discharge must NOT claim key {qx}
+			'select x as rx, id as rid from te where b = \'ab\'',                // in-scope discharge control (key {rx} is sound)
 		];
 
 		const rowArbA = fc.record({
@@ -1673,12 +1714,29 @@ describe('Property-Based Tests', () => {
 			a: fc.integer({ min: 1, max: 4 }),
 			c: fc.integer({ min: 1, max: 3 }),
 		}).map(r => ({ a: r.a, b: r.a + 1, c: r.c }));
+		// td: mixed-case TEXT over a BINARY PK (s,u) plus a NOCASE-declared column t.
+		// Case-variants of the same word are PK-distinct (BINARY) but fold together
+		// under NOCASE — the raw material for collation key over-claims.
+		const rowArbD = fc.record({
+			s: fc.constantFrom('ab', 'AB', 'Ab', 'cd'),
+			t: fc.constantFrom('ef', 'EF', 'gh'),
+			u: fc.integer({ min: 1, max: 3 }),
+		});
+		// te: partial-unique scope. b = 'ab' (BINARY, the index predicate's scope)
+		// vs case-variants outside it; x repeats freely outside the scope.
+		const rowArbE = fc.record({
+			x: fc.integer({ min: 1, max: 4 }),
+			b: fc.constantFrom('ab', 'AB', 'Ab'),
+		});
 
-		/** Create the three source tables (fresh `db` per `beforeEach`). */
+		/** Create the source tables (fresh `db` per `beforeEach`). */
 		async function createTables(): Promise<void> {
 			await db.exec('create table ta (a integer primary key, b integer, c integer) using memory');
 			await db.exec('create table tb (d integer primary key, e integer) using memory');
 			await db.exec('create table tc (a integer, b integer, c integer, check (b = a + 1)) using memory');
+			await db.exec('create table td (s text, t text collate nocase, u integer, primary key (s, u)) using memory');
+			await db.exec('create table te (id integer primary key, x integer, b text) using memory');
+			await db.exec("create unique index te_ux on te (x) where b = 'ab'");
 		}
 
 		/** Replace table contents with the generated rows, deduped by PK (tc is a bag — no PK). */
@@ -1686,10 +1744,14 @@ describe('Property-Based Tests', () => {
 			rowsA: { a: number; b: number; c: number }[],
 			rowsB: { d: number; e: number }[],
 			rowsC: { a: number; b: number; c: number }[],
+			rowsD: { s: string; t: string; u: number }[] = [],
+			rowsE: { x: number; b: string }[] = [],
 		): Promise<void> {
 			await db.exec('delete from ta');
 			await db.exec('delete from tb');
 			await db.exec('delete from tc');
+			await db.exec('delete from td');
+			await db.exec('delete from te');
 			const seenA = new Set<number>();
 			for (const r of rowsA) {
 				if (seenA.has(r.a)) continue;
@@ -1711,6 +1773,33 @@ describe('Property-Based Tests', () => {
 				if (seenC.has(sig)) continue;
 				seenC.add(sig);
 				await db.exec(`insert into tc values (${r.a}, ${r.b}, ${r.c})`);
+			}
+			// td: dedupe on the exact (BINARY) PK tuple (s,u) — case-variants of s
+			// with the same u deliberately coexist. Two sentinel rows guarantee a
+			// NOCASE-colliding / BINARY-distinct pair is always present, so the
+			// collation zoo shapes have their raw material on every draw.
+			const seenD = new Set<string>();
+			const sentinelD = [{ s: 'ab', t: 'ef', u: 1 }, { s: 'AB', t: 'EF', u: 1 }];
+			for (const r of [...sentinelD, ...rowsD]) {
+				const sig = `${r.s}|${r.u}`;
+				if (seenD.has(sig)) continue;
+				seenD.add(sig);
+				await db.exec(`insert into td values ('${r.s}', '${r.t}', ${r.u})`);
+			}
+			// te: the partial UNIQUE on (x) where b = 'ab' is maintained under the
+			// declared (BINARY) collation, so dedupe x among exactly-'ab' rows only.
+			// Sentinels: one in-scope row plus two out-of-scope case-variants sharing
+			// its x — the out-of-scope guard-discharge over-claim shape is always
+			// present.
+			const sentinelE = [{ x: 4, b: 'ab' }, { x: 4, b: 'Ab' }, { x: 4, b: 'AB' }];
+			const seenEx = new Set<number>();
+			let nextId = 1;
+			for (const r of [...sentinelE, ...rowsE]) {
+				if (r.b === 'ab') {
+					if (seenEx.has(r.x)) continue;
+					seenEx.add(r.x);
+				}
+				await db.exec(`insert into te values (${nextId++}, ${r.x}, '${r.b}')`);
 			}
 		}
 
@@ -1772,6 +1861,11 @@ describe('Property-Based Tests', () => {
 			expect(() => checkNoOverClaim('injected', [], true, cols, dupRows)).to.throw(/over-claim/);
 			// The honest case does not throw.
 			expect(() => checkNoOverClaim('honest', [[0]], false, cols, [{ x: 1, y: 1 }, { x: 2, y: 9 }])).to.not.throw();
+			// Collation-aware: value-distinct but NOCASE-equal key cells are an
+			// over-claim under a NOCASE output collation — and fine under BINARY.
+			const caseRows = [{ x: 'Bob' as SqlValue, y: 1 as SqlValue }, { x: 'bob' as SqlValue, y: 2 as SqlValue }];
+			expect(() => checkNoOverClaim('injected', [[0]], false, cols, caseRows, ['NOCASE', undefined])).to.throw(/over-claim/);
+			expect(() => checkNoOverClaim('honest', [[0]], false, cols, caseRows, ['BINARY', undefined])).to.not.throw();
 		});
 
 		it('keysOf / isSet never over-claim on materialized result rows', async () => {
@@ -1781,9 +1875,11 @@ describe('Property-Based Tests', () => {
 				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbC, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbD, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbE, { minLength: 0, maxLength: 12 }),
 				fc.constantFrom(...queries),
-				async (rowsA, rowsB, rowsC, q) => {
-					await seedTables(rowsA, rowsB, rowsC);
+				async (rowsA, rowsB, rowsC, rowsD, rowsE, q) => {
+					await seedTables(rowsA, rowsB, rowsC, rowsD, rowsE);
 
 					const block = db.getPlan(q) as any;
 					const root = block.getRelations?.()[0];
@@ -1795,7 +1891,7 @@ describe('Property-Based Tests', () => {
 					const rows: Record<string, SqlValue>[] = [];
 					for await (const row of db.eval(q)) rows.push(row as Record<string, SqlValue>);
 
-					checkNoOverClaim(q, keys, isSet, cols, rows);
+					checkNoOverClaim(q, keys, isSet, cols, rows, outputCollationsOf(root));
 				},
 			), { numRuns: 50 });
 		});
@@ -1814,9 +1910,11 @@ describe('Property-Based Tests', () => {
 				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbC, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbD, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbE, { minLength: 0, maxLength: 12 }),
 				fc.constantFrom(...queries),
-				async (rowsA, rowsB, rowsC, q) => {
-					await seedTables(rowsA, rowsB, rowsC);
+				async (rowsA, rowsB, rowsC, rowsD, rowsE, q) => {
+					await seedTables(rowsA, rowsB, rowsC, rowsD, rowsE);
 
 					const block = db.getPlan(q) as unknown as PlanNode;
 					const nodes = collectRelationalNodes(block);
@@ -1839,7 +1937,7 @@ describe('Property-Based Tests', () => {
 						}
 
 						checkedNodes++;
-						checkKeysAndSet(`${node.nodeType}[${node.id}] of \`${q}\``, keys, isSet, rows);
+						checkKeysAndSet(`${node.nodeType}[${node.id}] of \`${q}\``, keys, isSet, rows, outputCollationsOf(node));
 					}
 				},
 			), { numRuns: 50 });
@@ -1916,9 +2014,11 @@ describe('Property-Based Tests', () => {
 				fc.array(rowArbA, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbB, { minLength: 0, maxLength: 12 }),
 				fc.array(rowArbC, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbD, { minLength: 0, maxLength: 12 }),
+				fc.array(rowArbE, { minLength: 0, maxLength: 12 }),
 				fc.constantFrom(...queries),
-				async (rowsA, rowsB, rowsC, q) => {
-					await seedTables(rowsA, rowsB, rowsC);
+				async (rowsA, rowsB, rowsC, rowsD, rowsE, q) => {
+					await seedTables(rowsA, rowsB, rowsC, rowsD, rowsE);
 					const block = db.getPlan(q) as unknown as PlanNode;
 					for (const node of collectRelationalNodes(block)) {
 						const label = `${node.nodeType}[${node.id}] of \`${q}\``;

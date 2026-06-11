@@ -746,6 +746,24 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 	}
 }
 
+/**
+ * `<operand> COLLATE <name>` — identity on values, overrides the collation the
+ * surrounding comparison/ordering resolves.
+ *
+ * **Deliberately NOT injective** (`isInjectiveIn` stays the conservative
+ * `PlanNode` default of `false`) even though COLLATE is value-injective: a
+ * passthrough would let `deriveProjectionColumnMap` map a key minted under the
+ * source column's collation onto a column *published* with this node's
+ * collation. Key consumers interpret a key column under its **output**
+ * collation (the DISTINCT emitter resolves each attribute's collation; an MV
+ * backing PK uses the output collation), so a BINARY-enforced key surfacing on
+ * a NOCASE-published column would over-claim distinctness ('Bob' vs 'bob' are
+ * one NOCASE key value but two BINARY-distinct rows). Any future enablement
+ * needs a collation-strength gate at the key-propagation site: the output
+ * collation must be at least as fine as the source key's enforcement
+ * collation. Pinned by "CollateNode is not injective" tests (ticket
+ * `collation-blind-equality-fact-extraction`).
+ */
 export class CollateNode extends PlanNode implements UnaryScalarNode {
 	readonly nodeType = PlanNodeType.Collate;
 	private cachedType: Cached<ScalarType>;

@@ -10,6 +10,8 @@ import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { operandCollation } from '../../analysis/comparison-collation.js';
+import { normalizeCollationName } from '../../../util/comparison.js';
 
 export interface EquiPairExtraction {
 	equiPairs: EquiJoinPair[];
@@ -127,6 +129,22 @@ export function combineResidual(
 /**
  * Extract equi-join pairs and residual predicates from an ON condition.
  * Returns null if no equi-pairs are found.
+ *
+ * **Collation gate.** A `l = r` column pair is recognized only when both
+ * columns contribute the same collation. The physical join algorithms this
+ * extraction feeds (hash / merge / bloom) resolve the pair's comparison
+ * collation themselves (left-operand precedence in their emitters), while the
+ * canonical scalar comparison (`emitComparisonOp`, used by the nested-loop
+ * fallback) resolves right-first — for an asymmetric pair (NOCASE column vs
+ * BINARY column) the two would *disagree on the result rows*, and the join's
+ * key-coverage claims (left keys survive when pairs cover a right key) would
+ * be computed against whichever collation the algorithm happened to use. A
+ * matched-collation pair is immune to resolution order, and its coverage
+ * claims are sound (comparison collation = covered column's declared
+ * collation = its key's enforcement collation). Mismatched pairs demote to
+ * the residual, where the canonical scalar comparison evaluates them; if no
+ * matched pair remains, the rule doesn't fire and the generic join evaluates
+ * the whole condition. (Ticket `collation-blind-equality-fact-extraction`.)
  */
 export function extractEquiPairs(
 	condition: ScalarPlanNode | undefined,
@@ -150,7 +168,8 @@ export function extractEquiPairs(
 
 		let isEqui = false;
 		if (n instanceof BinaryOpNode && n.expression.operator === '=') {
-			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) {
+			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
+				&& operandCollation(n.left) === operandCollation(n.right)) {
 				const lId = n.left.attributeId;
 				const rId = n.right.attributeId;
 
@@ -181,11 +200,16 @@ export function extractEquiPairs(
 /**
  * Convert USING-column names into equi-pairs given the left/right attributes.
  * Returns null if no pairs could be matched.
+ *
+ * Applies the same matched-collation gate as {@link extractEquiPairs}: a
+ * USING pair over columns with differing declared collations is rejected
+ * outright (USING has no residual to demote into — the whole extraction
+ * returns null so the generic join handles the condition).
  */
 export function extractEquiPairsFromUsing(
 	usingColumns: readonly string[] | undefined,
-	leftAttrs: ReadonlyArray<{ id: number; name: string }>,
-	rightAttrs: ReadonlyArray<{ id: number; name: string }>,
+	leftAttrs: ReadonlyArray<{ id: number; name: string; type?: { collationName?: string } }>,
+	rightAttrs: ReadonlyArray<{ id: number; name: string; type?: { collationName?: string } }>,
 ): EquiPairExtraction | null {
 	if (!usingColumns || usingColumns.length === 0) return null;
 	const equiPairs: EquiJoinPair[] = [];
@@ -194,6 +218,9 @@ export function extractEquiPairsFromUsing(
 		const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lower);
 		const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lower);
 		if (leftAttr && rightAttr) {
+			const lColl = normalizeCollationName(leftAttr.type?.collationName ?? 'BINARY');
+			const rColl = normalizeCollationName(rightAttr.type?.collationName ?? 'BINARY');
+			if (lColl !== rColl) return null;
 			equiPairs.push({ leftAttrId: leftAttr.id, rightAttrId: rightAttr.id });
 		}
 	}

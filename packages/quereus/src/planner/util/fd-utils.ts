@@ -12,8 +12,9 @@ import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.
 import { BetweenNode, BinaryOpNode, CastNode, CollateNode, LiteralNode, UnaryOpNode } from '../nodes/scalar.js';
 import { InNode } from '../nodes/subquery.js';
 import type { SqlValue } from '../../common/types.js';
-import { compareSqlValues } from '../../util/comparison.js';
+import { compareSqlValues, normalizeCollationName } from '../../util/comparison.js';
 import { flipComparison } from '../analysis/predicate-shape.js';
+import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, isValueDiscriminatingEquality, operandCollation } from '../analysis/comparison-collation.js';
 
 const log = createLogger('planner:fd');
 
@@ -983,6 +984,19 @@ export interface EqualityFds {
  *     equivalence pair `[col1, col2]`.
  *
  * Non-equality conjuncts contribute nothing.
+ *
+ * **Collation gate.** Every extracted fact is a VALUE-level claim (a pinned
+ * column has one value across rows; `col1 = col2` rows are value-equal), so a
+ * conjunct only contributes when its comparison is value-discriminating
+ * (`isValueDiscriminatingEquality`): for textual operands the effective
+ * comparison collation must be BINARY. A NOCASE/RTRIM comparison — via a
+ * `COLLATE` wrapper on either side or a non-BINARY declared column collation —
+ * passes value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so its facts would
+ * over-claim (false ≤1-row keys, false EC-driven inferences, wrong insert
+ * defaults — ticket `collation-blind-equality-fact-extraction`). Declared-
+ * collation covered-key ≤1-row detection is NOT lost: it flows through the
+ * independent (and collation-sound) `extractConstraints` path in
+ * `FilterNode.computePhysical`.
  */
 export function extractEqualityFds(
 	predicate: ScalarPlanNode,
@@ -1002,6 +1016,8 @@ export function extractEqualityFds(
 			continue;
 		}
 		if (op !== '=') continue;
+		// Value-level facts only from value-discriminating comparisons (see doc).
+		if (!isValueDiscriminatingEquality(n.left, n.right)) continue;
 
 		const lIsCol = n.left instanceof ColumnReferenceNode;
 		const rIsCol = n.right instanceof ColumnReferenceNode;
@@ -1088,10 +1104,45 @@ interface FilterRange {
 	maxInclusive: boolean;
 }
 
+/**
+ * Collect per-column facts from a filter predicate for guard discharge.
+ *
+ * **Collation gate (per conjunct).** A fact may only discharge a guard when
+ * the filter's runtime comparison keeps filter-rows ⊆ guard-scope-rows. The
+ * guard predicate is evaluated under the column's *declared* collation at
+ * index-maintenance time (guard recognition — `partial-unique-extraction.ts` —
+ * only accepts bare column/literal AST shapes, so its comparisons resolve to
+ * the declared collation), hence:
+ *
+ *  - `col = lit` / singleton-IN facts: sound when the conjunct's effective
+ *    comparison collation is BINARY (value-equality implies equality under any
+ *    collation) OR equals the column's declared collation (same comparison the
+ *    guard scope uses; the strict `sqlValueEquals` literal match at discharge
+ *    then under-claims at worst). The previous code stripped `CollateNode`
+ *    from the literal side unconditionally, so `b = 'bob' collate nocase`
+ *    discharged a BINARY `eq-literal{b,'bob'}` guard while admitting rows
+ *    outside the partial-index scope (ticket
+ *    `collation-blind-equality-fact-extraction`, repro 4).
+ *  - `col1 = col2` facts: sound when both columns' contributed collations are
+ *    equal — then any operand-resolution order (filter conjunct or guard
+ *    spelling) lands on the same collation.
+ *  - range facts over TEXT bounds: the discharge subset check
+ *    (`filterRangeSubsetOfGuardRange`) compares bounds under BINARY, so the
+ *    filter's effective collation AND the column's declared collation must
+ *    both be BINARY (a BINARY bound comparison does not bound a NOCASE-ordered
+ *    row set). Non-text bounds are collation-inert and stay ungated. This is
+ *    deliberately stricter than the equality gate — a completeness loss for
+ *    collated text ranges, never a soundness one.
+ *  - plain `col IN (lits)`: the runtime (`emitIn`) compares under the
+ *    condition operand's collation, which for the only recognized shape (a
+ *    bare column) IS the declared collation; listed values' COLLATE wrappers
+ *    are inert. Gated uniformly anyway for future-proofing.
+ */
 function buildPredicateFacts(
 	predicate: ScalarPlanNode,
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNumeric: (col: number) => boolean,
+	declaredCollationOf: (col: number) => string,
 ): PredicateFacts {
 	const literalEqs = new Map<number, SqlValue>();
 	const columnEqs = new Map<number, Set<number>>();
@@ -1116,6 +1167,17 @@ function buildPredicateFacts(
 		}
 		return undefined;
 	};
+
+	// Equality-fact gate: BINARY, or matching the column's declared collation
+	// (the collation guard scopes are evaluated under). See the function doc.
+	const equalityCollationOk = (col: number, effColl: string): boolean =>
+		effColl === 'BINARY' || effColl === normalizeCollationName(declaredCollationOf(col));
+
+	// Range-fact gate for TEXT bounds: the discharge subset check is BINARY, so
+	// both the filter comparison and the guard-scope (declared) collation must be.
+	const rangeCollationOk = (col: number, effColl: string, bound: SqlValue): boolean =>
+		typeof bound !== 'string'
+		|| (effColl === 'BINARY' && normalizeCollationName(declaredCollationOf(col)) === 'BINARY');
 
 	const tightenLowerBound = (col: number, value: SqlValue, inclusive: boolean): void => {
 		const cur = rangeBounds.get(col);
@@ -1188,17 +1250,22 @@ function buildPredicateFacts(
 				const lIdx = columnIndexOf(n.left);
 				const rIdx = columnIndexOf(n.right);
 				if (lIdx !== undefined && rIdx !== undefined) {
-					addColumnEq(lIdx, rIdx);
+					// Both sides are bare column refs; require their contributed
+					// collations to agree so any resolution order matches the guard's.
+					if (operandCollation(n.left) === operandCollation(n.right)) {
+						addColumnEq(lIdx, rIdx);
+					}
 					continue;
 				}
+				const effColl = effectiveComparisonCollation(n.left, n.right);
 				if (lIdx !== undefined) {
 					const lit = literalSqlValueOf(n.right);
-					if (lit !== undefined) literalEqs.set(lIdx, lit);
+					if (lit !== undefined && equalityCollationOk(lIdx, effColl)) literalEqs.set(lIdx, lit);
 					continue;
 				}
 				if (rIdx !== undefined) {
 					const lit = literalSqlValueOf(n.left);
-					if (lit !== undefined) literalEqs.set(rIdx, lit);
+					if (lit !== undefined && equalityCollationOk(rIdx, effColl)) literalEqs.set(rIdx, lit);
 				}
 				continue;
 			}
@@ -1215,13 +1282,16 @@ function buildPredicateFacts(
 			if (op === '<' || op === '<=' || op === '>' || op === '>=') {
 				const lIdx = columnIndexOf(n.left);
 				const rIdx = columnIndexOf(n.right);
+				const effColl = effectiveComparisonCollation(n.left, n.right);
 				if (lIdx !== undefined && rIdx === undefined) {
 					const lit = literalSqlValueOf(n.right);
 					if (lit === undefined || lit === null) continue;
+					if (!rangeCollationOk(lIdx, effColl, lit)) continue;
 					recordComparison(lIdx, op, lit);
 				} else if (rIdx !== undefined && lIdx === undefined) {
 					const lit = literalSqlValueOf(n.left);
 					if (lit === undefined || lit === null) continue;
+					if (!rangeCollationOk(rIdx, effColl, lit)) continue;
 					recordComparison(rIdx, flipComparison(op), lit);
 				}
 				continue;
@@ -1234,8 +1304,15 @@ function buildPredicateFacts(
 			if (cIdx === undefined) continue;
 			const lo = literalSqlValueOf(n.lower);
 			const hi = literalSqlValueOf(n.upper);
-			if (lo !== undefined && lo !== null) tightenLowerBound(cIdx, lo, true);
-			if (hi !== undefined && hi !== null) tightenUpperBound(cIdx, hi, true);
+			// Per-bound effective collation (emitBetween: bound wins over expr).
+			if (lo !== undefined && lo !== null
+				&& rangeCollationOk(cIdx, effectiveBetweenBoundCollation(n.expr, n.lower), lo)) {
+				tightenLowerBound(cIdx, lo, true);
+			}
+			if (hi !== undefined && hi !== null
+				&& rangeCollationOk(cIdx, effectiveBetweenBoundCollation(n.expr, n.upper), hi)) {
+				tightenUpperBound(cIdx, hi, true);
+			}
 			continue;
 		}
 		if (n instanceof UnaryOpNode) {
@@ -1265,6 +1342,11 @@ function buildPredicateFacts(
 			if (!n.values || n.values.length === 0) continue;
 			const cIdx = columnIndexOf(n.condition);
 			if (cIdx === undefined) continue;
+			// emitIn compares under the condition operand's collation; for the
+			// bare-column condition recognized here that IS the declared collation,
+			// so this gate is currently always satisfied — kept explicit so a
+			// future condition-unwrapping change can't open a hole.
+			if (!equalityCollationOk(cIdx, effectiveInCollation(n.condition))) continue;
 			const set = new Set<SqlValue>();
 			let allLiterals = true;
 			for (const v of n.values) {
@@ -1343,6 +1425,10 @@ function bindingForColumn(
  * sound for numeric columns since the consumer matches `eq-literal{col, 0}`
  * via strict `sqlValueEquals`, which treats TEXT `''`, BLOB, and boolean
  * `false` as unequal to integer 0.
+ *
+ * `declaredCollationOf(col)` reports the source's output column collation
+ * (normalized or not; `'BINARY'` when undeclared). Used by the per-conjunct
+ * collation gate in `buildPredicateFacts` — see its doc.
  */
 export function predicateImpliesGuard(
 	predicate: ScalarPlanNode,
@@ -1352,8 +1438,9 @@ export function predicateImpliesGuard(
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNonNullable: (col: number) => boolean,
 	isColumnNumeric: (col: number) => boolean,
+	declaredCollationOf: (col: number) => string,
 ): boolean {
-	const facts = buildPredicateFacts(predicate, attrIdToIndex, isColumnNumeric);
+	const facts = buildPredicateFacts(predicate, attrIdToIndex, isColumnNumeric, declaredCollationOf);
 
 	for (const clause of guard.clauses) {
 		if (!clauseEntailed(clause, facts, ecs, bindings, isColumnNonNullable)) {

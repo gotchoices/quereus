@@ -17,6 +17,7 @@ import type { ConstraintOp, PredicateConstraint as VtabPredicateConstraint, Rang
 import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/reference.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
+import { effectiveComparisonCollation, operandCollation } from './comparison-collation.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -819,11 +820,20 @@ function isOrExpression(expr: ScalarPlanNode): boolean {
 }
 
 /**
- * Check if node is a column reference
- */
-/**
  * Unwrap a CastNode inserted by the planner for cross-category coercion.
  * Returns the inner operand if node is a Cast, otherwise returns the node itself.
+ *
+ * Deliberately does NOT unwrap `CollateNode`: a collate-wrapped literal or
+ * column changes the comparison's effective collation, so recognizing
+ * `b = 'x' collate nocase` as an ordinary `col = lit` constraint would mint a
+ * seek / covered-key witness under the column's declared collation while the
+ * runtime compares NOCASE — wrong rows from a seek, false ≤1-row claims from
+ * the covered-key path. Because this stays Cast-only, every recognized
+ * `col = lit` comparison's effective collation equals the column's declared
+ * collation (the key's enforcement collation), which is what keeps
+ * `FilterNode`'s covered-key detection sound. Pinned by seek-correctness tests
+ * (ticket `collation-blind-equality-fact-extraction`); do not add collate
+ * stripping here without gating consumers on the wrapper's collation.
  */
 function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
 	return node.nodeType === PlanNodeType.Cast ? (node as CastNode).operand : node;
@@ -958,10 +968,61 @@ export function extractCoveredKeysForTable(
 }
 
 /**
+ * Locate the (cast-unwrapped) column-reference side of a binary comparison
+ * matching `attributeId`. Used by {@link equalityConstraintCollationOk} to read
+ * the constrained column's declared collation off its reference type.
+ */
+function columnSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | undefined {
+	const l = unwrapCast(src.left);
+	if (l.nodeType === PlanNodeType.ColumnReference && (l as unknown as ColumnReferenceNode).attributeId === attributeId) return l;
+	const r = unwrapCast(src.right);
+	if (r.nodeType === PlanNodeType.ColumnReference && (r as unknown as ColumnReferenceNode).attributeId === attributeId) return r;
+	return undefined;
+}
+
+/**
+ * Collation gate for an equality constraint feeding covered-key detection.
+ *
+ * A covered key proves ≤1 row only when each pinned key column's comparison
+ * cannot conflate values the key's enforcement distinguishes — i.e. the
+ * comparison's effective collation is **at least as fine** as the enforcement
+ * collation (the column's declared collation: PK/UNIQUE enforcement compares
+ * under it — see the memory layer manager's uniqueness checks). The two
+ * decidable cases: effective collation BINARY (finest), or equal to the
+ * declared collation.
+ *
+ * The shape that needs this: constant folding collapses
+ * `'bob' COLLATE NOCASE` into a `LiteralNode` whose *type* keeps
+ * `collationName: 'NOCASE'` (const-pass preserves type metadata), so
+ * `b = 'bob' collate nocase` reaches extraction as an ordinary `col = lit`
+ * constraint that compares NOCASE at runtime over a BINARY-enforced key —
+ * counting it as covering produced a false ≤1-row claim (ticket
+ * `collation-blind-equality-fact-extraction`, repro 1). A `COLLATE` wrapper on
+ * the *column* side never folds and is already structurally rejected by
+ * `unwrapCast` being Cast-only.
+ *
+ * IN constraints need no gate: `emitIn` compares under the condition (column)
+ * operand's own collation — the declared collation itself — and listed values'
+ * collations are inert.
+ */
+function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		const eff = effectiveComparisonCollation(src.left, src.right);
+		if (eff === 'BINARY') return true;
+		const colSide = columnSideOf(src, c.attributeId);
+		return colSide !== undefined && operandCollation(colSide) === eff;
+	}
+	return true;
+}
+
+/**
  * Given a set of constraints and a table's unique keys, compute which keys are fully covered by
  * equality (optionally using FDs and equivalence classes to expand the equality-covered column set
  * via closure). A key is covered if every column in it lies in the closure of equality-covered
- * columns under the supplied FDs + EC-derived FDs.
+ * columns under the supplied FDs + EC-derived FDs. Equality constraints whose
+ * comparison collation is coarser than the column's declared (enforcement)
+ * collation are skipped — see {@link equalityConstraintCollationOk}.
  */
 export function computeCoveredKeysForConstraints(
     constraints: readonly PredicateConstraint[],
@@ -993,7 +1054,7 @@ export function computeCoveredKeysForConstraints(
         // uniformly — see `bindingReferencesOuterTable`.
         if (c.correlated) continue;
         if (c.op === '=') {
-            eqCols.add(c.columnIndex);
+            if (equalityConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
         if (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1) {
             eqCols.add(c.columnIndex);
