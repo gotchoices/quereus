@@ -63,7 +63,12 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 		case 'select': {
 			const stmt = node as AST.SelectStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
-			(stmt.columns ?? []).forEach(c => c.type === 'column' && traverseAst(c.expr, callbacks));
+			(stmt.columns ?? []).forEach(c => {
+				if (c.type === 'column') {
+					traverseAst(c.expr, callbacks);
+					c.inverse?.forEach(a => traverseAst(a.expr, callbacks));
+				}
+			});
 			(stmt.from ?? []).forEach(f => traverseAst(f, callbacks));
 			traverseAst(stmt.where, callbacks);
 			(stmt.groupBy ?? []).forEach(g => traverseAst(g, callbacks));

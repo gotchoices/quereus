@@ -3898,7 +3898,11 @@ simple_select      = "select" [ distinct_clause ] result_column { "," result_col
 
 distinct_clause    = "distinct" | "all" ;
 
-result_column      = "*" | table_name "." "*" | expr [ [ "as" ] column_alias ] ;
+result_column      = "*" | table_name "." "*"
+                   | expr [ [ "as" ] column_alias ] [ with_inverse_clause ] ;
+
+with_inverse_clause = "with" "inverse" "(" column_name "=" expr { "," column_name "=" expr } ")" ;
+                     (* authored write-back expressions for updatable views — see view-updateability.md *)
 
 from_clause        = "from" table_or_subquery { "," table_or_subquery } ;
 

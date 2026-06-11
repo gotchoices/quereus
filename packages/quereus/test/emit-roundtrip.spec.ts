@@ -272,9 +272,14 @@ describe('Emit: statement round-trips', () => {
 			expect(() => parse('select a with inverse (b = 1, b = 2) from t')).to.throw();
 		});
 
-		it('star result columns cannot carry the clause', () => {
-			expect(() => parse('select * with inverse (a = 1) from t')).to.throw();
-			expect(() => parse('select t.* with inverse (a = 1) from t')).to.throw();
+		it('star result columns cannot carry the clause — diagnostic names it', () => {
+			expect(() => parse('select * with inverse (a = 1) from t')).to.throw(/WITH INVERSE/);
+			expect(() => parse('select t.* with inverse (a = 1) from t')).to.throw(/WITH INVERSE/);
+		});
+
+		it('star followed by a non-INVERSE trailing WITH stays with the statement', () => {
+			const stmt = parse('select * with schema main') as SelectStmt;
+			expect(stmt.schemaPath).to.deep.equal(['main']);
 		});
 
 		it('inverse stays usable as an identifier', () => {

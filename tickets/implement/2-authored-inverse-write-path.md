@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/planner/analysis/update-lineage.ts       # computed + authored inverse → writable base site
   - packages/quereus/src/planner/analysis/scalar-invertibility.ts # authored-wins precedence over inferred profiles
   - packages/quereus/src/planner/building/view-mutation-builder.ts # UPDATE/INSERT lowering through authored expressions
+  - packages/quereus/src/schema/rename-rewriter.ts                # ALTER … RENAME descent into ResultColumnExpr.inverse
   - packages/quereus/test/logic/                                  # new authored-inverse sqllogic file
   - docs/view-updateability.md                                    # § Authored inverses (already written — reconcile)
 ----
@@ -30,9 +31,10 @@ relation is never written:
 - a non-`new.`-qualified column reference inside an assignment expression is
   an error (the inverse is over the written row only — bare base columns are
   not in scope; this is what keeps the clause unambiguous);
-- duplicate targets within one clause, and the same target across two result
-  columns of one select, are errors (two puts for one base column is
-  ill-defined).
+- the same target across two result columns of one select is an error (two
+  puts for one base column is ill-defined). A duplicate target *within* one
+  clause is already a **parse** error (landed with the parser ticket, mirroring
+  INSERT DEFAULTS) — only the cross-result-column check remains for build time.
 
 Sited diagnostics naming the result column and the offending target/ref.
 Until the relation is a write target the clause is otherwise **inert**.
@@ -107,6 +109,17 @@ below), agreeing with the dynamic truth as always.
   through the sparse-override merger per covered column (the merger must
   carry the field; a gap-filled column never has one). One lens-shaped logic
   test here; full prover integration is `authored-inverse-lens-prover`.
+- **ALTER … RENAME propagation** — `schema/rename-rewriter.ts` walks view-body
+  result-column expressions but does not yet descend into
+  `ResultColumnExpr.inverse`. By symmetry with `insert defaults`
+  (`renameTableInInsertDefaults` / `renameColumnInInsertDefaults`): a rename of
+  a FROM-table base column must rewrite each assignment's target `column`
+  (targets are base columns — exactly what renames touch), and renamed
+  tables/columns inside an assignment's expr (subqueries) rewrite scope-aware.
+  `new.<col>` refs are by view-output name, so the body rewrite alone covers
+  them. Deferred from the parser ticket because target resolution lands here;
+  land it with this ticket and note it in docs § Authored inverses (the
+  insert-defaults section already documents its equivalent).
 
 ## Tests
 
@@ -125,6 +138,7 @@ update-lineage/view-mutation spec neighborhood if one exists.
 - UPDATE substitution lowering; INSERT envelope evaluation; insertability gate scoped lift
 - Ownership routing (single + multi-source; decomposition defer-with-diagnostic if needed)
 - view_info / column_info parity
+- ALTER … RENAME propagation into inverse targets/exprs (rename-rewriter)
 - Logic tests + edge cases above
 - Reconcile docs/view-updateability.md § Authored inverses with what landed
 - `yarn build`, `yarn lint`, `yarn test`

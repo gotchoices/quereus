@@ -157,6 +157,15 @@ describe('traverseAst', () => {
 		});
 	});
 
+	describe('result-column WITH INVERSE traversal', () => {
+		it('traverses authored-inverse assignment expressions', () => {
+			const types = collectTypes('select a + 1 as b with inverse (a = new.b - 1) from t');
+			// The forward expression `a + 1` and the inverse expression `new.b - 1`
+			expect(types.filter(t => t === 'binary')).to.have.length(2);
+			expect(types.filter(t => t === 'literal')).to.have.length(2);
+		});
+	});
+
 	describe('statement node types', () => {
 		it('traverses INSERT with VALUES', () => {
 			const types = collectTypes('insert into t (a, b) values (1, 2), (3, 4)');

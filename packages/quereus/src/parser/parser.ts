@@ -869,6 +869,7 @@ export class Parser {
 			// Handle wildcard: * or table.*
 			if (this.match(TokenType.ASTERISK)) {
 				columns.push({ type: 'all' });
+				this.rejectInverseClauseOnStar();
 			}
 			// Handle table.* syntax
 			else if (this.checkIdentifierLike(CONTEXTUAL_KEYWORDS) && this.checkNext(1, TokenType.DOT) &&
@@ -877,6 +878,7 @@ export class Parser {
 				this.advance(); // consume DOT
 				this.advance(); // consume ASTERISK
 				columns.push({ type: 'all', table });
+				this.rejectInverseClauseOnStar();
 			}
 			// Handle regular column expression
 			else {
@@ -2783,6 +2785,20 @@ export class Parser {
 		} while (this.match(TokenType.COMMA));
 		this.consume(TokenType.RPAREN, "Expected ')' after WITH INVERSE list.");
 		return assignments;
+	}
+
+	/**
+	 * A `*` / `t.*` result column cannot carry WITH INVERSE (it names no single
+	 * expression to invert). Name the clause in the diagnostic rather than letting
+	 * the leftover WITH garble into a downstream CTE/clause error. A trailing
+	 * `with schema` / `with tags` is untouched — parseInverseClause commits only
+	 * on WITH followed by INVERSE.
+	 */
+	private rejectInverseClauseOnStar(): void {
+		const withToken = this.peek();
+		if (this.parseInverseClause()) {
+			throw this.error(withToken, "WITH INVERSE cannot apply to a '*' result column.");
+		}
 	}
 
 	/**
