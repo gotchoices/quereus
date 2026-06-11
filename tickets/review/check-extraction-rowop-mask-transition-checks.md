@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-11T14:17:10.944Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\check-extraction-rowop-mask-transition-checks.review.2026-06-11T14-17-10-944Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Review — row-invariant gate on CHECK fact extraction (operation mask ⊇ insert|update, no `old.` refs, not deferred); assertion-hoist synthetic checks now carry the default mask.
 files:
   - packages/quereus/src/planner/analysis/check-extraction.ts          # isRowInvariantCheck + containsOldRowImageRef, gate at top of extraction loop
