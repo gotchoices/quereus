@@ -6,6 +6,7 @@
  */
 
 import { QuereusError, StatusCode } from '@quereus/quereus';
+import { bytesToHex, compareBytes } from './bytes.js';
 import type { DataChangeEvent, StoreEventEmitter } from './events.js';
 import type { KVStore } from './kv-store.js';
 
@@ -17,20 +18,56 @@ interface PendingOp {
   value?: Uint8Array;
 }
 
-/** Hex-encode a key for use as a Map key. */
-function keyToHex(key: Uint8Array): string {
-  return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
-}
+/**
+ * The coordinator's default store: either a concrete handle or a lazy thunk
+ * resolved on first need (commit of default-store ops). The thunk form lets a
+ * coordinator be constructed synchronously before its store has ever been
+ * opened — e.g. by a synchronous `connect()` that must not await storage.
+ */
+export type DefaultStoreSource = KVStore | (() => Promise<KVStore>);
 
 /**
  * View of buffered ops targeting a specific store, with last-write-wins semantics.
+ *
+ * Returned views are LIVE references into the coordinator's incremental index —
+ * O(1) to obtain, but callers must treat them as read-only snapshots-in-time
+ * and must not retain them across further coordinator mutations.
  */
 export interface PendingStoreOps {
   /** Pending puts (key/value) for this store, keyed by hex-encoded key. */
-  puts: Map<string, { key: Uint8Array; value: Uint8Array }>;
+  puts: ReadonlyMap<string, { key: Uint8Array; value: Uint8Array }>;
   /** Hex-encoded keys with a pending delete for this store. */
+  deletes: ReadonlySet<string>;
+}
+
+/**
+ * Key-ordered view of buffered ops targeting a specific store: the merge input
+ * for read-your-own-writes scans. `puts` is sorted ascending by encoded key
+ * bytes (the KVStore iteration order); `deletes` is the same hex set as
+ * {@link PendingStoreOps}.
+ */
+export interface OrderedPendingOps {
+  /** Pending puts sorted ascending by encoded key bytes. */
+  puts: ReadonlyArray<{ key: Uint8Array; value: Uint8Array }>;
+  /** Hex-encoded keys with a pending delete for this store. */
+  deletes: ReadonlySet<string>;
+}
+
+/** Mutable index bucket backing the read-only views above. */
+interface PendingBucket {
+  puts: Map<string, { key: Uint8Array; value: Uint8Array }>;
   deletes: Set<string>;
 }
+
+/** Shared empty view returned when a store has no pending ops. */
+const EMPTY_PENDING: PendingStoreOps = Object.freeze({
+  puts: new Map<string, { key: Uint8Array; value: Uint8Array }>(),
+  deletes: new Set<string>(),
+});
+const EMPTY_ORDERED: OrderedPendingOps = Object.freeze({
+  puts: [],
+  deletes: new Set<string>(),
+});
 
 /** Savepoint snapshot recording position in the operation/event arrays. */
 interface SavepointSnapshot {
@@ -50,9 +87,20 @@ export interface TransactionCallbacks {
  * All mutations within a transaction are buffered in a shared WriteBatch.
  * On commit, the batch is written atomically and events are fired.
  * On rollback, the batch and events are discarded.
+ *
+ * Buffered ops are additionally indexed per target store with last-write-wins
+ * semantics (see {@link getPendingOpsForStore} / {@link getOrderedPendingOps}),
+ * so reads that need to see intra-transaction writes are O(1) rather than a
+ * re-scan of the op log. The default store may be a lazy thunk
+ * ({@link DefaultStoreSource}); ops queued without an explicit store target the
+ * default bucket by *role*, never by handle identity, so an unresolved default
+ * can never misfile them.
  */
 export class TransactionCoordinator {
-  private store: KVStore;
+  private storeSource: DefaultStoreSource;
+  /** Concrete default store once known (immediately for a handle, on first resolve for a thunk). */
+  private resolvedStore: KVStore | null;
+  private storePromise: Promise<KVStore> | null = null;
   private eventEmitter?: StoreEventEmitter;
 
   // Transaction state
@@ -61,9 +109,18 @@ export class TransactionCoordinator {
   private pendingEvents: DataChangeEvent[] = [];
   private savepointStack: SavepointSnapshot[] = [];
   private callbacks: TransactionCallbacks[] = [];
+  /**
+   * Incremental last-write-wins index over `pendingOps`, bucketed per target
+   * store. The `null` key is the default-store bucket (ops queued with no
+   * explicit store); explicit stores key their own bucket — except an explicit
+   * handle that IS the resolved default, which folds into the default bucket
+   * so both addressing forms see the same ops (see {@link bucketKey}).
+   */
+  private pendingIndex = new Map<KVStore | null, PendingBucket>();
 
-  constructor(store: KVStore, eventEmitter?: StoreEventEmitter) {
-    this.store = store;
+  constructor(store: DefaultStoreSource, eventEmitter?: StoreEventEmitter) {
+    this.storeSource = store;
+    this.resolvedStore = typeof store === 'function' ? null : store;
     this.eventEmitter = eventEmitter;
   }
 
@@ -87,6 +144,7 @@ export class TransactionCoordinator {
     this.pendingOps = [];
     this.pendingEvents = [];
     this.savepointStack = [];
+    this.pendingIndex = new Map();
   }
 
   /** Queue a put operation. If store is provided, targets that store instead of the default. */
@@ -95,6 +153,10 @@ export class TransactionCoordinator {
       throw new QuereusError('Cannot queue operation outside transaction', StatusCode.MISUSE);
     }
     this.pendingOps.push({ type: 'put', store, key, value });
+    const bucket = this.bucketFor(this.bucketKey(store));
+    const hex = bytesToHex(key);
+    bucket.puts.set(hex, { key, value });
+    bucket.deletes.delete(hex);
   }
 
   /** Queue a delete operation. If store is provided, targets that store instead of the default. */
@@ -103,6 +165,10 @@ export class TransactionCoordinator {
       throw new QuereusError('Cannot queue operation outside transaction', StatusCode.MISUSE);
     }
     this.pendingOps.push({ type: 'delete', store, key });
+    const bucket = this.bucketFor(this.bucketKey(store));
+    const hex = bytesToHex(key);
+    bucket.deletes.add(hex);
+    bucket.puts.delete(hex);
   }
 
   /** Queue a data change event (fired on commit). */
@@ -122,18 +188,23 @@ export class TransactionCoordinator {
     }
 
     try {
-      // Group pending operations by target store
+      // Group pending operations by target store. Buckets share the index's
+      // addressing (`bucketKey`), so an explicit handle that is the resolved
+      // default lands in the default bucket — one batch per physical store.
       if (this.pendingOps.length > 0) {
-        const opsByStore = new Map<KVStore, PendingOp[]>();
+        const opsByStore = new Map<KVStore | null, PendingOp[]>();
         for (const op of this.pendingOps) {
-          const target = op.store ?? this.store;
+          const target = this.bucketKey(op.store);
           let ops = opsByStore.get(target);
           if (!ops) { ops = []; opsByStore.set(target, ops); }
           ops.push(op);
         }
 
-        // Write a batch per store
-        for (const [targetStore, ops] of opsByStore) {
+        // Write a batch per store. The default store is resolved lazily here —
+        // and only when default-bucket ops exist, so a coordinator that only
+        // ever targeted explicit stores never opens the default.
+        for (const [target, ops] of opsByStore) {
+          const targetStore = target ?? await this.resolveStore();
           const batch = targetStore.batch();
           for (const op of ops) {
             if (op.type === 'put') {
@@ -203,6 +274,11 @@ export class TransactionCoordinator {
     this.pendingOps = this.pendingOps.slice(0, snapshot.opIndex);
     this.pendingEvents = this.pendingEvents.slice(0, snapshot.eventIndex);
 
+    // Rebuild the pending index from the truncated log: last-write-wins can't
+    // be incrementally undone (the pre-image is gone), and rollback-to is rare
+    // enough that an O(ops) replay is fine.
+    this.rebuildPendingIndex();
+
     // Remove savepoints above the target, but preserve the target itself
     this.savepointStack.length = targetDepth + 1;
   }
@@ -213,35 +289,101 @@ export class TransactionCoordinator {
     this.pendingOps = [];
     this.pendingEvents = [];
     this.savepointStack = [];
-  }
-
-  /** Get the underlying store for direct reads. */
-  getStore(): KVStore {
-    return this.store;
+    this.pendingIndex = new Map();
   }
 
   /**
-   * Snapshot pending ops targeting the given store (or the default if omitted),
-   * collapsed to last-write-wins. Used by reads that need to see
-   * intra-transaction writes (e.g. UNIQUE constraint checks).
+   * Get the underlying default store for direct reads.
+   * Throws MISUSE when the coordinator was constructed with a lazy thunk that
+   * has not resolved yet (nothing has needed the concrete handle so far).
    */
-  getPendingOpsForStore(store?: KVStore): PendingStoreOps {
-    const target = store ?? this.store;
-    const puts = new Map<string, { key: Uint8Array; value: Uint8Array }>();
-    const deletes = new Set<string>();
+  getStore(): KVStore {
+    if (!this.resolvedStore) {
+      throw new QuereusError('Default store not yet resolved (lazily constructed coordinator)', StatusCode.MISUSE);
+    }
+    return this.resolvedStore;
+  }
+
+  /** Resolve (and cache) the concrete default store. */
+  private resolveStore(): Promise<KVStore> {
+    if (this.resolvedStore) {
+      return Promise.resolve(this.resolvedStore);
+    }
+    if (!this.storePromise) {
+      this.storePromise = (this.storeSource as () => Promise<KVStore>)().then(store => {
+        this.resolvedStore = store;
+        return store;
+      }).catch(err => {
+        // Allow a later retry rather than caching the rejection forever.
+        this.storePromise = null;
+        throw err;
+      });
+    }
+    return this.storePromise;
+  }
+
+  /**
+   * Map a per-op / per-query store argument to its index bucket. `undefined`
+   * means "the default store" (the `null` bucket); an explicit handle that is
+   * the resolved default also folds into the default bucket so both addressing
+   * forms see the same ops. While the default is still an unresolved thunk no
+   * caller can hold its handle (it has never been opened through this
+   * coordinator), so role-vs-identity ambiguity cannot arise.
+   */
+  private bucketKey(store?: KVStore): KVStore | null {
+    if (store === undefined) return null;
+    if (this.resolvedStore !== null && store === this.resolvedStore) return null;
+    return store;
+  }
+
+  /** Get or create the mutable index bucket for a bucket key. */
+  private bucketFor(key: KVStore | null): PendingBucket {
+    let bucket = this.pendingIndex.get(key);
+    if (!bucket) {
+      bucket = { puts: new Map(), deletes: new Set() };
+      this.pendingIndex.set(key, bucket);
+    }
+    return bucket;
+  }
+
+  /** Rebuild the per-store index by replaying the (truncated) op log. */
+  private rebuildPendingIndex(): void {
+    this.pendingIndex = new Map();
     for (const op of this.pendingOps) {
-      const opStore = op.store ?? this.store;
-      if (opStore !== target) continue;
-      const hex = keyToHex(op.key);
+      const bucket = this.bucketFor(this.bucketKey(op.store));
+      const hex = bytesToHex(op.key);
       if (op.type === 'put') {
-        puts.set(hex, { key: op.key, value: op.value! });
-        deletes.delete(hex);
+        bucket.puts.set(hex, { key: op.key, value: op.value! });
+        bucket.deletes.delete(hex);
       } else {
-        deletes.add(hex);
-        puts.delete(hex);
+        bucket.deletes.add(hex);
+        bucket.puts.delete(hex);
       }
     }
-    return { puts, deletes };
+  }
+
+  /**
+   * Pending ops targeting the given store (or the default if omitted),
+   * collapsed to last-write-wins. Used by reads that need to see
+   * intra-transaction writes (e.g. UNIQUE constraint checks). O(1): returns
+   * the live indexed view (see {@link PendingStoreOps} for caveats).
+   */
+  getPendingOpsForStore(store?: KVStore): PendingStoreOps {
+    return this.pendingIndex.get(this.bucketKey(store)) ?? EMPTY_PENDING;
+  }
+
+  /**
+   * Key-ordered pending view for the given store (or the default if omitted):
+   * puts sorted ascending by encoded key bytes plus the delete set — the merge
+   * input for read-your-own-writes scans. Sorts on demand (pending sets are
+   * transaction-sized).
+   */
+  getOrderedPendingOps(store?: KVStore): OrderedPendingOps {
+    const bucket = this.pendingIndex.get(this.bucketKey(store));
+    if (!bucket || (bucket.puts.size === 0 && bucket.deletes.size === 0)) {
+      return EMPTY_ORDERED;
+    }
+    const puts = Array.from(bucket.puts.values()).sort((a, b) => compareBytes(a.key, b.key));
+    return { puts, deletes: bucket.deletes };
   }
 }
-

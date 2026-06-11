@@ -3,6 +3,7 @@
  */
 
 import { expect } from 'chai';
+import type { SqlValue } from '@quereus/quereus';
 import {
 	buildDataStoreName,
 	buildIndexStoreName,
@@ -13,11 +14,13 @@ import {
 	buildCatalogKey,
 	buildFullScanBounds,
 	buildIndexPrefixBounds,
+	buildPkPrefixBounds,
 	buildCatalogScanBounds,
 	STORE_SUFFIX,
 	CATALOG_STORE_NAME,
 	STATS_STORE_NAME,
 } from '../src/common/key-builder.js';
+import { compareBytes } from '../src/common/bytes.js';
 
 const encoder = new TextEncoder();
 
@@ -162,11 +165,103 @@ describe('key-builder', () => {
 		it('returns prefix-based range for non-empty prefix', () => {
 			const bounds = buildIndexPrefixBounds(['alice']);
 			expect(bounds.gte.length).to.be.greaterThan(0);
-			expect(bounds.lt.length).to.be.greaterThan(0);
+			expect(bounds.lt!.length).to.be.greaterThan(0);
 			// lt should be greater than gte
 			const gteHex = Array.from(bounds.gte).map(b => b.toString(16).padStart(2, '0')).join('');
-			const ltHex = Array.from(bounds.lt).map(b => b.toString(16).padStart(2, '0')).join('');
+			const ltHex = Array.from(bounds.lt!).map(b => b.toString(16).padStart(2, '0')).join('');
 			expect(ltHex > gteHex).to.be.true;
+		});
+
+		it('omits lt for an all-0xff prefix (leading DESC NULL)', () => {
+			// NULL encodes as [0x00]; DESC inversion yields [0xff] — no finite
+			// exclusive upper bound exists above an all-0xff prefix.
+			const bounds = buildIndexPrefixBounds([null], undefined, [true]);
+			expect(bounds.gte).to.deep.equal(new Uint8Array([0xff]));
+			expect(bounds.lt).to.be.undefined;
+		});
+	});
+
+	describe('buildPkPrefixBounds', () => {
+		/** True when `key` falls within [gte, lt). */
+		const within = (key: Uint8Array, bounds: { gte: Uint8Array; lt?: Uint8Array }): boolean =>
+			compareBytes(key, bounds.gte) >= 0
+			&& (bounds.lt === undefined || compareBytes(key, bounds.lt) < 0);
+
+		/**
+		 * Assert the bounds window selects exactly the keys whose row shares the
+		 * prefix values — the property every consumer relies on.
+		 */
+		function expectExactSlice(
+			rows: SqlValue[][],
+			prefix: SqlValue[],
+			matching: (row: SqlValue[]) => boolean,
+			directions?: boolean[],
+			collations?: (string | undefined)[],
+		): void {
+			const bounds = buildPkPrefixBounds(prefix, undefined, directions, collations);
+			for (const row of rows) {
+				const key = buildDataKey(row, undefined, directions, collations);
+				expect(within(key, bounds)).to.equal(
+					matching(row),
+					`row [${row.join(', ')}] vs prefix [${prefix.join(', ')}]`,
+				);
+			}
+		}
+
+		it('empty prefix yields full-scan bounds (no 0xff cap)', () => {
+			const bounds = buildPkPrefixBounds([]);
+			expect(bounds.gte).to.deep.equal(new Uint8Array(0));
+			expect(bounds.lt).to.be.undefined;
+		});
+
+		it('integer prefix selects exactly the prefix-equal slice', () => {
+			const rows: SqlValue[][] = [[1, 'a'], [1, 'b'], [2, 'a'], [2, 'z'], [3, 'a']];
+			expectExactSlice(rows, [2], r => r[0] === 2);
+		});
+
+		it('multi-column prefix selects exactly the prefix-equal slice', () => {
+			const rows: SqlValue[][] = [
+				['a', 1, 'x'], ['a', 1, 'y'], ['a', 2, 'x'], ['b', 1, 'x'], ['b', 2, 'y'],
+			];
+			expectExactSlice(rows, ['a', 1], r => r[0] === 'a' && r[1] === 1);
+		});
+
+		it('text prefix with embedded NUL and escape bytes stays exact', () => {
+			// 'a\x00' and 'a\x01' exercise the NUL-termination escaping: the encoded
+			// prefix of 'a' must NOT swallow 'a\x00b' (a distinct, longer first column).
+			const rows: SqlValue[][] = [
+				['a', 1], ['a\x00b', 1], ['a\x01b', 1], ['ab', 1], ['b', 1],
+			];
+			expectExactSlice(rows, ['a'], r => r[0] === 'a');
+			expectExactSlice(rows, ['a\x00b'], r => r[0] === 'a\x00b');
+			expectExactSlice(rows, ['a\x01b'], r => r[0] === 'a\x01b');
+		});
+
+		it('DESC leading column selects exactly the prefix-equal slice', () => {
+			const rows: SqlValue[][] = [[1, 'a'], [2, 'a'], [2, 'b'], [3, 'a']];
+			expectExactSlice(rows, [2], r => r[0] === 2, [true, false]);
+		});
+
+		it('NOCASE per-column collation folds case in the window', () => {
+			// Keys are encoded NOCASE: 'Alice' and 'alice' share key bytes, so a
+			// prefix of either selects both spellings; 'bob' stays outside.
+			const rows: SqlValue[][] = [['alice', 1], ['Alice', 2], ['bob', 1]];
+			expectExactSlice(
+				rows,
+				['ALICE'],
+				r => (r[0] as string).toLowerCase() === 'alice',
+				undefined,
+				['NOCASE'],
+			);
+		});
+
+		it('omits lt for an all-0xff prefix (leading DESC NULL) instead of an empty window', () => {
+			const bounds = buildPkPrefixBounds([null], undefined, [true]);
+			expect(bounds.gte).to.deep.equal(new Uint8Array([0xff]));
+			expect(bounds.lt).to.be.undefined;
+			// The NULL-prefixed key still falls inside the window.
+			const key = buildDataKey([null, 5], undefined, [true, false]);
+			expect(within(key, bounds)).to.be.true;
 		});
 	});
 

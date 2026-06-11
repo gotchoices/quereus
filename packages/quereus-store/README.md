@@ -194,14 +194,14 @@ const caps = storeModule.getCapabilities();
 // }
 ```
 
-**Important:** The base `StoreModule` does not provide transaction isolation. Without isolation:
-- Reads see only committed data (no read-your-own-writes within a transaction)
-- Concurrent readers may see partial writes
+**Important:** The base `StoreModule` does not provide transaction isolation:
+- No snapshot isolation: between connections, reads see only committed data, and concurrent readers may observe partial writes
+- Within a transaction, reads through the table's shared coordinator DO see that transaction's own pending writes (read-your-own-writes)
 - Savepoints are not supported
 
 ## Transaction Isolation
 
-To add full ACID transaction semantics with read-your-own-writes, wrap the store module with the `IsolationModule`:
+To add full ACID transaction semantics with snapshot isolation, wrap the store module with the `IsolationModule`:
 
 ```typescript
 import { Database, MemoryTableModule } from '@quereus/quereus';
@@ -318,6 +318,7 @@ console.log(hasIsolation(isolatedModule)); // true
 | `classifyCatalogKey` | Classify a loaded catalog key as `'table'` / `'view'` / `'materializedView'` |
 | `buildFullScanBounds` | Build bounds for full table scan |
 | `buildIndexPrefixBounds` | Build bounds for index prefix scan |
+| `buildPkPrefixBounds` | Build bounds for a data-store PK prefix range (per-column DESC + key collations) |
 | `buildCatalogScanBounds` | Build bounds for catalog scan |
 | `CATALOG_STORE_NAME` | Reserved catalog store name constant |
 | `STORE_SUFFIX` | Store name suffixes (INDEX, STATS) |

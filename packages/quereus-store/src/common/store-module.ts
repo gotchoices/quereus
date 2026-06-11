@@ -127,9 +127,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	/**
 	 * Returns capability flags for this module.
 	 *
-	 * The base StoreModule does NOT provide transaction isolation.
-	 * Without isolation, queries see only committed data (no read-your-own-writes
-	 * within a transaction). To enable isolation, wrap with IsolationModule:
+	 * The base StoreModule does NOT provide transaction isolation: there is no
+	 * snapshot isolation and no cross-connection isolation (readers on other
+	 * connections see only committed data). Within a transaction, reads through
+	 * the table's shared coordinator DO see that transaction's own pending
+	 * writes (read-your-own-writes — `StoreTable.query` merges the pending op
+	 * view over the committed store). For full isolation, wrap with
+	 * IsolationModule:
 	 *
 	 * ```typescript
 	 * import { IsolationModule, MemoryTableModule } from '@quereus/quereus';
@@ -1714,12 +1718,17 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 	/**
 	 * Get or create a transaction coordinator for a table.
+	 *
+	 * Synchronously constructible: the coordinator receives a lazy thunk for its
+	 * default store and only resolves it when a commit actually needs the
+	 * concrete handle. This lets callers that must stay synchronous (e.g. a
+	 * `BackingHost.connect()`) obtain a working coordinator before the table's
+	 * store has ever been opened.
 	 */
-	async getCoordinator(tableKey: string, config: StoreTableConfig): Promise<TransactionCoordinator> {
+	getCoordinator(tableKey: string, config: StoreTableConfig): TransactionCoordinator {
 		let coordinator = this.coordinators.get(tableKey);
 		if (!coordinator) {
-			const store = await this.getStore(tableKey, config);
-			coordinator = new TransactionCoordinator(store, this.eventEmitter);
+			coordinator = new TransactionCoordinator(() => this.getStore(tableKey, config), this.eventEmitter);
 			this.coordinators.set(tableKey, coordinator);
 		}
 		return coordinator;

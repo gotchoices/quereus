@@ -55,6 +55,7 @@ export {
 	type CatalogEntryKind,
 	buildFullScanBounds,
 	buildIndexPrefixBounds,
+	buildPkPrefixBounds,
 	buildCatalogScanBounds,
 	// Legacy exports (deprecated)
 	KEY_PREFIX,
@@ -81,7 +82,13 @@ export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializ
 export {
   TransactionCoordinator,
   type TransactionCallbacks,
+  type DefaultStoreSource,
+  type PendingStoreOps,
+  type OrderedPendingOps,
 } from './transaction.js';
+
+// Byte helpers for encoded keys
+export { bytesToHex, bytesEqual, compareBytes } from './bytes.js';
 
 // In-memory KV store
 export { InMemoryKVStore } from './memory-store.js';

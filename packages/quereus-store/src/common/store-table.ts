@@ -36,7 +36,8 @@ import {
 	type UpdateResult,
 } from '@quereus/quereus';
 
-import type { KVStore } from './kv-store.js';
+import type { IterateOptions, KVEntry, KVStore } from './kv-store.js';
+import { bytesEqual, bytesToHex, compareBytes } from './bytes.js';
 import type { StoreEventEmitter } from './events.js';
 import type { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
@@ -58,17 +59,12 @@ import type { EncodeOptions } from './encoding.js';
 /** Number of mutations before persisting statistics. */
 const STATS_FLUSH_INTERVAL = 100;
 
-/** Hex-encode a key for use as a Map/Set lookup. */
-function bytesToHex(key: Uint8Array): string {
-	return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/** Byte-wise equality check for Uint8Arrays. */
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) {
-		if (a[i] !== b[i]) return false;
-	}
+/** True when `key` falls within the (gte/gt/lte/lt) window of `bounds`. */
+function keyWithinBounds(key: Uint8Array, bounds: IterateOptions): boolean {
+	if (bounds.gte && compareBytes(key, bounds.gte) < 0) return false;
+	if (bounds.gt && compareBytes(key, bounds.gt) <= 0) return false;
+	if (bounds.lte && compareBytes(key, bounds.lte) > 0) return false;
+	if (bounds.lt && compareBytes(key, bounds.lt) >= 0) return false;
 	return true;
 }
 
@@ -144,8 +140,12 @@ export interface StoreTableModule {
 	getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore>;
 	/** Get the stats store for a table. */
 	getStatsStore(schemaName: string, tableName: string): Promise<KVStore>;
-	/** Get a coordinator for a table. */
-	getCoordinator(tableKey: string, config: StoreTableConfig): Promise<TransactionCoordinator>;
+	/**
+	 * Get a coordinator for a table. Synchronous: the coordinator's default
+	 * store may be a lazy thunk resolved at commit time, so obtaining one never
+	 * requires opening storage.
+	 */
+	getCoordinator(tableKey: string, config: StoreTableConfig): TransactionCoordinator;
 	/** Save table DDL to persistent storage. */
 	saveTableDDL(tableSchema: TableSchema): Promise<void>;
 }
@@ -487,7 +487,7 @@ export class StoreTable extends VirtualTable {
 	protected async ensureCoordinator(): Promise<TransactionCoordinator> {
 		if (!this.coordinator) {
 			const tableKey = `${this.schemaName}.${this.tableName}`.toLowerCase();
-			this.coordinator = await this.storeModule.getCoordinator(tableKey, this.config);
+			this.coordinator = this.storeModule.getCoordinator(tableKey, this.config);
 
 			this.coordinator.registerCallbacks({
 				onCommit: () => this.applyPendingStats(),
@@ -574,20 +574,24 @@ export class StoreTable extends VirtualTable {
 		return row.map((v, i) => validateAndParse(v, cols[i].logicalType, cols[i].name)) as Row;
 	}
 
-	/** Query the table with optional filters. */
+	/**
+	 * Query the table with optional filters.
+	 *
+	 * All three access arms read the EFFECTIVE row state: the committed store
+	 * merged with this table's coordinator's pending ops when a transaction is
+	 * active (read-your-own-writes — see {@link iterateEffective} /
+	 * {@link readLiveRowByPk}). Merged emission stays in encoded-PK-key order,
+	 * preserving the module's `providesOrdering` / `monotonicOn` advertisements.
+	 */
 	async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
 		const store = await this.ensureStore();
 
 		const pkAccess = this.analyzePKAccess(filterInfo);
 
 		if (pkAccess.type === 'point') {
-			const key = buildDataKey(pkAccess.values!, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
-			const value = await store.get(key);
-			if (value) {
-				const row = deserializeRow(value);
-				if (this.matchesFilters(row, filterInfo)) {
-					yield row;
-				}
+			const row = await this.readLiveRowByPk(pkAccess.values!);
+			if (row && this.matchesFilters(row, filterInfo)) {
+				yield row;
 			}
 			return;
 		}
@@ -599,11 +603,70 @@ export class StoreTable extends VirtualTable {
 
 		// Full table scan
 		const bounds = buildFullScanBounds();
-		for await (const entry of store.iterate(bounds)) {
+		for await (const entry of this.iterateEffective(store, bounds)) {
 			const row = deserializeRow(entry.value);
 			if (this.matchesFilters(row, filterInfo)) {
 				yield row;
 			}
+		}
+	}
+
+	/**
+	 * Iterate the effective entry state of this table's data store within
+	 * `bounds`: the committed `store.iterate` stream merged with the
+	 * coordinator's pending ops for the data store (read-your-own-writes).
+	 *
+	 * Both inputs are sorted by encoded key bytes, so this is an
+	 * order-preserving two-way merge: a pending put wins over a committed entry
+	 * at the same key, a pending delete suppresses its committed entry, and
+	 * pending puts outside `bounds` are excluded. With no active transaction
+	 * (or an empty pending bucket) it degrades to the bare committed iterate.
+	 *
+	 * The pending side is the coordinator's DEFAULT-store bucket — the
+	 * coordinator is per-table and its default store IS this table's data store
+	 * (both resolve through `StoreModule.getStore(tableKey)`), and addressing by
+	 * role keeps the lookup correct while a lazily-constructed coordinator's
+	 * default handle is still unresolved.
+	 */
+	protected async *iterateEffective(
+		store: KVStore,
+		bounds: IterateOptions,
+		reverse = false,
+	): AsyncIterable<KVEntry> {
+		const pending = this.coordinator?.isInTransaction()
+			? this.coordinator.getOrderedPendingOps()
+			: null;
+		const iterOptions: IterateOptions = reverse ? { ...bounds, reverse } : bounds;
+
+		if (!pending || (pending.puts.length === 0 && pending.deletes.size === 0)) {
+			yield* store.iterate(iterOptions);
+			return;
+		}
+
+		const puts = pending.puts.filter(p => keyWithinBounds(p.key, bounds));
+		if (reverse) puts.reverse();
+		// In iteration order, "before" means byte-less for forward and byte-greater
+		// for reverse; sign folds the direction into one comparison.
+		const sign = reverse ? -1 : 1;
+		let putIdx = 0;
+
+		for await (const entry of store.iterate(iterOptions)) {
+			// Emit pending puts that precede this committed entry in iteration order.
+			while (putIdx < puts.length && sign * compareBytes(puts[putIdx].key, entry.key) < 0) {
+				yield puts[putIdx++];
+			}
+			// Equal keys: the pending put shadows the committed entry.
+			if (putIdx < puts.length && compareBytes(puts[putIdx].key, entry.key) === 0) {
+				yield puts[putIdx++];
+				continue;
+			}
+			if (pending.deletes.has(bytesToHex(entry.key))) continue;
+			yield entry;
+		}
+
+		// Pending puts beyond the last committed entry.
+		while (putIdx < puts.length) {
+			yield puts[putIdx++];
 		}
 	}
 
@@ -673,7 +736,7 @@ export class StoreTable extends VirtualTable {
 		// the collation-aware filter below — matchesFilters stays the authoritative
 		// row filter either way. Today the full key space is visited, so there is
 		// no seek-start/early-termination carrying a BINARY assumption.
-		for await (const entry of store.iterate(bounds)) {
+		for await (const entry of this.iterateEffective(store, bounds)) {
 			const row = deserializeRow(entry.value);
 			if (this.matchesFilters(row, filterInfo)) {
 				yield row;
@@ -1241,8 +1304,11 @@ export class StoreTable extends VirtualTable {
 		selfPks: SqlValue[][],
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
 		const store = await this.ensureStore();
+		// Default-store bucket: the per-table coordinator's default store IS this
+		// table's data store, and addressing by role (no handle) stays correct
+		// even while a lazily-constructed coordinator's default is unresolved.
 		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getPendingOpsForStore(store)
+			? this.coordinator.getPendingOpsForStore()
 			: null;
 		const constrainedCols = uc.columns;
 		const schema = this.tableSchema!;
@@ -1316,13 +1382,15 @@ export class StoreTable extends VirtualTable {
 	/**
 	 * Read the live row at `pk` — this transaction's pending overlay (a pending
 	 * delete ⇒ gone; a pending put ⇒ its value) shadowing the committed store.
-	 * Used to validate covering-MV conflict candidates against the source of truth.
+	 * Backs `query()`'s point-lookup arm and validates covering-MV conflict
+	 * candidates against the source of truth.
 	 */
 	private async readLiveRowByPk(pk: SqlValue[]): Promise<Row | null> {
 		const store = await this.ensureStore();
 		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+		// Default-store bucket — see the matching note in findUniqueConflict.
 		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getPendingOpsForStore(store)
+			? this.coordinator.getPendingOpsForStore()
 			: null;
 		if (pending) {
 			const hex = bytesToHex(key);

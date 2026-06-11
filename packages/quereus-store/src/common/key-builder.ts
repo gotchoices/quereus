@@ -207,17 +207,60 @@ export function buildFullScanBounds(): { gte: Uint8Array } {
  *
  * `directions[i] === true` flips bytes of prefix component i to match DESC
  * encoding in the stored index keys.
+ *
+ * `lt` is omitted when the encoded prefix is all-0xff bytes (e.g. a single
+ * leading DESC NULL, whose type byte inverts to 0xff) — no finite exclusive
+ * upper bound exists, so the scan runs to the end of the store.
  */
 export function buildIndexPrefixBounds(
 	prefixValues: SqlValue[],
 	options?: EncodeOptions,
 	directions?: ReadonlyArray<boolean>,
-): { gte: Uint8Array; lt: Uint8Array } {
+): { gte: Uint8Array; lt?: Uint8Array } {
 	if (prefixValues.length === 0) {
 		return { gte: new Uint8Array(0), lt: new Uint8Array([0xff]) };
 	}
 
 	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions);
+	return {
+		gte: prefixEncoded,
+		lt: incrementLastByte(prefixEncoded),
+	};
+}
+
+/**
+ * Build range bounds for scanning a data store by a PRIMARY KEY prefix.
+ *
+ * The leading PK values are encoded exactly as {@link buildDataKey} encodes
+ * them — same per-column DESC `directions` and per-column key `collations`
+ * (`StoreTable.pkKeyCollations`) — so the bounds address the same key bytes
+ * the data store is keyed by.
+ *
+ * Relies on the composite-key prefix-preservation property: `encodeCompositeKey`
+ * concatenates self-delimiting per-column encodings (text NUL-terminated with
+ * 0x01 escaping, fixed-width tagged numerics), so the encoding of a leading
+ * value subset is a byte-prefix of every full key sharing those values — and
+ * that holds through per-column DESC bit-inversion and per-column collation
+ * encoders, which both apply column-locally.
+ *
+ * An empty prefix yields full-scan bounds (see {@link buildFullScanBounds} for
+ * why the data store must NOT cap with `lt: [0xff]` — a DESC NULL leading
+ * column encodes to a 0xff byte). The non-empty case is unaffected by that
+ * caveat because its upper bound derives from the actual prefix bytes; when
+ * those are all 0xff (so no finite increment exists), `lt` is omitted and the
+ * scan runs to the end of the store.
+ */
+export function buildPkPrefixBounds(
+	prefixValues: SqlValue[],
+	options?: EncodeOptions,
+	directions?: ReadonlyArray<boolean>,
+	collations?: ReadonlyArray<string | undefined>,
+): { gte: Uint8Array; lt?: Uint8Array } {
+	if (prefixValues.length === 0) {
+		return buildFullScanBounds();
+	}
+
+	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions, collations);
 	return {
 		gte: prefixEncoded,
 		lt: incrementLastByte(prefixEncoded),
@@ -231,9 +274,10 @@ export function buildIndexPrefixBounds(
 export function buildCatalogScanBounds(schemaName?: string): { gte: Uint8Array; lt: Uint8Array } {
 	if (schemaName) {
 		const prefix = `${schemaName}.`.toLowerCase();
+		// UTF-8 output never contains 0xff bytes, so the increment cannot overflow.
 		return {
 			gte: encoder.encode(prefix),
-			lt: incrementLastByte(encoder.encode(prefix)),
+			lt: incrementLastByte(encoder.encode(prefix))!,
 		};
 	}
 	return {
@@ -244,8 +288,11 @@ export function buildCatalogScanBounds(schemaName?: string): { gte: Uint8Array; 
 
 /**
  * Increment the last byte of a key to create an exclusive upper bound.
+ * Returns undefined when every byte is 0xff — no finite upper bound exists
+ * (every successor byte string still starts with the all-0xff prefix), so
+ * callers must scan unbounded above instead.
  */
-function incrementLastByte(key: Uint8Array): Uint8Array {
+function incrementLastByte(key: Uint8Array): Uint8Array | undefined {
 	const result = new Uint8Array(key.length);
 	result.set(key);
 
@@ -258,10 +305,7 @@ function incrementLastByte(key: Uint8Array): Uint8Array {
 		result[i] = 0;
 	}
 
-	// All bytes were 0xff, append 0x00
-	const extended = new Uint8Array(result.length + 1);
-	extended.set(result);
-	return extended;
+	return undefined;
 }
 
 /**
@@ -314,7 +358,7 @@ export function buildIndexScanBounds(
 	_indexName: string,
 	prefixValues?: SqlValue[],
 	options?: EncodeOptions
-): { gte: Uint8Array; lt: Uint8Array } {
+): { gte: Uint8Array; lt?: Uint8Array } {
 	return buildIndexPrefixBounds(prefixValues || [], options);
 }
 
