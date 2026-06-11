@@ -2,7 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { TableSchema } from '../../schema/table.js';
 import { classifyProjectionExpr, traceInvertibleColumn, composeDomain } from './scalar-invertibility.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
-import type { Attribute, AttributeDefault, ConstantBinding, ConstantValue, RelationalComponentRef, ScalarPlanNode, UpdateSite } from '../nodes/plan-node.js';
+import type { Attribute, AttributeDefault, AuthoredInverseMeta, AuthoredPut, ConstantBinding, ConstantValue, RelationalComponentRef, ScalarPlanNode, UpdateSite } from '../nodes/plan-node.js';
 
 /**
  * Update-lineage model — per-output-column provenance back onto base columns,
@@ -144,6 +144,13 @@ function composeUpdateSite(
 			// not make it base-writable. A bare projection (identity, no outer inverse)
 			// passes it through unchanged; the resolver still reports it non-writable.
 			return child;
+		case 'authored':
+			// Unreachable from deriveProjectUpdateLineage (it degrades an authored CHILD
+			// to `computed` before composing — the site's `newRefIndex` is indexed by the
+			// CARRYING select's outputs, which an outer re-projection can reorder/drop).
+			// A join merge passes authored sites through addSide without composing, so
+			// this case only defends future combinators: pass through unchanged.
+			return child;
 	}
 }
 
@@ -157,7 +164,7 @@ function composeUpdateSite(
  * the caller) carries key-ness along the same projection map.
  */
 export function deriveProjectUpdateLineage(
-	projections: ReadonlyArray<{ readonly node: ScalarPlanNode }>,
+	projections: ReadonlyArray<{ readonly node: ScalarPlanNode; readonly authoredInverse?: AuthoredInverseMeta }>,
 	outputAttrs: readonly Attribute[],
 	childLineage: ReadonlyMap<number, UpdateSite> | undefined,
 	childDefaults: ReadonlyMap<number, AttributeDefault> | undefined,
@@ -167,13 +174,26 @@ export function deriveProjectUpdateLineage(
 	projections.forEach((proj, i) => {
 		const outId = outputAttrs[i]?.id;
 		if (outId === undefined) return;
+		// Authored wins: a `with inverse` clause overrides any registry-inferred site
+		// entirely (the clause is total per column — never composed with inferred
+		// steps). An unroutable target (computed / inverse / null-extended child site)
+		// degrades the column to `computed` — the author took over, so the inferred
+		// put never applies (docs/view-updateability.md § Authored inverses).
+		if (proj.authoredInverse) {
+			const authored = childLineage ? deriveAuthoredSite(proj.authoredInverse, childLineage) : undefined;
+			lineage.set(outId, authored ?? { kind: 'computed', expr: proj.node.expression });
+			return;
+		}
 		const trace = childLineage ? traceInvertibleColumn(proj.node) : null;
 		const childSite = trace ? childLineage!.get(trace.attrId) : undefined;
-		if (trace && childSite) {
+		if (trace && childSite && childSite.kind !== 'authored') {
 			lineage.set(outId, composeUpdateSite(childSite, trace.inverse, trace.domain));
 			const carried = childDefaults?.get(trace.attrId);
 			if (carried) defaults.set(outId, carried);
 		} else {
+			// Includes an authored CHILD site re-projected by an outer select: its
+			// `newRefIndex` is indexed by the carrying select's outputs, which this
+			// projection can reorder/drop — degrade to read-only rather than mis-map.
 			lineage.set(outId, { kind: 'computed', expr: proj.node.expression });
 		}
 	});
@@ -181,6 +201,31 @@ export function deriveProjectUpdateLineage(
 		updateLineage: lineage.size > 0 ? lineage : undefined,
 		attributeDefaults: defaults.size > 0 ? defaults : undefined,
 	};
+}
+
+/**
+ * Resolve one projection's authored-inverse metadata into an `authored`
+ * UpdateSite: each assignment's build-time-resolved target attribute is read
+ * through the child lineage to its owning base relation — the same ownership
+ * walk every other put rides. Every target must reach a plain identity base
+ * column (writable, not null-extended, no registry inverse — the target IS a
+ * raw base column of the FROM sources); otherwise the site is unroutable and
+ * the caller degrades the column to `computed`.
+ */
+function deriveAuthoredSite(
+	meta: AuthoredInverseMeta,
+	childLineage: ReadonlyMap<number, UpdateSite>,
+): UpdateSite | undefined {
+	const puts: AuthoredPut[] = [];
+	for (const a of meta.assignments) {
+		const resolved = resolveBaseSite(childLineage.get(a.targetAttrId));
+		if (!resolved.writable || resolved.nullExtended || resolved.table === undefined
+			|| resolved.baseColumn === undefined || resolved.inverse !== undefined || resolved.authored) {
+			return undefined;
+		}
+		puts.push({ table: resolved.table, baseColumn: resolved.baseColumn, expr: a.expr });
+	}
+	return { kind: 'authored', puts, newRefIndex: meta.newRefIndex };
 }
 
 /** Build a symbolic default expression from a forward `ConstantBinding` value. */
@@ -373,6 +418,18 @@ export interface ResolvedBaseSite {
 	readonly existenceComponent?: RelationalComponentRef;
 	/** The join-predicate guard the existence flag is the truth-value of (present iff {@link existenceComponent}). */
 	readonly existenceGuard?: AST.Expression;
+	/**
+	 * Set on an `authored` (`with inverse`) site — writable AND insertable, but the
+	 * write fans out through the authored put expressions rather than a single
+	 * verbatim base column (`table` / `baseColumn` stay `undefined` so no verbatim-
+	 * value consumer silently admits it). Each put names its owning base relation;
+	 * `newRefIndex` maps a put expression's `new.<name>` references to output column
+	 * indexes of the select that carried the clause.
+	 */
+	readonly authored?: {
+		readonly puts: ReadonlyArray<{ readonly table: number; readonly baseColumn: string; readonly expr: AST.Expression }>;
+		readonly newRefIndex: ReadonlyMap<string, number>;
+	};
 }
 
 export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite {
@@ -397,6 +454,11 @@ export function resolveBaseSite(site: UpdateSite | undefined): ResolvedBaseSite 
 			// match). Both surface the `existenceComponent` discriminator; base-column
 			// readers gate on `baseColumn`, so they are unaffected.
 			return { writable: true, nullExtended: false, existenceComponent: site.component, existenceGuard: site.guard };
+		case 'authored':
+			// Writable and insertable through the authored put expressions; no single
+			// verbatim base column (`baseColumn` stays undefined), so a consumer must
+			// handle `authored` explicitly to route the write.
+			return { writable: true, nullExtended: false, authored: { puts: site.puts, newRefIndex: site.newRefIndex } };
 	}
 }
 

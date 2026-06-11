@@ -8,8 +8,9 @@ import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { deriveViewColumns, resolveBaseSite, type ViewColumn } from '../analysis/update-lineage.js';
+import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
-import { transformExpr, cloneExpr, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
+import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
 
 /**
  * Single-source view-mediated DML rewriting (the single-source spine of the
@@ -103,14 +104,32 @@ interface FilterConstant {
  * contract (`outColumns.filter(c => c.writable && !c.inverse)`). The identity-only AST
  * `deriveViewColumns` model is still not widened — it remains the parity bridge only
  * (`test/property.spec.ts`); INSERT and UPDATE both read this richer site map instead.
+ *
+ * An **`authored`** site (`with inverse (col = expr, …)` on the result column —
+ * docs/view-updateability.md § Authored inverses) is writable AND insertable: the
+ * write fans out through the authored put expressions (one base assignment / VALUES
+ * cell per put), with each `new.<output-col>` reference resolved through
+ * {@link AuthoredWritableSite.newRefIndex} — the assigned/supplied view value for
+ * the written column, the column's forward read image otherwise.
  */
-interface WritableSite {
+interface BaseWritableSite {
+	readonly kind: 'base';
 	readonly baseColumn: string;
 	/** Present only for a non-identity `inverse` profile; absent for identity / passthrough. */
 	readonly inverse?: (written: AST.Expression) => AST.Expression;
 	/** Domain restriction the profile carries (none shipped today — see analyzeView note). */
 	readonly domain?: AST.Expression;
 }
+
+interface AuthoredWritableSite {
+	readonly kind: 'authored';
+	/** One put per clause assignment (single-source: every target lives on the one base table). */
+	readonly puts: ReadonlyArray<{ readonly baseColumn: string; readonly expr: AST.Expression }>;
+	/** Lowercased `new.<name>` → view-column index (positionally stable under a `v(a, b)` rename). */
+	readonly newRefIndex: ReadonlyMap<string, number>;
+}
+
+type WritableSite = BaseWritableSite | AuthoredWritableSite;
 
 interface ViewAnalysis {
 	readonly baseTable: TableSchema;
@@ -494,8 +513,22 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	const writableSites = new Map<string, WritableSite>();
 	viewColumns.forEach((vc, i) => {
 		const site = resolveBaseSite(lineage?.get(attrs[i]?.id));
-		if (site.writable && !site.nullExtended && site.baseColumn) {
+		if (!site.writable || site.nullExtended) return;
+		if (site.authored) {
+			// An authored (`with inverse`) site — writable and insertable through its
+			// put expressions. Single-source: every put target is a column of THE base
+			// table (the lineage routed each through the sole TableReferenceNode), so
+			// the table discriminator is dropped here.
 			writableSites.set(vc.name.toLowerCase(), {
+				kind: 'authored',
+				puts: site.authored.puts.map(p => ({ baseColumn: p.baseColumn, expr: p.expr })),
+				newRefIndex: site.authored.newRefIndex,
+			});
+			return;
+		}
+		if (site.baseColumn) {
+			writableSites.set(vc.name.toLowerCase(), {
+				kind: 'base',
 				baseColumn: site.baseColumn,
 				...(site.inverse ? { inverse: site.inverse } : {}),
 				// No shipped invertibility profile produces a `domain` (`x ± k` is
@@ -692,18 +725,32 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 	// contract (`outColumns.filter(c => c.writable && !c.inverse)`), so the single- and
 	// multi-source INSERT spines now admit the identical set. (A bare "has a site" gate
 	// would wrongly admit an inverse column; the `inverse === undefined` check is load-bearing.)
+	// An AUTHORED (`with inverse`) column is the exception that supplies exactly that
+	// hook: it IS insertable — its puts are evaluated per VALUES row below — so the
+	// insertability gate is lifted for authored sites only (registry-`inverse` columns
+	// stay non-insertable; docs/view-updateability.md § Authored inverses).
 	const insertableBaseColumn = (name: string): string | undefined => {
 		const site = analysis.writableSites.get(name.toLowerCase());
-		return site && site.inverse === undefined ? site.baseColumn : undefined;
+		return site?.kind === 'base' && site.inverse === undefined ? site.baseColumn : undefined;
+	};
+	const authoredSiteOf = (name: string): AuthoredWritableSite | undefined => {
+		const site = analysis.writableSites.get(name.toLowerCase());
+		return site?.kind === 'authored' ? site : undefined;
 	};
 
 	// Target view columns: the explicit list, or every non-generated INSERTABLE view
-	// column (display order preserved). An exposed `inverse` / `opaque` computed column is
-	// omitted from the implicit set so it falls to its base default / NOT NULL check
-	// (matching multi-source) rather than erroring.
+	// column (display order preserved) — verbatim-insertable or authored. An exposed
+	// `inverse` / `opaque` computed column is omitted from the implicit set so it falls
+	// to its base default / NOT NULL check (matching multi-source) rather than erroring.
 	const targetNames = stmt.columns && stmt.columns.length > 0
 		? stmt.columns
-		: analysis.viewColumns.filter(vc => !vc.generated && insertableBaseColumn(vc.name) !== undefined).map(vc => vc.name);
+		: analysis.viewColumns
+			.filter(vc => !vc.generated && (insertableBaseColumn(vc.name) !== undefined || authoredSiteOf(vc.name) !== undefined))
+			.map(vc => vc.name);
+
+	if (targetNames.some(name => authoredSiteOf(name) !== undefined)) {
+		return rewriteAuthoredViewInsert(ctx, stmt, view, analysis, targetNames, insertableBaseColumn, authoredSiteOf);
+	}
 
 	// Resolve each target to its writable base column: an insertable writable site
 	// (identity + passthrough) routes to its base column; otherwise fall back to
@@ -715,34 +762,10 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 	// Merge the view's constant-FD defaults: a base column pinned by the
 	// selection predicate is supplied automatically when omitted, and a
 	// user-supplied literal that contradicts the pin is rejected at plan time.
-	const appendColumns: string[] = [];
-	const appendExprs: AST.Expression[] = [];
-	const isSupplied = (baseCol: string): boolean =>
-		baseColumns.some(b => b.toLowerCase() === baseCol.toLowerCase())
-		|| appendColumns.some(b => b.toLowerCase() === baseCol.toLowerCase());
-	for (const fc of analysis.filterConstants) {
-		const idx = baseColumns.findIndex(b => b.toLowerCase() === fc.baseColumnName.toLowerCase());
-		if (idx >= 0) {
-			checkContradiction(stmt.source, idx, fc, view);
-		} else {
-			appendColumns.push(fc.baseColumnName);
-			appendExprs.push(fc.valueExpr);
-		}
-	}
-
-	// Omitted-insert defaults, applied ahead of the base column's declared default
-	// (docs/view-updateability.md § Projection step 5, § View insert defaults): the
-	// view's `insert defaults (col = expr, …)` clause fills only a column the
-	// insert and the constant-FD chain left omitted — an explicit user value or a
-	// stronger predicate pin always wins. The clause value is already an AST
-	// expression — no text re-lowering. Pushing the schema-held node is safe: the
-	// VALUES rewrite below clones per row.
-	for (const d of view.insertDefaults ?? []) {
-		const baseCol = resolveDefaultForColumn(analysis, d.column.toLowerCase(), view, `'insert defaults (${d.column} = …)'`);
-		if (isSupplied(baseCol)) continue;
-		appendColumns.push(baseCol);
-		appendExprs.push(d.expr);
-	}
+	const { appendColumns, appendExprs } = collectAppendedDefaults(
+		analysis, view, baseColumns,
+		(fc, idx) => checkContradiction(stmt.source, idx, fc, view),
+	);
 
 	const finalColumns = [...baseColumns, ...appendColumns];
 
@@ -766,6 +789,181 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 		table: tableIdentifier(analysis.baseTable),
 		columns: finalColumns,
 		source,
+		onConflict: stmt.onConflict,
+		upsertClauses: stmt.upsertClauses,
+		contextValues: stmt.contextValues,
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view),
+		schemaPath: stmt.schemaPath,
+		loc: stmt.loc,
+	};
+}
+
+/**
+ * Collect the appended omitted-insert defaults shared by both INSERT lowerings:
+ * constant-FD selection pins first, then the view's `insert defaults` clause
+ * entries — each only for a base column the insert left unsupplied
+ * (docs/view-updateability.md § Projection step 5, § View insert defaults).
+ * `suppliedBaseColumns` are the base columns the insert targets directly
+ * (verbatim targets AND authored put targets — an authored target takes the
+ * inverse-computed value ahead of any default for that column: it is a supplied
+ * value, not an omission). `onPinnedSupplied` fires for a constant-FD pin whose
+ * base column IS supplied, with the index into `suppliedBaseColumns` (the plain
+ * path uses it for the literal-contradiction check; the authored path checks
+ * only its verbatim subset).
+ */
+function collectAppendedDefaults(
+	analysis: ViewAnalysis,
+	view: MutableViewLike,
+	suppliedBaseColumns: readonly string[],
+	onPinnedSupplied: (fc: FilterConstant, suppliedIndex: number) => void,
+): { appendColumns: string[]; appendExprs: AST.Expression[] } {
+	const appendColumns: string[] = [];
+	const appendExprs: AST.Expression[] = [];
+	const isSupplied = (baseCol: string): boolean =>
+		suppliedBaseColumns.some(b => b.toLowerCase() === baseCol.toLowerCase())
+		|| appendColumns.some(b => b.toLowerCase() === baseCol.toLowerCase());
+	for (const fc of analysis.filterConstants) {
+		const idx = suppliedBaseColumns.findIndex(b => b.toLowerCase() === fc.baseColumnName.toLowerCase());
+		if (idx >= 0) {
+			onPinnedSupplied(fc, idx);
+		} else {
+			appendColumns.push(fc.baseColumnName);
+			appendExprs.push(fc.valueExpr);
+		}
+	}
+
+	// Omitted-insert defaults, applied ahead of the base column's declared default:
+	// the clause fills only a column the insert and the constant-FD chain left
+	// omitted — an explicit user value or a stronger predicate pin always wins. The
+	// clause value is already an AST expression — no text re-lowering. Pushing the
+	// schema-held node is safe: the VALUES rewrite clones per row.
+	for (const d of view.insertDefaults ?? []) {
+		const baseCol = resolveDefaultForColumn(analysis, d.column.toLowerCase(), view, `'insert defaults (${d.column} = …)'`);
+		if (isSupplied(baseCol)) continue;
+		appendColumns.push(baseCol);
+		appendExprs.push(d.expr);
+	}
+	return { appendColumns, appendExprs };
+}
+
+/**
+ * The INSERT lowering when ≥1 target view column carries an authored inverse
+ * (docs/view-updateability.md § Authored inverses). Per VALUES row, each authored
+ * column contributes one cell per put: the authored expression with `new.<x>`
+ * bound to the supplied (post-view-defaulting) row values — the row's cell when
+ * `x` is a target column, the appended default expression when `x`'s base column
+ * is default-filled, NULL otherwise. Verbatim targets keep their cells; the
+ * appended defaults ride last, exactly as on the plain path. A SELECT source is
+ * rejected (the per-row cell substitution needs VALUES — same v1 boundary as the
+ * appended-defaults rewrite).
+ */
+function rewriteAuthoredViewInsert(
+	ctx: PlanningContext,
+	stmt: AST.InsertStmt,
+	view: MutableViewLike,
+	analysis: ViewAnalysis,
+	targetNames: readonly string[],
+	insertableBaseColumn: (name: string) => string | undefined,
+	authoredSiteOf: (name: string) => AuthoredWritableSite | undefined,
+): AST.InsertStmt {
+	if (stmt.source.type !== 'values') {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-source',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': a column with an authored inverse (WITH INVERSE) requires a VALUES source in phase 1 (each put expression is evaluated per supplied row)`,
+		});
+	}
+	const values = stmt.source.values;
+
+	// Classify each target, preserving its source-cell index. The unknown-column /
+	// no-inverse guards mirror the plain path (`findViewColumn` + `requireBaseColumn`).
+	interface VerbatimTarget { readonly baseColumn: string; readonly srcIndex: number }
+	interface AuthoredTarget { readonly viewColumn: string; readonly site: AuthoredWritableSite }
+	const verbatim: VerbatimTarget[] = [];
+	const authored: AuthoredTarget[] = [];
+	// Base column (lowercased) → the view column that supplies it — two supplied view
+	// columns landing on one base column (an authored put colliding with a verbatim
+	// target or another put) is ill-defined, mirroring the UPDATE collision guard.
+	const baseOwner = new Map<string, string>();
+	const claimBase = (baseColumn: string, viewColumn: string): void => {
+		const key = baseColumn.toLowerCase();
+		const prior = baseOwner.get(key);
+		if (prior !== undefined) {
+			raiseMutationDiagnostic({
+				reason: 'conflicting-assignment',
+				column: baseColumn,
+				table: view.name,
+				message: `cannot insert through view '${view.name}': columns '${prior}' and '${viewColumn}' both supply base column '${baseColumn}'`,
+			});
+		}
+		baseOwner.set(key, viewColumn);
+	};
+	targetNames.forEach((name, srcIndex) => {
+		const site = authoredSiteOf(name);
+		if (site) {
+			for (const put of site.puts) claimBase(put.baseColumn, name);
+			authored.push({ viewColumn: name, site });
+			return;
+		}
+		const baseColumn = insertableBaseColumn(name) ?? requireBaseColumn(findViewColumn(analysis, name, view));
+		claimBase(baseColumn, name);
+		verbatim.push({ baseColumn, srcIndex });
+	});
+
+	// Appended defaults over the FULL supplied base set (verbatim + authored puts):
+	// an authored put target is a supplied value, so it shadows any `insert defaults`
+	// entry / constant-FD pin for that base column. The literal-contradiction check
+	// applies only to verbatim targets (an authored cell is computed, not a literal).
+	const suppliedBase = [...verbatim.map(v => v.baseColumn), ...authored.flatMap(a => a.site.puts.map(p => p.baseColumn))];
+	const { appendColumns, appendExprs } = collectAppendedDefaults(analysis, view, suppliedBase, (fc, suppliedIndex) => {
+		const v = verbatim.find(t => t.baseColumn.toLowerCase() === suppliedBase[suppliedIndex].toLowerCase());
+		if (v) checkContradiction(stmt.source, v.srcIndex, fc, view);
+	});
+
+	// `new.<x>` binding for one row: the supplied cell when `x` is a target view
+	// column; the appended default expression when `x` resolves to a default-filled
+	// base column (the post-view-defaulting row image); NULL otherwise.
+	const targetIndexByName = new Map<string, number>();
+	targetNames.forEach((n, i) => {
+		if (!targetIndexByName.has(n.toLowerCase())) targetIndexByName.set(n.toLowerCase(), i);
+	});
+	const appendExprFor = (name: string): AST.Expression | undefined => {
+		const baseCol = insertableBaseColumn(name);
+		if (baseCol === undefined) return undefined;
+		const ai = appendColumns.findIndex(b => b.toLowerCase() === baseCol.toLowerCase());
+		return ai >= 0 ? appendExprs[ai] : undefined;
+	};
+
+	const finalColumns = [
+		...verbatim.map(v => v.baseColumn),
+		...authored.flatMap(a => a.site.puts.map(p => p.baseColumn)),
+		...appendColumns,
+	];
+	const newValues = values.map(row => {
+		if (row.length !== targetNames.length) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-source',
+				table: view.name,
+				message: `cannot insert through view '${view.name}': a VALUES row supplies ${row.length} value(s) but ${targetNames.length} view column(s) are targeted`,
+			});
+		}
+		const resolveNew = (name: string): AST.Expression => {
+			const ti = targetIndexByName.get(name.toLowerCase());
+			if (ti !== undefined) return row[ti];
+			return appendExprFor(name) ?? { type: 'literal', value: null };
+		};
+		return [
+			...verbatim.map(v => row[v.srcIndex]),
+			...authored.flatMap(a => a.site.puts.map(p => substituteNewRefs(p.expr, resolveNew))),
+			...appendExprs.map(cloneExpr),
+		];
+	});
+
+	return {
+		type: 'insert',
+		table: tableIdentifier(analysis.baseTable),
+		columns: finalColumns,
+		source: { type: 'values', values: newValues },
 		onConflict: stmt.onConflict,
 		upsertClauses: stmt.upsertClauses,
 		contextValues: stmt.contextValues,
@@ -827,7 +1025,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		}
 		seenBaseColumns.set(key, viewColumn);
 	};
-	const assignments = stmt.assignments.map(asg => {
+	const assignments = stmt.assignments.flatMap(asg => {
 		// Enforce view-column scope on the SET target (an unknown / base-only name is
 		// rejected here; a computed view column is found and surfaces `no-inverse` below).
 		const vc = findViewColumn(analysis, asg.column, view);
@@ -835,6 +1033,26 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		// base-only name on the RHS would otherwise read a column the view projects
 		// away (the same encapsulation leak as the `where` / `set`-target guard).
 		guardTopLevelScope(asg.value, analysis, view);
+		const site = analysis.writableSites.get(asg.column.toLowerCase());
+		// An authored (`with inverse`) column lowers to ONE base assignment per put:
+		// inside each authored expression, `new.<assigned col>` becomes the user's
+		// value and `new.<other col>` becomes that view column's name — still in VIEW
+		// terms — then the standard view→base lowering maps everything to base terms
+		// (the forward read image for the non-assigned columns). The result is a plain
+		// base-table `set` per target riding the existing spine
+		// (docs/view-updateability.md § Authored inverses).
+		if (site?.kind === 'authored') {
+			const assignedIdx = analysis.viewColumns.indexOf(vc);
+			return site.puts.map(put => {
+				const viewTermExpr = substituteNewRefs(put.expr, name => {
+					const idx = requireValidatedNewRefIndex(site.newRefIndex, name, asg.column);
+					return idx === assignedIdx ? asg.value : columnExpr(analysis.viewColumns[idx].name);
+				});
+				const lowered = transformExpr(viewTermExpr, substitute, descend);
+				recordBaseColumn(put.baseColumn, asg.column);
+				return { column: put.baseColumn, value: lowered };
+			});
+		}
 		const loweredValue = transformExpr(asg.value, substitute, descend);
 		// Route the SET target through the full writable-base set (identity / passthrough
 		// / inverse), mirroring the multi-source spine. An `inverse`-profile column (e.g.
@@ -844,14 +1062,13 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		// a value already in base terms, so it wraps the lowered value LAST (after
 		// base-term substitution). `findViewColumn` above stays the unknown-column guard;
 		// only an opaque `computed` column reaches `requireBaseColumn` (→ `no-inverse`).
-		const site = analysis.writableSites.get(asg.column.toLowerCase());
 		if (site) {
 			recordBaseColumn(site.baseColumn, asg.column);
-			return { column: site.baseColumn, value: site.inverse ? site.inverse(loweredValue) : loweredValue };
+			return [{ column: site.baseColumn, value: site.inverse ? site.inverse(loweredValue) : loweredValue }];
 		}
 		const baseColumn = requireBaseColumn(vc);
 		recordBaseColumn(baseColumn, asg.column);
-		return { column: baseColumn, value: loweredValue };
+		return [{ column: baseColumn, value: loweredValue }];
 	});
 
 	const userWhere = stmt.where ? transformExpr(stmt.where, substitute, descend) : undefined;

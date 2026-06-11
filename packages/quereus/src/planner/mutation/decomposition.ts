@@ -206,6 +206,27 @@ type ColumnRoute =
 	| { readonly kind: 'unbacked' };
 
 /**
+ * The decomposition put fan-out for an authored (`with inverse`) column is
+ * deferred (docs/view-updateability.md § Authored inverses — the documented
+ * decomposition deferral): reject a write that targets one, naming the member(s)
+ * its puts route to, rather than letting it fall through {@link classifyColumn}'s
+ * EAV / computed-mapping fallbacks into a silent mis-route. Read consumers (the
+ * WHERE anchor-resolvability gate) deliberately do NOT run this — an authored
+ * column reads through its forward expression like any computed column.
+ */
+function rejectAuthoredDecompositionWrite(view: MutableViewLike, shape: DecompShape, name: string, displayName: string): void {
+	const col = shape.columns.find(c => c.name === name);
+	if (!col?.authored) return;
+	const members = [...new Set(col.authored.puts.map(p => shape.memberByTableId.get(p.table)?.relationId ?? `relation #${p.table}`))];
+	raiseMutationDiagnostic({
+		reason: 'unsupported-decomposition-member',
+		column: displayName,
+		table: view.name,
+		message: `cannot write through logical table '${view.name}': column '${displayName}' carries an authored inverse (WITH INVERSE) targeting member${members.length > 1 ? 's' : ''} ${members.map(m => `'${m}'`).join(', ')}; the decomposition put fan-out for authored inverses is deferred`,
+	});
+}
+
+/**
  * Classify one logical column against the decomposition. The **primary routing**
  * (which member backs a writable/insertable column, and its base column) is read
  * from the threaded `updateLineage` (`shape.columns` + `shape.memberByTableId`);
@@ -428,6 +449,7 @@ function routeInsertColumn(
 	idx: number,
 ): RoutedInsertColumn {
 	const name = rawName.toLowerCase();
+	rejectAuthoredDecompositionWrite(view, shape, name, rawName);
 	const route = classifyColumn(view, shape, name);
 	switch (route.kind) {
 		case 'member': {
@@ -946,6 +968,7 @@ function routeAssignment(view: MutableViewLike, shape: DecompShape, declaredName
 			message: `cannot update logical table '${view.name}': column '${asg.column}' is part of the decomposition shared key; an identity change is not a value write`,
 		});
 	}
+	rejectAuthoredDecompositionWrite(view, shape, logical, asg.column);
 	const route = classifyColumn(view, shape, logical);
 	switch (route.kind) {
 		case 'member': {

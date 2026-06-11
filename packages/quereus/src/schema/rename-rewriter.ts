@@ -93,7 +93,13 @@ function visitTableRename(
 			const stmt = node as AST.SelectStmt;
 			stmt.withClause?.ctes.forEach(cte => visitTableRename(cte.query, oldName, newName, defaultSchemaName, ctx));
 			(stmt.columns ?? []).forEach(c => {
-				if (c.type === 'column') visitTableRename(c.expr, oldName, newName, defaultSchemaName, ctx);
+				if (c.type === 'column') {
+					visitTableRename(c.expr, oldName, newName, defaultSchemaName, ctx);
+					// A `with inverse` assignment expr can embed a subquery naming any
+					// table; the assignment's target names a base COLUMN, untouched by a
+					// table rename (mirrors renameTableInInsertDefaults).
+					(c.inverse ?? []).forEach(a => visitTableRename(a.expr, oldName, newName, defaultSchemaName, ctx));
+				}
 			});
 			(stmt.from ?? []).forEach(f => visitTableRename(f, oldName, newName, defaultSchemaName, ctx));
 			visitTableRename(stmt.where, oldName, newName, defaultSchemaName, ctx);
@@ -515,9 +521,48 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 				const frame = buildScopeFrame(stmt.from, state);
 				state.scopeStack.push(frame);
 				try {
+					// Capture pre-rewrite output names of UNALIASED bare projections: a
+					// rename that rewrites one shifts the select's OUTPUT name with it, so
+					// any `new.<old>` refs in sibling `with inverse` exprs must follow
+					// (a `new.` ref is by view-output name; aliased / computed projections
+					// keep their output name, so the body rewrite alone covers them).
+					const preOutputNames = (stmt.columns ?? []).map(c =>
+						c.type === 'column' && !c.alias && c.expr.type === 'column' ? c.expr.name : undefined);
 					(stmt.columns ?? []).forEach(c => {
 						if (c.type === 'column') visitColumnRename(c.expr, state);
 					});
+					// `with inverse` clauses: the assignment target is a bare base-column
+					// name resolving against this select's FROM — exactly an unqualified
+					// body ref, so it rides the same scope-aware walk via a synthetic
+					// probe (mirrors renameColumnInInsertDefaults' target rewrite); the
+					// assignment expr rewrites like any body expression.
+					(stmt.columns ?? []).forEach(c => {
+						if (c.type !== 'column' || !c.inverse?.length) return;
+						c.inverse.forEach(a => {
+							const probe: AST.ColumnExpr = { type: 'column', name: a.column };
+							visitColumnRename(probe, state);
+							if (probe.name !== a.column) {
+								(a as { column: string }).column = probe.name;
+								state.changed = true;
+							}
+							visitColumnRename(a.expr, state);
+						});
+					});
+					const outputRenames = new Map<string, string>();
+					(stmt.columns ?? []).forEach((c, i) => {
+						const before = preOutputNames[i];
+						if (before !== undefined && c.type === 'column' && c.expr.type === 'column' && c.expr.name !== before) {
+							outputRenames.set(before.toLowerCase(), c.expr.name);
+						}
+					});
+					if (outputRenames.size > 0) {
+						(stmt.columns ?? []).forEach(c => {
+							if (c.type !== 'column' || !c.inverse?.length) return;
+							c.inverse.forEach(a => {
+								if (renameNewQualifiedRefs(a.expr, outputRenames)) state.changed = true;
+							});
+						});
+					}
 					(stmt.from ?? []).forEach(f => visitColumnRename(f, state));
 					visitColumnRename(stmt.where, state);
 					(stmt.groupBy ?? []).forEach(g => visitColumnRename(g, state));
@@ -921,6 +966,41 @@ export function collectFromTableNames(query: AST.QueryExpr, defaultSchemaName: s
 	};
 	visitQuery(query);
 	return names;
+}
+
+/**
+ * Rename `new.<old>` → `new.<new>` references inside a `with inverse` assignment
+ * expression, for output columns whose name shifted under a column rename (an
+ * unaliased bare projection of the renamed column). Uniform, depth-blind in-place
+ * walk over the expression's object graph: the `new.` qualifier alone decides (it
+ * is the reserved written-row namespace no FROM source legitimately shadows), so
+ * no scope tracking applies — narrower and simpler than the scope-aware walkers
+ * above. Returns whether any reference was rewritten.
+ */
+function renameNewQualifiedRefs(expr: AST.Expression, renames: ReadonlyMap<string, string>): boolean {
+	let changed = false;
+	const visit = (v: unknown): void => {
+		if (Array.isArray(v)) {
+			v.forEach(visit);
+			return;
+		}
+		if (v === null || typeof v !== 'object') return;
+		const n = v as Record<string, unknown>;
+		if (n.type === 'column' && typeof n.table === 'string' && n.table.toLowerCase() === 'new'
+			&& n.schema === undefined && typeof n.name === 'string') {
+			const to = renames.get(n.name.toLowerCase());
+			if (to !== undefined && to !== n.name) {
+				n.name = to;
+				changed = true;
+			}
+		}
+		for (const key of Object.keys(n)) {
+			if (key === 'loc') continue;
+			visit(n[key]);
+		}
+	};
+	visit(expr);
+	return changed;
 }
 
 /**

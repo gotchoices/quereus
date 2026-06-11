@@ -60,6 +60,18 @@ export interface BackwardColumn {
 	readonly existenceComponent?: RelationalComponentRef;
 	/** The join-predicate guard the existence flag is the truth-value of (present iff {@link existenceComponent}). */
 	readonly existenceGuard?: AST.Expression;
+	/**
+	 * Set for an authored (`with inverse`) column — writable and insertable through the
+	 * put expressions rather than a single verbatim base column (`baseTableId` /
+	 * `baseColumn` stay undefined so no verbatim-value consumer silently admits it).
+	 * Each put names its owning base relation by `TableReferenceNode` id; `newRefIndex`
+	 * maps `new.<name>` references to output column indexes
+	 * (docs/view-updateability.md § Authored inverses).
+	 */
+	readonly authored?: {
+		readonly puts: ReadonlyArray<{ readonly table: number; readonly baseColumn: string; readonly expr: AST.Expression }>;
+		readonly newRefIndex: ReadonlyMap<string, number>;
+	};
 	/** The projection's source expression (already in base terms) — the substitution target for a user predicate / assigned value over this column. */
 	readonly baseTermExpr: AST.Expression;
 }
@@ -208,6 +220,7 @@ export function analyzeBodyLineage(ctx: PlanningContext, view: MutableViewLike):
 			...(resolved.domain ? { domain: resolved.domain } : {}),
 			...(resolved.existenceComponent ? { existenceComponent: resolved.existenceComponent } : {}),
 			...(resolved.existenceGuard ? { existenceGuard: resolved.existenceGuard } : {}),
+			...(resolved.authored ? { authored: resolved.authored } : {}),
 			baseTermExpr,
 		});
 	});

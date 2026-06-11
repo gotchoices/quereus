@@ -140,6 +140,20 @@ export function cloneExpr(expr: AST.Expression): AST.Expression {
 	return transformExpr(expr, () => undefined, cloneQueryExpr);
 }
 
+/**
+ * Substitute every `new.<name>`-qualified column reference in an authored
+ * inverse expression (docs/view-updateability.md § Authored inverses) — at any
+ * depth, including inside subquery operands (a `new.` ref correlates to the
+ * written view row wherever it appears; `new` is a reserved qualifier no FROM
+ * source legitimately shadows). The replacement is cloned by `transformExpr`,
+ * so `resolve` may return a shared expression.
+ */
+export function substituteNewRefs(expr: AST.Expression, resolve: (name: string) => AST.Expression): AST.Expression {
+	const sub = (col: AST.ColumnExpr): AST.Expression | undefined =>
+		col.table?.toLowerCase() === 'new' && !col.schema ? resolve(col.name) : undefined;
+	return transformExpr(expr, sub, q => mapQueryExprUniform(q, sub));
+}
+
 /** Deep structural clone of a relation-producing subquery (no substitution). */
 export function cloneQueryExpr(query: AST.QueryExpr): AST.QueryExpr {
 	return mapQueryExprUniform(query, () => undefined);
@@ -186,7 +200,12 @@ function rebuildSelect(
 	return {
 		...sel,
 		withClause: cloneWithClause(sel.withClause),
-		columns: sel.columns.map(rc => rc.type === 'all' ? { ...rc } : { ...rc, expr: onExpr(rc.expr) }),
+		// A `with inverse` clause is write-through metadata, not a live scalar of the
+		// read query — pure-clone it (severs sharing for in-place rewriters) without
+		// threading the substitution (its refs are `new.`-qualified written-row reads).
+		columns: sel.columns.map(rc => rc.type === 'all'
+			? { ...rc }
+			: { ...rc, expr: onExpr(rc.expr), inverse: cloneInverseClause(rc.inverse) }),
 		from: sel.from?.map(fc => rebuildFrom(fc, onExpr, onNested)),
 		where: sel.where ? onExpr(sel.where) : undefined,
 		groupBy: sel.groupBy ? sel.groupBy.map(onExpr) : undefined,
@@ -253,7 +272,16 @@ function cloneWithClause(withClause: AST.WithClause | undefined): AST.WithClause
 
 /** Structural clone of a RETURNING / projection column list. */
 function cloneResultColumns(columns: AST.ResultColumn[] | undefined): AST.ResultColumn[] | undefined {
-	return columns?.map(rc => rc.type === 'all' ? { ...rc } : { ...rc, expr: cloneExpr(rc.expr) });
+	return columns?.map(rc => rc.type === 'all'
+		? { ...rc }
+		: { ...rc, expr: cloneExpr(rc.expr), inverse: cloneInverseClause(rc.inverse) });
+}
+
+/** Structural clone of a result column's `with inverse` assignment list. */
+function cloneInverseClause(
+	inverse: ReadonlyArray<AST.ResultColumnInverse> | undefined,
+): AST.ResultColumnInverse[] | undefined {
+	return inverse?.map(a => ({ ...a, expr: cloneExpr(a.expr) }));
 }
 
 /** Structural clone of mutation-context assignments. */

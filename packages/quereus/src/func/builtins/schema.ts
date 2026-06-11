@@ -807,7 +807,27 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	const exposed = new Map<number, Set<string>>();
 	let anyBase = false;
 	for (const attr of root.getAttributes()) {
-		const bs = baseSiteOf(rootLineage?.get(attr.id));
+		const site = rootLineage?.get(attr.id);
+		// An authored (`with inverse`) column exposes each put's target base column —
+		// it is writable through the put expressions, so the targets count toward base
+		// reachability exactly like identity columns. INSERT coverage (`exposed`) is
+		// counted only for a single-source body: the single-source spine evaluates the
+		// puts per supplied row, but the multi-source insert envelope defers authored
+		// puts, so counting them there would over-report `is_insertable_into`.
+		if (site?.kind === 'authored') {
+			for (const put of site.puts) {
+				anyBase = true;
+				preservedTargets.add(put.table);
+				targetIds.add(put.table);
+				if (!isJoinBody(view.selectAst)) {
+					const set = exposed.get(put.table) ?? new Set<string>();
+					set.add(put.baseColumn.toLowerCase());
+					exposed.set(put.table, set);
+				}
+			}
+			continue;
+		}
+		const bs = baseSiteOf(site);
 		if (!bs) continue;
 		if (!bs.nullExtended) { anyBase = true; preservedTargets.add(bs.table); }
 		targetIds.add(bs.table);
@@ -1155,13 +1175,22 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 			// (`set-op-membership-read`) — it reports `is_updatable = 'NO'` with null base
 			// (a set-op view has no preserved base anchor anyway); the write half flips it on.
 			const isExistence = site?.kind === 'existence' && site.component.kind === 'join-side' && hasPreservedBase;
+			// An authored (`with inverse`) column is writable (and insertable) through its
+			// put expressions — report it updatable, with the base trace populated only
+			// for a single-put inverse (a multi-target inverse maps to no single base
+			// column, the same null-base shape an existence flag reports). Agrees with
+			// the dynamic spines, which route authored sites on UPDATE and INSERT alike.
+			const authored = site?.kind === 'authored' ? site : undefined;
+			const authoredPutRef = authored && authored.puts.length === 1
+				? tableRefsById.get(authored.puts[0].table)
+				: undefined;
 			// Updatable iff a base site resolves to a producing TableReferenceNode. A
 			// PRESERVED base column is always updatable; a non-preserved (`null-extended`)
 			// column is updatable when the body has a preserved anchor (the matched-update /
 			// null-extended-insert materialization pins identity off it), and read-only only
 			// when no anchor exists (a FULL outer — write-through stays deferred there). A
 			// base id without a resolved ref should not happen; fail conservative if it does.
-			const updatable = isExistence || !!(bs && ref && (!bs.nullExtended || hasPreservedBase));
+			const updatable = isExistence || authored !== undefined || !!(bs && ref && (!bs.nullExtended || hasPreservedBase));
 			// Base trace is reported only for an actual base column write (an existence flag
 			// is updatable but has no base mapping).
 			const hasBaseTrace = updatable && bs !== undefined && ref !== undefined;
@@ -1171,8 +1200,8 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 				cid: i,
 				columnName: attr.name,
 				isUpdatable: updatable,
-				baseTable: hasBaseTrace ? ref!.tableSchema.name : null,
-				baseColumn: hasBaseTrace ? bs!.baseColumn : null,
+				baseTable: hasBaseTrace ? ref!.tableSchema.name : authoredPutRef ? authoredPutRef.tableSchema.name : null,
+				baseColumn: hasBaseTrace ? bs!.baseColumn : authoredPutRef ? authored!.puts[0].baseColumn : null,
 			});
 		}
 		return rows;

@@ -11,7 +11,7 @@ import { ColumnReferenceNode } from './reference.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { ProjectionCapable } from '../framework/characteristics.js';
-import type { PhysicalProperties, FunctionalDependency } from './plan-node.js';
+import type { PhysicalProperties, FunctionalDependency, AuthoredInverseMeta } from './plan-node.js';
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
 import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
 
@@ -20,6 +20,14 @@ export interface Projection {
 	alias?: string;
 	/** Optional predefined attribute ID to preserve during optimization */
 	attributeId?: number;
+	/**
+	 * Build-time-validated `with inverse (col = expr, …)` metadata (authored
+	 * write-back puts). `deriveProjectUpdateLineage` upgrades a projection carrying
+	 * this to a writable `authored` UpdateSite — overriding any registry-inferred
+	 * site (authored wins; docs/view-updateability.md § Authored inverses). Inert
+	 * on the read path.
+	 */
+	authoredInverse?: AuthoredInverseMeta;
 }
 
 /**

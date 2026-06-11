@@ -1221,8 +1221,12 @@ function compileOverrideBody(
 		return overrideSourceByRel.get(key);
 	};
 
-	// Coverage map: lowercased output-column name -> the expression producing it.
-	const coverage = new Map<string, AST.Expression>();
+	// Coverage map: lowercased output-column name -> the expression producing it,
+	// plus the override column's `with inverse` clause when authored — carried per
+	// covered column into the composed body so the write path consumes it there
+	// (docs/view-updateability.md § Authored inverses; a gap-filled column never
+	// has one).
+	const coverage = new Map<string, { expr: AST.Expression; inverse?: ReadonlyArray<AST.ResultColumnInverse> }>();
 	let hasStar = false;
 	let starTable: string | undefined;
 	for (const col of select.columns) {
@@ -1241,7 +1245,7 @@ function compileOverrideBody(
 				StatusCode.ERROR,
 			);
 		}
-		coverage.set(outName.toLowerCase(), col.expr);
+		coverage.set(outName.toLowerCase(), { expr: col.expr, inverse: col.inverse });
 	}
 
 	// `*` covers every FROM-source column not already explicitly covered.
@@ -1250,7 +1254,7 @@ function compileOverrideBody(
 			if (starTable && src.refName.toLowerCase() !== starTable) continue;
 			for (const c of src.table.columns) {
 				const key = c.name.toLowerCase();
-				if (!coverage.has(key)) coverage.set(key, columnRef(c.name, qualify ? src.refName : undefined));
+				if (!coverage.has(key)) coverage.set(key, { expr: columnRef(c.name, qualify ? src.refName : undefined) });
 			}
 		}
 	}
@@ -1260,9 +1264,9 @@ function compileOverrideBody(
 	const effectiveColumns: string[] = [];
 	for (const col of logicalTable.columns) {
 		const key = col.name.toLowerCase();
-		const coveredExpr = coverage.get(key);
-		if (coveredExpr !== undefined) {
-			composed.push({ type: 'column', expr: coveredExpr, alias: col.name });
+		const covered = coverage.get(key);
+		if (covered !== undefined) {
+			composed.push({ type: 'column', expr: covered.expr, alias: col.name, inverse: covered.inverse });
 			provenance.push({ logicalColumn: col.name, source: 'override' });
 		} else {
 			// Advertisement-driven gap-fill (richer than name-match): resolve the

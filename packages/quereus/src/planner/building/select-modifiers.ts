@@ -210,6 +210,13 @@ function isIdentityProjection(projections: Projection[], source: RelationalPlanN
 		return false;
 	}
 
+	// A `with inverse` clause rides the ProjectNode's projections into the update
+	// lineage — skipping the node would silently drop the authored puts (e.g.
+	// `select code with inverse (code = upper(new.code)) from t`).
+	if (projections.some(p => p.authoredInverse)) {
+		return false;
+	}
+
 	// If the source exposes duplicate column names (e.g., a JOIN with same-named
 	// columns on each side), a ProjectNode is required to disambiguate via
 	// `name:N` suffixes — otherwise downstream row→object conversion would

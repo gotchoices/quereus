@@ -12,6 +12,7 @@ import { type RelationalPlanNode } from '../nodes/plan-node.js';
 import type { Scope } from '../scopes/scope.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
+import { validateAuthoredInverses } from '../analysis/authored-inverse.js';
 
 /**
  * Checks if an expression contains aggregate functions
@@ -127,11 +128,18 @@ function collectInnerAggregates(
 }
 
 /**
- * Analyzes SELECT columns and categorizes them into different types
+ * Analyzes SELECT columns and categorizes them into different types.
+ *
+ * `source` is the select's planned FROM relation (post-WHERE) — the namespace
+ * any `with inverse (col = expr, …)` clause is validated against
+ * ({@link validateAuthoredInverses}; position-independent, so a typo'd clause
+ * fails loud even on a select that is never a write target). The validated
+ * metadata is attached to the column's `Projection` for the lineage walk.
  */
 export function analyzeSelectColumns(
 	columns: AST.ResultColumn[],
-	selectContext: PlanningContext
+	selectContext: PlanningContext,
+	source: RelationalPlanNode
 ): {
 	projections: Projection[];
 	aggregates: { expression: ScalarPlanNode; alias: string }[];
@@ -147,19 +155,25 @@ export function analyzeSelectColumns(
 	let hasWindowFunctions = false;
 	let hasWrappedAggregates = false;
 
+	// Eager, position-independent validation of any `with inverse` clauses; the
+	// returned per-column metadata rides the Projection into the lineage walk.
+	const authoredInverses = validateAuthoredInverses(columns, source);
+
 	for (const column of columns) {
 		if (column.type === 'all') {
 			// Handle SELECT * - will be processed separately
 			continue;
 		} else if (column.type === 'column') {
 			const scalarNode = buildExpression(selectContext, column.expr, true);
+			const authoredInverse = authoredInverses.get(column);
 
 			if (isWindowExpression(scalarNode)) {
 				hasWindowFunctions = true;
 				collectWindowFunctions(scalarNode, column.alias, windowFunctions);
 				projections.push({
 					node: scalarNode,
-					alias: column.alias
+					alias: column.alias,
+					...(authoredInverse ? { authoredInverse } : {})
 				});
 			} else if (isAggregateExpression(scalarNode)) {
 				hasAggregates = true;
@@ -177,7 +191,8 @@ export function analyzeSelectColumns(
 			} else {
 				projections.push({
 					node: scalarNode,
-					alias: column.alias
+					alias: column.alias,
+					...(authoredInverse ? { authoredInverse } : {})
 				});
 			}
 		}

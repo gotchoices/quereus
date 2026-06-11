@@ -17,7 +17,8 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
-import { transformExpr, cloneExpr, mapQueryExprUniform } from './scope-transform.js';
+import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs } from './scope-transform.js';
+import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 
 /**
  * Multi-source view-mediated DML decomposition — the **key-preserving join**
@@ -201,6 +202,18 @@ interface OutColumn {
 	readonly existenceComponent?: RelationalComponentRef;
 	/** The non-preserved side index the existence flag drives (present iff {@link existenceComponent}). */
 	readonly existenceSide?: number;
+	/**
+	 * Set for an authored (`with inverse`) column — writable through the put
+	 * expressions, one base assignment per put, each routed to its owning join side
+	 * ({@link sideIndex} / {@link baseColumn} stay undefined: there is no single
+	 * verbatim base column). `newRefIndex` maps a put's `new.<name>` references to
+	 * output column indexes of this analysis's `outColumns`
+	 * (docs/view-updateability.md § Authored inverses).
+	 */
+	readonly authored?: {
+		readonly puts: ReadonlyArray<{ readonly sideIndex: number; readonly baseColumn: string; readonly expr: AST.Expression }>;
+		readonly newRefIndex: ReadonlyMap<string, number>;
+	};
 }
 
 export interface JoinViewAnalysis {
@@ -452,6 +465,19 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 			}
 			const existenceFlag = existenceInsertFlag(view, stmt, columnIndex, rawName);
 			return { name, type: EXISTENCE_FLAG_TYPE, isKey: false, existenceSide: out.existenceSide, existenceFlag };
+		}
+		// Evaluating an authored (`with inverse`) column's puts through the multi-source
+		// shared-surrogate envelope is deferred (the envelope projects supplied columns
+		// verbatim per side; per-row put evaluation over it is a follow-up — recorded in
+		// docs/view-updateability.md § Authored inverses). Name the deferral precisely
+		// rather than letting it fall into the generic non-insertable reject below.
+		if (out?.authored) {
+			raiseMutationDiagnostic({
+				reason: 'no-inverse',
+				column: rawName,
+				table: view.name,
+				message: `cannot insert through view '${view.name}': column '${rawName}' carries an authored inverse (WITH INVERSE); evaluating authored puts through a join view's insert envelope is deferred — insert into the base tables directly`,
+			});
 		}
 		// A base-routed column (identity/rename or outer-join null-extended) carries
 		// `sideIndex` + `baseColumn`; a computed column does not, and an `inverse` column
@@ -1023,6 +1049,28 @@ export function analyzeJoinView(ctx: PlanningContext, view: MutableViewLike): Jo
 				...(existenceSide !== undefined ? { existenceSide } : {}),
 			};
 		}
+		// An authored (`with inverse`) column: resolve each put's owning base relation
+		// to its join side — the same ownership routing every other put rides. A put
+		// whose relation is not a join side (defensive; the lineage routed it through a
+		// body TableReferenceNode) degrades the column to read-only.
+		if (bc.authored) {
+			const puts: { sideIndex: number; baseColumn: string; expr: AST.Expression }[] = [];
+			let routable = true;
+			for (const p of bc.authored.puts) {
+				const sideIndex = sideByTableId.get(p.table);
+				if (sideIndex === undefined) { routable = false; break; }
+				puts.push({ sideIndex, baseColumn: p.baseColumn, expr: p.expr });
+			}
+			if (routable) {
+				return {
+					name: bc.name,
+					displayName: bc.displayName,
+					writable: true,
+					nullExtended: false,
+					authored: { puts, newRefIndex: bc.authored.newRefIndex },
+				};
+			}
+		}
 		return { name: bc.name, displayName: bc.displayName, writable: false, nullExtended: false };
 	});
 
@@ -1462,6 +1510,86 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			list.push({ baseColumn: out.baseColumn, valAlias });
 			continue;
 		}
+		// Lower a view-term value expression onto one owning side: gate cross-source
+		// reads + 1:many cardinality, substitute view columns to base terms, then strip
+		// the owning side's qualifier (a partner-side read becomes a correlated read of
+		// its captured pre-mutation value). Shared by the plain per-column route and the
+		// authored put fan-out below.
+		const lowerValueOntoSide = (valueViewTerms: AST.Expression, owningSideIndex: number, assignedCol: string): AST.Expression => {
+			// Gate cross-source reads: a value that reads a partner-side view column is
+			// admitted only when that column has `base` lineage (its value is recoverable
+			// from a captured base column). A computed (non-base) partner column stays
+			// rejected (`no-inverse`); a same-side read keeps the qualifier-strip path. Run
+			// only when a capture carrier is threaded — the legacy path rejects wholesale.
+			if (registerCrossSource) gateCrossSourceReads(valueViewTerms, owningSideIndex, analysis, view);
+			const side = analysis.sides[owningSideIndex];
+			const others = analysis.sides.filter((_, i) => i !== owningSideIndex);
+			// Cross-source cardinality gate (§ Inner Join, cross-source `set`): a cross-source
+			// value `set owner.x = partner.y` is well-defined only when the owning side joins AT
+			// MOST ONE partner row — else the capture's correlated read-back is multi-valued and
+			// the runtime would error `Scalar subquery returned more than one row`. Reject the
+			// 1:many direction at plan time, naming the cross-source ambiguity. Bound to this
+			// assignment's owning side; memoized per partner side so the join equalities are
+			// collected once. Threaded only on the capture-carrier path (symmetric with
+			// `registerCrossSource`); the legacy path rejects cross-source wholesale before this.
+			const cardinalityProven = new Map<number, boolean>();
+			const gateCrossSourceCardinality = registerCrossSource
+				? (partnerCol: AST.ColumnExpr): void => {
+					const partnerIdx = resolveColumnSide(partnerCol, analysis.sides);
+					if (partnerIdx === undefined || partnerIdx === owningSideIndex) return;
+					let proven = cardinalityProven.get(partnerIdx);
+					if (proven === undefined) {
+						proven = ownerJoinsAtMostOnePartner(owningSideIndex, partnerIdx, analysis.sel, analysis.sides);
+						cardinalityProven.set(partnerIdx, proven);
+					}
+					if (!proven) {
+						const partnerTable = analysis.sides[partnerIdx].schema.name;
+						raiseMutationDiagnostic({
+							reason: 'cross-source-ambiguous-cardinality',
+							column: assignedCol,
+							table: view.name,
+							message: `cannot write through view '${view.name}': the cross-source assignment of column '${assignedCol}' reads column '${partnerCol.name}' on base table '${partnerTable}', but the assigned side joins more than one '${partnerTable}' row (the join does not constrain '${partnerTable}' to a unique key), so the partner value is ambiguous — a cross-source \`set\` value is well-defined only when the assigned side joins at most one partner row`,
+						});
+					}
+				}
+				: undefined;
+			// Rewrite the assigned value into base terms, then strip the owning side's
+			// qualifier (the base UPDATE targets that table directly). A reference to a
+			// partner side is rewritten to a correlated read of its captured pre-mutation
+			// value (`registerCrossSource`); absent the carrier it is rejected.
+			return stripSideQualifier(
+				substituteViewColumns(ctx, valueViewTerms, analysis.viewColToBaseRef, view),
+				view, side, owningSideIndex, others, registerCrossSource, gateCrossSourceCardinality,
+			);
+		};
+		// An authored (`with inverse`) column lowers to one base assignment per put,
+		// each routed to its owning join side — a two-sided target set yields two child
+		// ops, atomic, FK-parent-first ordered by the shared `orderSides` below. Inside
+		// each put, `new.<assigned col>` becomes the user's value and `new.<other col>`
+		// that view column's name — still in VIEW terms — then the standard lowering
+		// maps everything onto the put's side (the forward read image for non-assigned
+		// columns; a cross-side read rides the same captured-read machinery as a
+		// cross-source SET value). docs/view-updateability.md § Authored inverses.
+		if (out.authored) {
+			const authored = out.authored;
+			// The assigned VALUE's top-level references must name view columns (parity
+			// with the plain route below).
+			guardTopLevelScope(asg.value, analysis, view);
+			const assignedIdx = analysis.outColumns.indexOf(out);
+			for (const put of authored.puts) {
+				const viewTermExpr = substituteNewRefs(put.expr, name => {
+					const idx = requireValidatedNewRefIndex(authored.newRefIndex, name, asg.column);
+					return idx === assignedIdx
+						? asg.value
+						: { type: 'column', name: analysis.outColumns[idx].displayName };
+				});
+				perSide[put.sideIndex].push({
+					column: put.baseColumn,
+					value: lowerValueOntoSide(viewTermExpr, put.sideIndex, out.displayName),
+				});
+			}
+			continue;
+		}
 		if (!out.writable || out.sideIndex === undefined || !out.baseColumn) {
 			raiseMutationDiagnostic({
 				reason: 'no-inverse',
@@ -1475,53 +1603,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// otherwise re-bind in that table; across sides it would fail to resolve with a
 		// generic error — the structured guard makes the diagnostic uniform either way.
 		guardTopLevelScope(asg.value, analysis, view);
-		// Gate cross-source reads: a value that reads a partner-side view column is
-		// admitted only when that column has `base` lineage (its value is recoverable
-		// from a captured base column). A computed (non-base) partner column stays
-		// rejected (`no-inverse`); a same-side read keeps the qualifier-strip path. Run
-		// only when a capture carrier is threaded — the legacy path rejects wholesale.
-		if (registerCrossSource) gateCrossSourceReads(asg.value, out.sideIndex, analysis, view);
-		const side = analysis.sides[out.sideIndex];
-		const owningSideIndex = out.sideIndex;
-		const others = analysis.sides.filter((_, i) => i !== out.sideIndex);
-		// Cross-source cardinality gate (§ Inner Join, cross-source `set`): a cross-source
-		// value `set owner.x = partner.y` is well-defined only when the owning side joins AT
-		// MOST ONE partner row — else the capture's correlated read-back is multi-valued and
-		// the runtime would error `Scalar subquery returned more than one row`. Reject the
-		// 1:many direction at plan time, naming the cross-source ambiguity. Bound to this
-		// assignment's owning side; memoized per partner side so the join equalities are
-		// collected once. Threaded only on the capture-carrier path (symmetric with
-		// `registerCrossSource`); the legacy path rejects cross-source wholesale before this.
-		const cardinalityProven = new Map<number, boolean>();
-		const assignedCol = out.displayName;
-		const gateCrossSourceCardinality = registerCrossSource
-			? (partnerCol: AST.ColumnExpr): void => {
-				const partnerIdx = resolveColumnSide(partnerCol, analysis.sides);
-				if (partnerIdx === undefined || partnerIdx === owningSideIndex) return;
-				let proven = cardinalityProven.get(partnerIdx);
-				if (proven === undefined) {
-					proven = ownerJoinsAtMostOnePartner(owningSideIndex, partnerIdx, analysis.sel, analysis.sides);
-					cardinalityProven.set(partnerIdx, proven);
-				}
-				if (!proven) {
-					const partnerTable = analysis.sides[partnerIdx].schema.name;
-					raiseMutationDiagnostic({
-						reason: 'cross-source-ambiguous-cardinality',
-						column: assignedCol,
-						table: view.name,
-						message: `cannot write through view '${view.name}': the cross-source assignment of column '${assignedCol}' reads column '${partnerCol.name}' on base table '${partnerTable}', but the assigned side joins more than one '${partnerTable}' row (the join does not constrain '${partnerTable}' to a unique key), so the partner value is ambiguous — a cross-source \`set\` value is well-defined only when the assigned side joins at most one partner row`,
-					});
-				}
-			}
-			: undefined;
-		// Rewrite the assigned value into base terms, then strip the owning side's
-		// qualifier (the base UPDATE targets that table directly). A reference to a
-		// partner side is rewritten to a correlated read of its captured pre-mutation
-		// value (`registerCrossSource`); absent the carrier it is rejected.
-		const baseValue = stripSideQualifier(
-			substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view),
-			view, side, out.sideIndex, others, registerCrossSource, gateCrossSourceCardinality,
-		);
+		const baseValue = lowerValueOntoSide(asg.value, out.sideIndex, out.displayName);
 		// For an `inverse`-profile column the assigned value is in the VIEW domain;
 		// apply the site's inverse to recover the BASE value (`cv1 = cv + 1` ⇒ the
 		// write `cv1 = w` stores `cv = w - 1`). The base-term substitution + side-

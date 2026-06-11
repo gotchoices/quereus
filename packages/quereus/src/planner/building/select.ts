@@ -118,7 +118,7 @@ export function buildSelectStmt(
 		hasAggregates: hasAggregatesInSelect,
 		hasWindowFunctions,
 		hasWrappedAggregates
-	} = analyzeSelectColumns(stmt.columns, selectContext);
+	} = analyzeSelectColumns(stmt.columns, selectContext, input);
 	// `hasAggregates` may grow as buildAggregatePhase collects HAVING-only or
 	// ORDER-BY-only aggregates; track it locally so the post-aggregate branch
 	// is taken when those promote a non-aggregate query into an aggregate one.

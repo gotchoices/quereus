@@ -274,6 +274,11 @@ export type DomainConstraint =
  * - `null-extended` — potentially null-extended by an outer join; a write needs
  *   materialization of the missing side (later phase). `guard` is the join
  *   predicate, `inner` the un-extended site on the non-preserved base.
+ * - `authored` — the result column carries a `with inverse (col = expr, …)`
+ *   clause: author-supplied put expressions computing base columns from the
+ *   written view row (`new.<output-col>` refs). Writable AND insertable;
+ *   overrides any registry-inferred site (authored wins —
+ *   docs/view-updateability.md § Authored inverses).
  */
 export type UpdateSite =
 	| {
@@ -286,6 +291,17 @@ export type UpdateSite =
 		}
 	| { readonly kind: 'computed'; readonly expr: Expression }
 	| { readonly kind: 'null-extended'; readonly guard: Expression; readonly inner: UpdateSite }
+	| {
+			readonly kind: 'authored';
+			/** One put per clause assignment, target-resolved to its owning base relation. */
+			readonly puts: ReadonlyArray<AuthoredPut>;
+			/**
+			 * Lowercased `new.<name>` reference → output column index of the select that
+			 * carries the clause. Index-keyed (not name-keyed) so an explicit
+			 * `create view v(a, b)` column-list rename stays positionally stable.
+			 */
+			readonly newRefIndex: ReadonlyMap<string, number>;
+		}
 	| {
 			/**
 			 * An outer-join existence (`exists … as`) match flag — a clean `{true,false}`
@@ -329,6 +345,42 @@ export type RelationalComponentRef =
 			/** Which immediate operand the flag's membership reifies. */
 			readonly branch: 'left' | 'right';
 		};
+
+/**
+ * One assignment of an `authored` {@link UpdateSite}: the target base column
+ * (resolved through the child lineage to its producing `TableReferenceNode`)
+ * plus the authored expression that computes it from the written view row
+ * (`new.<output-col>` references, resolved via the site's `newRefIndex`).
+ */
+export interface AuthoredPut {
+	/** Producing `TableReferenceNode`'s plan-node id of the target base column's relation. */
+	readonly table: number;
+	readonly baseColumn: string;
+	/** The authored expression over `new.<output-col>` references (AST as written). */
+	readonly expr: Expression;
+}
+
+/**
+ * Build-time-validated `with inverse` metadata carried on a {@link import('./project-node.js').Projection}.
+ * Produced by `analysis/authored-inverse.ts` (`validateAuthoredInverses`) when the
+ * select's projections are built; consumed by `deriveProjectUpdateLineage`, which
+ * resolves each `targetAttrId` through the child lineage into an `authored`
+ * {@link UpdateSite} (authored wins over any registry-inferred site).
+ */
+export interface AuthoredInverseAssignment {
+	/** Child (FROM-source) attribute id the assignment target resolved to at build time. */
+	readonly targetAttrId: number;
+	/** Target base column in its resolved display spelling (diagnostics). */
+	readonly targetColumn: string;
+	/** The authored expression over `new.<output-col>` references. */
+	readonly expr: Expression;
+}
+
+export interface AuthoredInverseMeta {
+	readonly assignments: ReadonlyArray<AuthoredInverseAssignment>;
+	/** Lowercased `new.<name>` reference → output column index of the carrying select. */
+	readonly newRefIndex: ReadonlyMap<string, number>;
+}
 
 /**
  * Per-attribute insert-default provenance — the value used when an `insert`
