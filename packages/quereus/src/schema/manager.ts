@@ -30,7 +30,7 @@ import type { ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { hasNativeEventSupport } from '../util/event-support.js';
 import type { VTableSchemaChangeEvent } from '../vtab/events.js';
 import { quoteIdentifier, createViewToString, createMaterializedViewToString, astToString } from '../emit/ast-stringify.js';
-import { materializeView, adoptMaterializedView, deriveBackingShape, backingShapeMatches, type MaterializeViewDefinition, type BackingShape } from '../runtime/emit/materialized-view-helpers.js';
+import { materializeView, adoptMaterializedView, deriveBackingShape, backingShapeMatches, assertDeclaredColumnArity, type MaterializeViewDefinition, type BackingShape } from '../runtime/emit/materialized-view-helpers.js';
 
 const log = createLogger('schema:manager');
 const warnLog = log.extend('warn');
@@ -2725,6 +2725,9 @@ export class SchemaManager {
 	 * to plan until its upstream's round lands, and dropping here would destroy
 	 * the rows a later round could adopt (a genuinely un-plannable body then
 	 * errors per-entry with the backing preserved as a plain table — data-safe).
+	 * A declared-column arity mismatch likewise throws with the backing
+	 * preserved: such an entry can never materialize, so dropping first (as the
+	 * refill arm would) destroys durable rows for nothing.
 	 * Gates, of five (the caller already verified gate 1, same-module, and
 	 * gate 5, `trustBackings`):
 	 *
@@ -2755,10 +2758,10 @@ export class SchemaManager {
 	): Promise<boolean> {
 		// Throws when the body cannot plan — deliberately NOT caught (see docstring).
 		const shape: BackingShape = deriveBackingShape(this.db, def.bodySql, def.columns);
-		// Declared-column arity mismatch: let the refill arm raise its sited error.
-		if (def.columns && def.columns.length > 0 && def.columns.length !== shape.columns.length) {
-			return false;
-		}
+		// Declared-column arity mismatch: the entry can NEVER materialize (the refill
+		// arm would raise the same sited error AFTER the caller dropped the backing),
+		// so throw it here — per-entry error, durable rows preserved.
+		assertDeclaredColumnArity(def, shape);
 		if (!backingShapeMatches(preExisting, shape)) return false;
 
 		for (const qualified of shape.sourceTables) {

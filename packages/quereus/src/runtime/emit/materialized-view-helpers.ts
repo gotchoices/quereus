@@ -264,6 +264,61 @@ export interface MaterializeViewDefinition {
 }
 
 /**
+ * Throws the sited declared-column-arity diagnostic when `def`'s explicit column
+ * list disagrees with the body's output arity. Build-time creation already
+ * validated this (with a build-located diagnostic); this guards the import path —
+ * both the refill arm ({@link materializeView}) and the adopt gate check
+ * (`SchemaManager.tryAdoptPreExistingBacking`, which must raise it BEFORE the
+ * caller drops a durable backing: the entry can never materialize, so dropping
+ * would destroy rows for nothing). The refresh path deliberately does NOT share
+ * this — it reaches a legitimate mismatch after a source ALTER and has its own
+ * "drop and recreate" diagnostic.
+ */
+export function assertDeclaredColumnArity(def: MaterializeViewDefinition, shape: BackingShape): void {
+	if (def.columns && def.columns.length > 0 && def.columns.length !== shape.columns.length) {
+		throw new QuereusError(
+			`materialized view '${def.schemaName}.${def.viewName}' has ${def.columns.length} declared columns but body produces ${shape.columns.length}`,
+			StatusCode.ERROR,
+		);
+	}
+}
+
+/**
+ * Builds the {@link MaterializedViewSchema} record for `def` over the derived
+ * `shape` — the single record formula shared by {@link materializeView} (refill)
+ * and {@link adoptMaterializedView} (adopt), so the two paths cannot drift: an
+ * adopted and a refilled MV record are indistinguishable (fixed point: export
+ * DDL after adopt == after refill).
+ *
+ * `bodyHash` hashes the canonical DEFINITION (explicit columns + body +
+ * insert-defaults clause), NOT the executable bodySql — the declarative differ
+ * recomputes the same form from a declared MV, so a clause-only or
+ * explicit-columns-only change is detected as drift. `def.bodySql` stays
+ * select-only: it feeds execution (collectBodyRows / deriveBackingShape /
+ * linkCoveredUniqueConstraints).
+ */
+function buildMaterializedViewRecord(def: MaterializeViewDefinition, shape: BackingShape): MaterializedViewSchema {
+	return {
+		name: def.viewName,
+		schemaName: def.schemaName,
+		sql: def.sql,
+		selectAst: def.selectAst,
+		columns: def.columns,
+		insertDefaults: def.insertDefaults,
+		tags: def.tags,
+		backingTableName: backingTableNameFor(def.viewName),
+		backingModuleName: def.backingModuleName,
+		backingModuleArgs: def.backingModuleArgs,
+		primaryKey: shape.primaryKey,
+		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
+		ordering: shape.ordering,
+		sourceTables: shape.sourceTables,
+		stale: false,
+		origin: 'explicit',
+	};
+}
+
+/**
  * The materialize core shared by `emitCreateMaterializedView` and the
  * catalog-import path (`SchemaManager.importMaterializedView`): derive the
  * backing shape from the planned body → create the backing table in the
@@ -287,17 +342,9 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 	const sm = db.schemaManager;
 
 	const shape = deriveBackingShape(db, def.bodySql, def.columns);
-	// Build-time creation already validated declared-column arity (with a
-	// build-located diagnostic); this guards the import path, where the only
-	// earlier gate is the parser. Lives here — not in deriveBackingShape — because
-	// the refresh path reaches a legitimate mismatch after a source ALTER and has
-	// its own "drop and recreate" diagnostic.
-	if (def.columns && def.columns.length > 0 && def.columns.length !== shape.columns.length) {
-		throw new QuereusError(
-			`materialized view '${def.schemaName}.${def.viewName}' has ${def.columns.length} declared columns but body produces ${shape.columns.length}`,
-			StatusCode.ERROR,
-		);
-	}
+	// Lives here — not in deriveBackingShape — because the refresh path reaches a
+	// legitimate mismatch after a source ALTER (see the assert's docstring).
+	assertDeclaredColumnArity(def, shape);
 	const backingTableName = backingTableNameFor(def.viewName);
 	const backingSchema = buildBackingTableSchema(db, def.schemaName, backingTableName, shape, def.backingModuleName, def.backingModuleArgs);
 	const completeBacking = await sm.createBackingTable(backingSchema);
@@ -314,29 +361,7 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		throw e;
 	}
 
-	const mv: MaterializedViewSchema = {
-		name: def.viewName,
-		schemaName: def.schemaName,
-		sql: def.sql,
-		selectAst: def.selectAst,
-		columns: def.columns,
-		insertDefaults: def.insertDefaults,
-		tags: def.tags,
-		backingTableName,
-		backingModuleName: def.backingModuleName,
-		backingModuleArgs: def.backingModuleArgs,
-		primaryKey: shape.primaryKey,
-		// Hash the canonical DEFINITION (explicit columns + body + insert-defaults
-		// clause), NOT the executable bodySql — the differ recomputes the same form
-		// from a declared MV, so a clause-only or explicit-columns-only change is
-		// detected as drift. `def.bodySql` stays select-only: it feeds execution
-		// (collectBodyRows / deriveBackingShape / linkCoveredUniqueConstraints).
-		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
-		ordering: shape.ordering,
-		sourceTables: shape.sourceTables,
-		stale: false,
-		origin: 'explicit',
-	};
+	const mv = buildMaterializedViewRecord(def, shape);
 	// Eagerly record the constraint↔structure link if this MV covers a UNIQUE
 	// constraint (informational — enforcement still routes through the
 	// synchronously-maintained auto-index).
@@ -403,29 +428,7 @@ export async function adoptMaterializedView(
 	const stamped = buildBackingTableSchema(db, def.schemaName, backingTableName, shape, def.backingModuleName, def.backingModuleArgs);
 	sm.getSchemaOrFail(def.schemaName).addTable({ ...stamped, estimatedRows: preExisting.estimatedRows ?? 0 });
 
-	// Same record formula as materializeView — bodyHash by construction agrees
-	// with what the refill arm (and the declarative differ) computes from the
-	// same re-parsed canonical definition, so an adopted and a refilled MV
-	// record are indistinguishable (fixed point: export DDL after adopt ==
-	// after refill).
-	const mv: MaterializedViewSchema = {
-		name: def.viewName,
-		schemaName: def.schemaName,
-		sql: def.sql,
-		selectAst: def.selectAst,
-		columns: def.columns,
-		insertDefaults: def.insertDefaults,
-		tags: def.tags,
-		backingTableName,
-		backingModuleName: def.backingModuleName,
-		backingModuleArgs: def.backingModuleArgs,
-		primaryKey: shape.primaryKey,
-		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
-		ordering: shape.ordering,
-		sourceTables: shape.sourceTables,
-		stale: false,
-		origin: 'explicit',
-	};
+	const mv = buildMaterializedViewRecord(def, shape);
 	linkCoveredUniqueConstraints(db, mv, def.bodySql);
 	sm.addMaterializedView(mv);
 

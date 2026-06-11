@@ -217,6 +217,32 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(await rows(db3, 'select count(*) as n from mv where id = 99')).to.deep.equal([{ n: 0 }]);
 	});
 
+	it('a declared-column arity mismatch under trust errors per-entry without dropping the backing', async () => {
+		const { db, mod } = open();
+		await db.exec('create table src (id integer primary key, v integer) using store');
+		await db.exec('insert into src values (1, 10)');
+		await db.exec('create materialized view mv (a, b) using store as select * from src');
+		await mod.closeAll();
+
+		// Session 2: widen the source so the `select *` body produces three columns
+		// under the two-column declared list — the entry can never materialize.
+		// Clean close, so every gate up to the arity check passes on the next open.
+		const s2 = await reopen();
+		expect(s2.result.errors).to.have.lengthOf(0);
+		await s2.db.exec('alter table src add column w integer default 7');
+		await s2.mod.closeAll();
+		await plantSentinel('main._mv_mv', [99, 990]);
+
+		const { db: db3, result } = await reopen();
+		expect(result.errors, 'one per-entry error').to.have.lengthOf(1);
+		expect(result.errors[0].error.message).to.match(/2 declared columns but body produces 3/i);
+		expect(db3.schemaManager.getMaterializedView('main', 'mv'), 'no MV record').to.be.undefined;
+		// The durable backing was NOT dropped first (the refill arm would have
+		// destroyed the rows before raising the same error): it stays a plain table.
+		expect(db3.schemaManager.getTable('main', '_mv_mv'), 'backing still registered').to.not.be.undefined;
+		expect(await provider.stores.get('main._mv_mv')!.get(buildDataKey([99])), 'sentinel row preserved').to.not.be.undefined;
+	});
+
 	it('a memory source fails the same-module gate: refill every reopen', async () => {
 		const { db, mod } = open();
 		// An anchor store table establishes persistence; the source is MEMORY.
