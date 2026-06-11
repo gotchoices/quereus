@@ -424,7 +424,12 @@ function extractBinaryConstraint(
       } else if (innerValue.nodeType === PlanNodeType.ColumnReference) {
         const rhsAttrId = (innerValue as unknown as ColumnReferenceNode).attributeId;
         const sameTable = tableInfo.columnIndexMap.has(rhsAttrId);
-        result.bindingKind = sameTable ? 'expression' : 'correlated';
+        if (sameTable) {
+          // Same-table column ref: value is unknown until the row is scanned —
+          // can never be a seek key. Decline; the predicate stays as residual.
+          return null;
+        }
+        result.bindingKind = 'correlated';
       } else {
         result.bindingKind = 'expression';
       }

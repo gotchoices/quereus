@@ -1009,13 +1009,13 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].bindingKind).to.equal('correlated');
 		});
 
-		it('col = sameTableCol → expression binding', () => {
+		it('col = sameTableCol → residual (not a constraint, value unknown until scan)', () => {
 			const col_a = colRef(101, 'a', 1);
 			const col_b = colRef(102, 'b', 2);
 			const expr = binOp('=', col_a, col_b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.not.equal(undefined);
 		});
 
 		it('param = col (reversed) → parameter binding with flipped op', () => {
@@ -1058,17 +1058,15 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].correlated).to.equal(true);
 		});
 
-		// Same-table cast-wrapped ref reaches the 'expression' bindingKind branch
-		// (inner is a same-table column ref) and the walk correctly returns false —
-		// a legitimate same-table filter must not be de-classified.
-		it('p.id = cast(p.b) (cast-wrapped same-table ref) → correlated false, bindingKind expression', () => {
+		// Same-table cast-wrapped ref: the cast unwraps to a same-table ColumnReference,
+		// which is a per-row value and can never be a seek key — declined to residual.
+		it('p.id = cast(p.b) (cast-wrapped same-table ref) → residual (not a constraint)', () => {
 			const id = colRef(100, 'id', 0);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', id, castNode(b));
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
-			expect(result.allConstraints[0].correlated).to.equal(false);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 
 		// Documents the extractor limitation: a general-expression value side
@@ -1084,14 +1082,14 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.residualPredicate).to.exist;
 		});
 
-		it('p.id = p.b (bare same-table ref) → correlated false', () => {
+		// Same-table bare column ref: per-row value, declined to residual.
+		it('p.id = p.b (bare same-table ref) → residual (not a constraint)', () => {
 			const id = colRef(100, 'id', 0);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', id, b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
-			expect(result.allConstraints[0].correlated).to.equal(false);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 
 		it('p.id = :param → correlated false (parameter does not escape row scope)', () => {
@@ -1189,14 +1187,14 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 	// Edge cases: two-column expressions (no extraction)
 	// ===================================================================
 	describe('two-column binary expressions', () => {
-		it('col = col with no literals → no extraction (no table mapping for value side)', () => {
+		it('col = col with no literals → residual (same-table col ref can never be a seek key)', () => {
 			const a = colRef(101, 'a', 1);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', a, b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			// Both sides are columns from the same table → expression binding
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
+			// Both sides are columns from the same table — value is unknown until the row is scanned.
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.not.equal(undefined);
 		});
 	});
 
@@ -2029,14 +2027,13 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(c.valueExpr).to.exist;
 		});
 
-		it('col = otherCol (same table) → expression binding', () => {
+		it('col = otherCol (same table) → residual (value unknown until row scanned)', () => {
 			const a = colRef(101, 'a', 1);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', a, b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			const c = result.allConstraints[0];
-			expect(c.bindingKind).to.equal('expression');
-			expect(c.valueExpr).to.exist;
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.not.equal(undefined);
 		});
 
 		it('col = otherTableCol → correlated binding', () => {
